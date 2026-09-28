@@ -687,6 +687,34 @@ describe("UID-split solitary unreadable runner process", () => {
     });
   }
 
+  it("classifies the candidate before clone scope and keeps its start time private", () => {
+    const result = scanOnce(
+      solitaryReq({ mode: "seed", targetPaths: ["/another/clone"] }),
+      fakeTable({ 53: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 1 } }),
+      SELF,
+    );
+    assert.deepEqual(result.kill, [{
+      pid: 53, uid: RUNNER, comm: "proc 53", cwd: "unreadable",
+      reason: "unreadable_no_other_claim", startTime: DEFAULT_START,
+    }]);
+    assert.deepEqual(result.unverified, []);
+  });
+
+  it("missing stat field 22 leaves an unreadable process unverified and unsignalled", async () => {
+    const base = fakeTable({ 54: { uid: RUNNER, cwd: "EACCES", env: "EACCES" } });
+    const table: ProcTable = { ...base, readStat: (pid) => base.readStat(pid).split(" ").slice(0, -3).join(" ") };
+    let now = 0;
+    const signalled: number[] = [];
+    const r = await reapProcesses(solitaryReq(), {
+      table, selfPid: SELF, deadlineMs: 20, intervalMs: 10,
+      now: () => now, sleep: async (ms) => { now += ms; },
+      kill: (pid) => { signalled.push(pid); },
+    });
+    assert.equal(r.state, "unverified");
+    assert.deepEqual(signalled, []);
+    assert.equal(r.processes[0]?.reason, "unreadable_unattributed");
+  });
+
   it("a live other attempt marker keeps an unreadable process unverified and unsignalled", async () => {
     const { r, signalled } = await fakeReap(
       { 51: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 1 } },
@@ -754,7 +782,8 @@ describe("UID-split solitary unreadable runner process", () => {
     assert.equal(r.state, "survivors");
     assert.ok(signalled.length > 0);
     assert.deepEqual(r.processes.map((p) => p.pid), [62]);
-    assert.match(r.processes[0]!.reason, /kill_unconfirmed/);
+    assert.equal(r.processes[0]?.reason, "unreadable_no_other_claim:kill_unconfirmed");
+    assert.equal("startTime" in r.processes[0]!, false);
   });
 
   for (const afterReuse of ["readable out of scope", "vanished"] as const) {

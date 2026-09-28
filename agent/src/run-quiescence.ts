@@ -24,7 +24,8 @@
 //       ppid chain, process group or session leading to (or being) a recorded root of ANOTHER
 //       live attempt (a Claude CLI group or a Codex provider supervisor), or a long-lived
 //       runner-uid root the worker itself launched and recorded, is out of scope; anything else
-//       is `unverified`. A root is recorded as its pid AND its start time (`stat` field 22,
+//       is `unverified` unless the solitary uid-split permission and a stable stat start time
+//       permit reaping it. A root is recorded as its pid AND its start time (`stat` field 22,
 //       captured at spawn/registration) and matches only a live process with both, so a pid the
 //       kernel recycled after the root exited never exempts anything.
 //   R3  SCOPE first. A process is in scope iff its cwd lies (by whole path components) within a
@@ -469,8 +470,13 @@ export interface QuiesceProcess {
   reason: string;
 }
 
+interface KillCandidate extends QuiesceProcess {
+  /** Internal identity captured during classification; never included in ProcessQuiescence. */
+  startTime: number | undefined;
+}
+
 interface ScanResult {
-  kill: QuiesceProcess[];
+  kill: KillCandidate[];
   survivors: QuiesceProcess[];
   unverified: QuiesceProcess[];
   tableError?: string;
@@ -551,10 +557,14 @@ export function scanOnce(
   // R5: never self, never an ancestor; a descendant only when an attempt marker proves residue.
   const excluded = new Set<number>([selfPid, ...ancestorsOf(selfPid, table)]);
   const parentOf = new Map<number, number>();
+  const startTimeOf = new Map<number, number>();
   for (const pid of pids) {
     const r = tryRead(() => table.readStat(pid));
     const facts = r.ok ? parseStat(r.value) : undefined;
-    if (facts) parentOf.set(pid, facts.ppid);
+    if (facts) {
+      parentOf.set(pid, facts.ppid);
+      if (facts.startTime !== undefined) startTimeOf.set(pid, facts.startTime);
+    }
   }
   const isDescendant = (pid: number): boolean => {
     let cur = parentOf.get(pid);
@@ -588,19 +598,35 @@ export function scanOnce(
     const cwdRead = tryRead(() => table.readCwd(pid));
     if ((!envRead.ok && envRead.vanished) || (!cwdRead.ok && cwdRead.vanished)) continue;
     if (!envRead.ok || !cwdRead.ok) {
-      // A non-dumpable runner-uid process: attribute by ancestry, else fail closed.
+      // A non-dumpable runner-uid process: attribute by ancestry before considering a signal.
       if (attributedToOtherLive(pid, table, roots)) continue;
-      // The world-readable stat's comm names it for the operator (issue #1783 M2); the status
-      // Name line is the fallback when stat cannot be read.
       const statRead = tryRead(() => table.readStat(pid));
-      const statComm = statRead.ok ? parseStat(statRead.value)?.comm : undefined;
-      result.unverified.push({
+      const facts = statRead.ok ? parseStat(statRead.value) : undefined;
+      const entry: QuiesceProcess = {
         pid,
         uid: status.uid,
-        comm: statComm || status.comm,
+        comm: facts?.comm || status.comm,
         cwd: cwdRead.ok ? sanitizeForLog(cwdRead.value) : "unreadable",
         reason: "unreadable_unattributed",
-      });
+      };
+      // Under the uid split every runner-uid process is: (1) agent-controlled code of a
+      // current or finished claim, including deliberately unmarked dependency installs,
+      // provisioning builds, self-improve checks, stub git and runner-clone git that can run
+      // configured code; (2) a recorded worker-launched root or descendant (including the
+      // non-dumpable Codex supervisor); (3) a readable, worker-marked fixed-argv spawn that
+      // runs no repo code; or (4) this R5-excluded scanner. Thus an unreadable process with
+      // no recorded-root attribution and no other claim/attempt in flight is reapable residue,
+      // even when it came from a finished run. A future worker spawn that can become
+      // non-dumpable must be recorded as a root or this invariant breaks.
+      if (
+        req.mayKillUnreadableUnattributed === true &&
+        req.liveMarkers.length === 0 &&
+        facts?.startTime !== undefined
+      ) {
+        result.kill.push({ ...entry, reason: "unreadable_no_other_claim", startTime: facts.startTime });
+      } else {
+        result.unverified.push(entry);
+      }
       continue;
     }
     const env = parseEnviron(envRead.value);
@@ -625,11 +651,12 @@ export function scanOnce(
       cwd: sanitizeForLog(cwd),
       reason,
     });
+    const candidate = (reason: string): KillCandidate => ({ ...entry(reason), startTime: startTimeOf.get(pid) });
     const marker = env.get(RUN_ATTEMPT_ENV);
-    if (marker !== undefined && marker === req.ownMarker) result.kill.push(entry("own_attempt"));
+    if (marker !== undefined && marker === req.ownMarker) result.kill.push(candidate("own_attempt"));
     else if (marker !== undefined && liveMarkers.has(marker)) result.survivors.push(entry("live_attempt_conflict"));
-    else if (marker !== undefined) result.kill.push(entry("terminal_attempt"));
-    else if (req.mode === "own") result.kill.push(entry("unmarked_in_scope"));
+    else if (marker !== undefined) result.kill.push(candidate("terminal_attempt"));
+    else if (req.mode === "own") result.kill.push(candidate("unmarked_in_scope"));
     else result.survivors.push(entry("unattributed_in_scope"));
   }
   return result;
@@ -702,12 +729,21 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
     if ((last.kill.length === 0 && last.unverified.length === 0) || now() >= deadline) break;
     for (const p of last.kill) {
+      const statRead = tryRead(() => table.readStat(p.pid));
+      const currentStartTime = statRead.ok ? parseStat(statRead.value)?.startTime : undefined;
+      if (p.startTime === undefined || currentStartTime !== p.startTime) continue;
       kill(p.pid);
       killed.push(p.pid);
     }
     await sleep(deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS);
   }
-  const stuck = last.kill.map((p) => ({ ...p, reason: `${p.reason}:kill_unconfirmed` }));
+  const stuck: QuiesceProcess[] = last.kill.map((p) => ({
+    pid: p.pid,
+    uid: p.uid,
+    comm: p.comm,
+    cwd: p.cwd,
+    reason: `${p.reason}:kill_unconfirmed`,
+  }));
   if (last.unverified.length > 0) {
     return {
       state: "unverified",
