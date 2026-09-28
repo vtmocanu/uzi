@@ -60,10 +60,9 @@ def status_only:
         or ($b | contains("<!-- walkthrough_start -->"))
         or ($b | contains("<!-- auto-generated comment: rate limited by coderabbit.ai -->"))
         or ($b | contains("<!-- CodeRabbit review command invocation:"))
-        # The answer to the cr-rate-limit.sh quota query: pure status, short, no finding.
-        or (($b | contains("<!-- This is an auto-generated reply by CodeRabbit -->"))
-            and ($b | test("More reviews will be available in [0-9]+ minutes?|Reviews are available now"))
-            and ($b | length) < 600)))
+        # The answer to the cr-rate-limit.sh quota query, matched as the WHOLE body: any
+        # extra text (a mixed reply with feedback) still needs an ack.
+        or ($b | test("^\\s*<!-- This is an auto-generated reply by CodeRabbit -->\\s*Your \\[plan\\]\\([^)\\s]*\\) includes PR reviews subject to \\[rate limits\\]\\([^)\\s]*\\)\\. (More reviews will be available in [0-9]+ minutes?|Reviews are available now)\\.\\s*$"))))
     or ($u == "greptile-apps[bot]" and (
         ($b | contains("<!-- greptile_comment -->"))
         or ($b | contains("<!-- greptile_outside_diff -->"))));

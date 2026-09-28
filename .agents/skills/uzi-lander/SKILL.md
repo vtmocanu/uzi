@@ -57,9 +57,9 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   toolchain risk, and unexplained lockfile changes need review. State the decision. Reserve
   CodeRabbit/Greptile for large or high-risk work, and get user approval before requesting
   a review bot for Renovate-class work. Read references/renovate.md before landing one.
-- **Never wait out a CodeRabbit rate limit.** Switch at once: a large or trust-boundary PR
-  goes to Greptile (the buddy reviews too); a small PR to the buddy alone. Wait for the
-  reset only when the user asks for CodeRabbit on that PR.
+- **Prefer CodeRabbit; wait for it only when the live reset is 15 minutes or less.**
+  Its quota refills hourly. Otherwise switch at once: a large or trust-boundary PR goes to
+  Greptile (the buddy reviews too); a small PR to the buddy alone (step 3).
 - **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
   repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
   and message you instead of double-driving it. A PR another live session holds stops you
@@ -109,7 +109,7 @@ this lander's second pair of eyes.
 |---|---|
 | Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
 | After a small local fix | the buddy's `APPROVE` of the fixed head, plus green CI; a fix too big for that goes to `uzi run rework` (step 4) |
-| CodeRabbit rate-limited | no waiting: a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too; a small PR takes the buddy alone |
+| CodeRabbit rate-limited | live reset ≤ 15 min: wait for CodeRabbit; otherwise a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too, a small PR takes the buddy alone |
 | Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
 | Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
@@ -212,10 +212,12 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
    OWNER/REPO`, then batch fixes into one push.
-   - **Rate-limited (exit 5).** Switch without waiting. A large or trust-boundary PR: post
+   - **Rate-limited (exit 5).** Read the live reset first: `S/cr-rate-limit.sh OWNER/REPO PR
+     --query` (never the walkthrough's figure). `CR_RESET_MIN` ≤ 15 → wait for CodeRabbit
+     (below). Longer or `unknown` → switch: a large or trust-boundary PR posts
      `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`, and the buddy
-     reviews the same head. A small PR: the buddy alone, with `--reviewer none`. Only when
-     the user asks for CodeRabbit on that PR, run
+     reviews the same head; a small PR takes the buddy alone, with `--reviewer none`. To
+     wait, run
      `S/cr-rate-limit.sh OWNER/REPO PR --trigger-review`: it posts the exact two-word quota
      query, waits for the authoritative countdown or "Reviews are available now," then posts
      `@coderabbitai review` itself exactly once under a per-PR lock when safe and immediately
