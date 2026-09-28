@@ -8,6 +8,11 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 fail() { echo "FAIL: $*" >&2; exit 1; }
 
+# Resolve the real stat before the stubs shadow it: it is /usr/bin/stat on macOS but
+# /bin/stat on some Linux images (the uzi worker), where a hard-coded path made the stub
+# fail and the script fall through to the fake BSD output ("File: unbound variable").
+REAL_STAT=$(command -v stat) || { echo "BROKEN: no stat on PATH" >&2; exit 2; }
+export REAL_STAT
 mkdir -p "$WORK/bin" "$WORK/state"
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
@@ -20,7 +25,7 @@ set -eu
 # with filesystem text and is therefore not a portable feature probe.
 if [ "${1:-}" = -c ]; then
   last="${!#}"
-  if [ "$(uname -s)" = Darwin ]; then /usr/bin/stat -f %m "$last"; else /usr/bin/stat -c %Y "$last"; fi
+  if [ "$(uname -s)" = Darwin ]; then "$REAL_STAT" -f %m "$last"; else "$REAL_STAT" -c %Y "$last"; fi
   exit 0
 fi
 if [ "${1:-}" = -f ]; then
@@ -28,7 +33,7 @@ if [ "${1:-}" = -f ]; then
   echo '    ID: deadbeef Namelen: 255 Type: ext2/ext3'
   exit 0
 fi
-exec /usr/bin/stat "$@"
+exec "$REAL_STAT" "$@"
 STUB
 cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
