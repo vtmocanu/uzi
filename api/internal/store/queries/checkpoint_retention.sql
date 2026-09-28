@@ -206,6 +206,22 @@ WHERE repo_id = @repo_id
 ORDER BY created_at DESC, run_id
 LIMIT 10;
 
+-- name: ListActiveCheckpointRetentionsForBranch :many
+-- D2 (#1810 M1 rework): the OTHER runs' records that hold (retained) or are handing off
+-- (superseding) a branch's checkpoint slot, whatever their backoff: Publish reads it BEFORE any
+-- forge write, so a publish that DESCENDS from an older run's retained tip (a fast-forward the
+-- broker would accept) still supersedes that record first instead of leaving it retained at a
+-- tip that is no longer the branch tip. No next_attempt_at filter: a backed-off record still
+-- holds the slot, and the caller refuses the push until it is freed. Newest first, bounded.
+SELECT * FROM checkpoint_retentions
+WHERE repo_id = @repo_id
+  AND branch = @branch::text
+  AND run_id <> @exclude_run_id
+  AND ref = @ref::text
+  AND state IN ('retained', 'superseding')
+ORDER BY created_at DESC, run_id
+LIMIT 10;
+
 -- name: ListCheckpointRetentionWork :many
 -- The reconciliation sweeper's candidates in the given states, oldest-due first, bounded.
 -- The caller names the states its arms handle (superseding, settling), so rows no arm acts on

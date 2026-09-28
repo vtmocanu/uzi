@@ -565,6 +565,7 @@ type Store interface {
 	// superseded/settling transition, the tip-gone close, the publish-time tip advance, and the
 	// reconciler's candidate page.
 	ListCheckpointRetentionsForBranch(ctx context.Context, arg store.ListCheckpointRetentionsForBranchParams) ([]store.CheckpointRetention, error)
+	ListActiveCheckpointRetentionsForBranch(ctx context.Context, arg store.ListActiveCheckpointRetentionsForBranchParams) ([]store.CheckpointRetention, error)
 	BeginCheckpointSupersession(ctx context.Context, arg store.BeginCheckpointSupersessionParams) (int64, error)
 	MarkCheckpointSuperseded(ctx context.Context, runID uuid.UUID) (string, error)
 	SetCheckpointSupersessionTipGone(ctx context.Context, arg store.SetCheckpointSupersessionTipGoneParams) (int64, error)
@@ -5152,19 +5153,6 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		return PublishResult{}, fmt.Errorf("publish: bot PAT could not be decrypted")
 	}
 
-	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
-	// just-cancelled run may be its latest work), but not once the run's branch slot was handed to
-	// a newer run: the publish is refused before any forge call (terminalPublishSuperseded).
-	if terminalStatuses[owned.Status] {
-		superseded, serr := s.terminalPublishSuperseded(ctx, runID)
-		if serr != nil {
-			return PublishResult{}, serr
-		}
-		if superseded {
-			return PublishResult{Published: false, Ref: ref, Skipped: "superseded"}, nil
-		}
-	}
-
 	// 6. Hand the mechanical push to the go-git broker (stubbable seam). Map its
 	// benign sentinels to skips; anything else is a best-effort 5xx.
 	// The broker's Result.Ref equals the ref computed above; the service returns its
@@ -5180,15 +5168,110 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		DeclaredTip:   tipOid,
 		Pack:          pack,
 	}
-	_, err = s.publishFn(ctx, opts)
-	// PRD #1810 D2: a not_descendant refusal may be a RETAINED checkpoint of an older run on
-	// this branch holding the slot. freeCheckpointSlot supersedes it (moving its tip to
-	// refs/uzi-recovery/<old run id>, never deleting it) and reports whether the branch ref is
-	// now free; only then is the publish retried, ONCE, with the same options (Pack is a
-	// re-readable []byte). The retry's outcome is mapped exactly like the first attempt's.
+
+	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
+	// just-cancelled run may be its latest work), but not once the run's branch slot was handed to
+	// a newer run. With retention wired the whole terminal publish (the superseded check, the
+	// push, the tip persist and the record track) runs under the run's retention lock
+	// (publishTerminalLocked), so no supersession of this run can interleave with it.
+	if terminalStatuses[owned.Status] && s.retentionWired() {
+		return s.publishTerminalLocked(ctx, owned, branch, ref, tipOid, opts)
+	}
+
+	// PRD #1810 D2: another run's retained record may hold this branch's slot even when this
+	// publish would fast-forward over it (the new run's work descends from the old tip). The slot
+	// is claimed (the record superseded) BEFORE the push, or the push is refused.
+	if skip := s.claimCheckpointSlot(ctx, owned, branch); skip != "" {
+		return PublishResult{Published: false, Ref: ref, Skipped: skip}, nil
+	}
+	err = s.pushCheckpoint(ctx, owned, branch, opts, nil)
+	res, settle, err := s.publishOutcome(ctx, runID, terminalStatuses[owned.Status], branch, ref, tipOid, err)
+	if settle {
+		s.SettleRetainedCheckpoint(runID)
+	}
+	return res, err
+}
+
+// publishTerminalLocked is Publish for a TERMINAL run with retention wired (PRD #1810): the
+// terminalPublishSuperseded check, the branch-slot check, the forge push, the tip persist and the
+// retention-record track all run under the run's retention lock, so a supersession of this run
+// (which takes the same lock) can neither begin between the check and the push nor land between
+// the push and the track. The push is preceded by the lock's fence and skipped when it errors. A
+// busy lock (another instance or the sweeper is working the run's record, or the retention slots
+// are full) is the benign not_descendant skip with no forge call: the worker retries next tick. A
+// settle the track owes is dispatched only AFTER the lock is released (SettleRetainedCheckpoint
+// try-locks the same key, so dispatching it under the lock could lose to this very holder).
+//
+// withRetentionLock detaches from ctx and applies its own deadline; every call inside uses the
+// context it hands to fn.
+func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, branch, ref, tipOid string, opts pushbroker.Options) (PublishResult, error) {
+	runID := owned.ID
+	var (
+		res    PublishResult
+		resErr error
+		settle bool
+	)
+	acquired, lerr := s.withRetentionLock(ctx, runID, func(lctx context.Context, fence func(context.Context) error) error {
+		superseded, serr := s.terminalPublishSuperseded(lctx, runID)
+		if serr != nil {
+			resErr = serr
+			return nil
+		}
+		if superseded {
+			res = PublishResult{Published: false, Ref: ref, Skipped: "superseded"}
+			return nil
+		}
+		if skip := s.claimCheckpointSlot(lctx, owned, branch); skip != "" {
+			res = PublishResult{Published: false, Ref: ref, Skipped: skip}
+			return nil
+		}
+		if ferr := fence(lctx); ferr != nil {
+			slog.Warn("checkpoint: retention lock lost before a terminal publish; push skipped", "run", runID, "error", ferr)
+			res = PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
+			return nil
+		}
+		perr := s.pushCheckpoint(lctx, owned, branch, opts, fence)
+		res, settle, resErr = s.publishOutcome(lctx, runID, true, branch, ref, tipOid, perr)
+		return nil
+	})
+	if lerr != nil {
+		return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(lerr.Error()))
+	}
+	if !acquired {
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	}
+	if settle {
+		s.SettleRetainedCheckpoint(runID)
+	}
+	return res, resErr
+}
+
+// pushCheckpoint hands the push to the broker and, on a not_descendant refusal, runs the
+// supersession fallback: a not_descendant refusal may still be a RETAINED checkpoint of an older
+// run on this branch (a record claimCheckpointSlot did not list: a settling record, or one that
+// appeared since). freeCheckpointSlot supersedes it (moving its tip to
+// refs/uzi-recovery/<old run id>, never deleting it) and reports whether the branch ref is now
+// free; only then is the publish retried, ONCE, with the same options (Pack is a re-readable
+// []byte). freeCheckpointSlot refuses a terminal run, so a terminal publish is never retried.
+// beforeRetry, when non-nil, is the retention fence of a locked caller, run before the retry; its
+// error is returned in place of a push.
+func (s *Service) pushCheckpoint(ctx context.Context, owned store.Run, branch string, opts pushbroker.Options, beforeRetry func(context.Context) error) error {
+	_, err := s.publishFn(ctx, opts)
 	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, owned, branch) {
+		if beforeRetry != nil {
+			if ferr := beforeRetry(ctx); ferr != nil {
+				return pushbroker.ErrNotDescendant
+			}
+		}
 		_, err = s.publishFn(ctx, opts)
 	}
+	return err
+}
+
+// publishOutcome maps the broker's result to Publish's response. On success it persists the tip
+// and tracks the run's retention record; settle reports that the record now owes a settle, which
+// the caller dispatches (SettleRetainedCheckpoint) once no retention lock of the run is held.
+func (s *Service) publishOutcome(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tipOid string, err error) (res PublishResult, settle bool, _ error) {
 	switch {
 	case err == nil:
 		// The CAS-accepted advance is the ONLY arm that persists the tip: it runs on
@@ -5205,10 +5288,10 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		}
 		// PRD #1810: the run's retention record follows the ref to the tip just published
 		// (trackPublishedCheckpoint). Best-effort like the persist above.
-		s.trackPublishedCheckpoint(ctx, runID, terminalStatuses[owned.Status], branch, ref, tipOid)
-		return PublishResult{Published: true, Ref: ref}, nil
+		settle = s.trackPublishedCheckpoint(ctx, runID, terminal, branch, ref, tipOid)
+		return PublishResult{Published: true, Ref: ref}, settle, nil
 	case errors.Is(err, pushbroker.ErrNotDescendant):
-		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
 	case errors.Is(err, pushbroker.ErrWorkflowScopeRejected):
 		// The branch is behind on .github/workflows/** relative to the default branch,
 		// so the bot's repo-only PAT cannot push the checkpoint (PRD #456 M4). This is a
@@ -5216,14 +5299,14 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		// slog.Error default arm and never fails the run. Checkpoints stay best-effort;
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
-		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, nil
+		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
 	case errors.Is(err, pushbroker.ErrTipMissing),
 		errors.Is(err, pushbroker.ErrPackTooLarge),
 		errors.Is(err, pushbroker.ErrPackInvalid):
 		// A tip the pack never delivered, a pack over the reconstruction budget, or a
 		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
 		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, nil
+		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT
@@ -5233,7 +5316,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		// run it through the known-credential scrub. The pushbroker sentinels are all
 		// matched above, so this error is only logged/returned, never errors.Is-checked
 		// downstream — flattening the %w chain to a scrubbed string is safe here.
-		return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(err.Error()))
+		return PublishResult{}, false, fmt.Errorf("publish: %s", secretscrub.Scrub(err.Error()))
 	}
 }
 

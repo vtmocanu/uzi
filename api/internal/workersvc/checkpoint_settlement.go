@@ -22,7 +22,7 @@ import (
 // terminal writer that does not call the retention path at all). Each arm lists its own bounded
 // page, and every record is worked under its run's retention lock with try semantics: a busy
 // record is skipped this tick, a per-record error is logged and skipped, and only a candidate-list
-// read error fails the pass.
+// read error fails the pass (Sweep logs it and still runs its later passes).
 
 // reconcileRetentionBatch bounds each arm's page in one ReconcileCheckpointRetentions pass: a
 // record may cost a few forge round-trips, and the pass runs on the sweeper's tick.
@@ -39,7 +39,8 @@ const (
 
 // ReconcileCheckpointRetentions is the sweeper's checkpoint-retention pass (PRD #1810 M3/M4).
 // Returns the number of records it drove to a final step (a ref settled or verified, a record
-// backfilled, a supersession finished or exited). Inert unless every retention seam is wired.
+// backfilled, a supersession finished or exited). Inert unless every retention seam is wired. A
+// returned error (a candidate-list read) ends this pass only: Sweep logs it and continues.
 func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, error) {
 	return s.reconcileCheckpointRetentions(ctx, pgtype.UUID{})
 }

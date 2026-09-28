@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -37,7 +38,62 @@ func (s *Service) supersessionWired() bool {
 	return s.retentionWired() && s.createRefFn != nil && s.listRefTipsFn != nil
 }
 
-// freeCheckpointSlot is Publish's not_descendant follow-up (PRD #1810 D2): for an issue run it
+// claimCheckpointSlot is Publish's pre-push branch-slot check (PRD #1810 D2). A publish that
+// DESCENDS from an older run's retained tip is a fast-forward the broker accepts, so waiting for a
+// not_descendant refusal (freeCheckpointSlot) would leave that run's record `retained` at a tip
+// that is no longer the branch tip. Before any forge push, an issue run therefore lists the OTHER
+// runs' records holding (retained) or handing off (superseding) the branch ref, and returns the
+// skip label Publish must answer with instead of pushing, or "" to proceed:
+//
+//   - no such record, or the run is ineligible (not an issue run, no repo, supersession not
+//     wired): "" (proceed, the pre-#1810 behaviour);
+//   - a TERMINAL run: "superseded" while any such record exists. A terminal run must never
+//     evict another run's retention, nor fast-forward over it;
+//   - a LIVE run: each record is superseded (supersedeRetainedCheckpoint, under the record's own
+//     run's retention lock) and "" is returned only when every one freed the branch ref. A busy
+//     lock or slot, a supersession that did not free, or a record still in its retry backoff (a
+//     stopped supersession is not re-driven on every publish tick; the sweeper owns its retries)
+//     is "not_descendant": the push is refused and the worker retries on its next tick.
+//
+// A list error is also "not_descendant": whether another run's record holds the slot is then
+// unknown, and pushing could fast-forward over a retained tip and leave its record stale, while
+// refusing costs one best-effort checkpoint that the worker retries next tick.
+func (s *Service) claimCheckpointSlot(ctx context.Context, run store.Run, branch string) string {
+	if run.Kind != runkind.Issue || !run.RepoID.Valid || !s.supersessionWired() {
+		return ""
+	}
+	rows, err := s.q.ListActiveCheckpointRetentionsForBranch(ctx, store.ListActiveCheckpointRetentionsForBranchParams{
+		RepoID: uuid.UUID(run.RepoID.Bytes), Branch: branch, ExcludeRunID: run.ID, Ref: checkpointRefPrefix + branch,
+	})
+	if err != nil {
+		slog.Warn("checkpoint retention: list active branch records; publish refused", "run", run.ID, "branch", branch, "error", err)
+		return "not_descendant"
+	}
+	if len(rows) == 0 {
+		return ""
+	}
+	if terminalStatuses[run.Status] {
+		return "superseded"
+	}
+	now := time.Now()
+	for _, r := range rows {
+		if r.NextAttemptAt.Valid && r.NextAttemptAt.Time.After(now) {
+			return "not_descendant"
+		}
+		freed, acquired, err := s.supersedeRetainedCheckpoint(ctx, r.RunID)
+		if err != nil {
+			slog.Warn("checkpoint retention: supersede", "run", r.RunID, "for_run", run.ID, "error", secretscrub.Scrub(err.Error()))
+		}
+		if !acquired || !freed {
+			return "not_descendant"
+		}
+	}
+	return ""
+}
+
+// freeCheckpointSlot is Publish's not_descendant follow-up (PRD #1810 D2), the fallback behind
+// claimCheckpointSlot for the records that check does not drive (a settling record, a record that
+// appeared after the check, a race with another writer): for an issue run it
 // looks for OTHER runs' records still holding the branch's checkpoint ref, newest first, and
 // supersedes them one at a time until one frees the ref. It reports true only when a record
 // freed the branch ref, so the caller retries its publish once. A busy lock (another instance
@@ -194,11 +250,12 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 		return false, s.recordRetentionFailure(ctx, row, retentionSuperseding,
 			"delete branch ref: "+scrubForgeError(derr.Error(), f.pat))
 	}
-	// The CAS delete reports success for "absent or advanced" too. Advanced by THIS run is not
-	// done: a terminal run's publish that passed its superseded check before step 1 and landed
-	// between steps 2 and 3 leaves the branch ref at the run's later tip, which the record does
-	// not name. Marking the record superseded would leave that ref untracked, blocking every new
-	// run on the branch. So the branch ref is listed once more.
+	// The CAS delete reports success for "absent or advanced" too. Advanced by THIS run would not
+	// be done: the branch ref at a later tip of the run, which the record does not name, would be
+	// left untracked by a superseded record, blocking every new run on the branch. A terminal
+	// run's publish holds this same retention lock from its superseded check through its track
+	// (publishTerminalLocked), so it cannot land inside a supersession; the list below stays as a
+	// defensive check (a publish from a path that bypasses the lock, or a tip written by hand).
 	if stop, err := s.branchHeldByOwnPublish(ctx, row, f, branchRef); stop || err != nil {
 		return false, err
 	}
@@ -227,18 +284,19 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 	return true, nil
 }
 
-// branchHeldByOwnPublish is step 3's follow-up list. It reports stop when origin still advertises
-// the branch ref at the recorded tip (the delete did not take) or at runs.checkpoint_tip of THIS
-// run (the run's own later publish landed inside the supersession). The record then stays
+// branchHeldByOwnPublish is step 3's follow-up list, a DEFENSIVE check. It reports stop when origin
+// still advertises the branch ref at the recorded tip (the delete did not take) or at
+// runs.checkpoint_tip of THIS run (a later publish of the run's own tip). The record then stays
 // superseding with last_error and a backoff: a re-drive repeats steps 2-3 harmlessly, and once no
 // hold is open the stuck exit (exitStuckSupersessionLocked) CAS-deletes the recovery ref at the
 // recorded tip and the branch ref at the run's own tip. An absent branch ref, or one at any other
-// tip (another run's publish), is done, as before. The run tip is read AFTER the list, so a publish
-// whose tip persist committed before the list is recognised.
+// tip (another run's publish), is done, as before. The run tip is read AFTER the list.
 //
-// Residual: a publish whose ref update is visible to the list but whose runs.checkpoint_tip persist
-// has not committed yet, or one that lands after the list, is not seen here; its
-// trackPublishedCheckpoint moves no row and logs a Warn naming the run, branch and tip.
+// Only a record of a TERMINAL run is ever superseded, and a terminal run's publish runs its
+// superseded check, push and record track under this run's retention lock (publishTerminalLocked),
+// which the supersession holds throughout; so the run's own publish cannot land inside a
+// supersession and the second arm is not expected to fire. It stays as a defensive check against a
+// ref written outside that path.
 func (s *Service) branchHeldByOwnPublish(ctx context.Context, row store.CheckpointRetention, f retentionForge, branchRef string) (stop bool, err error) {
 	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef)
 	if lerr != nil {

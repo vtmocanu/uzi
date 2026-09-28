@@ -246,6 +246,72 @@ func (q *Queries) InsertCheckpointRetentionSettling(ctx context.Context, arg Ins
 	return result.RowsAffected(), nil
 }
 
+const listActiveCheckpointRetentionsForBranch = `-- name: ListActiveCheckpointRetentionsForBranch :many
+SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions
+WHERE repo_id = $1
+  AND branch = $2::text
+  AND run_id <> $3
+  AND ref = $4::text
+  AND state IN ('retained', 'superseding')
+ORDER BY created_at DESC, run_id
+LIMIT 10
+`
+
+type ListActiveCheckpointRetentionsForBranchParams struct {
+	RepoID       uuid.UUID `json:"repo_id"`
+	Branch       string    `json:"branch"`
+	ExcludeRunID uuid.UUID `json:"exclude_run_id"`
+	Ref          string    `json:"ref"`
+}
+
+// D2 (#1810 M1 rework): the OTHER runs' records that hold (retained) or are handing off
+// (superseding) a branch's checkpoint slot, whatever their backoff: Publish reads it BEFORE any
+// forge write, so a publish that DESCENDS from an older run's retained tip (a fast-forward the
+// broker would accept) still supersedes that record first instead of leaving it retained at a
+// tip that is no longer the branch tip. No next_attempt_at filter: a backed-off record still
+// holds the slot, and the caller refuses the push until it is freed. Newest first, bounded.
+func (q *Queries) ListActiveCheckpointRetentionsForBranch(ctx context.Context, arg ListActiveCheckpointRetentionsForBranchParams) ([]CheckpointRetention, error) {
+	rows, err := q.db.Query(ctx, listActiveCheckpointRetentionsForBranch,
+		arg.RepoID,
+		arg.Branch,
+		arg.ExcludeRunID,
+		arg.Ref,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []CheckpointRetention{}
+	for rows.Next() {
+		var i CheckpointRetention
+		if err := rows.Scan(
+			&i.RunID,
+			&i.UserID,
+			&i.RepoID,
+			&i.Branch,
+			&i.Tip,
+			&i.Ref,
+			&i.RecoveryRef,
+			&i.State,
+			&i.Attempts,
+			&i.NextAttemptAt,
+			&i.LastError,
+			&i.VerifyAfter,
+			&i.VerifiedAt,
+			&i.CreatedAt,
+			&i.UpdatedAt,
+			&i.SettledAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listCheckpointRetentionAudit = `-- name: ListCheckpointRetentionAudit :many
 SELECT run_id, user_id, repo_id, branch, tip, ref, recovery_ref, state, attempts, next_attempt_at, last_error, verify_after, verified_at, created_at, updated_at, settled_at FROM checkpoint_retentions
 WHERE state = 'deleted'

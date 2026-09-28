@@ -340,11 +340,16 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// Checkpoint-retention reconciliation (PRD #1810 M3/M4): backfill terminal runs with no
 	// record, retry failed deletes, settle unheld records whose trigger was lost, re-drive or exit
 	// interrupted supersessions, and audit deleted recovery refs, each record under its run's
-	// retention lock (ReconcileCheckpointRetentions). The same best-effort stance
-	// as the custody pass above: a candidate-list read error fails the pass, a per-record
-	// error is logged and skipped. Inert unless the retention seams are wired.
-	if res.CheckpointRetentionsReconciled, err = s.ReconcileCheckpointRetentions(ctx); err != nil {
-		return res, fmt.Errorf("reconcile checkpoint retentions: %w", err)
+	// retention lock (ReconcileCheckpointRetentions). A per-record error is logged and skipped
+	// inside the pass; unlike the custody pass above, the pass's own error (a candidate-list
+	// read) is logged here and does NOT fail the sweep: the passes below (the recovery upload and
+	// retention expiries among them) must not be starved by a checkpoint-retention fault, and the
+	// next tick retries. The count is reported only for a pass that succeeded. Inert unless the
+	// retention seams are wired.
+	if n, rerr := s.ReconcileCheckpointRetentions(ctx); rerr != nil {
+		slog.Error("sweeper: reconcile checkpoint retentions failed", "error", rerr)
+	} else {
+		res.CheckpointRetentionsReconciled = n
 	}
 
 	// Upload-retry-window sweep (PRD #1296 D3/D4): the LIVE consumer of

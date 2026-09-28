@@ -42,9 +42,12 @@ type memForge struct {
 
 	publishCalls int
 	createCalls  int
-	creates      map[string]int // refs actually created
-	deletes      map[string]int // refs actually deleted
-	lastCreate   pushbroker.CreateRefOptions
+	// events is the ordered log of every ref write that landed ("publish <ref> <tip>",
+	// "create <ref> <tip>", "delete <ref>"), so a test can assert what happened before what.
+	events     []string
+	creates    map[string]int // refs actually created
+	deletes    map[string]int // refs actually deleted
+	lastCreate pushbroker.CreateRefOptions
 
 	// M4 seams (set before any concurrent use): deleteErr/listErr fail every delete/list;
 	// beforeCreate/beforeDelete/beforeList run OUTSIDE the mutex at the start of the call (the
@@ -73,6 +76,7 @@ func (m *memForge) publish(_ context.Context, o pushbroker.Options) (pushbroker.
 		return pushbroker.Result{}, pushbroker.ErrNotDescendant
 	}
 	m.refs[ref] = o.DeclaredTip
+	m.events = append(m.events, "publish "+ref+" "+o.DeclaredTip)
 	return pushbroker.Result{Ref: ref}, nil
 }
 
@@ -103,6 +107,7 @@ func (m *memForge) createRef(_ context.Context, o pushbroker.CreateRefOptions) e
 	}
 	m.refs[o.Ref] = o.Tip
 	m.creates[o.Ref]++
+	m.events = append(m.events, "create "+o.Ref+" "+o.Tip)
 	return nil
 }
 
@@ -125,6 +130,7 @@ func (m *memForge) deleteRef(_ context.Context, o pushbroker.DeleteOptions) erro
 	if m.refs[ref] == o.ExpectedOldTip {
 		delete(m.refs, ref)
 		m.deletes[ref]++
+		m.events = append(m.events, "delete "+ref)
 	}
 	return nil // absent or advanced: benign, like pushbroker's CAS delete
 }
@@ -164,6 +170,12 @@ func (m *memForge) counts(ref string) (creates, deletes int) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.creates[ref], m.deletes[ref]
+}
+
+func (m *memForge) eventLog() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.events...)
 }
 
 func (m *memForge) calls() (publish, create int) {
@@ -310,8 +322,9 @@ func (p *pauser) waitPaused(t *testing.T) {
 // --- The happy path ------------------------------------------------------------------------------
 
 // TestSupersessionFreesBranchForNewRunLiveDB is M3's headline: the new run is not blocked, the
-// old tip survives at refs/uzi-recovery/<old run id>, the record is superseded, the publish was
-// retried once and landed, and the owner's recovery hold list reports the recovery ref.
+// old tip survives at refs/uzi-recovery/<old run id>, the record is superseded, the publish landed
+// on its first push (the slot is claimed before any push, claimCheckpointSlot), and the owner's
+// recovery hold list reports the recovery ref.
 func TestSupersessionFreesBranchForNewRunLiveDB(t *testing.T) {
 	f := newSupersedeFix(t)
 	res := f.publishNew(t, f.svc1)
@@ -322,8 +335,8 @@ func TestSupersessionFreesBranchForNewRunLiveDB(t *testing.T) {
 	if tip, _ := f.forge.ref(f.branchRef); tip != supersedeNewTip {
 		t.Fatalf("branch ref = %q, want the new run's tip", tip)
 	}
-	if pubs, creates := f.forge.calls(); pubs != 2 || creates != 1 {
-		t.Fatalf("publish calls = %d, create calls = %d; want 2 (refused, then the one retry) and 1", pubs, creates)
+	if pubs, creates := f.forge.calls(); pubs != 1 || creates != 1 {
+		t.Fatalf("publish calls = %d, create calls = %d; want 1 (the slot claimed before the push) and 1", pubs, creates)
 	}
 	c := f.forge.lastCreate
 	if c.CloneURL != "https://forge.e2e/g/interlock.git" || c.Username != "bot" || c.PAT != f.pat ||
@@ -358,6 +371,144 @@ func TestSupersessionFreesBranchForNewRunLiveDB(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("the old run's open hold is missing from ListHoldsForOwner")
+	}
+}
+
+// TestSupersessionOnDescendantPublishLiveDB (#1810 M1 rework): the new run's tip DESCENDS from
+// the old run's retained tip, so the broker would accept it as a fast-forward and never refuse
+// not_descendant. The old record must still be superseded, with the recovery ref created at the
+// old tip BEFORE the new run's push, never left retained at a tip that is no longer the branch tip.
+func TestSupersessionOnDescendantPublishLiveDB(t *testing.T) {
+	f := newSupersedeFix(t)
+	f.forge.mu.Lock()
+	f.forge.descends[supersedeNewTip] = retentionTestTip
+	f.forge.mu.Unlock()
+
+	res := f.publishNew(t, f.svc1)
+	if !res.Published || res.Skipped != "" {
+		t.Fatalf("Publish = %+v, want published", res)
+	}
+	f.assertSuperseded(t)
+	if tip, _ := f.forge.ref(f.branchRef); tip != supersedeNewTip {
+		t.Fatalf("branch ref = %q, want the new run's tip", tip)
+	}
+	events := f.forge.eventLog()
+	create, publish := -1, -1
+	for i, ev := range events {
+		switch ev {
+		case "create " + f.recoveryRef + " " + retentionTestTip:
+			create = i
+		case "publish " + f.branchRef + " " + supersedeNewTip:
+			publish = i
+		}
+	}
+	if create < 0 || publish < 0 || create > publish {
+		t.Fatalf("forge events = %q; want the recovery ref created at the old tip BEFORE the new run's push", events)
+	}
+	if pubs, creates := f.forge.calls(); pubs != 1 || creates != 1 {
+		t.Fatalf("publish calls = %d, create calls = %d; want 1 and 1", pubs, creates)
+	}
+}
+
+// TestTerminalPublishRefusedOverAnotherRunsRetentionLiveDB (#1810 M1 rework): a TERMINAL run whose
+// tip descends from ANOTHER run's retained tip must not fast-forward over it (the other record
+// would be left retained at a stale tip) and must never evict it: Skipped "superseded", no forge
+// call at all, the other record untouched.
+func TestTerminalPublishRefusedOverAnotherRunsRetentionLiveDB(t *testing.T) {
+	f := newSupersedeFix(t)
+	f.e.exec(t, `UPDATE runs SET status = 'failed', finished_at = now() WHERE id = $1`, f.newRun)
+	f.forge.mu.Lock()
+	f.forge.descends[supersedeNewTip] = retentionTestTip
+	f.forge.mu.Unlock()
+
+	res := f.publishNew(t, f.svc1)
+	if res.Published || res.Skipped != "superseded" {
+		t.Fatalf("Publish = %+v, want the superseded skip", res)
+	}
+	if pubs, creates := f.forge.calls(); pubs != 0 || creates != 0 {
+		t.Fatalf("publish calls = %d, create calls = %d; want 0 and 0 (no forge call)", pubs, creates)
+	}
+	if r := f.row(t); r.State != retentionRetained || r.Tip != retentionTestTip || r.Ref != f.branchRef {
+		t.Fatalf("other run's record = {state %q tip %q ref %q}, want retained at its tip", r.State, r.Tip, r.Ref)
+	}
+	if tip, _ := f.forge.ref(f.branchRef); tip != retentionTestTip {
+		t.Fatalf("branch ref = %q, want untouched at %s", tip, retentionTestTip)
+	}
+}
+
+// TestTerminalPublishSerializedWithSupersessionLiveDB (#1810 M1 rework): a TERMINAL run's publish
+// holds its own retention lock from the superseded check through the record track, so a
+// supersession of that run (a newer run's publish on another api replica) that tries to run
+// between the check and the push cannot take the lock. The publish lands and the run's record
+// tracks the new tip: no branch ref is left untracked by a superseded record.
+func TestTerminalPublishSerializedWithSupersessionLiveDB(t *testing.T) {
+	f := newSupersedeFix(t)
+	const t2 = "5555555555555555555555555555555555555555"
+	var oldWorker uuid.UUID
+	if err := f.e.pool.QueryRow(f.e.ctx, `SELECT worker_id FROM runs WHERE id = $1`, f.oldRun).Scan(&oldWorker); err != nil {
+		t.Fatalf("old worker: %v", err)
+	}
+	f.forge.mu.Lock()
+	f.forge.descends[t2] = retentionTestTip
+	f.forge.mu.Unlock()
+
+	var (
+		ran             bool
+		freed, acquired bool
+		supersedeErr    error
+	)
+	f.svc1.SetPublishFn(func(ctx context.Context, o pushbroker.Options) (pushbroker.Result, error) {
+		if !ran {
+			ran = true
+			// A supersession of the old run landing between its superseded check and its push.
+			freed, acquired, supersedeErr = f.svc2.supersedeRetainedCheckpoint(f.e.ctx, f.oldRun)
+		}
+		return f.forge.publish(ctx, o)
+	})
+
+	res, err := f.svc1.Publish(f.e.ctx, store.Worker{ID: oldWorker, UserID: f.e.userID}, f.oldRun, t2, []byte("pack"))
+	if err != nil || !res.Published {
+		t.Fatalf("terminal run's Publish = %+v, %v; want published", res, err)
+	}
+	if !ran {
+		t.Fatalf("the publish stub never ran")
+	}
+	if acquired || freed || supersedeErr != nil {
+		t.Fatalf("inline supersession = {freed %v acquired %v err %v}, want it refused the lock", freed, acquired, supersedeErr)
+	}
+	r := f.row(t)
+	if r.State != retentionRetained || r.Tip != t2 || r.Ref != f.branchRef || r.RecoveryRef.Valid {
+		t.Fatalf("record = {state %q tip %q ref %q recovery %v}, want retained at the published tip %s",
+			r.State, r.Tip, r.Ref, r.RecoveryRef, t2)
+	}
+	if tip, _ := f.forge.ref(f.branchRef); tip != t2 {
+		t.Fatalf("branch ref = %q, want the terminal run's published tip %s", tip, t2)
+	}
+	if _, ok := f.forge.ref(f.recoveryRef); ok {
+		t.Fatalf("a recovery ref was created: the supersession interleaved with the terminal publish")
+	}
+}
+
+// TestSupersessionFallbackFreesSettlingRecordLiveDB: the not_descendant fallback
+// (freeCheckpointSlot) still covers what the pre-push claim does not list: a SETTLING record of an
+// older run holding the branch ref is settled (its ref CAS-deleted) and the publish retried once.
+func TestSupersessionFallbackFreesSettlingRecordLiveDB(t *testing.T) {
+	f := newSupersedeFix(t)
+	f.discardHold(t)
+	f.e.exec(t, `UPDATE checkpoint_retentions SET state = 'settling' WHERE run_id = $1`, f.oldRun)
+
+	res := f.publishNew(t, f.svc1)
+	if !res.Published {
+		t.Fatalf("Publish = %+v, want published after the fallback settled the old ref", res)
+	}
+	if pubs, creates := f.forge.calls(); pubs != 2 || creates != 0 {
+		t.Fatalf("publish calls = %d, create calls = %d; want 2 (refused, then the one retry) and 0", pubs, creates)
+	}
+	if tip, _ := f.forge.ref(f.branchRef); tip != supersedeNewTip {
+		t.Fatalf("branch ref = %q, want the new run's tip", tip)
+	}
+	if r := f.row(t); r.State != "deleted" {
+		t.Fatalf("old record = %q, want deleted", r.State)
 	}
 }
 

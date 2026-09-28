@@ -778,20 +778,21 @@ func TestStuckSupersessionRecoveryAtOtherTipExitLiveDB(t *testing.T) {
 
 // --- M3 carry-over fixes -----------------------------------------------------------------------------
 
-// TestSupersessionRefusedForTerminalRunLiveDB (C1): a worker still bound to a terminal run gets the
-// plain not_descendant skip: it never evicts another run's retained checkpoint.
+// TestSupersessionRefusedForTerminalRunLiveDB (C1): a worker still bound to a terminal run never
+// evicts another run's retained checkpoint: while that record holds the branch slot the publish is
+// the superseded skip, refused before any forge call (claimCheckpointSlot, #1810 M1 rework).
 func TestSupersessionRefusedForTerminalRunLiveDB(t *testing.T) {
 	for _, status := range []string{"completed", "failed", "cancelled"} {
 		t.Run(status, func(t *testing.T) {
 			f := newSupersedeFix(t)
 			f.e.exec(t, `UPDATE runs SET status = $2, finished_at = now() WHERE id = $1`, f.newRun, status)
 			res := f.publishNew(t, f.svc1)
-			if res.Published || res.Skipped != "not_descendant" {
-				t.Fatalf("Publish = %+v, want the not_descendant skip", res)
+			if res.Published || res.Skipped != "superseded" {
+				t.Fatalf("Publish = %+v, want the superseded skip (another run's retention holds the slot)", res)
 			}
 			f.assertBranchRetained(t)
-			if _, creates := f.forge.calls(); creates != 0 {
-				t.Fatalf("create calls = %d, want 0", creates)
+			if pubs, creates := f.forge.calls(); pubs != 0 || creates != 0 {
+				t.Fatalf("publish calls = %d, create calls = %d; want 0 and 0 (refused before any forge call)", pubs, creates)
 			}
 		})
 	}

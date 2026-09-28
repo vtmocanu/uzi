@@ -367,10 +367,12 @@ func (f *supersedeFix) assertRunSettledOrSettling(t *testing.T, runID uuid.UUID,
 
 // --- Round 2: a terminal run's publish landing inside a supersession ---------------------------
 
-// TestSupersessionLatePublishInWindowLiveDB: the OLD (terminal) run's publish passed its superseded
-// check before the supersession began and lands between the recovery-ref create (step 2) and the
-// branch delete (step 3): origin's branch ref moves to the run's later tip T2 and runs.checkpoint_tip
-// follows it. The CAS delete on T1 is a benign no-op, and the record must NOT be marked superseded
+// TestSupersessionLatePublishInWindowLiveDB pins the supersession's DEFENSIVE post-delete list. A
+// terminal run's own publish can no longer land inside its supersession (publishTerminalLocked holds
+// the same retention lock; TestTerminalPublishSerializedWithSupersessionLiveDB), so this test writes
+// the late tip around that path: between the recovery-ref create (step 2) and the branch delete
+// (step 3) origin's branch ref moves to the OLD run's later tip T2 and runs.checkpoint_tip follows
+// it. The CAS delete on T1 is a benign no-op, and the record must NOT be marked superseded
 // (that would leave T2 untracked, blocking every new run): it stays superseding with last_error.
 // The late publish's own tracker moves no row and logs a Warn. Once the hold is discarded the stuck
 // exit deletes the recovery ref at T1 and the branch ref at T2, and the new run publishes.
