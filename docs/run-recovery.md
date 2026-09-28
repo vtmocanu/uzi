@@ -341,7 +341,8 @@ States shown on the run page and by `uzi run get`:
   at a different commit), `failed` (salvage stopped after repeated attempts; the last error names any
   ref that may remain), or
   `skipped_secret` (the run failed on a secret-scan block: never saved).
-- **Expired** — the copy was removed after its retention window.
+- **Expired** — the salvage copy's retention ended; uzi CAS-deleted it (or found it
+  already gone or moved).
 - **Off** (`disabled`) — salvage was turned off for this forge before a copy
   was made.
 
@@ -351,10 +352,31 @@ Fetch a saved copy:
 git fetch origin refs/uzi-salvage/<run-id>
 ```
 
+That bare form is what the run page and `uzi run get` print, and it is fine to inspect
+the commit right away, but it only sets `FETCH_HEAD`, which the next fetch in the same
+clone overwrites — so the commit can become unreachable once the salvage ref expires and
+is deleted. To keep it, name a local branch instead, the same way as the checkpoint and
+recovery refs above:
+
+```sh
+git fetch origin refs/uzi-salvage/<run-id>:refs/heads/recovered/<run-id>
+```
+
 While a failed run has a live salvage copy — made, or still being made —
 removing its repo or its forge connection is refused with a 409 naming the
 salvage refs and the runs still pending; the block lifts once each copy
 expires, or a pending one settles without being kept.
+
+**A run with no open custody hold usually gets no salvage copy at all.**
+Once such a run goes terminal, [custody retention](#where-the-work-is-kept)
+deletes its checkpoint ref on its own before the next salvage sweep looks,
+so salvage almost always settles that run `unavailable` — there is nothing
+left for it to verify and copy. Salvage produces a copy only for a run whose
+custody hold is still open when the sweep runs (or, occasionally, an older
+run whose ref happened to survive from before this feature existed). If you
+need a run's checkpoint and no salvage copy exists, check whether a
+[retained checkpoint or recovery ref](#where-the-work-is-kept) is still
+open first — that is usually where it is.
 
 ### Recovery order
 

@@ -69,7 +69,7 @@ Salvage reuses `pushbroker.CreateRef` and the generalized, ref-name-aware
 `CreateRef`'s allowed-prefix and `SourceRef` validation (`validateCreateRef`)
 widened to accept `refs/uzi-salvage/*` as a target, with a `SourceRef` under
 either `refs/uzi-checkpoints/` or `refs/uzi-recovery/`. This is the PRD's
-own default (reuse `CreateRef` unless it cannot serve); it could not, so no
+own default (reuse `CreateRef` unless it cannot serve); it could, so no
 deviation is recorded. `createSalvageRef` (`api/internal/workersvc/salvage.go`)
 lists all three refs in one `ListRefTips` call, resolves a source (the
 branch ref or the recovery ref, whichever is at the recorded tip), and
@@ -82,16 +82,24 @@ does not exist because salvage never deletes the source ref.
 
 Salvage's own `Delete` calls are scoped to `refs/uzi-salvage/<run-id>`
 only, through `deleteSalvageRef` and `deleteUnrecordedSalvage`, both CAS on
-the row's own recorded tip. Nothing in `salvage.go` calls
-`deleteCheckpointFn`, touches `refs/uzi-checkpoints/`, or writes to
-`refs/uzi-recovery/`; the source code comment at the top of the file states
-this as an invariant, not an implementation detail: "this file never
-deletes or moves them, never calls `deleteCheckpointFn`, and never changes
-a custody hold." Reusing #1810's own `CreateRef`/`Delete`/`ListRefTips`
-rather than a bespoke primitive is what makes that invariant mechanical
-rather than a matter of code review discipline: the same SSRF gate, auth
-and CAS behaviour that protects #1810's refs protects salvage's, and
-salvage's calls are simply never given #1810's ref names as a target.
+the row's own recorded tip. Salvage only ever **reads** the branch
+checkpoint ref and the recovery ref, as `createSalvageRef`'s source
+candidates; it never writes, moves or deletes either. Nothing in
+`salvage.go` calls `deleteCheckpointFn`; the source code comment at the top
+of the file states this as an invariant, not an implementation detail:
+"this file never deletes or moves them, never calls `deleteCheckpointFn`,
+and never changes a custody hold." `pushbroker.Delete` itself is not
+scoped to salvage's namespace — it also accepts a checkpoint or recovery
+ref as `o.Ref` (that is how #1810's own callers use it) — so reuse alone
+does not make the no-delete invariant mechanical. What does is that every
+`Delete` call salvage makes passes `pushbroker.SalvageRef(row.RunID)` with
+a non-empty `ExpectedOldTip`: a literal grep of `salvage.go`'s call sites,
+not `Delete`'s own prefix check, is what a bug in this file could violate.
+That invariant is pinned by an AST test,
+`TestSalvageSourceNeverDeletesCheckpointRefs`
+(`api/internal/workersvc/salvage_test.go`), which fails the build if a
+future edit passes anything but `pushbroker.SalvageRef(...)` as `Ref` from
+this file.
 
 ### Lifecycle and states
 
@@ -115,9 +123,15 @@ recorded `skipped_secret` at enqueue time, never attempted.
 
 `run_salvage.live_run_id` is a nullable `ON DELETE RESTRICT` foreign key to
 `runs`, set for as long as a remote salvage ref may exist (`pending` or
-`promoted`) and cleared only once the ref is confirmed gone (`expired` or
-`disabled`) — the same live-pointer pattern ADR-1296 established for
-`recovery_custody_holds`. Deleting the run, or cascading through a repo or
+`promoted`) and cleared once the row settles into any of `expired`,
+`disabled`, `unavailable` or `refused` — the last two settle a row that
+never had a confirmed create, so there is no ref left to hold the pointer
+for. At `salvageHardCeiling` (30 attempts) `giveUpSalvage` clears the
+pointer WITHOUT confirming the ref is gone: the cleanup that would confirm
+it has itself failed every time, so the row is settled `failed` unverified
+and `last_error` (plus an error log) names the salvage ref and tip that may
+still remain on the forge for manual deletion. This is the same live-pointer
+pattern ADR-1296 established for `recovery_custody_holds`. Deleting the run, or cascading through a repo or
 forge-connection removal, fails on `run_salvage_live_run_id_fkey` (23503)
 instead of silently dropping the only record of a public ref; the repo- and
 connection-removal handlers (`api/internal/handler/forge.go`) turn that
@@ -127,15 +141,19 @@ salvage refs and pending runs.
 Unlike #1810, which serializes its multi-step supersession and settlement
 operations under a per-run PostgreSQL session advisory lock (a fence
 against a lock lost mid-operation, plus a post-settlement audit — see
-ADR-1810's "Per-flight sink gate and preemption" and "Lock ownership
-proof"), salvage takes **no advisory lock at all**. Its operations do not
+ADR-1810's "Per-run session advisory lock, not a row lock"), salvage takes
+**no advisory lock at all**. Its operations do not
 need one: enqueue is a single `INSERT` guarded by the RESTRICT FK itself (a
 23503 on `run_salvage_live_run_id_fkey` at insert time means the run was
 deleted between the candidate read and the insert — a benign, logged skip,
-not a race to prevent), and every subsequent state transition
-(`RecordSalvageCreated`, `MarkSalvagePromoted`, `SettleSalvage`,
-`RecordSalvageAttemptFailed`) is scoped to one row by `run_id` and is
-itself idempotent against a re-run. The sweeper runs `SweepSalvage` serially
+not a race to prevent), and every subsequent state transition is scoped to
+one row by `run_id`. `RecordSalvageCreated`, `MarkSalvagePromoted` and
+`SettleSalvage` are each idempotent against a re-run (a repeat call is a
+no-op or keeps the first-recorded values); `RecordSalvageAttemptFailed` is
+not idempotent — it always increments `attempts` and can move the row into
+`failed` — but it is **re-drivable**: a re-run after a crash or a budget cut
+finds the row's persisted state (its recorded salvage ref, its attempt
+count) and picks up from there rather than repeating a stale decision. The sweeper runs `SweepSalvage` serially
 from one goroutine, so even the in-process round-robin lead toggle
 (below) needs no lock. This is deliberately less machinery than #1810's
 lock-plus-fence-plus-audit: salvage's operations are single-row and
@@ -169,9 +187,12 @@ not from #1810's settlement of the source ref.** The two clocks are
 unrelated: a salvage copy can expire and be removed while the source
 branch checkpoint is still retained under an open custody hold, and it can
 still be pending removal after the source ref has long since settled and
-been deleted. `push_secret_blocked` is the one carve-out that keeps
-today's immediate delete on the source side and never creates a salvage
-copy at all.
+been deleted. `push_secret_blocked` has no carve-out on the source side —
+every terminal path, secret-blocked or not, goes through #1810's
+`retainOrDeleteCheckpoint` like any other. Salvage's only secret-related
+policy is its own: a `push_secret_blocked` run is recorded `skipped_secret`
+at enqueue and never copied, so the secret that blocked its push is never
+given a second, unscanned publish target.
 
 ### Reliance on a single sweeper
 
@@ -229,7 +250,11 @@ its own right:
   sweeper failure paths never deleted theirs before #1810), salvage can
   still archive it on a later sweep tick, same as any other eligible failed
   run. This is not a deliberate backfill feature, just the same enqueue
-  query applied uniformly.
+  query applied uniformly — and it is still bounded by the enqueue window:
+  `ListSalvageCandidates` only reads runs finished within
+  `max(UZI_RECOVERY_READY_RETENTION, salvageMinWindow)` (24h) of "now", so
+  a pre-migration run that finished before that window is never enqueued
+  at all, regardless of whether its branch ref survived.
 - **The overlap is real and accepted, not eliminated.** For the common
   case — a failed run whose custody hold is still open — #1810 already
   keeps the branch or recovery ref reachable, and salvage's copy is
@@ -241,15 +266,24 @@ its own right:
   a source, verifies against them, and never competes with them for a
   delete), so the redundancy is bounded (salvage's own retention window)
   and one-directional, not a second copy of #1810's own state machine.
-- **No hold, no copy.** A failed run with no open custody hold has its
-  branch ref CAS-deleted by #1810 at the terminal transition, before the next
-  sweep tick can enqueue it, so salvage almost always settles it
+- **No hold, no copy.** #1810 does not delete an unheld run's checkpoint
+  ref synchronously "at" the terminal transition: the transition dispatches
+  `SettleRetainedCheckpoint` off the caller's own goroutine (a detached,
+  best-effort background settle), and any record it could not settle there
+  is picked up again by `ReconcileCheckpointRetentions`, #1810's own pass
+  on the shared sweeper tick — which runs in `Service.Sweep`, AFTER
+  `SweepSalvage` on that same tick. So on the tick right after the run goes
+  terminal, salvage's pass still runs first; but the background settle
+  dispatched at the terminal transition has almost always already deleted
+  an unheld run's ref by the time that tick's `SweepSalvage` looks (it
+  races only the DB write and a fast forge round-trip, not a full sweep
+  interval), so salvage still **almost always** settles such a row
   `unavailable`. Salvage therefore produces a copy only for held runs (and
-  surviving pre-migration refs), and its own value is the window between
-  the hold settling and the copy's expiry. A hold that outlives the
-  retention leaves a copy that only duplicated exposure. The #1856-shaped
-  loss is prevented by #1810's retention when the run held custody, not by
-  salvage.
+  surviving pre-migration refs within the enqueue window above), and its
+  own value is the window between the hold settling and the copy's expiry.
+  A hold that outlives the retention leaves a copy that only duplicated
+  exposure. The #1856-shaped loss is prevented by #1810's retention when
+  the run held custody, not by salvage.
 
 ## Consequences
 
@@ -257,14 +291,26 @@ its own right:
   run-scoped ref, independent of custody settling, on any forge the
   maintainer has enabled.** `git fetch origin refs/uzi-salvage/<run-id>`
   works for as long as the row is `promoted` and unexpired.
-- **Off by default, so merging this changes nothing until a forge passes
-  M6.** `UZI_SALVAGE_FORGES` empty (the default) makes every enqueue,
-  create and expire call a no-op; an unlisted forge behaves byte-for-byte
-  as it did before this PRD.
+- **Off by default, so merging this changes nothing for a stack with no
+  existing rows.** `UZI_SALVAGE_FORGES` empty (the default) makes
+  `enqueueSalvage` a no-op (it is gated on the setting directly), so a
+  forge that was never listed behaves byte-for-byte as it did before this
+  PRD. This is not unconditionally true across a rollback, though:
+  `processSalvage` (the create/expire phase) runs regardless of the
+  setting, so existing rows still progress. A `promoted` row's salvage ref
+  still expires on schedule even after its forge is removed from the list,
+  and a `pending` row with no recorded ref on a de-listed forge is
+  CAS-deleted of any unrecorded copy and settled `disabled`. So "nothing
+  changes" holds only where no `run_salvage` rows exist yet, not as a
+  general invariant of the empty setting.
 - **No new delete authority over #1810's refs.** Every `Delete` call
-  salvage makes is scoped to its own namespace; a bug in salvage's sweep
-  logic cannot reach `refs/uzi-checkpoints/` or `refs/uzi-recovery/`
-  because the code path to do so does not exist.
+  salvage makes is scoped to its own namespace: `deleteSalvageRef` and
+  `deleteUnrecordedSalvage` both pass `pushbroker.SalvageRef(row.RunID)`
+  with a non-empty `ExpectedOldTip`, pinned by the AST test
+  `TestSalvageSourceNeverDeletesCheckpointRefs`. `pushbroker.Delete` itself
+  is not scoped to salvage — it also serves #1810's checkpoint and recovery
+  refs — so the guarantee lives in salvage's own call sites, not in the
+  broker refusing salvage a wider target.
 - **A bounded, visible failure mode.** A permanently unreachable forge
   costs at most `salvageHardCeiling` attempts (with the 1h backoff past
   the cap) before the row gives up and releases the RESTRICT pointer,

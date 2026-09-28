@@ -23,16 +23,29 @@ the `uncommitted.patch` + `untracked.tar.gz` are what save it, not the bundle.
 
 ## Pick a source
 
+Several sources can exist at once and are not guaranteed to agree — a salvage copy is
+only the run's *last published checkpoint*, which can be behind any of the others.
+**Compare tips across whichever of these are available, and restore the freshest
+verified one; never prefer an older salvage checkpoint merely because it happens to be
+remote, but don't discard a fresher salvage tip either just because another source also
+exists.**
+
 - **A) A backup snapshot** (`scripts/backup-runs.sh` / `backup-loop.sh`) — preferred when
   one exists: it needs no kube access and it captured uncommitted work too. The snapshot
   dir holds `STEM.tgz` (bundle + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`)
   plus `run.json` / `plan.md` / `progress.txt` / `log-tail.ndjson`.
 - **B) The live PVC** (the worker pod still exists) — bundle `REF` out of the bare clone
   per *Recovering a failed run's work from the worker PVC* above, then continue at step 3.
-- **C) The salvage ref** (`refs/uzi-salvage/<RUN>`, PRD #1867, `salvage_state: promoted`) —
-  only the run's *last published checkpoint*, may be behind (A) or (B). Use it only when
-  neither A nor B nor the run's retained checkpoint/recovery ref (PRD #1810) is available;
-  `git fetch origin refs/uzi-salvage/<RUN>:refs/heads/recover/STEM` then continue at step 3.
+- **C) The run's retained checkpoint or recovery ref** (PRD #1810: the branch checkpoint
+  ref while custody is open, or `refs/uzi-recovery/<RUN>` once superseded) — fetch it the
+  same way as the salvage ref below, then continue at step 3.
+- **D) The worker's own tracking ref** (`REF` on the bare mirror, per *Recovering a
+  failed run's work from the worker PVC* above) when the live clone (B) is gone but the
+  bare mirror survives.
+- **E) The salvage ref** (`refs/uzi-salvage/<RUN>`, PRD #1867, `salvage_state: promoted`)
+  — compare its tip against A-D before using it in preference to any of them;
+  `git fetch origin refs/uzi-salvage/<RUN>:refs/heads/recover/STEM` then continue at
+  step 3.
 
 ## Steps
 

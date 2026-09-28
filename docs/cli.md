@@ -914,10 +914,12 @@ ref of the exact form `refs/uzi-salvage/<run-id>` naming this run. The same valu
 salvage record.
 
 While a failed run has a live salvage copy (made, or still being made), removing its repo
-or forge connection is refused with a 409. The body lists each created
-`refs/uzi-salvage/<run-id>` in `salvage_refs`, each run whose copy is still `pending` by
-run id in `salvage_pending_runs` (a pending copy may already have its ref), and the total
-in `salvage_count`; the error text names the same refs and runs. The block lifts when the
+or forge connection is refused with a 409. The body names **at most 5** live rows total,
+split between `salvage_refs` (each created `refs/uzi-salvage/<run-id>`) and
+`salvage_pending_runs` (each run whose copy is still `pending`, by run id; a pending copy
+may already have its ref); a run beyond that first 5 is only counted, in `salvage_count`
+(the true total) and in the error text's trailing "and N more run(s)". The error text
+otherwise names the same refs and runs as the body. The block lifts when the
 copies expire, or when a pending copy settles (into `promoted`, which then holds until it
 expires, or into a state that saved nothing); retry the removal after that.
 

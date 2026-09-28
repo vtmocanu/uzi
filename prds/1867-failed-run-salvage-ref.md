@@ -61,8 +61,13 @@ original promote-then-delete design above.**
 0. **Off by default, enabled per forge — unchanged from the original design.**
    - `UZI_SALVAGE_FORGES` (a comma list of `github`, `gitlab`, `forgejo`; default empty)
      turns the sweep's enqueue on for the listed forge kinds only.
-   - With the setting empty, or for an unlisted forge, salvage makes no broker call and
-     inserts no row: byte-for-byte today's behavior.
+   - With the setting empty, or for a forge that was never listed, salvage inserts no row
+     and makes no broker call for it: byte-for-byte today's behavior. This holds only
+     while no `run_salvage` row exists for that forge — the create/expire phase
+     (`processSalvage`) is not gated on the setting, so a row from before a forge was
+     de-listed still progresses (its `promoted` ref still expires on schedule; a `pending`
+     row with no recorded ref is CAS-deleted of any unrecorded copy and settled
+     `disabled`).
    - Merging this work therefore changes nothing until a forge has passed M6 and the
      maintainer enables it.
 1. **Salvage is create-only, downstream of PRD #1810's retention, and never touches the
@@ -78,7 +83,9 @@ original promote-then-delete design above.**
      broker call ever);
    - every other pending row is later handled by the sweep's broker phase (decision 2).
 
-   `deleteCheckpointBestEffort` (renamed `retainOrDeleteCheckpoint` by #1819) is untouched
+   `deleteCheckpointBestEffort` (replaced by `retainOrDeleteCheckpoint` at all three call
+   sites by #1819, not merely renamed — the new function retains a held run's checkpoint
+   ref instead of always deleting it) is untouched
    by this PRD.
 2. **Promotion reuses `pushbroker.CreateRef` (#1810's primitive, widened), not a new
    `Promote`.** The PRD's own constraint (prefer reusing `CreateRef` unless it cannot
@@ -94,10 +101,11 @@ original promote-then-delete design above.**
    4. otherwise `CreateRef{Ref: salvage ref, Tip, SourceRef: source}`: `Old = zero`, an
       empty pack, never forced, read back to confirm.
 
-   `CreateRef`'s prefix allowlist and `validateCreateRef` were widened (by #1819's own
-   authors, ahead of this PRD, per the operator's steering) to accept
+   `CreateRef`'s prefix allowlist and `validateCreateRef` were widened (by this branch,
+   #1867, after #1819 merged, per the operator's steering) to accept
    `refs/uzi-salvage/*` as a target with a source under either
-   `refs/uzi-checkpoints/` or `refs/uzi-recovery/`. There is no branch-ref delete step at
+   `refs/uzi-checkpoints/` or `refs/uzi-recovery/`. `Delete` and `ListRefTips` were widened
+   the same way, for salvage's own CAS delete and its one combined ref lookup. There is no branch-ref delete step at
    all: salvage never deletes or moves the source ref it reads from, only ever its own
    `refs/uzi-salvage/<run-id>`.
 3. **Failure handling and bounds, as built (differs from the original numbers).**
@@ -184,12 +192,17 @@ Every milestone runs its component gate (`task gate:api`, plus `task gate:web` f
   `CreateRef` already served once its allowed-prefix and `SourceRef` validation were
   widened to `refs/uzi-salvage/*`, so building a parallel primitive would have duplicated
   the exact CAS/SSRF/auth/redaction machinery `CreateRef` already has. `Delete` was
-  already ref-name-generalized by #1819 ahead of this PRD; salvage reuses it unchanged
-  for its own ref only. Landed: `pushbroker.SalvageRefPrefix`/`SalvageRef`, the
-  `refs/uzi-salvage/*` case in `validateCreateRef`, `createref_http_test.go` /
-  `createref_internal_test.go` coverage (create, idempotent re-create, refusal at a
-  different tip, `ErrSourceMissing`). A credential never appears in errors
-  (`secretscrub`), tested.
+  already ref-name-generalized by #1819 ahead of this PRD (it takes `o.Ref`), but this
+  branch added the `refs/uzi-salvage/*` case to its own prefix check and required a
+  non-empty `ExpectedOldTip` for it, the same CAS rule #1819 already required for
+  `refs/uzi-recovery/*`; salvage's own calls use it for its own ref only. Landed:
+  `pushbroker.SalvageRefPrefix`/`SalvageRef`, the `refs/uzi-salvage/*` case in
+  `validateCreateRef`, and coverage in `pushbroker_salvage_test.go` (create, idempotent
+  re-create, refusal at a different tip, `ErrSourceMissing`, the CAS delete, plus
+  `TestSalvageRefOverSmartHTTP`, which exercises the create over real smart-HTTP receive-pack
+  and skips without `git-http-backend`) and `api/internal/workersvc/salvage_test.go`
+  (the AST invariant test plus the sweep-level create/expire cases). A credential never
+  appears in errors (`secretscrub`), tested.
 - [x] **M2 Store.** `run_salvage` (migration draft `00268`, keyed on `run_id`) as planned,
   with two differences from the plan:
   - an extra `disabled` state (a forge left `UZI_SALVAGE_FORGES` before a pending row's
@@ -235,16 +248,24 @@ Every milestone runs its component gate (`task gate:api`, plus `task gate:web` f
   `api/internal/uzicli/skill/SKILL.md` and `docs/cli.md`. Web and CLI tests landed.
 - [x] **M5 Docs, ADR, skill.** `docs/run-recovery.md` gained a "Salvage copies" section
   with the recovery order, and `task docs:sync` was re-run. `.agents/skills/uzi-watcher/SKILL.md`
-  and `resume-recipe.md` were updated with the same order. `adr/1867-failed-run-salvage-ref.md`
+  and `resume-recipe.md` were updated with the same rule — compare tips across every
+  available source (the salvage ref included) and restore the freshest verified one,
+  never preferring an older salvage checkpoint merely because it is remotely reachable.
+  `resume-recipe.md`'s "Pick a source" list keeps its own ordering (backup snapshot, live
+  PVC, retained checkpoint/recovery ref, worker tracking ref, salvage), not an identical
+  copy of `docs/run-recovery.md`'s prose order, since it is written as a recipe to follow
+  rather than a priority list. `adr/1867-failed-run-salvage-ref.md`
   was written (the namespace, `CreateRef` reuse, the RESTRICT/FK-only serialization, the
   secret and plan-reject policy, the exposure tradeoff, reliance on a single sweeper, the
   retry bounds, and the distinct value/limits/overlap with #1810); `adr/0122-checkpoint-push-broker.md`
   and `adr/1810-checkpoint-retention-follows-custody.md` each gained a one-line cross-link.
-  `UZI_SALVAGE_FORGES` is documented in `docs/cli.md` next to the other `UZI_RECOVERY_*`
-  settings and in `docs/run-recovery.md`, both stating default-off, gated per forge by M6.
+  `UZI_SALVAGE_FORGES` is documented in `docs/cli.md`'s salvage section and in
+  `docs/run-recovery.md`'s "Salvage copies" section, both stating default-off; the M6
+  real-forge gate itself is stated in the `SalvageForges` field comment in
+  `api/internal/config/config.go`, not repeated verbatim in either doc page.
   A tagged `specs/human.md` line was added. A CHANGELOG `[Unreleased]` entry was added.
 - [ ] **M6 Real-forge gate (maintainer-owned; the worker stops at M5).**
-  - A forge kind may be added to `UZI_SALVAGE_FORGES` only after it passes on a **controlled test repository on a real instance of that forge**: a deliberately failed run's checkpoint is promoted, the branch ref is deleted, `git fetch origin refs/uzi-salvage/<run-id>` returns the tip, and the salvage ref expires.
+  - A forge kind may be added to `UZI_SALVAGE_FORGES` only after it passes on a **controlled test repository on a real instance of that forge**: a deliberately failed run's checkpoint is copied to `refs/uzi-salvage/<run-id>`, `git fetch origin refs/uzi-salvage/<run-id>` returns the tip, and the salvage ref expires. There is no branch-ref delete step to verify: the shipped design is create-only, and the branch checkpoint ref stays #1810's to retain or delete.
   - The compose e2e harness does **not** count: its GitLab and Forgejo lanes use `forge-fake` (real git smart HTTP, not the real products).
   - Initial support is whichever forges pass. Each forge that cannot be tested stays off, with today's behavior.
   - The switch is default-off, so this gate can run after merge without any forge being affected before it passes.
@@ -263,7 +284,9 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
 
 ## Success criteria (as built)
 
-- With `UZI_SALVAGE_FORGES` empty, nothing changes anywhere: no enqueue, no broker call.
+- With `UZI_SALVAGE_FORGES` empty and no existing `run_salvage` rows, nothing changes
+  anywhere: no enqueue, no broker call. A row that already exists from before the setting
+  was cleared still runs its create/expire lifecycle to completion (decision 0).
 - On an enabled forge:
   - an eligible failed run whose checkpoint tip is still verified live under the branch
     checkpoint ref or its recovery ref gets a confirmed `refs/uzi-salvage/<run-id>`, and the
@@ -286,9 +309,11 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
   because salvage never deletes the source it read from.
 - **The source ref moves or is deleted (by #1810's own settlement, or a sibling run) before
   a create lands:** the result is `unavailable` by design. Never overwrite or delete
-  anything; the tip is simply unavailable for this salvage attempt, and the row retries
-  next pass in case a later state (a recovery ref created by supersession) makes it
-  available again.
+  anything; the tip is simply unavailable for this salvage attempt. `unavailable` is
+  terminal, though, not retried: `SettleSalvage` clears the row's live pointer and
+  `ListSalvageDuePending` reads only `pending` rows, so a run with an `unavailable` row is
+  never re-enqueued even if a later state (a recovery ref created by supersession) would
+  have made the tip available again.
 - **A permanently dead forge (revoked PAT, dropped allowlist entry, deleted repo):** bounded
   by `salvageHardCeiling` (30 attempts, with the 1h backoff past the cap) — at most about 20
   extra hourly attempts before the row gives up and releases the RESTRICT pointer.
