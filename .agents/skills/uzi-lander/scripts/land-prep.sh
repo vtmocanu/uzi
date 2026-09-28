@@ -524,7 +524,8 @@ fi
 # branch whose workflow tree differs from the base with that PAT. So a workflow edit on a
 # uzi-owned branch makes every later uzi push there fail atomically (mr_rework, a ci_fix
 # adopt, a re-run), losing that run's commits. Stop before pushing one.
-wf=$(git diff --name-only "origin/$BASE..HEAD" -- .github/workflows/ || true)
+wf=$(git diff --name-only "origin/$BASE..HEAD" -- .github/workflows/) \
+  || { log "cannot read the branch's workflow-file diff against origin/$BASE; not pushing"; exit 3; }
 if [ -n "$wf" ]; then
   case "$BRANCH" in
     agent/*|uzi/*)

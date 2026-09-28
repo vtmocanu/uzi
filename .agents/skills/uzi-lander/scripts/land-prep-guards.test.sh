@@ -146,6 +146,17 @@ grep -q 'workflow_scope_missing' "$WORK/out.105" || fail "the consequence was no
 # ...the explicit override pushes, and a non-uzi branch is not stopped at all.
 run agent/issue-9 105 --skip-rebase --gate none --allow-workflow-edit
 [ "$rc" -eq 0 ] || fail "--allow-workflow-edit did not pass, rc=$rc: $(cat "$WORK/out.105")"
+# ...and an unreadable workflow diff fails closed (exit 3) instead of reading as "no edit".
+REAL_GIT=$(command -v git)
+cat > "$WORK/bin/git" <<STUB
+#!/usr/bin/env bash
+if [ -n "\${WF_DIFF_FAIL:-}" ] && [ "\$1" = diff ] && [ "\${*: -1}" = .github/workflows/ ]; then exit 128; fi
+exec "$REAL_GIT" "\$@"
+STUB
+chmod +x "$WORK/bin/git"
+WF_DIFF_FAIL=1 run agent/issue-9 107 --gate none --allow-workflow-edit
+rm -f "$WORK/bin/git"
+[ "$rc" -eq 3 ] || fail "an unreadable workflow diff did not fail closed, rc=$rc: $(cat "$WORK/out.107")"
 run lander/wf 106 --gate none
 [ "$rc" -eq 0 ] || fail "a non-uzi branch with a workflow edit was stopped, rc=$rc: $(cat "$WORK/out.106")"
 grep -q 'NOTE: branch changes workflow files' "$WORK/out.106" || fail "the workflow note is missing on a non-uzi branch"

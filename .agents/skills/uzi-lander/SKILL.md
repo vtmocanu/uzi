@@ -357,7 +357,7 @@ The chosen review requirement complements uzi's own wave; these checks are nobod
 and they precede every merge (step 6):
 
 - **Workflow files.** `gh pr diff PR --name-only` filtered on `.github/workflows/`, then
-  the two-dot merge-safety check `git fetch origin BRANCH && git diff --name-only
+  the two-dot merge-safety check `git fetch origin main BRANCH && git diff --name-only
   origin/main..origin/BRANCH -- .github/workflows/`. Empty means the branch's workflow tree
   matches `main`, so a workflow file in the three-dot PR diff is only a base-realignment
   artifact and the merge is safe; non-empty is a real workflow change, which only your
