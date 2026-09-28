@@ -13,8 +13,8 @@ import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
-import type { ChatClaimResponse, ClaimResponse, WorkerStats } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import type { ChatClaimResponse, ClaimResponse, RunDiskEntry, WorkerStats } from "../src/protocol.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 // PRD #1809 D8: the per-run HOME size on the heartbeat. The sampler measures in the background
 // (never on the heartbeat path), only worker-owned run-id dirs whose run is live here or
@@ -22,6 +22,10 @@ import { nullLogger } from "./helpers.js";
 
 const id = (n: number): string => `18090000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 const GIB = 1024 ** 3;
+
+/** The entries without their `sampled_at` (asserted by its own tests). */
+const sizesOf = (entries: RunDiskEntry[] | undefined): Array<Omit<RunDiskEntry, "sampled_at">> | undefined =>
+  entries?.map(({ sampled_at: _at, ...rest }) => rest);
 
 function deferred<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } {
   let resolve!: (v: T) => void;
@@ -108,7 +112,7 @@ describe("RunDiskSampler (PRD #1809 D8)", () => {
           entries.map((e) => e.run_id),
           [id(2), id(1), id(5)],
         );
-        assert.deepStrictEqual(entries[0], { run_id: id(2), home_bytes: 9 * GIB, cache_bytes: 4.5 * GIB });
+        assert.deepStrictEqual(sizesOf(entries)?.[0], { run_id: id(2), home_bytes: 9 * GIB, cache_bytes: 4.5 * GIB });
         assert.deepStrictEqual(measured.sort(), [id(1), id(2), id(5)].sort(), "nothing else was walked");
       } finally {
         fs.rmSync(outside, { recursive: true, force: true });
@@ -138,7 +142,8 @@ describe("RunDiskSampler (PRD #1809 D8)", () => {
       });
       const [one, ...rest] = await new RunDiskSampler(trunc.o).sample();
       assert.deepStrictEqual(rest, []);
-      assert.deepStrictEqual({ ...one, run_id: "" }, { run_id: "", home_bytes: 5, cache_bytes: 1, truncated: true });
+      assert.ok(one);
+      assert.deepStrictEqual(sizesOf([{ ...one, run_id: "" }]), [{ run_id: "", home_bytes: 5, cache_bytes: 1, truncated: true }]);
     });
   });
 
@@ -158,7 +163,7 @@ describe("RunDiskSampler (PRD #1809 D8)", () => {
         },
       });
       const entries = await new RunDiskSampler(o).sample();
-      assert.deepStrictEqual(entries, [{ run_id: id(1), home_bytes: 1, cache_bytes: 0 }], "the live run is still measured");
+      assert.deepStrictEqual(sizesOf(entries), [{ run_id: id(1), home_bytes: 1, cache_bytes: 0 }], "the live run is still measured");
       assert.strictEqual(lookups, 3, "the bail stops asking an unreachable api");
     });
   });
@@ -188,7 +193,7 @@ describe("RunDiskSampler (PRD #1809 D8)", () => {
       assert.strictEqual(calls, 1, "one sample in flight, never a second");
       gate.resolve();
       await sampler.settled();
-      assert.deepStrictEqual(sampler.current(), [{ run_id: id(1), home_bytes: 1, cache_bytes: 0 }]);
+      assert.deepStrictEqual(sizesOf(sampler.current()), [{ run_id: id(1), home_bytes: 1, cache_bytes: 0 }]);
       // Within the interval: no new sample.
       now += 60_000;
       sampler.current();
@@ -198,11 +203,11 @@ describe("RunDiskSampler (PRD #1809 D8)", () => {
       now += 5 * 60_000;
       gate = deferred();
       size = 2;
-      assert.deepStrictEqual(sampler.current(), [{ run_id: id(1), home_bytes: 1, cache_bytes: 0 }]);
+      assert.deepStrictEqual(sizesOf(sampler.current()), [{ run_id: id(1), home_bytes: 1, cache_bytes: 0 }]);
       await until(() => calls === 2, "the next measure to start");
       gate.resolve();
       await sampler.settled();
-      assert.deepStrictEqual(sampler.current(), [{ run_id: id(1), home_bytes: 2, cache_bytes: 0 }]);
+      assert.deepStrictEqual(sizesOf(sampler.current()), [{ run_id: id(1), home_bytes: 2, cache_bytes: 0 }]);
     });
   });
 
@@ -229,6 +234,167 @@ describe("RunDiskSampler (PRD #1809 D8)", () => {
       assert.strictEqual(off.current(), undefined);
       await off.settled();
       assert.strictEqual(off.current(), undefined);
+    });
+  });
+});
+
+describe("RunDiskSampler (PRD #1809 D8) — sampled_at, partial samples and rotation", () => {
+  /** Run one due sample through the production path (current → settled) and return the reading. */
+  async function tick(sampler: RunDiskSampler, clock: { now: number }): Promise<RunDiskEntry[] | undefined> {
+    clock.now += 10 * 60_000;
+    sampler.current();
+    await sampler.settled();
+    return sampler.current();
+  }
+
+  it("stamps each entry with when its sample FINISHED measuring (RFC 3339 UTC)", async () => {
+    await withRoot(async (root) => {
+      fs.mkdirSync(path.join(root, id(1)));
+      fs.mkdirSync(path.join(root, id(2)));
+      const clock = { now: Date.UTC(2026, 8, 28, 12, 0, 0) };
+      const { o } = opts(root, new Map([[id(1), 2], [id(2), 1]]), {
+        now: () => clock.now,
+        measure: async (home) => {
+          clock.now += 90_000; // each measure takes 90s of wall time
+          return { homeBytes: path.basename(home) === id(1) ? 2 : 1, cacheBytes: 0, entries: 1, truncated: false };
+        },
+      });
+      const entries = await new RunDiskSampler(o).sample();
+      const finished = new Date(clock.now).toISOString();
+      assert.strictEqual(finished, "2026-09-28T12:03:00.000Z", "two 90s measures after the start");
+      assert.deepStrictEqual(
+        entries.map((e) => e.sampled_at),
+        [finished, finished],
+        "the finish time, not the start time",
+      );
+    });
+  });
+
+  it("a partial sample keeps the previous entries of the runs it did not reach, while their HOME is still worker-owned", async () => {
+    await withRoot(async (root) => {
+      for (let n = 1; n <= 5; n++) fs.mkdirSync(path.join(root, id(n)));
+      const clock = { now: Date.UTC(2026, 8, 28, 12, 0, 0) };
+      const sizes = new Map([[id(1), 1], [id(2), 2], [id(3), 3], [id(4), 4], [id(5), 5]]);
+      let apiDownFor = new Set<string>();
+      let foreign = new Set<string>();
+      const rec = recordingLogger();
+      const { o } = opts(root, sizes, {
+        now: () => clock.now,
+        log: rec.logger,
+        workerUid: process.getuid?.() ?? 0,
+        statusOf: async (runId) => {
+          if (apiDownFor.has(runId)) throw new Error("api 503");
+          return "limit_wait";
+        },
+        lstat: async (p) => {
+          const st = await fs.promises.lstat(p);
+          return foreign.has(path.basename(p)) ? { uid: st.uid + 1, isDirectory: () => st.isDirectory() } : st;
+        },
+      });
+      const sampler = new RunDiskSampler(o);
+      const first = await tick(sampler, clock);
+      assert.strictEqual(first?.length, 5);
+      const firstAt = first[0]!.sampled_at;
+      assert.ok(!rec.lines.some((l) => (l as { partial?: boolean }).partial), "a complete sample is not partial");
+
+      // Second sample: the api cannot answer for id(2) and id(4); id(3)'s HOME is gone; id(4)'s is
+      // now owned by another uid; id(5) grew.
+      apiDownFor = new Set([id(2), id(4)]);
+      fs.rmSync(path.join(root, id(3)), { recursive: true });
+      foreign = new Set([id(4)]);
+      sizes.set(id(5), 50);
+      const second = await tick(sampler, clock);
+      const secondAt = new Date(clock.now).toISOString();
+      assert.deepStrictEqual(
+        second?.map((e) => [e.run_id, e.home_bytes / GIB, e.sampled_at]),
+        [
+          [id(5), 50, secondAt], // re-measured
+          [id(2), 2, firstAt], // not reached (lookup failed): the previous entry, with its own time
+          [id(1), 1, secondAt], // re-measured
+        ],
+        "id(3) (HOME gone) and id(4) (no longer worker-owned) are dropped, not carried",
+      );
+      const partial = rec.lines.filter((l) => (l as { partial?: boolean }).partial === true);
+      assert.strictEqual(partial.length, 1, "the partial sample is logged as such");
+      assert.deepStrictEqual(
+        { failures: (partial[0] as Record<string, unknown>).status_lookup_failures, carried: (partial[0] as Record<string, unknown>).carried },
+        { failures: 1, carried: 1 },
+      );
+
+      // Third sample: complete again, id(2) is re-measured with a fresh time.
+      apiDownFor = new Set();
+      const third = await tick(sampler, clock);
+      const thirdAt = new Date(clock.now).toISOString();
+      assert.deepStrictEqual(
+        third?.map((e) => [e.run_id, e.sampled_at]),
+        [
+          [id(5), thirdAt],
+          [id(2), thirdAt],
+          [id(1), thirdAt],
+        ],
+      );
+    });
+  });
+
+  it("a sample that hits its deadline keeps the unreached runs' previous entries", async () => {
+    await withRoot(async (root) => {
+      for (let n = 1; n <= 3; n++) fs.mkdirSync(path.join(root, id(n)));
+      const clock = { now: Date.UTC(2026, 8, 28, 12, 0, 0) };
+      let slow = false;
+      const rec = recordingLogger();
+      const { o } = opts(root, new Map([[id(1), 1], [id(2), 2], [id(3), 3]]), {
+        now: () => clock.now,
+        log: rec.logger,
+        sampleDeadlineMs: 60_000,
+        measure: async (home) => {
+          if (slow) clock.now += 61_000; // the first measure uses up the whole sample deadline
+          const g = Number(path.basename(home).slice(-1));
+          return { homeBytes: g * GIB, cacheBytes: 0, entries: 1, truncated: false };
+        },
+      });
+      const sampler = new RunDiskSampler(o);
+      const first = await tick(sampler, clock);
+      assert.strictEqual(first?.length, 3);
+      slow = true;
+      const second = await tick(sampler, clock);
+      assert.deepStrictEqual(
+        second?.map((e) => e.run_id),
+        [id(3), id(2), id(1)],
+        "a deadline-cut sample does not blank the runs it did not reach",
+      );
+      assert.strictEqual(second?.filter((e) => e.sampled_at !== first?.[0]?.sampled_at).length, 1, "one run re-measured");
+      assert.ok(
+        rec.lines.some((l) => (l as { partial?: boolean; stopped?: string }).partial && (l as { stopped?: string }).stopped === "deadline"),
+        "logged as a deadline-cut partial sample",
+      );
+    });
+  });
+
+  it("rotates the start across samples, so HOMEs past the per-sample budget are measured next time", async () => {
+    await withRoot(async (root) => {
+      for (let n = 1; n <= 5; n++) fs.mkdirSync(path.join(root, id(n)));
+      const clock = { now: Date.UTC(2026, 8, 28, 12, 0, 0) };
+      const sizes = new Map([[id(1), 1], [id(2), 2], [id(3), 3], [id(4), 4], [id(5), 5]]);
+      const { o, measured } = opts(root, sizes, { now: () => clock.now, maxMeasured: 2 });
+      const sampler = new RunDiskSampler(o);
+      const rounds: string[][] = [];
+      let reading: RunDiskEntry[] | undefined;
+      for (let i = 0; i < 4; i++) {
+        const before = measured.length;
+        reading = await tick(sampler, clock);
+        rounds.push(measured.slice(before));
+      }
+      assert.deepStrictEqual(rounds, [
+        [id(1), id(2)],
+        [id(3), id(4)],
+        [id(5), id(1)],
+        [id(2), id(3)],
+      ]);
+      assert.deepStrictEqual(
+        reading?.map((e) => e.run_id),
+        [id(5), id(4), id(3), id(2), id(1)],
+        "every HOME is in the reading, the trailing ones included",
+      );
     });
   });
 });
@@ -299,7 +465,8 @@ describe("Worker heartbeat — PRD #1809 D8 run_disk", () => {
         release.resolve();
         await until(() => beats.some((b) => b?.run_disk !== undefined), "a heartbeat with run_disk");
         const withDisk = beats.find((b) => b?.run_disk !== undefined);
-        assert.deepStrictEqual(withDisk?.run_disk, [{ run_id: id(1), home_bytes: 7 * GIB, cache_bytes: 3 * GIB }]);
+        assert.deepStrictEqual(sizesOf(withDisk?.run_disk), [{ run_id: id(1), home_bytes: 7 * GIB, cache_bytes: 3 * GIB }]);
+        assert.match(withDisk?.run_disk?.[0]?.sampled_at ?? "", /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d+)?Z$/);
       } finally {
         ac.abort();
         await done.catch(() => undefined);

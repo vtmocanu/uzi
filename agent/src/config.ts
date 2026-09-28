@@ -95,8 +95,11 @@ export interface Config {
   diskReclaimIntervalMs: number;
   /**
    * PRD #1809 D8: how often the background per-run HOME measure runs for the heartbeat's
-   * `run_disk` (UZI_RUN_DISK_SAMPLE_INTERVAL, default 5m; `0` turns the sampler off). The
-   * heartbeat only reads the latest finished sample, so this never delays a heartbeat.
+   * `run_disk` (UZI_RUN_DISK_SAMPLE_INTERVAL, default 10m; `0` turns the sampler off). The
+   * heartbeat only reads the latest finished sample, so this never delays a heartbeat. 10m, the
+   * reclaim cadence, because one sample may walk up to 500k dirents per HOME (rmtree.ts
+   * MEASURE_MAX_ENTRIES) for every live or parked run on the data volume the running builds use,
+   * and the reading is informational: the cache cap and the pressure layers never read it.
    */
   runDiskSampleIntervalMs: number;
   /**
@@ -533,7 +536,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     reviewModelTimeoutMs: 5 * 60_000,
     summaryModelTimeoutMs: summaryModelTimeoutMs(env),
     diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
-    runDiskSampleIntervalMs: duration(env, "UZI_RUN_DISK_SAMPLE_INTERVAL", "5m"),
+    runDiskSampleIntervalMs: duration(env, "UZI_RUN_DISK_SAMPLE_INTERVAL", "10m"),
     diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),
     diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),
     runCacheCapEnabled: parseBoolDefaultTrue(env.UZI_RUN_CACHE_CAP_ENABLED),

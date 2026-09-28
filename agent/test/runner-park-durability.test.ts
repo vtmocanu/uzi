@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -10,7 +11,7 @@ import { LimitReachedError } from "../src/limit.js";
 import type { StateRequest } from "../src/protocol.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 import { commitInTree, FakeRecoveryClient, FakeRecoveryGit, makeRecoveryCoordinator } from "./codex-reap-fixture.js";
 
 installHarness();
@@ -45,13 +46,29 @@ function stubPublish(httpStatus?: number): string[] {
   return tips;
 }
 
-/** Fail every fetch-back after the first `ok` ones, as a full data volume does. */
-function failFetchBackAfter(ok: number): void {
+/**
+ * Fail every fetch-back after the first `ok` ones, as a full data volume does. With
+ * `objectsLand`, a failing fetch-back first copies the clone's objects into the bare (to
+ * FETCH_HEAD only) and then fails before the tracking ref moves: the ref-update half of the
+ * fetch ran out of space. The run's newest commit is then present in the bare but NOT under the
+ * tracking ref, so only the positive tracking-ref verify tells the two apart.
+ */
+function failFetchBackAfter(ok: number, opts: { objectsLand?: boolean } = {}): void {
   const real = git.fetchAgentBranch.bind(git);
   let calls = 0;
   git.fetchAgentBranch = async (...args: Parameters<typeof real>) => {
     calls += 1;
-    if (calls > ok) throw new Error("fatal: unable to write loose object file: No space left on device");
+    if (calls > ok) {
+      if (opts.objectsLand) {
+        const [barePath, clonePath, branch] = args;
+        execFileSync(
+          "git",
+          ["--git-dir", barePath, "-c", "protocol.file.allow=user", "fetch", "--no-tags", `file://${clonePath}`, `refs/heads/${branch}`],
+          { env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" }, stdio: "pipe" },
+        );
+      }
+      throw new Error("fatal: unable to write loose object file: No space left on device");
+    }
     return await real(...args);
   };
 }
@@ -143,16 +160,17 @@ describe("RunRunner — PRD #1809 D8: the usage-limit park reports what its chec
     });
   });
 
-  it("the #1798 shape: fetch-back and recovery pin fail, the stale checkpoint is published; reports false and keeps the custody hold", async () => {
+  it("the #1798 shape: the fetch-back fails, the stale checkpoint is published; reports false and keeps the custody hold", async () => {
     await withHomeRoot(async (homeRoot) => {
       client.protocolFeatures = [FEATURE];
       const tips = stubPublish();
-      // The mid-run checkpoint's fetch-back lands (milestone 1); every later one fails.
-      failFetchBackAfter(1);
+      // The mid-run checkpoint's fetch-back lands (milestone 1); every later one fails after
+      // milestone 2's objects reached the bare but before the tracking ref moved.
+      failFetchBackAfter(1, { objectsLand: true });
       const archive = new FakeRecoveryClient();
-      const { coord, root } = makeRecoveryCoordinator(archive, new FakeRecoveryGit());
-      // The journal write fails too (ENOSPC): recovery.pin's failure result.
-      (coord as unknown as { pin: () => Promise<undefined> }).pin = async () => undefined;
+      const recoveryGit = new FakeRecoveryGit();
+      // The REAL coordinator, pin included: the settle runs its full transfer-and-verify.
+      const { coord, root } = makeRecoveryCoordinator(archive, recoveryGit);
       try {
         const { gitlab } = fakeGitlab();
         const claim = gitlabClaim(18094, { wait_on_limit: true, claim_generation: 4 });
@@ -166,11 +184,44 @@ describe("RunRunner — PRD #1809 D8: the usage-limit park reports what its chec
         assert.strictEqual(park.checkpoint_contains_latest, false, "the checkpoint lacks milestone 2");
         const feed = statusTexts(claim.run_id);
         assert.ok(
-          feed.some((t) => t.startsWith("park checkpoint published to origin, but it does not contain the latest committed work")),
+          feed.includes(
+            "park checkpoint published to origin, but the latest committed work is not in that checkpoint; the worker keeps it until it is recovered",
+          ),
           `the feed names the stale checkpoint, got ${JSON.stringify(feed)}`,
         );
+        // The settle's transfer fetch-back failed too: it must not trust the bare (whose objects
+        // include milestone 2, but whose tracking ref does not) and must keep the hold open.
         assert.deepStrictEqual(archive.releaseCalls, [], "custody is never released while the latest work is on the worker only");
-        assert.deepStrictEqual(archive.reserveCalls, [], "nothing to archive: the head never reached the bare");
+        assert.deepStrictEqual(archive.reserveCalls, [], "nothing archived from an unverified transfer");
+        assert.strictEqual(recoveryGit.produceCalls, 0, "no bundle produced from an unverified head");
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    });
+  });
+
+  it("only the recovery pin fails: the checkpoint holds the latest work, so it reports true and keeps the hold", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE];
+      const tips = stubPublish();
+      const archive = new FakeRecoveryClient();
+      const { coord, root } = makeRecoveryCoordinator(archive, new FakeRecoveryGit());
+      // The journal write fails (ENOSPC): recovery.pin's failure result. It does not change what
+      // the published checkpoint holds.
+      (coord as unknown as { pin: () => Promise<undefined> }).pin = async () => undefined;
+      try {
+        const { gitlab } = fakeGitlab();
+        const claim = gitlabClaim(18090, { wait_on_limit: true, claim_generation: 4 });
+        await runnerWith(twoMilestoneFactory(homeRoot, limitEnd), gitlab, undefined, nullLogger(), {
+          checkpointIntervalMs: 0,
+          recovery: coord,
+        }).execute(claim);
+        const [park] = reports(claim.run_id, "limit_wait");
+        assert.ok(park, "parked");
+        assert.strictEqual(tips.length, 1, "the park published a checkpoint");
+        assert.strictEqual(park.checkpoint_contains_latest, true, "the fetch-back landed: the checkpoint holds milestone 2");
+        assert.ok(statusTexts(claim.run_id).includes("park checkpoint published to origin"));
+        assert.deepStrictEqual(archive.releaseCalls, [], "a failed pin never releases custody");
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
@@ -214,6 +265,76 @@ describe("RunRunner — PRD #1809 D8: the owner pause park reports what its chec
       assert.ok(park, "paused");
       assert.strictEqual(tips.length, 1);
       assert.strictEqual(park.checkpoint_contains_latest, false);
+    });
+  });
+
+  it("a milestone overlay publish after a failed fetch-back does not let the next pause claim the latest work", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE];
+      const tips = stubPublish();
+      failFetchBackAfter(1);
+      // The overlay's default-tip wrapper needs a forge fetch; pack the plain tracking ref instead.
+      // The runner still took the overlay (unpinned) publish path.
+      const realPack = git.checkpointPack.bind(git);
+      git.checkpointPack = async (barePath, branch, _overlay, pinned) => await realPack(barePath, branch, undefined, pinned);
+      const { github } = fakeGitHub();
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(18088, {
+        repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+      });
+      const milestoneThenPause = async (ctx: RunContext): Promise<ExecutorResult> => {
+        // The milestone checkpoint (reap:true, overlay) publishes the OLDER tracking tip: its
+        // fetch-back of milestone 2 failed.
+        await ctx.checkpoint?.({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        const at = { completedCount: 1, total: 2 };
+        const parked = await ctx.parkForPause?.(at);
+        return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      };
+      await runnerWith(twoMilestoneFactory(homeRoot, milestoneThenPause), gitlab, undefined, nullLogger(), {
+        github,
+        checkpointIntervalMs: 0,
+      }).execute(claim);
+      assert.strictEqual(tips.length, 2, "the milestone published, and the pause published again");
+      assert.strictEqual(tips[0], tips[1], "both packed the older tracking tip");
+      const [park] = reports(claim.run_id, "paused");
+      assert.ok(park, "paused");
+      assert.strictEqual(park.checkpoint_contains_latest, false);
+    });
+  });
+
+  it("a second pause with no new commit after a stale publish still reports false", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE];
+      const tips = stubPublish();
+      failFetchBackAfter(1);
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(18089);
+      // The server declines the first pause (acks `running`), so the run keeps going and pauses
+      // again with no commit in between; the second one parks.
+      let pauses = 0;
+      api.onState(claim.run_id, (body) => {
+        if (body.status === "paused") pauses += 1;
+        api.overrideStateStatus(claim.run_id, body.status === "paused" && pauses === 1 ? "running" : body.status);
+      });
+      const twicePausing = async (ctx: RunContext): Promise<ExecutorResult> => {
+        const at = { completedCount: 1, total: 2 };
+        const first = await ctx.parkForPause?.(at);
+        assert.strictEqual(first, false, "the first pause was declined");
+        const parked = await ctx.parkForPause?.(at);
+        return parked ? { branch: ctx.branch, pausedAt: at } : { branch: ctx.branch };
+      };
+      await runnerWith(twoMilestoneFactory(homeRoot, twicePausing), gitlab, undefined, nullLogger(), {
+        checkpointIntervalMs: 0,
+      }).execute(claim);
+      const parks = reports(claim.run_id, "paused");
+      assert.strictEqual(parks.length, 2, "two pause reports");
+      assert.deepStrictEqual(
+        parks.map((p) => p.checkpoint_contains_latest),
+        [false, false],
+        "the second pause does not take the already-published shortcut on a tip that was never published",
+      );
+      assert.strictEqual(tips.length, 2, "the second pause published again (still the older tracking tip)");
+      assert.strictEqual(tips[0], tips[1]);
     });
   });
 });

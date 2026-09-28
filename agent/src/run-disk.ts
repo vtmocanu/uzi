@@ -30,12 +30,24 @@ import { errMessage, RUN_ID_RE } from "./util.js";
  * measured per sample, each measure gets its own deadline and entry budget ({@link
  * measureRunHome}), and the whole sample stops at `sampleDeadlineMs`. The result keeps the
  * `maxEntries` largest HOMEs, largest first.
+ *
+ * Partial samples: a sample that stopped at its measure budget or deadline, could not ask the api
+ * about a run, or could not measure a HOME did not reach every run. It does not replace the last
+ * reading wholesale: an entry of the previous reading whose run this sample did not reach is kept
+ * (with its own `sampled_at`, so the api ages it by when it was measured), as long as the run's
+ * HOME is still a worker-owned directory. A run the sample did reach is decided by this sample
+ * (measured, or dropped as terminal, unknown or gone). Each entry's `sampled_at` is when the
+ * sample that measured it finished.
+ *
+ * Rotation: the run directories are visited in name order starting just after where the previous
+ * sample stopped early, so a worker with more HOMEs than one sample can measure still measures the
+ * trailing ones on the next sample instead of starving them.
  */
 
 /** Dirents the root listing may read per sample. */
 const DEFAULT_MAX_DIR_READS = 5_000;
 /** Runs measured per sample. More HOMEs than this on one worker is a reclaim problem, not a
- *  reporting one; the listing order decides which are measured. */
+ *  reporting one; the next sample starts after the last run this one visited (rotation). */
 const DEFAULT_MAX_MEASURED = 200;
 /** Wall time one HOME's measure may take. */
 const DEFAULT_PER_RUN_DEADLINE_MS = 60_000;
@@ -73,6 +85,9 @@ export class RunDiskSampler {
   private latest: RunDiskEntry[] | undefined;
   private inFlight: Promise<void> | undefined;
   private lastStartedAt: number | undefined;
+  /** The run id the last sample stopped after when it ended early (budget or deadline); the next
+   *  sample starts just after it. Undefined after a sample that visited every listed run. */
+  private resumeAfter: string | undefined;
 
   constructor(opts: RunDiskSamplerOptions) {
     this.opts = opts;
@@ -112,7 +127,10 @@ export class RunDiskSampler {
       });
   }
 
-  /** One sample: list, filter, measure, rank. Rejects only on an unexpected error. */
+  /**
+   * One sample: list, filter, measure, rank, merged with the previous reading for the runs this
+   * sample did not reach (see the file comment). Rejects only on an unexpected error.
+   */
   async sample(): Promise<RunDiskEntry[]> {
     const o = this.opts;
     const measure = o.measure ?? measureRunHome;
@@ -123,72 +141,147 @@ export class RunDiskSampler {
     const maxEntries = o.maxEntries ?? RUN_DISK_MAX_ENTRIES;
     const perRunMs = o.perRunDeadlineMs ?? DEFAULT_PER_RUN_DEADLINE_MS;
     const sampleDeadline = this.now() + (o.sampleDeadlineMs ?? DEFAULT_SAMPLE_DEADLINE_MS);
+    const workerOwnedDir = (st: DirStat): boolean =>
+      st.isDirectory() && (workerUid === undefined || st.uid === workerUid);
 
-    const names = await this.listRunDirs(maxDirReads);
-    const entries: RunDiskEntry[] = [];
+    const { names, truncated: listingTruncated } = await this.listRunDirs(maxDirReads);
+    // Name order, starting just after where the previous sample stopped early (rotation).
+    names.sort();
+    const startAt = this.resumeAfter === undefined ? 0 : names.findIndex((n) => n > this.resumeAfter!);
+    const ordered = startAt <= 0 ? names : [...names.slice(startAt), ...names.slice(0, startAt)];
+
+    const fresh: Omit<RunDiskEntry, "sampled_at">[] = [];
+    // Runs this sample decided (measured, or dropped as gone/foreign/terminal/unknown).
+    const reached = new Set<string>();
     let measured = 0;
     let statusFailures = 0;
-    for (const runId of names) {
-      if (measured >= maxMeasured || this.now() >= sampleDeadline) break;
+    let lookupFailures = 0;
+    let measureFailures = 0;
+    let stoppedEarly: "budget" | "deadline" | undefined;
+    let lastVisited: string | undefined;
+    for (const runId of ordered) {
+      if (measured >= maxMeasured) {
+        stoppedEarly = "budget";
+        break;
+      }
+      if (this.now() >= sampleDeadline) {
+        stoppedEarly = "deadline";
+        break;
+      }
+      lastVisited = runId;
       const home = path.join(o.homeRoot, runId);
       let st: DirStat;
       try {
         st = await lstat(home);
       } catch {
-        continue; // gone since the listing
+        reached.add(runId); // gone since the listing
+        continue;
       }
-      if (!st.isDirectory() || (workerUid !== undefined && st.uid !== workerUid)) continue;
+      if (!workerOwnedDir(st)) {
+        reached.add(runId);
+        continue;
+      }
       if (!o.isRunLive(runId)) {
         // Past the consecutive-failure bail the api is treated as unreachable for this sample:
-        // only live runs are measured.
-        if (statusFailures >= DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES) continue;
+        // only live runs are measured. A run not asked about is not reached.
+        if (statusFailures >= DEFAULT_RECLAIM_MAX_CONSECUTIVE_FAILURES) {
+          lookupFailures += 1;
+          continue;
+        }
         let status: string | undefined;
         try {
           status = await o.statusOf(runId);
           statusFailures = 0;
         } catch {
           statusFailures += 1;
+          lookupFailures += 1;
           continue;
         }
-        if (status === undefined || TERMINAL_RUN_STATUSES.has(status)) continue;
+        if (status === undefined || TERMINAL_RUN_STATUSES.has(status)) {
+          reached.add(runId);
+          continue;
+        }
       }
       measured += 1;
       try {
         const r = await measure(home, { deadline: Math.min(sampleDeadline, this.now() + perRunMs) });
-        entries.push({
+        fresh.push({
           run_id: runId,
           home_bytes: r.homeBytes,
           cache_bytes: r.cacheBytes,
           ...(r.truncated ? { truncated: true } : {}),
         });
+        reached.add(runId);
       } catch (err) {
+        measureFailures += 1;
         o.log.warn("run disk sample could not measure a run HOME", { run_id: runId, error: errMessage(err) });
       }
     }
+    this.resumeAfter = stoppedEarly ? lastVisited : undefined;
+
+    // Every fresh entry carries the moment this sample finished measuring.
+    const sampledAt = new Date(this.now()).toISOString();
+    const entries: RunDiskEntry[] = fresh.map((e) => ({ ...e, sampled_at: sampledAt }));
+
+    // Keep the previous reading for the runs this sample did not reach, while their HOME is still a
+    // worker-owned directory. A run that is gone from the listing of a complete sample fails that
+    // check and drops out.
+    let carried = 0;
+    for (const prev of this.latest ?? []) {
+      if (reached.has(prev.run_id)) continue;
+      let st: DirStat;
+      try {
+        st = await lstat(path.join(o.homeRoot, prev.run_id));
+      } catch {
+        continue;
+      }
+      if (!workerOwnedDir(st)) continue;
+      entries.push(prev);
+      carried += 1;
+    }
+
+    const partial = stoppedEarly !== undefined || listingTruncated || lookupFailures > 0 || measureFailures > 0;
+    if (partial) {
+      o.log.info("run disk sample partial; kept the previous reading for the runs it did not reach", {
+        partial: true,
+        ...(stoppedEarly ? { stopped: stoppedEarly } : {}),
+        ...(listingTruncated ? { listing_truncated: true } : {}),
+        status_lookup_failures: lookupFailures,
+        measure_failures: measureFailures,
+        measured: fresh.length,
+        carried,
+      });
+    }
+
     entries.sort((a, b) => b.home_bytes - a.home_bytes || (a.run_id < b.run_id ? -1 : 1));
     return entries.slice(0, maxEntries);
   }
 
-  /** The run-id-named directory entries of the root, reading at most `maxReads` dirents. The
-   *  dirent type comes from the directory entry, so a symlink is never a directory here. */
-  private async listRunDirs(maxReads: number): Promise<string[]> {
+  /** The run-id-named directory entries of the root, reading at most `maxReads` dirents
+   *  (`truncated` when the listing stopped there). The dirent type comes from the directory entry,
+   *  so a symlink is never a directory here. */
+  private async listRunDirs(maxReads: number): Promise<{ names: string[]; truncated: boolean }> {
     let dir;
     try {
       dir = await fs.opendir(this.opts.homeRoot);
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { names: [], truncated: false };
       throw err;
     }
-    const out: string[] = [];
+    const names: string[] = [];
+    let truncated = true;
     try {
       for (let read = 0; read < maxReads; read++) {
         const e = await dir.read();
-        if (e === null) break;
-        if (e.isDirectory() && RUN_ID_RE.test(e.name)) out.push(e.name);
+        if (e === null) {
+          truncated = false;
+          break;
+        }
+        if (e.isDirectory() && RUN_ID_RE.test(e.name)) names.push(e.name);
       }
     } finally {
       await dir.close().catch(() => undefined);
     }
-    return out;
+    return { names, truncated };
   }
 }

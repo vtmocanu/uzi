@@ -442,7 +442,8 @@ export interface WorkerStats {
   disk_data_total_inodes?: number;
   /** PRD #1809 D8: the HOME size of each live or parked run with a HOME on this worker, from the
    *  worker's latest background sample (run-disk.ts; sampled at most every
-   *  UZI_RUN_DISK_SAMPLE_INTERVAL, never on the heartbeat path). Largest `home_bytes` first, at
+   *  UZI_RUN_DISK_SAMPLE_INTERVAL, never on the heartbeat path; each entry says when it was
+   *  measured, `sampled_at`). Largest `home_bytes` first, at
    *  most {@link RUN_DISK_MAX_ENTRIES} entries. Absent until the first sample completes, and when
    *  the sampler is off. The api's stats decode ignores unknown keys, so no feature gate. */
   run_disk?: RunDiskEntry[];
@@ -462,6 +463,11 @@ export interface RunDiskEntry {
   /** The measure stopped at its entry or time budget, so both numbers are lower bounds.
    *  Omitted when false. */
   truncated?: boolean;
+  /** When the worker's sample that produced this entry finished measuring (RFC 3339, UTC, e.g.
+   *  `2026-09-28T12:00:00.000Z`). Entries of one heartbeat can differ: a partial sample keeps the
+   *  previous entry, with its own `sampled_at`, for a run it did not reach, so the api ages each
+   *  size by when it was measured rather than when the heartbeat arrived. */
+  sampled_at: string;
 }
 
 /**

@@ -1929,10 +1929,12 @@ export class RunRunner {
         // once handleLimitReached reports `failed` (or the server coerces a park to `failed`)
         // the reconcile is refused (409), which would block the reap and leak the
         // exact-generation hold as source_only. The credentialed settle runs AFTER the report
-        // on the non-parked branch below. The PARKED path keeps its OWN park-boundary reconcile
-        // (limit_wait is actively-claimed, so its second reconcile is authorized) — a blocked
-        // pre-reap here poisons the registry (codex/registry.ts) so the park publish's reap also
-        // fails, but the park still stands (D4).
+        // on the non-parked branch below. The PARKED path keeps its OWN park-boundary reconcile:
+        // since PRD #1809 D8 it runs inside the park sink (parkSink below), which handleLimitReached
+        // calls BEFORE the limit_wait report, so that second reconcile also runs while the run is
+        // still `running` (actively-claimed) and is authorized. A blocked pre-reap here poisons the
+        // registry (codex/registry.ts) so the park publish's reap also fails, but the park still
+        // stands (D4).
         const limitReaped = await this.reapRecoveryProviderForSettle(
           claim,
           flight,
@@ -2048,7 +2050,7 @@ export class RunRunner {
                 ? "park checkpoint NOT published — a resume on another worker will restart from the default branch"
                 : parkHoldsLatest
                   ? "park checkpoint published to origin"
-                  : "park checkpoint published to origin, but it does not contain the latest committed work: that work is on this worker only",
+                  : "park checkpoint published to origin, but the latest committed work is not in that checkpoint; the worker keeps it until it is recovered",
             },
           });
           }
@@ -6530,10 +6532,13 @@ export class RunRunner {
         // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
         // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
         // iteration can become publish-eligible on a later tip-unmoved iteration).
+        // PRD #1809 D8: whether the tracking ref (what the publish packs) holds cloneTip: the tip was
+        // unmoved since the last fetch-back, or this fetch-back landed.
+        let fetchedBack = tipUnmovedSinceFetch;
         if (!tipUnmovedSinceFetch) {
           // Fetch back, credential-free (#218's helper): brings the committed work into
           // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
-          await this.fetchBackBestEffort(
+          fetchedBack = await this.fetchBackBestEffort(
             barePath,
             runnerClone.path,
             runnerClone.branch,
@@ -6680,16 +6685,25 @@ export class RunRunner {
                   });
                 }
               } else if (published) {
-                flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+                // PRD #1809 D8: the publish packed the tracking ref, which holds cloneTip only when the
+                // fetch-back landed (or the tip was unmoved since the last one). After a failed
+                // fetch-back the checkpoint is the OLDER tracking tip `fetchedTip`: cloneTip was never
+                // published, so it is neither lastPublishedTip (hasNewWork stays true and the next
+                // checkpoint retries, and a pause cannot shortcut on it) nor the floor.
+                const packedClone = fetchedBack && cloneTip !== null && fetchedTip === cloneTip;
+                if (packedClone) flight.lastPublishedTip = cloneTip;
                 // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
                 // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
                 // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
-                // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
-                // (H) above: it drives hasNewWork, a separate concern from the floor.
+                // otherwise C is the confirmed checkpoint tip: cloneTip, or the older tracking tip a
+                // failed fetch-back left. lastPublishedTip (H when it was packed, above) drives
+                // hasNewWork, a separate concern from the floor.
                 flight.checkpointFloor =
                   bridgeOutcome.kind === "bridged"
                     ? bridgeOutcome.bridge
-                    : (cloneTip ?? flight.checkpointFloor);
+                    : packedClone
+                      ? cloneTip
+                      : (fetchedTip ?? flight.checkpointFloor);
                 // PRD #267 M3: make the time-based publish observable, only for the time path so
                 // we do not double-log the milestone case.
                 if (!opts.reap) {
@@ -7594,7 +7608,7 @@ export class RunRunner {
 
   /** PRD #1809 D8: log a park whose published checkpoint is older than the run's latest work. */
   private logStaleParkCheckpoint(runLog: Logger, runId: string, park: string): void {
-    runLog.warn("park checkpoint does not contain the run's latest committed work; that work is on this worker only", {
+    runLog.warn("park checkpoint does not contain the run's latest committed work; the worker keeps it until it is recovered", {
       run_id: runId,
       park,
       checkpoint_contains_latest: false,
@@ -8638,7 +8652,10 @@ export class RunRunner {
     // logged and the park is still reported, without the field.
     const durability = beforePark
       ? await beforePark().catch((e: unknown) => {
-          runLog.warn("park checkpoint step failed; reporting the park without it", { error: errMessage(e) });
+          runLog.warn("park checkpoint step failed; reporting the park without it", {
+            run_id: claim.run_id,
+            error: errMessage(e),
+          });
           return {};
         })
       : {};
@@ -9945,7 +9962,11 @@ export class RunRunner {
           branch,
           undefined,
         );
-        if (published) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+        // PRD #1809 D8: the publish packed the tracking ref. When that ref does not hold the clone's
+        // HEAD (the fetch-back failed), the checkpoint is OLDER than cloneTip: recording cloneTip as
+        // published would let a later pause with no new commit take the shortcut above and report a
+        // stale checkpoint as holding the latest work.
+        if (published && holdsLatest !== false) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
       }
     }
 
