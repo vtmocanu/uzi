@@ -201,24 +201,31 @@ reject — the rest of a good plan stays.
 
 uzi's worker pushes with a GitHub PAT that **deliberately lacks the `workflow` scope** — a
 worker that could rewrite CI is a supply-chain risk, so this is by design, not a bug to
-"fix" by granting scope. A run whose diff touches `.github/workflows` therefore fails at
-the final push, **atomically**, with a `remote rejected … refusing to allow a Personal
-Access Token to create or update workflow … without workflow scope`. The whole branch push
-is rejected, so **nothing lands on the remote** (a `git ls-remote origin` for the run's
-`agent/issue-*` branch comes back empty). The committed work is usually recoverable from
-the durable sources or the worker's bare tracking ref, not guaranteed: a Docker worker's
-clone is an `emptyDir` lost with its pod. See *Recovering a failed run's work from the
-worker PVC* below (recovered #422's full 12 commits that way, 2026-08-20).
+"fix" by granting scope. A push creating a new ref that carries an authored workflow change
+is rejected **atomically** (`refusing to allow a Personal Access Token to create or update
+workflow … without workflow scope`), so nothing lands (#377, #456). How GitHub gates an
+update to an already-published ref is unverified (#1869). The worker checks before pushing:
+a run whose branch-only commits touch `.github/workflows/**` ends `failed` with
+`workflow_scope_missing` ("branch changes .github/workflows … failing early"), with a
+`preserved_patch` only when its secret scan is trusted and clean. The work is usually
+recoverable from the durable sources or the worker's bare tracking ref, not guaranteed: a
+Docker worker's clone is an `emptyDir` lost with its pod. See *Recovering a failed run's
+work from the worker PVC* below.
 
-**A workflow-scope rejection does NOT always mean the branch touched a workflow file.**
-GitHub compares the branch's `.github/workflows/` tree against the *current* default branch,
-so a branch merely **behind** main on those files (main's CI changed after the run's clone
-base) is rejected the same way — the "base-staleness" mode that killed #422 and #377's first
-run on 2026-08-20 (neither touched a workflow file). PRD #456 fixes this by aligning the
-branch onto current main before the push, so once it lands this mode disappears. Either way,
-if you hit it the work is recoverable (below): `git log --name-only BASE..TIP --
-.github/workflows/` on the recovered branch coming back **empty** confirms base-staleness
-rather than a real plan trap, and a plain rebase onto main then lands it.
+- **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base
+  <branch>` run inherits the source branch's commits, so a maintainer workflow commit on a
+  PR branch can fail later runs on it while it stays branch-only by SHA, including after
+  equivalent content lands on main under another SHA (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
+  rule, #1846).
+- **A branch merely behind main on workflow files is usually handled.** At finalize the
+  worker tries to realign it to the current default (workflow-subtree overlay, else merge,
+  else rebase; PRD #456, #627) before pushing; a conflict fails the run
+  `finalize_base_align_conflict`. Checkpoints get a broker-side overlay (#1036). The
+  precheck runs first, so an inherited workflow commit blocks this realign.
+- **Telling them apart on a recovered branch:** `git log --name-only origin/main..TIP --
+  .github/workflows/` empty is evidence of base staleness only; a rebase onto main that
+  succeeds clears it, then gate and push as usual. A listed commit needs inspection: it may be a real workflow change (the
+  split below) or one whose content is already on main under another SHA (#1869).
 
 **The split** (for a plan that genuinely *edits* a workflow file): uzi implements everything except `.github/workflows`; **you** add the
 workflow-file pieces locally, because your own token has `workflow` scope (confirm with
@@ -323,10 +330,11 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    sibling PR must land first (migration ordering), merge it, then `gh pr update-branch`
    this one so CI runs on the merged tree.
 
-The remote `refs/uzi-checkpoints/agent/issue-N` ref is the other recovery source, but a
-behind-on-workflows run leaves none (its checkpoint push hit the same rejection). The PVC
-tracking ref is the reliable source once the run has checkpointed; before that, prefer the
-working-clone HEAD (step 2).
+The remote checkpoint ref is the other recovery source: `refs/uzi-checkpoints/agent/issue-N`
+for an issue run, `refs/uzi-checkpoints/uzi/self-improve/<run-id>` for a self-improve run;
+`mr_rework` and task runs publish none. Any source can lag: compare the surviving
+working-clone HEAD (step 2), the worker tracking ref, any available archive and the remote
+checkpoint, use the freshest verified committed one, and preserve dirty work separately.
 
 The steps above are the **issue-run** shape; a **task run** (`uzi handoff`) uses
 `uzi/task/RUN` / `refs/uzi-runner/uzi/task/RUN` and often has its work entirely
