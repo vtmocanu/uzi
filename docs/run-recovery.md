@@ -185,11 +185,13 @@ during an in-progress supersession, or leave a stray ref untracked in a
 narrow window described in
 [ADR-1810](../adr/1810-checkpoint-retention-follows-custody.md#consequences);
 when in doubt, check both refs on your forge. Fetch either directly from
-your forge:
+your forge into a local branch; a bare fetch only sets `FETCH_HEAD`, which
+the next fetch overwrites, so the commit could become unreachable once uzi
+deletes the ref:
 
 ```sh
-git fetch origin refs/uzi-checkpoints/<branch>
-git fetch origin refs/uzi-recovery/<run-id>
+git fetch origin refs/uzi-checkpoints/<branch>:refs/heads/recovered/<run-id>
+git fetch origin refs/uzi-recovery/<run-id>:refs/heads/recovered/<run-id>
 ```
 
 The ref disappears once the run's last hold is released (automatically, by

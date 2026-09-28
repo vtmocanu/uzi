@@ -194,7 +194,9 @@ function HoldRow({
   const workerName = hold.worker_name ? stripUnsafeChars(hold.worker_name) : "this worker";
   const warningId = `discard-warning-${hold.id}`;
   const refWarningId = `discard-ref-warning-${hold.id}`;
-  const refWarning = isLastOpenHold ? view.checkpoint : null;
+  // Every checkpoint-backed hold warns: the server decides at discard time, so a sibling hold
+  // that settles after this listing loaded would otherwise delete the ref with no warning.
+  const refWarning = view.checkpoint;
   const inputId = `discard-input-${hold.id}`;
   const canDiscard = typed.trim().toLowerCase() === "discard";
 
@@ -285,7 +287,14 @@ function HoldRow({
           </p>
           {refWarning && (
             <p id={refWarningId} className="text-sm text-danger">
-              This is the run&rsquo;s last open hold: discarding it also deletes the retained
+              {isLastOpenHold ? (
+                <>This is the run&rsquo;s last open hold: discarding it also deletes the retained</>
+              ) : (
+                <>
+                  If no other hold of this run is still open when you discard, this also deletes
+                  the retained
+                </>
+              )}{" "}
               checkpoint ref <code className="break-all font-mono">{refWarning.ref}</code> on the
               forge. Fetch it first if you need it.
             </p>

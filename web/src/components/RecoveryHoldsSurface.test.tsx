@@ -351,7 +351,9 @@ describe("RecoveryHoldsSurface", () => {
       expect(describedBy).toContain("discard-warning-h-last");
     });
 
-    it("does not warn about the ref while the run still has another open hold", async () => {
+    // The server decides at discard time, so a sibling that settles after the listing loaded
+    // would make this the last hold: the ref sentence is conditional, never absent.
+    it("warns conditionally about the ref while the run still has another open hold", async () => {
       await renderSurface(
         listing([
           hold({
@@ -369,7 +371,13 @@ describe("RecoveryHoldsSurface", () => {
       const group = armConfirm("runtwo01");
       expect(within(group).getByText(/only copy/)).toBeTruthy();
       expect(within(group).queryByText(LAST_HOLD)).toBeNull();
-      expect(group.getAttribute("aria-describedby")).toBe("discard-warning-h-dec");
+      const warning = within(group).getByText(/If no other hold of this run is still open/);
+      expect(warning.textContent).toContain("also deletes the retained checkpoint ref");
+      expect(warning.textContent).toContain("Fetch it first if you need it.");
+      expect(warning.querySelector("code")?.textContent).toBe("refs/uzi-checkpoints/agent/issue-10");
+      const describedBy = (group.getAttribute("aria-describedby") ?? "").split(" ");
+      expect(describedBy).toContain(warning.id);
+      expect(describedBy).toContain("discard-warning-h-dec");
     });
 
     // Only state 'open' keeps custody alive (the server's own allowlist), so a sibling hold in
@@ -402,6 +410,7 @@ describe("RecoveryHoldsSurface", () => {
       const group = armConfirm("runbare1");
       expect(within(group).getByText(/only copy/)).toBeTruthy();
       expect(within(group).queryByText(LAST_HOLD)).toBeNull();
+      expect(within(group).queryByText(/checkpoint ref/)).toBeNull();
       expect(group.getAttribute("aria-describedby")).toBe("discard-warning-h-bare");
     });
   });
