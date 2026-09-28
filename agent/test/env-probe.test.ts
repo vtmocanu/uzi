@@ -34,11 +34,14 @@ function errno(code: string): NodeJS.ErrnoException {
 function fakeFs(over: Partial<FakeFs> = {}): FakeFs {
   return {
     readdirSync: () => ["1", "self"],
+    readFileSync: () => PROC_PLAIN,
     mkdtempSync: (prefix: string) => `${prefix}abc`,
     rmdirSync: () => undefined,
     ...over,
   };
 }
+
+const PROC_PLAIN = "22 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime shared:12 - proc proc rw\n";
 
 const ENV = { HOME: "/home/u", TMPDIR: "/tmp/u" };
 
@@ -56,6 +59,29 @@ describe("probeFacts", () => {
   });
   it("maps an empty listing to unverified", () => {
     assert.equal(probeFacts(fakeFs({ readdirSync: () => [] }), ENV).proc, "unverified");
+  });
+  // A hidepid/subset procfs still lists entries (e.g. only `self`) while hiding other rows.
+  for (const [name, line] of [
+    ["hidepid=2 (per-mount)", "22 1 0:21 / /proc rw,relatime,hidepid=2 - proc proc rw\n"],
+    ["hidepid=invisible (super-block)", "22 1 0:21 / /proc rw,relatime - proc proc rw,hidepid=invisible\n"],
+    ["subset=pid", "22 1 0:21 / /proc rw,relatime - proc proc rw,subset=pid\n"],
+  ] as const) {
+    it(`maps a listable /proc mounted ${name} to limited`, () => {
+      const f = fakeFs({ readdirSync: () => ["self"], readFileSync: () => line });
+      assert.equal(probeFacts(f, ENV).proc, "limited");
+    });
+  }
+  it("keeps hidepid=0 / hidepid=off as ok", () => {
+    for (const v of ["0", "off"]) {
+      const f = fakeFs({ readFileSync: () => `22 1 0:21 / /proc rw - proc proc rw,hidepid=${v}\n` });
+      assert.equal(probeFacts(f, ENV).proc, "ok");
+    }
+  });
+  it("maps an unreadable or /proc-less mountinfo to unverified", () => {
+    const unreadable = fakeFs({ readFileSync: () => { throw errno("EACCES"); } });
+    assert.equal(probeFacts(unreadable, ENV).proc, "unverified");
+    const noProc = fakeFs({ readFileSync: () => "30 1 0:5 / /sys rw - sysfs sysfs rw\n" });
+    assert.equal(probeFacts(noProc, ENV).proc, "unverified");
   });
   for (const code of ["EACCES", "EPERM", "EROFS"]) {
     it(`maps a mkdtemp ${code} to limited`, () => {

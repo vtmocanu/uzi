@@ -51,6 +51,7 @@ export function environmentFactsSummary(facts: EnvFacts): string {
 
 interface ProbeFs {
   readdirSync(path: string): readonly unknown[];
+  readFileSync(path: string, encoding: "utf8"): string;
   mkdtempSync(prefix: string): string;
   rmdirSync(path: string): void;
 }
@@ -67,9 +68,16 @@ const PROBE_FACTS_SOURCE = `function (fs, env) {
   var proc = "unverified";
   try {
     var entries = fs.readdirSync("/proc");
-    if (entries && entries.length > 0) proc = "ok";
+    if (entries && entries.length > 0) proc = "listed";
   } catch (e) {
     if (e && e.code === "EACCES") proc = "limited";
+  }
+  if (proc === "listed") {
+    try {
+      proc = procMountVisibility(fs.readFileSync("/proc/self/mountinfo", "utf8"));
+    } catch (e) {
+      proc = "unverified";
+    }
   }
   var dirs = [env.HOME, env.TMPDIR];
   var out = [];
@@ -96,6 +104,31 @@ const PROBE_FACTS_SOURCE = `function (fs, env) {
     out.push(status);
   }
   return { proc: proc, home: out[0], tmp: out[1] };
+
+  // A listable /proc still hides other processes' rows when mounted with hidepid (other than
+  // 0/off) or subset=: "limited". No proc mount at /proc, or an unparsable line: "unverified".
+  function procMountVisibility(mountinfo) {
+    var found = false;
+    var lines = String(mountinfo).split(String.fromCharCode(10));
+    for (var i = 0; i < lines.length; i++) {
+      if (lines[i] === "") continue;
+      var parts = lines[i].split(" - ");
+      if (parts.length < 2) return "unverified";
+      var lf = parts[0].split(" ");
+      var rf = parts[1].split(" ");
+      if (lf.length < 6 || rf.length < 3) return "unverified";
+      if (lf[4] !== "/proc") continue;
+      if (rf[0] !== "proc") return "unverified";
+      found = true;
+      var opts = (lf[5] + "," + rf[2]).split(",");
+      for (var j = 0; j < opts.length; j++) {
+        var kv = opts[j].split("=");
+        if (kv[0] === "hidepid" && kv[1] !== "0" && kv[1] !== "off") return "limited";
+        if (kv[0] === "subset") return "limited";
+      }
+    }
+    return found ? "ok" : "unverified";
+  }
 }`;
 
 /**

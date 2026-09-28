@@ -290,8 +290,10 @@ existing credential and `.git` restrictions also apply inside scratch.
 Before the lead's first turn (the plan turn, or the first implement turn on a
 run with no plan turn, e.g. a pre-approved resume), the worker runs a fixed
 probe it owns (a constant `node -e` script, never a repo script). It measures
-three facts: whether `/proc` can be enumerated, whether the command's actual
-`$HOME` is writable, and whether its actual `$TMPDIR` is writable. A probe
+three facts: whether `/proc` can be enumerated (a `/proc` mounted with
+`hidepid` or `subset=` lists entries but hides other processes, so it counts
+as limited), whether the command's actual `$HOME` is writable, and whether its
+actual `$TMPDIR` is writable. A probe
 that times out or fails is reported as "not verified", never as access being
 available.
 
