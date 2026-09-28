@@ -36,7 +36,8 @@ import (
 // ClaimHealthEpisodeNotice claim on the (episode_id, user_id) PK — a claim that inserts sends
 // one notice, a claim that no-ops (already notified) skips silently, so replays and a second
 // replica never double-notify. The sequence is claim → send → release-on-failure: when Notify
-// errors (which notifysvc only does before anything is persisted or sent) the claimer
+// errors (notifysvc errors only before its Slack send; the notification insert itself may have
+// committed if only its response was lost, so a retry can store a second row) the claimer
 // releases its slot with ReleaseHealthEpisodeNotice, so the next still-danger tick re-claims
 // and retries; the retries are bounded by the episode's lifetime (a closed episode is never
 // notified again).
@@ -190,7 +191,9 @@ func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUI
 		// (episode, admin) slot and must send; 0 means a prior tick/replica already claimed
 		// it, so skip silently (this is the 23505/no-op-claim "already notified" case). If the
 		// send then fails, release the slot so the next still-danger tick re-claims it and
-		// retries; notifysvc only errors before persisting or sending, so nothing was delivered.
+		// retries. notifysvc sends to Slack only after the notification insert returns, so a
+		// Notify error never means a Slack message went out; an insert that committed before
+		// its response was lost can leave one extra stored notification row after the retry.
 		claimed, err := r.store.ClaimHealthEpisodeNotice(ctx, store.ClaimHealthEpisodeNoticeParams{
 			EpisodeID: episodeID,
 			UserID:    uid,
