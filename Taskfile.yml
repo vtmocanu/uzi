@@ -2320,7 +2320,20 @@ tasks:
       # worker's scratch volume. The guard preserves npm test's own failure status
       # and always removes the scratch dir. It wraps `npm test`, never a bare node
       # call, for the timeout reason above.
-      - ../scripts/tmpdir-leak-guard.sh npm test
+      #
+      # issue #1863: tests that read the REAL process table skip (agent/test/real-procfs.ts)
+      # only when enumerating the proc root is DENIED with EACCES/EPERM, as in the Landlock
+      # Codex command sandbox, where readdir and file reads there fail but existsSync still
+      # says the proc root is present. Any other outcome runs them. A skip is green, so
+      # real-procfs-skip-check.sh is the gate on that gate: it collects every skip, re-probes
+      # enumeration on its own, and fails when a test skipped where the proc root enumerates,
+      # or in CI at all. CI's test-agent job runs `task test:agent`, so this is the zero-skip
+      # check there (the same idea as test-api-store-it's ran/skipped check) with no workflow
+      # edit. The wrapper sits OUTSIDE the leak guard: its skip log must not live in the
+      # guard's scratch TMPDIR, where it would count as a leftover. Its own hermetic test
+      # runs first, so a gutted verdict table reddens here too.
+      - ../scripts/real-procfs-skip-check.test.sh
+      - ../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh npm test
       # PRD 1287 C1 / D7 point 5: the strict Codex M4 conformance contract + the REAL-binary P
       # startup smoke, run as a MANDATORY serial second step here (never from gate:agent directly)
       # so gate:agent and existing Linux CI exercise the P layer EXACTLY ONCE per unchanged tree.
