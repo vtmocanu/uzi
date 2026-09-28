@@ -674,6 +674,27 @@ function solitaryReq(extra: Partial<ScanRequest> = {}): ScanRequest {
 }
 
 describe("UID-split solitary unreadable runner process", () => {
+  it("never signals an unreadable descendant of the scanner", () => {
+    const procs = { 49: { uid: RUNNER, cwd: "EACCES" as const, env: "EACCES" as const, ppid: SELF } };
+    const helper = scanOnce(solitaryReq(), fakeTable(procs), SELF, true);
+    assert.deepEqual(helper.kill, [], "the runner-uid helper owns and excludes all its descendants");
+    assert.deepEqual(helper.unverified, []);
+
+    const inProcess = scanOnce(solitaryReq(), fakeTable(procs), SELF, false);
+    assert.deepEqual(inProcess.kill, [], "without a readable attempt marker, scanner ancestry cannot authorize a kill");
+    assert.deepEqual(inProcess.unverified.map((p) => p.pid), [49]);
+  });
+
+  it("does not signal when an unreadable ancestor prevents excluding a scanner descendant", () => {
+    const procs: Record<number, FakeProc> = {
+      48: { uid: RUNNER, ppid: SELF, statError: "EACCES" },
+      49: { uid: RUNNER, cwd: "EACCES", env: "EACCES", ppid: 48 },
+    };
+    const result = scanOnce(solitaryReq(), fakeTable(procs), SELF, true);
+    assert.deepEqual(result.kill, []);
+    assert.deepEqual(result.unverified.map((p) => p.pid), [49]);
+  });
+
   for (const mode of ["own", "seed", "capture"] as const) {
     it(`${mode}: kills the sole unattributable runner-uid process and confirms its exit`, async () => {
       const procs: Record<number, FakeProc> = {
@@ -713,6 +734,16 @@ describe("UID-split solitary unreadable runner process", () => {
     assert.equal(r.state, "unverified");
     assert.deepEqual(signalled, []);
     assert.equal(r.processes[0]?.reason, "unreadable_unattributed");
+  });
+
+  it("does not signal readable residue when its start time cannot be checked", async () => {
+    const { r, signalled } = await fakeReap(
+      { 55: { uid: RUNNER, cwd: CLONE, statError: "EACCES" } },
+      solitaryReq(),
+    );
+    assert.equal(r.state, "survivors");
+    assert.deepEqual(signalled, []);
+    assert.equal(r.processes[0]?.reason, "unmarked_in_scope:kill_unconfirmed");
   });
 
   it("a live other attempt marker keeps an unreadable process unverified and unsignalled", async () => {

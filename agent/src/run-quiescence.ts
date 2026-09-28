@@ -566,13 +566,15 @@ export function scanOnce(
       if (facts.startTime !== undefined) startTimeOf.set(pid, facts.startTime);
     }
   }
-  const isDescendant = (pid: number): boolean => {
+  const isDescendant = (pid: number): boolean | undefined => {
     let cur = parentOf.get(pid);
-    for (let depth = 0; cur !== undefined && cur > 1 && depth < 256; depth++) {
+    for (let depth = 0; depth < 256; depth++) {
+      if (cur === undefined) return undefined;
+      if (cur <= 1) return false;
       if (cur === selfPid) return true;
       cur = parentOf.get(cur);
     }
-    return false;
+    return undefined;
   };
   const liveMarkers = new Set(req.liveMarkers);
   const roots = indexRoots(req.liveRoots);
@@ -580,6 +582,9 @@ export function scanOnce(
   for (const pid of pids) {
     if (excluded.has(pid)) continue;
     const descendant = isDescendant(pid);
+    // The runner-uid helper owns every child it starts, including non-dumpable loader
+    // children whose environment cannot be inspected for an attempt marker.
+    if (descendant === true && excludeAllDescendants) continue;
     // R0: the owning uid FIRST, from the world-readable status file.
     const st = tryRead(() => table.readStatus(pid));
     if (!st.ok) {
@@ -621,6 +626,7 @@ export function scanOnce(
       if (
         req.mayKillUnreadableUnattributed === true &&
         req.liveMarkers.length === 0 &&
+        descendant === false &&
         facts?.startTime !== undefined
       ) {
         result.kill.push({ ...entry, reason: "unreadable_no_other_claim", startTime: facts.startTime });
@@ -635,7 +641,7 @@ export function scanOnce(
     // nonce is agent residue that copied it, and is classified like any other.
     if (env.get(WORKER_SPAWN_ENV) === req.workerNonce && env.get(RUN_ATTEMPT_ENV) === undefined) continue;
     // R5: a descendant is the scanner's own unless an attempt marker says it is agent residue.
-    if (descendant && (excludeAllDescendants || env.get(RUN_ATTEMPT_ENV) === undefined)) continue;
+    if (descendant === true && env.get(RUN_ATTEMPT_ENV) === undefined) continue;
     const cwd = cwdRead.value;
     // R3: the key alone never scopes a process (a foreign run can carry another key's
     // UZI_RUN_CLONE_KEY with no marker and wedge that key's every seed); only together with a
