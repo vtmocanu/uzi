@@ -6861,6 +6861,20 @@ export function runnerGitCarriesWorkerMark(args: readonly string[]): boolean {
   return RUNNER_GIT_MARKED_SUBCOMMANDS.has(sub);
 }
 
+/**
+ * issue #1783 (R4): the env for a runner-uid git spawned OUTSIDE GitCache, built exactly as
+ * runGitAsRunner builds its own: worker-marked only for the driver-free subset
+ * (runnerGitCarriesWorkerMark), and for that subset GIT_ALLOW_PROTOCOL pins every transport
+ * off, independently of gitEnv's GIT_NO_LAZY_FETCH. `args` is the git argv WITHOUT a leading
+ * `-C <dir>` (the subcommand parser skips `-c key=value` pairs only).
+ */
+export function runnerGitSpawnEnv(args: readonly string[], runnerEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const marked = runnerGitCarriesWorkerMark(args);
+  const env: NodeJS.ProcessEnv = marked ? workerSpawnEnv(runnerEnv) : unmarkedSpawnEnv(runnerEnv);
+  if (marked && firstRunnerGitSubcommand(args) !== "clone") env.GIT_ALLOW_PROTOCOL = RUNNER_GIT_NO_PROTOCOL;
+  return env;
+}
+
 
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn

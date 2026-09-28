@@ -42,7 +42,7 @@ const ALLOWLIST: Record<string, { count: number; mark: Mark; disposition: string
   "runner-uid.ts#setprivArgsForUid()": { count: 3, mark: "wrapper", disposition: "setprivRunnerArgs / commandRootCommand / workerBoundaryCommand bodies (the wrappers themselves)" },
   "runner-uid.ts#setpriv-spawn": { count: 2, mark: "marked", disposition: "killRunnerGroup / killRunnerGroupOnly `kill -KILL` (worker-authored fixed argv: workerSpawnEnv)" },
   "runner-uid.ts#setpriv-literal": { count: 1, mark: "wrapper", disposition: "the SETPRIV constant the wrappers use" },
-  "executor.ts#runnerCommand()": { count: 2, mark: "conditional", disposition: "stub executor git (the agent turn's stand-in `add`/`commit` in the clone, which runs clone-configured filters): NOT marked; readWorktreeHeadSha (PRD #1798, fixed driver-free `rev-parse`): workerSpawnEnv via runnerGitCarriesWorkerMark" },
+  "executor.ts#runnerCommand()": { count: 2, mark: "conditional", disposition: "stub executor git (the agent turn's stand-in `add`/`commit` in the clone, which runs clone-configured filters): NOT marked; readWorktreeHeadSha (PRD #1798, fixed driver-free `rev-parse`): marked + GIT_ALLOW_PROTOCOL pin via git.ts runnerGitSpawnEnv" },
   "git.ts#runnerCommand()": { count: 4, mark: "conditional", disposition: "runGitAsRunner: workerSpawnEnv only for runnerGitCarriesWorkerMark's driver-free subcommands (rev-parse, update-ref, config, ls-files, …; lazy fetch pinned off); status/add/commit/checkout/reset/merge/rebase/diff/log run UNMARKED (a planted filter/driver stays reapable). runRunnerUidDelete (the retention sweep and the M3 canonical-path free): MARKED (workerSpawnEnv) — a worker-authored fixed argv `/bin/rm -rf -- <target>` (absolute root-owned busybox rm, cwd `/`, PATH /usr/bin:/bin) that reads no repo, clone-config or agent-authored input and so runs no repo-configured code; the uid, not the mark, is its containment, and its own timeout kills it via killRunnerGroup. materializeRunnerClone (issue #1769, the Codex self-contained seed: `git rev-parse`/`update-ref`/`repack -a -d`/`fsck --connectivity-only`/`cat-file -e` in the clone plus `/bin/mv` of its alternates file): NOT marked — materializeEnv(gitEnv()) is a replacement env that never carries the mark, and repack/fsck read the clone's `.git/config`; it runs before the executor starts, inside the bare's withLock. spawnGitAsRunnerWithStdin outside a boundary (issue #1769, ensureRunnerCloneObjects' `git index-pack --stdin` in the clone, the finalize base-align default-tip import): NOT marked — the same replacement gitEnv() with no mark, and index-pack reads the clone's `.git/config`; inside a boundary it is boundary.spawn'd as `command` instead (no runnerCommand)" },
   "js-deps.ts#runnerCommand()": { count: 1, mark: "unmarked", disposition: "JS deps install: NOT marked (the package manager reads repo-controlled config in the clone; leaks stay reapable)" },
   "provision.ts#runnerCommand()": { count: 2, mark: "conditional", disposition: "devbox/nix run: NOT marked (untrusted nix build hooks; cwd outside the clone); PATH probe (fixed script): workerSpawnEnv" },
@@ -155,7 +155,13 @@ describe("runner-uid spawn sites (issue #1783 R4)", () => {
         assert.equal(callsMark, false, `${file}: every site is unmarked, yet the file calls workerSpawnEnv`);
       }
       if (marks_.has("marked")) assert.equal(callsMark, true, `${file}: a marked site, yet no workerSpawnEnv call`);
-      if (marks_.has("conditional") && file !== "provision.ts" && file !== "codex/launcher.ts") {
+      if (file === "executor.ts") {
+        // Conditional across DIFFERENT sites: the stub's agent-stand-in git is unmarked here, and
+        // the pr_summary HEAD read is marked through git.ts's runnerGitSpawnEnv (its runtime env is
+        // pinned in pr-summary.test.ts).
+        assert.equal(callsUnmark, true, "executor.ts: the stub git must strip the mark");
+        assert.equal(callsAny(code, callableNames(text, "runnerGitSpawnEnv")), true, "executor.ts: the HEAD read must use runnerGitSpawnEnv");
+      } else if (marks_.has("conditional") && file !== "provision.ts" && file !== "codex/launcher.ts") {
         // provision.ts / codex/launcher.ts are conditional across DIFFERENT sites (a model-directed
         // spawn built on a replacement env, a fixed probe marked); git.ts and tick-spawner.ts decide
         // inside ONE site, so they must carry both branches.

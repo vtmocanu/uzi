@@ -33,10 +33,10 @@ import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
 import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
-import { AGENT_GIT_IDENTITY, gitEnv, runnerGitCarriesWorkerMark } from "./git.js";
+import { AGENT_GIT_IDENTITY, gitEnv, runnerGitSpawnEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
 import type { SdkAttemptEnv } from "./sdk-env.js";
-import { unmarkedSpawnEnv, workerSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
+import { unmarkedSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -1116,6 +1116,22 @@ export interface StubExecutorOptions {
  * plan→approve→work→MR path is provable end-to-end without a live Anthropic
  * session (mirrors SdkExecutor's gate handling).
  */
+/** The `git` subcommand argv readWorktreeHeadSha runs (after `-C <worktree>`). */
+const WORKTREE_HEAD_SHA_ARGS = ["rev-parse", "--verify", "HEAD^{commit}"] as const;
+
+/**
+ * issue #1783 (R4): the env readWorktreeHeadSha spawns with. A fixed, driver-free `rev-parse`
+ * carries the worker mark (a concurrent quiescence scan must not read it as the run's own
+ * residue) plus the GIT_ALLOW_PROTOCOL transport pin, exactly as runGitAsRunner applies them
+ * (runnerGitSpawnEnv).
+ */
+export function worktreeHeadShaEnv(): NodeJS.ProcessEnv {
+  const env = runnerGitSpawnEnv(WORKTREE_HEAD_SHA_ARGS, { ...gitEnv(), PATH: runnerPath() });
+  const tmp = runnerTmpdir();
+  if (tmp) env.TMPDIR = tmp;
+  return env;
+}
+
 /**
  * PRD #1798 M2: read the run worktree's HEAD for a pr_summary's `verifiedAtSha`. Runs git AS
  * the runner uid (the worktree is the runner-owned clone; see StubExecutor.git for why a
@@ -1124,16 +1140,8 @@ export interface StubExecutorOptions {
  */
 export async function readWorktreeHeadSha(worktreePath: string): Promise<string | undefined> {
   try {
-    // issue #1783 (R4): a driver-free, worker-authored fixed argv, so it carries the worker mark
-    // exactly as runGitAsRunner does for the same subcommand (runnerGitCarriesWorkerMark); a
-    // concurrent quiescence scan must not read it as the run's own residue.
-    const sub = ["rev-parse", "--verify", "HEAD^{commit}"];
-    const base: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
-    const env: NodeJS.ProcessEnv = runnerGitCarriesWorkerMark(sub) ? workerSpawnEnv(base) : unmarkedSpawnEnv(base);
-    const tmp = runnerTmpdir();
-    if (tmp) env.TMPDIR = tmp;
-    const wrapped = runnerCommand("git", ["-C", worktreePath, ...sub]);
-    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 30_000 });
+    const wrapped = runnerCommand("git", ["-C", worktreePath, ...WORKTREE_HEAD_SHA_ARGS]);
+    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env: worktreeHeadShaEnv(), timeout: 30_000 });
     return normalizeVerifiedSha(String(stdout));
   } catch {
     return undefined;

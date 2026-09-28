@@ -13,7 +13,8 @@ import { buildSignalMcpServer, normalizeVerifiedSha, scanSignals } from "../src/
 import { buildCodexDynamicTools } from "../src/codex/dynamic-tools.js";
 import { RunTurnReducerImpl } from "../src/harness-reducer.js";
 import type { HarnessContext, HarnessContextHook, HarnessEvent, TurnSignals } from "../src/harness.js";
-import { readWorktreeHeadSha, stampPrSummaryHead } from "../src/executor.js";
+import { readWorktreeHeadSha, stampPrSummaryHead, worktreeHeadShaEnv } from "../src/executor.js";
+import { WORKER_SPAWN_ENV } from "../src/worker-spawn-mark.js";
 import { buildImplementPrompt, PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 
@@ -238,5 +239,14 @@ describe("implement prompt pr_summary ask (PRD #1798 M2)", () => {
     }
     assert.match(PR_SUMMARY_GUIDANCE, /behaviour-level/);
     assert.match(PR_SUMMARY_GUIDANCE, /ONLY the checks\s+you actually ran/);
+  });
+});
+
+describe("issue #1783 × PRD #1798: the pr_summary HEAD read is a marked, transport-pinned runner git", () => {
+  it("carries the worker mark and GIT_ALLOW_PROTOCOL=none on top of GIT_NO_LAZY_FETCH", () => {
+    const env = worktreeHeadShaEnv();
+    assert.ok(env[WORKER_SPAWN_ENV], "worker-marked: a concurrent quiescence scan must not read it as run residue");
+    assert.equal(env.GIT_ALLOW_PROTOCOL, "none", "every transport pinned off, independent of the lazy-fetch pin");
+    assert.equal(env.GIT_NO_LAZY_FETCH, "1");
   });
 });
