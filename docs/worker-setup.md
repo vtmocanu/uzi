@@ -156,6 +156,60 @@ What the gauges mean:
   container instead and needs no configuration.
 - An **offline** worker shows its last-known stats dimmed, never live-looking.
 
+## Worker disk safety (PRD #1809)
+
+A run's build caches (Go module cache, `node_modules`, npm/pip caches, and
+the like) can grow far faster than the worker's data volume shrinks on its
+own, so uzi bounds them on a worker instead of relying only on the
+last-resort [disk self-heal recycle](hosted-workers.md#disk-self-heal). Four
+mechanisms, from routine to last resort:
+
+1. **Cache drop on park.** A run parked with its process ended (`limit_wait`,
+   `recovery_wait`, `paused`) has its rebuildable caches dropped immediately —
+   everything else in its HOME (the transcript, session state) stays for the
+   resume, so nothing needed to pick the run back up is lost.
+2. **In-run cache cap, two layers** (D4). A *soft* layer trims a running
+   run's own caches (least-recently-used entries first) at a proven quiet
+   point between turns — no live process, never judged from file mtimes —
+   whenever they exceed the run's share of the volume; a run that stays over
+   the cap parks preventively (uncounted, so this cannot by itself fail a
+   run). A *hard* layer watches the data volume itself on every stats tick,
+   independent of turn boundaries, and — only once the volume nears the
+   api's disk-pressure threshold — stops the running Claude run with the
+   largest caches and parks it with a **counted** `data_volume_full` park.
+   See [`UZI_RUN_CACHE_CAP_ENABLED`/`UZI_DISK_HARD_STOP_ENABLED` and the
+   rest of this group](configuration.md#worker-disk-safety-prd-1809) for the
+   exact thresholds and how to tune or disable either layer.
+3. **Periodic reclaim and a bounded admission stop** (D7, D5). Separately
+   from the in-run cap, the worker periodically sweeps for space it can
+   prove safe to remove — a terminal run's leftover HOME, a parked run's
+   rebuildable caches, an aged model-pass HOME — and runs the same sweep
+   out of cycle whenever the volume crosses a soft threshold below the disk-
+   pressure line. If the volume is still over that soft threshold after a
+   reclaim pass, the worker briefly refuses to claim a *new* run (the
+   admission stop) rather than start one it may not have room to finish;
+   this stop is itself time-bounded, so a worker with nothing left to
+   reclaim does not idle forever.
+4. **Disk-full classification and a bounded park** (D6). If a write still
+   fails disk-full despite all of the above — a recognised `ENOSPC`/`EDQUOT`
+   signal or git's own diagnostics, confirmed against the volume's actual
+   free space and inodes — the worker runs one more reclaim pass, retries
+   once, and parks the run as `recovery_wait`/`data_volume_full` instead of
+   failing it outright. This park has a lifetime cap
+   (`UZI_RUN_DISK_PARK_MAX`); past it, the run fails with
+   `fail_origin=data_volume_full`. See [Worker data volume
+   full](run-recovery-wait.md#worker-data-volume-full) for exactly what an
+   owner sees and how counted parks differ from preventive ones.
+
+**The [disk self-heal recycle](hosted-workers.md#disk-self-heal) (PRD #837)
+is still the last resort**, unchanged by any of the above: a hosted worker's
+volume that fills up anyway (sustained at or above the disk-pressure
+threshold) still gets drained and recycled, losing everything on `/data`.
+Everything in this section exists to make that outcome rare, not to replace
+it — none of these mechanisms touch `/nix` or trigger a recycle themselves.
+See [configuration.md](configuration.md#worker-disk-safety-prd-1809) for
+every tunable in this section and its default.
+
 ## Online, offline, busy
 
 - **online**: a recent heartbeat arrived within the server's staleness window.

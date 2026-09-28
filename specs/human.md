@@ -928,6 +928,16 @@ Tracked as GitHub issue vtmocanu/uzi#1604; decision record `adr/1604-plan-gate-v
 - A resumed run with an unapproved plan reads the owner's pending verdicts before it shows a plan. On Claude runs a pending cancel, reject or request-changes acts first (changes revise the submitted plan rather than re-offering it); a pending approve waits for the gate, where it is judged like any replayed verdict. On Codex runs every pending approve, reject or request-changes is ignored with a note asking to re-send it, and a fresh plan is shown. (AI-synced 2026-09-26)
 - Every ignored verdict is explained in the run feed, except an approve replaced by a newer verdict, a repeat approve after the plan was approved, and an empty change request. (AI-synced 2026-09-26)
 
+## Feature #1809 — Worker disk safety for long runs
+
+Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.md`; ADR at `adr/1809-per-run-cache-bounds.md`.
+
+- A run's rebuildable caches (Go build and module cache, npm cache) stay per run, never shared between runs, and are bounded while the run lives. (AI-synced 2026-09-28)
+- A park that ends the run's process drops those caches and keeps everything a resume needs (session, config, unknown files); a gate-parked run and Codex runs are untouched. (AI-synced 2026-09-28)
+- A full data volume never fails a run silently: the run waits in `recovery_wait` with the stated cause `data_volume_full`, and fails with that cause only after a bounded number of such waits. (AI-synced 2026-09-28)
+- Each live or parked run's HOME size is visible to operators (worker list, admin health, run page) before it can fill a volume. (AI-synced 2026-09-28)
+- Every control can be switched off; with them off only the bounded `data_volume_full` wait remains. (AI-synced 2026-09-28)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
