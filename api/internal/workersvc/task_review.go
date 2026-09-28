@@ -105,7 +105,8 @@ func (s *Service) authorizeTaskReviewTarget(ctx context.Context, wkr store.Worke
 //
 // Issue #1423: fenced on the REVIEW run's claim exactly like PostReview (checkAdviceClaim,
 // then the in-statement fence): a released, superseded, reassigned or mismatched claim, or
-// a review run already terminal, persists nothing and surfaces as ErrStaleClaim.
+// a review run already terminal, persists nothing and surfaces as ErrStaleClaim. Only an
+// advice_claim_fence_v1 worker must stamp the claim; one without it may omit both fields.
 func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission, claim AdviceClaim) error {
 	review, target, err := s.authorizeTaskReviewTarget(ctx, wkr, targetID)
 	if err != nil {

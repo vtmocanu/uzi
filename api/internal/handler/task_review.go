@@ -28,12 +28,12 @@ type workerTaskReviewRequest struct {
 	Summary  string                 `json:"summary"`
 	Findings []workerTaskReviewFind `json:"findings"`
 	// ClaimGeneration is the review flight's claim generation (issue #1423), the same fence
-	// the judge review POST carries. A capability worker must stamp it (with advice_run_id); a
-	// legacy one omits it.
+	// the judge review POST carries. An advice_claim_fence_v1 worker must stamp it (with
+	// advice_run_id); a worker without that capability may omit it.
 	ClaimGeneration *int64 `json:"claim_generation"`
 	// AdviceRunID is the review run the posting flight holds (issue #1423), fenced exactly
-	// like the judge review POST's (see workerReviewRequest.AdviceRunID): required of a
-	// capability worker, omitted by a legacy one.
+	// like the judge review POST's (see workerReviewRequest.AdviceRunID): required of
+	// an advice_claim_fence_v1 worker, optional for one without that capability.
 	AdviceRunID *string `json:"advice_run_id"`
 }
 

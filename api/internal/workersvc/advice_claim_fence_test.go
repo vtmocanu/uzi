@@ -18,7 +18,18 @@ import (
 // refuse a capability worker's unstamped post before any write. The live-DB suite
 // (advice_claim_fence_livedb_test.go) runs the real SQL fence.
 
+// capabilityWorker advertises advice_claim_fence_v1, the capability the stamping requirement
+// is keyed on (alongside credential_switch_v1, which every such worker also advertises).
 func capabilityWorker() store.Worker {
+	w := worker()
+	w.ProtocolCapabilities = []string{capability.CredentialSwitchV1, capability.AdviceClaimFenceV1}
+	return w
+}
+
+// credentialSwitchOnlyWorker is a worker image from before advice posts were stamped: it
+// advertises credential_switch_v1 (shipped earlier) but not advice_claim_fence_v1, and posts
+// advice without claim_generation or advice_run_id. An api upgraded ahead of it must accept.
+func credentialSwitchOnlyWorker() store.Worker {
 	w := worker()
 	w.ProtocolCapabilities = []string{capability.CredentialSwitchV1}
 	return w
@@ -228,6 +239,25 @@ func TestAdviceRunIDFence(t *testing.T) {
 			wrote, _, err := l.post(t, capabilityWorker(), uuid.New(), AdviceClaim{Generation: i64(1)})
 			if !errors.Is(err, ErrMissingClaimGeneration) || wrote {
 				t.Fatalf("err = %v wrote = %v, want ErrMissingClaimGeneration and no write", err, wrote)
+			}
+		})
+		// Rolling-upgrade regression: credential_switch_v1 shipped before advice posts were
+		// stamped, so keying the requirement on it would 409 every current worker's post.
+		t.Run(l.name+"/credential_switch_v1-only worker may omit both fields", func(t *testing.T) {
+			wkr := credentialSwitchOnlyWorker()
+			wrote, gotWorker, err := l.post(t, wkr, uuid.New(), AdviceClaim{})
+			if err != nil || !wrote {
+				t.Fatalf("err = %v wrote = %v, want the unstamped post to reach the upsert", err, wrote)
+			}
+			if gotWorker != wkr.ID {
+				t.Fatalf("upsert worker_id = %v, want the posting worker %v (SQL ownership fence)", gotWorker, wkr.ID)
+			}
+		})
+		t.Run(l.name+"/credential_switch_v1-only worker mismatched id is still stale", func(t *testing.T) {
+			other := uuid.New()
+			wrote, _, err := l.post(t, credentialSwitchOnlyWorker(), uuid.New(), AdviceClaim{Generation: i64(1), RunID: &other})
+			if !errors.Is(err, ErrStaleClaim) || wrote {
+				t.Fatalf("err = %v wrote = %v, want ErrStaleClaim and no write", err, wrote)
 			}
 		})
 		t.Run(l.name+"/legacy worker may omit the run id", func(t *testing.T) {

@@ -1175,10 +1175,12 @@ export class WorkerClient {
    *  retried ONCE with the field stripped. `advice_run_id` rides ONLY with the generation:
    *  when claim_generation is not on the wire (not included, or the stripped retry) neither
    *  is advice_run_id, so an older api that predates both still strict-decodes the retry
-   *  (the same degradation reportState applies to its presentation fields). A worker that
-   *  advertises credential_switch_v1 must send BOTH on the wire: the server refuses an
-   *  omission of either with the same missing-generation 409. The caller's request object is
-   *  never mutated. */
+   *  (the same degradation reportState applies to its presentation fields). The server's
+   *  requirement is keyed on advice_claim_fence_v1 (advertised by this image, see worker.ts),
+   *  not credential_switch_v1: a worker advertising it must send BOTH on the wire, and the
+   *  server refuses an omission of either with the same missing-generation 409. An older
+   *  credential_switch_v1-only image that omits both keeps posting during an upgrade. The
+   *  caller's request object is never mutated. */
   private async postAdvice(
     path: string,
     review: ReviewRequest | TaskReviewRequest,

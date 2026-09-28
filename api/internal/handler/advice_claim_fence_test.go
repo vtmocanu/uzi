@@ -93,6 +93,10 @@ func newAdviceFakeStore() *adviceFakeStore {
 	return &adviceFakeStore{owner: uuid.New(), adviceRunID: uuid.New(), targetID: uuid.New()}
 }
 
+// adviceFenceCaps is what a stamping worker advertises: advice_claim_fence_v1 (the key the
+// stamping requirement is on) alongside credential_switch_v1.
+var adviceFenceCaps = []string{capability.CredentialSwitchV1, capability.AdviceClaimFenceV1}
+
 var adviceCases = []struct {
 	name, path, body string
 }{
@@ -106,7 +110,7 @@ func TestAdvicePostDecodesClaimGeneration(t *testing.T) {
 	for _, tc := range adviceCases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newAdviceFakeStore()
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":11,"advice_run_id":"`+st.adviceRunID.String()+`"`))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d %s, want 200", rec.Code, rec.Body.String())
@@ -132,7 +136,7 @@ func TestAdvicePostStaleClaimIs409Disposition(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newAdviceFakeStore()
 			st.upsertErr = pgx.ErrNoRows // the fence persisted nothing
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":3,"advice_run_id":"`+st.adviceRunID.String()+`"`))
 			if rec.Code != http.StatusConflict || adviceDisposition(rec) != "stale_claim" {
 				t.Fatalf("stale post = %d %s, want 409 disposition stale_claim", rec.Code, rec.Body.String())
@@ -145,7 +149,7 @@ func TestAdvicePostMissingGenerationIs409(t *testing.T) {
 	for _, tc := range adviceCases {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newAdviceFakeStore()
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, ""))
 			if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "claim_generation") {
 				t.Fatalf("unstamped capability post = %d %s, want 409 naming claim_generation", rec.Code, rec.Body.String())
@@ -168,11 +172,11 @@ func TestAdvicePostMissingAdviceRunIDIsMissingGeneration(t *testing.T) {
 	for _, tc := range adviceCases {
 		t.Run(tc.name, func(t *testing.T) {
 			wantSt := newAdviceFakeStore()
-			wantWkr := store.Worker{ID: uuid.New(), UserID: wantSt.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wantWkr := store.Worker{ID: uuid.New(), UserID: wantSt.owner, ProtocolCapabilities: adviceFenceCaps}
 			want := advicePost(adviceRouter(wantSt, wantWkr), wantSt.targetID, tc.path, adviceBody(tc.body, ""))
 
 			st := newAdviceFakeStore()
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":1`))
 			if rec.Code != http.StatusConflict || rec.Code != want.Code || rec.Body.String() != want.Body.String() {
 				t.Fatalf("run-id-less capability post = %d %s, want the missing-generation response %d %s",
@@ -198,6 +202,35 @@ func TestAdvicePostLegacyWorkerUnstamped(t *testing.T) {
 	}
 }
 
+// Rolling-upgrade regression (issue #1423): credential_switch_v1 shipped before advice posts
+// were stamped, so a worker advertising only it posts /review and /task-review with neither
+// claim_generation nor advice_run_id. An api upgraded ahead of the worker image must accept
+// that post (200, review persisted with the posting worker fenced), not 409 it.
+func TestAdvicePostCredentialSwitchOnlyWorkerUnstamped(t *testing.T) {
+	for _, tc := range adviceCases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := newAdviceFakeStore()
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, ""))
+			if rec.Code != http.StatusOK {
+				t.Fatalf("credential_switch_v1-only unstamped post = %d %s, want 200", rec.Code, rec.Body.String())
+			}
+			var gotWorker uuid.UUID
+			switch {
+			case st.reviewParams != nil:
+				gotWorker = st.reviewParams.WorkerID
+			case st.taskParams != nil:
+				gotWorker = st.taskParams.WorkerID
+			default:
+				t.Fatal("no upsert reached the store")
+			}
+			if gotWorker != wkr.ID {
+				t.Fatalf("upsert worker_id = %v, want the posting worker %v", gotWorker, wkr.ID)
+			}
+		})
+	}
+}
+
 // Issue #1423 advice_run_id: a flight stamps the advice run it holds; a different run's id (a
 // stale flight of an earlier judge/review run whose generation collides) is a 409 stale_claim
 // with nothing written, a non-uuid is a 400, and the authorized run's id lands.
@@ -205,7 +238,7 @@ func TestAdvicePostAdviceRunID(t *testing.T) {
 	for _, tc := range adviceCases {
 		t.Run(tc.name+"/mismatch is 409 stale_claim", func(t *testing.T) {
 			st := newAdviceFakeStore()
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			extra := `,"claim_generation":1,"advice_run_id":"` + uuid.NewString() + `"`
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, extra))
 			if rec.Code != http.StatusConflict || adviceDisposition(rec) != "stale_claim" {
@@ -217,7 +250,7 @@ func TestAdvicePostAdviceRunID(t *testing.T) {
 		})
 		t.Run(tc.name+"/malformed is 400", func(t *testing.T) {
 			st := newAdviceFakeStore()
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path,
 				adviceBody(tc.body, `,"claim_generation":1,"advice_run_id":"not-a-uuid"`))
 			if rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "advice_run_id") {
@@ -229,7 +262,7 @@ func TestAdvicePostAdviceRunID(t *testing.T) {
 		})
 		t.Run(tc.name+"/matching id lands", func(t *testing.T) {
 			st := newAdviceFakeStore()
-			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: adviceFenceCaps}
 			extra := `,"claim_generation":1,"advice_run_id":"` + st.adviceRunID.String() + `"`
 			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, extra))
 			if rec.Code != http.StatusOK {

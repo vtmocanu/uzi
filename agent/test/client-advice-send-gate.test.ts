@@ -75,6 +75,9 @@ const LANES: { name: string; post: (c: WorkerClient, gen?: number, runId?: strin
   { name: "postTaskReview", post: (c, gen, runId) => c.postTaskReview("target-1", TASK_REVIEW, gen, runId) },
 ];
 const ADVICE_RUN = "11111111-2222-4333-8444-555555555555";
+// What a stamping image advertises (worker.ts): the client's send-gate keys on
+// credential_switch_v1, and the server's stamping requirement keys on advice_claim_fence_v1.
+const ADVICE_CAPS = ["credential_switch_v1", "advice_claim_fence_v1"];
 
 describe("advice post send-gate (issue #1423)", () => {
   for (const lane of LANES) {
@@ -82,7 +85,7 @@ describe("advice post send-gate (issue #1423)", () => {
       const srv = await adviceServer({ worker_id: "w1" }, () => OK);
       try {
         const client = clientFor(srv.url);
-        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         await lane.post(client, 7);
         assert.equal(srv.posts.length, 1);
         assert.equal(srv.posts[0]!.body.claim_generation, 7);
@@ -95,7 +98,7 @@ describe("advice post send-gate (issue #1423)", () => {
       const srv = await adviceServer({ worker_id: "w1" }, () => OK);
       try {
         const client = clientFor(srv.url);
-        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         await lane.post(client, 0);
         await lane.post(client, undefined);
         assert.equal(srv.posts.length, 2);
@@ -125,7 +128,7 @@ describe("advice post send-gate (issue #1423)", () => {
       );
       try {
         const client = clientFor(srv.url);
-        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         await lane.post(client, 4);
         assert.equal(srv.posts.length, 2, "one stamped attempt + one stripped retry");
         assert.equal(srv.posts[0]!.body.claim_generation, 4);
@@ -139,7 +142,7 @@ describe("advice post send-gate (issue #1423)", () => {
       const srv = await adviceServer({ worker_id: "w1" }, () => ({ status: 409, body: { disposition: "stale_claim" } }));
       try {
         const client = clientFor(srv.url);
-        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         let caught: unknown;
         try {
           await lane.post(client, 3);
@@ -160,7 +163,7 @@ describe("advice post send-gate (issue #1423)", () => {
       const srv = await adviceServer({ worker_id: "w1" }, () => OK);
       try {
         const client = clientFor(srv.url);
-        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         await lane.post(client, 7, ADVICE_RUN);
         assert.equal(srv.posts[0]!.body.claim_generation, 7);
         assert.equal(srv.posts[0]!.body.advice_run_id, ADVICE_RUN);
@@ -173,7 +176,7 @@ describe("advice post send-gate (issue #1423)", () => {
       const srv = await adviceServer({ worker_id: "w1" }, () => OK);
       try {
         const cap = clientFor(srv.url);
-        await cap.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await cap.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         await lane.post(cap, 0, ADVICE_RUN);
         const bare = clientFor(srv.url);
         await bare.register("bare");
@@ -194,7 +197,7 @@ describe("advice post send-gate (issue #1423)", () => {
       );
       try {
         const client = clientFor(srv.url);
-        await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+        await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
         await lane.post(client, 4, ADVICE_RUN);
         assert.equal(srv.posts.length, 2, "one stamped attempt + one stripped retry");
         assert.equal(srv.posts[0]!.body.claim_generation, 4);
@@ -211,7 +214,7 @@ describe("advice post send-gate (issue #1423)", () => {
     const srv = await adviceServer({ worker_id: "w1" }, () => OK);
     try {
       const client = clientFor(srv.url);
-      await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+      await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
       const review: ReviewRequest = { ...REVIEW };
       await client.postReview("target-1", review, 9, ADVICE_RUN);
       assert.equal("claim_generation" in review, false);
@@ -225,11 +228,11 @@ describe("advice post send-gate (issue #1423)", () => {
   it("isStaleClaimRefusal is false for a non-stale 409 and for non-RequestErrors", async () => {
     const srv = await adviceServer({ worker_id: "w1" }, () => ({
       status: 409,
-      body: { error: "this worker must stamp claim_generation on every advice post" },
+      body: { error: "an advice_claim_fence_v1 worker must stamp claim_generation and advice_run_id on every advice post" },
     }));
     try {
       const client = clientFor(srv.url);
-      await client.register("cap", undefined, 1, undefined, ["credential_switch_v1"]);
+      await client.register("cap", undefined, 1, undefined, ADVICE_CAPS);
       let caught: unknown;
       try {
         await client.postReview("target-1", REVIEW, 2);

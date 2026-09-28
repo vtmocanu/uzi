@@ -76,8 +76,10 @@ type ReviewResult struct {
 }
 
 // AdviceClaim is the claim a judge or task-review flight stamps on its advice POST (issue
-// #1423). Both fields are nil (not stamped) for a legacy worker; a credential_switch_v1
-// worker must stamp BOTH, and omitting either is ErrMissingClaimGeneration.
+// #1423). Both fields are nil (not stamped) for a legacy worker; an advice_claim_fence_v1
+// worker must stamp BOTH, and omitting either is ErrMissingClaimGeneration. The requirement is
+// keyed on advice_claim_fence_v1, not credential_switch_v1: the latter shipped before advice
+// posts were stamped, so a credential_switch_v1-only worker omits both and takes the legacy path.
 //   - Generation is the advice run's claim_generation the flight holds; the upsert is fenced
 //     on it in the same statement as the write.
 //   - RunID is the advice run the flight holds. Generations are PER-RUN counters, so a stale
@@ -85,20 +87,22 @@ type ReviewResult struct {
 //     the same worker (also gen 1) would otherwise be indistinguishable: authorization
 //     resolves (worker, target) to the ACTIVE run B, and A's generation would match B's.
 //     Stamping the run id makes that post ErrStaleClaim instead of landing under B, which is
-//     why a capability worker may not omit it.
+//     why an advice_claim_fence_v1 worker may not omit it.
 type AdviceClaim struct {
 	Generation *int64
 	RunID      *uuid.UUID
 }
 
 // checkAdviceClaim applies the pre-write half of the advice-post fence, AFTER authorization
-// (ErrRunNotFound wins over everything here): a credential_switch_v1 worker that omits the
+// (ErrRunNotFound wins over everything here): an advice_claim_fence_v1 worker that omits the
 // generation or the advice run id is ErrMissingClaimGeneration, then a stamped advice run id
-// that is not the authorized advice run is ErrStaleClaim. A legacy worker may omit both. The
+// that is not the authorized advice run is ErrStaleClaim. A worker without that capability
+// (including a credential_switch_v1 worker from before advice posts were stamped) may omit
+// both, so an api upgraded ahead of its workers keeps accepting their advice posts. The
 // generation / unreleased-claim / owning-worker / non-terminal-status half runs inside the
-// upsert itself.
+// upsert itself, whether or not the fields were stamped.
 func checkAdviceClaim(wkr store.Worker, adviceRunID uuid.UUID, claim AdviceClaim) error {
-	if (claim.Generation == nil || claim.RunID == nil) && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+	if (claim.Generation == nil || claim.RunID == nil) && slices.Contains(wkr.ProtocolCapabilities, capability.AdviceClaimFenceV1) {
 		return ErrMissingClaimGeneration
 	}
 	if claim.RunID != nil && *claim.RunID != adviceRunID {
@@ -118,7 +122,8 @@ func checkAdviceClaim(wkr store.Worker, adviceRunID uuid.UUID, claim AdviceClaim
 // the durable source of truth; the notification is a best-effort surface layered on).
 //
 // Issue #1423: the write is fenced on the JUDGE run's claim, mirroring the message fence
-// (see AdviceClaim and checkAdviceClaim). The upsert persists nothing when the judge run is
+// (see AdviceClaim and checkAdviceClaim; only an advice_claim_fence_v1 worker is required to
+// stamp the claim). The upsert persists nothing when the judge run is
 // no longer claimed by wkr, has reached a terminal status, its claim is released, or it is at
 // a different generation, and
 // that no-row outcome surfaces as ErrStaleClaim (the auto-dismiss net is skipped: there is

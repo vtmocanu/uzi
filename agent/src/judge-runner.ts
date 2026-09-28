@@ -298,7 +298,7 @@ export class JudgeRunner {
       // is the server fence (issue #1423), which checks the judge run's claim generation,
       // unreleased claim, owning worker and non-terminal status atomically in the same statement
       // as the review upsert (and the stamped run id against the authorized run, so an EARLIER
-      // run's colliding generation cannot land under a re-run; a credential_switch_v1 worker must
+      // run's colliding generation cannot land under a re-run; an advice_claim_fence_v1 worker must
       // stamp advice_run_id with the generation, or the post is refused like a missing
       // generation), so a supersession landing between this probe and the post is refused there
       // (409 stale_claim, handled below).

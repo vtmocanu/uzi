@@ -424,7 +424,7 @@ describe("JudgeRunner", () => {
           "POST",
           "/api/worker/runs/target-1/review",
           409,
-          '{"error":"this worker must stamp claim_generation on every advice post"}',
+          '{"error":"an advice_claim_fence_v1 worker must stamp claim_generation and advice_run_id on every advice post"}',
         );
       },
       reportState: async (_id: string, body: StateRequest) => {

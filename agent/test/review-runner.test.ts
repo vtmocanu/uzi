@@ -388,7 +388,7 @@ describe("ReviewRunner", () => {
           "POST",
           "/api/worker/runs/t/task-review",
           409,
-          '{"error":"this worker must stamp claim_generation on every advice post"}',
+          '{"error":"an advice_claim_fence_v1 worker must stamp claim_generation and advice_run_id on every advice post"}',
         );
       },
     } as unknown as WorkerClient;

@@ -153,14 +153,15 @@ type workerReviewRequest struct {
 	Status          string            `json:"status"`
 	Recommendations []workerReviewRec `json:"recommendations"`
 	// ClaimGeneration is the judge flight's claim generation (issue #1423): the write is
-	// fenced on it so a superseded flight cannot overwrite the current verdict. A capability
-	// worker must stamp it together with advice_run_id; a legacy worker omits it (nil).
+	// fenced on it so a superseded flight cannot overwrite the current verdict. An
+	// advice_claim_fence_v1 worker must stamp it together with advice_run_id; a worker without
+	// that capability (a credential_switch_v1 worker included) may omit it (nil).
 	ClaimGeneration *int64 `json:"claim_generation"`
 	// AdviceRunID is the judge run the posting flight holds (issue #1423). Generations are
 	// per-run counters, so without it a stale flight of an earlier judge run could match a
 	// re-judge's generation; a mismatch with the authorized judge run is a 409 stale_claim.
-	// A capability worker must stamp it (omitting it is the same 409 as omitting
-	// claim_generation); a legacy worker omits it. A present value must be a uuid (400 otherwise).
+	// An advice_claim_fence_v1 worker must stamp it (omitting it is the same 409 as omitting
+	// claim_generation); a worker without that capability may omit it. A present value must be a uuid (400 otherwise).
 	AdviceRunID *string `json:"advice_run_id"`
 }
 
@@ -238,7 +239,7 @@ func adviceClaim(gen *int64, runID *string) (workersvc.AdviceClaim, error) {
 // writeAdviceClaimRefusal answers the issue #1423 claim-fence refusals shared by the judge
 // review and task-review advice POSTs, and reports whether it wrote a response. Nothing was
 // persisted in either case, so the caller must not notify.
-//   - ErrMissingClaimGeneration: a capability worker omitted claim_generation or advice_run_id,
+//   - ErrMissingClaimGeneration: an advice_claim_fence_v1 worker omitted claim_generation or advice_run_id,
 //     so the fence could not engage; 409 with an error the worker fixes by stamping both.
 //   - ErrStaleClaim: the advice run's claim was released, superseded (a reclaim bumped its
 //     generation), reassigned to another worker, or the stamped advice_run_id is not the
@@ -247,7 +248,7 @@ func adviceClaim(gen *int64, runID *string) (workersvc.AdviceClaim, error) {
 func writeAdviceClaimRefusal(w http.ResponseWriter, err error) bool {
 	switch {
 	case errors.Is(err, workersvc.ErrMissingClaimGeneration):
-		httpx.Error(w, http.StatusConflict, "this worker must stamp claim_generation and advice_run_id on every advice post")
+		httpx.Error(w, http.StatusConflict, "an advice_claim_fence_v1 worker must stamp claim_generation and advice_run_id on every advice post")
 	case errors.Is(err, workersvc.ErrStaleClaim):
 		httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
 	default:

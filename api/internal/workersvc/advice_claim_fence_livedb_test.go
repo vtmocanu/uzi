@@ -14,8 +14,10 @@ import (
 // claim (claim_generation + claim_released_at IS NULL), in the same statement as the upsert.
 // These live-DB tests run the real CTEs: a superseded flight (the run was reclaimed at G+1
 // while the post carries G) and a released claim write NOTHING and surface ErrStaleClaim; the
-// current flight's post lands; a capability worker that omits the generation is refused before
-// anything is written; a legacy worker's unstamped post still lands on a live claim.
+// current flight's post lands; an advice_claim_fence_v1 worker that omits the generation is
+// refused before anything is written; a legacy worker's unstamped post, and a
+// credential_switch_v1-only worker's (an image from before advice posts were stamped), still
+// land on a live claim and are fenced out on a released one.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 
@@ -26,8 +28,15 @@ const (
 
 func adviceWorkers(workerID, userID uuid.UUID) (legacy, capable store.Worker) {
 	legacy = store.Worker{ID: workerID, UserID: userID}
-	capable = store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+	capable = store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CredentialSwitchV1, capability.AdviceClaimFenceV1}}
 	return legacy, capable
+}
+
+// adviceCredentialSwitchOnlyWorker advertises credential_switch_v1 but not
+// advice_claim_fence_v1: the worker image that shipped before advice posts were stamped, which
+// an api upgraded ahead of it must keep accepting during a rolling upgrade.
+func adviceCredentialSwitchOnlyWorker(workerID, userID uuid.UUID) store.Worker {
+	return store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
 }
 
 func (e codexTestEnv) adviceCount(t *testing.T, sql string, args ...any) int {
@@ -148,6 +157,16 @@ func TestPostReviewClaimGenerationFenceLiveDB(t *testing.T) {
 		t.Fatalf("legacy post: reviews=%d recs=%d summary=%q, want 1 / 2 / legacy", reviews(), recs(), summary())
 	}
 
+	// 6b. A credential_switch_v1-only worker (shipped before advice posts were stamped) omits
+	// both fields: accepted on a live claim, so an api upgraded ahead of it does not 409 it.
+	csOnly := adviceCredentialSwitchOnlyWorker(workerID, userID)
+	if _, err := svc.PostReview(env.ctx, csOnly, targetID, sub("cs-only"), AdviceClaim{}); err != nil {
+		t.Fatalf("credential_switch_v1-only unstamped post on a live claim: %v", err)
+	}
+	if reviews() != 1 || recs() != 2 || summary() != "cs-only" {
+		t.Fatalf("credential_switch_v1-only post: reviews=%d recs=%d summary=%q, want 1 / 2 / cs-only", reviews(), recs(), summary())
+	}
+
 	// 7. A RELEASED claim fences out even the current generation, and a legacy nil-gen post.
 	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, judgeID)
 	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("released"), AdviceClaim{Generation: i64(adviceLiveGen), RunID: &judgeID}); !errors.Is(err, ErrStaleClaim) {
@@ -156,7 +175,10 @@ func TestPostReviewClaimGenerationFenceLiveDB(t *testing.T) {
 	if _, err := svc.PostReview(env.ctx, legacy, targetID, sub("released-legacy"), AdviceClaim{}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("released-claim legacy post err = %v, want ErrStaleClaim", err)
 	}
-	if reviews() != 1 || recs() != 2 || summary() != "legacy" {
+	if _, err := svc.PostReview(env.ctx, csOnly, targetID, sub("released-cs-only"), AdviceClaim{}); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("released-claim credential_switch_v1-only post err = %v, want ErrStaleClaim", err)
+	}
+	if reviews() != 1 || recs() != 2 || summary() != "cs-only" {
 		t.Fatalf("released post changed the review: reviews=%d recs=%d summary=%q", reviews(), recs(), summary())
 	}
 }
@@ -262,6 +284,15 @@ func TestPostTaskReviewClaimGenerationFenceLiveDB(t *testing.T) {
 		t.Fatalf("legacy post: reviews=%d findings=%d summary=%q, want 1 / 2 / legacy", reviews(), findings(), summary())
 	}
 
+	// 6b. A credential_switch_v1-only worker's unstamped post on a live claim lands too.
+	csOnly := adviceCredentialSwitchOnlyWorker(workerID, userID)
+	if err := svc.PostTaskReview(env.ctx, csOnly, taskID, sub("cs-only"), AdviceClaim{}); err != nil {
+		t.Fatalf("credential_switch_v1-only unstamped post on a live claim: %v", err)
+	}
+	if reviews() != 1 || findings() != 2 || summary() != "cs-only" {
+		t.Fatalf("credential_switch_v1-only post: reviews=%d findings=%d summary=%q, want 1 / 2 / cs-only", reviews(), findings(), summary())
+	}
+
 	// 7. A RELEASED claim fences out even the current generation, and a legacy nil-gen post.
 	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, reviewID)
 	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("released"), AdviceClaim{Generation: i64(adviceLiveGen), RunID: &reviewID}); !errors.Is(err, ErrStaleClaim) {
@@ -270,7 +301,10 @@ func TestPostTaskReviewClaimGenerationFenceLiveDB(t *testing.T) {
 	if err := svc.PostTaskReview(env.ctx, legacy, taskID, sub("released-legacy"), AdviceClaim{}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("released-claim legacy post err = %v, want ErrStaleClaim", err)
 	}
-	if reviews() != 1 || findings() != 2 || summary() != "legacy" {
+	if err := svc.PostTaskReview(env.ctx, csOnly, taskID, sub("released-cs-only"), AdviceClaim{}); !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("released-claim credential_switch_v1-only post err = %v, want ErrStaleClaim", err)
+	}
+	if reviews() != 1 || findings() != 2 || summary() != "cs-only" {
 		t.Fatalf("released post changed the review: reviews=%d findings=%d summary=%q", reviews(), findings(), summary())
 	}
 }
