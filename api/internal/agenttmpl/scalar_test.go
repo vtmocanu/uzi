@@ -31,7 +31,7 @@ func TestRenderedDescriptionIsValidYAML(t *testing.T) {
 		`He said "go": now`, `back\slash: yes`, `"starts quoted`, "it's fine", "'single' start",
 		// Values YAML would read as null, a bool, a number or a timestamp.
 		"null", "~", "true", "No", "on", "42", "0x1F", "3.5", "1e3", ".inf", "2026-09-28",
-		"3 roles", "yes please",
+		"3 roles", "yes please", "0o7", "1:30.5", "1:30",
 	} {
 		raw := Render(Definition{Name: "x", Description: v, PromptBody: "body\n"})
 		fm := strings.SplitN(strings.TrimPrefix(string(raw), "---\n"), "\n---\n", 2)[0]
@@ -51,5 +51,12 @@ func TestRenderedDescriptionIsValidYAML(t *testing.T) {
 	}
 	if quoteScalar("plain words") != "plain words" {
 		t.Error("a plain value must stay bare")
+	}
+	// YAML 1.1 readers (PyYAML, which publishes the upstream files) resolve these
+	// to non-strings even though yaml.v3 does not, so they must be quoted too.
+	for _, v := range []string{"yes", "Off", "y", "1:30.5", "-1:30", "0o7"} {
+		if q := quoteScalar(v); !strings.HasPrefix(q, `"`) {
+			t.Errorf("%q must be quoted, got %s", v, q)
+		}
 	}
 }

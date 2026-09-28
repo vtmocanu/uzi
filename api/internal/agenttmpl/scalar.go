@@ -4,6 +4,8 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+
+	"gopkg.in/yaml.v3"
 )
 
 // unquoteScalar reverses quoteScalar and strips the one layer of quotes the
@@ -40,7 +42,7 @@ func unquoteScalar(v string) string {
 func quoteScalar(v string) string {
 	needs := v == "" || v != strings.TrimSpace(v) ||
 		strings.Contains(v, ": ") || strings.HasSuffix(v, ":") || strings.Contains(v, " #") ||
-		strings.ContainsAny(v[:1], "-?:,[]{}#&*!|>'\"%@`") || hasControl(v) || yamlImplicit.MatchString(v)
+		strings.ContainsAny(v[:1], "-?:,[]{}#&*!|>'\"%@`") || hasControl(v) || !bareReadsAsString(v)
 	if !needs {
 		return v
 	}
@@ -50,18 +52,25 @@ func quoteScalar(v string) string {
 	return `"` + v + `"`
 }
 
-// yamlImplicit matches a whole value a YAML 1.1 reader (PyYAML, which the
-// upstream publisher uses, and most frontmatter readers) resolves to something
-// other than a string: null, a boolean, an integer, a float or a timestamp.
-// Such a description must be quoted or it reads back as null, true, 3.5 and so on.
-var yamlImplicit = regexp.MustCompile(`^(?:` +
-	`~|null|Null|NULL|` +
-	`y|Y|yes|Yes|YES|n|N|no|No|NO|true|True|TRUE|false|False|FALSE|on|On|ON|off|Off|OFF|` +
-	`[-+]?(?:0b[01_]+|0x[0-9a-fA-F_]+|0[0-7_]+|0|[1-9][0-9_]*(?::[0-5]?[0-9])*)|` +
-	`[-+]?(?:[0-9][0-9_]*)?\.[0-9_]*(?:[eE][-+]?[0-9]+)?|[-+]?[0-9][0-9_]*[eE][-+]?[0-9]+|` +
-	`[-+]?\.(?:inf|Inf|INF)|\.(?:nan|NaN|NAN)|` +
-	`[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt ].*)?` +
-	`)$`)
+// bareReadsAsString reports whether `description: <v>` reads back as the string
+// v. It asks a real YAML parser (yaml.v3) rather than a hand-kept type list, and
+// adds the YAML 1.1 forms yaml.v3 no longer resolves but PyYAML (the upstream
+// publisher) and older frontmatter readers still do: yes/no/on/off/y/n booleans
+// and base-60 numbers such as 1:30.5.
+func bareReadsAsString(v string) bool {
+	if yaml11Only.MatchString(v) {
+		return false
+	}
+	var got map[string]any
+	if err := yaml.Unmarshal([]byte("description: "+v), &got); err != nil {
+		return false
+	}
+	s, ok := got["description"].(string)
+	return ok && s == v
+}
+
+var yaml11Only = regexp.MustCompile(`^(?:y|Y|yes|Yes|YES|n|N|no|No|NO|on|On|ON|off|Off|OFF|` +
+	`[-+]?[0-9][0-9_]*(?::[0-5]?[0-9])+(?:\.[0-9_]*)?)$`)
 
 func hasControl(v string) bool {
 	for _, r := range v {

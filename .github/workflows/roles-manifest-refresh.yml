@@ -235,6 +235,8 @@ jobs:
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.ROLES_REFRESH_TOKEN || github.token }}
+          # Explicit: when checkout itself failed there is no repo to infer it from.
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           LABEL="roles-manifest-refresh"
