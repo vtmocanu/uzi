@@ -162,7 +162,7 @@ type WorkerDTO struct {
 	StatsDiskDataTotalInodes *int64 `json:"stats_disk_data_total_inodes"`
 	// RunDisk is the worker's largest runs by HOME size (PRD #1809 M6, D8), at most
 	// WorkerRunDiskTop entries, largest first, from its latest heartbeat's run_disk report
-	// (entries whose sampled_at is more than 15 minutes old are dropped). ALWAYS a JSON array,
+	// (entries whose sampled_at is more than 25 minutes old are dropped). ALWAYS a JSON array,
 	// never null: the list handlers overlay it and the DTO builders seed it to []. Display-only.
 	RunDisk []WorkerRunDiskDTO `json:"run_disk"`
 	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).

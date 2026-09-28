@@ -750,7 +750,7 @@ type RunDTO struct {
 	CheckpointContainsLatest *bool `json:"checkpoint_contains_latest,omitempty"`
 	// HomeBytes / CacheBytes are the run's HOME size on its CURRENT worker (runs.worker_id) and, of
 	// that, the rebuildable caches (PRD #1809 M6, D8), from that worker's run_disk heartbeat report
-	// measured (sampled_at) within the last 15 minutes. Another worker's report is never
+	// measured (sampled_at) within the last 25 minutes. Another worker's report is never
 	// substituted, so a run with no current worker, or whose worker has not reported it recently,
 	// has them absent. SINGLE-RUN READ ONLY: set by GET /api/runs/{id} and absent on every list
 	// row (no per-row size lookup on a list). DiskTruncated means the worker's size walk was cut

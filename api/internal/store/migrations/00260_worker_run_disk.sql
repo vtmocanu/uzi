@@ -14,7 +14,7 @@
 --      cut short (truncated: the sizes are then lower bounds). A heartbeat that CARRIES run_disk
 --      (even an empty list) replaces the worker's whole set in one statement; a heartbeat that
 --      omits it (an older worker, or a tick with no sample) leaves the rows untouched, and every
---      reader ignores rows whose sampled_at is older than 15 minutes, so a downgraded worker's
+--      reader ignores rows whose sampled_at is older than 25 minutes, so a downgraded worker's
 --      rows stop showing without a writer.
 --
 --      run_id references runs ON DELETE CASCADE: deleting a run drops its size rows, and the

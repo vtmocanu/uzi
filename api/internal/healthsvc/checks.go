@@ -319,7 +319,9 @@ func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRo
 // inodes free. Both inputs are the worker's own display-only self-report (the run_disk list and
 // the stats_disk_data_* columns); a worker that reports neither is skipped, never counted. A
 // failed size read degrades the check to `unknown`. There is no danger band: fleet.disk and the
-// worker's own disk handling (the D6 park) own the full-volume case.
+// worker's own disk handling (the D6 park) own the full-volume case. The size rows' freshness is
+// ListLargestRunDiskForWorkers' 25-minute sampled_at window (queries/run_disk.sql, which names its
+// coupling to the agent's sample interval and deadline); this check holds no window of its own.
 func (s *Service) checkFleetRunDisk(ctx context.Context, now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
 	c := s.base("fleet.rundisk")
 	fresh := make([]store.ListAllWorkersRow, 0, len(workers))

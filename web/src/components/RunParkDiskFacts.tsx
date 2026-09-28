@@ -8,7 +8,7 @@
 //    running, so it never describes a later park (a server-side park carries none and reads
 //    absent). It renders only while the run is parked.
 // 2. The run's HOME size on its current worker and, of that, the rebuildable caches, from that
-//    worker's report measured in the last 15 minutes (absent otherwise). "at least" when the
+//    worker's report measured in the last 25 minutes (absent otherwise). "at least" when the
 //    worker's size walk was truncated.
 //
 // Both are display-only and render nothing when the server sent nothing.

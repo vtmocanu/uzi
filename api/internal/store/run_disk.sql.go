@@ -17,7 +17,7 @@ SELECT d.worker_id, d.run_id, d.home_bytes, d.cache_bytes, d.truncated, d.sample
 FROM worker_run_disk d
 WHERE d.run_id = $1
   AND d.worker_id = $2
-  AND d.sampled_at > now() - interval '15 minutes'
+  AND d.sampled_at > now() - interval '25 minutes'
 `
 
 type GetRunDiskParams struct {
@@ -26,7 +26,7 @@ type GetRunDiskParams struct {
 }
 
 // One run's fresh size row as reported by its CURRENT worker (runs.worker_id), for the run DTO.
-// A run with no current worker (NULL) or whose worker has not reported it within 15 minutes gets
+// A run with no current worker (NULL) or whose worker has not reported it within 25 minutes gets
 // pgx.ErrNoRows and shows no size: a row another worker reported earlier describes a HOME that
 // worker held, not necessarily where the run's work is now, so it is never substituted.
 func (q *Queries) GetRunDisk(ctx context.Context, arg GetRunDiskParams) (WorkerRunDisk, error) {
@@ -50,7 +50,7 @@ FROM (
            row_number() OVER (PARTITION BY d.worker_id ORDER BY d.home_bytes DESC, d.run_id) AS rn
     FROM worker_run_disk d
     WHERE d.worker_id = ANY($1::uuid[])
-      AND d.sampled_at > now() - interval '15 minutes'
+      AND d.sampled_at > now() - interval '25 minutes'
 ) ranked
 WHERE ranked.rn <= $2::int
 ORDER BY ranked.worker_id, ranked.home_bytes DESC, ranked.run_id
@@ -134,9 +134,18 @@ type ReplaceWorkerRunDiskParams struct {
 // scheduling, sweeper or custody query reads worker_run_disk or checkpoint_contains_latest.
 //
 // Freshness: every reader ignores a worker_run_disk row whose sampled_at (the worker's
-// measurement time, not the heartbeat's arrival) is more than 15 minutes ago. A
+// measurement time, not the heartbeat's arrival) is more than 25 minutes ago. A
 // heartbeat that omits run_disk (an older worker, a tick with no sample) leaves the worker's rows
 // in place, so the window is what retires a downgraded worker's last report.
+//
+// The 25 minutes is coupled to the agent's sampler (agent/src/run-disk.ts, agent/src/config.ts):
+// a steady run's entry is re-measured every UZI_RUN_DISK_SAMPLE_INTERVAL (default 10m), a sample
+// may take up to its deadline (DEFAULT_SAMPLE_DEADLINE_MS, 4m) before it stamps sampled_at, and the
+// new reading reaches the api on the next heartbeat (WORKER_HEARTBEAT_INTERVAL, default 15s). A
+// live entry can therefore be about 14m15s old just before it is replaced: a 15-minute window left
+// under a minute of slack for a late heartbeat or clock skew; 25 minutes leaves about 10.
+// Raising the sample interval or deadline means widening this window in EVERY reader below
+// (ListLargestRunDiskForWorkers, GetRunDisk) together.
 // Replace one worker's reported per-run sizes with the set its latest heartbeat carried, in ONE
 // statement: rows for runs no longer listed are deleted and the listed ones are upserted. The
 // parallel arrays are the handler's validated, de-duplicated, capped list (parseWorkerStats).

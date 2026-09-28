@@ -408,3 +408,114 @@ describe("RunRunner — PRD #1809 D8: the wall park reports what its checkpoint 
     });
   }
 });
+
+// PRD #1809 D8: the overlay (unpinned) publish after a FAILED fetch-back packs the OLDER tracking
+// tip, so the flight bookkeeping must name that tip, not the clone HEAD that never landed:
+//   - the checkpoint floor C is the tracking tip (a floor at the unpublished clone HEAD would let a
+//     later bridge or #1416 steer treat never-published work as durable);
+//   - lastPublishedTip stays unset (hasNewWork keeps retrying the clone HEAD);
+//   - but a checkpoint DID land, so a report_only completion must still refuse to orphan it (N1).
+describe("RunRunner — PRD #1809 D8: an overlay publish after a failed fetch-back", () => {
+  /** A GitHub claim (so the milestone checkpoint takes the overlay path) whose overlay pack is
+   *  the plain tracking ref: the overlay's default-tip wrapper would need a forge fetch. */
+  function overlayClaim(n: number) {
+    const realPack = git.checkpointPack.bind(git);
+    git.checkpointPack = async (barePath, branch, _overlay, pinned) => await realPack(barePath, branch, undefined, pinned);
+    return gitlabClaim(n, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+  }
+
+  /** Milestone 2 is committed but its fetch-back fails; the milestone checkpoint then publishes
+   *  the older tracking tip (milestone 1) through the overlay path, then the turn ends with `end`. */
+  const milestoneThen =
+    (end: (ctx: RunContext) => ExecutorResult) =>
+    async (ctx: RunContext): Promise<ExecutorResult> => {
+      await ctx.checkpoint?.({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+      return end(ctx);
+    };
+
+  it("sets the checkpoint floor to the older tracking tip, not the clone HEAD", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      const tips = stubPublish();
+      failFetchBackAfter(1);
+      const { github } = fakeGitHub();
+      const { gitlab } = fakeGitlab();
+      const claim = overlayClaim(18097);
+      const seen: Array<{ cloneTip: string | null; fetchedTip: string | null; lastPublishedTip?: string; checkpointFloor?: string }> =
+        [];
+      await runnerWith(
+        twoMilestoneFactory(
+          homeRoot,
+          milestoneThen((ctx) => ({ branch: ctx.branch })),
+        ),
+        gitlab,
+        undefined,
+        nullLogger(),
+        { github, checkpointIntervalMs: 0, checkpointTestHooks: { afterUnpinnedPublish: (s) => seen.push(s) } },
+      ).execute(claim);
+      assert.strictEqual(tips.length, 1, "the milestone checkpoint published once");
+      assert.strictEqual(seen.length, 1, "one unpinned (overlay) publish");
+      const s = seen[0];
+      assert.ok(s?.fetchedTip && s.cloneTip, "both tips resolved");
+      assert.notStrictEqual(s.fetchedTip, s.cloneTip, "the fetch-back failed: the tracking ref is behind the clone HEAD");
+      assert.strictEqual(tips[0], s.fetchedTip, "the publish packed the older tracking tip");
+      assert.strictEqual(s.checkpointFloor, s.fetchedTip, "the floor is the tip that was published");
+      assert.strictEqual(s.lastPublishedTip, undefined, "the clone HEAD was never published");
+    });
+  });
+
+  it("a report_only completion after that publish is refused, not left to orphan the checkpoint", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      const tips = stubPublish();
+      failFetchBackAfter(1);
+      const { github } = fakeGitHub();
+      const { gitlab, calls } = fakeGitlab();
+      const claim = overlayClaim(18098);
+      await runnerWith(
+        twoMilestoneFactory(
+          homeRoot,
+          milestoneThen((ctx) => ({ branch: ctx.branch, reportOnly: true, summary: "verified after milestone m1" })),
+        ),
+        gitlab,
+        undefined,
+        nullLogger(),
+        { github, checkpointIntervalMs: 0 },
+      ).execute(claim);
+      assert.strictEqual(tips.length, 1, "the milestone checkpoint landed (the older tracking tip)");
+      const [failed] = reports(claim.run_id, "failed");
+      assert.ok(failed, "the run failed");
+      assert.match(failed.failure_reason ?? "", /report_only/);
+      assert.match(failed.failure_reason ?? "", /checkpoint/);
+      assert.strictEqual(reports(claim.run_id, "completed").length, 0, "it did not complete report-only");
+      assert.strictEqual(calls.length, 0, "no MR opened");
+    });
+  });
+
+  it("a declined pause that published the older tip also blocks a later report_only completion", async () => {
+    await withHomeRoot(async (homeRoot) => {
+      const tips = stubPublish();
+      failFetchBackAfter(1);
+      const { gitlab, calls } = fakeGitlab();
+      const claim = gitlabClaim(18099);
+      // The server declines the pause (acks `running`), so the run continues past its publish.
+      api.onState(claim.run_id, (body) => {
+        api.overrideStateStatus(claim.run_id, body.status === "paused" ? "running" : body.status);
+      });
+      const pauseThenReport = async (ctx: RunContext): Promise<ExecutorResult> => {
+        const parked = await ctx.parkForPause?.({ completedCount: 1, total: 2 });
+        assert.strictEqual(parked, false, "the pause was declined");
+        return { branch: ctx.branch, reportOnly: true, summary: "verified after milestone m1" };
+      };
+      await runnerWith(twoMilestoneFactory(homeRoot, pauseThenReport), gitlab, undefined, nullLogger(), {
+        checkpointIntervalMs: 0,
+      }).execute(claim);
+      assert.strictEqual(tips.length, 1, "the pause published the older tracking tip");
+      const [failed] = reports(claim.run_id, "failed");
+      assert.ok(failed, "the run failed");
+      assert.match(failed.failure_reason ?? "", /report_only/);
+      assert.strictEqual(reports(claim.run_id, "completed").length, 0, "it did not complete report-only");
+      assert.strictEqual(calls.length, 0, "no MR opened");
+    });
+  });
+});

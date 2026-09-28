@@ -187,8 +187,16 @@ func TestWorkerRunDiskReplaceLiveDB(t *testing.T) {
 			t.Fatalf("%s: run DTO sizes = %v/%v, want absent (no substitution from another worker's row)", name, other.HomeBytes, other.CacheBytes)
 		}
 	}
-	// A stale row (older than the 15-minute window) is not shown.
+	// A row 20 minutes old is still inside the 25-minute window: a steady run's entry can be about
+	// 14 minutes old (sample interval + sample deadline + heartbeat) before it is replaced.
 	mustExecT(ctx, t, pool, `UPDATE worker_run_disk SET sampled_at = now() - interval '20 minutes' WHERE run_id = $1`, runA)
+	var late apitypes.RunDTO
+	h.overlayRunDiskSize(ctx, runRow, &late)
+	if late.HomeBytes == nil {
+		t.Fatalf("a row sampled 20 minutes ago (inside the 25-minute window) was hidden from the run DTO")
+	}
+	// A stale row (older than the 25-minute window) is not shown.
+	mustExecT(ctx, t, pool, `UPDATE worker_run_disk SET sampled_at = now() - interval '30 minutes' WHERE run_id = $1`, runA)
 	var stale apitypes.RunDTO
 	h.overlayRunDiskSize(ctx, runRow, &stale)
 	if stale.HomeBytes != nil || stale.CacheBytes != nil {
@@ -209,9 +217,9 @@ func TestWorkerRunDiskReplaceLiveDB(t *testing.T) {
 	}
 
 	// (6) sampled_at is the worker's MEASUREMENT time, clamped to [now-24h, now+5m] on the database
-	// clock, and missing means now(). The freshness window reads it: a report measured 20 minutes
+	// clock, and missing means now(). The freshness window reads it: a report measured 30 minutes
 	// ago is stored but not shown, even though the heartbeat carrying it just arrived.
-	runD, runE, runF, runG, runH := seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner)
+	runD, runE, runF, runG, runH, runI := seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner)
 	now := time.Now().UTC()
 	threeMin := now.Add(-3 * time.Minute).Truncate(time.Second)
 	heartbeat(fmt.Sprintf(`,"run_disk":[`+
@@ -219,12 +227,14 @@ func TestWorkerRunDiskReplaceLiveDB(t *testing.T) {
 		`{"run_id":%q,"home_bytes":20,"cache_bytes":0,"sampled_at":%q},`+
 		`{"run_id":%q,"home_bytes":30,"cache_bytes":0,"sampled_at":%q},`+
 		`{"run_id":%q,"home_bytes":40,"cache_bytes":0,"sampled_at":%q},`+
-		`{"run_id":%q,"home_bytes":50,"cache_bytes":0}]`,
+		`{"run_id":%q,"home_bytes":50,"cache_bytes":0},`+
+		`{"run_id":%q,"home_bytes":60,"cache_bytes":0,"sampled_at":%q}]`,
 		runD, threeMin.Format(time.RFC3339),
-		runE, now.Add(-20*time.Minute).Format(time.RFC3339),
+		runE, now.Add(-30*time.Minute).Format(time.RFC3339),
 		runF, now.Add(-72*time.Hour).Format(time.RFC3339),
 		runG, now.Add(2*time.Hour).Format(time.RFC3339),
-		runH))
+		runH,
+		runI, now.Add(-20*time.Minute).Format(time.RFC3339)))
 	// Offsets from the database clock, in seconds, so the assertions are immune to host/DB skew.
 	offsets := map[uuid.UUID]float64{}
 	rows, err := pool.Query(ctx, `SELECT run_id, EXTRACT(EPOCH FROM sampled_at - now())::float8 FROM worker_run_disk WHERE worker_id = $1`, workerID)
@@ -251,21 +261,22 @@ func TestWorkerRunDiskReplaceLiveDB(t *testing.T) {
 		}
 	}
 	within("reported 3 minutes ago (kept as measured)", offsets[runD], dbSkew-180, 5)
-	within("reported 20 minutes ago (kept as measured)", offsets[runE], dbSkew-1200, 5)
+	within("reported 30 minutes ago (kept as measured)", offsets[runE], dbSkew-1800, 5)
 	within("reported 3 days ago (clamped to 24h)", offsets[runF], -86400, 5)
 	within("reported 2 hours ahead (clamped to 5m)", offsets[runG], 300, 5)
 	within("not reported (now)", offsets[runH], 0, 5)
-	// The overlay drops the 20-minute-old and the clamped 24h-old measurements.
+	// The overlay drops the 30-minute-old and the clamped 24h-old measurements, and keeps the
+	// 20-minute-old one (inside the 25-minute window).
 	shown := map[string]bool{}
 	for _, e := range h.runDiskByWorker(ctx, []uuid.UUID{workerID})[workerID] {
 		shown[e.RunID] = true
 	}
-	if !shown[runD.String()] || !shown[runG.String()] || !shown[runH.String()] || shown[runE.String()] || shown[runF.String()] {
-		t.Fatalf("fresh overlay = %v, want D, G, H shown and E (20m old), F (clamped 24h) hidden", shown)
+	if !shown[runD.String()] || !shown[runG.String()] || !shown[runH.String()] || !shown[runI.String()] || shown[runE.String()] || shown[runF.String()] {
+		t.Fatalf("fresh overlay = %v, want D, G, H, I (20m old) shown and E (30m old), F (clamped 24h) hidden", shown)
 	}
 	stale = apitypes.RunDTO{}
 	h.overlayRunDiskSize(ctx, store.Run{ID: runE, WorkerID: runRow.WorkerID}, &stale)
 	if stale.HomeBytes != nil {
-		t.Fatalf("a run measured 20 minutes ago surfaced on the run DTO: %v", *stale.HomeBytes)
+		t.Fatalf("a run measured 30 minutes ago surfaced on the run DTO: %v", *stale.HomeBytes)
 	}
 }

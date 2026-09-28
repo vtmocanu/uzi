@@ -1053,6 +1053,13 @@ interface RunFlight {
   wallParkRefresh?: WallParkRefresh;
   lastPublish: number;
   lastPublishedTip: string | undefined;
+  /** PRD #1809 D8 (N1): THIS worker confirmed-landed a checkpoint mid-run (a time/milestone
+   *  checkpoint or an owner-pause publish). Separate from `lastPublishedTip`, which after a failed
+   *  fetch-back stays un-advanced (the packed tip is older than the clone HEAD) even though a
+   *  checkpoint DID land: the report-only orphan guards read this, not the tip. Not
+   *  `lastCheckpointRefTip`: that one is seeded from `claim.checkpoint_tip` (a prior/cross-worker
+   *  checkpoint, possibly a marker-only `wip(park):` one PRD #759 ignores). */
+  landedCheckpoint?: boolean;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
    *  knows it — seeded from `claim.checkpoint_tip`, advanced to the declared overlay/real tip on
    *  every CONFIRMED publish. Fed to `checkpointPack` as the overlay's `prevCheckpointTip` so a
@@ -1153,6 +1160,13 @@ export interface CheckpointTestHooks {
   scanDeadlineMs?: number;
   /** Observe the flight bookkeeping right after a confirmed PINNED publish. */
   afterPinnedPublish?: (state: { publishedTip: string; lastPublishedTip?: string; checkpointFloor?: string }) => void;
+  /** Observe the flight bookkeeping right after a confirmed UNPINNED (overlay/plain) publish. */
+  afterUnpinnedPublish?: (state: {
+    cloneTip: string | null;
+    fetchedTip: string | null;
+    lastPublishedTip?: string;
+    checkpointFloor?: string;
+  }) => void;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -3860,7 +3874,10 @@ export class RunRunner {
     }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
-    const lastPublishedTip = flight.lastPublishedTip;
+    // PRD #1809 D8 (N1): whether THIS worker landed a checkpoint, read by the report-only orphan
+    // guards below. Not `lastPublishedTip !== undefined`: a checkpoint that landed after a failed
+    // fetch-back leaves lastPublishedTip unset (it tracks the clone HEAD for hasNewWork).
+    const landedCheckpoint = flight.landedCheckpoint === true;
     const ciFixHumanApproved = flight.ciFixHumanApproved;
     // A ci_fix run that judged the failure not a code problem (PRD #6) completes
     // with the diagnosis and NO push/MR — there is nothing to land.
@@ -3900,7 +3917,7 @@ export class RunRunner {
       // an accepted edge resting on the convention "a genuine zero-code run never
       // checkpoints"; enforce that convention here instead. Detection is the UNION of
       // two signals, each covering a gap the other has:
-      //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
+      //   - landedCheckpoint: a checkpoint THIS worker confirmed-landed mid-run (set only
       //     on a landed publish), which may not yet be mirrored into the bare's local ref.
       //   - hasCommittedCheckpoint: origin's checkpoint ref, mirrored into the bare at
       //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
@@ -3911,7 +3928,7 @@ export class RunRunner {
       // so it still completes report-only below. Refuse loudly, mirroring the
       // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
       const publishedCheckpoint =
-        lastPublishedTip !== undefined ||
+        landedCheckpoint ||
         (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
       if (publishedCheckpoint) {
         batcher.emit({
@@ -4024,7 +4041,7 @@ export class RunRunner {
         // committed milestone still blocks.
         if (result.scopeCapped) {
           const publishedCheckpoint =
-            lastPublishedTip !== undefined ||
+            landedCheckpoint ||
             (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
           if (!publishedCheckpoint) {
             batcher.emit({
@@ -4096,14 +4113,14 @@ export class RunRunner {
         // ALREADY published committed work to a checkpoint ref on origin
         // (refs/uzi-checkpoints/<branch>), completing report-only would orphan that ref.
         // This mirrors the declared report_only terminal above: detect via the UNION of
-        // lastPublishedTip (a checkpoint THIS worker confirmed-landed mid-run) and
+        // landedCheckpoint (a checkpoint THIS worker confirmed-landed mid-run) and
         // hasCommittedCheckpoint (origin's checkpoint ref, mirrored into the bare at
         // clone/fetch time — catches a prior/cross-worker landing; per PRD #759 it ignores
         // a marker-only `wip(park):` checkpoint while a real committed milestone still
         // blocks). A genuine zero-code prompt run trips NEITHER and still completes
         // report-only below.
         const publishedCheckpoint =
-          lastPublishedTip !== undefined ||
+          landedCheckpoint ||
           (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
         if (publishedCheckpoint) {
           batcher.emit({
@@ -6671,6 +6688,7 @@ export class RunRunner {
                 const tipSha = scanned.range.tipSha;
                 const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
                 flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
+                flight.landedCheckpoint = true;
                 flight.checkpointFloor = tipSha;
                 this.checkpointTestHooks?.afterPinnedPublish?.({
                   publishedTip: tipSha,
@@ -6692,6 +6710,8 @@ export class RunRunner {
                 // checkpoint retries, and a pause cannot shortcut on it) nor the floor.
                 const packedClone = fetchedBack && cloneTip !== null && fetchedTip === cloneTip;
                 if (packedClone) flight.lastPublishedTip = cloneTip;
+                // N1: a checkpoint landed either way; the report-only orphan guards key on this.
+                flight.landedCheckpoint = true;
                 // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
                 // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
                 // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
@@ -6704,6 +6724,12 @@ export class RunRunner {
                     : packedClone
                       ? cloneTip
                       : (fetchedTip ?? flight.checkpointFloor);
+                this.checkpointTestHooks?.afterUnpinnedPublish?.({
+                  cloneTip,
+                  fetchedTip,
+                  lastPublishedTip: flight.lastPublishedTip,
+                  checkpointFloor: flight.checkpointFloor,
+                });
                 // PRD #267 M3: make the time-based publish observable, only for the time path so
                 // we do not double-log the milestone case.
                 if (!opts.reap) {
@@ -9967,6 +9993,8 @@ export class RunRunner {
         // published would let a later pause with no new commit take the shortcut above and report a
         // stale checkpoint as holding the latest work.
         if (published && holdsLatest !== false) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+        // N1: the pause's checkpoint landed even when it is older than the clone HEAD.
+        if (published) flight.landedCheckpoint = true;
       }
     }
 
