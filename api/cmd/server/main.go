@@ -792,9 +792,12 @@ func run() error {
 		// Failed-run checkpoint salvage (PRD #1867): records failed runs on the
 		// UZI_SALVAGE_FORGES forges, creates their run-scoped refs/uzi-salvage/<run-id>
 		// (create-only: it never deletes or moves a branch checkpoint or recovery ref) and
-		// CAS-deletes each salvage ref once it expires. Bounded to 20s and 5 broker items
-		// per tick. Always registered: with the setting empty and no rows it is two empty
-		// SELECTs and no forge call.
+		// CAS-deletes each salvage ref once it expires. It runs serially on this tick before
+		// the run-liveness sweep, at most 5 broker items per pass, and holds the tick for at
+		// most its 10s pass budget plus up to 5s for the detached outcome write of the item
+		// in flight when the budget runs out (within the 15s default SWEEP_INTERVAL). Always
+		// registered: with the setting empty and no rows it is two empty SELECTs and no
+		// forge call.
 		sweeper.Pass{
 			Name: "run_salvage",
 			Run:  wsvc.SweepSalvage,

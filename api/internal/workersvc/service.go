@@ -1714,7 +1714,7 @@ type Service struct {
 	// createSalvageFn / deleteSalvageFn are SweepSalvage's broker seams (PRD #1867),
 	// defaulting to pushbroker.CreateSalvageRef / pushbroker.DeleteRef (set in New); tests
 	// stub them. salvagePassBudget overrides the pass's wall-clock budget (zero = the
-	// 20s salvagePassBudgetDefault); tests shorten it.
+	// 10s salvagePassBudgetDefault); tests shorten it.
 	createSalvageFn   func(ctx context.Context, o pushbroker.CreateSalvageRefOptions) (pushbroker.SalvageResult, error)
 	deleteSalvageFn   func(ctx context.Context, o pushbroker.DeleteRefOptions) error
 	salvagePassBudget time.Duration

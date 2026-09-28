@@ -5,9 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"slices"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -31,16 +33,25 @@ import (
 // deletes is its own refs/uzi-salvage/<run-id>, CAS-bound to the recorded tip.
 const (
 	// salvagePassBudgetDefault bounds one whole SweepSalvage pass (DB reads and every broker
-	// call), so a slow forge can never hold the shared sweeper tick.
-	salvagePassBudgetDefault = 20 * time.Second
+	// call), so a slow forge can never hold the shared sweeper tick. The pass runs serially
+	// on that tick before the run-liveness sweep, and the item in flight when the budget
+	// runs out may still spend up to salvageWriteTimeout on its detached outcome write, so
+	// budget + salvageWriteTimeout (15s) stays within the default SWEEP_INTERVAL (15s).
+	salvagePassBudgetDefault = 10 * time.Second
 	// salvageMaxItems caps the broker items handled per pass, round-robin between due
 	// expiries and due pending rows so neither starves the other.
 	salvageMaxItems = 5
 	// salvageEnqueueLimit bounds the candidate rows one pass records.
 	salvageEnqueueLimit = 50
-	// salvageAttemptCap: a pending row with no salvage ref becomes 'failed' at this many
-	// failed attempts (RecordSalvageAttemptFailed).
+	// salvageAttemptCap: a pending row with no RECORDED salvage ref becomes 'failed' at this
+	// many failed attempts (RecordSalvageAttemptFailed), but only once the cap-reaching
+	// attempt's orphan cleanup (deleteUnrecordedSalvage) has succeeded.
 	salvageAttemptCap = 10
+	// salvageNoCap is the cap passed to RecordSalvageAttemptFailed when an attempt must be
+	// counted and its error recorded WITHOUT settling the row 'failed': the orphan cleanup
+	// failed (or a panic interrupted the item), so the row stays pending and live and the
+	// next pass retries. attempts and last_error still move, so a stuck row stays visible.
+	salvageNoCap = math.MaxInt32
 	// salvageErrMaxRunes bounds the persisted last_error (the column CHECK is 512).
 	salvageErrMaxRunes = 512
 	// salvageMinWindow is the floor of the enqueue look-back window; the window is
@@ -84,14 +95,28 @@ const (
 //     - pending, forge enabled: CreateSalvageRef; created records the creation and
 //     expiry and marks the row promoted, unavailable/refused settle, anything else
 //     (including an SSRF, claim-context or PAT failure) counts a failed attempt.
-//     - pending, forge no longer enabled (a rollback): settles 'disabled'. A pending row
-//     has no salvage ref, so there is nothing to delete.
+//     - pending, forge no longer enabled (a rollback): CAS-deletes any unrecorded salvage
+//     ref (deleteUnrecordedSalvage), then settles 'disabled'. 'disabled' is reached ONLY
+//     from a pending row with no recorded salvage ref; a promoted (or half-promoted) row
+//     on a disabled forge keeps its bounded expiry above instead.
 //     - pending with a salvage ref already recorded (the pass stopped between
 //     RecordSalvageCreated and MarkSalvagePromoted): marked promoted, no broker call.
 //
-// Every persisted or logged error is secretscrub-scrubbed and cut to 512 runes. A panic
-// in one item is recovered, logged and counted as that item's failed attempt. DB errors
-// are logged and returned joined; the sweeper logs them and carries on.
+// A pending row with salvage_created_at NULL may STILL have a salvage ref on the forge: a
+// create can land without being recorded (RecordSalvageCreated failed, or receive-pack
+// applied the ref but the client timed out and the re-list failed too). So neither path
+// that settles such a row without a create ('disabled', and 'failed' at the attempt cap)
+// does so blind: each first CAS-deletes refs/uzi-salvage/<run-id> at the recorded tip
+// (absent is success) and settles only once that succeeds. A failed cleanup is recorded
+// as an uncapped attempt (last_error set, row still pending and live) and retried next
+// pass, so an orphan is never forgotten and a stuck row is never silent.
+//
+// Every persisted or logged error is secretscrub-scrubbed, stripped of control and bidi
+// characters and cut to 512 runes. A panic in one item is recovered, logged and counted
+// as that item's failed attempt; a panic never caps a pending row (it cannot run the
+// orphan cleanup), so a row that keeps panicking stays pending with the panic in
+// last_error. DB errors are logged and returned joined; the sweeper logs them and
+// carries on.
 func (s *Service) SweepSalvage(ctx context.Context) (int64, error) {
 	budget := s.salvagePassBudget
 	if budget <= 0 {
@@ -220,7 +245,11 @@ func (s *Service) salvageOne(ctx context.Context, it salvageItem, now time.Time)
 		if r := recover(); r != nil {
 			msg := salvageErrText(fmt.Errorf("salvage: panic: %v", r), pat)
 			slog.Error("salvage: item panicked", "run", it.row.RunID, "panic", msg)
-			n, err = s.recordSalvageFailure(ctx, it, msg)
+			if it.expiry {
+				n, err = s.recordSalvageExpireFailure(ctx, it.row, msg)
+				return
+			}
+			n, err = s.recordSalvageAttempt(ctx, it.row, msg, salvageNoCap)
 		}
 	}()
 	if it.expiry {
@@ -238,14 +267,21 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		return s.q.MarkSalvagePromoted(wctx, store.MarkSalvagePromotedParams{PromotedAt: salvageTS(now), RunID: row.RunID})
 	}
 	if !slices.Contains(s.p.SalvageForges, row.ForgeType) {
-		// Rollback: the forge left UZI_SALVAGE_FORGES before this row was salvaged. No
-		// salvage ref exists, so nothing is deleted.
+		// Rollback: the forge left UZI_SALVAGE_FORGES before this row's salvage ref was
+		// recorded. 'disabled' is reached only here, from pending with no recorded salvage
+		// ref; a promoted row on a disabled forge is left to its normal bounded expiry. A
+		// create may still have landed unrecorded, so CAS-delete refs/uzi-salvage/<run-id>
+		// at the tip first and settle only once that succeeds; otherwise record the error
+		// (uncapped, the row stays pending and live) and retry next pass.
+		if derr := s.deleteUnrecordedSalvage(ctx, row, pat); derr != nil {
+			return s.recordSalvageAttempt(ctx, row, salvageErrText(derr, *pat), salvageNoCap)
+		}
 		return s.settleSalvage(ctx, row.RunID, salvageStateDisabled)
 	}
 
 	remote, err := s.salvageRemote(ctx, row.RunID)
 	if err != nil {
-		return s.recordSalvageFailure(ctx, salvageItem{row: row}, salvageErrText(err, ""))
+		return s.recordPendingFailure(ctx, row, salvageErrText(err, ""), pat)
 	}
 	*pat = remote.pat
 	res, berr := s.createSalvageFn(ctx, pushbroker.CreateSalvageRefOptions{
@@ -280,14 +316,14 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		if berr == nil {
 			berr = fmt.Errorf("salvage: create returned %v", res)
 		}
-		return s.recordSalvageFailure(ctx, salvageItem{row: row}, salvageErrText(berr, remote.pat))
+		return s.recordPendingFailure(ctx, row, salvageErrText(berr, remote.pat), pat)
 	}
 }
 
 func (s *Service) expireSalvage(ctx context.Context, row store.RunSalvage, pat *string) (int64, error) {
 	remote, err := s.salvageRemote(ctx, row.RunID)
 	if err != nil {
-		return s.recordSalvageFailure(ctx, salvageItem{row: row, expiry: true}, salvageErrText(err, ""))
+		return s.recordSalvageExpireFailure(ctx, row, salvageErrText(err, ""))
 	}
 	*pat = remote.pat
 	if derr := s.deleteSalvageFn(ctx, pushbroker.DeleteRefOptions{
@@ -297,9 +333,34 @@ func (s *Service) expireSalvage(ctx context.Context, row store.RunSalvage, pat *
 		PAT:            remote.pat,
 		ExpectedOldTip: row.Tip,
 	}); derr != nil {
-		return s.recordSalvageFailure(ctx, salvageItem{row: row, expiry: true}, salvageErrText(derr, remote.pat))
+		return s.recordSalvageExpireFailure(ctx, row, salvageErrText(derr, remote.pat))
 	}
 	return s.settleSalvage(ctx, row.RunID, salvageStateExpired)
+}
+
+// deleteUnrecordedSalvage CAS-deletes refs/uzi-salvage/<run-id> at row.Tip for a pending
+// row with no recorded salvage ref, before that row is settled without one ('disabled',
+// or 'failed' at the attempt cap): a create may have landed on the forge unrecorded. It
+// dials through salvageRemote (the SSRF gate before the PAT is decrypted) and touches only
+// the run's own salvage ref; an absent or moved ref is DeleteRef's benign success. It
+// stores the decrypted PAT in *pat so the caller's error text redacts it. The returned
+// error is not yet scrubbed.
+func (s *Service) deleteUnrecordedSalvage(ctx context.Context, row store.RunSalvage, pat *string) error {
+	remote, err := s.salvageRemote(ctx, row.RunID)
+	if err != nil {
+		return fmt.Errorf("salvage: unrecorded salvage ref cleanup: %w", err)
+	}
+	*pat = remote.pat
+	if err := s.deleteSalvageFn(ctx, pushbroker.DeleteRefOptions{
+		CloneURL:       remote.cloneURL,
+		Ref:            pushbroker.SalvageRef(row.RunID),
+		Username:       remote.username,
+		PAT:            remote.pat,
+		ExpectedOldTip: row.Tip,
+	}); err != nil {
+		return fmt.Errorf("salvage: unrecorded salvage ref cleanup: %w", err)
+	}
+	return nil
 }
 
 func (s *Service) settleSalvage(ctx context.Context, runID uuid.UUID, state string) (int64, error) {
@@ -314,18 +375,40 @@ func salvageWriteCtx(ctx context.Context) (context.Context, context.CancelFunc) 
 	return context.WithTimeout(context.WithoutCancel(ctx), salvageWriteTimeout)
 }
 
-// recordSalvageFailure records msg (already scrubbed and bounded) as a failed attempt:
-// an expiry retry for an expiry item, a capped create attempt for a pending one.
-func (s *Service) recordSalvageFailure(ctx context.Context, it salvageItem, msg string) (int64, error) {
-	slog.Warn("salvage: attempt failed", "run", it.row.RunID, "expiry", it.expiry, "error", msg)
+// recordPendingFailure records msg (already scrubbed and bounded) as a failed create
+// attempt on a pending row. When this attempt would reach salvageAttemptCap (and so settle
+// the row 'failed', clearing its live pointer), it first runs deleteUnrecordedSalvage: the
+// cap applies only once that cleanup succeeds. If the cleanup fails, the attempt is
+// recorded uncapped with the cleanup error leading last_error, and the next pass retries.
+func (s *Service) recordPendingFailure(ctx context.Context, row store.RunSalvage, msg string, pat *string) (int64, error) {
+	if row.Attempts+1 < salvageAttemptCap {
+		return s.recordSalvageAttempt(ctx, row, msg, salvageAttemptCap)
+	}
+	if derr := s.deleteUnrecordedSalvage(ctx, row, pat); derr != nil {
+		msg = salvageErrText(fmt.Errorf("attempt cap deferred: %w; last attempt: %s", derr, msg), *pat)
+		return s.recordSalvageAttempt(ctx, row, msg, salvageNoCap)
+	}
+	return s.recordSalvageAttempt(ctx, row, msg, salvageAttemptCap)
+}
+
+// recordSalvageAttempt writes one failed attempt on a pending row with the given cap
+// (salvageAttemptCap, or salvageNoCap to keep the row pending).
+func (s *Service) recordSalvageAttempt(ctx context.Context, row store.RunSalvage, msg string, attemptCap int32) (int64, error) {
+	slog.Warn("salvage: attempt failed", "run", row.RunID, "attempts", row.Attempts+1, "capped", attemptCap != salvageNoCap, "error", msg)
 	wctx, cancel := salvageWriteCtx(ctx)
 	defer cancel()
-	if it.expiry {
-		return s.q.RecordSalvageExpireFailed(wctx, store.RecordSalvageExpireFailedParams{LastError: msg, RunID: it.row.RunID})
-	}
 	return s.q.RecordSalvageAttemptFailed(wctx, store.RecordSalvageAttemptFailedParams{
-		LastError: msg, AttemptCap: salvageAttemptCap, RunID: it.row.RunID,
+		LastError: msg, AttemptCap: attemptCap, RunID: row.RunID,
 	})
+}
+
+// recordSalvageExpireFailure records msg (already scrubbed and bounded) as a failed
+// expiry delete; the row keeps its state and live pointer and is retried.
+func (s *Service) recordSalvageExpireFailure(ctx context.Context, row store.RunSalvage, msg string) (int64, error) {
+	slog.Warn("salvage: expiry failed", "run", row.RunID, "error", msg)
+	wctx, cancel := salvageWriteCtx(ctx)
+	defer cancel()
+	return s.q.RecordSalvageExpireFailed(wctx, store.RecordSalvageExpireFailedParams{LastError: msg, RunID: row.RunID})
 }
 
 // salvageRemoteInfo is the server-derived connection a salvage broker call dials.
@@ -365,14 +448,44 @@ func (s *Service) salvageRemote(ctx context.Context, runID uuid.UUID) (salvageRe
 
 // salvageErrText makes err safe for a log or last_error: the exact PAT this item used
 // (when known) is replaced first, since a forge PAT need not match any shape
-// secretscrub knows, then secretscrub removes every known credential shape, then the
-// text is cut to salvageErrMaxRunes.
+// secretscrub knows, then secretscrub removes every known credential shape, then
+// sanitizeSalvageText drops terminal and bidi payloads and invalid UTF-8, then the text
+// is cut to salvageErrMaxRunes.
 func salvageErrText(err error, pat string) string {
 	msg := err.Error()
 	if pat != "" {
 		msg = strings.ReplaceAll(msg, pat, "[redacted]")
 	}
-	return truncateRunes(secretscrub.Scrub(msg), salvageErrMaxRunes)
+	return truncateRunes(sanitizeSalvageText(secretscrub.Scrub(msg)), salvageErrMaxRunes)
+}
+
+// sanitizeSalvageText replaces invalid UTF-8 with U+FFFD, turns tab/CR/LF into a space and
+// drops every other C0/C1 control character (NUL and ESC included) and every Unicode bidi
+// control, so a forge-supplied error can carry neither a terminal escape sequence, a
+// bidi-reordering payload, nor bytes Postgres rejects (NUL, invalid UTF-8) into last_error.
+func sanitizeSalvageText(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case r == '\t' || r == '\n' || r == '\r':
+			return ' '
+		case unicode.IsControl(r), isBidiControl(r):
+			return -1
+		}
+		return r
+	}, strings.ToValidUTF8(s, "\uFFFD"))
+}
+
+// isBidiControl reports the Unicode bidirectional formatting characters: ALM, LRM, RLM,
+// the embeddings/overrides LRE..RLO (U+202A-U+202E) and the isolates LRI..PDI
+// (U+2066-U+2069).
+func isBidiControl(r rune) bool {
+	switch {
+	case r == '\u061C', r == '\u200E', r == '\u200F':
+		return true
+	case r >= '\u202A' && r <= '\u202E', r >= '\u2066' && r <= '\u2069':
+		return true
+	}
+	return false
 }
 
 func isSalvageLiveRunFKViolation(err error) bool {
