@@ -16,6 +16,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -48,6 +49,7 @@ func run(args []string) result {
 	fs.SetOutput(os.Stderr)
 	upstream := fs.String("upstream", "", "directory holding the upstream product-agents/*.md files (required)")
 	builtins := fs.String("builtins", "internal/agenttmpl/builtins", "directory holding the builtin *.md files")
+	manifest := fs.String("manifest", "internal/agenttmpl/library/manifest.json", "manifest whose roles are the expected builtin set")
 	if err := fs.Parse(args); err != nil {
 		return result{code: 2}
 	}
@@ -69,9 +71,23 @@ func run(args []string) result {
 		return result{code: 2, stderr: fmt.Sprintf("builtinparity: upstream: no role files in %s\n", *upstream)}
 	}
 
-	names := make([]string, 0, len(shipped))
+	// The expected set is the manifest's roles, so a builtin whose file went
+	// missing is reported rather than silently not compared.
+	expected, err := manifestRoles(*manifest)
+	if err != nil {
+		return result{code: 2, stderr: fmt.Sprintf("builtinparity: manifest: %v\n", err)}
+	}
+	names := make([]string, 0, len(expected)+len(shipped))
+	seen := map[string]bool{}
+	for _, n := range expected {
+		if !seen[n] && !productOnly[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
 	for n := range shipped {
-		if !productOnly[n] {
+		if !seen[n] && !productOnly[n] {
+			seen[n] = true
 			names = append(names, n)
 		}
 	}
@@ -81,13 +97,17 @@ func run(args []string) result {
 	drift := 0
 	for _, n := range names {
 		u, ok := up[n]
+		s, have := shipped[n]
 		switch {
+		case !have:
+			drift++
+			fmt.Fprintf(&out, "MISSING  %s: in the manifest but no builtins/%s.md\n", n, n)
 		case !ok:
 			drift++
 			fmt.Fprintf(&out, "MISSING  %s: no upstream product-agents/%s.md\n", n, n)
-		case !bytes.Equal(shipped[n], u):
+		case !bytes.Equal(s, u):
 			drift++
-			fmt.Fprintf(&out, "DIFFERS  %s: %s\n", n, firstDiff(shipped[n], u))
+			fmt.Fprintf(&out, "DIFFERS  %s: %s\n", n, firstDiff(s, u))
 		}
 	}
 	if drift == 0 {
@@ -120,6 +140,28 @@ func readRoles(dir string) (map[string][]byte, error) {
 			return nil, err
 		}
 		out[strings.TrimSuffix(e.Name(), ".md")] = b
+	}
+	return out, nil
+}
+
+// manifestRoles returns the role names library/manifest.json lists.
+func manifestRoles(path string) ([]string, error) {
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: the path is the operator's own -manifest flag, read only.
+	if err != nil {
+		return nil, err
+	}
+	var m struct {
+		Roles map[string]int `json:"roles"`
+	}
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, err
+	}
+	if len(m.Roles) == 0 {
+		return nil, fmt.Errorf("no roles in %s", path)
+	}
+	out := make([]string, 0, len(m.Roles))
+	for n := range m.Roles {
+		out = append(out, n)
 	}
 	return out, nil
 }

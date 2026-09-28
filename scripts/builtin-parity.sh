@@ -26,4 +26,4 @@ fi
 
 echo "upstream: $repo @ ${sha:0:12}"
 cd "$root/api"
-go run ./cmd/builtinparity -upstream "$tmp/product-agents" -builtins internal/agenttmpl/builtins
+go run ./cmd/builtinparity -upstream "$tmp/product-agents" -builtins internal/agenttmpl/builtins -manifest internal/agenttmpl/library/manifest.json

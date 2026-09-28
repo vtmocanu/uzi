@@ -178,10 +178,10 @@ different, so you're not resetting blind.
 
 The shipped builtin roles other than `lead` are copied unchanged from uzi's
 upstream role library, the same `product-agents/` files an
-[agent source](./agent-source.md) sync reads. uzi adds its own runtime rules
-(the run's scratch directory, the review-snapshot recipe, the safety rules) to
-every agent when a run starts, so those rules are not part of the stored
-template.
+[agent source](./agent-source.md) sync reads. When a run starts, uzi adds its own
+runtime rules to each subagent (the run's scratch directory, the
+review-snapshot recipe, the safety rules) through a shared block, and gives the
+lead its own runtime guidance. Neither is part of the stored template.
 
 A builtin can also arrive by a third route: an admin-configured
 [agent source](./agent-source.md) repo an admin has approved a sync from. A
