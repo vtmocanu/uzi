@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
   GitCache,
   OVERLAY_COMMIT_PREFIX,
@@ -130,7 +130,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
 
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt"); // non-workflow work off the v1-workflow base
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n"); // main moves its workflow
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -159,7 +159,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     assert.strictEqual(gitIn(bareB, ["rev-parse", checkpointRef]), ov, "checkpoint ref mirrored");
 
     // resume + this run's own persisted tip (== O_ov) so the #1059 owner anchor admits the adopt.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, "run-B", true, ov);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, noProofReseed, "run-B", true, ov);
     assert.strictEqual(rc.seededFrom, "checkpoint", "seeded from the checkpoint");
     assert.strictEqual(rc.baseCommit, realTip, "the peel landed the base on realTip (overlay discarded)");
     assert.strictEqual(gitIn(rc.path, ["rev-parse", "HEAD"]), realTip, "the clone is checked out at realTip");
@@ -175,7 +175,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt"); // no workflow change; main not advanced
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
 
@@ -189,7 +189,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     // The branch ITSELF edits a workflow file — the doomed-at-finalize shape.
     const realTip = commit(seed.path, WF, "name: ci\non: push\njobs: {}\n# branch-edit\n");
@@ -211,7 +211,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1037";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1037, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1037, noProofReseed, "run-A");
     const realTip = commit(seed.path, workflow, "name: branch\n");
     advanceOriginWorkflow(fx, "name: ci\n# v2\n");
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -228,7 +228,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const checkpointRef = `refs/uzi-checkpoints/${branch}`;
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realParent = commit(seed.path, "M1.txt"); // the last REAL commit (marker's parent)
     fs.writeFileSync(path.join(seed.path, "WIP.txt"), "in-progress\n"); // genuinely uncommitted
     assert.strictEqual(await gitA.commitWipMarker(seed.path), true, "a wip(park) marker was planted");
@@ -247,7 +247,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     publishPackToOrigin(fx, pack, ov, checkpointRef);
     const gitB = worker(fx, "B");
     const bareB = await gitB.ensureClone(fx.originPath);
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, "run-B", true, ov);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, noProofReseed, "run-B", true, ov);
 
     // Peel discards the overlay → base becomes the marker; the wip-park soft-reset then lands the
     // branch on realParent with the WIP uncommitted.
@@ -266,7 +266,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bare = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bare, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bare, 1036, noProofReseed, "run-A");
     const floor = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
     const pinnedTip = commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
@@ -285,7 +285,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -318,7 +318,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const checkpointRef = `refs/uzi-checkpoints/${branch}`;
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -333,7 +333,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     publishPackToOrigin(fx, await drain(p2!.pack), ov2, checkpointRef);
     const gitB = worker(fx, "B");
     const bareB = await gitB.ensureClone(fx.originPath);
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, "run-B", true, ov2);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, noProofReseed, "run-B", true, ov2);
     assert.strictEqual(rc.baseCommit, realTip2, "peeled to the LAST parent (realTip2), not O_ov1");
     assert.strictEqual(gitIn(rc.path, ["rev-parse", "HEAD"]), realTip2, "HEAD sits on realTip2");
     assert.strictEqual(
@@ -348,7 +348,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt"); // realTip still carries the v1 workflow
     deleteOriginWorkflow(fx); // default now has NO .github/workflows tree
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -366,7 +366,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt");
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
 
@@ -380,7 +380,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n");
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -397,7 +397,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     const realTip = commit(seed.path, "M1.txt");
     advanceOriginWorkflow(fx, "name: ci\non: push\njobs: {}\n# v2\n"); // behind, but no overlay asked for
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -419,7 +419,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const branch = "agent/issue-1036";
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     fs.writeFileSync(path.join(seed.path, "M1.txt"), "real agent work\n");
     gitIn(seed.path, ["add", "M1.txt"]);
     gitIn(seed.path, [...IDENT, "commit", "-m", `${OVERLAY_COMMIT_PREFIX} forged by the agent`]);
@@ -427,7 +427,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     // Stamp the worker-side tracking ref for run-A so the reseed is ownedHere.
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
 
-    const rc = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const rc = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     assert.strictEqual(rc.seededFrom, "tracking", "seeded from the owned tracking ref, not a checkpoint");
     assert.strictEqual(
       rc.baseCommit,
@@ -454,7 +454,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
     const checkpointRef = `refs/uzi-checkpoints/${branch}`;
     const gitA = worker(fx, "A");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 1036, noProofReseed, "run-A");
     // Real work, forged subject. main is NOT advanced ⇒ not behind ⇒ checkpointPack ships the
     // raw tip as a plain checkpoint (no overlay).
     fs.writeFileSync(path.join(seed.path, "M1.txt"), "real agent work\n");
@@ -471,7 +471,7 @@ describe("checkpoint .github/workflows overlay (PRD #1062 M2, #1036)", () => {
 
     const gitB = worker(fx, "B");
     const bareB = await gitB.ensureClone(fx.originPath);
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, "run-B", true, forged);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 1036, noProofReseed, "run-B", true, forged);
     assert.strictEqual(rc.seededFrom, "checkpoint", "seeded from the checkpoint ref (the forge vector)");
     assert.strictEqual(
       rc.baseCommit,

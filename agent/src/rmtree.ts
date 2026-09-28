@@ -4,6 +4,7 @@ import { type ChildProcess, execFile, spawn } from "node:child_process";
 import path from "node:path";
 import { promisify } from "node:util";
 import { commandRootCommand, runnerCommand, uidSplitActive } from "./runner-uid.js";
+import { workerSpawnEnv } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -255,7 +256,8 @@ async function purgeChildrenAsAgents(target: string): Promise<void> {
   for (const wrap of [runnerCommand, commandRootCommand, runnerCommand]) {
     const wrapped = wrap(process.execPath, ["-e", PURGE_CHILDREN_SCRIPT, target]);
     await execFileAsync(wrapped.command, wrapped.args, {
-      env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+      // issue #1783 (R4): worker-marked; still minimal and explicit (no credential).
+      env: workerSpawnEnv({ PATH: "/usr/local/bin:/usr/bin:/bin" }),
       timeout: PURGE_TIMEOUT_MS,
       maxBuffer: 64 * 1024,
     }).catch((e: NodeJS.ErrnoException & { code?: unknown }) => {
@@ -727,7 +729,8 @@ function helperFailure(e: HelperExecError): Error {
 async function runHelper(wrap: CommandWrapper, script: string, args: readonly string[], timeout: number): Promise<number> {
   const wrapped = wrap(process.execPath, ["-e", script, ...args]);
   return execFileAsync(wrapped.command, wrapped.args, {
-    env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+    // issue #1783 (R4): worker-marked (a fixed worker-authored script; no credential).
+    env: workerSpawnEnv({ PATH: "/usr/local/bin:/usr/bin:/bin" }),
     timeout,
     maxBuffer: 64 * 1024,
   }).then(
@@ -1066,7 +1069,8 @@ export async function measureRunCaches(home: string, opts: MeasureOptions = {}):
     let stdout: string;
     try {
       ({ stdout } = await execFileAsync(wrapped.command, wrapped.args, {
-        env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+        // issue #1783 (R4): worker-marked (a fixed worker-authored script; no credential).
+        env: workerSpawnEnv({ PATH: "/usr/local/bin:/usr/bin:/bin" }),
         timeout,
         maxBuffer: 64 * 1024,
       }));
@@ -1136,7 +1140,8 @@ export async function measureRunHome(home: string, opts: MeasureOptions = {}): P
     let stdout: string;
     try {
       ({ stdout } = await execFileAsync(wrapped.command, wrapped.args, {
-        env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+        // issue #1783 (R4): worker-marked (a fixed worker-authored script; no credential).
+        env: workerSpawnEnv({ PATH: "/usr/local/bin:/usr/bin:/bin" }),
         timeout,
         maxBuffer: 64 * 1024,
       }));
@@ -1588,7 +1593,8 @@ export async function runAgentHelper(
     try {
       child = spawn(wrapped.command, wrapped.args, {
         cwd: "/",
-        env: { PATH: "/usr/local/bin:/usr/bin:/bin" },
+        // issue #1783 (R4): worker-marked (a fixed worker-authored script; no credential).
+        env: workerSpawnEnv({ PATH: "/usr/local/bin:/usr/bin:/bin" }),
         stdio: ["pipe", "pipe", "ignore"],
       });
     } catch (e) {

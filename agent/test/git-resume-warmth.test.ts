@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 
 // PRD #1392 M3 (agent half) — RESUME warmth acceptance.
@@ -75,7 +75,7 @@ describe("ensureClone resume warmth (PRD #1392 M3 agent)", () => {
 
     // The resume then reaches the runner-clone step: the local `--shared` clone off the WARM
     // bare (the step runnerCloneForClaim performs) checks out real origin content.
-    const rc = await git.createOrAttachRunnerClone(bare, 1392);
+    const rc = await git.createOrAttachRunnerClone(bare, 1392, noProofReseed);
     assert.strictEqual(rc.branch, "agent/issue-1392");
     assert.strictEqual(
       fs.existsSync(path.join(rc.path, "README.md")),
@@ -103,7 +103,7 @@ describe("ensureClone resume warmth (PRD #1392 M3 agent)", () => {
     assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true, "the cold clone created the bare");
 
     // …and the resume reaches the runner-clone step off the freshly cold-cloned bare.
-    const rc = await git.createOrAttachRunnerClone(bare, 1392);
+    const rc = await git.createOrAttachRunnerClone(bare, 1392, noProofReseed);
     assert.strictEqual(rc.branch, "agent/issue-1392");
     assert.strictEqual(
       fs.existsSync(path.join(rc.path, "README.md")),
@@ -156,7 +156,7 @@ describe("ensureClone resume warmth (PRD #1392 M3 agent)", () => {
     assert.strictEqual(fs.existsSync(path.join(bare, "HEAD")), true, "the resume's cold clone created a healthy bare");
 
     // …and that healthy bare carries out the resume to the runner-clone step.
-    const rc = await git.createOrAttachRunnerClone(bare, 1392);
+    const rc = await git.createOrAttachRunnerClone(bare, 1392, noProofReseed);
     assert.strictEqual(
       fs.existsSync(path.join(rc.path, "README.md")),
       true,

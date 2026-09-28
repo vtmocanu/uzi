@@ -15,6 +15,10 @@
 #   - missing live clone     -> durable runner ref becomes a BARE bundle
 #   - missing clone + ref    -> nonzero, last recoverable `latest` is preserved
 #   - retention              -> only old timestamp-shaped directories are pruned
+#   - attempt layout (cases 9-18) -> the clone is chosen by journal/ledger identity
+#     plus branch, never by the newest <stem>.attempt-* path; none valid -> BARE;
+#     a tab-bearing dir name cannot forge the branch field; same-second attemptIds
+#     order by numeric generation (gx lowest); a trailing slash on the base is ignored
 # Run: bash backup-runs.test.sh   (exit 0 = pass)
 set -u
 
@@ -46,10 +50,11 @@ git clone -q --bare "$FORGE" "$BARE"
 git --git-dir="$BARE" update-ref refs/remotes/origin/main "$MAIN"
 
 # --- stubs ----------------------------------------------------------------------
-# kubectl stub: answers the three calls backup-runs.sh makes. The capture exec is
-# run verbatim, so the RUNNER_BASE the host forwarded as its last arg is what
-# points CLONE at the fake clone — this exercises the real host->exec argument
-# path, not a stub-injected env var (which would not cross a real `kubectl exec`).
+# kubectl stub: answers the calls backup-runs.sh makes. Both on-pod scripts are run
+# verbatim: the candidate listing receives the RUNNER_BASE the host forwarded, and
+# the capture receives the concrete clone the host selected (CLONE, its last arg).
+# This exercises the real host->exec argument path, not a stub-injected env var
+# (which would not cross a real `kubectl exec`).
 KSTUB="$WORK/kubectl"
 cat > "$KSTUB" <<STUB
 #!/usr/bin/env bash
@@ -73,8 +78,9 @@ if [ "\${cmd[0]:-}" = git ]; then
   exec "\${cmd[@]}"
 fi
 if [ "\${cmd[0]:-}" = sh ]; then
-  # cmd = (sh -c <CAPTURE> _ <STEM> <REALMAIN> <RUNNER_BASE>); the host already
-  # forwarded RUNNER_BASE as the last arg, so run it verbatim.
+  # cmd = (sh -c <LIST_CANDIDATES> _ <RUNNER_BASE> <STEM>) or
+  # (sh -c <CAPTURE> _ <STEM> <REALMAIN> <CLONE>); the host already forwarded the
+  # runner base / concrete clone as arguments, so run it verbatim.
   if [ "\${UZI_TEST_DUBIOUS:-}" = 1 ]; then export GIT_TEST_ASSUME_DIFFERENT_OWNER=1; fi
   exec "\${cmd[@]}"
 fi
@@ -102,13 +108,15 @@ chmod +x "$WORK/stat"
 # make_uzi_stub: write a fake `uzi` that answers `run get --json`. A run id containing
 # "mrr" reports a mr_rework run EXACTLY as the real API does IN-FLIGHT: branch is null
 # and the live branch is in pipeline_ref (agent/issue-9999), so the slug must come from
-# pipeline_ref (-> agent-issue-9999); anything else is the issue-4242 run.
+# pipeline_ref (-> agent-issue-9999); "mrrflat" is a mr_rework on the slash-free branch
+# "hotfix" (stem hotfix); anything else is the issue-4242 run.
 make_uzi_stub() {
   cat > "$WORK/uzi" <<STUB
 #!/usr/bin/env bash
 set -u
 if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
   case "\${3:-}" in
+    *mrrflat*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"hotfix","worker_id":"${WID:-w0rker}","mr_iid":7778,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *noworker*) printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *queuedbound*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
@@ -124,12 +132,15 @@ STUB
 }
 
 # run_backup <tag> [runid]: run the real script once into a fresh dir; echo its `latest`.
-# UZI_RUNNER_BASE is set on the HOST invocation (not the stub): the script must
-# forward it into the remote capture, which is the production behavior under test.
+# UZI_RUNNER_BASE (default $WORK/runner, override via TEST_RUNNER_BASE) is set on the
+# HOST invocation, not the stub: the script forwards it into the on-pod candidate
+# listing and passes the concrete selected clone to the capture, which is the
+# production behavior under test.
 run_backup() {
   local dest="$WORK/out.$1"; local rid="${2:-run-4242}"
   rm -rf "$dest"
-  UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+  UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo \
+    UZI_RUNNER_BASE="${TEST_RUNNER_BASE:-$WORK/runner}" \
     UZI_REPOS_BASE="$REPOS" \
     UZI_BACKUP_DIR="$dest" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" \
     bash "$SCRIPT" "$rid" >/dev/null 2>&1
@@ -339,5 +350,196 @@ if rg --files "$ROOT8" | grep -q '[.]tgz$'; then
   fail "case8: foreign-owned clone/ref was captured as current-run work"
 fi
 echo "PASS case8: clone/ref ownership mismatch rejected"
+
+# --- attempt layout (issue 1783): pick the clone by IDENTITY, never newest path ---
+# A Docker-wired worker seeds <stem>.attempt-<attemptId> per execution attempt and
+# keeps older ones; the bare's journal / attempt ledger say which one is this run's.
+A1="20260901T000000Z-g1-0123456789abcdef"
+A2="20260902T000000Z-g2-0123456789abcdef"
+A3="20260903T000000Z-gx-0123456789abcdef"
+RB="$WORK/runner"
+JKEY='uzi-recovery.agent/issue-4242.clone'
+LKEY='uzi-attempts.agent/issue-4242.entry'
+
+# reset_layout: empty runner dir, no journal/ledger, no tracking ref.
+reset_layout() {
+  rm -rf "$RB"; mkdir -p "$RB"
+  git --git-dir="$BARE" config --unset-all "$JKEY" 2>/dev/null || :
+  git --git-dir="$BARE" config --unset-all "$LKEY" 2>/dev/null || :
+  git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242 2>/dev/null || :
+  git --git-dir="$BARE" config 'uzi-trackowner.agent/issue-4242.owner' run-4242
+}
+# make_clone <dir> <branch> <marker>: a clone on <branch> with an uncommitted marker.
+make_clone() {
+  git clone -q "$FORGE" "$1"
+  git_q "$1" checkout -b "$2"
+  echo "$3" >> "$1/f.txt"
+}
+# journal <runId> <clonePath> [attemptId]
+journal() {
+  if [ -n "${3:-}" ]; then
+    git --git-dir="$BARE" config "$JKEY" "{\"runId\":\"$1\",\"clonePath\":\"$2\",\"attemptId\":\"$3\"}"
+  else
+    git --git-dir="$BARE" config "$JKEY" "{\"runId\":\"$1\",\"clonePath\":\"$2\"}"
+  fi
+}
+# ledger <attemptId> <runId> <clonePath> <state>: append one ledger value.
+ledger() {
+  git --git-dir="$BARE" config --add "$LKEY" \
+    "{\"attemptId\":\"$1\",\"runId\":\"$2\",\"clonePath\":\"$3\",\"state\":\"$4\"}"
+}
+# expect_pick <tag> <clone> <marker>: the backup captured exactly <clone>'s WIP.
+expect_pick() {
+  local l meta
+  l="$(run_backup "$1")"
+  [ -f "$l/issue-4242.tgz" ] || fail "$1: no archive; log: $(cat "$WORK/out.$1/latest-attempt/backup.log" 2>/dev/null)"
+  meta="$(tar -xOzf "$l/issue-4242.tgz" ./issue-4242.meta.txt)"
+  printf '%s\n' "$meta" | grep -qxF "clone=$2" \
+    || fail "$1: wrong clone captured, want $2; meta: $(printf '%s' "$meta" | grep '^clone=')"
+  tar -xOzf "$l/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF "+$3" \
+    || fail "$1: expected WIP marker $3 missing"
+}
+
+# case 9: canonical only (unwired worker; legacy journal without attemptId).
+reset_layout
+make_clone "$RB/issue-4242" agent/issue-4242 canon
+journal run-4242 "$RB/issue-4242"
+expect_pick 9 "$RB/issue-4242" canon
+echo "PASS case9: canonical-only layout captured"
+
+# case 10: several attempts; the newest VALID one wins. A3 is newer but on the wrong
+# branch; the canonical dir is valid too but counts as oldest.
+reset_layout
+make_clone "$RB/issue-4242" agent/issue-4242 canon
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 a2
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-other a3
+journal other-run "$RB/issue-4242"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+ledger "$A3" run-4242 "$RB/issue-4242.attempt-$A3" live
+expect_pick 10 "$RB/issue-4242.attempt-$A2" a2
+echo "PASS case10: newest valid attempt wins over a newer wrong-branch one"
+
+# case 11: a delayed Docker create recreated a NEWER, empty predecessor path (no
+# .git) beside the correct recovery clone; the journal-named clone is taken.
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+mkdir -p "$RB/issue-4242.attempt-$A2"
+journal run-4242 "$RB/issue-4242.attempt-$A1" "$A1"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+expect_pick 11 "$RB/issue-4242.attempt-$A1" a1
+echo "PASS case11: newer empty recreated attempt dir ignored"
+
+# case 12: a ledger entry naming ANOTHER run is rejected. A2 was ours, but its LAST
+# ledger value hands it to another run, so the older A1 is the valid pick.
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 a2
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+ledger "$A2" other-run "$RB/issue-4242.attempt-$A2" live
+expect_pick 12 "$RB/issue-4242.attempt-$A1" a1
+echo "PASS case12: attempt whose last ledger value names another run rejected"
+
+# case 13: a ledger entry naming a path OUTSIDE the stem's candidate set (here a
+# quarantined residue / skills-plugin sibling, which the <stem>.attempt-* glob and
+# the host's name check never list) cannot make that path the pick, even when newer.
+# The residue name is the worker's pinned grammar .uzi-residue-<key>.residue-<uuid>
+# (a lowercase v4 uuid; agent/src/attempt-path.ts formatResidueName).
+RESIDUE_UUID=0f8fad5b-d9cb-469f-a165-70867728950e
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+make_clone "$RB/.uzi-residue-issue-4242.residue-$RESIDUE_UUID" agent/issue-4242 residue
+make_clone "$RB/.uzi-skills-issue-4242" agent/issue-4242 skills
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
+ledger "$A3" run-4242 "$RB/.uzi-residue-issue-4242.residue-$RESIDUE_UUID" live
+ledger "$A2" run-4242 "$RB/.uzi-skills-issue-4242" live
+expect_pick 13 "$RB/issue-4242.attempt-$A1" a1
+echo "PASS case13: ledger entries naming non-candidate sibling paths ignored"
+
+# case 14: the journal-named valid attempt beats a newer valid ledger attempt.
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 a2
+journal run-4242 "$RB/issue-4242.attempt-$A1" "$A1"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+expect_pick 14 "$RB/issue-4242.attempt-$A1" a1
+echo "PASS case14: journal-named attempt beats a newer valid attempt"
+
+# case 15: no valid candidate (wrong branch, empty dir, journal attemptId mismatch,
+# unnamed attempt) -> the existing durable-ref BARE fallback, never a stray clone.
+reset_layout
+make_clone "$RB/issue-4242" agent/issue-other canon
+mkdir -p "$RB/issue-4242.attempt-$A2"
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 a3
+journal run-4242 "$RB/issue-4242.attempt-$A1" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+git_q "$RB/issue-4242.attempt-$A1" -c user.email=t@example.com -c user.name=tester \
+  commit -am committed-a1
+git --git-dir="$BARE" fetch -q "$RB/issue-4242.attempt-$A1" \
+  agent/issue-4242:refs/uzi-runner/agent/issue-4242
+L15="$(run_backup 15)"
+grep -q '^.*BARE .*run-4242' "$L15/backup.log" \
+  || fail "case15: expected BARE fallback; got: $(cat "$WORK/out.15/latest-attempt/backup.log")"
+if tar tzf "$L15/issue-4242.tgz" 2>/dev/null | grep -q 'uncommitted[.]patch'; then
+  fail "case15: an invalid candidate clone was captured"
+fi
+echo "PASS case15: no valid candidate -> BARE fallback"
+
+# case 16: a dir name carrying a TAB must not forge the branch field. A dir name
+# cannot hold "/", so the forgery needs a slash-free branch: a mr_rework on "hotfix"
+# (stem hotfix). The real A2 attempt is on the wrong branch; a sibling named
+# "hotfix.attempt-<A2><TAB>hotfix" (no .git) would otherwise list as
+# "<A2 path><TAB>hotfix<TAB>" and vouch for A2. The valid (older) A1 must be the pick.
+reset_layout
+FK='uzi-attempts.hotfix.entry'
+git --git-dir="$BARE" config --unset-all "$FK" 2>/dev/null || :
+make_clone "$RB/hotfix.attempt-$A1" hotfix a1
+make_clone "$RB/hotfix.attempt-$A2" wrong-branch a2
+mkdir "$RB/hotfix.attempt-$A2"$'\t'"hotfix"
+for a in "$A1" "$A2"; do
+  git --git-dir="$BARE" config --add "$FK" \
+    "{\"attemptId\":\"$a\",\"runId\":\"mrrflat-1\",\"clonePath\":\"$RB/hotfix.attempt-$a\",\"state\":\"live\"}"
+done
+L16="$(run_backup 16 mrrflat-1)"
+[ -f "$L16/hotfix.tgz" ] || fail "16: no archive; log: $(cat "$WORK/out.16/latest-attempt/backup.log" 2>/dev/null)"
+tar -xOzf "$L16/hotfix.tgz" ./hotfix.meta.txt | grep -qxF "clone=$RB/hotfix.attempt-$A1" \
+  || fail "16: tab-forged listing vouched for the wrong-branch attempt"
+tar -xOzf "$L16/hotfix.tgz" ./hotfix.uncommitted.patch | grep -qxF "+a1" \
+  || fail "16: expected WIP marker a1 missing"
+git --git-dir="$BARE" config --unset-all "$FK"
+echo "PASS case16: tab-bearing dir name cannot vouch for another attempt"
+
+# case 17: same-second attemptIds order by NUMERIC generation (g10 > g9, which a
+# lexical compare gets backwards), and gx (unknown generation) is lowest.
+G9="20260905T000000Z-g9-0123456789abcdef"
+G10="20260905T000000Z-g10-0123456789abcdef"
+GX="20260906T000000Z-gx-ffffffffffffffff"
+G1="20260906T000000Z-g1-0000000000000000"
+reset_layout
+make_clone "$RB/issue-4242.attempt-$G9" agent/issue-4242 g9
+make_clone "$RB/issue-4242.attempt-$G10" agent/issue-4242 g10
+ledger "$G9" run-4242 "$RB/issue-4242.attempt-$G9" live
+ledger "$G10" run-4242 "$RB/issue-4242.attempt-$G10" live
+expect_pick 17 "$RB/issue-4242.attempt-$G10" g10
+reset_layout
+make_clone "$RB/issue-4242.attempt-$GX" agent/issue-4242 gx
+make_clone "$RB/issue-4242.attempt-$G1" agent/issue-4242 g1
+ledger "$GX" run-4242 "$RB/issue-4242.attempt-$GX" live
+ledger "$G1" run-4242 "$RB/issue-4242.attempt-$G1" live
+expect_pick 17x "$RB/issue-4242.attempt-$G1" g1
+echo "PASS case17: same-second attempts ordered by numeric generation, gx lowest"
+
+# case 18: a trailing slash on UZI_RUNNER_BASE is normalized, so the journal's
+# clonePath still matches the listed candidate byte for byte.
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A1" agent/issue-4242 a1
+journal run-4242 "$RB/issue-4242.attempt-$A1" "$A1"
+TEST_RUNNER_BASE="$RB//" expect_pick 18 "$RB/issue-4242.attempt-$A1" a1
+echo "PASS case18: trailing slash on the runner base ignored"
 
 echo "ALL PASS"

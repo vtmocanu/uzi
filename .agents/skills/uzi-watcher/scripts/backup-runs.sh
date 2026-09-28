@@ -5,10 +5,21 @@
 # slug (agent/src/run-kind.ts deriveCloneKey): issue/chat/judge -> issue-N, task ->
 # task-<runid>, self_improve -> uzi-self-improve-<runid>, prompt -> uzi-prompt-<runid>,
 # and mr_rework/ci_fix -> slugify(pipeline_ref). A mr_rework run reuses the issue
-# branch's clone at /data/runner/<slug>/agent-issue-N (files agent-issue-N.*), NOT a
-# mr_rework-<runid> dir; runs.branch is NULL in-flight (claim_assembly.go) so the live
-# branch comes from pipeline_ref. A task or mr_rework run's work is often still
-# UNCOMMITTED, so the uncommitted.patch + untracked capture is what saves it.
+# branch's clone key agent-issue-N (files agent-issue-N.*), NOT a mr_rework-<runid>
+# dir; runs.branch is NULL in-flight (claim_assembly.go) so the live branch comes from
+# pipeline_ref. A task or mr_rework run's work is often still UNCOMMITTED, so the
+# uncommitted.patch + untracked capture is what saves it.
+#
+# Clone layout: an unwired worker clones at /data/runner/<slug>/<stem>; a Docker-wired
+# worker seeds a fresh /data/runner/<slug>/<stem>.attempt-<attemptId> per execution
+# attempt and retains older ones in place (a delayed create can even leave a NEWER,
+# empty, root-owned attempt dir). So the clone is chosen by IDENTITY, never by the
+# newest path: a candidate counts only when the bare's recovery journal
+# (uzi-recovery.<branch>.clone) or attempt ledger (uzi-attempts.<branch>.entry, last
+# value per attemptId wins) names it for THIS run, and its .git reports the run's
+# branch. The journal-named candidate wins, else the newest valid attemptId (the
+# canonical dir counts as oldest). .uzi-residue-* / .uzi-skills-* siblings are never
+# candidates. The host resolves the concrete dir and passes it to the capture.
 #
 # For each run id it resolves worker_id -> pod FRESH each call (so it survives a
 # worker roll or a cross-worker migration), then searches every running worker pod
@@ -70,6 +81,11 @@ if [ -z "$REPO_SLUG" ]; then
   REPO_SLUG="$(printf '%s' "$origin" | sed -E 's#^[a-z]+://##; s#^[^@]+@##; s#\.git$##; s#[:/]#+#g')"
 fi
 RUNNER_BASE="${UZI_RUNNER_BASE:-/data/runner/$REPO_SLUG}"
+# Strip trailing slashes: candidates are built as "$RUNNER_BASE/<name>" and compared
+# byte-for-byte against the journal/ledger clonePath, so "base/" would yield "base//x".
+while [ "${#RUNNER_BASE}" -gt 1 ] && [ "${RUNNER_BASE%/}" != "$RUNNER_BASE" ]; do
+  RUNNER_BASE="${RUNNER_BASE%/}"
+done
 REPOS_BASE="${UZI_REPOS_BASE:-/data/repos}"
 case "$RETENTION_DAYS" in
   ''|*[!0-9]*) echo "error: UZI_BACKUP_RETENTION_DAYS must be a non-negative integer (got '$RETENTION_DAYS')" >&2; exit 2 ;;
@@ -147,20 +163,18 @@ prune_old_backups(){
 }
 
 # --- on-pod capture: emits a tar.gz of the artifacts on stdout, noise on stderr.
-# This string runs REMOTELY (`sh -c` in the worker pod); only $REPO_SLUG is
-# spliced in here at build time, every other $VAR expands pod-side on purpose.
+# This string runs REMOTELY (`sh -c` in the worker pod); nothing is spliced in at
+# build time, every $VAR expands pod-side on purpose. Args: STEM REALMAIN CLONE.
 # shellcheck disable=SC2016
 CAPTURE='
 set -u
 STEM="$1"
 REALMAIN="${2:-}"
-# Runner working-clone root, forwarded by the host as $3 (env does not cross
-# `kubectl exec`, so a host UZI_RUNNER_BASE must be passed as an argument). Empty
-# selects the default on-pod path; a value overrides it (a local fake clone under
-# test, or a non-standard runner mount).
-RUNNER_BASE="${3:-/data/runner/'"$REPO_SLUG"'}"
-CLONE="$RUNNER_BASE/$STEM"
-[ -d "$CLONE/.git" ] || { echo "NO_CLONE $CLONE" >&2; exit 3; }
+# The concrete working clone, resolved and identity-checked by the host
+# (select_clone) and forwarded as $3: env does not cross `kubectl exec`, and the
+# attempt layout means the path cannot be recomputed from the stem here.
+CLONE="${3:-}"
+[ -n "$CLONE" ] && [ -e "$CLONE/.git" ] || { echo "NO_CLONE ${CLONE:-<unset>}" >&2; exit 3; }
 cd "$CLONE" || exit 3
 # kubectl exec enters as the worker container user, while the runner clone can
 # belong to another UID. Trust only the verified clone for this capture;
@@ -203,6 +217,7 @@ fi
 rm -f "$OUT/.untracked"
 {
   echo "stem=$STEM head=$HEAD branch=$BR captured=$(date -u +%FT%TZ)"
+  echo "clone=$CLONE"
   echo "clone_origin_main=$(git rev-parse origin/main 2>/dev/null)"
   echo "real_remote_main=${REALMAIN:-unknown}"
   echo "bundle_base=${BASE:-<none: full-history bundle>}"
@@ -298,18 +313,102 @@ list_pods(){
   done
 }
 
-pod_has_clone(){
-  local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5" clone journal
+# On-pod candidate listing: one "<path><TAB><branch>" line per existing candidate
+# dir ($1=runner base, $2=stem): the canonical dir plus every <stem>.attempt-*
+# sibling (quoted prefix, so the glob can never reach another stem). <branch> is
+# empty when the dir has no readable .git (a recreated empty or root-owned attempt
+# dir). Quarantined residue and skills-plugin dirs never qualify (defensive: the
+# stem-anchored glob cannot produce them today). A path carrying a newline or a TAB is
+# skipped: a newline could forge a second line, a tab could forge the branch field.
+# shellcheck disable=SC2016
+LIST_CANDIDATES='
+set -u
+tab="$(printf "\t")"
+for d in "$1/$2" "$1/$2".attempt-*; do
+  [ -d "$d" ] || continue
+  case "${d##*/}" in .uzi-residue-*|.uzi-skills-*) continue ;; esac
+  case "$d" in *"
+"*|*"$tab"*) continue ;; esac
+  br=""
+  if [ -r "$d/.git" ]; then
+    br="$(git -c safe.directory="$d" -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)" || br=""
+  fi
+  printf "%s\t%s\n" "$d" "$br"
+done
+'
+ATTEMPT_RE='^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$'
+
+# aid_newer <a> <b>: succeed when attemptId <a> is newer than <b>. Both match
+# ATTEMPT_RE. Order: timestamp (fixed width, so lexical), then the generation
+# NUMERICALLY (g10 > g9; gx, an unknown generation, is lowest), then the full id
+# lexically as a deterministic tie-break.
+aid_newer(){
+  local ta="${1%%-*}" tb="${2%%-*}" ga gb
+  [ "$ta" = "$tb" ] || { [[ "$ta" > "$tb" ]]; return; }
+  ga="${1#*-g}"; ga="${ga%%-*}"; gb="${2#*-g}"; gb="${gb%%-*}"
+  if [ "$ga" = x ]; then ga=-1; else ga=$((10#$ga)); fi
+  if [ "$gb" = x ]; then gb=-1; else gb=$((10#$gb)); fi
+  [ "$ga" -eq "$gb" ] || { [ "$ga" -gt "$gb" ]; return; }
+  [[ "$1" > "$2" ]]
+}
+
+# select_clone <ns> <pod> <stem> <branch> <rid>: print the identity-verified working
+# clone for run <rid> on this pod, or return 1 (see the header's "Clone layout").
+# A candidate is valid only when (a) the journal or the ledger names it for <rid>
+# (runId equal, clonePath equal, attemptId equal when the entry carries one) and
+# (b) its .git reports <branch>. Journal-named wins; else the newest attemptId
+# (aid_newer).
+select_clone(){
+  local ns="$1" pod="$2" stem="$3" branch="$4" rid="$5"
+  local LC_ALL=C listing journal ledger ledger_ok jr="" jc="" ja="" path br name aid
+  local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
   [ -n "$branch" ] || return 1
-  clone="$RUNNER_BASE/$stem"
-  # shellcheck disable=SC2016  # $1/$2 expand in the remote sh, not in this host shell.
-  "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    sh -c '[ -d "$1/.git" ]' _ "$clone" >/dev/null 2>&1 || return 1
+  listing="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    sh -c "$LIST_CANDIDATES" _ "$RUNNER_BASE" "$stem" 2>/dev/null)" || return 1
+  [ -n "$listing" ] || return 1
   journal="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-recovery.$branch.clone" 2>/dev/null)" || return 1
-  # shellcheck disable=SC2016  # $rid/$clone are jq variables supplied with --arg.
-  printf '%s' "$journal" | "$JQ" -e --arg rid "$rid" --arg clone "$clone" \
-    '.runId == $rid and .clonePath == $clone' >/dev/null 2>&1
+    git --git-dir="$bare" config --get "uzi-recovery.$branch.clone" 2>/dev/null)" || journal=""
+  ledger="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry" 2>/dev/null)" || ledger=""
+  if [ -n "$journal" ]; then
+    jr="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .runId // "" else "" end' 2>/dev/null)" || jr=""
+    jc="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .clonePath // "" else "" end' 2>/dev/null)" || jc=""
+    ja="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .attemptId // "" else "" end' 2>/dev/null)" || ja=""
+  fi
+  # Ledger: the LAST value per attemptId wins. Keep "<attemptId><TAB><clonePath>" for
+  # each attempt whose winning entry names this run; unparseable values are skipped.
+  # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
+  ledger_ok="$(printf '%s\n' "$ledger" | "$JQ" -rRn --arg rid "$rid" '
+    [inputs | fromjson? | select(type == "object"
+       and (.attemptId | type) == "string" and .attemptId != ""
+       and (.clonePath | type) == "string")]
+    | reduce .[] as $e ({}; .[$e.attemptId] = $e)
+    | .[] | select(.runId == $rid) | "\(.attemptId)\t\(.clonePath)"' 2>/dev/null)" || ledger_ok=""
+  while IFS="$tab" read -r path br; do
+    [ -n "$path" ] && [ "${path%/*}" = "$RUNNER_BASE" ] || continue
+    # Belt-and-braces for the on-pod tab filter: a tab left in the branch field
+    # means the line had an extra field, so it cannot be trusted.
+    case "$br" in *"$tab"*) continue ;; esac
+    name="${path##*/}"
+    if [ "$name" = "$stem" ]; then
+      aid=""
+    else
+      case "$name" in "$stem".attempt-*) aid="${name#"$stem".attempt-}" ;; *) continue ;; esac
+      [[ "$aid" =~ $ATTEMPT_RE ]] || continue
+    fi
+    [ "$br" = "$branch" ] || continue
+    if [ "$jr" = "$rid" ] && [ "$jc" = "$path" ] && { [ -z "$ja" ] || [ "$ja" = "$aid" ]; }; then
+      printf '%s\n' "$path"
+      return 0
+    fi
+    [ -n "$aid" ] || continue
+    printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path" || continue
+    if [ "$have_best" -eq 0 ] || aid_newer "$aid" "$best_aid"; then
+      best="$path"; best_aid="$aid"; have_best=1
+    fi
+  done <<< "$listing"
+  [ "$have_best" -eq 1 ] || return 1
+  printf '%s\n' "$best"
 }
 
 pod_has_ref(){
@@ -416,10 +515,10 @@ for RID in "${RUNS[@]}"; do
 
   preferred=""
   preferred="$(resolve_pod "$wid" || true)"
-  ns=""; pod=""; capture_kind=""
+  ns=""; pod=""; capture_kind=""; CLONE_PATH=""
   if [ -n "$preferred" ]; then
     ns="${preferred%% *}"; pod="${preferred#* }"
-    if pod_has_clone "$ns" "$pod" "$STEM" "$RUN_BRANCH" "$RID"; then capture_kind="clone"; fi
+    if CLONE_PATH="$(select_clone "$ns" "$pod" "$STEM" "$RUN_BRANCH" "$RID")"; then capture_kind="clone"; fi
   fi
 
   # A run may have resumed on a new worker. Search all running worker pods for its
@@ -428,7 +527,7 @@ for RID in "${RUNS[@]}"; do
     while read -r cns cpod; do
       [ -n "$cpod" ] || continue
       if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
-      if pod_has_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID"; then
+      if CLONE_PATH="$(select_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID")"; then
         ns="$cns"; pod="$cpod"; capture_kind="clone"; break
       fi
     done < <(list_pods)
@@ -482,7 +581,7 @@ for RID in "${RUNS[@]}"; do
     rm -f "$tmp"
     if [ "$capture_kind" = "clone" ]; then
       "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-        sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" "$RUNNER_BASE" > "$tmp" 2>>"$LOG"
+        sh -c "$CAPTURE" _ "$STEM" "$REALMAIN" "$CLONE_PATH" > "$tmp" 2>>"$LOG"
     else
       "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
         sh -c "$BARE_CAPTURE" _ "$STEM" "$TRACK_REF" "$REALMAIN" "$REPOS_BASE" > "$tmp" 2>>"$LOG"
@@ -517,11 +616,11 @@ for RID in "${RUNS[@]}"; do
       if [ "$capture_kind" = "bare" ]; then
         log "BARE $RID ($LBL) status=$st pod=$pod ref=$TRACK_REF -> $f ($(du -h "$f" | cut -f1)); committed history only, uncommitted WIP unavailable"
       else
-        log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod -> $f ($(du -h "$f" | cut -f1))"
+        log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod clone=$CLONE_PATH -> $f ($(du -h "$f" | cut -f1))"
       fi
       recoverable=1
     else
-      log "PART $RID ($LBL): verified .tgz but WITHOUT a git bundle (uncommitted/status only) -> $f"
+      log "PART $RID ($LBL) clone=$CLONE_PATH: verified .tgz but WITHOUT a git bundle (uncommitted/status only) -> $f"
       recoverable=1
     fi
   elif [ -s "$f" ]; then

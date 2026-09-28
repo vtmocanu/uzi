@@ -197,6 +197,9 @@ export interface ClaudeHarnessDeps {
   /** The run's recorded pid set — shared with the owner, which reaps it in
    *  killAgentTree on the done path (the legacy path stays in the owner). */
   spawnedPids: Set<number>;
+  /** issue #1783 (R0): told of every CLI root pid right after its spawn, so the owner can record
+   *  the root's start time before the pid could be recycled. */
+  onRootSpawned?: (pid: number) => void;
   /** Per-run SDK HOME, for session inspection. */
   homeDir: string;
 }
@@ -296,6 +299,7 @@ export class ClaudeHarness implements RunHarness {
       if (typeof proc.pid === "number") {
         currentChild.pid = proc.pid;
         this.deps.spawnedPids.add(proc.pid);
+        this.deps.onRootSpawned?.(proc.pid);
       }
       return proc as unknown as SpawnedProcess;
     };

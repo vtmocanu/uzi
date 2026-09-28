@@ -1,6 +1,7 @@
 package agentsource
 
 import (
+	"encoding/json"
 	"testing"
 
 	"github.com/google/uuid"
@@ -138,4 +139,51 @@ func TestDecodeStagedRolesInvalidJSONErrors(t *testing.T) {
 			t.Fatalf("on error, defs/skipped must be nil: defs=%+v skipped=%+v", defs, skipped)
 		}
 	}
+}
+
+// PRD #1849 D5: upstream cannot name uzi's forge tools, so an approved sync of an
+// upstream fact-checker must keep the builtin's product-only tools instead of
+// writing the source allowlist verbatim, and a re-sync of that same content must
+// classify as unchanged rather than as a perpetual override.
+func TestPlanApplyKeepsBuiltinProductTools(t *testing.T) {
+	upstream := agenttmpl.Definition{
+		Name: "fact-checker", Description: "fc desc", PromptBody: "fc body\n",
+		Tools: []string{"Bash", "Read"},
+	}
+	withDelta := agenttmpl.WithProductTools(upstream)
+	if len(withDelta.Tools) <= len(upstream.Tools) {
+		t.Fatalf("fixture: fact-checker has no product tool delta: %v", withDelta.Tools)
+	}
+
+	row := tmpl("fact-checker", "builtin", "embedded", "fc desc", "old body\n")
+	op, ok := opFor(planApply([]agenttmpl.Definition{upstream}, []store.AgentTemplate{row}), "fact-checker")
+	if !ok || op.Action != ActionOverrideBuiltin {
+		t.Fatalf("want an override-builtin op, got %+v (found=%v)", op, ok)
+	}
+	for _, tool := range withDelta.Tools {
+		found := false
+		for _, got := range op.Def.Tools {
+			if got == tool {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("override would write fact-checker without %q: %v", tool, op.Def.Tools)
+		}
+	}
+
+	synced := tmpl("fact-checker", "builtin", "synced", "fc desc", "fc body\n")
+	synced.Tools = mustJSON(t, withDelta.Tools)
+	if op, _ := opFor(planApply([]agenttmpl.Definition{upstream}, []store.AgentTemplate{synced}), "fact-checker"); op.Action != ActionUnchanged {
+		t.Errorf("re-sync of identical content: action = %s, want %s", op.Action, ActionUnchanged)
+	}
+}
+
+func mustJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	b, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return b
 }

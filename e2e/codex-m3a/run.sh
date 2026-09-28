@@ -49,7 +49,7 @@ COMMON=(
   --cap-drop ALL
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID
   --entrypoint /usr/local/sbin/uzi-entrypoint
-  -v "$HERE":/m3a:ro
+  --mount "type=bind,src=$HERE,dst=/m3a,readonly"
 )
 
 run_container() {

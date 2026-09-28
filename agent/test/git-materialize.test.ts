@@ -5,8 +5,9 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
-import { GitCache, RunnerCloneMaterializationError, WIP_PARK_COMMIT_PREFIX, materializeEnv, type RunnerClone } from "../src/git.js";
+import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { GitCache, RunnerCloneMaterializationError, WIP_PARK_COMMIT_PREFIX, materializeEnv, type AttemptSeedOptions, type RunnerClone } from "../src/git.js";
+import { mintAttemptId } from "../src/run-quiescence.js";
 
 // issue #1769 m1 — a Codex (sandboxed) run's runner clone is made SELF-CONTAINED at seed:
 // the objects it borrowed from the worker bare through `objects/info/alternates` are copied
@@ -108,7 +109,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
   it("a fresh selfContained seed has no alternates and works with the bare gone", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 1, "run-1", false, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed, "run-1", false, undefined, undefined, SELF);
     assert.strictEqual(rc.seededFrom, "default");
     hideBare(bare);
     assertStandalone(rc.path, rc);
@@ -117,19 +118,19 @@ describe("runner clone materialization (issue #1769 m1)", () => {
   it("without the option the clone keeps its alternates (Claude path unchanged)", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 2, "run-2");
+    const rc = await git.createOrAttachRunnerClone(bare, 2, noProofReseed, "run-2");
     assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), true, "alternates present");
-    const explicitFalse = await git.createOrAttachRunnerClone(bare, 3, "run-3", false, undefined, { selfContained: false });
+    const explicitFalse = await git.createOrAttachRunnerClone(bare, 3, noProofReseed, "run-3", false, undefined, undefined, { selfContained: false });
     assert.strictEqual(fs.existsSync(alternatesPath(explicitFalse.path)), true, "selfContained:false keeps alternates");
   });
 
   it("owned tracking leg: recovered commits resolve with the bare gone", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const seed = await git.createOrAttachRunnerClone(bare, 10, "run-A");
+    const seed = await git.createOrAttachRunnerClone(bare, 10, noProofReseed, "run-A");
     const work = commit(seed.path, "WORK.txt");
     await git.fetchAgentBranch(bare, seed.path, "agent/issue-10", "run-A");
-    const rc = await git.createOrAttachRunnerClone(bare, 10, "run-A", true, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 10, noProofReseed, "run-A", true, undefined, undefined, SELF);
     assert.strictEqual(rc.seededFrom, "tracking");
     assert.strictEqual(rc.baseCommit, work);
     hideBare(bare);
@@ -140,14 +141,14 @@ describe("runner clone materialization (issue #1769 m1)", () => {
   it("wip(park) marker leg: reset --soft onto the marker parent, staged WIP survives the bare going away", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const seed = await git.createOrAttachRunnerClone(bare, 11, "run-A");
+    const seed = await git.createOrAttachRunnerClone(bare, 11, noProofReseed, "run-A");
     const forkPoint = gitIn(seed.path, ["rev-parse", "HEAD"]);
     fs.writeFileSync(path.join(seed.path, "WIP.txt"), "in-progress work\n");
     assert.strictEqual(await git.commitWipMarker(seed.path), true);
     const marker = gitIn(seed.path, ["rev-parse", "HEAD"]);
     await git.fetchAgentBranch(bare, seed.path, "agent/issue-11", "run-A");
 
-    const rc = await git.createOrAttachRunnerClone(bare, 11, "run-A", true, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 11, noProofReseed, "run-A", true, undefined, undefined, SELF);
     assert.strictEqual(rc.wipRecovered, true);
     assert.strictEqual(rc.baseCommit, forkPoint);
     hideBare(bare);
@@ -164,7 +165,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const bareA = await gitA.ensureClone(fx.originPath);
     const floor0 = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
     // Worker A: a wip(park) marker over the pre-park floor, published as the checkpoint.
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 12, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 12, noProofReseed, "run-A");
     fs.writeFileSync(path.join(seed.path, "WIP.txt"), "diverged wip\n");
     assert.strictEqual(await gitA.commitWipMarker(seed.path), true);
     const marker = gitIn(seed.path, ["rev-parse", "HEAD"]);
@@ -185,7 +186,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const { logger, lines } = recordingLogger();
     const gitB = worker("workerB", logger);
     const bareB = await gitB.ensureClone(fx.originPath);
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 12, "run-B", true, marker, SELF);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 12, noProofReseed, "run-B", true, marker, undefined, SELF);
     assert.strictEqual(rc.wipRecovered, true, "the diverged WIP was cherry-picked");
     assert.strictEqual(rc.baseCommit, originTip);
     assert.ok(
@@ -202,7 +203,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
   it("origin/<branch> leg: the published branch SHA resolves with the bare gone", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const first = await git.createOrAttachRunnerClone(bare, 13, "run-1");
+    const first = await git.createOrAttachRunnerClone(bare, 13, noProofReseed, "run-1");
     const pushed = commit(first.path, "PUSHED.txt");
     await git.fetchAgentBranch(bare, first.path, "agent/issue-13", "run-1");
     await git.pushBranch(bare, "agent/issue-13", "", fx.originPath);
@@ -210,7 +211,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     await git.ensureClone(fx.originPath);
     assert.strictEqual(await git.originBranchTip(bare, "agent/issue-13"), pushed);
 
-    const rc = await git.createOrAttachRunnerClone(bare, 13, "run-2", true, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 13, noProofReseed, "run-2", true, undefined, undefined, SELF);
     assert.strictEqual(rc.seededFrom, "origin");
     hideBare(bare);
     assert.ok(resolves(rc.path, pushed), "origin/<branch> resolves");
@@ -231,7 +232,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
       return orig(command, args, options, identity);
     });
     await assert.rejects(
-      git.createOrAttachRunnerClone(bare, 20, "run-1", false, undefined, SELF),
+      git.createOrAttachRunnerClone(bare, 20, noProofReseed, "run-1", false, undefined, undefined, SELF),
       (err: unknown) =>
         err instanceof RunnerCloneMaterializationError &&
         err.name === "RunnerCloneMaterializationError" &&
@@ -262,7 +263,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
       return orig(command, args, options, identity);
     });
     await assert.rejects(
-      git.createOrAttachRunnerClone(bare, 21, "run-1", false, undefined, SELF),
+      git.createOrAttachRunnerClone(bare, 21, noProofReseed, "run-1", false, undefined, undefined, SELF),
       (err: unknown) => err instanceof RunnerCloneMaterializationError && /injected fsck failure/.test(err.message),
     );
     assert.strictEqual(parkedDuringFsck, true, "verification ran with the alternates renamed aside");
@@ -316,7 +317,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
       }
       return orig(command, args, options, identity);
     });
-    const rc = await git.createOrAttachRunnerClone(bare, 26, "run-1", false, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 26, noProofReseed, "run-1", false, undefined, undefined, SELF);
     assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), false, "alternates retired");
     assert.strictEqual(fs.existsSync(parkedPath(rc.path)), true, "the parked file is left behind");
     assert.ok(lines.some((l) => /could not remove the parked alternates file/.test(String((l as { msg?: string }).msg))));
@@ -328,7 +329,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
   it("the worker fetch-back works from a materialized clone after the agent commits", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 27, "run-1", false, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 27, noProofReseed, "run-1", false, undefined, undefined, SELF);
     assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), false);
     const work = commit(rc.path, "FETCHBACK.txt");
     const dst = await git.fetchAgentBranch(bare, rc.path, "agent/issue-27", "run-1");
@@ -340,7 +341,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const { logger, lines } = recordingLogger();
     const git = worker("w", logger);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 23, "run-1", false, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 23, noProofReseed, "run-1", false, undefined, undefined, SELF);
     let spawned = 0;
     wrapExec(git, async (orig, ...a) => {
       spawned += 1;
@@ -356,7 +357,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
     const { logger, lines } = recordingLogger();
     const git = worker("w", logger);
     const bare = await git.ensureClone(fx.originPath);
-    const seed = git.createOrAttachRunnerClone(bare, 24, "run-1", false, undefined, SELF);
+    const seed = git.createOrAttachRunnerClone(bare, 24, noProofReseed, "run-1", false, undefined, undefined, SELF);
     let sawMaterialized = false;
     let seedSettled = false;
     void seed.then(() => { seedSettled = true; }, () => { seedSettled = true; });
@@ -374,7 +375,7 @@ describe("runner clone materialization (issue #1769 m1)", () => {
   it("refuses to run inside a permit-held boundary", async () => {
     const git = worker("w");
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 25, "run-1");
+    const rc = await git.createOrAttachRunnerClone(bare, 25, noProofReseed, "run-1");
     const internals = git as unknown as { materializeRunnerClone(p: string, shas: string[]): Promise<void> };
     await assert.rejects(
       git.withBoundaryProcessSpawner(
@@ -385,6 +386,57 @@ describe("runner clone materialization (issue #1769 m1)", () => {
       RunnerCloneMaterializationError,
     );
     assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), true, "alternates untouched");
+  });
+});
+
+// issue #1783 M2 x #1769 — a Docker-wired worker seeds every execution attempt at a FRESH
+// `<key>.attempt-<id>` path (attemptCloneForBranch), not the canonical one. A Codex run there must
+// get a self-contained clone exactly like the canonical seed: the option has to reach the attempt
+// seed too, or the Codex command sandbox is handed a clone whose objects live in the bare.
+
+function attemptOpts(claimGeneration: number): AttemptSeedOptions {
+  return {
+    attemptId: mintAttemptId(claimGeneration),
+    isLive: () => false,
+    beforeSeed: async () => {},
+    quiescent: async () => true,
+  };
+}
+
+describe("attempt-path seed materialization (issue #1783 M2 x #1769)", () => {
+  it("a fresh Docker-wired attempt seed with selfContained has no alternates and works with the bare gone", async () => {
+    const git = worker("w");
+    const bare = await git.ensureClone(fx.originPath);
+    const attempt = attemptOpts(1);
+    const rc = await git.runnerCloneForBranch(bare, "agent/issue-40", "issue-40", noProofReseed, "run-1", false, undefined, attempt, SELF);
+    assert.strictEqual(rc.attemptId, attempt.attemptId);
+    assert.ok(rc.path.endsWith(`issue-40.attempt-${attempt.attemptId}`), `an attempt path: ${rc.path}`);
+    hideBare(bare);
+    assertStandalone(rc.path, rc);
+  });
+
+  it("a Docker-wired RESUME (a second attempt of the same run) seeds a self-contained attempt clone off the tracking ref", async () => {
+    const git = worker("w");
+    const bare = await git.ensureClone(fx.originPath);
+    const first = await git.runnerCloneForBranch(bare, "agent/issue-41", "issue-41", noProofReseed, "run-A", false, undefined, attemptOpts(1), SELF);
+    const work = commit(first.path, "WORK.txt");
+    await git.fetchAgentBranch(bare, first.path, "agent/issue-41", "run-A");
+    const second = attemptOpts(2);
+    const rc = await git.runnerCloneForBranch(bare, "agent/issue-41", "issue-41", noProofReseed, "run-A", true, undefined, second, SELF);
+    assert.notStrictEqual(rc.path, first.path, "the resume seeds a fresh attempt path");
+    assert.strictEqual(rc.attemptId, second.attemptId);
+    assert.strictEqual(rc.seededFrom, "tracking");
+    assert.strictEqual(rc.baseCommit, work);
+    hideBare(bare);
+    assert.ok(resolves(rc.path, work), "the recovered commit resolves without the bare");
+    assertStandalone(rc.path, rc);
+  });
+
+  it("without the option a Docker-wired attempt seed keeps its alternates (Claude path unchanged)", async () => {
+    const git = worker("w");
+    const bare = await git.ensureClone(fx.originPath);
+    const rc = await git.runnerCloneForBranch(bare, "agent/issue-42", "issue-42", noProofReseed, "run-1", false, undefined, attemptOpts(1));
+    assert.strictEqual(fs.existsSync(alternatesPath(rc.path)), true, "alternates present");
   });
 });
 

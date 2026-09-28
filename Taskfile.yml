@@ -297,6 +297,10 @@ tasks:
       # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
       # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
       - task: test:sqlc-drift-gate
+      # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
+      # fake `go install` failing then succeeding, no real gitleaks and no network,
+      # proving a transient proxy failure is retried while a broken scan is not.
+      - task: test:scan-secrets
       # Hermetic extraction and ordered package-rule regression for the three
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
@@ -377,6 +381,9 @@ tasks:
       # WITHOUT editing .github/workflows/** (which this branch must not touch). Ordered
       # before `scan:secrets`, which is deliberately last because it dominates.
       - task: test:migration-renumber
+      # #1851: the weekly role refresh (builtins + dev-team roster) is all-or-nothing
+      # and never widens the roster; temp repos and stubs, a second or two.
+      - task: test:refresh-role-manifest
       # #1720: the agent runtime-base input key must change for every runtime-stage input
       # and refuse any form it cannot account for; a gap there makes a release silently
       # reuse a stale base. Temp git repos, a few seconds.
@@ -627,11 +634,11 @@ tasks:
     #
     # THE REASON IS THE VERDICT, NOT THE NETWORK, and the distinction matters
     # because the network version of this argument is FALSE here. `task gate` is
-    # not offline: `lint:api`, `deadcode:api` and `scan:secrets` are all
-    # `go run pkg@version` and all three need the network on a cold module cache
-    # (measured: `task scan:secrets` under GOPROXY=off returns 201 with "module
-    # lookup disabled"). What separates those from these two is that a pinned
-    # `go run` fetches a checksum-verified artifact ONCE and then answers from the
+    # not offline: `lint:api` (a pinned release archive), `deadcode:api` and
+    # `scan:secrets` (`go run` / `go install pkg@version`) all need the network on
+    # a cold cache (measured: `task scan:secrets` under GOPROXY=off returns 201
+    # with "module lookup disabled"). What separates those from these two is that
+    # a pinned fetch gets a checksum-verified artifact ONCE and then answers from the
     # TREE, whereas govulncheck and npm audit query a REMOTE MUTABLE DATABASE on
     # every run. So `task gate` would answer differently on two runs of one commit
     # with nobody's diff in between, and a contributor's gate must be
@@ -729,9 +736,9 @@ tasks:
   # 🔴 THAT PARAGRAPH IS ABOUT THREE OF THE FOUR. `scan:secrets` HAS NO SKIP BRANCH
   # AND NO `*_REQUIRED` VARIABLE, and the asymmetry is the ruling rather than an
   # oversight. shellcheck, yamllint and ruby are brew/pip/system tools a
-  # contributor may simply not have; gitleaks arrives through `go run pkg@version`,
-  # the Go toolchain is mandatory here, and `gate:api` ALREADY `go run`s two pinned
-  # remote modules. So the population that cannot obtain gitleaks is the population
+  # contributor may simply not have; gitleaks arrives through `go install pkg@version`,
+  # the Go toolchain is mandatory here, and `gate:api` ALREADY fetches two pinned
+  # remote tools. So the population that cannot obtain gitleaks is the population
   # that cannot run `gate:api` either -- a skip would buy nobody anything while
   # putting a fail-open branch in the one check where fail-open is worst. And a
   # `UZI_SCAN_SECRETS_REQUIRED` guarding a branch that does not exist would be the
@@ -893,6 +900,11 @@ tasks:
     cmds:
       - ./scripts/golangci-lint.test.sh
 
+  test:scan-secrets:
+    desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)
+    cmds:
+      - ./scripts/scan-secrets.test.sh
+
   test:sqlc-drift-gate:
     desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)
     cmds:
@@ -1014,6 +1026,15 @@ tasks:
       # refusals, and the happy-path renumber. Prints `N passed, N failed` and exits nonzero
       # on any failure. See the script header.
       - ./scripts/migration-renumber-test.sh
+
+  test:refresh-role-manifest:
+    desc: offline fixture test of scripts/refresh-role-manifest.sh (weekly builtin + roster sync; issue 1851)
+    cmds:
+      # A gate:repo member. Temp repos, a stub sync.py and a stub parity command drive
+      # the real script: forward bump, all-or-nothing warnings, same-version body change,
+      # pin-only change, roster sync with dropped lines, the tester allowlist, BAD-FM,
+      # a failed apply, and stable-tag selection. Needs jq, yq and python3.
+      - ./scripts/refresh-role-manifest-test.sh
 
   check:spec-numbering:
     desc: specs/ai.md is frozen at section 637 (issue 1317), unique numbers, none above the head, count 637, with a canary proving both detectors fired
@@ -1177,13 +1198,13 @@ tasks:
       # SHOWS THEM MOVING, the same reason `lint:shell` carries its severity and
       # its version pin rather than defaulting them inside the script.
       #
-      # THE VERSION IS THE ONLY VERSION RECORD THERE IS. Under `go run`, gitleaks'
+      # THE VERSION IS THE ONLY VERSION RECORD THERE IS. Built from source (`go install`), gitleaks'
       # own `version` subcommand prints the literal string "version is set by build
       # process" -- measured 2026-08-03 -- because the release workflow stamps it
       # with ldflags and a source build does not. So NOTHING CAN ASSERT THE RUNNING
       # BINARY'S VERSION the way `lint:shell` asserts shellcheck's; this line is the
       # pin, and a `gitleaks version` assertion written against it would compare a
-      # sentence to a number. Pinned `go run` for the reason carry-forward item 6
+      # sentence to a number. Pinned `go install` for the reason carry-forward item 6
       # gives for golangci-lint: the official image would be this pipeline's first
       # unpinned effective toolchain.
       #
@@ -1235,7 +1256,7 @@ tasks:
       # what gates it; `task sast:semgrep` is how you run it alone.
       #
       # 🔴 BYO ON PATH, mirroring lint:yaml: semgrep is a Python/OCaml tool with no
-      # static binary, so it is not a pinned `go run`/curl+sha256 like gitleaks or
+      # static binary, so it is not a pinned `go install`/curl+sha256 like gitleaks or
       # golangci. The wrapper fail-open SKIPs when semgrep is absent on a laptop and
       # is forced (UZI_SAST_REQUIRED) in the CI sast job (PRD #862 M5). Acquisition
       # on a uzi worker is the baked toolchain (M0).
@@ -2413,6 +2434,18 @@ tasks:
     cmds:
       - ./e2e/home-uid-split/run.sh
 
+  test:clone-quiescence:
+    desc: Opt-in run the run-quiescence reaper suite as the worker uid under the real uid split (#1783)
+    # Builds the base worker image and runs e2e/clone-quiescence/fixture.test.ts through its
+    # root entrypoint under compose's hardened cap set, so the reaper's scan and kills run in
+    # the runner-uid helper via the real setpriv wrapper, next to real worker, root and
+    # runner-cmd processes. A host or single-uid run cannot manufacture that uid split, which
+    # is why this is not a unit test. Requires a working docker daemon. NOT wired into gate.
+    # Set CQ_SKIP_BUILD=1 CQ_IMAGE=<tag> to reuse an image, CQ_MOUNT_SRC=1 to test this
+    # tree's agent/src against it, and CQ_BUILD_ARGS="--network host" where the build needs it.
+    cmds:
+      - ./e2e/clone-quiescence/run.sh
+
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)
     # Separate build and fixture targets permit reusing an existing image after source edits.
@@ -2793,3 +2826,12 @@ tasks:
     dir: api
     cmds:
       - go run ./cmd/roleparity
+
+  # Same contract as nudge:roles: never in a gate, exits 0 on any drift. It
+  # compares each builtin byte for byte with the upstream product-agents/ file at
+  # the commit library/manifest.json pins (PRD #1849), so it needs network access
+  # to the upstream repo; it exits 2 only when it cannot fetch or read it.
+  nudge:builtins:
+    desc: 'builtin-parity NUDGE - builtins vs upstream product-agents at the pinned sha (PRD #1849; never gates)'
+    cmds:
+      - ./scripts/builtin-parity.sh

@@ -59,10 +59,17 @@
 // The false present is additionally UNREACHABLE in both lanes today, because each lane's
 // cwd is invariant for a session's life, so a HOME only ever holds the ONE project dir
 // of its own session(s):
-//   - Run lane: HOME is per-run (`agent-home/<runId>`) and the cwd is that run's clone,
-//     `runner/<repoDir>/<key>` where `key` is `issue-<iid>` (git.ts, runnerCloneForBranch
-//     / createOrAttachRunnerClone) — no runId, no attempt counter, no nonce, so a re-
-//     claimed run reuses the same clone dir. One session, one project dir.
+//   - Run lane: HOME is per-run (`agent-home/<runId>`) and the cwd is that run's clone.
+//     On an UNWIRED worker that is `runner/<repoDir>/<key>` where `key` is `issue-<iid>`
+//     (git.ts, runnerCloneForBranch / createOrAttachRunnerClone) — no runId, no attempt
+//     counter, no nonce, so a re-claimed run reuses the same clone dir. One session, one
+//     project dir. On a DOCKER-WIRED worker (issue #1783 M2) every execution attempt runs
+//     at a FRESH `runner/<repoDir>/<key>.attempt-<attemptId>`, so a HOME that a re-claim
+//     preserved CAN hold a second project dir (the predecessor attempt's). The runner
+//     therefore never asks this check on a wired worker: it drops the resume session id
+//     BEFORE the check (runner.ts phaseResume, reason `cwd_changed_attempt_path`), so the
+//     false present described below is unreachable there too — a wired attempt never
+//     reports a resumable session and always starts a fresh one.
 //   - Chat lane: the cwd is the baked source snapshot `UZI_SRC_DIR` (`/opt/uzi-src`) —
 //     `main.ts` builds ChatExecutor with no `srcDir` override, so `chat-executor.ts`
 //     defaults it (`srcDir ?? UZI_SRC_DIR`, then `cwd: this.srcDir`), and EVERY chat
@@ -79,7 +86,8 @@
 // that the CLI will not resolve — a false present. Still the survivable direction (a
 // kept dead resume, not a discarded live one), but it would mean the glob is no longer
 // behaviorally identical to a correct scoped check. If you add a second cwd per HOME,
-// revisit this.
+// revisit this — the Docker-wired attempt paths did, and are handled by never consulting
+// this check there (see the run-lane bullet above).
 //
 // FAIL-OPEN on top of all that, cut deliberately: "the directory or file is not there"
 // (ENOENT/ENOTDIR) is a FACT and drops the resume; "I could not look" (EACCES, EIO,

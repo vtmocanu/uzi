@@ -834,7 +834,7 @@ describe("buildImplementPrompt", () => {
     assert.ok(!/<plan>/.test(blank));
   });
 
-  // issue #222: a resume reseeds the working tree (unconditional fs.rm + re-clone),
+  // issue #222: a resume reseeds the working tree (fs.rm + re-clone of the canonical path),
   // destroying local-only prior-attempt work. A follow-up queued against that tree is
   // delivered on a later turn, so the lead must be told the tree changed. The warning
   // rides the FIRST implement turn (queued follow-ups drain at iteration end, so turn 1

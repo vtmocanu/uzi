@@ -19,6 +19,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { ClaimResponse, Milestone, StateRequest } from "../src/protocol.js";
 import type { Executor } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
+import type { QuiesceRunOutcome } from "../src/run-quiescence.js";
 import { api, assistant, fakeGitlab, homeDir, installHarness, resultOk, runner, runnerWith } from "./runner-harness.js";
 import {
   GateExecutor,
@@ -96,6 +97,29 @@ function sdkRunner(approvalMs = 4_000): ReturnType<typeof runnerWith> {
   );
 }
 
+/** issue #1783 M2: the SDK runner on a DOCKER-WIRED worker (every claim seeds a fresh attempt
+ *  path and a resume starts a fresh model session). The quiescence proof is scripted quiescent:
+ *  what is under test is the gate binding, not the process scan. */
+function dockerWiredSdkRunner(approvalMs = 4_000): ReturnType<typeof runnerWith> {
+  const { gitlab } = fakeGitlab();
+  const quiescent = async (): Promise<QuiesceRunOutcome> => ({
+    process: { state: "quiescent", processes: [], killed: [], detail: "" },
+    docker: { state: "docker_unconfirmed", removed: [], detail: "" },
+  });
+  return runnerWith(
+    () => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn: sdkQuery() }), homeDir }),
+    gitlab,
+    undefined,
+    nullLogger(),
+    {
+      planApprovalTimeoutMs: approvalMs,
+      recoveryRetryMs: 1,
+      dockerHost: "unix:///nonexistent/uzi-test-docker.sock",
+      quiesceRun: quiescent,
+    },
+  );
+}
+
 function execute(exec: Executor, claim: ClaimResponse): Promise<void> {
   const { gitlab } = fakeGitlab();
   return runner(exec, gitlab, undefined, { planApprovalTimeoutMs: 4_000, recoveryRetryMs: 1 }).execute(claim);
@@ -126,6 +150,29 @@ describe("gate presentation id choice on a reclaim (PRD #1795 decision 7)", () =
       PRESENTED,
       "the presented requirements, not a fresh detection",
     );
+    assert.deepStrictEqual(api.gateOf(runId), { revision: 3, presentationId: ID_X }, "no new revision");
+    assert.deepStrictEqual(api.gateRefusals, []);
+    assert.ok(statuses(runId).includes("completed"), "the approve bound to revision 3 was taken");
+  });
+
+  // issue #1783 M2 x PRD #1795: on a Docker-wired worker a resume runs at a fresh attempt path and
+  // drops the earlier model session (a fresh Claude session). The gate identity lives on the claim,
+  // not in the session, so the re-presented gate must still keep the persisted id and revision N,
+  // and an approve bound to N must still be the one that is taken.
+  it("a Docker-wired SDK resume (fresh attempt path, dropped session) still keeps revision N and takes the approve bound to it", async () => {
+    newApi();
+    const runId = freshClaim().run_id;
+    seed(runId, 3, ID_X);
+    approveWhenShown(runId);
+    const claim = { ...resumeClaim(runId, 2), session_id: "0f5c2d4e-3333-4a2b-8c3d-000000000003" };
+    await dockerWiredSdkRunner().execute(claim);
+    assert.ok(
+      feed(runId).some((t) => t.includes("earlier session is not resumed")),
+      "the Docker-wired resume dropped the earlier session (fresh attempt path)",
+    );
+    const [g] = gates(runId);
+    assert.equal(g!.plan_md, PLAN, "the persisted plan was re-presented");
+    assert.equal(g!.presentation_id, ID_X, "under the persisted presentation id");
     assert.deepStrictEqual(api.gateOf(runId), { revision: 3, presentationId: ID_X }, "no new revision");
     assert.deepStrictEqual(api.gateRefusals, []);
     assert.ok(statuses(runId).includes("completed"), "the approve bound to revision 3 was taken");

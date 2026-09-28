@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { GitCache, ScratchPublicationError } from "../src/git.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, noProofReseed } from "./helpers.js";
 
 // Every case creates a runner clone, whose scratch provisioning needs Linux procfs;
 // the unsupported-platform refusal itself is covered in git.test.ts.
@@ -27,7 +27,7 @@ function commit(dir: string, name: string): string {
 }
 async function setup(): Promise<{ bare: string; clone: string }> {
   const bare = await cache.ensureClone(fx.originPath);
-  const rc = await cache.createOrAttachRunnerClone(bare, 1719);
+  const rc = await cache.createOrAttachRunnerClone(bare, 1719, noProofReseed);
   return { bare, clone: rc.path };
 }
 async function track(bare: string, clone: string): Promise<void> {

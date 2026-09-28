@@ -7,7 +7,7 @@ audience: user
 # Admin settings
 
 uzi keeps a small set of instance-wide settings in the database, editable by
-an admin from **Admin → Instance settings**. Today: two forge labels, a
+an admin from **Admin → Instance**. Today: two forge labels, a
 default theme, and the run judge.
 
 ## The two labels
@@ -205,7 +205,7 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
 uzi can flag a run that looks stuck, looping, or close to its timeout — see
 [Run health](./run-health.md) for what each flag means. Tune it, or turn a
-signal off, from **Admin → Instance settings → Run health**:
+signal off, from **Admin → Instance → Run health**:
 
 | Setting | Default | Controls |
 |---|---|---|

@@ -22,7 +22,7 @@ that run, with no fallback to another harness.
 
 ## 1. Enable it
 
-Your admin enables the feature globally under **Admin → Instance settings →
+Your admin enables the feature globally under **Admin → Instance →
 Run judge**. Once that's on, open **Settings → Run judge** and check
 **Judge my finished runs**. Admins can also force-enable or force-disable the
 judge for any individual user from **Admin → Users**. See
@@ -113,7 +113,7 @@ and a shallow retrospective produces shallow self-improvement work. From
 **Settings → Run judge**, the **Judge model** picker lets you override that
 default for your own judge runs; leave it on **Inherit** to use whatever the
 instance is set to. Your admin can also pin a cheaper instance-wide default (`haiku` or
-`sonnet`) from **Admin → Instance settings → Run judge** — either lever
+`sonnet`) from **Admin → Instance → Run judge** — either lever
 works, but your own override only changes your runs, while the admin's is
 the fallback for everyone who hasn't set one.
 

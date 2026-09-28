@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream } from "node:fs";
+import { constants as fsConstants, createReadStream, type Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
@@ -11,8 +11,20 @@ import { PassThrough, type Readable, type Writable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
-import { RUNNER_UID, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
+import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withForgeRetry } from "./forge-retry.js";
+import {
+  ATTEMPT_ID_RE,
+  attemptClonePath,
+  compareAttemptIds,
+  formatResidueName,
+  isRetainedArtifactName,
+  isWithinPath,
+  parseAttemptPath,
+  parseRetainedArtifactName,
+} from "./attempt-path.js";
+import { sanitizeForLog } from "./run-quiescence.js";
 
 import {
   commitsScannedFromStderr,
@@ -110,6 +122,19 @@ class RemoteBranchAdvancedError extends Error {
   constructor() {
     super("non-fast-forward: remote branch advanced");
     this.name = "RemoteBranchAdvancedError";
+  }
+}
+
+/** issue #1783 M2 — {@link GitCache.releaseAttemptInPlace} failed at `stage` (the ledger append,
+ *  or the journal clear that follows it). The journal is KEPT in both cases (the clear is the last
+ *  step), so the path stays protected. */
+export class AttemptReleaseError extends Error {
+  constructor(
+    readonly stage: "ledger" | "journal",
+    cause: unknown,
+  ) {
+    super(`attempt release failed at the ${stage === "ledger" ? "ledger append" : "journal clear"}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+    this.name = "AttemptReleaseError";
   }
 }
 
@@ -218,6 +243,15 @@ const GITLEAKS_BIN = "/usr/local/bin/gitleaks";
 //     `config.worktree` to reach). Where the runner checks out its own clone, such a key is
 //     the untrusted uid exec'ing in its OWN tree — not a boundary crossing. In M0 (no split,
 //     the worker did the checkout) they WERE reachable worker-side; (b) removed that path.
+//     issue #1783: such a runner git is still a WORKER-started process, so it must never carry
+//     the worker spawn mark (a plant it starts would inherit the nonce and be exempt from the
+//     run-quiescence reaper forever): runGitAsRunner marks only runnerGitCarriesWorkerMark's
+//     driver-free subcommands.
+//   - `remote.<name>.uploadpack` / `.promisor` with `extensions.partialClone` — also
+//     arbitrary-name, so not pinnable here; reached by LAZY FETCH of a missing object from any
+//     git, even a pure ref read. Closed by GIT_NO_LAZY_FETCH=1 below (and, for the worker-marked
+//     runner git, GIT_ALLOW_PROTOCOL naming no protocol, which overrides every `protocol.*` key a
+//     planted config sets): issue #1783, round 3.
 const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string]> = [
   ["core.fsmonitor", "false"],
   ["diff.external", "true"],
@@ -229,6 +263,9 @@ const GIT_CODE_EXEC_KEY_PINS: ReadonlyArray<readonly [key: string, value: string
 ];
 
 const GIT_TIMEOUT_MS = 10 * 60_000; // 10m — clones can be large on cold caches.
+/** issue #1783: provisioning's `check-ignore` of the scratch dir reads only the local ignore
+ *  files, so it is bounded far below GIT_TIMEOUT_MS (a planted FIFO would otherwise stall it). */
+const SCRATCH_IGNORE_CHECK_TIMEOUT_MS = 15_000;
 const GIT_MAX_BUFFER = 64 * 1024 * 1024;
 /** Wall-clock ceiling on the preserved_patch scan (the patch is already byte-capped by
  *  REVIEW_DIFF_MAX_BYTES, so gitleaks stdin finishes in well under a second in practice). */
@@ -276,6 +313,31 @@ export interface GitCacheOptions {
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
+  /** issue #1783 M2 — test-only seam for the runner-uid deletions (the retention sweep's, and M3's
+   *  canonical-path free). `split` overrides {@link uidSplitActive} for these deletions alone; `run`
+   *  executes the ALREADY runner-wrapped delete argv in place of the real spawn. Production never
+   *  passes it. The rest drive the REAL spawn/timeout/close-wait path of runRunnerUidDelete
+   *  (and so must not be combined with `run`): `spawn` stands in for the detached spawn of the
+   *  wrapped argv, `kill` for killRunnerGroup, `timeoutMs` / `closeWaitMs` for
+   *  {@link RETENTION_RM_TIMEOUT_MS} / {@link RETENTION_RM_CLOSE_WAIT_MS}. `lstat` replaces the
+   *  retention sweep's re-validation lstat in deleteRetainedArtifact (issue #1783 final). */
+  retentionDelete?: {
+    split?: boolean;
+    run?: (command: string, args: string[]) => Promise<void>;
+    spawn?: (command: string, args: string[]) => ChildProcess;
+    kill?: (pid: number | undefined) => boolean;
+    timeoutMs?: number;
+    closeWaitMs?: number;
+    lstat?: (p: string) => Promise<Stats>;
+  };
+  /** issue #1783 M3 — test-only fs seam for the canonical-path free (freeCanonicalClonePath):
+   *  `lstat` replaces the validation lstat of the repo dir and the canonical path, `rename` the
+   *  quarantine rename, `residueUuid` the residue name's uuid. Production never passes it. */
+  canonicalFree?: {
+    lstat?: (p: string) => Promise<Stats>;
+    rename?: (from: string, to: string) => Promise<void>;
+    residueUuid?: () => string;
+  };
 }
 
 /** issue #1597 M2: the mid-turn checkpoint secret scan's hard deadline (all of its git + gitleaks
@@ -586,6 +648,30 @@ export class CapturePathMismatchError extends Error {
   }
 }
 
+/** issue #1783: the failure-reason prefix of a run whose clone (or the canonical clone path it
+ *  must free) could not be proven quiescent or freed. The runner's failOriginForReason maps it to
+ *  the fail_origin `worker_residue_blocked`; the runner re-exports it. */
+export const REASON_WORKER_RESIDUE_BLOCKED = "worker_residue_blocked";
+
+/**
+ * issue #1783 M3 — the canonical runner clone path could not be freed for a reseed: the scoped
+ * process scan found survivors, an unverified process or a live same-key owner, the path or its
+ * repo dir failed validation (not `<runnerRoot>/<repoDir>/<key>`, or the repo dir not a real
+ * directory), the delete failed with nothing left to quarantine, or the same-parent quarantine
+ * rename (or its confirm) failed. Nothing further is moved or deleted. The run fails typed
+ * `worker_residue_blocked`, never the generic agent_failure.
+ */
+export class CloneResidueBlockedError extends Error {
+  readonly detail: string;
+  constructor(detail: string) {
+    // The detail reaches the run's failure_reason: short, and stripped of control/bidi characters.
+    const clean = sanitizeForLog(detail, 160);
+    super(`${REASON_WORKER_RESIDUE_BLOCKED}: the canonical runner clone path could not be freed for the reseed (${clean}); what remains there is kept`);
+    this.detail = clean;
+    this.name = "CloneResidueBlockedError";
+  }
+}
+
 /**
  * issue #1769 — a sandboxed (Codex) runner clone could not be made self-contained. The
  * Codex command sandbox does not grant the worker bare, so a clone still borrowing objects
@@ -625,6 +711,155 @@ export class RunnerCloneImportError extends Error {
 
 function recoveryCaptureKey(branch: string): string {
   return `uzi-recovery.${branch}.clone`;
+}
+
+/** The recovery-capture journal value (one per branch, in the bare's `config --local`). A
+ *  Docker-wired worker (issue #1783 M2) adds the attempt id; an entry an older worker wrote has
+ *  none, and is still read. */
+export interface RecoveryJournalEntry {
+  runId: string;
+  clonePath: string;
+  attemptId?: string;
+}
+
+// issue #1783 M2 — the per-branch ATTEMPT LEDGER, a MULTI-VALUED `config --local` key in the
+// worker bare (on the /data PVC, so it survives a container and a pod restart). Every value is the
+// JSON `{"attemptId","runId","clonePath","state"}`, appended with `git config --add`; for one
+// attemptId the LAST value wins. `live` is written when an attempt is seeded, `retired` when the
+// owner's terminal retire disposed of its clone (or the retention sweep deleted it), `abandoned`
+// when a VERIFIED capture released it IN PLACE (the clone stays on disk, unreachable by any
+// successor; its work is in the tracking ref, so the retention sweep may dispose of it), and
+// `reclaimed` when the terminal-orphan reclaim released a FOREIGN owner's attempt in place WITHOUT
+// capturing it: the clone may be the only copy of that run's work, so it is retained FOREVER (the
+// attempt-path twin of the unwired worker's foreign quarantine, `discard:false`) — never counted
+// toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
+// attemptId (see compactAttemptLedger).
+// The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
+// this key and these field names: keep them byte-for-byte. (It never reads `state`, so a new state
+// value is invisible to it.)
+function attemptLedgerKey(branch: string): string {
+  return `uzi-attempts.${branch}.entry`;
+}
+
+/** One attempt ledger state (see {@link attemptLedgerKey}). */
+export type AttemptLedgerState = "live" | "abandoned" | "retired" | "reclaimed";
+
+/** One attempt ledger value. */
+export interface AttemptLedgerEntry {
+  attemptId: string;
+  runId: string;
+  clonePath: string;
+  state: AttemptLedgerState;
+}
+
+function parseRecoveryJournal(value: string): RecoveryJournalEntry {
+  const parsed: unknown = JSON.parse(value);
+  if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
+      || typeof parsed.runId !== "string" || typeof parsed.clonePath !== "string") {
+    throw new Error("invalid retained recovery clone journal");
+  }
+  const attemptId = "attemptId" in parsed ? parsed.attemptId : undefined;
+  if (attemptId !== undefined && (typeof attemptId !== "string" || !ATTEMPT_ID_RE.test(attemptId))) {
+    throw new Error("invalid retained recovery clone journal");
+  }
+  return attemptId === undefined
+    ? { runId: parsed.runId, clonePath: parsed.clonePath }
+    : { runId: parsed.runId, clonePath: parsed.clonePath, attemptId };
+}
+
+function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(value);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null) return undefined;
+  const o = parsed as Record<string, unknown>;
+  if (typeof o.attemptId !== "string" || !ATTEMPT_ID_RE.test(o.attemptId)) return undefined;
+  if (typeof o.runId !== "string" || typeof o.clonePath !== "string") return undefined;
+  if (o.state !== "live" && o.state !== "abandoned" && o.state !== "retired" && o.state !== "reclaimed") return undefined;
+  return { attemptId: o.attemptId, runId: o.runId, clonePath: o.clonePath, state: o.state };
+}
+
+/** One ledger value, in the documented field order (the backup script's contract). */
+function attemptLedgerValue(entry: AttemptLedgerEntry): string {
+  return JSON.stringify({
+    attemptId: entry.attemptId,
+    runId: entry.runId,
+    clonePath: entry.clonePath,
+    state: entry.state,
+  });
+}
+
+/** How many abandoned attempts (each with its skills sibling) the retention sweep keeps per key. */
+const RETAINED_ABANDONED_PER_KEY = 3;
+/** The private temp-file prefix of the atomic ledger compaction (inside the bare, beside `config`). */
+const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
+/** How many `.uzi-residue-*` entries the retention sweep keeps per clone key. */
+const RETAINED_RESIDUE_PER_KEY = 5;
+/** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
+ *  never resolves from a runner-writable PATH), and its deadline. */
+const RETENTION_RM_BIN = "/bin/rm";
+const RETENTION_RM_TIMEOUT_MS = 120_000;
+/** After the timeout's group kill, how long the delete waits for the rm's 'close' (its stderr
+ *  pipe shut: every holder of it gone) before declaring the rm possibly still alive. */
+const RETENTION_RM_CLOSE_WAIT_MS = 10_000;
+
+/**
+ * issue #1783 — the runner-uid delete timed out and its rm could NOT be shown gone: the child's
+ * 'close' did not arrive within {@link RETENTION_RM_CLOSE_WAIT_MS} after the group kill, whether
+ * the kill reported success or failure (a failed kill may be ESRCH from a group already gone, so
+ * it waits for 'close' too). The GitCache remembers the path until that 'close' arrives. busybox
+ * rm walks by PATH, so a surviving rm deletes whatever is later created at that path (a fresh
+ * clone reseeded there). A caller must neither quarantine nor reseed at, nor keep deleting beside,
+ * a path such an rm may still be walking.
+ */
+class RunnerDeleteUnsettledError extends Error {
+  constructor(detail: string) {
+    super(`runner-uid delete timed out and may still be running: ${detail}`);
+    this.name = "RunnerDeleteUnsettledError";
+  }
+}
+
+/**
+ * issue #1783 M3 — what the runner hands {@link GitCache.runnerCloneForBranch} so a CANONICAL
+ * reseed (an unwired worker, or any canonical-path seed) frees `<runnerRoot>/<repoDir>/<key>`
+ * only after a scoped process proof, and quarantines what it cannot delete instead of failing on
+ * it. REQUIRED on every entry point (N5): there is no unproven plain-`fs.rm` fallback. A
+ * Docker-wired attempt seed never frees the canonical path, so it never calls this.
+ */
+export interface CanonicalReseedOptions {
+  /** The process proof over the canonical path, called under the bare lock AFTER the journal
+   *  classification and only when the canonical path exists and is a real directory under
+   *  runnerRoot (a symlink or other non-directory there is quarantined without it: renaming the
+   *  entry moves nothing a process can be inside). Throws (a {@link CloneResidueBlockedError}) to
+   *  block: nothing is removed or moved. */
+  beforeFree: (canonicalPath: string) => Promise<void>;
+}
+
+/**
+ * issue #1783 M2 — what a Docker-wired worker hands {@link GitCache.runnerCloneForBranch} to seed
+ * a fresh ATTEMPT path `<runnerRoot>/<repoDir>/<key>.attempt-<attemptId>` instead of the fixed
+ * canonical `<key>` path. Absent ⇒ today's canonical seed, byte-for-byte.
+ */
+export interface AttemptSeedOptions {
+  /** The attempt id minted for this execution attempt (the marker carries the same id). */
+  attemptId: string;
+  /** True when `clonePath` belongs to an attempt live on this worker right now. */
+  isLive: (clonePath: string) => boolean;
+  /** The seed-time recovery sweep, called under the bare lock AFTER the journal classification
+   *  and BEFORE anything is seeded, with every NON-LIVE path of this key (the canonical path,
+   *  every `<key>.attempt-*` sibling on disk and every path the ledger records for the key).
+   *  Throws to block the seed (nothing is moved or seeded). */
+  beforeSeed: (nonLivePaths: string[], canonicalPath: string) => Promise<void>;
+  /** Called under the bare lock once the attempt path is seeded and its ledger `live` entry is
+   *  written, so the caller can register the attempt live before any other seed of the key can
+   *  run its sweep. */
+  onSeeded?: (clonePath: string) => void;
+  /** The retention sweep's quiescence predicate: true when the scoped process scan over `paths`
+   *  finds nothing in scope. A false (or a throw) keeps the entry. */
+  quiescent: (paths: string[], canonicalPath: string) => Promise<boolean>;
 }
 
 // issue #909 — the PRE-#887 flattened owner-key form. Kept ONLY so a resume can still READ a
@@ -762,6 +997,9 @@ export interface RunnerClone {
    *  WIP-snapshot recovery from committed-milestone recovery) and M4 (recovery-success signal
    *  for the re-gate decision). Absent/false on every other leg. */
   wipRecovered?: boolean;
+  /** issue #1783 M2: the attempt id when the clone was seeded at an ATTEMPT path (a
+   *  Docker-wired worker); absent for a canonical-path seed. */
+  attemptId?: string;
 }
 
 /**
@@ -830,6 +1068,17 @@ export class GitCache {
   private readonly gitleaksBin: string;
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
+  /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
+  private readonly retentionDeleteSeam: GitCacheOptions["retentionDelete"];
+  /** See {@link GitCacheOptions.canonicalFree}; undefined in production. */
+  private readonly canonicalFreeSeam: GitCacheOptions["canonicalFree"];
+  /** issue #1783 (N1): the targets (resolved) of every runner-uid delete that settled as a
+   *  {@link RunnerDeleteUnsettledError}, each counted until its child's 'close' arrives. In-process
+   *  only: the rm walks by path, so a canonical free or reseed at such a path is refused
+   *  ({@link assertNoUnsettledDelete}), and the retention sweep keeps such a path or anything
+   *  under it ({@link deleteRetainedArtifact}), for as long as that rm may still be running. An
+   *  entry is logged (warn) when it is recorded and (info) when its 'close' removes it. */
+  private readonly unsettledDeletes = new Map<string, number>();
   /** issue #1597 M2: memoised `--remerge-diff` support probe. */
   private remergeProbe: Promise<boolean> | undefined;
 
@@ -843,6 +1092,8 @@ export class GitCache {
   ) {
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.scratchProvisioner = opts.scratchProvisioner;
+    this.retentionDeleteSeam = opts.retentionDelete;
+    this.canonicalFreeSeam = opts.canonicalFree;
     this.reposRoot = path.join(dataDir, "repos");
     this.runnerRoot = path.join(dataDir, "runner");
     this.runnerHoldingRoot = path.join(dataDir, "runner-quarantine");
@@ -1086,12 +1337,14 @@ export class GitCache {
   async createOrAttachRunnerClone(
     barePath: string,
     issueIid: number,
+    reseed: CanonicalReseedOptions,
     runId?: string,
     resume = false,
     expectedCheckpointTip?: string,
+    attempt?: AttemptSeedOptions,
     opts?: { selfContained?: boolean },
   ): Promise<RunnerClone> {
-    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, runId, resume, expectedCheckpointTip, opts);
+    return this.runnerCloneForBranch(barePath, `agent/issue-${issueIid}`, `issue-${issueIid}`, reseed, runId, resume, expectedCheckpointTip, attempt, opts);
   }
 
   /** The canonical runner-clone path for a clone key under a bare's repo dir: the single
@@ -1182,32 +1435,42 @@ export class GitCache {
    * the untrusted direction (worker fetching BACK from the runner clone) is the one
    * forced onto the pack transport in fetchAgentBranch (B2 invariant 3).
    *
+   * issue #1783 M2 — `attempt` (a Docker-wired worker only) seeds a FRESH per-attempt path
+   * instead of this canonical one and classifies the journal by identity; see
+   * {@link attemptCloneForBranch}. Absent ⇒ everything above, byte-for-byte.
+   *
+   * issue #1783 M3 — `reseed` (REQUIRED: the runner passes it on every claim, and there is no
+   * unproven plain-`fs.rm` fallback) makes the canonical reseed free the canonical path through
+   * {@link freeCanonicalClonePath}: a scoped process proof first, then the runner-uid delete, and a
+   * same-parent quarantine of whatever the delete could not remove. An attempt seed never uses it.
+   *
    * issue #1769 — `opts.selfContained` (the runner passes `executor.sandboxesCommands === true`,
    * i.e. Codex, whose command sandbox is fixed at executor construction):
    * after every ref/checkpoint step, still under this bare's lock, the clone is dissociated
    * from the bare (materializeRunnerClone), because the Codex command sandbox does not grant
    * the bare and git there cannot follow the alternate. Default false: the Claude path keeps
-   * the shared clone unchanged.
+   * the shared clone unchanged. It applies to BOTH seeds: the canonical one and
+   * (issue #1783) the per-attempt one on a Docker-wired worker.
    */
   async runnerCloneForBranch(
     barePath: string,
     branch: string,
     key: string,
+    reseed: CanonicalReseedOptions,
     runId?: string,
     resume = false,
     expectedCheckpointTip?: string,
+    attempt?: AttemptSeedOptions,
     opts?: { selfContained?: boolean },
   ): Promise<RunnerClone> {
+    if (attempt) return this.attemptCloneForBranch(barePath, branch, key, runId, resume, expectedCheckpointTip, attempt, opts);
     return this.withLock(barePath, async () => {
       const clonePath = this.runnerClonePath(barePath, key);
       // #1197, verified 2026-09-08: the clone is the only remaining copy when a
       // recovery capture failed. The journal is in WORKER-owned bare config, never
       // in the runner-owned clone. An unreadable journal fails closed before rm.
       const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending && await fs.lstat(pending.clonePath).then(() => true, (err: NodeJS.ErrnoException) => {
-        if (err.code === "ENOENT") return false;
-        throw err;
-      })) {
+      if (pending && await this.pathPresent(pending.clonePath)) {
         // issue #1315 — three fail-closed cases. The git layer NEVER probes owner
         // status and NEVER disposes; it only classifies. Only Case B is reclaimable,
         // and only the runner reclaims, after an authoritative owner probe.
@@ -1227,7 +1490,619 @@ export class GitCache {
         // Case C: this run's own retained work — capture before reseeding.
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
-      await fs.rm(clonePath, { recursive: true, force: true });
+      // issue #1783 M3: the journal cases above ran first and threw with the path untouched.
+      await this.freeCanonicalClonePath(clonePath, key, reseed);
+      return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
+    });
+  }
+
+  /**
+   * issue #1783 M3 — free the canonical clone path `<runnerRoot>/<repoDir>/<key>` for a reseed,
+   * under the caller's bare lock, after the journal classification:
+   *
+   *   1. Inspect ({@link inspectCanonical}): the path lies under runnerRoot, its parent IS
+   *      `<runnerRoot>/<repoDir>` and lstat's as a real directory. Nothing there (ENOENT) ⇒ nothing
+   *      to free, no proof needed.
+   *   2. A symlink, plain file or any other non-directory AT the canonical path (a runner-uid agent
+   *      of another run can plant one: the repo dir is 2775 and not sticky) is never followed and
+   *      never deleted through: the entry itself is quarantined by the same-parent rename (step 5;
+   *      rename(2) never follows its final component), logged, and the reseed continues.
+   *   3. A real directory: the scoped process proof (`reseed.beforeFree`); it throws to block with
+   *      nothing moved.
+   *   4. The delete, AS THE RUNNER UID under the uid split ({@link runRunnerUidDelete}: the
+   *      setpriv-wrapped `/bin/rm -rf -- <canonical>`, bounded by its timeout). The tree is
+   *      runner-writable, so its interior is agent-controlled: a path-based recursive delete run as
+   *      the WORKER follows a directory swapped for a symlink mid-walk into worker-owned data, while
+   *      the runner uid can reach only what it could already delete. Single-uid (#58) has no second
+   *      uid and so no boundary: the delete stays the in-process `fs.rm` there. Done when the path
+   *      is then gone. A timeout settles only once the killed rm's 'close' arrives; when 'close'
+   *      stays absent past a bounded wait after the group kill (whether the kill succeeded or
+   *      failed), the rm may still be walking the path, so this BLOCKS right here, before any
+   *      rename or reseed, and every later free or reseed of the same path on this GitCache
+   *      blocks too until that rm's 'close' arrives.
+   *   5. Otherwise (the delete failed, timed out, or left the path present: a root-owned or read-only
+   *      directory in the tree, e.g. left by a Docker bind) re-inspect (step 1's checks again), then
+   *      rename what is left to `<runnerRoot>/<repoDir>/<formatResidueName(key, uuid)>` in the SAME
+   *      parent, as the worker: a rename is non-recursive and never follows. Same parent is
+   *      load-bearing: `<repoDir>` is worker-owned 2775 and not sticky (see seedRunnerClone), so the
+   *      worker may rename any entry within it, while a cross-parent move (like
+   *      createRetireScratchParent's `.retire-*`) must also rewrite the moved directory's `..`,
+   *      which needs write on the moved directory itself: EACCES on a root-owned one. A delete that
+   *      FAILED yet left nothing to rename has an unknown outcome and blocks.
+   *   6. Confirm the canonical path is free (lstat ENOENT).
+   *
+   * The residue is KEPT: nothing here deletes it. Only the retention sweep may, later, as the runner
+   * uid and under the per-key cap (a root-owned residue then fails that delete and stays). Any
+   * failure of steps 1, 3, 5 or 6 is a {@link CloneResidueBlockedError}.
+   */
+  private async freeCanonicalClonePath(canonical: string, key: string, reseed: CanonicalReseedOptions): Promise<void> {
+    // An earlier claim's rm on this path may still be walking it: touch nothing (N1).
+    this.assertNoUnsettledDelete(canonical);
+    const found = await this.inspectCanonical(canonical);
+    if (found === "absent") return;
+    if (found === "other") {
+      const residue = await this.quarantineCanonical(canonical, key);
+      this.log.warn("runner clone: the canonical path was not a real directory (a symlink or a file); quarantined the entry itself as residue in the same parent, never followed (kept)", {
+        canonical,
+        residue,
+      });
+      return;
+    }
+    await reseed.beforeFree(canonical);
+    let deleteErr: unknown;
+    try {
+      await this.runRunnerUidDelete(canonical);
+    } catch (err) {
+      deleteErr = err;
+    }
+    // An rm that may still be alive walks the canonical path by name: a quarantine rename would
+    // hand it nothing new, but the reseed right after would hand it the fresh clone. Block first.
+    if (deleteErr instanceof RunnerDeleteUnsettledError) {
+      throw new CloneResidueBlockedError(`${deleteErr.message}; nothing quarantined or reseeded`);
+    }
+    // Re-validate: whatever the delete did, what is at the canonical path is inspected afresh.
+    const after = await this.inspectCanonical(canonical);
+    if (after === "absent") {
+      if (deleteErr === undefined) return;
+      throw new CloneResidueBlockedError(`the delete failed and left nothing to quarantine: ${gitErrorMessage(deleteErr)}`);
+    }
+    const residue = await this.quarantineCanonical(canonical, key);
+    this.log.warn("runner clone: the canonical path could not be deleted; quarantined it as residue in the same parent (kept)", {
+      canonical,
+      residue,
+      rm_error: (deleteErr as NodeJS.ErrnoException | undefined)?.code,
+      detail: deleteErr === undefined ? "the delete left the path present" : sanitizeForLog(gitErrorMessage(deleteErr)),
+    });
+  }
+
+  /** issue #1783 (N1) — refuse a path an earlier runner-uid delete may still be walking: its
+   *  child settled as a {@link RunnerDeleteUnsettledError} and has not closed since. Throws
+   *  {@link CloneResidueBlockedError}. */
+  private assertNoUnsettledDelete(target: string): void {
+    if (this.unsettledDeletes.has(path.resolve(target))) {
+      throw new CloneResidueBlockedError("an earlier runner-uid delete of this path may still be running; nothing freed or reseeded until it exits");
+    }
+  }
+
+  /** issue #1783 M3 — the same-parent quarantine rename of whatever is at `canonical` (any type:
+   *  rename(2) moves the entry itself, never what a symlink points at) to
+   *  `formatResidueName(key, uuid)`, then the confirm that the canonical path is free. Returns the
+   *  residue path. Throws {@link CloneResidueBlockedError}. */
+  private async quarantineCanonical(canonical: string, key: string): Promise<string> {
+    let residue: string;
+    try {
+      residue = path.join(path.dirname(canonical), formatResidueName(key, this.canonicalFreeSeam?.residueUuid?.() ?? randomUUID()));
+    } catch (err) {
+      throw new CloneResidueBlockedError(`no residue name for the key: ${gitErrorMessage(err)}`);
+    }
+    if (path.dirname(residue) !== path.dirname(canonical)) throw new CloneResidueBlockedError("the residue name leaves the canonical parent");
+    // rename(2) silently replaces an EMPTY directory at the destination: never let it.
+    if (await this.pathPresent(residue)) throw new CloneResidueBlockedError(`the residue path already exists: ${path.basename(residue)}`);
+    try {
+      await (this.canonicalFreeSeam?.rename ?? fs.rename)(canonical, residue);
+    } catch (err) {
+      throw new CloneResidueBlockedError(`quarantine rename failed: ${gitErrorMessage(err)}`);
+    }
+    if (await this.pathPresent(canonical)) {
+      throw new CloneResidueBlockedError(`the canonical path is still present after the quarantine moved it to ${path.basename(residue)}`);
+    }
+    return residue;
+  }
+
+  /** issue #1783 M3 — what is at the canonical path, validated: it must be
+   *  `<runnerRoot>/<repoDir>/<key>`, and `<repoDir>` must lstat as a REAL directory (a symlink is
+   *  never followed). `"absent"` when the repo dir or the canonical path does not exist,
+   *  `"directory"` for a real directory, `"other"` for a symlink, file or anything else (lstat,
+   *  never followed). Throws {@link CloneResidueBlockedError}. */
+  private async inspectCanonical(canonical: string): Promise<"absent" | "directory" | "other"> {
+    const root = path.resolve(this.runnerRoot);
+    const resolved = path.resolve(canonical);
+    if (!isWithinPath(resolved, root) || path.dirname(path.dirname(resolved)) !== root) {
+      throw new CloneResidueBlockedError("the canonical path is not <runnerRoot>/<repoDir>/<key>");
+    }
+    const lstat = this.canonicalFreeSeam?.lstat ?? ((p: string) => fs.lstat(p));
+    let pst: Stats;
+    try {
+      pst = await lstat(path.dirname(resolved));
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw new CloneResidueBlockedError(`the runner repo dir cannot be inspected: ${gitErrorMessage(err)}`);
+    }
+    if (pst.isSymbolicLink() || !pst.isDirectory()) throw new CloneResidueBlockedError("the runner repo dir is not a real directory");
+    let st: Stats;
+    try {
+      st = await lstat(resolved);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return "absent";
+      throw new CloneResidueBlockedError(`the canonical path cannot be inspected: ${gitErrorMessage(err)}`);
+    }
+    return st.isDirectory() && !st.isSymbolicLink() ? "directory" : "other";
+  }
+
+  /** issue #1783 M2 — lstat reconciliation: true when `p` exists (any type), false on ENOENT;
+   *  any other error propagates (fail closed). A pod restart makes the paths vanish while the
+   *  journal and ledger (on the PVC) survive, so every path they name is re-checked here. */
+  private async pathPresent(p: string): Promise<boolean> {
+    return fs.lstat(p).then(
+      () => true,
+      (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      },
+    );
+  }
+
+  /**
+   * issue #1783 M2 — the Docker-wired seed: EVERY execution attempt gets a fresh clone path
+   * `<runnerRoot>/<repoDir>/<key>.attempt-<attemptId>`. A predecessor's path is never reseeded,
+   * executed in, moved or deleted here: prior work reaches the new attempt only through the
+   * tracking ref, checkpoint adoption and the journal/capture flow, all resolved in the bare.
+   *
+   * The recovery journal is classified by IDENTITY — the (runId, repoDir/key) pair plus the
+   * attempt grammar — not by literal path equality, so a journal naming the predecessor's
+   * attempt path is never a spurious mismatch:
+   *   - C′ own retained work: same runId and the journaled path is this key's canonical path or a
+   *     valid `<key>.attempt-<id>` (whose id matches the journal's, when it carries one) →
+   *     PendingRecoveryCaptureError(journaledPath).
+   *   - B′ the same key, another run → ForeignCaptureBlockedError(journaledPath).
+   *   - A′ a different key, or a path that parses as neither → CapturePathMismatchError.
+   * A journal whose path is gone (lstat ENOENT, e.g. after a pod restart) is ignored exactly as
+   * today, and overwritten by the new attempt's journal.
+   */
+  private async attemptCloneForBranch(
+    barePath: string,
+    branch: string,
+    key: string,
+    runId: string | undefined,
+    resume: boolean,
+    expectedCheckpointTip: string | undefined,
+    attempt: AttemptSeedOptions,
+    opts?: { selfContained?: boolean },
+  ): Promise<RunnerClone> {
+    // A key must never be mistaken for a retained artifact (or be one): a git branch component
+    // cannot start with `.`, so a key derived from a valid branch never does either.
+    if (key === "" || key.startsWith(".") || key.includes(path.sep) || isRetainedArtifactName(key)) {
+      throw new Error("refusing an unsafe runner clone key");
+    }
+    if (!ATTEMPT_ID_RE.test(attempt.attemptId)) throw new Error("malformed attempt id");
+    return this.withLock(barePath, async () => {
+      const canonical = this.runnerClonePath(barePath, key);
+      const clonePath = attemptClonePath(canonical, attempt.attemptId);
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending && await this.pathPresent(pending.clonePath)) {
+        const shape = this.clonePathShape(pending.clonePath, canonical);
+        const idMismatch =
+          pending.attemptId !== undefined && (shape?.attemptId ?? "") !== pending.attemptId;
+        if (!shape || idMismatch) {
+          throw new CapturePathMismatchError(pending.clonePath, canonical, branch, pending.runId);
+        }
+        if (pending.runId !== runId) {
+          throw new ForeignCaptureBlockedError(pending.clonePath, branch, pending.runId);
+        }
+        throw new PendingRecoveryCaptureError(pending.clonePath, branch);
+      }
+      // The attempt id carries 64 random bits: an existing path is not a collision to paper
+      // over, it is something planted. Fail closed and touch nothing.
+      if (await this.pathPresent(clonePath)) {
+        throw new Error(`${REASON_WORKER_RESIDUE_BLOCKED}: the fresh attempt clone path already exists (${sanitizeForLog(path.basename(clonePath), 160)}); nothing seeded`);
+      }
+      // Bound the ledger before reading it: the last value per attemptId, gone paths dropped (see compactAttemptLedger).
+      await this.compactAttemptLedger(barePath, branch);
+      // The seed-time recovery sweep over every NON-LIVE path of this key. It throws to block.
+      const ledger = await this.readAttemptLedger(barePath, branch);
+      await attempt.beforeSeed(await this.nonLiveKeyPaths(canonical, ledger, attempt.isLive), canonical);
+      await fs.mkdir(path.dirname(clonePath), { recursive: true });
+      // `live` BEFORE the clone: every attempt dir on disk then has a ledger identity.
+      //
+      // Crash-window orphans (issue #1783 M2 review, N5). Verified ordering in runner.ts phaseClone:
+      // runnerCloneForClaim returns this seed, and the runner writes the recovery journal naming this
+      // path (markRecoveryCapture) before any executor or agent starts in it. Between this append
+      // and that write the path only ever sees the seed itself (the worker-driven runner-uid clone,
+      // checkout and scratch provisioning), the retention sweep below, and a worker-side read of the
+      // bare (the runner's originBranchTip). So a
+      // `live` entry that no journal names, that is not live on this worker and whose run holds no
+      // custody record was interrupted between this append and that journal write: it holds a seed
+      // and no agent work, and the retention sweep treats it as disposable under the abandoned cap.
+      await this.appendAttemptLedger(barePath, branch, {
+        attemptId: attempt.attemptId,
+        runId: runId ?? "",
+        clonePath,
+        state: "live",
+      });
+      let seeded: RunnerClone;
+      try {
+        seeded = await this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
+      } catch (err) {
+        // A half-seeded attempt holds no work; release it to the retention sweep.
+        await this.appendAttemptLedger(barePath, branch, {
+          attemptId: attempt.attemptId,
+          runId: runId ?? "",
+          clonePath,
+          state: "abandoned",
+        }).catch(() => undefined);
+        throw err;
+      }
+      attempt.onSeeded?.(clonePath);
+      await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) =>
+        this.log.warn("runner clone retention sweep failed; nothing further removed", {
+          key,
+          error: gitErrorMessage(err),
+        }),
+      );
+      return { ...seeded, attemptId: attempt.attemptId };
+    });
+  }
+
+  /** The identity of a runner clone path relative to one key's canonical path: the canonical
+   *  path itself (no attempt id), or a valid `<canonical>.attempt-<id>` (whole-grammar parse,
+   *  normalized, directly under runnerRoot/<repoDir>). Anything else ⇒ undefined. */
+  private clonePathShape(p: string, canonical: string): { attemptId: string | undefined } | undefined {
+    // issue #1783 M3: a retained artifact (`.uzi-skills-*`, quarantined `.uzi-residue-*`) is never
+    // a clone of any key. The grammar already cannot produce one (a key never starts with `.`);
+    // this is the explicit guard every listing of `<runnerRoot>/<repoDir>` classifies through.
+    if (isRetainedArtifactName(path.basename(p))) return undefined;
+    if (p === canonical) return { attemptId: undefined };
+    const parsed = parseAttemptPath(p, path.resolve(this.runnerRoot));
+    if (!parsed) return undefined;
+    if (path.join(path.resolve(this.runnerRoot), parsed.repoDir, parsed.key) !== canonical) return undefined;
+    return { attemptId: parsed.attemptId };
+  }
+
+  /** Every path of the key `canonical` names that is NOT live on this worker and still exists
+   *  (lstat): the canonical path and each `<key>.attempt-<id>` sibling on disk, plus every path the
+   *  ledger records for it, so the set stays bounded by what is on disk however long the ledger's
+   *  history. A gone path is not swept: nothing is left there to kill or tear down by path. */
+  private async nonLiveKeyPaths(
+    canonical: string,
+    ledger: Map<string, AttemptLedgerEntry>,
+    isLive: (p: string) => boolean,
+  ): Promise<string[]> {
+    const parent = path.dirname(canonical);
+    const out = new Set<string>();
+    if (await this.pathPresent(canonical)) out.add(canonical);
+    let names: string[] = [];
+    try {
+      names = await fs.readdir(parent);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    }
+    for (const name of names) {
+      const p = path.join(parent, name);
+      if (this.clonePathShape(p, canonical)?.attemptId !== undefined) out.add(p);
+    }
+    for (const e of ledger.values()) {
+      if (this.clonePathShape(e.clonePath, canonical) && (await this.pathPresent(e.clonePath))) out.add(e.clonePath);
+    }
+    return [...out].filter((p) => !isLive(p)).sort();
+  }
+
+  /**
+   * issue #1783 M2 — the retention sweep, run at each attempt seed under the bare lock.
+   *
+   * Attempts: keeps at most {@link RETAINED_ABANDONED_PER_KEY} DISPOSABLE-KIND attempts per key and
+   * deletes the oldest beyond that (attempt-id order), each with its `.uzi-skills-*` sibling as a
+   * pair (the sibling first, so a failed attempt delete never orphans it). A skills sibling whose
+   * attempt dir is already gone and whose ledger entry is not `reclaimed`/`live` is swept too. The disposable kinds are `abandoned` (a verified capture released it in place) and a
+   * crash-window orphan: a `live` entry not live on this worker, named by no journal and whose run
+   * holds no custody record (see the ordering note in attemptCloneForBranch). `reclaimed` (an
+   * uncaptured foreign owner's attempt), `retired`, a live attempt and a dir with no ledger identity
+   * are never counted and never deleted.
+   *
+   * Residue: keeps at most {@link RETAINED_RESIDUE_PER_KEY} `.uzi-residue-<key>.residue-<uuid>`
+   * entries of this key (the one grammar, see formatResidueName) and deletes the oldest beyond that,
+   * OLDEST by the residue directory's own lstat mtime, the name as the tie-break. A uuid is not
+   * sortable, and mtime is what the producer's rename leaves; a runner-uid process that touches a
+   * residue can only reorder which disposable residue goes first. Residue is un-journaled by
+   * definition and carries no run id: it is disposable when no journal names it (or a path inside
+   * it), it is not live, and the scoped scan over it is quiescent.
+   *
+   * `seeding` (the attempt path this seed just made) is never a candidate.
+   * Every deletion goes through {@link deleteRetainedArtifact} (re-validated, runner-uid). A deletion
+   * that fails or is refused (e.g. a root-owned dir, a symlinked attempt) is logged and the entry is
+   * kept. A residue entry that is a symlink or file is unlinked (the entry itself, never followed).
+   */
+  private async sweepRetainedArtifacts(
+    barePath: string,
+    canonical: string,
+    seeding: string,
+    attempt: AttemptSeedOptions,
+  ): Promise<void> {
+    const parent = path.dirname(canonical);
+    const key = path.basename(canonical);
+    const names = await fs.readdir(parent);
+    const journaled = [...(await this.journaledClonePaths(barePath))];
+    const ledgers = await this.readAllAttemptLedgers(barePath);
+    const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p));
+    const entryFor = (attemptId: string, p: string): (AttemptLedgerEntry & { branch: string }) | undefined => {
+      const e = ledgers.get(attemptId);
+      return e && e.clonePath === p ? e : undefined;
+    };
+    const quiescent = async (paths: string[]): Promise<boolean> => {
+      try {
+        return await attempt.quiescent(paths, canonical);
+      } catch {
+        return false;
+      }
+    };
+
+    // 1. Disposable-kind attempts, oldest first beyond the cap.
+    const candidates: Array<{ p: string; attemptId: string; entry: AttemptLedgerEntry & { branch: string } }> = [];
+    for (const name of names) {
+      const p = path.join(parent, name);
+      const id = this.clonePathShape(p, canonical)?.attemptId;
+      // The attempt this seed just made is `live` and not yet journaled: never a candidate, whether
+      // or not the caller has registered it live yet.
+      if (id === undefined || p === seeding) continue;
+      const entry = entryFor(id, p);
+      if (entry === undefined || entry.runId === "") continue;
+      if (entry.state === "abandoned") {
+        candidates.push({ p, attemptId: id, entry });
+      } else if (entry.state === "live" && !attempt.isLive(p) && !namedByJournal(p) && !(await this.custodyHeld(entry.runId))) {
+        candidates.push({ p, attemptId: id, entry });
+      }
+    }
+    candidates.sort((a, b) => compareAttemptIds(a.attemptId, b.attemptId));
+    for (const a of candidates.slice(0, Math.max(0, candidates.length - RETAINED_ABANDONED_PER_KEY))) {
+      const skillsName = `.uzi-skills-${path.basename(a.p)}`;
+      const skills = path.join(parent, skillsName);
+      if (namedByJournal(a.p) || attempt.isLive(a.p) || (await this.custodyHeld(a.entry.runId))) continue;
+      if (!(await quiescent([a.p, skills]))) continue;
+      // The skills sibling FIRST: materializeSkillsPlugin rebuilds it for any attempt that runs, so
+      // losing it costs nothing, while an attempt dir deleted before a failed skills delete would
+      // leave the skills dir orphaned. A failed attempt delete after this keeps the attempt (still
+      // `abandoned`, retried at the next seed) and orphans nothing.
+      if (!(await this.deleteRetainedArtifact(parent, skills, (n) => n === skillsName))) continue;
+      if (!(await this.deleteRetainedArtifact(parent, a.p, (n) => this.clonePathShape(path.join(parent, n), canonical)?.attemptId === a.attemptId))) continue;
+      const { branch: entryBranch, ...entry } = a.entry;
+      await this.appendAttemptLedger(barePath, entryBranch, { ...entry, state: "retired" }).catch(() => undefined);
+      this.log.info("runner clone retention: deleted a retained attempt", { path: a.p, state: a.entry.state });
+    }
+
+    // 1b. Orphaned skills siblings of this key: a `.uzi-skills-<key>.attempt-<id>` whose attempt dir
+    // is gone (an older worker's attempt-first delete, or a crash between the two deletes) and whose
+    // ledger entry is neither `reclaimed` nor `live` (an absent entry, e.g. compacted away, counts as
+    // neither). A skills dir holds a rebuilt plugin tree, never run work. Deleted behind the same
+    // journal / live / scoped-quiescence checks and the same re-validated runner-uid delete.
+    for (const name of await fs.readdir(parent)) {
+      const art = parseRetainedArtifactName(name);
+      if (art?.kind !== "skills") continue;
+      const attemptDir = path.join(parent, art.cloneBasename);
+      const id = this.clonePathShape(attemptDir, canonical)?.attemptId;
+      if (id === undefined || attemptDir === seeding) continue;
+      if (await this.pathPresent(attemptDir)) continue;
+      const state = ledgers.get(id)?.state;
+      if (state === "reclaimed" || state === "live") continue;
+      const p = path.join(parent, name);
+      if (namedByJournal(attemptDir) || namedByJournal(p) || attempt.isLive(attemptDir) || attempt.isLive(p)) continue;
+      if (!(await quiescent([p]))) continue;
+      if (await this.deleteRetainedArtifact(parent, p, (n) => n === name)) {
+        this.log.info("runner clone retention: deleted an orphaned skills sibling", { path: p });
+      }
+    }
+
+    // 2. This key's residue, oldest (mtime) first beyond the cap.
+    const isOwnResidue = (n: string): boolean => {
+      const art = parseRetainedArtifactName(n);
+      return art?.kind === "residue" && art.key === key;
+    };
+    const residue: Array<{ p: string; name: string; mtimeMs: number }> = [];
+    for (const name of names) {
+      if (!isOwnResidue(name)) continue;
+      const p = path.join(parent, name);
+      const st = await fs.lstat(p).catch(() => undefined);
+      if (st) residue.push({ p, name, mtimeMs: st.mtimeMs });
+    }
+    residue.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+    for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
+      if (namedByJournal(r.p) || attempt.isLive(r.p)) continue;
+      if (!(await quiescent([r.p]))) continue;
+      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, { unlinkNonDirectory: true })) {
+        this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
+      }
+    }
+  }
+
+  /**
+   * issue #1783 M2 — delete ONE retained artifact of the retention sweep. `target` lives in the
+   * runner-writable `<runnerRoot>/<repoDir>` tree, so its interior is agent-controlled: a recursive
+   * delete run as the WORKER could be steered by a directory swapped for a symlink mid-walk into
+   * anything the worker can delete (the bare repo, `recovery/`). So, re-validated immediately before
+   * the delete:
+   *   - `target` is directly under `parent`, `parent` directly under runnerRoot and a real directory,
+   *     and the basename parses as the expected artifact of this key (`isExpected`);
+   *   - `target` lstat's as a REAL directory, never a symlink (absent ⇒ nothing to delete). With
+   *     `unlinkNonDirectory` (the residue sweep only, issue #1783 M3: a symlink or file quarantined
+   *     off the canonical path is residue too) a non-directory is instead removed by a plain
+   *     unlink(2) of the entry, as the worker: it never follows, and never recurses.
+   * Then, under the uid split, the delete runs AS THE RUNNER UID through the runnerCommand/setpriv
+   * wrapper (`/bin/rm -rf -- <target>`, bounded by a timeout that kills the runner group), so a
+   * swapped symlink can reach only what the runner uid could already delete. The image's `/bin/rm`
+   * is busybox, which has no `--one-file-system`: the uid is the containment. A tree the runner
+   * cannot delete (a root-owned subtree) fails the rm and is KEPT, with a log line.
+   * Single-uid (#58): there is no second uid and so no boundary to route through (the worker IS the
+   * agent's uid there, the #58 accepted posture): the delete stays the in-process fs.rm.
+   * A timed-out rm that cannot be shown gone (no 'close' within the bounded wait after the group
+   * kill, whether or not the kill succeeded) is rethrown, which stops the whole sweep. A target
+   * such an rm (of this sweep or an earlier one) may still be walking, the recorded path itself or
+   * anything under it, is refused (kept, logged) before any delete starts.
+   * Returns true when the target is gone.
+   */
+  private async deleteRetainedArtifact(
+    parent: string,
+    target: string,
+    isExpected: (name: string) => boolean,
+    opts: { unlinkNonDirectory?: boolean } = {},
+  ): Promise<boolean> {
+    const refuse = (why: string): false => {
+      this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: why });
+      return false;
+    };
+    const root = path.resolve(this.runnerRoot);
+    if (path.dirname(parent) !== root || path.dirname(target) !== parent) return refuse("not a direct child of a runner repo dir");
+    if (!isExpected(path.basename(target))) return refuse("not the expected retained artifact of this key");
+    // An earlier runner-uid rm of this path (or of a directory above it) may still be walking it:
+    // a second rm here would run beside it. Keep the target; a later sweep retries it after 'close'.
+    for (const unsettled of this.unsettledDeletes.keys()) {
+      if (isWithinPath(target, unsettled)) {
+        return refuse(`an earlier runner-uid delete of this path (${unsettled}) may still be running`);
+      }
+    }
+    const lstat = this.retentionDeleteSeam?.lstat ?? ((p: string) => fs.lstat(p));
+    try {
+      const pst = await lstat(parent);
+      if (pst.isSymbolicLink() || !pst.isDirectory()) return refuse("the runner repo dir is not a real directory");
+      const st = await lstat(target);
+      if (st.isSymbolicLink() || !st.isDirectory()) {
+        if (!opts.unlinkNonDirectory) return refuse("not a real directory");
+        // issue #1783 M3: a symlink or file quarantined off the canonical path. unlink(2) removes
+        // the entry itself and never follows it; a directory swapped in meanwhile fails it (kept).
+        await fs.unlink(target);
+        return true;
+      }
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      return refuse(gitErrorMessage(err));
+    }
+    try {
+      await this.runRunnerUidDelete(target);
+    } catch (err) {
+      // An rm that may still be alive: stop the whole sweep (the caller logs "nothing further
+      // removed") rather than start another delete beside it.
+      if (err instanceof RunnerDeleteUnsettledError) throw err;
+      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: gitErrorMessage(err) });
+      return false;
+    }
+    return true;
+  }
+
+  /** The recursive delete itself (see {@link deleteRetainedArtifact}, and M3's
+   *  {@link freeCanonicalClonePath}): runner-uid under the split, in-process single-uid. */
+  private async runRunnerUidDelete(target: string): Promise<void> {
+    const split = this.retentionDeleteSeam?.split ?? uidSplitActive();
+    if (!split) {
+      await fs.rm(target, { recursive: true, force: true });
+      return;
+    }
+    const wrapped = runnerCommand(RETENTION_RM_BIN, ["-rf", "--", target], true);
+    if (this.retentionDeleteSeam?.run) {
+      await this.retentionDeleteSeam.run(wrapped.command, wrapped.args);
+      return;
+    }
+    const seam = this.retentionDeleteSeam;
+    const timeoutMs = seam?.timeoutMs ?? RETENTION_RM_TIMEOUT_MS;
+    const closeWaitMs = seam?.closeWaitMs ?? RETENTION_RM_CLOSE_WAIT_MS;
+    const kill = seam?.kill ?? killRunnerGroup;
+    await new Promise<void>((resolve, reject) => {
+      // cwd "/" and a fixed root-owned PATH: nothing resolves from a runner-writable dir. Detached,
+      // so the setpriv'd rm leads its own group and a timeout can kill it as the runner uid.
+      const child = seam?.spawn
+        ? seam.spawn(wrapped.command, wrapped.args)
+        : spawn(wrapped.command, wrapped.args, {
+            cwd: "/",
+            env: workerSpawnEnv({ PATH: "/usr/bin:/bin" }),
+            detached: true,
+            stdio: ["ignore", "ignore", "pipe"],
+          });
+      let stderr = "";
+      child.stderr?.on("data", (c: Buffer) => {
+        if (stderr.length < 4096) stderr += c.toString("utf8");
+      });
+      let settled = false;
+      let timedOut = false;
+      let closed = false;
+      let closeTimer: NodeJS.Timeout | undefined;
+      const settle = (err?: Error): void => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        clearTimeout(closeTimer);
+        if (err instanceof RunnerDeleteUnsettledError && !closed) {
+          // N1: remember the path until this child's 'close' (the listener below stays attached
+          // after settle), so no later claim frees or reseeds where this rm may still walk.
+          const key = path.resolve(target);
+          const pending = (this.unsettledDeletes.get(key) ?? 0) + 1;
+          this.unsettledDeletes.set(key, pending);
+          this.log.warn("runner-uid delete recorded as unsettled: it may still be running; no free, reseed or retention delete of this path until it exits", {
+            path: key,
+            pid: child.pid,
+            pending,
+          });
+          child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
+            const n = (this.unsettledDeletes.get(key) ?? 1) - 1;
+            if (n > 0) this.unsettledDeletes.set(key, n);
+            else this.unsettledDeletes.delete(key);
+            this.log.info("runner-uid delete exited and left the unsettled record", {
+              path: key,
+              pid: child.pid,
+              exit: code ?? signal ?? "abnormal",
+              pending: n,
+            });
+          });
+        }
+        if (err) reject(err);
+        else resolve();
+      };
+      // The timeout never settles on its own: busybox rm walks by path, so an rm that outlives
+      // this call deletes from whatever is next created at the target. It settles only once the
+      // child's 'close' proves the group gone, or as a RunnerDeleteUnsettledError when 'close'
+      // stays absent past the bounded wait. A failed kill waits too (N2): ESRCH, a group that
+      // already exited, reads the same as a kill that failed, and only 'close' tells them apart.
+      const timer = setTimeout(() => {
+        timedOut = true;
+        const killed = kill(child.pid);
+        const unsettled = killed
+          ? `no exit within ${closeWaitMs}ms of the runner group kill after ${timeoutMs}ms`
+          : `group kill of pid ${child.pid ?? "?"} failed after ${timeoutMs}ms; no close within ${closeWaitMs}ms`;
+        closeTimer = setTimeout(() => settle(new RunnerDeleteUnsettledError(unsettled)), closeWaitMs);
+      }, timeoutMs);
+      child.once("error", (err) => {
+        // A spawn failure ran nothing. After the timeout, 'error' proves nothing about the rm.
+        if (!timedOut) settle(err);
+      });
+      child.once("close", (code, signal) => {
+        closed = true;
+        if (timedOut) settle(new Error(`runner-uid delete timed out after ${timeoutMs}ms (killed; exited ${code ?? signal ?? "abnormally"})`));
+        else if (code === 0) settle();
+        else settle(new Error(`runner-uid delete exited ${code ?? signal ?? "abnormally"}: ${stripAnsiSgr(stderr).slice(0, 512)}`));
+      });
+    });
+  }
+
+  /** The seed itself (base resolution, the local `clone --shared`, checkout, WIP recovery, the
+   *  ratchet clamp, scratch provisioning) at `clonePath`, which the caller has freed (canonical)
+   *  or proven fresh (attempt). Runs under the caller's bare lock. */
+  private async seedRunnerClone(
+    barePath: string,
+    branch: string,
+    clonePath: string,
+    runId: string | undefined,
+    resume: boolean,
+    expectedCheckpointTip: string | undefined,
+    opts?: { selfContained?: boolean },
+  ): Promise<RunnerClone> {
+    // (A bare block: the body below kept its original indentation when issue #1783 M2 lifted it
+    // out of runnerCloneForBranch's lock callback, so its diff stays reviewable.)
+    {
       // The clone's parent dir. Under the M4 split it must be group-`runner`-writable so
       // the runner-uid `git clone` can create <key> inside it: /data/runner is
       // worker:runner 3775 (setgid+sticky) from the entrypoint, and the worker runs with umask
@@ -1783,7 +2658,7 @@ export class GitCache {
       // baseSha (byte-identical) on every other leg. wipRecovered surfaces the recovery to
       // M4/M5.
       return { path: clonePath, branch, priorCommits, baseCommit: effectiveBase, defaultBranchCommit, seededFrom, checkpointSetAside, wipRecovered };
-    });
+    }
   }
 
   /** Provision the per-run artifact directory without following checkout symlinks. */
@@ -1879,7 +2754,12 @@ export class GitCache {
       // while leaving other artifacts stageable. Publication refusal remains
       // necessary if an agent later changes the repository's ignore rules.
       try {
-        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/"]);
+        // Bounded: git opens .git/info/exclude with a plain blocking open, so a FIFO swapped in
+        // after the regular-file check above would otherwise hold this for GIT_TIMEOUT_MS. A
+        // timeout is a failed check, i.e. the same fail-closed refusal as any other failure.
+        await this.runGitAsRunner(clonePath, ["check-ignore", "-q", "--no-index", "--", ".uzi/scratch/"], {
+          timeoutMs: SCRATCH_IGNORE_CHECK_TIMEOUT_MS,
+        });
       } catch {
         throw new Error("repository ignore rules expose .uzi/scratch to ordinary staging");
       }
@@ -2409,13 +3289,16 @@ export class GitCache {
    * later capture cannot prevent the restart guard from knowing whose work it is.
    * The runner clears this journal only after atomically retiring the clone
    * (retireRunnerClone), never before the rename. */
-  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string): Promise<void> {
+  async markRecoveryCapture(barePath: string, clonePath: string, branch: string, runId: string, attemptId?: string): Promise<void> {
     await this.withLock(barePath, async () => {
-      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify({ runId, clonePath })]);
+      // issue #1783 M2: a Docker-wired worker also journals the attempt id (the same id its path
+      // and marker carry). Absent ⇒ today's `{ runId, clonePath }` byte-for-byte.
+      const value: RecoveryJournalEntry = attemptId === undefined ? { runId, clonePath } : { runId, clonePath, attemptId };
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(value)]);
     });
   }
 
-  private async readRecoveryCapture(barePath: string, branch: string): Promise<{ runId: string; clonePath: string } | undefined> {
+  private async readRecoveryCapture(barePath: string, branch: string): Promise<RecoveryJournalEntry | undefined> {
     // Unlike tryGitStdout, --list succeeds when the key is absent and throws on
     // an unreadable/corrupt config. Never interpret a failed read as no journal.
     const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
@@ -2423,12 +3306,242 @@ export class GitCache {
     const entry = entries.filter((item) => item.startsWith(prefix)).at(-1);
     const value = entry?.slice(prefix.length);
     if (!value) return undefined;
-    const parsed: unknown = JSON.parse(value);
-    if (typeof parsed !== "object" || parsed === null || !("runId" in parsed) || !("clonePath" in parsed)
-        || typeof parsed.runId !== "string" || typeof parsed.clonePath !== "string") {
-      throw new Error("invalid retained recovery clone journal");
+    return parseRecoveryJournal(value);
+  }
+
+  /** Every clone path any branch's recovery journal names (issue #1783 M2: the retention sweep
+   *  never deletes a journaled path). Throws on an unreadable config or a malformed journal. */
+  private async journaledClonePaths(barePath: string): Promise<Set<string>> {
+    const out = new Set<string>();
+    for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
+      const nl = item.indexOf("\n");
+      if (nl < 0) continue;
+      const k = item.slice(0, nl);
+      if (!/^uzi-recovery\..+\.clone$/.test(k)) continue;
+      const v = item.slice(nl + 1);
+      if (v) out.add(parseRecoveryJournal(v).clonePath);
     }
-    return { runId: parsed.runId, clonePath: parsed.clonePath };
+    return out;
+  }
+
+  /** issue #1783 M2: append one attempt-ledger value (see {@link attemptLedgerKey}). Lock-free:
+   *  every caller already holds the bare lock. The field order is the documented contract. */
+  private async appendAttemptLedger(barePath: string, branch: string, entry: AttemptLedgerEntry): Promise<void> {
+    await this.runGit(barePath, ["config", "--local", "--add", attemptLedgerKey(branch), attemptLedgerValue(entry)]);
+  }
+
+  /**
+   * issue #1783 M2 review (N4, NB2, NB3) — bound one branch's attempt ledger, under the caller's bare
+   * lock (the attempt seed). Rewrites `uzi-attempts.<branch>.entry` to the LAST value per attemptId
+   * (in last-write order), dropping every unparseable value and every entry whose (absolute) path is
+   * gone (lstat ENOENT), whatever its state: after a pod roll `<runnerRoot>` is an emptyDir, so a
+   * gone path has nothing left for any reader to find. Two exceptions are always kept:
+   *   - an entry any branch's recovery journal still names (the journal is what (d′) and a capture
+   *     resolve through the ledger);
+   *   - a gone `reclaimed` entry while its run's journal or custody record (`recovery/<runId>`,
+   *     `recovery-settlement/<runId>`) exists; with both gone it is dropped.
+   * Nothing is rewritten when nothing would change.
+   *
+   * The rewrite is ATOMIC ({@link rewriteLedgerAtomically}): the full compacted value set lands in
+   * one rename of the bare config, under git's own `config.lock`, so a crash part-way can never
+   * leave a partial ledger (the old `--replace-all` then N×`--add` could drop a foreign owner's
+   * `live` entry a journal still names, wedging (d′)). Best-effort: a failure (including a
+   * concurrent git holding `config.lock`) is logged and the ledger is left exactly as it was.
+   */
+  private async compactAttemptLedger(barePath: string, branch: string): Promise<void> {
+    try {
+      const key = attemptLedgerKey(branch);
+      const raw = (await this.readAllAttemptLedgerRaw(barePath)).filter(([b]) => b === branch).map(([, v]) => v);
+      const last = new Map<string, AttemptLedgerEntry>();
+      for (const v of raw) {
+        const e = parseAttemptLedgerEntry(v);
+        if (!e) continue;
+        last.delete(e.attemptId);
+        last.set(e.attemptId, e);
+      }
+      const journaled = [...(await this.journaledClonePaths(barePath))];
+      const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p) || isWithinPath(p, j));
+      const kept: string[] = [];
+      for (const e of last.values()) {
+        const gone = path.isAbsolute(e.clonePath) && !(await this.pathPresent(e.clonePath));
+        const droppable = gone && !namedByJournal(e.clonePath) && (e.state !== "reclaimed" || !(await this.custodyHeld(e.runId)));
+        if (!droppable) kept.push(attemptLedgerValue(e));
+      }
+      if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
+      await this.rewriteLedgerAtomically(barePath, key, kept);
+    } catch (err) {
+      this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });
+    }
+  }
+
+  /**
+   * Replace every value of the multi-valued config `key` in the bare's config with `values`, in ONE
+   * rename, following git's own lockfile protocol (lockfile.c): the new content is built in a
+   * private temp file (a byte copy of the config, edited with `git config --file`), then published
+   * by hard-linking it to `config.lock` — an exclusive create, exactly git's `O_CREAT|O_EXCL` lock,
+   * so it fails (EEXIST) while any git holds the lock, and every git writer fails while we hold it —
+   * then the config is re-read and compared to the snapshot the edit started from (a writer that
+   * committed between the snapshot and our lock aborts us instead of being overwritten), and
+   * `config.lock` is renamed over `config`. Any failure before the rename leaves `config` untouched
+   * and removes our lock. A process crash between the link and the rename leaves a stale
+   * `config.lock` (the same window git's own config writes have), never a partial ledger.
+   */
+  private async rewriteLedgerAtomically(barePath: string, key: string, values: string[]): Promise<void> {
+    const cfgPath = path.join(barePath, "config");
+    const lockPath = `${cfgPath}.lock`;
+    // A temp file left by a crashed compaction is inert (never read by git); clear it. Only this
+    // method creates the prefix, always under the bare lock.
+    for (const n of await fs.readdir(barePath)) {
+      if (n.startsWith(LEDGER_COMPACT_TMP_PREFIX)) await fs.rm(path.join(barePath, n), { force: true });
+    }
+    const snapshot = await fs.readFile(cfgPath);
+    const mode = (await fs.stat(cfgPath)).mode & 0o777;
+    const tmp = path.join(barePath, `${LEDGER_COMPACT_TMP_PREFIX}${randomUUID()}`);
+    try {
+      await fs.writeFile(tmp, snapshot, { flag: "wx", mode });
+      if (values.length === 0) {
+        await this.runGit(barePath, ["config", "--file", tmp, "--unset-all", key]);
+      } else {
+        await this.runGit(barePath, ["config", "--file", tmp, "--replace-all", key, values[0]!]);
+        for (const v of values.slice(1)) await this.runGit(barePath, ["config", "--file", tmp, "--add", key, v]);
+      }
+      await fs.chmod(tmp, mode);
+      await fs.link(tmp, lockPath);
+      try {
+        if (!(await fs.readFile(cfgPath)).equals(snapshot)) throw new Error("the bare config changed during ledger compaction");
+        await fs.rename(lockPath, cfgPath);
+      } catch (err) {
+        await fs.rm(lockPath, { force: true });
+        throw err;
+      }
+    } finally {
+      await fs.rm(tmp, { force: true });
+    }
+  }
+
+  /** issue #1783 M2: one branch's attempt ledger, the LAST value per attemptId winning.
+   *  Unparseable values are skipped (the ledger is advisory for backups, and every consumer
+   *  here fails closed on a missing entry); an unreadable config throws. */
+  private async readAttemptLedger(barePath: string, branch: string): Promise<Map<string, AttemptLedgerEntry>> {
+    const out = new Map<string, AttemptLedgerEntry>();
+    for (const [b, e] of (await this.readAllAttemptLedgerValues(barePath))) {
+      if (b === branch) out.set(e.attemptId, e);
+    }
+    return out;
+  }
+
+  /** Every branch's attempt ledger, the LAST value per attemptId winning (ids are globally
+   *  unique: 64 random bits). */
+  private async readAllAttemptLedgers(barePath: string): Promise<Map<string, AttemptLedgerEntry & { branch: string }>> {
+    const out = new Map<string, AttemptLedgerEntry & { branch: string }>();
+    for (const [branch, e] of (await this.readAllAttemptLedgerValues(barePath))) out.set(e.attemptId, { ...e, branch });
+    return out;
+  }
+
+  private async readAllAttemptLedgerValues(barePath: string): Promise<Array<[string, AttemptLedgerEntry]>> {
+    const out: Array<[string, AttemptLedgerEntry]> = [];
+    for (const [branch, v] of await this.readAllAttemptLedgerRaw(barePath)) {
+      const e = parseAttemptLedgerEntry(v);
+      if (e) out.push([branch, e]);
+    }
+    return out;
+  }
+
+  /** Every raw attempt-ledger value, in config order, with its branch. Throws on an unreadable config. */
+  private async readAllAttemptLedgerRaw(barePath: string): Promise<Array<[string, string]>> {
+    const out: Array<[string, string]> = [];
+    for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
+      const nl = item.indexOf("\n");
+      if (nl < 0) continue;
+      const m = /^uzi-attempts\.(.+)\.entry$/.exec(item.slice(0, nl));
+      if (m) out.push([m[1]!, item.slice(nl + 1)]);
+    }
+    return out;
+  }
+
+  /** issue #1783 M2: true when a custody or capture record under the recovery stores belongs to
+   *  `runId` (a durable-recovery journal/bundle under `recovery/<runId>`, or an ancestry
+   *  settlement record under `recovery-settlement/<runId>`). Neither record names a clone path,
+   *  so any record of the run holds every retained attempt of that run. An unreadable store
+   *  counts as held (fail closed). */
+  private async custodyHeld(runId: string): Promise<boolean> {
+    for (const root of [this.recoveryRoot, this.recoverySettlementRoot]) {
+      try {
+        if ((await fs.readdir(path.join(root, runId))).length > 0) return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return true;
+      }
+    }
+    return false;
+  }
+
+  /**
+   * issue #1783 M2 — release a predecessor attempt IN PLACE: a Docker-wired worker's replacement for
+   * retireRunnerClone after a VERIFIED capture (`state` `abandoned`: its work is in the tracking ref,
+   * so the retention sweep may later dispose of it), and for a terminal FOREIGN owner's attempt in
+   * the orphan reclaim, which captures nothing (`state` `reclaimed`: retained forever, never
+   * disposable — see attemptLedgerKey). Under the bare lock it re-validates that the journal still
+   * names this exact (runId, clonePath) and refuses otherwise (nothing written), appends the ledger
+   * state, and only THEN clears the journal (the caller calls this only once any capture is
+   * verified — the #1197 rule). The ledger goes first so the journal never stops protecting a path
+   * whose release the ledger does not yet record: a path left `live`, unjournaled and not live here
+   * is a crash-window orphan the retention sweep may delete, which an uncaptured `reclaimed` attempt
+   * must never become. A failure after the re-validation throws {@link AttemptReleaseError} with the
+   * journal kept. It performs NO filesystem operation on the path: a successor never
+   * moves or deletes a predecessor's path; only the retention sweep disposes of an `abandoned` one.
+   */
+  async releaseAttemptInPlace(
+    barePath: string,
+    clonePath: string,
+    branch: string,
+    runId: string,
+    state: "abandoned" | "reclaimed",
+  ): Promise<void> {
+    await this.withLock(barePath, async () => {
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending?.runId !== runId || pending.clonePath !== clonePath) {
+        throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
+      }
+      const attemptId = pending.attemptId ?? parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId;
+      if (attemptId !== undefined) {
+        try {
+          await this.appendAttemptLedger(barePath, branch, { attemptId, runId, clonePath, state });
+        } catch (err) {
+          throw new AttemptReleaseError("ledger", err);
+        }
+      } else {
+        // A legacy canonical path has no attempt identity; it is never reseeded on a wired worker.
+        this.log.info("releasing a legacy canonical clone in place (no attempt ledger entry)", { clone: clonePath, state });
+      }
+      try {
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      } catch (err) {
+        throw new AttemptReleaseError("journal", err);
+      }
+    });
+  }
+
+  /**
+   * issue #1783 M2 — predicate (d′) of the terminal-orphan reclaim: does `journaledPath` belong to
+   * the OWNER whose clone key is `ownerKey`? `canonical` when it IS the owner's canonical path;
+   * `attempt` when it parses (whole grammar, normalized, directly under the repo dir) as
+   * `<that canonical>.attempt-<id>` AND the ledger records that attemptId for `ownerRunId` at
+   * exactly this path; undefined otherwise (a different key, a traversal, an id the ledger does
+   * not record for the owner) — the caller then fails closed with the path untouched.
+   */
+  async classifyOwnerClonePath(
+    barePath: string,
+    branch: string,
+    ownerKey: string,
+    ownerRunId: string,
+    journaledPath: string,
+  ): Promise<"canonical" | "attempt" | undefined> {
+    const canonical = this.runnerClonePath(barePath, ownerKey);
+    const shape = this.clonePathShape(journaledPath, canonical);
+    if (!shape) return undefined;
+    if (shape.attemptId === undefined) return "canonical";
+    const entry = (await this.readAttemptLedger(barePath, branch)).get(shape.attemptId);
+    return entry?.runId === ownerRunId && entry.clonePath === journaledPath ? "attempt" : undefined;
   }
 
   /**
@@ -3098,7 +4211,7 @@ export class GitCache {
     clonePath: string,
     branch: string,
     ownerRunId: string,
-    opts: { discard: boolean },
+    opts: { discard: boolean; attemptId?: string },
   ): Promise<void> {
     const result = await this.withLock(barePath, async (): Promise<{ holding?: string; scratch?: string }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
@@ -3219,6 +4332,20 @@ export class GitCache {
       const still = await this.readRecoveryCapture(barePath, branch);
       if (still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
+      // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
+      // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
+      // cleared, so a failed append must neither fail the completed retire nor skip step 6's
+      // disposal of the holding copy.
+      if (opts.attemptId !== undefined) {
+        await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
+          (err: unknown) =>
+            this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
+              clone: clonePath,
+              attempt_id: opts.attemptId,
+              error: gitErrorMessage(err),
+            }),
+        );
       }
       return { holding, scratch };
     });
@@ -5356,10 +6483,25 @@ export class GitCache {
    * but with the RUNNER PATH + the runner's private TMPDIR so `git` resolves and its
    * scratch lands on the runner's 0700 tmp (not the worker's, which the runner cannot
    * write). Single-uid (#58): `runnerCommand` is a passthrough, so this is a plain git.
+   * issue #1783: carries the worker spawn mark only for {@link runnerGitCarriesWorkerMark}'s
+   * subcommands; every other runner git runs unmarked (its plants stay reapable).
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[]): Promise<string> {
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number } = {}): Promise<string> {
     const base = gitEnv();
-    const env: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+    // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
+    // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
+    // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an
+    // agent-planted filter/driver, which must stay reapable: it runs UNMARKED.
+    const runnerEnv: NodeJS.ProcessEnv = { ...base, PATH: runnerPath() };
+    const marked = runnerGitCarriesWorkerMark(args);
+    const env: NodeJS.ProcessEnv = marked ? workerSpawnEnv(runnerEnv) : unmarkedSpawnEnv(runnerEnv);
+    // Belt to gitEnv's GIT_NO_LAZY_FETCH for the marked subset: those reads need no transport at
+    // all, so GIT_ALLOW_PROTOCOL names no protocol and git refuses every transport. The env var
+    // overrides EVERY `protocol.allow` / `protocol.<name>.allow` config key, so a planted
+    // `[protocol "file"] allow = always` in the agent-writable .git/config cannot re-enable one
+    // (a `protocol.allow=never` config pin could be: the per-protocol key outranks it). The seed's
+    // `clone --no-checkout` reads the bare over the local transport, so it is exempt.
+    if (marked && firstRunnerGitSubcommand(args) !== "clone") env.GIT_ALLOW_PROTOCOL = RUNNER_GIT_NO_PROTOCOL;
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     // A permit-scoped subprocess is already launched as the isolated command uid
@@ -5372,7 +6514,7 @@ export class GitCache {
     try {
       const { stdout } = await this.execScoped(wrapped.command, wrapped.args, {
         env,
-        timeout: GIT_TIMEOUT_MS,
+        timeout: opts.timeoutMs ?? GIT_TIMEOUT_MS,
         maxBuffer: GIT_MAX_BUFFER,
       }, "command");
       return stdout;
@@ -5661,6 +6803,79 @@ export const OVERLAY_COMMIT_PREFIX = "ckpt(overlay):" as const;
  * (local fixture path / scp form) has no scope, so the header falls back to
  * unscoped — harmless because local/file transport ignores http.* config entirely.
  */
+/**
+ * issue #1783 (R4, auditor M1) — runner-clone git subcommands that may carry the worker spawn
+ * mark: they start no filter, diff, merge or signing driver, and (with the pins below) no
+ * transport, so no program the clone configures. They are NOT code-free on their own: a missing
+ * object would make any of them LAZY-FETCH through a `extensions.partialClone` promisor remote
+ * the agent-writable config plants (its `uploadpack` is a program), and a planted program would
+ * inherit the nonce. That path is closed by two pins, not by the subcommand choice:
+ * GIT_NO_LAZY_FETCH=1 in {@link gitEnv} (every worker git, marked or not), and
+ * GIT_ALLOW_PROTOCOL={@link RUNNER_GIT_NO_PROTOCOL} on this marked subset (runGitAsRunner; the
+ * seed's local clone exempt), which no `protocol.*` key in the clone's config can override.
+ * test/git-no-lazy-fetch.test.ts runs the plant against each pin alone.
+ * The runner clone's `.git/config` and `.gitattributes` are agent-writable, and the
+ * arbitrary-name driver keys (`filter.<name>.*`,
+ * `diff.<name>.*`, `merge.<name>.driver`) and `gpg.program` cannot be pinned off (see the
+ * GIT_CODE_EXEC_KEY_PINS note above), so a git that touches the working tree, content-diffs,
+ * merges or shows signatures can start an agent-planted program. That program inherits the git's
+ * env: were the git worker-marked, the plant would carry the nonce and be exempt from every reap
+ * forever. So only these pure ref/object/config/index reads and ref writes are marked; the
+ * seed's clone is marked only with `--no-checkout` (no working tree is written). Anything else
+ * (status, add, commit, checkout, reset, rm, clean, merge, rebase, cherry-pick, diff, log, …) runs
+ * UNMARKED, and every path that runs one after a quiescence proof (the park, shutdown and pause
+ * wip markers, the restore-point, hold and settle-transfer captures, finalize's base-align) re-proves
+ * before its next credentialed step (runner.ts). Leading `-c key=value` pairs are skipped to find the subcommand.
+ */
+const RUNNER_GIT_MARKED_SUBCOMMANDS: ReadonlySet<string> = new Set([
+  "rev-parse",
+  "rev-list",
+  "update-ref",
+  "config",
+  "ls-files",
+  "ls-tree",
+  "check-ignore",
+]);
+
+/** A GIT_ALLOW_PROTOCOL value naming no real protocol: git then allows NO transport. */
+const RUNNER_GIT_NO_PROTOCOL = "none";
+
+/** The argv index of a git subcommand: the first index past any leading `-c key=value` pairs
+ *  (which may be `args.length`, i.e. past the end, when nothing follows them). */
+function firstRunnerGitSubcommandIndex(args: readonly string[]): number {
+  let i = 0;
+  while (args[i] === "-c" && i + 1 < args.length) i += 2;
+  return i;
+}
+
+/** The subcommand of a git argv (leading `-c key=value` pairs skipped), or undefined. */
+function firstRunnerGitSubcommand(args: readonly string[]): string | undefined {
+  return args[firstRunnerGitSubcommandIndex(args)];
+}
+
+export function runnerGitCarriesWorkerMark(args: readonly string[]): boolean {
+  const i = firstRunnerGitSubcommandIndex(args);
+  const sub = args[i];
+  if (sub === undefined) return false;
+  if (sub === "clone") return args.slice(i + 1).includes("--no-checkout");
+  return RUNNER_GIT_MARKED_SUBCOMMANDS.has(sub);
+}
+
+/**
+ * issue #1783 (R4): the env for a runner-uid git spawned OUTSIDE GitCache, built exactly as
+ * runGitAsRunner builds its own: worker-marked only for the driver-free subset
+ * (runnerGitCarriesWorkerMark), and for that subset GIT_ALLOW_PROTOCOL pins every transport
+ * off, independently of gitEnv's GIT_NO_LAZY_FETCH. `args` is the git argv WITHOUT a leading
+ * `-C <dir>` (the subcommand parser skips `-c key=value` pairs only).
+ */
+export function runnerGitSpawnEnv(args: readonly string[], runnerEnv: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+  const marked = runnerGitCarriesWorkerMark(args);
+  const env: NodeJS.ProcessEnv = marked ? workerSpawnEnv(runnerEnv) : unmarkedSpawnEnv(runnerEnv);
+  if (marked && firstRunnerGitSubcommand(args) !== "clone") env.GIT_ALLOW_PROTOCOL = RUNNER_GIT_NO_PROTOCOL;
+  return env;
+}
+
+
 export function gitEnv(pat?: string, httpScope?: string, username?: string): NodeJS.ProcessEnv {
   // REPLACEMENT env (M10 audit), NOT a process.env spread. A git subprocess can spawn
   // agent-controlled code (a hook at the default path) as the worker uid, outside the
@@ -5681,6 +6896,13 @@ export function gitEnv(pat?: string, httpScope?: string, username?: string): Nod
     // key could be planted, and it is outside the inline-pin override guarantee for
     // any key we don't pin. The worker needs nothing from it (PRD #51 M0).
     GIT_CONFIG_NOSYSTEM: "1",
+    // issue #1783 (auditor, round 3): never LAZY-FETCH a missing object. A runner clone's
+    // agent-writable `.git/config` can declare `extensions.partialClone=<remote>` with that
+    // remote's `uploadpack=<program>`; any git that then needs a missing object (even a
+    // `rev-parse --verify <sha>^{commit}`) spawns the planted program to fetch it. No worker git
+    // needs lazy fetch: the bare is a full clone and every runner clone a `clone --shared` of it,
+    // so every object a legitimate op reads is local. With this pin a missing object is an error.
+    GIT_NO_LAZY_FETCH: "1",
   };
   // PRD #51 M3 / 5-bis: keep git's scratch (packs, lockfiles) on the worker's private
   // 0700 TMPDIR (set by the entrypoint) rather than a shared sticky /tmp. Carry it only

@@ -161,19 +161,27 @@ function defaultSocketExists(socketPath: string): boolean {
 
 type ConnectTarget = { path: string } | { host: string; port: number };
 
+/** The Docker CLI's default port for a plain-TCP DOCKER_HOST that names none. */
+const DOCKER_DEFAULT_TCP_PORT = 2375;
+
 /** Parse a DOCKER_HOST into a raw-connect target. unix://<path> and a bare /abs path
- *  connect to the unix socket; tcp://host:port connects TCP. Anything else ⇒ undefined
- *  (unprobeable ⇒ unreachable). */
-function parseDockerTarget(dockerHost: string): ConnectTarget | undefined {
-  if (dockerHost.startsWith("unix://")) return { path: dockerHost.slice("unix://".length) };
+ *  connect to the unix socket; tcp://host[:port][/] connects TCP (no port ⇒ Docker's
+ *  default 2375; an IPv6 host is bracketed, `tcp://[::1]:2375`). Anything else ⇒ undefined
+ *  (unprobeable ⇒ unreachable). The ONE parser for every DOCKER_HOST consumer (the
+ *  reachability probe here and the run-quiescence Docker teardown). */
+export function parseDockerTarget(dockerHost: string): ConnectTarget | undefined {
+  if (dockerHost.startsWith("unix://")) {
+    const socketPath = dockerHost.slice("unix://".length);
+    return socketPath ? { path: socketPath } : undefined;
+  }
   if (dockerHost.startsWith("/")) return { path: dockerHost };
   if (dockerHost.startsWith("tcp://")) {
-    const rest = dockerHost.slice("tcp://".length);
-    const idx = rest.lastIndexOf(":");
-    if (idx < 0) return undefined;
-    const host = rest.slice(0, idx);
-    const port = Number(rest.slice(idx + 1));
-    if (!host || !Number.isInteger(port) || port <= 0) return undefined;
+    const rest = dockerHost.slice("tcp://".length).replace(/\/$/, "");
+    const m = /^(\[[^\]]+\]|[^:/[\]]+)(?::([0-9]+))?$/.exec(rest);
+    if (!m) return undefined;
+    const host = m[1]!.replace(/^\[|\]$/g, "");
+    const port = m[2] === undefined ? DOCKER_DEFAULT_TCP_PORT : Number(m[2]);
+    if (!host || !Number.isInteger(port) || port <= 0 || port > 65535) return undefined;
     return { host, port };
   }
   return undefined;

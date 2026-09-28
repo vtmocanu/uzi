@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache, gitEnv, gitBasicCredential, httpScopeForUrl } from "../src/git.js";
 
 // Primary directive (auditor): the bot PAT must never be readable in the git
@@ -99,7 +99,7 @@ describe("pushBranch secret flow", () => {
     // focused on push). Under (b) pushBranch pushes FROM the worker-side tracking ref
     // that fetchAgentBranch writes, so the fetch-back must run first.
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 7);
+    const rc = await git.createOrAttachRunnerClone(bare, 7, noProofReseed);
     await git.fetchAgentBranch(bare, rc.path, "agent/issue-7", "run-fixture");
 
     const oldPath = process.env.PATH ?? "";

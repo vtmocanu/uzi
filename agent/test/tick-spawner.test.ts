@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner, argvClass, killProbeSaysGone, processGroupAlive } from "../src/tick-spawner.js";
+import { WORKER_SPAWN_ENV, workerSpawnEnv, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 
 // issue #1597 M2 — the mid-turn checkpoint tick's spawner: own process group per child, SIGTERM
 // then SIGKILL after a grace, `completed` only after exit, settled(), and PROVEN-ownership lock
@@ -88,6 +89,23 @@ describe("TickSpawner (issue #1597 M2)", () => {
     h.stdout!.on("data", (c: Buffer) => (out += String(c)));
     assert.deepEqual(await h.completed, { code: 0 });
     assert.equal(fs.realpathSync(out), fs.realpathSync(dir));
+  });
+
+  it("issue #1783: a runner-uid child keeps its caller's mark decision; a worker_pat child is always marked", async () => {
+    const markOf = async (identity: BoundaryProcessRequest["identity"], env: NodeJS.ProcessEnv): Promise<string> => {
+      const ac = new AbortController();
+      const sp = new TickSpawner({ signal: ac.signal });
+      const h = await sp.spawn({ ...req([NODE, "-e", `process.stdout.write(process.env.${WORKER_SPAWN_ENV} ?? "none")`], identity), env });
+      let out = "";
+      h.stdout!.on("data", (c: Buffer) => (out += String(c)));
+      assert.deepEqual(await h.completed, { code: 0 });
+      return out;
+    };
+    // runGitAsRunner leaves a clone-config-running git (status/add/commit) UNMARKED: re-marking it
+    // here would hand a planted filter the nonce.
+    assert.equal(await markOf("command", { PATH: process.env.PATH }), "none");
+    assert.equal(await markOf("command", workerSpawnEnv({ PATH: process.env.PATH })), workerSpawnNonce());
+    assert.equal(await markOf("worker_pat", { PATH: process.env.PATH }), workerSpawnNonce());
   });
 
   it("rejects a relative executable and refuses to spawn after the signal aborted", async () => {

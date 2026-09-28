@@ -8,7 +8,7 @@ import os from "node:os";
 import path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache, ScratchProvisionError, bareDirName, gitEnv } from "../src/git.js";
 import { TickSpawner } from "../src/tick-spawner.js";
 
@@ -236,7 +236,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("seeds a runner clone on agent/issue-N off the default branch (a real clone, not a worktree)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 42);
+    const rc = await git.createOrAttachRunnerClone(bare, 42, noProofReseed);
 
     assert.strictEqual(rc.branch, "agent/issue-42");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "README.md")), true); // origin content checked out
@@ -261,7 +261,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("provisions ignored, group-writable scratch on fresh and reseeded clones", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const first = await git.createOrAttachRunnerClone(bare, 1719);
+    const first = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     const scratch = path.join(first.path, ".uzi", "scratch");
     const stat = fs.statSync(scratch);
     assert.equal(stat.isDirectory(), true);
@@ -272,7 +272,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     assert.equal(gitIn(first.path, ["status", "--porcelain"]), "");
     gitIn(first.path, ["add", "-A"]);
     assert.equal(gitIn(first.path, ["diff", "--cached", "--name-only"]), "");
-    const second = await git.createOrAttachRunnerClone(bare, 1719, "run", true);
+    const second = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed, "run", true);
     assert.equal(fs.existsSync(path.join(second.path, ".uzi", "scratch", "gate-log.test")), false);
     assert.equal(fs.statSync(path.join(second.path, ".uzi", "scratch")).isDirectory(), true);
   });
@@ -282,7 +282,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(fx.originPath, ["add", ".gitignore"]);
     gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "expose scratch"]);
     const bare = await git.ensureClone(fx.originPath);
-    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719, noProofReseed), ScratchProvisionError);
   });
 
   it("refuses ignore rules that hide only the scratch probe while exposing artifacts", async () => {
@@ -291,7 +291,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(fx.originPath, ["add", ".gitignore"]);
     gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "hide probe only"]);
     const bare = await git.ensureClone(fx.originPath);
-    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719), ScratchProvisionError);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1719, noProofReseed), ScratchProvisionError);
   });
 
   it("accepts an unrelated repository unignore rule while scratch stays ignored", async () => {
@@ -299,7 +299,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(fx.originPath, ["add", ".gitignore"]);
     gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated unignore"]);
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     fs.writeFileSync(path.join(clone.path, ".uzi", "scratch", "artifact.txt"), "artifact");
     gitIn(clone.path, ["add", "-A"]);
     assert.equal(gitIn(clone.path, ["diff", "--cached", "--name-only"]), "");
@@ -307,7 +307,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("rejects a crafted local exclude that hides one probe but exposes artifacts", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     const excludePath = path.join(clone.path, ".git", "info", "exclude");
     fs.writeFileSync(excludePath, "/.uzi/scratch/\n!/.uzi/scratch/\n/.uzi/scratch/.uzi-ignore-probe\n");
     await assert.rejects(
@@ -318,7 +318,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("rejects an unwritable scratch directory on single-uid adoption", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     const scratch = path.join(clone.path, ".uzi", "scratch");
     fs.chmodSync(scratch, 0o500);
     await assert.rejects(
@@ -329,7 +329,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("rejects a symlinked scratch leaf on revalidation without following it", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     const scratch = path.join(clone.path, ".uzi", "scratch");
     fs.rmSync(scratch, { recursive: true });
     fs.symlinkSync(fx.originPath, scratch);
@@ -346,7 +346,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(fx.originPath, ["add", ".uzi/keep.txt"]);
     gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "unrelated uzi"]);
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     assert.equal(fs.readFileSync(path.join(clone.path, ".uzi", "keep.txt"), "utf8"), "keep");
     assert.equal(fs.statSync(path.join(clone.path, ".uzi", "scratch")).gid, fs.statSync(clone.path).gid);
     const uzi = path.join(clone.path, ".uzi");
@@ -359,9 +359,46 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     assert.equal(fs.readFileSync(uzi, "utf8"), "not a directory");
   });
 
+  it("issue #1783: a FIFO swapped in at .git/info/exclude cannot stall the scratch check-ignore", { timeout: 60_000 }, async () => {
+    const bare = await git.ensureClone(fx.originPath);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
+    const excludePath = path.join(clone.path, ".git", "info", "exclude");
+    // The provisioner opens and stats the exclude itself (a FIFO there is refused as "not a regular
+    // file"), so the FIFO is swapped in AFTER that check: right before the check-ignore git runs,
+    // the race a surviving process could win. git then blocks opening it for reading.
+    type RunGitAsRunner = (cwd: string | undefined, args: string[], opts?: { timeoutMs?: number }) => Promise<string>;
+    const self = git as unknown as { runGitAsRunner: RunGitAsRunner };
+    const orig = self.runGitAsRunner;
+    let swapped = false;
+    self.runGitAsRunner = function (this: unknown, cwd, args, opts) {
+      if (args[0] === "check-ignore" && !swapped) {
+        swapped = true;
+        fs.rmSync(excludePath);
+        execFileSync("mkfifo", [excludePath]);
+      }
+      return orig.call(git, cwd, args, opts);
+    };
+    const started = Date.now();
+    try {
+      await assert.rejects(
+        (git as unknown as { provisionRunnerScratch(path: string): Promise<void> }).provisionRunnerScratch(clone.path),
+        (err: unknown) => {
+          assert.ok(err instanceof ScratchProvisionError);
+          assert.match(err.message, /repository ignore rules expose \.uzi\/scratch/);
+          return true;
+        },
+      );
+    } finally {
+      self.runGitAsRunner = orig;
+    }
+    assert.equal(swapped, true, "the check-ignore ran against the FIFO");
+    assert.ok(Date.now() - started < 30_000, `bounded well below the 10-minute git timeout (${Date.now() - started} ms)`);
+    assert.equal(fs.statSync(excludePath).isFIFO(), true);
+  });
+
   it("refuses a git exclude that would exceed the bound after appending the rule", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     const excludePath = path.join(clone.path, ".git", "info", "exclude");
     const atLimit = "x".repeat(64 * 1024);
     fs.writeFileSync(excludePath, atLimit);
@@ -374,7 +411,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("refuses an oversized git exclude without reading or appending the whole file", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const clone = await git.createOrAttachRunnerClone(bare, 1719);
+    const clone = await git.createOrAttachRunnerClone(bare, 1719, noProofReseed);
     const excludePath = path.join(clone.path, ".git", "info", "exclude");
     const oversized = "x".repeat(64 * 1024 + 1);
     fs.writeFileSync(excludePath, oversized);
@@ -391,19 +428,19 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     gitIn(fx.originPath, ["add", ".uzi/scratch/tracked.txt"]);
     gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "tracked scratch"]);
     const bare = await git.ensureClone(fx.originPath);
-    await assert.rejects(git.createOrAttachRunnerClone(bare, 1720), ScratchProvisionError);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1720, noProofReseed), ScratchProvisionError);
 
     fs.rmSync(path.join(fx.originPath, ".uzi"), { recursive: true });
     fs.symlinkSync(".", path.join(fx.originPath, ".uzi"));
     gitIn(fx.originPath, ["add", "-A"]);
     gitIn(fx.originPath, ["-c", "user.email=t@t", "-c", "user.name=t", "commit", "-m", "symlinked ancestor"]);
     await git.ensureClone(fx.originPath);
-    await assert.rejects(git.createOrAttachRunnerClone(bare, 1721), ScratchProvisionError);
+    await assert.rejects(git.createOrAttachRunnerClone(bare, 1721, noProofReseed), ScratchProvisionError);
   });
 
   it("round-trips: commit in the clone → worker fetch-back → bare tree-diff → push to origin", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 7);
+    const rc = await git.createOrAttachRunnerClone(bare, 7, noProofReseed);
 
     // The agent commits in the runner clone (the only working tree).
     fs.writeFileSync(path.join(rc.path, "NEW.txt"), "hi\n");
@@ -433,7 +470,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
   // This is the behavioral companion to the structural refspec; it drives real local git.
   it("refuses a NON-fast-forward push — the worker push is non-forced, so it can never rewrite origin history (PRD #400 M7)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 400);
+    const rc = await git.createOrAttachRunnerClone(bare, 400, noProofReseed);
 
     // Cycle 1: commit A in the clone, fetch it back, and push agent/issue-400 to origin.
     fs.writeFileSync(path.join(rc.path, "A.txt"), "a\n");
@@ -500,7 +537,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("plants a git author identity so the agent's first commit succeeds with no ambient identity (#234)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 234);
+    const rc = await git.createOrAttachRunnerClone(bare, 234, noProofReseed);
 
     // The clone carries the planted identity, written repo-local (see runnerCloneForBranch).
     assert.strictEqual(gitIn(rc.path, ["config", "--get", "user.name"]), "uzi-agent");
@@ -519,7 +556,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("without the planted identity, that same commit fails exit 128 — the control the fix removes (#234)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 235);
+    const rc = await git.createOrAttachRunnerClone(bare, 235, noProofReseed);
     // Undo the fix's plant to reconstruct the pre-#234 clone state.
     gitIn(rc.path, ["config", "--unset", "user.name"]);
     gitIn(rc.path, ["config", "--unset", "user.email"]);
@@ -542,7 +579,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
   it("resumes off the branch's origin tip when it already exists at origin", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // First cycle: commit + fetch-back + push agent/issue-9 to origin.
-    const first = await git.createOrAttachRunnerClone(bare, 9);
+    const first = await git.createOrAttachRunnerClone(bare, 9, noProofReseed);
     fs.writeFileSync(path.join(first.path, "A.txt"), "a\n");
     gitIn(first.path, ["add", "A.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "a"]);
@@ -553,7 +590,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
     // Refresh the bare so origin-tracking learns agent/issue-9, then reseed.
     await git.ensureClone(fx.originPath);
-    const second = await git.createOrAttachRunnerClone(bare, 9);
+    const second = await git.createOrAttachRunnerClone(bare, 9, noProofReseed);
 
     assert.strictEqual(second.branch, "agent/issue-9");
     // Resumed off the fresh origin tip (A.txt present), NOT recreated off default.
@@ -607,7 +644,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     assert.strictEqual(gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]), freshHead, "precondition: bare origin-tracking is fresh");
     assert.strictEqual(gitIn(bare, ["rev-parse", "refs/heads/main"]), initialHead, "precondition: bare's refs/heads/main is the frozen mirror");
 
-    const rc = await git.createOrAttachRunnerClone(bare, 262);
+    const rc = await git.createOrAttachRunnerClone(bare, 262, noProofReseed);
 
     // The clone's origin/main (the ratchet base) is the FRESH head, not the frozen initial commit.
     assert.strictEqual(
@@ -654,7 +691,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     // Seed a first runner clone off the FRESH default, commit, and push agent/issue-313 to
     // origin — so on the reseed the branch tip descends from freshHead (its real base is fresh).
     await git.ensureClone(fx.originPath); // origin-tracking learns freshHead
-    const first = await git.createOrAttachRunnerClone(bare, 313);
+    const first = await git.createOrAttachRunnerClone(bare, 313, noProofReseed);
     assert.strictEqual(first.baseCommit, freshHead, "precondition: first seed is off the fresh default");
     fs.writeFileSync(path.join(first.path, "WORK.txt"), "w\n");
     gitIn(first.path, ["add", "WORK.txt"]);
@@ -676,7 +713,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
     // Reseed: a resume off origin/agent/issue-313 (baseCommit fresh) whose defaultBranchCommit
     // resolves through the frozen rung to the stale initial commit.
-    const rc = await git.createOrAttachRunnerClone(bare, 313);
+    const rc = await git.createOrAttachRunnerClone(bare, 313, noProofReseed);
     assert.strictEqual(rc.baseCommit, branchTip, "precondition: resume base is the fresh branch tip");
 
     // PRECONDITION: the topology is genuinely the stale-ANCESTOR case — defaultBranchCommit is a
@@ -714,7 +751,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     const { logger, lines } = recordingLogger();
     const git = new GitCache(fx.dataDir, logger);
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 3131);
+    const rc = await git.createOrAttachRunnerClone(bare, 3131, noProofReseed);
 
     // Fresh seed: the base IS the default tip, so the two coincide (see the fresh-seed test above).
     assert.strictEqual(rc.defaultBranchCommit, rc.baseCommit, "precondition: fresh run, the two commits coincide");
@@ -741,7 +778,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
     const bare = await git.ensureClone(fx.originPath);
 
     // Seed the branch off the INITIAL commit, commit, and push agent/issue-3132 to origin.
-    const first = await git.createOrAttachRunnerClone(bare, 3132);
+    const first = await git.createOrAttachRunnerClone(bare, 3132, noProofReseed);
     fs.writeFileSync(path.join(first.path, "BRANCH.txt"), "b\n");
     gitIn(first.path, ["add", "BRANCH.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "branch work"]);
@@ -758,7 +795,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
     // Refresh the bare so origin-tracking learns both the fresh main and agent/issue-3132.
     await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 3132);
+    const rc = await git.createOrAttachRunnerClone(bare, 3132, noProofReseed);
 
     // Resume: base is the branch tip; defaultBranchCommit is the fresh main.
     assert.strictEqual(rc.baseCommit, branchTip, "precondition: resume base is the branch tip");
@@ -801,7 +838,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
     // Seed a first runner clone off the FRESH default, commit, push agent/issue-<issue> to origin.
     await git.ensureClone(fx.originPath);
-    const first = await git.createOrAttachRunnerClone(bare, issue);
+    const first = await git.createOrAttachRunnerClone(bare, issue, noProofReseed);
     assert.strictEqual(first.baseCommit, freshHead, "precondition: first seed is off the fresh default");
     fs.writeFileSync(path.join(first.path, "WORK.txt"), "w\n");
     gitIn(first.path, ["add", "WORK.txt"]);
@@ -821,7 +858,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
     // Reseed: a resume whose defaultBranchCommit resolves through the frozen rung to the stale
     // initial commit, so the clamp fires and pins origin/main to the fresh branch base.
-    const rc = await git.createOrAttachRunnerClone(bare, issue);
+    const rc = await git.createOrAttachRunnerClone(bare, issue, noProofReseed);
     assert.strictEqual(rc.baseCommit, branchTip, "precondition: resume base is the fresh branch tip");
     assert.notStrictEqual(rc.defaultBranchCommit, rc.baseCommit, "precondition: stale STRICT ancestor, not equal");
     return { rc, frozen };
@@ -895,7 +932,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
   // race is not — and #127 spent two agents' effort failing to reproduce the race on demand.
   it("disables git auto-maintenance in BOTH repos it creates, so no detached gc races their removal (#134)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 77);
+    const rc = await git.createOrAttachRunnerClone(bare, 77, noProofReseed);
 
     for (const [label, repo] of [["worker bare", bare], ["runner clone", rc.path]] as const) {
       assert.strictEqual(
@@ -950,7 +987,7 @@ describe("runner clone lifecycle (PRD #51 M3, (b) separate-runner-clone)", { ski
 
   it("removes the runner clone but keeps the worker bare clone", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 5);
+    const rc = await git.createOrAttachRunnerClone(bare, 5, noProofReseed);
 
     await git.removeRunnerClone(rc.path);
 
@@ -964,7 +1001,7 @@ describe("branchTip / trackingTip (PRD #122 M6)", { skip: linuxCloneSkip }, () =
 
   it("branchTip reads the runner clone's own head; trackingTip is null before a fetch-back and the tip after", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 7);
+    const rc = await git.createOrAttachRunnerClone(bare, 7, noProofReseed);
 
     // The agent commits in the runner clone (the only working tree).
     fs.writeFileSync(path.join(rc.path, "NEW.txt"), "hi\n");
@@ -986,7 +1023,7 @@ describe("branchTip / trackingTip (PRD #122 M6)", { skip: linuxCloneSkip }, () =
 
   it("both answer null for a branch that does not exist rather than throwing", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 8);
+    const rc = await git.createOrAttachRunnerClone(bare, 8, noProofReseed);
     assert.strictEqual(await git.branchTip(rc.path, "agent/issue-does-not-exist"), null);
     assert.strictEqual(await git.trackingTip(bare, "agent/issue-does-not-exist"), null);
   });
@@ -1007,7 +1044,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     const bare = await git.ensureClone(fx.originPath);
     // Build a checkpoint commit descending the default branch, land its objects in the
     // bare (as a fetch-back would), and publish it as origin's mirrored checkpoint ref.
-    const seed = await git.createOrAttachRunnerClone(bare, 700, "run-A");
+    const seed = await git.createOrAttachRunnerClone(bare, 700, noProofReseed, "run-A");
     const cpSha = commit(seed.path, "CP.txt");
     await git.fetchAgentBranch(bare, seed.path, "agent/issue-700", "run-A");
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-700", cpSha]);
@@ -1019,7 +1056,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // production per issue #1059 M1: resume=true and THIS run's own persisted checkpoint tip
     // (== the mirrored checkpoint's SHA), so the owner anchor admits the adopt; with no
     // origin/<branch> this is the Path-A resume-adopt leg.
-    const rc = await git.createOrAttachRunnerClone(bare, 700, "run-B", true /*resume*/, cpSha /*matching own tip*/);
+    const rc = await git.createOrAttachRunnerClone(bare, 700, noProofReseed, "run-B", true /*resume*/, cpSha /*matching own tip*/);
     assert.strictEqual(rc.seededFrom, "checkpoint");
     assert.strictEqual(rc.baseCommit, cpSha, "baseCommit is the checkpoint tip");
     assert.strictEqual(fs.existsSync(path.join(rc.path, "CP.txt")), true, "checkpointed work checked out");
@@ -1029,7 +1066,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
   it("(b) origin wins and the checkpoint is set aside LOUDLY when the checkpoint diverged from origin", async () => {
     const bare = await git.ensureClone(fx.originPath);
     // Cycle 1: push agent/issue-701 to origin at commit A.
-    const first = await git.createOrAttachRunnerClone(bare, 701, "run-1");
+    const first = await git.createOrAttachRunnerClone(bare, 701, noProofReseed, "run-1");
     const shaA = commit(first.path, "A.txt");
     await git.fetchAgentBranch(bare, first.path, "agent/issue-701", "run-1");
     await git.pushBranch(bare, "agent/issue-701", "", fx.originPath);
@@ -1039,7 +1076,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // A DIVERGED checkpoint: a sibling of A off the default branch (neither descends the
     // other). Built on a throwaway branch so its commit objects reach the bare, then
     // republished under issue-701's checkpoint ref.
-    const sib = await git.createOrAttachRunnerClone(bare, 7011, "run-sib");
+    const sib = await git.createOrAttachRunnerClone(bare, 7011, noProofReseed, "run-sib");
     const cpxSha = commit(sib.path, "CPX.txt");
     await git.fetchAgentBranch(bare, sib.path, "agent/issue-7011", "run-sib");
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-701", cpxSha]);
@@ -1050,7 +1087,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     // resume=true + THIS run's own persisted checkpoint tip (== cpxSha). ownerMatch holds and,
     // because origin/<branch> exists, this is the Path-B strict-descendant leg: the checkpoint
     // diverges from the origin floor → origin wins and the checkpoint is set aside LOUDLY.
-    const rc = await git.createOrAttachRunnerClone(bare, 701, "run-2", true /*resume*/, cpxSha /*matching own tip*/);
+    const rc = await git.createOrAttachRunnerClone(bare, 701, noProofReseed, "run-2", true /*resume*/, cpxSha /*matching own tip*/);
     assert.strictEqual(rc.seededFrom, "origin", "origin wins on divergence");
     assert.strictEqual(rc.baseCommit, shaA);
     assert.strictEqual(rc.checkpointSetAside, true, "the diverged checkpoint is flagged, not dropped silently");
@@ -1058,14 +1095,14 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
 
   it("(c) absent checkpoint ⇒ unchanged behaviour (fresh seed off default, no set-aside)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 702, "run-C");
+    const rc = await git.createOrAttachRunnerClone(bare, 702, noProofReseed, "run-C");
     assert.strictEqual(rc.seededFrom, "default");
     assert.notStrictEqual(rc.checkpointSetAside, true);
   });
 
   it("(d) ownedHere local tracking ref still wins over a present checkpoint (same-worker work is not overridden)", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc1 = await git.createOrAttachRunnerClone(bare, 800, "run-D");
+    const rc1 = await git.createOrAttachRunnerClone(bare, 800, noProofReseed, "run-D");
     const shaD = commit(rc1.path, "D.txt");
     await git.fetchAgentBranch(bare, rc1.path, "agent/issue-800", "run-D"); // tracking owned by run-D
     // A checkpoint that WOULD win the not-ownedHere path (it descends the default floor).
@@ -1073,7 +1110,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     await git.removeRunnerClone(rc1.path);
 
     // Reseed as the SAME run: the owned tracking ref is consulted, the checkpoint ignored.
-    const rc = await git.createOrAttachRunnerClone(bare, 800, "run-D");
+    const rc = await git.createOrAttachRunnerClone(bare, 800, noProofReseed, "run-D");
     assert.strictEqual(rc.seededFrom, "tracking", "the checkpoint must not override same-worker local work");
     assert.strictEqual(rc.baseCommit, shaD);
     assert.notStrictEqual(rc.checkpointSetAside, true);
@@ -1088,7 +1125,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     const floorSha = gitIn(bare, ["rev-parse", "refs/remotes/origin/HEAD"]);
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-703", floorSha]);
 
-    const rc = await git.createOrAttachRunnerClone(bare, 703, "run-E");
+    const rc = await git.createOrAttachRunnerClone(bare, 703, noProofReseed, "run-E");
     assert.notStrictEqual(rc.seededFrom, "checkpoint", "an equal checkpoint recovers nothing");
     assert.strictEqual(rc.seededFrom, "default", "falls through to the default floor");
     assert.strictEqual(rc.baseCommit, floorSha);
@@ -1099,7 +1136,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     const bare = await git.ensureClone(fx.originPath);
     // Build a checkpoint that STRICTLY DESCENDS the default floor (as test (a) does), so only
     // the owner anchor — not the strict-descendant guard — can keep it from being adopted.
-    const seed = await git.createOrAttachRunnerClone(bare, 704, "run-A");
+    const seed = await git.createOrAttachRunnerClone(bare, 704, noProofReseed, "run-A");
     const cpSha = commit(seed.path, "CP.txt");
     await git.fetchAgentBranch(bare, seed.path, "agent/issue-704", "run-A");
     gitIn(bare, ["update-ref", "refs/uzi-checkpoints/agent/issue-704", cpSha]);
@@ -1112,7 +1149,7 @@ describe("checkpoint reseed candidate (PRD #122 M8)", { skip: linuxCloneSkip }, 
     );
 
     // A genuine FRESH run: resume=false (default), no own-checkpoint tip → ownerMatch false.
-    const rc = await git.createOrAttachRunnerClone(bare, 704, "run-B");
+    const rc = await git.createOrAttachRunnerClone(bare, 704, noProofReseed, "run-B");
     assert.strictEqual(rc.seededFrom, "default", "a foreign checkpoint is refused; the fresh run seeds off the floor");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor, not the foreign checkpoint");
     assert.strictEqual(rc.priorCommits, 0, "no foreign committed work re-treaded");
@@ -1132,7 +1169,7 @@ describe("checkpointPack (PRD #122 M8)", { skip: linuxCloneSkip }, () => {
 
   it("returns null with no tracking ref, and a valid non-empty pack whose tipOid is the tracking tip once one exists", async () => {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 900, "run-p");
+    const rc = await git.createOrAttachRunnerClone(bare, 900, noProofReseed, "run-p");
 
     // No fetch-back yet ⇒ no tracking ref ⇒ nothing to publish.
     assert.strictEqual(await git.checkpointPack(bare, "agent/issue-900"), null);
@@ -1562,7 +1599,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     const disjointTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/agent/issue-55"]);
     const defaultTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
 
-    const rc = await git.createOrAttachRunnerClone(bare, 55);
+    const rc = await git.createOrAttachRunnerClone(bare, 55, noProofReseed);
     assert.strictEqual(rc.seededFrom, "default", "a disjoint origin ref is ignored; the seed falls back to default");
     assert.strictEqual(rc.priorCommits, 0, "a default seed carries no prior commits");
     assert.strictEqual(rc.baseCommit, defaultTip, "seeded off the fresh default tip");
@@ -1574,7 +1611,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     // Seed a first runner clone off the initial default and build a tracking ref several
     // commits ahead, owned by run-far. It forks off main's initial commit — so it merely
     // DIVERGES from default; it is not disjoint.
-    const first = await git.createOrAttachRunnerClone(bare, 66, "run-far");
+    const first = await git.createOrAttachRunnerClone(bare, 66, noProofReseed, "run-far");
     for (const f of ["F1.txt", "F2.txt", "F3.txt"]) {
       fs.writeFileSync(path.join(first.path, f), `${f}\n`);
       gitIn(first.path, ["add", f]);
@@ -1604,7 +1641,7 @@ describe("issue #781 — disjoint-ref seed guard + fetch --prune", () => {
     );
 
     // Reseed as the SAME run: the guard KEEPS the diverged tracking ref, so it seeds off it.
-    const rc = await git.createOrAttachRunnerClone(bare, 66, "run-far");
+    const rc = await git.createOrAttachRunnerClone(bare, 66, noProofReseed, "run-far");
     assert.strictEqual(rc.seededFrom, "tracking", "a merely-diverged owned tracking ref must be kept, not rejected");
     assert.strictEqual(rc.baseCommit, tip, "…and seeded off the tracking tip");
   });
@@ -1692,7 +1729,7 @@ describe("issue #887 — fetchAgentBranch clears a D/F-conflicting legacy ancest
 
     const runId = "37702d9d-887d-49c9-b3cd-7974a3b2ecde";
     const branch = `uzi/self-improve/${runId}`;
-    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, runId);
+    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, noProofReseed, runId);
 
     // The agent commits in the runner clone.
     fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
@@ -1759,7 +1796,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
 
     // Build a genuine UNPUSHED commit that descends origin/main and land it in the worker
     // bare as a fetch-back would, creating refs/uzi-runner/agent/issue-500 at that tip.
-    const first = await git.runnerCloneForBranch(bare, branch, "issue-500", runId);
+    const first = await git.runnerCloneForBranch(bare, branch, "issue-500", noProofReseed, runId);
     fs.writeFileSync(path.join(first.path, "W.txt"), "unpushed work\n");
     gitIn(first.path, ["add", "W.txt"]);
     gitIn(first.path, [...IDENT, "commit", "-m", "unpushed work"]);
@@ -1776,7 +1813,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     // No origin/agent/issue-500 (never pushed), so ownedHere alone decides. On unfixed code
     // the reader sees only the (absent) subsection key ⇒ ownedHere=false ⇒ seededFrom other
     // than "tracking" and the unpushed commit is silently redone.
-    const rc = await git.runnerCloneForBranch(bare, branch, "issue-500", runId);
+    const rc = await git.runnerCloneForBranch(bare, branch, "issue-500", noProofReseed, runId);
     assert.strictEqual(rc.seededFrom, "tracking", "the legacy-flat-owned tracking ref must be adopted via the fallback");
     assert.strictEqual(rc.baseCommit, workSha, "…seeded off the unpushed tracking tip, not the default floor");
   });
@@ -1794,7 +1831,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     // collision guard — not a value mismatch — can keep the fallback from adopting it.
     gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", runId]);
 
-    const rc = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", runId);
+    const rc = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", noProofReseed, runId);
     assert.notStrictEqual(rc.seededFrom, "tracking", "an ambiguous flat stamp must not be attributed to either branch");
   });
 
@@ -1808,11 +1845,11 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
     gitIn(bare, ["config", "--local", "uzi-trackowner.agent-issue-500", "flat-run"]);
 
     // The run whose id matches the NEW subsection value is ownedHere.
-    const owned = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", "new-run");
+    const owned = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", noProofReseed, "new-run");
     assert.strictEqual(owned.seededFrom, "tracking", "the new subsection stamp must decide ownership");
     // The run whose id matches only the FLAT value is NOT ownedHere — the flat value is never
     // consulted once the subsection key is present.
-    const notOwned = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", "flat-run");
+    const notOwned = await git.runnerCloneForBranch(bare, "agent/issue-500", "issue-500", noProofReseed, "flat-run");
     assert.notStrictEqual(notOwned.seededFrom, "tracking", "the flat value must never be consulted when the subsection key exists");
   });
 
@@ -1828,7 +1865,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
 
     const runId = "37702d9d-909d-49c9-b3cd-7974a3b2ecde";
     const branch = `uzi/self-improve/${runId}`;
-    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, runId);
+    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, noProofReseed, runId);
     fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
     gitIn(rc.path, ["add", "SI.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);
@@ -1854,7 +1891,7 @@ describe("issue #909 — the owner-stamp reader falls back to the pre-#887 flatt
 
     const runId = "37702d9d-909e-49c9-b3cd-7974a3b2ecde";
     const branch = `uzi/self-improve/${runId}`;
-    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, runId);
+    const rc = await git.runnerCloneForBranch(bare, branch, `self-improve-${runId}`, noProofReseed, runId);
     fs.writeFileSync(path.join(rc.path, "SI.txt"), "self-improve\n");
     gitIn(rc.path, ["add", "SI.txt"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "self-improve work"]);

@@ -439,7 +439,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
-      # Go is needed for scan:secrets (gitleaks via `go run pkg@version`).
+      # Go is needed for scan:secrets (gitleaks via `go install pkg@version`).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
           # Latest patch of this Go minor, so a stdlib CVE fixed in a patch release

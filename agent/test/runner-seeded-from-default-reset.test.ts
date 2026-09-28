@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { GitCache, type RunnerClone } from "../src/git.js";
+import { GitCache, type AttemptSeedOptions, type CanonicalReseedOptions, type RunnerClone } from "../src/git.js";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness } from "./runner-harness.js";
@@ -36,9 +36,13 @@ class ForcedSeedGit extends GitCache {
     barePath: string,
     branch: string,
     key: string,
+    reseed: CanonicalReseedOptions,
     runId?: string,
+    resume = false,
+    expectedCheckpointTip?: string,
+    attempt?: AttemptSeedOptions,
   ): Promise<RunnerClone> {
-    const rc = await super.runnerCloneForBranch(barePath, branch, key, runId);
+    const rc = await super.runnerCloneForBranch(barePath, branch, key, reseed, runId, resume, expectedCheckpointTip, attempt);
     return { ...rc, seededFrom: this.forced };
   }
 }

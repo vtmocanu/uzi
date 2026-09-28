@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
-import { GitCache, RunnerCloneMaterializationError, type RunnerClone } from "../src/git.js";
+import { GitCache, RunnerCloneMaterializationError, type AttemptSeedOptions, type CanonicalReseedOptions, type RunnerClone } from "../src/git.js";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { CodexExecutionSafety } from "../src/harness.js";
 import { CodexExecutor, type CodexExecutorOptions } from "../src/codex/codex-executor.js";
@@ -20,6 +20,8 @@ const STOP = "stop after recording the clone options (issue #1769 test)";
 
 class RecordingGit extends GitCache {
   readonly seen: Array<{ selfContained?: boolean } | undefined> = [];
+  /** issue #1783 M2: the attempt id each seed was handed (undefined = the canonical seed). */
+  readonly attempts: Array<string | undefined> = [];
   constructor(dataDir: string) {
     super(dataDir, nullLogger(), undefined, testGitCacheOptions());
   }
@@ -27,12 +29,15 @@ class RecordingGit extends GitCache {
     _barePath: string,
     _branch: string,
     _key: string,
+    _reseed: CanonicalReseedOptions,
     _runId?: string,
     _resume?: boolean,
     _expectedCheckpointTip?: string,
+    attempt?: AttemptSeedOptions,
     opts?: { selfContained?: boolean },
   ): Promise<RunnerClone> {
     this.seen.push(opts);
+    this.attempts.push(attempt?.attemptId);
     throw new Error(STOP);
   }
 }
@@ -55,7 +60,11 @@ function fakeSafety(): CodexExecutionSafety {
   };
 }
 
-async function seedOptsFor(executor: Executor, issue: number): Promise<Array<{ selfContained?: boolean } | undefined>> {
+async function recordSeed(
+  executor: Executor,
+  issue: number,
+  wiring: { dockerHost?: string; resume?: boolean } = {},
+): Promise<RecordingGit> {
   const recording = new RecordingGit(fx.dataDir);
   const { gitlab } = fakeGitlab();
   const factory: ExecutorFactory = () => ({ executor });
@@ -64,14 +73,21 @@ async function seedOptsFor(executor: Executor, issue: number): Promise<Array<{ s
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,
     gitlab,
+    ...(wiring.dockerHost ? { dockerHost: wiring.dockerHost } : {}),
   });
   const claim = gitlabClaim(issue);
+  // A resume is `session_id != null` (a run that executed before, re-claimed after a park).
+  if (wiring.resume) claim.session_id = "11111111-2222-4333-8444-555555555555";
   await runner.execute(claim);
   assert.ok(
     api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"),
     "the stopped seed fails the run",
   );
-  return recording.seen;
+  return recording;
+}
+
+async function seedOptsFor(executor: Executor, issue: number): Promise<Array<{ selfContained?: boolean } | undefined>> {
+  return (await recordSeed(executor, issue)).seen;
 }
 
 describe("RunRunner — self-contained runner clone for Codex (issue #1769 m1)", () => {
@@ -91,6 +107,33 @@ describe("RunRunner — self-contained runner clone for Codex (issue #1769 m1)",
   it("the signal is sandboxesCommands, not safety: a safety-only executor seeds with selfContained false", async () => {
     const seen = await seedOptsFor({ run: neverRun, safety: fakeSafety() }, 1771);
     assert.deepStrictEqual(seen, [{ selfContained: false }]);
+  });
+
+  // issue #1783 M2 x #1769: a Docker-wired worker seeds a fresh ATTEMPT path on every claim,
+  // resumes included. The runner must hand that attempt seed the same self-contained option, or a
+  // Codex resume there runs in a clone that still borrows the bare's objects.
+  it("a real CodexExecutor on a Docker-wired worker's RESUME seeds an attempt path with selfContained true", async () => {
+    const recording = await recordSeed(realCodexExecutor(), 1773, {
+      dockerHost: "unix:///nonexistent/uzi-test-docker.sock",
+      resume: true,
+    });
+    assert.deepStrictEqual(recording.seen, [{ selfContained: true }]);
+    assert.strictEqual(recording.attempts.length, 1);
+    assert.ok(recording.attempts[0], "the Docker-wired seed carries an attempt id");
+  });
+
+  it("a Claude/stub executor on a Docker-wired worker seeds an attempt path with selfContained false", async () => {
+    const recording = await recordSeed({ run: neverRun }, 1774, {
+      dockerHost: "unix:///nonexistent/uzi-test-docker.sock",
+      resume: true,
+    });
+    assert.deepStrictEqual(recording.seen, [{ selfContained: false }]);
+    assert.ok(recording.attempts[0], "the Docker-wired seed carries an attempt id");
+  });
+
+  it("an unwired worker's seed carries no attempt id (the canonical seed)", async () => {
+    const recording = await recordSeed(realCodexExecutor(), 1775);
+    assert.deepStrictEqual(recording.attempts, [undefined]);
   });
 });
 

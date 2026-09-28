@@ -575,6 +575,10 @@ export const execInstall: InstallExec = (cmd) =>
     let settled = false;
     const child = spawn(cmd.command, cmd.args, {
       cwd: cmd.cwd,
+      // issue #1783 (R4): deliberately NOT worker-marked. Install scripts are off (every manager
+      // runs with --ignore-scripts, plus the pnpmfile/yarnPath neutralizers above), but the
+      // package manager still reads repo-controlled config with its cwd in the clone, so anything
+      // it leaks must stay reapable by the run's own quiescence proof.
       env: cmd.env,
       detached: true,
       stdio: "ignore",

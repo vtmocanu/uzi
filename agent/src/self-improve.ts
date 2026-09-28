@@ -235,6 +235,9 @@ export function defaultCheckRunner(env: NodeJS.ProcessEnv, timeoutMs = 15 * 60 *
       // `stdio: "ignore"` keeps the no-output-capture property STRUCTURAL rather than
       // disciplinary — stronger than execFile's buffer-then-discard, and it also retires a
       // `maxBuffer` that would have killed a merely-verbose passing suite.
+      // issue #1783 (R4): deliberately NOT worker-marked. The check executes REPO-authored code
+      // (e.g. `npm test`) with its cwd in the clone, so anything it leaks (a detached dev server)
+      // must stay reapable by the run's own quiescence proof; a mark would exempt it forever.
       const child = spawn(wc.command, wc.args, { cwd, env, detached: true, stdio: "ignore" });
       const timer = setTimeout(() => {
         timedOut = true;

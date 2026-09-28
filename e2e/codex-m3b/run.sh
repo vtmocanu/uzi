@@ -40,7 +40,7 @@ timeout --kill-after=30s "$TIMEOUT" docker run --rm --network none \
   --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
   --security-opt no-new-privileges \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
-  -v "$REPO/e2e":/work/e2e:ro \
+  --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
   --name "$NAME" \
   "$IMAGE" /bin/sh /work/e2e/codex-m3b/controls.sh
 rc=$?

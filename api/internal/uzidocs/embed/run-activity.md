@@ -390,6 +390,101 @@ one: `scope --through 4` then `scope --through 5` finalizes at 5, not 4, and
 CLI docs](./cli.md#commands) for the exact commands, and
 [ADR-634](../adr/0634-run-scope-steering.md) for the design rationale.
 
+## When the worker cannot prove a run stopped
+
+Before it pushes a run's branch, captures its work, or reseeds its clone,
+the worker checks that everything the run started has actually stopped: the
+processes its tools spawned, and, best-effort, the Docker activity it
+began. An unresolved Docker container never blocks anything on its own; only
+an unproven **process** is treated as a run still running.
+
+What happens next depends on where in the run this check comes up, because
+most of the places that check are not the end of the run:
+
+- At a wall-clock, usage-limit, or completion-hold park, the check being
+  unproven means the worker skips the capture for that park entirely — no
+  checkpoint publish, so the latest local work stays on this worker only
+  for now (a checkpoint publish targets a separate checkpoint ref, never
+  the run's branch directly) — but the park itself still stands: a
+  same-worker resume recovers the kept clone's local work through a capture
+  of that clone, which itself needs the clone proven stopped (on a
+  Docker-wired worker, that later capture can still fail the run with
+  worker residue blocked), while a resume on another worker recovers only
+  from whatever checkpoint was last durably published.
+- At a pause the owner requested, it means the pause itself fails: the run
+  reports **pause failed** and keeps running rather than stopping on
+  unproven ground.
+- At a milestone checkpoint, it means that one checkpoint's publish is
+  skipped and the run continues to its next milestone.
+- During a credential switch, the worker retries capturing a verified
+  restore point a bounded number of times. If it never succeeds, it reports
+  **credential switch failed**; when the server confirms the failure stamp
+  cleared, the run normally continues on the old credential in place (its
+  clone and session are kept); otherwise it is stopped and left to be
+  requeued rather than continuing on uncertain ground.
+- A recovery capture that cannot prove the clone stopped is retried, up to a
+  bounded number of times; if the clone still can't be proven stopped after
+  that, the run fails the same way finalize does (see below), with the clone
+  kept.
+- On graceful shutdown, an unproven clone means nothing is published to the
+  run's checkpoint; the pending requeue stands, and a later resume recovers
+  from whatever was last durably saved.
+
+The run actually **fails**, with `fail_origin = worker_residue_blocked`
+(shown as **worker residue blocked**), at points where there is no safe
+way to continue without the proof: the finalize gate that pushes the run's
+branch (and its re-proofs after any git operation that could have started
+something new), capturing a predecessor attempt's or a reclaimed orphan's
+work (both on a Docker-wired worker), a canonical clone reseed that cannot
+free the path it needs, and a recovery capture whose proof stays blocked
+past its bounded number of retries (above). Seeding a fresh attempt clone
+for a new execution attempt is the one site that is let through when the
+only problem is a process it cannot positively attribute to anyone — the
+new path is untouched by that process either way, so nothing is moved or
+freed by proceeding. It still fails, the same as everywhere else, on any
+other unproven verdict, including a process it *can* place in scope (another
+live attempt's process, or an unmarked in-scope process left in a non-live
+path). A blocked check during cleanup **after** a
+run has already reached its own outcome — retiring a finished run's clone,
+for instance — does not itself fail the run: the clone is simply kept in
+place instead of being removed, and the run's own status and failure
+reason (if any) stand unchanged.
+
+When the check is unproven because a specific process's environment or
+working directory could not be read, so the worker cannot positively
+account for it, the failure reason names that process's process ID and
+program name, so an operator knows exactly what to look for on the worker.
+That process does not have to belong to the run that failed — any such
+unaccountable process, running as the same worker user, blocks a Claude or
+stub run's own checks at those sites, and blocks the canonical clone reseed
+and, on a Docker-wired worker, every capture of another attempt's clone,
+regardless of which harness the run belongs to (seeding a fresh attempt clone is the one
+exception described above), by design:
+the worker would rather refuse to proceed than guess. **A Codex run's own
+checks are a disclosed exception**: they don't scan the process table at
+all, relying instead on Codex's own proof that its processes have drained,
+so an unaccountable process elsewhere on the worker does not block a Codex
+run's own park, finalize, shutdown, retire, or recovery and credential-switch
+capture the way it blocks a Claude or stub run's. The exception is a run
+capturing a predecessor attempt's clone: its recovery capture always scans.
+See [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md)
+for exactly which of those checks still has no process proof at all. A
+process the worker *can* positively tie, by ancestry, to another live run's
+own recorded root, or to a long-lived process the worker itself launched
+(not the agent), is not this case: it is attributed and does not block.
+When the check is unproven
+instead because an in-scope process was seen but could not be confirmed
+stopped, the failure reason reports only how many such processes survived
+the reap, not their pid or program name. Either way, to clear a block on
+an unaccountable process, stop the named process on the worker (or wait
+for it to exit on its own), then start a new run.
+
+This is a worker infrastructure problem, not something the agent did wrong,
+so a run that fails this way is never sent to the judge. Nothing is
+published from the unproven state; commits the run had already pushed
+before this point stay on its branch. Start a new run once the worker is
+healthy again.
+
 ## From the CLI
 
 `uzi run inputs <run-id>` shows the same queue from the terminal — see

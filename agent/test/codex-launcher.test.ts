@@ -17,6 +17,7 @@ import {
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
 import { runLaunchCli, type LaunchCliDeps } from "../src/codex/launch-cli.js";
+import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark.js";
 
 // PRD #1156 (M3a) — the isolated per-root launcher. NO real Go binary, NO network,
 // NO setpriv/root: the supervisor is a FAKE process, every privileged/uid-resolving
@@ -200,6 +201,7 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
       [
         "CODEX_HOME", "CODEX_PROVIDER_KEY", "HOME", "LANG", "PATH", "SHELL", "TERM", "TMPDIR",
         "XDG_CACHE_HOME", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME",
+        // issue #1783 (R4): NO worker spawn mark — the app-server runs model-directed work.
       ].sort(),
     );
     assert.equal(env.CODEX_PROVIDER_KEY, "dummy-key");
@@ -223,6 +225,23 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
     const env = spawnCalls[0]?.options.env ?? {};
     assert.equal(env.CODEX_PROVIDER_KEY, undefined, "no provider credential for a command root");
     assert.equal(Object.keys(env).includes("CODEX_PROVIDER_KEY"), false);
+  });
+
+  it("issue #1783: a runner-uid provider root is a recorded worker-launched root until it exits; a command root is not; neither carries the worker mark", async () => {
+    const provider = newFake();
+    await launchCodexRoot(baseSpec(), baseDeps(provider, { rootStartTime: (pid) => pid + 7 }));
+    assert.equal(spawnCalls[0]?.options.env[WORKER_SPAWN_ENV], undefined, "no worker mark on the model-driving provider root");
+    assert.ok(
+      workerRunnerRootPids().some((r) => r.pid === provider.pid && r.startTime === provider.pid + 7),
+      "the non-dumpable provider supervisor is attributable (pid + the start time read at registration)",
+    );
+    provider.exitWith(0);
+    assert.equal(workerRunnerRootPids().some((r) => r.pid === provider.pid), false, "unregistered once it exited");
+
+    const command = newFake({ uid: COMMAND_UID });
+    await launchCodexRoot(baseSpec({ kind: "command", childArgv: ["exec", "--", "echo"] }), baseDeps(command, { rootStartTime: (pid) => pid + 7 }));
+    assert.equal(spawnCalls[1]?.options.env[WORKER_SPAWN_ENV], undefined, "no worker mark on a command root");
+    assert.equal(workerRunnerRootPids().some((r) => r.pid === command.pid), false, "a runner-cmd root is never scanned, so never recorded");
   });
 
   it("(c) creates the fresh trees 0700 as the runner uid via the injected step", async () => {
@@ -453,6 +472,7 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
       "--cleanup-token", cleanupToken,
       "--", "/bin/sh", "-c", "exit 7",
     ]);
+    // issue #1783 (R4): a command/effect root runs model-directed work: NO worker spawn mark.
     assert.deepEqual(call.options.env, env);
     fake.emitChildExit(7);
     assert.deepEqual(await handle.waitChild(), { event: "child_exit", code: 7 });
@@ -479,6 +499,7 @@ describe("launchCodexEffectRoot: supervised command identity", () => {
       ...setprivArgsForUid(WORKER_UID), SUPERVISOR_BIN,
       "--expect-uid", String(WORKER_UID), "--drop-controller-caps", "--", "/usr/bin/git", "status",
     ]);
+    // issue #1783 (R4): a command/effect root runs model-directed work: NO worker spawn mark.
     assert.deepEqual(call.options.env, env);
   });
 });

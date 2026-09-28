@@ -44,7 +44,7 @@ run_negative() {
   local name=$1 image=$2 arch=$3 body=$4
   OWNED_CONTAINERS+=("$name")
   timeout "$TIMEOUT" docker run --rm --platform "linux/$arch" --name "$name" \
-    --entrypoint /bin/sh -v "$REPO/agent/codex:/m3a:ro" "$image" -ceu "$body"
+    --entrypoint /bin/sh --mount "type=bind,src=$REPO/agent/codex,dst=/m3a,readonly" "$image" -ceu "$body"
   docker rm -f "$name" >/dev/null 2>&1 || true
 }
 
@@ -64,8 +64,8 @@ for template in "${TEMPLATES[@]}"; do
     printf '==> negative checksum %s × %s\n' "$template" "$arch"
     timeout "$TIMEOUT" docker run --rm --platform "linux/$arch" --name "$checksum_name" \
       --entrypoint /bin/sh \
-      -v "$REPO/agent/codex:/m3a:ro" \
-      -v "$RUN_DIR/$artifact.corrupt:/artifact.tgz:ro" \
+      --mount "type=bind,src=$REPO/agent/codex,dst=/m3a,readonly" \
+      --mount "type=bind,src=$RUN_DIR/$artifact.corrupt,dst=/artifact.tgz,readonly" \
       "$image" -ceu 'if UZI_CODEX_ARTIFACT=/artifact.tgz UZI_CODEX_PREFIX=/tmp/codex-bad bash /m3a/install-codex.sh "$1"; then echo "corrupt checksum unexpectedly installed" >&2; exit 1; fi' sh "$arch"
     docker rm -f "$checksum_name" >/dev/null 2>&1 || true
 

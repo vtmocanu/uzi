@@ -33,8 +33,10 @@ import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
 import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
-import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
+import { AGENT_GIT_IDENTITY, gitEnv, runnerGitSpawnEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
+import type { SdkAttemptEnv } from "./sdk-env.js";
+import { unmarkedSpawnEnv, type RecordedRoot } from "./worker-spawn-mark.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -127,6 +129,10 @@ export interface RunContext {
   pipeline?: ClaimPipeline | null;
   /** Checked-out worktree the executor edits and commits in (local only). */
   worktreePath: string;
+  /** issue #1783 (R2): this execution attempt's marker, which the SDK executor emits into
+   *  the agent CLI's env (buildSdkEnv) so the run-quiescence reaper can attribute every
+   *  process the agent starts. Absent ⇒ no marker (the stub and Codex executors ignore it). */
+  runAttempt?: SdkAttemptEnv;
   branch: string;
   /** The commit `branch` was cut from in the runner clone (git.ts `RunnerClone.baseCommit`).
    *  The executor states it in the lead's prompts so the lead does not have to infer the
@@ -233,9 +239,10 @@ export interface RunContext {
    *  session-less seeded path there is no planning turn, so the sdk-executor forwards it to
    *  the IMPLEMENT prompt instead (first turn only). */
   priorWork?: PriorWork;
-  /** issue #222: this run was picked up again (a resume), so the runner clone was wiped
-   *  and re-seeded on this claim, destroying any local-only work an earlier attempt left in
-   *  the tree. Set by the RUNNER from the raw `claim.session_id` (a run that executed before
+  /** issue #222: this run was picked up again (a resume), so the runner clone was rebuilt
+   *  on this claim (wiped and re-seeded; on a Docker-wired worker, issue #1783 M2, seeded at a
+   *  fresh attempt path with the predecessor retained out of reach), so any uncaptured
+   *  local-only work an earlier attempt left in its tree is not here. Set by the RUNNER from the raw `claim.session_id` (a run that executed before
    *  reported one) — the same discriminator the reseed feed-status uses, read raw so a
    *  dropped-transcript resume still counts. Forwarded to the FIRST implement prompt so the
    *  lead is warned before a queued follow-up written against the destroyed tree arrives.
@@ -797,6 +804,12 @@ export interface Executor {
    * it; the SDK executor also self-reaps in its own run() finally.
    */
   killAgentTree?(): void;
+  /** issue #1783 (R0): the roots of the agent processes this executor has spawned and not yet
+   *  reaped (the CLI process groups), each as its pid AND its start time captured at spawn. The
+   *  run-quiescence reaper attributes an unreadable runner-uid process to ANOTHER live attempt by
+   *  ancestry to one of these, and only while a live process matches both. Optional: an executor
+   *  without it contributes no roots. */
+  recordedRootPids?(): RecordedRoot[];
   /**
    * PRD #1809 D4: SIGKILL the run's processes that {@link killAgentTree}'s process-group reap
    * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
@@ -1103,6 +1116,22 @@ export interface StubExecutorOptions {
  * plan→approve→work→MR path is provable end-to-end without a live Anthropic
  * session (mirrors SdkExecutor's gate handling).
  */
+/** The `git` subcommand argv readWorktreeHeadSha runs (after `-C <worktree>`). */
+const WORKTREE_HEAD_SHA_ARGS = ["rev-parse", "--verify", "HEAD^{commit}"] as const;
+
+/**
+ * issue #1783 (R4): the env readWorktreeHeadSha spawns with. A fixed, driver-free `rev-parse`
+ * carries the worker mark (a concurrent quiescence scan must not read it as the run's own
+ * residue) plus the GIT_ALLOW_PROTOCOL transport pin, exactly as runGitAsRunner applies them
+ * (runnerGitSpawnEnv).
+ */
+export function worktreeHeadShaEnv(): NodeJS.ProcessEnv {
+  const env = runnerGitSpawnEnv(WORKTREE_HEAD_SHA_ARGS, { ...gitEnv(), PATH: runnerPath() });
+  const tmp = runnerTmpdir();
+  if (tmp) env.TMPDIR = tmp;
+  return env;
+}
+
 /**
  * PRD #1798 M2: read the run worktree's HEAD for a pr_summary's `verifiedAtSha`. Runs git AS
  * the runner uid (the worktree is the runner-owned clone; see StubExecutor.git for why a
@@ -1111,11 +1140,8 @@ export interface StubExecutorOptions {
  */
 export async function readWorktreeHeadSha(worktreePath: string): Promise<string | undefined> {
   try {
-    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
-    const tmp = runnerTmpdir();
-    if (tmp) env.TMPDIR = tmp;
-    const wrapped = runnerCommand("git", ["-C", worktreePath, "rev-parse", "--verify", "HEAD^{commit}"]);
-    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 30_000 });
+    const wrapped = runnerCommand("git", ["-C", worktreePath, ...WORKTREE_HEAD_SHA_ARGS]);
+    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env: worktreeHeadShaEnv(), timeout: 30_000 });
     return normalizeVerifiedSha(String(stdout));
   } catch {
     return undefined;
@@ -1741,7 +1767,13 @@ export class StubExecutor implements Executor {
     // Commit identity rides the caller's `-c` flags, which survive the setpriv `--`
     // passthrough. Single-uid (#58 / no split): runnerCommand is a passthrough and
     // runnerPath/runnerTmpdir fall back to the ambient PATH/TMPDIR — a plain git.
-    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    //
+    // issue #1783 (R4): NOT worker-marked. This is the stub's stand-in for the agent's own git
+    // (`add`/`commit` in the clone), and such a git runs whatever filter/driver the clone's
+    // agent-writable `.git/config` + `.gitattributes` name, so anything it leaks must stay
+    // reapable (in scope by cwd). It runs inside the stub's run() body, awaited to completion
+    // before run() returns, so it never overlaps the post-run quiescence scan anyway.
+    const env: NodeJS.ProcessEnv = unmarkedSpawnEnv({ ...gitEnv(), PATH: runnerPath() });
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     const wrapped = runnerCommand("git", ["-C", cwd, ...args]);

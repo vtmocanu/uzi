@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 
 // PRD #1416 M2 — the tri-state, error-safe ancestry helper `git.ancestry(bare, floor, tip)`,
@@ -36,7 +36,7 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
     const bare = await git.ensureClone(fx.originPath);
     const mainTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
     // A runner clone commits ON TOP of main → its tip strictly descends from main.
-    const rc = await git.createOrAttachRunnerClone(bare, 1);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
     gitIn(rc.path, ["add", "impl.ts"]);
     gitIn(rc.path, [...IDENT, "commit", "-m", "impl"]);
@@ -52,7 +52,7 @@ describe("GitCache.ancestry (PRD #1416 M2)", () => {
   it("returns 'divergent' for a rewritten/diverged tip (both present, floor not an ancestor)", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const mainTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
-    const rc = await git.createOrAttachRunnerClone(bare, 1);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed);
     // First history X: commit on top of main, fetched into the bare (objects retained there).
     fs.writeFileSync(path.join(rc.path, "a.ts"), "export const a = 1;\n");
     gitIn(rc.path, ["add", "a.ts"]);

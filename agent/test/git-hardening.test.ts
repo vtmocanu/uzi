@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache, gitEnv } from "../src/git.js";
 
 // PRD #51 M0 — standalone shared-git hardening (the gitEnv belt), PLUS the M3 (b)
@@ -152,7 +152,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     file: string,
     content: string,
   ): Promise<{ ref: string; baseSha: string; tipSha: string }> {
-    const rc = await git.createOrAttachRunnerClone(bare, iid);
+    const rc = await git.createOrAttachRunnerClone(bare, iid, noProofReseed);
     const baseSha = gitOut(rc.path, ["rev-parse", "HEAD"]);
     fs.writeFileSync(path.join(rc.path, file), content);
     runGit(rc.path, ["add", file], plainEnv());
@@ -204,7 +204,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
     // Plant BEFORE seeding, so if the runner clone ever consulted <bare>/config it
     // would inherit the code-exec key.
     plant(bare, "diff.external", evil);
-    const rc = await git.createOrAttachRunnerClone(bare, 100);
+    const rc = await git.createOrAttachRunnerClone(bare, 100, noProofReseed);
     // Two commits in the CLONE so a content diff there is possible.
     fs.writeFileSync(path.join(rc.path, "X.txt"), "1\n");
     runGit(rc.path, ["add", "X.txt"], plainEnv());
@@ -237,7 +237,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
   it("(b) invariant 6: a runner-planted uploadpack.packObjectsHook does NOT execute in the worker's file:// fetch-back", async (t) => {
     if (!gitAvailable()) return t.skip("git not available");
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 200);
+    const rc = await git.createOrAttachRunnerClone(bare, 200, noProofReseed);
     fs.writeFileSync(path.join(rc.path, "F.txt"), "x\n");
     runGit(rc.path, ["add", "F.txt"], plainEnv());
     runGit(rc.path, [...IDENT, "commit", "-m", "c"], plainEnv());
@@ -261,7 +261,7 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
   it("(b) moot-by-construction: the worker's bare-only changedFiles never resolves a runner clone's git dir (commondir/gitdir), so runner-clone corruption cannot reach it", async (t) => {
     if (!gitAvailable()) return t.skip("git not available");
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 301);
+    const rc = await git.createOrAttachRunnerClone(bare, 301, noProofReseed);
     fs.writeFileSync(path.join(rc.path, "R.txt"), "1\n");
     runGit(rc.path, ["add", "R.txt"], plainEnv());
     runGit(rc.path, [...IDENT, "commit", "-m", "c"], plainEnv());

@@ -471,6 +471,8 @@ function makeRig(opts: { responder?: Responder; token?: string } = {}): Rig {
       (transport as unknown as { specProviderName?: string }).specProviderName = spec.provider.name;
       return { root, transport, supervisorPid: 1234 };
     },
+    // issue #1783 (R0): the fake supervisor pid's start time, as recorded at launch.
+    rootStartTime: (pid) => pid * 10,
     spawnCommand: async (argv, cmdOpts) => {
       spawnCommandCalls.push({ argv, opts: cmdOpts });
       return { code: 0, stdout: "ok", stderr: "" };
@@ -759,6 +761,26 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     assert.equal(result.branch, "agent/issue-42");
     const texts = emitted.flatMap((m) => (typeof m.payload.text === "string" ? [m.payload.text] : []));
     assert.ok(texts.some((t) => t.includes("working on it")), "the accumulated agent text was emitted");
+  });
+
+  it("issue #1783: recordedRootPids names the live provider supervisor while the run is in flight", async () => {
+    // The supervisor runs as the runner uid and is non-dumpable; a concurrent Claude run's
+    // quiescence reaper can attribute it (instead of reporting `unverified`) only through these.
+    let executor: CodexExecutor | undefined;
+    const seen: Array<Array<{ pid: number; startTime: number }>> = [];
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start") seen.push(executor?.recordedRootPids() ?? []);
+        return defaultResponder(c);
+      },
+    });
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    assert.deepEqual(executor.recordedRootPids(), [], "nothing launched yet");
+    await withTimeout(executor.run(makeCtx().ctx), 3000, "clean run");
+    assert.deepEqual(seen[0], [{ pid: 1234, startTime: 12340 }], "the launched provider root's supervisor pid AND start time are recorded while live");
+    assert.equal(rig.reaped() + rig.disposed() > 0, true);
+    assert.deepEqual(executor.recordedRootPids(), [], "forgotten once its root was cleanly reaped/disposed");
   });
 
   it("(8) a failed turn_finished is represented as DATA once and materializes+throws ONCE (never double-thrown)", async () => {

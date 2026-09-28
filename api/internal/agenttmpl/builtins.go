@@ -10,12 +10,14 @@ import (
 	"strings"
 )
 
-// builtinFS holds the product's builtin agent-template definitions. This
-// directory is the single source of truth for builtins: they are versioned in
-// git, shipped in the binary via go:embed, and boot-seeded into the database.
+// builtinFS holds the product's builtin agent-template definitions, versioned
+// in git, shipped in the binary via go:embed, and boot-seeded into the
+// database. Every file except lead.md is a verbatim copy of the upstream role
+// library's published product-agents/ file at the release commit pinned in
+// library/manifest.json (PRD #1849); uzi-only rules live in the worker's
+// prompt append (agent/src/prompt.ts) and uzi-only tools in productToolDelta.
 // It is independent of this repo's own .claude/agents/ dev-team roster (which
-// is free to drift); parse/validity tests, not a byte-match against those
-// files, guard these definitions.
+// is free to drift).
 //
 //go:embed builtins/*.md
 var builtinFS embed.FS
@@ -42,7 +44,7 @@ func init() {
 		if err != nil {
 			panic(fmt.Sprintf("agenttmpl: parse builtin %s: %v", e.Name(), err))
 		}
-		builtins = append(builtins, def)
+		builtins = append(builtins, WithProductTools(def))
 	}
 	sort.Slice(builtins, func(i, j int) bool { return builtins[i].Name < builtins[j].Name })
 }
@@ -106,7 +108,12 @@ func parse(raw []byte) (Definition, error) {
 			}
 			d.Version = n
 		case "description":
-			d.Description = val
+			// The upstream publisher double-quotes a description that would not
+			// round-trip as a bare YAML scalar (for example one containing ": "),
+			// and refuses any value that needs escaping. Strip that one layer, as
+			// the agent-source parser does, so the stored description has no
+			// literal quotes; Render adds them back.
+			d.Description = unquoteScalar(val)
 		case "model":
 			d.Model = val
 		case "tools":

@@ -150,7 +150,7 @@ else
     --cap-add CHOWN --cap-add DAC_OVERRIDE --cap-add SETPCAP --cap-add SETUID --cap-add SETGID \
     --security-opt no-new-privileges \
     --entrypoint /usr/local/sbin/uzi-entrypoint \
-    -v "$REPO/e2e":/work/e2e:ro \
+    --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
     --name "$CONTROLS_NAME" \
     "$IMAGE" /bin/sh /work/e2e/codex-m3b/controls.sh
   rc_controls=$?
@@ -323,8 +323,8 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network "$NET" \
   -e "CODEX_M3B_APIKEY_CAP=$APIKEY_CAP" \
   -e "CODEX_M3B_TEST_TIMEOUT_MS=$TEST_TIMEOUT_MS" \
   "${LIVE_LIFECYCLE_ENV[@]}" \
-  -v "$REPO/e2e":/work/e2e:ro \
-  -v "$REPO/agent/test":/app/test:ro \
+  --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
+  --mount "type=bind,src=$REPO/agent/test,dst=/app/test,readonly" \
   --name "$LIFECYCLE_NAME" \
   "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout="${CODEX_M3B_TEST_TIMEOUT_MS:-120000}" \
     /app/test/codex-command-root-linux.test.ts /work/e2e/codex-m3b/lifecycle.test.ts' 2>&1 | tee "$LIFECYCLE_OUT"

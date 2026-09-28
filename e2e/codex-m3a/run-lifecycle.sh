@@ -62,7 +62,7 @@ timeout --kill-after=60s "$TIMEOUT" docker run --rm --network none \
   --read-only \
   --tmpfs /nix:exec --tmpfs /data --tmpfs /tmp:exec \
   --entrypoint /usr/local/sbin/uzi-entrypoint \
-  -v "$REPO/e2e":/work/e2e:ro \
+  --mount "type=bind,src=$REPO/e2e,dst=/work/e2e,readonly" \
   --name "$NAME" \
   "$IMAGE" /bin/sh -c 'cd /app && exec /usr/local/bin/node --import tsx --test --test-concurrency=1 --test-timeout=120000 \
     /work/e2e/codex-m3a/lifecycle.test.ts \

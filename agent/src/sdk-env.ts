@@ -22,6 +22,7 @@
 // `bash`, and coreutils.
 
 import { runnerPath, runnerTmpdir } from "./runner-uid.js";
+import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV } from "./worker-spawn-mark.js";
 
 /** Keys a provisioned tool env may NEVER set (PRD #18 M3): the OAuth credential,
  *  HOME, and the two ANTHROPIC_* keys pinned to undefined so nothing outranks the
@@ -36,7 +37,25 @@ const PROTECTED_ENV_KEYS: ReadonlySet<string> = new Set([
   // live conflict; protecting it keeps the --no-sandbox guarantee durable against
   // allowlist drift, so a provisioned var can never overwrite or drop it.
   "AGENT_BROWSER_ARGS",
+  // issue #1783 (R2/R4): the run-attempt marker and the worker spawn mark. The quiescence
+  // reaper attributes processes by them, so a provisioned var must never forge or drop one.
+  RUN_ATTEMPT_ENV,
+  RUN_CLONE_ENV,
+  RUN_CLONE_KEY_ENV,
+  WORKER_SPAWN_ENV,
 ]);
+
+/** issue #1783 (R2): the execution attempt the agent CLI runs for. Emitted as
+ *  UZI_RUN_ATTEMPT / UZI_RUN_CLONE / UZI_RUN_CLONE_KEY so every process the agent starts
+ *  inherits positive attribution to this attempt. */
+export interface SdkAttemptEnv {
+  /** `<runId>:<attemptId>`. */
+  marker: string;
+  /** The attempt's absolute clone path. */
+  clonePath: string;
+  /** `<repoDir>/<key>`. */
+  cloneKey: string;
+}
 
 /** Exactly the keys the SDK subprocess is allowed to see. The index signature
  *  carries the PRD #18 M3 provisioned tool vars, which are added ONLY from
@@ -69,12 +88,15 @@ export interface SdkEnv {
  *                   host socket. Widening the deliberately-minimal agent env is safe:
  *                   it is a socket path/URL, NOT a secret, and is present only when a
  *                   sidecar is wired.
+ * @param attempt    issue #1783 (R2): the execution attempt marker (see
+ *                   {@link SdkAttemptEnv}). Undefined ⇒ no marker keys are emitted.
  */
 export function buildSdkEnv(
   oauthToken: string,
   homeDir: string,
   toolEnv: Record<string, string> = {},
   dockerHost?: string,
+  attempt?: SdkAttemptEnv,
 ): SdkEnv {
   const env: SdkEnv = {
     CLAUDE_CODE_OAUTH_TOKEN: oauthToken,
@@ -122,6 +144,13 @@ export function buildSdkEnv(
   // provision allowlist never emits it, so the fold above cannot carry it. Set it AFTER
   // the fold so a provisioned var can never clobber the worker's wired endpoint.
   if (dockerHost) env.DOCKER_HOST = dockerHost;
+  // issue #1783 (R2): the attempt marker, set AFTER the fold (and protected above) so a
+  // provisioned var can neither forge nor clear it. Absent attempt ⇒ no key at all.
+  if (attempt) {
+    env[RUN_ATTEMPT_ENV] = attempt.marker;
+    env[RUN_CLONE_ENV] = attempt.clonePath;
+    env[RUN_CLONE_KEY_ENV] = attempt.cloneKey;
+  }
   return env;
 }
 

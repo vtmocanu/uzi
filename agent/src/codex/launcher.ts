@@ -46,6 +46,7 @@ import {
   uidSplitActive,
   workerBoundaryCommand,
 } from "../runner-uid.js";
+import { registerWorkerRunnerRoot, workerSpawnEnv, type StartTimeReader } from "../worker-spawn-mark.js";
 import {
   assertNoUnexpectedSystemConfig as defaultAssertNoUnexpectedSystemConfig,
   buildCodexConfigToml,
@@ -196,6 +197,9 @@ export interface LauncherDeps {
   /** Static, path-free diagnostic for a best-effort tree-removal failure. */
   readonly reportRunnerTreeCleanupFailure?: () => void;
   readonly spawnSupervisor?: SpawnSupervisor;
+  /** issue #1783 (R0): reads a supervisor pid's start time when it is recorded as a worker-launched
+   *  root (default procfs); a test with a fake supervisor pid injects it. */
+  readonly rootStartTime?: StartTimeReader;
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
@@ -340,7 +344,8 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
   // The helper itself runs as the shared runner uid, so it must not inherit the worker
   // process environment: another concurrent runner can read a normal helper process via
   // /proc/<pid>/environ. Only inert locale/path values cross this short provisioning step.
-  const provisionEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  // issue #1783 (R4): plus the worker spawn mark (inert, never an attempt marker).
+  const provisionEnv: NodeJS.ProcessEnv = workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" });
   const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
   const mk = wrap("/bin/sh", [
     "-ceu",
@@ -372,12 +377,12 @@ function defaultMakeRunnerTrees(request: RunnerTreeRequest): void {
         shared.sessionDir,
       ]);
       const seeded = spawnSync(seed.command, seed.args, {
-        env: {
+        env: workerSpawnEnv({
           PATH: "/usr/local/bin:/usr/bin:/bin",
           LANG: "C",
           HOME: join(request.root, "home"),
           TMPDIR: join(request.root, "tmp"),
-        },
+        }),
         stdio: ["ignore", "ignore", "pipe"],
       });
       if (seeded.status !== 0) {
@@ -411,7 +416,7 @@ function defaultRemoveRunnerTree(request: Pick<RunnerTreeRequest, "uid" | "kind"
   }
   const wrap = request.kind === "command" ? commandRootCommand : runnerCommand;
   const rm = wrap("/bin/rm", ["-rf", "--", request.root]);
-  const cleanupEnv: NodeJS.ProcessEnv = { PATH: "/usr/bin:/bin", LANG: "C" };
+  const cleanupEnv: NodeJS.ProcessEnv = workerSpawnEnv({ PATH: "/usr/bin:/bin", LANG: "C" }); // issue #1783 (R4)
   const result = spawnSync(rm.command, rm.args, { env: cleanupEnv, stdio: ["ignore", "ignore", "pipe"] });
   if (result.status !== 0) {
     throw new Error(`runner-owned tree removal failed (exit ${String(result.status)}): ${String(result.stderr)}`);
@@ -660,11 +665,20 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   const wrapped = spec.kind === "command"
     ? commandRootCommand(spec.supervisorBin, supervisorArgv)
     : runnerCommand(spec.supervisorBin, supervisorArgv);
+  // issue #1783 (R4): NO worker mark. The supervisor runs the Codex app-server, which executes
+  // model-directed work, so anything it leaks must stay reapable and the nonce must stay out of
+  // its env. A runner-uid (provider) root makes itself non-dumpable instead, so the reaper
+  // attributes it through the worker-launched-root registry, recorded here until it exits.
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
     env: replacedEnv,
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
+  if (spec.kind !== "command") {
+    const unregister = registerWorkerRunnerRoot(child.pid, deps.rootStartTime);
+    child.once("exit", () => unregister());
+    child.once("error", () => unregister());
+  }
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
   const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
@@ -728,6 +742,8 @@ export async function launchCodexEffectRoot(
     : workerBoundaryCommand(spec.supervisorBin, supervisorArgv);
   const child = (deps.spawnSupervisor ?? defaultSpawnSupervisor)(wrapped.command, wrapped.args, {
     cwd: spec.cwd,
+    // issue #1783 (R4): NO worker mark. A command root runs model-directed shells, and neither
+    // identity here is the runner uid the reaper scans, so the mark would only spread the nonce.
     env: { ...spec.env },
     stdio: ["pipe", "pipe", "pipe", "pipe", "pipe"],
   });
@@ -1075,7 +1091,7 @@ function defaultKillAsCommandUid(pid: number, runKill: NonNullable<StandaloneMod
 }
 
 const defaultRunKill: NonNullable<StandaloneModeDeps["runKill"]> = (command, args) =>
-  spawnSync(command, [...args], { env: STANDALONE_MODE_ENV, stdio: "ignore", timeout: 10_000 });
+  spawnSync(command, [...args], { env: workerSpawnEnv(STANDALONE_MODE_ENV), stdio: "ignore", timeout: 10_000 });
 
 function spawnStandaloneMode(
   mode: "--reap-orphans" | "--hold-cache" | "--remove-cache",
@@ -1092,7 +1108,7 @@ function spawnStandaloneMode(
   const wrapped = commandRootCommand(SUPERVISOR_BIN, args);
   return (deps.spawn ?? defaultSpawnStandaloneMode)(wrapped.command, wrapped.args, {
     cwd: "/",
-    env: { ...STANDALONE_MODE_ENV },
+    env: workerSpawnEnv(STANDALONE_MODE_ENV), // issue #1783 (R4): worker mark
     stdio: [stdin, "pipe", "ignore"],
   });
 }

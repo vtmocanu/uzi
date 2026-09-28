@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -388,6 +389,8 @@ export interface SdkExecutorOptions {
   /** issue #1656: whether a process group still has members; undefined = unknowable (default
    *  = processGroupPresent). Injected in tests. */
   cliGroupPresent?: (pgid: number) => boolean | undefined;
+  /** issue #1783: read a spawned CLI root's start time (default = procfs). Injected in tests. */
+  rootStartTime?: StartTimeReader;
   /** Worker-credential file paths (UZI_WORKER_TOKEN_FILE) the Bash guard denies. */
   secretPaths?: readonly string[];
   /** Root for per-run tool-provisioning dirs (PRD #18 M3), OUTSIDE any clone.
@@ -719,6 +722,13 @@ export class SdkExecutor implements Executor {
    *  signal (its group not confirmed gone). The run-end reap signals these group-only: after
    *  the leader exited, killProcessGroup's bare-pid fallback could hit a recycled process. */
   private readonly deadCliPids = new Set<number>();
+  /** issue #1783 (R0): each spawned CLI root with its start time, captured AT SPAWN (a pid read
+   *  later may already name a recycled process). Keyed by pid; read through spawnedPids. */
+  private readonly rootStartTimes = new Map<number, RecordedRoot>();
+  /** issue #1783: the start-time reader for {@link rootStartTimes} (procfs unless injected). */
+  private readonly rootStartTime?: StartTimeReader;
+  /** issue #1783: whether an unrecordable CLI root was already logged (warn once per executor). */
+  private rootDropWarned = false;
   /** The Claude run-lane adapter (PRD #1146 M2). Owns query options finalization,
    *  frame decode, the lead context read, process ownership and terminal building;
    *  driveTurn drives it and the per-run reducer. */
@@ -750,6 +760,7 @@ export class SdkExecutor implements Executor {
     this.kill = opts.kill ?? killProcessGroup;
     this.killCliGroup = opts.killCliGroup ?? killProcessGroupOnly;
     this.cliGroupPresent = opts.cliGroupPresent ?? processGroupPresent;
+    this.rootStartTime = opts.rootStartTime;
     this.quietSettleMs = opts.quietSettleMs ?? QUIET_SETTLE_MS;
     this.runProcesses = opts.runProcesses ?? defaultRunProcesses;
     this.secretPaths = opts.secretPaths ?? [];
@@ -801,6 +812,7 @@ export class SdkExecutor implements Executor {
       log: this.log,
       contextUsageTimeoutMs: this.contextUsageTimeoutMs,
       spawnedPids: this.spawnedPids,
+      onRootSpawned: (pid) => this.recordCliRoot(pid),
       homeDir: this.homeDir,
     });
     this.reducer = new RunTurnReducerImpl(this.harness.contextHook);
@@ -823,6 +835,36 @@ export class SdkExecutor implements Executor {
     }
     this.spawnedPids.clear();
     this.deadCliPids.clear();
+    // A reaped root exempts nothing any more; drop its recorded start time with its pid.
+    this.rootStartTimes.clear();
+  }
+
+  /** issue #1783 (R0): record a spawned CLI root with its start time, read NOW. A root whose start
+   *  time cannot be read is not recorded (it then exempts nothing, and the reaper fails closed on
+   *  its unreadable descendants); that is logged once per executor, since it degrades every later
+   *  quiescence proof of this run to `unverified` for such descendants. */
+  private recordCliRoot(pid: number): void {
+    const root = recordRoot(pid, this.rootStartTime);
+    if (root) {
+      this.rootStartTimes.set(pid, root);
+      return;
+    }
+    this.rootStartTimes.delete(pid);
+    if (this.rootDropWarned) return;
+    this.rootDropWarned = true;
+    this.log.warn("agent CLI root not recorded: its start time is unreadable, so it exempts none of its descendants from the quiescence reaper", {
+      pid,
+    });
+  }
+
+  /** issue #1783 (R0): the CLI process-group roots not yet reaped, each with the start time
+   *  captured when it was spawned (see Executor.recordedRootPids). A root whose start time could
+   *  not be read at spawn is omitted: it then exempts nothing. */
+  recordedRootPids(): RecordedRoot[] {
+    return [...this.spawnedPids].flatMap((pid) => {
+      const root = this.rootStartTimes.get(pid);
+      return root ? [root] : [];
+    });
   }
 
   /**
@@ -934,6 +976,7 @@ export class SdkExecutor implements Executor {
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.spawnedPids.clear();
     this.deadCliPids.clear();
+    this.rootStartTimes.clear();
     this.runWorktree = ctx.worktreePath;
     // Fresh per-run reducer: the first-truthy-session latch must not survive a
     // second run() on this instance (one executor per run is the norm, but keep
@@ -1073,7 +1116,9 @@ export class SdkExecutor implements Executor {
     // the prompt's consumer is the agent that will actually run the gates.
     let depsTruncated = false;
 
-    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost);
+    // issue #1783 (R2): the runner's attempt marker rides the CLI env, so every process the
+    // agent starts is positively attributable to this attempt by the quiescence reaper.
+    const env = buildSdkEnv(oauthToken, this.homeDir, toolEnv, this.dockerHost, ctx.runAttempt);
     // PRD #122 M2: `let`, not `const` — the implement loop raises it to the server's
     // milestone-scaled ceiling when the state-report ACK serves one (Decisions 5/5b). The
     // claim config already carries the scaled value on a RESUME (the run is frozen); the
@@ -3873,6 +3918,7 @@ export class SdkExecutor implements Executor {
             }
             this.spawnedPids.delete(pid);
             this.deadCliPids.delete(pid);
+            this.rootStartTimes.delete(pid);
             signalDeathRetries++;
             resumeId = sessionId;
             this.log.warn("agent CLI died from a foreign signal; resuming the session", {

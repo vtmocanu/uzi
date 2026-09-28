@@ -5,35 +5,48 @@ import (
 	"testing"
 )
 
-func TestBuiltinScratchGuidance(t *testing.T) {
-	for _, name := range []string{"coder", "lead", "tester", "reviewer", "auditor", "fact-checker", "web-ux", "ux-designer"} {
-		t.Run(name, func(t *testing.T) {
-			def, ok := BuiltinByName(name)
-			if !ok {
-				t.Fatal("missing builtin")
-			}
-			if !strings.Contains(def.PromptBody, ".uzi/scratch/") {
-				t.Error("builtin does not name the run scratch directory")
-			}
-			for _, stale := range []string{"git worktree add --detach", "./gate-log.XXXXXX", "outside the tracked tree", "it can never be staged", "add the pattern if it is not"} {
-				if strings.Contains(def.PromptBody, stale) {
-					t.Errorf("builtin retains stale guidance %q", stale)
+// staleScratchGuidance lists phrases that contradict a uzi worker (PRD #1719): a
+// nested worktree it refuses, a gate log outside run scratch, a tracked .gitignore
+// edit, and the false claim that an ignored file cannot be staged. Every builtin
+// body must be free of them. The upstream role library keeps its bodies free of
+// them too (PRD #1849 M1), which is what lets the builtins copy it verbatim.
+var staleScratchGuidance = []string{
+	"git worktree add --detach",
+	"./gate-log.XXXXXX",
+	"outside the tracked tree",
+	"it can never be staged",
+	"add the pattern if it is not",
+}
+
+// flattenWS collapses every whitespace run to one space, so a phrase wrapped
+// across lines in a body is still found.
+func flattenWS(s string) string { return strings.Join(strings.Fields(s), " ") }
+
+func TestBuiltinsCarryNoStaleScratchGuidance(t *testing.T) {
+	for _, def := range Builtins() {
+		t.Run(def.Name, func(t *testing.T) {
+			body := flattenWS(def.PromptBody)
+			for _, stale := range staleScratchGuidance {
+				if strings.Contains(body, stale) {
+					t.Errorf("builtin retains guidance a uzi worker contradicts: %q", stale)
 				}
 			}
 		})
 	}
-	for _, name := range []string{"coder", "lead", "tester"} {
-		def, _ := BuiltinByName(name)
-		if !strings.Contains(def.PromptBody, "mktemp .uzi/scratch/gate-log.XXXXXX") {
-			t.Errorf("%s: gate logs must use run scratch", name)
-		}
+}
+
+// The uzi runtime facts (scratch path, gate-log and snapshot recipe) reach every
+// subagent through the worker append (agent/src/prompt.ts RUN_SCRATCH_GUIDANCE;
+// pinned in agent/test/agents.test.ts and codex-render.test.ts). The lead body is
+// uzi-only and still names the path itself.
+func TestLeadNamesRunScratch(t *testing.T) {
+	def, ok := BuiltinByName("lead")
+	if !ok {
+		t.Fatal("missing lead builtin")
 	}
-	for _, name := range []string{"reviewer", "auditor", "fact-checker", "tester"} {
-		def, _ := BuiltinByName(name)
-		for _, want := range []string{"mktemp -d .uzi/scratch/snap.XXXXXX", "set -o pipefail", "git archive \"$sha\" | tar -x -C \"$snap\"", "parent checkout; never run Git there"} {
-			if !strings.Contains(def.PromptBody, want) {
-				t.Errorf("%s: missing snapshot instruction %q", name, want)
-			}
+	for _, want := range []string{".uzi/scratch/", "mktemp .uzi/scratch/gate-log.XXXXXX"} {
+		if !strings.Contains(def.PromptBody, want) {
+			t.Errorf("lead: missing %q", want)
 		}
 	}
 }

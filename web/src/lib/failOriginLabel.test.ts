@@ -6,6 +6,10 @@ describe("failOriginLabel", () => {
     expect(failOriginLabel("plan_missing")).toBe("plan missing");
   });
 
+  it("labels the worker_residue_blocked origin (issue #1783)", () => {
+    expect(failOriginLabel("worker_residue_blocked")).toBe("worker residue blocked");
+  });
+
   it("labels the data_volume_full origin (PRD #1809)", () => {
     expect(failOriginLabel("data_volume_full")).toBe("data volume full");
   });

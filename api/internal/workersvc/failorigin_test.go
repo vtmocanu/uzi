@@ -92,6 +92,54 @@ func TestPlanMissingIsWorkerReportableAndJudged(t *testing.T) {
 	}
 }
 
+// TestWorkerResidueBlockedIsWorkerReportableAndNeverJudged pins issue #1783's origin:
+// worker_residue_blocked is a stored vocabulary member, the worker may report it
+// (CoerceFailOrigin passes it through verbatim, so the typed failure is not flattened to
+// agent_failure), and it is WORKER INFRASTRUCTURE (the worker could not prove the run's
+// execution stopped, or could not clear the run's clone-path residue), so it is in
+// neverJudgeFailOrigins and skips the judge at EVERY iteration count: it can fire pre-start at
+// reseed or at finalize on a resumed run. It is in no other skip set (the iteration-gated
+// preStartInfraFailOrigins would judge a resumed run) and it is not human-landable: the worker
+// refused to publish from an unproven state.
+func TestWorkerResidueBlockedIsWorkerReportableAndNeverJudged(t *testing.T) {
+	const o = "worker_residue_blocked"
+	if !failOriginSet[o] {
+		t.Fatalf("%q is not in the stored fail_origin vocabulary", o)
+	}
+	v := o
+	if got := CoerceFailOrigin(&v); got == nil || *got != o {
+		t.Fatalf("CoerceFailOrigin(%q) = %v, want passthrough (worker-reportable)", o, got)
+	}
+	if !neverJudgeFailOrigins[o] {
+		t.Fatalf("%q must be in neverJudgeFailOrigins: it is worker infrastructure, not an agent defect", o)
+	}
+	for name, set := range map[string]map[string]bool{
+		"preStartInfraFailOrigins": preStartInfraFailOrigins,
+		"envPublishFailOrigins":    envPublishFailOrigins,
+		"humanLandableFailOrigins": humanLandableFailOrigins,
+	} {
+		if set[o] {
+			t.Fatalf("%q must not be in %s", o, name)
+		}
+	}
+	if IsHumanLandableFailOrigin(o) {
+		t.Fatalf("IsHumanLandableFailOrigin(%q) = true, want false", o)
+	}
+	for _, iter := range []int32{0, 7} {
+		t.Run("iteration_count="+strconv.Itoa(int(iter)), func(t *testing.T) {
+			fs, svc, run := eligibleFixture(t)
+			run.Status = "failed"
+			run.IterationCount = iter
+			run.FailOrigin = pgconv.TextOrNull(o)
+			svc.maybeEnqueueJudge(context.Background(), run)
+			if fs.createdJudgeRun != nil {
+				t.Fatalf("%s at iteration_count=%d is worker infrastructure and must NOT be judged, got %+v",
+					o, iter, fs.createdJudgeRun)
+			}
+		})
+	}
+}
+
 // TestFailOriginVocabularyMatchesCheck is the instrument migration 00126's comment
 // promises, copied from TestRateLimitTypeVocabularyMatchesCheck (00091's) for the same
 // reason it exists there: a value Go writes and the CHECK rejects becomes a constraint

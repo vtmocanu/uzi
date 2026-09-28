@@ -95,5 +95,14 @@ Two consequences are worth stating plainly:
   branch. Keep out of skill bodies anything you would not want in a merge
   request on that repo.
 
+Repo agents need no opt-in; they are offered at the plan gate whenever the
+repo has a `.claude/agents/` folder. Two related per-repo opt-ins are separate:
+the repo's own skills and its root `CLAUDE.md`, both off by default (see
+[Agent skills](./skills.md#repo-skills-opt-in-default-off) and
+[Repo instructions](./skills.md#repo-instructions-opt-in-default-off)).
+Whichever agents a run uses, uzi appends its runtime rules (scratch
+directory, safety rules) to every subagent; see
+[Agent templates](./agent-templates.md#resetting-a-builtin-template).
+
 For how detection, validation, and the gate-boundary rebuild work, see
 [ARCHITECTURE.md](../ARCHITECTURE.md#agent-templates).

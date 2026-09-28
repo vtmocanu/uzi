@@ -7,7 +7,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { PassThrough, Readable, Writable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { noProofReseed, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache, RunnerCloneImportError, type BoundaryProcessSpawner, type RunnerClone } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 
@@ -60,7 +60,7 @@ async function setup(opts?: { selfContained: true }): Promise<{
   defaultTip: string;
 }> {
   const bare = await git.ensureClone(fx.originPath);
-  const rc = await git.createOrAttachRunnerClone(bare, 1, "run-1", false, undefined, opts);
+  const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed, "run-1", false, undefined, undefined, opts);
   fs.writeFileSync(path.join(rc.path, "impl.ts"), "export const x = 1;\n");
   gitIn(rc.path, ["add", "."]);
   gitIn(rc.path, [...IDENT, "commit", "-m", "agent work"]);
@@ -200,7 +200,7 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
     const spy = spyImport(git);
     await git.ensureRunnerCloneObjects(shared.bare, shared.rc.path, shared.defaultTip, [shared.rc.baseCommit]);
     // A self-contained clone asked for a tip it already holds (its own base).
-    const self = await git.createOrAttachRunnerClone(shared.bare, 2, "run-2", false, undefined, SELF);
+    const self = await git.createOrAttachRunnerClone(shared.bare, 2, noProofReseed, "run-2", false, undefined, undefined, SELF);
     await git.ensureRunnerCloneObjects(shared.bare, self.path, self.baseCommit, []);
     assert.strictEqual(spy.producers.length, 0, "no producer spawned");
     assert.strictEqual(spy.consumers.length, 0, "no consumer spawned");
@@ -607,7 +607,7 @@ describe("GitCache spawnGit exit-gated stdout, finalize import (issue #1769)", (
    *  so the pack is far larger than any stream buffer (64 KiB highWaterMark, 64 KiB pipe). */
   async function setupBig(): Promise<{ bare: string; rc: RunnerClone; defaultTip: string; revs: string }> {
     const bare = await git.ensureClone(fx.originPath);
-    const rc = await git.createOrAttachRunnerClone(bare, 1, "run-1", false, undefined, SELF);
+    const rc = await git.createOrAttachRunnerClone(bare, 1, noProofReseed, "run-1", false, undefined, undefined, SELF);
     for (let i = 0; i < BIG_MIB; i++) fs.writeFileSync(path.join(fx.originPath, `blob-${i}.bin`), crypto.randomBytes(1 << 20));
     gitIn(fx.originPath, ["add", "."]);
     gitIn(fx.originPath, [...IDENT, "commit", "-m", "main gains big blobs"]);

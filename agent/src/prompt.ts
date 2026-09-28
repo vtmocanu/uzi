@@ -39,8 +39,11 @@ const UNTRUSTED_FRAME =
  */
 const RUN_SCRATCH_GUIDANCE = [
   "Put temporary file-tool and shell artifacts, including test logs and review exports,",
-  "under `.uzi/scratch/` in this worktree. Use `mktemp .uzi/scratch/gate-log.XXXXXX`",
-  "for gate logs. File tools deny paths outside the worktree; shell screening differs,",
+  "under `.uzi/scratch/` in this worktree: it is the scratch directory this runtime",
+  "provides, so where a role's guidance says to set `scratch`, use `scratch=.uzi/scratch`.",
+  "Use `mktemp .uzi/scratch/gate-log.XXXXXX` for gate logs. This runtime does not permit",
+  "a detached checkout or any other nested worktree: review from an export instead.",
+  "File tools deny paths outside the worktree; shell screening differs,",
   "so keep shell artifacts here too. An outside-path denial points back to this dir.",
   "Scratch is available to this run only while the identical runner clone is retained",
   "through a park/resume. Fresh reseed and cross-worker recovery start empty. Retirement",
@@ -53,8 +56,10 @@ const RUN_SCRATCH_GUIDANCE = [
   "`snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)` and",
   "`git archive \"$sha\" | tar -x -C \"$snap\"`. Check both archive and extraction",
   "status, remove that snapshot after review, and create a new one for each review.",
-  "Exports contain no Git metadata or installed dependencies. Run Git-dependent gates",
-  "in the real checkout under the frozen gate discipline.",
+  "Exports contain no Git metadata or installed dependencies. Git commands run inside an",
+  "export can find the parent checkout; never run Git there. Run Git-dependent gates",
+  "in the real checkout under the frozen gate discipline, and report any check that",
+  "cannot run in the export rather than claiming it ran.",
 ].join("\n");
 
 export const LEAD_GUARDRAIL_APPEND = [
@@ -714,9 +719,14 @@ function priorWorkNote(prior: PriorWork | undefined): string {
 }
 
 // ─── The reseed warning (issue #222) ─────────────────────────────────────────
-// The runner clone is wiped and re-seeded on EVERY claim (git.ts `runnerCloneForBranch`
-// opens with an unconditional `fs.rm`). On a RESUME that destroys any work an earlier
-// attempt left in the tree but never pushed. A follow-up the user QUEUED against the
+// The runner clone is rebuilt on EVERY claim. An unwired worker wipes and re-seeds the one
+// canonical clone path (git.ts `runnerCloneForBranch` deletes it, or quarantines what it cannot
+// delete as `.uzi-residue-*` beside it, issue #1783 M3); a
+// Docker-wired worker (issue #1783 M2) seeds a FRESH `<key>.attempt-<id>` path per attempt and
+// RETAINS the predecessor's path in place, unreachable from the new attempt — its work arrives
+// only through the branch, the tracking ref, checkpoint adoption and the journal/capture. On a
+// RESUME either way the new tree lacks any work an earlier attempt left there but never
+// captured or pushed. A follow-up the user QUEUED against the
 // pre-reseed tree survives the wipe (it is cleared only once a worker has applied it,
 // issue #1673) and is delivered on a later implement turn, so the lead can act on a
 // correction whose premise — the files/commits it names — no longer exists, with nothing
@@ -1247,8 +1257,10 @@ export interface ImplementPromptInput {
   subagentCanWrite?: Record<string, boolean>;
   /** True for the first implementation turn (right after approval). */
   first: boolean;
-  /** issue #222: this run was picked up again (a resume), so the runner clone was wiped
-   *  and re-seeded and any local-only work from an earlier attempt is gone. FIRST TURN
+  /** issue #222: this run was picked up again (a resume), so the runner clone was rebuilt
+   *  (wiped and re-seeded, or on a Docker-wired worker seeded at a fresh attempt path with the
+   *  predecessor retained out of reach) and any uncaptured local-only work from an earlier
+   *  attempt is not in this tree. FIRST TURN
    *  ONLY, like the facts below; drives the reseed warning so a queued follow-up written
    *  against the destroyed tree cannot be acted on as if that work is still present.
    *  Absent/false ⇒ no note (a fresh run had no prior tree to lose). See reseedNote. */

@@ -5,7 +5,7 @@ import fs from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
-import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import { GitCache, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
 
 // PRD #628 M3 — the cross-worker checkpoint recovery regression test (SC#2).
@@ -158,7 +158,7 @@ async function publishWipParkCheckpoint(
   wipContent: string,
   milestones: string[] = [],
 ): Promise<{ marker: string; parent: string }> {
-  const seed = await gitA.createOrAttachRunnerClone(bareA, issue, "run-A");
+  const seed = await gitA.createOrAttachRunnerClone(bareA, issue, noProofReseed, "run-A");
   for (const m of milestones) commit(seed.path, m);
   const parent = gitIn(seed.path, ["rev-parse", "HEAD"]); // the marker's parent = the fork point
   fs.writeFileSync(path.join(seed.path, wipFile), wipContent);
@@ -202,7 +202,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     // checkpoint pack from the fetched-back tracking ref via the PRODUCTION pack builder.
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 628, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 628, noProofReseed, "run-A");
     fs.writeFileSync(path.join(seed.path, ".uzi", "scratch", "worker-A.log"), "private artifact");
     commit(seed.path, "M1.txt");
     const cpTip = commit(seed.path, "M2.txt"); // ≥1 commit strictly ahead of the floor
@@ -245,7 +245,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     // off the mirrored checkpoint. Models production: resume=true and THIS run's own persisted
     // checkpoint tip (== the mirrored checkpoint's SHA), so the issue-#1059 owner anchor admits
     // the adopt. With no origin/<branch> this is the Path-A resume-adopt leg.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 628, "run-B", true /*resume*/, cpTip /*matching own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 628, noProofReseed, "run-B", true /*resume*/, cpTip /*matching own tip*/);
     assert.equal(fs.statSync(path.join(rc.path, ".uzi", "scratch")).isDirectory(), true);
     assert.deepEqual(fs.readdirSync(path.join(rc.path, ".uzi", "scratch")), [], "cross-worker recovery has no transferred scratch");
 
@@ -289,7 +289,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
       "precondition: the mirrored checkpoint EQUALS the floor",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 629, "run-B");
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 629, noProofReseed, "run-B");
 
     // The reseed must fall through to the default floor rather than seed "checkpoint": under
     // issue #1059 M1 this fresh run (no resume, no own-checkpoint tip) fails the owner anchor,
@@ -314,7 +314,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     // Seed off the default branch, then leave a genuinely UNCOMMITTED edit in the clone —
     // the single deviation from the committing park factories, mirroring the #685 incident
     // (mid-milestone work never committed).
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 759, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 759, noProofReseed, "run-A");
     const forkPoint = gitIn(seed.path, ["rev-parse", "HEAD"]); // the last REAL commit
     fs.writeFileSync(path.join(seed.path, "WIP.txt"), "in-progress work\n");
 
@@ -328,7 +328,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
 
     // THE RESEED (same worker, same run): the tracking ref is owned here and its tip is the
     // marker, so M2's reset --soft fires.
-    const rc = await gitA.createOrAttachRunnerClone(bareA, 759, "run-A");
+    const rc = await gitA.createOrAttachRunnerClone(bareA, 759, noProofReseed, "run-A");
 
     // (a) the WIP content is present in the resumed clone as an UNCOMMITTED change.
     assert.strictEqual(fs.existsSync(path.join(rc.path, "WIP.txt")), true, "recovered WIP file is in the working tree");
@@ -363,7 +363,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     // reseed has no marker to reset --soft and the "recovered N commits" count is unperturbed.
     const gitA = worker("workerA");
     const bareA = await gitA.ensureClone(fx.originPath);
-    const seed = await gitA.createOrAttachRunnerClone(bareA, 766, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, 766, noProofReseed, "run-A");
     const headBefore = gitIn(seed.path, ["rev-parse", "HEAD"]);
     assert.strictEqual(gitIn(seed.path, ["status", "--porcelain"]), "", "precondition: the clone is clean");
 
@@ -423,7 +423,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
 
     // RESUME with THIS run's own matching tip (== the marker) so the owner anchor admits it;
     // origin/<branch> exists → Path B; diverged → set aside → leg #4 fires.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 760, "run-B", true /*resume*/, marker /*matching own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 760, noProofReseed, "run-B", true /*resume*/, marker /*matching own tip*/);
 
     // (a) the WIP content is recovered as an UNCOMMITTED change on the origin floor.
     //     PRE-FIX this FAILS: M2 cherry-picked `refs/uzi-checkpoints/<branch>` by NAME, but a
@@ -484,7 +484,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
       "the checkpoint is diverged (set aside)",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 761, "run-B", true /*resume*/, marker /*matching own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 761, noProofReseed, "run-B", true /*resume*/, marker /*matching own tip*/);
 
     // Recovery FAILED — set aside, not recovered.
     assert.notStrictEqual(rc.wipRecovered, true, "a conflicting WIP is not recovered");
@@ -533,7 +533,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
       "the checkpoint is diverged (set aside)",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 762, "run-B", true /*resume*/, marker /*matching own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 762, noProofReseed, "run-B", true /*resume*/, marker /*matching own tip*/);
 
     // The guard left it set aside: NO cherry-pick, NO flip, NO silent milestone drop.
     assert.strictEqual(rc.checkpointSetAside, true, "committed divergence below the marker stays SET ASIDE");
@@ -553,7 +553,7 @@ describe("cross-worker checkpoint recovery (PRD #628 M3)", () => {
     const bareB = await gitB.ensureClone(fx.originPath);
     assert.strictEqual(refInBare(bareB, checkpointRef), false, "no checkpoint ref exists for this branch");
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 630, "run-B");
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 630, noProofReseed, "run-B");
 
     // seededFrom="checkpoint" in the positive test therefore genuinely depends on the
     // published checkpoint + the fetch-mirror leg, not on incidental fixture state.
@@ -581,7 +581,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     branch: string,
     milestones: string[],
   ): Promise<string> {
-    const seed = await gitA.createOrAttachRunnerClone(bareA, issue, "run-A");
+    const seed = await gitA.createOrAttachRunnerClone(bareA, issue, noProofReseed, "run-A");
     let tip = gitIn(seed.path, ["rev-parse", "HEAD"]);
     for (const m of milestones) tip = commit(seed.path, m);
     await gitA.fetchAgentBranch(bareA, seed.path, branch, "run-A");
@@ -622,7 +622,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     // THE RESUME (resume=true, no origin/<branch>): adopt the checkpoint despite divergence.
     // issue #1042 M4: adoption is now gated on the owner anchor — pass THIS run's own persisted
     // checkpoint tip (== the mirrored checkpoint's SHA) so the legitimate same-run resume adopts.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10301, "run-B", true, cpTip);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10301, noProofReseed, "run-B", true, cpTip);
 
     assert.strictEqual(rc.seededFrom, "checkpoint", "resume adopts the diverged checkpoint, not the default floor");
     assert.strictEqual(rc.baseCommit, cpTip, "the base is the checkpoint tip (committed milestones preserved)");
@@ -660,7 +660,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     // false), so it is neither adopted NOR set aside (setting aside would drive the #759
     // cherry-pick, re-importing the very foreign work the owner anchor keeps out). The run
     // cold-starts from the default floor, quietly-loudly (a warn, no checkpointSetAside flag).
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, "run-B", false /*fresh*/, undefined /*no own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10302, noProofReseed, "run-B", false /*fresh*/, undefined /*no own tip*/);
 
     assert.strictEqual(rc.seededFrom, "default", "a fresh run falls through to the default floor");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced default floor");
@@ -699,7 +699,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     // RESUME, but origin/<branch> EXISTS → the strict-descendant test is KEPT: the published
     // origin branch is the floor and wins; the checkpoint is set aside, not blindly adopted.
     // A matching owner-anchor tip does NOT relax this (the resume-adopt leg requires !originExists).
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10303, "run-B", true, cpTip);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10303, noProofReseed, "run-B", true, cpTip);
 
     assert.strictEqual(rc.seededFrom, "origin", "the published origin branch is the floor even on resume");
     assert.strictEqual(rc.baseCommit, originBranchTip, "the base is the origin branch tip, NOT the checkpoint");
@@ -731,7 +731,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     );
 
     // THE RESUME with NO own-checkpoint tip (a run that never published its own checkpoint).
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10304, "run-B", true /* resume */, undefined /* no own tip */);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10304, noProofReseed, "run-B", true /* resume */, undefined /* no own tip */);
 
     assert.strictEqual(rc.seededFrom, "default", "a never-published resume seeds off the default floor, NOT the checkpoint");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor");
@@ -752,7 +752,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     // run's own persisted tip pointing somewhere other than the foreign checkpoint".
     assert.notStrictEqual(floorSha, cpTip, "precondition: the run's own tip differs from the mirrored checkpoint tip");
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10305, "run-B", true /* resume */, floorSha /* mismatching own tip */);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10305, noProofReseed, "run-B", true /* resume */, floorSha /* mismatching own tip */);
 
     assert.strictEqual(rc.seededFrom, "default", "a mismatching own tip means the foreign checkpoint is NOT adopted");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the default floor, not the foreign checkpoint");
@@ -770,7 +770,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     const gitB = worker("workerB");
     const bareB = await gitB.ensureClone(fx.originPath);
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10306, "run-B", true /* resume */, cpTip /* own tip == checkpoint */);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10306, noProofReseed, "run-B", true /* resume */, cpTip /* own tip == checkpoint */);
 
     assert.strictEqual(rc.seededFrom, "checkpoint", "a matching own tip adopts the checkpoint (same-run legitimate resume)");
     assert.strictEqual(rc.baseCommit, cpTip, "the base is the checkpoint tip — the run's own committed milestones");
@@ -804,7 +804,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
     );
 
     // A genuine FRESH run: resume=false, no own-checkpoint tip.
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10307, "run-B", false /*fresh*/, undefined /*no own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10307, noProofReseed, "run-B", false /*fresh*/, undefined /*no own tip*/);
 
     assert.notStrictEqual(rc.seededFrom, "checkpoint", "a strictly-descending FOREIGN checkpoint is refused (the #1059 fix)");
     assert.strictEqual(rc.seededFrom, "default", "the fresh run seeds off the default floor");
@@ -837,7 +837,7 @@ describe("resume-relaxed checkpoint adoption (PRD #1030 M3)", () => {
       "precondition: the checkpoint is diverged (old Path B would have SET IT ASIDE)",
     );
 
-    const rc = await gitB.createOrAttachRunnerClone(bareB, 10308, "run-B", false /*fresh*/, undefined /*no own tip*/);
+    const rc = await gitB.createOrAttachRunnerClone(bareB, 10308, noProofReseed, "run-B", false /*fresh*/, undefined /*no own tip*/);
 
     assert.strictEqual(rc.seededFrom, "default", "the fresh run seeds off the default floor");
     assert.strictEqual(rc.baseCommit, floorSha, "the base is the advanced default floor");
