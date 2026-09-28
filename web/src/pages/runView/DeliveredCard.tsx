@@ -114,6 +114,8 @@ function strings(list: unknown): string[] {
 
 const HEADING = "text-xs font-semibold uppercase tracking-wider text-faint";
 const NOTE = "text-xs italic text-faint";
+/** The PR body's D8 rung-2 note (agent/src/pr-description.ts RUNG2_NOTE), in plain text. */
+const UNCHECKED_NOTE = "Summary written by the agent, not checked against the diff.";
 
 interface Delivered {
   summary: string;
@@ -122,6 +124,9 @@ interface Delivered {
   scopeNotes: { kind: string; text: string }[];
   verification: { command: string; result: string; sha: string }[];
   sizeLine: string | null;
+  /** PRD #1798 D8 rung 2: the summary is the lead's own claims (`source: "lead_only"`), not checked
+   *  against the diff; the PR body says so and this surface must too. */
+  unchecked: boolean;
   /** The last-write outcome note, or null when there is nothing to say. */
   note: string | null;
   /** True when the published description has anything to show under the heading. */
@@ -159,7 +164,8 @@ function delivered(run: Run): Delivered | null {
     scopeNotes.length > 0 ||
     verification.length > 0;
   if (!hasBody && note === null) return null;
-  return { summary, changes, pointers, scopeNotes, verification, sizeLine, note, hasBody };
+  const unchecked = desc?.source === "lead_only";
+  return { summary, changes, pointers, scopeNotes, verification, sizeLine, note, hasBody, unchecked };
 }
 
 /** Whether the run has a Delivered section to show (RunSummary's gate for rendering at all). */
@@ -179,7 +185,7 @@ export function DeliveredCard({ run }: { run: Run }) {
   const d = delivered(run);
   if (!d) return null;
   if (!d.hasBody) return <p className={NOTE}>{d.note}</p>;
-  const { summary, changes, pointers, scopeNotes, verification, sizeLine, note } = d;
+  const { summary, changes, pointers, scopeNotes, verification, sizeLine, note, unchecked } = d;
 
   return (
     <section className="space-y-3" aria-labelledby={headingId}>
@@ -187,6 +193,7 @@ export function DeliveredCard({ run }: { run: Run }) {
         Delivered
       </h3>
       {summary !== "" && <p className="whitespace-pre-wrap text-sm text-fg">{summary}</p>}
+      {unchecked && summary !== "" && <p className={NOTE}>{UNCHECKED_NOTE}</p>}
       {sizeLine && <p className="font-mono text-xs text-muted">{sizeLine}</p>}
 
       {changes.length > 0 && (

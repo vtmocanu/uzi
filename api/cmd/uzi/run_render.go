@@ -1210,6 +1210,11 @@ func prDescriptionRows(r apitypes.RunDTO) [][]string {
 	if d := r.PrDescription; d != nil {
 		if s := cellText(displayPrText(d.Fields.Summary)); s != "" {
 			rows = append(rows, []string{"DELIVERED", s})
+			// PRD #1798 D8 rung 2: a lead_only summary is the lead's own claims, not checked against
+			// the diff. The PR body carries that note; so must this surface (web twin: DeliveredCard).
+			if d.Source == "lead_only" {
+				rows = append(rows, []string{"UNCHECKED", "Summary written by the agent, not checked against the diff."})
+			}
 		}
 		if body := prSizeBody(d.Size); body != "" {
 			rows = append(rows, []string{"SIZE", body})

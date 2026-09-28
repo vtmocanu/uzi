@@ -150,5 +150,6 @@ uzi markers untouched entirely.
 
 **Where to see it.** The run page shows a "Delivered" section of the same
 card as the intent and plan summaries. `uzi run get <id>` prints the same
-summary as a `DELIVERED` row, the size line as `SIZE`, and, when the PR's
+summary as a `DELIVERED` row (followed by an `UNCHECKED` row when the summary is
+the agent's own, not checked against the diff), the size line as `SIZE`, and, when the PR's
 description couldn't be refreshed, a `PR_UPDATE` row explaining why.

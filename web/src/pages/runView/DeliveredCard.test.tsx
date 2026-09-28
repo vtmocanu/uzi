@@ -197,6 +197,15 @@ describe("DeliveredCard", () => {
     expect(screen.getByText("Last PR update skipped: a human edited the description.")).toBeTruthy();
   });
 
+  it("warns that a lead-only summary was not checked against the diff, and only then", () => {
+    const warning = "Summary written by the agent, not checked against the diff.";
+    render(<DeliveredCard run={run({ pr_description: desc({}, { source: "lead_only" }) })} />);
+    expect(screen.getByText(warning)).toBeTruthy();
+    cleanup();
+    render(<DeliveredCard run={run({ pr_description: desc() })} />);
+    expect(screen.queryByText(warning)).toBeNull();
+  });
+
   it("renders the size line alone for a deterministic-only description", () => {
     const empty = desc(
       { summary: "", changes: [], scope_notes: [], review_pointers: [], verification: [] },

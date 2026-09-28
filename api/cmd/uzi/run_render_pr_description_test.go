@@ -154,6 +154,19 @@ func TestRenderRunDetailPrDescription(t *testing.T) {
 		}
 	}
 
+	// A lead_only summary (the editor pass failed) carries the not-checked note; a generated one
+	// (the case above) does not.
+	if strings.Contains(out, "UNCHECKED") {
+		t.Errorf("a generated summary must print no UNCHECKED row, got:\n%s", out)
+	}
+	leadOnly := renderDetail(t, prDescRun(&apitypes.RunPrDescriptionDTO{
+		Source: "lead_only",
+		Fields: apitypes.PrDescriptionFields{Summary: "Adds a limiter."},
+	}, &published))
+	if !strings.Contains(leadOnly, "UNCHECKED") || !strings.Contains(leadOnly, "Summary written by the agent, not checked against the diff.") {
+		t.Errorf("a lead_only summary must print the not-checked note, got:\n%s", leadOnly)
+	}
+
 	// Deterministic-only: no text, the size row alone.
 	unavailable := apitypes.PrDescriptionSize{Unavailable: true}
 	only := renderDetail(t, prDescRun(&apitypes.RunPrDescriptionDTO{Source: "deterministic_only", Size: &unavailable}, nil))
