@@ -160,14 +160,14 @@ interface ResponderCtx {
 type Responder = (c: ResponderCtx) => unknown;
 
 class FakeTransport implements CodexTransport {
-  requests: { method: string; params: unknown; opts?: { signal?: AbortSignal } }[] = [];
+  requests: { method: string; params: unknown; opts?: { signal?: AbortSignal; deadlineMs?: number } }[] = [];
   responses: { requestId: number | string; response: unknown }[] = [];
   notifies: { method: string; params: unknown }[] = [];
   closes = 0;
   threadStartCount = 0;
   turnStartCount = 0;
   /** When set for a method, request() returns THIS (rejects/pends) instead of the responder. */
-  requestOverride?: (c: ResponderCtx, opts?: { signal?: AbortSignal }) => Promise<unknown> | undefined;
+  requestOverride?: (c: ResponderCtx, opts?: { signal?: AbortSignal; deadlineMs?: number }) => Promise<unknown> | undefined;
 
   private readonly queue: CodexNotification[] = [];
   private ended = false;
@@ -199,7 +199,7 @@ class FakeTransport implements CodexTransport {
     return this;
   }
 
-  request<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal }): Promise<T> {
+  request<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal; deadlineMs?: number }): Promise<T> {
     this.requests.push({ method, params, opts });
     // The pinned app-server auth handshake (createCodexAppServerAuth → authenticate): answer
     // initialize + account/login/start here so EVERY responder (and requestOverride) is free of
@@ -4036,7 +4036,7 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
       { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
     ];
 
-    async function runOpenDelegation(shellHonoursAbort: boolean): Promise<{
+    async function runOpenDelegation(shellHonoursAbort: boolean, interruptNeverAnswers = false): Promise<{
       outcome: { ok: true; branch: string } | { ok: false; error: unknown };
       shellObservedAbort: boolean;
       interruptsDelivered: unknown[];
@@ -4074,9 +4074,25 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
         if (o?.signal?.aborted) {
           return Promise.reject(new CodexTransportError({ category: "aborted", message: "codex transport request aborted before send" }));
         }
-        if (c.method === "turn/interrupt") interruptsDelivered.push(c.params);
+        if (c.method === "turn/interrupt") {
+          interruptsDelivered.push(c.params);
+          // A provider that never answers the interrupt: only the request's own deadline (as in
+          // transport.ts) ends it.
+          if (interruptNeverAnswers && rec(c.params).threadId === "th-child") {
+            const deadlineMs = o?.deadlineMs;
+            if (deadlineMs === undefined) return new Promise(() => {});
+            return new Promise((_resolve, reject) => {
+              setTimeout(
+                () => reject(new CodexTransportError({ category: "timeout", message: "codex transport request deadline exceeded" })),
+                deadlineMs,
+              ).unref();
+            });
+          }
+        }
         return undefined;
       };
+      // A short boundary budget (and hence a short child-interrupt bound) for the never-answering case.
+      if (interruptNeverAnswers) rig.deps = { ...rig.deps, boundaryDeadlineMs: 200 };
       let shellStarted = false;
       let shellObservedAbort = false;
       let releaseShell!: () => void;
@@ -4165,6 +4181,22 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
         [{ threadId: "th-child", turnId: "tn-child" }],
         "the child interrupt reached the transport",
       );
+      const interrupt = r.rig.epochs[0]!.transport.requests.find(
+        (q) => q.method === "turn/interrupt" && rec(q.params).threadId === "th-child",
+      );
+      assert.equal(interrupt?.opts?.signal, undefined, "the interrupt carries no (already-aborted) signal");
+      assert.ok(
+        typeof interrupt?.opts?.deadlineMs === "number" && interrupt.opts.deadlineMs > 0 && interrupt.opts.deadlineMs <= 5_000,
+        `the interrupt is bounded well below the boundary budget: ${String(interrupt?.opts?.deadlineMs)}`,
+      );
+    });
+
+    it("(d) a provider that never answers the child turn/interrupt still lets the checkpoint quiesce inside its boundary", async () => {
+      const r = await runOpenDelegation(true, true);
+      r.releaseShell();
+      assert.equal(r.outcome.ok, true, r.outcome.ok ? "" : `run failed: ${String((r.outcome as { error: unknown }).error)}`);
+      assert.equal(r.interruptsDelivered.filter((p) => rec(p).threadId === "th-child").length, 1, "the interrupt was sent");
+      assert.equal(r.rig.providerLaunches(), 2, "the checkpoint reap recreated a fresh provider epoch");
     });
   });
 

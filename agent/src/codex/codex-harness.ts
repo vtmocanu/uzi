@@ -313,6 +313,8 @@ interface DelegationDispatch {
   /** The scrubbed + bounded `description` arg (display only, never authority); may be "". */
   readonly label: string;
   readonly ordinal: number;
+  /** Issue #1864: when the dispatch was reserved (epoch ms), for the open-at-turn-end warn. */
+  readonly openedAt: number;
   state: "pending" | "bound" | "closed";
   /** The child binding once bound; kept after the child sink unregisters so a close can still
    *  settle its open child tools. */
@@ -760,7 +762,11 @@ export class CodexHarness implements RunHarness {
    *  start/interrupt a child thread on the SAME app-server; the child's frames are
    *  demuxed back via {@link registerChildSink}. Rejects if the provider root is not
    *  launched (a child turn is only ever started from inside an active root turn). */
-  requestOnTransport<T = unknown>(method: string, params?: unknown, opts?: { signal?: AbortSignal }): Promise<T> {
+  requestOnTransport<T = unknown>(
+    method: string,
+    params?: unknown,
+    opts?: { signal?: AbortSignal; deadlineMs?: number },
+  ): Promise<T> {
     const transport = this.transport;
     if (!transport) {
       return Promise.reject(new CodexHarnessError({ category: "protocol", message: "codex provider root is not launched" }));
@@ -1567,7 +1573,9 @@ export class CodexHarness implements RunHarness {
       } catch {
         label = "";
       }
-      const dispatch: DelegationDispatch = { threadId, turnId, callId, dispatchId, label, ordinal, state: "pending" };
+      const dispatch: DelegationDispatch = {
+        threadId, turnId, callId, dispatchId, label, ordinal, openedAt: Date.now(), state: "pending",
+      };
       this.dispatches.add(dispatch);
       return dispatch;
     } catch {
@@ -1608,6 +1616,7 @@ export class CodexHarness implements RunHarness {
         const wasBound = dispatch.state === "bound";
         dispatch.state = "closed";
         if (!wasBound) continue;
+        if (content === DISPATCH_OPEN_AT_TURN_END) this.warnOpenAtTurnEnd(dispatch);
         this.closeOpenChildTools(dispatch);
         this.emitProjected(
           this.leadFrame({
@@ -1623,6 +1632,35 @@ export class CodexHarness implements RunHarness {
       }
     } catch {
       /* projection is best-effort */
+    }
+  }
+
+  /** Issue #1864: one worker-log warn for a bound delegation still open when the lead's turn
+   *  finished, naming the dispatch, the child's projected role, its age and the child tools still
+   *  open (a count plus at most five sanitized names). Never child text or arguments. Called
+   *  BEFORE {@link closeOpenChildTools} clears the open tools. Fail-safe. */
+  private warnOpenAtTurnEnd(dispatch: DelegationDispatch): void {
+    try {
+      const binding = dispatch.child;
+      let openCount = 0;
+      const names: string[] = [];
+      for (const queue of binding?.openTools.values() ?? []) {
+        for (const open of queue) {
+          openCount += 1;
+          if (names.length >= 5) continue;
+          const name = String(open.name).replace(/[^A-Za-z0-9_.-]/g, "_").slice(0, 64);
+          if (name !== "") names.push(name);
+        }
+      }
+      this.log.warn("codex delegation open at turn end", {
+        dispatch_id: dispatch.dispatchId,
+        role: binding?.role ?? "",
+        age_ms: Math.max(0, Date.now() - dispatch.openedAt),
+        open_child_tools: openCount,
+        open_child_tool_names: names,
+      });
+    } catch {
+      /* diagnostics are best-effort */
     }
   }
 

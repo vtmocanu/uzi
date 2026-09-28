@@ -983,6 +983,12 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 - Each live or parked run's HOME and cache size is visible before it can fill a volume: `uzi run get` for any run, each worker's largest run in the worker lists, the run page's park panels; admin health warns on a large run (`fleet.rundisk`). (AI-synced 2026-09-28)
 - The in-run cache cap, the hard disk stop, the periodic reclaim and the admission stop each have an off switch; the park-time cache drop and the claim/resume disk check are always on. (AI-synced 2026-09-28)
 
+## Bug #1864 — Codex delegation still open when the lead's turn ends
+
+Tracked as GitHub issue vtmocanu/uzi#1864.
+
+- A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

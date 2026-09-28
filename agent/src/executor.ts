@@ -3,7 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
-import type { CodexExecutionSafety, HarnessError } from "./harness.js";
+import type { BoundarySink, CodexExecutionSafety, HarnessError } from "./harness.js";
 import type {
   AgentSelection,
   AgentSource,
@@ -439,8 +439,10 @@ export interface RunContext {
    *
    * Fire-and-forget in spirit: BEST-EFFORT, and the runner's implementation swallows any
    * failure so a checkpoint can never fail the run. Absent on the stub/test executors.
+   * `sink` (issue #1864) labels which checkpoint sink asked, for boundary-failure
+   * diagnostics only.
    */
-  checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress }): Promise<void>;
+  checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress; sink?: BoundarySink }): Promise<void>;
   /**
    * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
    * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a

@@ -951,3 +951,124 @@ describe("CodexExecutionSafety: vault_locked deferral (issue #1766)", () => {
     assert.equal(laterRan, true);
   });
 });
+
+describe("CodexBoundaryError.diagnostic (issue #1864)", () => {
+  const unsettled = { category: "protocol" as const, message: "quiesceChildren: 1 callback/child-turn reservation(s) unsettled" };
+
+  it("names the stage, the milestone checkpoint and the unsettled work; message stays bare", () => {
+    const err = new CodexBoundaryError("quiesce", [unsettled], undefined, undefined, {
+      boundary: "checkpoint",
+      sink: "milestone_checkpoint",
+    });
+    assert.equal(
+      err.diagnostic,
+      "codex boundary failed at quiesce (milestone checkpoint): quiesceChildren: 1 callback/child-turn reservation(s) unsettled",
+    );
+    assert.equal(err.message, "codex boundary failed at quiesce");
+    assert.equal(err.boundary, "checkpoint");
+    assert.equal(err.sink, "milestone_checkpoint");
+  });
+
+  it("labels the done checkpoint, falls back to the boundary name, and omits the label when neither is known", () => {
+    const done = new CodexBoundaryError("reap", [{ category: "timeout", message: "reap timed out" }], undefined, undefined, {
+      boundary: "checkpoint",
+      sink: "done_checkpoint",
+    });
+    assert.equal(done.diagnostic, "codex boundary failed at reap (done checkpoint): reap timed out");
+    const park = new CodexBoundaryError("reap", [{ category: "timeout", message: "reap timed out" }], undefined, undefined, {
+      boundary: "park",
+    });
+    assert.equal(park.diagnostic, "codex boundary failed at reap (park): reap timed out");
+    assert.equal(park.sink, undefined);
+    const bare = new CodexBoundaryError("action", [{ category: "timeout", message: "late" }]);
+    assert.equal(bare.diagnostic, "codex boundary failed at action: late");
+    assert.equal(bare.boundary, undefined);
+  });
+
+  it("says 'no detail' when there are no errors and no action error", () => {
+    assert.equal(new CodexBoundaryError("quiesce", []).diagnostic, "codex boundary failed at quiesce: no detail");
+  });
+
+  it("keeps at most three errors and counts the rest", () => {
+    const errors = ["a", "b", "c", "d", "e"].map((m) => ({ category: "protocol" as const, message: m }));
+    assert.equal(new CodexBoundaryError("reap", errors).diagnostic, "codex boundary failed at reap: a; b; c; +2 more");
+  });
+
+  it("replaces control characters (C0 incl. CR/LF/TAB, DEL, C1) with a space", () => {
+    const err = new CodexBoundaryError("quiesce", [
+      { category: "protocol", message: "line1\r\nline2\tx\u0007y\u007fz\u0085w\u009b" },
+    ]);
+    assert.equal(err.diagnostic, "codex boundary failed at quiesce: line1 line2 x y z w");
+    for (let i = 0; i < err.diagnostic.length; i++) {
+      const code = err.diagnostic.charCodeAt(i);
+      assert.ok(code > 0x1f && !(code >= 0x7f && code <= 0x9f), `control char at ${i}`);
+    }
+  });
+
+  it("caps each error at 160 characters and the whole diagnostic at 500", () => {
+    const one = new CodexBoundaryError("reap", [{ category: "protocol", message: "x".repeat(400) }]);
+    const detail = one.diagnostic.slice("codex boundary failed at reap: ".length);
+    assert.equal(detail.length, 160);
+    assert.ok(detail.endsWith("…"));
+    const many = new CodexBoundaryError(
+      "reap",
+      Array.from({ length: 10 }, () => ({ category: "protocol" as const, message: "y".repeat(400) })),
+      new TypeError("boom"),
+      undefined,
+      { boundary: "checkpoint", sink: "milestone_checkpoint" },
+    );
+    assert.equal(many.diagnostic.length, 500);
+    assert.ok(many.diagnostic.endsWith("…"));
+  });
+
+  it("names only the action error's class, never its message or object", () => {
+    // Secret-shaped fixture assembled at runtime, never a full token literal in source.
+    const secret = "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    const typed = new CodexBoundaryError(
+      "action",
+      [{ category: "tool", message: "spawnBoundaryAction: child action failed before reap completed" }],
+      new TypeError(`push failed with ${secret}`),
+    );
+    assert.equal(
+      typed.diagnostic,
+      "codex boundary failed at action: spawnBoundaryAction: child action failed before reap completed; action error: TypeError",
+    );
+    assert.ok(!typed.diagnostic.includes(secret));
+    const weird = new Error(`x ${secret}`);
+    weird.name = `Bad name ${secret}`;
+    const odd = new CodexBoundaryError("action", [], weird);
+    assert.equal(odd.diagnostic, "codex boundary failed at action: action error: Error");
+    const plain = new CodexBoundaryError("action", [], { token: secret });
+    assert.equal(plain.diagnostic, "codex boundary failed at action: action error: Error");
+    assert.ok(!plain.diagnostic.includes(secret));
+    assert.equal(typed.message, "codex boundary failed at action");
+  });
+
+  it("a quiesce failure through withBoundary carries the request's boundary, sink and diagnostic", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
+    const safety = new CodexExecutionSafetyImpl(reg, {
+      quiesce: async () => ({ kind: "incomplete", errors: [unsettled] }),
+      reap: async () => ({ kind: "observed_empty", evidence: "supervisor_echild", epoch: 3 }),
+      dispose: async () => ({ kind: "disposed" }),
+      spawnRoot: spawnCounter().seam,
+    });
+    let called = 0;
+    await assert.rejects(
+      safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1000, sink: "milestone_checkpoint" }, async () => {
+        called += 1;
+      }),
+      (e: unknown) => {
+        assert.ok(e instanceof CodexBoundaryError);
+        assert.equal(e.stage, "quiesce");
+        assert.equal(e.boundary, "checkpoint");
+        assert.equal(e.sink, "milestone_checkpoint");
+        assert.equal(
+          e.diagnostic,
+          "codex boundary failed at quiesce (milestone checkpoint): quiesceChildren: 1 callback/child-turn reservation(s) unsettled",
+        );
+        return true;
+      },
+    );
+    assert.equal(called, 0);
+  });
+});

@@ -1614,6 +1614,14 @@ function refreshWallAfterRefusal(
   }
 }
 
+/** Issue #1864: the bound on a delegated child's `turn/interrupt`. The delegation awaits that
+ *  interrupt before its root `spawn_agent` reservation settles, and the next boundary's quiesce
+ *  waits for that reservation under its own deadline, so the interrupt must finish well inside
+ *  it: a quarter of the boundary budget, at most 5 s, at least 1 ms. */
+function childInterruptDeadlineMs(boundaryDeadlineMs: number): number {
+  return Math.min(5_000, Math.max(1, Math.floor(boundaryDeadlineMs / 4)));
+}
+
 export class CodexExecutor implements Executor {
   /** M3/M4 (PRD #1171): the Codex outer safety facade, POPULATED at the top of `run()` (before
    *  any model work) with the per-sink auth-mode reconcile closure. The runner's durability
@@ -2395,7 +2403,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
           // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
           // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
           progressMissedLastTurn = false;
@@ -2412,7 +2420,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
-          await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+          await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
           const { unmet } = await ctx.recordCompletionAttempt!({
@@ -2655,7 +2663,8 @@ export class CodexExecutor implements Executor {
         const delegationRunner = new CodexDelegationRunner({
           registry,
           roles: runPlan.roles,
-          startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness!, provider, worktreePath, spec, boundaryDeadlineMs),
+          startChildTurn: (spec: StartChildTurnSpec) =>
+            this.startChildTurn(harness!, provider, worktreePath, spec, childInterruptDeadlineMs(boundaryDeadlineMs)),
           spawnCommand,
           fileop,
           worktreePath,
@@ -2921,8 +2930,9 @@ export class CodexExecutor implements Executor {
     // delegation still open when the lead turn finishes is cancelled: its effects reap and its
     // reservations settle before the next boundary's quiesce, instead of running to the child
     // deadline. Callbacks that ignore the signal (MCP handlers, fileop) stay fail-closed at
-    // quiesce. turnAbort itself is not aborted on a clean finish: the harness request listens on
-    // it and would send turn/interrupt on the finished lead turn.
+    // quiesce. turnAbort itself is not aborted on a clean finish: it is the turn request's
+    // signal, and the harness reads an abort of it as an owner stop (watchdog/cancel), not as a
+    // clean end of the turn. A separate controller cancels only the delegations.
     const effectsAbort = new AbortController();
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
@@ -3314,14 +3324,14 @@ export class CodexExecutor implements Executor {
         project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
         // Issue #1864: the delegation interrupts only AFTER spec.signal aborted, and the transport
-        // rejects a request whose signal is already aborted, so the interrupt carries its own
-        // bounded signal instead.
+        // rejects a request whose signal is already aborted, so the interrupt carries no signal and
+        // is bounded by the transport's own short deadline instead (childInterruptDeadlineMs).
         interrupt: async (): Promise<void> => {
           await harness
             .requestOnTransport(
               "turn/interrupt",
               { threadId: childThreadId, turnId: childTurnId },
-              { signal: AbortSignal.timeout(interruptDeadlineMs) },
+              { deadlineMs: interruptDeadlineMs },
             )
             .catch(() => undefined);
         },

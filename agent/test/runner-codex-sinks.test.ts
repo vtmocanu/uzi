@@ -16,6 +16,7 @@ import { LimitReachedError } from "../src/limit.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import {
+  CodexBoundaryError,
   createCodexExecutionSafety,
   type ArmBoundaryDeadline,
   type ReconcileBeforeBoundary,
@@ -792,6 +793,99 @@ describe("RunRunner m4 — per-sink reconcile before the boundary", () => {
     assert.equal(calls.length, 1, "the trusted push/MR ran (reconcile ready)");
     assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
   });
+});
+
+// ================================================================================
+describe("RunRunner #1864 — a Codex boundary failure names its stage, checkpoint and unsettled work", () => {
+  const UNSETTLED = "quiesceChildren: 1 callback/child-turn reservation(s) unsettled";
+
+  /** Runs a Codex run whose milestone checkpoint (reap:true, sink milestone_checkpoint) boundary
+   *  throws `makeError(request)` BEFORE its action runs. Oracles for "nothing published": the
+   *  checkpoint upload spy (`client.publishCheckpoint` call count) and the forge MR calls. */
+  async function failMilestoneCheckpoint(
+    issue: number,
+    makeError: (request: BoundaryRequest) => Error,
+  ): Promise<{ reasons: string[]; lines: unknown[]; uploads: number; mrCalls: number; boundaries: string[]; sinks: unknown[] }> {
+    const { gitlab, calls } = fakeGitlab();
+    const rig = codexRig();
+    const sinks: unknown[] = [];
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = async (request, action) => {
+      if (request.boundary === "checkpoint") {
+        sinks.push(request.sink);
+        throw makeError(request);
+      }
+      return originalWithBoundary(request, action);
+    };
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let uploads = 0;
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string,
+      _tipOid: string,
+      pack: Readable,
+    ) => {
+      uploads += 1;
+      await drain(pack);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-x" } };
+    };
+    const { logger, lines } = recordingLogger();
+    try {
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        commitInTree(ctx.worktreePath, "M1.txt", "milestone 1\n");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+        return { branch: ctx.branch };
+      });
+      const claim = gitlabClaim(issue);
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+      const reasons = api.states
+        .filter((st) => st.runId === claim.run_id && st.body.status === "failed")
+        .map((st) => String(st.body.failure_reason));
+      return { reasons, lines, uploads, mrCalls: calls.length, boundaries: rig.boundaries, sinks };
+    } finally {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+  }
+
+  it("a milestone checkpoint quiesce failure reports the full diagnostic, logs it, and publishes nothing", async () => {
+    const r = await failMilestoneCheckpoint(1864, (request) =>
+      new CodexBoundaryError("quiesce", [{ category: "protocol", message: UNSETTLED }], undefined, undefined, {
+        boundary: request.boundary,
+        ...(request.sink !== undefined ? { sink: request.sink } : {}),
+      }));
+    const expected = `codex boundary failed at quiesce (milestone checkpoint): ${UNSETTLED}`;
+    assert.deepEqual(r.sinks, ["milestone_checkpoint"], "the runner forwarded the sink into the boundary request");
+    assert.deepEqual(r.reasons, [expected], "the failed report names the stage, checkpoint and unsettled work");
+    const runFailed = r.lines.find((l) => (l as { msg?: string }).msg === "run failed") as { error?: unknown } | undefined;
+    assert.equal(runFailed?.error, expected, "the run-failed log carries the diagnostic");
+    const detail = r.lines.find((l) => (l as { msg?: string }).msg === "codex boundary failed") as Record<string, unknown> | undefined;
+    assert.ok(detail, "the structured boundary line is logged");
+    assert.equal(detail.stage, "quiesce");
+    assert.equal(detail.boundary, "checkpoint");
+    assert.equal(detail.sink, "milestone_checkpoint");
+    assert.equal(detail.detail, expected);
+    assert.equal(r.uploads, 0, "no checkpoint was uploaded");
+    assert.equal(r.mrCalls, 0, "no MR was opened");
+    assert.ok(!r.boundaries.includes("finalize"), "finalize never ran");
+  });
+
+  for (const [label, diagnostic] of [
+    ["a non-string", 42],
+    ["an oversize", `codex boundary failed at quiesce: ${"x".repeat(600)}`],
+    ["a control-character", "codex boundary failed at quiesce: forged\nline"],
+  ] as const) {
+    it(`a forged CodexBoundaryError with ${label} diagnostic falls back to the bare message`, async () => {
+      const r = await failMilestoneCheckpoint(1865, () => {
+        const forged = new Error("codex boundary failed at quiesce");
+        forged.name = "CodexBoundaryError";
+        (forged as unknown as { diagnostic: unknown }).diagnostic = diagnostic;
+        return forged;
+      });
+      assert.deepEqual(r.reasons, ["codex boundary failed at quiesce"]);
+      assert.ok(!r.lines.some((l) => (l as { msg?: string }).msg === "codex boundary failed"), "no structured line for a forged diagnostic");
+      assert.equal(r.uploads, 0);
+      assert.equal(r.mrCalls, 0);
+    });
+  }
 });
 
 // ================================================================================
