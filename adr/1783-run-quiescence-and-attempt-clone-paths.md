@@ -371,7 +371,8 @@ path:
   (`!parkResidueBlocked`), not only on the pre-report reap.
 - **Mid-run `data_volume_full` park.** PRD #1809 D4's park runs
   `executor.reapAttributedProcesses?.()` (`run-procs.ts`) and drops the run-home
-  caches before `captureRecoveryRestorePoint`. That reap is cleanup, never
+  caches (Claude/stub runs only; a Codex run skips that early drop) before
+  `captureRecoveryRestorePoint`. That reap is cleanup, never
   proof: the capture still opens with this ADR's `recovery_capture` quiescence
   proof. A blocked proof means no WIP marker, no fetch-back, no publish and no
   settle or release. The clone is kept (`preserveRecoveryClone`) and custody
@@ -394,43 +395,53 @@ path:
   `00261_run_data_volume_full.sql` and `00262_worker_run_disk.sql`. Its Up adds
   `worker_residue_blocked` to 00261's eighteen values, making nineteen. Its Down
   restores exactly those eighteen. `worker_residue_blocked` is the only one of the
-  three new values (with `gate_presentation_refused` and `data_volume_full`) that
+  three newest values (with main's `gate_presentation_refused` and `data_volume_full`) that
   a worker may report. All three are never judged, and none is human-landable.
 
 ## Root-only acceptance at the final head
 
-(recorded after the final acceptance run)
+(recorded after the final acceptance run, following the #1826 merge)
 
-Final code commit 576521c0 (runner.ts comment + spawn-site test inventory);
-later commits change only documentation and code comments. Acceptance ran at
-60f164b1 (`git diff --stat 576521c0 60f164b1`: adr, docs, embed mirror,
-specs only).
+**This is mounted-source validation**, not a fresh image build. The final code
+commit is `34b6b6c8`. The merge `d82789ad` (origin/main
+`1d4ba878113fc113a7d52778054e83a46b53e269`) and `34b6b6c8` both change
+`agent/src`, so acceptance was re-run over that code. Later commits change only
+this ADR (`git diff --stat 34b6b6c8 8249dec9 -- agent/src e2e` is empty).
 
-A fresh build (`CQ_BUILD_ARGS="--network host" CQ_IMAGE=cq1783:9ef3a599ddda
-CQ_TIMEOUT=2400 task test:clone-quiescence`) failed twice at image extraction
-with "no space left on device" on the shared Docker daemon's fixed 29.4G
-storage pool (no test ran); so the run used an existing worker base image
-with this tree's `agent/src` mounted:
+The shared Docker daemon had 10.2G free of its fixed 29.4G pool, which is not
+enough for a fresh build of the ~8.75GB worker base image. (Earlier fresh builds
+on this branch failed with "no space left on device".) The run therefore used
+an existing worker base image, with this tree's `agent/src` and `e2e/` mounted
+into it.
 
 Command: `CQ_SKIP_BUILD=1 CQ_IMAGE=uzi-agent-codex-git-trust:base
 CQ_MOUNT_SRC=1 CQ_TIMEOUT=900 task test:clone-quiescence` → exit 0.
 
-Image ID `sha256:5c04540739e3cfd6fc43aa13620bb888593783a77eb505058a055ac7b879d788`,
-`org.opencontainers.image.revision` `3692a3801e4ca11759f34b41d40f0acc8a4e097f`.
-`git diff --stat 3692a3801e4ca11759f34b41d40f0acc8a4e097f 576521c0 --
-agent/templates agent/package.json agent/package-lock.json agent/bin
-agent/codex agent/devbox-global agent/tsconfig.json` is empty; the two other
-Dockerfile build inputs, `COPY agent/src ./src` (superseded by the `CQ_SRC`
-mount) and `COPY . /opt/uzi-src`, differ between those commits but are not
-read by the fixture. The fixture (`e2e/`, mounted read-only) and
-`agent/src` (mounted via `CQ_MOUNT_SRC`; `fixture.test.ts:40` `const SRC =
-process.env.CQ_SRC ?? "/app/src";`) come from the tree at 60f164b1, whose
-`agent/src` equals the final code commit 576521c0's (`git diff --stat
-576521c0 60f164b1 -- agent/src` is empty), and the commits after 60f164b1
-(978cbde5, 312a8fb7, c7e97e4c and the ADR fix that follows them) change only
-docs and code comments.
+- Image ID `sha256:5c04540739e3cfd6fc43aa13620bb888593783a77eb505058a055ac7b879d788`.
+- Build SHA (`org.opencontainers.image.revision`) `3692a3801e4ca11759f34b41d40f0acc8a4e097f`.
+- Mounted source SHA: `34b6b6c8` (`agent/src` via `CQ_MOUNT_SRC`,
+  `fixture.test.ts`: `const SRC = process.env.CQ_SRC ?? "/app/src";`; `e2e/`
+  bind-mounted read-only).
 
-PASS lines (7/7; tests 7, pass 7, fail 0, cancelled 0, skipped 0):
+Image inputs outside the mounted `agent/src` and `e2e/`, build SHA against the
+final code commit: `git diff --stat 3692a3801e4ca11759f34b41d40f0acc8a4e097f
+34b6b6c8 -- agent/templates agent/package.json agent/package-lock.json
+agent/bin agent/codex agent/devbox-global agent/tsconfig.json` is empty. That
+covers each of the following:
+
+- the Dockerfile itself, including its digest-pinned `FROM node:24-alpine@sha256:…`
+  base layers;
+- the entrypoint (`agent/templates/entrypoint.sh` → `/usr/local/sbin/uzi-entrypoint`);
+- `setpriv` (installed by the Dockerfile's own `apk add`, with its util-linux
+  `--reuid` assertion);
+- the Codex supervisor, fileop and command-sandbox binaries (built from
+  `agent/codex/supervisor`);
+- `agent/devbox-global`, `agent/bin` and the package manifests.
+
+The one remaining input, `COPY . /opt/uzi-src`, differs but is not read by the
+fixture.
+
+PASS lines (tests 7, pass 7, fail 0, cancelled 0, skipped 0):
 
 ```
 ✔ runs as the worker uid under the split, not as root or single-uid
