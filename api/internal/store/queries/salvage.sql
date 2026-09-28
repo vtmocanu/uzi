@@ -1,6 +1,6 @@
 -- PRD #1867 M2: the run_salvage lifecycle (migration 00264). The sweep enqueues failed,
--- checkpoint-published runs, promotes their branch-scoped checkpoint ref to a run-scoped
--- salvage ref, and later expires it. The live_run_id pointer (ON DELETE RESTRICT) is held
+-- checkpoint-published runs, creates a run-scoped salvage ref at the recorded tip (never
+-- touching the branch checkpoint ref, which #1810's retention owns), and later expires it. The live_run_id pointer (ON DELETE RESTRICT) is held
 -- while a remote ref may exist and cleared when the row settles; the CHECKs in 00264 enforce
 -- that, so every transition below that clears it is guarded on the source state.
 
@@ -39,7 +39,7 @@ ON CONFLICT (run_id) DO NOTHING;
 SELECT * FROM run_salvage WHERE run_id = @run_id::uuid;
 
 -- name: ListSalvageDuePending :many
--- The promotion pass: pending rows, least recently touched first (a failed attempt bumps
+-- The create pass: pending rows, least recently touched first (a failed attempt bumps
 -- updated_at, so retries rotate). A pending row whose created salvage ref is already due
 -- for expiry (ListSalvageDueExpiry at the same now) is excluded, so no row is in both lists.
 SELECT * FROM run_salvage
@@ -59,8 +59,7 @@ LIMIT @lim::int;
 
 -- name: RecordSalvageCreated :execrows
 -- The salvage ref is confirmed at the tip. Sets salvage_created_at and expires_at once (a
--- repeat call, e.g. the idempotent same-tip path after a partial success, keeps the first
--- values). Only on a pending row.
+-- repeat call keeps the first values). Only on a pending row.
 UPDATE run_salvage
 SET expires_at = CASE WHEN salvage_created_at IS NULL THEN @expires_at::timestamptz ELSE expires_at END,
     salvage_created_at = COALESCE(salvage_created_at, @created_at::timestamptz),
@@ -68,7 +67,7 @@ SET expires_at = CASE WHEN salvage_created_at IS NULL THEN @expires_at::timestam
 WHERE run_id = @run_id::uuid AND state = 'pending';
 
 -- name: RecordSalvageAttemptFailed :execrows
--- A failed promotion attempt on a pending row: bump attempts and record the bounded error.
+-- A failed create attempt on a pending row: bump attempts and record the bounded error.
 -- At the cap the row becomes 'failed' and drops its live pointer, but ONLY when no salvage
 -- ref was created; a created salvage ref stays pending (and live) until it expires.
 UPDATE run_salvage
@@ -82,8 +81,9 @@ SET attempts = attempts + 1,
 WHERE run_id = @run_id::uuid AND state = 'pending';
 
 -- name: MarkSalvagePromoted :execrows
--- The branch ref is gone (deleted, or CAS proved another owner moved it) after a confirmed
--- salvage create. Only from pending with a created salvage ref; the pointer stays set.
+-- A salvage copy was created ('promoted' keeps its historical name). Called right after
+-- RecordSalvageCreated, or on a later pass if the sweep stopped between the two. Only from
+-- pending with a created salvage ref; the pointer stays set.
 UPDATE run_salvage
 SET state = 'promoted',
     promoted_at = @promoted_at::timestamptz,
@@ -94,12 +94,10 @@ WHERE run_id = @run_id::uuid AND state = 'pending' AND salvage_created_at IS NOT
 -- name: SettleSalvage :execrows
 -- Settle a live row into a terminal state and clear the live pointer: 'unavailable' or
 -- 'refused' (no salvage ref was created), 'disabled' (the forge left UZI_SALVAGE_FORGES;
--- the caller CAS-deleted any created salvage ref and the branch ref first) or 'expired'
--- (the salvage ref was CAS-deleted or confirmed absent). Any other target state matches no
--- row (0 rows). Settling a row with a created salvage ref to 'unavailable' or 'refused'
--- violates run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
--- So a created row that a later Promote finds unavailable or refused is settled by the
--- caller as 'expired', and only after its salvage ref is confirmed deleted or absent.
+-- the caller CAS-deleted any created salvage ref first) or 'expired' (the salvage ref was
+-- CAS-deleted or confirmed absent). Any other target state matches no row (0 rows).
+-- Settling a row with a created salvage ref to 'unavailable' or 'refused' violates
+-- run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
 UPDATE run_salvage
 SET state = @state::text,
     live_run_id = NULL,

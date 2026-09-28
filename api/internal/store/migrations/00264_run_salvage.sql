@@ -1,10 +1,13 @@
 -- +goose Up
 
--- PRD #1867 M2: the durable state of a failed run's checkpoint SALVAGE. When a failed,
--- checkpoint-eligible run has a published checkpoint tip, the api sweep promotes the
--- branch-scoped refs/uzi-checkpoints/<branch> to a run-scoped refs/uzi-salvage/<run-id>
--- (pushbroker.Promote) instead of deleting it, and later CAS-deletes that salvage ref when
--- it expires. This table records that lifecycle, one row per run.
+-- PRD #1867 M2: the durable state of a failed run's checkpoint SALVAGE. Salvage is
+-- CREATE-ONLY: when a failed, checkpoint-eligible run has a published checkpoint tip, the
+-- api sweep creates a run-scoped refs/uzi-salvage/<run-id> at that tip
+-- (pushbroker.CreateSalvageRef), only when refs/uzi-checkpoints/<branch> or
+-- refs/uzi-recovery/<run-id> is verified at the recorded tip, and later CAS-deletes that
+-- salvage ref when it expires. It never deletes or moves the branch checkpoint ref or a
+-- recovery ref: #1810's retention owns those. This table records that lifecycle, one row
+-- per run. The state name 'promoted' is kept; it means "a salvage copy was created".
 --
 -- Purely ADDITIVE: one brand-new table, no change to an existing one.
 --
@@ -17,13 +20,10 @@
 -- set, so deleting the run (directly, or via the repo / forge-connection / owner cascade)
 -- fails with 23503 on run_salvage_live_run_id_fkey instead of silently dropping the only
 -- record of a public ref. Settling the row clears the pointer, which lifts the restriction.
--- Settling does NOT always mean no ref is left on the forge. A created salvage ref settles
--- only as 'expired' (CAS-deleted or confirmed absent) or 'disabled' (the forge left
--- UZI_SALVAGE_FORGES and the salvage and branch refs were CAS-deleted). But a 'failed' row
--- (the attempt cap was reached before any salvage ref was created) clears the pointer while
--- its branch-scoped refs/uzi-checkpoints/<branch> may REMAIN on the forge: a known leftover,
--- the same status quo as a failed checkpoint cleanup today. 'unavailable' and 'refused'
--- created no salvage ref.
+-- The pointer tracks only the salvage ref: the branch checkpoint ref is #1810's, whatever
+-- the row's state. A created salvage ref settles only as 'expired' or 'disabled', both
+-- after it is CAS-deleted or confirmed absent. 'unavailable', 'refused' and 'failed' (the
+-- attempt cap was reached first) created no salvage ref.
 --
 -- The repo-removal and forge-connection-removal handlers turn that restriction into an
 -- owner-facing 409 naming the refs, and map a 23503 on this constraint (a sweep inserting a
@@ -45,23 +45,23 @@ CREATE TABLE run_salvage (
     -- refs/uzi-checkpoints/<branch>.
     branch text NOT NULL CONSTRAINT run_salvage_branch_format_check
         CHECK (branch ~ '^(agent/issue-[0-9]+|uzi/self-improve/[0-9a-f-]{36})$'),
-    -- The recorded checkpoint tip (runs.checkpoint_tip at enqueue). Promotion is bound to
-    -- it: a branch ref at any other tip is never promoted, a salvage ref at any other tip is
-    -- never overwritten. Full lowercase hex object id (SHA-1, or SHA-256 for a sha256 repo).
+    -- The recorded checkpoint tip (runs.checkpoint_tip at enqueue). The create is bound to
+    -- it: no salvage ref is created from a source at any other tip, and a salvage ref at any
+    -- other tip is never overwritten. Full lowercase hex object id (SHA-1, or SHA-256 for a sha256 repo).
     tip text NOT NULL CHECK (tip ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
     -- The LIVE pointer: ON DELETE RESTRICT while a remote ref may exist for this row. It
     -- only ever points at the row's own run.
     live_run_id uuid CONSTRAINT run_salvage_live_run_id_fkey REFERENCES runs(id) ON DELETE RESTRICT
         CONSTRAINT run_salvage_live_run_is_own_check CHECK (live_run_id IS NULL OR live_run_id = run_id),
     state text NOT NULL CHECK (state IN (
-        'pending',        -- recorded; promotion not yet confirmed (retried by the sweep)
-        'promoted',       -- salvage ref created and the branch ref removed
-        'unavailable',    -- the branch ref was missing or had moved; nothing created
+        'pending',        -- recorded; salvage create not yet confirmed (retried by the sweep)
+        'promoted',       -- a salvage copy was created (the name is historical)
+        'unavailable',    -- no source ref was at the recorded tip; nothing created
         'refused',        -- a salvage ref already existed at another tip; never overwritten
-        'failed',         -- promotion gave up after the attempt cap; branch ref kept
-        'skipped_secret', -- fail_origin push_secret_blocked: never promoted
+        'failed',         -- the create gave up after the attempt cap; nothing created
+        'skipped_secret', -- fail_origin push_secret_blocked: never salvaged
         'expired',        -- the salvage ref was CAS-deleted (or confirmed absent)
-        'disabled'        -- the forge was taken off UZI_SALVAGE_FORGES before promotion
+        'disabled'        -- the forge was taken off UZI_SALVAGE_FORGES before the create
     )),
     attempts int NOT NULL DEFAULT 0,
     -- Bounded (and scrubbed by the caller) last broker error, shown on the run.
@@ -93,7 +93,7 @@ CREATE TABLE run_salvage (
         CHECK (state <> 'skipped_secret' OR live_run_id IS NULL)
 );
 
--- The sweep's promotion pass: pending rows, least recently touched first.
+-- The sweep's create pass: pending rows, least recently touched first.
 CREATE INDEX idx_run_salvage_due_pending ON run_salvage (updated_at) WHERE state = 'pending';
 -- The sweep's expiry pass: created salvage refs still live, by expiry.
 CREATE INDEX idx_run_salvage_due_expiry ON run_salvage (expires_at)
