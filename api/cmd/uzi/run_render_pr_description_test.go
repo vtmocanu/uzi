@@ -166,6 +166,15 @@ func TestRenderRunDetailPrDescription(t *testing.T) {
 	if !strings.Contains(leadOnly, "UNCHECKED") || !strings.Contains(leadOnly, "Summary written by the agent, not checked against the diff.") {
 		t.Errorf("a lead_only summary must print the not-checked note, got:\n%s", leadOnly)
 	}
+	// The CLI shows only the summary of the lead's text (changes and pointers are web-only), so a
+	// lead_only description with an empty summary puts no unchecked claim on screen and no note.
+	blankLead := renderDetail(t, prDescRun(&apitypes.RunPrDescriptionDTO{
+		Source: "lead_only",
+		Fields: apitypes.PrDescriptionFields{Changes: []string{"New middleware."}},
+	}, &published))
+	if strings.Contains(blankLead, "UNCHECKED") || strings.Contains(blankLead, "New middleware.") {
+		t.Errorf("an empty lead_only summary shows no lead text and no UNCHECKED row, got:\n%s", blankLead)
+	}
 
 	// Deterministic-only: no text, the size row alone.
 	unavailable := apitypes.PrDescriptionSize{Unavailable: true}

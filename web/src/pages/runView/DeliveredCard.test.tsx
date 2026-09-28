@@ -204,6 +204,11 @@ describe("DeliveredCard", () => {
     cleanup();
     render(<DeliveredCard run={run({ pr_description: desc() })} />);
     expect(screen.queryByText(warning)).toBeNull();
+    cleanup();
+    // A lead_only description with an empty summary still shows the lead's changes: still unchecked.
+    render(<DeliveredCard run={run({ pr_description: desc({ summary: "" }, { source: "lead_only" }) })} />);
+    expect(screen.getByText("New middleware in the router.")).toBeTruthy();
+    expect(screen.getByText(warning)).toBeTruthy();
   });
 
   it("renders the size line alone for a deterministic-only description", () => {

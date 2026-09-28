@@ -164,7 +164,11 @@ function delivered(run: Run): Delivered | null {
     scopeNotes.length > 0 ||
     verification.length > 0;
   if (!hasBody && note === null) return null;
-  const unchecked = desc?.source === "lead_only";
+  // Any lead-authored text on show (not the deterministic size line alone) gets the note: a
+  // lead_only description may carry changes with an empty summary.
+  const unchecked =
+    desc?.source === "lead_only" &&
+    (summary !== "" || changes.length > 0 || pointers.length > 0 || scopeNotes.length > 0 || verification.length > 0);
   return { summary, changes, pointers, scopeNotes, verification, sizeLine, note, hasBody, unchecked };
 }
 
@@ -193,7 +197,7 @@ export function DeliveredCard({ run }: { run: Run }) {
         Delivered
       </h3>
       {summary !== "" && <p className="whitespace-pre-wrap text-sm text-fg">{summary}</p>}
-      {unchecked && summary !== "" && <p className={NOTE}>{UNCHECKED_NOTE}</p>}
+      {unchecked && <p className={NOTE}>{UNCHECKED_NOTE}</p>}
       {sizeLine && <p className="font-mono text-xs text-muted">{sizeLine}</p>}
 
       {changes.length > 0 && (
