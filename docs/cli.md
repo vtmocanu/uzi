@@ -904,8 +904,8 @@ SALVAGE_FETCH    git fetch origin refs/uzi-salvage/<run-id>
 
 The other states read `pending` (the copy is being made), `unavailable` (not saved: the
 published checkpoint was no longer at its recorded tip on the forge, either gone or moved),
-`refused` (the salvage ref already pointed at a different commit), `failed` (making the
-copy kept failing), `skipped_secret` (not saved: the run failed on a secret-scan block),
+`refused` (the salvage ref already pointed at a different commit), `failed` (salvage stopped after
+repeated attempts; the last error names any ref that may remain), `skipped_secret` (not saved: the run failed on a secret-scan block),
 `expired` (the copy was removed) and `disabled` (not saved: salvage was turned off for
 that forge before a copy was made). `SALVAGE_REF` and `SALVAGE_FETCH` print only for a
 ref of the exact form `refs/uzi-salvage/<run-id>` naming this run. The same values are the run's `salvage_state`,

@@ -77,6 +77,9 @@ therefore strictly stronger.
 
 ## Consequences
 
+- **Extended twice, both CAS and never-forced.** [ADR-1810](1810-checkpoint-retention-follows-custody.md)
+  adds a ref-create primitive for custody-retained checkpoints; [ADR-1867](1867-failed-run-salvage-ref.md)
+  reuses that primitive, widened to a third namespace, for failed-run checkpoint salvage.
 - **The api gains its first git capability and its first outbound git push.** It has
   only ever spoken forge REST; the broker adds a pure-Go smart-HTTP push client
   (go-git) and a binary/pack upload endpoint (the existing worker→api channel is

@@ -305,6 +305,68 @@ executed on an older worker, or against an older server, is honestly
 reported as **unsupported** rather than silently promised a recovery that
 was never captured. Upgrading your fleet only protects runs going forward.
 
+## Salvage copies
+
+Separate from the archive above, a **salvage copy** is a bounded, run-scoped
+copy of a failed run's *last published checkpoint* — the state uzi already
+pushed to origin before the run failed, which may be behind the run's final
+local work. Every surface calls this "checkpointed commits saved," never
+"recovered," because it can be stale.
+
+Salvage is **off by default**. An operator turns it on per forge kind with
+`UZI_SALVAGE_FORGES`, a comma list of `github`, `gitlab`, `forgejo`; a forge
+should be added only after the maintainer's real-forge check for that forge
+has passed. With the setting empty, or for an unlisted forge, nothing about
+a failed run's checkpoint changes.
+
+On an enabled forge, a periodic sweep verifies the tip is still current —
+still at the branch's own checkpoint ref, `refs/uzi-checkpoints/<branch>`,
+or at its recovery ref, `refs/uzi-recovery/<run-id>` (see
+[Where the work is kept](#where-the-work-is-kept)) — and, only then, copies
+it into a run-scoped `refs/uzi-salvage/<run-id>`. A promoted copy expires
+after `UZI_RECOVERY_READY_RETENTION` (the same window as the archive
+retention above), by CAS-deleting the salvage ref. Salvage never deletes or
+moves any other ref: the branch checkpoint ref and any recovery ref stay
+[custody retention](#where-the-work-is-kept)'s, never salvage's, to manage
+— salvage only ever reads them as a source, and only ever creates or deletes
+its own ref.
+
+States shown on the run page and by `uzi run get`:
+
+- **Saving** (`pending`) — a copy is being made.
+- **Saved** (`promoted`) — the copy exists; the run page shows its ref, tip,
+  expiry, and a copyable fetch command.
+- **Not saved** — `unavailable` (the published checkpoint no longer matched
+  its recorded tip on the forge), `refused` (the salvage ref already pointed
+  at a different commit), `failed` (salvage stopped after repeated attempts; the last error names any
+  ref that may remain), or
+  `skipped_secret` (the run failed on a secret-scan block: never saved).
+- **Expired** — the copy was removed after its retention window.
+- **Off** (`disabled`) — salvage was turned off for this forge before a copy
+  was made.
+
+Fetch a saved copy:
+
+```sh
+git fetch origin refs/uzi-salvage/<run-id>
+```
+
+While a failed run has a live salvage copy — made, or still being made —
+removing its repo or its forge connection is refused with a 409 naming the
+salvage refs and the runs still pending; the block lifts once each copy
+expires, or a pending one settles without being kept.
+
+### Recovery order
+
+When you're recovering a failed run's work, check in this order: whether a
+salvage copy exists, then compare its tip against any available
+[recovery archive](#downloading-an-archive), the run's
+[retained checkpoint or recovery ref](#where-the-work-is-kept), a live
+worker clone, and the worker's own tracking ref. Restore whichever verified
+source is freshest. Never prefer an older salvage checkpoint merely because
+it happens to be the one that's remotely reachable — any of the other
+sources may hold newer work the salvage copy never saw.
+
 Related: [Recovering from a transient interruption](run-recovery-wait.md) (a different,
 earlier mechanism — a transient in-place retry, not a byte archive) ·
 [Hosted workers](hosted-workers.md) · [CLI](cli.md)

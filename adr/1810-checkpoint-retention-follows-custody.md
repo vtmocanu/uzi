@@ -433,3 +433,6 @@ above.
 - [PRD #1810](../prds/1810-retain-failed-run-checkpoint-ref.md)
 - [ADR-0122](0122-checkpoint-push-broker.md) — the push broker's CAS,
   never-forced invariant this ADR extends to a second ref namespace.
+- [ADR-1867](1867-failed-run-salvage-ref.md) — reuses `CreateRef` for a third,
+  create-only namespace (failed-run salvage); never deletes or moves a ref this
+  ADR's retention manages.

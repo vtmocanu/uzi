@@ -29,6 +29,10 @@ the `uncommitted.patch` + `untracked.tar.gz` are what save it, not the bundle.
   plus `run.json` / `plan.md` / `progress.txt` / `log-tail.ndjson`.
 - **B) The live PVC** (the worker pod still exists) — bundle `REF` out of the bare clone
   per *Recovering a failed run's work from the worker PVC* above, then continue at step 3.
+- **C) The salvage ref** (`refs/uzi-salvage/<RUN>`, PRD #1867, `salvage_state: promoted`) —
+  only the run's *last published checkpoint*, may be behind (A) or (B). Use it only when
+  neither A nor B nor the run's retained checkpoint/recovery ref (PRD #1810) is available;
+  `git fetch origin refs/uzi-salvage/<RUN>:refs/heads/recover/STEM` then continue at step 3.
 
 ## Steps
 

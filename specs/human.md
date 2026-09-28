@@ -822,6 +822,12 @@ Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/1810-retain-failed-run-c
 
 - A finished run's last published checkpoint ref stays on the forge while any of its custody holds is open — a failed or cancelled run, but also a completed run that still has an older generation's open hold — instead of being deleted at the terminal transition; a new run on the same branch moves it to a per-run recovery ref rather than being blocked by it, and it is deleted only once the run's last hold is released or discarded. [AI-synced 2026-09-27, #1810]
 
+## Feature #1867 — A failed run's last published checkpoint gets a bounded, run-scoped salvage copy
+
+Tracked as GitHub issue vtmocanu/uzi#1867; PRD at `prds/1867-failed-run-salvage-ref.md`.
+
+- On a forge listed in `UZI_SALVAGE_FORGES` (default empty: off), a failed, checkpoint-eligible run's last published checkpoint is copied to a run-scoped `refs/uzi-salvage/<run-id>`, only when it is still verified live under the branch checkpoint ref or its recovery ref, and expires after `UZI_RECOVERY_READY_RETENTION`; a `push_secret_blocked` failure is never salvaged, and salvage never deletes or moves the branch checkpoint ref or a recovery ref, which stay #1810's to manage. (AI-synced 2026-09-28)
+
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
 Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.

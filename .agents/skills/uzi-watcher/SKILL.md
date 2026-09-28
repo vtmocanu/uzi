@@ -261,6 +261,13 @@ no kube access:
   --json` (each hold's `captures[].id`) or from `run export`'s own stderr listing when it
   refuses to guess.
 - `uzi run get RUN --json | jq -r .preserved_patch`: the diff a typed push failure preserves.
+- `uzi run get RUN --json | jq -r .salvage_state`: a **failed** run on a forge listed in
+  `UZI_SALVAGE_FORGES` may have `salvage_ref` at `promoted` — a bounded, run-scoped copy of
+  the run's *last published checkpoint* (may be behind its final local work), fetchable with
+  `git fetch origin refs/uzi-salvage/<run-id>` (PRD #1867). Check it, then the run's retained
+  checkpoint or recovery ref (`uzi run recovery RUN`, PRD #1810), THEN the sources below;
+  restore whichever verified source is freshest, never the salvage copy merely because it is
+  remotely reachable — see `docs/run-recovery.md`'s "Recovery order".
 
 Fall back to the worker PVC only for a **persistent** hosted worker: the bare repository's
 `refs/uzi-runner/agent/issue-N` tracking ref survives a pod roll on its data PVC. On
