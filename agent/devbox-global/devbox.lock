@@ -2,13 +2,13 @@
   "lockfile_version": "1",
   "packages": {
     "chromium": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#chromium",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#chromium",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
           "outputs": [
             {
-              "path": "/nix/store/agamzskapmh5018k98bqfwrrb738bgpv-chromium-153.0.8010.52",
+              "path": "/nix/store/g0yvxs8p2ijrvmxpd5mim1ni0fyk9bnh-chromium-154.0.8037.57",
               "default": true
             }
           ]
@@ -16,7 +16,7 @@
       }
     },
     "coreutils": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#coreutils",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#coreutils",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -30,7 +30,7 @@
       }
     },
     "dejavu_fonts": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#dejavu_fonts",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#dejavu_fonts",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -44,7 +44,7 @@
       }
     },
     "fd": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#fd",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#fd",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -58,7 +58,7 @@
       }
     },
     "file.out": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#file.out",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#file.out",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -72,7 +72,7 @@
       }
     },
     "fontconfig": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#fontconfig",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#fontconfig",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -87,7 +87,7 @@
       }
     },
     "gcc": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#gcc",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#gcc",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -106,22 +106,22 @@
       }
     },
     "github:NixOS/nixpkgs/nixpkgs-unstable": {
-      "last_modified": "2026-09-19T18:56:16Z",
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5?lastModified=1789844176"
+      "last_modified": "2026-09-28T04:45:22Z",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e?lastModified=1790570722"
     },
     "gnumake": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#gnumake",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#gnumake",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
           "outputs": [
             {
-              "name": "man",
-              "path": "/nix/store/cnhhvss345vj63rgzx9jq172b6ni7x5i-gnumake-4.4.1-man",
+              "path": "/nix/store/kpnsgmzydsr7ig2p09p0143rsw1qik5b-gnumake-4.4.1",
               "default": true
             },
             {
-              "path": "/nix/store/kpnsgmzydsr7ig2p09p0143rsw1qik5b-gnumake-4.4.1",
+              "name": "man",
+              "path": "/nix/store/cnhhvss345vj63rgzx9jq172b6ni7x5i-gnumake-4.4.1-man",
               "default": true
             }
           ]
@@ -129,7 +129,7 @@
       }
     },
     "go-task": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#go-task",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#go-task",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -181,7 +181,7 @@
       }
     },
     "jq.bin": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#jq.bin",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#jq.bin",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -196,7 +196,7 @@
       }
     },
     "kubeconform": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#kubeconform",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#kubeconform",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -210,7 +210,7 @@
       }
     },
     "kubernetes-helm": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#kubernetes-helm",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#kubernetes-helm",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -224,7 +224,7 @@
       }
     },
     "lsof": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#lsof",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#lsof",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -238,7 +238,7 @@
       }
     },
     "openssl.bin": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#openssl.bin",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#openssl.bin",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -253,7 +253,7 @@
       }
     },
     "opentofu": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#opentofu",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#opentofu",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -267,18 +267,18 @@
       }
     },
     "perl": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#perl",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#perl",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
           "outputs": [
             {
-              "path": "/nix/store/w03i01kiakf4wz7jbp1l59c0bhb3pjca-perl-5.42.3",
+              "name": "man",
+              "path": "/nix/store/gw7zagh9cvx25b601jd1sv021xjp797p-perl-5.42.3-man",
               "default": true
             },
             {
-              "name": "man",
-              "path": "/nix/store/gw7zagh9cvx25b601jd1sv021xjp797p-perl-5.42.3-man",
+              "path": "/nix/store/w03i01kiakf4wz7jbp1l59c0bhb3pjca-perl-5.42.3",
               "default": true
             }
           ]
@@ -286,7 +286,7 @@
       }
     },
     "procps.out": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#procps.out",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#procps.out",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -301,7 +301,7 @@
     },
     "python3": {
       "plugin_version": "0.0.5",
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#python3",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#python3",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -315,7 +315,7 @@
       }
     },
     "python3Packages.pip": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#python3Packages.pip",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#python3Packages.pip",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -334,7 +334,7 @@
       }
     },
     "ripgrep": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#ripgrep",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#ripgrep",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -348,13 +348,13 @@
       }
     },
     "semgrep": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#semgrep",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#semgrep",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
           "outputs": [
             {
-              "path": "/nix/store/8l09rc8f8sfxj7ax45gkqq4hm9f9wv3i-python3.14-semgrep-1.172.0",
+              "path": "/nix/store/wiaxllabh4izc7wyb9hz9dq3p15bwwm3-python3.14-semgrep-1.172.0",
               "default": true
             }
           ]
@@ -362,7 +362,7 @@
       }
     },
     "shellcheck.bin": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#shellcheck.bin",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#shellcheck.bin",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -377,7 +377,7 @@
       }
     },
     "yamllint": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#yamllint",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#yamllint",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
@@ -391,7 +391,7 @@
       }
     },
     "yq-go": {
-      "resolved": "github:NixOS/nixpkgs/79b35bf0bda5cd110f856aa5b5b2c5ba4460dbf5#yq-go",
+      "resolved": "github:NixOS/nixpkgs/419fe0f449b3fbe3bdd53d9840288db4509ec32e#yq-go",
       "source": "nixpkg",
       "systems": {
         "x86_64-linux": {
