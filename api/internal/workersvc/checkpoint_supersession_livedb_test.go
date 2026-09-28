@@ -80,6 +80,21 @@ func (m *memForge) publish(_ context.Context, o pushbroker.Options) (pushbroker.
 	return pushbroker.Result{Ref: ref}, nil
 }
 
+// land applies a push LATE, as a forge applying a receive-pack request the api's client already
+// gave up on: the real pushbroker binds the request's old value to the branch tip as it FETCHED it
+// (old; "" = the ref was absent), so the update lands only if the ref is still exactly there. It
+// reports whether it landed.
+func (m *memForge) land(ref, old, tip string) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if cur, ok := m.refs[ref]; (ok && cur != old) || (!ok && old != "") {
+		return false
+	}
+	m.refs[ref] = tip
+	m.events = append(m.events, "publish "+ref+" "+tip)
+	return true
+}
+
 func (m *memForge) createRef(_ context.Context, o pushbroker.CreateRefOptions) error {
 	if m.beforeCreate != nil {
 		m.beforeCreate(o.Ref)

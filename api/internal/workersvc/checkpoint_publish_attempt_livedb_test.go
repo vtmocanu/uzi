@@ -30,11 +30,15 @@ var noCooling = pgtype.Interval{Valid: true}
 
 // publishGate holds the FIRST publishFn call for tip inside the forge call until release is
 // closed. late: that call then returns a client-side timeout WITHOUT landing (the test lands the
-// update itself later, as a forge applying a request the client gave up on).
+// update itself later, with memForge.land, as a forge applying a request the client gave up on).
+// fetched is the branch tip the call saw on entry ("" = absent): the old value the real pushbroker
+// binds the receive-pack request to, so a late landing is honoured only while the ref is still
+// there.
 type publishGate struct {
 	tip     string
 	late    bool
 	once    sync.Once
+	fetched string
 	entered chan struct{}
 	release chan struct{}
 }
@@ -46,6 +50,7 @@ func gatePublish(svc *Service, forge *memForge, tip string, late bool) *publishG
 			first := false
 			g.once.Do(func() { first = true })
 			if first {
+				g.fetched, _ = forge.ref(checkpointRefPrefix + o.Branch)
 				close(g.entered)
 				<-g.release
 				if g.late {
@@ -211,10 +216,12 @@ func TestLiveRoutedPublishInFlightAtTerminalLiveDB(t *testing.T) {
 
 // TestLatePublishLandsAfterCoolingLiveDB (operator constraint, residual 2): the old run's push
 // returns a client-side timeout, but the forge applies it later, AFTER the cooling period elapsed.
-// The attempt row written before the push survives the unknown outcome, and the sweeper's attempts
-// arm reconciles the branch ref, so the landing cannot leave a permanently untracked ref.
+// The attempt row written before the push survives the unknown outcome. Every late landing is
+// bound to the branch tip the push fetched (memForge.land), as the real pushbroker's receive-pack
+// request is; where one lands, the supersession or the sweeper's attempts arm reconciles it. What
+// the attempt record cannot cover (the run row deleted, the horizon passed) is not exercised here.
 func TestLatePublishLandsAfterCoolingLiveDB(t *testing.T) {
-	t.Run("after a completed supersession: CAS-deleted at the late tip", func(t *testing.T) {
+	t.Run("after a completed supersession: refused by the forge's compare-and-swap, then retired", func(t *testing.T) {
 		f, oldGate, oldOut := newInFlightFix(t, true)
 		close(oldGate.release)
 		if o := recvPublish(t, oldOut); o.err == nil || o.res.Published {
@@ -223,40 +230,87 @@ func TestLatePublishLandsAfterCoolingLiveDB(t *testing.T) {
 		if n := f.attemptCount(t, f.oldRun); n != 1 {
 			t.Fatalf("old run attempt rows = %d after an unknown outcome, want 1", n)
 		}
+		if oldGate.fetched != retentionTestTip {
+			t.Fatalf("setup: the old push fetched the branch at %q, want the retained tip", oldGate.fetched)
+		}
 
 		f.svc2.checkpointSupersessionCooling = time.Hour
 		f.coolOff(t)
-		newGate := gatePublish(f.svc2, f.forge, supersedeNewTip, false)
-		first := f.startNewRunPublish(f.svc2)
-		waitEntered(t, newGate.entered)
+		if res := f.publishNew(t, f.svc2); !res.Published {
+			t.Fatalf("new run's publish after the cooling period = %+v, want published", res)
+		}
 		f.assertSupersededAt(t, retentionTestTip)
-		if _, ok := f.forge.ref(f.branchRef); ok {
-			t.Fatal("branch ref still present after the supersession")
-		}
-		// The forge applies the old, timed-out push now: a create on the freed branch ref.
-		if _, err := f.forge.publish(f.e.ctx, pushbroker.Options{Branch: f.branch, DeclaredTip: lateTip}); err != nil {
-			t.Fatalf("late landing: %v", err)
-		}
-		close(newGate.release)
-		if o := recvPublish(t, first); o.err != nil || o.res.Skipped != "not_descendant" {
-			t.Fatalf("new run's publish over the late landing = %+v (err %v), want not_descendant", o.res, o.err)
-		}
-		if res := f.publishNew(t, f.svc2); res.Published {
-			t.Fatal("setup: the untracked late landing did not block the new run")
+		// The forge applies the old, timed-out push now: bound to the retained tip it fetched, it
+		// cannot move a branch ref the supersession freed and the new run then advanced.
+		if f.forge.land(f.branchRef, oldGate.fetched, lateTip) {
+			t.Fatal("a late push bound to the superseded tip landed over the new run's tip")
 		}
 
 		f.reconcileRun(t, f.svc1, f.oldRun)
-		if _, ok := f.forge.ref(f.branchRef); ok {
-			t.Fatal("branch ref at the late tip survived the sweeper's attempts arm")
+		if tip, _ := f.forge.ref(f.branchRef); tip != supersedeNewTip {
+			t.Fatalf("branch ref = %q, want the new run's tip left alone", tip)
 		}
 		if tip, ok := f.forge.ref(f.recoveryRef); !ok || tip != retentionTestTip {
 			t.Fatalf("recovery ref = %q (present %v), want the superseded tip kept", tip, ok)
 		}
+		if n := f.attemptCount(t, f.oldRun); n != 1 {
+			t.Fatalf("old run attempt rows = %d while origin does not carry the tip, want 1 (kept)", n)
+		}
+		f.e.exec(t, `UPDATE checkpoint_publish_attempts SET next_check_at = now(),
+		               attempted_at = now() - interval '8 days' WHERE run_id = $1`, f.oldRun)
+		f.reconcileRun(t, f.svc1, f.oldRun)
 		if n := f.attemptCount(t, f.oldRun); n != 0 {
-			t.Fatalf("old run attempt rows = %d after reconciliation, want 0", n)
+			t.Fatalf("attempt rows = %d past the horizon, want 0 (retired)", n)
+		}
+	})
+
+	t.Run("between the supersession's recovery-ref create and its branch delete: held via the attempt row", func(t *testing.T) {
+		f, oldGate, oldOut := newInFlightFix(t, true)
+		close(oldGate.release)
+		if o := recvPublish(t, oldOut); o.err == nil {
+			t.Fatalf("old run's timed-out publish = %+v, want an error", o.res)
+		}
+		f.coolOff(t)
+		var landed bool
+		f.svc2.retentionHooks = &retentionTestHooks{beforeForgeWrite: func(id uuid.UUID, op string) {
+			if id == f.oldRun && op == "delete-branch" {
+				// The recovery ref exists at the retained tip; the forge applies the old push now,
+				// a fast-forward from the tip it fetched, before the branch CAS-delete.
+				landed = f.forge.land(f.branchRef, oldGate.fetched, lateTip)
+			}
+		}}
+		if res := f.publishNew(t, f.svc2); res.Published {
+			t.Fatalf("new run's publish over the late landing = %+v, want refused", res)
+		}
+		f.svc2.retentionHooks = nil
+		if !landed {
+			t.Fatal("setup: the late push never landed inside the supersession")
+		}
+		// Only the attempt row names lateTip: the timed-out push persisted nothing.
+		if tip, err := f.e.q.GetRunCheckpointTipForRetention(f.e.ctx, f.oldRun); err != nil || tip.String != retentionTestTip {
+			t.Fatalf("setup: runs.checkpoint_tip = %q (err %v), want still the retained tip", tip.String, err)
+		}
+		if r := f.row(t); r.State != retentionSuperseding || !r.LastError.Valid || r.Tip != retentionTestTip {
+			t.Fatalf("record = {state %q last_error %v tip %s}, want a stopped supersession at the retained tip "+
+				"(the branch ref at the attempted tip is the run's own)", r.State, r.LastError, r.Tip)
+		}
+		if tip, _ := f.forge.ref(f.branchRef); tip != lateTip {
+			t.Fatalf("branch ref = %q, want the late tip left for the stuck exit", tip)
+		}
+
+		// Custody releases: the stuck exit deletes the recovery ref at the recorded tip and the
+		// branch ref at the attempted tip, as the run's own, and the new run's publish lands.
+		f.discardHold(t)
+		f.e.exec(t, `UPDATE checkpoint_retentions SET next_attempt_at = now() - interval '1 second' WHERE run_id = $1`, f.oldRun)
+		f.reconcileRun(t, f.svc1, f.oldRun)
+		if r := f.row(t); r.State != "deleted" {
+			t.Fatalf("record = %q after the stuck exit, want deleted", r.State)
+		}
+		if _, ok := f.forge.ref(f.branchRef); ok {
+			t.Fatal("branch ref at the attempted tip survived the stuck exit")
 		}
 		if res := f.publishNew(t, f.svc2); !res.Published {
-			t.Fatalf("new run's publish after reconciliation = %+v, want published", res)
+			t.Fatalf("new run's publish after the exit = %+v, want published", res)
 		}
 	})
 
@@ -268,8 +322,8 @@ func TestLatePublishLandsAfterCoolingLiveDB(t *testing.T) {
 		}
 		f.coolOff(t)
 		// The forge applies it after the cooling period: a fast-forward of the retained ref.
-		if _, err := f.forge.publish(f.e.ctx, pushbroker.Options{Branch: f.branch, DeclaredTip: lateTip}); err != nil {
-			t.Fatalf("late landing: %v", err)
+		if !f.forge.land(f.branchRef, oldGate.fetched, lateTip) {
+			t.Fatal("late landing refused")
 		}
 
 		f.reconcileRun(t, f.svc1, f.oldRun)

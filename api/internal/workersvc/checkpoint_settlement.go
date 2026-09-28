@@ -58,8 +58,9 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 //     wired in the api that served the publish;
 //  2. attempts: an outstanding checkpoint push of a terminal run (checkpoint_publish_attempts,
 //     written before the push and never accounted for) is compared with origin's branch ref; a
-//     ref at the attempted tip is re-recorded on the run's record, or CAS-deleted at that tip when
-//     the run's slot was handed on (reconcilePublishAttempts, #1810 residual 2);
+//     ref at the attempted tip is re-recorded on the run's record (compare-and-set on what was
+//     read before the list), or CAS-deleted at that tip when the run's slot was handed on and no
+//     custody hold of the run is open (reconcilePublishAttempts, #1810 residual 2);
 //  3. work: a due `settling` record retries its CAS delete; a due `superseding` record is
 //     re-driven, or, when its supersession stopped (last_error set) and no hold is open, exited;
 //  4. unheld: a `retained`/`superseded` record whose run has no open hold moves to settling and

@@ -12,12 +12,18 @@
 -- its tip was persisted (runs.checkpoint_tip) and tracked by the run's retention record. A row
 -- whose outcome is unknown, or whose landed tip no record tracks, stays: the sweeper's attempts
 -- arm (ReconcileCheckpointRetentions) compares the branch ref on origin with it once the run is
--- terminal and, under the run's retention lock, either re-records the tip on the run's record or
--- CAS-deletes the branch ref at exactly that tip (when the run's slot was handed to a newer run).
+-- terminal and, under the run's retention lock, either re-records the tip on the run's record
+-- (compare-and-set on the record and runs.checkpoint_tip it read before listing origin) or, once
+-- no custody hold of the run is open, CAS-deletes the branch ref at exactly that tip (when the
+-- run's slot was handed to a newer run).
+--
+-- Not covered: an attempt whose run is gone is dropped by the sweeper, which then has no forge
+-- coordinates to act with, and an attempt origin never shows is retired after the sweeper's
+-- horizon (seven days). A push the forge applies after either still leaves a branch ref no record
+-- tracks, until a human deletes it.
 --
 -- Plain columns, no ON DELETE CASCADE FK (the 00263 rationale): a run delete must not silently
--- drop the record of a push that may still land. An attempt whose run is gone is dropped by the
--- sweeper, which then has no forge coordinates to act with. Purely additive.
+-- drop the record of a push that may still land. Purely additive.
 CREATE TABLE checkpoint_publish_attempts (
     id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     run_id uuid NOT NULL,

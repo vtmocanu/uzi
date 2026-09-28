@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
+	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -37,18 +38,34 @@ import (
 //   - a durable attempt record (checkpoint_publish_attempts) written BEFORE every push and removed
 //     only once the push's outcome is accounted for, plus the sweeper's attempts arm, which
 //     compares origin's branch ref with each outstanding attempt of a terminal run and, under the
-//     run's retention lock, re-records the tip on the run's record or CAS-deletes the branch ref at
-//     exactly that tip. A supersession's post-delete list and the stuck exit also treat an attempted
-//     tip as the run's own.
+//     run's retention lock, re-records the tip on the run's record (compare-and-set on the record
+//     and runs.checkpoint_tip it read before listing origin, so a newer publish is never
+//     overwritten) or, once no custody hold of the run is open, CAS-deletes the branch ref at
+//     exactly that tip. A supersession's post-delete list and the stuck exit also treat an
+//     attempted tip as the run's own.
+//
+// What the attempt record does NOT cover: a row is dropped when its run row is deleted (the arm
+// then has no forge coordinates), and retired once publishAttemptHorizon has passed without origin
+// carrying its tip. A push the forge applies after either leaves a branch ref no record tracks,
+// which blocks a new run's checkpoint on the branch until a human deletes it.
 const (
 	// livePublishPrePushBudget: see Service.livePublishPrePushBudget. The claim/free supersessions
 	// run detached (withRetentionLock) under retentionOpTimeout and can exceed it.
 	livePublishPrePushBudget = 2 * time.Minute
-	// checkpointSupersessionCooling: see Service.checkpointSupersessionCooling. It must exceed the
-	// latest moment an ordinary live-routed push can still be in flight on the client side:
-	// livePublishPrePushBudget + pushbroker.MaxPublishDuration, plus supersessionCoolingSlack for
-	// clock skew between api replicas and the database and for the push's own tip persist and
-	// track. The constant below fails to compile when the relation breaks.
+	// checkpointSupersessionCooling: see Service.checkpointSupersessionCooling. It is measured
+	// from runs.status_since, which the terminal transaction stamps with its own now(): the
+	// transaction's START time, not its commit. A publish routed live read the status before that
+	// commit became visible, but its routedAt can still be LATER than status_since, by up to the
+	// terminal transaction's own duration (start to commit). The last push such a publish sends
+	// starts no later than routedAt + livePublishPrePushBudget (checked after the attempt row is
+	// written, immediately before the forge call) and the api stops waiting on it
+	// pushbroker.MaxPublishDuration later, so the cooling period covers
+	// livePublishPrePushBudget + pushbroker.MaxPublishDuration, and supersessionCoolingSlack covers
+	// the terminal transaction's duration plus the push's own tip persist and track. Each duration
+	// is measured on one clock (the api's for the budget, the database's for the cooling), so no
+	// clock offset enters; only rate differences do, which are negligible at these lengths. This
+	// is a delay, not the correctness argument (the attempt record is). The constant below fails
+	// to compile when the relation breaks.
 	checkpointSupersessionCooling = 5 * time.Minute
 	supersessionCoolingSlack      = time.Minute
 	// publishAttemptHorizon is how long the sweeper keeps comparing an outstanding attempt whose
@@ -87,22 +104,25 @@ type checkpointPush struct {
 	landed uuid.UUID
 }
 
-// pushOnce sends ONE push: the live budget check, the durable attempt record, then the forge call.
-// A push the forge definitively refused removes its attempt row at once (nothing landed); an
-// error of unknown outcome keeps it for the sweeper.
+// pushOnce sends ONE push: the durable attempt record, the live budget check, then the forge call.
+// The budget is checked AFTER the insert, immediately before the forge call, so the insert's own
+// latency is inside it; a push refused there removes its row (nothing was sent). A push the forge
+// definitively refused removes its attempt row at once (nothing landed); an error of unknown
+// outcome keeps it for the sweeper.
 func (p *checkpointPush) pushOnce(ctx context.Context) error {
 	s := p.s
-	if p.live {
-		if elapsed := time.Since(p.routedAt); elapsed > s.livePublishPrePushBudget {
-			slog.Warn("checkpoint: live-routed publish exceeded its pre-push budget; push not sent",
-				"run", p.runID, "branch", p.branch, "elapsed", elapsed, "budget", s.livePublishPrePushBudget)
-			return errPushRefused
-		}
-	}
 	id, err := s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip)
 	if err != nil {
 		slog.Warn("checkpoint: record publish attempt; push not sent", "run", p.runID, "branch", p.branch, "error", err)
 		return errPushRefused
+	}
+	if p.live {
+		if elapsed := time.Since(p.routedAt); elapsed > s.livePublishPrePushBudget {
+			s.clearPublishAttempt(ctx, id)
+			slog.Warn("checkpoint: live-routed publish exceeded its pre-push budget; push not sent",
+				"run", p.runID, "branch", p.branch, "elapsed", elapsed, "budget", s.livePublishPrePushBudget)
+			return errPushRefused
+		}
 	}
 	_, perr := s.publishFn(ctx, p.opts)
 	switch {
@@ -167,8 +187,13 @@ func (s *Service) ownPublishedTip(ctx context.Context, runID uuid.UUID, tip stri
 // outstanding attempt of a terminal run is compared with origin under the run's retention lock
 // (reconcilePublishAttemptLocked). A settle the reconciliation owes runs after the lock is
 // released.
+//
+// Every row the arm could not resolve has its next comparison pushed out, whatever stopped it (a
+// read or write error, a recovered panic, the lock held elsewhere), so a row that keeps failing
+// never keeps its place at the head of the bounded, next_check_at-ordered page.
 func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.UUID) (int64, error) {
 	due, err := s.q.ListDueCheckpointPublishAttempts(ctx, store.ListDueCheckpointPublishAttemptsParams{
+		Cooling:   pgtype.Interval{Microseconds: s.checkpointSupersessionCooling.Microseconds(), Valid: true},
 		OnlyRunID: onlyRun, MaxRows: reconcileAttemptBatch,
 	})
 	if err != nil {
@@ -177,7 +202,7 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 	var progressed int64
 	for _, a := range due {
 		var settle bool
-		done, _, err := s.lockedRetentionStep(ctx, a.RunID, func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
+		done, acquired, err := s.lockedRetentionStep(ctx, a.RunID, func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
 			var (
 				d   bool
 				err error
@@ -187,6 +212,11 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 		})
 		if err != nil {
 			slog.Warn("sweeper: checkpoint publish attempt", "run", a.RunID, "attempt", a.ID, "error", err)
+			s.deferPublishAttemptLogged(ctx, a, secretscrub.Scrub(err.Error()))
+			continue
+		}
+		if !acquired {
+			s.deferPublishAttemptLogged(ctx, a, "retention lock busy")
 			continue
 		}
 		if done {
@@ -202,19 +232,27 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 }
 
 // reconcilePublishAttemptLocked compares one outstanding attempt with origin, under its run's
-// retention lock (the run is terminal, so every publish of it now takes the same lock):
+// retention lock. The run is terminal, so every publish of it ROUTED terminal takes the same lock;
+// a publish routed while the run was still live does not, and may land, persist and track a NEWER
+// tip at any moment. So the run row (runs.checkpoint_tip) and the run's record are read BEFORE
+// origin is listed, and every re-record is compare-and-set on exactly what was read: a newer
+// publish that moved either meanwhile makes the write move nothing, and the row is re-checked on a
+// later pass instead of overwriting it.
 //
-//   - origin's branch ref is NOT at the attempted tip: nothing of this attempt landed yet. The row
-//     is checked again after a backoff, and retired once publishAttemptHorizon has passed;
+//   - origin's branch ref is NOT at the attempted tip: nothing of this attempt landed yet (or a
+//     newer push already replaced it). The row is checked again after a backoff, and retired once
+//     publishAttemptHorizon has passed;
 //   - it IS, and another run claims that tip: not provably ours; the row is dropped;
-//   - it IS, and the run's record can track it (no record, or one that never named a recovery
-//     ref): the tip is persisted on the run and re-recorded (TrackTerminalCheckpointPublish:
-//     insert, advance or reopen); a settling result is owed a settle (settle true);
 //   - it IS, and the record is superseding: left to the supersession, whose post-delete list and
 //     stuck exit treat an attempted tip as the run's own;
-//   - it IS, and the run's slot was handed on (the record names a recovery ref, or tracking it
-//     was refused): behind the fence, the branch ref is CAS-deleted at exactly the attempted tip,
-//     as the terminal publish of a superseded run would have been refused.
+//   - it IS, and the run's record can track it (no record, or one naming the branch ref that
+//     never named a recovery ref): the tip is re-recorded on the record and persisted on the run,
+//     both compare-and-set in one transaction; a settling result is owed a settle (settle true);
+//   - it IS, and the run's slot was handed on (the record names a recovery ref, or tracking it is
+//     refused): while any custody hold of the run is open the ref is kept (it may be the newest
+//     copy of the run's work) and the row deferred; once none is, behind the fence, the branch ref
+//     is CAS-deleted at exactly the attempted tip, as the terminal publish of a superseded run
+//     would have been refused.
 //
 // done reports the row was resolved (re-recorded, deleted, dropped or retired).
 func (s *Service) reconcilePublishAttemptLocked(ctx context.Context, id uuid.UUID, fence func(context.Context) error) (done, settle bool, err error) {
@@ -232,23 +270,31 @@ func (s *Service) reconcilePublishAttemptLocked(ctx context.Context, id uuid.UUI
 		return s.dropPublishAttempt(ctx, a.ID)
 	}
 	if problem != "" {
-		return false, false, s.deferPublishAttempt(ctx, a, problem)
+		return s.deferPublishAttempt(ctx, a, problem)
 	}
+
+	// Observed BEFORE the list: the compare-and-set bases of every write below.
+	run, err := s.q.GetRunByID(ctx, a.RunID)
+	if err != nil {
+		return false, false, fmt.Errorf("read run: %w", err)
+	}
+	rec, err := s.q.GetCheckpointRetention(ctx, a.RunID)
+	hasRec := err == nil
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		return false, false, fmt.Errorf("read record: %w", err)
+	}
+
 	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, a.Ref)
 	if lerr != nil {
-		return false, false, s.deferPublishAttempt(ctx, a, "list branch ref: "+scrubForgeError(lerr.Error(), f.pat))
+		return s.deferPublishAttempt(ctx, a, "list branch ref: "+scrubForgeError(lerr.Error(), f.pat))
 	}
 	if tip, ok := tips[a.Ref]; !ok || tip != a.Tip {
 		if a.AttemptedAt.Valid && time.Since(a.AttemptedAt.Time) > publishAttemptHorizon {
 			return s.dropPublishAttempt(ctx, a.ID)
 		}
-		return false, false, s.deferPublishAttempt(ctx, a, "")
+		return s.deferPublishAttempt(ctx, a, "")
 	}
 
-	run, err := s.q.GetRunByID(ctx, a.RunID)
-	if err != nil {
-		return false, false, fmt.Errorf("read run: %w", err)
-	}
 	claimed, err := s.q.CheckpointTipClaimedByOtherRun(ctx, store.CheckpointTipClaimedByOtherRunParams{
 		RepoID: run.RepoID, RunID: a.RunID, Tip: a.Tip,
 	})
@@ -261,46 +307,103 @@ func (s *Service) reconcilePublishAttemptLocked(ctx context.Context, id uuid.UUI
 		return s.dropPublishAttempt(ctx, a.ID)
 	}
 
-	rec, err := s.q.GetCheckpointRetention(ctx, a.RunID)
-	hasRec := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
-		return false, false, fmt.Errorf("read record: %w", err)
-	}
 	if hasRec && rec.State == retentionSuperseding {
-		return false, false, s.deferPublishAttempt(ctx, a, "")
+		return s.deferPublishAttempt(ctx, a, "")
 	}
-	if !hasRec || !rec.RecoveryRef.Valid {
-		if _, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
-			CheckpointTip: pgtype.Text{String: a.Tip, Valid: true}, ID: a.RunID,
-		}); perr != nil {
-			return false, false, fmt.Errorf("persist reconciled tip: %w", perr)
+	if !hasRec || recordTracksPublish(rec, a.Ref) {
+		var expected pgtype.Text
+		if hasRec {
+			expected = pgtype.Text{String: rec.Tip, Valid: true}
 		}
-		state, terr := s.q.TrackTerminalCheckpointPublish(ctx, store.TrackTerminalCheckpointPublishParams{
-			RunID: a.RunID, Branch: a.Branch, Ref: a.Ref, Tip: a.Tip,
-		})
-		switch {
-		case terr == nil:
-			slog.Info("checkpoint: a late publish was re-recorded on the run's retention record",
-				"run", a.RunID, "ref", a.Ref, "tip", a.Tip, "state", state)
-			d, _, derr := s.dropPublishAttempt(ctx, a.ID)
-			return d, state == retentionSettling, derr
-		case !errors.Is(terr, pgx.ErrNoRows):
-			return false, false, fmt.Errorf("track reconciled publish: %w", terr)
+		state, moved, err := s.reRecordPublishedTip(ctx, a, expected, run.CheckpointTip)
+		if err != nil {
+			return false, false, err
 		}
-		// No row moved: the record names another ref or state tracking refuses; fall through.
+		if !moved {
+			return s.deferPublishAttempt(ctx, a, "the run's record or checkpoint tip moved while origin was listed; re-checked later")
+		}
+		slog.Info("checkpoint: a late publish was re-recorded on the run's retention record",
+			"run", a.RunID, "ref", a.Ref, "tip", a.Tip, "state", state)
+		d, _, derr := s.dropPublishAttempt(ctx, a.ID)
+		return d, state == retentionSettling, derr
 	}
 
+	held, err := s.q.RunHasOpenCustodyHold(ctx, a.RunID)
+	if err != nil {
+		return false, false, fmt.Errorf("read custody: %w", err)
+	}
+	if held {
+		return s.deferPublishAttempt(ctx, a, "the run's slot was handed on but a custody hold is open; the branch ref is kept until custody releases")
+	}
 	if err := s.beforeRetentionWrite(ctx, a.RunID, "attempt-delete", fence); err != nil {
 		return false, false, err
 	}
 	if derr := s.deleteCheckpointFn(ctx, pushbroker.DeleteOptions{
 		CloneURL: f.cloneURL, Branch: a.Branch, Ref: a.Ref, Username: f.username, PAT: f.pat, ExpectedOldTip: a.Tip,
 	}); derr != nil {
-		return false, false, s.deferPublishAttempt(ctx, a, "delete untracked branch ref: "+scrubForgeError(derr.Error(), f.pat))
+		return s.deferPublishAttempt(ctx, a, "delete untracked branch ref: "+scrubForgeError(derr.Error(), f.pat))
 	}
-	slog.Warn("checkpoint: deleted a branch ref a terminal run's late publish left untracked (its slot was handed on)",
-		"run", a.RunID, "ref", a.Ref, "tip", a.Tip)
+	slog.Warn("checkpoint: CAS delete sent for a branch ref at a terminal run's late-publish tip (its slot was handed on); "+
+		"a no-op if origin had moved on", "run", a.RunID, "ref", a.Ref, "tip", a.Tip)
 	return s.dropPublishAttempt(ctx, a.ID)
+}
+
+// recordTracksPublish reports whether TrackTerminalCheckpointPublish's conflict arm can move rec
+// to a publish of ref: it names that ref, never named a recovery ref, and is in a state tracking
+// advances or reopens.
+func recordTracksPublish(rec store.CheckpointRetention, ref string) bool {
+	if rec.RecoveryRef.Valid || rec.Ref != ref {
+		return false
+	}
+	switch rec.State {
+	case retentionRetained, retentionSettling, "deleted", "abandoned":
+		return true
+	}
+	return false
+}
+
+// reRecordPublishedTip re-records a late-landed tip: the run's record (insert, advance or reopen)
+// and runs.checkpoint_tip, each compare-and-set on the value observed before origin was listed
+// (expectedRecordTip NULL: no record; expectedRunTip NULL: no tip persisted). Both statements run
+// in one transaction, so either both move or neither does; moved false means one of them found a
+// newer value and nothing was written. Without a wired transaction beginner (fake-store tests) the
+// record is written first and the run tip second, with no rollback.
+func (s *Service) reRecordPublishedTip(ctx context.Context, a store.CheckpointPublishAttempt, expectedRecordTip, expectedRunTip pgtype.Text) (state string, moved bool, err error) {
+	q := s.q
+	if s.txBeginner != nil {
+		tx, berr := s.txBeginner.Begin(ctx)
+		if berr != nil {
+			return "", false, fmt.Errorf("begin re-record: %w", berr)
+		}
+		defer func() { _ = tx.Rollback(ctx) }()
+		q = store.New(tx)
+		defer func() {
+			if err == nil && moved {
+				if cerr := tx.Commit(ctx); cerr != nil {
+					state, moved, err = "", false, fmt.Errorf("commit re-record: %w", cerr)
+				}
+			}
+		}()
+	}
+	state, terr := q.TrackReconciledCheckpointPublish(ctx, store.TrackReconciledCheckpointPublishParams{
+		RunID: a.RunID, Branch: a.Branch, Ref: a.Ref, Tip: a.Tip, ExpectedTip: expectedRecordTip,
+	})
+	if errors.Is(terr, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	if terr != nil {
+		return "", false, fmt.Errorf("track reconciled publish: %w", terr)
+	}
+	n, perr := q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
+		CheckpointTip: a.Tip, ID: a.RunID, ExpectedTip: expectedRunTip,
+	})
+	if perr != nil {
+		return "", false, fmt.Errorf("persist reconciled tip: %w", perr)
+	}
+	if n == 0 {
+		return "", false, nil
+	}
+	return state, true, nil
 }
 
 // dropPublishAttempt removes a resolved attempt row under the lock.
@@ -313,17 +416,29 @@ func (s *Service) dropPublishAttempt(ctx context.Context, id uuid.UUID) (done, s
 }
 
 // deferPublishAttempt pushes the attempt's next comparison out by the retry backoff; a non-empty
-// (already scrubbed) note replaces last_error.
-func (s *Service) deferPublishAttempt(ctx context.Context, a store.CheckpointPublishAttempt, note string) error {
+// (already scrubbed) note replaces last_error. It runs on a fresh context detached from ctx and
+// bounded by retentionRecordTimeout, so the bookkeeping still lands when the locked step's own
+// context has expired.
+func (s *Service) deferPublishAttempt(ctx context.Context, a store.CheckpointPublishAttempt, note string) (done, settle bool, err error) {
 	var n pgtype.Text
 	if note != "" {
 		n = pgtype.Text{String: note, Valid: true}
 	}
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
+	defer cancel()
 	next := time.Now().Add(retentionBackoff(a.Checks))
 	if _, err := s.q.DeferCheckpointPublishAttempt(ctx, store.DeferCheckpointPublishAttemptParams{
 		ID: a.ID, NextCheckAt: pgtype.Timestamptz{Time: next, Valid: true}, Note: n,
 	}); err != nil {
-		return fmt.Errorf("defer publish attempt: %w", err)
+		return false, false, fmt.Errorf("defer publish attempt: %w", err)
 	}
-	return nil
+	return false, false, nil
+}
+
+// deferPublishAttemptLogged is deferPublishAttempt for a row the locked step did not resolve or
+// defer itself (an error, a recovered panic, the lock held elsewhere); a failure is only logged.
+func (s *Service) deferPublishAttemptLogged(ctx context.Context, a store.CheckpointPublishAttempt, note string) {
+	if _, _, err := s.deferPublishAttempt(ctx, a, note); err != nil {
+		slog.Warn("sweeper: checkpoint publish attempt bookkeeping", "run", a.RunID, "attempt", a.ID, "error", err)
+	}
 }

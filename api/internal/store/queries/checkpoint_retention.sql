@@ -474,12 +474,18 @@ SELECT EXISTS (
 -- name: ListDueCheckpointPublishAttempts :many
 -- The sweeper's attempts arm: outstanding attempts, due for a comparison, whose run is TERMINAL
 -- (or gone). A live run's own next publish fetches origin and builds on whatever landed; once it
--- is terminal nothing else of the run will. only_run_id NULL lists every run (production); a run
--- id confines the page (the LiveDB tests' isolation from a reused database).
+-- is terminal nothing else of the run will. A live run's rows are excluded here, in SQL, so they
+-- never occupy the bounded page. A terminal run's rows are listed only once the run has been
+-- terminal for @cooling (the supersession cooling period, on the database clock): until then a
+-- push routed while it was live may still be returning and track its own tip. That is a delay
+-- only; the arm's writes are compare-and-set on what it read, so a concurrent publish is never
+-- overwritten either way. only_run_id NULL lists every run (production); a run id confines the
+-- page (the LiveDB tests' isolation from a reused database).
 SELECT a.* FROM checkpoint_publish_attempts a
 LEFT JOIN runs r ON r.id = a.run_id
 WHERE a.next_check_at <= now()
-  AND (r.id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
+  AND (r.id IS NULL OR (r.status IN ('completed', 'failed', 'cancelled')
+                        AND r.status_since <= now() - @cooling::interval))
   AND (sqlc.narg(only_run_id)::uuid IS NULL OR a.run_id = sqlc.narg(only_run_id)::uuid)
 ORDER BY a.next_check_at, a.id
 LIMIT @max_rows::int;
@@ -492,6 +498,52 @@ SET checks = checks + 1,
     next_check_at = @next_check_at::timestamptz,
     last_error = COALESCE(sqlc.narg(note)::text, last_error)
 WHERE id = @id;
+
+-- name: TrackReconciledCheckpointPublish :one
+-- The attempts arm's re-record of a late-landed tip: TrackTerminalCheckpointPublish, but
+-- COMPARE-AND-SET on the record the arm observed BEFORE it listed origin. expected_tip is that
+-- record's tip, or NULL when the run had no record: then only the insert may happen, and a record
+-- that appeared meanwhile (a newer publish of the run, tracked while the arm was listing) moves
+-- nothing. A newer publish never takes the retention lock the arm holds when it was routed live,
+-- so without this guard the arm could move the record's tip BACKWARDS over it. Returns the
+-- record's state after the statement; no row when nothing moved (the caller re-checks later).
+INSERT INTO checkpoint_retentions (run_id, user_id, repo_id, branch, tip, ref, state)
+SELECT r.id, r.user_id, r.repo_id, @branch::text, @tip::text, @ref::text,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.run_id = r.id AND h.state = 'open'
+       ) THEN 'retained' ELSE 'settling' END
+FROM runs r
+WHERE r.id = @run_id
+  AND r.repo_id IS NOT NULL
+  AND r.status IN ('completed', 'failed', 'cancelled')
+ON CONFLICT (run_id) DO UPDATE
+SET tip = EXCLUDED.tip,
+    state = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                 THEN checkpoint_retentions.state ELSE EXCLUDED.state END,
+    attempts = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                    THEN checkpoint_retentions.attempts ELSE 0 END,
+    last_error = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                      THEN checkpoint_retentions.last_error END,
+    next_attempt_at = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                           THEN checkpoint_retentions.next_attempt_at ELSE now() END,
+    settled_at = NULL,
+    verify_after = NULL,
+    verified_at = NULL,
+    updated_at = now()
+WHERE checkpoint_retentions.recovery_ref IS NULL
+  AND checkpoint_retentions.ref = EXCLUDED.ref
+  AND checkpoint_retentions.state IN ('retained', 'settling', 'deleted', 'abandoned')
+  AND checkpoint_retentions.tip = sqlc.narg(expected_tip)::text
+RETURNING checkpoint_retentions.state;
+
+-- name: SetRunCheckpointTipIf :execrows
+-- The attempts arm's persist of a late-landed tip: SetRunCheckpointTip, but COMPARE-AND-SET on
+-- the runs.checkpoint_tip the arm observed before it listed origin (NULL: none was persisted). A
+-- newer publish persisted meanwhile moves nothing here, so the tip never moves backwards.
+UPDATE runs SET checkpoint_tip = @checkpoint_tip::text, checkpoint_tip_at = now()
+WHERE id = @id
+  AND checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text;
 
 -- name: CheckpointTipClaimedByOtherRun :one
 -- Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding

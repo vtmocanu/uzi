@@ -601,6 +601,8 @@ type Store interface {
 	ListDueCheckpointPublishAttempts(ctx context.Context, arg store.ListDueCheckpointPublishAttemptsParams) ([]store.CheckpointPublishAttempt, error)
 	DeferCheckpointPublishAttempt(ctx context.Context, arg store.DeferCheckpointPublishAttemptParams) (int64, error)
 	CheckpointTipClaimedByOtherRun(ctx context.Context, arg store.CheckpointTipClaimedByOtherRunParams) (bool, error)
+	TrackReconciledCheckpointPublish(ctx context.Context, arg store.TrackReconciledCheckpointPublishParams) (string, error)
+	SetRunCheckpointTipIf(ctx context.Context, arg store.SetRunCheckpointTipIfParams) (int64, error)
 	// Issue #1582 M1: the predecessor-settle pair. GetCustodyHoldForSettle reads the exact hold
 	// (scoped to its run); ReleasePredecessorCustodyHoldByAncestry is the single guarded
 	// statement that releases that one older-generation hold with 'ancestry' evidence after the

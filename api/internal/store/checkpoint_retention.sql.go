@@ -690,23 +690,30 @@ const listDueCheckpointPublishAttempts = `-- name: ListDueCheckpointPublishAttem
 SELECT a.id, a.run_id, a.branch, a.ref, a.tip, a.attempted_at, a.next_check_at, a.checks, a.last_error FROM checkpoint_publish_attempts a
 LEFT JOIN runs r ON r.id = a.run_id
 WHERE a.next_check_at <= now()
-  AND (r.id IS NULL OR r.status IN ('completed', 'failed', 'cancelled'))
-  AND ($1::uuid IS NULL OR a.run_id = $1::uuid)
+  AND (r.id IS NULL OR (r.status IN ('completed', 'failed', 'cancelled')
+                        AND r.status_since <= now() - $1::interval))
+  AND ($2::uuid IS NULL OR a.run_id = $2::uuid)
 ORDER BY a.next_check_at, a.id
-LIMIT $2::int
+LIMIT $3::int
 `
 
 type ListDueCheckpointPublishAttemptsParams struct {
-	OnlyRunID pgtype.UUID `json:"only_run_id"`
-	MaxRows   int32       `json:"max_rows"`
+	Cooling   pgtype.Interval `json:"cooling"`
+	OnlyRunID pgtype.UUID     `json:"only_run_id"`
+	MaxRows   int32           `json:"max_rows"`
 }
 
 // The sweeper's attempts arm: outstanding attempts, due for a comparison, whose run is TERMINAL
 // (or gone). A live run's own next publish fetches origin and builds on whatever landed; once it
-// is terminal nothing else of the run will. only_run_id NULL lists every run (production); a run
-// id confines the page (the LiveDB tests' isolation from a reused database).
+// is terminal nothing else of the run will. A live run's rows are excluded here, in SQL, so they
+// never occupy the bounded page. A terminal run's rows are listed only once the run has been
+// terminal for @cooling (the supersession cooling period, on the database clock): until then a
+// push routed while it was live may still be returning and track its own tip. That is a delay
+// only; the arm's writes are compare-and-set on what it read, so a concurrent publish is never
+// overwritten either way. only_run_id NULL lists every run (production); a run id confines the
+// page (the LiveDB tests' isolation from a reused database).
 func (q *Queries) ListDueCheckpointPublishAttempts(ctx context.Context, arg ListDueCheckpointPublishAttemptsParams) ([]CheckpointPublishAttempt, error) {
-	rows, err := q.db.Query(ctx, listDueCheckpointPublishAttempts, arg.OnlyRunID, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listDueCheckpointPublishAttempts, arg.Cooling, arg.OnlyRunID, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -1144,6 +1151,89 @@ func (q *Queries) SetCheckpointSupersessionTipGone(ctx context.Context, arg SetC
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const setRunCheckpointTipIf = `-- name: SetRunCheckpointTipIf :execrows
+UPDATE runs SET checkpoint_tip = $1::text, checkpoint_tip_at = now()
+WHERE id = $2
+  AND checkpoint_tip IS NOT DISTINCT FROM $3::text
+`
+
+type SetRunCheckpointTipIfParams struct {
+	CheckpointTip string      `json:"checkpoint_tip"`
+	ID            uuid.UUID   `json:"id"`
+	ExpectedTip   pgtype.Text `json:"expected_tip"`
+}
+
+// The attempts arm's persist of a late-landed tip: SetRunCheckpointTip, but COMPARE-AND-SET on
+// the runs.checkpoint_tip the arm observed before it listed origin (NULL: none was persisted). A
+// newer publish persisted meanwhile moves nothing here, so the tip never moves backwards.
+func (q *Queries) SetRunCheckpointTipIf(ctx context.Context, arg SetRunCheckpointTipIfParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setRunCheckpointTipIf, arg.CheckpointTip, arg.ID, arg.ExpectedTip)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const trackReconciledCheckpointPublish = `-- name: TrackReconciledCheckpointPublish :one
+INSERT INTO checkpoint_retentions (run_id, user_id, repo_id, branch, tip, ref, state)
+SELECT r.id, r.user_id, r.repo_id, $1::text, $2::text, $3::text,
+       CASE WHEN EXISTS (
+           SELECT 1 FROM recovery_custody_holds h
+           WHERE h.run_id = r.id AND h.state = 'open'
+       ) THEN 'retained' ELSE 'settling' END
+FROM runs r
+WHERE r.id = $4
+  AND r.repo_id IS NOT NULL
+  AND r.status IN ('completed', 'failed', 'cancelled')
+ON CONFLICT (run_id) DO UPDATE
+SET tip = EXCLUDED.tip,
+    state = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                 THEN checkpoint_retentions.state ELSE EXCLUDED.state END,
+    attempts = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                    THEN checkpoint_retentions.attempts ELSE 0 END,
+    last_error = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                      THEN checkpoint_retentions.last_error END,
+    next_attempt_at = CASE WHEN checkpoint_retentions.state IN ('retained', 'settling')
+                           THEN checkpoint_retentions.next_attempt_at ELSE now() END,
+    settled_at = NULL,
+    verify_after = NULL,
+    verified_at = NULL,
+    updated_at = now()
+WHERE checkpoint_retentions.recovery_ref IS NULL
+  AND checkpoint_retentions.ref = EXCLUDED.ref
+  AND checkpoint_retentions.state IN ('retained', 'settling', 'deleted', 'abandoned')
+  AND checkpoint_retentions.tip = $5::text
+RETURNING checkpoint_retentions.state
+`
+
+type TrackReconciledCheckpointPublishParams struct {
+	Branch      string      `json:"branch"`
+	Tip         string      `json:"tip"`
+	Ref         string      `json:"ref"`
+	RunID       uuid.UUID   `json:"run_id"`
+	ExpectedTip pgtype.Text `json:"expected_tip"`
+}
+
+// The attempts arm's re-record of a late-landed tip: TrackTerminalCheckpointPublish, but
+// COMPARE-AND-SET on the record the arm observed BEFORE it listed origin. expected_tip is that
+// record's tip, or NULL when the run had no record: then only the insert may happen, and a record
+// that appeared meanwhile (a newer publish of the run, tracked while the arm was listing) moves
+// nothing. A newer publish never takes the retention lock the arm holds when it was routed live,
+// so without this guard the arm could move the record's tip BACKWARDS over it. Returns the
+// record's state after the statement; no row when nothing moved (the caller re-checks later).
+func (q *Queries) TrackReconciledCheckpointPublish(ctx context.Context, arg TrackReconciledCheckpointPublishParams) (string, error) {
+	row := q.db.QueryRow(ctx, trackReconciledCheckpointPublish,
+		arg.Branch,
+		arg.Tip,
+		arg.Ref,
+		arg.RunID,
+		arg.ExpectedTip,
+	)
+	var state string
+	err := row.Scan(&state)
+	return state, err
 }
 
 const trackTerminalCheckpointPublish = `-- name: TrackTerminalCheckpointPublish :one

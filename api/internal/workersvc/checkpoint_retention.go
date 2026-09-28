@@ -555,9 +555,10 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 // When a run's publish moved no row in either statement and the run is terminal (as read at
 // Publish's top, or, for terminal false, as re-read here), it published a branch ref no record
 // tracks (a record in a state neither statement moves: superseding, superseded, or one whose
-// recovery ref is set). A Warn names the run, branch and tip, and tracked is false: the caller
-// then keeps the push's checkpoint_publish_attempts row, and the sweeper's attempts arm
-// (reconcilePublishAttempts) re-records the tip or CAS-deletes the branch ref at it.
+// recovery ref is set), or its status could not be re-read. A Warn names the run, branch and tip,
+// and tracked is false: the caller then keeps the push's checkpoint_publish_attempts row, and the
+// sweeper's attempts arm (reconcilePublishAttempts) re-records the tip or, once no custody hold of
+// the run is open, CAS-deletes the branch ref at it.
 //
 // Residual: the tip persist (SetRunCheckpointTip, publishOutcome) and this track are best-effort
 // writes AFTER the push. If they fail, or are delayed past the cooling period's slack, the record's
@@ -599,16 +600,17 @@ func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID,
 
 // terminalAtTrack reports whether a publish that moved no retention row belongs to a terminal run:
 // true when Publish routed it as terminal, else the run's CURRENT status is re-read, since a run
-// live at Publish's top read may have turned terminal while its push was in flight. Best-effort: a
-// read failure is logged at Warn and reports false.
+// live at Publish's top read may have turned terminal while its push was in flight. A read failure
+// is logged at Warn and reports TRUE: an unknown status must be treated as untracked, so the
+// push's attempt row is kept for the sweeper rather than cleared on a guess.
 func (s *Service) terminalAtTrack(ctx context.Context, runID uuid.UUID, terminal bool) bool {
 	if terminal {
 		return true
 	}
 	run, err := s.q.GetRunByID(ctx, runID)
 	if err != nil {
-		slog.Warn("checkpoint retention: re-read run status for an untracked publish", "run", runID, "error", err)
-		return false
+		slog.Warn("checkpoint retention: re-read run status for an untracked publish; treated as untracked", "run", runID, "error", err)
+		return true
 	}
 	return terminalStatuses[run.Status]
 }
