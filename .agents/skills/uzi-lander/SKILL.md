@@ -413,6 +413,9 @@ Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task s
 
 ## Keep this skill and its scripts current
 
+- **Test a script change on Linux before pushing.** CI and the workers are Linux:
+  `S/test-linux.sh [TEST.sh ...]` runs `test:uzi-lander` (or the named tests) in
+  `ubuntu:24.04` against the working tree.
 - **Never hand-roll a poll loop inline.** Every wait goes through a bundled poller; an
   ad-hoc heredoc is where the path typos and fail-open reads came from. When a poller
   lacks a signal, stop state, flag or exit code, extend the script: keep its existing exit
