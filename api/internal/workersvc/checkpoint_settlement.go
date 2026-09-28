@@ -53,6 +53,14 @@ const (
 	retentionSweepOpTimeout = retentionMaxForgeCallsPerOp*retentionForgeCallCeiling + retentionSweepOpSlack
 )
 
+// Compile-time: retentionSweepOpTimeout covers retentionMaxForgeCallsPerOp calls at EACH
+// pushbroker ceiling plus the slack, so replacing the derivation above with a literal that is too
+// short fails to build (a negative constant does not convert to uint).
+const (
+	_ = uint(retentionSweepOpTimeout - retentionMaxForgeCallsPerOp*pushbroker.MaxDeleteDuration - retentionSweepOpSlack)
+	_ = uint(retentionSweepOpTimeout - retentionMaxForgeCallsPerOp*pushbroker.MaxCreateRefDuration - retentionSweepOpSlack)
+)
+
 // Notes persisted on a record's last_error by the M4 arms (never carry forge output).
 const (
 	retentionGoneNote     = "run, repository or forge connection no longer exists"
@@ -86,14 +94,20 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 //
 //  1. the step's own failure bookkeeping (recordRetentionFailure, deferRetentionVerify or
 //     deferPublishAttempt on retentionBookkeepingCtx) after the forge call that hit the deadline;
-//  2. lockedRetentionStep's expiry bookkeeping when the step still returned an error (a fence or
-//     database read on the expired context, or a failed write in 1), or, in the attempts arm,
-//     its defer of the attempt row, which runs in place of this write (never in addition to it);
+//  2. a second bookkeeping write when the step still returned an error (a fence or database read
+//     on the expired context, or a failed write in 1): lockedRetentionStep's expiry bookkeeping
+//     (deferExpiredRetentionStep, one read and one write on one bookkeeping context). In the
+//     attempts arm this second write is the attempt row's defer, run EITHER by the expiry
+//     bookkeeping under the lock OR, when that did not run (a recovered panic), by the arm itself
+//     after the unlock, never both;
 //  3. the unlock (releaseRetentionLock);
 //  4. destroyRetentionConn, when the unlock failed.
 //
-// So with the defaults a pass runs for at most retentionPassBudget + retentionSweepOpTimeout +
-// 4 x 10s = 30s + 160s + 40s = 230s. Not counted: the candidate-list reads and the backfill arm's
+// retentionSweepOpTimeout = retentionMaxForgeCallsPerOp x retentionForgeCallCeiling +
+// retentionSweepOpSlack = 5 x 30s + 10s = 160s, so with the defaults a pass runs for at most
+// retentionPassBudget + retentionSweepOpTimeout + 4 x 10s = 30s + 160s + 40s = 230s. The attempts
+// arm's owed settle is a second locked operation, but it too starts only while the budget is
+// unspent, so it is the pass's last operation or none (the same bound). Not counted: the candidate-list reads and the backfill arm's
 // re-read, which run on the sweeper's own context (a list started just before the budget runs out
 // starts none of its records). With the real pushbroker a hung forge ends far sooner: its first
 // call fails at retentionForgeCallCeiling, and the step records the failure and returns. The
@@ -403,9 +417,10 @@ func backfillWatermark(page []store.ListCheckpointRetentionBackfillRow, recorded
 // deadline passed. A forge call that returns just before the deadline leaves the step's next
 // fence or database read to run on the expired context; that error is not a forge failure, so the
 // step records nothing for it, and without this the record would keep its place at the head of
-// its arm's due-ordered page on every later pass. It never runs when a fence the step started
-// while the deadline was still live failed: the lock was then genuinely lost (the session ended,
-// or the lock was released under it) and another holder may own the record. expired receives the
+// its arm's due-ordered page on every later pass. It never runs when a fence failed while the
+// deadline was still live (the context not yet done when the fence returned): the lock was then
+// genuinely lost (the session ended, or the lock was released under it) and another holder may
+// own the record. expired receives the
 // operation's context (already expired, so it must write on retentionBookkeepingCtx) and the
 // scrubbed error.
 func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID, timeout time.Duration,
@@ -418,12 +433,12 @@ func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID, time
 		}
 	}()
 	acquired, err = s.withRetentionLockTimeout(ctx, runID, timeout, func(ctx context.Context, fence func(context.Context) error) error {
-		// lostLive: a fence started before the deadline failed, so the lock was genuinely lost.
+		// lostLive: a fence failed while the deadline was still live (checked when the fence
+		// returned, so a fence the deadline cut short mid-query counts as expired, not lost).
 		lostLive := false
 		watched := func(fctx context.Context) error {
-			live := fctx.Err() == nil
 			ferr := fence(fctx)
-			if ferr != nil && live {
+			if ferr != nil && fctx.Err() == nil {
 				lostLive = true
 			}
 			return ferr

@@ -208,8 +208,15 @@ func (s *timedArmStore) DeferCheckpointPublishAttempt(context.Context, store.Def
 	return 1, nil
 }
 
+// ListCheckpointRetentionWork alternates settling and superseding rows, so the two operations the
+// pass starts before its budget is spent cover both of the work arm's locked operations (the
+// settle and reconcileSuperseding).
 func (s *timedArmStore) ListCheckpointRetentionWork(context.Context, store.ListCheckpointRetentionWorkParams) ([]store.CheckpointRetention, error) {
-	return s.retentionPage("work", retentionSettling), nil
+	out := s.retentionPage("work", retentionSettling)
+	for i := 1; i < len(out); i += 2 {
+		out[i].State = retentionSuperseding
+	}
+	return out, nil
 }
 
 func (s *timedArmStore) ListUnheldCheckpointRetentions(context.Context, store.ListUnheldCheckpointRetentionsParams) ([]store.CheckpointRetention, error) {
@@ -255,12 +262,12 @@ func (a *slowAcquirer) acquired() []time.Duration {
 // arm's rows once its budget is spent, so it starts fewer than the page (the per-row pass.spent
 // check in the arm), and (2) runs every operation it starts under the sweeper's per-record timeout,
 // not the publish path's retentionOpTimeout (pass.timeout()). Removing either from any one arm
-// fails that arm's subtest.
+// fails that arm's subtest (in the work arm, either of its two operations).
 func TestRetentionPassArmsCheckBudgetPerRowAndUseSweepTimeout(t *testing.T) {
 	const (
 		rows      = 6
 		per       = 60 * time.Millisecond
-		budget    = 100 * time.Millisecond // two operations fit: rows 0 and 1 start, row 2 does not
+		budget    = 150 * time.Millisecond // three operations fit: rows 0-2 start, row 3 does not
 		opTimeout = 7 * time.Second        // far below retentionOpTimeout, and above per
 	)
 	for _, arm := range []string{"attempts", "work", "unheld", "audit"} {
