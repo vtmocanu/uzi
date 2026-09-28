@@ -1792,6 +1792,11 @@ type Service struct {
 	retentionSem chan struct{}
 	// retentionHooks are the retention paths' LiveDB race seams (nil in production).
 	retentionHooks *retentionTestHooks
+	// terminalLockRetryBudget and terminalLockRetryInterval bound publishTerminalLocked's retry
+	// of a busy retention lock (set in New from the terminalPublishLockRetry* constants; a test
+	// shrinks them to stay fast).
+	terminalLockRetryBudget   time.Duration
+	terminalLockRetryInterval time.Duration
 	// readyAt is the moment the worker-facing listener(s) became ready (PRD #1390 M1, D1),
 	// stored as Unix nanoseconds (0 = not yet ready). main.go writes it via SetReadyAt after
 	// binding every enabled listener; the sweeper goroutine reads it each tick to anchor the
@@ -1979,6 +1984,9 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		listRefTipsFn:      pushbroker.ListRefTips,
 		background:         func(fn func()) { go fn() },
 		retentionSem:       make(chan struct{}, retentionDefaultConc),
+
+		terminalLockRetryBudget:   terminalPublishLockRetryBudget,
+		terminalLockRetryInterval: terminalPublishLockRetryInterval,
 	}
 }
 
@@ -5173,7 +5181,9 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	// just-cancelled run may be its latest work), but not once the run's branch slot was handed to
 	// a newer run. With retention wired the whole terminal publish (the superseded check, the
 	// push, the tip persist and the record track) runs under the run's retention lock
-	// (publishTerminalLocked), so no supersession of this run can interleave with it.
+	// (publishTerminalLocked), so no supersession of this run can interleave with it. The branch
+	// is taken on the status read above: a run that turns terminal after this read publishes
+	// unlocked below, which the supersession's post-delete list (branchHeldByOwnPublish) covers.
 	if terminalStatuses[owned.Status] && s.retentionWired() {
 		return s.publishTerminalLocked(ctx, owned, branch, ref, tipOid, opts)
 	}
@@ -5184,7 +5194,7 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	if skip := s.claimCheckpointSlot(ctx, owned, branch); skip != "" {
 		return PublishResult{Published: false, Ref: ref, Skipped: skip}, nil
 	}
-	err = s.pushCheckpoint(ctx, owned, branch, opts, nil)
+	err = s.pushCheckpoint(ctx, owned, branch, opts)
 	res, settle, err := s.publishOutcome(ctx, runID, terminalStatuses[owned.Status], branch, ref, tipOid, err)
 	if settle {
 		s.SettleRetainedCheckpoint(runID)
@@ -5196,11 +5206,17 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 // terminalPublishSuperseded check, the branch-slot check, the forge push, the tip persist and the
 // retention-record track all run under the run's retention lock, so a supersession of this run
 // (which takes the same lock) can neither begin between the check and the push nor land between
-// the push and the track. The push is preceded by the lock's fence and skipped when it errors. A
-// busy lock (another instance or the sweeper is working the run's record, or the retention slots
-// are full) is the benign not_descendant skip with no forge call: the worker retries next tick. A
-// settle the track owes is dispatched only AFTER the lock is released (SettleRetainedCheckpoint
-// try-locks the same key, so dispatching it under the lock could lose to this very holder).
+// the push and the track. The single push is preceded by the lock's fence and skipped when it
+// errors; it is never retried (pushCheckpoint).
+//
+// A busy lock (another instance or the sweeper is working the run's record, or the retention
+// slots are full) is retried every terminalLockRetryInterval for up to terminalLockRetryBudget,
+// because the agent's shutdown checkpoint sink is one-shot: a cancelled run's last checkpoint
+// has no next tick. Only the lock acquisition is retried; nothing inside fn has run on a busy
+// attempt. A lock still busy after the budget, or a ctx done while waiting, is the benign
+// not_descendant skip with no forge call. A settle the track owes is dispatched only AFTER the
+// lock is released (SettleRetainedCheckpoint try-locks the same key, so dispatching it under the
+// lock could lose to this very holder).
 //
 // withRetentionLock detaches from ctx and applies its own deadline; every call inside uses the
 // context it hands to fn.
@@ -5211,7 +5227,7 @@ func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, br
 		resErr error
 		settle bool
 	)
-	acquired, lerr := s.withRetentionLock(ctx, runID, func(lctx context.Context, fence func(context.Context) error) error {
+	locked := func(lctx context.Context, fence func(context.Context) error) error {
 		superseded, serr := s.terminalPublishSuperseded(lctx, runID)
 		if serr != nil {
 			resErr = serr
@@ -5230,15 +5246,30 @@ func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, br
 			res = PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
 			return nil
 		}
-		perr := s.pushCheckpoint(lctx, owned, branch, opts, fence)
+		perr := s.pushCheckpoint(lctx, owned, branch, opts)
 		res, settle, resErr = s.publishOutcome(lctx, runID, true, branch, ref, tipOid, perr)
 		return nil
-	})
-	if lerr != nil {
-		return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(lerr.Error()))
 	}
-	if !acquired {
-		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, nil
+	busy := PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}
+	deadline := time.Now().Add(s.terminalLockRetryBudget)
+	for {
+		acquired, lerr := s.withRetentionLock(ctx, runID, locked)
+		if lerr != nil {
+			return PublishResult{}, fmt.Errorf("publish: %s", secretscrub.Scrub(lerr.Error()))
+		}
+		if acquired {
+			break
+		}
+		if !time.Now().Add(s.terminalLockRetryInterval).Before(deadline) {
+			return busy, nil
+		}
+		wait := time.NewTimer(s.terminalLockRetryInterval)
+		select {
+		case <-ctx.Done():
+			wait.Stop()
+			return busy, nil
+		case <-wait.C:
+		}
 	}
 	if settle {
 		s.SettleRetainedCheckpoint(runID)
@@ -5252,17 +5283,11 @@ func (s *Service) publishTerminalLocked(ctx context.Context, owned store.Run, br
 // appeared since). freeCheckpointSlot supersedes it (moving its tip to
 // refs/uzi-recovery/<old run id>, never deleting it) and reports whether the branch ref is now
 // free; only then is the publish retried, ONCE, with the same options (Pack is a re-readable
-// []byte). freeCheckpointSlot refuses a terminal run, so a terminal publish is never retried.
-// beforeRetry, when non-nil, is the retention fence of a locked caller, run before the retry; its
-// error is returned in place of a push.
-func (s *Service) pushCheckpoint(ctx context.Context, owned store.Run, branch string, opts pushbroker.Options, beforeRetry func(context.Context) error) error {
+// []byte). freeCheckpointSlot refuses a terminal run, so a TERMINAL publish is never retried:
+// its one push is the fenced push publishTerminalLocked makes under the run's retention lock.
+func (s *Service) pushCheckpoint(ctx context.Context, owned store.Run, branch string, opts pushbroker.Options) error {
 	_, err := s.publishFn(ctx, opts)
 	if errors.Is(err, pushbroker.ErrNotDescendant) && s.freeCheckpointSlot(ctx, owned, branch) {
-		if beforeRetry != nil {
-			if ferr := beforeRetry(ctx); ferr != nil {
-				return pushbroker.ErrNotDescendant
-			}
-		}
 		_, err = s.publishFn(ctx, opts)
 	}
 	return err

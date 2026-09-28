@@ -43,6 +43,13 @@ const (
 	// Retry backoff for a failed forge write: base * 2^attempts, capped.
 	retentionBackoffBase = time.Minute
 	retentionBackoffCap  = time.Hour
+	// A terminal run's publish retries a busy retention lock (publishTerminalLocked) every
+	// interval for up to budget: the agent's shutdown checkpoint sink is one-shot, so a skip
+	// under brief contention would lose a cancelled run's last checkpoint. The budget is a small
+	// share of the agent's whole shutdown publish budget (shutdownPublishTimeoutMs, 15s by
+	// default in agent/src/runner.ts), which also covers its scan and the push itself.
+	terminalPublishLockRetryBudget   = 3 * time.Second
+	terminalPublishLockRetryInterval = 200 * time.Millisecond
 )
 
 // ErrRetentionLockLost is returned by the fence when the pinned session no longer holds the
@@ -511,12 +518,16 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 //     unchanged, the tip-lag advance of a retained/settling record naming the branch ref
 //     (AdvanceCheckpointRetentionTip).
 //
-// A terminal run's publish reaches here under the run's retention lock, after
+// A publish Publish routed as terminal reaches here under the run's retention lock, after
 // terminalPublishSuperseded refused a run whose slot was handed on (publishTerminalLocked), so a
-// supersession cannot interleave. A TERMINAL run whose publish still moved no row in either
-// statement published a branch ref no record tracks (a record in a state neither statement moves);
-// that ref blocks every new run on the branch unless the supersession's defensive post-delete list
-// or its stuck exit catches it, so a Warn names the run, branch and tip for an operator.
+// supersession cannot interleave with it. Publish routes on the status it read at its top, though:
+// a run LIVE at that read that turned terminal while its unlocked push was in flight arrives here
+// with terminal false (only the tip-lag advance runs) and without the lock, and its push may have
+// landed inside a supersession of its just-inserted record. A TERMINAL run whose publish still
+// moved no row in either statement published a branch ref no record tracks (a record in a state
+// neither statement moves); that ref blocks every new run on the branch unless the supersession's
+// post-delete list (branchHeldByOwnPublish) or its stuck exit catches it, so a Warn names the run,
+// branch and tip for an operator.
 //
 // Best-effort: a failure is logged and the publish still reports success (the ref already moved).
 func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tip string) (settle bool) {

@@ -252,10 +252,12 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 	}
 	// The CAS delete reports success for "absent or advanced" too. Advanced by THIS run would not
 	// be done: the branch ref at a later tip of the run, which the record does not name, would be
-	// left untracked by a superseded record, blocking every new run on the branch. A terminal
-	// run's publish holds this same retention lock from its superseded check through its track
-	// (publishTerminalLocked), so it cannot land inside a supersession; the list below stays as a
-	// defensive check (a publish from a path that bypasses the lock, or a tip written by hand).
+	// left untracked by a superseded record, blocking every new run on the branch. A publish that
+	// Publish routed as TERMINAL holds this same retention lock from its superseded check through
+	// its track (publishTerminalLocked), but Publish routes on the status it read at its top: a
+	// run LIVE at that read whose status turns terminal (and whose record is inserted) while its
+	// unlocked push is in flight can still land inside this supersession. The list below catches
+	// that window (and a tip written outside Publish); it is load-bearing, not merely defensive.
 	if stop, err := s.branchHeldByOwnPublish(ctx, row, f, branchRef); stop || err != nil {
 		return false, err
 	}
@@ -284,7 +286,7 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 	return true, nil
 }
 
-// branchHeldByOwnPublish is step 3's follow-up list, a DEFENSIVE check. It reports stop when origin
+// branchHeldByOwnPublish is step 3's follow-up list. It reports stop when origin
 // still advertises the branch ref at the recorded tip (the delete did not take) or at
 // runs.checkpoint_tip of THIS run (a later publish of the run's own tip). The record then stays
 // superseding with last_error and a backoff: a re-drive repeats steps 2-3 harmlessly, and once no
@@ -292,11 +294,13 @@ func (s *Service) driveSupersession(ctx context.Context, row store.CheckpointRet
 // recorded tip and the branch ref at the run's own tip. An absent branch ref, or one at any other
 // tip (another run's publish), is done, as before. The run tip is read AFTER the list.
 //
-// Only a record of a TERMINAL run is ever superseded, and a terminal run's publish runs its
+// Only a record of a TERMINAL run is ever superseded. A publish Publish routes as terminal runs its
 // superseded check, push and record track under this run's retention lock (publishTerminalLocked),
-// which the supersession holds throughout; so the run's own publish cannot land inside a
-// supersession and the second arm is not expected to fire. It stays as a defensive check against a
-// ref written outside that path.
+// which the supersession holds throughout, so that publish cannot land inside a supersession. But
+// Publish routes on the run status it read at its top: a run that was LIVE at that read and turned
+// terminal (its record just inserted) while its unlocked push was in flight can still land its tip
+// inside a supersession of that record. The second arm is what catches that narrow window, so it is
+// load-bearing, not merely defensive; it also catches a ref written outside Publish.
 func (s *Service) branchHeldByOwnPublish(ctx context.Context, row store.CheckpointRetention, f retentionForge, branchRef string) (stop bool, err error) {
 	tips, lerr := s.listRefTipsFn(ctx, pushbroker.ListRefsOptions{CloneURL: f.cloneURL, Username: f.username, PAT: f.pat}, branchRef)
 	if lerr != nil {
