@@ -346,7 +346,7 @@ while [ "$i" -lt "$MAX" ]; do
       # post-push walkthrough still names the OLDER commit, so this exact-head match cannot
       # forge a ready; finding liveness stays with reviewThreads (cr_live), so a clean marker
       # never zeroes a genuinely unresolved thread.
-      if printf '%s' "$wt_body" | grep -qF "change_assessment_commit:\"$head\""; then cr_reviewed=1; fi
+      case "$wt_body" in *"change_assessment_commit:\"$head\""*) cr_reviewed=1 ;; esac
     fi
     # A "Review triggered." acknowledgement NEWER than a "Review rate limited" status means
     # the quota reset and the review was accepted; CodeRabbit flips the status to "in
@@ -362,7 +362,7 @@ while [ "$i" -lt "$MAX" ]; do
     fi
     rl_row=$(printf '%s' "$issue_c" | jq -rs '[.[][]|select(.user.login=="coderabbitai[bot]")|select(.body|contains("rate limited by coderabbit.ai"))]|last|select(.!=null)|"\(.updated_at)\t\(.body)"' 2>/dev/null || true)
     if [ -n "$rl_row" ]; then
-      rl_ts=$(printf '%s' "$rl_row" | head -1 | cut -f1)
+      rl_ts=${rl_row%%$'\t'*}   # no `| head -1`: SIGPIPE on a large body under pipefail kills the poll (141)
       rl_n=$(printf '%s' "$rl_row" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' \
              | grep -oE 'available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
       if [ -n "$rl_n" ] && [ -n "$rl_ts" ]; then
@@ -609,7 +609,7 @@ while [ "$i" -lt "$MAX" ]; do
         while IFS= read -r f; do
           [ -z "$f" ] && continue
           # Absent from the PR's diff vs base ⇒ HEAD matches base for this path ⇒ a merge-in.
-          if ! printf '%s\n' "$pr_diff" | grep -qxF "$f"; then continue; fi
+          if ! grep -qxF -- "$f" <<<"$pr_diff"; then continue; fi
           # In the PR diff but a regenerated/mirror artifact derived from reviewed sources.
           # Scope each pattern to the exact dir a generator/sync check covers: validate:api
           # regenerates only api/internal/store, and docs:sync mirrors only *.md into embed.
