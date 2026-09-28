@@ -204,6 +204,13 @@ if run_case old; then
      && grep -q 'apply failed' "$ghout"; then ok "$case_name"; else bad "$case_name" "$out"; fi
 fi
 
+# 11b. a release without sync.py is reported, never silently skipped.
+case_name="missing sync.py needs a human"; new_case nosync
+rm "$stub/sync.py"
+if run_case old; then
+  if [ "$(outv roster_needs_human)" = true ] && grep -q 'no sync.py' "$ghout"; then ok "$case_name"; else bad "$case_name" "$out"; fi
+fi
+
 # 12. latest stable tag ignores prereleases and sorts by version.
 case_name="latest stable tag ignores prereleases"; new_case tags
 (cd "$up" && git init -q && git -c user.email=t@t -c user.name=t commit -q --allow-empty -m t \

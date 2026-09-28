@@ -134,7 +134,10 @@ else
   fi
 
   # ---- roster half -----------------------------------------------------------
-  if [ -d "$agents" ] && [ -f "$sync_py" ]; then
+  if [ -d "$agents" ] && [ ! -f "$sync_py" ]; then
+    roster_needs_human=true
+    roster_report="$(printf 'Roster sync skipped: the upstream release has no sync.py at %s, so .claude/agents/ was not checked.' "$sync_py")"
+  elif [ -d "$agents" ]; then
     rc=0
     check_out="$(python3 "$sync_py" --library "$roles_yaml" --agents "$agents" check 2>&1)" || rc=$?
     if [ "$rc" -ge 2 ] || grep -qE '^[a-z0-9-]+ +.*[[:space:]](BAD-FM|ERROR)([[:space:]]|$)' <<<"$check_out"; then
