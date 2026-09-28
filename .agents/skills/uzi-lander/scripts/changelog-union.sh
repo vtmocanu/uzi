@@ -158,7 +158,7 @@ if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL"
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
   st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
-  /^[|]{7}( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
+  /^[|][|][|][|][|][|][|]( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
   /^=======$/     {
     if (st != 1 && st != 2) { bad = "stray ======= at line " NR; exit 1 }
     st = 3

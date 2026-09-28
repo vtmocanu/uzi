@@ -206,6 +206,18 @@ func TestFilterProtocol_KeepsCodexCustomModelV1(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_KeepsAdviceClaimFenceV1 pins issue #1423: advice_claim_fence_v1 survives
+// registration (the advice-post stamping requirement reads it off workers.protocol_capabilities),
+// is not a scheduler capability, and orders after gate_revision_v1 in protocolOrder.
+func TestFilterProtocol_KeepsAdviceClaimFenceV1(t *testing.T) {
+	if got := FilterProtocol([]string{AdviceClaimFenceV1, CredentialSwitchV1}); !reflect.DeepEqual(got, []string{CredentialSwitchV1, AdviceClaimFenceV1}) {
+		t.Errorf("FilterProtocol([advice fence, credential switch]) = %v, want [%q %q]", got, CredentialSwitchV1, AdviceClaimFenceV1)
+	}
+	if got := Filter([]string{AdviceClaimFenceV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", AdviceClaimFenceV1, got)
+	}
+}
+
 // TestUnmet_SubsetPresent pins the empty result when every required capability is present
 // in the effective set — the run is approvable/claimable by that worker (PRD #84 M4 4c).
 func TestUnmet_SubsetPresent(t *testing.T) {

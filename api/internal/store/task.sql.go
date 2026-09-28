@@ -1134,9 +1134,20 @@ func (q *Queries) TaskBranchRmStats(ctx context.Context, arg TaskBranchRmStatsPa
 }
 
 const upsertTaskReviewWithFindings = `-- name: UpsertTaskReviewWithFindings :one
-WITH upserted AS (
+WITH live AS (
+    SELECT r.id FROM runs r
+    WHERE r.id = $1::uuid
+      AND r.worker_id = $2::uuid
+      AND r.claim_released_at IS NULL
+      AND r.status NOT IN ('completed', 'failed', 'cancelled')
+      AND ($3::bigint IS NULL
+           OR r.claim_generation = $3::bigint)
+    FOR SHARE
+),
+upserted AS (
     INSERT INTO task_reviews (target_run_id, review_run_id, user_id, status, summary_md)
-    VALUES ($1, $2, $3, $4, $5)
+    SELECT $4, $1::uuid, $5, $6, $7
+    WHERE $1::uuid IS NULL OR EXISTS (SELECT 1 FROM live)
     ON CONFLICT (target_run_id) DO UPDATE
         SET review_run_id = EXCLUDED.review_run_id,
             status        = EXCLUDED.status,
@@ -1151,19 +1162,22 @@ inserted AS (
     INSERT INTO task_review_findings
         (review_id, file, symbol, line, severity, summary_md, rationale_md)
     SELECT (SELECT id FROM upserted), x.file, x.symbol, x.line, x.severity, x.summary_md, x.rationale_md
-    FROM jsonb_to_recordset($6::jsonb)
+    FROM jsonb_to_recordset($8::jsonb)
         AS x(file text, symbol text, line int, severity text, summary_md text, rationale_md text)
+    WHERE EXISTS (SELECT 1 FROM upserted)
 )
 SELECT id FROM upserted
 `
 
 type UpsertTaskReviewWithFindingsParams struct {
-	TargetRunID uuid.UUID   `json:"target_run_id"`
-	ReviewRunID pgtype.UUID `json:"review_run_id"`
-	UserID      uuid.UUID   `json:"user_id"`
-	Status      string      `json:"status"`
-	SummaryMd   string      `json:"summary_md"`
-	Findings    []byte      `json:"findings"`
+	ReviewRunID     pgtype.UUID `json:"review_run_id"`
+	WorkerID        uuid.UUID   `json:"worker_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	TargetRunID     uuid.UUID   `json:"target_run_id"`
+	UserID          uuid.UUID   `json:"user_id"`
+	Status          string      `json:"status"`
+	SummaryMd       string      `json:"summary_md"`
+	Findings        []byte      `json:"findings"`
 }
 
 // Persist a review's header + its findings for a reviewed task in ONE atomic statement
@@ -1173,10 +1187,30 @@ type UpsertTaskReviewWithFindingsParams struct {
 // CTE gives atomicity without a service-level transaction (workersvc holds no pool). The
 // finding rows arrive already validated + scrubbed in Go; the table CHECK on severity is
 // the backstop.
+//
+// Issue #1423: the write is FENCED on the REVIEW (advice) run's claim, the same fence the
+// judge's UpsertRunReviewWithRecommendations carries (see its comment for the full shape):
+// with @review_run_id NOT NULL (every production caller) the header + findings land ONLY
+// while that run is still claimed by the posting worker (@worker_id, checked in the same
+// statement as the write), its claim is unreleased, the run is NON-TERMINAL (status NOT IN
+// ('completed', 'failed', 'cancelled'), the same terminal set as
+// GetActiveTaskReviewRunForWorkerTarget; SetRunCompleted leaves worker_id, claim_generation
+// and claim_released_at intact, so without it a delayed post from a finished review run
+// could overwrite a newer review run's review) and, when @claim_generation is stamped,
+// still at that generation. A fenced-out call writes nothing and returns no row (pgx.ErrNoRows ->
+// ErrStaleClaim in the service); `inserted` is guarded by EXISTS(upserted). A NULL
+// @review_run_id is the unfenced seeder path. `live` takes FOR SHARE on the run row so a
+// concurrent ClaimRun `claim_generation = claim_generation + 1` UPDATE serializes with this
+// write and the predicate is re-checked on the new row version (a strengthening over the
+// message fence); the same lock serializes against a terminal-status UPDATE, so a
+// completion, fail or cancel committing while this statement waits is seen by the
+// EvalPlanQual re-check and fences the write out.
 func (q *Queries) UpsertTaskReviewWithFindings(ctx context.Context, arg UpsertTaskReviewWithFindingsParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, upsertTaskReviewWithFindings,
-		arg.TargetRunID,
 		arg.ReviewRunID,
+		arg.WorkerID,
+		arg.ClaimGeneration,
+		arg.TargetRunID,
 		arg.UserID,
 		arg.Status,
 		arg.SummaryMd,

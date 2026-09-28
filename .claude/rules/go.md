@@ -79,7 +79,7 @@ Same token-not-annotation mechanism as `+goose`, with GitLab as the parser.
 - `go test ./...` does not cover them: they skip silently without `UZI_TEST_DATABASE_URL`.
 - Run the ordinary gate with that variable unset; exporting it there turns them red, because package binaries race one shared database and truncate mid-flight.
 - Run the sweep via `./e2e/run-store-it.sh`, or by hand with `-p 1`. `-p 1` is load-bearing, not a speed knob: without it you get nondeterministic reds that look like a regression in whatever you just touched.
-- The sweep runs only the packages it enumerates; a `*LiveDB` test in any other package runs nowhere while its skip message claims otherwise. Both lists carry five: `store`, `handler`, `forgesvc`, `schedsvc`, `workersvc`.
+- The sweep runs only the packages it enumerates; a `*LiveDB` test in any other package runs nowhere while its skip message claims otherwise. Both lists carry six: `store`, `handler`, `forgesvc`, `schedsvc`, `workersvc`, `recovery`.
 - A `*LiveDB` test in a new package is a two-list edit, `./e2e/run-store-it.sh` and `ci.yml`'s `test-api-store-it` step, in the same commit. The skip message is a claim about those lists: do not write it before they are true.
 - Fixtures share one database across packages, so a fixed literal in a `UNIQUE` column (`workers.token_hash` bit here) passes alone and fails once another package inserted it first. Derive per-test uniqueness from a fresh `uuid.New()`, as `handler/hosted_provision_livedb_test.go` documents.
 

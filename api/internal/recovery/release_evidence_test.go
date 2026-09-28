@@ -11,8 +11,8 @@ import (
 // ErrBadRequest. The allowlist short-circuits before the pool, so this is a plain unit test that
 // runs in `go test ./...` / gate:api. The STORAGE and generation-echo proofs for these paths are
 // the swept-package *LiveDB tests (store.TestCustodyReleaseEvidenceLiveDB and
-// handler.TestRecoveryReleaseAndDiscardEvidenceLiveDB), since internal/recovery is swept by no CI
-// LiveDB job.
+// handler.TestRecoveryReleaseAndDiscardEvidenceLiveDB). internal/recovery is a swept package too
+// (e2e/run-store-it.sh and CI), but these two storage proofs live where they were written.
 func TestAllowlistedReleaseEvidence(t *testing.T) {
 	str := func(s string) *string { return &s }
 

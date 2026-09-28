@@ -128,6 +128,15 @@ const InputReceiptsV1 = "input_receipts_v1"
 // to an api whose strict decoder would reject them.
 const GateRevisionV1 = "gate_revision_v1"
 
+// AdviceClaimFenceV1 is the PROTOCOL capability a worker self-reports (issue #1423) to declare it
+// stamps claim_generation and advice_run_id on its advice POSTs (/review and /task-review). The api
+// refuses an advice POST from a worker advertising it that omits either field, fail-closed. It is
+// keyed separately from CredentialSwitchV1 because that capability shipped before advice posts were
+// stamped: keying the refusal on it would 409 every current worker's advice POST mid-upgrade. Like
+// the other protocol capabilities it is a worker/server protocol fact, so it lives in the protocol
+// vocabulary below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
+const AdviceClaimFenceV1 = "advice_claim_fence_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -142,11 +151,12 @@ var protocolVocabulary = map[string]struct{}{
 	WallParkV1:                 {},
 	InputReceiptsV1:            {},
 	GateRevisionV1:             {},
+	AdviceClaimFenceV1:         {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

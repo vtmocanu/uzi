@@ -132,8 +132,10 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 		{"category": "install_worker_tool", "target": "shellcheck", "rationale_md": "missing", "confidence": "high"},
 		{"category": "improve_uzi", "target": "", "rationale_md": "tidy", "confidence": "low"},
 	})
+	// The fenced upsert (issue #1423) lands because the judge run's claim is unreleased and
+	// owned by workerID (claimed above); a NULL generation skips only the generation check.
 	reviewID, err := q.UpsertRunReviewWithRecommendations(ctx, store.UpsertRunReviewWithRecommendationsParams{
-		TargetRunID: targetID, JudgeRunID: pgtype.UUID{Bytes: judge.ID, Valid: true}, UserID: userID,
+		TargetRunID: targetID, JudgeRunID: pgtype.UUID{Bytes: judge.ID, Valid: true}, UserID: userID, WorkerID: workerID,
 		Verdict: "issues", SummaryMd: "s", JudgeModel: "haiku", Status: "complete",
 		ProducedByRunID: pgtype.UUID{Bytes: judge.ID, Valid: true}, ProducedByUserID: pgtype.UUID{Bytes: userID, Valid: true},
 		Recommendations: recs2,
@@ -148,8 +150,9 @@ func TestJudgeQueriesLiveDB(t *testing.T) {
 	recs1, _ := json.Marshal([]map[string]string{
 		{"category": "improve_agent", "target": "coder", "rationale_md": "tweak", "confidence": ""},
 	})
+	// Same fence as above: still unreleased and owned by workerID, so the re-judge lands.
 	reviewID2, err := q.UpsertRunReviewWithRecommendations(ctx, store.UpsertRunReviewWithRecommendationsParams{
-		TargetRunID: targetID, JudgeRunID: pgtype.UUID{Bytes: judge.ID, Valid: true}, UserID: userID,
+		TargetRunID: targetID, JudgeRunID: pgtype.UUID{Bytes: judge.ID, Valid: true}, UserID: userID, WorkerID: workerID,
 		Verdict: "ok", SummaryMd: "s2", JudgeModel: "haiku", Status: "complete",
 		ProducedByRunID: pgtype.UUID{Bytes: judge.ID, Valid: true}, ProducedByUserID: pgtype.UUID{Bytes: userID, Valid: true},
 		Recommendations: recs1,

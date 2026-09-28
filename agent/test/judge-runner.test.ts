@@ -11,7 +11,7 @@ import { Outbox } from "../src/outbox.js";
 import type { StateAck } from "../src/protocol.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
-import type { WorkerClient } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import type {
   ClaimConfig,
   ClaimResponse,
@@ -333,11 +333,11 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review, undefined, "no review is posted when the pre-post probe is stale");
   });
 
-  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is a SUPERSESSION FENCE and is
-  // FAIL-CLOSED. A TRANSIENT failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, and
-  // postReview is generation-blind until #1423, so proceeding could overwrite a reclaiming flight's
-  // advice. The throw therefore propagates to the advice-phase catch (safeReportFailed) and posts
-  // NO advice. Removing the fence (or making it best-effort) reddens this (a review would be posted).
+  // PRD #1247 fix round (Greptile P1 disposition): the pre-post probe is FAIL-CLOSED. A TRANSIENT
+  // failure (a throw, NOT a staleClaim ack) leaves ownership UNKNOWN, so the throw propagates to the
+  // advice-phase catch (safeReportFailed) and posts NO advice. The server fence on postReview
+  // (issue #1423) is the guard against a stale overwrite; this probe is the fast path. Making the
+  // probe best-effort reddens this (a review would be posted).
   it("fails closed when the pre-post probe throws transiently: NO advice post, the run reports failed", async () => {
     let running = 0;
     const calls: { review?: unknown; states: string[] } = { states: [] };
@@ -364,6 +364,80 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review, undefined, "a probe throw posts NO advice (fail-closed: ownership unknown)");
     assert.ok(calls.states.includes("failed"), "the run reports failed via the advice-phase catch");
     assert.ok(!calls.states.includes("completed"), "no completed report when the pre-post fence fails closed");
+  });
+
+  // Issue #1423: the server fences postReview on the judge run's claim generation, so the runner
+  // hands it the claim's generation (the client's send-gate decides whether it goes on the wire).
+  it("passes the claim generation and the judge run id to postReview (issue #1423)", async () => {
+    let gotGeneration: number | undefined;
+    let gotRunId: string | undefined;
+    const client = {
+      getTrace: async () => emptyTrace,
+      postReview: async (_id: string, _review: ReviewRequest, claimGeneration?: number, adviceRunId?: string) => {
+        gotGeneration = claimGeneration;
+        gotRunId = adviceRunId;
+      },
+      reportState: async (_id: string, body: StateRequest) => ({ applied: true, status: body.status }) as never,
+      postMessages: async () => {},
+    } as unknown as WorkerClient;
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    const claim = judgeClaim({ claim_generation: 6 });
+    await runner.execute(claim);
+    assert.equal(gotGeneration, 6, "postReview receives the claim's generation");
+    assert.equal(gotRunId, claim.run_id, "postReview receives the judge run's own id (advice_run_id)");
+  });
+
+  // Issue #1423: a supersession landing AFTER the pre-post probe is caught by the server fence,
+  // which answers 409 {"disposition":"stale_claim"}. The runner abandons like the probe's stale
+  // path: NO completed and NO failed report (safeReportFailed would fail the current flight's run).
+  it("abandons on a 409 stale_claim from the review post with no completed/failed report (issue #1423)", async () => {
+    const states: string[] = [];
+    let posts = 0;
+    const client = {
+      getTrace: async () => emptyTrace,
+      postReview: async () => {
+        posts++;
+        throw new RequestError("POST", "/api/worker/runs/target-1/review", 409, '{"disposition":"stale_claim"}');
+      },
+      reportState: async (_id: string, body: StateRequest) => {
+        states.push(body.status);
+        return { applied: true, status: body.status } as never;
+      },
+      postMessages: async () => {},
+    } as unknown as WorkerClient;
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+    assert.equal(posts, 1, "the review post was attempted once");
+    assert.deepEqual(states, ["running", "running"], "no completed/failed report after a stale_claim refusal");
+  });
+
+  // Contrast: a 409 that is NOT a stale_claim disposition (e.g. the missing-generation refusal) is a
+  // real failure and still reaches the advice-phase catch, which reports failed.
+  it("reports failed on a non-stale 409 from the review post (issue #1423)", async () => {
+    const states: string[] = [];
+    const client = {
+      getTrace: async () => emptyTrace,
+      postReview: async () => {
+        throw new RequestError(
+          "POST",
+          "/api/worker/runs/target-1/review",
+          409,
+          '{"error":"an advice_claim_fence_v1 worker must stamp claim_generation and advice_run_id on every advice post"}',
+        );
+      },
+      reportState: async (_id: string, body: StateRequest) => {
+        states.push(body.status);
+        return { applied: true, status: body.status } as never;
+      },
+      postMessages: async () => {},
+    } as unknown as WorkerClient;
+    const modelJson = JSON.stringify({ verdict: "ok", summary: "s", recommendations: [] });
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn: replyingQueryFn(modelJson) });
+    await runner.execute(judgeClaim({ claim_generation: 5 }));
+    assert.ok(states.includes("failed"), "a non-stale refusal fails the run");
+    assert.ok(!states.includes("completed"));
   });
 
   it("posts NO usage frame on the model-error path (PRD #69 M6)", async () => {

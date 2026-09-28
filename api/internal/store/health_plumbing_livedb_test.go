@@ -25,7 +25,7 @@ import (
 // the same property the custody-episode M6 queries rely on).
 //
 // It lives in the store package DELIBERATELY: e2e/run-store-it.sh + CI's test-api-store-it job
-// run `-run 'LiveDB$'` over store/handler/forgesvc/schedsvc/workersvc only. The new healthsvc
+// run `-run 'LiveDB$'` over store/handler/forgesvc/schedsvc/workersvc/recovery only. The new healthsvc
 // and slacksvc packages are NOT enumerated, so query behaviour is proven here.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres. `ts`, `mustExec` and

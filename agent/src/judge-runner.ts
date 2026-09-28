@@ -18,7 +18,12 @@ import type { Logger } from "./log.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn, mapSdkMessage } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
-import { makeTerminalOutboxDeps, postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
+import {
+  isStaleClaimRefusal,
+  makeTerminalOutboxDeps,
+  postTerminalState,
+  type TerminalOutboxDeps,
+} from "./terminal-resolve.js";
 import type { Outbox } from "./outbox.js";
 import type { EmittedMessage } from "./executor.js";
 import { classifyLimitFailure, LimitReachedError } from "./limit.js";
@@ -232,12 +237,11 @@ export class JudgeRunner {
       });
       // PRD #1247 fix round (Greptile P1): a judge claim SUPERSEDED by an ordinary stale-worker
       // requeue + reclaim (which bumps the run-lane generation) gets staleClaim on this first
-      // report. postReview does NOT fence on generation, so a superseded flight would overwrite
-      // the current verdict. Abandon cleanly BEFORE any trace/model/advice/completed/failed work.
-      // A normal RETURN, not a throw: throwing here would fall through to the catch's
-      // deterministic-fallback `completed` report, which would ALSO overwrite. This closes only
-      // the INITIAL-stale window; the atomic fence for post-ack supersession + the ungenerationed
-      // postReview write is a follow-up (issue #1423).
+      // report. Abandon cleanly BEFORE any trace/model/advice/completed/failed work. A normal
+      // RETURN, not a throw: throwing here would fall through to the catch's deterministic-
+      // fallback `completed` report. This is now the FAST PATH (it skips the model call); the
+      // guard against a stale overwrite is the server's atomic fence on postReview, which
+      // refuses a superseded, released or already-terminal flight's write (issue #1423).
       if (runningAck?.staleClaim) {
         this.log.warn("judge claim superseded (stale) at running report; abandoning without posting", {
           run_id: judgeRunId,
@@ -288,21 +292,19 @@ export class JudgeRunner {
       }
       // PRD #1247 fix round (Greptile P1, pre-post probe): the initial running ack closes only the
       // pre-model window. A judge model call can run minutes while a stale-worker requeue (~45s)
-      // plus a same-worker reclaim (concurrency 2) advances the run to G+1 mid-flight; postReview
-      // authorizes on worker+nonterminal ONLY (no generation fence), so a stale G flight could
-      // overwrite G+1's verdict. Re-probe with an idempotent running report (SetRunRunning
-      // preserves status_since) IMMEDIATELY before the advice write; a stale ack abandons before
-      // postReview. A residual sub-RPC TOCTOU and the ungenerationed advice write itself remain for
-      // the atomic-fence follow-up (issue #1423).
-      // The pre-post probe is a SUPERSESSION FENCE, and it is FAIL-CLOSED (Greptile P1 disposition —
-      // NOT best-effort). A staleClaim ack abandons cleanly (below). A transport/transient failure
-      // leaves ownership UNKNOWN — the run may have been reclaimed at G+1 during the outage — and
-      // postReview is generation-blind until #1423, so PROCEEDING could overwrite the reclaiming
-      // flight's advice with this stale one. So a probe throw PROPAGATES to the advice-phase catch
-      // (safeReportFailed, itself generation-fenced), posting NO advice: the review is lost
-      // (recoverable — advice is re-derivable) rather than risking a stale overwrite. In the
-      // api-unreachable case postReview would fail anyway, so this only changes the narrow
-      // reclaim-during-blip case, in the safe direction.
+      // plus a same-worker reclaim (concurrency 2) advances the run to G+1 mid-flight. Re-probe with
+      // an idempotent running report (SetRunRunning preserves status_since) before the advice
+      // write; a stale ack abandons before postReview. This probe is now the FAST PATH: the guard
+      // is the server fence (issue #1423), which checks the judge run's claim generation,
+      // unreleased claim, owning worker and non-terminal status atomically in the same statement
+      // as the review upsert (and the stamped run id against the authorized run, so an EARLIER
+      // run's colliding generation cannot land under a re-run; an advice_claim_fence_v1 worker must
+      // stamp advice_run_id with the generation, or the post is refused like a missing
+      // generation), so a supersession landing between this probe and the post is refused there
+      // (409 stale_claim, handled below).
+      // A probe throw still PROPAGATES to the advice-phase catch (safeReportFailed, itself
+      // generation-fenced), posting NO advice: ownership is unknown during a transport failure,
+      // and in the api-unreachable case postReview would fail anyway.
       const prePostAck = await this.client.reportState(judgeRunId, {
         status: "running",
         claim_generation: claim.claim_generation,
@@ -313,7 +315,20 @@ export class JudgeRunner {
         });
         return;
       }
-      await this.client.postReview(targetId, review);
+      try {
+        await this.client.postReview(targetId, review, claim.claim_generation, judgeRunId);
+      } catch (err) {
+        // Issue #1423: the server fence refused the write because this flight's claim was
+        // superseded (reclaimed at a newer generation), released, reassigned, or its judge run
+        // already reached a terminal status. Nothing was persisted and the run belongs to another
+        // flight, so abandon exactly like the staleClaim probes above: no completed report and
+        // NO safeReportFailed (that would fail the current flight's run).
+        if (isStaleClaimRefusal(err)) {
+          this.log.warn("judge claim superseded (stale) at review post; abandoning", { run_id: judgeRunId });
+          return;
+        }
+        throw err;
+      }
       // PRD #1391 Run B M3b (D6): journal the terminal STATE write-ahead (never the postReview above),
       // then resolve it. Fence 0 — the judge's own trace is a single advisory usage frame that gates
       // no api sub-work. The completion still carries the claim generation (#1247 M2 fix round: a

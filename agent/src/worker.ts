@@ -367,6 +367,11 @@ export class Worker {
           // UNCONDITIONALLY: the new report fields themselves are sent only when the api's register
           // response advertises the gate_revision_v1 feature, so an older api never sees them.
           "gate_revision_v1",
+          // Issue #1423: this image stamps claim_generation and advice_run_id on its advice POSTs
+          // (/review and /task-review). Advertised UNCONDITIONALLY: the api refuses an unstamped
+          // advice post only from a worker advertising this, never on credential_switch_v1, which
+          // shipped before advice posts were stamped, so older images keep posting mid-upgrade.
+          "advice_claim_fence_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the

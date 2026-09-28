@@ -7,7 +7,8 @@
 # directory, a red gate.
 #
 # Usage: land-prep.sh OWNER/REPO PR [--worktree DIR] [--skip-rebase] [--gate auto|none|api,web,agent,controller]
-#                     [--no-push] [--no-rework-check] [--allow-changelog-removals] [--repo-root DIR]
+#                     [--no-push] [--no-rework-check] [--allow-changelog-removals]
+#                     [--allow-workflow-edit] [--repo-root DIR]
 #   --worktree DIR   where the PR branch is checked out (default: <repo-root>-land-<PR>,
 #                    a sibling of the repo root). Reused if it already exists on the branch.
 #   --skip-rebase    re-entry after you resolved a conflict by hand (`git rebase --continue`
@@ -24,6 +25,8 @@
 #   --no-rework-check  skip the mr_rework guard (ONLY for a repo that is not on uzi).
 #   --allow-changelog-removals  push even though the branch deletes CHANGELOG.md lines the
 #                    base carries (a deliberate reword); without it that stops with exit 9.
+#   --allow-workflow-edit  push a .github/workflows change onto a uzi-owned branch anyway
+#                    (exit 10 otherwise). Only when no uzi push to it can follow.
 #   --repo-root DIR  the checkout whose .git the worktree is added to (default: cwd's root).
 #
 # Guards, in order: no active mr_rework on the MR (a rework push would collide; the check
@@ -75,9 +78,12 @@
 #      --allow-changelog-removals for a deliberate reword. Deleted `### ` headings and
 #      blank lines are not a removal only when they are exactly what
 #      `changelog-union.sh --collapse` makes of the branch's file
+#  10  the branch is uzi-owned (agent/*, uzi/*) and changes .github/workflows files: pushing
+#      it would make every later uzi push there fail (worker PAT lacks workflow scope).
+#      Split the workflow edit into a separate PR, or --allow-workflow-edit
 set -uo pipefail
 
-REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0
+REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --worktree) WT="${2:?}"; shift 2;;
@@ -87,8 +93,9 @@ while [ $# -gt 0 ]; do
     --no-push) PUSH=0; shift;;
     --no-rework-check) REWORK_CHECK=0; shift;;
     --allow-changelog-removals) ALLOW_CL_RM=1; shift;;
+    --allow-workflow-edit) ALLOW_WF=1; shift;;
     --repo-root) ROOT="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,77p' "$0"; exit 2;;
+    -h|--help) sed -n '2,83p' "$0"; exit 2;;
     -*) echo "unknown flag: $1" >&2; exit 2;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 2; fi; shift;;
   esac
@@ -512,9 +519,26 @@ if [ "$GATE" != "none" ]; then
   done
 fi
 
-# ---- workflow-file note ----------------------------------------------------------------------
-wf=$(git diff --name-only "origin/$BASE..HEAD" -- .github/workflows/ || true)
-[ -n "$wf" ] && log "NOTE: branch changes workflow files (your token has workflow scope; the worker's does not): $(printf '%s' "$wf" | tr '\n' ' ')"
+# ---- workflow-file stop ----------------------------------------------------------------------
+# Your token has workflow scope; uzi's worker PAT does not, and GitHub refuses ANY push of a
+# branch whose workflow tree differs from the base with that PAT. So a workflow edit on a
+# uzi-owned branch makes every later uzi push there fail atomically (mr_rework, a ci_fix
+# adopt, a re-run), losing that run's commits. Stop before pushing one.
+wf=$(git diff --name-only "origin/$BASE..HEAD" -- .github/workflows/) \
+  || { log "cannot read the branch's workflow-file diff against origin/$BASE; not pushing"; exit 3; }
+if [ -n "$wf" ]; then
+  case "$BRANCH" in
+    agent/*|uzi/*)
+      if [ "${ALLOW_WF:-0}" -ne 1 ] && [ "$PUSH" -eq 1 ]; then
+        log "STOP: $BRANCH is uzi-owned and changes workflow files: $(printf '%s' "$wf" | tr '\n' ' ')"
+        log "every later uzi push to this branch (mr_rework, ci_fix, re-run) would fail with workflow_scope_missing"
+        log "move the workflow edit to a separate maintainer PR landed after this one, or pass --allow-workflow-edit when no uzi push can follow"
+        echo "RESULT=workflow_edit WORKTREE=$WT"
+        exit 10
+      fi ;;
+  esac
+  log "NOTE: branch changes workflow files (your token has workflow scope; the worker's does not): $(printf '%s' "$wf" | tr '\n' ' ')"
+fi
 
 NEW_HEAD=$(git rev-parse HEAD)
 if [ "$PUSH" -eq 0 ]; then

@@ -411,12 +411,20 @@ async function appendTombstones(
     // Nit: read the PARSED top-level `disposition` off the 409 body (the same key readRunAck reads
     // stale_claim from), never a fragile substring match on the raw JSON — a `"stale_claim"` literal
     // could otherwise appear inside an unrelated error/message field and be misclassified.
-    if (err instanceof RequestError && err.status === 409 && has409Disposition(err.body, "stale_claim")) {
+    if (isStaleClaimRefusal(err)) {
       return "stale_claim";
     }
     deps.log.warn("outbox: gap-fill tombstone append failed", { run_id: runId, error: errMessage(err) });
     return "error";
   }
+}
+
+/** Whether `err` is the api's stale-claim refusal: a 409 RequestError whose PARSED top-level
+ *  `disposition` is "stale_claim" (the claim was released or superseded by a reclaim). Shared by
+ *  the gap-fill tombstone append above and the judge/task-review advice posts (issue #1423), which
+ *  abandon the superseded flight on it rather than fail the run. */
+export function isStaleClaimRefusal(err: unknown): boolean {
+  return err instanceof RequestError && err.status === 409 && has409Disposition(err.body, "stale_claim");
 }
 
 /** Parse a 409 RequestError body and report whether its TOP-LEVEL `disposition` equals `want`

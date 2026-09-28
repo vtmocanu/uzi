@@ -3,11 +3,15 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -71,6 +75,42 @@ type ReviewResult struct {
 	ReviewID uuid.UUID
 }
 
+// AdviceClaim is the claim a judge or task-review flight stamps on its advice POST (issue
+// #1423). Both fields are nil (not stamped) for a legacy worker; an advice_claim_fence_v1
+// worker must stamp BOTH, and omitting either is ErrMissingClaimGeneration. The requirement is
+// keyed on advice_claim_fence_v1, not credential_switch_v1: the latter shipped before advice
+// posts were stamped, so a credential_switch_v1-only worker omits both and takes the legacy path.
+//   - Generation is the advice run's claim_generation the flight holds; the upsert is fenced
+//     on it in the same statement as the write.
+//   - RunID is the advice run the flight holds. Generations are PER-RUN counters, so a stale
+//     flight of an earlier judge run A (gen 1) and a re-judge B of the same target claimed by
+//     the same worker (also gen 1) would otherwise be indistinguishable: authorization
+//     resolves (worker, target) to the ACTIVE run B, and A's generation would match B's.
+//     Stamping the run id makes that post ErrStaleClaim instead of landing under B, which is
+//     why an advice_claim_fence_v1 worker may not omit it.
+type AdviceClaim struct {
+	Generation *int64
+	RunID      *uuid.UUID
+}
+
+// checkAdviceClaim applies the pre-write half of the advice-post fence, AFTER authorization
+// (ErrRunNotFound wins over everything here): an advice_claim_fence_v1 worker that omits the
+// generation or the advice run id is ErrMissingClaimGeneration, then a stamped advice run id
+// that is not the authorized advice run is ErrStaleClaim. A worker without that capability
+// (including a credential_switch_v1 worker from before advice posts were stamped) may omit
+// both, so an api upgraded ahead of its workers keeps accepting their advice posts. The
+// generation / unreleased-claim / owning-worker / non-terminal-status half runs inside the
+// upsert itself, whether or not the fields were stamped.
+func checkAdviceClaim(wkr store.Worker, adviceRunID uuid.UUID, claim AdviceClaim) error {
+	if (claim.Generation == nil || claim.RunID == nil) && slices.Contains(wkr.ProtocolCapabilities, capability.AdviceClaimFenceV1) {
+		return ErrMissingClaimGeneration
+	}
+	if claim.RunID != nil && *claim.RunID != adviceRunID {
+		return ErrStaleClaim
+	}
+	return nil
+}
+
 // PostReview persists a judge's review of a target run (PRD #46 Decision 5) — the
 // worker's write-back at judge-run completion. Authorization is judge-run-scoped
 // (authorizeJudgeTrace): the caller's worker must own the active judge run reviewing
@@ -80,9 +120,20 @@ type ReviewResult struct {
 // Provenance — the producing judge run + owner — is stamped on every recommendation.
 // Returns the owner + review id so the caller can notify persist-first (the review is
 // the durable source of truth; the notification is a best-effort surface layered on).
-func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission) (ReviewResult, error) {
+//
+// Issue #1423: the write is fenced on the JUDGE run's claim, mirroring the message fence
+// (see AdviceClaim and checkAdviceClaim; only an advice_claim_fence_v1 worker is required to
+// stamp the claim). The upsert persists nothing when the judge run is
+// no longer claimed by wkr, has reached a terminal status, its claim is released, or it is at
+// a different generation, and
+// that no-row outcome surfaces as ErrStaleClaim (the auto-dismiss net is skipped: there is
+// no fresh review).
+func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission, claim AdviceClaim) (ReviewResult, error) {
 	judge, target, err := s.authorizeJudgeTrace(ctx, wkr, targetID)
 	if err != nil {
+		return ReviewResult{}, err
+	}
+	if err := checkAdviceClaim(wkr, judge.ID, claim); err != nil {
 		return ReviewResult{}, err
 	}
 	recs := sub.Recommendations
@@ -104,8 +155,13 @@ func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uui
 		ProducedByRunID:  pgconv.UUID(judge.ID),
 		ProducedByUserID: pgconv.UUID(target.UserID),
 		Recommendations:  recsJSON,
+		ClaimGeneration:  pgconv.Int8Ptr(claim.Generation),
+		WorkerID:         wkr.ID,
 	})
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ReviewResult{}, ErrStaleClaim
+		}
 		return ReviewResult{}, err
 	}
 	s.autoDismissDeniedCLIRecommendations(ctx, reviewID, recs)

@@ -102,9 +102,17 @@ func (s *Service) authorizeTaskReviewTarget(ctx context.Context, wkr store.Worke
 // header and its findings are written in ONE atomic CTE with UPSERT (replace) semantics,
 // so a re-review overwrites the prior findings rather than 23505-ing (the same shape the
 // judge's PostReview uses; workersvc holds no pool for a service-level tx).
-func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission) error {
+//
+// Issue #1423: fenced on the REVIEW run's claim exactly like PostReview (checkAdviceClaim,
+// then the in-statement fence): a released, superseded, reassigned or mismatched claim, or
+// a review run already terminal, persists nothing and surfaces as ErrStaleClaim. Only an
+// advice_claim_fence_v1 worker must stamp the claim; one without it may omit both fields.
+func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub TaskReviewSubmission, claim AdviceClaim) error {
 	review, target, err := s.authorizeTaskReviewTarget(ctx, wkr, targetID)
 	if err != nil {
+		return err
+	}
+	if err := checkAdviceClaim(wkr, review.ID, claim); err != nil {
 		return err
 	}
 	findings := sub.Findings
@@ -116,13 +124,18 @@ func (s *Service) PostTaskReview(ctx context.Context, wkr store.Worker, targetID
 		return fmt.Errorf("marshal findings: %w", err)
 	}
 	if _, err := s.q.UpsertTaskReviewWithFindings(ctx, store.UpsertTaskReviewWithFindingsParams{
-		TargetRunID: target.ID,
-		ReviewRunID: pgconv.UUID(review.ID),
-		UserID:      target.UserID,
-		Status:      sub.Status,
-		SummaryMd:   sub.SummaryMd,
-		Findings:    findingsJSON,
+		TargetRunID:     target.ID,
+		ReviewRunID:     pgconv.UUID(review.ID),
+		UserID:          target.UserID,
+		Status:          sub.Status,
+		SummaryMd:       sub.SummaryMd,
+		Findings:        findingsJSON,
+		ClaimGeneration: pgconv.Int8Ptr(claim.Generation),
+		WorkerID:        wkr.ID,
 	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrStaleClaim
+		}
 		return err
 	}
 	return nil
