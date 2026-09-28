@@ -317,9 +317,12 @@ The worker also passes through, unprobed, the harness and whether Docker is
 wired — worker configuration, not a measurement. It reports no egress tier:
 the worker receives no egress-tier configuration to pass through.
 
-The facts feed the prompt on a schedule that differs by harness: on Claude,
-the plan prompt and the first implement prompt only; on Codex, the plan
-prompt and every implement prompt. The block lists only the limits and "not
+The facts feed the prompt on a schedule that differs by harness. On Claude,
+the issue plan prompt and the first implement prompt carry them; the CI-fix
+and self-improvement plan prompts do not. On Codex, the plan prompt and each
+regular implement prompt carry them; a completion-rework follow-up or a
+clarification continuation replaces that prompt and does not, relying on the
+same session having already seen the block. The block lists only the limits and "not
 verified" facts it found, plus a Docker-not-wired line when Docker isn't
 wired on this worker — so on a non-Docker worker it appears every run, even
 with every probed fact `ok` — plus a fixed rule: when a gate is blocked by a
