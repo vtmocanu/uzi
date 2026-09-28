@@ -264,15 +264,29 @@ completion with no time budget, so a slow or hung forge could stall the
 rest of that Sweep tick indefinitely. It now runs under a `retentionPass`:
 a pass-wide budget (`retentionPassBudget`, 30s) checked before starting
 each record, in every arm, never mid-record; each record's locked
-operation runs under an op timeout (`retentionSweepOpTimeout`) sized to
-the pass's single longest locked operation rather than the publish path's
-own shorter timeout — 160s, derived as five forge calls at a 30s ceiling
-each plus 10s slack. A record cut off by its own deadline still runs its
-failure bookkeeping and releases its lock on a fresh, un-cancelled context,
-so a hung forge call is recorded as a failure and backed off rather than
-left holding the lock. Per the code's own accounting, the worst case for
-one tick is `retentionPassBudget + retentionSweepOpTimeout + 4 × 10s = 30s
-+ 160s + 40s = 230s`; any records or arms the pass could not reach are left
+operation runs under an op timeout (`retentionSweepOpTimeout`, 60s) rather
+than the publish path's 2-minute `retentionOpTimeout`. The bound is a
+documented relation, not a derivation: 60s fits the longest locked
+operation (a superseding record's re-drive, five forge calls) on a slow
+but healthy forge answering in about 10s per call. Sizing it to five calls
+at the broker's 30s per-call ceiling (160s) would let one record hold the
+sweeper's single goroutine for minutes on every tick it is due. A forge
+slower than about 12s per call makes a sweeper re-drive time out; the
+record backs off, every re-drive step is idempotent against origin (what
+completed stays done, though a re-drive repeats each call), with no
+custody hold open the next pass takes the three-call stuck exit, and the
+publish path's own re-drive runs under its 2-minute bound. A record cut off
+by its own deadline still runs its failure bookkeeping and releases its
+lock on un-cancelled contexts, so a hung forge call is recorded as a
+failure and backed off rather than left holding the lock. All of one
+operation's bookkeeping after its deadline shares a single 10s window past
+that deadline, and the expiry bookkeeping writes nothing unless a fresh
+fence re-check shows the lock is still held (a lock lost mid-forge-call is
+never written through). Per the code's own accounting, the worst case for
+one tick is `retentionPassBudget + retentionSweepOpTimeout + 3 × 10s = 30s
++ 60s + 30s = 120s` (the bookkeeping window, the unlock, the connection
+teardown), below the sweeper health beat's danger line of ten 15s default
+intervals (150s); any records or arms the pass could not reach are left
 for the next tick, logged once per pass rather than per record. The pass's
 four forge-calling arms (work, unheld, audit, attempts) also rotate which
 arm runs first each pass, so a burst of slow records in one arm cannot
@@ -319,7 +333,7 @@ above.
   the old run at all.
 - **The sweeper's retention reconciliation pass is now time-bounded
   (rework round 2)**, trading unbounded work per tick (previously able to
-  stall on a hung forge) for a documented worst case per tick (~230s) and
+  stall on a hung forge) for a documented worst case per tick (~120s) and
   leftover work that carries to the next tick under load.
 - **The api's forge-write surface for checkpoints grows**: a create-ref
   primitive alongside the existing publish/delete (ADR-0122), still CAS,

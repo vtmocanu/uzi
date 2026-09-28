@@ -196,8 +196,8 @@ const MaxPublishDuration = maxPublishDuration
 
 // MaxDeleteDuration and MaxCreateRefDuration export the per-call ceilings of Delete, ListRefTips
 // (which shares maxDeleteDuration) and CreateRef for the retention timing relations in workersvc
-// (PRD #1810: the sweeper's per-record timeout is sized to cover the forge calls of its longest
-// locked operation, each at its own ceiling).
+// (PRD #1810: one hung forge call ends at its own ceiling, inside the sweeper's per-record
+// timeout, so the record's failure is recorded before the operation's deadline).
 const (
 	MaxDeleteDuration    = maxDeleteDuration
 	MaxCreateRefDuration = maxCreateRefDuration

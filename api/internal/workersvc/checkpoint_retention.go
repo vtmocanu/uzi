@@ -143,6 +143,11 @@ func (s *Service) withRetentionLockTimeout(ctx context.Context, runID uuid.UUID,
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 	defer cancel()
+	// Bookkeeping contexts derived from this operation share one window past its deadline
+	// (retentionBookkeepingCtx); a caller's own bookkeeping mark does not carry into it.
+	if d, ok := ctx.Deadline(); ok {
+		ctx = context.WithValue(context.WithValue(ctx, retentionOpDeadlineKey{}, d), retentionBookkeepingKey{}, nil)
+	}
 
 	conn, err := s.retentionPool.Acquire(ctx)
 	if err != nil {
@@ -420,9 +425,39 @@ func (s *Service) forgeForRetention(ctx context.Context, runID uuid.UUID) (f ret
 // deadline): detached from ctx's cancellation and bounded by retentionRecordTimeout. Without it an
 // expired operation records no backoff, and the record keeps its place at the head of its arm's
 // next_attempt_at-ordered page on every later pass.
+//
+// Its deadline is the EARLIEST of:
+//
+//   - now + retentionRecordTimeout;
+//   - ctx's own deadline, when ctx is itself a bookkeeping context: a nested call (the expiry
+//     bookkeeping's re-read handing its context to recordRetentionFailure, say) shares its
+//     caller's deadline instead of starting a fresh one;
+//   - the locked operation's deadline + retentionRecordTimeout, when ctx descends from a locked
+//     operation (withRetentionLockTimeout): every bookkeeping write of one operation that runs
+//     after its deadline (the step's own failure write, then the expiry bookkeeping's fence
+//     re-check, read and write) shares ONE retentionRecordTimeout window past that deadline.
 func retentionBookkeepingCtx(ctx context.Context) (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.WithoutCancel(ctx), retentionRecordTimeout)
+	deadline := time.Now().Add(retentionRecordTimeout)
+	if ctx.Value(retentionBookkeepingKey{}) != nil {
+		if d, ok := ctx.Deadline(); ok && d.Before(deadline) {
+			deadline = d
+		}
+	} else if d, ok := ctx.Value(retentionOpDeadlineKey{}).(time.Time); ok {
+		if capped := d.Add(retentionRecordTimeout); capped.Before(deadline) {
+			deadline = capped
+		}
+	}
+	bctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), deadline)
+	return context.WithValue(bctx, retentionBookkeepingKey{}, true), cancel
 }
+
+// retentionBookkeepingKey marks a retentionBookkeepingCtx context; retentionOpDeadlineKey carries
+// a locked operation's deadline (withRetentionLockTimeout) to the bookkeeping contexts derived
+// from it.
+type (
+	retentionBookkeepingKey struct{}
+	retentionOpDeadlineKey  struct{}
+)
 
 // recordRetentionFailure records a failed (or refused) retention step on the record, guarded on
 // the state the caller acted in: attempts+1, the already-scrubbed msg as last_error, and the

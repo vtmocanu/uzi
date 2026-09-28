@@ -245,9 +245,10 @@ func (s *Service) ownPublishedTip(ctx context.Context, runID uuid.UUID, tip stri
 // read or write error, a recovered panic, the lock held elsewhere, the locked step's own deadline,
 // including a fence that failed only because it ran on the expired context), so a row that keeps
 // failing never keeps its place at the head of the bounded, next_check_at-ordered page. The one
-// exception is a lock genuinely lost while the step's deadline was still live (a fence started
-// before the deadline failed): another holder may be reconciling the row, so it is left to them
-// (lockedRetentionStep's rule for the record arms).
+// exception is a lock that is not held: lost while the step's deadline was still live (a fence
+// started before the deadline failed), or found gone by the expiry path's fence re-check after the
+// deadline (lockedRetentionStep). Another holder may be reconciling the row, so it is left to them,
+// as the record arms leave a record.
 //
 // The arm checks the pass budget before starting each row (and before the settle a row owes); each
 // locked step runs under pass.timeout(). A settle the budget stops is left to the work arm, which
@@ -266,6 +267,8 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 			pass.leave(len(due) - i)
 			break
 		}
+		// expiredDeferred: the expiry bookkeeping deferred the row under the lock (its fence
+		// re-check passed).
 		var settle, expiredDeferred bool
 		done, acquired, err := s.lockedRetentionStep(ctx, a.RunID, pass.timeout(), func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
 			var (
@@ -275,13 +278,15 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 			d, settle, err = s.reconcilePublishAttemptLocked(ctx, a.ID, fence)
 			return d, err
 		}, func(ctx context.Context, _ uuid.UUID, msg string) {
-			// The step ran out of time: defer the row while the lock is still held.
+			// The step ran out of time and the lock is still held (re-checked): defer the row now,
+			// on the expiry path's bookkeeping context.
 			expiredDeferred = true
 			s.deferPublishAttemptLogged(ctx, a, "operation timed out: "+msg)
 		})
 		if err != nil {
 			slog.Warn("sweeper: checkpoint publish attempt", "run", a.RunID, "attempt", a.ID, "error", err)
-			// Deferred already (expired), or a lock genuinely lost: another holder owns the row.
+			// Deferred already (expired), or the lock is not held (lost while live, or found gone
+			// by the expiry re-check): another holder owns the row.
 			if !expiredDeferred && !errors.Is(err, ErrRetentionLockLost) {
 				s.deferPublishAttemptLogged(ctx, a, secretscrub.Scrub(err.Error()))
 			}
@@ -495,7 +500,8 @@ func (s *Service) dropPublishAttempt(ctx context.Context, id uuid.UUID) (done, s
 
 // deferPublishAttempt pushes the attempt's next comparison out by the retry backoff; a non-empty
 // (already scrubbed) note replaces last_error. It runs on retentionBookkeepingCtx, so the
-// bookkeeping still lands when the locked step's own context has expired.
+// bookkeeping still lands when the locked step's own context has expired (within the one window
+// past the operation's deadline that context shares).
 func (s *Service) deferPublishAttempt(ctx context.Context, a store.CheckpointPublishAttempt, note string) (done, settle bool, err error) {
 	var n pgtype.Text
 	if note != "" {

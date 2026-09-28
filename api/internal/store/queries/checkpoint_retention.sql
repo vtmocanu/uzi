@@ -563,10 +563,14 @@ RETURNING checkpoint_retentions.state;
 -- SetRunCheckpointTip, but COMPARE-AND-SET on the runs.checkpoint_tip the writer observed (NULL:
 -- none was persisted): Publish's persist (observed immediately before its forge call) and the
 -- attempts arm's persist of a late-landed tip (observed before it listed origin). A newer tip
--- persisted meanwhile moves nothing here, so the tip never moves backwards.
+-- persisted meanwhile moves nothing here, so the tip never moves backwards. Idempotent: a row
+-- already at @checkpoint_tip matches too (the same tip persisted meanwhile, by a retry or the
+-- attempts arm), so the writer tracks its push rather than reporting a moved tip; the tip itself
+-- does not change in that arm.
 UPDATE runs SET checkpoint_tip = @checkpoint_tip::text, checkpoint_tip_at = now()
 WHERE id = @id
-  AND checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text;
+  AND (checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text
+       OR checkpoint_tip = @checkpoint_tip::text);
 
 -- name: CheckpointTipClaimedByOtherRun :one
 -- Whether any OTHER run of the repo claims this tip (its persisted checkpoint tip, an outstanding

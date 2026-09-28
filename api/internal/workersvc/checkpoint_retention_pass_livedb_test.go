@@ -323,20 +323,60 @@ func TestRetentionLockLostLiveRecordsNothingLiveDB(t *testing.T) {
 	}
 }
 
+// TestRetentionLockLostThenExpiredRecordsNothingLiveDB (#1810 rework review N4): the lock is lost
+// mid-operation (released on the pinned session at the stuck exit's branch-ref write, as a forge
+// call running into the deadline could see it lost), and the step's fence then runs only after the
+// operation's deadline, so it fails on the expired context and the step is classified expired, not
+// lost-live. The expiry bookkeeping's fence re-check, on a fresh bookkeeping context, must find the
+// lock gone and write NOTHING: another holder may own the record. Before the re-check the record
+// got attempts+1 and a backoff without the lock.
+func TestRetentionLockLostThenExpiredRecordsNothingLiveDB(t *testing.T) {
+	const opTimeout = 300 * time.Millisecond
+	f := stuckExitFix(t)
+	before := f.row(t)
+	unlock := f.holdLockLost(t)
+	f.svc1.retentionSweepOpTimeout = opTimeout
+	var reached atomic.Int32
+	f.svc1.retentionHooks.beforeForgeWrite = func(id uuid.UUID, op string) {
+		if id == f.oldRun && op == "exit-branch" {
+			reached.Add(1)
+			unlock()
+			time.Sleep(opTimeout + 200*time.Millisecond) // the fence then runs on the expired context
+		}
+	}
+
+	f.reconcileRun(t, f.svc1, f.oldRun)
+	if n := reached.Load(); n != 1 {
+		t.Fatalf("exit-branch write reached %d times, want 1", n)
+	}
+	if tip, ok := f.forge.ref(f.branchRef); !ok || tip != retentionTestTip {
+		t.Fatalf("branch ref = %q (present %v), want left at %s: the failed fence must stop the delete", tip, ok, retentionTestTip)
+	}
+	r := f.row(t)
+	if r.State != before.State || r.Attempts != before.Attempts || !r.NextAttemptAt.Time.Equal(before.NextAttemptAt.Time) ||
+		r.LastError != before.LastError {
+		t.Fatalf("record = {state %q attempts %d next %v last_error %q}, want untouched {%q %d %v %q}",
+			r.State, r.Attempts, r.NextAttemptAt.Time, r.LastError.String,
+			before.State, before.Attempts, before.NextAttemptAt.Time, before.LastError.String)
+	}
+}
+
 // TestAttemptsArmChecksBudgetBeforeOwedSettleLiveDB (#1810 review N3): the attempts arm re-records
 // a late-landed tip on a settling record, which owes a settle (a second locked operation). When the
 // comparison itself ran past the pass budget, the arm must not start that settle: the ref stays for
 // the work arm's later pass. The control subtest, with an ample budget, shows the same setup does
 // reach the settle and deletes the ref.
 func TestAttemptsArmChecksBudgetBeforeOwedSettleLiveDB(t *testing.T) {
-	const budget = 200 * time.Millisecond
 	for _, tc := range []struct {
 		name       string
+		budget     time.Duration
 		listDelay  time.Duration
 		wantSettle bool
 	}{
-		{"the comparison spends the budget", budget + 100*time.Millisecond, false},
-		{"control: budget left", 0, true},
+		{"the comparison spends the budget", 200 * time.Millisecond, 300 * time.Millisecond, false},
+		// A whole locked operation (lock, reads, list, re-record transaction) must fit in the budget
+		// under -race: 3s, not the spent case's 200ms.
+		{"control: budget left", 3 * time.Second, 0, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSupersedeFix(t)
@@ -352,7 +392,7 @@ func TestAttemptsArmChecksBudgetBeforeOwedSettleLiveDB(t *testing.T) {
 				return f.forge.listRefTips(ctx, o, refs...)
 			})
 
-			pass := &retentionPass{deadline: time.Now().Add(budget), opTimeout: 30 * time.Second}
+			pass := &retentionPass{deadline: time.Now().Add(tc.budget), opTimeout: 30 * time.Second}
 			if _, err := svc.reconcilePublishAttempts(f.e.ctx, pgconv.UUID(f.oldRun), pass); err != nil {
 				t.Fatalf("reconcilePublishAttempts: %v", err)
 			}
@@ -370,40 +410,66 @@ func TestAttemptsArmChecksBudgetBeforeOwedSettleLiveDB(t *testing.T) {
 	}
 }
 
-// TestLockedRetentionStepExpiryRuleLiveDB (#1810 review N2): lockedRetentionStep's expiry
+// TestLockedRetentionStepExpiryRuleLiveDB (#1810 review N2, N4): lockedRetentionStep's expiry
 // bookkeeping runs for a step that failed after the deadline because its fence ran on the expired
-// context, and never for one whose fence started while the deadline was live and found the lock
-// genuinely lost, even when that step only returns after the deadline.
+// context while the lock is still held, and never when the lock is gone: a fence that started
+// while the deadline was live found it lost (even when that step only returns after the deadline),
+// or the lock was lost mid-operation and the step's first fence ran only after the deadline (the
+// expiry path's own fence re-check, on a fresh bookkeeping context, finds it gone). Either way the
+// error still wraps ErrRetentionLockLost.
 func TestLockedRetentionStepExpiryRuleLiveDB(t *testing.T) {
 	for _, tc := range []struct {
-		name         string
-		loseLock     bool
-		wantExpiries int32
+		name string
+		// loseLock releases the lock mid-step; fenceLive runs the step's fence before the deadline.
+		loseLock, fenceLive bool
+		wantExpiries        int32
 	}{
-		{"the fence runs on the expired context", false, 1},
-		{"the lock is lost while live and the step returns after the deadline", true, 0},
+		{"the fence runs on the expired context", false, false, 1},
+		{"the lock is lost while live and the step returns after the deadline", true, true, 0},
+		{"the lock is lost, then the fence runs on the expired context", true, false, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSupersedeFix(t)
 			unlock := f.holdLockLost(t)
-			var expiries atomic.Int32
+			var (
+				expiries  atomic.Int32
+				opDone    time.Time
+				bookkeepD time.Time
+			)
 			_, acquired, err := f.svc1.lockedRetentionStep(f.e.ctx, f.oldRun, 300*time.Millisecond,
 				func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
 					if tc.loseLock {
-						unlock()
+						unlock() // lost mid-operation (say, during a forge call)
+					}
+					if tc.fenceLive {
 						ferr := fence(ctx) // started while the deadline is live
 						<-ctx.Done()
 						return false, ferr
 					}
 					<-ctx.Done()
-					return false, fence(ctx)
+					opDone = time.Now()
+					// The step's own failure bookkeeping would run here; the expiry bookkeeping
+					// that follows must still end within ONE window past the operation's deadline.
+					time.Sleep(time.Second)
+					return false, fence(ctx) // first fenced after the deadline
 				},
-				func(context.Context, uuid.UUID, string) { expiries.Add(1) })
+				func(bctx context.Context, _ uuid.UUID, _ string) {
+					expiries.Add(1)
+					bookkeepD, _ = bctx.Deadline()
+				})
 			if !acquired || !errors.Is(err, ErrRetentionLockLost) {
 				t.Fatalf("lockedRetentionStep = acquired %v, err %v; want acquired and a failed fence", acquired, err)
 			}
 			if n := expiries.Load(); n != tc.wantExpiries {
 				t.Fatalf("expiry bookkeeping ran %d times, want %d", n, tc.wantExpiries)
+			}
+			// #1810 rework review N2: the expiry bookkeeping's context ends within
+			// retentionRecordTimeout of the operation's deadline, not a fresh window after the
+			// step's late return (which here comes a second after the deadline).
+			if tc.wantExpiries == 1 {
+				if limit := opDone.Add(retentionRecordTimeout + 500*time.Millisecond); bookkeepD.IsZero() || bookkeepD.After(limit) {
+					t.Fatalf("expiry bookkeeping deadline = %v, want by %v (the operation's deadline + %s)", bookkeepD, limit, retentionRecordTimeout)
+				}
 			}
 		})
 	}
@@ -411,17 +477,32 @@ func TestLockedRetentionStepExpiryRuleLiveDB(t *testing.T) {
 
 // TestAttemptsArmExpiryRuleLiveDB (#1810 review N2, the attempts arm): an attempt row whose locked
 // step reaches the attempt-delete fence is deferred when that fence failed only because it ran on
-// the expired context (the comparison's list returned just after the deadline), and left untouched
-// when the lock was genuinely lost while the deadline was live: another holder may be reconciling
-// the row.
+// the expired context (the step is held just before it until the deadline has passed), and left
+// untouched when the lock is not held: lost while the deadline was live, or lost and only then
+// found by a fence or a database read that ran after the deadline (the expiry path's fence
+// re-check sees it gone, and its error wraps ErrRetentionLockLost, so the arm does not defer the
+// row after the unlock either). Another holder may be reconciling the row.
+//
+// The expired-context subtest reaches the fence itself: the comparison's list and reads all run
+// before the deadline, and only the beforeForgeWrite hook outlasts it (review N3: a list delayed
+// past the deadline failed the tip-claims read first and never reached the fence). Passing nil
+// instead of the expiry callback in reconcilePublishAttempts fails that subtest.
 func TestAttemptsArmExpiryRuleLiveDB(t *testing.T) {
+	const opTimeout = 300 * time.Millisecond
 	for _, tc := range []struct {
-		name      string
-		loseLock  bool
-		wantCheck int32
+		name string
+		// loseLock releases the lock at the attempt-delete hook; pastDeadline then holds the step
+		// there until the operation's deadline has passed, so the fence runs on the expired context.
+		// inList instead releases it inside the comparison's list, which answers only after the
+		// deadline, so a database read (not a fence) is the first to fail on the expired context.
+		loseLock, pastDeadline, inList bool
+		wantCheck                      int32
+		wantFenceReached               int32
 	}{
-		{"the fence runs on the expired context", false, 1},
-		{"the lock is lost while live", true, 0},
+		{"the fence runs on the expired context", false, true, false, 1, 1},
+		{"the lock is lost, then the fence runs on the expired context", true, true, false, 0, 1},
+		{"the lock is lost while live", true, false, false, 0, 1},
+		{"the lock is lost, then a read fails on the expired context", false, false, true, 0, 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSupersedeFix(t)
@@ -429,23 +510,38 @@ func TestAttemptsArmExpiryRuleLiveDB(t *testing.T) {
 			id := f.recordAttempt(t, lateTip)
 			f.handOnSlot(t, lateTip)
 			svc := f.svc1
-			if tc.loseLock {
-				unlock := f.holdLockLost(t)
-				svc.retentionHooks.beforeForgeWrite = func(rid uuid.UUID, op string) {
-					if rid == f.oldRun && op == "attempt-delete" {
-						unlock()
-					}
-				}
-			} else {
+			unlock := func() {}
+			switch {
+			case tc.loseLock:
+				unlock = f.holdLockLost(t)
+			case tc.inList:
+				lose := f.holdLockLost(t)
 				svc.SetListRefTipsFn(func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
+					lose()
 					<-ctx.Done()
 					return f.forge.listRefTips(context.Background(), o, refs...)
 				})
+			default:
+				svc.retentionHooks = &retentionTestHooks{}
+			}
+			var reached atomic.Int32
+			svc.retentionHooks.beforeForgeWrite = func(rid uuid.UUID, op string) {
+				if rid != f.oldRun || op != "attempt-delete" {
+					return
+				}
+				reached.Add(1)
+				unlock()
+				if tc.pastDeadline {
+					time.Sleep(opTimeout + 200*time.Millisecond) // the fence then runs on the expired context
+				}
 			}
 			before := f.attemptRow(t, id)
-			pass := &retentionPass{deadline: time.Now().Add(time.Minute), opTimeout: 300 * time.Millisecond}
+			pass := &retentionPass{deadline: time.Now().Add(time.Minute), opTimeout: opTimeout}
 			if _, err := svc.reconcilePublishAttempts(f.e.ctx, pgconv.UUID(f.oldRun), pass); err != nil {
 				t.Fatalf("reconcilePublishAttempts: %v", err)
+			}
+			if n := reached.Load(); n != tc.wantFenceReached {
+				t.Fatalf("attempt-delete fence reached %d times, want %d", n, tc.wantFenceReached)
 			}
 			if tip, ok := f.forge.ref(f.branchRef); !ok || tip != lateTip {
 				t.Fatalf("branch ref = %q (present %v), want left at %s: the failed fence must stop the delete", tip, ok, lateTip)
@@ -454,8 +550,9 @@ func TestAttemptsArmExpiryRuleLiveDB(t *testing.T) {
 			if a.Checks != tc.wantCheck {
 				t.Fatalf("attempt checks = %d, want %d", a.Checks, tc.wantCheck)
 			}
-			if tc.wantCheck == 0 && !a.NextCheckAt.Time.Equal(before.NextCheckAt.Time) {
-				t.Fatalf("attempt next_check_at moved from %v to %v, want untouched", before.NextCheckAt.Time, a.NextCheckAt.Time)
+			if tc.wantCheck == 0 && (!a.NextCheckAt.Time.Equal(before.NextCheckAt.Time) || a.LastError != before.LastError) {
+				t.Fatalf("attempt = {next %v last_error %q}, want untouched {%v %q}",
+					a.NextCheckAt.Time, a.LastError.String, before.NextCheckAt.Time, before.LastError.String)
 			}
 			if tc.wantCheck == 1 && (!a.NextCheckAt.Time.After(time.Now()) || !strings.Contains(a.LastError.String, "operation timed out")) {
 				t.Fatalf("attempt = {next %v last_error %q}, want deferred into the future with the timeout recorded",

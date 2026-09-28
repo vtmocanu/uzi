@@ -174,3 +174,36 @@ func TestLivePublishCreateAfterSettleReopensRecordLiveDB(t *testing.T) {
 		t.Fatalf("attempt rows = %d, want 0 (the landed tip was persisted and tracked)", n)
 	}
 }
+
+// TestPersistPublishedTipIsIdempotentLiveDB (#1810 rework review nit 1): a push's tip persist is
+// compare-and-set on the runs.checkpoint_tip it observed, and ALSO matches a row already at the
+// tip it persists (a retry of the same push, or the attempts arm, recorded it meanwhile): that
+// write reports persisted, so the push is tracked instead of logging a moved tip and keeping a
+// redundant attempt row. A DIFFERENT tip persisted meanwhile still moves nothing (never
+// backwards).
+func TestPersistPublishedTipIsIdempotentLiveDB(t *testing.T) {
+	f := newSupersedeFix(t)
+	push := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+	if err := push.observePublishBase(f.e.ctx); err != nil {
+		t.Fatalf("observePublishBase: %v", err)
+	}
+	if !push.base.runTip.Valid || push.base.runTip.String != retentionTestTip {
+		t.Fatalf("setup: observed run tip = %v, want %s", push.base.runTip, retentionTestTip)
+	}
+	// The same tip lands on runs.checkpoint_tip after the push observed its base.
+	f.e.exec(t, `UPDATE runs SET checkpoint_tip = $2 WHERE id = $1`, f.oldRun, lateTip)
+
+	if !f.svc1.persistPublishedTip(f.e.ctx, push, lateTip) {
+		t.Fatal("persisting the tip the run already carries reported not persisted; want the idempotent match")
+	}
+	if tip, err := f.e.q.GetRunCheckpointTipForRetention(f.e.ctx, f.oldRun); err != nil || tip.String != lateTip {
+		t.Fatalf("runs.checkpoint_tip = %q (err %v), want %s", tip.String, err, lateTip)
+	}
+	// Control: another tip, on the same stale base, moves nothing.
+	if f.svc1.persistPublishedTip(f.e.ctx, push, newerTip) {
+		t.Fatal("persisting a different tip over a moved runs.checkpoint_tip reported persisted; want compare-and-set to refuse")
+	}
+	if tip, err := f.e.q.GetRunCheckpointTipForRetention(f.e.ctx, f.oldRun); err != nil || tip.String != lateTip {
+		t.Fatalf("runs.checkpoint_tip = %q (err %v), want still %s", tip.String, err, lateTip)
+	}
+}

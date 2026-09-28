@@ -1170,7 +1170,8 @@ func (q *Queries) SetCheckpointSupersessionTipGone(ctx context.Context, arg SetC
 const setRunCheckpointTipIf = `-- name: SetRunCheckpointTipIf :execrows
 UPDATE runs SET checkpoint_tip = $1::text, checkpoint_tip_at = now()
 WHERE id = $2
-  AND checkpoint_tip IS NOT DISTINCT FROM $3::text
+  AND (checkpoint_tip IS NOT DISTINCT FROM $3::text
+       OR checkpoint_tip = $1::text)
 `
 
 type SetRunCheckpointTipIfParams struct {
@@ -1182,7 +1183,10 @@ type SetRunCheckpointTipIfParams struct {
 // SetRunCheckpointTip, but COMPARE-AND-SET on the runs.checkpoint_tip the writer observed (NULL:
 // none was persisted): Publish's persist (observed immediately before its forge call) and the
 // attempts arm's persist of a late-landed tip (observed before it listed origin). A newer tip
-// persisted meanwhile moves nothing here, so the tip never moves backwards.
+// persisted meanwhile moves nothing here, so the tip never moves backwards. Idempotent: a row
+// already at @checkpoint_tip matches too (the same tip persisted meanwhile, by a retry or the
+// attempts arm), so the writer tracks its push rather than reporting a moved tip; the tip itself
+// does not change in that arm.
 func (q *Queries) SetRunCheckpointTipIf(ctx context.Context, arg SetRunCheckpointTipIfParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCheckpointTipIf, arg.CheckpointTip, arg.ID, arg.ExpectedTip)
 	if err != nil {

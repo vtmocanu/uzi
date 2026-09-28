@@ -304,3 +304,78 @@ func TestRetentionPassArmsCheckBudgetPerRowAndUseSweepTimeout(t *testing.T) {
 		})
 	}
 }
+
+// TestRetentionPassWorstCaseBelowSweeperDanger pins the per-tick worst case the retentionPass doc
+// states (#1810 rework review N1): the pass budget, one full per-record timeout, one shared
+// bookkeeping window past that deadline, the unlock and the connection teardown must stay clearly
+// below the sweeper health beat's danger line (ten 15s default intervals, internal/healthsvc and
+// internal/sweeper's defaultInterval). Raising retentionSweepOpTimeout back to the 5 x 30s
+// derivation (160s) fails it.
+func TestRetentionPassWorstCaseBelowSweeperDanger(t *testing.T) {
+	const (
+		sweeperDefaultInterval = 15 * time.Second
+		dangerLine             = 10 * sweeperDefaultInterval
+		margin                 = 20 * time.Second
+	)
+	worst := retentionPassBudget + retentionSweepOpTimeout + retentionRecordTimeout + 2*retentionUnlockTimeout
+	if worst != 120*time.Second {
+		t.Errorf("worst case per tick = %s, want the documented 120s (update the retentionPass doc, the PRD and the ADR with it)", worst)
+	}
+	if worst > dangerLine-margin {
+		t.Fatalf("worst case per tick = %s, want at most %s (the danger line %s less %s)", worst, dangerLine-margin, dangerLine, margin)
+	}
+	svc := New(nil, nil, testParams())
+	if svc.retentionSweepOpTimeout != retentionSweepOpTimeout || svc.retentionPassBudget != retentionPassBudget {
+		t.Fatalf("New wired op timeout %s / budget %s, want the defaults %s / %s", svc.retentionSweepOpTimeout,
+			svc.retentionPassBudget, retentionSweepOpTimeout, retentionPassBudget)
+	}
+}
+
+// TestRetentionBookkeepingCtxSharesOneWindow (#1810 rework review N2): a bookkeeping context
+// derived from another shares its deadline (deferExpiredRetentionStep hands its context to
+// recordRetentionFailure), and every bookkeeping context derived from a locked operation ends
+// within one retentionRecordTimeout past the operation's deadline, however late it is created. A
+// context unrelated to either gets a fresh window.
+func TestRetentionBookkeepingCtxSharesOneWindow(t *testing.T) {
+	const slack = time.Second
+
+	outer, cancelOuter := retentionBookkeepingCtx(context.Background())
+	defer cancelOuter()
+	d1, _ := outer.Deadline()
+	time.Sleep(20 * time.Millisecond)
+	nested, cancelNested := retentionBookkeepingCtx(outer)
+	defer cancelNested()
+	if d2, _ := nested.Deadline(); !d2.Equal(d1) {
+		t.Fatalf("nested bookkeeping deadline = %v, want its caller's %v (one shared window)", d2, d1)
+	}
+
+	// A locked operation whose deadline passed 4s ago: its bookkeeping ends 6s from now, not 10s.
+	opDeadline := time.Now().Add(-4 * time.Second)
+	opCtx, cancelOp := context.WithDeadline(context.Background(), opDeadline)
+	defer cancelOp()
+	opCtx = context.WithValue(context.WithValue(opCtx, retentionOpDeadlineKey{}, opDeadline), retentionBookkeepingKey{}, nil)
+	late, cancelLate := retentionBookkeepingCtx(opCtx)
+	defer cancelLate()
+	if d, _ := late.Deadline(); !d.Equal(opDeadline.Add(retentionRecordTimeout)) {
+		t.Fatalf("late bookkeeping deadline = %v, want the operation's deadline + %s = %v", d, retentionRecordTimeout,
+			opDeadline.Add(retentionRecordTimeout))
+	}
+	if late.Err() != nil {
+		t.Fatalf("late bookkeeping context is done (%v); want it detached from the expired operation", late.Err())
+	}
+
+	// A context with no operation or bookkeeping mark: a fresh window.
+	fresh, cancelFresh := retentionBookkeepingCtx(opCtxWithoutMarks(t))
+	defer cancelFresh()
+	if d, _ := fresh.Deadline(); time.Until(d) < retentionRecordTimeout-slack {
+		t.Fatalf("fresh bookkeeping deadline in %s, want about %s", time.Until(d), retentionRecordTimeout)
+	}
+}
+
+// opCtxWithoutMarks is an already-expired context that carries no retention marks.
+func opCtxWithoutMarks(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Minute))
+	t.Cleanup(cancel)
+	return ctx
+}
