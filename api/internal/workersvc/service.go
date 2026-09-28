@@ -1714,10 +1714,12 @@ type Service struct {
 	// createSalvageFn / deleteSalvageFn are SweepSalvage's broker seams (PRD #1867),
 	// defaulting to pushbroker.CreateSalvageRef / pushbroker.DeleteRef (set in New); tests
 	// stub them. salvagePassBudget overrides the pass's wall-clock budget (zero = the
-	// 10s salvagePassBudgetDefault); tests shorten it.
-	createSalvageFn   func(ctx context.Context, o pushbroker.CreateSalvageRefOptions) (pushbroker.SalvageResult, error)
-	deleteSalvageFn   func(ctx context.Context, o pushbroker.DeleteRefOptions) error
-	salvagePassBudget time.Duration
+	// 10s salvagePassBudgetDefault); tests shorten it. salvageLeadPending is which due
+	// list leads the next pass's round-robin (false = expiries), flipped every pass.
+	createSalvageFn    func(ctx context.Context, o pushbroker.CreateSalvageRefOptions) (pushbroker.SalvageResult, error)
+	deleteSalvageFn    func(ctx context.Context, o pushbroker.DeleteRefOptions) error
+	salvagePassBudget  time.Duration
+	salvageLeadPending bool
 	// background dispatches a best-effort forge side-effect off the request/report
 	// goroutine so a slow/down forge can never delay or wedge the caller (PRD #1030
 	// M4's checkpoint delete). Defaults to `go fn()` (set in New); tests override it

@@ -42,7 +42,7 @@ describe("SalvagePanel per-state copy", () => {
       "Not saved",
     ],
     ["refused", "No copy saved: a different commit already holds this run's salvage ref.", "Not saved"],
-    ["failed", "No copy saved after repeated attempts.", "Not saved"],
+    ["failed", "Salvage stopped after repeated attempts.", "Not saved"],
     ["skipped_secret", "Not saved: this run failed on a secret-scan block.", "Not saved"],
     ["expired", "The saved copy expired and was removed.", "Expired"],
     ["disabled", "Not saved: salvage was turned off for this forge before a copy was made.", "Off"],

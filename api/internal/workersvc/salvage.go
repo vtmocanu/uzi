@@ -39,14 +39,18 @@ const (
 	// budget + salvageWriteTimeout (15s) stays within the default SWEEP_INTERVAL (15s).
 	salvagePassBudgetDefault = 10 * time.Second
 	// salvageMaxItems caps the broker items handled per pass, round-robin between due
-	// expiries and due pending rows so neither starves the other.
+	// expiries and due pending rows. Which list leads alternates per pass
+	// (Service.salvageLeadPending), so a single due row of either kind whose remote hangs
+	// for the whole pass budget cannot starve the other list.
 	salvageMaxItems = 5
 	// salvageEnqueueLimit bounds the candidate rows one pass records.
 	salvageEnqueueLimit = 50
 	// salvageAttemptCap: a pending row with no RECORDED salvage ref becomes 'failed' at this
 	// many failed attempts (RecordSalvageAttemptFailed). The cap-reaching attempt makes no
-	// create: it runs only the orphan cleanup (deleteUnrecordedSalvage), on the full pass
-	// budget, and caps the row only once that cleanup has succeeded.
+	// create: it runs only the orphan cleanup (deleteUnrecordedSalvage), on whatever pass
+	// budget remains when its turn comes, and caps the row only once that cleanup has
+	// succeeded. A cleanup cut off by the budget is recorded as an uncapped attempt; a row
+	// the pass never reached is not written, keeps its updated_at and sorts first next pass.
 	salvageAttemptCap = 10
 	// salvageRetryBackoff: a pending row with no recorded salvage ref that is already at or
 	// past salvageAttemptCap (its cleanup keeps failing) is retried at most once per this
@@ -60,7 +64,10 @@ const (
 	salvageHardCeiling = 3 * salvageAttemptCap
 	// salvagePendingScanLimit bounds the pending rows one pass reads. Rows inside their
 	// salvageRetryBackoff are filtered out in Go before the salvageMaxItems budget is
-	// applied, so a backlog of backed-off rows does not starve the due ones.
+	// applied, so backed-off rows inside the scan do not take item slots. The filter runs
+	// after the LIMIT, though: when more than 50 backed-off rows sort ahead of a due row,
+	// that row waits until some of them leave their backoff, up to about the 1h
+	// salvageRetryBackoff.
 	salvagePendingScanLimit = 50
 	// salvageNoCap is the cap passed to RecordSalvageAttemptFailed when an attempt must be
 	// counted and its error recorded WITHOUT settling the row 'failed': the orphan cleanup
@@ -101,7 +108,9 @@ const (
 //     push_secret_blocked run is recorded 'skipped_secret' (no pointer, never a broker
 //     call); every other one 'pending'. A 23503 on the insert (the run was deleted first)
 //     is a benign skip.
-//  2. At most salvageMaxItems items, alternating due expiries and due pending rows:
+//  2. At most salvageMaxItems items, alternating due expiries and due pending rows. The
+//     list that leads alternates per pass (expiry on the first pass, then pending), so a
+//     hanging remote on one list's head row costs the other list at most every other pass:
 //     - expiry: DeleteRef on refs/uzi-salvage/<run-id> at the recorded tip; success
 //     (deleted, absent or moved) settles 'expired', an error is recorded and retried.
 //     Expiry runs whatever SalvageForges says: a promoted row on a forge that has since
@@ -112,8 +121,11 @@ const (
 //     else (including an SSRF, claim-context or PAT failure) counts a failed attempt.
 //     - pending, forge enabled, the attempt that reaches salvageAttemptCap: NO create. It
 //     runs only the orphan cleanup (deleteUnrecordedSalvage) and records the capped
-//     failure ('failed') once that succeeds, so a create that burns the pass budget can
-//     never starve the cleanup of the attempt meant to cap the row.
+//     failure ('failed') once that succeeds, so this row's own create can never burn the
+//     budget its capping cleanup needs. The cleanup still runs on whatever pass budget
+//     remains when the row's turn comes, not on a fresh one: cut off, it is recorded as an
+//     uncapped attempt and retried; a row the pass never reached is not written at all,
+//     keeps its updated_at and sorts first next pass.
 //     - pending, forge no longer enabled (a rollback): CAS-deletes any unrecorded salvage
 //     ref (deleteUnrecordedSalvage), then settles 'disabled'. 'disabled' is reached ONLY
 //     from a pending row with no recorded salvage ref; a promoted (or half-promoted) row
@@ -242,9 +254,13 @@ func (s *Service) processSalvage(ctx context.Context, now time.Time) (int64, err
 		}
 	}
 
+	// The sweeper runs SweepSalvage serially from one goroutine, so this toggle needs no lock.
+	leadPending := s.salvageLeadPending
+	s.salvageLeadPending = !leadPending
+
 	var touched int64
 	var errs []error
-	for _, it := range roundRobinSalvage(expiry, pending, salvageMaxItems) {
+	for _, it := range roundRobinSalvage(expiry, pending, salvageMaxItems, leadPending) {
 		if ctx.Err() != nil {
 			break // budget spent: the rest waits for the next tick
 		}
@@ -267,15 +283,21 @@ func salvageBackedOff(row store.RunSalvage, now time.Time) bool {
 		row.UpdatedAt.Valid && row.UpdatedAt.Time.After(now.Add(-salvageRetryBackoff))
 }
 
-// roundRobinSalvage alternates expiry and pending rows (expiry first), at most limit.
-func roundRobinSalvage(expiry, pending []store.RunSalvage, limit int) []salvageItem {
+// roundRobinSalvage alternates expiry and pending rows, at most limit. Expiry rows take
+// the first turn unless leadPending is set, in which case pending rows do.
+func roundRobinSalvage(expiry, pending []store.RunSalvage, limit int, leadPending bool) []salvageItem {
+	first, second := expiry, pending
+	firstExpiry := true
+	if leadPending {
+		first, second, firstExpiry = pending, expiry, false
+	}
 	out := make([]salvageItem, 0, limit)
-	for i := 0; len(out) < limit && (i < len(expiry) || i < len(pending)); i++ {
-		if i < len(expiry) {
-			out = append(out, salvageItem{row: expiry[i], expiry: true})
+	for i := 0; len(out) < limit && (i < len(first) || i < len(second)); i++ {
+		if i < len(first) {
+			out = append(out, salvageItem{row: first[i], expiry: firstExpiry})
 		}
-		if i < len(pending) && len(out) < limit {
-			out = append(out, salvageItem{row: pending[i]})
+		if i < len(second) && len(out) < limit {
+			out = append(out, salvageItem{row: second[i], expiry: !firstExpiry})
 		}
 	}
 	return out

@@ -52,7 +52,7 @@ const STATE_VIEWS: Record<string, StateView> = {
   failed: {
     badge: "Not saved",
     tone: "danger",
-    lead: "No copy saved after repeated attempts.",
+    lead: "Salvage stopped after repeated attempts.",
   },
   skipped_secret: {
     badge: "Not saved",

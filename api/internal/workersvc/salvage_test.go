@@ -7,6 +7,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -170,11 +171,14 @@ type salvageBroker struct {
 	block     bool
 	// blockRes: a blocked create returns its configured result once ctx is done (the
 	// forge applied it but the reply arrived after the pass budget), not a failure.
-	blockRes  bool
-	deleteErr error
-	creates   []pushbroker.CreateSalvageRefOptions
-	deletes   []pushbroker.DeleteRefOptions
-	order     []string
+	blockRes bool
+	// blockDelete: every DeleteRef hangs until ctx is done (a remote that stalls rather
+	// than failing fast).
+	blockDelete bool
+	deleteErr   error
+	creates     []pushbroker.CreateSalvageRefOptions
+	deletes     []pushbroker.DeleteRefOptions
+	order       []string
 }
 
 func (b *salvageBroker) create(ctx context.Context, o pushbroker.CreateSalvageRefOptions) (pushbroker.SalvageResult, error) {
@@ -207,10 +211,13 @@ func (b *salvageBroker) delete(ctx context.Context, o pushbroker.DeleteRefOption
 	b.deletes = append(b.deletes, o)
 	b.order = append(b.order, "delete:"+id)
 	boom := b.panicOn[uuid.MustParse(id)]
-	err := b.deleteErr
+	err, block := b.deleteErr, b.blockDelete
 	b.mu.Unlock()
 	if boom {
 		panic("go-git nil deref deleting " + id + " via " + o.PAT)
+	}
+	if block {
+		<-ctx.Done()
 	}
 	if cerr := ctx.Err(); cerr != nil {
 		return cerr
@@ -902,8 +909,9 @@ func TestSweepSalvageClaimContextErrorIsAttemptFailure(t *testing.T) {
 	}
 }
 
-// TestSweepSalvageRoundRobinAtMostFive: with 4 due expiries and 4 due pending rows the
-// pass handles exactly 5, alternating expiry and pending, expiry first.
+// TestSweepSalvageRoundRobinAtMostFive: with 4 due expiries and 4 due pending rows each
+// pass handles exactly 5, alternating expiry and pending. The first pass leads with
+// expiry, the next with pending.
 func TestSweepSalvageRoundRobinAtMostFive(t *testing.T) {
 	var exp, pend []store.RunSalvage
 	for range 4 {
@@ -926,25 +934,79 @@ func TestSweepSalvageRoundRobinAtMostFive(t *testing.T) {
 	if strings.Join(b.order, " ") != strings.Join(want, " ") {
 		t.Fatalf("broker order =\n  %v\nwant\n  %v", b.order, want)
 	}
+	// The fake due lists do not shrink, so the second pass sees the same rows.
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("second SweepSalvage: %v", err)
+	}
+	want2 := []string{
+		"create:" + pend[0].RunID.String(), "delete:" + exp[0].RunID.String(),
+		"create:" + pend[1].RunID.String(), "delete:" + exp[1].RunID.String(),
+		"create:" + pend[2].RunID.String(),
+	}
+	if got := b.order[len(want):]; strings.Join(got, " ") != strings.Join(want2, " ") {
+		t.Fatalf("second-pass broker order =\n  %v\nwant\n  %v", got, want2)
+	}
 	if fs.expiryParams[0].Lim != salvageMaxItems || fs.pendingParams[0].Lim != salvagePendingScanLimit {
 		t.Errorf("due-list limits = (%d, %d), want (%d, %d)", fs.expiryParams[0].Lim, fs.pendingParams[0].Lim, salvageMaxItems, salvagePendingScanLimit)
 	}
 }
 
-// TestSweepSalvageRoundRobinOneSided: only pending rows still yields at most five.
+// TestSweepSalvageRoundRobinOneSided: only one list's rows still yields at most five, in
+// order and with the right kind, whichever list leads.
 func TestSweepSalvageRoundRobinOneSided(t *testing.T) {
-	var pend []store.RunSalvage
+	var rows []store.RunSalvage
 	for range 7 {
-		pend = append(pend, pendingSalvageRow("github"))
+		rows = append(rows, pendingSalvageRow("github"))
 	}
-	got := roundRobinSalvage(nil, pend, salvageMaxItems)
-	if len(got) != salvageMaxItems {
-		t.Fatalf("items = %d, want %d", len(got), salvageMaxItems)
-	}
-	for i, it := range got {
-		if it.expiry || it.row.RunID != pend[i].RunID {
-			t.Fatalf("item %d = %+v, want pending row %d in order", i, it, i)
+	for _, lead := range []bool{false, true} {
+		for _, expiry := range []bool{false, true} {
+			var got []salvageItem
+			if expiry {
+				got = roundRobinSalvage(rows, nil, salvageMaxItems, lead)
+			} else {
+				got = roundRobinSalvage(nil, rows, salvageMaxItems, lead)
+			}
+			if len(got) != salvageMaxItems {
+				t.Fatalf("lead=%v expiry=%v: items = %d, want %d", lead, expiry, len(got), salvageMaxItems)
+			}
+			for i, it := range got {
+				if it.expiry != expiry || it.row.RunID != rows[i].RunID {
+					t.Fatalf("lead=%v expiry=%v: item %d = %+v, want row %d in order", lead, expiry, i, it, i)
+				}
+			}
 		}
+	}
+}
+
+// TestSweepSalvageHangingExpiryDoesNotStarvePending: a due expiry whose remote hangs
+// burns the whole pass budget. The lead alternates per pass, so a due pending row (here
+// at cap-1, so its turn is the capping cleanup) still gets its turn within two passes.
+func TestSweepSalvageHangingExpiryDoesNotStarvePending(t *testing.T) {
+	exp := promotedSalvageRow("github")
+	pend := pendingSalvageRow("github")
+	pend.Attempts = salvageAttemptCap - 1
+	fs := &salvageStore{dueExpiry: []store.RunSalvage{exp}, duePending: []store.RunSalvage{pend}}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	svc.salvagePassBudget = 50 * time.Millisecond
+	b.blockDelete = true
+
+	for pass := range 2 {
+		if _, err := svc.SweepSalvage(context.Background()); err != nil {
+			t.Fatalf("pass %d: SweepSalvage: %v", pass, err)
+		}
+	}
+	if !slices.Contains(b.order, "delete:"+pend.RunID.String()) {
+		t.Fatalf("broker order = %v; the pending row never got its turn in two passes", b.order)
+	}
+	var pendingAttempted bool
+	for _, a := range fs.attempts {
+		pendingAttempted = pendingAttempted || a.RunID == pend.RunID
+	}
+	if !pendingAttempted {
+		t.Fatalf("attempts = %+v; want the pending row's capping attempt recorded", fs.attempts)
+	}
+	if len(fs.expireFailed) == 0 {
+		t.Errorf("the hanging expiry's timeout was not recorded")
 	}
 }
 
