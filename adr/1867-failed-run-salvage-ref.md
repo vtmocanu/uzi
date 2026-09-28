@@ -281,7 +281,7 @@ its own right:
   interval), so salvage still **almost always** settles such a row
   `unavailable`. The exception is a terminal writer that dispatches no
   background settle and runs after the reconcile or outside the sweep
-  (auto-stop, claim-assembly failure, Codex account-wait failure): its
+  (auto-stop, Codex account-wait failure): its
   `settling` record waits for the next tick's reconcile, which runs after
   that tick's `SweepSalvage`, so salvage usually copies such an unheld
   run's ref before #1810 deletes it. Otherwise salvage produces a copy only

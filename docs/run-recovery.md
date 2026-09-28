@@ -374,7 +374,7 @@ looks, so salvage almost always settles that run `unavailable` — there is noth
 left for it to verify and copy. Salvage produces a copy only for a run whose
 custody hold is still open when the sweep runs (or, occasionally, an older
 run whose ref happened to survive from before this feature existed, or a run
-failed by auto-stop, a claim-assembly failure or a Codex account wait, whose
+failed by auto-stop or a Codex account wait, whose
 ref custody retention deletes a little later). If you
 need a run's checkpoint and no salvage copy exists, check whether a
 [retained checkpoint or recovery ref](#where-the-work-is-kept) is still
