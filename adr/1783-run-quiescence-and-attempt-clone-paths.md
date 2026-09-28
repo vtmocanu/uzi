@@ -511,12 +511,12 @@ not built here; it is Follow-up 5 in *Follow-ups and accepted risks* below.
 (recorded after the final acceptance run, following the #1826 merge)
 
 **This is mounted-source validation**, not a fresh image build. It covers the
-code up to `34b6b6c8`, the final code commit when it ran; rework 3 changed
-`agent/src` after it (see *Not re-run after rework 3* at the end of this
-section). The merge `d82789ad` (origin/main
+code up to `34b6b6c8`, the final code commit when it ran; `agent/src` has
+changed since (see *Not re-run after rework 3* at the end of this section). The merge `d82789ad` (origin/main
 `1d4ba878113fc113a7d52778054e83a46b53e269`) and `34b6b6c8` both change
-`agent/src`, so acceptance was re-run over that code. Later commits change only
-this ADR (`git diff --stat 34b6b6c8 8249dec9 -- agent/src e2e` is empty).
+`agent/src`, so acceptance was re-run over that code. The commits up to
+`8249dec9` changed only this ADR (`git diff --stat 34b6b6c8 8249dec9 -- agent/src
+e2e` is empty).
 
 The shared Docker daemon had 10.2G free of its fixed 29.4G pool, which is not
 enough for a fresh build of the ~8.75GB worker base image. (Earlier fresh builds
@@ -534,7 +534,7 @@ CQ_MOUNT_SRC=1 CQ_TIMEOUT=900 task test:clone-quiescence` → exit 0.
   bind-mounted read-only).
 
 Image inputs outside the mounted `agent/src` and `e2e/`, build SHA against the
-final code commit: `git diff --stat 3692a3801e4ca11759f34b41d40f0acc8a4e097f
+accepted code commit `34b6b6c8`: `git diff --stat 3692a3801e4ca11759f34b41d40f0acc8a4e097f
 34b6b6c8 -- agent/templates agent/package.json agent/package-lock.json
 agent/bin agent/codex agent/devbox-global agent/tsconfig.json` is empty. That
 covers each of the following:
@@ -565,10 +565,11 @@ PASS lines (tests 7, pass 7, fail 0, cancelled 0, skipped 0):
 
 ### Not re-run after rework 3 (the hermetic-test and bounded-capture rework)
 
-Rework 3 changed `agent/src` again (`run-quiescence.ts`: the test-only process-table
-view, the pid and comm in the operator reason; `runner.ts`: the bounded
-recovery-capture retry), so the acceptance above no longer covers the final code
-commit. `task test:clone-quiescence` was **not re-run** for it: the shared Docker
+`agent/src` changed after `8249dec9`: the two pr_summary spawn-site fixes
+(`8fbaf2a5`, `27bd3789`), two merges of origin/main (`7675a2b1`, `61f4c8e4`), and
+rework 3 (`run-quiescence.ts`: the test-only process-table view, the pid and comm
+in the operator reason; `runner.ts`: the bounded recovery-capture retry). The
+acceptance above therefore no longer covers the final code commit. `task test:clone-quiescence` was **not re-run** for it: the shared Docker
 daemon no longer held any image built from `agent/templates/base/Dockerfile`
 (neither the `uzi-agent-codex-git-trust:base` used above nor the script's own
 default tag), so the mounted-source fallback had nothing to mount into, and with
