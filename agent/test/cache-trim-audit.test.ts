@@ -65,8 +65,9 @@ describe("trim LIST helper: names with control characters never forge protocol l
     fs.mkdirSync(path.join(home, GB, "0a", forged));
     fs.utimesSync(path.join(home, GB, "0a", forged), T0 - 200 * 3600, T0 - 200 * 3600);
 
-    const { units } = await listGoBuildUnits(home, 1 << 30);
+    const { units, truncated } = await listGoBuildUnits(home, 1 << 30);
     assert.ok(!units.some((u) => u.rel === "README"), `README must never be a unit: ${JSON.stringify(units.map((u) => u.rel))}`);
+    assert.strictEqual(truncated, true, "a pass that skipped a control-character name reports itself incomplete");
     const control = (x: string): boolean => [...x].some((ch) => ch.charCodeAt(0) < 0x20);
     assert.ok(!units.some((u) => control(u.rel)), "no unit carries a control character");
 
@@ -78,6 +79,16 @@ describe("trim LIST helper: names with control characters never forge protocol l
     });
     assert.ok(fs.existsSync(readme), "Go's README survives the trim");
     assert.ok(fs.existsSync(path.join(home, GB, "0a", forged)), "the planted entry is not a unit and is left alone");
+  });
+
+  it("a go-build listing with no control-character name is not truncated (the flag does not over-reach)", async (t) => {
+    if (!HAS_PROC_FD) return t.skip(skipReason);
+    put(path.join(GB, "README"), 64, -100);
+    put(path.join(GB, "0a", "0000000a-a"), 4096, 5);
+    fs.mkdirSync(path.join(home, GB, "0b", "0000000b-d"), { recursive: true });
+    const { units, truncated } = await listGoBuildUnits(home, 1 << 30);
+    assert.strictEqual(truncated, false);
+    assert.deepStrictEqual(units.map((u) => u.rel).sort(), ["0a/0000000a-a", "0b/0000000b-d"]);
   });
 
   it("a forged H line inside a bucket name cannot make a truncated npm listing complete", async (t) => {

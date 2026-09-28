@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
-import { type ExecutorResult, type RunContext, StubExecutor } from "../src/executor.js";
+import { type Executor, type ExecutorResult, type RunContext, StubExecutor } from "../src/executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
 import { LimitReachedError } from "../src/limit.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
@@ -13,10 +13,12 @@ import { nullLogger, recordingLogger } from "./helpers.js";
 import {
   api,
   fakeGitlab,
+  git,
   gitlabClaim,
   input,
   installHarness,
   planThenDoneQuery,
+  runner,
   runnerWith,
   simulateCommittedWork,
 } from "./runner-harness.js";
@@ -175,6 +177,72 @@ describe("RunRunner — cache drop on a process-ending park (PRD #1809 M1)", () 
     } finally {
       forceRm(homeRoot);
     }
+  });
+
+  it("a process-ending park reaps the run's attributed processes BEFORE its cache drop (N-a)", async (t) => {
+    if (!fs.existsSync("/proc/self/fd")) return t.skip("no /proc/self/fd on this host: the cache drop refuses here by design");
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-reap-"));
+    try {
+      let home = "";
+      const events: string[] = [];
+      let cachesAtReap: boolean[] = [];
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (): Promise<ExecutorResult> => {
+              seedHome(home);
+              throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+            },
+            killAgentTree: () => events.push("kill"),
+            reapAttributedProcesses: async () => {
+              events.push("reap");
+              cachesAtReap = CACHES.map((rel) => fs.existsSync(path.join(home, rel)));
+            },
+          },
+        };
+      };
+      const runId = "18090000-0000-4000-8000-000000001813";
+      await runnerWith(factory, gitlab).execute(gitlabClaim(1813, { run_id: runId, wait_on_limit: true }));
+      assert.ok(api.states.some((s) => s.runId === runId && s.body.status === "limit_wait"), "precondition: parked");
+      assert.ok(events.includes("reap"), `the attributed reap ran (${JSON.stringify(events)})`);
+      assert.deepStrictEqual(cachesAtReap, [true, true, true], "it ran while the caches were still there: before the drop");
+      assertCachesDropped(home);
+      assertResumeStateKept(home);
+    } finally {
+      forceRm(homeRoot);
+    }
+  });
+
+  it("the finalize security reap awaits the attributed reap BEFORE the PAT-bearing push (N-a)", async () => {
+    const { gitlab } = fakeGitlab();
+    simulateCommittedWork();
+    const events: string[] = [];
+    const exec: Executor = {
+      run: async (ctx) => ({ branch: ctx.branch }),
+      killAgentTree: () => events.push("kill"),
+      reapAttributedProcesses: async () => {
+        // Resolves on a later tick: a push that did not await it would be recorded first.
+        await new Promise((r) => setTimeout(r, 20));
+        events.push("reap");
+      },
+    };
+    const origPush = git.pushBranch.bind(git);
+    (git as unknown as { pushBranch: unknown }).pushBranch = async (...args: unknown[]) => {
+      events.push("push");
+      return (origPush as (...a: unknown[]) => Promise<void>)(...args);
+    };
+    try {
+      await runner(exec, gitlab).execute(gitlabClaim(1814));
+    } finally {
+      (git as unknown as { pushBranch: unknown }).pushBranch = origPush;
+    }
+    const first = (e: string) => events.indexOf(e);
+    assert.ok(first("reap") >= 0 && first("push") >= 0, JSON.stringify(events));
+    assert.ok(first("kill") < first("reap"), `the group kill, then the attributed reap (${JSON.stringify(events)})`);
+    assert.ok(first("reap") < first("push"), `the attributed reap finished before the push (${JSON.stringify(events)})`);
   });
 
   it("a worker-shutdown interrupt (preserveSession only) keeps the caches", async () => {

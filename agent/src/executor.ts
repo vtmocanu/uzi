@@ -783,8 +783,9 @@ export interface Executor {
    * PRD #1809 D4: SIGKILL the run's processes that {@link killAgentTree}'s process-group reap
    * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
    * every live process attributed to the run by `HOME` or working directory (run-procs.ts). The
-   * mid-run disk parks await it right after killAgentTree. Never rejects. Absent on the stub/test
-   * and Codex executors.
+   * runner awaits it right after killAgentTree at the mid-run disk parks, before every park cache
+   * drop (D2), and at the finalize security reap before the push. Never rejects. Absent on the
+   * stub/test and Codex executors.
    */
   reapAttributedProcesses?(): Promise<void>;
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;

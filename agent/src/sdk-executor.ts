@@ -449,13 +449,14 @@ export interface SdkExecutorOptions {
 
 /** PRD #1809 D4: the run-process attribution the executor uses (see run-procs.ts). */
 export interface RunProcessOps {
-  scan: (home: string, worktree: string | undefined) => Promise<RunProcessScan>;
-  reap: (home: string, worktree: string | undefined) => Promise<RunProcessReap>;
+  /** `spawnedPids`: the run's live CLI pids, which link an unreadable descendant to the run. */
+  scan: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessScan>;
+  reap: (home: string, worktree: string | undefined, spawnedPids: readonly number[]) => Promise<RunProcessReap>;
 }
 
 const defaultRunProcesses: RunProcessOps = {
-  scan: (home, worktree) => scanRunProcesses(home, worktree),
-  reap: (home, worktree) => reapRunProcesses(home, worktree),
+  scan: (home, worktree, spawnedPids) => scanRunProcesses(home, worktree, spawnedPids),
+  reap: (home, worktree, spawnedPids) => reapRunProcesses(home, worktree, spawnedPids),
 };
 
 /**
@@ -818,12 +819,14 @@ export class SdkExecutor implements Executor {
   /**
    * PRD #1809 D4: SIGKILL every live process attributed to this run by environment (`HOME` = this
    * run's HOME) or working directory (inside the run's worktree or HOME), each by exact pid as the
-   * uid that owns it, re-verified immediately before the kill (run-procs.ts). The disk parks call
-   * it right after {@link killAgentTree}: the pinned CLI spawns every Bash command detached (its own
-   * session and process group), so a backgrounded build survives the group kill. Never throws.
+   * uid that owns it, re-verified immediately before the kill (run-procs.ts). The runner calls it
+   * right after {@link killAgentTree} wherever that reap must be complete: the disk parks, every
+   * park whose HOME cache drop runs, and the finalize security reap before the push. The pinned CLI
+   * spawns every Bash command detached (its own session and process group), so a backgrounded
+   * build survives the group kill. Never throws.
    */
   async reapAttributedProcesses(): Promise<void> {
-    const r = await this.runProcesses.reap(this.homeDir, this.runWorktree).catch(
+    const r = await this.runProcesses.reap(this.homeDir, this.runWorktree, [...this.spawnedPids]).catch(
       (): RunProcessReap => ({ killed: [], left: [], complete: false }),
     );
     if (r.killed.length > 0 || r.left.length > 0 || !r.complete) {
@@ -3958,7 +3961,7 @@ export class SdkExecutor implements Executor {
       }
       if (!alive) {
         const scan = await this.runProcesses
-          .scan(this.homeDir, this.runWorktree)
+          .scan(this.homeDir, this.runWorktree, [...this.spawnedPids])
           .catch((): RunProcessScan => ({ pids: [], complete: false }));
         alive = !scan.complete || scan.pids.length > 0;
       }

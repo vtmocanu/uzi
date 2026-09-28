@@ -9,15 +9,31 @@
 // run when its `/proc/<pid>/environ` holds the exact entry `HOME=<runHome>`, or when its working
 // directory is inside the run's worktree or HOME.
 //
-// The scan runs as the agent uids (the uids that own the run's processes) through the same wrappers
-// as the rmtree.ts helpers: under the uid split as `runner`, then `runner-cmd`; single-uid directly
-// as the worker. A process's `environ` and `cwd` are readable by its own uid, so each pass looks
-// only at processes of its own uid; one of those it cannot read (non-dumpable, or a read racing its
-// exit that did not end in ESRCH/ENOENT) is ATTRIBUTED (fail closed: "not quiet"), while a pid that
-// is gone is skipped. Every pass is bounded: a streamed read of `/proc`, at most `maxPids` pids, and
-// an in-script wall-time budget (the worker cannot kill a helper under the split, see rmtree.ts).
+// Only the `runner` uid is scanned. This is the Claude executor's attribution, and the Claude CLI is
+// spawned as `runner` (sdk-spawn.ts spawnDetached -> runner-uid.ts runnerSpawn: setpriv to `runner`
+// under the uid split); its Bash tool commands are the CLI's own children, so they are `runner` too.
+// `runner-cmd` is the Codex command-root uid (runner-uid.ts commandRootCommand) and no Claude process
+// runs as it. Single-uid, the one pass runs directly as the worker's uid.
+//
+// A process's `environ` and `cwd` are readable by its own uid only while it is dumpable. A
+// NON-DUMPABLE process (the Codex supervisor and its cache holder, ssh-agent, gpg-agent) reads EACCES
+// even for its own uid, so "unreadable" alone says nothing about whose it is: counting every such
+// process as the run's would let any unrelated one keep every run "not quiet". An unreadable process
+// therefore counts as the run's ONLY when something readable links it to the run, through its
+// world-readable `stat`: its session or process group is that of a readable-attributed process of
+// this run (never the worker's own session or group), or its parent chain (walked up through `stat`,
+// bounded) reaches a readable-attributed process or one of the run's CLI pids. Otherwise it is
+// skipped. A pid that is gone is skipped. Every pass is bounded: a streamed read of `/proc`, at most
+// `maxPids` pids, and an in-script wall-time budget (the worker cannot kill a helper under the
+// split, see rmtree.ts).
+//
+// A proc mount with `hidepid` (other than 0/off) or `subset=` hides processes from the scan, a
+// non-dumpable same-uid one among them. As the Codex supervisor's procscan.go does, the helper checks
+// the mount first; a hiding mount, or one it cannot confirm, makes the scan incomplete (unknown, so
+// not quiet). The reap still kills what it can see.
 
-import { type CommandWrapper, agentWrappers, runAgentHelper } from "./rmtree.js";
+import { type CommandWrapper, runAgentHelper } from "./rmtree.js";
+import { runnerCommand } from "./runner-uid.js";
 
 /** Pids one pass may look at before it stops (and says the scan is incomplete). */
 const MAX_PIDS = 200_000;
@@ -26,41 +42,55 @@ const SCAN_BUDGET_MS = 10_000;
 /** A reap pass's own wall-time budget (it scans, kills and scans again). */
 const REAP_BUDGET_MS = 20_000;
 const HELPER_SLACK_MS = 5_000;
+/** The run's CLI pids handed to one pass, at most. */
+const MAX_SPAWNED = 64;
 
 /**
  * The attribution helper, as `node -e <script> <mode> <procRoot> <home> <worktree|-> <maxPids>
- * <budgetMs> <workerPid>`.
+ * <budgetMs> <workerPid> <spawnedPids|->` (`spawnedPids`: the run's CLI pids, comma-separated).
+ *
+ * First it reads `<procRoot>/self/mountinfo` and finds every mount whose mount point is
+ * `<procRoot>`: there must be one, and each must be a `proc` mount with no `hidepid` other than
+ * 0/off and no `subset=`, in its per-mount or its super-block options (`procMount`: `ok`, `hidden`,
+ * or `unknown` when it cannot tell).
  *
  * For each numeric entry of `<procRoot>` (streamed, never listed whole) it reads `status` (the Uid
- * line and State) and `stat` (ppid and start time). A process whose real or effective uid is not
- * this helper's is not this pass's to judge and is skipped; a zombie (or dead) process holds no
- * files and is skipped; the helper itself and `<workerPid>` are skipped. Otherwise it reads
- * `environ` (at most 4 MiB, bounded reads) and `cwd`:
+ * line and State) and `stat` (ppid, process group, session and start time). A process whose real or
+ * effective uid is not this helper's is not this pass's to judge and is skipped; a zombie (or dead)
+ * process holds no files and is skipped; the helper itself and `<workerPid>` are skipped. Otherwise
+ * it reads `environ` (at most 4 MiB, bounded reads) and `cwd`:
  *  - `home`: environ holds the NUL-separated entry `HOME=<home>` exactly;
  *  - `cwd`: the working directory is `<home>` or `<worktree>` or inside either;
- *  - `unreadable`: either read failed while the pid still exists, or environ is over 4 MiB;
+ *  - `unreadable`: either read failed while the pid still exists, or environ is over 4 MiB. It is
+ *    attributed only when LINKED (see the file comment): its session or process group is one of a
+ *    `home`/`cwd` process's (never the worker's own, never 0 or 1), or its parent chain (at most 64
+ *    steps up, through any uid's `stat`, stopping at pid 1 or `<workerPid>`) reaches a `home`/`cwd`
+ *    process or a `<spawnedPids>` pid. An unlinked one is skipped;
  *  - otherwise not the run's; a pid that vanished mid-read is skipped.
  *
  * Mode `scan` prints `A\t<pid>\t<why>` per attributed process. Mode `kill` SIGKILLs every process
  * attributed by `home` or `cwd` (never an `unreadable` one: that is not known to be the run's, and
  * never a direct child of `<workerPid>`: the worker's own git or helper children), in rounds until a
- * round kills nothing (at most 5): immediately before each kill it re-reads `stat` and requires the
- * same start time (a recycled pid has another), and re-reads `environ`/`cwd` and requires the
- * attribution again; it prints `K\t<pid>\t<why>` per kill, then the last round's survivors as `A`
- * lines. Both modes end with ONE `H\t<json>` summary (`scanned`, `truncated`: the pid or time budget
- * ran out, `unresolved`: pids whose uid could not be read). Exit 0; 6 on bad arguments; 7 when
- * `<procRoot>` cannot be read.
+ * round kills nothing (at most 5; the links found in earlier rounds are kept, so a linked process
+ * whose linking parent was just killed stays linked): immediately before each kill it re-reads
+ * `stat` and requires the same start time (a recycled pid has another), and re-reads
+ * `environ`/`cwd` and requires the attribution again; it prints `K\t<pid>\t<why>` per kill, then the
+ * last round's survivors as `A` lines. Both modes end with ONE `H\t<json>` summary (`scanned`,
+ * `truncated`: the pid or time budget ran out, `unresolved`: pids whose uid could not be read,
+ * `procMount`). Exit 0; 6 on bad arguments; 7 when `<procRoot>` cannot be read.
  */
 const RUN_PROCS_SCRIPT = `
 const fs = require("node:fs");
 const C = fs.constants;
-const [mode, root, home, worktree, maxArg, budgetArg, workerArg] = process.argv.slice(1);
+const [mode, root, home, worktree, maxArg, budgetArg, workerArg, spawnedArg] = process.argv.slice(1);
 const maxPids = Number(maxArg);
 const budgetMs = Number(budgetArg);
 const workerPid = Number(workerArg);
 const abs = (p) => typeof p === "string" && p.startsWith("/") && p.length > 1;
 if ((mode !== "scan" && mode !== "kill") || !abs(root) || !abs(home) || (worktree !== "-" && !abs(worktree))) process.exit(6);
 if (!(maxPids >= 0) || !(budgetMs >= 0) || !Number.isInteger(workerPid)) process.exit(6);
+if (typeof spawnedArg !== "string" || !/^(-|[1-9][0-9]*(,[1-9][0-9]*)*)$/.test(spawnedArg)) process.exit(6);
+const spawned = new Set(spawnedArg === "-" ? [] : spawnedArg.split(",").map(Number));
 const uid = process.getuid();
 const self = process.pid;
 const deadline = Date.now() + budgetMs;
@@ -68,6 +98,7 @@ const want = Buffer.from("HOME=" + home);
 const dirs = worktree === "-" ? [home] : [home, worktree];
 const inside = (p) => dirs.some((d) => p === d || p.startsWith(d + "/"));
 const ENV_MAX = 4 * 1024 * 1024;
+const MAX_DEPTH = 64;
 const w = (line) => process.stdout.write(line + "\\n");
 const gone = (e) => e && (e.code === "ENOENT" || e.code === "ESRCH");
 // Read at most max + 1 bytes; null when there are more than max.
@@ -89,7 +120,55 @@ function readBounded(p, max) {
     fs.closeSync(fd);
   }
 }
+// The proc mount must not hide processes (hidepid, subset): "ok" | "hidden" | "unknown".
+function procMount() {
+  let text;
+  try {
+    const b = readBounded(root + "/self/mountinfo", ENV_MAX);
+    if (b === null) return "unknown";
+    text = b.toString("latin1");
+  } catch {
+    return "unknown";
+  }
+  const unesc = (s) => s.replace(/\\\\([0-7]{3})/g, (_, o) => String.fromCharCode(parseInt(o, 8)));
+  let found = false;
+  for (const line of text.split("\\n")) {
+    if (line === "") continue;
+    const cut = line.indexOf(" - ");
+    if (cut < 0) return "unknown";
+    const lf = line.slice(0, cut).split(" ").filter((x) => x !== "");
+    const rf = line.slice(cut + 3).split(" ").filter((x) => x !== "");
+    if (lf.length < 6 || rf.length < 3) return "unknown";
+    if (unesc(lf[4]) !== root) continue;
+    found = true;
+    if (rf[0] !== "proc") return "unknown";
+    for (const opts of [lf[5], rf[2]]) {
+      for (const opt of opts.split(",")) {
+        const eq = opt.indexOf("=");
+        const k = eq < 0 ? opt : opt.slice(0, eq);
+        const v = eq < 0 ? "" : opt.slice(eq + 1);
+        if ((k === "hidepid" && v !== "0" && v !== "off") || k === "subset") return "hidden";
+      }
+    }
+  }
+  return found ? "ok" : "unknown";
+}
 const exists = (pid) => { try { fs.lstatSync(root + "/" + pid); return true; } catch { return false; } };
+function parseStat(buf) {
+  const t = buf.toString("latin1");
+  const f = t.slice(t.lastIndexOf(")") + 2).split(" ");
+  if (f.length < 20) return undefined;
+  return { ppid: Number(f[1]), pgrp: Number(f[2]), session: Number(f[3]), start: f[19] };
+}
+// Any uid's stat fields (stat is world-readable), or undefined.
+function statOf(pid) {
+  try {
+    const b = readBounded(root + "/" + pid + "/stat", 65536);
+    return b === null ? undefined : parseStat(b);
+  } catch {
+    return undefined;
+  }
+}
 // undefined: vanished, not this uid's, or a zombie. "unknown": its uid could not be read.
 function info(pid) {
   let status, stat;
@@ -106,10 +185,7 @@ function info(pid) {
   if (Number(u[1]) !== uid && Number(u[2]) !== uid) return undefined;
   const st = /^State:\\s+(\\S)/m.exec(s);
   if (st && (st[1] === "Z" || st[1] === "X" || st[1] === "x")) return undefined;
-  const t = stat.toString("latin1");
-  const f = t.slice(t.lastIndexOf(")") + 2).split(" ");
-  if (f.length < 20) return "unknown";
-  return { ppid: Number(f[1]), start: f[19] };
+  return parseStat(stat) ?? "unknown";
 }
 function hasHome(buf) {
   let i = 0;
@@ -139,6 +215,23 @@ function attribution(pid) {
   }
   return unreadable ? "unreadable" : "none";
 }
+// The worker's own session and group never link: its git children, and whatever else shares them.
+const noLink = new Set([0, 1]);
+const workerStat = statOf(workerPid);
+if (workerStat) { noLink.add(workerStat.session); noLink.add(workerStat.pgrp); }
+// What links an unreadable process to the run; kept across the kill mode's rounds.
+const links = { pids: new Set(), sessions: new Set(), pgrps: new Set() };
+function linked(pi) {
+  if (links.sessions.has(pi.session) || links.pgrps.has(pi.pgrp)) return true;
+  let p = pi.ppid;
+  for (let d = 0; d < MAX_DEPTH && p > 1 && p !== workerPid; d++) {
+    if (links.pids.has(p) || spawned.has(p)) return true;
+    const up = statOf(p);
+    if (!up) return false;
+    p = up.ppid;
+  }
+  return false;
+}
 let scanned = 0, truncated = false, unresolved = 0;
 const spend = () => {
   if (truncated) return false;
@@ -149,6 +242,7 @@ const spend = () => {
 // One pass over the pids: [pid, why, info] for each attributed process.
 function round() {
   const found = [];
+  const unreadable = [];
   let dir;
   try { dir = fs.opendirSync(root); } catch { process.exit(7); }
   try {
@@ -165,13 +259,20 @@ function round() {
       if (pi === "unknown") { unresolved++; continue; }
       const why = attribution(pid);
       if (why === "gone" || why === "none") continue;
+      if (why === "unreadable") { unreadable.push([pid, why, pi]); continue; }
       found.push([pid, why, pi]);
+      links.pids.add(pid);
+      if (!noLink.has(pi.session)) links.sessions.add(pi.session);
+      if (!noLink.has(pi.pgrp)) links.pgrps.add(pi.pgrp);
     }
   } finally {
     dir.closeSync();
   }
+  // Judged after the whole listing, so a link to a process listed later is seen.
+  for (const u of unreadable) if (linked(u[2])) found.push(u);
   return found;
 }
+const mount = procMount();
 if (mode === "scan") {
   for (const [pid, why] of round()) w("A\\t" + pid + "\\t" + why);
 } else {
@@ -201,14 +302,15 @@ if (mode === "scan") {
   }
   for (const [pid, why] of left) w("A\\t" + pid + "\\t" + why);
 }
-w("H\\t" + JSON.stringify({ scanned, truncated, unresolved }));
+w("H\\t" + JSON.stringify({ scanned, truncated, unresolved, procMount: mount }));
 `;
 
 /** Test seams for {@link scanRunProcesses} / {@link reapRunProcesses}. */
 export interface RunProcsOptions {
-  /** The uids to run the passes as, in order (default: the measuring wrappers of rmtree.ts). */
+  /** The uids to run the passes as, in order (default: `runner` only, see the file comment). */
   wrappers?: readonly CommandWrapper[];
-  /** The proc root to read (default `/proc`); tests point it at a fake tree. */
+  /** The proc root to read (default `/proc`); tests point it at a fake tree, whose
+   *  `self/mountinfo` must then name it as a proc mount. */
   procRoot?: string;
   /** Pids one pass may look at (default {@link MAX_PIDS}). */
   maxPids?: number;
@@ -221,10 +323,12 @@ export interface RunProcsOptions {
 
 /** What one scan found. */
 export interface RunProcessScan {
-  /** Pids attributed to the run (by HOME, working directory, or an unreadable environ/cwd). */
+  /** Pids attributed to the run (by HOME, working directory, or an unreadable process linked to
+   *  one of those or to a CLI pid). */
   pids: number[];
-  /** Every pass ran to the end: no budget ran out, no uid was unreadable, no helper failed. A scan
-   *  that is not complete is "unknown", and unknown is not quiet. */
+  /** Every pass ran to the end: no budget ran out, no uid was unreadable, no helper failed, and
+   *  the proc mount hides nothing. A scan that is not complete is "unknown", and unknown is not
+   *  quiet. */
   complete: boolean;
 }
 
@@ -243,10 +347,12 @@ async function passes(
   mode: "scan" | "kill",
   home: string,
   worktree: string | undefined,
+  spawnedPids: readonly number[],
   opts: RunProcsOptions,
 ): Promise<{ attributed: number[]; killed: number[]; complete: boolean }> {
-  const wrappers = opts.wrappers ?? agentWrappers("measure");
+  const wrappers = opts.wrappers ?? [runnerCommand];
   const budgetMs = opts.budgetMs ?? (mode === "scan" ? SCAN_BUDGET_MS : REAP_BUDGET_MS);
+  const spawned = spawnedPids.filter((p) => Number.isSafeInteger(p) && p > 0).slice(0, MAX_SPAWNED);
   const attributed = new Set<number>();
   const killed = new Set<number>();
   let complete = true;
@@ -259,6 +365,7 @@ async function passes(
       String(opts.maxPids ?? MAX_PIDS),
       String(budgetMs),
       String(opts.workerPid ?? process.pid),
+      spawned.length > 0 ? spawned.join(",") : "-",
     ];
     let result;
     try {
@@ -273,14 +380,14 @@ async function passes(
       complete = false;
       continue;
     }
-    let summary: { truncated?: unknown; unresolved?: unknown };
+    let summary: { truncated?: unknown; unresolved?: unknown; procMount?: unknown };
     try {
       summary = JSON.parse(last.slice(2)) as typeof summary;
     } catch {
       complete = false;
       continue;
     }
-    if (summary.truncated !== false || summary.unresolved !== 0) complete = false;
+    if (summary.truncated !== false || summary.unresolved !== 0 || summary.procMount !== "ok") complete = false;
     for (const line of lines) {
       const f = line.split("\t");
       const pid = Number(f[1]);
@@ -298,12 +405,19 @@ async function passes(
 
 /**
  * PRD #1809 D4: the live processes attributed to a run (see the file comment): the cache cap's
- * quiet point needs none of them alive. Never throws: a helper that could not run, or a pass that
- * ran out of its budget, makes the scan incomplete, and the caller treats that as "not quiet".
+ * quiet point needs none of them alive. `spawnedPids` are the run's CLI pids, which link an
+ * unreadable descendant to the run. Never throws: a helper that could not run, a pass that ran out
+ * of its budget, or a proc mount that hides processes makes the scan incomplete, and the caller
+ * treats that as "not quiet".
  */
-export async function scanRunProcesses(home: string, worktree: string | undefined, opts: RunProcsOptions = {}): Promise<RunProcessScan> {
+export async function scanRunProcesses(
+  home: string,
+  worktree: string | undefined,
+  spawnedPids: readonly number[] = [],
+  opts: RunProcsOptions = {},
+): Promise<RunProcessScan> {
   try {
-    const r = await passes("scan", home, worktree, opts);
+    const r = await passes("scan", home, worktree, spawnedPids, opts);
     return { pids: r.attributed, complete: r.complete };
   } catch {
     return { pids: [], complete: false };
@@ -313,12 +427,18 @@ export async function scanRunProcesses(home: string, worktree: string | undefine
 /**
  * PRD #1809 D4: SIGKILL the processes attributed to a run by HOME or working directory, each by its
  * exact pid, as the uid that owns it, after re-verifying it immediately before the kill (see
- * {@link RUN_PROCS_SCRIPT}). The disk parks call this after the executor's process-group reap, which
- * misses a detached Bash command. Never throws.
+ * {@link RUN_PROCS_SCRIPT}). Called after the executor's process-group reap, which misses a detached
+ * Bash command: by the disk parks, before any park cache drop, and at the finalize security reap.
+ * Never throws.
  */
-export async function reapRunProcesses(home: string, worktree: string | undefined, opts: RunProcsOptions = {}): Promise<RunProcessReap> {
+export async function reapRunProcesses(
+  home: string,
+  worktree: string | undefined,
+  spawnedPids: readonly number[] = [],
+  opts: RunProcsOptions = {},
+): Promise<RunProcessReap> {
   try {
-    const r = await passes("kill", home, worktree, opts);
+    const r = await passes("kill", home, worktree, spawnedPids, opts);
     return { killed: r.killed, left: r.attributed, complete: r.complete };
   } catch {
     return { killed: [], left: [], complete: false };

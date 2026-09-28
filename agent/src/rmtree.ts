@@ -618,7 +618,7 @@ process.stdout.write(JSON.stringify({ cacheBytes, entries, truncated }) + "\\n")
  *  command roots are members of group `runner` and can write into a group-writable HOME),
  *  then, for a removal, `runner` again for what the second pass unblocked. Single-uid the
  *  wrapper is the identity, so the one pass runs as the worker itself. */
-export function agentWrappers(passes: "remove" | "measure"): CommandWrapper[] {
+function agentWrappers(passes: "remove" | "measure"): CommandWrapper[] {
   if (!uidSplitActive()) return [runnerCommand];
   return passes === "remove" ? [runnerCommand, commandRootCommand, runnerCommand] : [runnerCommand, commandRootCommand];
 }
@@ -1131,8 +1131,8 @@ function each(dirFd, fn) {
  * `fstat`ed: it must be a regular file of at most 8 MiB at read time, and at most 8 MiB + 1 bytes
  * are read (the name can be swapped for a sparse file or a FIFO after the `lstat`; a FIFO's open
  * does not block, and anything else is an `X`). A name holding a control character is never
- * printed: `go` skips it (counted as `badNames`), `npm` prints an escaped `E` entry for it, so that
- * listing is incomplete. The `H` summary is always the single last line.
+ * printed: `go` skips it (counted as `badNames`, and its summary then says `truncated`), `npm`
+ * prints an escaped `E` entry for it; either way that listing is incomplete. The `H` summary is always the single last line.
  *
  * Exit 0 (listed), 2 (the cache is absent), 3 (a symlinked component), 5, 6, 7 as the removal
  * script; a truncated listing still exits 0 and says so in its summary.
@@ -1197,7 +1197,8 @@ if (kind === "go") {
     sum += u[2];
     printed++;
   }
-  w("H\\t" + JSON.stringify({ units: units.length, bytes: total, truncated: exhausted, badNames }));
+  // A skipped name is an entry this listing did not judge: the listing is partial, like a spent budget.
+  w("H\\t" + JSON.stringify({ units: units.length, bytes: total, truncated: exhausted || badNames > 0, badNames }));
 } else {
   const INTEGRITY = /sha[0-9]+-[A-Za-z0-9+/=]+/g;
   const MAX_BUCKET = 8 * 1024 * 1024;

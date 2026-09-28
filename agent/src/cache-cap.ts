@@ -19,7 +19,10 @@
 //    loop is stoppable: a run still cloning, planning or waiting at its plan gate, and a run that
 //    has left the loop to finalize, is never a candidate (the stop is only routed to the disk park
 //    at an implement boundary or turn). A stop that has not produced a park within
-//    {@link STOP_TIMEOUT_MS} is given up, so one lost stop cannot wedge the hard layer.
+//    {@link STOP_TIMEOUT_MS} is given up, so one lost stop cannot wedge the hard layer. A stop
+//    landing while the run sits in a long wait inside the implement loop is
+//    honoured only when that wait returns, so the give-up can let the hard layer stop a SECOND run
+//    for the same pressure event while the first stop is still pending.
 //
 // Both parks end the executor, so the runner's park cache drop (run-caches.ts dropRunCaches, D2)
 // runs on the way out. Both layers can be disabled (UZI_RUN_CACHE_CAP_ENABLED,

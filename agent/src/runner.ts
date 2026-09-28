@@ -2611,6 +2611,12 @@ export class RunRunner {
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
       if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety) {
+        // "Only a park that ended the run's processes drops": the park's process-group reap misses
+        // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
+        // session and group), so a detached `go test &` could still be writing the caches this
+        // drop removes. Reap every process attributed to the run (run-procs.ts) first. Never
+        // rejects; after a disk park's own reap it finds nothing left.
+        await executor.reapAttributedProcesses?.();
         // A disk park already dropped them before its capture (N3): this pass only finishes what
         // that one could not, and says nothing when there was nothing left.
         await dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {});
@@ -7376,7 +7382,14 @@ export class RunRunner {
     // this run's subprocess tree (per-run instance, Decision 4); a concurrent
     // sibling's tree is untouched. The SDK executor also self-reaps in its run()
     // finally; this is the explicit, load-bearing call at the security boundary.
+    // The group kill alone misses a subprocess the agent backgrounded from a Bash
+    // command (the pinned CLI runs each one detached, in its own session and
+    // group), so the attributed reap (PRD #1809 D4, run-procs.ts: every process
+    // carrying this run's HOME or working inside its trees) follows it, awaited
+    // before this returns to the push. A process that has dropped both (another
+    // HOME and a working directory outside the run) is beyond either reap.
     executor.killAgentTree?.();
+    await executor.reapAttributedProcesses?.();
     flight.result = result;
     return result;
   }
