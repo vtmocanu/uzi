@@ -243,7 +243,7 @@ describe("a malformed view is refused by the setter and by the helper", () => {
 // This suite reads the REAL proc root: a sandbox that denies enumerating it skips through the
 // shared detector (issue #1863). The fake-root suites above and below keep running there.
 describe("the scoped real view lists only this process's descendants and the registered pids", {
-  skip: !HAS_LINUX ? true : realProcfsSkip("run-quiescence-fake-view: the scoped real view"),
+  skip: !HAS_LINUX ? "reads procfs (Linux only)" : realProcfsSkip("run-quiescence-fake-view: the scoped real view"),
 }, () => {
   it("a real non-descendant in the clone is excluded, and appears once registered by pid or pidfile (within 64 KiB)", async () => {
     const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-scoped-view-"));

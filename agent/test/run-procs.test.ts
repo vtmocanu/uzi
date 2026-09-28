@@ -324,6 +324,7 @@ fs.openSync = function (p, ...rest) {
     const found = await scanRunProcesses(runHome, undefined);
     assert.ok(found.pids.includes(mine.pid!), `the run's detached child is attributed (${JSON.stringify(found)})`);
     assert.ok(!found.pids.includes(other.pid!), "another HOME is not");
+    assert.strictEqual(found.complete, true, `the real scan completed, so the negative above is proven (${JSON.stringify(found)})`);
     // The test process is the "worker" here and both children are its direct children, so name
     // another worker pid for the reap.
     const exited = new Promise<NodeJS.Signals | null>((resolve) => mine.once("exit", (_c, sig) => resolve(sig)));
@@ -349,6 +350,7 @@ fs.openSync = function (p, ...rest) {
     const found = await scanRunProcesses(runHome, worktree);
     assert.ok(!found.pids.includes(nd.pid!), `the unrelated non-dumpable process is not the run's (${JSON.stringify(found)})`);
     assert.deepStrictEqual(found.pids, [], "nothing of this run is alive");
+    assert.strictEqual(found.complete, true, `the real scan completed: a scan that failed outright is not a quiet point (${JSON.stringify(found)})`);
   });
 
   it("this host's real proc tree: a NON-DUMPABLE child of an attributed process IS the run's", { skip: realTreeSkip("real proc tree: NON-DUMPABLE child of an attributed process") }, async (t) => {
