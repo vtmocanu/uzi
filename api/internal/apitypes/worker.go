@@ -155,6 +155,16 @@ type WorkerDTO struct {
 	StatsDiskDindTotalBytes  *int64 `json:"stats_disk_dind_total_bytes"`
 	StatsDiskDindInodes      *int64 `json:"stats_disk_dind_inodes"`
 	StatsDiskDindTotalInodes *int64 `json:"stats_disk_dind_total_inodes"`
+	// Data-volume inode sample (PRD #1809 M6, D8): used + total inodes of the data volume,
+	// null until the worker reports them (and re-nulled if it stops). DISPLAY-ONLY, never a
+	// disk_pressure input. Same freshness contract as the fields above.
+	StatsDiskDataInodes      *int64 `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes *int64 `json:"stats_disk_data_total_inodes"`
+	// RunDisk is the worker's largest runs by HOME size (PRD #1809 M6, D8), at most
+	// WorkerRunDiskTop entries, largest first, from its latest heartbeat's run_disk report
+	// (rows older than 15 minutes are dropped). ALWAYS a JSON array, never null: the list
+	// handlers overlay it and the DTO builders seed it to []. Display-only.
+	RunDisk []WorkerRunDiskDTO `json:"run_disk"`
 	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
 	// Both null means "unbound": the worker spends its owner's default token, which
 	// is every worker's state until someone binds one. The label rides alongside the
@@ -213,6 +223,21 @@ type WorkerDTO struct {
 type AdminWorkerDTO struct {
 	WorkerDTO
 	OwnerEmail string `json:"owner_email"`
+}
+
+// WorkerRunDiskTop is how many of a worker's largest runs WorkerDTO.RunDisk carries.
+const WorkerRunDiskTop = 5
+
+// WorkerRunDiskDTO is one run's disk size on a worker (PRD #1809 M6, D8): the bytes under the
+// run's HOME and, of those, the rebuildable caches. Truncated means the worker's size walk was cut
+// short, so both numbers are lower bounds. SampledAt is when the worker reported it. Nested in
+// WorkerDTO.RunDisk.
+type WorkerRunDiskDTO struct {
+	RunID      string    `json:"run_id"`
+	HomeBytes  int64     `json:"home_bytes"`
+	CacheBytes int64     `json:"cache_bytes"`
+	Truncated  bool      `json:"truncated"`
+	SampledAt  time.Time `json:"sampled_at"`
 }
 
 // WorkerReportedRunDTO is one entry of a worker's reported active-run snapshot (PRD #1390

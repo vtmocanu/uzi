@@ -5,8 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -36,6 +38,7 @@ var checkMeta = map[string]struct {
 	"fleet.roll":         {groupWorkers, "Worker image roll", "worker-upgrades"},
 	"fleet.capacity":     {groupWorkers, "Worker capacity", "hosted-workers"},
 	"fleet.disk":         {groupWorkers, "Worker disk", "hosted-workers"},
+	"fleet.rundisk":      {groupWorkers, "Run disk size", "hosted-workers"},
 	"queue.waiting":      {groupQueue, "Runs waiting for a worker", ""},
 	"queue.undispatched": {groupQueue, "Undispatched task runs", ""},
 	"controller.report":  {groupControl, "Controller reporting", "hosted-workers"},
@@ -308,6 +311,76 @@ func (s *Service) checkFleetDisk(now time.Time, workers []store.ListAllWorkersRo
 	c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Workers", Value: fmt.Sprintf("%d", affected)}}
 	c.Action = strPtr("Free disk on the affected worker(s) or increase the worker volume size.")
 	return c
+}
+
+// checkFleetRunDisk (PRD #1809 M6, D8) warns before one run fills a worker's data volume: any
+// worker with a fresh heartbeat whose largest reported run HOME is at least runDiskWarnFraction of
+// its data volume's total bytes, or whose data volume has less than runDiskInodeFreeWarn of its
+// inodes free. Both inputs are the worker's own display-only self-report (the run_disk list and
+// the stats_disk_data_* columns); a worker that reports neither is skipped, never counted. A
+// failed size read degrades the check to `unknown`. There is no danger band: fleet.disk and the
+// worker's own disk handling (the D6 park) own the full-volume case.
+func (s *Service) checkFleetRunDisk(ctx context.Context, now time.Time, workers []store.ListAllWorkersRow) apitypes.HealthCheckDTO {
+	c := s.base("fleet.rundisk")
+	fresh := make([]store.ListAllWorkersRow, 0, len(workers))
+	ids := make([]uuid.UUID, 0, len(workers))
+	for _, w := range workers {
+		if w.Worker.LastHeartbeatAt.Valid && now.Sub(w.Worker.LastHeartbeatAt.Time) <= s.heartbeatStale() {
+			fresh = append(fresh, w)
+			ids = append(ids, w.Worker.ID)
+		}
+	}
+	largest := map[uuid.UUID]int64{}
+	if len(ids) > 0 {
+		rows, err := s.cfg.Store.ListLargestRunDiskForWorkers(ctx, store.ListLargestRunDiskForWorkersParams{WorkerIds: ids, PerWorker: 1})
+		if err != nil {
+			return degradeUnknown(c, "fleet.rundisk", err)
+		}
+		for _, r := range rows {
+			largest[r.WorkerID] = r.HomeBytes
+		}
+	}
+	var bigRun, lowInodes int
+	for _, w := range fresh {
+		total := w.Worker.StatsDiskDataTotalBytes
+		if home, ok := largest[w.Worker.ID]; ok && total.Valid && total.Int64 > 0 &&
+			float64(home) >= runDiskWarnFraction*float64(total.Int64) {
+			bigRun++
+		}
+		used, all := w.Worker.StatsDiskDataInodes, w.Worker.StatsDiskDataTotalInodes
+		if used.Valid && all.Valid && all.Int64 > 0 && used.Int64 <= all.Int64 &&
+			float64(all.Int64-used.Int64) < runDiskInodeFreeWarn*float64(all.Int64) {
+			lowInodes++
+		}
+	}
+	if bigRun == 0 && lowInodes == 0 {
+		c.Severity = sevOK
+		c.Summary = "No run is close to filling its worker's data volume."
+		return c
+	}
+	c.Severity = sevWarn
+	switch {
+	case bigRun > 0 && lowInodes > 0:
+		c.Summary = fmt.Sprintf("%d worker(s) hold a run using %d%% or more of the data volume, and %d worker(s) are low on data-volume inodes.", bigRun, runDiskWarnPercent(), lowInodes)
+	case bigRun > 0:
+		c.Summary = fmt.Sprintf("%d worker(s) hold a run using %d%% or more of the data volume.", bigRun, runDiskWarnPercent())
+	default:
+		c.Summary = fmt.Sprintf("%d worker(s) are low on data-volume inodes.", lowInodes)
+	}
+	if bigRun > 0 {
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Workers with a large run", Value: fmt.Sprintf("%d", bigRun)})
+	}
+	if lowInodes > 0 {
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Workers low on inodes", Value: fmt.Sprintf("%d", lowInodes)})
+	}
+	c.Action = strPtr("Check the largest run on each affected worker (uzi worker list) and cancel, finish or move it before the volume fills.")
+	return c
+}
+
+// runDiskWarnPercent renders runDiskWarnFraction as a whole percentage for a summary.
+func runDiskWarnPercent() int {
+	f := runDiskWarnFraction * 100
+	return int(math.Round(f))
 }
 
 // -------------------------------------------------------------------------

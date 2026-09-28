@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -128,7 +129,9 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		// Seed reported_runs to a non-nil [] (PRD #1390 M2c): the DB overlay only runs on the
 		// list/patch surfaces, so this keeps every OTHER WorkerDTO producer (register, heartbeat,
 		// create, hosted-provision) marshaling an array rather than null.
-		ReportedRuns:       []apitypes.WorkerReportedRunDTO{},
+		ReportedRuns: []apitypes.WorkerReportedRunDTO{},
+		// PRD #1809 M6: seeded [] like reported_runs; the list/patch surfaces overlay it.
+		RunDisk:            []apitypes.WorkerRunDiskDTO{},
 		TemplateDeclared:   textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
 		TemplateReported:   textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
 		Version:            textPtrValue(w.Version.Valid, w.Version.String),
@@ -150,6 +153,9 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 		StatsDiskDindTotalBytes:  int8PtrValue(w.StatsDiskDindTotalBytes),
 		StatsDiskDindInodes:      int8PtrValue(w.StatsDiskDindInodes),
 		StatsDiskDindTotalInodes: int8PtrValue(w.StatsDiskDindTotalInodes),
+
+		StatsDiskDataInodes:      int8PtrValue(w.StatsDiskDataInodes),
+		StatsDiskDataTotalInodes: int8PtrValue(w.StatsDiskDataTotalInodes),
 	}
 }
 
@@ -190,6 +196,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		MaxConcurrentRuns:        intPtrValue(w.MaxConcurrentRuns),
 		// Seeded to [] (PRD #1390 M2c); ListWorkers overlays the real snapshot rows after.
 		ReportedRuns:             []apitypes.WorkerReportedRunDTO{},
+		RunDisk:                  []apitypes.WorkerRunDiskDTO{},
 		RetainingUnpublishedWork: w.RetainingUnpublishedWork,
 		TemplateDeclared:         textPtrValue(w.TemplateDeclared.Valid, w.TemplateDeclared.String),
 		TemplateReported:         textPtrValue(w.TemplateReported.Valid, w.TemplateReported.String),
@@ -212,6 +219,9 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		StatsDiskDindTotalBytes:  int8PtrValue(w.StatsDiskDindTotalBytes),
 		StatsDiskDindInodes:      int8PtrValue(w.StatsDiskDindInodes),
 		StatsDiskDindTotalInodes: int8PtrValue(w.StatsDiskDindTotalInodes),
+
+		StatsDiskDataInodes:      int8PtrValue(w.StatsDiskDataInodes),
+		StatsDiskDataTotalInodes: int8PtrValue(w.StatsDiskDataTotalInodes),
 	}
 }
 
@@ -398,6 +408,69 @@ func (h *Handler) overlayReportedRuns(dto *apitypes.WorkerDTO, byWorker map[uuid
 	dto.ReportedRuns = runs
 }
 
+// runDiskByWorker reads each listed worker's largest runs by HOME size (PRD #1809 M6, D8) in ONE
+// batched round-trip, at most apitypes.WorkerRunDiskTop per worker, largest first. Same posture as
+// reportedRunsByWorker: every listed worker gets a non-nil slice, and a query error (or a nil store)
+// is logged and yields the all-empty map, because run_disk is a display overlay and must never fail
+// the response.
+func (h *Handler) runDiskByWorker(ctx context.Context, workerIDs []uuid.UUID) map[uuid.UUID][]apitypes.WorkerRunDiskDTO {
+	byWorker := make(map[uuid.UUID][]apitypes.WorkerRunDiskDTO, len(workerIDs))
+	for _, id := range workerIDs {
+		byWorker[id] = []apitypes.WorkerRunDiskDTO{}
+	}
+	if len(workerIDs) == 0 || h.q == nil {
+		return byWorker
+	}
+	rows, err := h.q.ListLargestRunDiskForWorkers(ctx, store.ListLargestRunDiskForWorkersParams{
+		WorkerIds: workerIDs,
+		PerWorker: apitypes.WorkerRunDiskTop,
+	})
+	if err != nil {
+		slog.Error("overlay run disk", "error", err)
+		return byWorker
+	}
+	for _, row := range rows {
+		byWorker[row.WorkerID] = append(byWorker[row.WorkerID], apitypes.WorkerRunDiskDTO{
+			RunID:      row.RunID.String(),
+			HomeBytes:  row.HomeBytes,
+			CacheBytes: row.CacheBytes,
+			Truncated:  row.Truncated,
+			SampledAt:  row.SampledAt.Time,
+		})
+	}
+	return byWorker
+}
+
+// overlayRunDisk folds a worker's largest runs (runDiskByWorker's batched result) onto its DTO,
+// always as a non-nil slice so run_disk marshals as a JSON array.
+func overlayRunDisk(dto *apitypes.WorkerDTO, byWorker map[uuid.UUID][]apitypes.WorkerRunDiskDTO, workerID uuid.UUID) {
+	runs := byWorker[workerID]
+	if runs == nil {
+		runs = []apitypes.WorkerRunDiskDTO{}
+	}
+	dto.RunDisk = runs
+}
+
+// overlayRunDiskSize sets a run DTO's home_bytes / cache_bytes / disk_truncated (PRD #1809 M6, D8)
+// from the freshest worker_run_disk row for the run, preferring its current worker's. No fresh row
+// leaves them absent; a query error is logged and also leaves them absent (display overlay).
+func (h *Handler) overlayRunDiskSize(ctx context.Context, run store.Run, dto *apitypes.RunDTO) {
+	if h.q == nil {
+		return
+	}
+	row, err := h.q.GetRunDisk(ctx, store.GetRunDiskParams{RunID: run.ID, CurrentWorkerID: run.WorkerID})
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Error("resolve run disk size", "run_id", run.ID, "error", err)
+		}
+		return
+	}
+	home, cache := row.HomeBytes, row.CacheBytes
+	dto.HomeBytes = &home
+	dto.CacheBytes = &cache
+	dto.DiskTruncated = row.Truncated
+}
+
 // -------------------------------------------------------------------------
 // Worker management (session-authenticated)
 // -------------------------------------------------------------------------
@@ -487,10 +560,12 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, row.ID)
 	}
 	reported := h.reportedRunsByWorker(r.Context(), ids)
+	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 		h.overlayOutbox(&dto, row.ID)
 		h.overlayReportedRuns(&dto, reported, row.ID)
+		overlayRunDisk(&dto, runDisk, row.ID)
 		out = append(out, dto)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"workers": out})
@@ -511,10 +586,12 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, row.Worker.ID)
 	}
 	reported := h.reportedRunsByWorker(r.Context(), ids)
+	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromAdminRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
 		h.overlayOutbox(&dto, row.Worker.ID)
 		h.overlayReportedRuns(&dto, reported, row.Worker.ID)
+		overlayRunDisk(&dto, runDisk, row.Worker.ID)
 		out = append(out, apitypes.AdminWorkerDTO{
 			WorkerDTO:  dto,
 			OwnerEmail: row.OwnerEmail,
@@ -695,5 +772,6 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	// live snapshot, so without the overlay its reported_runs would read [] on this response.
 	reported := h.reportedRunsByWorker(r.Context(), []uuid.UUID{wkr.ID})
 	h.overlayReportedRuns(&dto, reported, wkr.ID)
+	overlayRunDisk(&dto, h.runDiskByWorker(r.Context(), []uuid.UUID{wkr.ID}), wkr.ID)
 	httpx.JSON(w, http.StatusOK, map[string]any{"worker": dto})
 }

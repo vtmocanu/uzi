@@ -970,6 +970,8 @@ type Worker struct {
 	StatsDiskDindTotalBytes  pgtype.Int8        `json:"stats_disk_dind_total_bytes"`
 	StatsDiskDindInodes      pgtype.Int8        `json:"stats_disk_dind_inodes"`
 	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
+	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
+	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
 }
 
 type WorkerActiveRun struct {
@@ -981,6 +983,15 @@ type WorkerActiveRun struct {
 	TerminalPendingUntil pgtype.Timestamptz `json:"terminal_pending_until"`
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
+}
+
+type WorkerRunDisk struct {
+	WorkerID   uuid.UUID          `json:"worker_id"`
+	RunID      uuid.UUID          `json:"run_id"`
+	HomeBytes  int64              `json:"home_bytes"`
+	CacheBytes int64              `json:"cache_bytes"`
+	Truncated  bool               `json:"truncated"`
+	SampledAt  pgtype.Timestamptz `json:"sampled_at"`
 }
 
 type WorkerUpgradeMute struct {

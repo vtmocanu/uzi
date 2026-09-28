@@ -6150,3 +6150,36 @@ describe("RunView — forge-aware MR/PR link fallback when mr_web_url is null (#
     expect(href).not.toContain("/-/merge_requests/");
   });
 });
+
+// PRD #1809 M6 (D8): each parked panel carries the checkpoint-durability line and the run's HOME
+// size on its worker, and says neither when the server sent neither.
+describe("parked panels: checkpoint durability and run size (PRD #1809 M6)", () => {
+  const GIB = 1073741824;
+  const facts = { checkpoint_contains_latest: false, home_bytes: 4 * GIB, cache_bytes: 3 * GIB } as const;
+
+  it("the recovery park shows both facts", () => {
+    render(<RecoveryWaitPanel run={run({ status: "recovery_wait", ...facts })} />);
+    expect(screen.getByText(/does not contain the latest committed work/)).toBeTruthy();
+    expect(screen.getByText("Home on the worker: 4 GiB, including 3 GiB of rebuildable caches.")).toBeTruthy();
+  });
+
+  it("the pause park shows both facts", () => {
+    render(<PausedPanel run={run({ status: "paused", ...facts, checkpoint_contains_latest: true })} busy={false} onResume={vi.fn()} onStop={vi.fn()} />);
+    expect(screen.getByText("The published checkpoint contains the latest work.")).toBeTruthy();
+    expect(screen.getByText(/Home on the worker: 4 GiB/)).toBeTruthy();
+  });
+
+  it("the usage-limit park shows both facts", () => {
+    render(
+      <LimitWaitPanel run={run({ status: "limit_wait", wait_on_limit: true, ...facts })} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />,
+    );
+    expect(screen.getByText(/does not contain the latest committed work/)).toBeTruthy();
+    expect(screen.getByText(/Home on the worker: 4 GiB/)).toBeTruthy();
+  });
+
+  it("a park with no report and no size adds neither line", () => {
+    render(<RecoveryWaitPanel run={run({ status: "recovery_wait" })} />);
+    expect(screen.queryByText(/published checkpoint/)).toBeNull();
+    expect(screen.queryByText(/Home on the worker/)).toBeNull();
+  });
+});

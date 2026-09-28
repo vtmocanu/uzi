@@ -387,3 +387,56 @@ describe("WorkerStatLine", () => {
     expect(container.textContent).toContain("cpu 34% · mem 2.1/4 GiB · disk 8/20 GiB (inodes 98%)");
   });
 });
+
+describe("WorkerStatGauges: largest run and data-volume inodes (PRD #1809 M6)", () => {
+  const GIB = 1073741824;
+  const sampled = { stats_mem_bytes: 1, stats_source: "cgroup" } as const;
+  const run = (run_id: string, home_bytes: number, cache_bytes: number, truncated = false) => ({
+    run_id,
+    home_bytes,
+    cache_bytes,
+    truncated,
+    sampled_at: "2026-09-28T00:00:00Z",
+  });
+
+  it("shows the largest run's home and cache size", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({ ...sampled, run_disk: [run("small", GIB, 0), run("big", 5 * GIB, 3 * GIB)] })}
+      />,
+    );
+    expect(screen.getByText("Largest run")).toBeTruthy();
+    expect(screen.getByText(/^5 GiB home/)).toBeTruthy();
+    expect(screen.getByText(/3 GiB cache/)).toBeTruthy();
+    expect(screen.getByTitle("run big")).toBeTruthy();
+  });
+
+  it("marks a truncated size walk as a lower bound", () => {
+    render(<WorkerStatGauges worker={aWorker({ ...sampled, run_disk: [run("r1", 2 * GIB, GIB, true)] })} />);
+    expect(screen.getByText(/^at least 2 GiB home/)).toBeTruthy();
+  });
+
+  it("renders no largest-run line when the worker reports no run sizes", () => {
+    render(<WorkerStatGauges worker={aWorker({ ...sampled, run_disk: [] })} />);
+    // Positive control: the gauge block rendered.
+    expect(screen.getByRole("progressbar", { name: "CPU" })).toBeTruthy();
+    expect(screen.queryByText("Largest run")).toBeNull();
+  });
+
+  it("fills the /data bar to its inode ratio when inodes are fuller than bytes", () => {
+    render(
+      <WorkerStatGauges
+        worker={aWorker({
+          ...sampled,
+          stats_disk_data_bytes: 2 * GIB,
+          stats_disk_data_total_bytes: 10 * GIB,
+          stats_disk_data_inodes: 97,
+          stats_disk_data_total_inodes: 100,
+        })}
+      />,
+    );
+    const bar = screen.getByRole("progressbar", { name: "Disk /data" });
+    expect(bar.getAttribute("aria-valuenow")).toBe("97");
+    expect(screen.getByText(/2\/10 GiB · 20% · inodes 97%/)).toBeTruthy();
+  });
+});

@@ -500,6 +500,10 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	} else {
 		dto.WorkerName = name
 	}
+	// PRD #1809 M6 (D8): the run's HOME / cache size from its worker's run_disk report. Best-effort
+	// like the worker name: no fresh report leaves the fields absent, and a lookup error never fails
+	// the read.
+	h.overlayRunDiskSize(r.Context(), run, &dto)
 	// issue #1418: overlay the capture-aware landing_state on the single-run detail read.
 	// runToDTO seeded it capture-unaware (preserved_patch only); only a human-landable
 	// fail_origin can ever reach needs_landing/unrecoverable, so the extra capture query

@@ -11,7 +11,7 @@
 import { useId } from "react";
 import { cx } from "./ui";
 import { MeterTrack } from "./Meter";
-import type { Worker } from "../lib/api";
+import type { Worker, WorkerRunDisk } from "../lib/api";
 
 const KIB = 1024;
 const MIB = 1024 * KIB;
@@ -51,7 +51,7 @@ function pctOf(used: number, limit: number | null): number | null {
 }
 
 /** One reported disk volume. `pct` is the bar fill: the bytes ratio, or the inode ratio
- *  when that is fuller (only the dind volume reports inodes). `inodePct` is set only when
+ *  when that is fuller (the dind and data volumes report inodes). `inodePct` is set only when
  *  the ROUNDED inode percent exceeds the rounded bytes percent, i.e. exactly when it
  *  explains the displayed fill (78.2% bytes / 78.4% inodes is not "78% · inodes 78%"). */
 interface DiskVolume {
@@ -75,7 +75,15 @@ function diskVolumes(w: Worker): DiskVolume[] {
   const out: DiskVolume[] = [];
   const vols: { label: string; hint?: string; used: number | null; total: number | null; inodes?: number | null; totalInodes?: number | null }[] = [
     { label: "Disk /nix", used: w.stats_disk_nix_bytes, total: w.stats_disk_nix_total_bytes },
-    { label: "Disk /data", used: w.stats_disk_data_bytes, total: w.stats_disk_data_total_bytes },
+    {
+      label: "Disk /data",
+      used: w.stats_disk_data_bytes,
+      total: w.stats_disk_data_total_bytes,
+      // PRD #1809 M6: the data volume reports inodes too, so a volume full of small cache
+      // files reads as full even when its bytes look roomy.
+      inodes: w.stats_disk_data_inodes,
+      totalInodes: w.stats_disk_data_total_inodes,
+    },
     {
       label: "Disk dind",
       hint: "docker daemon data (images, layers, containers)",
@@ -96,6 +104,35 @@ function diskVolumes(w: Worker): DiskVolume[] {
     out.push({ label, hint, used, total, bytesPct, inodePct, pct: inodePct ?? bytesPct });
   }
   return out;
+}
+
+/** The worker's largest run by HOME size (PRD #1809 M6), or null when it reports none. The
+ *  server sends run_disk largest first; the max is taken anyway so the order is not load-bearing. */
+function largestRun(w: Worker): WorkerRunDisk | null {
+  const runs = w.run_disk ?? [];
+  if (runs.length === 0) return null;
+  return runs.reduce((a, b) => (b.home_bytes > a.home_bytes ? b : a));
+}
+
+/** "4.2 GiB" or "at least 4.2 GiB" when the worker's size walk was truncated. */
+function runBytes(bytes: number, truncated: boolean): string {
+  return truncated ? `at least ${formatBytes(bytes)}` : formatBytes(bytes);
+}
+
+/** The largest run's HOME and cache size under the disk bars (PRD #1809 M6), so one run growing
+ *  toward filling the data volume is visible before it does. Nothing when no size is reported. */
+function LargestRun({ worker }: { worker: Worker }) {
+  const run = largestRun(worker);
+  if (!run) return null;
+  return (
+    <div className="flex items-center justify-between text-xs" title={`run ${run.run_id}`}>
+      <span className="text-muted">Largest run</span>
+      <span className="tabular-nums text-muted">
+        {runBytes(run.home_bytes, run.truncated)} home
+        <span className="text-faint"> · {formatBytes(run.cache_bytes)} cache</span>
+      </span>
+    </div>
+  );
 }
 
 /** " · inodes 98%" when inodes (not bytes) are what fill the bar, else "". */
@@ -199,6 +236,7 @@ export function WorkerStatGauges({ worker }: { worker: Worker }) {
           fillPct={d.pct}
         />
       ))}
+      <LargestRun worker={worker} />
       {isProcess && <p className="text-[0.7rem] text-faint">worker process only</p>}
     </div>
   );

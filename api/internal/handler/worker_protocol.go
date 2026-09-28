@@ -406,6 +406,11 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_data_volume_full"},
+		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
+		// /state limit_wait / recovery_wait / paused reports and the wall-park report) and stores
+		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a
+		// worker sends it only after seeing this token.
+		{"run_checkpoint_durability"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
@@ -736,6 +741,13 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 		DiskDindTotalBytes  *json.Number `json:"disk_dind_total_bytes"`
 		DiskDindInodes      *json.Number `json:"disk_dind_inodes"`
 		DiskDindTotalInodes *json.Number `json:"disk_dind_total_inodes"`
+		// Data-volume inodes (PRD #1809 M6, D8): used + total, the same tolerant per-field
+		// decode. Display-only.
+		DiskDataInodes      *json.Number `json:"disk_data_inodes"`
+		DiskDataTotalInodes *json.Number `json:"disk_data_total_inodes"`
+		// Per-run sizes (PRD #1809 M6, D8), kept RAW so a malformed list (not an array, or a
+		// junk entry) is handled by parseRunDisk alone and never drops the cpu/mem gauge.
+		RunDisk json.RawMessage `json:"run_disk"`
 	}
 	if err := json.Unmarshal(raw, &s); err != nil {
 		return drop()
@@ -780,6 +792,64 @@ func parseWorkerStats(raw json.RawMessage, workerID uuid.UUID) *workersvc.Worker
 	out.DiskDindTotalBytes = diskBytesOrNil(s.DiskDindTotalBytes)
 	out.DiskDindInodes = diskBytesOrNil(s.DiskDindInodes)
 	out.DiskDindTotalInodes = diskBytesOrNil(s.DiskDindTotalInodes)
+	out.DiskDataInodes = diskBytesOrNil(s.DiskDataInodes)
+	out.DiskDataTotalInodes = diskBytesOrNil(s.DiskDataTotalInodes)
+	out.RunDisk = parseRunDisk(s.RunDisk)
+	return out
+}
+
+// maxRunDiskEntries caps how many run_disk entries one heartbeat may store (PRD #1809 M6, D8).
+// A worker runs a handful of runs at once; the cap bounds what a garbled or hostile list can
+// write per tick. Entries past it are ignored, not an error.
+const maxRunDiskEntries = 50
+
+// parseRunDisk decodes a heartbeat's run_disk list (PRD #1809 M6, D8) defensively. It returns nil
+// when the key is absent, null, or not a JSON array: the worker's stored sizes are then left
+// untouched (the same outcome as an older worker that never sends the list). An array, even an
+// empty one, returns a non-nil slice, which replaces the worker's stored set. Each entry must
+// carry a uuid run_id and non-negative int64 home_bytes and cache_bytes; truncated is optional
+// (false when absent or not a boolean). An invalid entry is skipped on its own, a repeated run_id
+// keeps its first entry, and at most maxRunDiskEntries entries are kept.
+func parseRunDisk(raw json.RawMessage) []workersvc.RunDiskSample {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	var entries []json.RawMessage
+	if err := json.Unmarshal(raw, &entries); err != nil {
+		return nil
+	}
+	out := make([]workersvc.RunDiskSample, 0, min(len(entries), maxRunDiskEntries))
+	seen := make(map[uuid.UUID]bool, len(out))
+	for _, e := range entries {
+		if len(out) >= maxRunDiskEntries {
+			break
+		}
+		var v struct {
+			RunID      string          `json:"run_id"`
+			HomeBytes  *json.Number    `json:"home_bytes"`
+			CacheBytes *json.Number    `json:"cache_bytes"`
+			Truncated  json.RawMessage `json:"truncated"`
+		}
+		if err := json.Unmarshal(e, &v); err != nil {
+			continue
+		}
+		id, err := uuid.Parse(v.RunID)
+		if err != nil || seen[id] {
+			continue
+		}
+		home := diskBytesOrNil(v.HomeBytes)
+		cache := diskBytesOrNil(v.CacheBytes)
+		if home == nil || cache == nil {
+			continue
+		}
+		seen[id] = true
+		out = append(out, workersvc.RunDiskSample{
+			RunID:      id,
+			HomeBytes:  *home,
+			CacheBytes: *cache,
+			Truncated:  string(v.Truncated) == "true",
+		})
+	}
 	return out
 }
 
@@ -1652,12 +1722,15 @@ func (h *Handler) WorkerRunWallPark(w http.ResponseWriter, r *http.Request) {
 		// PRD #1497 M1 (D16): the claim generation the worker holds. A wall_park_v1 worker stamps it
 		// so the fence refuses a released/superseded stale flight's reclaimed run. Nullable + OPTIONAL.
 		ClaimGeneration *int64 `json:"claim_generation"`
+		// PRD #1809 M6 (D8): whether the checkpoint this park published contains the run's latest
+		// committed work. Nullable + OPTIONAL, display-only (advertised as run_checkpoint_durability).
+		CheckpointContainsLatest *bool `json:"checkpoint_contains_latest"`
 	}
 	if err := httpx.DecodeJSON(r, &body); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	run, applied, err := h.wsvc.ReportWallPark(r.Context(), wkr, runID, body.Head, body.Published, body.ClaimGeneration)
+	run, applied, err := h.wsvc.ReportWallPark(r.Context(), wkr, runID, body.Head, body.Published, body.ClaimGeneration, body.CheckpointContainsLatest)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")

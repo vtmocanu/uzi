@@ -45,6 +45,8 @@ type fakeStore struct {
 	controllerErr error
 	ciwatch       []store.CountEligibleCIWatchRefsPerRepoRow
 	ciwatchErr    error
+	runDisk       []store.WorkerRunDisk
+	runDiskErr    error
 }
 
 func (f *fakeStore) ListAllWorkers(context.Context) ([]store.ListAllWorkersRow, error) {
@@ -73,6 +75,9 @@ func (f *fakeStore) GetControllerReport(context.Context) (pgtype.Timestamptz, er
 }
 func (f *fakeStore) CountEligibleCIWatchRefsPerRepo(context.Context, pgtype.Timestamptz) ([]store.CountEligibleCIWatchRefsPerRepoRow, error) {
 	return f.ciwatch, f.ciwatchErr
+}
+func (f *fakeStore) ListLargestRunDiskForWorkers(context.Context, store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error) {
+	return f.runDisk, f.runDiskErr
 }
 
 type fakeSettings struct {
@@ -298,6 +303,62 @@ func TestFleetDisk(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			svc := newSvc(&fakeStore{}, &fakeSettings{})
 			c := svc.checkFleetDisk(fixedNow, tc.workers)
+			if c.Severity != tc.wantSev {
+				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
+			}
+			if !strings.Contains(c.Summary, tc.wantSubstr) {
+				t.Fatalf("summary %q does not contain %q", c.Summary, tc.wantSubstr)
+			}
+		})
+	}
+}
+
+// ---- fleet.rundisk ---------------------------------------------------------
+
+func TestFleetRunDisk(t *testing.T) {
+	const gib = int64(1) << 30
+	wid := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	worker := func(dataTotal, inodesUsed, inodesTotal int64, hbAgo time.Duration) store.ListAllWorkersRow {
+		w := store.Worker{
+			ID:              wid,
+			Kind:            "hosted",
+			LastHeartbeatAt: pgtype.Timestamptz{Time: fixedNow.Add(-hbAgo), Valid: true},
+		}
+		if dataTotal > 0 {
+			w.StatsDiskDataTotalBytes = pgtype.Int8{Int64: dataTotal, Valid: true}
+		}
+		if inodesTotal > 0 {
+			w.StatsDiskDataInodes = pgtype.Int8{Int64: inodesUsed, Valid: true}
+			w.StatsDiskDataTotalInodes = pgtype.Int8{Int64: inodesTotal, Valid: true}
+		}
+		return store.ListAllWorkersRow{Worker: w}
+	}
+	largest := func(home int64) []store.WorkerRunDisk {
+		return []store.WorkerRunDisk{{WorkerID: wid, RunID: uuid.New(), HomeBytes: home, CacheBytes: home / 2}}
+	}
+	tests := []struct {
+		name       string
+		worker     store.ListAllWorkersRow
+		runDisk    []store.WorkerRunDisk
+		runDiskErr error
+		wantSev    string
+		wantSubstr string
+	}{
+		{"ok under the fraction", worker(100*gib, 0, 0, time.Second), largest(39 * gib), nil, sevOK, "No run is close to filling"},
+		{"warn at the fraction", worker(100*gib, 0, 0, time.Second), largest(40 * gib), nil, sevWarn, "1 worker(s) hold a run using 40% or more of the data volume"},
+		{"warn above the fraction", worker(100*gib, 0, 0, time.Second), largest(90 * gib), nil, sevWarn, "hold a run using 40% or more"},
+		{"stale heartbeat does not count", worker(100*gib, 0, 0, 5*time.Minute), largest(90 * gib), nil, sevOK, "No run is close to filling"},
+		{"no data total is skipped", worker(0, 0, 0, time.Second), largest(90 * gib), nil, sevOK, "No run is close to filling"},
+		{"no reported runs is ok", worker(100*gib, 0, 0, time.Second), nil, nil, sevOK, "No run is close to filling"},
+		{"inodes free above 5% is ok", worker(100*gib, 94, 100, time.Second), nil, nil, sevOK, "No run is close to filling"},
+		{"inodes free under 5% warns", worker(100*gib, 96, 100, time.Second), nil, nil, sevWarn, "1 worker(s) are low on data-volume inodes"},
+		{"both conditions", worker(100*gib, 99, 100, time.Second), largest(50 * gib), nil, sevWarn, "and 1 worker(s) are low on data-volume inodes"},
+		{"size read error is unknown", worker(100*gib, 0, 0, time.Second), nil, errors.New("boom"), sevUnknown, ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newSvc(&fakeStore{runDisk: tc.runDisk, runDiskErr: tc.runDiskErr}, &fakeSettings{})
+			c := svc.checkFleetRunDisk(context.Background(), fixedNow, []store.ListAllWorkersRow{tc.worker})
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
 			}
@@ -580,9 +641,9 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	}
 	// The full registry, in a stable order (PRD "Checks in v1" table order), always
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
-	// (integrations), so it is 14, not 11.
+	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk (workers), 15.
 	wantIDs := []string{
-		"fleet.roll", "fleet.capacity", "fleet.disk", "queue.waiting", "queue.undispatched",
+		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "loops", "forge.ciwatch", "slack.socket",
 		"schedules.paused", "board.drift", "custody.holds", "release.check",
 	}

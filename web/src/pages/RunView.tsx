@@ -71,6 +71,7 @@ import { CredentialDisabledPanel, isCredentialDisabledHold } from "../components
 import { RunPriorityBadge } from "../components/RunPriorityBadge";
 import { formatDuration } from "../components/RunEvent";
 import { RunUsagePanel } from "../components/RunUsage";
+import { RunParkDiskFacts } from "../components/RunParkDiskFacts";
 import { ActivityFeed } from "../components/ActivityFeed";
 import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
@@ -1024,6 +1025,8 @@ export function LimitWaitPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing is lost — the run keeps its branch and its history and picks up where it left off.
           </p>
+          {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
+          <RunParkDiskFacts run={run} />
         </div>
         {/* A ROW, not a column. As a column with items-end it wrapped under the prose
             at ordinary widths and left the Stop button stranded mid-panel with the
@@ -1157,6 +1160,8 @@ export function PausedPanel({
           <p className="mt-1.5 text-xs text-muted">
             Nothing runs and nothing is spent while it waits.
           </p>
+          {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
+          <RunParkDiskFacts run={run} />
           {/* Worker / re-planning mechanics live behind a disclosure so the panel stays
               four sentences by default (mock note 7). */}
           <details className="mt-1.5 text-xs text-muted">
@@ -1717,6 +1722,8 @@ export function RecoveryWaitPanel({ run }: { run: Run }) {
                 "Any branch or pushed checkpoint the run already has is kept, and the worker keeps the run's work until it resumes."
               : "Nothing is lost — the run keeps its branch and its history and picks up where it left off."}
         </p>
+        {/* PRD #1809 M6: checkpoint durability and the run's size on its worker. */}
+        <RunParkDiskFacts run={run} />
       </div>
     </div>
   );

@@ -1823,6 +1823,17 @@ export interface WorkerReportedRun {
   claim_generation: number;
 }
 
+/** One run's disk size on a worker (PRD #1809 M6, D8): the bytes under the run's HOME and, of
+ *  those, the rebuildable caches. truncated means the worker's size walk was cut short, so both
+ *  numbers are lower bounds. Nested in Worker.run_disk, largest HOME first. */
+export interface WorkerRunDisk {
+  run_id: string;
+  home_bytes: number;
+  cache_bytes: number;
+  truncated: boolean;
+  sampled_at: string;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -1968,6 +1979,14 @@ export interface Worker {
   stats_disk_dind_total_bytes: number | null;
   stats_disk_dind_inodes: number | null;
   stats_disk_dind_total_inodes: number | null;
+  // Data-volume inodes (PRD #1809 M6, D8): used/total inodes of /data, null until the worker
+  // reports them. Optional so a pre-M6 fixture stays valid. Display-only.
+  stats_disk_data_inodes?: number | null;
+  stats_disk_data_total_inodes?: number | null;
+  // run_disk (PRD #1809 M6, D8): the worker's largest runs by HOME size (at most 5, largest
+  // first) from its latest heartbeat. A handler overlay like reported_runs, so optional; [] on
+  // the real wire when the worker reports none.
+  run_disk?: WorkerRunDisk[];
   // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
   // Both null means unbound: the worker spends its owner's default token, which is
   // every worker's state until someone binds one. The label rides alongside the id
@@ -2640,6 +2659,17 @@ export interface Run {
    *  from forge_park_count. A preventive disk park (the worker stopped the run before its
    *  data volume filled) does not count. 0 for a run that has never taken a counted disk park. */
   disk_park_count?: number;
+  /** PRD #1809 M6 (D8): the worker's report, on the run's latest park, of whether the checkpoint
+   *  that park published contains the run's latest committed work. false: it does not (the worker
+   *  keeps the latest work under its custody hold). Absent when not reported. It is not cleared
+   *  on resume, so show it only while the run is parked. */
+  checkpoint_contains_latest?: boolean;
+  /** PRD #1809 M6 (D8): the run's HOME size on its worker and, of that, the rebuildable caches,
+   *  from a fresh worker report (single-run read only; absent otherwise). disk_truncated: the
+   *  worker's size walk was cut short, so both sizes are lower bounds. */
+  home_bytes?: number;
+  cache_bytes?: number;
+  disk_truncated?: boolean;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the

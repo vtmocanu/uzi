@@ -739,6 +739,21 @@ type RunDTO struct {
 	// preventive disk park (the worker stopped the run before its volume filled) does not count.
 	// 0 for a run that has never taken a counted disk park.
 	DiskParkCount int `json:"disk_park_count"`
+	// CheckpointContainsLatest is the worker's report, on the run's latest park, of whether the
+	// checkpoint that park published contains the run's latest committed work (PRD #1809 M6, D8).
+	// false means it does not (the recovery pin or the fetch-back failed): the worker keeps the
+	// latest work under its custody hold. Absent when not reported (older worker, no checkpoint
+	// published on that park). It describes the latest park and is not cleared when the run
+	// resumes, so clients show it only while the run is parked. Display-only.
+	CheckpointContainsLatest *bool `json:"checkpoint_contains_latest,omitempty"`
+	// HomeBytes / CacheBytes are the run's HOME size on its worker and, of that, the rebuildable
+	// caches (PRD #1809 M6, D8), from the worker's run_disk heartbeat report no older than 15
+	// minutes; the report from the run's current worker wins. Set on the single-run read only,
+	// absent when no fresh report exists. DiskTruncated means the worker's size walk was cut short,
+	// so both sizes are lower bounds. Display-only.
+	HomeBytes     *int64 `json:"home_bytes,omitempty"`
+	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
+	DiskTruncated bool   `json:"disk_truncated,omitempty"`
 	// Model is the model frozen onto the run at fire time by the schedule that created it
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.

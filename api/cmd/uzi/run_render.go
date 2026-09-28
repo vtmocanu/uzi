@@ -132,6 +132,16 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if line := diskParkLine(r); line != "" {
 		rows = append(rows, []string{"DISK", line})
 	}
+	// HOME (PRD #1809 M6, D8): the run's HOME and cache size on its worker, emit-only-when-
+	// reported (the server sets them only from a fresh worker report).
+	if line := runDiskSizeLine(r); line != "" {
+		rows = append(rows, []string{"HOME", line})
+	}
+	// CHECKPOINT (PRD #1809 M6, D8): whether the parked run's published checkpoint holds its
+	// latest committed work, emit-only-while-parked-and-reported.
+	if line := checkpointDurabilityLine(r); line != "" {
+		rows = append(rows, []string{"CHECKPOINT", line})
+	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
@@ -1740,6 +1750,41 @@ func fitVaultParkLine(r apitypes.RunDTO, width int) string {
 		}
 	}
 	return floor
+}
+
+// runDiskSizeLine renders a run's HOME and cache size on its worker (PRD #1809 M6, D8) for
+// `uzi run get`'s HOME row, e.g. "4.2 GiB (cache 3.0 GiB)". "at least" leads when the worker's
+// size walk was truncated (both numbers are lower bounds). "" when the server sent no size (no
+// fresh report from the run's worker).
+func runDiskSizeLine(r apitypes.RunDTO) string {
+	if r.HomeBytes == nil {
+		return ""
+	}
+	line := humanBytes(*r.HomeBytes)
+	if r.CacheBytes != nil {
+		line += " (cache " + humanBytes(*r.CacheBytes) + ")"
+	}
+	if r.DiskTruncated {
+		line = "at least " + line
+	}
+	return line
+}
+
+// parkedStatuses are the park statuses a checkpoint-durability report describes (PRD #1809 M6).
+var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: true, statusPaused: true}
+
+// checkpointDurabilityLine is the parked run's checkpoint-durability sentence (PRD #1809 M6, D8):
+// whether the checkpoint its latest park published contains the run's latest committed work. The
+// flag describes the latest park and is not cleared on resume, so it is shown only while the run
+// is parked. "" when the run is not parked or the worker did not report it.
+func checkpointDurabilityLine(r apitypes.RunDTO) string {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] {
+		return ""
+	}
+	if *r.CheckpointContainsLatest {
+		return "contains the latest work"
+	}
+	return "does NOT contain the latest committed work (the worker keeps it)"
 }
 
 // dataVolumeFullCause is the RecoveryWaitCause of a run parked because its worker's data

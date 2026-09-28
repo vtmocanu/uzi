@@ -830,6 +830,9 @@ var workerDTOKeys = []string{
 	// Display-only, never a disk_pressure input (that stays nix/data only).
 	"stats_disk_dind_bytes", "stats_disk_dind_total_bytes",
 	"stats_disk_dind_inodes", "stats_disk_dind_total_inodes",
+	// PRD #1809 M6 (D8): data-volume used + total inodes, and the worker's largest runs by HOME
+	// size (always an array). Display-only.
+	"stats_disk_data_inodes", "stats_disk_data_total_inodes", "run_disk",
 	// PRD #104 M3: which Anthropic credential this worker's run-lane claims spend.
 	// Both null ⇒ unbound ⇒ the owner's default. The LABEL, never the token value —
 	// this DTO is the shape the web UI and the CLI both read.

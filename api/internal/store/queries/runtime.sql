@@ -322,6 +322,10 @@ UPDATE workers SET
     stats_disk_dind_total_bytes  = sqlc.narg('stats_disk_dind_total_bytes'),
     stats_disk_dind_inodes       = sqlc.narg('stats_disk_dind_inodes'),
     stats_disk_dind_total_inodes = sqlc.narg('stats_disk_dind_total_inodes'),
+    -- data-volume inode sample (PRD #1809 M6, D8): used + total inodes beside the byte pair,
+    -- same write-every-tick-incl-NULL discipline; display-only, never a disk_pressure input.
+    stats_disk_data_inodes       = sqlc.narg('stats_disk_data_inodes'),
+    stats_disk_data_total_inodes = sqlc.narg('stats_disk_data_total_inodes'),
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample

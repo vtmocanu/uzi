@@ -301,6 +301,8 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		ForgeParkMax:           forgeParkMax,
 		// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 		DiskParkCount: int(r.DiskParkCount),
+		// PRD #1809 M6 (D8): the latest park's checkpoint-durability report (absent = not reported).
+		CheckpointContainsLatest: boolPtrValue(r.CheckpointContainsLatest),
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
 		// nil (NULL column) for every run that inherited the owner's per-user default.
 		Model: textPtrValue(r.Model.Valid, r.Model.String),
