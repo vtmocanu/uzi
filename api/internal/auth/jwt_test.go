@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"testing"
 	"time"
 
@@ -23,6 +24,9 @@ func TestIssueParseRoundTrip(t *testing.T) {
 	}
 	if claims.TokenVersion != 7 {
 		t.Errorf("token version = %d, want 7", claims.TokenVersion)
+	}
+	if claims.Subject != "user-123" {
+		t.Errorf("subject = %q, want user-123", claims.Subject)
 	}
 }
 
@@ -50,5 +54,37 @@ func TestParseRejectsAlgNone(t *testing.T) {
 	}
 	if _, err := ParseToken(testSecret, raw); err == nil {
 		t.Fatal("alg=none token accepted")
+	}
+}
+
+func TestParseRejectsOtherHMACAlg(t *testing.T) {
+	// HS384 under the same secret passes the *jwt.SigningMethodHMAC type check;
+	// only the HS256 pin rejects it.
+	claims := Claims{
+		UserID:       "user-123",
+		TokenVersion: 7,
+		RegisteredClaims: jwt.RegisteredClaims{
+			Subject:   "user-123",
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(time.Hour)),
+		},
+	}
+	hs256, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(testSecret)
+	if err != nil {
+		t.Fatalf("sign HS256: %v", err)
+	}
+	got, err := ParseToken(testSecret, hs256)
+	if err != nil {
+		t.Fatalf("HS256 token rejected: %v", err)
+	}
+	if got.UserID != "user-123" {
+		t.Errorf("HS256 user id = %q, want user-123", got.UserID)
+	}
+
+	hs384, err := jwt.NewWithClaims(jwt.SigningMethodHS384, claims).SignedString(testSecret)
+	if err != nil {
+		t.Fatalf("sign HS384: %v", err)
+	}
+	if _, err := ParseToken(testSecret, hs384); !errors.Is(err, jwt.ErrTokenSignatureInvalid) {
+		t.Errorf("HS384 token: err = %v, want ErrTokenSignatureInvalid", err)
 	}
 }
