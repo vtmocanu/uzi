@@ -5063,8 +5063,9 @@ export class RunRunner {
         mode: refreshRun ? "refresh" : "own",
         interlockIssueIid: scanIid,
         completionCloses: createCloses,
-        // An interlocked run's reconcile below reads the PR and has its own blind fallback, so a
-        // publisher blind rewrite there would only destroy human text.
+        // An interlocked run's reconcile below reads the PR, and its reconcile (or the strip that
+        // follows an unconfirmed one) falls back blind, so a publisher blind rewrite there would
+        // only destroy human text.
         blindFallback: !interlocked,
         prior: claim.pr_description,
         lead: result.prSummary,
@@ -5141,8 +5142,9 @@ export class RunRunner {
     // owner partial, a #634 scope cap) must not complete while its PR still closes the issue. The
     // publisher scanned the body and tried the whole-body non-closing rewrite; when it reports a
     // closing directive left on the PR (the rewrite failed or was not confirmed), or it never read
-    // the PR and its blind whole-body non-closing rewrite failed too (nothing observed is not proof
-    // of nothing closing), fail closed. An interlocked run's own reconcile below owns this for it.
+    // the PR and its blind whole-body non-closing rewrite then failed or was not attempted (a
+    // stopped publication; nothing observed is not proof of nothing closing), fail closed. An
+    // interlocked run's own reconcile below owns this for it.
     if (!interlocked && scanIid !== undefined && !createCloses && published.closingRemains) {
       runLog.warn("PR description: a closing directive remains on a non-closing merge request; failing the run", {
         run_id: runId,

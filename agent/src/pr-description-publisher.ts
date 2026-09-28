@@ -7,9 +7,10 @@
 // forge ended up showing (D9). Every failure here is ADVISORY: nothing in this module fails or
 // holds a run. The interlock's own reconcile (reconcileCompletion) reports a typed result and the
 // runner decides whether to hold or fail closed. One outcome the runner does act on: on a
-// NON-interlocked issue run whose completion block is non-closing, `closingRemains` reports that the PR may still carry a
-// closing directive uzi could not remove, or could not rule out because it never saw the body and
-// its blind rewrite failed (amended D10), and the runner fails the run closed.
+// NON-interlocked issue run whose completion block is non-closing, `closingRemains` reports that
+// the PR may still carry a closing directive uzi could not remove, or could not rule out because
+// it never saw the body and its blind rewrite failed or was not attempted (amended D10), and the
+// runner fails the run closed.
 //
 // A publication runs under a time budget (the editor pass's remaining deadline plus FORGE_BUDGET_MS);
 // every api call, forge call and wait honours it. prepare() runs under one budget; publish() starts a
@@ -23,8 +24,8 @@
 // runner acts on) never read the PR, it falls back to the blind whole-body non-closing rewrite
 // reconcileCompletion uses, under the caller's signal (spec.signal) rather than the spent or failed
 // budget. It is a safety write, not a region update. An interlocked run never makes it: its own
-// reconcile reads the PR afterwards and has its own blind fallback, so the write would only destroy
-// human text.
+// reconcile reads the PR afterwards, and its reconcile (or the strip that follows an unconfirmed
+// one) falls back blind, so the write would only destroy human text.
 //
 // The publication, in the spec's steps:
 //
@@ -161,7 +162,8 @@ export interface PublicationSpec {
   completionCloses: boolean;
   /** Whether a scanning publication that never read the PR writes the blind whole-body
    *  non-closing rewrite (see the header). The runner sets it for a NON-interlocked run only: an
-   *  interlocked run's reconcile owns the body after publish() and falls back blind on its own.
+   *  interlocked run's reconcile owns the body after publish(), and its reconcile (or the strip
+   *  that follows an unconfirmed one) falls back blind.
    *  Absent means off: the unread PR is left as it is and closingRemains reports it. */
   blindFallback?: boolean;
   /** claim.pr_description: the PR's record as the api delivered it. Absent is NOT authoritative. */
