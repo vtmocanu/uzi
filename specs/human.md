@@ -934,6 +934,20 @@ Tracked as GitHub issue vtmocanu/uzi#1795; decision record `adr/1795-gate-revisi
 
 - A plan-gate approve, reject or request-changes applies only to the plan revision it was sent against; a client that shows a plan (web, CLI, Slack) sends back the revision it displayed, and a stale one is refused rather than applied to a different plan. (AI-synced 2026-09-27)
 
+## Feature #1798 — Plain-English PR descriptions
+
+Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-descriptions.md`.
+
+- Every PR uzi opens gets a plain-English description plus a computed size
+  line; a human can see what it does and how big it is from the description
+  alone. (AI-synced 2026-09-28)
+- A Claude run and a Codex run produce the same layout. (AI-synced 2026-09-28)
+- Generated or lead-written text can never close an issue. (AI-synced 2026-09-28)
+- Text outside uzi's own blocks is preserved. (AI-synced 2026-09-28)
+- The footer wording ("Opened by uzi from `<branch>`. A human reviews and
+  merges; uzi never merges.") was approved by the maintainer on 2026-09-27.
+  (AI-synced 2026-09-28)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

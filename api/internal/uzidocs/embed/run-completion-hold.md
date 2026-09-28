@@ -157,6 +157,30 @@ The run page and `uzi run get --json` surface this plainly as
 is durably recoverable everywhere. Durable cross-worker conversation context
 is a separate, later piece of work — this page will be updated when it ships.
 
+## Closing directives and the completion block
+
+Every interlocked run's merge/pull request has a completion block that uzi
+alone owns and rewrites; on a verified full delivery it's the only place
+`Closes #N` is ever written. Two rules keep that guarantee even when
+something goes wrong or a human has touched the request in between:
+
+- **On a verified head, if the `Closes` write can't be confirmed** — the
+  write itself fails, the read-back to confirm it fails, or the PR's head
+  moved in between — uzi strips `Closes` back out and, only once that strip
+  is confirmed, holds the run for your review rather than reporting it
+  complete. If even that strip can't be confirmed, uzi doesn't hold at all:
+  it fails the run closed, since a hold is a nominally non-closing parked
+  state and uzi can't guarantee that here.
+- **On a non-closing run** — a hold, an owner-partial delivery, or one
+  scope-capped mid-flight — uzi scans the whole resulting request body,
+  not just its own completion block, for a closing directive aimed at the
+  issue. If it finds one anywhere it doesn't own (a human typed `Closes #N`
+  into the description, or the request is an older one uzi adopted that
+  already carried one), it rewrites the whole body to a non-closing form.
+  If that rewrite can't be written or confirmed, the run fails closed rather
+  than leaving a possibly-closing request unmerged. This applies to legacy
+  (seeded) runs too, not only interlocked ones.
+
 ## Not the same as an owner pause
 
 A completion hold and [an owner-requested pause](run-pause.md) both leave a

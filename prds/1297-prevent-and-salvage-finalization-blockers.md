@@ -255,6 +255,8 @@ A run the owner already reduced can still hit a blocker: it ends `status = parti
 
 Do not write a second title or body builder, a second closing-keyword stripper, or a partial-specific copy of the reconcile re-render. D4's synthetic commit message is separate text and keeps its own no-closing-reference rule.
 
+**Amendment (2026-09-28, PRD #1798).** `mrDescription` no longer exists in `agent/src/runner.ts`. PR bodies now come from the PRD #1798 publisher's region (`agent/src/pr-description.ts` / `pr-description-publisher.ts`) plus `mrCompletionBlock`, the deterministic completion-block renderer that replaced the old fixed-sentence body; `mrTitle` is unchanged. A blocker arm still owns its own closing decision, but it must do so by setting the single `nonClosingDelivery` flag in `runner.ts`'s `phasePublish` (currently derived from `isOwnerPartial || !!result.scopeCapped`) rather than checking `effectiveCloses` alone: `nonClosingDelivery` is what gates the run into the whole-body closing-directive scan and the strip/fail-closed paths (ADR-1798 I4/I5), so a new arm that skips it can render a non-closing body that the interlock never scans.
+
 **Visible difference.** `Partial delivery` (this PRD, D8) is a distinct terminal outcome and must not reuse the green completed styling. How `scope_capped` and `scope_reduced` runs are presented is out of scope here; do not restyle them in this PRD.
 
 ## Milestones and dependency plan
