@@ -194,6 +194,15 @@ const maxPublishDuration = 60 * time.Second
 // plus this client-side ceiling).
 const MaxPublishDuration = maxPublishDuration
 
+// MaxDeleteDuration and MaxCreateRefDuration export the per-call ceilings of Delete, ListRefTips
+// (which shares maxDeleteDuration) and CreateRef for the retention timing relations in workersvc
+// (PRD #1810: the sweeper's per-record timeout is sized to cover the forge calls of its longest
+// locked operation, each at its own ceiling).
+const (
+	MaxDeleteDuration    = maxDeleteDuration
+	MaxCreateRefDuration = maxCreateRefDuration
+)
+
 // checkpointRefPrefix is the uzi-owned ref namespace no CI watches (Rule 3). The
 // end-of-run push targets refs/heads/<branch>; checkpoints never do.
 const checkpointRefPrefix = "refs/uzi-checkpoints/"

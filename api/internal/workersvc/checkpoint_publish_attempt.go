@@ -242,9 +242,12 @@ func (s *Service) ownPublishedTip(ctx context.Context, runID uuid.UUID, tip stri
 // released.
 //
 // Every row the arm could not resolve has its next comparison pushed out, whatever stopped it (a
-// read or write error, a recovered panic, the lock held elsewhere, the locked step's own deadline),
-// so a row that keeps failing never keeps its place at the head of the bounded,
-// next_check_at-ordered page.
+// read or write error, a recovered panic, the lock held elsewhere, the locked step's own deadline,
+// including a fence that failed only because it ran on the expired context), so a row that keeps
+// failing never keeps its place at the head of the bounded, next_check_at-ordered page. The one
+// exception is a lock genuinely lost while the step's deadline was still live (a fence started
+// before the deadline failed): another holder may be reconciling the row, so it is left to them
+// (lockedRetentionStep's rule for the record arms).
 //
 // The arm checks the pass budget before starting each row (and before the settle a row owes); each
 // locked step runs under pass.timeout(). A settle the budget stops is left to the work arm, which
@@ -263,7 +266,7 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 			pass.leave(len(due) - i)
 			break
 		}
-		var settle bool
+		var settle, expiredDeferred bool
 		done, acquired, err := s.lockedRetentionStep(ctx, a.RunID, pass.timeout(), func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
 			var (
 				d   bool
@@ -271,10 +274,17 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 			)
 			d, settle, err = s.reconcilePublishAttemptLocked(ctx, a.ID, fence)
 			return d, err
+		}, func(ctx context.Context, _ uuid.UUID, msg string) {
+			// The step ran out of time: defer the row while the lock is still held.
+			expiredDeferred = true
+			s.deferPublishAttemptLogged(ctx, a, "operation timed out: "+msg)
 		})
 		if err != nil {
 			slog.Warn("sweeper: checkpoint publish attempt", "run", a.RunID, "attempt", a.ID, "error", err)
-			s.deferPublishAttemptLogged(ctx, a, secretscrub.Scrub(err.Error()))
+			// Deferred already (expired), or a lock genuinely lost: another holder owns the row.
+			if !expiredDeferred && !errors.Is(err, ErrRetentionLockLost) {
+				s.deferPublishAttemptLogged(ctx, a, secretscrub.Scrub(err.Error()))
+			}
 			continue
 		}
 		if !acquired {

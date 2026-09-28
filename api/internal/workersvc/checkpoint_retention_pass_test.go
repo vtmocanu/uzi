@@ -8,7 +8,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -156,5 +158,142 @@ func TestReconcileCheckpointRetentionsSpentBudgetStartsNothing(t *testing.T) {
 	}
 	if got := st.take(); !reflect.DeepEqual(got, []string{"backfill"}) {
 		t.Fatalf("listed %v, want only the backfill page (every forge arm left for the next tick)", got)
+	}
+}
+
+// timedArmStore answers the one arm under test with a page of rows (every other arm lists an empty
+// page) and accepts the attempts arm's defer of a row it could not resolve.
+type timedArmStore struct {
+	*fakeStore
+	arm  string
+	rows int
+}
+
+func (s *timedArmStore) page(arm string) int {
+	if arm == s.arm {
+		return s.rows
+	}
+	return 0
+}
+
+func (s *timedArmStore) retentionPage(arm, state string) []store.CheckpointRetention {
+	out := make([]store.CheckpointRetention, s.page(arm))
+	for i := range out {
+		out[i] = store.CheckpointRetention{RunID: uuid.New(), State: state}
+	}
+	return out
+}
+
+func (s *timedArmStore) GetCheckpointRetentionBackfillNow(context.Context) (pgtype.Timestamptz, error) {
+	return pgtype.Timestamptz{Time: time.Now(), Valid: true}, nil
+}
+
+func (s *timedArmStore) ListCheckpointRetentionBackfill(context.Context, store.ListCheckpointRetentionBackfillParams) ([]store.ListCheckpointRetentionBackfillRow, error) {
+	return nil, nil
+}
+
+func (s *timedArmStore) AdvanceCheckpointRetentionBackfillWatermark(context.Context, pgtype.Timestamptz) (int64, error) {
+	return 0, nil
+}
+
+func (s *timedArmStore) ListDueCheckpointPublishAttempts(context.Context, store.ListDueCheckpointPublishAttemptsParams) ([]store.CheckpointPublishAttempt, error) {
+	out := make([]store.CheckpointPublishAttempt, s.page("attempts"))
+	for i := range out {
+		out[i] = store.CheckpointPublishAttempt{ID: uuid.New(), RunID: uuid.New()}
+	}
+	return out, nil
+}
+
+func (s *timedArmStore) DeferCheckpointPublishAttempt(context.Context, store.DeferCheckpointPublishAttemptParams) (int64, error) {
+	return 1, nil
+}
+
+func (s *timedArmStore) ListCheckpointRetentionWork(context.Context, store.ListCheckpointRetentionWorkParams) ([]store.CheckpointRetention, error) {
+	return s.retentionPage("work", retentionSettling), nil
+}
+
+func (s *timedArmStore) ListUnheldCheckpointRetentions(context.Context, store.ListUnheldCheckpointRetentionsParams) ([]store.CheckpointRetention, error) {
+	return s.retentionPage("unheld", retentionRetained), nil
+}
+
+func (s *timedArmStore) ListCheckpointRetentionAudit(context.Context, store.ListCheckpointRetentionAuditParams) ([]store.CheckpointRetention, error) {
+	return s.retentionPage("audit", "deleted"), nil
+}
+
+// slowAcquirer is the retention lock's connection source for a pure unit test: every Acquire (one
+// per locked operation the pass starts) records how long its context had left, spends per (or
+// until that context ends), and fails, so the operation ends with no lock taken.
+type slowAcquirer struct {
+	per  time.Duration
+	mu   sync.Mutex
+	left []time.Duration // the remaining time of each Acquire's context; -1 when it had no deadline
+}
+
+func (a *slowAcquirer) Acquire(ctx context.Context) (*pgxpool.Conn, error) {
+	left := time.Duration(-1)
+	if dl, ok := ctx.Deadline(); ok {
+		left = time.Until(dl)
+	}
+	a.mu.Lock()
+	a.left = append(a.left, left)
+	a.mu.Unlock()
+	select {
+	case <-time.After(a.per):
+	case <-ctx.Done():
+	}
+	return nil, errors.New("slowAcquirer: no connection")
+}
+
+func (a *slowAcquirer) acquired() []time.Duration {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return append([]time.Duration(nil), a.left...)
+}
+
+// TestRetentionPassArmsCheckBudgetPerRowAndUseSweepTimeout: for each forge-calling arm alone, with
+// a full page of due rows whose every locked operation takes per, the pass (1) stops starting that
+// arm's rows once its budget is spent, so it starts fewer than the page (the per-row pass.spent
+// check in the arm), and (2) runs every operation it starts under the sweeper's per-record timeout,
+// not the publish path's retentionOpTimeout (pass.timeout()). Removing either from any one arm
+// fails that arm's subtest.
+func TestRetentionPassArmsCheckBudgetPerRowAndUseSweepTimeout(t *testing.T) {
+	const (
+		rows      = 6
+		per       = 60 * time.Millisecond
+		budget    = 100 * time.Millisecond // two operations fit: rows 0 and 1 start, row 2 does not
+		opTimeout = 7 * time.Second        // far below retentionOpTimeout, and above per
+	)
+	for _, arm := range []string{"attempts", "work", "unheld", "audit"} {
+		t.Run(arm, func(t *testing.T) {
+			st := &timedArmStore{fakeStore: &fakeStore{}, arm: arm, rows: rows}
+			svc := New(st, newBox(t), testParams())
+			acq := &slowAcquirer{per: per}
+			svc.SetRetentionLockPool(acq)
+			svc.SetForgeBaseURLAllowed(func(string) bool { return true })
+			svc.SetBackground(func(fn func()) { fn() })
+			unreached := errors.New("forge seam reached without a lock")
+			svc.SetDeleteCheckpointFn(func(context.Context, pushbroker.DeleteOptions) error { return unreached })
+			svc.SetCreateRefFn(func(context.Context, pushbroker.CreateRefOptions) error { return unreached })
+			svc.SetListRefTipsFn(func(context.Context, pushbroker.ListRefsOptions, ...string) (map[string]string, error) {
+				return nil, unreached
+			})
+			svc.retentionPassBudget = budget
+			svc.retentionSweepOpTimeout = opTimeout
+
+			if _, err := svc.ReconcileCheckpointRetentions(context.Background()); err != nil {
+				t.Fatalf("ReconcileCheckpointRetentions: %v", err)
+			}
+			left := acq.acquired()
+			if len(left) == 0 || len(left) >= rows {
+				t.Fatalf("the %s arm started %d of its %d rows, want at least 1 and fewer than all "+
+					"(the spent budget must stop it between rows)", arm, len(left), rows)
+			}
+			for i, l := range left {
+				if l <= 0 || l > opTimeout {
+					t.Fatalf("the %s arm's operation %d ran with %s left on its context, want at most the sweeper's "+
+						"per-record timeout %s (not retentionOpTimeout %s)", arm, i, l, opTimeout, retentionOpTimeout)
+				}
+			}
+		})
 	}
 }

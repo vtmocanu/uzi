@@ -242,3 +242,225 @@ func TestRetentionForgeTimeoutRecordsBackoffLiveDB(t *testing.T) {
 		t.Fatalf("hanging forge calls after a second pass = %d, want still 1 (the record's backoff moved it past)", n)
 	}
 }
+
+// stuckExitFix is a superseding record of the old run whose supersession stopped (the recovery ref
+// sits at another tip) and whose hold is discarded, so the work arm's next pass takes the stuck
+// exit: one list of both refs, then the branch-ref delete behind the fence.
+func stuckExitFix(t *testing.T) *supersedeFix {
+	t.Helper()
+	f := newSupersedeFix(t)
+	f.forge.set(f.recoveryRef, supersedeOtherTip)
+	f.stopSupersession(t)
+	f.discardHold(t)
+	return f
+}
+
+// TestRetentionExpiredFenceRecordsBackoffLiveDB (#1810 review N2): the stuck exit's list returns
+// just AFTER the sweeper's per-record deadline, so the fence before the branch-ref delete runs on
+// the expired context and fails. That is not a lost lock and not a forge failure, and the step
+// records nothing for it; lockedRetentionStep's expiry bookkeeping must still push the record out
+// (attempts+1, next_attempt_at in the future), so the next pass does not start it first again.
+// Before the fix the record stayed due with its attempts unchanged, and the next pass listed again.
+func TestRetentionExpiredFenceRecordsBackoffLiveDB(t *testing.T) {
+	f := stuckExitFix(t)
+	before := f.row(t)
+	svc := f.svc2
+	svc.retentionSweepOpTimeout = 300 * time.Millisecond
+	var lists atomic.Int32
+	svc.SetListRefTipsFn(func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
+		lists.Add(1)
+		<-ctx.Done() // the forge answers just after the operation's deadline, with a good answer
+		return f.forge.listRefTips(context.Background(), o, refs...)
+	})
+
+	f.reconcileRun(t, svc, f.oldRun)
+	if n := lists.Load(); n != 1 {
+		t.Fatalf("lists = %d, want 1 (the stuck exit's)", n)
+	}
+	if tip, ok := f.forge.ref(f.branchRef); !ok || tip != retentionTestTip {
+		t.Fatalf("branch ref = %q (present %v), want left at %s: the fence on the expired context must stop the delete",
+			tip, ok, retentionTestTip)
+	}
+	r := f.row(t)
+	if r.State != retentionSuperseding || r.Attempts != before.Attempts+1 || !r.NextAttemptAt.Time.After(time.Now()) ||
+		!strings.Contains(r.LastError.String, "operation timed out") {
+		t.Fatalf("record = {state %q attempts %d (before %d) next_attempt_at %v last_error %q}, want superseding, "+
+			"one more attempt, a future next attempt and the timeout recorded", r.State, r.Attempts, before.Attempts,
+			r.NextAttemptAt.Time, r.LastError.String)
+	}
+
+	// Not due any more: the next pass does not start the record again.
+	f.reconcileRun(t, svc, f.oldRun)
+	if n := lists.Load(); n != 1 {
+		t.Fatalf("lists after a second pass = %d, want still 1 (the backoff moved the record past)", n)
+	}
+}
+
+// TestRetentionLockLostLiveRecordsNothingLiveDB (#1810 review N2, the other side): a lock
+// genuinely lost while the operation's deadline is still live (released on the pinned session just
+// before the stuck exit's fence) stops the delete and records NOTHING: another holder may own the
+// record now, so neither the step nor the expiry bookkeeping writes to it.
+func TestRetentionLockLostLiveRecordsNothingLiveDB(t *testing.T) {
+	f := stuckExitFix(t)
+	before := f.row(t)
+	unlock := f.holdLockLost(t)
+	f.svc1.retentionHooks.beforeForgeWrite = func(id uuid.UUID, op string) {
+		if id == f.oldRun && op == "exit-branch" {
+			unlock()
+		}
+	}
+
+	f.reconcileRun(t, f.svc1, f.oldRun)
+	if tip, ok := f.forge.ref(f.branchRef); !ok || tip != retentionTestTip {
+		t.Fatalf("branch ref = %q (present %v), want left at %s: the lost lock must stop the delete", tip, ok, retentionTestTip)
+	}
+	r := f.row(t)
+	if r.State != before.State || r.Attempts != before.Attempts || !r.NextAttemptAt.Time.Equal(before.NextAttemptAt.Time) ||
+		r.LastError != before.LastError {
+		t.Fatalf("record = {state %q attempts %d next %v last_error %q}, want untouched {%q %d %v %q}",
+			r.State, r.Attempts, r.NextAttemptAt.Time, r.LastError.String,
+			before.State, before.Attempts, before.NextAttemptAt.Time, before.LastError.String)
+	}
+}
+
+// TestAttemptsArmChecksBudgetBeforeOwedSettleLiveDB (#1810 review N3): the attempts arm re-records
+// a late-landed tip on a settling record, which owes a settle (a second locked operation). When the
+// comparison itself ran past the pass budget, the arm must not start that settle: the ref stays for
+// the work arm's later pass. The control subtest, with an ample budget, shows the same setup does
+// reach the settle and deletes the ref.
+func TestAttemptsArmChecksBudgetBeforeOwedSettleLiveDB(t *testing.T) {
+	const budget = 200 * time.Millisecond
+	for _, tc := range []struct {
+		name       string
+		listDelay  time.Duration
+		wantSettle bool
+	}{
+		{"the comparison spends the budget", budget + 100*time.Millisecond, false},
+		{"control: budget left", 0, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupersedeFix(t)
+			f.discardHold(t)
+			// Settling but not due, so only the attempts arm's owed settle can delete the ref.
+			f.e.exec(t, `UPDATE checkpoint_retentions SET state = 'settling', next_attempt_at = now() + interval '1 hour'
+			             WHERE run_id = $1`, f.oldRun)
+			f.recordAttempt(t, lateTip)
+			f.forge.set(f.branchRef, lateTip)
+			svc := f.svc2
+			svc.SetListRefTipsFn(func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
+				time.Sleep(tc.listDelay)
+				return f.forge.listRefTips(ctx, o, refs...)
+			})
+
+			pass := &retentionPass{deadline: time.Now().Add(budget), opTimeout: 30 * time.Second}
+			if _, err := svc.reconcilePublishAttempts(f.e.ctx, pgconv.UUID(f.oldRun), pass); err != nil {
+				t.Fatalf("reconcilePublishAttempts: %v", err)
+			}
+			if r := f.row(t); r.Tip != lateTip {
+				t.Fatalf("record tip = %s, want the late tip %s re-recorded", r.Tip, lateTip)
+			}
+			if n := f.attemptCount(t, f.oldRun); n != 0 {
+				t.Fatalf("attempt rows = %d, want 0 (resolved by the re-record)", n)
+			}
+			_, deletes := f.forge.counts(f.branchRef)
+			if settled := deletes == 1; settled != tc.wantSettle {
+				t.Fatalf("branch ref deletes = %d, want the owed settle to run: %v", deletes, tc.wantSettle)
+			}
+		})
+	}
+}
+
+// TestLockedRetentionStepExpiryRuleLiveDB (#1810 review N2): lockedRetentionStep's expiry
+// bookkeeping runs for a step that failed after the deadline because its fence ran on the expired
+// context, and never for one whose fence started while the deadline was live and found the lock
+// genuinely lost, even when that step only returns after the deadline.
+func TestLockedRetentionStepExpiryRuleLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		loseLock     bool
+		wantExpiries int32
+	}{
+		{"the fence runs on the expired context", false, 1},
+		{"the lock is lost while live and the step returns after the deadline", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupersedeFix(t)
+			unlock := f.holdLockLost(t)
+			var expiries atomic.Int32
+			_, acquired, err := f.svc1.lockedRetentionStep(f.e.ctx, f.oldRun, 300*time.Millisecond,
+				func(ctx context.Context, _ uuid.UUID, fence func(context.Context) error) (bool, error) {
+					if tc.loseLock {
+						unlock()
+						ferr := fence(ctx) // started while the deadline is live
+						<-ctx.Done()
+						return false, ferr
+					}
+					<-ctx.Done()
+					return false, fence(ctx)
+				},
+				func(context.Context, uuid.UUID, string) { expiries.Add(1) })
+			if !acquired || !errors.Is(err, ErrRetentionLockLost) {
+				t.Fatalf("lockedRetentionStep = acquired %v, err %v; want acquired and a failed fence", acquired, err)
+			}
+			if n := expiries.Load(); n != tc.wantExpiries {
+				t.Fatalf("expiry bookkeeping ran %d times, want %d", n, tc.wantExpiries)
+			}
+		})
+	}
+}
+
+// TestAttemptsArmExpiryRuleLiveDB (#1810 review N2, the attempts arm): an attempt row whose locked
+// step reaches the attempt-delete fence is deferred when that fence failed only because it ran on
+// the expired context (the comparison's list returned just after the deadline), and left untouched
+// when the lock was genuinely lost while the deadline was live: another holder may be reconciling
+// the row.
+func TestAttemptsArmExpiryRuleLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		loseLock  bool
+		wantCheck int32
+	}{
+		{"the fence runs on the expired context", false, 1},
+		{"the lock is lost while live", true, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupersedeFix(t)
+			f.discardHold(t)
+			id := f.recordAttempt(t, lateTip)
+			f.handOnSlot(t, lateTip)
+			svc := f.svc1
+			if tc.loseLock {
+				unlock := f.holdLockLost(t)
+				svc.retentionHooks.beforeForgeWrite = func(rid uuid.UUID, op string) {
+					if rid == f.oldRun && op == "attempt-delete" {
+						unlock()
+					}
+				}
+			} else {
+				svc.SetListRefTipsFn(func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
+					<-ctx.Done()
+					return f.forge.listRefTips(context.Background(), o, refs...)
+				})
+			}
+			before := f.attemptRow(t, id)
+			pass := &retentionPass{deadline: time.Now().Add(time.Minute), opTimeout: 300 * time.Millisecond}
+			if _, err := svc.reconcilePublishAttempts(f.e.ctx, pgconv.UUID(f.oldRun), pass); err != nil {
+				t.Fatalf("reconcilePublishAttempts: %v", err)
+			}
+			if tip, ok := f.forge.ref(f.branchRef); !ok || tip != lateTip {
+				t.Fatalf("branch ref = %q (present %v), want left at %s: the failed fence must stop the delete", tip, ok, lateTip)
+			}
+			a := f.attemptRow(t, id)
+			if a.Checks != tc.wantCheck {
+				t.Fatalf("attempt checks = %d, want %d", a.Checks, tc.wantCheck)
+			}
+			if tc.wantCheck == 0 && !a.NextCheckAt.Time.Equal(before.NextCheckAt.Time) {
+				t.Fatalf("attempt next_check_at moved from %v to %v, want untouched", before.NextCheckAt.Time, a.NextCheckAt.Time)
+			}
+			if tc.wantCheck == 1 && (!a.NextCheckAt.Time.After(time.Now()) || !strings.Contains(a.LastError.String, "operation timed out")) {
+				t.Fatalf("attempt = {next %v last_error %q}, want deferred into the future with the timeout recorded",
+					a.NextCheckAt.Time, a.LastError.String)
+			}
+		})
+	}
+}

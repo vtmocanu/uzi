@@ -31,8 +31,26 @@ const reconcileRetentionBatch = 10
 const (
 	// retentionPassBudget: see Service.retentionPassBudget.
 	retentionPassBudget = 30 * time.Second
-	// retentionSweepOpTimeout: see Service.retentionSweepOpTimeout.
-	retentionSweepOpTimeout = 20 * time.Second
+	// retentionForgeCallCeiling is the longest one pushbroker forge call of a locked retention
+	// operation may take: Delete and ListRefTips are bounded by pushbroker.MaxDeleteDuration,
+	// CreateRef by pushbroker.MaxCreateRefDuration.
+	retentionForgeCallCeiling = max(pushbroker.MaxDeleteDuration, pushbroker.MaxCreateRefDuration)
+	// retentionMaxForgeCallsPerOp is the most forge calls one locked operation of the pass makes.
+	// The longest is a superseding record's re-drive (reconcileSuperseding -> driveSupersession):
+	// CreateRef, the ErrSourceMissing list (resolveMissingSource), the branch-ref Delete, the
+	// post-delete list (branchHeldByOwnPublish) and, with no hold open, the recovery-ref Delete
+	// (deleteSettlingRef): five. The stuck exit (exitStuckSupersessionLocked) makes three (a list
+	// and up to two deletes), the audit and attempts arms two, a settle one.
+	retentionMaxForgeCallsPerOp = 5
+	// retentionSweepOpSlack covers the operation's database work around its forge calls: the
+	// connection acquire, the try-lock, the record and run reads, the fences and the record writes.
+	retentionSweepOpSlack = 10 * time.Second
+	// retentionSweepOpTimeout: see Service.retentionSweepOpTimeout. Sized so the longest locked
+	// operation completes even when every forge call takes up to its own ceiling (a slow but
+	// healthy forge): a shorter bound would time that operation out on the same call every pass,
+	// and the record (a stuck supersession the exit must clear, say) would never progress. It is
+	// derived from the pushbroker ceilings, so raising one raises it.
+	retentionSweepOpTimeout = retentionMaxForgeCallsPerOp*retentionForgeCallCeiling + retentionSweepOpSlack
 )
 
 // Notes persisted on a record's last_error by the M4 arms (never carry forge output).
@@ -58,13 +76,29 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 }
 
 // retentionPass is one reconciliation pass's time budget. Every arm checks spent BEFORE STARTING
-// each record, never inside one, and runs the record's locked operation under opTimeout. A record
-// already started when the budget runs out finishes (or hits opTimeout), so with a forge call that
-// honours its context a pass takes about the budget plus one opTimeout. On top of that come the
-// bounded writes after a timed-out operation (the failure bookkeeping on retentionBookkeepingCtx
-// and the unlock, each bounded by its own 10-second timeout); the LiveDB test
-// TestSweepRetentionPassBudgetLiveDB measures the bound against a forge that hangs until its
-// context ends. A nil *retentionPass is unbounded (the direct arm calls in tests).
+// each record, never inside one (the attempts arm checks it again before the settle a
+// re-recorded tip owes, which is a second locked operation), and runs the record's locked
+// operation under opTimeout.
+//
+// The worst case, with forge calls that honour their context: the last operation starts just
+// before the budget runs out and runs its full opTimeout, and after its deadline come, each on its
+// own fresh 10-second context (retentionRecordTimeout, retentionUnlockTimeout):
+//
+//  1. the step's own failure bookkeeping (recordRetentionFailure, deferRetentionVerify or
+//     deferPublishAttempt on retentionBookkeepingCtx) after the forge call that hit the deadline;
+//  2. lockedRetentionStep's expiry bookkeeping when the step still returned an error (a fence or
+//     database read on the expired context, or a failed write in 1), or, in the attempts arm,
+//     its defer of the attempt row, which runs in place of this write (never in addition to it);
+//  3. the unlock (releaseRetentionLock);
+//  4. destroyRetentionConn, when the unlock failed.
+//
+// So with the defaults a pass runs for at most retentionPassBudget + retentionSweepOpTimeout +
+// 4 x 10s = 30s + 160s + 40s = 230s. Not counted: the candidate-list reads and the backfill arm's
+// re-read, which run on the sweeper's own context (a list started just before the budget runs out
+// starts none of its records). With the real pushbroker a hung forge ends far sooner: its first
+// call fails at retentionForgeCallCeiling, and the step records the failure and returns. The
+// LiveDB test TestSweepRetentionPassBudgetLiveDB measures the bound against a forge that hangs
+// until its context ends. A nil *retentionPass is unbounded (the direct arm calls in tests).
 type retentionPass struct {
 	deadline  time.Time
 	opTimeout time.Duration
@@ -274,7 +308,7 @@ func (s *Service) reconcileRetentionAudit(ctx context.Context, onlyRun pgtype.UU
 			pass.leave(len(audit) - i)
 			break
 		}
-		done, _, err := s.lockedRetentionStep(ctx, r.RunID, pass.timeout(), s.auditRecoveryRefLocked)
+		done, _, err := s.lockedRetentionStep(ctx, r.RunID, pass.timeout(), s.auditRecoveryRefLocked, s.deferExpiredRetentionStep)
 		if err != nil {
 			slog.Warn("sweeper: checkpoint retention audit", "run", r.RunID, "error", secretscrub.Scrub(err.Error()))
 			continue
@@ -363,8 +397,20 @@ func backfillWatermark(page []store.ListCheckpointRetentionBackfillRow, recorded
 // lockedRetentionStep runs one locked step for runID under its retention lock (try semantics), the
 // whole operation bounded by timeout (withRetentionLockTimeout), recovering a panic from the go-git
 // seams into err. done is meaningful only when acquired.
+//
+// expired, when non-nil, is the step's failure bookkeeping for an operation that ran out of time:
+// it runs, still under the lock, when the step returned an error after the operation's own
+// deadline passed. A forge call that returns just before the deadline leaves the step's next
+// fence or database read to run on the expired context; that error is not a forge failure, so the
+// step records nothing for it, and without this the record would keep its place at the head of
+// its arm's due-ordered page on every later pass. It never runs when a fence the step started
+// while the deadline was still live failed: the lock was then genuinely lost (the session ended,
+// or the lock was released under it) and another holder may own the record. expired receives the
+// operation's context (already expired, so it must write on retentionBookkeepingCtx) and the
+// scrubbed error.
 func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID, timeout time.Duration,
 	step func(ctx context.Context, runID uuid.UUID, fence func(context.Context) error) (bool, error),
+	expired func(ctx context.Context, runID uuid.UUID, msg string),
 ) (done, acquired bool, err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -372,11 +418,53 @@ func (s *Service) lockedRetentionStep(ctx context.Context, runID uuid.UUID, time
 		}
 	}()
 	acquired, err = s.withRetentionLockTimeout(ctx, runID, timeout, func(ctx context.Context, fence func(context.Context) error) error {
+		// lostLive: a fence started before the deadline failed, so the lock was genuinely lost.
+		lostLive := false
+		watched := func(fctx context.Context) error {
+			live := fctx.Err() == nil
+			ferr := fence(fctx)
+			if ferr != nil && live {
+				lostLive = true
+			}
+			return ferr
+		}
 		var ferr error
-		done, ferr = step(ctx, runID, fence)
+		done, ferr = step(ctx, runID, watched)
+		if ferr != nil && expired != nil && !lostLive && errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			expired(ctx, runID, secretscrub.Scrub(ferr.Error()))
+		}
 		return ferr
 	})
 	return done && acquired, acquired, err
+}
+
+// deferExpiredRetentionStep is lockedRetentionStep's expiry bookkeeping for the record arms: on
+// retentionBookkeepingCtx it re-reads the run's record and pushes its next attempt out by the
+// retry backoff, guarded on the state it read (recordRetentionFailure), or, for a deleted record
+// whose audit is pending, pushes the audit out (deferRetentionVerify). A record in any other state,
+// or none, is left alone; a failure is only logged.
+func (s *Service) deferExpiredRetentionStep(ctx context.Context, runID uuid.UUID, msg string) {
+	bctx, cancel := retentionBookkeepingCtx(ctx)
+	defer cancel()
+	row, err := s.q.GetCheckpointRetention(bctx, runID)
+	if err != nil {
+		if !errors.Is(err, pgx.ErrNoRows) {
+			slog.Warn("checkpoint retention: expired step bookkeeping: read record", "run", runID, "error", secretscrub.Scrub(err.Error()))
+		}
+		return
+	}
+	msg = "operation timed out: " + msg
+	switch row.State {
+	case retentionRetained, retentionSuperseding, retentionSuperseded, retentionSettling:
+		err = s.recordRetentionFailure(bctx, row, row.State, msg)
+	case "deleted":
+		if row.RecoveryRef.Valid && !row.VerifiedAt.Valid {
+			err = s.deferRetentionVerify(bctx, row, msg)
+		}
+	}
+	if err != nil {
+		slog.Warn("checkpoint retention: expired step bookkeeping", "run", runID, "error", secretscrub.Scrub(err.Error()))
+	}
 }
 
 // reconcileSuperseding is the sweeper's arm for a due `superseding` record. Under the lock it
@@ -407,7 +495,7 @@ func (s *Service) reconcileSuperseding(ctx context.Context, runID uuid.UUID, tim
 			}
 		}
 		return s.driveSupersession(ctx, row, fence)
-	})
+	}, s.deferExpiredRetentionStep)
 }
 
 // exitStuckSupersessionLocked settles a stopped `superseding` record whose run has no open hold

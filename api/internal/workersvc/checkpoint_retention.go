@@ -34,7 +34,7 @@ const (
 	retentionDefaultConc = 2
 	// retentionOpTimeout bounds one whole locked operation (lock, re-read, forge round-trip,
 	// record), detached from the caller's context. The publish and settle paths use it; a record
-	// the sweeper's pass starts uses the shorter Service.retentionSweepOpTimeout instead.
+	// the sweeper's pass starts uses Service.retentionSweepOpTimeout instead.
 	retentionOpTimeout = 2 * time.Minute
 	// retentionRecordTimeout bounds the terminal-time record inserts run on the caller's path, and
 	// every failure-bookkeeping write (retentionBookkeepingCtx).
@@ -73,8 +73,9 @@ type ConnAcquirer interface {
 // (a settling record's ref), "create" (supersession's recovery ref), "delete-branch"
 // (supersession's branch ref), "exit-recovery"/"exit-branch" (a stuck supersession's exit, M4)
 // "audit-delete" (the post-settlement audit's stray recovery ref, M4) or "attempt-delete" (a
-// terminal run's late publish the attempts arm deletes, #1810 residual 2). afterLock runs once the lock is held, with the pinned
-// connection, so a test can release the lock WITHOUT ending the session.
+// terminal run's late publish the attempts arm deletes, #1810 residual 2). afterLock runs once
+// the lock is held, with the pinned connection, so a test can release the lock WITHOUT ending the
+// session.
 type retentionTestHooks struct {
 	beforeForgeWrite func(runID uuid.UUID, op string)
 	afterLock        func(runID uuid.UUID, conn *pgxpool.Conn)
@@ -112,10 +113,10 @@ func (s *Service) retentionWired() bool {
 // retries); nothing destructive ever happens without the lock.
 //
 // The whole operation is detached from ctx's cancellation and bounded by retentionOpTimeout
-// (withRetentionLockTimeout takes the bound explicitly). fn receives that context and a fence: fn MUST call fence immediately before every forge write
-// and skip the write when it errors. The fence re-reads pg_locks on the pinned session, so a lock
-// lost mid-operation (backend terminated, connection dropped) is observed before the write, not
-// after.
+// (withRetentionLockTimeout takes the bound explicitly). fn receives that context and a fence: fn
+// MUST call fence immediately before every forge write and skip the write when it errors. The
+// fence re-reads pg_locks on the pinned session, so a lock lost mid-operation (backend terminated,
+// connection dropped) is observed before the write, not after.
 //
 // The unlock runs on a fresh bounded context. If it fails, or reports the lock was not held, the
 // connection is hijacked out of the pool and closed, so a session that may still hold the lock
@@ -125,8 +126,8 @@ func (s *Service) withRetentionLock(ctx context.Context, runID uuid.UUID, fn fun
 }
 
 // withRetentionLockTimeout is withRetentionLock with the operation's bound passed explicitly: the
-// sweeper's pass passes Service.retentionSweepOpTimeout, so one slow forge call costs the pass at
-// most that long (reconcileCheckpointRetentions).
+// sweeper's pass passes Service.retentionSweepOpTimeout, so one record costs the pass at most that
+// long (reconcileCheckpointRetentions).
 func (s *Service) withRetentionLockTimeout(ctx context.Context, runID uuid.UUID, timeout time.Duration,
 	fn func(ctx context.Context, fence func(context.Context) error) error,
 ) (acquired bool, err error) {
@@ -342,7 +343,7 @@ func (s *Service) settleRetainedCheckpoint(ctx context.Context, runID uuid.UUID)
 // acquired is false when the lock or a concurrency slot was busy (nothing ran). A panic from the
 // go-git seams is recovered into err.
 func (s *Service) settleRetainedCheckpointOnce(ctx context.Context, runID uuid.UUID, timeout time.Duration) (done, acquired bool, err error) {
-	return s.lockedRetentionStep(ctx, runID, timeout, s.settleLocked)
+	return s.lockedRetentionStep(ctx, runID, timeout, s.settleLocked, s.deferExpiredRetentionStep)
 }
 
 // settleLocked is one settle under the run's retention lock: a retained/superseded record with no
