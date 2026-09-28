@@ -2771,6 +2771,10 @@ export class RunRunner {
       // `executor.safety`, so a Claude/stub run (no safety) is untouched. Best-effort +
       // idempotent (disposeTools is), so a standalone-backstop dispose never double-disposes,
       // and a dispose failure can never convert a completed run into a failed one.
+      // Issue #1856: an `incomplete` or rejected dispose has not proven the Codex processes
+      // drained, so the clone, its journal and the paired skills dir are kept (the #1783
+      // blocked-retire posture). HOME handling is unchanged: a run without resume artifacts
+      // still loses its HOME, as in #1783.
       let terminalDisposeUnproven = false;
       if (executor.safety) {
         try {
