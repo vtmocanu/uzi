@@ -646,6 +646,16 @@ uzi version
   `landing_state` is `needs_landing` carries human-landable work: recover it with
   `uzi run export` when an archive is available, or from the preserved diff
   (`uzi run get <run-id> --field preserved_patch`) when it isn't.
+- **Salvage copy of a failed run** (off by default; an operator enables it per forge with
+  `UZI_SALVAGE_FORGES`). `uzi run get <run-id>` on a failed run with a salvage record prints a
+  `SALVAGE` block: the state with a one-line explanation, `SALVAGE_REF`, `SALVAGE_TIP`,
+  `SALVAGE_EXPIRES`, `SALVAGE_ERROR` when set, and, when `promoted`, `SALVAGE_FETCH` with
+  `git fetch origin refs/uzi-salvage/<run-id>`. A promoted copy means checkpointed commits
+  saved: the last **published** checkpoint, which may be behind the run's final local work,
+  kept until it expires. Other states: `pending`, `unavailable`, `refused`, `failed`,
+  `skipped_secret` (not saved: the run failed on a secret-scan block), `expired`, `disabled`.
+  Read it as `--field salvage_state` / `salvage_ref`; all `salvage_*` fields are null without a
+  record. The branch's own checkpoint ref is never a salvage ref.
 - `uzi run discard <run-id> --hold <hold-id> [--yes]` — discard ONE exact custody hold (a held
   source of unpublished committed work), so a blocked worker/PVC can be torn down. **Destructive:**
   the worker-local source may be the only copy and no server archive can restore it after discard.

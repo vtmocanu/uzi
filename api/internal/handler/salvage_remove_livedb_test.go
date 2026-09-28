@@ -114,12 +114,14 @@ func (f *salvageRemoveFixture) settle(run uuid.UUID) {
 type salvageConflictBody struct {
 	Error        string   `json:"error"`
 	SalvageRefs  []string `json:"salvage_refs"`
+	PendingRuns  []string `json:"salvage_pending_runs"`
 	SalvageCount int64    `json:"salvage_count"`
 }
 
 // assertSalvage409 checks a 409 carrying the salvage body for one run naming exactly
-// wantRefs, in order.
-func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string, wantRefs ...string) {
+// wantRefs (its created salvage ref) or, with none, the run whose salvage copy is still
+// being made. The branch-scoped checkpoint ref (#1810's) is never named.
+func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string, run uuid.UUID, wantRefs ...string) {
 	t.Helper()
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("%s = %d, want 409\nbody: %s", what, rec.Code, rec.Body.String())
@@ -128,8 +130,16 @@ func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string,
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("%s: decode 409 body: %v\n%s", what, err, rec.Body.String())
 	}
-	if body.SalvageCount != 1 || strings.Join(body.SalvageRefs, "\n") != strings.Join(wantRefs, "\n") {
-		t.Fatalf("%s: salvage body = %+v, want count 1 naming %q", what, body, wantRefs)
+	wantPending := []string{}
+	if len(wantRefs) == 0 {
+		wantPending = []string{run.String()}
+		if !strings.Contains(body.Error, "a salvage copy is being made for run "+run.String()) {
+			t.Fatalf("%s: error text %q must say a salvage copy is being made for run %s", what, body.Error, run)
+		}
+	}
+	if body.SalvageCount != 1 || strings.Join(body.SalvageRefs, "\n") != strings.Join(wantRefs, "\n") ||
+		strings.Join(body.PendingRuns, "\n") != strings.Join(wantPending, "\n") {
+		t.Fatalf("%s: salvage body = %+v, want count 1 naming refs %q, pending runs %q", what, body, wantRefs, wantPending)
 	}
 	for _, ref := range wantRefs {
 		if !strings.Contains(body.Error, ref) {
@@ -139,10 +149,14 @@ func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string,
 	if !strings.Contains(body.Error, "checkpointed commits") || strings.Contains(body.Error, "more run") {
 		t.Fatalf("%s: error text %q must name the checkpointed commits and no further runs", what, body.Error)
 	}
+	if strings.Contains(rec.Body.String(), "uzi-checkpoints") {
+		t.Fatalf("%s: the 409 must never name a branch checkpoint ref: %s", what, rec.Body.String())
+	}
 }
 
-// Pending, promoted and created-pending salvage rows make BOTH removal routes 409, and the
-// repo, connection, run and salvage row all survive. Settling the row lifts both guards.
+// Pending, promoted and created-pending salvage rows make BOTH removal routes 409 (naming
+// the salvage ref once created, else the run), and the repo, connection, run and salvage
+// row all survive. Settling the row lifts both guards.
 func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 	f := newSalvageRemoveFixture(t)
 	cases := []struct {
@@ -151,11 +165,10 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 		created bool
 		refs    func(run uuid.UUID) []string
 	}{
-		{"pending", "pending", false, func(uuid.UUID) []string { return []string{"refs/uzi-checkpoints/agent/issue-7"} }},
-		// Created but not yet promoted: the branch ref may still exist beside the salvage ref.
-		{"created-pending", "pending", true, func(run uuid.UUID) []string {
-			return []string{"refs/uzi-salvage/" + run.String(), "refs/uzi-checkpoints/agent/issue-7"}
-		}},
+		// Pending, nothing created yet: the run is named, never its branch checkpoint ref.
+		{"pending", "pending", false, func(uuid.UUID) []string { return nil }},
+		// A created salvage ref on a still-pending row names only that salvage ref.
+		{"created-pending", "pending", true, func(run uuid.UUID) []string { return []string{"refs/uzi-salvage/" + run.String()} }},
 		{"promoted", "promoted", true, func(run uuid.UUID) []string { return []string{"refs/uzi-salvage/" + run.String()} }},
 	}
 	for i, tc := range cases {
@@ -164,9 +177,9 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 			f.salvage(run, repo, tc.state, tc.created)
 
 			rec := cookieReq(t, f.router, http.MethodDelete, "/api/repos/"+repo.String(), f.jwt, "")
-			assertSalvage409(t, rec, "DELETE repo", tc.refs(run)...)
+			assertSalvage409(t, rec, "DELETE repo", run, tc.refs(run)...)
 			rec = cookieReq(t, f.router, http.MethodDelete, "/api/forge/connections/"+conn.String(), f.jwt, "")
-			assertSalvage409(t, rec, "DELETE connection", tc.refs(run)...)
+			assertSalvage409(t, rec, "DELETE connection", run, tc.refs(run)...)
 
 			for _, c := range []struct {
 				table string
@@ -312,7 +325,7 @@ func TestDeleteRacingSalvageInsertIs409LiveDB(t *testing.T) {
 			case <-time.After(20 * time.Second):
 				t.Fatalf("the handler never returned after the sweep committed")
 			}
-			assertSalvage409(t, rec, "racing DELETE "+route, "refs/uzi-checkpoints/agent/issue-7")
+			assertSalvage409(t, rec, "racing DELETE "+route, run)
 			if !f.exists(table, anchor) || !f.exists("runs", run) || !f.exists("run_salvage", run) {
 				t.Fatalf("the %s, run and committed salvage row must all survive the raced 409", route)
 			}
@@ -339,6 +352,72 @@ func TestSalvageInsertAfterRepoDeleteFailsLiveDB(t *testing.T) {
 	}
 	if _, err := q.GetRunSalvage(context.Background(), run); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("the refused insert must leave no row, GetRunSalvage err = %v", err)
+	}
+}
+
+// PRD #1867 M4: GET /api/runs/{id} overlays the salvage fields on a failed run with a
+// salvage row (salvage_ref only when promoted), leaves them null without a row, and never
+// overlays a run that is not failed. The lookup-error case is TestApplyRunSalvage's.
+func TestGetRunSalvageOverlayLiveDB(t *testing.T) {
+	f := newSalvageRemoveFixture(t)
+	type dto struct {
+		Status       string     `json:"status"`
+		LandingState string     `json:"landing_state"`
+		State        *string    `json:"salvage_state"`
+		Ref          *string    `json:"salvage_ref"`
+		Tip          *string    `json:"salvage_tip"`
+		ExpiresAt    *time.Time `json:"salvage_expires_at"`
+		LastError    *string    `json:"salvage_last_error"`
+	}
+	get := func(run uuid.UUID) (dto, string) {
+		t.Helper()
+		rec := cookieReq(t, f.router, http.MethodGet, "/api/runs/"+run.String(), f.jwt, "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET run = %d\nbody: %s", rec.Code, rec.Body.String())
+		}
+		var env struct {
+			Run dto `json:"run"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &env); err != nil {
+			t.Fatalf("decode run: %v", err)
+		}
+		return env.Run, rec.Body.String()
+	}
+
+	_, repo, promoted := f.connRepoRun(1867_60)
+	f.salvage(promoted, repo, "promoted", true)
+	d, raw := get(promoted)
+	if d.State == nil || *d.State != "promoted" || d.Ref == nil || *d.Ref != "refs/uzi-salvage/"+promoted.String() ||
+		d.Tip == nil || *d.Tip != salvageTestTip || d.ExpiresAt == nil || d.LastError != nil || d.LandingState != "none" {
+		t.Fatalf("promoted overlay = %s", raw)
+	}
+
+	_, repo, pending := f.connRepoRun(1867_61)
+	f.salvage(pending, repo, "pending", false)
+	cliMustExec(t, f.pool, `UPDATE run_salvage SET last_error = 'forge unreachable', attempts = 1 WHERE run_id = $1`, pending)
+	d, raw = get(pending)
+	if d.State == nil || *d.State != "pending" || d.Ref != nil || d.Tip == nil || d.ExpiresAt != nil ||
+		d.LastError == nil || *d.LastError != "forge unreachable" {
+		t.Fatalf("pending overlay = %s", raw)
+	}
+	if strings.Contains(raw, "uzi-checkpoints") {
+		t.Fatalf("the run DTO must never surface the branch checkpoint ref as salvage's: %s", raw)
+	}
+
+	_, _, bare := f.connRepoRun(1867_62)
+	d, raw = get(bare)
+	if d.State != nil || d.Ref != nil || d.Tip != nil || d.ExpiresAt != nil || d.LastError != nil ||
+		!strings.Contains(raw, `"salvage_state":null`) {
+		t.Fatalf("no-row overlay must leave the salvage fields null: %s", raw)
+	}
+
+	// A run that is not failed is never overlaid, even with a row.
+	_, repo, done := f.connRepoRun(1867_63)
+	f.salvage(done, repo, "promoted", true)
+	cliMustExec(t, f.pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, done)
+	d, raw = get(done)
+	if d.Status != "completed" || d.State != nil || d.Ref != nil {
+		t.Fatalf("a completed run must carry no salvage fields: %s", raw)
 	}
 }
 

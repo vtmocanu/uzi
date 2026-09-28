@@ -513,6 +513,22 @@ type RunDTO struct {
 	// "unrecoverable" when the origin is in that set but neither exists, "none" (default) otherwise.
 	// Derived by workersvc.DeriveLandingState; a worker cannot report it.
 	LandingState string `json:"landing_state"`
+	// The failed-run checkpoint salvage fields (PRD #1867 M4): a read-only surfacing of the
+	// run's run_salvage row, the bounded archive copy of its last published checkpoint at
+	// refs/uzi-salvage/<run-id>. All five are null when the run has no salvage row, and they
+	// are populated ONLY on the single-run detail read (GetRun) of a failed run; list reads
+	// leave them null. landing_state is independent of them. SalvageState is the row's state
+	// (pending, promoted, unavailable, refused, failed, skipped_secret, expired, disabled).
+	// SalvageRef is refs/uzi-salvage/<run-id>, set only while the state is promoted (the
+	// salvage copy exists and has not expired). SalvageTip is the checkpoint commit the copy
+	// is (or would be) pinned at, SalvageExpiresAt when the copy is removed (null until one
+	// exists), SalvageLastError the bounded (<=512), server-scrubbed last broker error.
+	// The branch checkpoint ref is never surfaced here: its retention is #1810's, not salvage's.
+	SalvageState     *string    `json:"salvage_state"`
+	SalvageRef       *string    `json:"salvage_ref"`
+	SalvageTip       *string    `json:"salvage_tip"`
+	SalvageExpiresAt *time.Time `json:"salvage_expires_at"`
+	SalvageLastError *string    `json:"salvage_last_error"`
 	// PrdDonePath is the repo-relative path the run declared it moved a PRD to when it
 	// archived a completed PRD (e.g. prds/done/72-x.md), null for a run that moved none.
 	// Read-only surfacing of the runs.prd_done_path column so the issue's PRD link can be

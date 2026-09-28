@@ -130,15 +130,13 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid;
 
 -- name: ListLiveSalvageRefsForRepo :many
--- The refs the repo-removal 409 names, per live row: salvage_ref is the run-scoped salvage
--- ref once created ('' before), retained_ref the branch-scoped checkpoint ref while the row
--- is still pending ('' once promoted), since a pending row's branch ref may still exist even
--- after its salvage ref was created. Owner-scoped like the count. Bounded by lim rows.
-SELECT s.run_id,
+-- What the repo-removal 409 names, per live row: the run, its state, and salvage_ref, the
+-- run-scoped salvage ref once created (empty before, while the salvage copy is still being
+-- made). The branch-scoped checkpoint ref is never named: #1810's retention owns it, not
+-- salvage. Owner-scoped like the count. Bounded by lim rows.
+SELECT s.run_id, s.state,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
-       (CASE WHEN s.state = 'pending'
-             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
@@ -157,12 +155,10 @@ JOIN forge_connections c ON c.id = p.connection_id
 WHERE c.id = @connection_id::uuid AND c.user_id = @user_id::uuid;
 
 -- name: ListLiveSalvageRefsForConnection :many
--- The refs the forge-connection-removal 409 names (see ListLiveSalvageRefsForRepo).
-SELECT s.run_id,
+-- What the forge-connection-removal 409 names (see ListLiveSalvageRefsForRepo).
+SELECT s.run_id, s.state,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
-       (CASE WHEN s.state = 'pending'
-             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id

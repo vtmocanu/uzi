@@ -199,6 +199,9 @@ var runDTOKeys = []string{
 	// is always on the wire — "" on a run with no landing state, else none/needs_landing/
 	// unrecoverable.
 	"landing_state",
+	// PRD #1867 M4: the failed-run checkpoint salvage fields, all null without a run_salvage
+	// row (and on list reads), but the keys are always on the wire.
+	"salvage_state", "salvage_ref", "salvage_tip", "salvage_expires_at", "salvage_last_error",
 	// PRD-link reconciliation (read-only): the path the run declared it archived a PRD
 	// to, and when that patch lifecycle settled (null while pending). Both always on the
 	// wire — prd_done_path null for a run that moved no PRD, prd_patch_settled_at null

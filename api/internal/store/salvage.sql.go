@@ -126,11 +126,9 @@ func (q *Queries) InsertRunSalvage(ctx context.Context, arg InsertRunSalvagePara
 }
 
 const listLiveSalvageRefsForConnection = `-- name: ListLiveSalvageRefsForConnection :many
-SELECT s.run_id,
+SELECT s.run_id, s.state,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
-       (CASE WHEN s.state = 'pending'
-             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
@@ -147,12 +145,12 @@ type ListLiveSalvageRefsForConnectionParams struct {
 }
 
 type ListLiveSalvageRefsForConnectionRow struct {
-	RunID       uuid.UUID `json:"run_id"`
-	SalvageRef  string    `json:"salvage_ref"`
-	RetainedRef string    `json:"retained_ref"`
+	RunID      uuid.UUID `json:"run_id"`
+	State      string    `json:"state"`
+	SalvageRef string    `json:"salvage_ref"`
 }
 
-// The refs the forge-connection-removal 409 names (see ListLiveSalvageRefsForRepo).
+// What the forge-connection-removal 409 names (see ListLiveSalvageRefsForRepo).
 func (q *Queries) ListLiveSalvageRefsForConnection(ctx context.Context, arg ListLiveSalvageRefsForConnectionParams) ([]ListLiveSalvageRefsForConnectionRow, error) {
 	rows, err := q.db.Query(ctx, listLiveSalvageRefsForConnection, arg.ConnectionID, arg.UserID, arg.Lim)
 	if err != nil {
@@ -162,7 +160,7 @@ func (q *Queries) ListLiveSalvageRefsForConnection(ctx context.Context, arg List
 	items := []ListLiveSalvageRefsForConnectionRow{}
 	for rows.Next() {
 		var i ListLiveSalvageRefsForConnectionRow
-		if err := rows.Scan(&i.RunID, &i.SalvageRef, &i.RetainedRef); err != nil {
+		if err := rows.Scan(&i.RunID, &i.State, &i.SalvageRef); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -174,11 +172,9 @@ func (q *Queries) ListLiveSalvageRefsForConnection(ctx context.Context, arg List
 }
 
 const listLiveSalvageRefsForRepo = `-- name: ListLiveSalvageRefsForRepo :many
-SELECT s.run_id,
+SELECT s.run_id, s.state,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
-       (CASE WHEN s.state = 'pending'
-             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
@@ -195,15 +191,15 @@ type ListLiveSalvageRefsForRepoParams struct {
 }
 
 type ListLiveSalvageRefsForRepoRow struct {
-	RunID       uuid.UUID `json:"run_id"`
-	SalvageRef  string    `json:"salvage_ref"`
-	RetainedRef string    `json:"retained_ref"`
+	RunID      uuid.UUID `json:"run_id"`
+	State      string    `json:"state"`
+	SalvageRef string    `json:"salvage_ref"`
 }
 
-// The refs the repo-removal 409 names, per live row: salvage_ref is the run-scoped salvage
-// ref once created (” before), retained_ref the branch-scoped checkpoint ref while the row
-// is still pending (” once promoted), since a pending row's branch ref may still exist even
-// after its salvage ref was created. Owner-scoped like the count. Bounded by lim rows.
+// What the repo-removal 409 names, per live row: the run, its state, and salvage_ref, the
+// run-scoped salvage ref once created (empty before, while the salvage copy is still being
+// made). The branch-scoped checkpoint ref is never named: #1810's retention owns it, not
+// salvage. Owner-scoped like the count. Bounded by lim rows.
 func (q *Queries) ListLiveSalvageRefsForRepo(ctx context.Context, arg ListLiveSalvageRefsForRepoParams) ([]ListLiveSalvageRefsForRepoRow, error) {
 	rows, err := q.db.Query(ctx, listLiveSalvageRefsForRepo, arg.RepoID, arg.UserID, arg.Lim)
 	if err != nil {
@@ -213,7 +209,7 @@ func (q *Queries) ListLiveSalvageRefsForRepo(ctx context.Context, arg ListLiveSa
 	items := []ListLiveSalvageRefsForRepoRow{}
 	for rows.Next() {
 		var i ListLiveSalvageRefsForRepoRow
-		if err := rows.Scan(&i.RunID, &i.SalvageRef, &i.RetainedRef); err != nil {
+		if err := rows.Scan(&i.RunID, &i.State, &i.SalvageRef); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

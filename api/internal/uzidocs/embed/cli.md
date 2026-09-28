@@ -868,6 +868,40 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
+### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
+
+Salvage is **off by default**. An operator turns it on per forge with
+`UZI_SALVAGE_FORGES` (a comma list of `github`, `gitlab`, `forgejo`). When it is on,
+uzi copies a failed run's last **published** checkpoint to a run-scoped ref,
+`refs/uzi-salvage/<run-id>`, and removes that copy after `UZI_RECOVERY_READY_RETENTION`.
+The copy is only what the run had checkpointed to the forge, so it may be behind the
+run's final local work. Salvage never moves or deletes the branch's own checkpoint ref.
+
+`uzi run get` on a failed run with a salvage record prints a `SALVAGE` block: the state
+with a one-line explanation, then `SALVAGE_REF`, `SALVAGE_TIP` (short), `SALVAGE_EXPIRES`
+and `SALVAGE_ERROR` when set. A promoted copy also prints the fetch command:
+
+```
+SALVAGE          promoted: checkpointed commits saved (last published checkpoint; may be behind the run's final local work)
+SALVAGE_REF      refs/uzi-salvage/<run-id>
+SALVAGE_TIP      89abcdef0123
+SALVAGE_EXPIRES  2026-09-29T12:00:00Z
+SALVAGE_FETCH    git fetch origin refs/uzi-salvage/<run-id>
+```
+
+The other states read `pending` (the copy is being made), `unavailable` (the published
+checkpoint was no longer on the forge), `refused` (the salvage ref already pointed at a
+different commit), `failed` (making the copy kept failing), `skipped_secret` (not saved:
+the run failed on a secret-scan block), `expired` (the copy was removed) and `disabled`
+(salvage was turned off for that forge). The same values are the run's `salvage_state`,
+`salvage_ref`, `salvage_tip`, `salvage_expires_at` and `salvage_last_error` fields
+(`--json`, or `uzi run get <run-id> --field salvage_state`); all are null without a
+salvage record.
+
+While a failed run has a live salvage copy (or one being made), removing its repo or forge
+connection is refused with a 409 that names each `refs/uzi-salvage/<run-id>`; retry after
+the copies expire.
+
 ## uzi handoff: ephemeral branch-scoped task runs
 
 ```sh

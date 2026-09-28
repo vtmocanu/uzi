@@ -996,8 +996,8 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// salvageRefListCap bounds how many live salvage rows a removal 409 names (each names at
-// most two refs); the total row count is reported alongside.
+// salvageRefListCap bounds how many live salvage rows a removal 409 names; the total row
+// count is reported alongside.
 const salvageRefListCap = 5
 
 // salvageRestrictConstraint is run_salvage's live pointer FK (migration 00264). The
@@ -1011,17 +1011,12 @@ func isSalvageRestrict(err error) bool {
 	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == salvageRestrictConstraint
 }
 
-// salvageRowRefs is the refs one live salvage row names: its salvage ref once created and
-// its branch-scoped checkpoint ref while still pending (a created-but-pending row names
-// both, since the branch ref may still exist beside the salvage ref).
-func salvageRowRefs(salvageRef, retainedRef string) []string {
-	var refs []string
-	for _, ref := range []string{salvageRef, retainedRef} {
-		if ref != "" {
-			refs = append(refs, ref)
-		}
-	}
-	return refs
+// salvageConflictRow is one live salvage row a removal 409 names: the run and its salvage
+// ref once created (empty while the salvage copy is still being made). The 409 names only
+// salvage's own refs, never the branch-scoped checkpoint ref, which #1810's retention owns.
+type salvageConflictRow struct {
+	RunID      uuid.UUID
+	SalvageRef string
 }
 
 // writeRepoSalvageConflict writes the repo-removal salvage 409 (owner-scoped). count < 0
@@ -1034,15 +1029,15 @@ func (h *Handler) writeRepoSalvageConflict(ctx context.Context, w http.ResponseW
 		}
 		count = n
 	}
-	var refs []string
 	rows, err := h.q.ListLiveSalvageRefsForRepo(ctx, store.ListLiveSalvageRefsForRepoParams{RepoID: repoID, UserID: userID, Lim: salvageRefListCap})
 	if err != nil {
 		slog.Error("list salvage refs for repo delete", "error", err)
 	}
+	named := make([]salvageConflictRow, 0, len(rows))
 	for _, row := range rows {
-		refs = append(refs, salvageRowRefs(row.SalvageRef, row.RetainedRef)...)
+		named = append(named, salvageConflictRow{RunID: row.RunID, SalvageRef: row.SalvageRef})
 	}
-	writeSalvageConflict(w, "repo", count, len(rows), refs)
+	writeSalvageConflict(w, "repo", count, named)
 }
 
 // writeConnectionSalvageConflict is writeRepoSalvageConflict for a forge connection
@@ -1055,39 +1050,49 @@ func (h *Handler) writeConnectionSalvageConflict(ctx context.Context, w http.Res
 		}
 		count = n
 	}
-	var refs []string
 	rows, err := h.q.ListLiveSalvageRefsForConnection(ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: connID, UserID: userID, Lim: salvageRefListCap})
 	if err != nil {
 		slog.Error("list salvage refs for connection delete", "error", err)
 	}
+	named := make([]salvageConflictRow, 0, len(rows))
 	for _, row := range rows {
-		refs = append(refs, salvageRowRefs(row.SalvageRef, row.RetainedRef)...)
+		named = append(named, salvageConflictRow{RunID: row.RunID, SalvageRef: row.SalvageRef})
 	}
-	writeSalvageConflict(w, "connection", count, len(rows), refs)
+	writeSalvageConflict(w, "connection", count, named)
 }
 
-// writeSalvageConflict writes the removal 409 for live salvage refs. what is "repo" or
-// "connection", count the total number of failed runs holding refs, listed how many of
-// those runs refs names (at most salvageRefListCap). A lookup that failed or raced still
-// refuses: the count is floored at the number of runs listed, and at 1.
-func writeSalvageConflict(w http.ResponseWriter, what string, count int64, listed int, refs []string) {
-	if refs == nil {
-		refs = []string{}
-	}
-	count = max(count, int64(listed), 1)
-	named := ""
-	if len(refs) > 0 {
-		named = " (" + strings.Join(refs, ", ")
-		if int64(listed) < count {
-			named += fmt.Sprintf(", and %d more run(s)", count-int64(listed))
+// writeSalvageConflict writes the removal 409 for live salvage rows. what is "repo" or
+// "connection", count the total number of failed runs with a live salvage row, rows the
+// (at most salvageRefListCap) rows named. A created row names its refs/uzi-salvage/<run-id>;
+// a row whose salvage copy is still being made names its run instead. A lookup that failed
+// or raced still refuses: the count is floored at the number of rows named, and at 1.
+func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows []salvageConflictRow) {
+	refs := []string{}
+	pending := []string{}
+	parts := make([]string, 0, len(rows)+1)
+	for _, row := range rows {
+		if row.SalvageRef != "" {
+			refs = append(refs, row.SalvageRef)
+			parts = append(parts, row.SalvageRef)
+			continue
 		}
-		named += ")"
+		pending = append(pending, row.RunID.String())
+		parts = append(parts, "a salvage copy is being made for run "+row.RunID.String())
+	}
+	count = max(count, int64(len(rows)), 1)
+	named := ""
+	if len(parts) > 0 {
+		if int64(len(rows)) < count {
+			parts = append(parts, fmt.Sprintf("and %d more run(s)", count-int64(len(rows))))
+		}
+		named = " (" + strings.Join(parts, "; ") + ")"
 	}
 	httpx.JSON(w, http.StatusConflict, map[string]any{
-		"error": fmt.Sprintf("this %s has %d failed run(s) whose checkpointed commits are kept on the forge for recovery%s; "+
-			"they are removed automatically when they expire, so remove the %s after that", what, count, named, what),
-		"salvage_refs":  refs,
-		"salvage_count": count,
+		"error": fmt.Sprintf("this %s has %d failed run(s) whose checkpointed commits are kept on the forge for recovery until they expire%s; "+
+			"they are removed automatically at expiry, so remove the %s after that", what, count, named, what),
+		"salvage_refs":         refs,
+		"salvage_pending_runs": pending,
+		"salvage_count":        count,
 	})
 }
 

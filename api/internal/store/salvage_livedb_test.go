@@ -615,9 +615,9 @@ func TestListSalvageCandidatesLiveDB(t *testing.T) {
 	}
 }
 
-// The delete-guard reads: count and ref names per (owner-scoped) repo and connection. A
-// pending row names its branch ref, a created-but-pending row both refs, a promoted row
-// only its salvage ref.
+// The delete-guard reads: count and names per (owner-scoped) repo and connection. A row
+// names its salvage ref only once created (a pending row without one names nothing but its
+// run and state); the branch checkpoint ref is never named.
 func TestLiveSalvageRefsLiveDB(t *testing.T) {
 	f := openSalvageLiveDB(t)
 	repo := f.repo("gitlab")
@@ -652,19 +652,19 @@ func TestLiveSalvageRefsLiveDB(t *testing.T) {
 			t.Fatalf("CountLiveSalvageForConnection(owner=%v) = (%d, %v), want (%d, nil)", tc.user == f.user, n, err, tc.want)
 		}
 	}
-	type refs struct{ salvage, retained string }
-	want := map[uuid.UUID]refs{
-		pending:  {"", "refs/uzi-checkpoints/agent/issue-7"},
-		created:  {"refs/uzi-salvage/" + created.String(), "refs/uzi-checkpoints/agent/issue-7"},
-		promoted: {"refs/uzi-salvage/" + promoted.String(), ""},
+	type named struct{ state, salvage string }
+	want := map[uuid.UUID]named{
+		pending:  {"pending", ""},
+		created:  {"pending", "refs/uzi-salvage/" + created.String()},
+		promoted: {"promoted", "refs/uzi-salvage/" + promoted.String()},
 	}
 	byRepo, err := f.q.ListLiveSalvageRefsForRepo(f.ctx, store.ListLiveSalvageRefsForRepoParams{RepoID: repo, UserID: f.user, Lim: 5})
 	if err != nil || len(byRepo) != 3 {
 		t.Fatalf("ListLiveSalvageRefsForRepo = (%v, %v), want 3 rows", byRepo, err)
 	}
 	for _, r := range byRepo {
-		if got := (refs{r.SalvageRef, r.RetainedRef}); got != want[r.RunID] {
-			t.Fatalf("repo refs for %s = %+v, want %+v", r.RunID, got, want[r.RunID])
+		if got := (named{r.State, r.SalvageRef}); got != want[r.RunID] {
+			t.Fatalf("repo names for %s = %+v, want %+v", r.RunID, got, want[r.RunID])
 		}
 	}
 	byConn, err := f.q.ListLiveSalvageRefsForConnection(f.ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: conn, UserID: f.user, Lim: 5})
@@ -672,8 +672,8 @@ func TestLiveSalvageRefsLiveDB(t *testing.T) {
 		t.Fatalf("ListLiveSalvageRefsForConnection = (%v, %v), want 3 rows", byConn, err)
 	}
 	for _, r := range byConn {
-		if got := (refs{r.SalvageRef, r.RetainedRef}); got != want[r.RunID] {
-			t.Fatalf("connection refs for %s = %+v, want %+v", r.RunID, got, want[r.RunID])
+		if got := (named{r.State, r.SalvageRef}); got != want[r.RunID] {
+			t.Fatalf("connection names for %s = %+v, want %+v", r.RunID, got, want[r.RunID])
 		}
 	}
 	if rows, err := f.q.ListLiveSalvageRefsForConnection(f.ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: conn, UserID: f.user, Lim: 1}); err != nil || len(rows) != 1 {

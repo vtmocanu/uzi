@@ -154,6 +154,10 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if r.FailOrigin != nil && *r.FailOrigin != "" {
 		rows = append(rows, []string{"FAIL_ORIGIN", failOriginCell(r)})
 	}
+	// SALVAGE (PRD #1867 M4): the failed run's checkpoint salvage state, its archive ref and
+	// the fetch command while promoted. Emit-only-when-set, so every run without a salvage row
+	// renders as before.
+	rows = append(rows, salvageRows(r)...)
 	// The run's inferred scheduling requirement set (PRD #84 M4), the CLI twin of the
 	// three DTO fields added in 4c. All three are model/inference-derived, hence UNTRUSTED,
 	// and each is emit-only-when-set exactly like HEALTH_REASON/FAILURE_REASON above: a run

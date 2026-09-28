@@ -526,6 +526,9 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		}
 		dto.LandingState = landingStateOverlay(dto.FailOrigin, run.PreservedPatch.Valid, hasCap, err)
 	}
+	// PRD #1867 M4: the failed-run checkpoint salvage fields, beside landing_state (which they
+	// leave unchanged). Detail read only, failed runs only; best-effort like the overlay above.
+	h.overlayRunSalvage(r.Context(), run, &dto)
 	// PRD #411: stamp the run's originating forge issue web URL for the run-view #<iid>
 	// link, resolved best-effort from the cached issues row — a join on GetRunByID* would
 	// flip its return type and ripple through ~15 callers (Design Decision 2). Guarded on

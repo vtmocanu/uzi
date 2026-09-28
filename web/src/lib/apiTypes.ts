@@ -2449,6 +2449,21 @@ export interface Run {
    *  patch exists), "unrecoverable" (neither), or "none" (default). Typed string, not a union,
    *  to match the recorded contract fixtures' ""/"x" values. */
   landing_state?: string;
+  /** PRD #1867: the failed-run checkpoint salvage fields, the bounded archive copy of the
+   *  run's last published checkpoint at `refs/uzi-salvage/<run-id>`. All null when the run
+   *  has no salvage row; populated only on the single-run detail read of a failed run (list
+   *  reads leave them null). OPTIONAL for api/web rollout skew. `salvage_state` is pending,
+   *  promoted, unavailable, refused, failed, skipped_secret, expired or disabled (typed string
+   *  to match the recorded fixtures). `salvage_ref` is set only while promoted (the copy exists
+   *  and has not expired). The copy is the last PUBLISHED checkpoint and may be behind the
+   *  run's final local work: say "checkpointed commits saved", never "recovered".
+   *  `salvage_last_error` is a bounded, server-scrubbed forge error: render as escaped plain
+   *  text through stripUnsafeChars, never <Markdown>. */
+  salvage_state?: string | null;
+  salvage_ref?: string | null;
+  salvage_tip?: string | null;
+  salvage_expires_at?: string | null;
+  salvage_last_error?: string | null;
   /** issue #150: the repo-relative path the run declared it moved a completed PRD to
    *  (e.g. `prds/done/72-x.md`), and the RFC3339 instant its PRD-completion patch settled.
    *  Both null on a run that moved no PRD. OPTIONAL for the SAME api/web rollout skew as
