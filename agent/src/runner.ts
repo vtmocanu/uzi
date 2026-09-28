@@ -200,10 +200,13 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  held the claim forever. After this many the run fails with fail_origin `worker_residue_blocked`
  *  (the failure_reason names the blocking pid and comm), the clone and session kept for
  *  inspection. Any capture outcome that is NOT a blocked proof resets the count. The wall time
- *  before that failure is 5 reap deadlines (5 s each) plus 4 recoveryRetryMs backoffs: roughly 30 s
- *  at the defaults, about 40 s on the vault-locked park, whose backoff doubles; that is accepted because a non-dumpable same-uid process does not clear on
- *  its own, the operator reason names the pid to kill, failing closed is the maintainer's decision,
- *  and per-attempt cgroup v2 containment is the follow-up that removes the case. */
+ *  before that failure holds only when every blocked proof is `unverified`: 5 reap deadlines
+ *  (5 s each) plus 4 recoveryRetryMs backoffs, up to roughly 30 s at the defaults, about 40 s
+ *  on the vault-locked park, whose backoff doubles. A `survivors` proof with nothing left to kill
+ *  returns at once, so the bound can be reached in as little as ~4 s; that is accepted because a
+ *  non-dumpable same-uid process does not clear on its own, the operator reason names the pid to
+ *  kill, failing closed is the maintainer's decision, and per-attempt cgroup v2 containment is the
+ *  follow-up that removes the case. */
 const RECOVERY_CAPTURE_BLOCKED_ATTEMPTS = 5;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion

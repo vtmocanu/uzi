@@ -434,25 +434,36 @@ The run actually **fails**, with `fail_origin = worker_residue_blocked`
 (shown as **worker residue blocked**), at points where there is no safe
 way to continue without the proof: the finalize gate that pushes the run's
 branch (and its re-proofs after any git operation that could have started
-something new), seeding a fresh attempt clone for a new execution attempt,
-capturing a predecessor attempt's or a reclaimed orphan's work (both on a
-Docker-wired worker), a canonical clone reseed that cannot free the path it
-needs, and a recovery capture whose proof stays blocked past its bounded
-number of retries (above). A blocked check during cleanup **after** a run
-has already reached its own outcome — retiring a finished run's clone, for
-instance — does not itself fail the run: the clone is simply kept in place
-instead of being removed, and the run's own status and failure reason (if
-any) stand unchanged.
+something new), capturing a predecessor attempt's or a reclaimed orphan's
+work (both on a Docker-wired worker), a canonical clone reseed that cannot
+free the path it needs, and a recovery capture whose proof stays blocked
+past its bounded number of retries (above). Seeding a fresh attempt clone
+for a new execution attempt can fail this way too, but only on a survivor
+it can positively place in scope (another live attempt's process, or an
+unmarked in-scope process left in a non-live path) — seeding a fresh path
+moves and frees nothing, so it is deliberately let through a process the
+worker can merely see but not positively account for; that process still
+blocks the *other* sites above. A blocked check during cleanup **after** a
+run has already reached its own outcome — retiring a finished run's clone,
+for instance — does not itself fail the run: the clone is simply kept in
+place instead of being removed, and the run's own status and failure
+reason (if any) stand unchanged.
 
-When the check is unproven because a specific process could not be
-confirmed stopped, the failure reason names that process's process ID and
+When the check is unproven because a specific process's environment or
+working directory could not be read, so the worker cannot positively
+account for it, the failure reason names that process's process ID and
 program name, so an operator knows exactly what to look for on the worker.
-That process does not have to belong to the run that failed — any process
-running as the same worker user that the worker cannot positively account
-for blocks every run on that worker the same way, by design: the worker
-would rather refuse to proceed than guess. To clear it, stop the named
-process on the worker (or wait for it to exit on its own), then start a new
-run.
+That process does not have to belong to the run that failed — any such
+unaccountable process, running as the same worker user, blocks every run
+on that worker at those sites, by design: the worker would rather refuse
+to proceed than guess. A process the worker *can* positively tie, by
+ancestry, to another live run's own recorded root is not this case: it is
+attributed to that run and does not block. When the check is unproven
+instead because an in-scope process was seen but could not be confirmed
+stopped, the failure reason reports only how many such processes survived
+the reap, not their pid or program name. Either way, to clear a block on
+an unaccountable process, stop the named process on the worker (or wait
+for it to exit on its own), then start a new run.
 
 This is a worker infrastructure problem, not something the agent did wrong,
 so a run that fails this way is never sent to the judge. Nothing is
