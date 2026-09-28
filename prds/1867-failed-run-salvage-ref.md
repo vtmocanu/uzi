@@ -148,7 +148,9 @@ original promote-then-delete design above.**
      (`promoted_at + UZI_RECOVERY_READY_RETENTION`, or `promoted_at` itself for a
      non-positive retention, which the next expiry pass removes immediately).
    - The same `SweepSalvage` pass CAS-deletes due expiries (`deleteSalvageRef`, confirmed
-     by a re-list), settles `expired`, and retries a failed remote delete on a later pass.
+     by a re-list), settles `expired`, and retries a failed remote delete on a later pass,
+     hourly past `salvageAttemptCap`, until `salvageHardCeiling` settles it `expired` with
+     no forge call and `last_error` naming the ref that may remain.
    - The retention bound applies to a **created** (`promoted`) salvage ref only. A row that
      never reaches a confirmed create (`pending`, or eventually `failed`) holds no public
      ref of its own; the source ref it reads from is #1810's to retain or delete, on
@@ -431,3 +433,13 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
     `run_salvage` rows and needed no coordination with the sweep pass's own internal
     logic (M3) beyond the shared schema from M2, so M4 did not have to wait for M3's
     review rounds to finish.
+- 2026-09-28: **A failing expiry delete is bounded like a pending row** (review finding).
+  `RecordSalvageExpireFailed` counted attempts but nothing read them, so a dead remote
+  retried every tick and held the RESTRICT pointer forever (repo and connection removal
+  409 indefinitely). Now, in Go only (no SQL change): a due expiry at or past
+  `salvageAttemptCap` backs off to one retry per `salvageRetryBackoff` (1h), filtered
+  before the item budget from a 50-row scan (`salvageExpiryScanLimit`); at
+  `salvageHardCeiling` `giveUpSalvageExpiry` makes no forge call, records a `last_error`
+  naming the salvage ref and tip for manual deletion, and settles `expired`, clearing the
+  pointer. Promotion happens only below the cap, so an expiry always gets a fast retry
+  first.

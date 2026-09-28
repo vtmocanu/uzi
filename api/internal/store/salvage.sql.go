@@ -494,7 +494,8 @@ type RecordSalvageExpireFailedParams struct {
 }
 
 // A failed CAS delete of an expired salvage ref: record the bounded error and retry on a
-// later sweep. The row keeps its state and live pointer.
+// later sweep (hourly past the attempt cap, until the hard ceiling settles it 'expired'
+// with no delete). The row keeps its state and live pointer.
 func (q *Queries) RecordSalvageExpireFailed(ctx context.Context, arg RecordSalvageExpireFailedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, recordSalvageExpireFailed, arg.LastError, arg.RunID)
 	if err != nil {
@@ -521,7 +522,8 @@ type SettleSalvageParams struct {
 // Settle a live row into a terminal state and clear the live pointer: 'unavailable' or
 // 'refused' (no salvage ref was created), 'disabled' (the forge left UZI_SALVAGE_FORGES;
 // the caller CAS-deleted any created salvage ref first) or 'expired' (the salvage ref was
-// CAS-deleted or confirmed absent). Any other target state matches no row (0 rows).
+// CAS-deleted or confirmed absent, or its delete reached the hard ceiling). Any other
+// target state matches no row (0 rows).
 // Settling a row with a created salvage ref to 'unavailable' or 'refused' violates
 // run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
 func (q *Queries) SettleSalvage(ctx context.Context, arg SettleSalvageParams) (int64, error) {

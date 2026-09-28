@@ -58,15 +58,17 @@ const (
 	// succeeded. A cleanup cut off by the budget is recorded as an uncapped attempt; a row
 	// the pass never reached is not written, keeps its updated_at and sorts first next pass.
 	salvageAttemptCap = 10
-	// salvageRetryBackoff: a pending row with no recorded salvage ref that is already at or
-	// past salvageAttemptCap (its cleanup keeps failing) is retried at most once per this
-	// interval, measured from its updated_at.
+	// salvageRetryBackoff: a row at or past salvageAttemptCap whose forge work keeps
+	// failing is retried at most once per this interval, measured from its updated_at. It
+	// applies to a pending row with no recorded salvage ref (its cleanup keeps failing) and
+	// to a due expiry (its delete keeps failing).
 	salvageRetryBackoff = time.Hour
-	// salvageHardCeiling: a pending row with no recorded salvage ref that reaches this many
-	// attempts is settled 'failed' WITHOUT the cleanup, so a permanently dead remote (a
-	// revoked PAT, a changed box key, a host dropped from the allowlist, a deleted repo) can
-	// neither hold the RESTRICT pointer nor spend forge calls forever. last_error and an
-	// error log name the salvage ref that may remain on the forge.
+	// salvageHardCeiling: a row that reaches this many attempts is settled WITHOUT a forge
+	// call, so a permanently dead remote (a revoked PAT, a changed box key, a host dropped
+	// from the allowlist, a deleted repo) can neither hold the RESTRICT pointer nor spend
+	// forge calls forever. A pending row with no recorded salvage ref settles 'failed'; a
+	// due expiry settles 'expired'. last_error and an error log name the salvage ref that
+	// may remain on the forge.
 	salvageHardCeiling = 3 * salvageAttemptCap
 	// salvagePendingScanLimit bounds the pending rows one pass reads. Rows inside their
 	// salvageRetryBackoff are filtered out in Go before the salvageMaxItems budget is
@@ -75,6 +77,13 @@ const (
 	// that row waits until some of them leave their backoff, up to about the 1h
 	// salvageRetryBackoff.
 	salvagePendingScanLimit = 50
+	// salvageExpiryScanLimit bounds the due expiry rows one pass reads. Rows inside their
+	// salvageRetryBackoff (salvageExpiryBackedOff) are filtered out in Go before the
+	// salvageMaxItems budget is applied, so backed-off rows inside the scan do not take
+	// item slots. As with salvagePendingScanLimit the filter runs after the LIMIT: when
+	// more than 50 backed-off rows sort ahead of a due row, that row waits up to about the
+	// 1h salvageRetryBackoff.
+	salvageExpiryScanLimit = 50
 	// salvageNoCap is the cap passed to RecordSalvageAttemptFailed when an attempt must be
 	// counted and its error recorded WITHOUT settling the row 'failed': the orphan cleanup
 	// failed (or a panic interrupted the item), so the row stays pending and live and the
@@ -119,7 +128,8 @@ const (
 //     hanging remote on one list's head row costs the other list at most every other pass:
 //     - expiry: deleteSalvageRef (a CAS Delete of refs/uzi-salvage/<run-id> at the recorded
 //     tip, confirmed by a re-list); success (deleted, absent or moved) settles 'expired',
-//     an error is recorded and retried.
+//     an error is recorded and retried under the same bound as below (salvageRetryBackoff
+//     past salvageAttemptCap, then salvageHardCeiling settles 'expired' with no delete).
 //     Expiry runs whatever SalvageForges says: a promoted row on a forge that has since
 //     left the list is simply left to this normal expiry, which keeps its bounded
 //     retention and needs no second delete path.
@@ -149,14 +159,17 @@ const (
 // as an uncapped attempt (last_error set, row still pending and live) and retried, so an
 // orphan is not forgotten and a stuck row is never silent.
 //
-// That retry is bounded. Once a row with no recorded salvage ref is at or past
-// salvageAttemptCap it is retried only when its updated_at is at least
-// salvageRetryBackoff (1h) old; backed-off rows are skipped before the per-pass item
-// budget. At salvageHardCeiling (3x the cap) attempts the row is settled 'failed' with no
-// further forge call, which clears the RESTRICT pointer; last_error and an error log name
+// That retry is bounded, and so is a failing expiry delete. Once a row with no recorded
+// salvage ref, or a due expiry, is at or past salvageAttemptCap it is retried only when
+// its updated_at is at least salvageRetryBackoff (1h) old; backed-off rows are skipped
+// before the per-pass item budget. At salvageHardCeiling (3x the cap) attempts the row is
+// settled with no further forge call ('failed' for a pending row, 'expired' for an
+// expiry), which clears the RESTRICT pointer; last_error and an error log name
 // refs/uzi-salvage/<run-id> and its tip as possibly left on the forge for manual
 // deletion. So a permanently dead remote costs at most about 20 extra hourly attempts
-// past the cap before the row stops blocking run, repo and connection removal.
+// past the cap before the row stops blocking run, repo and connection removal. A row is
+// promoted only below the cap (the cap-reaching attempt never creates), so an expiry
+// always gets at least one fast retry before the hourly ones start.
 //
 // Every persisted or logged error is stripped of control, bidi and line-separator
 // characters and invalid UTF-8, then has the item's exact PAT replaced, is
@@ -244,10 +257,16 @@ type salvageItem struct {
 }
 
 func (s *Service) processSalvage(ctx context.Context, now time.Time) (int64, error) {
-	expiry, err := s.q.ListSalvageDueExpiry(ctx, store.ListSalvageDueExpiryParams{Now: salvageTS(now), Lim: salvageMaxItems})
+	scannedExpiry, err := s.q.ListSalvageDueExpiry(ctx, store.ListSalvageDueExpiryParams{Now: salvageTS(now), Lim: salvageExpiryScanLimit})
 	if err != nil {
 		slog.Error("salvage: list due expiry", "error", err)
 		return 0, fmt.Errorf("salvage: list due expiry: %w", err)
+	}
+	expiry := make([]store.RunSalvage, 0, len(scannedExpiry))
+	for _, row := range scannedExpiry {
+		if !salvageExpiryBackedOff(row, now) {
+			expiry = append(expiry, row)
+		}
 	}
 	scanned, err := s.q.ListSalvageDuePending(ctx, store.ListSalvageDuePendingParams{Now: salvageTS(now), Lim: salvagePendingScanLimit})
 	if err != nil {
@@ -287,6 +306,14 @@ func (s *Service) processSalvage(ctx context.Context, now time.Time) (int64, err
 // only pending step is MarkSalvagePromoted).
 func salvageBackedOff(row store.RunSalvage, now time.Time) bool {
 	return !row.SalvageCreatedAt.Valid && row.Attempts >= salvageAttemptCap &&
+		row.UpdatedAt.Valid && row.UpdatedAt.Time.After(now.Add(-salvageRetryBackoff))
+}
+
+// salvageExpiryBackedOff reports a due expiry that must wait: at or past
+// salvageAttemptCap (its delete kept failing) and touched less than salvageRetryBackoff
+// ago.
+func salvageExpiryBackedOff(row store.RunSalvage, now time.Time) bool {
+	return row.Attempts >= salvageAttemptCap &&
 		row.UpdatedAt.Valid && row.UpdatedAt.Time.After(now.Add(-salvageRetryBackoff))
 }
 
@@ -395,6 +422,9 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 }
 
 func (s *Service) expireSalvage(ctx context.Context, row store.RunSalvage, pat *string) (int64, error) {
+	if row.Attempts >= salvageHardCeiling {
+		return s.giveUpSalvageExpiry(ctx, row)
+	}
 	remote, err := s.salvageRemote(ctx, row.RunID)
 	if err != nil {
 		return s.recordSalvageExpireFailure(ctx, row, salvageErrText(err, ""))
@@ -580,6 +610,26 @@ func (s *Service) giveUpSalvage(ctx context.Context, row store.RunSalvage) (int6
 	return s.recordSalvageAttempt(ctx, row, msg, salvageAttemptCap)
 }
 
+// giveUpSalvageExpiry settles a due expiry that reached salvageHardCeiling: its delete
+// never succeeded (the remote is unreachable, or its credentials or allowlisting are
+// gone), so it is settled 'expired' with NO forge call and no claim-context read. It first
+// records last_error naming the salvage ref that may remain on the forge
+// (recordSalvageExpireFailure), then settles, which clears the live pointer and keeps
+// last_error. If the first write fails its error is returned and the next pass retries.
+func (s *Service) giveUpSalvageExpiry(ctx context.Context, row store.RunSalvage) (int64, error) {
+	ref := pushbroker.SalvageRef(row.RunID)
+	slog.Error("salvage: expiry gave up at the hard ceiling; the salvage ref may remain on the forge",
+		"run", row.RunID, "ref", ref, "tip", row.Tip, "attempts", row.Attempts)
+	msg := truncateRunes(fmt.Sprintf("expiry gave up after %d attempts; %s may remain on the forge at %s and can be deleted by hand",
+		row.Attempts, ref, row.Tip), salvageErrMaxRunes)
+	n, err := s.recordSalvageExpireFailure(ctx, row, msg)
+	if err != nil {
+		return n, err
+	}
+	m, err := s.settleSalvage(ctx, row.RunID, salvageStateExpired)
+	return n + m, err
+}
+
 // recordSalvageAttempt writes one failed attempt on a pending row with the given cap
 // (salvageAttemptCap, or salvageNoCap to keep the row pending).
 func (s *Service) recordSalvageAttempt(ctx context.Context, row store.RunSalvage, msg string, attemptCap int32) (int64, error) {
@@ -592,7 +642,9 @@ func (s *Service) recordSalvageAttempt(ctx context.Context, row store.RunSalvage
 }
 
 // recordSalvageExpireFailure records msg (already scrubbed and bounded) as a failed
-// expiry delete; the row keeps its state and live pointer and is retried.
+// expiry delete, counting an attempt; the row keeps its state and live pointer and is
+// retried, under salvageRetryBackoff once at the cap, until salvageHardCeiling
+// (giveUpSalvageExpiry, which also writes its note through here).
 func (s *Service) recordSalvageExpireFailure(ctx context.Context, row store.RunSalvage, msg string) (int64, error) {
 	slog.Warn("salvage: expiry failed", "run", row.RunID, "error", msg)
 	wctx, cancel := salvageWriteCtx(ctx)

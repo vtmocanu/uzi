@@ -342,7 +342,9 @@ States shown on the run page and by `uzi run get`:
   ref that may remain), or
   `skipped_secret` (the run failed on a secret-scan block: never saved).
 - **Expired** — the salvage copy's retention ended; uzi CAS-deleted it (or found it
-  already gone or moved).
+  already gone or moved). If the delete kept failing (hourly after the first few
+  tries), uzi stops after a bounded number of attempts; the last error names the ref
+  that may remain on the forge for you to delete by hand.
 - **Off** (`disabled`) — salvage was turned off for this forge before a copy
   was made.
 

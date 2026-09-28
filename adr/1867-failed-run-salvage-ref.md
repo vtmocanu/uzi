@@ -113,7 +113,7 @@ recorded tip), `refused` (the salvage ref already existed at a different
 tip: never overwritten), `failed` (no salvage ref recorded; gave up after
 retries), `skipped_secret` (`fail_origin = push_secret_blocked`: never
 salvaged), `expired` (the salvage ref was CAS-deleted, or confirmed
-absent), and `disabled` (the forge left `UZI_SALVAGE_FORGES` before a
+absent, or its delete gave up at the hard ceiling), and `disabled` (the forge left `UZI_SALVAGE_FORGES` before a
 create landed). `enqueueSalvage` excludes `plan_rejected` failures (a
 plan rejection is not a code failure worth archiving) and only enqueues on
 a forge listed in `UZI_SALVAGE_FORGES`; a `push_secret_blocked` run is
@@ -130,7 +130,9 @@ for. At `salvageHardCeiling` (30 attempts) `giveUpSalvage` clears the
 pointer WITHOUT confirming the ref is gone: the cleanup that would confirm
 it has itself failed every time, so the row is settled `failed` unverified
 and `last_error` (plus an error log) names the salvage ref and tip that may
-still remain on the forge for manual deletion. This is the same live-pointer
+still remain on the forge for manual deletion. A due expiry whose delete
+has failed that often is settled `expired` the same way
+(`giveUpSalvageExpiry`). This is the same live-pointer
 pattern ADR-1296 established for `recovery_custody_holds`. Deleting the run, or cascading through a repo or
 forge-connection removal, fails on `run_salvage_live_run_id_fkey` (23503)
 instead of silently dropping the only record of a public ref; the repo- and
@@ -219,7 +221,13 @@ to at most one retry per `salvageRetryBackoff` (1h), and gives up entirely
 (3× the cap, 30 attempts) — bounding a permanently dead remote (a revoked
 PAT, a dropped allowlist entry, a deleted repo) to at most about 20 extra
 hourly attempts before it stops holding the RESTRICT pointer or spending
-forge calls. Each pass handles at most `salvageMaxItems` (5) broker items,
+forge calls. A failing expiry delete takes the same bound: past the cap it
+backs off to one retry per hour, and at the ceiling it is settled
+`expired` with no forge call, `last_error` naming the ref and tip left for
+manual deletion. A row is promoted only below the cap, so an expiry always
+gets at least one fast retry first. Both due lists are read up to 50 rows
+(`salvagePendingScanLimit`, `salvageExpiryScanLimit`) and backed-off rows
+are filtered out before the item budget. Each pass handles at most `salvageMaxItems` (5) broker items,
 round-robin between due expiries and due pending rows, and which list
 leads **alternates every pass** (`Service.salvageLeadPending`) so a
 hanging item at the head of one list cannot starve the other list for more
@@ -321,7 +329,9 @@ its own right:
 - **A bounded, visible failure mode.** A permanently unreachable forge
   costs at most `salvageHardCeiling` attempts (with the 1h backoff past
   the cap) before the row gives up and releases the RESTRICT pointer,
-  rather than blocking run/repo/connection deletion indefinitely.
+  rather than blocking run/repo/connection deletion indefinitely. This
+  holds for a pending row's create or cleanup and for a promoted row's
+  expiry delete alike.
 - **Redundant coverage with #1810 for the common case, by design.** A
   salvage copy of a still-custody-held run's checkpoint duplicates a ref
   #1810 already keeps reachable. This is accepted, not a bug: the

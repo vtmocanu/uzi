@@ -58,6 +58,7 @@ type salvageStore struct {
 	pendingParams []store.ListSalvageDuePendingParams
 
 	createdErr   error // RecordSalvageCreated fails with this (the ref landed unrecorded)
+	expireErr    error // RecordSalvageExpireFailed fails with this
 	created      []store.RecordSalvageCreatedParams
 	promoted     []store.MarkSalvagePromotedParams
 	attempts     []store.RecordSalvageAttemptFailedParams
@@ -149,6 +150,9 @@ func (f *salvageStore) RecordSalvageExpireFailed(ctx context.Context, arg store.
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if f.expireErr != nil {
+		return 0, f.expireErr
+	}
 	f.expireFailed = append(f.expireFailed, arg)
 	return 1, nil
 }
@@ -938,6 +942,162 @@ func TestSweepSalvageDeadRemoteIsBounded(t *testing.T) {
 	}
 }
 
+// TestSweepSalvageExpiryHardCeilingGivesUp: at salvageHardCeiling attempts a due expiry
+// is settled 'expired' with NO forge call and no claim-context read, after a
+// RecordSalvageExpireFailed write whose last_error names the possibly remaining ref and
+// its tip. One attempt below the ceiling still attempts the delete. A failed note write
+// is returned and the row is not settled, so the next pass retries.
+func TestSweepSalvageExpiryHardCeilingGivesUp(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		attempts  int32
+		giveUp    bool
+		expireErr error
+	}{
+		{"at ceiling", salvageHardCeiling, true, nil},
+		{"past ceiling", salvageHardCeiling + 4, true, nil},
+		{"below ceiling", salvageHardCeiling - 1, false, nil},
+		{"note write fails", salvageHardCeiling, true, errors.New("db: connection reset")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := promotedSalvageRow("github")
+			row.Attempts = tc.attempts
+			row.UpdatedAt = pgtype.Timestamptz{Time: salvageNow.Add(-2 * salvageRetryBackoff), Valid: true}
+			fs := &salvageStore{dueExpiry: []store.RunSalvage{row}, expireErr: tc.expireErr}
+			svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+			b.deleteErr = errors.New("401 bad credentials")
+			_, err := svc.SweepSalvage(context.Background())
+			if tc.expireErr != nil {
+				if !errors.Is(err, tc.expireErr) || len(fs.settled) != 0 {
+					t.Fatalf("err=%v settled=%+v, want the note-write error returned and no settle", err, fs.settled)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("SweepSalvage: %v", err)
+			}
+			if len(fs.expireFailed) != 1 || len(fs.attempts) != 0 {
+				t.Fatalf("expireFailed=%+v attempts=%+v, want one expiry-failure write", fs.expireFailed, fs.attempts)
+			}
+			if !tc.giveUp {
+				if len(b.deletes) != 1 || len(fs.settled) != 0 {
+					t.Fatalf("below ceiling: deletes=%d settled=%+v, want the delete attempted and the row kept", len(b.deletes), fs.settled)
+				}
+				return
+			}
+			if len(b.lists)+len(b.creates)+len(b.deletes) != 0 || fs.claimCalls != 0 {
+				t.Fatalf("give-up made forge work: lists=%d creates=%d deletes=%d claim=%d",
+					len(b.lists), len(b.creates), len(b.deletes), fs.claimCalls)
+			}
+			want := fmt.Sprintf("expiry gave up after %d attempts; refs/uzi-salvage/%s may remain on the forge at %s and can be deleted by hand",
+				tc.attempts, row.RunID, row.Tip)
+			if got := fs.expireFailed[0].LastError; got != want {
+				t.Errorf("last_error = %q, want %q", got, want)
+			}
+			if len(fs.settled) != 1 || fs.settled[0].State != salvageStateExpired || fs.settled[0].RunID != row.RunID {
+				t.Errorf("settled = %+v, want the row settled expired", fs.settled)
+			}
+		})
+	}
+}
+
+// TestSweepSalvageExpiryBackoffPastCap: a due expiry at or past the cap is retried only
+// once its updated_at is salvageRetryBackoff old. Backed-off rows make no broker call and
+// no write, and more of them than salvageMaxItems do not take the item budget from a due
+// row behind them.
+func TestSweepSalvageExpiryBackoffPastCap(t *testing.T) {
+	expiring := func(attempts int32, age time.Duration) store.RunSalvage {
+		r := promotedSalvageRow("github")
+		r.Attempts = attempts
+		r.UpdatedAt = pgtype.Timestamptz{Time: salvageNow.Add(-age), Valid: true}
+		return r
+	}
+	var rows []store.RunSalvage
+	for range salvageMaxItems + 2 {
+		rows = append(rows, expiring(salvageAttemptCap+2, 30*time.Minute))
+	}
+	due := expiring(salvageAttemptCap+2, salvageRetryBackoff) // exactly 1h old: due
+	below := expiring(salvageAttemptCap-1, 0)                 // below the cap: never backed off
+	rows = append(rows, due, below)
+
+	fs := &salvageStore{dueExpiry: rows}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("SweepSalvage: %v", err)
+	}
+	want := orderOf("delete:"+due.RunID.String(), "list:"+due.RunID.String(),
+		"delete:"+below.RunID.String(), "list:"+below.RunID.String())
+	if got := strings.Join(b.order, " "); got != want {
+		t.Fatalf("broker order = %s, want %s (backed-off expiries skipped without using the budget)", got, want)
+	}
+	if fs.claimCalls != 2 || len(fs.expireFailed) != 0 {
+		t.Errorf("claim reads=%d expireFailed=%+v, want 2 and none", fs.claimCalls, fs.expireFailed)
+	}
+	if len(fs.settled) != 2 || fs.settled[0].RunID != due.RunID || fs.settled[1].RunID != below.RunID {
+		t.Errorf("settled = %+v, want the due and below-cap rows expired", fs.settled)
+	}
+	if fs.expiryParams[0].Lim != salvageExpiryScanLimit {
+		t.Errorf("expiry scan limit = %d, want %d", fs.expiryParams[0].Lim, salvageExpiryScanLimit)
+	}
+}
+
+// TestSweepSalvageDeadRemoteExpiryIsBounded simulates a permanently dead remote on a due
+// expiry (the claim context never resolves) against a store that applies each
+// expiry-failure write, on the default 15s sweep tick. The row must settle 'expired'
+// within the hard ceiling and bounded time, making at most one claim-context read per
+// backoff window once at the cap.
+func TestSweepSalvageDeadRemoteExpiryIsBounded(t *testing.T) {
+	row := promotedSalvageRow("github")
+	row.UpdatedAt = pgtype.Timestamptz{Time: salvageNow, Valid: true}
+	fs := &salvageStore{claimErr: errors.New("401 bad credentials")}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	clock := salvageNow
+	svc.now = func() time.Time { return clock }
+	var reads []time.Time // when each claim-context read happened, with the attempts before it
+	var readAttempts []int32
+	settled := false
+	var passes int
+	for passes = 0; passes < 100_000 && !settled; passes++ {
+		fs.dueExpiry = []store.RunSalvage{row}
+		fs.expireFailed, fs.settled = nil, nil
+		before := fs.claimCalls
+		if _, err := svc.SweepSalvage(context.Background()); err != nil {
+			t.Fatalf("pass %d: %v", passes, err)
+		}
+		if fs.claimCalls > before {
+			reads = append(reads, clock)
+			readAttempts = append(readAttempts, row.Attempts)
+		}
+		if len(fs.expireFailed) == 1 {
+			row.Attempts++
+			row.UpdatedAt = pgtype.Timestamptz{Time: clock, Valid: true}
+			row.LastError = pgtype.Text{String: fs.expireFailed[0].LastError, Valid: true}
+		}
+		settled = len(fs.settled) == 1 && fs.settled[0].State == salvageStateExpired
+		clock = clock.Add(15 * time.Second)
+	}
+	if !settled {
+		t.Fatalf("expiry still live after %d passes (attempts %d)", passes, row.Attempts)
+	}
+	if row.Attempts != salvageHardCeiling+1 || fs.claimCalls != salvageHardCeiling || len(b.deletes) != 0 {
+		t.Errorf("attempts=%d claim reads=%d deletes=%d, want %d/%d/0",
+			row.Attempts, fs.claimCalls, len(b.deletes), salvageHardCeiling+1, salvageHardCeiling)
+	}
+	if !strings.Contains(row.LastError.String, pushbroker.SalvageRef(row.RunID)) {
+		t.Errorf("last_error = %q, want it to name the salvage ref", row.LastError.String)
+	}
+	for i := 1; i < len(reads); i++ {
+		if readAttempts[i] > salvageAttemptCap && reads[i].Sub(reads[i-1]) < salvageRetryBackoff {
+			t.Fatalf("reads %d and %d past the cap are %v apart, want at least %v", i-1, i, reads[i].Sub(reads[i-1]), salvageRetryBackoff)
+		}
+	}
+	el := clock.Sub(salvageNow)
+	if lo, hi := time.Duration(salvageHardCeiling-salvageAttemptCap)*salvageRetryBackoff,
+		time.Duration(salvageHardCeiling-salvageAttemptCap+2)*salvageRetryBackoff; el < lo || el > hi {
+		t.Errorf("settled after %v, want between %v and %v (hourly retries past the cap)", el, lo, hi)
+	}
+}
+
 // TestSweepSalvageCreatedOutcomeSurvivesBudget: the broker reports Created only after the
 // pass budget expired (the forge applied the ref, the reply was late). The outcome writes
 // run on the detached write context, so RecordSalvageCreated and MarkSalvagePromoted are
@@ -1147,8 +1307,8 @@ func TestSweepSalvageRoundRobinAtMostFive(t *testing.T) {
 	if got := b.order[len(want):]; strings.Join(got, " ") != strings.Join(want2, " ") {
 		t.Fatalf("second-pass broker order =\n  %v\nwant\n  %v", got, want2)
 	}
-	if fs.expiryParams[0].Lim != salvageMaxItems || fs.pendingParams[0].Lim != salvagePendingScanLimit {
-		t.Errorf("due-list limits = (%d, %d), want (%d, %d)", fs.expiryParams[0].Lim, fs.pendingParams[0].Lim, salvageMaxItems, salvagePendingScanLimit)
+	if fs.expiryParams[0].Lim != salvageExpiryScanLimit || fs.pendingParams[0].Lim != salvagePendingScanLimit {
+		t.Errorf("due-list limits = (%d, %d), want (%d, %d)", fs.expiryParams[0].Lim, fs.pendingParams[0].Lim, salvageExpiryScanLimit, salvagePendingScanLimit)
 	}
 }
 
