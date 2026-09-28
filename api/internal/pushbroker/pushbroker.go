@@ -420,10 +420,14 @@ type DeleteOptions struct {
 // ref named in full) from the remote, BEST-EFFORT (PRD #1030 M4). A run's checkpoint ref is uzi-owned scratch state; once the run reaches
 // a terminal state it is stale, and a stale ref left behind later blocks a NEW run on
 // the same branch with a not_descendant skip (the new run's tip does not descend the
-// dead run's checkpoint). The caller invokes this on every terminal transition and
-// SWALLOWS the returned error — it must never block or fail the worker's terminal
-// report — so this carries its OWN short wall-clock timeout rather than inheriting an
-// unbounded ctx.
+// dead run's checkpoint). PRD #1810 routes terminal cleanup through checkpoint
+// retention (workersvc), not a delete on every terminal transition: the branch ref is
+// deleted once the run's last open custody hold settles, or immediately at the
+// terminal transition when the run has no hold; a supersession (another run needing
+// the slot) and the sweep reconciler also call this, each a CAS on the run's recorded
+// tip. Every caller SWALLOWS or records the returned error — it must never block or
+// fail the worker's terminal report — so this carries its OWN short wall-clock
+// timeout rather than inheriting an unbounded ctx.
 //
 // The delete goes out as a go-git delete refspec (":<ref>" — empty source, the ref as
 // destination), the pure-Go equivalent of `git push origin :refs/uzi-checkpoints/…`.

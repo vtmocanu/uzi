@@ -872,6 +872,12 @@ uzi run discard <run-id> --hold <hold-id> --yes
   interactively and refuses outright when stdin is not a TTY (so a script cannot discard
   unprompted); a declined prompt makes no change. Discarding a capture-less hold can
   destroy the last copy of that work — export anything you might need first.
+- **Discarding a run's last open hold also deletes its retained checkpoint ref on the
+  forge.** Once no hold of the run is left open, the server settles (CAS-deletes) whatever
+  ref still carries the run's tip (`refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>`
+  once a newer run superseded it) — see the `run recovery` checkpoint line above. Both the
+  `run discard` help and its confirmation prompt name this; fetch the ref first if you
+  might still need it.
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 

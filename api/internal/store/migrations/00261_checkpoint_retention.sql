@@ -6,9 +6,13 @@
 -- checkpoint ref and what the api has done (or still owes) to it. Purely ADDITIVE: two
 -- brand-new tables, no change to any worker-facing table.
 --
--- One row per run (run_id PRIMARY KEY). The row is written ONCE at the run's terminal
--- transition and never reset: a later terminal call for the same run (a duplicate report,
--- a second cancel path) finds the existing row and leaves its state alone.
+-- One row per run (run_id PRIMARY KEY). The row is inserted at the run's terminal
+-- transition, or backfilled by the sweep reconciler for a terminal run with none. A
+-- later terminal call for the same run (a duplicate report, a second cancel path)
+-- finds the existing row and leaves its state alone; but the row is not otherwise
+-- frozen there, a later publish of the SAME run can still advance or reopen it
+-- (TrackTerminalCheckpointPublish, AdvanceCheckpointRetentionTip), and a supersession
+-- (another run needing the branch slot) moves it to `superseded`.
 CREATE TABLE checkpoint_retentions (
     -- Owner/run/repo are PLAIN columns, NOT ON DELETE CASCADE FKs (the rationale
     -- recovery_custody_holds records in 00223): a run, repo or owner delete must not
