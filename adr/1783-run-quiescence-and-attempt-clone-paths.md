@@ -353,6 +353,50 @@ rather than left to wedge the worker or silently deleted. The durable fix for
 Option A's continuity loss (Option B, a per-attempt Docker API mediation proxy)
 remains open work.
 
+## Reconciliation with PRD #1809 (worker disk safety, #1826)
+
+The branch merged origin/main at `1d4ba878113fc113a7d52778054e83a46b53e269`
+(merge commit `d82789ad`), which carries PRD #1809's bounded run caches,
+data-volume-full parks and reclaim. Where the two touch the same sink or seed
+path:
+
+- **Limit park.** PRD #1809 D8 moved the park's durability publish into a
+  `parkSink` closure that `handleLimitReached` runs *before* the `limit_wait`
+  report. This ADR's first proof (through `reapForSink` with `flight`) and its
+  re-proof after the WIP marker (`quiesceOrBlockSink(flight, executor, "park",
+  { processOnly: true })`) run inside that closure. A blocked proof publishes
+  nothing, and the report then carries no `checkpoint_contains_latest`. The
+  park itself still stands. Because the sink now also runs on a park the server
+  refuses, both settle legs are gated on the sink's result
+  (`!parkResidueBlocked`), not only on the pre-report reap.
+- **Mid-run `data_volume_full` park.** PRD #1809 D4's park runs
+  `executor.reapAttributedProcesses?.()` (`run-procs.ts`) and drops the run-home
+  caches before `captureRecoveryRestorePoint`. That reap is cleanup, never
+  proof: the capture still opens with this ADR's `recovery_capture` quiescence
+  proof. A blocked proof means no WIP marker, no fetch-back, no publish and no
+  settle or release. The clone is kept (`preserveRecoveryClone`) and custody
+  stays with the run (`agent/test/run-quiescence-disk-park.test.ts`). The cache
+  drop touches only the run's home directory, never the clone, so it may run
+  ahead of the proof.
+- **Finalize.** PRD #1809 added `reapAttributedProcesses` to the finalize
+  security reap after the implement loop. The finalize quiescence proof
+  (`site: "finalize"`) still runs after it and still gates the push.
+- **Worker spawn marks.** PRD #1809 added runner-uid helper spawns in
+  `agent/src/rmtree.ts` (`runHelper`, the run-cache and run-home measure
+  helpers, and `runAgentHelper`, which `run-procs.ts` uses). Each runs a fixed
+  worker-authored `node -e` script with a PATH-only environment, so each now
+  carries `workerSpawnEnv(...)`. Without the mark, the reaper would count an
+  in-scope helper as an unmarked survivor in `seed`/`capture` mode and fail the
+  run as `worker_residue_blocked` by mistake. `agent/test/runner-spawn-sites.test.ts`
+  inventories them.
+- **Migration and vocabulary.** The fail_origin widening was renumbered to
+  `00263_run_fail_origin_worker_residue_blocked.sql`, above main's
+  `00261_run_data_volume_full.sql` and `00262_worker_run_disk.sql`. Its Up adds
+  `worker_residue_blocked` to 00261's eighteen values, making nineteen. Its Down
+  restores exactly those eighteen. `worker_residue_blocked` is the only one of the
+  three new values (with `gate_presentation_refused` and `data_volume_full`) that
+  a worker may report. All three are never judged, and none is human-landable.
+
 ## Root-only acceptance at the final head
 
 (recorded after the final acceptance run)
