@@ -403,10 +403,11 @@ type ListCheckpointRetentionBackfillRow struct {
 }
 
 // M4 backfill: terminal runs that published a checkpoint and own a checkpoint branch (an issue
-// run with an issue iid, or a self_improve run) but have NO record: a terminal writer that
-// never calls the retention path (the sweeper's worker-loss and cap fails, the auto-stop, the
-// claim-assembly and Codex account-wait fails), or a best-effort insert that failed (including a
-// terminal run's late first publish whose TrackTerminalCheckpointPublish failed). Bounded to
+// run with an issue iid, or a self_improve run) but have NO record. Since migration 00265 every
+// terminal transition inserts its record in the same transaction (the runs.status trigger,
+// whichever writer made it), so what is left here is a run that went terminal before 00265, or
+// a terminal run's late first publish (after the transition, so the trigger saw no tip) whose
+// TrackTerminalCheckpointPublish insert failed. Bounded to
 // runs whose current status began at or after retention was enabled
 // (checkpoint_retention_meta.enabled_at), so it never reaches back to runs the old
 // delete-on-terminal path already handled.

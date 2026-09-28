@@ -186,6 +186,10 @@ func (m *memForge) calls() (publish, create int) {
 
 // supersedeFix: an OLD failed issue run whose published checkpoint is retained (its custody hold
 // open) and a NEW running issue run on the same issue/branch, served by two Service instances.
+//
+// The old run's hold is opened BEFORE its terminal UPDATE, as in production (a hold is only ever
+// opened at claim): migration 00265's runs.status trigger records the retention row in the
+// terminal transaction itself, and reads the open-hold state at that instant.
 type supersedeFix struct {
 	e          interlockLiveDB
 	rf         *retentionFix // for the pg_locks helpers
@@ -204,6 +208,22 @@ type supersedeFix struct {
 }
 
 func newSupersedeFix(t *testing.T) *supersedeFix {
+	t.Helper()
+	f := newSupersedeFixWith(t, nil)
+	// The post-commit Go half of the terminal path (retainOrDeleteCheckpoint): it finds the
+	// trigger's row and leaves it retained.
+	f.svc1.retainOrDeleteCheckpoint(f.e.ctx, f.oldRun, runkind.Issue, pgtype.Int8{Int64: f.iid, Valid: true})
+	if r := f.row(t); r.State != retentionRetained {
+		t.Fatalf("setup: old run's record = %q, want retained", r.State)
+	}
+	return f
+}
+
+// newSupersedeFixWith builds the fixture with no Go retention call at all: the old run's terminal
+// status is committed by terminal (nil: one raw UPDATE to failed), so whatever records it is the
+// database alone. The old run's checkpoint is published (checkpoint_tip, and the branch ref on the
+// forge at retentionTestTip) and its hold open before terminal runs.
+func newSupersedeFixWith(t *testing.T, terminal func(f *supersedeFix)) *supersedeFix {
 	t.Helper()
 	e := setupInterlockLiveDB(t)
 	box := newBox(t)
@@ -232,16 +252,17 @@ func newSupersedeFix(t *testing.T) *supersedeFix {
 	oldWorker := e.seedWorker(t, nil)
 	f.iid = *e.nextIID
 	f.oldRun = e.seedLegacyRunningRun(t, oldWorker)
-	e.exec(t, `UPDATE runs SET checkpoint_tip = $2, checkpoint_tip_at = now(), claim_generation = 1,
-	             status = 'failed', finished_at = now() WHERE id = $1`, f.oldRun, retentionTestTip)
+	e.exec(t, `UPDATE runs SET checkpoint_tip = $2, checkpoint_tip_at = now(), claim_generation = 1
+	           WHERE id = $1`, f.oldRun, retentionTestTip)
 	f.oldHold = mhOpenHold(t, e, f.oldRun, 1, oldWorker)
 	f.branch = agentIssueBranch(f.iid)
 	f.branchRef = checkpointRefPrefix + f.branch
 	f.recoveryRef = pushbroker.RecoveryRefPrefix + f.oldRun.String()
 	forge.set(f.branchRef, retentionTestTip)
-	f.svc1.retainOrDeleteCheckpoint(e.ctx, f.oldRun, runkind.Issue, pgtype.Int8{Int64: f.iid, Valid: true})
-	if r := f.row(t); r.State != retentionRetained {
-		t.Fatalf("setup: old run's record = %q, want retained", r.State)
+	if terminal == nil {
+		e.exec(t, `UPDATE runs SET status = 'failed', finished_at = now() WHERE id = $1`, f.oldRun)
+	} else {
+		terminal(f)
 	}
 
 	f.newWorker = e.seedWorker(t, nil)

@@ -375,7 +375,19 @@ func TestDeleteCheckpointPendingOutcomeCancelWithoutHoldLiveDB(t *testing.T) {
 // retainOrDeleteCheckpoint and SettleRetainedCheckpoint directly.
 func (f *retentionFix) seedTerminalPublishedRun(t *testing.T, w uuid.UUID) (uuid.UUID, int64) {
 	t.Helper()
+	return f.seedTerminalPublishedRunWith(t, w, nil)
+}
+
+// seedTerminalPublishedRunWith is seedTerminalPublishedRun with a hook run on the still-running
+// run BEFORE its terminal UPDATE. Migration 00265's runs.status trigger records the retention row
+// in that UPDATE from the run row and its holds as they are then, so whatever a test needs the
+// terminal transition to see (an open hold, the run's kind, an unpublished tip) is set up here.
+func (f *retentionFix) seedTerminalPublishedRunWith(t *testing.T, w uuid.UUID, before func(runID uuid.UUID)) (uuid.UUID, int64) {
+	t.Helper()
 	runID, iid := f.seedPublishedRun(t, w)
+	if before != nil {
+		before(runID)
+	}
 	f.e.exec(t, `UPDATE runs SET status = 'failed', finished_at = now() WHERE id = $1`, runID)
 	return runID, iid
 }
@@ -386,8 +398,9 @@ func (f *retentionFix) seedTerminalPublishedRun(t *testing.T, w uuid.UUID) (uuid
 func TestRetainedCheckpointSettlesAfterHoldReleaseLiveDB(t *testing.T) {
 	f := newRetentionFix(t)
 	w := f.e.seedWorker(t, nil)
-	runID, iid := f.seedTerminalPublishedRun(t, w)
-	hold := f.openHold(t, runID, w, 1)
+	var hold uuid.UUID
+	// The hold is open at the terminal transition (a hold is only ever opened at claim).
+	runID, iid := f.seedTerminalPublishedRunWith(t, w, func(runID uuid.UUID) { hold = f.openHold(t, runID, w, 1) })
 
 	f.svc.retainOrDeleteCheckpoint(f.e.ctx, runID, runkind.Issue, pgtype.Int8{Int64: iid, Valid: true})
 	f.assertRetained(t, runID, iid)
@@ -409,7 +422,10 @@ func TestRetainedCheckpointSettlesAfterHoldReleaseLiveDB(t *testing.T) {
 func TestRetentionSelfImproveBranchLiveDB(t *testing.T) {
 	f := newRetentionFix(t)
 	w := f.e.seedWorker(t, nil)
-	runID, iid := f.seedTerminalPublishedRun(t, w)
+	// The run row is a self_improve run (its tracking issue_iid set), as the terminal trigger reads it.
+	runID, iid := f.seedTerminalPublishedRunWith(t, w, func(runID uuid.UUID) {
+		f.e.exec(t, `UPDATE runs SET kind = 'self_improve' WHERE id = $1`, runID)
+	})
 	f.svc.retainOrDeleteCheckpoint(f.e.ctx, runID, runkind.SelfImprove, pgtype.Int8{Int64: iid, Valid: true})
 	f.assertDeleted(t, runID, "uzi/self-improve/"+runID.String())
 }
@@ -419,8 +435,9 @@ func TestRetentionSelfImproveBranchLiveDB(t *testing.T) {
 func TestRetentionNeverPublishedNoRecordLiveDB(t *testing.T) {
 	f := newRetentionFix(t)
 	w := f.e.seedWorker(t, nil)
-	runID, iid := f.seedTerminalPublishedRun(t, w)
-	f.e.exec(t, `UPDATE runs SET checkpoint_tip = NULL WHERE id = $1`, runID)
+	runID, iid := f.seedTerminalPublishedRunWith(t, w, func(runID uuid.UUID) {
+		f.e.exec(t, `UPDATE runs SET checkpoint_tip = NULL WHERE id = $1`, runID)
+	})
 	f.svc.retainOrDeleteCheckpoint(f.e.ctx, runID, runkind.Issue, pgtype.Int8{Int64: iid, Valid: true})
 	if _, ok := f.row(t, runID); ok {
 		t.Fatalf("a never-published run got a retention record")

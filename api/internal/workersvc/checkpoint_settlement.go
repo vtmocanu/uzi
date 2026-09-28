@@ -50,7 +50,11 @@ func (s *Service) ReconcileCheckpointRetentions(ctx context.Context) (int64, err
 // test's forge); the zero value lists every run, as production does. The arms run in order:
 //
 //  1. backfill: terminal runs that own a checkpoint ref but have no record get one (retained
-//     with an open hold, else settling), so arm 2 settles a new settling record the same pass;
+//     with an open hold, else settling), so arm 2 settles a new settling record the same pass.
+//     Since migration 00265 every terminal transition records its run in the same transaction
+//     (the runs.status trigger), so this arm is left with runs that went terminal before 00265
+//     and terminal runs whose first publish landed after the transition and whose
+//     TrackTerminalCheckpointPublish insert failed;
 //  2. work: a due `settling` record retries its CAS delete; a due `superseding` record is
 //     re-driven, or, when its supersession stopped (last_error set) and no hold is open, exited;
 //  3. unheld: a `retained`/`superseded` record whose run has no open hold moves to settling and

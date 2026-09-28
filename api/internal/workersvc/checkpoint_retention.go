@@ -93,8 +93,10 @@ func (s *Service) beforeRetentionWrite(ctx context.Context, runID uuid.UUID, op 
 func (s *Service) SetRetentionLockPool(p ConnAcquirer) { s.retentionPool = p }
 
 // retentionWired reports whether this service can broker a retained-ref delete at all. Any
-// missing seam means RETAIN: the terminal path records nothing and deletes nothing, and the
-// ref simply stays on origin.
+// missing seam means RETAIN: the Go terminal path records nothing and deletes nothing, and the
+// ref simply stays on origin. The record itself may still exist: migration 00265's trigger
+// inserts it in the terminal transaction whatever this service has wired, and without the seams
+// nothing ever drives it to a delete.
 func (s *Service) retentionWired() bool {
 	return s.retentionPool != nil && s.retentionSem != nil && s.deleteCheckpointFn != nil &&
 		s.forgeBaseURLAllowed != nil && s.box != nil && s.background != nil
@@ -197,18 +199,29 @@ func destroyRetentionConn(conn *pgxpool.Conn) {
 	_ = c.Close(ctx)
 }
 
-// retainOrDeleteCheckpoint is the terminal-transition checkpoint handler (PRD #1810 M1, D1),
-// replacing the unconditional best-effort delete of PRD #1030 M4. It runs AFTER the terminal
-// state committed and never fails or delays the caller beyond two bounded inserts:
+// retainOrDeleteCheckpoint is the post-commit half of the terminal-transition checkpoint handler
+// (PRD #1810 M1, D1), replacing the unconditional best-effort delete of PRD #1030 M4. It runs
+// AFTER the terminal state committed and never fails or delays the caller beyond two bounded
+// inserts and a re-read.
 //
-//   - an ineligible kind (checkpointBranch), or any missing retention seam: nothing (RETAIN);
+// The record is normally already there: migration 00265's trigger on runs.status inserts it in
+// the SAME transaction as the terminal status (so no reader, claimCheckpointSlot included, ever
+// sees a terminal run that published a checkpoint without its record), with the same columns,
+// the same retained/settling choice and the same never-reset rule as the inserts below. Both
+// inserts then move zero rows and the re-read finds the trigger's row; this path's job is to
+// dispatch the settle that row owes (a completed run's hold is released after the terminal commit,
+// so its row is typically `retained` at insert and settles here). The inserts stay as the
+// fallback for a database without the trigger. The cases:
+//
+//   - an ineligible kind (checkpointBranch), or any missing retention seam: no forge call (RETAIN);
 //   - a run that published a checkpoint and has an OPEN custody hold (any generation): a
 //     `retained` record, and no forge call. The ref stays on origin for recovery;
 //   - a run that published a checkpoint and has NO open hold (a completed run whose hold was
 //     just released, or a failed/cancelled run on a worker without the recovery capability):
 //     a `settling` record, and a background settle that deletes the ref CAS on its tip under
 //     the run's retention lock;
-//   - a run that already has a record (a duplicate terminal call): the record is never reset;
+//   - a run that already has a record (the trigger's row, or a duplicate terminal call): the
+//     record is never reset;
 //     one still owing work is handed to the settle, which re-reads the record under the lock
 //     and moves it to settling only through the guarded SetCheckpointRetentionSettlingIfUnheld
 //     (its NOT EXISTS open-hold predicate is the custody check).
@@ -227,7 +240,10 @@ func (s *Service) retainOrDeleteCheckpoint(ctx context.Context, runID uuid.UUID,
 // recordCheckpointRetention is the record half of retainOrDeleteCheckpoint, shared with the
 // sweeper's backfill (PRD #1810 M4): it inserts the run's `retained` or `settling` record
 // (never resetting an existing one) and reports whether a record was inserted now and whether
-// the run's record owes a settle. It makes no forge call.
+// the run's record owes a settle. It makes no forge call. For a terminal transition committed
+// with migration 00265's trigger in place the record already exists, so inserted is false and
+// settle reflects the existing record's state; inserted is true only for a run the trigger never
+// recorded (one that went terminal before 00265, or a record the backfill finds missing).
 func (s *Service) recordCheckpointRetention(ctx context.Context, runID uuid.UUID, kind string, issueIid pgtype.Int8) (inserted, settle bool) {
 	branch, ok := checkpointBranch(kind, runID, issueIid)
 	if !ok {

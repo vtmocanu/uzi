@@ -468,8 +468,10 @@ func TestCompletedGenerationWithOlderHoldPreservedLiveDB(t *testing.T) {
 }
 
 // TestBackfillStaleWorkerFailLiveDB: FailRunsOfStaleWorkersOverCap fails a run without calling the
-// retention path, so it has no record; the sweeper's backfill records it (retained with an open
-// hold, else settling) and a settling record is deleted in the same pass.
+// Go retention path. Since migration 00265 its terminal UPDATE records the run anyway (the
+// runs.status trigger: retained with an open hold, else settling). To pin the backfill that
+// covers a run which went terminal BEFORE 00265, the trigger's row is then deleted: the sweeper's
+// backfill records it the same way, and a settling record is deleted in the same pass.
 func TestBackfillStaleWorkerFailLiveDB(t *testing.T) {
 	for _, withHold := range []bool{false, true} {
 		name := "no hold: deleted"
@@ -494,9 +496,15 @@ func TestBackfillStaleWorkerFailLiveDB(t *testing.T) {
 			if s := f.e.runStatus(t, runID); s != "failed" {
 				t.Fatalf("run status = %q, want failed by the stale-worker sweep", s)
 			}
-			if _, ok := f.record(t, runID); ok {
-				t.Fatalf("the stale-worker fail recorded a retention row itself; the backfill is what this test pins")
+			wantTrig := retentionSettling
+			if withHold {
+				wantTrig = retentionRetained
 			}
+			if r, ok := f.record(t, runID); !ok || r.State != wantTrig || r.Ref != ref || r.Tip != retentionTestTip {
+				t.Fatalf("record after the stale-worker fail = %+v (present %v), want the trigger's %s row at %s", r, ok, wantTrig, ref)
+			}
+			// Model a pre-00265 terminal transition: no record.
+			f.e.exec(t, `DELETE FROM checkpoint_retentions WHERE run_id = $1`, runID)
 			f.reconcileRun(t, f.svc2, runID)
 			r, ok := f.record(t, runID)
 			if !ok {
