@@ -7,12 +7,16 @@
 -- brand-new tables, no change to any worker-facing table.
 --
 -- One row per run (run_id PRIMARY KEY). The row is inserted at the run's terminal
--- transition, or backfilled by the sweep reconciler for a terminal run with none. A
--- later terminal call for the same run (a duplicate report, a second cancel path)
--- finds the existing row and leaves its state alone; but the row is not otherwise
--- frozen there, a later publish of the SAME run can still advance or reopen it
--- (TrackTerminalCheckpointPublish, AdvanceCheckpointRetentionTip), and a supersession
--- (another run needing the branch slot) moves it to `superseded`.
+-- transition, backfilled by the sweep reconciler for a terminal run with none, or
+-- inserted by TrackTerminalCheckpointPublish for a terminal run that still has none
+-- when one of its checkpoint publishes lands AFTER the terminal transition (e.g. its
+-- shutdown checkpoint). A later terminal call for the same run (a duplicate report, a
+-- second cancel path) finds the existing row and leaves its state alone; but the row
+-- is not otherwise frozen there, a later publish of the SAME run can still advance or
+-- reopen it (TrackTerminalCheckpointPublish, AdvanceCheckpointRetentionTip), and a
+-- supersession (another run needing the branch slot) moves it through `superseding`
+-- to `superseded` when a custody hold is still open, or straight to `settling` when
+-- none is.
 CREATE TABLE checkpoint_retentions (
     -- Owner/run/repo are PLAIN columns, NOT ON DELETE CASCADE FKs (the rationale
     -- recovery_custody_holds records in 00223): a run, repo or owner delete must not

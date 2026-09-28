@@ -16,11 +16,12 @@ the worker-reported terminal state report, and the two server-side
 cancel/reject paths. Instead, at each of those writers it retains the ref
 while any custody hold of that run is open, and settles it
 (compare-and-swap delete on the recorded tip) only once the run's last
-hold is released or discarded. When a new run on the same branch is
-blocked because a retained ref still occupies the slot (a
-`not_descendant` publish refusal), the api **supersedes** the old run's
-record: it moves the tip to `refs/uzi-recovery/<run-id>` and frees the
-branch ref, rather than deleting the tip or force-updating anything.
+hold is released or discarded. When another run needs the slot a retained
+ref still occupies — its publish would be refused `not_descendant`, or
+would fast-forward over the retained tip and succeed with no refusal at
+all — the api **supersedes** the old run's record: it moves the tip to
+`refs/uzi-recovery/<run-id>` and frees the branch ref, rather than
+deleting the tip or force-updating anything.
 
 Every forge write this invariant requires is CAS, never forced, consistent
 with the push broker's existing rule (ADR-0122).
@@ -146,15 +147,24 @@ push that would otherwise succeed, a terminal run's publish (its
 the tip persist, and the retention-record track) must not be allowed to
 interleave with a supersession of that same run. `publishTerminalLocked`
 now runs that whole sequence under the run's own retention advisory lock,
-fenced immediately before the push exactly like every other retention
-forge write: a supersession of the run (which takes the same lock) can
-neither begin between the check and the push nor land between the push and
-the track. A busy lock (another instance, or the sweeper, already working
-the run's record) is a benign `not_descendant` skip with no forge call, on
-the same short bounded wait every retention lock acquisition uses; the
-worker retries next tick. Any settle the publish itself ends up owing is
-dispatched only *after* the lock releases, since dispatching it under the
-lock could lose the race to the very holder that just released it.
+fenced immediately before the push (the same `pg_locks` re-check every
+retention forge write uses, though not through `beforeRetentionWrite` —
+that write has no test hook): a supersession of the run (which takes the
+same lock) can neither begin between the check and the push nor land
+between the push and the track. `withRetentionLock` itself is a single
+try (`pg_try_advisory_lock`, no retry loop), and a full retention
+concurrency slot is busy in the same way a held lock is. Only
+`publishTerminalLocked` retries a busy lock, every
+`terminalPublishLockRetryInterval` (200ms) for up to
+`terminalPublishLockRetryBudget` (3s total) — because the agent's shutdown
+checkpoint sink is one-shot, so a skip under brief contention would lose a
+cancelled run's last checkpoint outright. A lock still busy past that
+budget (another instance or the sweeper already working the run's record,
+or the retention slots full) is a benign `not_descendant` skip with no
+forge call; the worker retries next tick. Any settle the publish itself
+ends up owing is dispatched only *after* the lock releases: dispatching it
+under the lock would have it try-lock the same key and lose to the lock
+this operation still holds.
 
 ### Empty pack, not "pack-less" (amends the PRD's D2)
 
@@ -195,20 +205,30 @@ above.
   any forge write, and forge writes never race a lost lock" invariant
   actually requires; see the PRD's D2 amendment above for why the simpler
   design does not work.
-- **The first two residuals from the original design are closed (2026-09-28)
-  by serializing a terminal run's own publish under its retention lock**
-  (above): the old run's publish can no longer land *inside* a
-  supersession of that same run, whether the old run is terminal
-  (`publishTerminalLocked` holds the same lock a supersession of it would
-  need) or was live and only turned terminal mid-publish. The remaining
-  window is narrower and different in shape: a run that read as **live**
-  at the moment its own `Publish` call started — so it took the unlocked
+- **Residual 1 (terminal-at-read publish) is closed (2026-09-28) by
+  serializing a terminal run's own publish under its retention lock**
+  (above): a publish that `Publish` routes as terminal at its status read
+  can no longer land *inside* a supersession of that same run —
+  `publishTerminalLocked` holds the same lock a supersession of it would
+  need, across the check, the push and the track.
+- **Residual 2 is narrower, not closed.** A run that read as **live** at
+  the moment its own `Publish` call started — so it took the unlocked
   live-run path rather than `publishTerminalLocked` — can still turn
   terminal (a concurrent cancel or completion) while that unlocked push is
-  still in flight. `branchHeldByOwnPublish`'s post-delete list still covers
-  this case: it re-lists the branch ref after the CAS delete and treats a
-  tip that matches the run's own later `checkpoint_tip` as not done, so the
-  record stays `superseding` for a re-drive instead of going stale.
+  still in flight. The window that remains is exactly: the run's push
+  lands *after* a supersession's recovery-ref create and *before* its
+  branch CAS-delete, and the run's `runs.checkpoint_tip` persist commits
+  *after* the supersession's post-delete list (`branchHeldByOwnPublish`)
+  has already run. In that ordering the list takes the branch ref's tip
+  for another run's publish, the record is marked `superseded`, and
+  neither retention statement the run's own track runs
+  (`TrackTerminalCheckpointPublish`, `AdvanceCheckpointRetentionTip`) moves
+  a row for it, so the ref stays untracked and can block a new run on the
+  branch until an operator clears it. This is logged, not silently lost:
+  the track logs a Warn naming the run, branch and tip for an operator,
+  based on the run's *current* status at that point (a run live at
+  `Publish`'s top read can have turned terminal by the time the track
+  runs).
 - **A remaining known residual (tip lag), by design, rather than closed
   with a primitive the push broker does not have:** in the tip-lag case —
   the record's recorded tip lags what the run itself later published, and
@@ -218,14 +238,17 @@ above.
   Moving the ref instead of leaving it for a human would need a
   CAS-*update* primitive the push broker does not have.
 - **New residual (2026-09-28): a stuck `superseding` record blocks a new
-  live run's checkpoints entirely, not just the one publish that hit it.**
-  `claimCheckpointSlot` treats a record still in its retry backoff as
-  `not_descendant` and refuses the new run's push outright. The new run's
-  checkpoints stay blocked until the old run's holds all release and the
-  sweeper's stuck-exit path (`exitStuckSupersessionLocked`) clears the
-  record — a direct consequence of leaving a stuck supersession's retry
-  cadence to the sweeper rather than re-driving it inline on every
-  publish.
+  live run's checkpoints entirely, not just the one publish that hit it,
+  for as long as the record stays in backoff.** `claimCheckpointSlot`
+  treats a record still in its retry backoff as `not_descendant` and
+  refuses the new run's push outright; its list is bounded (`LIMIT 10`)
+  as well. This is not sweeper-only: once a record's backoff expires, the
+  very next publish on the branch re-drives it inline through the same
+  `claimCheckpointSlot` path, no sweeper tick required. The residual is
+  narrower than "blocked until the sweeper runs" — it is blocked only
+  while the record is still within its backoff window, or until the old
+  run's holds all release and the sweeper's stuck-exit path
+  (`exitStuckSupersessionLocked`) clears the record outright.
 - **The live-settle ancestry proof (PRD #1349/#1751,
   `ReleasePredecessorCustodyHoldByLiveAncestry`) is unchanged.** It only
   runs against a *live* run's checkpoint or branch head, and a retention

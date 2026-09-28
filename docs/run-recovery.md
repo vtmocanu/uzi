@@ -169,16 +169,20 @@ even if the worker and its disk are gone. Once every hold on the run is
 released or discarded, uzi removes the ref.
 
 If you start a new run on the same branch while the old ref is still held,
-uzi moves the old tip out of the way rather than blocking your new run or
-overwriting it: it creates `refs/uzi-recovery/<run-id>` pointing at the old
-run's tip, frees `refs/uzi-checkpoints/<branch>` for the new run, and keeps
-the old ref around under its own name until that run's holds are resolved.
+uzi normally moves the old tip out of the way rather than blocking your
+new run: it creates `refs/uzi-recovery/<run-id>` pointing at the old run's
+tip, frees `refs/uzi-checkpoints/<branch>` for the new run, and keeps the
+old ref around under its own name until that run's holds are resolved. A
+stuck supersession — for example, the branch is not actually at the tip
+its record names — is the exception: it can refuse your new run's
+checkpoints until the old run's holds all release, rather than blocking
+just the one publish that hit it.
 
 `uzi run recovery <run-id>` shows which ref uzi's record names for a run's
 checkpoint, its tip commit, and its retention state — so you usually know
 whether to fetch the branch ref or the recovery ref. It can lag briefly
-during an in-progress supersession, or leave a stray ref untracked in the
-rare late-publish cases described in
+during an in-progress supersession, or leave a stray ref untracked in a
+narrow window described in
 [ADR-1810](../adr/1810-checkpoint-retention-follows-custody.md#consequences);
 when in doubt, check both refs on your forge. Fetch either directly from
 your forge:
