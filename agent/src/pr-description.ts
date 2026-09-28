@@ -933,6 +933,7 @@ const EMPTY_CODE = "(empty)";
 export function codeSpan(s: string): string {
   const flat = flatten(s);
   if (flat === "") return EMPTY_CODE;
+  // [<]: see MARKER_HEAD_RE (semgrep parse)
   const t = breakMentions(breakClosingKeywords(flat, "directives")).replace(/[<]!--/gu, `<${ZWSP}!--`);
   let longest = 0;
   for (const m of t.matchAll(/`+/gu)) longest = Math.max(longest, m[0].length);
@@ -1293,6 +1294,7 @@ const LINE_BREAKS_RE = /\r\n|[\r\n\u2028\u2029]/gu;
  *  never carry a block marker, or any HTML comment, into the completion block. Text without `<!--`
  *  is returned unchanged, so today's fixed wording is byte-identical. */
 function neutraliseMarkers(s: string): string {
+  // [<]: see MARKER_HEAD_RE (semgrep parse)
   return s.replace(/[<]!--/gu, `<${ZWSP}!--`);
 }
 
@@ -1351,8 +1353,8 @@ export type ParsedBody =
 // reported malformed rather than silently ignored; only the exact forms above are accepted. The
 // marker then runs to the first `>` after this head, which must close it as `-->` (the former
 // `[^>]*?-->` tail, found with one forward pointer instead of a rescan per candidate).
-// `[<]` rather than a bare `<` before `!--`: semgrep's TypeScript parser (sast:semgrep, --strict)
-// reads a `<!--` inside a regex literal as an HTML-comment opener and fails the whole file.
+// `[<]` rather than a bare `<` before `!--`: a regex literal that BEGINS with `<!--` (right after the
+// opening `/`) trips semgrep's TypeScript parser (sast:semgrep, --strict), which fails the whole file.
 const MARKER_HEAD_RE = /[<]!--[\s\p{Z}]*uzi:(description|completion):(start|end)\b/iuy;
 
 // A fence line (CommonMark: up to 3 SPACES of indent, optionally inside `>` quotes, then 3+

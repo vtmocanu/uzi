@@ -67,7 +67,8 @@ describe("mrCompletionBlock — owner PARTIAL (PRD #1227 M2)", () => {
   });
 
   // MUTATION-MINDED (PRD M2): a partial NEVER closes, even when renderCloses would otherwise be true.
-  // Restoring unconditional closing language (dropping the effectiveCloses guard) must FAIL this.
+  // Restoring unconditional closing language (dropping the renderer's issueArm partial arms in
+  // agent/src/pr-description.ts, which never write Closes) must FAIL this.
   it("emits NO `Closes #<iid>` for a partial body even when renderCloses=true", () => {
     const body = render({ deferred: DEFERRED }, true);
     assert.doesNotMatch(body, /Closes #/, "an owner partial must never close the issue, regardless of renderCloses");

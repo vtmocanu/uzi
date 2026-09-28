@@ -946,7 +946,7 @@ describe("round trip: the renderer's own output always parses ok", () => {
   /** Every marker-shaped comment in `body` (outside nothing: the renderer writes no marker in code)
    *  starts a line and ends it. */
   const markersAtColumn0 = (body: string) => {
-    for (const m of body.matchAll(/<!--[\s\p{Z}]*uzi:(?:description|completion):[^>]*>/giu)) {
+    for (const m of body.matchAll(/[<]!--[\s\p{Z}]*uzi:(?:description|completion):[^>]*>/giu)) {
       const at = m.index;
       assert.ok(at === 0 || body[at - 1] === "\n", `${JSON.stringify(m[0])} at ${at}:\n${body}`);
       const end = at + m[0].length;

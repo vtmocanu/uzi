@@ -205,7 +205,7 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     const result = await readRepoInstructions(clone);
     assert.ok("text" in result);
     assert.ok(!result.text.includes("@./secrets.md"));
-    assert.strictEqual(result.text.match(/<!-- uzi: @-import stripped -->/g)?.length, 1);
+    assert.strictEqual(result.text.match(/[<]!-- uzi: @-import stripped -->/g)?.length, 1);
     assert.ok(result.text.includes("Run the gate before every push."));
   });
 
@@ -345,7 +345,7 @@ describe("readRepoInstructions (PRD #246 M2)", () => {
     assert.ok(!text.includes("@docs/internal.md"));
     assert.ok(!text.includes("@~/home/rc"));
     // Replaced with an auditable marker, one per stripped line.
-    assert.strictEqual(text.match(/<!-- uzi: @-import stripped -->/g)?.length, 3);
+    assert.strictEqual(text.match(/[<]!-- uzi: @-import stripped -->/g)?.length, 3);
     // Normal prose is untouched.
     assert.ok(text.includes("# Conventions"));
     assert.ok(text.includes("Run the gate before every push."));

@@ -4850,8 +4850,9 @@ export class RunRunner {
     // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
     // verification. It is threaded to reconcileMrDescription(!isOwnerPartial) below so the verified-head
     // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
-    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, is the belt-and-suspenders,
-    // and nonClosingDelivery below gates every Closes decision. Absent/empty ⇒ false ⇒ the accept-closing and
+    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, decides the rendered Closes
+    // line itself (renderCloses/withCloses go into issueArm), and nonClosingDelivery below gates the
+    // closing-directive scans, strips and fail-closed paths. Absent/empty ⇒ false ⇒ the accept-closing and
     // full-delivery paths add Closes after verify exactly as before.
     const isOwnerPartial = (claim.config?.completion_scope?.deferred?.length ?? 0) > 0;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
@@ -5015,10 +5016,13 @@ export class RunRunner {
     // closing directive for the issue.
     const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
     // The ONE non-closing-delivery predicate: this run delivers less than its issue asked for, so no
-    // body it writes may close the issue, verified head or not. Every closing decision below (the
-    // creation block, the reconcile's `closes`, whether the verified reconcile ADDED Closes) derives
-    // from it. Any new partial or blocker arm (a delivery that must not close its issue) MUST set it
-    // here rather than add its own check at one of those sites.
+    // body it writes may close the issue, verified head or not. It gates the closing-directive scans,
+    // strips and fail-closed paths below (the publisher's non-closing scan via createCloses, the
+    // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
+    // rendered Closes line itself is decided by renderCloses/withCloses going into the renderer's
+    // issueArm (agent/src/pr-description.ts), whose partial arms never write it. Any new partial or
+    // blocker arm (a delivery that must not close its issue) MUST set it here rather than add its own
+    // check at one of those sites.
     const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
     const createCloses = renderCloses && !nonClosingDelivery;
     // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
