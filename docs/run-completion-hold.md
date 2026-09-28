@@ -166,20 +166,24 @@ something goes wrong or a human has touched the request in between:
 
 - **On a verified head, if the `Closes` write can't be confirmed** — the
   write itself fails, the read-back to confirm it fails, or the PR's head
-  moved in between — uzi strips `Closes` back out and, only once that strip
-  is confirmed, holds the run for your review rather than reporting it
-  complete. If even that strip can't be confirmed, uzi doesn't hold at all:
-  it fails the run closed, since a hold is a nominally non-closing parked
-  state and uzi can't guarantee that here.
+  moved in between — uzi strips `Closes` back out. The run holds once that
+  strip is confirmed, or once the request turns out to be unreadable and the
+  strip falls back to writing a non-closing body blind (with no read-back,
+  but no closing directive by construction). Only when the strip write itself
+  is refused, or is written but a confirming read-back shows it didn't land,
+  does uzi skip the hold: it fails the run closed instead, since a hold is a
+  nominally non-closing parked state and uzi can't guarantee that here.
 - **On a non-closing run** — a hold, an owner-partial delivery, or one
   scope-capped mid-flight — uzi scans the whole resulting request body,
   not just its own completion block, for a closing directive aimed at the
   issue. If it finds one anywhere it doesn't own (a human typed `Closes #N`
   into the description, or the request is an older one uzi adopted that
   already carried one), it rewrites the whole body to a non-closing form.
-  If that rewrite can't be written or confirmed, the run fails closed rather
-  than leaving a possibly-closing request unmerged. This applies to legacy
-  (seeded) runs too, not only interlocked ones.
+  If that rewrite can't be *written*, the run fails closed rather than
+  leaving a possibly-closing request open; if the request was unreadable, a
+  blind rewrite that succeeds is accepted even though nothing read the body
+  back to confirm it. This applies to legacy (seeded) runs too, not only
+  interlocked ones.
 
 ## Not the same as an owner pause
 

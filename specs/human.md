@@ -943,7 +943,10 @@ Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-de
   alone. (AI-synced 2026-09-28)
 - A Claude run and a Codex run produce the same layout. (AI-synced 2026-09-28)
 - Generated or lead-written text can never close an issue. (AI-synced 2026-09-28)
-- Text outside uzi's own blocks is preserved. (AI-synced 2026-09-28)
+- Text outside uzi's own blocks is preserved on an ordinary refresh; a few
+  named cases (no uzi markers yet, a closing directive found outside the
+  completion block, a blind rewrite of an unreadable PR) rewrite the whole
+  body instead. (AI-synced 2026-09-28)
 - The footer wording ("Opened by uzi from `<branch>`. A human reviews and
   merges; uzi never merges.") was approved by the maintainer on 2026-09-27.
   (AI-synced 2026-09-28)

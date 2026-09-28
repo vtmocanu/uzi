@@ -72,12 +72,15 @@ it is without reading the diff first.
 **What the body contains.** A 2-3 sentence summary of what the PR does and
 why, a computed size line, a short "What changed" list, a "Verification"
 section (only when there's something to report), and "Scope and review
-notes" when the delivery differs from the ask. Below that sits a separate,
-deterministic completion block: the issue reference (`Related to #N` or
-`Closes #N`), any partial-delivery or unmet-criteria warnings, and a fixed
-footer: "Opened by uzi from `<branch>`. A human reviews and merges; uzi never
-merges." The summary and the size line are omitted, not left blank, when
-there's nothing to show.
+notes" when the delivery differs from the ask, followed by a line saying
+which commit it describes and against which branch. Below that sits a
+separate, deterministic completion block: the issue reference — `Related to
+#N.` on its own for a non-closing delivery, `Related to #N.` plus `Closes
+#N` together once the delivery is verified closing, or `Implements part of
+#N` for a partial delivery — any partial-delivery or unmet-criteria
+warnings, and a fixed footer: "Opened by uzi from `<branch>`. A human
+reviews and merges; uzi never merges." The summary and the size line are
+omitted, not left blank, when there's nothing to show.
 
 **The size line.** A line like:
 
@@ -86,7 +89,8 @@ there's nothing to show.
 ```
 
 is always computed from the actual diff (`git diff --numstat`), never
-written by a model, and empty buckets are omitted. Each changed file is
+written by a model, and empty buckets are omitted; a bucket with a file in it
+but no net line change still shows as `+0 −0`. Each changed file is
 classified into one bucket, first by your repo's own `.gitattributes`
 (`linguist-generated`, `linguist-documentation`, `linguist-vendored`), then by
 generic path rules (test files, `docs/`, lockfiles and other generated
@@ -94,14 +98,17 @@ artifacts, config files) with anything left over counted as `code`. If your
 repo classifies something uzi's generic rules get wrong (generated code that
 doesn't match a common pattern, for example), add or adjust a
 `.gitattributes` entry for it; the size line has no repo-specific rules
-baked in.
+baked in. `uzi run get`'s own `SIZE` row is a shorter cut of the same
+numbers: it omits a bucket that has a file but no net line change, which the
+PR's own size line still shows.
 
 **Verification is only what the agent reported.** The Verification section
 never claims the CI passed (that's on the PR itself, from the forge) and
 never says "tests added" on its own — the size line's `tests` bucket is a
 line count, not a claim that anything was actually tested. It lists only the
 checks the agent ran and reported, labelled with the commit SHA they were
-run at.
+run at — the run's own worktree `HEAD` at the moment it signalled done, not
+necessarily the PR's final head.
 
 **The lead can supply its own claims.** Normally an editor pass writes the
 plain-English text from the lead's structured claims and the final diff. If
@@ -112,12 +119,22 @@ the size line. The completion block is always written, on every rung.
 
 **Editing the description.** You can edit the text uzi writes, or add your
 own notes outside it (a review bot's summary, a filled-in PR template
-section) — uzi never touches text outside its two marked blocks. If you edit
+section), and uzi leaves that text alone on an ordinary refresh. If you edit
 inside uzi's own description block, uzi notices on the next refresh (a
 `mr_rework` run, for example) and leaves your edit alone instead of
 overwriting it; the completion block below it is still kept current.
 
-**Where to see it.** The run page shows a "Delivered" card next to the
-intent and plan cards. `uzi run get <id>` prints the same summary as a
-`DELIVERED` row, the size line as `SIZE`, and, when the PR's description
-couldn't be refreshed, a `PR_UPDATE` row explaining why.
+Text outside uzi's two blocks isn't untouchable, though: uzi rewrites the
+**whole** body, region and all, in a few specific cases where preserving text
+would let something it doesn't own slip through — a PR with none of uzi's
+markers and no previously published description; a directive elsewhere in
+the body that would close the issue on a run whose delivery must not close
+it; or, when the PR can't even be read back, a blind non-closing rewrite as a
+last resort. A refresh run (`mr_rework`, or a `ci_fix` picking up an existing
+branch) never does this: it only ever touches its own two blocks, or leaves a
+PR with no uzi markers untouched entirely.
+
+**Where to see it.** The run page shows a "Delivered" section of the same
+card as the intent and plan summaries. `uzi run get <id>` prints the same
+summary as a `DELIVERED` row, the size line as `SIZE`, and, when the PR's
+description couldn't be refreshed, a `PR_UPDATE` row explaining why.
