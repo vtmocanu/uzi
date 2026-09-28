@@ -77,6 +77,25 @@ describe("production code never installs a quiescence test view", () => {
     // `process.env`, `process["env"]`, and a destructured `{ env } = process`.
     assert.deepEqual(matches(src, /\bprocess\s*(?:\?\.|\.)\s*env\b|\bprocess\s*\[\s*["'`]env["'`]\s*\]/g), []);
     assert.deepEqual(matches(src, /\benv\b[^}=]*\}\s*=\s*process\b/g), []);
+    // No import of the process module at all (so no `env` binding by named import, alias, default
+    // or namespace import): static `import … from`, `export … from`, a dynamic `import()` or a
+    // `require()` of "process" / "node:process". The specifier is a string, so this reads `src`.
+    assert.deepEqual(matches(src, /\b(?:import|export)\b[^;]*?["'`](?:node:)?process["'`]/g), []);
+    assert.deepEqual(matches(src, /\brequire\s*\(\s*["'`](?:node:)?process["'`]\s*\)/g), []);
+    const bare = withoutStrings(src);
+    // No aliasing of the process object (`const p = process;`, `= globalThis.process`,
+    // `= globalThis?.process`): a bare `process` on the right of `=`, not followed by a member access.
+    assert.deepEqual(
+      matches(bare, /=\s*(?:globalThis\s*(?:\?\.|\.)\s*)?process\b(?!\s*(?:\?\.|\.|\[))/g),
+      [],
+    );
+    // No `env` member read on anything, whatever the receiver (an alias, `globalThis.process`, a
+    // call result), by dot, optional chain or a computed "env" key. The one `.env` in code today is
+    // the helper spawner handing its own `opts.env` (built by the caller from `workerSpawnEnv(...)`)
+    // to `spawn`; a spawn option `env:` object key is not a member access and is not matched.
+    assert.deepEqual(matches(bare, /[\w$)\]]*\s*(?:\?\.|\.)\s*env\b/g), ["opts.env"]);
+    assert.match(bare, /const defaultHelperSpawn: HelperSpawn = \(command, args, opts\) =>\s*spawn\([^;]*\benv: opts\.env\b/);
+    assert.deepEqual(matches(src, /\[\s*["'`]env["'`]\s*\]/g), []);
     // And, stated for the view path itself: the setter and the view validation mention no `process`.
     const setter = /export function setQuiescenceViewForTests\([^)]*\): void \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
     const validation = /function isQuiescenceView\([^)]*\): v is QuiescenceView \{[\s\S]*?\n\}/.exec(src)?.[0] ?? "";
