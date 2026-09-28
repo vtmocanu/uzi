@@ -168,7 +168,10 @@ func TestValidateCSRFRequiresNonEmptyAuthCookie(t *testing.T) {
 	}
 
 	emptyCookie := httptest.NewRequest(http.MethodPost, "/", nil)
-	emptyCookie.AddCookie(&http.Cookie{Name: AuthCookieName, Value: ""})
+	emptyCookie.AddCookie(&http.Cookie{
+		Name: AuthCookieName, Value: "",
+		Secure: true, HttpOnly: true, SameSite: http.SameSiteStrictMode,
+	})
 	emptyCookie.Header.Set(CSRFHeaderName, emptyKeyed)
 	if ValidateCSRF(emptyCookie) {
 		t.Error("CSRF passed with an empty auth cookie and an empty-key token")
@@ -177,9 +180,15 @@ func TestValidateCSRFRequiresNonEmptyAuthCookie(t *testing.T) {
 
 func TestSetAuthCookiesLifetimeAndPath(t *testing.T) {
 	rec := httptest.NewRecorder()
+	before := time.Now()
 	if err := SetAuthCookies(rec, "the-jwt", CookieOptions{Secure: false, TTL: 90 * time.Minute}); err != nil {
 		t.Fatalf("set cookies: %v", err)
 	}
+	after := time.Now()
+	// Expires is serialized at second granularity; browsers that ignore
+	// Max-Age rely on it, so it must track the TTL too.
+	earliest := before.Add(90 * time.Minute).Truncate(time.Second)
+	latest := after.Add(90 * time.Minute)
 	got := cookiesByName(t, rec)
 	if v := got[AuthCookieName].Value; v != "the-jwt" {
 		t.Errorf("auth cookie value = %q, want the-jwt", v)
@@ -191,6 +200,9 @@ func TestSetAuthCookiesLifetimeAndPath(t *testing.T) {
 		}
 		if c.Path != "/" {
 			t.Errorf("%s Path = %q, want /", name, c.Path)
+		}
+		if c.Expires.Before(earliest) || c.Expires.After(latest) {
+			t.Errorf("%s Expires = %v, want within [%v, %v]", name, c.Expires, earliest, latest)
 		}
 		if c.Secure {
 			t.Errorf("%s Secure = true, want false (opts.Secure=false)", name)
