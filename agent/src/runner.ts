@@ -4849,8 +4849,9 @@ export class RunRunner {
     // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
     // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
     // verification. It is threaded to reconcileMrDescription(!isOwnerPartial) below so the verified-head
-    // reconcile re-renders the NON-closing partial body instead of adding Closes; mrCompletionBlock's own
-    // effectiveCloses guard is the belt-and-suspenders. Absent/empty ⇒ false ⇒ the accept-closing and
+    // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
+    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, is the belt-and-suspenders,
+    // and nonClosingDelivery below gates every Closes decision. Absent/empty ⇒ false ⇒ the accept-closing and
     // full-delivery paths add Closes after verify exactly as before.
     const isOwnerPartial = (claim.config?.completion_scope?.deferred?.length ?? 0) > 0;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
