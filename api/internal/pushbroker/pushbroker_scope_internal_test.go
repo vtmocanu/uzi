@@ -73,7 +73,7 @@ func TestIsWorkflowScopeRejection(t *testing.T) {
 // a benign CAS-delete refusal (origin's checkpoint ref moved out from under the Old we
 // bound in the list→delete window → nil, no retry) versus a genuine transport/auth fault
 // (→ the wrapped error is surfaced). That wire branch is unreachable in the file:// test
-// harness (the go-git internal server does not enforce the wire CAS — casDelete's local
+// harness (go-git's file:// client execs the real git-receive-pack, but casDelete's local
 // list-and-compare guard short-circuits first), so this unit test is the only coverage of
 // the classification production depends on. It lives in an internal test file (mirroring
 // TestIsWorkflowScopeRejection above) because the predicate is unexported.

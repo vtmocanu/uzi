@@ -578,7 +578,8 @@ func TestDeleteAbsentRefOnFreshRemoteIsNil(t *testing.T) {
 // guard (current != expectedOld → nil) short-circuits and refuses the delete — a benign
 // nil — and B's checkpoint SURVIVES. That local guard is what THIS file:// test exercises;
 // the wire receive-pack compare-and-swap covers the same list→delete TOCTOU on a real
-// forge but is not reachable here (the go-git internal server does not enforce it). Under the pre-fix
+// forge but is not reachable here (go-git's file:// client execs the real
+// git-receive-pack, but the local guard short-circuits first). Under the pre-fix
 // behaviour (empty ExpectedOldTip → the unconditional list-then-`:ref` push) the delete
 // would have removed B's ref, clobbering run B's fresh checkpoint; that is precisely the
 // race the CAS closes.

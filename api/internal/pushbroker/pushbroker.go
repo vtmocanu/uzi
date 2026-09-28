@@ -493,9 +493,9 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 //     delete ships no objects). A real forge's receive-pack compare-and-swap on Old then
 //     refuses the delete if the ref moved in the list→delete window; that refusal is
 //     classified benign (isCASDeleteRefusal, reusing isNonFastForward) → nil, never a
-//     retry. (The go-git internal server behind file:// does not enforce this wire CAS,
-//     which is why the local guard above is the primary one — see Publish's note that the
-//     pure wire race is not reproducible in the harness.)
+//     retry. (go-git's file:// client execs the real git-receive-pack, which enforces this
+//     wire CAS too; the local guard above stays the primary one — see Publish's note that
+//     the pure wire race is not reproducible in the harness.)
 //
 // Only a genuine transport/session/auth fault returns a wrapped error, which the caller
 // swallows best-effort (scrubbed of the credential URL).
@@ -711,24 +711,43 @@ var emptyPack = []byte{
 // refs/uzi-checkpoints/<branch> to the run-scoped refs/uzi-salvage/<run-id> (PRD #1867
 // decision 2), identity-bound to o.Tip and idempotent. In order:
 //
-//  1. It lists origin's refs ONCE (an empty remote reads as "nothing present").
+//  1. It lists origin's refs (an empty remote reads as "nothing present").
 //  2. A salvage ref already AT the tip is an idempotent success: skip to step 5. One at
 //     any other tip is PromoteRefused, with no write — a salvage ref is never overwritten.
 //  3. A branch ref missing or not at the tip is PromoteUnavailable, with no write: the
 //     recorded tip is no longer the one origin holds, and a sibling's ref is not ours.
 //  4. It creates the salvage ref with a manual receive-pack command Old=zero, New=tip
-//     and emptyPack (origin already holds the tip, so no objects travel). A failure is
-//     PromoteFailed and the branch ref is NOT touched.
+//     and emptyPack (origin already holds the tip, so no objects travel). If the create
+//     fails it re-lists origin once, closing the list→create race with a concurrent
+//     promoter: a salvage ref now AT the tip continues as the idempotent path (step 5);
+//     one at another tip is PromoteRefused with no further write; otherwise (or when the
+//     re-list itself fails) it is PromoteFailed and the branch ref is NOT touched.
 //  5. Only after that confirmed create (or the idempotent find), it CAS-deletes the
-//     branch ref at the tip (casDelete). Success, or a benign absent/moved ref, is
-//     PromoteDone; a fault is PromoteSalvagedBranchPending with the wrapped error.
+//     branch ref at the tip (casDelete). A fault is PromoteSalvagedBranchPending with the
+//     wrapped error. Because casDelete also reads some lock-failure refusals ("cannot lock
+//     ref", "failed to update ref") as benign, a nil from it is not taken on trust: Promote
+//     re-lists origin and returns PromoteDone only when the branch ref is absent or no
+//     longer at the tip (moved by another owner, which the CAS leaves alone). A branch ref
+//     still at the tip, or a failed re-list, is PromoteSalvagedBranchPending with an error,
+//     so the next pass retries the delete.
 //
-// Invalid input (a nil RunID, a Tip that is not a full non-zero sha, an empty Branch)
+// Invalid input (a nil RunID, a Tip that is not a full non-zero sha, an empty Branch, or
+// a Branch whose checkpoint ref fails the same validateUziRef checks DeleteRef applies)
 // returns PromoteFailed and an error before any network I/O. It runs through the same
 // remote/auth/transport setup as Publish and Delete, under its own maxPromoteDuration
 // ceiling. Errors carry no credential from this package; the caller still scrubs them
 // (secretscrub) before persisting.
 func Promote(ctx context.Context, o PromoteOptions) (PromoteResult, error) {
+	return promote(ctx, o, casDelete)
+}
+
+// branchDeleteFunc is the branch-ref CAS delete promote runs after a confirmed salvage
+// ref: casDelete in production. It is a parameter so a test can model a delete whose
+// refusal casDelete classified benign (nil) while the ref stayed put, which real
+// git-receive-pack does not produce on demand.
+type branchDeleteFunc func(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, refName plumbing.ReferenceName, expectedOld plumbing.Hash) error
+
+func promote(ctx context.Context, o PromoteOptions, deleteBranch branchDeleteFunc) (PromoteResult, error) {
 	if o.RunID == uuid.Nil {
 		return PromoteFailed, errors.New("pushbroker: promote: run id is required")
 	}
@@ -738,6 +757,10 @@ func Promote(ctx context.Context, o PromoteOptions) (PromoteResult, error) {
 	}
 	if o.Branch == "" {
 		return PromoteFailed, errors.New("pushbroker: promote: branch is required")
+	}
+	branchRef := plumbing.ReferenceName(checkpointRefPrefix + o.Branch)
+	if err := validateUziRef(branchRef.String()); err != nil {
+		return PromoteFailed, fmt.Errorf("pushbroker: promote: branch: %w", err)
 	}
 
 	ctx, cancel := context.WithTimeout(ctx, maxPromoteDuration)
@@ -749,20 +772,10 @@ func Promote(ctx context.Context, o PromoteOptions) (PromoteResult, error) {
 	}
 	auth := authFor(Options{Username: o.Username, PAT: o.PAT})
 	salvageRef := plumbing.ReferenceName(SalvageRef(o.RunID))
-	branchRef := plumbing.ReferenceName(checkpointRefPrefix + o.Branch)
 
-	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
-	if err != nil && !errors.Is(err, transport.ErrEmptyRemoteRepository) {
+	salvageAt, branchAt, err := listTwoRefs(ctx, remote, auth, salvageRef, branchRef)
+	if err != nil {
 		return PromoteFailed, fmt.Errorf("pushbroker: promote: list: %w", err)
-	}
-	var salvageAt, branchAt plumbing.Hash
-	for _, r := range advertised {
-		switch r.Name() {
-		case salvageRef:
-			salvageAt = r.Hash()
-		case branchRef:
-			branchAt = r.Hash()
-		}
 	}
 
 	switch {
@@ -773,15 +786,54 @@ func Promote(ctx context.Context, o PromoteOptions) (PromoteResult, error) {
 	case branchAt != tip:
 		return PromoteUnavailable, nil
 	default:
-		if err := forwardPack(ctx, remote, auth, salvageRef, plumbing.ZeroHash, tip, emptyPack); err != nil {
-			return PromoteFailed, fmt.Errorf("pushbroker: promote: create %s: %w", salvageRef, err)
+		if cerr := forwardPack(ctx, remote, auth, salvageRef, plumbing.ZeroHash, tip, emptyPack); cerr != nil {
+			// A concurrent promoter may have created the salvage ref between our list and
+			// our create; re-list once so that race is not reported as a failure.
+			nowAt, _, lerr := listTwoRefs(ctx, remote, auth, salvageRef, branchRef)
+			switch {
+			case lerr == nil && nowAt == tip:
+				// Someone else created it at our tip: continue as the idempotent path.
+			case lerr == nil && !nowAt.IsZero():
+				return PromoteRefused, nil
+			default:
+				return PromoteFailed, fmt.Errorf("pushbroker: promote: create %s: %w", salvageRef, cerr)
+			}
 		}
 	}
 
-	if err := casDelete(ctx, remote, auth, branchRef, tip); err != nil {
+	if err := deleteBranch(ctx, remote, auth, branchRef, tip); err != nil {
 		return PromoteSalvagedBranchPending, fmt.Errorf("pushbroker: promote: branch ref delete after salvage: %w", err)
 	}
+	// casDelete's nil also covers refusals it classifies benign, so confirm the outcome.
+	_, branchNow, err := listTwoRefs(ctx, remote, auth, salvageRef, branchRef)
+	if err != nil {
+		return PromoteSalvagedBranchPending, fmt.Errorf("pushbroker: promote: confirm branch ref delete: %w", err)
+	}
+	if branchNow == tip {
+		return PromoteSalvagedBranchPending, fmt.Errorf("pushbroker: promote: branch ref %s still at tip after delete", branchRef)
+	}
 	return PromoteDone, nil
+}
+
+// listTwoRefs lists origin's advertised refs once and returns the tips of a and b (the
+// zero hash for an absent ref). An empty remote reads as both absent, not an error.
+func listTwoRefs(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, a, b plumbing.ReferenceName) (aAt, bAt plumbing.Hash, err error) {
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return plumbing.ZeroHash, plumbing.ZeroHash, nil
+		}
+		return plumbing.ZeroHash, plumbing.ZeroHash, err
+	}
+	for _, r := range advertised {
+		switch r.Name() {
+		case a:
+			aAt = r.Hash()
+		case b:
+			bAt = r.Hash()
+		}
+	}
+	return aAt, bAt, nil
 }
 
 // newOriginRemote builds the in-memory "origin" remote every broker operation dials:

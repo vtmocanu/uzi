@@ -3,6 +3,7 @@ package pushbroker_test
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/cgi" //nolint:gosec // G504: test-only CGI host for git http-backend on a fixed modern Go toolchain; httpoxy (CVE-2016-5386) affects Go < 1.6.3 only.
@@ -19,8 +20,8 @@ import (
 
 // Regression tests for the forge-credential redirect boundary on every go-git HTTP
 // operation the broker performs: reference listing, fetch, manual receive-pack
-// (publish and CAS delete) and the refspec delete push. The remote is a real
-// smart-HTTP server (git http-backend behind an httptest TLS proxy) so each
+// (publish, CAS delete, salvage promote and DeleteRef) and the refspec delete push.
+// The remote is a real smart-HTTP server (git http-backend behind an httptest TLS proxy) so each
 // operation's earlier discovery steps succeed and the redirect lands on exactly the
 // request under test; the forbidden destination counts requests and must see ZERO.
 
@@ -230,6 +231,38 @@ func brokerOps() []brokerOp {
 			}
 		}
 	}
+	// promoteSetup puts a run tip on origin's checkpoint ref over file://, so Promote
+	// creates the salvage ref and CAS-deletes the branch ref over the HTTP remote.
+	promoteSetup := func(t *testing.T, f *gitFixture) func(string) error {
+		t.Helper()
+		f.commit("a.txt", "base\n", "base")
+		f.pushMain()
+		tip := f.commit("b.txt", "one\n", "c1")
+		f.git("push", "origin", tip+":refs/uzi-checkpoints/main")
+		return func(u string) error {
+			res, err := pushbroker.Promote(context.Background(), pushbroker.PromoteOptions{
+				CloneURL: u, Branch: "main", Tip: tip, RunID: salvageRunID, Username: "uzi-bot", PAT: redirectTestPAT(),
+			})
+			if err == nil && res != pushbroker.PromoteDone {
+				return fmt.Errorf("promote = %v, want done", res)
+			}
+			return err
+		}
+	}
+	// deleteRefSetup puts a salvage ref on origin over file:// for DeleteRef to remove.
+	deleteRefSetup := func(t *testing.T, f *gitFixture) func(string) error {
+		t.Helper()
+		f.commit("a.txt", "base\n", "base")
+		f.pushMain()
+		tip := f.commit("b.txt", "one\n", "c1")
+		ref := pushbroker.SalvageRef(salvageRunID)
+		f.git("push", "origin", tip+":"+ref)
+		return func(u string) error {
+			return pushbroker.DeleteRef(context.Background(), pushbroker.DeleteRefOptions{
+				CloneURL: u, Ref: ref, ExpectedOldTip: tip, Username: "uzi-bot", PAT: redirectTestPAT(),
+			})
+		}
+	}
 	return []brokerOp{
 		{"publish list", "git-upload-pack", 1, publishSetup},
 		{"publish fetch", "git-upload-pack", 2, publishSetup},
@@ -238,6 +271,13 @@ func brokerOps() []brokerOp {
 		{"delete push", "git-receive-pack", 1, deleteSetup(false)},
 		{"cas delete list", "git-upload-pack", 1, deleteSetup(true)},
 		{"cas delete receive-pack", "git-receive-pack", 1, deleteSetup(true)},
+		{"promote list", "git-upload-pack", 1, promoteSetup},
+		{"promote create receive-pack", "git-receive-pack", 1, promoteSetup},
+		{"promote branch delete list", "git-upload-pack", 2, promoteSetup},
+		{"promote branch delete receive-pack", "git-receive-pack", 2, promoteSetup},
+		{"promote confirm list", "git-upload-pack", 3, promoteSetup},
+		{"delete ref list", "git-upload-pack", 1, deleteRefSetup},
+		{"delete ref receive-pack", "git-receive-pack", 1, deleteRefSetup},
 	}
 }
 

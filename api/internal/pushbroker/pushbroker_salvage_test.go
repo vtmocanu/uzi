@@ -269,6 +269,99 @@ func TestPromotePartialSuccessBranchPending(t *testing.T) {
 	}
 }
 
+// TestPromoteBenignDeleteRefusalIsNotDone: casDelete reads a lock-failure refusal
+// ("cannot lock ref" / "failed to update ref") as benign, and a forge can emit that text
+// for transient lock contention, so its nil does not prove the branch ref is gone.
+// Real git-receive-pack cannot be made to emit that reason on demand (a hook's stderr
+// travels on the sideband, not in the "ng" reason; git 2.54 reports a held <ref>.lock as
+// "reference already exists"), so the delete is stubbed to return nil without deleting.
+// Promote's re-list must find the branch ref still at the tip and report
+// salvaged_branch_pending with an error, never done.
+func TestPromoteBenignDeleteRefusalIsNotDone(t *testing.T) {
+	f, _, tip := salvageFixture(t)
+
+	res, err := pushbroker.PromoteWithBenignDeleteForTest(context.Background(), promoteOpts(f.cloneURL(), tip))
+	if err == nil || res != pushbroker.PromoteSalvagedBranchPending {
+		t.Fatalf("Promote = (%v, %v), want (salvaged_branch_pending, error)", res, err)
+	}
+	if !strings.Contains(err.Error(), "still at tip after delete") {
+		t.Fatalf("Promote error = %v; want the post-delete re-list to report the ref still at the tip", err)
+	}
+	if got := f.originRef(salvageRef()); got != tip {
+		t.Fatalf("salvage ref = %q, want tip %q", got, tip)
+	}
+	if got := f.originRef(checkpointRef()); got != tip {
+		t.Fatalf("branch ref = %q, want intact %q", got, tip)
+	}
+}
+
+// TestPromoteCreateRaceRelists: a concurrent promoter creates the salvage ref between
+// Promote's list and its create (staged by a pre-receive hook that writes the ref, then
+// declines ours). Promote re-lists once: the ref at OUR tip continues as the idempotent
+// path (branch ref deleted, done); at ANOTHER tip it is refused with no further write.
+func TestPromoteCreateRaceRelists(t *testing.T) {
+	// raceHook writes refs/uzi-salvage/* to sha before declining the create. The hook
+	// runs with GIT_QUARANTINE_PATH set, under which git refuses ref updates, so it is
+	// unset for the inner update-ref.
+	raceHook := func(sha string) string {
+		return "#!/bin/sh\n" +
+			"while read old new ref; do\n" +
+			"  case \"$ref\" in refs/uzi-salvage/*) env -u GIT_QUARANTINE_PATH git update-ref \"$ref\" " + sha + " || exit 2; echo 'raced by test hook' >&2; exit 1;; esac\n" +
+			"done\nexit 0\n"
+	}
+	t.Run("same tip", func(t *testing.T) {
+		f, _, tip := salvageFixture(t)
+		installPreReceive(t, f, raceHook(tip))
+
+		res, err := pushbroker.Promote(context.Background(), promoteOpts(f.cloneURL(), tip))
+		if err != nil || res != pushbroker.PromoteDone {
+			t.Fatalf("Promote = (%v, %v), want (done, nil)", res, err)
+		}
+		if got := f.originRef(salvageRef()); got != tip {
+			t.Fatalf("salvage ref = %q, want tip %q", got, tip)
+		}
+		if got := f.originRef(checkpointRef()); got != "" {
+			t.Fatalf("branch ref = %q, want deleted", got)
+		}
+	})
+	t.Run("other tip", func(t *testing.T) {
+		f, base, tip := salvageFixture(t)
+		installPreReceive(t, f, raceHook(base))
+
+		res, err := pushbroker.Promote(context.Background(), promoteOpts(f.cloneURL(), tip))
+		if err != nil || res != pushbroker.PromoteRefused {
+			t.Fatalf("Promote = (%v, %v), want (refused, nil)", res, err)
+		}
+		if got := f.originRef(salvageRef()); got != base {
+			t.Fatalf("salvage ref = %q, want the racer's %q", got, base)
+		}
+		if got := f.originRef(checkpointRef()); got != tip {
+			t.Fatalf("branch ref = %q, want untouched %q", got, tip)
+		}
+	})
+}
+
+// TestPromoteIdempotentWithSiblingMovedBranchRef: the salvage ref is already at the tip
+// and a sibling run has since moved the branch ref elsewhere. That is done: the CAS
+// leaves the sibling's branch ref alone and the salvage ref is untouched.
+func TestPromoteIdempotentWithSiblingMovedBranchRef(t *testing.T) {
+	f, _, tip := salvageFixture(t)
+	f.git("push", "origin", tip+":"+salvageRef())
+	sibling := f.commit("c.txt", "sibling\n", "sibling run")
+	f.git("push", "origin", sibling+":"+checkpointRef())
+
+	res, err := pushbroker.Promote(context.Background(), promoteOpts(f.cloneURL(), tip))
+	if err != nil || res != pushbroker.PromoteDone {
+		t.Fatalf("Promote = (%v, %v), want (done, nil)", res, err)
+	}
+	if got := f.originRef(salvageRef()); got != tip {
+		t.Fatalf("salvage ref = %q, want untouched %q", got, tip)
+	}
+	if got := f.originRef(checkpointRef()); got != sibling {
+		t.Fatalf("sibling branch ref = %q, want untouched %q", got, sibling)
+	}
+}
+
 // TestDeleteRefSalvage: DeleteRef CAS-deletes a salvage ref at the matching tip; a
 // mismatch or an absent ref is benign nil and leaves origin untouched.
 func TestDeleteRefSalvage(t *testing.T) {
@@ -357,6 +450,10 @@ func TestPromoteRejectsInvalidInputWithoutNetwork(t *testing.T) {
 		{"zero tip", pushbroker.PromoteOptions{CloneURL: url, Branch: salvageBranch, Tip: strings.Repeat("0", 40), RunID: salvageRunID}},
 		{"non-hex tip", pushbroker.PromoteOptions{CloneURL: url, Branch: salvageBranch, Tip: strings.Repeat("zz", 20), RunID: salvageRunID}},
 		{"empty branch", pushbroker.PromoteOptions{CloneURL: url, Tip: good, RunID: salvageRunID}},
+		{"dot-dot branch escape", pushbroker.PromoteOptions{CloneURL: url, Branch: "../heads/main", Tip: good, RunID: salvageRunID}},
+		{"dot-dot inside branch", pushbroker.PromoteOptions{CloneURL: url, Branch: "x/../y", Tip: good, RunID: salvageRunID}},
+		{"trailing slash branch", pushbroker.PromoteOptions{CloneURL: url, Branch: "agent/", Tip: good, RunID: salvageRunID}},
+		{"bare slash branch", pushbroker.PromoteOptions{CloneURL: url, Branch: "/", Tip: good, RunID: salvageRunID}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
