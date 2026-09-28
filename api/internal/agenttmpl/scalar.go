@@ -8,8 +8,8 @@ import (
 // unquoteScalar reverses quoteScalar and strips the one layer of quotes the
 // upstream publisher adds, so a builtin parsed here and the same file parsed by
 // an agent-source sync (agentsource stripQuotes) yield the same description. A
-// double-quoted value with escapes is decoded; a single-quoted one has its ''
-// pairs folded back to '.
+// double-quoted value with escapes is decoded; in a single-quoted one each
+// doubled single quote is folded back to one.
 func unquoteScalar(v string) string {
 	if len(v) < 2 {
 		return v
