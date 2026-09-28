@@ -1129,6 +1129,7 @@ WITH live AS (
     WHERE r.id = $1::uuid
       AND r.worker_id = $2::uuid
       AND r.claim_released_at IS NULL
+      AND r.status NOT IN ('completed', 'failed', 'cancelled')
       AND ($3::bigint IS NULL
            OR r.claim_generation = $3::bigint)
     FOR SHARE
@@ -1181,13 +1182,19 @@ type UpsertTaskReviewWithFindingsParams struct {
 // judge's UpsertRunReviewWithRecommendations carries (see its comment for the full shape):
 // with @review_run_id NOT NULL (every production caller) the header + findings land ONLY
 // while that run is still claimed by the posting worker (@worker_id, checked in the same
-// statement as the write), its claim is unreleased and, when @claim_generation is stamped,
+// statement as the write), its claim is unreleased, the run is NON-TERMINAL (status NOT IN
+// ('completed', 'failed', 'cancelled'), the same terminal set as
+// GetActiveTaskReviewRunForWorkerTarget; SetRunCompleted leaves worker_id, claim_generation
+// and claim_released_at intact, so without it a delayed post from a finished review run
+// could overwrite a newer review run's review) and, when @claim_generation is stamped,
 // still at that generation. A fenced-out call writes nothing and returns no row (pgx.ErrNoRows ->
 // ErrStaleClaim in the service); `inserted` is guarded by EXISTS(upserted). A NULL
 // @review_run_id is the unfenced seeder path. `live` takes FOR SHARE on the run row so a
 // concurrent ClaimRun `claim_generation = claim_generation + 1` UPDATE serializes with this
 // write and the predicate is re-checked on the new row version (a strengthening over the
-// message fence).
+// message fence); the same lock serializes against a terminal-status UPDATE, so a
+// completion, fail or cancel committing while this statement waits is seen by the
+// EvalPlanQual re-check and fences the write out.
 func (q *Queries) UpsertTaskReviewWithFindings(ctx context.Context, arg UpsertTaskReviewWithFindingsParams) (uuid.UUID, error) {
 	row := q.db.QueryRow(ctx, upsertTaskReviewWithFindings,
 		arg.ReviewRunID,

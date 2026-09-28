@@ -116,7 +116,8 @@ func checkAdviceClaim(wkr store.Worker, adviceRunID uuid.UUID, claim AdviceClaim
 //
 // Issue #1423: the write is fenced on the JUDGE run's claim, mirroring the message fence
 // (see AdviceClaim and checkAdviceClaim). The upsert persists nothing when the judge run is
-// no longer claimed by wkr, its claim is released, or it is at a different generation, and
+// no longer claimed by wkr, has reached a terminal status, its claim is released, or it is at
+// a different generation, and
 // that no-row outcome surfaces as ErrStaleClaim (the auto-dismiss net is skipped: there is
 // no fresh review).
 func (s *Service) PostReview(ctx context.Context, wkr store.Worker, targetID uuid.UUID, sub ReviewSubmission, claim AdviceClaim) (ReviewResult, error) {
