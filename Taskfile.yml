@@ -297,6 +297,10 @@ tasks:
       # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
       # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
       - task: test:sqlc-drift-gate
+      # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
+      # fake `go install` failing then succeeding, no real gitleaks and no network,
+      # proving a transient proxy failure is retried while a broken scan is not.
+      - task: test:scan-secrets
       # Hermetic extraction and ordered package-rule regression for the three
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
@@ -895,6 +899,11 @@ tasks:
     desc: hermetic tests of the verified golangci-lint archive cache and build-Go guard
     cmds:
       - ./scripts/golangci-lint.test.sh
+
+  test:scan-secrets:
+    desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)
+    cmds:
+      - ./scripts/scan-secrets.test.sh
 
   test:sqlc-drift-gate:
     desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)

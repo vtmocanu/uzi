@@ -80,7 +80,7 @@
 # when absent, because they are brew/pip/system tools a contributor may simply not
 # have, and `gate:repo` runs FIRST inside `task gate` (PRD #103 Decision 2 -- a
 # gate people cannot run is a gate that stops being run). gitleaks is not in that
-# category: it arrives through `go run pkg@version`, the Go toolchain is mandatory
+# category: it arrives through `go install pkg@version`, the Go toolchain is mandatory
 # in this repo, and `gate:api` ALREADY `go run`s two pinned remote modules
 # (golangci-lint, deadcode). So the population that cannot obtain gitleaks is the
 # population that cannot run `gate:api` either -- a skip would buy nobody anything
@@ -199,7 +199,7 @@ fi
 # failure here for the same reason it is one for lint:api.
 if ! command -v go >/dev/null 2>&1; then
   echo "scan-secrets: no go on PATH." >&2
-  echo "  gitleaks arrives via \`go run …@$VERSION\`, the same pinned-module route" >&2
+  echo "  gitleaks arrives via \`go install …@$VERSION\`, the same pinned-module route" >&2
   echo "  gate:api already uses for golangci-lint and deadcode. Install Go." >&2
   exit 2
 fi
@@ -221,7 +221,11 @@ TRACKED="$(mktemp "${TMPDIR:-/tmp}/uzi-scan-tracked.XXXXXX")" || {
   echo "scan-secrets: mktemp failed" >&2
   exit 2
 }
-trap 'rm -f "$REPORT" "$TRACKED"' EXIT HUP INT TERM
+BINDIR="$(mktemp -d "${TMPDIR:-/tmp}/uzi-scan-bin.XXXXXX")" || {
+  echo "scan-secrets: mktemp -d failed" >&2
+  exit 2
+}
+trap 'rm -f "$REPORT" "$TRACKED"; rm -rf "$BINDIR"' EXIT HUP INT TERM
 
 # 🔴 THE GATING SCOPE IS THE GIT INDEX, AND IT IS ENFORCED HERE, ON THE REPORT --
 # NOT BY WHAT IS HANDED TO GITLEAKS. THAT DISTINCTION IS THE WHOLE OF H1.
@@ -371,11 +375,43 @@ done
 # `--redact` belts the template's braces: the template emits no secret, and this
 # stops one reaching gitleaks' own console output either.
 #
-# NOTE `go run` FLATTENS EXIT CODES -- a tool exiting 3 surfaces as 1 with
-# "exit status 3" on stderr. That costs nothing here precisely because
-# `--exit-code 0` already made every non-zero status mean the same thing.
+# 🔴 FETCH AND SCAN ARE TWO STEPS, AND ONLY THE FETCH RETRIES. A single
+# `go run pkg@version` folded a transient module-proxy failure (proxy.golang.org
+# unreachable on a CI runner) into the same exit 2 as a broken scanner, reddening
+# lint-repo with nothing wrong in the tree. `go install` into a private GOBIN is
+# the network-bearing step, so it alone gets bounded retries with backoff; the
+# scan then runs the built binary once, and a non-zero status from it is still an
+# instrument failure with no retry, since re-running cannot fix a malformed
+# .gitleaks.toml. Retrying the fetch never weakens the verdict: the canaries still
+# decide whether the scan that follows was live.
+# SCAN_SECRETS_FETCH_ATTEMPTS / SCAN_SECRETS_FETCH_DELAY exist for the hermetic
+# test (scripts/scan-secrets.test.sh); they bound a download, not what is scanned.
+attempts="${SCAN_SECRETS_FETCH_ATTEMPTS:-3}"
+delay="${SCAN_SECRETS_FETCH_DELAY:-10}"
+attempt=1
+while :; do
+  if GOBIN="$BINDIR" go install "github.com/zricethezav/gitleaks/v8@$VERSION"; then
+    break
+  fi
+  if [ "$attempt" -ge "$attempts" ]; then
+    echo "scan-secrets: fetching gitleaks $VERSION failed $attempts time(s)." >&2
+    echo "  INSTRUMENT failure, not a scan result: the module proxy was unreachable" >&2
+    echo "  or the pinned module did not build. Nothing was scanned." >&2
+    exit 2
+  fi
+  echo "scan-secrets: fetching gitleaks $VERSION failed (attempt $attempt/$attempts); retrying in $((attempt * delay))s." >&2
+  sleep "$((attempt * delay))"
+  attempt=$((attempt + 1))
+done
+
+GITLEAKS="$BINDIR/gitleaks"
+if [ ! -x "$GITLEAKS" ]; then
+  echo "scan-secrets: go install reported success but $GITLEAKS is missing." >&2
+  exit 2
+fi
+
 rc=0
-go run "github.com/zricethezav/gitleaks/v8@$VERSION" dir \
+"$GITLEAKS" dir \
   --exit-code 0 \
   --no-banner \
   --redact \
@@ -387,7 +423,7 @@ go run "github.com/zricethezav/gitleaks/v8@$VERSION" dir \
 if [ "$rc" -ne 0 ]; then
   echo "scan-secrets: gitleaks exited $rc under --exit-code 0, so this is NOT a" >&2
   echo "  finding -- with that flag set, findings exit 0. Something stopped the" >&2
-  echo "  scanner running: an unreachable module proxy, a malformed" >&2
+  echo "  scanner running: a malformed" >&2
   echo "  $TEMPLATE, or a .gitleaks.toml gitleaks could not parse." >&2
   echo "  INSTRUMENT failure, not a scan result." >&2
   exit 2
