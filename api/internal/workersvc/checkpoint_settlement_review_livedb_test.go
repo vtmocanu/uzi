@@ -469,3 +469,63 @@ func TestTrackTerminalPublishSkipsRecoveryRecordsLiveDB(t *testing.T) {
 		})
 	}
 }
+
+// TestLiveRoutedLatePublishSupersededLogsWarnLiveDB pins the residual trackPublishedCheckpoint
+// documents: a publish Publish routed as LIVE (terminal false, the status read at its top) whose
+// run turned terminal while the push was in flight lands inside a supersession of the run's
+// record, between the recovery-ref create and the branch CAS-delete, and BEFORE its own
+// SetRunCheckpointTip commits. The supersession's post-delete list (branchHeldByOwnPublish) then
+// reads the stale runs.checkpoint_tip, takes the late tip for another run's, and marks the record
+// superseded. The late publish's tracker moves no row in either statement, so the Warn must fire on
+// the run's CURRENT (terminal) status, not the live status Publish routed on. A run still live at
+// track time logs nothing.
+func TestLiveRoutedLatePublishSupersededLogsWarnLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		status   string
+		wantWarn bool
+	}{
+		{"terminal at track", "failed", true},
+		{"live at track", "running", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupersedeFix(t)
+			const t2 = "7777777777777777777777777777777777777777"
+			var once sync.Once
+			f.forge.beforeDelete = func(ref string) {
+				if ref != f.branchRef {
+					return
+				}
+				// The late push lands; its tip persist has not committed yet.
+				once.Do(func() { f.forge.set(f.branchRef, t2) })
+			}
+			f.publishNew(t, f.svc1)
+			if r := f.row(t); r.State != retentionSuperseded {
+				t.Fatalf("record = %q, want superseded (the stale checkpoint_tip read the late tip as another run's)", r.State)
+			}
+
+			// The late publish's outcome: its tip persists, then its tracker runs routed as live.
+			if tc.status == "running" {
+				// One active run per issue: retire the new run so the old one can read as live.
+				f.e.exec(t, `UPDATE runs SET status = 'completed', finished_at = now() WHERE id = $1`, f.newRun)
+			}
+			f.e.exec(t, `UPDATE runs SET status = $2, checkpoint_tip = $3, checkpoint_tip_at = now() WHERE id = $1`,
+				f.oldRun, tc.status, t2)
+			logs := captureSlog(t)
+			if settle := f.svc2.trackPublishedCheckpoint(f.e.ctx, f.oldRun, false, f.branch, f.branchRef, t2); settle {
+				t.Fatalf("trackPublishedCheckpoint settle = true, want false (no row moved)")
+			}
+			if r := f.row(t); r.State != retentionSuperseded || r.Tip == t2 {
+				t.Fatalf("record = {state %q tip %s}, want superseded at its recorded tip (neither statement moves it)", r.State, r.Tip)
+			}
+			out := logs.String()
+			warned := strings.Contains(out, "tracked by no record")
+			if warned != tc.wantWarn {
+				t.Fatalf("untracked-publish Warn logged = %v, want %v:\n%s", warned, tc.wantWarn, out)
+			}
+			if warned && (!strings.Contains(out, f.branch) || !strings.Contains(out, t2) || !strings.Contains(out, f.oldRun.String())) {
+				t.Fatalf("Warn does not name the run %s, branch %s and tip %s:\n%s", f.oldRun, f.branch, t2, out)
+			}
+		})
+	}
+}
