@@ -1671,7 +1671,9 @@ export class GitCache {
       }
       // The attempt id carries 64 random bits: an existing path is not a collision to paper
       // over, it is something planted. Fail closed and touch nothing.
-      if (await this.pathPresent(clonePath)) throw new Error("the fresh attempt clone path already exists");
+      if (await this.pathPresent(clonePath)) {
+        throw new Error(`${REASON_WORKER_RESIDUE_BLOCKED}: the fresh attempt clone path already exists (${sanitizeForLog(path.basename(clonePath), 160)}); nothing seeded`);
+      }
       // Bound the ledger before reading it: the last value per attemptId, gone paths dropped (see compactAttemptLedger).
       await this.compactAttemptLedger(barePath, branch);
       // The seed-time recovery sweep over every NON-LIVE path of this key. It throws to block.

@@ -10,7 +10,7 @@ import type { ExecutorResult, RunContext } from "../src/executor.js";
 import type { BoundaryPermit, CodexExecutionSafety } from "../src/harness.js";
 import { CapturePathMismatchError, GitCache, type AttemptSeedOptions } from "../src/git.js";
 import { LimitReachedError } from "../src/limit.js";
-import { RunRunner, type ExecutorFactory } from "../src/runner.js";
+import { RunRunner, failOriginForReason, type ExecutorFactory } from "../src/runner.js";
 import { CodexSessionStore } from "../src/codex/session-state.js";
 import { formatAttemptId, parseAttemptPath } from "../src/attempt-path.js";
 import {
@@ -1196,4 +1196,22 @@ describe("issue #1783 M2 review: checkpoint adoption on a wired resume that seed
       if (own) assert.equal(seen.head, tip, "seeded at the checkpoint tip");
     });
   }
+});
+
+describe("issue #1783: a planted fresh-attempt path fails typed worker_residue_blocked", () => {
+  it("an existing <key>.attempt-<id> path refuses the seed, touches nothing, and classifies as worker_residue_blocked", async () => {
+    const iid = 91;
+    const b = await git.ensureClone(fx.originPath);
+    const attemptId = mintAttemptId(1);
+    const planted = `${canonicalFor(iid)}.attempt-${attemptId}`;
+    fs.mkdirSync(planted, { recursive: true });
+    fs.writeFileSync(path.join(planted, "PLANTED.txt"), "not ours\n");
+    const before = treeHash(planted);
+    const err = await git
+      .createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID(), false, undefined, fixtureSeed(attemptId))
+      .then(() => undefined, (e: unknown) => e as Error);
+    assert.ok(err instanceof Error, "the seed is refused");
+    assert.equal(failOriginForReason(err.message), "worker_residue_blocked", `classified from: ${err.message}`);
+    assert.equal(treeHash(planted), before, "the planted path is left exactly as found");
+  });
 });
