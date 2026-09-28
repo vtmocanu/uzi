@@ -1,4 +1,4 @@
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
@@ -8,8 +8,10 @@ import { execFileSync } from "node:child_process";
 import type { ExecutorResult, RunContext } from "../src/executor.js";
 import type { ExecutorFactory } from "../src/runner.js";
 import { runnerGitCarriesWorkerMark } from "../src/git.js";
-import { procfsTable } from "../src/run-quiescence.js";
+import { procfsTable, setQuiescenceViewForTests } from "../src/run-quiescence.js";
+import { scopedRealView } from "./fake-proc.js";
 import { api, client, fakeGitHub, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
+import { restoreHermeticView } from "./setup/hermetic-proc.js";
 
 // issue #1783 (auditor M1) — an agent-planted git filter driver must not outlive a park.
 //
@@ -42,7 +44,16 @@ function plantedPids(pidFile: string): number[] {
     .map(Number);
 }
 
+// The reaper sees this file's own descendants plus the planted (reparented) sleeps, never the
+// host's other processes.
+before(() => {
+  setQuiescenceViewForTests(
+    scopedRealView({ pidFiles: ["limit", "pause", "wall", "align"].map((n) => path.join(scratch, `${n}.pids`)) }),
+  );
+});
+
 after(() => {
+  restoreHermeticView();
   for (const f of pidFiles) {
     for (const pid of plantedPids(f)) {
       try {

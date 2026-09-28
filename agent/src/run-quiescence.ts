@@ -197,18 +197,142 @@ export interface ProcTable {
 
 const PROC_ROOT = path.join("/", "proc");
 
+/** A procfs-shaped table rooted at `root`: `<root>/<pid>/{status,environ,cwd,stat}`. */
+export function procfsTableAt(root: string): ProcTable {
+  return {
+    listPids: () =>
+      fs
+        .readdirSync(root)
+        .filter((n) => /^[0-9]+$/.test(n))
+        .map(Number),
+    readStatus: (pid) => fs.readFileSync(path.join(root, String(pid), "status"), "utf8"),
+    readEnviron: (pid) => fs.readFileSync(path.join(root, String(pid), "environ"), "latin1"),
+    readCwd: (pid) => fs.readlinkSync(path.join(root, String(pid), "cwd")),
+    readStat: (pid) => fs.readFileSync(path.join(root, String(pid), "stat"), "utf8"),
+  };
+}
+
 /** The real process table (Linux procfs). */
-export const procfsTable: ProcTable = {
-  listPids: () =>
-    fs
-      .readdirSync(PROC_ROOT)
-      .filter((n) => /^[0-9]+$/.test(n))
-      .map(Number),
-  readStatus: (pid) => fs.readFileSync(path.join(PROC_ROOT, String(pid), "status"), "utf8"),
-  readEnviron: (pid) => fs.readFileSync(path.join(PROC_ROOT, String(pid), "environ"), "latin1"),
-  readCwd: (pid) => fs.readlinkSync(path.join(PROC_ROOT, String(pid), "cwd")),
-  readStat: (pid) => fs.readFileSync(path.join(PROC_ROOT, String(pid), "stat"), "utf8"),
-};
+export const procfsTable: ProcTable = procfsTableAt(PROC_ROOT);
+
+// ─── Test view ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * TEST ONLY: what a reap sees instead of the host's whole process table. JSON-serializable, so it
+ * crosses into the helper with the request. Either a FAKE procfs-shaped root (a "kill" removes
+ * `<procRoot>/<pid>`, so a fake pid never signals a real process), or the REAL procfs narrowed to
+ * the descendants of one pid (plus pids the test registered, directly or in pidfiles read at every
+ * listing: a `setsid` plant is reparented away from the test), killed for real. Production never
+ * sets one: it is installed only through {@link setQuiescenceViewForTests}, never from the
+ * environment, because a knob that narrows the scan would be a fail-open switch.
+ */
+export type QuiescenceView =
+  | { procRoot: string; deadlineMs?: number; intervalMs?: number }
+  | { descendantsOf: number; extraPids?: number[]; extraPidFiles?: string[]; deadlineMs?: number; intervalMs?: number };
+
+const VIEW_TIMING_MAX_MS = 10_000;
+const VIEW_EXTRA_PIDS_MAX = 1024;
+const FAKE_VIEW_DEADLINE_MS = 200;
+const FAKE_VIEW_INTERVAL_MS = 10;
+
+let testView: QuiescenceView | undefined;
+
+const viewTiming = (v: unknown): boolean =>
+  v === undefined || (Number.isSafeInteger(v) && (v as number) >= 0 && (v as number) <= VIEW_TIMING_MAX_MS);
+const positivePid = (v: unknown): boolean => Number.isSafeInteger(v) && (v as number) > 0;
+
+/** True for a well-formed view whose fake root (if any) is an absolute path that is not, and does
+ *  not resolve into, the real proc root. */
+function isQuiescenceView(v: unknown): v is QuiescenceView {
+  if (typeof v !== "object" || v === null) return false;
+  const o = v as Record<string, unknown>;
+  if (!viewTiming(o.deadlineMs) || !viewTiming(o.intervalMs)) return false;
+  if ("procRoot" in o) {
+    if (typeof o.procRoot !== "string" || !path.isAbsolute(o.procRoot) || "descendantsOf" in o) return false;
+    let real = path.resolve(o.procRoot);
+    try {
+      real = fs.realpathSync(real);
+    } catch {
+      // A missing root is not the real one; its listing fails and the reap is unverified.
+    }
+    return !isWithinPath(path.resolve(o.procRoot), PROC_ROOT) && !isWithinPath(real, PROC_ROOT);
+  }
+  return (
+    positivePid(o.descendantsOf) &&
+    (o.extraPids === undefined ||
+      (Array.isArray(o.extraPids) && o.extraPids.length <= VIEW_EXTRA_PIDS_MAX && o.extraPids.every(positivePid))) &&
+    (o.extraPidFiles === undefined ||
+      (Array.isArray(o.extraPidFiles) &&
+        o.extraPidFiles.length <= VIEW_EXTRA_PIDS_MAX &&
+        o.extraPidFiles.every((f) => typeof f === "string" && path.isAbsolute(f))))
+  );
+}
+
+/** TEST ONLY: install (or, with undefined, clear) the view every reap without an explicit `table`
+ *  uses, in-process and forwarded to the helper. Throws on a malformed view. */
+export function setQuiescenceViewForTests(view: QuiescenceView | undefined): void {
+  if (view !== undefined && !isQuiescenceView(view)) throw new Error("invalid quiescence test view");
+  testView = view === undefined ? undefined : structuredClone(view);
+}
+
+/** The pids listed one per line in `file` (none when it cannot be read). */
+function pidsInFile(file: string): number[] {
+  try {
+    return fs
+      .readFileSync(file, "utf8")
+      .split("\n")
+      .filter((l) => /^\d+$/.test(l.trim()))
+      .map(Number);
+  } catch {
+    return [];
+  }
+}
+
+/** The real procfs listing only `root`'s descendants (by the world-readable ppid), `extraPids` and
+ *  the pids in `extraPidFiles` (re-read at every listing). */
+function descendantsTable(root: number, extraPids: readonly number[], extraPidFiles: readonly string[]): ProcTable {
+  return {
+    ...procfsTable,
+    listPids: () => {
+      const pids = procfsTable.listPids();
+      const extra = new Set([...extraPids, ...extraPidFiles.flatMap(pidsInFile)]);
+      const parentOf = new Map<number, number>();
+      for (const pid of pids) {
+        const r = tryRead(() => procfsTable.readStat(pid));
+        const facts = r.ok ? parseStat(r.value) : undefined;
+        if (facts) parentOf.set(pid, facts.ppid);
+      }
+      const under = (pid: number): boolean => {
+        let cur = parentOf.get(pid);
+        for (let depth = 0; cur !== undefined && cur > 0 && depth < 256; depth++) {
+          if (cur === root) return true;
+          cur = parentOf.get(cur);
+        }
+        return false;
+      };
+      return pids.filter((pid) => extra.has(pid) || under(pid));
+    },
+  };
+}
+
+/** The table, kill and timings a view stands for. */
+function viewReapDeps(view: QuiescenceView): Required<Pick<ReapDeps, "table" | "kill" | "deadlineMs" | "intervalMs">> {
+  if ("procRoot" in view) {
+    const root = view.procRoot;
+    return {
+      table: procfsTableAt(root),
+      kill: (pid) => fs.rmSync(path.join(root, String(pid)), { recursive: true, force: true }),
+      deadlineMs: view.deadlineMs ?? FAKE_VIEW_DEADLINE_MS,
+      intervalMs: view.intervalMs ?? FAKE_VIEW_INTERVAL_MS,
+    };
+  }
+  return {
+    table: descendantsTable(view.descendantsOf, view.extraPids ?? [], view.extraPidFiles ?? []),
+    kill: defaultKill,
+    deadlineMs: view.deadlineMs ?? REAP_DEADLINE_MS,
+    intervalMs: view.intervalMs ?? REAP_INTERVAL_MS,
+  };
+}
 
 type ReadOutcome<T> = { ok: true; value: T } | { ok: false; vanished: boolean };
 
@@ -294,6 +418,9 @@ export interface ScanRequest {
   liveRoots: RecordedRoot[];
   /** This worker's spawn nonce: a process carrying it is never run-owned. */
   workerNonce: string;
+  /** TEST ONLY: the {@link QuiescenceView} the helper reaps against. Production never sets it
+   *  (only {@link setQuiescenceViewForTests} does), so the helper scans the real procfs. */
+  view?: QuiescenceView;
 }
 
 /** One listed process in a result. */
@@ -515,11 +642,13 @@ function defaultKill(pid: number): void {
  * final scan.
  */
 export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Promise<ProcessQuiescence> {
-  const table = deps.table ?? procfsTable;
-  const kill = deps.kill ?? defaultKill;
+  // A test view stands in for the real table only when the caller injected none.
+  const view = deps.table === undefined && testView !== undefined ? viewReapDeps(testView) : undefined;
+  const table = deps.table ?? view?.table ?? procfsTable;
+  const kill = deps.kill ?? view?.kill ?? defaultKill;
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
-  const deadline = now() + (deps.deadlineMs ?? REAP_DEADLINE_MS);
+  const deadline = now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS);
   const selfPid = deps.selfPid ?? process.pid;
   const killed: number[] = [];
   let last: ScanResult;
@@ -535,7 +664,7 @@ export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Prom
       kill(p.pid);
       killed.push(p.pid);
     }
-    await sleep(deps.intervalMs ?? REAP_INTERVAL_MS);
+    await sleep(deps.intervalMs ?? view?.intervalMs ?? REAP_INTERVAL_MS);
   }
   const stuck = last.kill.map((p) => ({ ...p, reason: `${p.reason}:kill_unconfirmed` }));
   if (last.unverified.length > 0) {
@@ -830,7 +959,7 @@ async function reapProcessesViaHelper(
     // A helper that dies before reading its request fails this write (EPIPE); the close handler
     // below reports that exit, so the write error itself is only swallowed here.
     child.stdin?.on("error", () => undefined);
-    child.stdin?.end(JSON.stringify(req));
+    child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
     child.on("error", (err) => done(unverified(`quiescence helper spawn failed: ${err.message}`)));
     child.on("close", (code, signal) => {
       if (code !== 0) {
@@ -1152,7 +1281,8 @@ function isScanRequest(v: unknown): v is ScanRequest {
         Number.isInteger((r as { pid?: unknown }).pid) &&
         Number.isSafeInteger((r as { startTime?: unknown }).startTime),
     ) &&
-    typeof o.workerNonce === "string"
+    typeof o.workerNonce === "string" &&
+    (o.view === undefined || isQuiescenceView(o.view))
   );
 }
 
@@ -1177,7 +1307,8 @@ async function helperMain(): Promise<ProcessQuiescence> {
     return { state: "unverified", processes: [], killed: [], detail: "helper request unparsable" };
   }
   if (!isScanRequest(req)) return { state: "unverified", processes: [], killed: [], detail: "helper request invalid" };
-  return reapProcesses(req, { excludeAllDescendants: true });
+  const view = req.view === undefined ? {} : viewReapDeps(req.view);
+  return reapProcesses(req, { ...view, excludeAllDescendants: true });
 }
 
 if (process.argv[2] === HELPER_FLAG && process.argv[1] && path.resolve(process.argv[1]) === HELPER_FILE) {

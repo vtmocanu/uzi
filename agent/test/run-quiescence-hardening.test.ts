@@ -23,6 +23,7 @@ import {
   type ScanRequest,
 } from "../src/run-quiescence.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
+import { scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 
 // issue #1783 review round — the hardening of the run-quiescence reaper: attribution of a
@@ -547,16 +548,19 @@ require("node:fs").writeFileSync(pidFile, String(c.pid)); c.unref();`;
     };
     assert.equal(aliveNow(), true, "the leak outlived its check");
     const own = newRunAttempt("run-17", 1, clone, () => []);
-    const r = await reapProcesses({
-      mode: "own",
-      targetUid: ME,
-      targetKey: own.cloneKey,
-      targetPaths: [clone],
-      ownMarker: own.marker,
-      liveMarkers: [],
-      liveRoots: [],
-      workerNonce: workerSpawnNonce(),
-    });
+    // The real procfs, scoped to this process's descendants plus the (reparented) leak.
+    const r = await withQuiescenceView(scopedRealView({ pidFiles: [pidFile] }), () =>
+      reapProcesses({
+        mode: "own",
+        targetUid: ME,
+        targetKey: own.cloneKey,
+        targetPaths: [clone],
+        ownMarker: own.marker,
+        liveMarkers: [],
+        liveRoots: [],
+        workerNonce: workerSpawnNonce(),
+      }),
+    );
     assert.equal(r.state, "quiescent", r.detail);
     assert.ok(r.killed.includes(leaked), "the unmarked leak was reaped");
   });

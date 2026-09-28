@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { after, afterEach, before, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import http from "node:http";
@@ -18,6 +18,7 @@ import {
   mintAttemptId,
   newRunAttempt,
   quiesceRunAttempt,
+  setQuiescenceViewForTests,
   type ProcessQuiescenceState,
   type QuiesceRunOutcome,
   type QuiesceRunRequest,
@@ -25,6 +26,8 @@ import {
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { makeFakeProcRoot, plantUnreadableUnattributed, scopedRealView, withQuiescenceView } from "./fake-proc.js";
+import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
   api,
@@ -135,6 +138,17 @@ function createContainer(socket: string, bindSource: string): Promise<string> {
 let daemon: FakeDaemon;
 let daemonDir: string;
 const orphans: number[] = [];
+
+// The real reaper sees this file's own descendants plus its orphans (reparented away, so recorded
+// in a pidfile), never the host's other processes.
+const orphanPidDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-orphan-pids-"));
+const orphanPidFile = path.join(orphanPidDir, "orphans.pids");
+const FILE_VIEW = scopedRealView({ pidFiles: [orphanPidFile] });
+before(() => setQuiescenceViewForTests(FILE_VIEW));
+after(() => {
+  restoreHermeticView();
+  fs.rmSync(orphanPidDir, { recursive: true, force: true });
+});
 
 beforeEach(async () => {
   daemonDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-attempt-docker-"));
@@ -337,6 +351,7 @@ function orphanIn(cwd: string, extraEnv: Record<string, string> = {}): number {
   });
   const pid = Number(out.trim());
   orphans.push(pid);
+  fs.appendFileSync(orphanPidFile, `${pid}\n`);
   return pid;
 }
 
@@ -683,6 +698,72 @@ describe("issue #1783 M2 P-capture-blocked", { skip: !HAS_PROCFS }, () => {
     assert.deepEqual([...readLedger(iid).values()], ledgerBefore);
     assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true);
     assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false);
+  });
+});
+
+// ─── the real primitive over a fake proc root: an unreadable, unattributed process ──────────
+//
+// The CI incident's shape (a same-uid non-dumpable process anywhere on the worker, e.g. a setgid
+// ssh-agent), planted in a FAKE proc root so the outcome never depends on the host. The real
+// quiescence primitive (no scripted quiescer) must fail closed at the capture and the terminal
+// retire; the fresh attempt seed alone is allowed through (#1783 N6: it moves nothing).
+
+describe("issue #1783 hermetic: an unreadable_unattributed process on a fake proc root (wired)", () => {
+  /** Run `fn` with a fake proc root holding one unreadable, unattributed same-uid process. */
+  function withUnreadable<T>(fn: () => Promise<T>): Promise<T> {
+    const root = makeFakeProcRoot();
+    plantUnreadableUnattributed(root, 4242);
+    return withQuiescenceView({ procRoot: root }, fn, FILE_VIEW).finally(() => fs.rmSync(root, { recursive: true, force: true }));
+  }
+
+  it("capture: the predecessor capture is refused (worker_residue_blocked); journal, ledger and path untouched", async () => {
+    const iid = 2041;
+    const runId = randomUUID();
+    const pred = await seedPredecessor(iid, runId, { attempt: true });
+    const journalBefore = readJournal(iid);
+    const ledgerBefore = [...readLedger(iid).values()];
+    const { factory, started } = transientFactory();
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    const timedOut = await withUnreadable(() => boundedExecute(wired(factory, { quiesceRun }), gitlabClaim(iid, { run_id: runId })));
+    assert.equal(timedOut, false);
+    assert.equal(calls[0]?.site, "predecessor_capture");
+    assert.equal(api.states.filter((s) => s.body.status === "failed").at(-1)?.body.fail_origin, "worker_residue_blocked");
+    assert.equal(started(), 0, "no model started");
+    assert.deepEqual(readJournal(iid), journalBefore);
+    assert.deepEqual([...readLedger(iid).values()], ledgerBefore);
+    assert.equal(fs.existsSync(path.join(pred.clonePath, "ONLY_COPY.txt")), true);
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), false, "no fetch-back ran");
+  });
+
+  it("control: the same capture over an EMPTY fake root verifies, fetches back and parks", async () => {
+    const iid = 2042;
+    const runId = randomUUID();
+    await seedPredecessor(iid, runId, { attempt: true });
+    const { factory, started } = transientFactory();
+    const root = makeFakeProcRoot();
+    const timedOut = await withQuiescenceView({ procRoot: root }, () => boundedExecute(wired(factory), gitlabClaim(iid, { run_id: runId })), FILE_VIEW);
+    fs.rmSync(root, { recursive: true, force: true });
+    assert.equal(timedOut, false);
+    assert.equal(started(), 0);
+    assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 1, "the capture verified and parked");
+    assert.equal(readJournal(iid), undefined, "the journal is cleared after the verified capture");
+    assert.equal(trackingHas(iid, "ONLY_COPY.txt"), true, "the predecessor's work was fetched back");
+  });
+
+  it("seed + terminal retire: the fresh attempt seeds (N6), but the retire keeps the clone and the ledger entry live", async () => {
+    const iid = 2043;
+    let worktree = "";
+    const { factory, started } = transientFactory((ctx) => {
+      worktree = ctx.worktreePath;
+    });
+    const { calls, quiesceRun } = recorded(fastQuiesce);
+    await withUnreadable(() => wired(factory, { quiesceRun }).execute(gitlabClaim(iid)));
+    assert.equal(started(), 1, "the fresh attempt path was seeded despite the unverified sweep");
+    assert.ok(calls.some((c) => c.site === "attempt_seed"));
+    const id = parseAttemptPath(worktree, path.join(fx.dataDir, "runner"))?.attemptId;
+    assert.ok(id);
+    assert.notEqual(readLedger(iid).get(id)?.state, "retired", "the terminal retire failed closed");
+    assert.equal(fs.existsSync(worktree), true, "the clone is kept");
   });
 });
 

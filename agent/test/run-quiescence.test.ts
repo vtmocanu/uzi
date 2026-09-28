@@ -13,6 +13,7 @@ import {
   reapProcesses,
   reapRunProcesses,
   scanOnce,
+  setQuiescenceViewForTests,
   teardownDocker,
   type HelperSpawn,
   type ProcTable,
@@ -20,6 +21,8 @@ import {
   type ScanRequest,
 } from "../src/run-quiescence.js";
 import { SinkGate } from "../src/sink-gate.js";
+import { scopedRealView } from "./fake-proc.js";
+import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, recordRoot, workerSpawnEnv, workerSpawnNonce, type RecordedRoot } from "../src/worker-spawn-mark.js";
 
 // issue #1783 (R0/R3/R5 + Docker) — the run-quiescence reaper. Real processes where stated (single
@@ -36,6 +39,9 @@ const RUNNER = 10002;
 let tmp: string;
 before(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-quiesce-"));
+  // The real-process cases reap this file's own children only, never the host's other processes
+  // (the injected-table cases pass their own table and are unaffected).
+  setQuiescenceViewForTests(scopedRealView());
 });
 const spawned: ChildProcess[] = [];
 /** Grandchildren we know by pid only (the stand-in CLI's detached tool). */
@@ -61,6 +67,7 @@ after(() => {
     }
   }
   fs.rmSync(tmp, { recursive: true, force: true });
+  restoreHermeticView();
 });
 
 /** A runner root with a repo dir holding `keys` as clone dirs. */
@@ -272,7 +279,9 @@ describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire
       await new Promise((r) => setTimeout(r, 200));
       assert.ok(boundUnder(daemon, own.clonePath).length > before, "base: the survivor keeps creating clone-bound containers");
 
-      // The fix: quiesce (process reap, then Docker teardown), then retire the clone.
+      // The fix: quiesce (process reap, then Docker teardown), then retire the clone. The tool
+      // was reparented away from this process when its CLI died, so the scoped view names it.
+      setQuiescenceViewForTests(scopedRealView({ pids: strays }));
       const out = await quiesceRunAttempt(
         {
           mode: "own",

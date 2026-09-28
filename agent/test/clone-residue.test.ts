@@ -1,6 +1,7 @@
-import { afterEach, describe, it } from "node:test";
+import { after, afterEach, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { execFileSync, type ChildProcess } from "node:child_process";
@@ -23,11 +24,14 @@ import {
   mintAttemptId,
   newRunAttempt,
   quiesceRunAttempt,
+  setQuiescenceViewForTests,
   type QuiesceRunOutcome,
   type QuiesceRunRequest,
 } from "../src/run-quiescence.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
+import { scopedRealView } from "./fake-proc.js";
+import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -42,6 +46,16 @@ const HAS_PROCFS = process.platform === "linux";
 /** Directories made read-only by a test, restored (u+w) before the harness removes the fixture. */
 const readOnly: string[] = [];
 const orphans: number[] = [];
+
+// The real reaper sees this file's own descendants plus its orphans (reparented away, so recorded
+// in a pidfile), never the host's other processes.
+const orphanPidDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-orphan-pids-"));
+const orphanPidFile = path.join(orphanPidDir, "orphans.pids");
+before(() => setQuiescenceViewForTests(scopedRealView({ pidFiles: [orphanPidFile] })));
+after(() => {
+  restoreHermeticView();
+  fs.rmSync(orphanPidDir, { recursive: true, force: true });
+});
 
 // Registered BEFORE installHarness so it runs before the harness removes the fixture dir.
 afterEach(() => {
@@ -175,6 +189,7 @@ function orphanIn(cwd: string, extraEnv: Record<string, string> = {}): number {
   });
   const pid = Number(out.trim());
   orphans.push(pid);
+  fs.appendFileSync(orphanPidFile, `${pid}\n`);
   return pid;
 }
 
