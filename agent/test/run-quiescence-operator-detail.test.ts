@@ -76,12 +76,22 @@ function assertClean(text: string, label: string): void {
   assert.ok(!UNSAFE.test(text), `${label} carries no control or bidi character: ${JSON.stringify(text)}`);
 }
 
+/** Comms that try to close their own entry and name another pid an operator might kill. */
+const SPOOF_COMMS = ["x); pid 1 (y", "a) (b); pid 7 ("];
+/** A double-quoted string with `"` and `\` backslash-escaped: how the detail renders a comm. */
+const QUOTED = /"(?:[^"\\]|\\.)*"/g;
+
+/** The `pid N` tokens a reader finds OUTSIDE the detail's quoted comms. */
+function pidTokensOutsideComms(detail: string): string[] {
+  return detail.replace(QUOTED, "<comm>").match(/pid \d+/g) ?? [];
+}
+
 describe("issue #1783 M2: an unattributed unreadable process is named in the verdict", { skip: !HAS_LINUX }, () => {
   it("the detail names the pid and comm first and says it could not be attributed", async () => {
     plantUnreadableUnattributed(root, PID);
     const r = await reapProcesses(req());
     assert.equal(r.state, "unverified");
-    assert.equal(r.detail, `runner-uid pid ${PID} (ssh-agent) could not be attributed (env/cwd unreadable)`);
+    assert.equal(r.detail, `runner-uid pid ${PID} "ssh-agent" could not be attributed (env/cwd unreadable)`);
     assert.deepEqual(describeProcesses(r), [
       { pid: PID, uid: ME, comm: "ssh-agent", cwd: "/", reason: "unreadable_unattributed", attribution: "could not be attributed" },
     ]);
@@ -99,7 +109,7 @@ describe("issue #1783 M2: an unattributed unreadable process is named in the ver
     plantUnreadable(PID, "a) (b c");
     const r = await reapProcesses(req());
     assert.deepEqual(r.processes.map((p) => p.comm), ["a) (b c"]);
-    assert.match(r.detail, /^runner-uid pid 4242 \(a\) \(b c\) could not be attributed/);
+    assert.match(r.detail, /^runner-uid pid 4242 "a\) \(b c" could not be attributed/);
     // The same comm on a process whose session is a recorded live root: the ppid/pgrp/session
     // fields after the LAST ")" are what attribute it.
     plantFakeProc(root, 50, { uid: ME, startTime: 777, env: {}, cwd: "/tmp" });
@@ -112,7 +122,7 @@ describe("issue #1783 M2: an unattributed unreadable process is named in the ver
     plantUnreadable(PID, hostile);
     const r = await reapProcesses(req());
     assert.equal(r.processes[0]!.comm, "?x?)y");
-    assert.ok(r.detail.startsWith(`runner-uid pid ${PID} (?x?)y) could not be attributed`), r.detail);
+    assert.ok(r.detail.startsWith(`runner-uid pid ${PID} "?x?)y" could not be attributed`), r.detail);
     assertClean(r.detail, "detail");
     assertClean(JSON.stringify(describeProcesses(r)), "log fields");
   });
@@ -121,7 +131,7 @@ describe("issue #1783 M2: an unattributed unreadable process is named in the ver
     plantUnreadable(PID, "\u202eevil\u2028comm");
     const r = await reapRunProcesses(req(), { viaHelper: true });
     assert.equal(r.state, "unverified", r.detail);
-    assert.match(r.detail, /^runner-uid pid 4242 \(\?evil\?comm\) could not be attributed/);
+    assert.match(r.detail, /^runner-uid pid 4242 "\?evil\?comm" could not be attributed/);
     assertClean(r.detail, "helper detail");
     assertClean(JSON.stringify(r.processes), "helper processes");
   });
@@ -131,9 +141,37 @@ describe("issue #1783 M2: an unattributed unreadable process is named in the ver
     for (let i = 0; i < 6; i++) plantUnreadable(PID + i, i === 0 ? long : `p${i}`);
     const r = await reapProcesses(req());
     assert.equal(r.processes.length, 6);
-    assert.match(r.detail, /; pid 4243 \(p1\) \(env\/cwd unreadable\); \+4 more$/);
+    assert.match(r.detail, /; pid 4243 "p1" \(env\/cwd unreadable\); \+4 more$/);
     const capped = sanitizeForLog(r.detail, 160);
-    assert.ok(capped.includes(`runner-uid pid ${PID} (${long}) could not be attributed`), capped);
+    assert.ok(capped.includes(`runner-uid pid ${PID} "${long}" could not be attributed`), capped);
+  });
+
+  for (const spoof of SPOOF_COMMS) {
+    it(`a comm spoofing another entry (${spoof}) cannot make the detail name a second pid`, async () => {
+      plantUnreadable(PID, spoof);
+      const r = await reapProcesses(req());
+      assert.deepEqual(r.processes.map((p) => p.comm), [spoof]);
+      assert.equal(r.detail, `runner-uid pid ${PID} ${JSON.stringify(spoof)} could not be attributed (env/cwd unreadable)`);
+      assert.deepEqual(pidTokensOutsideComms(r.detail), [`pid ${PID}`], r.detail);
+      const quoted = r.detail.match(QUOTED) ?? [];
+      assert.equal(quoted.length, 1, r.detail);
+      assert.equal(JSON.parse(quoted[0]!), spoof, "the quoted comm reads back as the process's own comm");
+    });
+  }
+
+  it("a comm of quotes and backslashes stays one quoted string, and the worst case survives the 160 cap", async () => {
+    plantUnreadable(PID, 'q"\\"); pid 1 ("');
+    const r = await reapProcesses(req());
+    assert.deepEqual(pidTokensOutsideComms(r.detail), [`pid ${PID}`], r.detail);
+    assert.equal(JSON.parse((r.detail.match(QUOTED) ?? [])[0]!), 'q"\\"); pid 1 ("');
+    // Worst case: every character a `"` (each escaped to two) and over the 64-character cap.
+    const worst = '"'.repeat(70);
+    plantUnreadable(4194304, worst);
+    fs.rmSync(path.join(root, String(PID)), { recursive: true, force: true });
+    const w = await reapProcesses(req());
+    const entry = `runner-uid pid 4194304 "${'\\"'.repeat(64)}..."`;
+    assert.equal(entry.length, 156, "the first pid and its comm end at most 156 characters in");
+    assert.ok(sanitizeForLog(w.detail, 160).startsWith(entry), w.detail);
   });
 
   it("other unverified reasons are described sensibly", async () => {
@@ -144,7 +182,7 @@ describe("issue #1783 M2: an unattributed unreadable process is named in the ver
     const r = await reapProcesses(req());
     const reasons = Object.fromEntries(r.processes.map((p) => [p.pid, p.reason]));
     assert.deepEqual(reasons, { [PID]: "unreadable_unattributed", [PID + 1]: "status_unreadable", [PID + 2]: "status_unparsable" });
-    assert.match(r.detail, /^runner-uid pid 4242 \(ssh-agent\) could not be attributed \(env\/cwd unreadable\); pid 4243 \(\?\) \(status unreadable\); \+1 more$/);
+    assert.match(r.detail, /^runner-uid pid 4242 "ssh-agent" could not be attributed \(env\/cwd unreadable\); pid 4243 "\?" \(status unreadable\); \+1 more$/);
   });
 });
 
@@ -170,10 +208,10 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
     const failed = lastFailed(claim.run_id);
     assert.equal(failed?.fail_origin, "worker_residue_blocked");
     const reason = String(failed?.failure_reason);
-    assert.ok(reason.includes(`pid ${PID} (ssh-agent) could not be attributed`), reason);
+    assert.ok(reason.includes(`pid ${PID} "ssh-agent" could not be attributed`), reason);
     const warn = notQuiescentLines(lines).find((l) => l.site === "finalize");
     assert.ok(warn, "the finalize proof logged its block");
-    assert.match(String(warn.detail), /pid 4242 \(ssh-agent\) could not be attributed/);
+    assert.match(String(warn.detail), /pid 4242 "ssh-agent" could not be attributed/);
     assert.deepEqual(
       (warn.processes as Array<Record<string, unknown>>).map((p) => [p.pid, p.comm, p.attribution]),
       [[PID, "ssh-agent", "could not be attributed"]],
@@ -198,7 +236,7 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
     assert.equal(failed?.fail_origin, "worker_residue_blocked");
     const reason = String(failed?.failure_reason);
     assert.match(reason, /canonical runner clone path could not be freed/);
-    assert.ok(reason.includes(`pid ${PID} (ssh-agent) could not be attributed`), reason);
+    assert.ok(reason.includes(`pid ${PID} "ssh-agent" could not be attributed`), reason);
   });
 
   it("a hostile comm never reaches the failure_reason or the warn line raw", async () => {
@@ -208,11 +246,21 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
     const claim = gitlabClaim(3953);
     await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab, undefined, logger).execute(claim);
     const reason = String(lastFailed(claim.run_id)?.failure_reason);
-    assert.ok(reason.includes(`pid ${PID} (?x?)y) could not be attributed`), reason);
+    assert.ok(reason.includes(`pid ${PID} "?x?)y" could not be attributed`), reason);
     assertClean(reason, "failure_reason");
     const warns = notQuiescentLines(lines);
     assert.ok(warns.length > 0);
     assertClean(JSON.stringify(warns), "warn lines");
+  });
+
+  it("a spoofing comm cannot make the failure_reason name a second pid", async () => {
+    simulateCommittedWork();
+    plantUnreadable(PID, SPOOF_COMMS[0]!);
+    const claim = gitlabClaim(3955);
+    await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab).execute(claim);
+    const reason = String(lastFailed(claim.run_id)?.failure_reason);
+    assert.ok(reason.includes(`pid ${PID} ${JSON.stringify(SPOOF_COMMS[0])} could not be attributed`), reason);
+    assert.deepEqual(pidTokensOutsideComms(reason), [`pid ${PID}`], reason);
   });
 
   it("many long-comm pids: the failure_reason still carries the first pid and its whole comm", async () => {
@@ -222,6 +270,6 @@ describe("issue #1783 M2: the run's failure_reason and warn line name the blocki
     const claim = gitlabClaim(3954);
     await runnerWith(factoryOf(async (ctx) => ({ branch: ctx.branch, summary: "done" })), fakeGitlab().gitlab).execute(claim);
     const reason = String(lastFailed(claim.run_id)?.failure_reason);
-    assert.ok(reason.includes(`pid ${PID} (${long}) could not be attributed`), reason);
+    assert.ok(reason.includes(`pid ${PID} "${long}" could not be attributed`), reason);
   });
 });

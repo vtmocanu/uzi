@@ -23,7 +23,7 @@ import { restoreHermeticView } from "./setup/hermetic-proc.js";
 //   (a) block a seed when the agent is in the clone's scope (by cwd, or by another live attempt's
 //       markers), naming its pid;
 //   (b) on an UNRELATED agent (cwd elsewhere, no markers), fail closed when its env/cwd cannot be
-//       read, naming `pid <pid> (ssh-agent) could not be attributed` for the operator; when they
+//       read, naming `pid <pid> "ssh-agent" could not be attributed` for the operator; when they
 //       can be read (root, or a dumpable build), leave it out of the verdict entirely.
 //
 // Each agent is started `ssh-agent -D` (foreground: it keeps the cwd it was started in, which the
@@ -164,14 +164,14 @@ function assertDetailNames(t: TestContext, q: ProcessQuiescence, pid: number): v
   const at = order.indexOf(pid);
   if (at === 0) {
     assert.ok(
-      q.detail.startsWith(`runner-uid pid ${pid} (ssh-agent) could not be attributed (env/cwd unreadable)`),
+      q.detail.startsWith(`runner-uid pid ${pid} "ssh-agent" could not be attributed (env/cwd unreadable)`),
       q.detail,
     );
-    assert.ok(q.detail.includes(`pid ${pid} (ssh-agent) could not be attributed`), q.detail);
+    assert.ok(q.detail.includes(`pid ${pid} "ssh-agent" could not be attributed`), q.detail);
     return;
   }
   t.diagnostic(`another unattributable runner-uid process ranks first on this host: ${q.detail}`);
-  if (at === 1) assert.ok(q.detail.includes(`; pid ${pid} (ssh-agent) (env/cwd unreadable)`), q.detail);
+  if (at === 1) assert.ok(q.detail.includes(`; pid ${pid} "ssh-agent" (env/cwd unreadable)`), q.detail);
   else assert.match(q.detail, /; \+\d+ more$/);
 }
 

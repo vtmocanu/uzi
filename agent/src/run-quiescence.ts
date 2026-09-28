@@ -743,18 +743,32 @@ function unverifiedWhy(reason: string): string {
 }
 
 /**
+ * A process-chosen comm rendered as a double-quoted string for {@link unverifiedDetail}: sanitized
+ * (control and bidi code points become `?`, capped at 64 characters plus `...`), then `"` and `\`
+ * backslash-escaped, so no comm can close its own quotes and add text that reads as another
+ * `pid N` entry of the detail. At most 2 + 2 x 64 + 3 = 133 characters (every character a `"`).
+ */
+function quotedComm(comm: string): string {
+  let out = "";
+  for (const ch of sanitizeForLog(comm, 64)) out += ch === '"' || ch === "\\" ? `\\${ch}` : ch;
+  return `"${out}"`;
+}
+
+/**
  * issue #1783 M2 — the detail of an `unverified` verdict, naming the first pid and its comm FIRST
  * so they survive the 160-character cap RunResidueBlockedError / CloneResidueBlockedError put on
- * the failure_reason (the first entry is at most ~130 characters: a 64-character comm plus fixed
- * text): an operator reads which process to kill. Up to {@link UNVERIFIED_DETAIL_NAMED} pids are
- * named, the rest counted as "+N more": the unreadable, unattributed ones first (they carry a comm),
- * then by pid, so the same table always reads back the same detail.
+ * the failure_reason: an operator reads which process to kill. The first entry's pid and comm end
+ * at most 156 characters in (`runner-uid pid ` 15, a 7-digit pid at Linux's pid_max 4194304, a
+ * space, a {@link quotedComm} of at most 133). The comm is quoted because the process chooses it
+ * and `(`, `)` and `;` are this detail's own separators. Up to {@link UNVERIFIED_DETAIL_NAMED} pids
+ * are named, the rest counted as "+N more": the unreadable, unattributed ones first (they carry a
+ * comm), then by pid, so the same table always reads back the same detail.
  */
 function unverifiedDetail(unverified: readonly QuiesceProcess[]): string {
   const rank = (p: QuiesceProcess): number => (p.reason === "unreadable_unattributed" ? 0 : 1);
   const [first, ...rest] = [...unverified].sort((a, b) => rank(a) - rank(b) || a.pid - b.pid);
   if (first === undefined) return "no runner-uid process could be attributed";
-  const name = (p: QuiesceProcess): string => `pid ${p.pid} (${sanitizeForLog(p.comm, 64)})`;
+  const name = (p: QuiesceProcess): string => `pid ${p.pid} ${quotedComm(p.comm)}`;
   let out = `runner-uid ${name(first)} could not be attributed (${unverifiedWhy(first.reason)})`;
   const named = rest.slice(0, UNVERIFIED_DETAIL_NAMED - 1);
   for (const p of named) out += `; ${name(p)} (${unverifiedWhy(p.reason)})`;

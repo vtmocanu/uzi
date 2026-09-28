@@ -199,7 +199,11 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  exits (a cancel, a shutdown, the server moving the run) may never come, so an unbounded retry
  *  held the claim forever. After this many the run fails with fail_origin `worker_residue_blocked`
  *  (the failure_reason names the blocking pid and comm), the clone and session kept for
- *  inspection. Any capture outcome that is NOT a blocked proof resets the count. */
+ *  inspection. Any capture outcome that is NOT a blocked proof resets the count. The wall time
+ *  before that failure is about 5 x (the 5 s reap deadline + the recoveryRetryMs backoff), roughly
+ *  30 s at the defaults; that is accepted because a non-dumpable same-uid process does not clear on
+ *  its own, the operator reason names the pid to kill, failing closed is the maintainer's decision,
+ *  and per-attempt cgroup v2 containment is the follow-up that removes the case. */
 const RECOVERY_CAPTURE_BLOCKED_ATTEMPTS = 5;
 
 /** PRD #1226 M4 (D5): the STATIC, content-free failure_reason a worker reports when the completion
@@ -10741,6 +10745,10 @@ export class RunRunner {
             });
           }
           blockedCaptures = blockedDetail === undefined ? 0 : blockedCaptures + 1;
+          // Cancellation/shutdown may have arrived during local git or publish. Either takes
+          // precedence over the blocked bound below: the loop's top routes a shutdown to the
+          // retained posture and a cancel to the cancel report, never to worker_residue_blocked.
+          if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
           if (blockedDetail !== undefined && blockedCaptures >= RECOVERY_CAPTURE_BLOCKED_ATTEMPTS) {
             // issue #1783 M3: the proof keeps blocking, and nothing else is guaranteed to end this
             // loop. Stop retrying: keep the clone and session for inspection (a surviving process
