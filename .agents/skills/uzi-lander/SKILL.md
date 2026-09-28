@@ -403,10 +403,10 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 
 ## Waiting, uniformly
 
-Every long wait (a CR reset, only when the user asked for CodeRabbit on that PR; a laggy `mr_rework`, a re-review, CI) is a background poller
+Every long wait (a CR reset of 15 minutes or less, a laggy `mr_rework`, a re-review, CI) is a background poller
 whose exit re-invokes you, never a foreground `--watch` or a long `sleep`; the harness reaps
 long processes, and a killed short poll simply re-fires. The patient path is the default
-(except a CodeRabbit rate limit, which switches reviewer at once); a user reply that
+(except a CodeRabbit reset over 15 minutes, which switches reviewer at once); a user reply that
 arrives first wins.
 Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task status: a
 `script > log; echo "EXIT=$?"` wrapper always completes with 0.
