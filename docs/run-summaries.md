@@ -73,11 +73,15 @@ it is without reading the diff first.
 why, a computed size line, a short "What changed" list, a "Verification"
 section (only when there's something to report), and "Scope and review
 notes" when the delivery differs from the ask, followed by a line saying
-which commit it describes and against which branch. Below that sits a
-separate, deterministic completion block: the issue reference — `Related to
+which commit it describes and against which branch — omitted when either the
+head or the target branch isn't known yet. Below that sits a separate,
+deterministic completion block: the issue reference — `Related to
 #N.` on its own for a non-closing delivery, `Related to #N.` plus `Closes
-#N` together once the delivery is verified closing, or `Implements part of
-#N` for a partial delivery — any partial-delivery or unmet-criteria
+#N` together for a closing delivery, or `Implements part of
+#N` for a partial delivery. On an interlocked run `Closes #N` is added only
+once the PR's head is independently verified, never at creation; a legacy
+(non-interlocked) run renders both lines together at creation, with no head
+verification — any partial-delivery or unmet-criteria
 warnings, and a fixed footer: "Opened by uzi from `<branch>`. A human
 reviews and merges; uzi never merges." The summary and the size line are
 omitted, not left blank, when there's nothing to show.
@@ -90,7 +94,8 @@ omitted, not left blank, when there's nothing to show.
 
 is always computed from the actual diff (`git diff --numstat`), never
 written by a model, and empty buckets are omitted; a bucket with a file in it
-but no net line change still shows as `+0 −0`. Each changed file is
+but no added and no deleted lines (a binary file, say) still shows as
+`+0 −0`. Each changed file is
 classified into one bucket, first by your repo's own `.gitattributes`
 (`linguist-generated`, `linguist-documentation`, `linguist-vendored`), then by
 generic path rules (test files, `docs/`, lockfiles and other generated
@@ -98,9 +103,10 @@ artifacts, config files) with anything left over counted as `code`. If your
 repo classifies something uzi's generic rules get wrong (generated code that
 doesn't match a common pattern, for example), add or adjust a
 `.gitattributes` entry for it; the size line has no repo-specific rules
-baked in. `uzi run get`'s own `SIZE` row is a shorter cut of the same
-numbers: it omits a bucket that has a file but no net line change, which the
-PR's own size line still shows.
+baked in. `uzi run get`'s own `SIZE` row and the run page's "Delivered"
+card both print a shorter cut of the same numbers: each omits a bucket that
+has a file but no added and no deleted lines, which the PR's own size line
+still shows.
 
 **Verification is only what the agent reported.** The Verification section
 never claims the CI passed (that's on the PR itself, from the forge) and
@@ -127,12 +133,16 @@ overwriting it; the completion block below it is still kept current.
 Text outside uzi's two blocks isn't untouchable, though: uzi rewrites the
 **whole** body, region and all, in a few specific cases where preserving text
 would let something it doesn't own slip through — a PR with none of uzi's
-markers and no previously published description; a directive elsewhere in
-the body that would close the issue on a run whose delivery must not close
-it; or, when the PR can't even be read back, a blind non-closing rewrite as a
-last resort. A refresh run (`mr_rework`, or a `ci_fix` picking up an existing
-branch) never does this: it only ever touches its own two blocks, or leaves a
-PR with no uzi markers untouched entirely.
+markers and no previously published description; markers that are malformed,
+or a completion block that's gone missing, on an interlocked run (the
+publisher itself skips such a PR rather than write into damaged markers, and
+the completion interlock's own reconcile is what then rewrites it whole, on
+a verified `Closes` add exactly as on a hold's strip); a directive elsewhere
+in the body that would close the issue on a run whose delivery must not
+close it; or, when the PR can't even be read back, a blind non-closing
+rewrite as a last resort. A refresh run (`mr_rework`, or a `ci_fix` picking
+up an existing branch) never does this: it only ever touches its own two
+blocks, or leaves a PR with no uzi markers untouched entirely.
 
 **Where to see it.** The run page shows a "Delivered" section of the same
 card as the intent and plan summaries. `uzi run get <id>` prints the same
