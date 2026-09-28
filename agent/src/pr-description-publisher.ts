@@ -91,8 +91,9 @@ import type { DeliverySummary, DeliverySummaryClaimView, DeliverySummaryInput } 
 /** The forge reads and writes the publisher needs (every ForgeClient driver has them). */
 export type PublisherForge = Pick<ForgeClient, "getMergeRequest" | "updateMergeRequestDescription">;
 
-/** The four pr-description routes (WorkerClient). Stage is NEVER retried; bind, lookup and ack are
- *  safe to replay and get a bounded retry. */
+/** The four pr-description routes (WorkerClient). Stage is NEVER retried. Bind, lookup and ack
+ *  replay HTTP 408/429/5xx and malformed responses. A transport failure ends this
+ *  publication's api calls so advisory work cannot hold its terminal report. */
 export type PublisherApi = Pick<
   WorkerClient,
   "stagePrDescription" | "bindPrDescription" | "lookupPrDescription" | "ackPrDescription"
@@ -423,7 +424,7 @@ async function replay<T>(fn: () => Promise<T>, sleep: (ms: number) => Promise<vo
       last = e;
       // A transport failure has no HTTP response and a retry can hold the run's
       // terminal behind another full connect timeout. HTTP 408/429/5xx still replay.
-      const retryable = e instanceof RequestError && isTransient(e);
+      const retryable = e instanceof PrDescriptionMalformedResponse || (e instanceof RequestError && isTransient(e));
       if (!retryable || attempt === REPLAY_ATTEMPTS - 1) throw e;
       await sleep(e instanceof PrDescriptionRateLimited && e.retryAfterMs !== undefined ? e.retryAfterMs : 250 * (attempt + 1));
     }

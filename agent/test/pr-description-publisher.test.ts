@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import type { WorkerClient } from "../src/client.js";
+import { PrDescriptionMalformedResponse, type WorkerClient } from "../src/client.js";
 import { ForgeError, ForgeResponseTooLarge, MR_DETAIL_MAX_BYTES, type MergeRequestDetail } from "../src/forge.js";
 import type { DeliveryContext } from "../src/pr-description-context.js";
 import {
@@ -239,6 +239,30 @@ describe("api outage while publishing a PR description", () => {
     healthy.forge.pr.description = healthyPub.initialBody(completion(true));
     await healthyPub.publish(MR);
     assert.equal(api.calls.filter((c) => c.op === "lookup").length, 3);
+  });
+
+  it("still replays a malformed lookup response because the api answered", async () => {
+    const forge = new FakeForge();
+    let attempts = 0;
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: apiWith({
+        lookupPrDescription: async (runId, request, signal) => {
+          attempts++;
+          if (attempts === 1) throw new PrDescriptionMalformedResponse("/pr-description/lookup", "lookup");
+          return client.lookupPrDescription(runId, request, signal);
+        },
+      }),
+      pass: null,
+      log: nullLogger(),
+      emit: () => {},
+      sleep: async () => {},
+      headLagRetryMs: 0,
+    });
+    const pub = await publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.equal(attempts, 2);
   });
 });
 
