@@ -24,7 +24,8 @@ import (
 // the data-volume inode pair; a later heartbeat REPLACES the set (a run no longer listed is
 // deleted, a listed one updated); a heartbeat without run_disk leaves the rows untouched; an empty
 // list clears them; a run id of another owner is dropped; the worker DTO overlay and the run DTO
-// size overlay read the rows back.
+// size overlay read the rows back (the run DTO only from the run's current worker); sampled_at is
+// the reported measurement time, clamped, and the freshness window reads it.
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; ./e2e/run-store-it.sh
 // provides one.
@@ -173,6 +174,19 @@ func TestWorkerRunDiskReplaceLiveDB(t *testing.T) {
 	if dto.HomeBytes == nil || *dto.HomeBytes != 6000 || dto.CacheBytes == nil || *dto.CacheBytes != 0 || dto.DiskTruncated {
 		t.Fatalf("run DTO sizes = %v/%v truncated=%v, want 6000/0", dto.HomeBytes, dto.CacheBytes, dto.DiskTruncated)
 	}
+	// Only the run's CURRENT worker's row is shown: a run bound to another worker (which has not
+	// reported it) or to no worker gets no size, never this worker's row as a fallback.
+	for name, wid := range map[string]*uuid.UUID{"another worker": func() *uuid.UUID { u := uuid.New(); return &u }(), "no worker": nil} {
+		r := store.Run{ID: runA}
+		if wid != nil {
+			r.WorkerID.Bytes, r.WorkerID.Valid = *wid, true
+		}
+		var other apitypes.RunDTO
+		h.overlayRunDiskSize(ctx, r, &other)
+		if other.HomeBytes != nil || other.CacheBytes != nil {
+			t.Fatalf("%s: run DTO sizes = %v/%v, want absent (no substitution from another worker's row)", name, other.HomeBytes, other.CacheBytes)
+		}
+	}
 	// A stale row (older than the 15-minute window) is not shown.
 	mustExecT(ctx, t, pool, `UPDATE worker_run_disk SET sampled_at = now() - interval '20 minutes' WHERE run_id = $1`, runA)
 	var stale apitypes.RunDTO
@@ -192,5 +206,66 @@ func TestWorkerRunDiskReplaceLiveDB(t *testing.T) {
 	mustExecT(ctx, t, pool, `DELETE FROM runs WHERE id = $1`, runC)
 	if got = readRows(); len(got) != 0 {
 		t.Fatalf("deleting the run left its size row: %+v", got)
+	}
+
+	// (6) sampled_at is the worker's MEASUREMENT time, clamped to [now-24h, now+5m] on the database
+	// clock, and missing means now(). The freshness window reads it: a report measured 20 minutes
+	// ago is stored but not shown, even though the heartbeat carrying it just arrived.
+	runD, runE, runF, runG, runH := seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner), seedRun(owner)
+	now := time.Now().UTC()
+	threeMin := now.Add(-3 * time.Minute).Truncate(time.Second)
+	heartbeat(fmt.Sprintf(`,"run_disk":[`+
+		`{"run_id":%q,"home_bytes":10,"cache_bytes":0,"sampled_at":%q},`+
+		`{"run_id":%q,"home_bytes":20,"cache_bytes":0,"sampled_at":%q},`+
+		`{"run_id":%q,"home_bytes":30,"cache_bytes":0,"sampled_at":%q},`+
+		`{"run_id":%q,"home_bytes":40,"cache_bytes":0,"sampled_at":%q},`+
+		`{"run_id":%q,"home_bytes":50,"cache_bytes":0}]`,
+		runD, threeMin.Format(time.RFC3339),
+		runE, now.Add(-20*time.Minute).Format(time.RFC3339),
+		runF, now.Add(-72*time.Hour).Format(time.RFC3339),
+		runG, now.Add(2*time.Hour).Format(time.RFC3339),
+		runH))
+	// Offsets from the database clock, in seconds, so the assertions are immune to host/DB skew.
+	offsets := map[uuid.UUID]float64{}
+	rows, err := pool.Query(ctx, `SELECT run_id, EXTRACT(EPOCH FROM sampled_at - now())::float8 FROM worker_run_disk WHERE worker_id = $1`, workerID)
+	if err != nil {
+		t.Fatalf("read sampled_at: %v", err)
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		var off float64
+		if err := rows.Scan(&id, &off); err != nil {
+			t.Fatalf("scan sampled_at: %v", err)
+		}
+		offsets[id] = off
+	}
+	rows.Close()
+	var dbSkew float64 // host now - db now, seconds
+	if err := pool.QueryRow(ctx, `SELECT EXTRACT(EPOCH FROM $1::timestamptz - now())::float8`, now).Scan(&dbSkew); err != nil {
+		t.Fatalf("read db clock: %v", err)
+	}
+	within := func(name string, got, want, tol float64) {
+		t.Helper()
+		if got < want-tol || got > want+tol {
+			t.Fatalf("%s: sampled_at - now() = %.1fs, want %.1fs (+/- %.0fs); all offsets %v", name, got, want, tol, offsets)
+		}
+	}
+	within("reported 3 minutes ago (kept as measured)", offsets[runD], dbSkew-180, 5)
+	within("reported 20 minutes ago (kept as measured)", offsets[runE], dbSkew-1200, 5)
+	within("reported 3 days ago (clamped to 24h)", offsets[runF], -86400, 5)
+	within("reported 2 hours ahead (clamped to 5m)", offsets[runG], 300, 5)
+	within("not reported (now)", offsets[runH], 0, 5)
+	// The overlay drops the 20-minute-old and the clamped 24h-old measurements.
+	shown := map[string]bool{}
+	for _, e := range h.runDiskByWorker(ctx, []uuid.UUID{workerID})[workerID] {
+		shown[e.RunID] = true
+	}
+	if !shown[runD.String()] || !shown[runG.String()] || !shown[runH.String()] || shown[runE.String()] || shown[runF.String()] {
+		t.Fatalf("fresh overlay = %v, want D, G, H shown and E (20m old), F (clamped 24h) hidden", shown)
+	}
+	stale = apitypes.RunDTO{}
+	h.overlayRunDiskSize(ctx, store.Run{ID: runE, WorkerID: runRow.WorkerID}, &stale)
+	if stale.HomeBytes != nil {
+		t.Fatalf("a run measured 20 minutes ago surfaced on the run DTO: %v", *stale.HomeBytes)
 	}
 }

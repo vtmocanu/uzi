@@ -16,21 +16,21 @@ const getRunDisk = `-- name: GetRunDisk :one
 SELECT d.worker_id, d.run_id, d.home_bytes, d.cache_bytes, d.truncated, d.sampled_at
 FROM worker_run_disk d
 WHERE d.run_id = $1
+  AND d.worker_id = $2
   AND d.sampled_at > now() - interval '15 minutes'
-ORDER BY (d.worker_id = $2::uuid) DESC NULLS LAST, d.sampled_at DESC
-LIMIT 1
 `
 
 type GetRunDiskParams struct {
-	RunID           uuid.UUID   `json:"run_id"`
-	CurrentWorkerID pgtype.UUID `json:"current_worker_id"`
+	RunID    uuid.UUID `json:"run_id"`
+	WorkerID uuid.UUID `json:"worker_id"`
 }
 
-// One run's latest fresh size row for the run DTO: the row its current worker reported when
-// there is one, else the most recently sampled row from any worker (a parked run whose worker
-// binding moved still shows the size its last worker saw). pgx.ErrNoRows when nothing fresh.
+// One run's fresh size row as reported by its CURRENT worker (runs.worker_id), for the run DTO.
+// A run with no current worker (NULL) or whose worker has not reported it within 15 minutes gets
+// pgx.ErrNoRows and shows no size: a row another worker reported earlier describes a HOME that
+// worker held, not necessarily where the run's work is now, so it is never substituted.
 func (q *Queries) GetRunDisk(ctx context.Context, arg GetRunDiskParams) (WorkerRunDisk, error) {
-	row := q.db.QueryRow(ctx, getRunDisk, arg.RunID, arg.CurrentWorkerID)
+	row := q.db.QueryRow(ctx, getRunDisk, arg.RunID, arg.WorkerID)
 	var i WorkerRunDisk
 	err := row.Scan(
 		&i.WorkerID,
@@ -95,20 +95,22 @@ const replaceWorkerRunDisk = `-- name: ReplaceWorkerRunDisk :exec
 
 WITH incoming AS (
     -- Ordinality-joined single-array unnests (sqlc cannot type a multi-argument unnest), the
-    -- judge_bulk_disposition.sql shape: the four arrays are parallel and equal-length.
-    SELECT ids.val AS run_id, hb.val AS home_bytes, cb.val AS cache_bytes, tr.val AS truncated
+    -- judge_bulk_disposition.sql shape: the five arrays are parallel and equal-length.
+    SELECT ids.val AS run_id, hb.val AS home_bytes, cb.val AS cache_bytes, tr.val AS truncated,
+           LEAST(GREATEST(COALESCE(sa.val, now()), now() - interval '24 hours'), now() + interval '5 minutes') AS sampled_at
     FROM unnest($2::uuid[]) WITH ORDINALITY AS ids(val, ord)
     JOIN unnest($3::bigint[]) WITH ORDINALITY AS hb(val, ord) ON hb.ord = ids.ord
     JOIN unnest($4::bigint[]) WITH ORDINALITY AS cb(val, ord) ON cb.ord = ids.ord
     JOIN unnest($5::boolean[]) WITH ORDINALITY AS tr(val, ord) ON tr.ord = ids.ord
-    JOIN runs r ON r.id = ids.val AND r.user_id = $6::uuid
+    JOIN unnest($6::timestamptz[]) WITH ORDINALITY AS sa(val, ord) ON sa.ord = ids.ord
+    JOIN runs r ON r.id = ids.val AND r.user_id = $7::uuid
 ), deleted AS (
     DELETE FROM worker_run_disk d
     WHERE d.worker_id = $1::uuid
       AND NOT EXISTS (SELECT 1 FROM incoming WHERE incoming.run_id = d.run_id)
 )
 INSERT INTO worker_run_disk (worker_id, run_id, home_bytes, cache_bytes, truncated, sampled_at)
-SELECT $1::uuid, incoming.run_id, incoming.home_bytes, incoming.cache_bytes, incoming.truncated, now()
+SELECT $1::uuid, incoming.run_id, incoming.home_bytes, incoming.cache_bytes, incoming.truncated, incoming.sampled_at
 FROM incoming
 ON CONFLICT (worker_id, run_id) DO UPDATE SET
     home_bytes  = EXCLUDED.home_bytes,
@@ -118,28 +120,35 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
 `
 
 type ReplaceWorkerRunDiskParams struct {
-	WorkerID   uuid.UUID   `json:"worker_id"`
-	RunIds     []uuid.UUID `json:"run_ids"`
-	HomeBytes  []int64     `json:"home_bytes"`
-	CacheBytes []int64     `json:"cache_bytes"`
-	Truncated  []bool      `json:"truncated"`
-	UserID     uuid.UUID   `json:"user_id"`
+	WorkerID   uuid.UUID            `json:"worker_id"`
+	RunIds     []uuid.UUID          `json:"run_ids"`
+	HomeBytes  []int64              `json:"home_bytes"`
+	CacheBytes []int64              `json:"cache_bytes"`
+	Truncated  []bool               `json:"truncated"`
+	SampledAt  []pgtype.Timestamptz `json:"sampled_at"`
+	UserID     uuid.UUID            `json:"user_id"`
 }
 
 // PRD #1809 M6 (D8): per-run disk size (worker_run_disk) and the park's checkpoint durability
 // flag (runs.checkpoint_contains_latest). Everything here is DISPLAY-ONLY: no claim,
 // scheduling, sweeper or custody query reads worker_run_disk or checkpoint_contains_latest.
 //
-// Freshness: every reader ignores a worker_run_disk row sampled more than 15 minutes ago. A
+// Freshness: every reader ignores a worker_run_disk row whose sampled_at (the worker's
+// measurement time, not the heartbeat's arrival) is more than 15 minutes ago. A
 // heartbeat that omits run_disk (an older worker, a tick with no sample) leaves the worker's rows
 // in place, so the window is what retires a downgraded worker's last report.
 // Replace one worker's reported per-run sizes with the set its latest heartbeat carried, in ONE
-// statement: rows for runs no longer listed are deleted and the listed ones are upserted with a
-// fresh sampled_at. The parallel arrays are the handler's validated, de-duplicated, capped list
-// (parseWorkerStats). Only run ids that exist AND belong to the worker's own owner are kept, so a
-// garbled or hostile id is dropped here instead of violating the runs FK. The DELETE and the
-// INSERT touch disjoint rows (listed vs not listed), so the two data-modifying parts never
-// target the same row.
+// statement: rows for runs no longer listed are deleted and the listed ones are upserted. The
+// parallel arrays are the handler's validated, de-duplicated, capped list (parseWorkerStats).
+// Only run ids that exist AND belong to the worker's own owner are kept, so a garbled or hostile
+// id is dropped here instead of violating the runs FK. The DELETE and the INSERT touch disjoint
+// rows (listed vs not listed), so the two data-modifying parts never target the same row.
+//
+// sampled_at is the MEASUREMENT time: when the worker's size walk finished, as the entry's
+// sampled_at carried it. A NULL element (an older worker that sends none) is stored as now().
+// The reported time is clamped to [now() - 24 hours, now() + 5 minutes] on the database clock
+// the freshness readers use, so a skewed or hostile worker clock can neither pin a row as fresh
+// far into the future nor store an absurd past (a row clamped to 24 hours ago is already stale).
 func (q *Queries) ReplaceWorkerRunDisk(ctx context.Context, arg ReplaceWorkerRunDiskParams) error {
 	_, err := q.db.Exec(ctx, replaceWorkerRunDisk,
 		arg.WorkerID,
@@ -147,6 +156,7 @@ func (q *Queries) ReplaceWorkerRunDisk(ctx context.Context, arg ReplaceWorkerRun
 		arg.HomeBytes,
 		arg.CacheBytes,
 		arg.Truncated,
+		arg.SampledAt,
 		arg.UserID,
 	)
 	return err

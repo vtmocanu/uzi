@@ -1085,6 +1085,12 @@ UPDATE runs SET
     -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
     -- requeue_count charged against a generation this claim has already replaced.
     stale_requeue_generation = NULL,
+    -- PRD #1809 M6 (D8): a claim starts a new flight, so the previous park's checkpoint-durability
+    -- report no longer describes this run. Cleared here AND on every running report
+    -- (SetRunRunning) so a later park the worker does not report on (a server-side
+    -- credential_disabled park of this claimed run, a sweeper wall park, a completion hold) shows
+    -- "not reported" instead of an older park's value. Display-only.
+    checkpoint_contains_latest = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -13788,6 +13794,14 @@ UPDATE runs SET
     -- survive to reach the worker's ACK.
     hold_reason                    = NULL,
     hold_captured_head             = NULL,
+    -- PRD #1809 M6 (D8): the run is executing again, so the last park's checkpoint-durability
+    -- report is over: it describes only the park that reported it. Every resume reaches running
+    -- here (paused/limit_wait/recovery_wait -> queued -> claimed -> running, and the in-place
+    -- awaiting_* windows), and the source guards above refuse a stale running report onto a
+    -- parked run, so the clear never lands on the park it would erase. ClaimRun clears it too
+    -- (a claimed run a server-side park catches before its first running report). A running ->
+    -- running heartbeat re-clears an already-NULL column (a no-op). Display-only.
+    checkpoint_contains_latest     = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, $1),
     session_id       = COALESCE($2, session_id),

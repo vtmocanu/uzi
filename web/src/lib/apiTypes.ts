@@ -1825,7 +1825,9 @@ export interface WorkerReportedRun {
 
 /** One run's disk size on a worker (PRD #1809 M6, D8): the bytes under the run's HOME and, of
  *  those, the rebuildable caches. truncated means the worker's size walk was cut short, so both
- *  numbers are lower bounds. Nested in Worker.run_disk, largest HOME first. */
+ *  numbers are lower bounds. sampled_at is when the worker's measurement finished (not when the
+ *  heartbeat carrying it arrived); entries measured more than 15 minutes ago are dropped. Nested
+ *  in Worker.run_disk, largest HOME first. */
 export interface WorkerRunDisk {
   run_id: string;
   home_bytes: number;
@@ -2661,12 +2663,14 @@ export interface Run {
   disk_park_count?: number;
   /** PRD #1809 M6 (D8): the worker's report, on the run's latest park, of whether the checkpoint
    *  that park published contains the run's latest committed work. false: it does not (the worker
-   *  keeps the latest work under its custody hold). Absent when not reported. It is not cleared
-   *  on resume, so show it only while the run is parked. */
+   *  keeps the latest work under its custody hold). Absent when not reported. The server clears
+   *  it when the run is claimed again or reports running, so it only ever describes the park that
+   *  reported it; a later park the worker did not report on (a server-side park) reads absent. */
   checkpoint_contains_latest?: boolean;
-  /** PRD #1809 M6 (D8): the run's HOME size on its worker and, of that, the rebuildable caches,
-   *  from a fresh worker report (single-run read only; absent otherwise). disk_truncated: the
-   *  worker's size walk was cut short, so both sizes are lower bounds. */
+  /** PRD #1809 M6 (D8): the run's HOME size on its CURRENT worker and, of that, the rebuildable
+   *  caches, from that worker's report measured within the last 15 minutes. Set on the single-run
+   *  read (GET /api/runs/{id}) only, never on list rows; absent with no current worker or no fresh
+   *  report. disk_truncated: the worker's size walk was cut short, so both sizes are lower bounds. */
   home_bytes?: number;
   cache_bytes?: number;
   disk_truncated?: boolean;

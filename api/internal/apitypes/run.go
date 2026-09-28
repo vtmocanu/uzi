@@ -743,14 +743,18 @@ type RunDTO struct {
 	// checkpoint that park published contains the run's latest committed work (PRD #1809 M6, D8).
 	// false means it does not (the recovery pin or the fetch-back failed): the worker keeps the
 	// latest work under its custody hold. Absent when not reported (older worker, no checkpoint
-	// published on that park). It describes the latest park and is not cleared when the run
-	// resumes, so clients show it only while the run is parked. Display-only.
+	// published on that park, or a server-side park, which never carries a report). It is cleared
+	// when the run is claimed again or reports running (ClaimRun, SetRunRunning), so it only ever
+	// describes the park that reported it; clients show it only while the run is parked.
+	// Display-only.
 	CheckpointContainsLatest *bool `json:"checkpoint_contains_latest,omitempty"`
-	// HomeBytes / CacheBytes are the run's HOME size on its worker and, of that, the rebuildable
-	// caches (PRD #1809 M6, D8), from the worker's run_disk heartbeat report no older than 15
-	// minutes; the report from the run's current worker wins. Set on the single-run read only,
-	// absent when no fresh report exists. DiskTruncated means the worker's size walk was cut short,
-	// so both sizes are lower bounds. Display-only.
+	// HomeBytes / CacheBytes are the run's HOME size on its CURRENT worker (runs.worker_id) and, of
+	// that, the rebuildable caches (PRD #1809 M6, D8), from that worker's run_disk heartbeat report
+	// measured (sampled_at) within the last 15 minutes. Another worker's report is never
+	// substituted, so a run with no current worker, or whose worker has not reported it recently,
+	// has them absent. SINGLE-RUN READ ONLY: set by GET /api/runs/{id} and absent on every list
+	// row (no per-row size lookup on a list). DiskTruncated means the worker's size walk was cut
+	// short, so both sizes are lower bounds. Display-only.
 	HomeBytes     *int64 `json:"home_bytes,omitempty"`
 	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
 	DiskTruncated bool   `json:"disk_truncated,omitempty"`

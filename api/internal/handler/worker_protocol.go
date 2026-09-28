@@ -808,7 +808,11 @@ const maxRunDiskEntries = 50
 // untouched (the same outcome as an older worker that never sends the list). An array, even an
 // empty one, returns a non-nil slice, which replaces the worker's stored set. Each entry must
 // carry a uuid run_id and non-negative int64 home_bytes and cache_bytes; truncated is optional
-// (false when absent or not a boolean). An invalid entry is skipped on its own, a repeated run_id
+// (false when absent or not a boolean). sampled_at is the measurement time (an RFC 3339 string,
+// when the worker's size walk finished): absent or null leaves it nil, which the store records as
+// now() (an older worker that predates the field); present but not an RFC 3339 string skips the
+// entry, because a garbled time must not be stored as a fresh measurement. The store clamps a
+// parsed time to [now-24h, now+5m]. An invalid entry is skipped on its own, a repeated run_id
 // keeps its first entry, and at most maxRunDiskEntries entries are kept.
 func parseRunDisk(raw json.RawMessage) []workersvc.RunDiskSample {
 	if len(raw) == 0 || string(raw) == "null" {
@@ -829,6 +833,7 @@ func parseRunDisk(raw json.RawMessage) []workersvc.RunDiskSample {
 			HomeBytes  *json.Number    `json:"home_bytes"`
 			CacheBytes *json.Number    `json:"cache_bytes"`
 			Truncated  json.RawMessage `json:"truncated"`
+			SampledAt  json.RawMessage `json:"sampled_at"`
 		}
 		if err := json.Unmarshal(e, &v); err != nil {
 			continue
@@ -842,15 +847,39 @@ func parseRunDisk(raw json.RawMessage) []workersvc.RunDiskSample {
 		if home == nil || cache == nil {
 			continue
 		}
+		sampledAt, ok := parseRunDiskSampledAt(v.SampledAt)
+		if !ok {
+			continue
+		}
 		seen[id] = true
 		out = append(out, workersvc.RunDiskSample{
 			RunID:      id,
 			HomeBytes:  *home,
 			CacheBytes: *cache,
 			Truncated:  string(v.Truncated) == "true",
+			SampledAt:  sampledAt,
 		})
 	}
 	return out
+}
+
+// parseRunDiskSampledAt decodes a run_disk entry's sampled_at (PRD #1809 M6, D8). Absent or JSON
+// null returns (nil, true): not reported. A JSON string in RFC 3339 returns the time in UTC.
+// Anything else (a number, an unparseable string) returns ok=false and the caller skips the entry.
+func parseRunDiskSampledAt(raw json.RawMessage) (*time.Time, bool) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil, true
+	}
+	var str string
+	if err := json.Unmarshal(raw, &str); err != nil {
+		return nil, false
+	}
+	t, err := time.Parse(time.RFC3339Nano, str)
+	if err != nil {
+		return nil, false
+	}
+	t = t.UTC()
+	return &t, true
 }
 
 // diskBytesOrNil converts a raw disk-field JSON number to a non-negative *int64, dropping

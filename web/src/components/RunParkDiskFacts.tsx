@@ -3,10 +3,13 @@
 // 1. Checkpoint durability: whether the checkpoint the park published contains the run's latest
 //    committed work. "Checkpoint published" only means a ref was pushed; when the recovery pin or
 //    the fetch-back failed, the pushed checkpoint is older than the work, and the only copy of the
-//    latest commits is on the worker (which keeps it under its custody hold). The server keeps the
-//    latest park's report and does not clear it on resume, so this renders only while parked.
-// 2. The run's HOME size on its worker and, of that, the rebuildable caches, from a fresh worker
-//    report (absent otherwise). "at least" when the worker's size walk was truncated.
+//    latest commits is on the worker (which keeps it under its custody hold). The server stores the
+//    report of the park that carried it and clears it when the run is claimed again or reports
+//    running, so it never describes a later park (a server-side park carries none and reads
+//    absent). It renders only while the run is parked.
+// 2. The run's HOME size on its current worker and, of that, the rebuildable caches, from that
+//    worker's report measured in the last 15 minutes (absent otherwise). "at least" when the
+//    worker's size walk was truncated.
 //
 // Both are display-only and render nothing when the server sent nothing.
 

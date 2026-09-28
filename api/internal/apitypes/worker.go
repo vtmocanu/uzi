@@ -162,8 +162,8 @@ type WorkerDTO struct {
 	StatsDiskDataTotalInodes *int64 `json:"stats_disk_data_total_inodes"`
 	// RunDisk is the worker's largest runs by HOME size (PRD #1809 M6, D8), at most
 	// WorkerRunDiskTop entries, largest first, from its latest heartbeat's run_disk report
-	// (rows older than 15 minutes are dropped). ALWAYS a JSON array, never null: the list
-	// handlers overlay it and the DTO builders seed it to []. Display-only.
+	// (entries whose sampled_at is more than 15 minutes old are dropped). ALWAYS a JSON array,
+	// never null: the list handlers overlay it and the DTO builders seed it to []. Display-only.
 	RunDisk []WorkerRunDiskDTO `json:"run_disk"`
 	// Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
 	// Both null means "unbound": the worker spends its owner's default token, which
@@ -230,8 +230,10 @@ const WorkerRunDiskTop = 5
 
 // WorkerRunDiskDTO is one run's disk size on a worker (PRD #1809 M6, D8): the bytes under the
 // run's HOME and, of those, the rebuildable caches. Truncated means the worker's size walk was cut
-// short, so both numbers are lower bounds. SampledAt is when the worker reported it. Nested in
-// WorkerDTO.RunDisk.
+// short, so both numbers are lower bounds. SampledAt is the MEASUREMENT time: when the worker's
+// size walk finished, as the worker reported it (clamped server-side to [now-24h, now+5m]; an older
+// worker that sends none gets the heartbeat's arrival time). It is what the 15-minute freshness
+// window is measured against. Nested in WorkerDTO.RunDisk.
 type WorkerRunDiskDTO struct {
 	RunID      string    `json:"run_id"`
 	HomeBytes  int64     `json:"home_bytes"`

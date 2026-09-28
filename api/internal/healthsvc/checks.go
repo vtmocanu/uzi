@@ -373,7 +373,7 @@ func (s *Service) checkFleetRunDisk(ctx context.Context, now time.Time, workers 
 	if lowInodes > 0 {
 		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Workers low on inodes", Value: fmt.Sprintf("%d", lowInodes)})
 	}
-	c.Action = strPtr("Check the largest run on each affected worker (uzi worker list) and cancel, finish or move it before the volume fills.")
+	c.Action = strPtr("Check the largest run on each affected worker (uzi admin workers, LARGEST RUN column) and cancel, finish or move it before the volume fills.")
 	return c
 }
 

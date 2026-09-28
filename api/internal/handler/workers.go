@@ -452,13 +452,14 @@ func overlayRunDisk(dto *apitypes.WorkerDTO, byWorker map[uuid.UUID][]apitypes.W
 }
 
 // overlayRunDiskSize sets a run DTO's home_bytes / cache_bytes / disk_truncated (PRD #1809 M6, D8)
-// from the freshest worker_run_disk row for the run, preferring its current worker's. No fresh row
-// leaves them absent; a query error is logged and also leaves them absent (display overlay).
+// from the fresh worker_run_disk row its CURRENT worker reported. A run with no current worker, or
+// no fresh row from that worker, leaves them absent: another worker's older report is never
+// substituted. A query error is logged and also leaves them absent (display overlay).
 func (h *Handler) overlayRunDiskSize(ctx context.Context, run store.Run, dto *apitypes.RunDTO) {
-	if h.q == nil {
+	if h.q == nil || !run.WorkerID.Valid {
 		return
 	}
-	row, err := h.q.GetRunDisk(ctx, store.GetRunDiskParams{RunID: run.ID, CurrentWorkerID: run.WorkerID})
+	row, err := h.q.GetRunDisk(ctx, store.GetRunDiskParams{RunID: run.ID, WorkerID: uuid.UUID(run.WorkerID.Bytes)})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
 			slog.Error("resolve run disk size", "run_id", run.ID, "error", err)

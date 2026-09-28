@@ -2130,12 +2130,15 @@ type WorkerStats struct {
 
 // RunDiskSample is one validated entry of a heartbeat's run_disk list (PRD #1809 M6, D8): the
 // run's HOME bytes and rebuildable-cache bytes on this worker, and whether the worker's size walk
-// was cut short (Truncated: both sizes are then lower bounds).
+// was cut short (Truncated: both sizes are then lower bounds). SampledAt is when the worker's
+// measurement finished, as the entry reported it; nil when the entry carried none (an older
+// worker), which ReplaceWorkerRunDisk stores as the database's now(). The store clamps it.
 type RunDiskSample struct {
 	RunID      uuid.UUID
 	HomeBytes  int64
 	CacheBytes int64
 	Truncated  bool
+	SampledAt  *time.Time
 }
 
 // Heartbeat refreshes liveness, overwrites the worker's latest resource sample (PRD
@@ -2295,9 +2298,11 @@ var checkpointDurabilityParks = map[string]bool{"limit_wait": true, "recovery_wa
 // Each park overwrites the value with what it carried, so the flag describes the LATEST park: a
 // report without the flag clears an older park's value to NULL ("not reported"). That clearing
 // write is skipped when the run has no stored value (owned, read before the transition), so a
-// worker that never reports the flag costs no extra statement. The flag is not cleared when the
-// run resumes; surfaces show it only while the run is parked. Best-effort and display-only: a
-// failed write is logged and never fails the report, and custody never reads it.
+// worker that never reports the flag costs no extra statement. The next claim (ClaimRun) or
+// running report (SetRunRunning) clears the flag too, so a later park that does not pass through
+// here (a server-side credential_disabled, completion-hold or wall park) reads "not reported"
+// rather than an older park's value. Best-effort and display-only: a failed write is logged and
+// never fails the report, and custody never reads it.
 func (s *Service) recordCheckpointDurability(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest) {
 	if !checkpointDurabilityParks[req.State] {
 		return
@@ -2347,12 +2352,19 @@ func (s *Service) replaceRunDisk(ctx context.Context, wkr store.Worker, stats *W
 		HomeBytes:  make([]int64, 0, n),
 		CacheBytes: make([]int64, 0, n),
 		Truncated:  make([]bool, 0, n),
+		SampledAt:  make([]pgtype.Timestamptz, 0, n),
 	}
 	for _, e := range stats.RunDisk {
 		arg.RunIds = append(arg.RunIds, e.RunID)
 		arg.HomeBytes = append(arg.HomeBytes, e.HomeBytes)
 		arg.CacheBytes = append(arg.CacheBytes, e.CacheBytes)
 		arg.Truncated = append(arg.Truncated, e.Truncated)
+		// A nil (not reported) measurement time is a NULL element, stored as now() by the query.
+		var at pgtype.Timestamptz
+		if e.SampledAt != nil {
+			at = pgtype.Timestamptz{Time: *e.SampledAt, Valid: true}
+		}
+		arg.SampledAt = append(arg.SampledAt, at)
 	}
 	if err := s.q.ReplaceWorkerRunDisk(ctx, arg); err != nil {
 		slog.Warn("heartbeat: store run disk sizes", "worker_id", wkr.ID.String(), "error", err)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -111,5 +112,40 @@ func TestParseWorkerStatsDataInodes(t *testing.T) {
 	}
 	if st.DiskDataInodes != nil || st.DiskDataTotalInodes != nil {
 		t.Fatalf("bad inode fields kept: %v / %v", st.DiskDataInodes, st.DiskDataTotalInodes)
+	}
+}
+
+// sampled_at is the measurement time: an RFC 3339 string is kept (in UTC), absent or null is nil
+// (an older worker; the store records now()), and a present but non-RFC-3339 value skips only that
+// entry, because a garbled time must not be stored as a fresh measurement.
+func TestParseWorkerStatsRunDiskSampledAt(t *testing.T) {
+	a, b, c, d, e := uuid.New(), uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	list := fmt.Sprintf(`[
+		{"run_id":%q,"home_bytes":1,"cache_bytes":0,"sampled_at":"2026-09-28T10:11:12Z"},
+		{"run_id":%q,"home_bytes":2,"cache_bytes":0},
+		{"run_id":%q,"home_bytes":3,"cache_bytes":0,"sampled_at":null},
+		{"run_id":%q,"home_bytes":4,"cache_bytes":0,"sampled_at":"yesterday"},
+		{"run_id":%q,"home_bytes":5,"cache_bytes":0,"sampled_at":1727517072}
+	]`, a, b, c, d, e)
+	raw, wid := parseStatsJSON(t, `,"run_disk":`+list)
+	st := parseWorkerStats(raw, wid)
+	if st == nil || len(st.RunDisk) != 3 {
+		t.Fatalf("RunDisk = %#v, want 3 entries (the two garbled sampled_at entries skipped)", st)
+	}
+	want := time.Date(2026, 9, 28, 10, 11, 12, 0, time.UTC)
+	if got := st.RunDisk[0]; got.RunID != a || got.SampledAt == nil || !got.SampledAt.Equal(want) || got.SampledAt.Location() != time.UTC {
+		t.Fatalf("entry 0 = %#v, want a sampled at %v UTC", got, want)
+	}
+	for i, id := range []uuid.UUID{b, c} {
+		if got := st.RunDisk[i+1]; got.RunID != id || got.SampledAt != nil {
+			t.Fatalf("entry %d = %#v, want run %s with no sampled_at (the store stamps now())", i+1, got, id)
+		}
+	}
+	// An offset form is RFC 3339 too and normalizes to UTC.
+	raw, wid = parseStatsJSON(t, fmt.Sprintf(`,"run_disk":[{"run_id":%q,"home_bytes":1,"cache_bytes":0,"sampled_at":"2026-09-28T12:11:12.5+02:00"}]`, a))
+	st = parseWorkerStats(raw, wid)
+	if st == nil || len(st.RunDisk) != 1 || st.RunDisk[0].SampledAt == nil ||
+		!st.RunDisk[0].SampledAt.Equal(want.Add(500*time.Millisecond)) || st.RunDisk[0].SampledAt.Location() != time.UTC {
+		t.Fatalf("offset sampled_at = %#v, want %v UTC", st, want.Add(500*time.Millisecond))
 	}
 }
