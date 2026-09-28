@@ -37,15 +37,18 @@ exists.**
 - **B) The live PVC** (the worker pod still exists) — bundle `REF` out of the bare clone
   per *Recovering a failed run's work from the worker PVC* above, then continue at step 3.
 - **C) The run's retained checkpoint or recovery ref** (PRD #1810: the branch checkpoint
-  ref while custody is open, or `refs/uzi-recovery/<RUN>` once superseded) — fetch it the
-  same way as the salvage ref below, then continue at step 3.
+  ref while custody is open, or `refs/uzi-recovery/<RUN>` once superseded) — fetch it
+  straight into `refs/heads/recover/STEM` the same way as the salvage ref below. There is
+  no bundle: skip steps 1-2 and step 3's bundle fetch, run only step 3's
+  `git worktree add` and `cd`, then continue at step 4.
 - **D) The worker's own tracking ref** (`REF` on the bare mirror, per *Recovering a
   failed run's work from the worker PVC* above) when the live clone (B) is gone but the
   bare mirror survives.
 - **E) The salvage ref** (`refs/uzi-salvage/<RUN>`, PRD #1867, `salvage_state: promoted`)
   — compare its tip against A-D before using it in preference to any of them;
-  `git fetch origin refs/uzi-salvage/<RUN>:refs/heads/recover/STEM` then continue at
-  step 3.
+  `git fetch origin refs/uzi-salvage/<RUN>:refs/heads/recover/STEM`, then, as for C,
+  skip steps 1-2 and step 3's bundle fetch, run only step 3's `git worktree add` and
+  `cd`, and continue at step 4.
 
 ## Steps
 
@@ -74,9 +77,11 @@ cd <the repo>                              # your normal checkout; work happens 
    ```sh
    git bundle verify "$BUNDLE"                # "…is okay"; names the ref + the required base
    ```
-3. **Fetch into a recovery branch + an ISOLATED worktree** (never `main`):
+3. **Fetch into a recovery branch + an ISOLATED worktree** (never `main`). The `git fetch`
+   line is for bundle sources (A, B, D) only; a direct-ref source (C, E) already fetched
+   `recover/STEM` and starts at `git worktree add`:
    ```sh
-   git fetch "$BUNDLE" "$FETCH_REF:refs/heads/recover/STEM"
+   git fetch "$BUNDLE" "$FETCH_REF:refs/heads/recover/STEM"   # bundle sources only
    git worktree add DIR recover/STEM
    cd DIR
    ```
