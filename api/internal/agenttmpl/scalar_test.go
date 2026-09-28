@@ -29,18 +29,21 @@ func TestRenderedDescriptionIsValidYAML(t *testing.T) {
 	for _, v := range []string{
 		"plain words", "has: colon space", "ends with:", "- leading dash", "tab #comment",
 		`He said "go": now`, `back\slash: yes`, `"starts quoted`, "it's fine", "'single' start",
+		// Values YAML would read as null, a bool, a number or a timestamp.
+		"null", "~", "true", "No", "on", "42", "0x1F", "3.5", "1e3", ".inf", "2026-09-28",
+		"3 roles", "yes please",
 	} {
 		raw := Render(Definition{Name: "x", Description: v, PromptBody: "body\n"})
 		fm := strings.SplitN(strings.TrimPrefix(string(raw), "---\n"), "\n---\n", 2)[0]
-		var got struct {
-			Description string `yaml:"description"`
-		}
+		// Decode into `any`, not a string field: yaml.v3 coerces a bool or a
+		// number into a string field, which would hide an unquoted `true`.
+		var got map[string]any
 		if err := yaml.Unmarshal([]byte(fm), &got); err != nil {
 			t.Errorf("%q: rendered frontmatter is not YAML: %v\n%s", v, err, fm)
 			continue
 		}
-		if got.Description != v {
-			t.Errorf("%q: YAML reads back %q", v, got.Description)
+		if s, ok := got["description"].(string); !ok || s != v {
+			t.Errorf("%q: YAML reads back %#v", v, got["description"])
 		}
 		if d, err := parse(raw); err != nil || d.Description != v {
 			t.Errorf("%q: parse gives %q (err %v)", v, d.Description, err)

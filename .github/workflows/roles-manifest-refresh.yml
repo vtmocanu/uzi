@@ -57,6 +57,9 @@ jobs:
           # No write credential on disk while the upstream release's sync.py runs:
           # the last step authenticates only its own push and gh calls.
           persist-credentials: false
+          # Full history: the branch-ownership check walks origin/main..branch and a
+          # three-dot diff, which a shallow clone cannot answer once main moves on.
+          fetch-depth: 0
 
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:
@@ -225,3 +228,21 @@ jobs:
 
           echo "PR creation failed; filing a tracking issue instead." >&2
           upsert_issue "${BODY}"
+
+      - name: Report a failed refresh
+        # The script or a step above failed before it could surface anything (a
+        # missing tool, an unreachable upstream, no stable tag): keep the drift signal.
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.ROLES_REFRESH_TOKEN || github.token }}
+        run: |
+          set -euo pipefail
+          LABEL="roles-manifest-refresh"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          gh label create "${LABEL}" \
+            --description "Upstream role-library drift detected by the weekly refresh" \
+            --color 1D76DB --force
+          if [ -z "$(gh issue list --state open --label "${LABEL}" --json number --jq '.[0].number // empty')" ]; then
+            gh issue create --title "Upstream role library: the weekly refresh needs a human" \
+              --label "${LABEL}" --body "The weekly roles-manifest-refresh run failed before it could sync or report. Run: ${RUN_URL}"
+          fi
