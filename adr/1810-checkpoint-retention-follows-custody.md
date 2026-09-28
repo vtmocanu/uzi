@@ -215,12 +215,14 @@ above.
   the moment its own `Publish` call started — so it took the unlocked
   live-run path rather than `publishTerminalLocked` — can still turn
   terminal (a concurrent cancel or completion) while that unlocked push is
-  still in flight. The window that remains is exactly: the run's push
-  lands *after* a supersession's recovery-ref create and *before* its
-  branch CAS-delete, and the run's `runs.checkpoint_tip` persist commits
-  *after* the supersession's post-delete list (`branchHeldByOwnPublish`)
-  has already run. In that ordering the list takes the branch ref's tip
-  for another run's publish, the record is marked `superseded`, and
+  still in flight. The window that remains: the run's push lands any
+  time *after* a supersession's recovery-ref create (before the branch
+  CAS-delete, or after it as a create from an absent ref), and its
+  `runs.checkpoint_tip` persist does not commit before the supersession's
+  post-delete list (`branchHeldByOwnPublish`) reads it — or the push lands
+  after that list entirely. Then the list takes the branch ref's tip for
+  another run's publish (or never sees it), the record ends `superseded`
+  (or `settling`) with its recovery ref set, and
   neither retention statement the run's own track runs
   (`TrackTerminalCheckpointPublish`, `AdvanceCheckpointRetentionTip`) moves
   a row for it, so the ref stays untracked and can block a new run on the
@@ -244,11 +246,13 @@ above.
   refuses the new run's push outright; its list is bounded (`LIMIT 10`)
   as well. This is not sweeper-only: once a record's backoff expires, the
   very next publish on the branch re-drives it inline through the same
-  `claimCheckpointSlot` path, no sweeper tick required. The residual is
-  narrower than "blocked until the sweeper runs" — it is blocked only
-  while the record is still within its backoff window, or until the old
-  run's holds all release and the sweeper's stuck-exit path
-  (`exitStuckSupersessionLocked`) clears the record outright.
+  `claimCheckpointSlot` path, no sweeper tick required. That frees the
+  new run only when the cause was transient (a forge error); a persistent
+  cause (the branch is not at the recorded tip, a recovery ref at another
+  tip) fails the re-drive the same way and restarts the backoff, so the
+  new run stays blocked until the old run's holds all release and the
+  sweeper's stuck-exit path (`exitStuckSupersessionLocked`) clears the
+  record.
 - **The live-settle ancestry proof (PRD #1349/#1751,
   `ReleasePredecessorCustodyHoldByLiveAncestry`) is unchanged.** It only
   runs against a *live* run's checkpoint or branch head, and a retention

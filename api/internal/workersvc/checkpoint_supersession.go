@@ -52,8 +52,9 @@ func (s *Service) supersessionWired() bool {
 //   - a LIVE run: each record is superseded (supersedeRetainedCheckpoint, under the record's own
 //     run's retention lock) and "" is returned only when every one freed the branch ref. A busy
 //     lock or slot, a supersession that did not free, or a record still in its retry backoff (a
-//     stopped supersession is not re-driven on every publish tick; the sweeper owns its retries)
-//     is "not_descendant": the push is refused and the worker retries on its next tick.
+//     stopped supersession is not re-driven on every publish tick, only once its backoff expires;
+//     the sweeper retries it too) is "not_descendant": the push is refused and the worker retries
+//     on its next tick.
 //
 // A list error is also "not_descendant": whether another run's record holds the slot is then
 // unknown, and pushing could fast-forward over a retained tip and leave its record stale, while

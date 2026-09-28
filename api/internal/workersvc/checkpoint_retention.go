@@ -518,7 +518,8 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 //     unchanged, the tip-lag advance of a retained/settling record naming the branch ref
 //     (AdvanceCheckpointRetentionTip).
 //
-// Both statements always run in that order, whatever terminal says: TrackTerminalCheckpointPublish
+// Neither statement is gated on terminal (the second runs only when the first matched no row):
+// TrackTerminalCheckpointPublish
 // reads the run's CURRENT status in SQL, so a run that turned terminal after Publish's top read is
 // tracked as terminal here. terminal (the status Publish read at its top) only gates the Warn below
 // and records how the publish was routed.
@@ -536,9 +537,10 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 //
 // Residual, logged not closed: that post-delete list reads runs.checkpoint_tip, which the late
 // publish persists (SetRunCheckpointTip, publishOutcome) only after its push lands. A push landing
-// between the supersession's recovery-ref create and its branch CAS-delete, with its tip persist
-// committing after the supersession's list read, is taken for another run's publish, and the record
-// is marked superseded. Neither statement here then moves it, and the ref stays untracked until an
+// any time after the supersession's recovery-ref create (after the branch CAS-delete too, as a
+// create from an absent ref) whose tip persist has not committed by the list read, or that lands
+// after the list, is taken for another run's publish or never seen, and the record ends superseded
+// (or settling) with its recovery ref set. Neither statement here then moves it, and the ref stays untracked until an
 // operator deletes it; the Warn is the only signal.
 //
 // Best-effort: a failure is logged and the publish still reports success (the ref already moved).
