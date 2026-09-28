@@ -23,7 +23,7 @@ import {
   type ScanRequest,
 } from "../src/run-quiescence.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
-import { scopedRealView, withQuiescenceView } from "./fake-proc.js";
+import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { RUN_ATTEMPT_ENV, registerWorkerRunnerRoot, workerSpawnNonce } from "../src/worker-spawn-mark.js";
 
 // issue #1783 review round — the hardening of the run-quiescence reaper: attribution of a
@@ -382,6 +382,55 @@ describe("A-helper-tmp: the uid-split TMPDIR setup runs mktemp/rm asynchronously
 });
 
 describe("A-helper: request on stdin, private TMPDIR, tsx cache off, one bounded verdict", () => {
+  it("serializes the solitary permission only for an explicit clear claim and empty registry under uid split", async () => {
+    const previous = process.env.UZI_UID_SPLIT;
+    process.env.UZI_UID_SPLIT = "1";
+    try {
+      const registry = new LiveAttemptRegistry();
+      const echo = `let b = ""; process.stdin.on("data", (c) => (b += c)); process.stdin.on("end", () => {
+        const r = JSON.parse(b);
+        process.stdout.write(JSON.stringify({ state: "quiescent", processes: [], killed: [], detail: String(r.mayKillUnreadableUnattributed) }) + "\\n");
+      });`;
+      const check = async (otherClaimInFlight?: boolean) => {
+        const r = await quiesceRunAttempt(
+          { mode: "own", attempt: undefined, cloneKey: KEY, targetPaths: [CLONE], processes: true,
+            dockerHost: undefined, registry, otherClaimInFlight },
+          { targetUid: RUNNER, reap: { viaHelper: true, spawnHelper: scriptHelper(echo), helperTmp: recordingTmp() } },
+        );
+        return r.process?.detail;
+      };
+      assert.equal(await check(false), "true");
+      assert.equal(await check(true), "false");
+      assert.equal(await check(), "false");
+      registry.add(newRunAttempt("run-other", 1, "/other", () => []));
+      assert.equal(await check(false), "false");
+    } finally {
+      if (previous === undefined) delete process.env.UZI_UID_SPLIT;
+      else process.env.UZI_UID_SPLIT = previous;
+    }
+  });
+
+  it("the actual serialized helper accepts omitted and boolean permission, rejecting wrong types", async () => {
+    const root = makeFakeProcRoot();
+    try {
+      for (const value of [undefined, false, true, "false", 1]) {
+        const request = fakeReq();
+        if (value !== undefined) (request as unknown as { mayKillUnreadableUnattributed: unknown }).mayKillUnreadableUnattributed = value;
+        const r = await withQuiescenceView({ procRoot: root }, () =>
+          reapRunProcesses(request, { viaHelper: true, helperTmp: recordingTmp() }),
+        );
+        if (typeof value === "string" || typeof value === "number") {
+          assert.equal(r.state, "unverified");
+          assert.equal(r.detail, "helper request invalid");
+        } else {
+          assert.equal(r.state, "quiescent", r.detail);
+        }
+      }
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("the request rides stdin (never argv), TMPDIR is a fresh private dir removed after, TSX_DISABLE_CACHE=1", async () => {
     const seen: { args?: string[]; env?: NodeJS.ProcessEnv } = {};
     // Echo the request's targetKey back as the verdict detail: proof the request arrived on stdin.

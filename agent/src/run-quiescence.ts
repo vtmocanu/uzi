@@ -444,6 +444,8 @@ export interface ScanRequest {
   ownMarker?: string;
   /** Markers of every OTHER live attempt on this worker. */
   liveMarkers: string[];
+  /** Explicit permission for solitary uid-split reaping; omission is false. */
+  mayKillUnreadableUnattributed?: boolean;
   /** Recorded roots (pid + start time) of every OTHER live attempt on this worker (Claude CLI
    *  groups, Codex provider supervisors), plus the long-lived runner-uid roots the worker itself
    *  launched. A root matches only while a live process has BOTH its pid and its start time. */
@@ -1300,6 +1302,8 @@ export interface QuiesceRunRequest {
   processes: boolean;
   dockerHost: string | undefined;
   registry: LiveAttemptRegistry;
+  /** Whether another claim is executing, including before it registers an attempt. */
+  otherClaimInFlight?: boolean;
   /** The runner site asking (e.g. `finalize`, `park:after_runner_git` for a re-proof after a
    *  runner-clone git): diagnostic only, the proof itself never reads it. */
   site?: string;
@@ -1330,6 +1334,7 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       targetPaths: req.targetPaths.map((p) => path.resolve(p)),
       ownMarker: req.attempt?.marker,
       liveMarkers: others.map((a) => a.marker),
+      mayKillUnreadableUnattributed: uidSplitActive() && req.otherClaimInFlight === false && others.length === 0,
       // Other live attempts' recorded roots (Claude CLI groups, Codex provider supervisors) plus
       // every long-lived runner-uid root this worker launched and recorded itself.
       liveRoots: [
@@ -1365,6 +1370,7 @@ function isScanRequest(v: unknown): v is ScanRequest {
     strings(o.targetPaths) &&
     (o.ownMarker === undefined || typeof o.ownMarker === "string") &&
     strings(o.liveMarkers) &&
+    (o.mayKillUnreadableUnattributed === undefined || typeof o.mayKillUnreadableUnattributed === "boolean") &&
     Array.isArray(o.liveRoots) &&
     o.liveRoots.every(
       (r) =>

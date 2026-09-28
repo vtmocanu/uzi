@@ -8517,6 +8517,7 @@ export class RunRunner {
           // Docker teardown already ran at the sink's first proof, and never blocks anyway.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
+          otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),
           site: opts.site,
         });
       } catch (err) {
