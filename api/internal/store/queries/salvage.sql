@@ -1,8 +1,9 @@
 -- PRD #1867 M2: the run_salvage lifecycle (migration 00264). The sweep enqueues failed,
 -- checkpoint-published runs, creates a run-scoped salvage ref at the recorded tip (never
--- touching the branch checkpoint ref, which #1810's retention owns), and later expires it. The live_run_id pointer (ON DELETE RESTRICT) is held
--- while a remote ref may exist and cleared when the row settles; the CHECKs in 00264 enforce
--- that, so every transition below that clears it is guarded on the source state.
+-- touching the branch checkpoint ref, which #1810's retention owns), and later expires it.
+-- The live_run_id pointer (ON DELETE RESTRICT) is held while a remote ref may exist and
+-- cleared when the row settles; the CHECKs in 00264 enforce that, so every transition below
+-- that clears it is guarded on the source state.
 
 -- name: ListSalvageCandidates :many
 -- Failed, checkpoint-eligible runs with a recorded checkpoint tip on an enabled forge kind,
@@ -67,9 +68,12 @@ SET expires_at = CASE WHEN salvage_created_at IS NULL THEN @expires_at::timestam
 WHERE run_id = @run_id::uuid AND state = 'pending';
 
 -- name: RecordSalvageAttemptFailed :execrows
--- A failed create attempt on a pending row: bump attempts and record the bounded error.
--- At the cap the row becomes 'failed' and drops its live pointer, but ONLY when no salvage
--- ref was created; a created salvage ref stays pending (and live) until it expires.
+-- A failed attempt on a pending row: bump attempts and record the bounded error. At the cap
+-- the row becomes 'failed' and drops its live pointer, but ONLY when no salvage ref was
+-- recorded; a recorded salvage ref stays pending (and live) until it expires. 'failed' means
+-- no salvage ref was recorded: the caller CAS-deleted an unrecorded one first, or gave up at
+-- its hard ceiling and named the possibly remaining ref in last_error. Callers may pass an
+-- uncapped attempt_cap (e.g. the int32 maximum) to count the attempt without ever settling.
 UPDATE run_salvage
 SET attempts = attempts + 1,
     last_error = left(@last_error::text, 512),

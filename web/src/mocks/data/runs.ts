@@ -1357,11 +1357,11 @@ export const mockRuns: Run[] = [
     mr_state: null,
     failure_reason: "run timed out after 2h0m0s (RUN_TIMEOUT)",
     // PRD #1867: a promoted salvage, so mock mode shows the Salvage panel's saved state
-    // with the fetch command. The ref id is UUID-shaped (the real ref is keyed by the run's
-    // UUID; mock run ids are slugs), because the panel offers the command only for a
-    // well-formed refs/uzi-salvage/<uuid> ref.
+    // with the fetch command. The ref names this run's own id (the server builds it from the
+    // run's UUID; mock run ids are slugs), because the panel shows the ref and the command
+    // only for refs/uzi-salvage/<this run's id>.
     salvage_state: "promoted",
-    salvage_ref: "refs/uzi-salvage/5f0c2a4e-8d1b-4c7a-9e3f-2b6d8a1c4e70",
+    salvage_ref: "refs/uzi-salvage/run-failed",
     salvage_tip: "9c41e07b2d5a8f3e61b0c7d94a2e5f18b3c6d0a7",
     salvage_expires_at: minsAhead(60 * 24 * 13),
     salvage_last_error: null,

@@ -3,6 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { act, cleanup, fireEvent, render, screen } from "@testing-library/react";
 import { SalvagePanel } from "./SalvagePanel";
 import type { Run } from "../lib/api";
+import { mockRuns } from "../mocks/data/runs";
 
 afterEach(() => {
   cleanup();
@@ -30,7 +31,7 @@ function promoted(over: Partial<Run> = {}): Run {
 }
 
 const heading = () => screen.queryByRole("heading", { name: "Salvage" });
-const copyButton = () => screen.queryByRole("button", { name: "Copy command" });
+const copyButton = () => screen.queryByRole("button", { name: "Copy fetch command" });
 
 describe("SalvagePanel per-state copy", () => {
   const cases: [string, string, string][] = [
@@ -41,7 +42,7 @@ describe("SalvagePanel per-state copy", () => {
       "Not saved",
     ],
     ["refused", "No copy saved: a different commit already holds this run's salvage ref.", "Not saved"],
-    ["failed", "No copy saved after repeated attempts", "Not saved"],
+    ["failed", "No copy saved after repeated attempts.", "Not saved"],
     ["skipped_secret", "Not saved: this run failed on a secret-scan block.", "Not saved"],
     ["expired", "The saved copy expired and was removed.", "Expired"],
     ["disabled", "Not saved: salvage was turned off for this forge before a copy was made.", "Off"],
@@ -97,6 +98,22 @@ describe("SalvagePanel per-state copy", () => {
     expect(screen.getByText("<b>503</b> from forge")).toBeTruthy();
   });
 
+  it.each(["pending", "promoted", "unavailable", "refused", "failed", "skipped_secret", "expired", "disabled"])(
+    "%s shows a non-null last error",
+    (state) => {
+      render(<SalvagePanel run={promoted({ salvage_state: state, salvage_last_error: "forge 503 on delete" })} />);
+      expect(screen.getByText(state === "pending" ? "Last attempt:" : "Last error:", { exact: false })).toBeTruthy();
+      expect(screen.getByText("forge 503 on delete")).toBeTruthy();
+    },
+  );
+
+  it("shows no error line when the last error is null or blank", () => {
+    const { rerender } = render(<SalvagePanel run={promoted({ salvage_last_error: null })} />);
+    expect(screen.queryByText("Last error:", { exact: false })).toBeNull();
+    rerender(<SalvagePanel run={promoted({ salvage_state: "failed", salvage_last_error: "  " })} />);
+    expect(screen.queryByText("Last error:", { exact: false })).toBeNull();
+  });
+
   it("an unknown future state renders nothing, while a known one renders the panel", () => {
     const { rerender } = render(<SalvagePanel run={aRun({ salvage_state: "failed" })} />);
     expect(heading()).not.toBeNull();
@@ -146,15 +163,36 @@ describe("SalvagePanel fetch command", () => {
     ["an uppercase id", `refs/uzi-salvage/${RUN_UUID.toUpperCase()}`],
     ["a short id", "refs/uzi-salvage/5f0c2a4e"],
     ["a foreign namespace", `refs/uzi-checkpoint/${RUN_UUID}`],
+    ["the branch checkpoint ref", "refs/uzi-checkpoints/agent/issue-7"],
+    ["the run's recovery ref", `refs/uzi-recovery/${RUN_UUID}`],
+    ["another run's salvage ref", "refs/uzi-salvage/0b7e9d21-4c3a-4f5e-8a6b-1d2c3e4f5a6b"],
     ["a trailing shell payload", `${GOOD_REF}; rm -rf ~`],
     ["an embedded newline", `${GOOD_REF}\n`],
-  ])("withholds the command for %s but still shows the ref", (_label, ref) => {
-    render(<SalvagePanel run={promoted({ salvage_ref: ref })} />);
+  ])("withholds both the command and the ref row for %s", (_label, ref) => {
+    const { container } = render(<SalvagePanel run={promoted({ salvage_ref: ref })} />);
     // Positive control: the promoted panel and its details did render.
     expect(screen.getByText("Checkpointed commits saved")).toBeTruthy();
     expect(screen.getByText(TIP.slice(0, 12))).toBeTruthy();
     expect(copyButton()).toBeNull();
     expect(screen.queryByText(/^git fetch origin/)).toBeNull();
+    expect(screen.queryByText("Ref:", { exact: false })).toBeNull();
+    const text = container.textContent ?? "";
+    expect(text).not.toContain(ref.trim());
+    expect(text).not.toMatch(/uzi-checkpoints|uzi-recovery/);
+  });
+
+  it("shows the ref and command for the run's own id whatever its shape (mock slug ids)", () => {
+    render(<SalvagePanel run={promoted({ id: "run-failed", salvage_ref: "refs/uzi-salvage/run-failed" })} />);
+    expect(screen.getByText("refs/uzi-salvage/run-failed")).toBeTruthy();
+    expect(screen.getByText("git fetch origin refs/uzi-salvage/run-failed")).toBeTruthy();
+    expect(copyButton()).not.toBeNull();
+  });
+
+  it("the promoted mock run shows its own salvage ref and fetch command", () => {
+    const mock = mockRuns.find((r) => r.id === "run-failed");
+    expect(mock?.salvage_state).toBe("promoted");
+    render(<SalvagePanel run={mock!} />);
+    expect(screen.getByText(`git fetch origin refs/uzi-salvage/${mock!.id}`)).toBeTruthy();
   });
 
   it("withholds the command on a non-promoted state even with a well-formed ref", () => {

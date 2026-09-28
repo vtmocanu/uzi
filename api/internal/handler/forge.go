@@ -970,7 +970,7 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 	// PRD #1867 M2: a failed run's live salvage row holds live_run_id (ON DELETE RESTRICT)
 	// while its salvage copy is being made or exists on the forge; the runs.repo_id cascade
 	// would error on it. Refuse with a 409 naming the salvage refs and pending runs until the
-	// copies expire or the pending ones settle.
+	// copies expire or a pending copy ends without being kept.
 	salvage, err := h.q.CountLiveSalvageForRepo(r.Context(), store.CountLiveSalvageForRepoParams{RepoID: id, UserID: user.ID})
 	if err != nil {
 		slog.Error("count salvage refs for repo delete", "error", err)
@@ -1101,7 +1101,7 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 	}
 	httpx.JSON(w, http.StatusConflict, map[string]any{
 		"error": fmt.Sprintf("this %s has live salvage copies, made or still being made, of the last published checkpoints of %d failed run(s)%s; "+
-			"the block lifts when the copies expire, or when a pending copy settles, so remove the %s after that", what, count, named, what),
+			"the block lifts when each copy expires, or when a pending copy ends without being kept, so remove the %s after that", what, count, named, what),
 		"salvage_refs":         refs,
 		"salvage_pending_runs": pending,
 		"salvage_count":        count,

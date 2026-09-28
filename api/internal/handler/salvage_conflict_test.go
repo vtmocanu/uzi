@@ -80,7 +80,7 @@ func TestWriteSalvageConflict(t *testing.T) {
 		"run " + p.String() + ", copy pending; ",
 		"run " + cp.String() + ", copy pending at refs/uzi-salvage/" + cp.String(),
 		"; and 4 more run(s))",
-		"the block lifts when the copies expire, or when a pending copy settles, so remove the repo after that",
+		"the block lifts when each copy expires, or when a pending copy ends without being kept, so remove the repo after that",
 	} {
 		if !strings.Contains(b.Error, want) {
 			t.Errorf("message %q lacks %q", b.Error, want)

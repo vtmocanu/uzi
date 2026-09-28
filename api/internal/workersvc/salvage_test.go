@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
@@ -195,15 +196,26 @@ func (b *salvageBroker) create(ctx context.Context, o pushbroker.CreateSalvageRe
 	return res, err
 }
 
-func (b *salvageBroker) delete(_ context.Context, o pushbroker.DeleteRefOptions) error {
+// delete fails with ctx's error once ctx is done (as a real network call would), and
+// panics for a run in panicOn.
+func (b *salvageBroker) delete(ctx context.Context, o pushbroker.DeleteRefOptions) error {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	if !strings.HasPrefix(o.Ref, "refs/uzi-salvage/") {
 		b.t.Errorf("DeleteRef called with %q; salvage may only delete refs/uzi-salvage/*", o.Ref)
 	}
+	id := strings.TrimPrefix(o.Ref, "refs/uzi-salvage/")
 	b.deletes = append(b.deletes, o)
-	b.order = append(b.order, "delete:"+strings.TrimPrefix(o.Ref, "refs/uzi-salvage/"))
-	return b.deleteErr
+	b.order = append(b.order, "delete:"+id)
+	boom := b.panicOn[uuid.MustParse(id)]
+	err := b.deleteErr
+	b.mu.Unlock()
+	if boom {
+		panic("go-git nil deref deleting " + id + " via " + o.PAT)
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	return err
 }
 
 // newSalvageSvc wires a Service for SweepSalvage: an open SSRF gate for the fake forge, a
@@ -552,25 +564,26 @@ func TestSweepSalvageUnrecordedCreateThenRollback(t *testing.T) {
 }
 
 // TestSweepSalvageAttemptCapCleansUpFirst: the attempt that would reach the cap (and so
-// settle 'failed', dropping the live pointer) first CAS-deletes the run's salvage ref at the
-// tip; the cap applies only once that succeeds. A failed cleanup records the attempt
-// uncapped with both errors; an attempt below the cap makes no delete.
+// settle 'failed', dropping the live pointer) makes NO create: it only CAS-deletes the
+// run's salvage ref at the tip, and the cap applies only once that succeeds. A failed
+// cleanup records the attempt uncapped with the cleanup error and the previous error; an
+// attempt below the cap creates and makes no delete.
 func TestSweepSalvageAttemptCapCleansUpFirst(t *testing.T) {
 	for _, tc := range []struct {
 		name      string
 		attempts  int32
 		deleteErr error
-		wantDel   int
 		wantCap   int32
 	}{
-		{"below cap", salvageAttemptCap - 2, nil, 0, salvageAttemptCap},
-		{"at cap, cleanup ok", salvageAttemptCap - 1, nil, 1, salvageAttemptCap},
-		{"past cap, cleanup ok", salvageAttemptCap + 3, nil, 1, salvageAttemptCap},
-		{"at cap, cleanup fails", salvageAttemptCap - 1, errors.New("https://uzi-bot:" + salvagePATok + "@x: 503"), 1, salvageNoCap},
+		{"below cap", salvageAttemptCap - 2, nil, salvageAttemptCap},
+		{"at cap, cleanup ok", salvageAttemptCap - 1, nil, salvageAttemptCap},
+		{"past cap, cleanup ok", salvageAttemptCap + 3, nil, salvageAttemptCap},
+		{"at cap, cleanup fails", salvageAttemptCap - 1, errors.New("https://uzi-bot:" + salvagePATok + "@x: 503"), salvageNoCap},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			row := pendingSalvageRow("github")
 			row.Attempts = tc.attempts
+			row.LastError = pgtype.Text{String: "create: 500", Valid: true}
 			fs := &salvageStore{duePending: []store.RunSalvage{row}}
 			svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
 			b.createErr[row.RunID] = errors.New("create: 500")
@@ -578,14 +591,15 @@ func TestSweepSalvageAttemptCapCleansUpFirst(t *testing.T) {
 			if _, err := svc.SweepSalvage(context.Background()); err != nil {
 				t.Fatalf("SweepSalvage: %v", err)
 			}
-			if len(b.deletes) != tc.wantDel {
-				t.Fatalf("deletes = %d, want %d", len(b.deletes), tc.wantDel)
+			wantOrder := "create:" + row.RunID.String()
+			if tc.attempts+1 >= salvageAttemptCap {
+				wantOrder = "delete:" + row.RunID.String()
+				if b.deletes[0].Ref != pushbroker.SalvageRef(row.RunID) || b.deletes[0].ExpectedOldTip != row.Tip {
+					t.Errorf("delete = %+v, want the run's salvage ref at the tip", b.deletes[0])
+				}
 			}
-			if tc.wantDel == 1 && (b.deletes[0].Ref != pushbroker.SalvageRef(row.RunID) || b.deletes[0].ExpectedOldTip != row.Tip) {
-				t.Errorf("delete = %+v, want the run's salvage ref at the tip", b.deletes[0])
-			}
-			if strings.Join(b.order, " ") != "create:"+row.RunID.String()+strings.Repeat(" delete:"+row.RunID.String(), tc.wantDel) {
-				t.Errorf("broker order = %v, want the create, then any cleanup delete", b.order)
+			if strings.Join(b.order, " ") != wantOrder {
+				t.Fatalf("broker order = %v, want %s (a capping attempt never creates)", b.order, wantOrder)
 			}
 			if len(fs.attempts) != 1 || fs.attempts[0].AttemptCap != tc.wantCap {
 				t.Fatalf("attempts = %+v, want one with cap %d", fs.attempts, tc.wantCap)
@@ -601,6 +615,165 @@ func TestSweepSalvageAttemptCapCleansUpFirst(t *testing.T) {
 				t.Errorf("settled = %+v, want none", fs.settled)
 			}
 		})
+	}
+}
+
+// TestSweepSalvageCapFiresDespiteBlockingCreate is the timeout probe: a create that
+// blocks until the pass budget is spent must not keep a row at attempts = cap-1 from
+// capping. The capping attempt makes no create, so its cleanup runs on a live budget
+// and the capped failure is written on the first pass.
+func TestSweepSalvageCapFiresDespiteBlockingCreate(t *testing.T) {
+	row := pendingSalvageRow("github")
+	row.Attempts = salvageAttemptCap - 1
+	fs := &salvageStore{duePending: []store.RunSalvage{row}}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	svc.salvagePassBudget = 50 * time.Millisecond
+	b.block = true
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("SweepSalvage: %v", err)
+	}
+	if len(b.creates) != 0 || len(b.deletes) != 1 {
+		t.Fatalf("creates=%d deletes=%d, want 0/1: the capping attempt only cleans up", len(b.creates), len(b.deletes))
+	}
+	if len(fs.attempts) != 1 || fs.attempts[0].AttemptCap != salvageAttemptCap {
+		t.Fatalf("attempts = %+v, want one capped attempt", fs.attempts)
+	}
+}
+
+// TestSweepSalvageBackoffPastCap: a row with no recorded salvage ref at or past the cap is
+// retried only once its updated_at is salvageRetryBackoff old; backed-off rows make no
+// broker call and no write, and do not take the item budget from due rows.
+func TestSweepSalvageBackoffPastCap(t *testing.T) {
+	backedOff := func(age time.Duration) store.RunSalvage {
+		r := pendingSalvageRow("github")
+		r.Attempts = salvageAttemptCap + 2
+		r.UpdatedAt = pgtype.Timestamptz{Time: salvageNow.Add(-age), Valid: true}
+		return r
+	}
+	var rows []store.RunSalvage
+	for range salvageMaxItems + 2 {
+		rows = append(rows, backedOff(30*time.Minute))
+	}
+	due := backedOff(salvageRetryBackoff)                               // exactly 1h old: due
+	below := pendingSalvageRow("github")                                // below the cap: never backed off
+	below.UpdatedAt = pgtype.Timestamptz{Time: salvageNow, Valid: true} // touched just now
+	half := backedOff(time.Minute)                                      // a recorded ref is never backed off
+	half.SalvageCreatedAt = pgtype.Timestamptz{Time: salvageNow.Add(-time.Hour), Valid: true}
+	half.ExpiresAt = pgtype.Timestamptz{Time: salvageNow.Add(time.Hour), Valid: true}
+	rows = append(rows, due, below, half)
+
+	fs := &salvageStore{duePending: rows}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	b.result[below.RunID] = pushbroker.SalvageUnavailable
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("SweepSalvage: %v", err)
+	}
+	want := "delete:" + due.RunID.String() + " create:" + below.RunID.String()
+	if got := strings.Join(b.order, " "); got != want {
+		t.Fatalf("broker order = %s, want %s (backed-off rows skipped without using the budget)", got, want)
+	}
+	if len(fs.attempts) != 1 || fs.attempts[0].RunID != due.RunID {
+		t.Errorf("attempts = %+v, want only the due row's", fs.attempts)
+	}
+	if len(fs.promoted) != 1 || fs.promoted[0].RunID != half.RunID {
+		t.Errorf("promoted = %+v, want the half-promoted row finished despite its attempts", fs.promoted)
+	}
+	if fs.pendingParams[0].Lim != salvagePendingScanLimit {
+		t.Errorf("pending scan limit = %d, want %d", fs.pendingParams[0].Lim, salvagePendingScanLimit)
+	}
+}
+
+// TestSweepSalvageHardCeilingGivesUp: at salvageHardCeiling attempts a pending row with
+// no recorded salvage ref is settled 'failed' through RecordSalvageAttemptFailed with the
+// normal cap and NO forge call (not even the claim context), and last_error names the
+// possibly orphaned ref and its tip. This holds on an enabled and on a rolled-back forge;
+// one attempt below the ceiling still runs the cleanup.
+func TestSweepSalvageHardCeilingGivesUp(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		forges   []string
+		attempts int32
+		giveUp   bool
+	}{
+		{"enabled, at ceiling", []string{"github"}, salvageHardCeiling, true},
+		{"rolled back, at ceiling", nil, salvageHardCeiling, true},
+		{"enabled, past ceiling", []string{"github"}, salvageHardCeiling + 4, true},
+		{"enabled, below ceiling", []string{"github"}, salvageHardCeiling - 1, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			row := pendingSalvageRow("github")
+			row.Attempts = tc.attempts
+			row.UpdatedAt = pgtype.Timestamptz{Time: salvageNow.Add(-2 * salvageRetryBackoff), Valid: true}
+			fs := &salvageStore{duePending: []store.RunSalvage{row}}
+			svc, b := newSalvageSvc(t, fs, tc.forges, 168*time.Hour)
+			b.deleteErr = errors.New("401 bad credentials")
+			if _, err := svc.SweepSalvage(context.Background()); err != nil {
+				t.Fatalf("SweepSalvage: %v", err)
+			}
+			if len(fs.attempts) != 1 || len(fs.settled) != 0 {
+				t.Fatalf("attempts=%+v settled=%+v, want one attempt write and no settle", fs.attempts, fs.settled)
+			}
+			a := fs.attempts[0]
+			if !tc.giveUp {
+				if len(b.deletes) != 1 || a.AttemptCap != salvageNoCap {
+					t.Fatalf("below ceiling: deletes=%d cap=%d, want the cleanup retried uncapped", len(b.deletes), a.AttemptCap)
+				}
+				return
+			}
+			if len(b.creates)+len(b.deletes) != 0 || fs.claimCalls != 0 {
+				t.Fatalf("give-up made forge work: creates=%d deletes=%d claim=%d", len(b.creates), len(b.deletes), fs.claimCalls)
+			}
+			if a.AttemptCap != salvageAttemptCap {
+				t.Errorf("give-up cap = %d, want the normal cap %d (which settles 'failed' and clears the pointer)", a.AttemptCap, salvageAttemptCap)
+			}
+			want := fmt.Sprintf("gave up after %d attempts; refs/uzi-salvage/%s may remain on the forge at %s and can be deleted by hand",
+				tc.attempts, row.RunID, row.Tip)
+			if a.LastError != want {
+				t.Errorf("last_error = %q, want %q", a.LastError, want)
+			}
+		})
+	}
+}
+
+// TestSweepSalvageDeadRemoteIsBounded simulates a permanently dead remote (the claim
+// context never resolves) against a store that applies each attempt write, on the default
+// 15s sweep tick. The row must settle within the hard ceiling, making at most one
+// claim-context read per attempt and about 20 hourly attempts past the cap.
+func TestSweepSalvageDeadRemoteIsBounded(t *testing.T) {
+	row := pendingSalvageRow("github")
+	row.UpdatedAt = pgtype.Timestamptz{Time: salvageNow, Valid: true}
+	fs := &salvageStore{claimErr: errors.New("401 bad credentials")}
+	svc, _ := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	clock := salvageNow
+	svc.now = func() time.Time { return clock }
+	settled := false
+	var passes int
+	for passes = 0; passes < 100_000 && !settled; passes++ {
+		fs.duePending = []store.RunSalvage{row}
+		fs.attempts = nil
+		if _, err := svc.SweepSalvage(context.Background()); err != nil {
+			t.Fatalf("pass %d: %v", passes, err)
+		}
+		if len(fs.attempts) == 1 {
+			a := fs.attempts[0]
+			row.Attempts++
+			row.UpdatedAt = pgtype.Timestamptz{Time: clock, Valid: true}
+			row.LastError = pgtype.Text{String: a.LastError, Valid: true}
+			settled = row.Attempts >= a.AttemptCap
+		}
+		clock = clock.Add(15 * time.Second)
+	}
+	if !settled {
+		t.Fatalf("row still pending after %d passes (attempts %d)", passes, row.Attempts)
+	}
+	if row.Attempts != salvageHardCeiling+1 || fs.claimCalls != salvageHardCeiling {
+		t.Errorf("attempts=%d claim reads=%d, want %d/%d", row.Attempts, fs.claimCalls, salvageHardCeiling+1, salvageHardCeiling)
+	}
+	// About 20 hourly retries past the cap: never faster (the backoff held), never much slower.
+	el := clock.Sub(salvageNow)
+	if lo, hi := time.Duration(salvageHardCeiling-salvageAttemptCap)*salvageRetryBackoff,
+		time.Duration(salvageHardCeiling-salvageAttemptCap+2)*salvageRetryBackoff; el < lo || el > hi {
+		t.Errorf("settled after %v, want between %v and %v (hourly retries past the cap)", el, lo, hi)
 	}
 }
 
@@ -753,8 +926,8 @@ func TestSweepSalvageRoundRobinAtMostFive(t *testing.T) {
 	if strings.Join(b.order, " ") != strings.Join(want, " ") {
 		t.Fatalf("broker order =\n  %v\nwant\n  %v", b.order, want)
 	}
-	if fs.expiryParams[0].Lim != salvageMaxItems || fs.pendingParams[0].Lim != salvageMaxItems {
-		t.Errorf("due-list limits = (%d, %d), want %d each", fs.expiryParams[0].Lim, fs.pendingParams[0].Lim, salvageMaxItems)
+	if fs.expiryParams[0].Lim != salvageMaxItems || fs.pendingParams[0].Lim != salvagePendingScanLimit {
+		t.Errorf("due-list limits = (%d, %d), want (%d, %d)", fs.expiryParams[0].Lim, fs.pendingParams[0].Lim, salvageMaxItems, salvagePendingScanLimit)
 	}
 }
 
@@ -857,6 +1030,54 @@ func TestSweepSalvagePanicIsRecoveredPerItem(t *testing.T) {
 	}
 }
 
+// TestSweepSalvagePanicAtCapStaysUncapped: a panic in the capping attempt's cleanup
+// (attempts = cap-1) is recorded with salvageNoCap, so the row is neither capped nor
+// settled while its orphan cleanup is unproven.
+func TestSweepSalvagePanicAtCapStaysUncapped(t *testing.T) {
+	row := pendingSalvageRow("github")
+	row.Attempts = salvageAttemptCap - 1
+	fs := &salvageStore{duePending: []store.RunSalvage{row}}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	b.panicOn[row.RunID] = true
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("SweepSalvage: %v", err)
+	}
+	if len(b.deletes) != 1 || len(b.creates) != 0 {
+		t.Fatalf("deletes=%d creates=%d, want the panicking cleanup only", len(b.deletes), len(b.creates))
+	}
+	if len(fs.attempts) != 1 || fs.attempts[0].AttemptCap != salvageNoCap || !strings.Contains(fs.attempts[0].LastError, "panic") {
+		t.Fatalf("attempts = %+v, want one uncapped panic attempt", fs.attempts)
+	}
+	if strings.Contains(fs.attempts[0].LastError, salvagePATok) {
+		t.Errorf("panic last_error carries the PAT: %q", fs.attempts[0].LastError)
+	}
+	if len(fs.settled)+len(fs.expireFailed)+len(fs.promoted) != 0 {
+		t.Errorf("settled=%+v expireFailed=%d promoted=%d, want nothing settled", fs.settled, len(fs.expireFailed), len(fs.promoted))
+	}
+}
+
+// TestSweepSalvageExpiryPanicUsesExpiryRecorder: a panic in an expiry item is recorded
+// through RecordSalvageExpireFailed (the row keeps its state and pointer), never through
+// the pending-attempt recorder, which would not match a promoted row.
+func TestSweepSalvageExpiryPanicUsesExpiryRecorder(t *testing.T) {
+	row := promotedSalvageRow("github")
+	fs := &salvageStore{dueExpiry: []store.RunSalvage{row}}
+	svc, b := newSalvageSvc(t, fs, []string{"github"}, 168*time.Hour)
+	b.panicOn[row.RunID] = true
+	if _, err := svc.SweepSalvage(context.Background()); err != nil {
+		t.Fatalf("SweepSalvage: %v", err)
+	}
+	if len(fs.expireFailed) != 1 || fs.expireFailed[0].RunID != row.RunID || !strings.Contains(fs.expireFailed[0].LastError, "panic") {
+		t.Fatalf("expireFailed = %+v, want the panic recorded as an expiry failure", fs.expireFailed)
+	}
+	if strings.Contains(fs.expireFailed[0].LastError, salvagePATok) {
+		t.Errorf("panic last_error carries the PAT: %q", fs.expireFailed[0].LastError)
+	}
+	if len(fs.attempts)+len(fs.settled) != 0 {
+		t.Errorf("attempts=%+v settled=%+v, want neither", fs.attempts, fs.settled)
+	}
+}
+
 // TestSweepSalvageErrorBounded: a huge broker error is cut to 512 runes before it is
 // persisted.
 func TestSweepSalvageErrorBounded(t *testing.T) {
@@ -911,6 +1132,38 @@ func TestSalvageErrTextSanitizes(t *testing.T) {
 		}
 		check(t, fs.attempts[0].LastError)
 	})
+}
+
+// TestSalvageErrTextSanitizesBeforeScrub: a credential split by a character the sanitizer
+// drops (NUL, a bidi control) is rejoined BEFORE the PAT replace and secretscrub run, so it
+// comes out redacted instead of being reassembled after them. The fixtures are built from
+// fragments, never a full token literal.
+func TestSalvageErrTextSanitizesBeforeScrub(t *testing.T) {
+	head, tail := "abcdefghij", "KLMNOPQRSTUVWXYZ0123456789"
+	for _, tc := range []struct {
+		name, in string
+		gone     []string
+	}{
+		{"classic token split by NUL", "push failed: token=" + "ghp_" + head + "\x00" + tail + " rejected", []string{head + tail, tail}},
+		{"classic token split by RLO", "push failed: token=" + "ghp_" + head + "\u202E" + tail, []string{head + tail, tail}},
+		{"item PAT split by NUL", "auth " + salvagePATok[:9] + "\x00" + salvagePATok[9:] + " denied", []string{salvagePATok, salvagePATok[9:]}},
+		{"item PAT split by LRI", "auth " + salvagePATok[:9] + "\u2066" + salvagePATok[9:], []string{salvagePATok, salvagePATok[9:]}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := salvageErrText(errors.New(tc.in), salvagePATok)
+			for _, g := range tc.gone {
+				if strings.Contains(got, g) {
+					t.Errorf("%q survived in %q", g, got)
+				}
+			}
+			if !strings.Contains(got, "push failed") && !strings.Contains(got, "auth") {
+				t.Errorf("lost the surrounding text: %q", got)
+			}
+		})
+	}
+	if got := salvageErrText(errors.New("a\u2028b\u2029c"), ""); got != "a b c" {
+		t.Errorf("line/paragraph separators = %q, want %q", got, "a b c")
+	}
 }
 
 // TestSweepSalvageDueListErrorIsReturned: a DB error reading the due lists is returned.

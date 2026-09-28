@@ -20,10 +20,13 @@ import { BranchIcon } from "./icons";
 // Every salvage_* field is server-supplied; salvage_last_error is a bounded, scrubbed forge
 // error. All of them render as escaped plain text through stripUnsafeChars, never Markdown.
 
-// The only ref shape the fetch command is offered for. Anything else (an empty, truncated or
-// unexpected value) shows no command, so the panel never hands an operator a malformed or
-// foreign ref to paste into a shell.
-const SALVAGE_REF_RE = /^refs\/uzi-salvage\/[0-9a-f-]{36}$/;
+// The ref row and the fetch command are shown only when salvage_ref is exactly
+// refs/uzi-salvage/<this run's id>, as the CLI does (salvageRefFor). Anything else (an empty,
+// truncated, foreign-namespace or other run's ref) shows neither, so the panel never names a
+// ref salvage does not own or hands an operator a foreign ref to paste into a shell. The
+// charset check keeps even an unexpected run id from putting a shell metacharacter or a line
+// break into the command.
+const SALVAGE_REF_SAFE_RE = /^refs\/uzi-salvage\/[A-Za-z0-9-]+$/;
 
 type StateView = { badge: string; tone: BadgeTone; lead: string };
 
@@ -49,7 +52,7 @@ const STATE_VIEWS: Record<string, StateView> = {
   failed: {
     badge: "Not saved",
     tone: "danger",
-    lead: "No copy saved after repeated attempts",
+    lead: "No copy saved after repeated attempts.",
   },
   skipped_secret: {
     badge: "Not saved",
@@ -60,9 +63,12 @@ const STATE_VIEWS: Record<string, StateView> = {
   disabled: { badge: "Off", tone: "neutral", lead: "Not saved: salvage was turned off for this forge before a copy was made." },
 };
 
-// isWellFormedSalvageRef gates the copyable fetch command.
-function isWellFormedSalvageRef(ref: string | null | undefined): ref is string {
-  return typeof ref === "string" && SALVAGE_REF_RE.test(ref);
+// ownSalvageRef returns the run's salvage ref when it is exactly refs/uzi-salvage/<run.id>,
+// null otherwise. It gates both the Ref row and the fetch command.
+function ownSalvageRef(run: Run): string | null {
+  const ref = run.salvage_ref;
+  if (typeof ref !== "string" || ref !== `refs/uzi-salvage/${run.id}`) return null;
+  return SALVAGE_REF_SAFE_RE.test(ref) ? ref : null;
 }
 
 export function SalvagePanel({ run }: { run: Run }) {
@@ -76,7 +82,9 @@ export function SalvagePanel({ run }: { run: Run }) {
 
 function SalvageCard({ run, state, view }: { run: Run; state: string; view: StateView }) {
   const lastError = run.salvage_last_error?.trim() ? stripUnsafeChars(run.salvage_last_error) : null;
-  const showError = lastError !== null && (state === "pending" || state === "failed");
+  // Shown in every state that carries one, as the CLI does (a promoted copy can carry an
+  // expiry-delete error, for instance).
+  const showError = lastError !== null;
 
   return (
     <Card id="salvage" className="scroll-mt-20 space-y-3 p-4">
@@ -106,7 +114,7 @@ function SalvageCard({ run, state, view }: { run: Run; state: string; view: Stat
 
 function PromotedDetails({ run }: { run: Run }) {
   const now = useNow(60_000);
-  const ref = run.salvage_ref ? stripUnsafeChars(run.salvage_ref) : null;
+  const ref = ownSalvageRef(run);
   const tip = run.salvage_tip ? stripUnsafeChars(shortSha(run.salvage_tip)) : null;
   const expiresAt = run.salvage_expires_at ?? null;
   const expiresMs = expiresAt ? Date.parse(expiresAt) : NaN;
@@ -114,9 +122,7 @@ function PromotedDetails({ run }: { run: Run }) {
     ? new Date(expiresMs).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" })
     : null;
   const expiresIn = formatCountdown(expiresAt, now);
-  const fetchCommand = isWellFormedSalvageRef(run.salvage_ref)
-    ? `git fetch origin ${run.salvage_ref}`
-    : null;
+  const fetchCommand = ref ? `git fetch origin ${ref}` : null;
 
   return (
     <>
@@ -173,7 +179,7 @@ function FetchCommand({ command }: { command: string }) {
           {command}
         </code>
         <Button variant="secondary" size="sm" onClick={copy}>
-          {copied ? "Copied" : "Copy command"}
+          {copied ? "Copied" : "Copy fetch command"}
         </Button>
       </div>
       <span role="status" aria-live="polite" className="sr-only">

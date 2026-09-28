@@ -44,9 +44,24 @@ const (
 	// salvageEnqueueLimit bounds the candidate rows one pass records.
 	salvageEnqueueLimit = 50
 	// salvageAttemptCap: a pending row with no RECORDED salvage ref becomes 'failed' at this
-	// many failed attempts (RecordSalvageAttemptFailed), but only once the cap-reaching
-	// attempt's orphan cleanup (deleteUnrecordedSalvage) has succeeded.
+	// many failed attempts (RecordSalvageAttemptFailed). The cap-reaching attempt makes no
+	// create: it runs only the orphan cleanup (deleteUnrecordedSalvage), on the full pass
+	// budget, and caps the row only once that cleanup has succeeded.
 	salvageAttemptCap = 10
+	// salvageRetryBackoff: a pending row with no recorded salvage ref that is already at or
+	// past salvageAttemptCap (its cleanup keeps failing) is retried at most once per this
+	// interval, measured from its updated_at.
+	salvageRetryBackoff = time.Hour
+	// salvageHardCeiling: a pending row with no recorded salvage ref that reaches this many
+	// attempts is settled 'failed' WITHOUT the cleanup, so a permanently dead remote (a
+	// revoked PAT, a changed box key, a host dropped from the allowlist, a deleted repo) can
+	// neither hold the RESTRICT pointer nor spend forge calls forever. last_error and an
+	// error log name the salvage ref that may remain on the forge.
+	salvageHardCeiling = 3 * salvageAttemptCap
+	// salvagePendingScanLimit bounds the pending rows one pass reads. Rows inside their
+	// salvageRetryBackoff are filtered out in Go before the salvageMaxItems budget is
+	// applied, so a backlog of backed-off rows does not starve the due ones.
+	salvagePendingScanLimit = 50
 	// salvageNoCap is the cap passed to RecordSalvageAttemptFailed when an attempt must be
 	// counted and its error recorded WITHOUT settling the row 'failed': the orphan cleanup
 	// failed (or a panic interrupted the item), so the row stays pending and live and the
@@ -92,9 +107,13 @@ const (
 //     Expiry runs whatever SalvageForges says: a promoted row on a forge that has since
 //     left the list is simply left to this normal expiry, which keeps its bounded
 //     retention and needs no second delete path.
-//     - pending, forge enabled: CreateSalvageRef; created records the creation and
-//     expiry and marks the row promoted, unavailable/refused settle, anything else
-//     (including an SSRF, claim-context or PAT failure) counts a failed attempt.
+//     - pending, forge enabled, below the cap: CreateSalvageRef; created records the
+//     creation and expiry and marks the row promoted, unavailable/refused settle, anything
+//     else (including an SSRF, claim-context or PAT failure) counts a failed attempt.
+//     - pending, forge enabled, the attempt that reaches salvageAttemptCap: NO create. It
+//     runs only the orphan cleanup (deleteUnrecordedSalvage) and records the capped
+//     failure ('failed') once that succeeds, so a create that burns the pass budget can
+//     never starve the cleanup of the attempt meant to cap the row.
 //     - pending, forge no longer enabled (a rollback): CAS-deletes any unrecorded salvage
 //     ref (deleteUnrecordedSalvage), then settles 'disabled'. 'disabled' is reached ONLY
 //     from a pending row with no recorded salvage ref; a promoted (or half-promoted) row
@@ -108,15 +127,25 @@ const (
 // that settles such a row without a create ('disabled', and 'failed' at the attempt cap)
 // does so blind: each first CAS-deletes refs/uzi-salvage/<run-id> at the recorded tip
 // (absent is success) and settles only once that succeeds. A failed cleanup is recorded
-// as an uncapped attempt (last_error set, row still pending and live) and retried next
-// pass, so an orphan is never forgotten and a stuck row is never silent.
+// as an uncapped attempt (last_error set, row still pending and live) and retried, so an
+// orphan is not forgotten and a stuck row is never silent.
 //
-// Every persisted or logged error is secretscrub-scrubbed, stripped of control and bidi
-// characters and cut to 512 runes. A panic in one item is recovered, logged and counted
-// as that item's failed attempt; a panic never caps a pending row (it cannot run the
-// orphan cleanup), so a row that keeps panicking stays pending with the panic in
-// last_error. DB errors are logged and returned joined; the sweeper logs them and
-// carries on.
+// That retry is bounded. Once a row with no recorded salvage ref is at or past
+// salvageAttemptCap it is retried only when its updated_at is at least
+// salvageRetryBackoff (1h) old; backed-off rows are skipped before the per-pass item
+// budget. At salvageHardCeiling (3x the cap) attempts the row is settled 'failed' with no
+// further forge call, which clears the RESTRICT pointer; last_error and an error log name
+// refs/uzi-salvage/<run-id> and its tip as possibly left on the forge for manual
+// deletion. So a permanently dead remote costs at most about 20 extra hourly attempts
+// past the cap before the row stops blocking run, repo and connection removal.
+//
+// Every persisted or logged error is stripped of control, bidi and line-separator
+// characters and invalid UTF-8, then has the item's exact PAT replaced, is
+// secretscrub-scrubbed, and is cut to 512 runes. A panic in one item is recovered,
+// logged and counted as that item's failed attempt; a panic never caps a pending row (it
+// cannot have finished the orphan cleanup), so a row that keeps panicking stays pending
+// with the panic in last_error until the backoff and hard ceiling settle it. DB errors
+// are logged and returned joined; the sweeper logs them and carries on.
 func (s *Service) SweepSalvage(ctx context.Context) (int64, error) {
 	budget := s.salvagePassBudget
 	if budget <= 0 {
@@ -201,10 +230,16 @@ func (s *Service) processSalvage(ctx context.Context, now time.Time) (int64, err
 		slog.Error("salvage: list due expiry", "error", err)
 		return 0, fmt.Errorf("salvage: list due expiry: %w", err)
 	}
-	pending, err := s.q.ListSalvageDuePending(ctx, store.ListSalvageDuePendingParams{Now: salvageTS(now), Lim: salvageMaxItems})
+	scanned, err := s.q.ListSalvageDuePending(ctx, store.ListSalvageDuePendingParams{Now: salvageTS(now), Lim: salvagePendingScanLimit})
 	if err != nil {
 		slog.Error("salvage: list due pending", "error", err)
 		return 0, fmt.Errorf("salvage: list due pending: %w", err)
+	}
+	pending := make([]store.RunSalvage, 0, len(scanned))
+	for _, row := range scanned {
+		if !salvageBackedOff(row, now) {
+			pending = append(pending, row)
+		}
 	}
 
 	var touched int64
@@ -221,6 +256,15 @@ func (s *Service) processSalvage(ctx context.Context, now time.Time) (int64, err
 		}
 	}
 	return touched, errors.Join(errs...)
+}
+
+// salvageBackedOff reports a pending row that must wait: no salvage ref recorded, at or
+// past salvageAttemptCap (its cap-reaching cleanup kept failing), and touched less than
+// salvageRetryBackoff ago. A row with a recorded salvage ref is never backed off (its
+// only pending step is MarkSalvagePromoted).
+func salvageBackedOff(row store.RunSalvage, now time.Time) bool {
+	return !row.SalvageCreatedAt.Valid && row.Attempts >= salvageAttemptCap &&
+		row.UpdatedAt.Valid && row.UpdatedAt.Time.After(now.Add(-salvageRetryBackoff))
 }
 
 // roundRobinSalvage alternates expiry and pending rows (expiry first), at most limit.
@@ -266,6 +310,9 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		defer cancel()
 		return s.q.MarkSalvagePromoted(wctx, store.MarkSalvagePromotedParams{PromotedAt: salvageTS(now), RunID: row.RunID})
 	}
+	if row.Attempts >= salvageHardCeiling {
+		return s.giveUpSalvage(ctx, row)
+	}
 	if !slices.Contains(s.p.SalvageForges, row.ForgeType) {
 		// Rollback: the forge left UZI_SALVAGE_FORGES before this row's salvage ref was
 		// recorded. 'disabled' is reached only here, from pending with no recorded salvage
@@ -278,10 +325,13 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		}
 		return s.settleSalvage(ctx, row.RunID, salvageStateDisabled)
 	}
+	if row.Attempts+1 >= salvageAttemptCap {
+		return s.capPendingSalvage(ctx, row, pat)
+	}
 
 	remote, err := s.salvageRemote(ctx, row.RunID)
 	if err != nil {
-		return s.recordPendingFailure(ctx, row, salvageErrText(err, ""), pat)
+		return s.recordSalvageAttempt(ctx, row, salvageErrText(err, ""), salvageAttemptCap)
 	}
 	*pat = remote.pat
 	res, berr := s.createSalvageFn(ctx, pushbroker.CreateSalvageRefOptions{
@@ -316,7 +366,9 @@ func (s *Service) advancePendingSalvage(ctx context.Context, row store.RunSalvag
 		if berr == nil {
 			berr = fmt.Errorf("salvage: create returned %v", res)
 		}
-		return s.recordPendingFailure(ctx, row, salvageErrText(berr, remote.pat), pat)
+		// Below the cap by construction (the cap-reaching attempt never creates), so this
+		// write only counts the attempt.
+		return s.recordSalvageAttempt(ctx, row, salvageErrText(berr, remote.pat), salvageAttemptCap)
 	}
 }
 
@@ -375,19 +427,40 @@ func salvageWriteCtx(ctx context.Context) (context.Context, context.CancelFunc) 
 	return context.WithTimeout(context.WithoutCancel(ctx), salvageWriteTimeout)
 }
 
-// recordPendingFailure records msg (already scrubbed and bounded) as a failed create
-// attempt on a pending row. When this attempt would reach salvageAttemptCap (and so settle
-// the row 'failed', clearing its live pointer), it first runs deleteUnrecordedSalvage: the
-// cap applies only once that cleanup succeeds. If the cleanup fails, the attempt is
-// recorded uncapped with the cleanup error leading last_error, and the next pass retries.
-func (s *Service) recordPendingFailure(ctx context.Context, row store.RunSalvage, msg string, pat *string) (int64, error) {
-	if row.Attempts+1 < salvageAttemptCap {
-		return s.recordSalvageAttempt(ctx, row, msg, salvageAttemptCap)
+// capPendingSalvage is the attempt that reaches salvageAttemptCap on a pending row with no
+// recorded salvage ref. It makes NO create: a create could burn the pass budget and leave
+// the cleanup a done context, so the row would never cap. It runs only
+// deleteUnrecordedSalvage, then records the capped failure (the row settles 'failed' and
+// drops its live pointer), keeping the previous last_error. If the cleanup fails, the
+// attempt is recorded uncapped with the cleanup error leading last_error; the row stays
+// pending and is retried under salvageRetryBackoff until salvageHardCeiling.
+func (s *Service) capPendingSalvage(ctx context.Context, row store.RunSalvage, pat *string) (int64, error) {
+	prev := ""
+	if row.LastError.Valid {
+		prev = row.LastError.String
 	}
 	if derr := s.deleteUnrecordedSalvage(ctx, row, pat); derr != nil {
-		msg = salvageErrText(fmt.Errorf("attempt cap deferred: %w; last attempt: %s", derr, msg), *pat)
+		msg := salvageErrText(fmt.Errorf("attempt cap deferred: %w; last attempt: %s", derr, prev), *pat)
 		return s.recordSalvageAttempt(ctx, row, msg, salvageNoCap)
 	}
+	msg := salvageErrText(fmt.Errorf("gave up at the attempt cap (%d); last attempt: %s", salvageAttemptCap, prev), *pat)
+	return s.recordSalvageAttempt(ctx, row, msg, salvageAttemptCap)
+}
+
+// giveUpSalvage settles a pending row with no recorded salvage ref that reached
+// salvageHardCeiling: its cleanup never succeeded (the remote is unreachable, or its
+// credentials or allowlisting are gone), so it is settled 'failed' with NO forge call.
+// RecordSalvageAttemptFailed with the normal salvageAttemptCap does that (attempts+1 is
+// past the cap and salvage_created_at is NULL, so state becomes 'failed' and live_run_id
+// NULL, which every run_salvage CHECK allows for an uncreated row). A salvage ref created
+// but never recorded may remain, so it is named in last_error and logged at error level
+// for manual deletion.
+func (s *Service) giveUpSalvage(ctx context.Context, row store.RunSalvage) (int64, error) {
+	ref := pushbroker.SalvageRef(row.RunID)
+	slog.Error("salvage: gave up at the hard ceiling; the salvage ref may be orphaned on the forge",
+		"run", row.RunID, "ref", ref, "tip", row.Tip, "attempts", row.Attempts)
+	msg := truncateRunes(fmt.Sprintf("gave up after %d attempts; %s may remain on the forge at %s and can be deleted by hand",
+		row.Attempts, ref, row.Tip), salvageErrMaxRunes)
 	return s.recordSalvageAttempt(ctx, row, msg, salvageAttemptCap)
 }
 
@@ -446,27 +519,29 @@ func (s *Service) salvageRemote(ctx context.Context, runID uuid.UUID) (salvageRe
 	return salvageRemoteInfo{cloneURL: cloneURL, username: rc.BotUsername, pat: string(pat)}, nil
 }
 
-// salvageErrText makes err safe for a log or last_error: the exact PAT this item used
-// (when known) is replaced first, since a forge PAT need not match any shape
-// secretscrub knows, then secretscrub removes every known credential shape, then
-// sanitizeSalvageText drops terminal and bidi payloads and invalid UTF-8, then the text
-// is cut to salvageErrMaxRunes.
+// salvageErrText makes err safe for a log or last_error, in this order:
+// sanitizeSalvageText first (dropping control and bidi characters and invalid UTF-8), so a
+// credential split by a dropped character is rejoined BEFORE the redaction passes see it;
+// then the exact PAT this item used (when known) is replaced, since a forge PAT need not
+// match any shape secretscrub knows; then secretscrub removes every known credential
+// shape; then the text is cut to salvageErrMaxRunes.
 func salvageErrText(err error, pat string) string {
-	msg := err.Error()
+	msg := sanitizeSalvageText(err.Error())
 	if pat != "" {
 		msg = strings.ReplaceAll(msg, pat, "[redacted]")
 	}
-	return truncateRunes(sanitizeSalvageText(secretscrub.Scrub(msg)), salvageErrMaxRunes)
+	return truncateRunes(secretscrub.Scrub(msg), salvageErrMaxRunes)
 }
 
-// sanitizeSalvageText replaces invalid UTF-8 with U+FFFD, turns tab/CR/LF into a space and
-// drops every other C0/C1 control character (NUL and ESC included) and every Unicode bidi
-// control, so a forge-supplied error can carry neither a terminal escape sequence, a
-// bidi-reordering payload, nor bytes Postgres rejects (NUL, invalid UTF-8) into last_error.
+// sanitizeSalvageText replaces invalid UTF-8 with U+FFFD, turns tab/CR/LF and the Unicode
+// line and paragraph separators (U+2028, U+2029) into a space, and drops every other C0/C1
+// control character (NUL and ESC included) and every Unicode bidi control, so a
+// forge-supplied error can carry neither a terminal escape sequence, a bidi-reordering
+// payload, a line break, nor bytes Postgres rejects (NUL, invalid UTF-8) into last_error.
 func sanitizeSalvageText(s string) string {
 	return strings.Map(func(r rune) rune {
 		switch {
-		case r == '\t' || r == '\n' || r == '\r':
+		case r == '\t' || r == '\n' || r == '\r', r == '\u2028', r == '\u2029':
 			return ' '
 		case unicode.IsControl(r), isBidiControl(r):
 			return -1

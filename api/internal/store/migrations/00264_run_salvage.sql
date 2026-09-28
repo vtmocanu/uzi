@@ -22,8 +22,9 @@
 -- record of a public ref. Settling the row clears the pointer, which lifts the restriction.
 -- The pointer tracks only the salvage ref: the branch checkpoint ref is #1810's, whatever
 -- the row's state. A created salvage ref settles only as 'expired' or 'disabled', both
--- after it is CAS-deleted or confirmed absent. 'unavailable', 'refused' and 'failed' (the
--- attempt cap was reached first) created no salvage ref.
+-- after it is CAS-deleted or confirmed absent. 'unavailable' and 'refused' created no salvage
+-- ref. 'failed' means no salvage ref was recorded: an unrecorded one was CAS-deleted first,
+-- or the hard ceiling gave up and names it in last_error.
 --
 -- The repo-removal and forge-connection-removal handlers turn that restriction into an
 -- owner-facing 409 naming the refs, and map a 23503 on this constraint (a sweep inserting a
@@ -58,7 +59,8 @@ CREATE TABLE run_salvage (
         'promoted',       -- a salvage copy was created (the name is historical)
         'unavailable',    -- no source ref was at the recorded tip; nothing created
         'refused',        -- a salvage ref already existed at another tip; never overwritten
-        'failed',         -- the create gave up after the attempt cap; nothing created
+        'failed',         -- no salvage ref was recorded: an unrecorded one was CAS-deleted
+                          -- first, or the hard ceiling gave up and names it in last_error
         'skipped_secret', -- fail_origin push_secret_blocked: never salvaged
         'expired',        -- the salvage ref was CAS-deleted (or confirmed absent)
         'disabled'        -- the forge was taken off UZI_SALVAGE_FORGES before the create
