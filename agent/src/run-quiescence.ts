@@ -746,7 +746,8 @@ function unverifiedWhy(reason: string): string {
  * A process-chosen comm rendered as a double-quoted string for {@link unverifiedDetail}: sanitized
  * (control and bidi code points become `?`, capped at 64 characters plus `...`), then `"` and `\`
  * backslash-escaped, so no comm can close its own quotes and add text that reads as another
- * `pid N` entry of the detail. At most 2 + 2 x 64 + 3 = 133 characters (every character a `"`).
+ * `pid N` entry. That holds for the FIRST entry, which always ends within the 160-character cap;
+ * a later entry may be cut mid-quote by that cap, which a real (15-byte) comm never reaches. At most 2 + 2 x 64 + 3 = 133 characters (every character a `"`).
  */
 function quotedComm(comm: string): string {
   let out = "";

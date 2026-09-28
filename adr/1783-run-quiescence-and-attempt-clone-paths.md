@@ -441,7 +441,8 @@ clears the moment no such process remains.
 `handleRecoveryExhausted`'s capture retry used to retry a blocked quiescence
 proof forever — this is what could hang a test run driving the same code
 path. It is now bounded: after `RECOVERY_CAPTURE_BLOCKED_ATTEMPTS` (5)
-CONSECUTIVE captures whose proof blocked (roughly 30 s at the defaults), the
+CONSECUTIVE captures whose proof blocked (roughly 30 s at the defaults, about
+40 s on the vault-locked park), the
 run fails with the typed `fail_origin` `worker_residue_blocked`, the clone
 and session kept for inspection. Any capture outcome that is not a blocked
 proof resets the count. Shutdown and cancellation still take precedence over
