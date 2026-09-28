@@ -5522,12 +5522,14 @@ func (s *Service) pushCheckpoint(ctx context.Context, push *checkpointPush) erro
 }
 
 // publishOutcome maps the broker's result to Publish's response. On success it persists the tip
-// and tracks the run's retention record; settle reports that the record now owes a settle, which
-// the caller dispatches (SettleRetainedCheckpoint) once no retention lock of the run is held. The
-// successful push's attempt row is removed only once its tip is persisted and tracked; otherwise
-// the sweeper's attempts arm reconciles it.
+// and tracks the run's retention record, both compare-and-set on what the push observed
+// immediately before its forge call (push.base); settle reports that the record now owes a settle,
+// which the caller dispatches (SettleRetainedCheckpoint) once no retention lock of the run is
+// held. The successful push's attempt row is removed only once its tip is persisted and tracked;
+// otherwise (a write failed, or found a newer value and moved nothing) the publish is UNTRACKED
+// and the sweeper's attempts arm reconciles the row.
 func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, terminal bool, tipOid string, err error) (res PublishResult, settle bool, _ error) {
-	runID, branch, ref := push.runID, push.branch, push.ref
+	ref := push.ref
 	switch {
 	case errors.Is(err, errPushRefused):
 		// No forge call was made (the live pre-push budget elapsed, or the attempt could not be
@@ -5540,18 +5542,12 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// terminal-time retention record (checkpoint_retentions.tip) binds its CAS writes
 		// to. Persist is best-effort — a failure must NOT fail the publish, since the ref
 		// is already advanced on the forge.
-		_, perr := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
-			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
-			ID:            runID,
-		})
-		if perr != nil {
-			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", perr)
-		}
+		persisted := s.persistPublishedTip(ctx, push, tipOid)
 		// PRD #1810: the run's retention record follows the ref to the tip just published
 		// (trackPublishedCheckpoint). Best-effort like the persist above.
 		var tracked bool
-		settle, tracked = s.trackPublishedCheckpoint(ctx, runID, terminal, branch, ref, tipOid)
-		if perr == nil && tracked {
+		settle, tracked = s.trackPublishedCheckpoint(ctx, push, terminal, tipOid)
+		if persisted && tracked {
 			s.clearPublishAttempt(ctx, push.landed)
 		}
 		return PublishResult{Published: true, Ref: ref}, settle, nil
@@ -5583,6 +5579,40 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// downstream — flattening the %w chain to a scrubbed string is safe here.
 		return PublishResult{}, false, fmt.Errorf("publish: %s", secretscrub.Scrub(err.Error()))
 	}
+}
+
+// persistPublishedTip records a successful push's tip on runs.checkpoint_tip and reports whether
+// it did. With the push's base observed (retention wired) the write is compare-and-set on the
+// runs.checkpoint_tip the push read immediately before its forge call (SetRunCheckpointTipIf): a
+// live-routed publish holds no retention lock and its write may arrive after a newer publish, or
+// the sweeper's attempts arm re-recording a newer late push, persisted a newer tip, which it must
+// not move backwards. A write that moves no row is logged and reported false, so the caller keeps
+// the push's attempt row for the arm.
+func (s *Service) persistPublishedTip(ctx context.Context, push *checkpointPush, tipOid string) bool {
+	runID := push.runID
+	if !push.base.observed {
+		if _, err := s.q.SetRunCheckpointTip(ctx, store.SetRunCheckpointTipParams{
+			CheckpointTip: pgtype.Text{String: tipOid, Valid: true},
+			ID:            runID,
+		}); err != nil {
+			slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
+			return false
+		}
+		return true
+	}
+	n, err := s.q.SetRunCheckpointTipIf(ctx, store.SetRunCheckpointTipIfParams{
+		CheckpointTip: tipOid, ID: runID, ExpectedTip: push.base.runTip,
+	})
+	if err != nil {
+		slog.Warn("checkpoint: persist tip", "run", runID, "tip", tipOid, "error", err)
+		return false
+	}
+	if n == 0 {
+		slog.Warn("checkpoint: runs.checkpoint_tip moved since this push was sent; not overwritten, the push is left to "+
+			"the sweeper's publish-attempt reconciliation", "run", runID, "tip", tipOid, "observed", push.base.runTip.String)
+		return false
+	}
+	return true
 }
 
 // forgeHostFromURL reduces a URL (here the clone URL, repo_web_url + ".git") to the

@@ -199,12 +199,18 @@ WHERE checkpoint_retentions.run_id = @run_id
 -- the branch ref to the tip just published, so a later CAS delete or supersession binds to
 -- the tip origin actually holds. Only retained/settling records naming exactly that ref move;
 -- a superseding/superseded record has already bound its recovery ref to its recorded tip.
+-- Compare-and-set on what the publish observed immediately before its forge call, exactly as
+-- TrackTerminalCheckpointPublish (see there): a record another writer moved since is never moved
+-- backwards by a publish whose writes arrive late.
 UPDATE checkpoint_retentions
 SET tip = @tip::text,
     updated_at = now()
 WHERE run_id = @run_id
   AND ref = @ref::text
-  AND state IN ('retained', 'settling');
+  AND state IN ('retained', 'settling')
+  AND (tip = @tip::text
+       OR tip = sqlc.narg(expected_tip)::text
+       OR (sqlc.narg(expected_tip)::text IS NULL AND tip = sqlc.narg(expected_run_tip)::text));
 
 -- name: ListCheckpointRetentionsForBranch :many
 -- D2 (M3): the OTHER runs' active records still holding a branch's checkpoint slot (`ref` is the
@@ -409,6 +415,18 @@ WHERE checkpoint_retentions.run_id = @run_id
 -- is returned. Publish refuses such a run before its forge call; this guard is the backstop.
 -- The terminal-status predicate is on the SELECT, so for a live run nothing is proposed and the
 -- ON CONFLICT arm cannot fire either: a live run's record is never reopened.
+--
+-- COMPARE-AND-SET (PRD #1810 D2, residual 2): the conflict arm moves an existing record only when
+-- its tip is what the publish observed immediately before its forge call (expected_tip; NULL: no
+-- record was observed), or is already the published tip. A publish routed LIVE writes without the
+-- run's retention lock, and its writes may arrive long after its push landed: by then a newer
+-- publish, or the sweeper's attempts arm re-recording a newer late push, may have moved the record,
+-- and an unconditional write would move it BACKWARDS to a tip origin no longer carries. When no
+-- record was observed, the record may since have been inserted by the run's terminal transaction
+-- from runs.checkpoint_tip (migration 00265), so a record at the runs.checkpoint_tip the publish
+-- observed (expected_run_tip) also matches: that tip predates this push. The insert arm (no record
+-- at all) is unconditional. No row moved: the caller treats the publish as untracked and keeps its
+-- attempt row for the sweeper.
 -- Returns the record's state after the statement; no row when nothing moved.
 INSERT INTO checkpoint_retentions (run_id, user_id, repo_id, branch, tip, ref, state)
 SELECT r.id, r.user_id, r.repo_id, @branch::text, @tip::text, @ref::text,
@@ -437,6 +455,10 @@ SET tip = EXCLUDED.tip,
 WHERE checkpoint_retentions.recovery_ref IS NULL
   AND checkpoint_retentions.ref = EXCLUDED.ref
   AND checkpoint_retentions.state IN ('retained', 'settling', 'deleted', 'abandoned')
+  AND (checkpoint_retentions.tip = EXCLUDED.tip
+       OR checkpoint_retentions.tip = sqlc.narg(expected_tip)::text
+       OR (sqlc.narg(expected_tip)::text IS NULL
+           AND checkpoint_retentions.tip = sqlc.narg(expected_run_tip)::text))
 RETURNING checkpoint_retentions.state;
 
 -- name: GetRunCheckpointTipForRetention :one
@@ -538,9 +560,10 @@ WHERE checkpoint_retentions.recovery_ref IS NULL
 RETURNING checkpoint_retentions.state;
 
 -- name: SetRunCheckpointTipIf :execrows
--- The attempts arm's persist of a late-landed tip: SetRunCheckpointTip, but COMPARE-AND-SET on
--- the runs.checkpoint_tip the arm observed before it listed origin (NULL: none was persisted). A
--- newer publish persisted meanwhile moves nothing here, so the tip never moves backwards.
+-- SetRunCheckpointTip, but COMPARE-AND-SET on the runs.checkpoint_tip the writer observed (NULL:
+-- none was persisted): Publish's persist (observed immediately before its forge call) and the
+-- attempts arm's persist of a late-landed tip (observed before it listed origin). A newer tip
+-- persisted meanwhile moves nothing here, so the tip never moves backwards.
 UPDATE runs SET checkpoint_tip = @checkpoint_tip::text, checkpoint_tip_at = now()
 WHERE id = @id
   AND checkpoint_tip IS NOT DISTINCT FROM sqlc.narg(expected_tip)::text;

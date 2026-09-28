@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
@@ -77,57 +76,84 @@ func (f *supersedeFix) handOnSlot(t *testing.T, branchTip string) {
 
 // TestReconcileNeverMovesTipBackwardsLiveDB (review B1): the old run's attempt at lateTip landed
 // with an unknown outcome. While the attempts arm is listing origin (after it saw lateTip), a NEWER
-// publish of the run, routed while the run was live and so without the retention lock, lands,
-// persists and tracks newerTip. The arm's re-record is compare-and-set on what it read before the
-// list, so it moves nothing: the record and runs.checkpoint_tip stay at the newer tip.
+// publish of the run, routed while the run was live and so without the retention lock, lands
+// newerTip and makes some of its writes. The arm's re-record is compare-and-set on what it read
+// before the list, in one transaction, so it moves nothing: the record and runs.checkpoint_tip keep
+// whatever the newer publish wrote, and the row is deferred.
+//
+// The subtests separate the two guards and the transaction: when the newer publish persists
+// runs.checkpoint_tip WITHOUT tracking the record, only the run-tip guard stops the arm, and the
+// record move it already made must roll back; when it tracks the record WITHOUT persisting the run
+// tip, only the record guard stops it.
 func TestReconcileNeverMovesTipBackwardsLiveDB(t *testing.T) {
-	f, oldGate, oldOut := newInFlightFix(t, true)
-	close(oldGate.release)
-	if o := recvPublish(t, oldOut); o.err == nil {
-		t.Fatalf("old run's timed-out publish = %+v, want an error", o.res)
+	cases := []struct {
+		name           string
+		persist, track bool
+		wantRunTip     string
+		wantRecordTip  string
+	}{
+		{"the newer publish persists and tracks", true, true, newerTip, newerTip},
+		{"the newer publish persists runs.checkpoint_tip only", true, false, newerTip, retentionTestTip},
+		{"the newer publish tracks the record only", false, true, retentionTestTip, newerTip},
 	}
-	if !f.forge.land(f.branchRef, oldGate.fetched, lateTip) {
-		t.Fatal("setup: the late landing was refused")
-	}
-	var once sync.Once
-	f.svc1.SetListRefTipsFn(func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
-		tips, err := f.forge.listRefTips(ctx, o, refs...)
-		once.Do(func() {
-			if !f.forge.land(f.branchRef, lateTip, newerTip) {
-				t.Error("the newer publish did not land")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, oldGate, oldOut := newInFlightFix(t, true)
+			close(oldGate.release)
+			if o := recvPublish(t, oldOut); o.err == nil {
+				t.Fatalf("old run's timed-out publish = %+v, want an error", o.res)
 			}
-			// What publishOutcome does after that push returned success.
-			if _, err := f.e.q.SetRunCheckpointTip(f.e.ctx, store.SetRunCheckpointTipParams{
-				CheckpointTip: pgtype.Text{String: newerTip, Valid: true}, ID: f.oldRun,
-			}); err != nil {
-				t.Errorf("persist the newer tip: %v", err)
+			if !f.forge.land(f.branchRef, oldGate.fetched, lateTip) {
+				t.Fatal("setup: the late landing was refused")
 			}
-			if _, tracked := f.svc2.trackPublishedCheckpoint(f.e.ctx, f.oldRun, false, f.branch, f.branchRef, newerTip); !tracked {
-				t.Error("the newer publish was not tracked")
+			var once sync.Once
+			f.svc1.SetListRefTipsFn(func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error) {
+				tips, err := f.forge.listRefTips(ctx, o, refs...)
+				once.Do(func() {
+					// The newer publish: its base read before its forge call, then its writes, as
+					// publishOutcome makes them after that push returned success.
+					push := &checkpointPush{s: f.svc2, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+					if err := push.observePublishBase(f.e.ctx); err != nil {
+						t.Errorf("observe the newer publish's base: %v", err)
+					}
+					if !f.forge.land(f.branchRef, lateTip, newerTip) {
+						t.Error("the newer publish did not land")
+					}
+					if tc.persist && !f.svc2.persistPublishedTip(f.e.ctx, push, newerTip) {
+						t.Error("the newer tip was not persisted")
+					}
+					if tc.track {
+						if _, tracked := f.svc2.trackPublishedCheckpoint(f.e.ctx, push, false, newerTip); !tracked {
+							t.Error("the newer publish was not tracked")
+						}
+					}
+				})
+				return tips, err
+			})
+
+			f.reconcileAttempts(t, f.svc1)
+			if r := f.row(t); r.Tip != tc.wantRecordTip || r.State != retentionRetained {
+				t.Fatalf("record = {state %q tip %s}, want retained at %s (never moved backwards, never half-written)",
+					r.State, r.Tip, tc.wantRecordTip)
+			}
+			if tip, err := f.e.q.GetRunCheckpointTipForRetention(f.e.ctx, f.oldRun); err != nil || tip.String != tc.wantRunTip {
+				t.Fatalf("runs.checkpoint_tip = %q (err %v), want %s (never moved backwards, never half-written)",
+					tip.String, err, tc.wantRunTip)
+			}
+			if tip, _ := f.forge.ref(f.branchRef); tip != newerTip {
+				t.Fatalf("branch ref = %q, want the newer tip", tip)
+			}
+			if n := f.attemptCount(t, f.oldRun); n != 1 {
+				t.Fatalf("attempt rows = %d, want 1 (deferred and re-checked, never written over the newer publish)", n)
+			}
+
+			// The re-check sees origin past the attempted tip: nothing to do, the record stays.
+			f.e.exec(t, `UPDATE checkpoint_publish_attempts SET next_check_at = now() WHERE run_id = $1`, f.oldRun)
+			f.reconcileAttempts(t, f.svc1)
+			if r := f.row(t); r.Tip != tc.wantRecordTip {
+				t.Fatalf("record tip = %s after the re-check, want %s", r.Tip, tc.wantRecordTip)
 			}
 		})
-		return tips, err
-	})
-
-	f.reconcileAttempts(t, f.svc1)
-	if r := f.row(t); r.Tip != newerTip || r.State != retentionRetained {
-		t.Fatalf("record = {state %q tip %s}, want retained at the NEWER tip (never moved backwards)", r.State, r.Tip)
-	}
-	if tip, err := f.e.q.GetRunCheckpointTipForRetention(f.e.ctx, f.oldRun); err != nil || tip.String != newerTip {
-		t.Fatalf("runs.checkpoint_tip = %q (err %v), want the NEWER tip", tip.String, err)
-	}
-	if tip, _ := f.forge.ref(f.branchRef); tip != newerTip {
-		t.Fatalf("branch ref = %q, want the newer tip", tip)
-	}
-	if n := f.attemptCount(t, f.oldRun); n != 1 {
-		t.Fatalf("attempt rows = %d, want 1 (deferred and re-checked, never written over the newer publish)", n)
-	}
-
-	// The re-check sees origin past the attempted tip: nothing to do, the record stays.
-	f.e.exec(t, `UPDATE checkpoint_publish_attempts SET next_check_at = now() WHERE run_id = $1`, f.oldRun)
-	f.reconcileAttempts(t, f.svc1)
-	if r := f.row(t); r.Tip != newerTip {
-		t.Fatalf("record tip = %s after the re-check, want the newer tip", r.Tip)
 	}
 }
 
@@ -241,6 +267,9 @@ func TestPublishOutcomeKeepsUntrackedAttemptLiveDB(t *testing.T) {
 		t.Helper()
 		id := f.recordAttempt(t, lateTip)
 		push := &checkpointPush{s: f.svc1, runID: f.oldRun, branch: f.branch, ref: f.branchRef, landed: id}
+		if err := push.observePublishBase(f.e.ctx); err != nil {
+			t.Fatalf("observePublishBase: %v", err)
+		}
 		res, _, err := f.svc1.publishOutcome(f.e.ctx, push, false, lateTip, nil)
 		if err != nil || !res.Published {
 			t.Fatalf("publishOutcome = %+v (err %v), want published", res, err)

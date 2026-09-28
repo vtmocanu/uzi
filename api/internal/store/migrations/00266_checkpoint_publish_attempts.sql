@@ -15,7 +15,13 @@
 -- terminal and, under the run's retention lock, either re-records the tip on the run's record
 -- (compare-and-set on the record and runs.checkpoint_tip it read before listing origin) or, once
 -- no custody hold of the run is open, CAS-deletes the branch ref at exactly that tip (when the
--- run's slot was handed to a newer run).
+-- run's slot was handed to a newer run). While a custody hold is open that ref is kept, so the
+-- newer run's checkpoints are refused (not_descendant) until custody releases: the same cost the
+-- supersession's stuck exit accepts, since the ref may hold the only copy of the held work.
+--
+-- The publish's own tip persist and record track are compare-and-set on what the push observed
+-- immediately before its forge call, so writes that arrive late never move either backwards over
+-- a newer publish or the sweeper's re-record; a push whose writes move nothing keeps its row.
 --
 -- Not covered: an attempt whose run is gone is dropped by the sweeper, which then has no forge
 -- coordinates to act with, and an attempt origin never shows is retired after the sweeper's

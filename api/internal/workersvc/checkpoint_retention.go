@@ -587,21 +587,35 @@ func (s *Service) terminalPublishSuperseded(ctx context.Context, runID uuid.UUID
 // sweeper's attempts arm (reconcilePublishAttempts) re-records the tip or, once no custody hold of
 // the run is open, CAS-deletes the branch ref at it.
 //
-// Residual: the tip persist (SetRunCheckpointTip, publishOutcome) and this track are best-effort
-// writes AFTER the push. If they fail, or are delayed past the cooling period's slack, the record's
-// tip lags the branch ref: a supersession then stops in resolveMissingSource ("branch ref is not at
-// the recorded tip") and holds the branch slot until the stuck exit clears it once the run's
-// custody holds release (the push's attempt row lets that exit recognise the tip as the run's own).
+// Both statements are COMPARE-AND-SET on the record tip (and, when no record was observed, the
+// runs.checkpoint_tip) the push observed immediately before its forge call (push.base; see
+// TrackTerminalCheckpointPublish): a publish routed live holds no retention lock, so its track can
+// arrive after a newer publish, or the sweeper's attempts arm re-recording a newer late push, moved
+// the record, and must then move nothing rather than move the record BACKWARDS. Such a publish is
+// untracked (tracked false when the run is terminal), and its attempt row stays for the arm.
+//
+// Residual: the tip persist (persistPublishedTip) and this track are best-effort writes AFTER the
+// push. If they fail, find a newer value, or are delayed past the cooling period's slack, the
+// record's tip can lag the branch ref: a supersession then stops in resolveMissingSource ("branch
+// ref is not at the recorded tip") and holds the branch slot until the stuck exit clears it once
+// the run's custody holds release. That exit recognises the branch ref as the run's own only when
+// runs.checkpoint_tip or an outstanding attempt row names its tip (ownPublishedTip). A push whose
+// persist or track did not complete keeps its attempt row, and the arm defers a row at origin
+// whose record is superseding, so a landed tip stays named until the arm resolves it; only a row
+// the arm retired (publishAttemptHorizon) or dropped (its run gone, or its tip another run's) can
+// leave a landed tip no row and no runs.checkpoint_tip names.
 //
 // Best-effort: a failure is logged and the publish still reports success (the ref already moved).
 // tracked reports the tip is accounted for: recorded on the run's record, or the run is live (its
 // record, inserted at its terminal transition, then reads the tip persisted before it).
-func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID, terminal bool, branch, ref, tip string) (settle, tracked bool) {
+func (s *Service) trackPublishedCheckpoint(ctx context.Context, push *checkpointPush, terminal bool, tip string) (settle, tracked bool) {
 	if !s.retentionWired() {
 		return false, true
 	}
+	runID, branch, ref := push.runID, push.branch, push.ref
 	state, err := s.q.TrackTerminalCheckpointPublish(ctx, store.TrackTerminalCheckpointPublishParams{
 		RunID: runID, Branch: branch, Ref: ref, Tip: tip,
+		ExpectedTip: push.base.recordTip, ExpectedRunTip: push.base.runTip,
 	})
 	switch {
 	case err == nil:
@@ -611,7 +625,7 @@ func (s *Service) trackPublishedCheckpoint(ctx context.Context, runID uuid.UUID,
 		return false, false
 	}
 	n, aerr := s.q.AdvanceCheckpointRetentionTip(ctx, store.AdvanceCheckpointRetentionTipParams{
-		RunID: runID, Ref: ref, Tip: tip,
+		RunID: runID, Ref: ref, Tip: tip, ExpectedTip: push.base.recordTip, ExpectedRunTip: push.base.runTip,
 	})
 	if aerr != nil {
 		slog.Warn("checkpoint retention: advance tip", "run", runID, "tip", tip, "error", aerr)

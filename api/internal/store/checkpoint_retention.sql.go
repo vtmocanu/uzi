@@ -40,12 +40,17 @@ SET tip = $1::text,
 WHERE run_id = $2
   AND ref = $3::text
   AND state IN ('retained', 'settling')
+  AND (tip = $1::text
+       OR tip = $4::text
+       OR ($4::text IS NULL AND tip = $5::text))
 `
 
 type AdvanceCheckpointRetentionTipParams struct {
-	Tip   string    `json:"tip"`
-	RunID uuid.UUID `json:"run_id"`
-	Ref   string    `json:"ref"`
+	Tip            string      `json:"tip"`
+	RunID          uuid.UUID   `json:"run_id"`
+	Ref            string      `json:"ref"`
+	ExpectedTip    pgtype.Text `json:"expected_tip"`
+	ExpectedRunTip pgtype.Text `json:"expected_run_tip"`
 }
 
 // Tip lag (M3): a successful publish by a run that already has a record (the checkpoint_tip
@@ -53,8 +58,17 @@ type AdvanceCheckpointRetentionTipParams struct {
 // the branch ref to the tip just published, so a later CAS delete or supersession binds to
 // the tip origin actually holds. Only retained/settling records naming exactly that ref move;
 // a superseding/superseded record has already bound its recovery ref to its recorded tip.
+// Compare-and-set on what the publish observed immediately before its forge call, exactly as
+// TrackTerminalCheckpointPublish (see there): a record another writer moved since is never moved
+// backwards by a publish whose writes arrive late.
 func (q *Queries) AdvanceCheckpointRetentionTip(ctx context.Context, arg AdvanceCheckpointRetentionTipParams) (int64, error) {
-	result, err := q.db.Exec(ctx, advanceCheckpointRetentionTip, arg.Tip, arg.RunID, arg.Ref)
+	result, err := q.db.Exec(ctx, advanceCheckpointRetentionTip,
+		arg.Tip,
+		arg.RunID,
+		arg.Ref,
+		arg.ExpectedTip,
+		arg.ExpectedRunTip,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -1165,9 +1179,10 @@ type SetRunCheckpointTipIfParams struct {
 	ExpectedTip   pgtype.Text `json:"expected_tip"`
 }
 
-// The attempts arm's persist of a late-landed tip: SetRunCheckpointTip, but COMPARE-AND-SET on
-// the runs.checkpoint_tip the arm observed before it listed origin (NULL: none was persisted). A
-// newer publish persisted meanwhile moves nothing here, so the tip never moves backwards.
+// SetRunCheckpointTip, but COMPARE-AND-SET on the runs.checkpoint_tip the writer observed (NULL:
+// none was persisted): Publish's persist (observed immediately before its forge call) and the
+// attempts arm's persist of a late-landed tip (observed before it listed origin). A newer tip
+// persisted meanwhile moves nothing here, so the tip never moves backwards.
 func (q *Queries) SetRunCheckpointTipIf(ctx context.Context, arg SetRunCheckpointTipIfParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunCheckpointTipIf, arg.CheckpointTip, arg.ID, arg.ExpectedTip)
 	if err != nil {
@@ -1264,14 +1279,20 @@ SET tip = EXCLUDED.tip,
 WHERE checkpoint_retentions.recovery_ref IS NULL
   AND checkpoint_retentions.ref = EXCLUDED.ref
   AND checkpoint_retentions.state IN ('retained', 'settling', 'deleted', 'abandoned')
+  AND (checkpoint_retentions.tip = EXCLUDED.tip
+       OR checkpoint_retentions.tip = $5::text
+       OR ($5::text IS NULL
+           AND checkpoint_retentions.tip = $6::text))
 RETURNING checkpoint_retentions.state
 `
 
 type TrackTerminalCheckpointPublishParams struct {
-	Branch string    `json:"branch"`
-	Tip    string    `json:"tip"`
-	Ref    string    `json:"ref"`
-	RunID  uuid.UUID `json:"run_id"`
+	Branch         string      `json:"branch"`
+	Tip            string      `json:"tip"`
+	Ref            string      `json:"ref"`
+	RunID          uuid.UUID   `json:"run_id"`
+	ExpectedTip    pgtype.Text `json:"expected_tip"`
+	ExpectedRunTip pgtype.Text `json:"expected_run_tip"`
 }
 
 // A successful checkpoint publish by a TERMINAL run (a worker still bound to it: a shutdown
@@ -1288,6 +1309,18 @@ type TrackTerminalCheckpointPublishParams struct {
 // is returned. Publish refuses such a run before its forge call; this guard is the backstop.
 // The terminal-status predicate is on the SELECT, so for a live run nothing is proposed and the
 // ON CONFLICT arm cannot fire either: a live run's record is never reopened.
+//
+// COMPARE-AND-SET (PRD #1810 D2, residual 2): the conflict arm moves an existing record only when
+// its tip is what the publish observed immediately before its forge call (expected_tip; NULL: no
+// record was observed), or is already the published tip. A publish routed LIVE writes without the
+// run's retention lock, and its writes may arrive long after its push landed: by then a newer
+// publish, or the sweeper's attempts arm re-recording a newer late push, may have moved the record,
+// and an unconditional write would move it BACKWARDS to a tip origin no longer carries. When no
+// record was observed, the record may since have been inserted by the run's terminal transaction
+// from runs.checkpoint_tip (migration 00265), so a record at the runs.checkpoint_tip the publish
+// observed (expected_run_tip) also matches: that tip predates this push. The insert arm (no record
+// at all) is unconditional. No row moved: the caller treats the publish as untracked and keeps its
+// attempt row for the sweeper.
 // Returns the record's state after the statement; no row when nothing moved.
 func (q *Queries) TrackTerminalCheckpointPublish(ctx context.Context, arg TrackTerminalCheckpointPublishParams) (string, error) {
 	row := q.db.QueryRow(ctx, trackTerminalCheckpointPublish,
@@ -1295,6 +1328,8 @@ func (q *Queries) TrackTerminalCheckpointPublish(ctx context.Context, arg TrackT
 		arg.Tip,
 		arg.Ref,
 		arg.RunID,
+		arg.ExpectedTip,
+		arg.ExpectedRunTip,
 	)
 	var state string
 	err := row.Scan(&state)

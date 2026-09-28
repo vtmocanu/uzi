@@ -387,9 +387,13 @@ func TestSupersessionLatePublishInWindowLiveDB(t *testing.T) {
 			return
 		}
 		once.Do(func() {
+			push := &checkpointPush{s: f.svc2, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+			if err := push.observePublishBase(f.e.ctx); err != nil {
+				t.Errorf("observePublishBase: %v", err)
+			}
 			f.forge.set(f.branchRef, t2)
 			f.e.exec(t, `UPDATE runs SET checkpoint_tip = $2, checkpoint_tip_at = now() WHERE id = $1`, f.oldRun, t2)
-			f.svc2.trackPublishedCheckpoint(f.e.ctx, f.oldRun, true, f.branch, f.branchRef, t2)
+			f.svc2.trackPublishedCheckpoint(f.e.ctx, push, true, t2)
 		})
 	}
 
@@ -492,6 +496,11 @@ func TestLiveRoutedLatePublishSupersededLogsWarnLiveDB(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSupersedeFix(t)
 			const t2 = "7777777777777777777777777777777777777777"
+			// The late publish's compare-and-set base, read before its push (the record retained).
+			push := &checkpointPush{s: f.svc2, runID: f.oldRun, branch: f.branch, ref: f.branchRef}
+			if err := push.observePublishBase(f.e.ctx); err != nil {
+				t.Fatalf("observePublishBase: %v", err)
+			}
 			var once sync.Once
 			f.forge.beforeDelete = func(ref string) {
 				if ref != f.branchRef {
@@ -513,7 +522,7 @@ func TestLiveRoutedLatePublishSupersededLogsWarnLiveDB(t *testing.T) {
 			f.e.exec(t, `UPDATE runs SET status = $2, checkpoint_tip = $3, checkpoint_tip_at = now() WHERE id = $1`,
 				f.oldRun, tc.status, t2)
 			logs := captureSlog(t)
-			settle, tracked := f.svc2.trackPublishedCheckpoint(f.e.ctx, f.oldRun, false, f.branch, f.branchRef, t2)
+			settle, tracked := f.svc2.trackPublishedCheckpoint(f.e.ctx, push, false, t2)
 			if settle {
 				t.Fatalf("trackPublishedCheckpoint settle = true, want false (no row moved)")
 			}

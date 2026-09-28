@@ -23,9 +23,11 @@ import (
 // run's retention record while that push is still on the wire. A push the forge already accepted
 // is not undone by the api's client giving up (pushbroker's 60-second ceiling bounds the CLIENT,
 // not the forge's receive-pack), so the branch ref can move to the old run's tip at any later
-// moment the forge's compare-and-swap still matches: in particular onto an ABSENT branch ref (a
-// create, when the push fetched the branch after a supersession deleted it). Such a ref is tracked
-// by no retention record and would block every later publish on the branch.
+// moment the forge's compare-and-swap still matches (the ref is still at the tip the push
+// fetched, or still absent when it fetched none: a create): after the run turned terminal, before
+// a supersession of its record or inside one (between its recovery-ref create and its branch
+// delete), or after a settle deleted the branch ref. Such a ref is tracked by no retention record
+// and would block every later publish on the branch.
 //
 // Three mechanisms, and only the last is the correctness argument:
 //
@@ -42,7 +44,10 @@ import (
 //     and runs.checkpoint_tip it read before listing origin, so a newer publish is never
 //     overwritten) or, once no custody hold of the run is open, CAS-deletes the branch ref at
 //     exactly that tip. A supersession's post-delete list and the stuck exit also treat an
-//     attempted tip as the run's own.
+//     attempted tip as the run's own. The publish path's own tip persist and record track are
+//     compare-and-set too, on what the push observed immediately before its forge call
+//     (publishBase), so writes that arrive late never move either BACKWARDS over what the arm or
+//     a newer publish recorded; a push whose writes move nothing keeps its row for the arm.
 //
 // What the attempt record does NOT cover: a row is dropped when its run row is deleted (the arm
 // then has no forge coordinates), and retired once publishAttemptHorizon has passed without origin
@@ -82,7 +87,7 @@ const (
 const _ = uint(checkpointSupersessionCooling - livePublishPrePushBudget - pushbroker.MaxPublishDuration - supersessionCoolingSlack - 1)
 
 // errPushRefused is a push Publish refused to send (the live pre-push budget elapsed, or the
-// attempt record could not be written). Publish answers it with the benign not_descendant skip:
+// attempt record or the push's compare-and-set base could not be written or read). Publish answers it with the benign not_descendant skip:
 // no forge call was made, and the worker retries on its next tick.
 var errPushRefused = errors.New("checkpoint push refused before the forge call")
 
@@ -102,18 +107,66 @@ type checkpointPush struct {
 	routedAt time.Time
 	// landed is the attempt row of the push that returned success (uuid.Nil when unrecorded).
 	landed uuid.UUID
+	// base is what the push observed of the run's tracking state immediately before its forge
+	// call: the compare-and-set base of its tip persist and record track (publishOutcome).
+	base publishBase
 }
 
-// pushOnce sends ONE push: the durable attempt record, the live budget check, then the forge call.
-// The budget is checked AFTER the insert, immediately before the forge call, so the insert's own
-// latency is inside it; a push refused there removes its row (nothing was sent). A push the forge
-// definitively refused removes its attempt row at once (nothing landed); an error of unknown
-// outcome keeps it for the sweeper.
+// publishBase is the run's tracking state a push observed immediately before its forge call
+// (observePublishBase). A push's persist (SetRunCheckpointTipIf) and track
+// (TrackTerminalCheckpointPublish, AdvanceCheckpointRetentionTip) are compare-and-set on it, so
+// writes that arrive late (a live-routed publish holds no retention lock, and its writes can stall
+// past the cooling period) never move runs.checkpoint_tip or the record BACKWARDS over a newer
+// publish, or over the sweeper's attempts arm re-recording a newer late push.
+type publishBase struct {
+	// observed: the base was read (retention wired). Unobserved, the persist is unconditional
+	// (SetRunCheckpointTip), as no record, attempt row or attempts arm exists to race with.
+	observed bool
+	// runTip is runs.checkpoint_tip (invalid: none persisted); recordTip the run's retention
+	// record tip (invalid: no record).
+	runTip, recordTip pgtype.Text
+}
+
+// observePublishBase reads the push's compare-and-set base. Inert when retention is not wired.
+func (p *checkpointPush) observePublishBase(ctx context.Context) error {
+	p.base = publishBase{}
+	if !p.s.retentionWired() {
+		return nil
+	}
+	runTip, err := p.s.q.GetRunCheckpointTipForRetention(ctx, p.runID)
+	if err != nil {
+		return fmt.Errorf("read run checkpoint tip: %w", err)
+	}
+	var recordTip pgtype.Text
+	rec, err := p.s.q.GetCheckpointRetention(ctx, p.runID)
+	switch {
+	case err == nil:
+		recordTip = pgtype.Text{String: rec.Tip, Valid: true}
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("read checkpoint retention: %w", err)
+	}
+	p.base = publishBase{observed: true, runTip: runTip, recordTip: recordTip}
+	return nil
+}
+
+// pushOnce sends ONE push: the durable attempt record, the compare-and-set base read, the live
+// budget check, then the forge call. The budget is checked AFTER the insert and the read,
+// immediately before the forge call, so their latency is inside it; a push refused there (or whose
+// base could not be read) removes its row (nothing was sent). A push the forge definitively
+// refused removes its attempt row at once (nothing landed); an error of unknown outcome keeps it
+// for the sweeper. Every push re-reads its base, so the retry after freeCheckpointSlot binds to
+// what it observed, not to the first push's view.
 func (p *checkpointPush) pushOnce(ctx context.Context) error {
 	s := p.s
 	id, err := s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip)
 	if err != nil {
 		slog.Warn("checkpoint: record publish attempt; push not sent", "run", p.runID, "branch", p.branch, "error", err)
+		return errPushRefused
+	}
+	if err := p.observePublishBase(ctx); err != nil {
+		s.clearPublishAttempt(ctx, id)
+		slog.Warn("checkpoint: read the publish's compare-and-set base; push not sent", "run", p.runID, "branch", p.branch,
+			"error", secretscrub.Scrub(err.Error()))
 		return errPushRefused
 	}
 	if p.live {
@@ -262,6 +315,12 @@ func (s *Service) reconcilePublishAttempts(ctx context.Context, onlyRun pgtype.U
 //     copy of the run's work) and the row deferred; once none is, behind the fence, the branch ref
 //     is CAS-deleted at exactly the attempted tip, as the terminal publish of a superseded run
 //     would have been refused.
+//
+// The custody gate has a cost, the same one the supersession's stuck exit accepts: while the old
+// run's custody hold is open, the late tip stays on the branch ref, and the NEW run that took the
+// slot cannot publish over it (its checkpoints are refused with the benign not_descendant skip)
+// until custody releases and the ref is deleted. Custody wins because that ref may hold the only
+// copy of work the hold protects; the new run's checkpoints are best-effort and resume after.
 //
 // done reports the row was resolved (re-recorded, deleted, dropped or retired).
 func (s *Service) reconcilePublishAttemptLocked(ctx context.Context, id uuid.UUID, fence func(context.Context) error) (done, settle bool, err error) {
