@@ -40,7 +40,7 @@ import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import { selectCodexBinding, CodexSelectionError, type CodexBinding } from "../src/codex/select.js";
 import type { CodexLaunchRootResult, CodexProviderConfig } from "../src/codex/codex-harness.js";
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "../src/codex/registry.js";
-import { createCodexExecutionSafety } from "../src/codex/safety.js";
+import { CodexBoundaryError, createCodexExecutionSafety } from "../src/codex/safety.js";
 import type { FileopHelperHandle } from "../src/codex/fileop-client.js";
 import type {
   CodexAdviceLaunchResult,
@@ -4025,6 +4025,147 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
     assert.ok(rig.epochs[0]!.disposed() >= 1, "epoch 0 was fully disposed on recreation");
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the next implement turn ran on the NEW root");
     assert.ok(rig.epochs[1]!.transport.requests.some((r) => r.method === "thread/resume"), "the new epoch resumed the prior session");
+  });
+
+  // Issue #1864: a spawn_agent delegation still open when the lead turn finishes must be
+  // cancelled at turn end, so the next reap:true checkpoint's quiesce sees its effects settled
+  // instead of timing out on a child that would otherwise run to the child-turn deadline.
+  describe("open delegation at lead turn end (issue #1864)", () => {
+    const delegationAgents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+
+    async function runOpenDelegation(shellHonoursAbort: boolean): Promise<{
+      outcome: { ok: true; branch: string } | { ok: false; error: unknown };
+      shellObservedAbort: boolean;
+      interruptsDelivered: unknown[];
+      checkpointRegistry: ExecutionRegistry | undefined;
+      registryStateAfterBoundary: string | undefined;
+      rig: MultiRig;
+      releaseShell: () => void;
+    }> {
+      const interruptsDelivered: unknown[] = [];
+      // Epoch 0: the root turn delegates; the CHILD turn (started on the same transport) issues a
+      // shell callback. The root's checkpoint + terminal are pushed by the test only once the
+      // child's shell effect is running.
+      const epoch0: Responder = (c) => {
+        if (c.method === "thread/start") return { thread: { id: c.threadStartCount === 1 ? "th-1" : "th-child" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) {
+            c.transport
+              .push(threadStarted("th-1"))
+              .push(toolCall(1, "spawn_agent", { subagent_type: "coder", description: "[m1] open", prompt: "p" }, "th-1", "tn-1", "c-spawn"));
+            return { turn: { id: "tn-1" } };
+          }
+          c.transport.push(toolCall(11, "uzi_bash", { command: "sleep 60" }, "th-child", "tn-child", "cc-bash"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      };
+      const rig = makeMultiEpochRig([
+        epoch0,
+        epochResponder("resumed-1", "tn-2", (t, th, tn) => {
+          t.push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+        }),
+      ]);
+      // Mirror transport.ts: a request whose signal is already aborted is rejected before send.
+      rig.epochs[0]!.transport.requestOverride = (c, o) => {
+        if (o?.signal?.aborted) {
+          return Promise.reject(new CodexTransportError({ category: "aborted", message: "codex transport request aborted before send" }));
+        }
+        if (c.method === "turn/interrupt") interruptsDelivered.push(c.params);
+        return undefined;
+      };
+      let shellStarted = false;
+      let shellObservedAbort = false;
+      let releaseShell!: () => void;
+      const shellGate = new Promise<void>((r) => {
+        releaseShell = r;
+      });
+      rig.deps = {
+        ...rig.deps,
+        spawnCommand: async (_argv, opts) => new Promise((resolve) => {
+          shellStarted = true;
+          void shellGate.then(() => resolve({ code: 0, stdout: "late", stderr: "" }));
+          if (!shellHonoursAbort) return;
+          const settle = (): void => {
+            shellObservedAbort = true;
+            resolve({ code: 137, stdout: "", stderr: "" });
+          };
+          if (opts.signal?.aborted) settle();
+          else opts.signal?.addEventListener("abort", settle, { once: true });
+        }),
+      };
+      let exec!: CodexExecutor;
+      let checkpointRegistry: ExecutionRegistry | undefined;
+      let registryStateAfterBoundary: string | undefined;
+      const { ctx } = makeCtx({
+        agents: delegationAgents,
+        checkpoint: async (opts) => {
+          if (!opts.reap) return;
+          const safety = exec.safety!;
+          checkpointRegistry = (safety as unknown as { registry?: ExecutionRegistry }).registry;
+          try {
+            await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
+          } finally {
+            registryStateAfterBoundary = checkpointRegistry?.state();
+          }
+        },
+      });
+      exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const runP = exec.run(ctx).then(
+        (r) => ({ ok: true as const, branch: r.branch }),
+        (error: unknown) => ({ ok: false as const, error }),
+      );
+      await waitFor(() => shellStarted, "child shell effect start");
+      rig.epochs[0]!.transport
+        .push(toolCall(3, "checkpoint", {}, "th-1", "tn-1", "c-ckpt"))
+        .push(turnCompleted("completed", "th-1", "tn-1"));
+      const outcome = await withTimeout(runP, 4000, "open-delegation run");
+      return { outcome, shellObservedAbort, interruptsDelivered, checkpointRegistry, registryStateAfterBoundary, rig, releaseShell };
+    }
+
+    it("(a) the turn-end cancel aborts the child's shell, so the reap:true checkpoint quiesces and the run recreates the epoch", async () => {
+      const r = await runOpenDelegation(true);
+      r.releaseShell();
+      assert.equal(r.outcome.ok, true, r.outcome.ok ? "" : `run failed: ${String((r.outcome as { error: unknown }).error)}`);
+      if (r.outcome.ok) assert.equal(r.outcome.branch, "agent/issue-42");
+      assert.equal(r.shellObservedAbort, true, "the child's shell effect saw its abort at lead turn end");
+      assert.equal(r.rig.providerLaunches(), 2, "the checkpoint reap recreated a fresh provider epoch");
+      assert.ok(r.checkpointRegistry, "the checkpoint boundary's registry is observable");
+      assert.equal(r.checkpointRegistry!.inFlightCallbackCount(), 0, "no callback was left in flight across the boundary");
+    });
+
+    it("(b) a callback that ignores the signal stays fail-closed: the checkpoint quiesce fails with unsettled reservations", async () => {
+      const r = await runOpenDelegation(false);
+      try {
+        assert.equal(r.outcome.ok, false, "the run failed at the checkpoint boundary");
+        const err = (r.outcome as { error: unknown }).error;
+        assert.ok(err instanceof CodexBoundaryError, `got ${String(err)}`);
+        assert.equal(err.stage, "quiesce");
+        assert.ok(
+          err.errors.some((e) => /callback\/child-turn reservation\(s\) unsettled/.test(e.message)),
+          JSON.stringify(err.errors),
+        );
+        assert.equal(r.shellObservedAbort, false);
+        assert.equal(r.rig.providerLaunches(), 1, "no fresh epoch was launched past the failed boundary");
+        assert.equal(r.registryStateAfterBoundary, "poisoned", "the failed quiesce poisoned the registry");
+      } finally {
+        r.releaseShell();
+      }
+    });
+
+    it("(c) the child turn/interrupt is actually sent on the turn-end cancel (not rejected on the already-aborted child signal)", async () => {
+      const r = await runOpenDelegation(true);
+      r.releaseShell();
+      assert.equal(r.outcome.ok, true);
+      assert.deepEqual(
+        r.interruptsDelivered.filter((p) => rec(p).threadId === "th-child"),
+        [{ threadId: "th-child", turnId: "tn-child" }],
+        "the child interrupt reached the transport",
+      );
+    });
   });
 
   it("(m4-1 fail-old) a checkpoint withBoundary reap PERMANENTLY closes the registry, so reusing it for the next provider root is DENIED (recreation REQUIRES a fresh registry)", async () => {

@@ -2655,7 +2655,7 @@ export class CodexExecutor implements Executor {
         const delegationRunner = new CodexDelegationRunner({
           registry,
           roles: runPlan.roles,
-          startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness!, provider, worktreePath, spec),
+          startChildTurn: (spec: StartChildTurnSpec) => this.startChildTurn(harness!, provider, worktreePath, spec, boundaryDeadlineMs),
           spawnCommand,
           fileop,
           worktreePath,
@@ -2917,9 +2917,16 @@ export class CodexExecutor implements Executor {
     // LEAD_TEXT_TAIL_KEEP characters are held, so a long turn never grows this without bound.
     let rootText = "";
 
+    // Issue #1864: the per-turn broker's effects signal also fires when this turn returns, so a
+    // delegation still open when the lead turn finishes is cancelled: its effects reap and its
+    // reservations settle before the next boundary's quiesce, instead of running to the child
+    // deadline. Callbacks that ignore the signal (MCP handlers, fileop) stay fail-closed at
+    // quiesce. turnAbort itself is not aborted on a clean finish: the harness request listens on
+    // it and would send turn/interrupt on the finished lead turn.
+    const effectsAbort = new AbortController();
     const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
     try {
-      harness.useBroker(buildPhaseBroker(phase, turnAbort.signal));
+      harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       armIdle();
       let turn = harness.startTurn(request);
@@ -2990,6 +2997,7 @@ export class CodexExecutor implements Executor {
       if (tripReason) throw this.tripError(tripReason, tripToken!);
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
+      effectsAbort.abort();
       unsubscribeCallbacks();
       if (idleTimer) clearTimeout(idleTimer);
       if (wallTimer) clearTimeout(wallTimer);
@@ -3246,6 +3254,7 @@ export class CodexExecutor implements Executor {
     provider: CodexProviderConfig,
     workspace: string,
     spec: StartChildTurnSpec,
+    interruptDeadlineMs: number,
   ): Promise<ChildThreadController> {
     return (async (): Promise<ChildThreadController> => {
       // Start a CHILD thread on the SAME app-server transport as the root (same untrusted
@@ -3304,9 +3313,16 @@ export class CodexExecutor implements Executor {
         notifications: () => sink.iterator(),
         project: (items) => harness.emitChildFrame(childThreadId, items),
         respond: (requestId, reply) => harness.respondOnTransport(requestId, reply),
+        // Issue #1864: the delegation interrupts only AFTER spec.signal aborted, and the transport
+        // rejects a request whose signal is already aborted, so the interrupt carries its own
+        // bounded signal instead.
         interrupt: async (): Promise<void> => {
           await harness
-            .requestOnTransport("turn/interrupt", { threadId: childThreadId, turnId: childTurnId }, { signal: spec.signal })
+            .requestOnTransport(
+              "turn/interrupt",
+              { threadId: childThreadId, turnId: childTurnId },
+              { signal: AbortSignal.timeout(interruptDeadlineMs) },
+            )
             .catch(() => undefined);
         },
         close: async (): Promise<void> => {
