@@ -872,6 +872,7 @@ describe("RunRunner #1864 — a Codex boundary failure names its stage, checkpoi
     ["a non-string", 42],
     ["an oversize", `codex boundary failed at quiesce: ${"x".repeat(600)}`],
     ["a control-character", "codex boundary failed at quiesce: forged\nline"],
+    ["a bidi-override", `codex boundary failed at quiesce: forged${String.fromCharCode(0x202e)}enil`],
   ] as const) {
     it(`a forged CodexBoundaryError with ${label} diagnostic falls back to the bare message`, async () => {
       const r = await failMilestoneCheckpoint(1865, () => {

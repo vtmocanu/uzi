@@ -4010,14 +4010,18 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
       }),
     ]);
     let exec!: CodexExecutor;
+    const sinks: unknown[] = [];
     const { ctx } = makeCtx({
       checkpoint: async (opts) => {
+        sinks.push(opts.sink);
         // Faithfully mirror the runner: reap the CURRENT epoch's roots through withBoundary.
         if (opts.reap) await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 200 }, async () => {});
       },
     });
     exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
     const result = await withTimeout(exec.run(ctx), 5000, "m4-1 run");
+    // Issue #1864: the milestone checkpoint names its sink, so a boundary failure there says so.
+    assert.deepEqual(sinks, ["milestone_checkpoint"], "the milestone checkpoint is labelled milestone_checkpoint");
 
     assert.equal(result.branch, "agent/issue-42", "the run resolved on the NEW root's signal_done");
     assert.equal(rig.providerLaunches(), 2, "the checkpoint reap recreated a fresh provider epoch");
@@ -6505,11 +6509,12 @@ describe("Codex completion interlock", () => {
   it("checkpoints before the server attempt and reworks on the same thread", async () => {
     const rig = makeMultiEpochRig([firstEpoch(1), doneEpoch(2)]);
     const order: string[] = [];
+    const sinks: unknown[] = [];
     let count = 0;
     const { ctx } = makeCtx({
       kind: "issue", completionInterlock: true,
       frozenMilestones: [{ id: "m2", title: "Remaining" }],
-      checkpoint: async (opts) => { assert.equal(opts.reap, true); order.push("checkpoint"); },
+      checkpoint: async (opts) => { assert.equal(opts.reap, true); sinks.push(opts.sink); order.push("checkpoint"); },
       worktreeFingerprint: async () => { order.push("fingerprint"); return "head-1\n M x"; },
       recordCompletionAttempt: async (args) => {
         order.push("attempt");
@@ -6520,6 +6525,8 @@ describe("Codex completion interlock", () => {
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "completion rework");
     assert.equal(result.completionHeld, undefined);
     assert.deepEqual(order, ["checkpoint", "fingerprint", "attempt", "checkpoint", "fingerprint", "attempt"]);
+    // Issue #1864: each done-with-interlock checkpoint names its sink.
+    assert.deepEqual(sinks, ["done_checkpoint", "done_checkpoint"], "the done checkpoint is labelled done_checkpoint");
     assert.equal(rig.providerLaunches(), 2);
     assert.equal(rig.epochs[0]!.disposed(), 1);
     assert.ok(rig.sessionOps.persist >= 2);

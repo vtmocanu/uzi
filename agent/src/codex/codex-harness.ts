@@ -1615,8 +1615,10 @@ export class CodexHarness implements RunHarness {
         if (dispatch.ordinal !== ordinal || dispatch.state === "closed") continue;
         const wasBound = dispatch.state === "bound";
         dispatch.state = "closed";
+        // Issue #1864: a still-pending dispatch (reserved, child never bound) is warned too, since
+        // it is the likeliest unsettled reservation; only a bound one is projected.
+        if (content === DISPATCH_OPEN_AT_TURN_END) this.warnOpenAtTurnEnd(dispatch, wasBound ? "bound" : "pending");
         if (!wasBound) continue;
-        if (content === DISPATCH_OPEN_AT_TURN_END) this.warnOpenAtTurnEnd(dispatch);
         this.closeOpenChildTools(dispatch);
         this.emitProjected(
           this.leadFrame({
@@ -1635,11 +1637,12 @@ export class CodexHarness implements RunHarness {
     }
   }
 
-  /** Issue #1864: one worker-log warn for a bound delegation still open when the lead's turn
-   *  finished, naming the dispatch, the child's projected role, its age and the child tools still
+  /** Issue #1864: one worker-log warn for a delegation still open when the lead's turn finished,
+   *  naming the dispatch, its `state` (`pending`: reserved but no child bound, so role "" and no
+   *  open child tools; `bound`), the child's projected role, its age and the child tools still
    *  open (a count plus at most five sanitized names). Never child text or arguments. Called
    *  BEFORE {@link closeOpenChildTools} clears the open tools. Fail-safe. */
-  private warnOpenAtTurnEnd(dispatch: DelegationDispatch): void {
+  private warnOpenAtTurnEnd(dispatch: DelegationDispatch, state: "pending" | "bound"): void {
     try {
       const binding = dispatch.child;
       let openCount = 0;
@@ -1654,6 +1657,7 @@ export class CodexHarness implements RunHarness {
       }
       this.log.warn("codex delegation open at turn end", {
         dispatch_id: dispatch.dispatchId,
+        state,
         role: binding?.role ?? "",
         age_ms: Math.max(0, Date.now() - dispatch.openedAt),
         open_child_tools: openCount,

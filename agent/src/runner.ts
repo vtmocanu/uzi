@@ -247,17 +247,34 @@ const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
 ]);
 const CODEX_BOUNDARY_SINKS: ReadonlySet<BoundarySink> = new Set<BoundarySink>(["milestone_checkpoint", "done_checkpoint"]);
 
+/** Issue #1864: a character a CodexBoundaryError `diagnostic` must not contain: C0, DEL, C1, the
+ *  line/paragraph separators, and the zero-width and bidi formatting characters (U+200B-200F,
+ *  U+202A-202E, U+2066-2069, U+FEFF). Keep in step with `isDiagnosticControl` in
+ *  agent/src/codex/safety.ts, which folds the same set to a space when building the diagnostic. */
+function isCodexBoundaryDiagnosticChar(code: number): boolean {
+  return (
+    code <= 0x1f ||
+    (code >= 0x7f && code <= 0x9f) ||
+    (code >= 0x200b && code <= 0x200f) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069) ||
+    code === 0xfeff
+  );
+}
+
 /** Issue #1864: the one-line `diagnostic` a CodexBoundaryError carries (stage, checkpoint, the
  *  unsettled work), read by name like {@link isCodexBoundaryError}. Returned only when it is a
- *  string of at most 500 characters with no control characters; anything else (a forged or
- *  malformed field) yields undefined, so the caller falls back to the bare message. */
+ *  string of at most 500 characters with none of {@link isCodexBoundaryDiagnosticChar}; anything
+ *  else (a forged or malformed field) yields undefined, so the caller falls back to the bare
+ *  message. */
 function codexBoundaryDiagnosticOf(err: unknown): string | undefined {
   if (!isCodexBoundaryError(err)) return undefined;
   const diagnostic = (err as { diagnostic?: unknown }).diagnostic;
   if (typeof diagnostic !== "string" || diagnostic.length > CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS) return undefined;
   for (let i = 0; i < diagnostic.length; i++) {
-    const code = diagnostic.charCodeAt(i);
-    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029) return undefined;
+    if (isCodexBoundaryDiagnosticChar(diagnostic.charCodeAt(i))) return undefined;
   }
   return diagnostic;
 }

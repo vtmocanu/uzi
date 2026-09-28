@@ -1005,6 +1005,17 @@ describe("CodexBoundaryError.diagnostic (issue #1864)", () => {
     }
   });
 
+  it("folds zero-width and bidi formatting characters (U+202E, U+200B, U+2066, U+FEFF) to a space", () => {
+    const rlo = String.fromCharCode(0x202e);
+    const zwsp = String.fromCharCode(0x200b);
+    const err = new CodexBoundaryError("quiesce", [
+      { category: "protocol", message: `safe${rlo}txt.exe${zwsp}tail\u2066iso\u2069\ufeffend` },
+    ]);
+    assert.equal(err.diagnostic, "codex boundary failed at quiesce: safe txt.exe tail iso end");
+    assert.ok(!err.diagnostic.includes(rlo), "no U+202E");
+    assert.ok(!err.diagnostic.includes(zwsp), "no U+200B");
+  });
+
   it("caps each error at 160 characters and the whole diagnostic at 500", () => {
     const one = new CodexBoundaryError("reap", [{ category: "protocol", message: "x".repeat(400) }]);
     const detail = one.diagnostic.slice("codex boundary failed at reap: ".length);

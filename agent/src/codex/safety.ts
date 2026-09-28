@@ -137,10 +137,21 @@ function capChars(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
 }
 
-/** C0, DEL, C1 and the two Unicode line/paragraph separators (a char-code test, since
- *  oxlint denies `no-control-regex`). */
+/** C0, DEL, C1, the two Unicode line/paragraph separators, and the zero-width and bidi
+ *  formatting characters (U+200B-200F, U+202A-202E, U+2066-2069, U+FEFF) that can hide or
+ *  reorder log text (a char-code test, since oxlint denies `no-control-regex`). Keep in step
+ *  with `isCodexBoundaryDiagnosticChar` in agent/src/runner.ts, which rejects the same set. */
 function isDiagnosticControl(code: number): boolean {
-  return code <= 0x1f || (code >= 0x7f && code <= 0x9f) || code === 0x2028 || code === 0x2029;
+  return (
+    code <= 0x1f ||
+    (code >= 0x7f && code <= 0x9f) ||
+    (code >= 0x200b && code <= 0x200f) ||
+    code === 0x2028 ||
+    code === 0x2029 ||
+    (code >= 0x202a && code <= 0x202e) ||
+    (code >= 0x2066 && code <= 0x2069) ||
+    code === 0xfeff
+  );
 }
 
 function diagnosticText(raw: unknown): string {
@@ -206,7 +217,7 @@ export class CodexBoundaryError extends Error {
   /** Issue #1864: the boundary and the checkpoint sink that requested it, when known. */
   readonly boundary?: SafeBoundary;
   readonly sink?: BoundarySink;
-  /** Issue #1864: a one-line, control-character-free, secret-free summary of this failure,
+  /** Issue #1864: a one-line, secret-free summary free of control, zero-width and bidi characters of this failure,
    *  at most {@link CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS} characters. `message` stays the bare
    *  `codex boundary failed at <stage>`. */
   readonly diagnostic: string;

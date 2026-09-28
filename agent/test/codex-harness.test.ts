@@ -2077,8 +2077,9 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     const openWarns = warns.filter((w) => w.msg === "codex delegation open at turn end");
     assert.equal(openWarns.length, 1, "one open-at-turn-end warn");
     const fields = openWarns[0]!.fields!;
-    assert.deepEqual(Object.keys(fields).sort(), ["age_ms", "dispatch_id", "open_child_tool_names", "open_child_tools", "role"]);
+    assert.deepEqual(Object.keys(fields).sort(), ["age_ms", "dispatch_id", "open_child_tool_names", "open_child_tools", "role", "state"]);
     assert.equal(fields.dispatch_id, "cx-abcdef012345-t1-c-1");
+    assert.equal(fields.state, "bound");
     assert.equal(fields.role, "coder");
     assert.equal(typeof fields.age_ms, "number");
     assert.ok((fields.age_ms as number) >= 0);
@@ -2097,6 +2098,47 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     const completionAt = seen.findIndex((e) => e.kind === "frame" && e.items.some((i) => i.kind === "tool" && i.phase === "finished"));
     assert.ok(completionAt < seen.findIndex((e) => e.kind === "turn_finished"), "the completion precedes turn_finished");
     assert.equal(transport.responses.filter((r) => r.requestId === 1).length, 1, "the parent still replied exactly once");
+  });
+
+  it("a PENDING dispatch still open at turn end (reserved, child never bound) is warned with state pending and projects nothing", async () => {
+    let entered = false;
+    const broker = stubBroker(async (_rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      entered = true;
+      return new Promise<CallbackResult>(() => {}); // never binds a child, never settles
+    });
+    const warns: { msg: string; fields: Record<string, unknown> | undefined }[] = [];
+    const log: Logger = {
+      ...noopLog,
+      warn(msg: string, fields?: Record<string, unknown>) {
+        warns.push({ msg, fields });
+      },
+    };
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345", log });
+    transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"));
+    const iter = harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+    const seen: HarnessEvent[] = [];
+    const upToTerminal = (async (): Promise<void> => {
+      for (;;) {
+        const step = await iter.next();
+        assert.ok(!step.done, "the stream ended before turn_finished");
+        seen.push(step.value);
+        if (step.value.kind === "turn_finished") return;
+      }
+    })();
+    await waitUntil(() => entered, "the delegation reserved");
+    transport.push(turnCompleted("completed")).end();
+    await withTimeout(upToTerminal, 2000, "turn events");
+
+    const openWarns = warns.filter((w) => w.msg === "codex delegation open at turn end");
+    assert.equal(openWarns.length, 1, "one open-at-turn-end warn for the pending dispatch");
+    const fields = openWarns[0]!.fields!;
+    assert.equal(fields.dispatch_id, "cx-abcdef012345-t1-c-1");
+    assert.equal(fields.state, "pending");
+    assert.equal(fields.role, "");
+    assert.equal(fields.open_child_tools, 0);
+    assert.deepEqual(fields.open_child_tool_names, []);
+    assert.deepEqual(frames(seen), [], "a pending dispatch projects no dispatch, child or completion frame");
   });
 
   it("requestStop with a bound open dispatch yields a synthesized stopped completion before the stream ends", async () => {
