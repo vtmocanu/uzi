@@ -5535,6 +5535,15 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// No forge call was made (the live pre-push budget elapsed, or the attempt could not be
 		// recorded): the benign skip, retried on the worker's next tick.
 		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
+	case err == nil && push.alreadyCurrent && !push.ownsTip(tipOid):
+		// PRD #1810: origin already held the declared tip, so this push wrote nothing, and the tip
+		// is not the run's own persisted one: another run's ref (retained, settling, or a late push
+		// the attempts arm is about to delete) at the same SHA. Counting it as published would let
+		// that run's CAS delete remove a ref this run records as durable. An outstanding attempt
+		// row is no proof either (it is written before its push, which may never have landed).
+		// The benign skip; the worker retries on its next tick. Nothing landed from this push.
+		s.clearPublishAttempt(ctx, push.landed)
+		return PublishResult{Published: false, Ref: ref, Skipped: "not_descendant"}, false, nil
 	case err == nil:
 		// The CAS-accepted advance is the ONLY arm that persists the tip: it runs on
 		// EVERY successful publish (mid-run/park/shutdown all route through here), so

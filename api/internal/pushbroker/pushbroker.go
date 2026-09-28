@@ -76,6 +76,10 @@ type Options struct {
 // Result reports the ref that was (or would have been) advanced.
 type Result struct {
 	Ref string
+	// AlreadyCurrent: origin's checkpoint ref already pointed at the declared tip, so nothing
+	// was written. The success proves only that origin holds the tip, not who wrote it; the
+	// caller decides whether the tip is the run's own (PRD #1810).
+	AlreadyCurrent bool
 }
 
 var (
@@ -306,6 +310,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// checkpoint ref, so its presence is proven and there is nothing to advance. tipHash
 	// is non-zero (guarded above), so this fires only for a real, matching checkpoint ref.
 	if checkpointTip == tipHash {
+		result.AlreadyCurrent = true
 		return result, nil
 	}
 

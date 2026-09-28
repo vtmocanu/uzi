@@ -107,6 +107,10 @@ type checkpointPush struct {
 	routedAt time.Time
 	// landed is the attempt row of the push that returned success (uuid.Nil when unrecorded).
 	landed uuid.UUID
+	// alreadyCurrent: that push wrote nothing, because origin already held the declared tip
+	// (pushbroker.Result.AlreadyCurrent). publishOutcome counts it as published only when the
+	// tip is the run's own.
+	alreadyCurrent bool
 	// base is what the push observed of the run's tracking state immediately before its forge
 	// call: the compare-and-set base of its tip persist and record track (publishOutcome).
 	base publishBase
@@ -149,6 +153,16 @@ func (p *checkpointPush) observePublishBase(ctx context.Context) error {
 	return nil
 }
 
+// ownsTip reports whether tip is the run's own persisted checkpoint (runs.checkpoint_tip as the
+// push observed it immediately before its forge call). Without an observed base (retention not
+// wired) every tip counts, the pre-#1810 behaviour: no retention delete runs then.
+func (p *checkpointPush) ownsTip(tip string) bool {
+	if !p.base.observed {
+		return true
+	}
+	return p.base.runTip.Valid && p.base.runTip.String == tip
+}
+
 // pushOnce sends ONE push: the durable attempt record, the compare-and-set base read, the live
 // budget check, then the forge call. The budget is checked AFTER the insert and the read,
 // immediately before the forge call, so their latency is inside it; a push refused there (or whose
@@ -158,6 +172,7 @@ func (p *checkpointPush) observePublishBase(ctx context.Context) error {
 // what it observed, not to the first push's view.
 func (p *checkpointPush) pushOnce(ctx context.Context) error {
 	s := p.s
+	p.alreadyCurrent = false
 	id, err := s.recordPublishAttempt(ctx, p.runID, p.branch, p.ref, p.opts.DeclaredTip)
 	if err != nil {
 		slog.Warn("checkpoint: record publish attempt; push not sent", "run", p.runID, "branch", p.branch, "error", err)
@@ -177,10 +192,11 @@ func (p *checkpointPush) pushOnce(ctx context.Context) error {
 			return errPushRefused
 		}
 	}
-	_, perr := s.publishFn(ctx, p.opts)
+	res, perr := s.publishFn(ctx, p.opts)
 	switch {
 	case perr == nil:
 		p.landed = id
+		p.alreadyCurrent = res.AlreadyCurrent
 	case pushDefinitelyRefused(perr):
 		s.clearPublishAttempt(ctx, id)
 	}

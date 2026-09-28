@@ -281,12 +281,16 @@ lock on un-cancelled contexts, so a hung forge call is recorded as a
 failure and backed off rather than left holding the lock. All of one
 operation's bookkeeping after its deadline shares a single 10s window past
 that deadline, and the expiry bookkeeping writes nothing unless a fresh
-fence re-check shows the lock is still held (a lock lost mid-forge-call is
-never written through). Per the code's own accounting, the worst case for
-one tick is `retentionPassBudget + retentionSweepOpTimeout + 3 × 10s = 30s
-+ 60s + 30s = 120s` (the bookkeeping window, the unlock, the connection
-teardown), below the sweeper health beat's danger line of ten 15s default
-intervals (150s); any records or arms the pass could not reach are left
+fence re-check shows the lock is still held. The step's own failure write
+after a forge call that ran into the deadline is not fenced: a lock lost
+during that call can still see that one write, guarded only on the
+record's state. Per the code's own accounting, the worst case for the
+retention pass is `retentionPassBudget + retentionSweepOpTimeout + 3 × 10s
+= 30s + 60s + 30s = 120s` (the bookkeeping window, the unlock, the
+connection teardown). That bounds the pass, not the whole Sweep tick: the
+tick's other passes add to it, so the margin under the sweeper health
+beat's danger line of ten 15s default intervals (150s) is thinner than the
+pass bound alone suggests. Any records or arms the pass could not reach are left
 for the next tick, logged once per pass rather than per record. The pass's
 four forge-calling arms (work, unheld, audit, attempts) also rotate which
 arm runs first each pass, so a burst of slow records in one arm cannot
@@ -333,8 +337,32 @@ above.
   the old run at all.
 - **The sweeper's retention reconciliation pass is now time-bounded
   (rework round 2)**, trading unbounded work per tick (previously able to
-  stall on a hung forge) for a documented worst case per tick (~120s) and
-  leftover work that carries to the next tick under load.
+  stall on a hung forge) for a documented worst case per retention pass
+  (~120s, before the rest of the Sweep tick) and leftover work that carries
+  to the next tick under load.
+- **A publish that finds its tip already on origin counts only for the
+  run's own persisted tip (landing review, 2026-09-28).** The broker's
+  already-current short-circuit writes nothing, so its success proves only
+  that origin holds the tip. Counted as published, a new run could record
+  another run's ref at the same SHA (a `settling` record's ref, or a late
+  push the attempts arm deletes) as its durable checkpoint, and that run's
+  CAS delete, matching the SHA, removed it. `publishOutcome` now answers the
+  benign `not_descendant` skip unless the tip equals the run's persisted
+  `runs.checkpoint_tip`, read immediately before the push; an outstanding
+  attempt row is not proof, since it is written before its push. A resumed
+  run re-declaring its own tip still succeeds (PRD #1030 M1). The cost: a
+  run whose only unpublished tip is another run's gets skips until its
+  first commit or until that ref goes.
+- **Runs that went terminal before this migration are not backfilled.**
+  The backfill arm starts at `checkpoint_retention_meta.enabled_at`, and
+  the terminal trigger cannot record a transition that already happened.
+  A pre-migration failed run that still has an open custody hold and a
+  surviving branch ref (the sweeper failure paths never deleted theirs) has
+  no record, so a new run on the branch neither supersedes nor preserves
+  it: a descendant publish fast-forwards over it (the old tip stays
+  reachable as an ancestor) and a divergent one is refused, both as before
+  this change. Recover such a run with `uzi run export` or its preserved
+  patch.
 - **The api's forge-write surface for checkpoints grows**: a create-ref
   primitive alongside the existing publish/delete (ADR-0122), still CAS,
   still never forced.

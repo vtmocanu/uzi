@@ -385,8 +385,12 @@ func TestPublishSameTipTwiceReportsSuccess(t *testing.T) {
 	opts := pushbroker.Options{
 		CloneURL: f.cloneURL(), Branch: "main", DefaultBranch: "main", DeclaredTip: tip, Pack: f.pack(tip, base),
 	}
-	if _, err := pushbroker.Publish(context.Background(), opts); err != nil {
+	first, err := pushbroker.Publish(context.Background(), opts)
+	if err != nil {
 		t.Fatalf("first Publish: %v", err)
+	}
+	if first.AlreadyCurrent {
+		t.Fatal("first Publish reported AlreadyCurrent, want a real advance")
 	}
 	ref := "refs/uzi-checkpoints/main"
 	if got := f.originRef(ref); got != tip {
@@ -400,6 +404,10 @@ func TestPublishSameTipTwiceReportsSuccess(t *testing.T) {
 	}
 	if res.Ref != ref {
 		t.Fatalf("ref = %q, want %q", res.Ref, ref)
+	}
+	// PRD #1810: the no-op is flagged, so the caller can refuse to count a tip it never wrote.
+	if !res.AlreadyCurrent {
+		t.Fatal("same-tip re-publish did not report AlreadyCurrent")
 	}
 	if got := f.originRef(ref); got != tip {
 		t.Fatalf("checkpoint changed on same-tip re-publish: got %q, want unchanged %q", got, tip)
