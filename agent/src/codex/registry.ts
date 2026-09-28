@@ -17,6 +17,29 @@
 
 import type { ChildQuiescence, HarnessError, ProcessReap, ToolDisposal } from "../harness.js";
 
+/** Issue #1864: a caught error's class name, as it may appear in a harness error message. That
+ *  message reaches the boundary diagnostic and so a run's `failure_reason`, and an error's `name`
+ *  is mutable and can carry any string (a token-shaped one included), so only a closed set of
+ *  standard names passes through; anything else reads `Error`, and a non-Error `unknown`. */
+const SAFE_ERROR_NAMES: ReadonlySet<string> = new Set([
+  "Error",
+  "AbortError",
+  "AggregateError",
+  "EvalError",
+  "RangeError",
+  "ReferenceError",
+  "SyntaxError",
+  "SystemError",
+  "TimeoutError",
+  "TypeError",
+  "URIError",
+]);
+
+export function safeErrorName(e: unknown): string {
+  if (!(e instanceof Error)) return "unknown";
+  return typeof e.name === "string" && SAFE_ERROR_NAMES.has(e.name) ? e.name : "Error";
+}
+
 // --- Local execution epoch: a branded number, module-private brand. -----------
 // Branding is compile-time only; at runtime it is a plain number. It exists so an
 // API claim epoch (also a number) can never be passed where a local execution
@@ -754,7 +777,7 @@ export class ExecutionRegistry {
       } catch (e) {
         errors.push({
           category: "tool",
-          message: `disposeTools: root dispose failed (${e instanceof Error ? e.name : "unknown"})`,
+          message: `disposeTools: root dispose failed (${safeErrorName(e)})`,
         });
       }
     }

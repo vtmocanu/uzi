@@ -29,6 +29,7 @@ import type {
   ToolDisposal,
 } from "../harness.js";
 import type { CaptureSettlement, ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
+import { safeErrorName } from "./registry.js";
 
 /** Which OS identity a boundary action runs as. `worker_pat` is a PAT-bearing
  *  (credentialed) action (e.g. `git push`); `command` is the credential-free
@@ -131,7 +132,6 @@ const SINK_LABELS: Record<BoundarySink, string> = {
   milestone_checkpoint: "milestone checkpoint",
   done_checkpoint: "done checkpoint",
 };
-const SAFE_ERROR_NAME = /^[A-Za-z0-9_]{1,64}$/;
 
 function capChars(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
@@ -181,8 +181,8 @@ function boundaryDiagnostic(
   const parts = errors.slice(0, DIAGNOSTIC_MAX_ERRORS).map((e) => diagnosticText(e?.message));
   if (errors.length > DIAGNOSTIC_MAX_ERRORS) parts.push(`+${errors.length - DIAGNOSTIC_MAX_ERRORS} more`);
   if (actionError !== undefined) {
-    const name = actionError instanceof Error && SAFE_ERROR_NAME.test(actionError.name) ? actionError.name : "Error";
-    parts.push(`action error: ${name}`);
+    const name = safeErrorName(actionError);
+    parts.push(`action error: ${name === "unknown" ? "Error" : name}`);
   }
   const details = parts.length > 0 ? parts.join("; ") : "no detail";
   const head = `codex boundary failed at ${stage}${label !== undefined ? ` (${label})` : ""}`;
@@ -637,7 +637,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.cancelReservation(reserved.reservation);
       const error: HarnessError = {
         category: "tool",
-        message: `spawnBoundaryAction: spawn failed (${e instanceof Error ? e.name : "unknown"})`,
+        message: `spawnBoundaryAction: spawn failed (${safeErrorName(e)})`,
       };
       this.registry.poison(error);
       return { kind: "poisoned", error };

@@ -1070,6 +1070,40 @@ describe("CodexBoundaryError.diagnostic (issue #1864)", () => {
     assert.equal(typed.message, "codex boundary failed at action");
   });
 
+  it("keeps a token-shaped error name out of harness messages and the diagnostic", async () => {
+    // An identifier-shaped secret: a name-syntax check alone would let it through.
+    const secret = "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    const named = new Error("x");
+    named.name = secret;
+    const direct = new CodexBoundaryError("action", [], named);
+    assert.equal(direct.diagnostic, "codex boundary failed at action: action error: Error");
+
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const seam: SpawnRootSeam = async () => {
+      const e = new Error("spawn");
+      e.name = secret;
+      throw e;
+    };
+    const safety = createCodexExecutionSafety(reg, seam);
+    let outcome: BoundaryActionOutcome | undefined;
+    const thrown = await safety
+      .withBoundary(req("finalize"), async (permit) => {
+        outcome = await safety.spawnBoundaryAction(permit, ["git", "push"], "command");
+      })
+      .then(
+        () => undefined,
+        (e: unknown) => e,
+      );
+    assert.equal(outcome?.kind, "poisoned");
+    assert.equal(
+      outcome?.kind === "poisoned" ? outcome.error.message : undefined,
+      "spawnBoundaryAction: spawn failed (Error)",
+    );
+    assert.ok(thrown instanceof CodexBoundaryError);
+    assert.ok(!thrown.diagnostic.includes(secret));
+    assert.ok(thrown.diagnostic.includes("spawnBoundaryAction: spawn failed (Error)"));
+  });
+
   it("a quiesce failure through withBoundary carries the request's boundary, sink and diagnostic", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(3));
     const safety = new CodexExecutionSafetyImpl(reg, {

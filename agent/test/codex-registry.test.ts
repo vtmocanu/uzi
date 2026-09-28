@@ -6,6 +6,7 @@ import {
   MAX_CALLBACK_RESERVATIONS,
   MAX_POISON_ERRORS,
   newLocalExecutionEpoch,
+  safeErrorName,
   type ReapOutcome,
   type RegisteredRoot,
   type RootKind,
@@ -540,6 +541,40 @@ describe("ExecutionRegistry: disposal and poison stickiness", () => {
     const res = await reg.disposeTools(DEADLINE);
     assert.equal(res.kind, "incomplete");
     assert.equal(reg.state(), "poisoned");
+  });
+
+  it("a failing root dispose names only a standard error class, never a token-shaped name", async () => {
+    const secret = "gh" + "p_" + "A1b2C3d4E5f6G7h8I9j0K1l2M3n4O5p6Q7r8";
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    registerRoot(
+      reg,
+      new FakeRoot("provider", undefined, async () => {
+        const e = new Error("dispose boom");
+        e.name = secret;
+        throw e;
+      }),
+    );
+    registerRoot(
+      reg,
+      new FakeRoot("provider", undefined, async () => {
+        throw new TypeError("dispose boom");
+      }),
+    );
+    const res = await reg.disposeTools(DEADLINE);
+    assert.equal(res.kind, "incomplete");
+    assert.deepEqual(
+      res.kind === "incomplete" ? res.errors.map((e) => e.message) : [],
+      ["disposeTools: root dispose failed (Error)", "disposeTools: root dispose failed (TypeError)"],
+    );
+  });
+
+  it("safeErrorName passes only a closed set of standard names", () => {
+    const custom = new Error("x");
+    custom.name = "gh" + "p_" + "shapedLikeAToken";
+    assert.equal(safeErrorName(custom), "Error");
+    assert.equal(safeErrorName(new RangeError("x")), "RangeError");
+    assert.equal(safeErrorName({ name: "TypeError" }), "unknown");
+    assert.equal(safeErrorName("boom"), "unknown");
   });
 
   it("retries one failed root disposal without clearing poison evidence", async () => {
