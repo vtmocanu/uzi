@@ -1,6 +1,6 @@
 ---
 name: spec-keeper
-version: 6
+version: 7
 description: Keeps specs/ in sync with implementation work. Maintains specs/human.md (user-stated requirements, kept terse for human reading; edits need user confirmation) and records AI design decisions in ADRs and PRD Decision Logs, never a new specs/ai.md. Goal is rebuild-from-specs.
 tools: Bash, Read, Grep, Glob, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -56,7 +56,7 @@ strictly separated by decision provenance.
 2. Diff reality vs specs: new decisions to record, stale entries to
    update or remove.
 3. Apply decision-record changes directly; propose human.md changes to
-   the lead and apply only after user approval.
+   the lead via SendMessage to `main` and apply only after user approval.
 4. Report via SendMessage to `main`: what changed in each file, what is
    pending confirmation.
 

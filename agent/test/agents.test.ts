@@ -277,7 +277,16 @@ describe("issue #581: in-process MCP server wiring for subagents", () => {
     "builtins",
     "fact-checker.md",
   );
-  const factCheckerTools = parseToolsLine(readFileSync(factCheckerPath, "utf8"));
+  // PRD #1849 D5: the file mirrors upstream, which cannot name uzi's forge tools; the
+  // api appends them from agenttmpl/tool_delta.go (WithProductTools) before seeding.
+  // This builds a fact-checker-shaped allowlist from the file plus the
+  // "fact-checker" entry of that Go map, so it pins the HARNESS wiring (forge tools
+  // in the allowlist => the forge server is attached). What the api actually seeds
+  // is pinned on the Go side (TestBuiltinsCarryProductToolDelta).
+  const toolDeltaPath = join(import.meta.dirname, "..", "..", "api", "internal", "agenttmpl", "tool_delta.go");
+  const deltaEntry = readFileSync(toolDeltaPath, "utf8").match(/"fact-checker":\s*\{([^}]*)\}/)?.[1] ?? "";
+  const deltaTools = [...deltaEntry.matchAll(/"(mcp__forge__[a-z_]+)"/g)].map((m) => m[1]!);
+  const factCheckerTools = [...parseToolsLine(readFileSync(factCheckerPath, "utf8")), ...deltaTools];
   const factChecker: AgentTemplate = {
     name: "fact-checker",
     description: "verifies claims",
@@ -286,8 +295,8 @@ describe("issue #581: in-process MCP server wiring for subagents", () => {
     model: null,
   };
 
-  it("the real fact-checker builtin resolves to mcpServers ['forge','findings'] in deterministic order", () => {
-    // Anchor to the shipped builtin so the test breaks if it ever drops the forge grant:
+  it("a fact-checker allowlist with the shipped forge delta resolves to mcpServers ['forge','findings'] in deterministic order", () => {
+    // Anchor to the shipped file plus delta so the test breaks if either drops the forge grant:
     // the fact-checker is the whole reason this wiring exists (issue #581).
     assert.ok(
       factCheckerTools.some((t) => t.startsWith("mcp__forge__")),
@@ -830,6 +839,58 @@ describe("worker-owned subagent safety block (issue #1660)", () => {
       assert.ok(Object.keys(roster).length > 0, `${source}: non-empty roster`);
       for (const [name, def] of Object.entries(roster)) {
         assert.ok(def.prompt.includes(SUBAGENT_SAFETY_APPEND), `${source}/${name}: safety block present`);
+      }
+    }
+  });
+});
+
+// PRD #1849 M2: the builtin bodies are verbatim upstream copies, runtime-neutral by
+// design, so the uzi runtime facts reach every subagent through the worker append
+// alone. Pinned on a builtin rendered from its shipped (upstream) body AND on a
+// repo-authored agent, whose body says nothing about scratch at all. These phrases
+// are uzi's; none of them appears in an upstream body, so removing one from
+// RUN_SCRATCH_GUIDANCE reddens this test.
+describe("uzi runtime facts reach every subagent through the append (PRD #1849)", () => {
+  const UZI_RUNTIME_PHRASES = [
+    "mktemp .uzi/scratch/gate-log.XXXXXX",
+    "mktemp -d .uzi/scratch/snap.XXXXXX",
+    "set -o pipefail",
+    "scratch=.uzi/scratch",
+    "does not permit\na detached checkout",
+    "Git commands run inside an\nexport can find the parent checkout; never run Git there.",
+    "cannot run in the export",
+  ];
+  const shippedBody = (role: string): string => {
+    const raw = readFileSync(join(import.meta.dirname, "..", "..", "api", "internal", "agenttmpl", "builtins", `${role}.md`), "utf8");
+    return raw.slice(raw.indexOf("\n---\n") + "\n---\n\n".length);
+  };
+  const reviewerShipped: AgentTemplate = {
+    name: "reviewer",
+    description: "shipped reviewer",
+    prompt_body: shippedBody("reviewer"),
+    tools: ["Read", "Bash"],
+  };
+  const repoAuthored: AgentTemplate = {
+    name: "checker",
+    description: "repo-authored role",
+    prompt_body: "Check the change.",
+    tools: ["Read", "Bash"],
+  };
+
+  it("the shipped reviewer body does not carry the uzi phrases itself", () => {
+    for (const phrase of UZI_RUNTIME_PHRASES.filter((p) => p !== "set -o pipefail")) {
+      assert.ok(!reviewerShipped.prompt_body.includes(phrase), `upstream body unexpectedly carries ${JSON.stringify(phrase)}`);
+    }
+  });
+
+  it("both rosters render every uzi phrase for a shipped and a repo-authored agent", () => {
+    const own = assembleAgents([reviewerShipped, repoAuthored]).subagents;
+    const repo = subagentsFromTemplates([reviewerShipped, repoAuthored], new Set());
+    for (const [source, roster] of Object.entries({ own, repo })) {
+      for (const [name, def] of Object.entries(roster)) {
+        for (const phrase of UZI_RUNTIME_PHRASES) {
+          assert.ok(def.prompt.includes(phrase), `${source}/${name}: missing ${JSON.stringify(phrase)}`);
+        }
       }
     }
   });

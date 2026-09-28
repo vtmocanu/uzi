@@ -346,7 +346,9 @@ func computeDiff(parsed []agenttmpl.Definition, current []store.AgentTemplate) [
 		case !ok:
 			out = append(out, DiffEntry{Name: d.Name, Action: DiffAdd, Detail: "new synced-only role"})
 		case row.Scope == "builtin":
-			if originOf(row) == "synced" && agenttmpl.SameContent(rowToDefinition(row), d) {
+			// A builtin override carries the builtin's product-only tools
+			// (agenttmpl.WithProductTools, PRD #1849 D5), so compare with them applied.
+			if originOf(row) == "synced" && agenttmpl.SameContent(rowToDefinition(row), agenttmpl.WithProductTools(d)) {
 				out = append(out, DiffEntry{Name: d.Name, Action: DiffUnchanged})
 			} else {
 				out = append(out, DiffEntry{Name: d.Name, Action: DiffOverride, Detail: "overrides a builtin"})

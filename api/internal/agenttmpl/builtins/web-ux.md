@@ -1,6 +1,6 @@
 ---
 name: web-ux
-version: 10
+version: 11
 description: Web UX expert. Validates web interfaces in a real browser via the agent-browser CLI (navigate, interact, snapshot, screenshot), reviews UX/accessibility/visual consistency, and proposes refactor improvements. Reports findings only; never modifies code.
 tools: Bash, Read, Grep, Glob, WebFetch, SendMessage, TaskUpdate, TaskList, TaskGet
 model: opus
@@ -68,9 +68,10 @@ real browser, not by reading code. Report findings only; never modify code.
 - A full-page `open` is a reload: it resets SPA state and may re-seed and
   re-authenticate a mock build, so navigate in-app to keep or observe a
   transient state.
-- Write transient artifacts (screenshots, a11y dumps, logs) under the
-  worker-provisioned `.uzi/scratch/` directory inside the checkout;
-  `git status --porcelain` should stay clean under ordinary staging.
+- Write transient artifacts (screenshots, a11y dumps, logs) to the scratch
+  directory your runtime provides, else a path the repo ignores or one
+  outside the worktree when your sandbox allows it; `git status --porcelain`
+  must stay empty without a manual `rm`.
 - A browser-CLI launch failure is an environment finding, not a task to debug: spend at most three attempts (the bare command, its `--version`, one known workaround recorded in the repo's own guidance), then report it Blocking as `browser unavailable: <exact error>` and validate everything that needs no browser. Never spend the dispatch debugging the image.
 
 ## Review lenses, in priority order
