@@ -72,7 +72,7 @@ describe("production code never installs a quiescence test view", () => {
     assert.ok(setter.includes(writes[0]!), "the one write sits in the setter's body");
   });
 
-  it("run-quiescence.ts never reads the environment, so no env var can supply or shape a view", () => {
+  it("run-quiescence.ts has none of the env-read shapes this scans for (process.env, process-module imports, process aliases, other .env reads)", () => {
     const src = code(OWNER);
     // `process.env`, `process["env"]`, and a destructured `{ env } = process`.
     assert.deepEqual(matches(src, /\bprocess\s*(?:\?\.|\.)\s*env\b|\bprocess\s*\[\s*["'`]env["'`]\s*\]/g), []);

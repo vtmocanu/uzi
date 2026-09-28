@@ -456,14 +456,17 @@ account for it, the failure reason names that process's process ID and
 program name, so an operator knows exactly what to look for on the worker.
 That process does not have to belong to the run that failed — any such
 unaccountable process, running as the same worker user, blocks a Claude or
-stub run's own checks at those sites, and blocks every seeding or capture
-sweep on that worker regardless of which harness it belongs to, by design:
+stub run's own checks at those sites, and blocks the canonical clone reseed
+and every capture of another attempt's clone on that worker regardless of
+which harness it belongs to (seeding a fresh attempt clone is the one
+exception described above), by design:
 the worker would rather refuse to proceed than guess. **A Codex run's own
 checks are a disclosed exception**: they don't scan the process table at
 all, relying instead on Codex's own proof that its processes have drained,
 so an unaccountable process elsewhere on the worker does not block a Codex
-run's own park, finalize, or shutdown the way it blocks a Claude or stub
-run's — see [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md)
+run's own park, finalize, shutdown, retire, or recovery and credential-switch
+capture the way it blocks a Claude or stub run's (unless that run is itself
+capturing a predecessor attempt's clone, which always scans) — see [ADR-1783](../adr/1783-run-quiescence-and-attempt-clone-paths.md)
 for exactly which of those checks still has no process proof at all. A
 process the worker *can* positively tie, by ancestry, to another live run's
 own recorded root, or to a long-lived process the worker itself launched

@@ -419,7 +419,9 @@ covers. Canonical reseed and the predecessor/orphan capture sites
 always scans regardless of executor (see the Invariants section above), so
 they lock out on any run, Codex included. Terminal retire, finalize, the
 `recovery_capture`/`credential_switch` sites, and the pause/wall/completion-
-hold parks all run `mode: "own"`, so for a Claude or stub run they are
+hold parks all run `mode: "own"` (except on a flight capturing a
+predecessor attempt's clone, where `quiesceRun` switches every proof to
+`capture` mode, which scans), so for a Claude or stub run they are
 covered and lock out the same way, but **a Codex run's own-mode proof at
 those sites is not**: it skips the process scan outright (mode `"own"`, per
 the Invariants section above), so an unrelated unreadable process elsewhere
@@ -501,18 +503,17 @@ real-procfs `ssh-agent` integration tests
 default and pin this fail-closed behaviour against the real proc root on
 Linux CI, the same shape that produced the original incident.
 
-**Follow-up 5 — a per-attempt cgroup v2 boundary.** The durable fix for this
-whole class is proper per-run process ownership (a cgroup v2 boundary scoped
-to the attempt), separate from this PR's fail-closed-with-a-bound mitigation.
-Not built here; listed for the maintainer to file after merge, alongside
-Follow-ups 1-4 below.
+The durable fix for this whole class, a per-attempt cgroup v2 boundary, is
+not built here; it is Follow-up 5 in *Follow-ups and accepted risks* below.
 
 ## Root-only acceptance at the final head
 
 (recorded after the final acceptance run, following the #1826 merge)
 
-**This is mounted-source validation**, not a fresh image build. The final code
-commit is `34b6b6c8`. The merge `d82789ad` (origin/main
+**This is mounted-source validation**, not a fresh image build. It covers the
+code up to `34b6b6c8`, the final code commit when it ran; rework 3 changed
+`agent/src` after it (see *Not re-run after rework 3* at the end of this
+section). The merge `d82789ad` (origin/main
 `1d4ba878113fc113a7d52778054e83a46b53e269`) and `34b6b6c8` both change
 `agent/src`, so acceptance was re-run over that code. Later commits change only
 this ADR (`git diff --stat 34b6b6c8 8249dec9 -- agent/src e2e` is empty).
