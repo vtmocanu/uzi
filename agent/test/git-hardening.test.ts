@@ -110,10 +110,14 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
 
   // A pin-LESS env that still isolates from the host — used to prove the plant
   // really fires (the baseline vector) so a "not fired" under gitEnv is meaningful.
+  // TMPDIR is carried (issue #1863): git writes an external-diff driver's temp files there and
+  // falls back to /tmp without it, which the Landlock command sandbox denies ("unable to create
+  // temp-file", exit 128), so the diff.external baseline would read "did not fire".
   function plainEnv(): NodeJS.ProcessEnv {
     return {
       PATH: process.env.PATH,
       HOME: process.env.HOME,
+      ...(process.env.TMPDIR ? { TMPDIR: process.env.TMPDIR } : {}),
       GIT_CONFIG_GLOBAL: "/dev/null",
       GIT_CONFIG_SYSTEM: "/dev/null",
       GIT_TERMINAL_PROMPT: "0",

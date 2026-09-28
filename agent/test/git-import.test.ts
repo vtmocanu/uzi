@@ -558,6 +558,38 @@ describe("GitCache.ensureRunnerCloneObjects (issue #1769 m2)", () => {
     assert.match(err.causeMessage, /^pack-objects exited 1/);
     assert.ok(resolves(rc.path, defaultTip), "the pack did land: only the producer's status fails the import");
   });
+
+  it("a consumer that indexes the whole pack and exits 0 before the producer's exit is known still imports", async () => {
+    // issue #1863: index-pack stops reading at the pack trailer and exits, and Node destroys a
+    // child's stdin on its exit, so the consumer's stdin can close (unfinished, no error) while
+    // the producer's exit-gated stdout still waits for pack-objects' exit status. Under the
+    // Landlock command sandbox that window was wide enough to fail real imports with "pack stream
+    // failed: Premature close" although both sides exited 0 and the tip had landed. Here the
+    // producer's status is held until the consumer has exited, which makes that order certain.
+    const { bare, rc, defaultTip } = await setup(SELF);
+    const consumerDone = deferred<void>();
+    const spawner: BoundaryProcessSpawner = async (request) => {
+      const real = spawnReal(request);
+      if (request.argv.includes("pack-objects")) {
+        const completed = real.handle.completed.then(async (res) => {
+          await consumerDone.promise;
+          return res;
+        });
+        return { ...real.handle, completed };
+      }
+      if (request.argv.includes("index-pack")) {
+        void real.handle.completed.then(() => consumerDone.resolve(), () => consumerDone.resolve());
+      }
+      return real.handle;
+    };
+    await settleWithin(
+      git.withBoundaryProcessSpawner(spawner, new AbortController().signal, () =>
+        git.ensureRunnerCloneObjects(bare, rc.path, defaultTip, [rc.baseCommit])),
+      30_000,
+      () => [],
+    );
+    assert.ok(resolves(rc.path, defaultTip), "the tip resolves after the import");
+  });
 });
 
 // issue #1769 (reconciled with #1804) — spawnGit hands back exitGatedStream's PassThrough, piped

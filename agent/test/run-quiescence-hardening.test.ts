@@ -353,14 +353,14 @@ describe("A-helper-tmp: the uid-split TMPDIR setup runs mktemp/rm asynchronously
     assert.ok(ticks >= 5, `the event loop kept running while mktemp hung (ticks=${ticks})`);
     const hungPid = Number(fs.readFileSync(pidFile, "utf8").trim());
     // hungPid is this process's own spawned child, so node reaps it once it dies and
-    // process.kill(pid, 0) then reports ESRCH. Only "no such process" counts as gone: a status read
-    // denied by the sandbox (EACCES) falls back to the signal probe instead of passing vacuously.
+    // process.kill(pid, 0) then reports ESRCH. A failed status read never counts as gone by itself:
+    // ENOENT (also what a host with no proc filesystem returns for every pid) and a read denied by
+    // the sandbox (EACCES) both fall back to the signal probe instead of passing vacuously.
     const hungGone = (): boolean => {
       try {
         return /^State:\s*[ZX]/m.test(procfsTable.readStatus(hungPid));
       } catch (e) {
-        const code = (e as NodeJS.ErrnoException).code;
-        if (code === "ENOENT" || code === "ESRCH") return true;
+        if ((e as NodeJS.ErrnoException).code === "ESRCH") return true;
       }
       try {
         process.kill(hungPid, 0);
