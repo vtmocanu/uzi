@@ -12,6 +12,7 @@
 
 import type { Readable, Writable } from "node:stream";
 import type { EmittedMessage } from "./executor.js";
+import type { PrSummaryClaim } from "./signals.js";
 import type {
   AskUserQuestion,
   Milestone,
@@ -415,6 +416,8 @@ export interface TurnSignals {
   summary?: string;
   reportOnly?: boolean;
   proposal?: Proposal;
+  /** PRD #1798 M2: see ScannedSignals.prSummary (last-wins; never carries verifiedAtSha). */
+  prSummary?: PrSummaryClaim;
 }
 
 export interface ReducedTurnResult extends TurnSignals {

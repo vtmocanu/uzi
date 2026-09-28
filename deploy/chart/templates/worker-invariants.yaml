@@ -119,12 +119,14 @@
   maxPVCStorage 25Gi); `gt` and not `ge` because equal is a valid
   configuration.
 
-  🔴 THIS GUARD IS DOCKER-TIER ONLY, WHICH IS CORRECT AND READS BROADER THAN IT IS
-  (audit A18.4). The restricted tier has no chart-supplied PVC size — its two claims are
-  sized by Go constants — so there is nothing here for this loop to check and the
-  `workers.docker.enabled` condition is right. The consequence a reader of THIS FILE
-  ALONE would miss: `workers.limitRange.maxPVCStorage` is checked by nothing in the
-  chart at all.
+  🔴 THE dindDataSize GUARD IS DOCKER-TIER ONLY; THE RUN-BOUND /data GUARD IS NOT
+  (audit A18.4, revised by issue #1815). dindDataSize is claimed only by docker workers,
+  so its loop is correctly gated on `workers.docker.enabled`. Until #1815 the restricted
+  tier had no chart-supplied PVC size at all and `workers.limitRange.maxPVCStorage` was
+  checked by nothing in the chart. That is no longer true: a run-bound worker's /data
+  (workers.ephemeralWorkerDataSize) is chart-supplied and lands in EITHER tier, so the
+  second guard below checks it against the restricted tier's maxPVCStorage whenever
+  that LimitRange renders, and against the docker tier's under the dind guard's gate.
 
   🔴 WHAT THIS CANNOT SEE, stated because a guard's blind spot is the thing that gets
   assumed away: the OTHER two claimants are compiled into the controller, not supplied
@@ -139,12 +141,15 @@
   SO THERE ARE THREE NETS, AT THREE DIFFERENT TIMES, AND THIS IS THE FIRST OF THEM:
 
     1. HERE, at `helm install`/`template` time — the earliest and cheapest, covering the
-       one claimant the chart supplies, overrides included.
-    2. `go test` — TWO tests, one per source of a Go constant, and the pair is what
+       two claimants the chart supplies (dindDataSize, ephemeralWorkerDataSize),
+       overrides and the empty/default path included.
+    2. `go test` — THREE tests, one per source of a Go constant, and the set is what
        makes this net exhaustive: TestPresetPVCSizesFitTheChartsLimitRangeMax covers
-       nixSize and each preset's DataSize, and TestDinDDataDefaultFitsTheChartsLimitRangeMax
-       covers dindDataDefaultSize. Both read maxPVCStorage out of values.yaml under the
-       same parse-and-Fatal contract, so neither carries a hardcoded ceiling. They catch
+       nixSize and each preset's DataSize, TestDinDDataDefaultFitsTheChartsLimitRangeMax
+       covers dindDataDefaultSize, and TestEphemeralDataDefaultFitsTheChartsLimitRangeMax
+       covers ephemeralDataDefaultSize (issue #1815). All read maxPVCStorage out of
+       values.yaml under the same parse-and-Fatal contract, so none carries a hardcoded
+       ceiling. They catch
        a DEVELOPER raising a size in the repo.
     3. CONTROLLER BOOT — kube.ValidatePVCCeilings, fed the real ceilings at runtime
        (UZI_WORKER_MAX_PVC_STORAGE / UZI_WORKER_DOCKER_MAX_PVC_STORAGE), refuses to start
@@ -260,6 +265,39 @@
 {{- fail (printf "%s=%v exceeds workers.docker.limitRange.maxPVCStorage=%v. The claim would be REJECTED by the LimitRange admission plugin, and nothing surfaces that: helm renders clean, the controller boots clean, and the worker then provisions and NEVER APPEARS while the reconcile loop retries every tick with the reason only in its log. Raise workers.docker.limitRange.maxPVCStorage to at least %v (and raise workers.docker.quota.requestsStorage with it, or the tier runs out of storage budget instead), or lower %s." $key $size $max $size $key) }}
 {{- end }}
 {{- end }}
+{{- end }}
+{{- end }}
+{{- /*
+  THE RUN-BOUND /data CLAIMANT (issue #1815 → UZI_WORKER_EPHEMERAL_DATA_SIZE). A
+  run-bound ("ephemeral" = run-bound, NOT ephemeral-storage) worker's /data is sized by
+  workers.ephemeralWorkerDataSize INSTEAD of its preset's DataSize, on EITHER tier, so
+  unlike dindDataSize it is checked against BOTH ceilings: the restricted tier's
+  whenever its LimitRange renders, the docker tier's under the same gate the dind guard
+  above uses. Same shape, same failure it prevents.
+
+  The unset path is checked too, for the dind guard's reason: empty means the
+  controller supplies its own default, not "no claim". The "20Gi" literal below
+  MIRRORS ephemeralDataDefaultSize in controller/internal/kube/render.go and the two
+  must move together; that constant's comment names this file, and
+  TestEphemeralDataDefaultFitsTheChartsLimitRangeMax (controller/internal/kube) fails if
+  the controller's default outgrows either tier's max.
+*/ -}}
+{{- $runSize := .Values.workers.ephemeralWorkerDataSize }}
+{{- $runKey := "workers.ephemeralWorkerDataSize" }}
+{{- if not $runSize }}
+{{- $runSize = "20Gi" }}
+{{- $runKey = "the controller's built-in run-bound worker /data default (workers.ephemeralWorkerDataSize is unset, so the controller supplies 20Gi itself)" }}
+{{- end }}
+{{- $runCeilings := dict }}
+{{- if .Values.workers.limitRange.enabled }}
+{{- $_ := set $runCeilings "workers.limitRange.maxPVCStorage" .Values.workers.limitRange.maxPVCStorage }}
+{{- end }}
+{{- if and .Values.workers.docker.enabled .Values.workers.docker.limitRange.enabled }}
+{{- $_ := set $runCeilings "workers.docker.limitRange.maxPVCStorage" .Values.workers.docker.limitRange.maxPVCStorage }}
+{{- end }}
+{{- range $maxKey, $max := $runCeilings }}
+{{- if gt (float64 (include "uzi.quantityBytes" $runSize)) (float64 (include "uzi.quantityBytes" $max)) }}
+{{- fail (printf "%s=%v exceeds %s=%v. A run-bound (ephemeral) worker's /data claim can land in either tier, so it must fit both ceilings; this one would be REJECTED by the LimitRange admission plugin, and nothing surfaces that: helm renders clean and the worker then provisions and NEVER APPEARS while the reconcile loop retries every tick with the reason only in its log (the controller's boot check refuses to start instead). Raise %s to at least %v (and the tier's quota.requestsStorage with it), or lower %s." $runKey $runSize $maxKey $max $maxKey $runSize $runKey) }}
 {{- end }}
 {{- end }}
 {{- end }}

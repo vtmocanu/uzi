@@ -82,6 +82,7 @@ import {
 import {
   buildSignalMcpServer,
   SIGNAL_SERVER_NAME,
+  type PrSummaryClaim,
 } from "./signals.js";
 import { classifyLimitEvidence, LimitReachedError } from "./limit.js";
 import { PauseNowSignal, CredentialSwitchSignal, PLAN_APPROVAL_TIMEOUT_REASON, type PlanVerdict } from "./steering.js";
@@ -105,10 +106,10 @@ import type {
   RunTurnRequest,
   TurnStreamEnd,
 } from "./harness.js";
-import { PlanRejectedError } from "./executor.js";
+import { PlanRejectedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { clampToDirCharset, errMessage } from "./util.js";
-import { SummaryRunner } from "./summary-runner.js";
+import { SummaryRunner, type PlanSummaryResult } from "./summary-runner.js";
 import { resolvePrdInput, type PrdInput } from "./prd-link.js";
 import {
   STALL_LIMIT,
@@ -518,6 +519,10 @@ interface TurnResult {
    *  turn, if any. Last-wins within the turn (like summary); forwarded on the prompt-run
    *  completion report so the server can file it as a forge issue. */
   proposal?: Proposal;
+  /** PRD #1798 M2 (D4): the structured PR claims the lead passed to signal_done this turn, if
+   *  any. Last-wins within the turn (like summary); stamped with the worktree HEAD by the loop
+   *  when it latches the claims and forwarded as ExecutorResult.prSummary. */
+  prSummary?: PrSummaryClaim;
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -733,6 +738,10 @@ export class SdkExecutor implements Executor {
    *  into a second run() on the same instance). Typed as the neutral RunTurnReducer
    *  seam; `beginTurn()`/`accept()`/`finish()` are all on that interface. */
   private reducer: RunTurnReducer;
+  /** PRD #1798 M2: the last plan summary + deltas the api accepted this run
+   *  (generateAndPostPlanSummary), forwarded as ExecutorResult.summaryPlan/summaryDeltas.
+   *  Reset per run in run(). */
+  private latestPlanSummary: PlanSummaryResult | undefined;
 
   /**
    * @param homeDir per-run SDK HOME (`agent-home/<runId>` on $UZI_DATA_DIR, PRD #42
@@ -930,6 +939,9 @@ export class SdkExecutor implements Executor {
     const token = ctx.oauthToken?.trim();
     const isIssue = ctx.kind === "issue" || ctx.kind === undefined;
     if (!isIssue || !token || !this.client || !prdInputP) return;
+    // PRD #1798 M2: a new generation supersedes the latched summary of an earlier plan, so a
+    // re-plan whose summary then fails never forwards the OLD plan's summary on the result.
+    this.latestPlanSummary = undefined;
     try {
       const prd = await prdInputP;
       const r = await this.summaryRunner.generatePlanSummary({
@@ -950,6 +962,8 @@ export class SdkExecutor implements Executor {
           // 0x00 in the plan text would silently 409 every plan-summary write.
           plan_md: approvedPlan.replaceAll("\u0000", ""),
         });
+        // PRD #1798 M2: latch only after the api ACCEPTED it (a 409 stale / 400 throws above).
+        this.latestPlanSummary = { summary: r.summary, deltas: r.deltas };
       }
     } catch (err) {
       this.log.warn("plan summary hook failed", {
@@ -968,6 +982,7 @@ export class SdkExecutor implements Executor {
     // second run() on this instance (one executor per run is the norm, but keep
     // the latch honest regardless).
     this.reducer = new RunTurnReducerImpl(this.harness.contextHook);
+    this.latestPlanSummary = undefined;
     const drive = await this.phaseSetup(ctx);
     try {
       const early = await this.phasePlanGate(ctx, drive);
@@ -2265,6 +2280,9 @@ export class SdkExecutor implements Executor {
       // signal_done proposal must survive the `break` below to reach the final ExecutorResult
       // (and thence the runner's prompt-run completion report).
       let declaredProposal: Proposal | undefined;
+      // PRD #1798 M2 (D4): hoisted for the same reason as declaredProposal. Stamped with the
+      // worktree HEAD on the done turn that declared it.
+      let declaredPrSummary: PrSummaryClaim | undefined;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -2708,6 +2726,15 @@ export class SdkExecutor implements Executor {
         // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
         // the terminating turn reaches the final ExecutorResult after the break below.
         if (turn.proposal !== undefined) declaredProposal = turn.proposal;
+        // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the turn
+        // that CARRIED the claims, so a later bare signal_done (an interlock rework, an interactive
+        // follow-up) keeps the earlier claims with the sha they were made at. A turn carrying
+        // claims is always a done turn: scanSignals extracts pr_summary only inside the
+        // signal_done branch that latches `done`. A HEAD read failure leaves verifiedAtSha absent
+        // and never throws.
+        if (turn.prSummary !== undefined) {
+          declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
+        }
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -3240,6 +3267,16 @@ export class SdkExecutor implements Executor {
       // deepStrictEqual on this result holds. The api is the authoritative control.
       if (declaredProposal !== undefined) {
         result.proposal = declaredProposal;
+      }
+      // PRD #1798 M2: forward the lead's PR claims. NOT gated on run kind (every kind that
+      // pushes a branch opens a PR; the runner reads it only where it renders a description).
+      // OMITTED-not-undefined like the siblings above.
+      if (declaredPrSummary !== undefined) result.prSummary = declaredPrSummary;
+      // PRD #1798 M2: the last plan summary + deltas the api accepted this run, if any. Absent
+      // on a resume past the gate or when the advisory pass never succeeded.
+      if (this.latestPlanSummary !== undefined) {
+        result.summaryPlan = this.latestPlanSummary.summary;
+        result.summaryDeltas = this.latestPlanSummary.deltas;
       }
       // PRD #634 M3: forward the scope-capped disposition on `issue` runs only, OMITTED (not
       // undefined) like the siblings above so a normal completion's result shape is unchanged

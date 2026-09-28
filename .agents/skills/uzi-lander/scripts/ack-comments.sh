@@ -65,13 +65,13 @@ for a in "$@"; do
     *) echo "bad argument '$a' (want c<id>@<digest> or r<id>@<digest>, as --show prints)" >&2; exit 2 ;;
   esac
 done
-missing=$(jq -nr --argjson it "$items" --argjson a "$args_json" '($a | map(split("@")[0])) - [$it[].key] | join(" ")')
+missing=$(jq -nr --rawfile it <(printf '%s' "$items") --argjson a "$args_json" '($it | fromjson) as $it | ($a | map(split("@")[0])) - [$it[].key] | join(" ")')
 if [ -n "$missing" ]; then
   echo "not a current must-ack item on #$PR: $missing (run --list); nothing acknowledged" >&2
   exit 4
 fi
-stale=$(jq -nr --argjson it "$items" --argjson a "$args_json" \
-  '[$a[] | split("@") as $p | select(([$it[] | select(.key == $p[0]) | .digest] | first) != $p[1]) | $p[0]] | join(" ")')
+stale=$(jq -nr --rawfile it <(printf '%s' "$items") --argjson a "$args_json" \
+  '($it | fromjson) as $it | [$a[] | split("@") as $p | select(([$it[] | select(.key == $p[0]) | .digest] | first) != $p[1]) | $p[0]] | join(" ")')
 if [ -n "$stale" ]; then
   echo "changed since you read it (digest mismatch) on #$PR: $stale; re-read with --show, then ack the new digest; nothing acknowledged" >&2
   exit 5

@@ -157,6 +157,41 @@ The run page and `uzi run get --json` surface this plainly as
 is durably recoverable everywhere. Durable cross-worker conversation context
 is a separate, later piece of work — this page will be updated when it ships.
 
+## Closing directives and the completion block
+
+Every interlocked run's merge/pull request has a completion block that uzi
+alone owns and rewrites; on a verified full delivery it's the only place
+`Closes #N` is ever written. Two rules keep that guarantee even when
+something goes wrong or a human has touched the request in between:
+
+- **On a verified head, if the `Closes` write can't be confirmed** — the
+  write itself fails, the read-back to confirm it fails, or the PR's head
+  moved in between — uzi strips `Closes` back out. The run holds once that
+  strip is confirmed, or once the request turns out to be unreadable and the
+  strip falls back to writing a non-closing body blind (with no read-back,
+  but no closing directive by construction). Only when the strip write itself
+  is refused, or is written but a confirming read-back shows it didn't land,
+  does uzi skip the hold: it fails the run closed instead, since a hold is a
+  nominally non-closing parked state and uzi can't guarantee that here.
+- **On a non-closing run** — a hold, an owner-partial delivery, or one
+  scope-capped mid-flight — uzi scans the whole resulting request body,
+  not just its own completion block, for a closing directive aimed at the
+  issue. If it finds one anywhere it doesn't own (a human typed `Closes #N`
+  into the description, or the request is an older one uzi adopted that
+  already carried one), it rewrites the whole body to a non-closing form.
+  If that rewrite can't be *written*, or is written but the read-back
+  shows it did not land, the run fails closed rather than leaving a
+  possibly-closing request open; if the request was unreadable to begin
+  with, a blind rewrite that succeeds is still accepted, even though
+  nothing read the body back to confirm it. A read-back that errors
+  outright after the rewrite is written plays out differently by run
+  kind: on a legacy (non-interlocked: seeded, kill-switched or pre-rollout) run,
+  that failure has no further fallback
+  and the run fails closed there and then; on an interlocked run, that
+  same failure falls through to the same blind whole-body rewrite the
+  unreadable case uses, and is accepted on the same terms. This scan and
+  rewrite apply to legacy runs too, not only interlocked ones.
+
 ## Not the same as an owner pause
 
 A completion hold and [an owner-requested pause](run-pause.md) both leave a

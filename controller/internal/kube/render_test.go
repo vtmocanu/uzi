@@ -380,8 +380,8 @@ func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
 // cross-run/cross-repo executable-persistence residual for ephemeral usage
 // (PRD #529 M8, adr/0091-runner-cross-run-persistence-residual.md).
 //
-// The controller has no notion of "ephemeral": an ephemeral worker is just a
-// hosted worker with a unique id, materialized by this same RenderPVCs path. So
+// An ephemeral (run-bound) worker is a hosted worker with a unique id, materialized by
+// this same RenderPVCs path; only its /data SIZE differs (issue #1815), never a name. So
 // the residual is closed iff each worker's -nix and -data PVCs are NAMED by that
 // worker's id and no name is shared across workers. Two distinct ids must yield
 // two DISJOINT PVC name sets — a fresh worker per run means a fresh /nix and
@@ -704,36 +704,56 @@ func TestDinDDataDefaultFitsTheChartsLimitRangeMax(t *testing.T) {
 }
 
 // chartDockerMaxPVCStorage reads workers.docker.limitRange.maxPVCStorage out of
-// deploy/chart/values.yaml. Same contract as chartDeploymentQuotas below: parsed rather
-// than grepped (maxPVCStorage appears under two tiers), and FATAL on anything
-// unexpected, because a fallback would silently reinstate the hardcoded ceiling these
-// readers exist to remove.
+// deploy/chart/values.yaml. A thin view over chartMaxPVCStorages.
 func chartDockerMaxPVCStorage(t *testing.T) resource.Quantity {
+	t.Helper()
+	_, docker := chartMaxPVCStorages(t)
+	return docker
+}
+
+// chartMaxPVCStorages reads BOTH tiers' limitRange.maxPVCStorage out of
+// deploy/chart/values.yaml (restricted: workers.limitRange.maxPVCStorage; docker:
+// workers.docker.limitRange.maxPVCStorage). Same contract as chartDeploymentQuotas
+// below: parsed rather than grepped (maxPVCStorage appears under two tiers), and FATAL
+// on anything unexpected, because a fallback would silently reinstate the hardcoded
+// ceiling these readers exist to remove.
+func chartMaxPVCStorages(t *testing.T) (restricted, docker resource.Quantity) {
 	t.Helper()
 	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
 	raw, err := os.ReadFile(path) //nolint:gosec // G304: reads a test-controlled fixture/chart path (not user input)
 	if err != nil {
 		t.Fatalf("read %s: %v (the PVC ceiling is read from the chart; it must not fall back to a hardcoded constant)", path, err)
 	}
+	type limitRange struct {
+		MaxPVCStorage string `json:"maxPVCStorage"`
+	}
 	var v struct {
 		Workers struct {
-			Docker struct {
-				LimitRange struct {
-					MaxPVCStorage string `json:"maxPVCStorage"`
-				} `json:"limitRange"`
+			LimitRange limitRange `json:"limitRange"`
+			Docker     struct {
+				LimitRange limitRange `json:"limitRange"`
 			} `json:"docker"`
 		} `json:"workers"`
 	}
 	if err := yaml.Unmarshal(raw, &v); err != nil {
 		t.Fatalf("parse %s: %v", path, err)
 	}
-	if v.Workers.Docker.LimitRange.MaxPVCStorage == "" {
-		t.Fatalf("workers.docker.limitRange.maxPVCStorage is empty in %s; there is no ceiling to check against", path)
+	return chartQuantity(t, path, "workers.limitRange.maxPVCStorage", v.Workers.LimitRange.MaxPVCStorage),
+		chartQuantity(t, path, "workers.docker.limitRange.maxPVCStorage", v.Workers.Docker.LimitRange.MaxPVCStorage)
+}
+
+// chartQuantity parses one values.yaml quantity, FATAL on empty or unparseable.
+func chartQuantity(t *testing.T, path, key, raw string) resource.Quantity {
+	t.Helper()
+	if raw == "" {
+		t.Fatalf("%s is empty in %s; there is nothing to check against", key, path)
 	}
-	q, err := resource.ParseQuantity(v.Workers.Docker.LimitRange.MaxPVCStorage)
+	q, err := resource.ParseQuantity(raw)
 	if err != nil {
-		t.Fatalf("workers.docker.limitRange.maxPVCStorage = %q in %s is not a resource quantity: %v",
-			v.Workers.Docker.LimitRange.MaxPVCStorage, path, err)
+		t.Fatalf("%s = %q in %s is not a resource quantity: %v", key, raw, path, err)
+	}
+	if q.Sign() <= 0 {
+		t.Fatalf("%s = %s in %s; a non-positive value would make the assertion vacuous", key, q.String(), path)
 	}
 	return q
 }

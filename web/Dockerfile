@@ -48,6 +48,9 @@ COPY fixtures/api-contract/ /app/fixtures/api-contract/
 # statically imports `../../../fixtures/milestone-attribution/cases.json` as a typed JSON module,
 # so `tsc --noEmit` needs this sibling dir present too (else TS2307). Mirrors api-contract above.
 COPY fixtures/milestone-attribution/ /app/fixtures/milestone-attribution/
+# Same reason for the PR size-line cases (PRD #1798): DeliveredCard.test.tsx statically imports
+# `../../../../fixtures/pr-size-line/cases.json`, shared with the agent's size-line renderer.
+COPY fixtures/pr-size-line/ /app/fixtures/pr-size-line/
 RUN npm run build
 
 # --- runtime stage ---

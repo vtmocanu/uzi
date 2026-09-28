@@ -943,6 +943,28 @@ Tracked as GitHub issue vtmocanu/uzi#1795; decision record `adr/1795-gate-revisi
 
 - A plan-gate approve, reject or request-changes applies only to the plan revision it was sent against; a client that shows a plan (web, CLI, Slack) sends back the revision it displayed, and a stale one is refused rather than applied to a different plan. (AI-synced 2026-09-27)
 
+## Feature #1798 — Plain-English PR descriptions
+
+Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-descriptions.md`.
+
+- Every PR uzi opens gets a plain-English description plus a computed size
+  line; a human can see what it does and how big it is from the description
+  alone. (AI-synced 2026-09-28)
+- A Claude run and a Codex run produce the same layout. (AI-synced 2026-09-28)
+- Generated or lead-written text can never close an issue. (AI-synced 2026-09-28)
+- Text outside uzi's own blocks is preserved on an ordinary refresh; a few
+  named cases (no uzi markers yet, malformed markers — the publisher skips
+  such a PR and the interlock's own reconcile rewrites it whole — a closing
+  directive found outside the completion block, a blind rewrite of an
+  unreadable PR) rewrite the whole body instead. A missing completion block
+  is repaired in place instead: the publisher appends a fresh one and keeps
+  everything else, and only a completion block still missing when the
+  interlock's reconcile reads the PR gets the whole-body rewrite.
+  (AI-synced 2026-09-28)
+- The footer wording ("Opened by uzi from `<branch>`. A human reviews and
+  merges; uzi never merges.") was approved by the maintainer on 2026-09-27.
+  (AI-synced 2026-09-28)
+
 ## Feature #1809 — Worker disk safety for long runs
 
 Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.md`; ADR at `adr/1809-per-run-cache-bounds.md`.

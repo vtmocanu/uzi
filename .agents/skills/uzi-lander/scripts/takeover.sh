@@ -9,6 +9,9 @@
 #   Unless --no-claim, an open PR is CLAIMED for this session (claims.sh) so other landers
 #   see it; a PR another live session holds stops here with NEXT=claimed_by_other.
 #
+# SKILL_SCRIPTS_STALE=1 means these scripts differ from the local origin/main ref (a stale
+# checkout, or a local edit): rerun from a fresh detached origin/main worktree.
+#
 # Prints KEY=VALUE lines (empty when unknown), then NEXT=<state> — the branch point the
 # uzi-lander SKILL.md decision tree keys on:
 #   run_active:<status>   run not terminal (running, or a park: awaiting_*, limit_wait, …)
@@ -36,12 +39,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/review-threads.sh
 . "$HERE/lib/review-threads.sh"
+# shellcheck source=lib/freshness.sh
+. "$HERE/lib/freshness.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
     --no-claim) CLAIM=0; shift;;
-    -h|--help) sed -n '2,29p' "$0"; exit 3;;
+    -h|--help) sed -n '2,32p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -51,6 +56,9 @@ if [ -z "$REPO" ]; then
   REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || { echo "cannot infer --repo" >&2; exit 3; }
 fi
 echo "REPO=$REPO"
+stale=$(skill_scripts_stale "$HERE")
+echo "SKILL_SCRIPTS_STALE=$stale"
+[ "$stale" = 1 ] && echo "WARNING: these uzi-lander scripts differ from origin/main; run them from a fresh detached origin/main worktree (git fetch origin main && git worktree add --detach ../uzi-lander-tools origin/main)" >&2
 
 have_uzi=0; command -v uzi >/dev/null 2>&1 && have_uzi=1
 # UNKNOWN is set by any lookup that fails or returns an unreadable payload; a snapshot with
@@ -157,7 +165,22 @@ fr_head=$(printf '%s' "$wt_body" | awk '/final_review_risk_start/{f=1} f{print} 
 [ -n "$fr_head" ] && printf '%s' "$head" | grep -q "^$fr_head" && cr_reviewed=1
 echo "CR_REVIEWED_HEAD=$cr_reviewed"; echo "CR_UNCONFIRMED_ON_HEAD=$cr_unconfirmed"
 cr_reset=$(printf '%s' "$wt_body" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' | grep -oE 'available in [0-9]+ minutes' | tail -1 | grep -oE '[0-9]+' || true)
-[ -n "$cr_reset" ] && echo "CR_RESET_MIN=$cr_reset (as of the walkthrough's last edit; scripts/cr-rate-limit.sh for the live remainder)"
+if [ -n "$cr_reset" ]; then
+  # The figure is relative to the walkthrough's last edit, which can be hours old: report the
+  # remainder from that edit, never the raw figure (a 12 read as 12 while the live wait was 57).
+  wt_at=$(printf '%s' "$issue_c" | jq -r '[.[]|select(.user.login=="coderabbitai[bot]" and (.body|contains("rate limited by coderabbit.ai")))]|last|(.updated_at // .created_at // empty)' 2>/dev/null || true)
+  wt_epoch=$(jq -rn --arg t "$wt_at" '$t|sub("\\.[0-9]+";"")|fromdateiso8601' 2>/dev/null || true)
+  if [ -n "$wt_epoch" ]; then
+    left=$(( ( wt_epoch + cr_reset*60 - $(date +%s) + 59 ) / 60 ))
+    if [ "$left" -gt 0 ]; then
+      echo "CR_RESET_MIN=$left (from the walkthrough edited $wt_at; the account quota is shared, so scripts/cr-rate-limit.sh for the live remainder)"
+    else
+      echo "CR_RESET_MIN=unknown (the walkthrough's ${cr_reset}m window from $wt_at has passed; run scripts/cr-rate-limit.sh for the live remainder)"
+    fi
+  else
+    echo "CR_RESET_MIN=unknown (walkthrough said ${cr_reset}m at an unreadable time; run scripts/cr-rate-limit.sh)"
+  fi
+fi
 cr_tally=$(printf '%s' "$rev_raw" | jq -r '.[]|select(.user.login=="coderabbitai[bot]")|.body' 2>/dev/null | grep -oiE 'Actionable comments posted: [0-9]+' | tail -1 || true)
 [ -n "$cr_tally" ] && echo "CR_TALLY='$cr_tally'"
 

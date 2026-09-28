@@ -8,7 +8,7 @@ import {
   FORGE_RETRY_SCHEDULE,
   DEVBOX_RETRY_SCHEDULE,
 } from "../src/forge-retry.js";
-import { ForgeError } from "../src/forge.js";
+import { ForgeError, ForgeResponseTooLarge } from "../src/forge.js";
 import { DEFAULT_TERMINAL_RETRY_SCHEDULE } from "../src/client.js";
 
 // PRD #284 M1: the worker→forge retry schedule is a deliberate SECOND
@@ -66,6 +66,7 @@ describe("classifyForgeError", () => {
     },
     // ForgeError status classification
     { name: "ForgeError(0) transport failure", err: new ForgeError(0, "socket hang up"), want: "transient" },
+    { name: "ForgeResponseTooLarge (status 0) is permanent", err: new ForgeResponseTooLarge(1024), want: "permanent" },
     { name: "ForgeError(503)", err: new ForgeError(503, "service unavailable"), want: "transient" },
     { name: "ForgeError(429)", err: new ForgeError(429, "rate limited"), want: "transient" },
     { name: "ForgeError(422)", err: new ForgeError(422, "validation failed"), want: "permanent" },

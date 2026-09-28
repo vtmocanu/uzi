@@ -49,6 +49,15 @@ INSERT INTO health_episode_notices (episode_id, user_id)
 VALUES (@episode_id, @user_id)
 ON CONFLICT (episode_id, user_id) DO NOTHING;
 
+-- name: ReleaseHealthEpisodeNotice :exec
+-- Release a claimed per-admin, per-episode notice slot whose Notify failed (issue #1499), so
+-- a later still-danger tick re-claims it through ClaimHealthEpisodeNotice and retries the
+-- send. Only the caller whose claim INSERTED (rows-affected 1) calls this, and while the row
+-- exists no sibling tick or replica can re-insert it (the claim is a no-op for them), so a
+-- release never deletes another caller's win. Deleting a slot that is already gone is a no-op.
+DELETE FROM health_episode_notices
+WHERE episode_id = @episode_id AND user_id = @user_id;
+
 -- name: UpsertHealthBannerSnooze :exec
 -- Snooze the caller's Danger banner for the named episode until snoozed_until. Re-snoozing
 -- overwrites the expiry (ON CONFLICT DO UPDATE).

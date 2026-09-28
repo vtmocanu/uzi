@@ -35,7 +35,12 @@ import (
 // write-only notifications event log; the Slack DM to a linked admin is the only surface). Per-admin exactly-once is the atomic
 // ClaimHealthEpisodeNotice claim on the (episode_id, user_id) PK — a claim that inserts sends
 // one notice, a claim that no-ops (already notified) skips silently, so replays and a second
-// replica never double-notify.
+// replica never double-notify. The sequence is claim → send → release-on-failure: when Notify
+// errors (notifysvc errors only before its Slack send; the notification insert itself may have
+// committed if only its response was lost, so a retry can store a second row) the claimer
+// releases its slot with ReleaseHealthEpisodeNotice, so the next still-danger tick re-claims
+// and retries; the retries are bounded by the episode's lifetime (a closed episode is never
+// notified again).
 //
 // Its decision logic is unit-tested with fakes (this is not a live-DB test — healthsvc is
 // not in the sweep-enumerated live-DB package list; the claim query's atomicity is proven in
@@ -57,13 +62,14 @@ type healthEvaluator interface {
 
 // episodeStore is the episode-lifecycle slice of *store.Queries the reconciler uses: the
 // open-episode read, the atomic open, the idempotent close, the admin fan-out set, and the
-// atomic per-admin notice claim.
+// atomic per-admin notice claim and its release after a failed send.
 type episodeStore interface {
 	GetOpenHealthEpisode(ctx context.Context) (store.GetOpenHealthEpisodeRow, error)
 	OpenHealthEpisode(ctx context.Context, openedAt pgtype.Timestamptz) (uuid.UUID, error)
 	CloseHealthEpisode(ctx context.Context, arg store.CloseHealthEpisodeParams) error
 	ListAdmins(ctx context.Context) ([]uuid.UUID, error)
 	ClaimHealthEpisodeNotice(ctx context.Context, arg store.ClaimHealthEpisodeNoticeParams) (int64, error)
+	ReleaseHealthEpisodeNotice(ctx context.Context, arg store.ReleaseHealthEpisodeNoticeParams) error
 }
 
 // episodeNotifier is the notifysvc write seam (persist-first, best-effort Slack).
@@ -151,7 +157,10 @@ func (r *EpisodeReconciler) Reconcile(ctx context.Context) {
 // unreadable setting suppresses the notice entirely — and it dedups per admin with the atomic
 // ClaimHealthEpisodeNotice claim: only a claim that INSERTED (rows-affected 1) proceeds to
 // Notify, so a replay, a sibling replica or a later still-danger tick never double-notifies.
-// Best-effort throughout: one admin's claim/notify error is logged and never aborts the rest.
+// A failed Notify releases the claimed slot (ReleaseHealthEpisodeNotice) so the next
+// still-danger tick re-claims and retries it, bounded by the episode's lifetime.
+// Best-effort throughout: one admin's claim/notify/release error is logged and never aborts
+// the rest.
 func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUID, doc Doc) {
 	enabled, err := r.settings.HealthEnabled(ctx)
 	if err != nil {
@@ -180,7 +189,11 @@ func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUI
 	for _, uid := range admins {
 		// Atomic claim BEFORE the send: rows-affected 1 means THIS caller claimed the
 		// (episode, admin) slot and must send; 0 means a prior tick/replica already claimed
-		// it, so skip silently (this is the 23505/no-op-claim "already notified" case).
+		// it, so skip silently (this is the 23505/no-op-claim "already notified" case). If the
+		// send then fails, release the slot so the next still-danger tick re-claims it and
+		// retries. notifysvc sends to Slack only after the notification insert returns, so a
+		// Notify error never means a Slack message went out; an insert that committed before
+		// its response was lost can leave one extra stored notification row after the retry.
 		claimed, err := r.store.ClaimHealthEpisodeNotice(ctx, store.ClaimHealthEpisodeNoticeParams{
 			EpisodeID: episodeID,
 			UserID:    uid,
@@ -195,6 +208,13 @@ func (r *EpisodeReconciler) notifyAdmins(ctx context.Context, episodeID uuid.UUI
 		n := buildHealthEpisodeNotification(base, uid, episodeID, danger)
 		if _, err := r.notifier.Notify(ctx, n); err != nil {
 			r.logger.Warn("health episode: notify", "user", uid.String(), "error", err)
+			if rerr := r.store.ReleaseHealthEpisodeNotice(ctx, store.ReleaseHealthEpisodeNoticeParams{
+				EpisodeID: episodeID,
+				UserID:    uid,
+			}); rerr != nil {
+				r.logger.Error("health episode: release notice after failed notify; this admin's notice for the episode stays suppressed",
+					"user", uid.String(), "episode", episodeID.String(), "error", rerr)
+			}
 		}
 	}
 }

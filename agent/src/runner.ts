@@ -134,7 +134,17 @@ import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
-import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
+import { computeSize } from "./pr-size.js";
+import { buildDeliveryContext } from "./pr-description-context.js";
+import { resolvePrdInputFromBare } from "./prd-link.js";
+import {
+  PrDescriptionPublisher,
+  reconcileCompletion,
+  repoPathFromUrl,
+  type ReconcileResult,
+} from "./pr-description-publisher.js";
+import { renderCompletionBlock, type KindSection } from "./pr-description.js";
+import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
@@ -187,6 +197,15 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
  *  branch (the finalize push already landed before the permit was requested). */
 const COMPLETION_INTERLOCK_UNHELD_REASON =
   "completion interlock: could not verify the final head or park the run for recovery";
+
+/** PRD #1798 M6 (amended D10, M1): the STATIC failure_reason of a NON-interlocked issue run whose
+ *  completion is non-closing (an owner partial, a scope cap) when the description publisher reports
+ *  that the PR still carries a closing directive for the issue outside uzi's completion block (the
+ *  rewrite failed or could not be confirmed). Completing would leave a partial delivery that closes
+ *  its issue on merge. Before PRD #1798 such a body was never rewritten, so this failure is new and
+ *  intentional. Content-free, like COMPLETION_INTERLOCK_UNHELD_REASON. */
+const NON_CLOSING_BODY_UNCONFIRMED_REASON =
+  "completion interlock: a closing directive could not be removed from a non-closing merge request";
 
 /** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
  *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
@@ -1428,6 +1447,17 @@ export interface RunnerOptions {
    *  Measured against the injectable `now`, so a test can shrink it. Default 20s — well under the
    *  api's claimed-never-started grace so a probe never outlives the claim. */
   queuedDuplicateProbeBudgetMs?: number;
+  /** PRD #1798 M5: the SummaryRunner whose generateDeliverySummary writes the PR description.
+   *  main.ts injects one on the SDK HOME root with the production Codex factory. There is NO
+   *  default: without one the pass never runs and the description falls back to the lead's claims
+   *  or the size line alone (D8), rather than a live SDK call from a HOME under os.tmpdir(). */
+  summaryRunner?: SummaryRunner;
+  /** PRD #1798 M5: never run the editor pass (main.ts sets it under UZI_EXECUTOR=stub, so an e2e
+   *  spends nothing on either harness: the Codex advice path ignores the stub queryFn). */
+  skipDeliverySummary?: boolean;
+  /** PRD #1798 M6: how long the description publisher waits before re-reading a PR whose head is
+   *  not yet the landed head (a forge may lag a push by a moment). Default 2 s; tests pass 0. */
+  prDescriptionHeadLagMs?: number;
 }
 
 /**
@@ -1521,6 +1551,10 @@ export class RunRunner {
   private readonly setTimer: (cb: () => void, ms: number) => () => void;
   /** issue #1597 M2: arms the repeating mid-turn checkpoint tick (see RunnerOptions.setTickTimer). */
   private readonly setTickTimer: (cb: () => void, ms: number) => () => void;
+  /** PRD #1798 M5: see {@link RunRunner.deliverySummaryRunner}. */
+  private readonly deliverySummary: SummaryRunner | null;
+  /** PRD #1798 M6: see RunnerOptions.prDescriptionHeadLagMs. */
+  private readonly prDescriptionHeadLagMs: number | undefined;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -1697,6 +1731,17 @@ export class RunRunner {
     };
     this.setTimer = opts.setTimer ?? realTimer;
     this.setTickTimer = opts.setTickTimer ?? realTimer;
+    // PRD #1798 M5: the injected PR-description editor pass, or null when none is injected or it
+    // must never run (stub).
+    this.deliverySummary = opts.skipDeliverySummary ? null : (opts.summaryRunner ?? null);
+    this.prDescriptionHeadLagMs = opts.prDescriptionHeadLagMs;
+  }
+
+  /** PRD #1798 M5: the SummaryRunner the finalize path runs the PR-description editor pass on, or
+   *  null when none was injected or the pass is disabled (`skipDeliverySummary`), in which case the
+   *  description falls back to the lead's claims or the size line alone (D8). */
+  deliverySummaryRunner(): SummaryRunner | null {
+    return this.deliverySummary;
   }
 
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
@@ -4451,7 +4496,7 @@ export class RunRunner {
     // path the change touched, folding both into the MR description. Best-effort —
     // gathered before the push so the MR opens with its evidence, and a suite that
     // can't run is reported "skipped", never failing the run.
-    let selfImproveSection: string | undefined;
+    let selfImproveSection: KindSection | undefined;
     // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
     // web build) are hardcoded to uzi's OWN layout and are meaningless against an
     // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
@@ -4539,7 +4584,7 @@ export class RunRunner {
     // SELF_IMPROVE_CHECKS here — those are uzi's own gate suite and are meaningless
     // against an arbitrary repo. Best-effort, gathered before the push like the
     // self_improve evidence above.
-    let promptGuardSection: string | undefined;
+    let promptGuardSection: KindSection | undefined;
     if (claim.kind === "prompt") {
       // null (diff failed) → fail CLOSED with a loud "guard-path check unavailable"
       // note, exactly as the self_improve path does above (M5 audit).
@@ -5555,8 +5600,10 @@ export class RunRunner {
     // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
     // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
     // verification. It is threaded to reconcileMrDescription(!isOwnerPartial) below so the verified-head
-    // reconcile re-renders the NON-closing partial body instead of adding Closes; mrDescription's own
-    // effectiveCloses guard is the belt-and-suspenders. Absent/empty ⇒ false ⇒ the accept-closing and
+    // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
+    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, decides the rendered Closes
+    // line itself (renderCloses/withCloses go into issueArm), and nonClosingDelivery below gates the
+    // closing-directive scans, strips and fail-closed paths. Absent/empty ⇒ false ⇒ the accept-closing and
     // full-delivery paths add Closes after verify exactly as before.
     const isOwnerPartial = (claim.config?.completion_scope?.deferred?.length ?? 0) > 0;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
@@ -5598,12 +5645,17 @@ export class RunRunner {
     // failed strip cannot guarantee the MR is non-closing; a hold is a nominally non-closing parked
     // state, so we must not enter it here. Failing is the safe direction — loud and terminal — rather
     // than parking a possibly-closing MR on an unverified head that a human could merge.
-    const failInterlockedClosed = async (reason: string): Promise<void> => {
+    // PRD #1798 M6 (M1): a non-interlocked non-closing run whose PR still closes its issue fails the
+    // same way, with its own static reason.
+    const failInterlockedClosed = async (
+      reason: string,
+      failureReason: string = COMPLETION_INTERLOCK_UNHELD_REASON,
+    ): Promise<void> => {
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
       // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
       // survives an outage as this exact outcome, not a generic agent_failure.
-      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      await journalTerminalReport({ status: "failed", failure_reason: failureReason });
       runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
         run_id: runId,
         reason,
@@ -5670,20 +5722,6 @@ export class RunRunner {
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
       "main";
-    // PRD #1798 M1 (D3): the deterministic size line, computed HERE — after the push, align and
-    // history bridge (so the branch that will be published is final) and after the interlock permit
-    // (so the head is the landed tip, never a pre-align candidate) — from the worker-side tracking ref
-    // against the merge-base with the target branch. It is threaded into BOTH mrDescription calls
-    // (creation and the verified-head reconcile) so a body rewrite keeps it. computeSizeLine never
-    // throws; the extra catch only guards the tracking-ref read, so the size line can never fail a run.
-    let sizeLine: string | null;
-    try {
-      const sizeHead = await this.git.trackingTip(barePath, result.branch);
-      sizeLine = await computeSizeLine(this.git, barePath, targetBranch, sizeHead, runLog);
-    } catch (err) {
-      runLog.warn("PR size line unavailable", { run_id: runId, error: errMessage(err) });
-      sizeLine = SIZE_UNAVAILABLE;
-    }
     // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
     // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
     // path; each client derives its own API base + project from repo.url (D9).
@@ -5697,11 +5735,151 @@ export class RunRunner {
         : claim.repo.forge_type === "github"
           ? this.github
           : this.gitlab;
+
+    // ── PRD #1798 M6: the PR description (D8-D12, D15, D17) ──────────────────────
+    // The completion block this run writes, with or without `Closes #N` and the unverified banner.
+    // mrCompletionBlock's wording; the publisher and the reconcile compose the region and the
+    // preserved text around it.
+    const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
+      mrCompletionBlock(
+        claim,
+        result.branch,
+        result.agentSelection,
+        selfImproveSection,
+        promptGuardSection,
+        result.gatesUnverified,
+        result.gatesDiscoveryTruncated,
+        result.scopeCapped,
+        withCloses,
+        claim.config?.completion_scope,
+        bridged,
+        opts,
+      );
+    const runKind = resolveRunKind(claim.kind);
+    // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
+    // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
+    const refreshRun =
+      runKind === "mr_rework" ||
+      (runKind === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const repoPath = repoPathFromUrl(claim.repo.url);
+    // Amended D10: an issue run whose completion block is non-closing (an interlocked run until its
+    // head is verified, an owner partial, a scope-capped run) has its whole body scanned for a
+    // closing directive for the issue.
+    const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
+    // The ONE non-closing-delivery predicate: this run delivers less than its issue asked for, so no
+    // body it writes may close the issue, verified head or not. It gates the closing-directive scans,
+    // strips and fail-closed paths below (the publisher's non-closing scan via createCloses, the
+    // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
+    // rendered Closes line itself is decided by renderCloses/withCloses going into the renderer's
+    // issueArm (agent/src/pr-description.ts), whose partial arms never write it. Any new partial or
+    // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
+    // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
+    // own completion block), and this flag set here rather than its own check at one of those sites.
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
+    const createCloses = renderCloses && !nonClosingDelivery;
+    // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
+    // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
+    // and the interlock then treat the MR as unreadable; on the create path it fails the create.
+    // The publisher passes the signal of its current budget (prepare() and publish() each run under
+    // their own), so a retry stops waiting once that budget is spent.
+    const forgeRetry = <T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> =>
+      withForgeRetry(fn, {
+        log: runLog,
+        signal: signal ?? boundarySignal,
+        label: "PR description",
+        classify: classifyForgeError,
+      });
+    // The landed head the description describes (D2: after the push, align and bridge, so the branch
+    // is final). A read failure leaves it empty: the size line then reads unavailable.
+    let landedHead = "";
+    try {
+      landedHead = (await this.git.trackingTip(barePath, result.branch)) ?? "";
+    } catch (err) {
+      runLog.warn("PR description: the landed head is unreadable", { run_id: runId, error: errMessage(err) });
+    }
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: this.client,
+      pass: this.deliverySummaryRunner(),
+      log: runLog,
+      emit: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      forgeRetry,
+      headLagRetryMs: this.prDescriptionHeadLagMs,
+    });
+    // Step 1: context + editor pass + stage, before createMergeRequest (D2). Never throws; every
+    // failure falls down the D8 ladder. The size line is computed per snapshot, so a regeneration for
+    // the PR's actual target (read back after create) recomputes it against that target.
+    const description = await publisher.prepare(
+      {
+        runId,
+        claimGeneration: flight.claimGeneration,
+        claim,
+        repoUrl: claim.repo.url,
+        pat: claim.secrets.forge_pat,
+        repoPath,
+        mode: refreshRun ? "refresh" : "own",
+        interlockIssueIid: scanIid,
+        completionCloses: createCloses,
+        // An interlocked run's reconcile below reads the PR, and its reconcile (or the strip that
+        // follows an unconfirmed one) falls back blind, so a publisher blind rewrite there would
+        // only destroy human text.
+        blindFallback: !interlocked,
+        prior: claim.pr_description,
+        lead: result.prSummary,
+        facts: async (s) => {
+          const size = await computeSize(this.git, barePath, s.targetBranch, s.headSha || null, runLog);
+          let baseSha: string | null = null;
+          try {
+            if (s.headSha) baseSha = await this.git.sizeMergeBase(barePath, s.targetBranch, s.headSha);
+          } catch {
+            baseSha = null;
+          }
+          return { size, baseSha };
+        },
+        context: async (s, deadlineMs, previous) => {
+          // From the bare snapshot at the described head, never the agent-writable worktree: a FIFO
+          // left at the PRD path would block an open there with no deadline (CodeRabbit on #1825).
+          const prd = await resolvePrdInputFromBare(
+            this.git,
+            barePath,
+            s.headSha,
+            claim.issue_description ?? "",
+            claim.issue_iid,
+            { timeoutMs: deadlineMs - Date.now(), signal: boundarySignal },
+            runLog,
+          );
+          // flight.redactText scrubs every claim secret: the forge PAT, the Anthropic token, the join
+          // token, the git basic credential and, on a Codex run, the Codex access token and capability.
+          return buildDeliveryContext({
+            git: this.git,
+            barePath,
+            targetBranch: s.targetBranch,
+            headSha: s.headSha,
+            deadlineMs,
+            signal: boundarySignal,
+            redact: redactText,
+            issueTitle: claim.issue_title ?? "",
+            issueBody: claim.issue_description ?? "",
+            prdText: prd.prdText,
+            summaryPlan: result.summaryPlan,
+            summaryDeltas: result.summaryDeltas,
+            planMd: claim.plan_md ?? null,
+            prSummary: result.prSummary,
+            previous,
+            log: runLog,
+          });
+        },
+        completion: (staleness) => completionFor(renderCloses, { staleness }),
+        signal: boundarySignal,
+      },
+      { headSha: landedHead, targetBranch },
+    );
     // PRD #284 Layer A/D3: wrap the WHOLE createMergeRequest call (POST → duplicate
     // → findOpenMr GET) in the retry loop, not just its final thrown status. It is
     // already idempotent — on a duplicate it adopts the existing MR/PR — but a
     // transient findOpenMr failure after a duplicate POST would otherwise fail a run
-    // whose MR actually exists; retrying the whole call re-runs it instead.
+    // whose MR actually exists; retrying the whole call re-runs it instead. Create
+    // failures stay fatal. Step 2: a new PR is created with the final body.
     const mr = await withForgeRetry(
       () =>
         forge.createMergeRequest({
@@ -5710,28 +5888,35 @@ export class RunRunner {
           sourceBranch: result.branch,
           targetBranch,
           title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
-          description: mrDescription(
-            claim,
-            result.branch,
-            result.agentSelection,
-            selfImproveSection,
-            promptGuardSection,
-            result.gatesUnverified,
-            result.gatesDiscoveryTruncated,
-            result.scopeCapped,
-            renderCloses,
-            claim.config?.completion_scope,
-            bridged,
-            sizeLine ?? undefined,
-          ),
+          description: description.initialBody(completionFor(renderCloses)),
         }, boundarySignal),
-      { log: runLog, signal: boundarySignal },
+      { log: runLog, signal: boundarySignal, classify: classifyForgeError },
     );
     batcher.emit({
       kind: "status",
       agent: "worker",
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
+    // Steps 3-9: read, bind, revalidate, write, confirm, ack. Advisory: never throws, never fails or
+    // holds the run. For an interlocked run it writes the NON-closing creation completion block; the
+    // interlock below then owns that block.
+    const published = await description.publish(mr.iid);
+    // uzi's own region: what a whole-body rewrite below writes (never text read back from the forge).
+    const ownRegion = published.region;
+    // PRD #1798 M6 (amended D10, M1): a NON-interlocked issue run whose completion is non-closing (an
+    // owner partial, a #634 scope cap) must not complete while its PR still closes the issue. The
+    // publisher scanned the body and tried the whole-body non-closing rewrite; when it reports a
+    // closing directive left on the PR (the rewrite failed or was not confirmed), or it never read
+    // the PR and its blind whole-body non-closing rewrite then failed or was not attempted (a
+    // stopped publication; nothing observed is not proof of nothing closing), fail closed. An
+    // interlocked run's own reconcile below owns this for it.
+    if (!interlocked && scanIid !== undefined && !createCloses && published.closingRemains) {
+      runLog.warn("PR description: a closing directive remains on a non-closing merge request; failing the run", {
+        run_id: runId,
+      });
+      await failInterlockedClosed("closing directive remains on a non-closing MR", NON_CLOSING_BODY_UNCONFIRMED_REASON);
+      return;
+    }
 
     // ── PRD #1226 M4 (D5): PR-head verification (create-then-verify) ────────────
     // For an interlocked run (completionHead set on the granted path) the MR now exists; read its
@@ -5745,58 +5930,54 @@ export class RunRunner {
     // create-then-verify state (a human merge closing the issue on an unverified head) is structurally
     // impossible for it. reconcileMrDescription ADDS the canonical `Closes #N` body ONLY after the PR
     // head is verified to equal H, and the head is then RE-READ to bind that add to the verified head
-    // (a change in the read→add window strips Closes and holds); if the add FAILS the run HOLDS rather
-    // than reporting completion (the completion contract requires the merged MR to carry Closes). The
-    // hold branches strip Closes and add the unverified banner FIRST and REQUIRE that write to succeed:
+    // (a change in the read→add window strips Closes and holds); if the add is not CONFIRMED (the
+    // write failed, its re-read failed, or the re-read did not carry the written block) the add may
+    // have landed, so the run strips Closes and holds rather than reporting completion (the completion
+    // contract requires the merged MR to carry Closes). The hold branches strip Closes and add the unverified banner FIRST and REQUIRE that write to succeed:
     // `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`, so a failed
     // strip cannot prove the MR is non-closing and we fail CLOSED instead of holding (stripClosesThenHold
     // → failInterlockedClosed). The whole block is skipped for a legacy run (completionHead ===
     // undefined), so its completion is byte-for-byte unchanged.
     const UNVERIFIED_BANNER =
       "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
-    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
-      try {
-        const base = mrDescription(
-          claim,
-          result.branch,
-          result.agentSelection,
-          selfImproveSection,
-          promptGuardSection,
-          result.gatesUnverified,
-          result.gatesDiscoveryTruncated,
-          result.scopeCapped,
-          withCloses,
-          claim.config?.completion_scope,
-          bridged,
-          sizeLine ?? undefined,
-        );
-        const desc = banner ? `${banner}\n\n${base}` : base;
-        await withForgeRetry(
-          () =>
-            forge.updateMergeRequestDescription(
-              claim.repo.url,
-              claim.secrets.forge_pat,
-              mr.iid,
-              desc,
-              boundarySignal,
-            ),
-          { log: runLog, signal: boundarySignal },
-        );
-        return true;
-      } catch (e) {
-        runLog.warn(
-          "completion interlock: could not reconcile the MR description; leaving the created MR as-is",
-          { run_id: runId, error: errMessage(e) },
-        );
-        return false;
-      }
+    // PRD #1798 M6 (D10): the reconcile reads the MR, replaces ONLY its completion block (preserving
+    // the region and every byte outside the blocks), writes, and re-reads: `confirmed` only when the
+    // re-read body carries exactly the completion block it wrote. Malformed or missing completion markers get
+    // a whole-body rewrite. A NON-closing block on an issue run (a hold, an owner partial, a scope cap)
+    // scans the whole result for a closing directive uzi does not write; one forces a whole-body
+    // non-closing rewrite (re-read and re-scanned), and `closing` means it could not be removed. On a
+    // non-closing write a failed read falls back to the blind whole-body rewrite (today's behaviour),
+    // reported as `blind`: accepted by a hold's strip, never enough to complete.
+    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<ReconcileResult> => {
+      const closes = withCloses && !nonClosingDelivery;
+      return reconcileCompletion({
+        forge,
+        repoUrl: claim.repo.url,
+        pat: claim.secrets.forge_pat,
+        mrIid: mr.iid,
+        signal: boundarySignal,
+        completion: (headSha) =>
+          completionFor(withCloses, {
+            banner,
+            staleness:
+              headSha && published.describedSha ? { describedSha: published.describedSha, headSha } : undefined,
+          }),
+        ownRegion,
+        nonClosing: !closes && scanIid !== undefined ? { issueIid: scanIid, repoPath } : undefined,
+        forgeRetry: (fn) => withForgeRetry(fn, { log: runLog, signal: boundarySignal, classify: classifyForgeError }),
+        log: runLog,
+      });
     };
     // PRD #1225 (CodeRabbit !1254): strip any `Closes #N` (writing the unverified banner) BEFORE a
-    // hold. If that write FAILS we cannot guarantee the MR is non-closing — `createMergeRequest` can
-    // ADOPT a pre-existing MR that already carried `Closes #N` — so fail CLOSED rather than hold a
-    // possibly-closing MR on an unverified head.
+    // hold. If that write FAILS, or cannot be confirmed non-closing, we cannot guarantee the MR is
+    // non-closing — `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`,
+    // and a human may have typed one anywhere in the body (amended D10) — so fail CLOSED rather than
+    // hold a possibly-closing MR on an unverified head. `blind` (the MR was unreadable, so a
+    // non-closing whole body was written without a re-read) is accepted here, as before: that body
+    // carries no closing directive by construction.
     const stripClosesThenHold = async (holdReason: string, failReason: string): Promise<void> => {
-      if (!(await reconcileMrDescription(false, UNVERIFIED_BANNER))) {
+      const stripped = await reconcileMrDescription(false, UNVERIFIED_BANNER);
+      if (stripped !== "confirmed" && stripped !== "blind") {
         await failInterlockedClosed(failReason);
         return;
       }
@@ -5835,14 +6016,45 @@ export class RunRunner {
       // Verified: ADD the canonical `Closes #N` body. The interlocked MR was created WITHOUT Closes,
       // so this is the ONLY place a completion's closing line is written (it is also a REPAIR on an
       // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
-      // requires the merged MR to carry Closes, so if this write FAILS we hold rather than report
-      // completion.
+      // requires the merged MR to carry Closes, so if this add is not confirmed we strip it and hold
+      // (failing closed when the strip is not confirmed) rather than report completion.
       // PRD #1227 M2: an OWNER PARTIAL (scope_reduced) run must NEVER close its issue even on a verified
       // head, so it re-renders its NON-closing partial body here (reconcileMrDescription(false)) instead
       // of adding Closes; the head is still verified (permit binding) — only the Closes-add is
       // suppressed. An accept-only/full-delivery run has isOwnerPartial=false and adds Closes as before.
-      if (!(await reconcileMrDescription(!isOwnerPartial))) {
-        await holdOrFailInterlocked("could not assert the verified-head completion body");
+      // PRD #1798 M6 (amended D10): the partial's non-closing write is scanned; a closing directive it
+      // cannot remove fails the run closed rather than holding or completing a closing MR.
+      const verified = await reconcileMrDescription(!isOwnerPartial);
+      // PRD #1798 M6 (ADR 1225): whether this reconcile ADDED `Closes #N` (reconcileMrDescription's
+      // own `closes`: always !nonClosingDelivery here, since the verified reconcile asks for Closes
+      // unless the delivery is partial).
+      const addedCloses = !nonClosingDelivery;
+      if (verified === "closing") {
+        await failInterlockedClosed("could not remove a closing directive from a non-closing MR");
+        return;
+      }
+      if (verified === "unconfirmed") {
+        // The reconcile could not be confirmed, so the MR may carry Closes: the one this reconcile
+        // ADDED (a write attempted but unconfirmed, a confirm read that failed, a re-read that did not
+        // carry the written block), or, on a non-closing delivery, an adopted closing block. Either
+        // way the hold strips first and fails closed when the strip is not confirmed; a plain hold
+        // here would keep `Closes #N` on an unverified head. This is EVERY non-confirmed result of a
+        // Closes add: a closing reconcile scans nothing and never falls back blind, so it answers only
+        // `confirmed` or `unconfirmed` (reconcileCompletion reports `blind` and `closing` only for a
+        // non-closing write).
+        await stripClosesThenHold(
+          "could not assert the verified-head completion body",
+          addedCloses
+            ? "could not strip Closes after an unconfirmed add"
+            : "could not strip Closes from an unconfirmed non-closing MR",
+        );
+        return;
+      }
+      if (verified === "blind") {
+        // L3: the MR was unreadable, so a non-closing body was written with no re-read. It carries no
+        // closing directive by construction, but nothing confirmed the completion: hold, never
+        // complete.
+        await holdOrFailInterlocked("could not confirm the verified-head completion body");
         return;
       }
       // BIND the Closes add to the verified head (CodeRabbit !1254): re-read the PR head AFTER writing
@@ -12606,17 +12818,29 @@ export function mrTitle(
   return `${prefix}Work on issue #${claim.issue_iid}`;
 }
 
-/** MR body: links + closes the issue (issue run) or links the failing pipeline
- *  (ci_fix, PRD #6), states the primary directive (humans merge), and — when the
- *  run used the repo's own agents (PRD #37 Decision 3b) — a marker so the human
- *  reviewer knows the internal review loop was performed by repo-authored agents,
- *  not by uzi's built-in reviewer. */
-export function mrDescription(
+/** PRD #1798: the options mrCompletionBlock takes after its positional parameters. All optional.
+ *  `banner` is the completion-unverified banner (PRD #1225), rendered INSIDE the completion block;
+ *  `staleness` is the D12 staleness line's two SHAs. */
+export interface MrDescriptionOptions {
+  banner?: string;
+  staleness?: { describedSha: string; headSha: string };
+}
+
+/**
+ * PRD #1798 M6: the completion block of a run's MR body, which carries every deterministic line the
+ * MR body has always owned: `Related to #N.` and `Closes #N` (issue arm), the partial and accepted
+ * warnings (PRD #1227), the gates-unverified section, the history-bridge sentence (PRD #1416), the
+ * completion-unverified banner (PRD #1225), the agents line (PRD #37 Decision 3b), the kind's
+ * one-liner (D14) and the footer. The publisher and the interlock's reconcile compose the region and
+ * the preserved text around it (a new PR's body is renderBody(region, this block)). A thin wrapper
+ * over pr-description.ts renderCompletionBlock; exported for the direct rendering tests.
+ */
+export function mrCompletionBlock(
   claim: ClaimResponse,
   branch: string,
   agentSelection?: { source: AgentSource; agents: string[] },
-  selfImproveSection?: string,
-  promptGuardSection?: string,
+  selfImproveSection?: KindSection,
+  promptGuardSection?: KindSection,
   gatesUnverified?: string[],
   gatesDiscoveryTruncated?: boolean,
   scopeCapped?: { completedCount: number; total?: number },
@@ -12626,155 +12850,45 @@ export function mrDescription(
   // "no `Closes` on an unverified head" invariant structural for the fixed text this function writes.
   // #1801: that only holds if no OTHER fixed line is a closing directive on some forge; GitLab's default
   // pattern also closes on `Implement(s|ed|ing)`, so the reference line reads `Related to #N.`.
-  // Interpolated owner text (deferred titles/reasons, accepted criteria) is not scanned here (PRD #1798).
-  // Defaults true so the sole issue-arm caller keeps today's behavior.
+  // PRD #1798 D7: interpolated owner text (deferred titles/reasons, accepted criteria) is escaped
+  // with its closing keywords and mentions broken (pr-description.ts escapeInline).
   renderCloses = true,
   // PRD #1227 M2/M3: the run's owner completion decisions. `deferred` (non-empty ⇒ owner PARTIAL,
   // scope_reduced) drives a partial-delivery body that lists each deferred milestone + reason and
   // NEVER closes the issue — it takes precedence over the #634 scopeCapped count body. `accepted`
   // (non-empty) appends a warning block naming each owner-accepted unmet criterion (id + text +
-  // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
-  // no accept, so the body is byte-identical to today.
+  // reason), present in ANY branch — including on a closing accept-only PR.
   completionScope?: ClaimConfig["completion_scope"],
   // PRD #1416 M3 (Part D): the pushed history contains an ancestry bridge (derived from history via
-  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is appended to the
-  // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
-  // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
+  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is rendered in the
+  // completion block of EVERY kind's MR — never "the worker bridged it", because the agent's own
+  // `git merge -s ours <P>` bridge is equally possible.
   bridged = false,
-  // PRD #1798 M1 (D3): the deterministic size line (`**Size:** ...`, or `**Size:** unavailable`),
-  // appended to EVERY kind's body: before the `---` footer in the issue arm, after the body (like the
-  // bridge note) in a per-kind arm. Absent/empty (no diff, or a caller that does not pass it) ⇒ the
-  // body is byte-identical to today.
-  sizeLine?: string,
+  opts?: MrDescriptionOptions,
 ): string {
-  const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
-  // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
-  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged). #1416
-  // FIX 6: the issue arm renders it WITHIN the body (before the `---` footer); the bridgeNote form
-  // (with its leading blank line) is kept for the per-kind arm, which appends it to a body that
-  // already carries its own footer.
-  const bridgeSentence = bridged
-    ? "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
-    : "";
-  const bridgeNote = bridgeSentence ? `\n\n${bridgeSentence}` : "";
-  const repoMarker =
-    agentSelection?.source === "repo"
-      ? [
-          "",
-          "> ⚠️ This run used agent definitions from the repository's own " +
-            `\`.claude/agents/\` (${agentSelection.agents.join(", ") || "none"}). The internal ` +
-            "review was performed by those repo-authored agents, not by uzi's built-in " +
-            "reviewer — review this change accordingly.",
-        ]
-      : [];
-  // PRD #983 M4b: the per-kind MR bodies (self_improve's tracking-issue reference,
-  // ci_fix's pipeline body, prompt/task/mr_rework's issue-less bodies) live in
-  // RUN_KIND_PROFILES.mrBody, each returning its exact array-`.join("\n")` string from
-  // one explicit context bag. A row's undefined — ci_fix with no pipeline, and the
-  // issue/chat/judge kinds that carry no mrBody — falls through to the issue body below
-  // (the scopeCapped / gates / Closes arm), which stays here as the richest arm.
-  const kindBody = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].mrBody?.(claim, {
+  // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
+  // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
+  // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
+  // accepted / gates) inside renderCompletionBlock.
+  const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
     branch,
-    baseBranch: claim.base_branch?.trim(),
-    repoMarker,
-    footer,
-    selfImproveSection,
-    promptGuardSection,
+    baseBranch: claim.base_branch?.trim() || undefined,
   });
-  const sizeNote = sizeLine ? `\n\n${sizeLine}` : "";
-  if (kindBody !== undefined) return kindBody + bridgeNote + sizeNote;
-  // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
-  // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
-  // criteria to name in a warning block. Both absent/empty on a normal run.
-  const deferred = completionScope?.deferred ?? [];
-  const accepted = completionScope?.accepted ?? [];
-  const isOwnerPartial = deferred.length > 0;
-  const hasAccepted = accepted.length > 0;
-  // An owner partial NEVER closes the issue, regardless of the caller's renderCloses — this makes
-  // "a partial never closes" structural in the renderer too, not only in the create-then-verify flow.
-  const effectiveCloses = renderCloses && !isOwnerPartial;
-  // Body selection, in precedence order:
-  //   1. PRD #1227 owner partial (deferred) — partial-delivery body listing each deferred milestone +
-  //      reason; NO Closes. Takes precedence over the #634 scopeCapped count body.
-  //   2. PRD #634 operator scope (scopeCapped) — the existing count-only partial body, UNCHANGED.
-  //   3. normal — `Related to #N.` with the Closes pair gated on effectiveCloses.
-  const body = isOwnerPartial
-    ? [
-        `Implements part of #${claim.issue_iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
-        "",
-        "> ⚠️ **Partial delivery — owner scope decision (PRD #1227).** The owner reduced this run's",
-        "> completion scope. The milestone(s) below were DEFERRED BY THE OWNER and are NOT delivered by",
-        "> this merge request, so it does not close the issue:",
-        ...deferred.map(
-          (d) => `> - \`${d.milestone_id}\` — ${d.title}: ${d.reason}`,
-        ),
-        ...repoMarker,
-      ]
-    : scopeCapped
-      ? // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
-        // issue — it delivered only the approved slice of milestones — so the closing line is
-        // replaced with a partial-delivery statement and a scope-note blockquote is inserted.
-        [
-          `Implements part of #${claim.issue_iid} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
-          "",
-          "> ⚠️ **Partial delivery — operator scope directive.** The operator narrowed this run's",
-          `> scope mid-flight. ${scopeCapped.completedCount}${typeof scopeCapped.total === "number" ? ` of ${scopeCapped.total}` : ""} approved milestone(s) were completed and`,
-          "> are included here; any remaining milestones were deferred to a follow-up run. Review this",
-          "> as a partial implementation — it does not complete the issue.",
-          ...repoMarker,
-        ]
-      : [
-          // #1801: NOT `Implements issue #N.` — GitLab's default closing pattern treats Implement(s)
-          // as a closing keyword, which made this "non-closing" body close the issue on merge.
-          `Related to #${claim.issue_iid}.`,
-          // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When effectiveCloses is true (a legacy
-          // run at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads
-          // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
-          ...(effectiveCloses ? ["", `Closes #${claim.issue_iid}`] : []),
-          ...repoMarker,
-        ];
-  // PRD #1227 M3 (D3): WHENEVER the owner accepted unmet criteria, append a warning block naming each
-  // by id + criterion text + owner reason. Present in ANY branch above — including on a closing
-  // accept-only PR, so a closing PR carries the reason the unmet criteria were waived.
-  if (hasAccepted) {
-    body.push(
-      "",
-      "> ⚠️ **Accepted unmet criteria — owner decision (PRD #1227).** The owner accepted the following",
-      "> unmet criteria as-is with the reason given; they are NOT met by this merge request:",
-      ...accepted.map((a) => `> - \`${a.id}\` — ${a.text}: ${a.reason}`),
-    );
-  }
-  const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
-  if (gatesSection) body.push("", gatesSection);
-  // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
-  if (bridgeSentence) body.push("", bridgeSentence);
-  // PRD #1798 M1: the size line, after gates/bridge and before the `---` footer.
-  if (sizeLine) body.push("", sizeLine);
-  body.push("", "---", footer);
-  return body.join("\n");
-}
-
-/** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every
- *  component's deps installed AND discovery saw the whole tree. Dir names arrive already
- *  clamped (safeDirLabel). The truncation caveat (review F1) fires even when `dirs` is
- *  empty: a capped discovery means components it never reached could be unverified too,
- *  which named dirs alone cannot say. */
-function gatesUnverifiedMrSection(dirs?: string[], discoveryTruncated?: boolean): string {
-  const named = dirs ?? [];
-  if (named.length === 0 && !discoveryTruncated) return "";
-  const parts: string[] = [];
-  if (named.length > 0) {
-    const list = named.map((d) => `\`${d}\``).join(", ");
-    parts.push(
-      `JS dependencies did not install in: ${list}. Gates that need them (e.g. \`vitest\`, \`knip\`) could not run on this change, so treat those gates as unverified, not passing.`,
-    );
-  }
-  if (discoveryTruncated) {
-    parts.push(
-      "Dependency discovery stopped at its scan cap, so components beyond it were never checked and their gates may also be unverified.",
-    );
-  }
-  return `> ⚠️ **Quality gates unverified.** ${parts.join(" ")}`;
+  return renderCompletionBlock({
+    issueIid: claim.issue_iid,
+    branch,
+    kindLine,
+    kindSections: [selfImproveSection, promptGuardSection],
+    closes: renderCloses,
+    completionScope,
+    scopeCapped,
+    repoAgents: agentSelection?.source === "repo",
+    gatesUnverified,
+    gatesDiscoveryTruncated,
+    bridged,
+    banner: opts?.banner,
+    staleness: opts?.staleness,
+  });
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

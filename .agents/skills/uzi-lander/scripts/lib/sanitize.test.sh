@@ -53,7 +53,11 @@ check_inert "$WORK/fields.out" fields
 printf '%s' "$body" | sanitize_untrusted > "$WORK/stdin.out"
 check_inert "$WORK/stdin.out" stdin
 long=$(jq -rn '"y" * 1000' | sanitize_untrusted)
-[ "${#long}" -eq 301 ] && [ "${long: -1}" = "…" ] || fail "cap: want 300 chars + ellipsis, got ${#long}"
+# Count characters with jq: bash's ${#long} counts BYTES under a C locale (Debian's default,
+# the uzi worker), where the 3-byte "…" made a correct cap read as 303.
+long_n=$(printf '%s' "$long" | jq -Rrs 'length')
+long_end=$(printf '%s' "$long" | jq -Rrs '.[-1:]')
+[ "$long_n" -eq 301 ] && [ "$long_end" = "…" ] || fail "cap: want 300 chars + ellipsis, got $long_n"
 [ "$(printf 'short' | sanitize_untrusted 300)" = short ] || fail "a short string was altered"
 
 # 3b. Every invisible or reordering code point is stripped, one at a time: "a<cp>b" -> "ab".

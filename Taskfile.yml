@@ -967,6 +967,7 @@ tasks:
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/freshness.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh

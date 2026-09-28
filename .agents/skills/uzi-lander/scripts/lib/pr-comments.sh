@@ -59,7 +59,10 @@ def status_only:
         ($b | contains("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->"))
         or ($b | contains("<!-- walkthrough_start -->"))
         or ($b | contains("<!-- auto-generated comment: rate limited by coderabbit.ai -->"))
-        or ($b | contains("<!-- CodeRabbit review command invocation:"))))
+        or ($b | contains("<!-- CodeRabbit review command invocation:"))
+        # The answer to the cr-rate-limit.sh quota query, matched as the WHOLE body: any
+        # extra text (a mixed reply with feedback) still needs an ack.
+        or ($b | test("^\\s*<!-- This is an auto-generated reply by CodeRabbit -->\\s*Your \\[plan\\]\\([^)\\s]*\\) includes PR reviews subject to \\[rate limits\\]\\([^)\\s]*\\)\\. (More reviews will be available in [0-9]+ minutes?|Reviews are available now)\\.\\s*$"))))
     or ($u == "greptile-apps[bot]" and (
         ($b | contains("<!-- greptile_comment -->"))
         or ($b | contains("<!-- greptile_outside_diff -->"))));
@@ -127,18 +130,22 @@ code_scanning_open() {
   return 0
 }
 
+# JSON documents that carry comment bodies go to jq by --rawfile, never --argjson: Linux caps
+# one argv string at 128 KiB, and a large CodeRabbit walkthrough exceeds it (E2BIG read as
+# an unknown lookup, so the PR never reached ready on a Linux host).
+#
 # must_ack_json ISSUE_FLAT REVIEWS_FLAT -> JSON array of comment/review-body items, each
 # with its digest. Both inputs are ONE flat JSON array each. rc 1 on unreadable input.
 must_ack_json() {
   local items b64 digests='' d
-  items=$(jq -nc --argjson i "$1" --argjson r "$2" "$PRC_JQ"' if ($i|type) == "array" and ($r|type) == "array" then must_ack($i; $r) else error("x") end' 2>/dev/null) || return 1
+  items=$(jq -nc --rawfile i <(printf '%s' "$1") --rawfile r <(printf '%s' "$2") "$PRC_JQ"' ($i|fromjson) as $i | ($r|fromjson) as $r | if ($i|type) == "array" and ($r|type) == "array" then must_ack($i; $r) else error("x") end' 2>/dev/null) || return 1
   # One base64 line per item, in order; the digest hashes that line.
   while IFS= read -r b64; do
     d=$(printf '%s' "$b64" | _prc_sha) || return 1
     digests="${digests}${d}"$'\n'
   done < <(printf '%s' "$items" | jq -r '.[] | .fp | @base64')
-  jq -nc --argjson it "$items" --arg d "$digests" \
-    '($d | split("\n") | map(select(. != ""))) as $ds
+  jq -nc --rawfile it <(printf '%s' "$items") --arg d "$digests" \
+    '($it | fromjson) as $it | ($d | split("\n") | map(select(. != ""))) as $ds
      | if ($ds | length) != ($it | length) then error("digest count") else [range($it | length) as $n | $it[$n] + {digest: $ds[$n]}] end' 2>/dev/null
 }
 
@@ -160,7 +167,7 @@ ack_read() {
 }
 
 # unacked_json ITEMS ACKS -> the items whose key has no ack at their current digest.
-unacked_json() { jq -nc --argjson it "$1" --argjson a "$2" "$PRC_JQ"' $it | unacked($a)' 2>/dev/null; }
+unacked_json() { jq -nc --rawfile it <(printf '%s' "$1") --argjson a "$2" "$PRC_JQ"' ($it|fromjson) | unacked($a)' 2>/dev/null; }
 
 # print_items ITEMS -> one sanitized untrusted_row per item.
 print_items() { printf '%s' "$1" | jq -r "$UNTRUSTED_JQ"' .[] | untrusted_row' 2>/dev/null; }

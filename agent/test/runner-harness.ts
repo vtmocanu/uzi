@@ -20,6 +20,7 @@ import {
   ForgejoClient,
   GitHubClient,
   type FetchFn,
+  type FetchResponse,
 } from "../src/forge.js";
 import {
   RunRunner,
@@ -96,126 +97,130 @@ export interface MrCall {
   body?: string;
 }
 
+/** PRD #1798 M6: the fake forge's single PR, as the detail read (getMergeRequest) reports it. A
+ *  successful create POST sets `description` (unless the PR was adopted, `existing`), and every
+ *  successful body write replaces it, so a read after a write sees what was written. */
+export interface FakePr {
+  head: string;
+  target: string;
+  description: string;
+}
+
 /** PRD #1226 M4 (D5): options for the PR-head read (getMergeRequestHead). `head` is the SHA the
  *  fake answers on the single-item GET; `headStatus` (default 200) models an unverifiable read (a
- *  non-200 makes getMergeRequestHead throw a ForgeError). Absent ⇒ no interlocked run reads the
- *  head, so the GET branch is never exercised (legacy behavior). */
+ *  non-200 makes getMergeRequestHead throw a ForgeError). Absent ⇒ the GET answers an empty head,
+ *  which every read refuses (legacy behavior: no head is verified, no description is read). */
 export interface FakeForgeOpts {
   head?: string;
   headStatus?: number;
-  /** PRD #1225 (CodeRabbit !1254): per-GET head sequence. When set, the Nth single-item GET answers
-   *  `heads[N]` (falling back to `head` once exhausted), so a test can model the PR head CHANGING
-   *  between the verify read and the post-add re-verify read (the TOCTOU bind). Absent ⇒ every GET
-   *  answers the fixed `head`. */
-  heads?: string[];
   /** Status for the body-rewrite PUT/PATCH (default 200); a non-2xx makes updateMergeRequestDescription throw a ForgeError (the add-Closes reconcile failure). */
   putStatus?: number;
+  /** PRD #1798 M6: the PR's target branch (default "main"). */
+  target?: string;
+  /** PRD #1798 M6: an ADOPTED PR. The PR already carries this description, and the create POST
+   *  (which a real forge answers with the existing PR) leaves it unchanged. */
+  existing?: string;
+  /** PRD #1798 M6: called after each successful body write with the fake PR (already updated), so a
+   *  test can move the head or edit the description at a given write (or, by changing `headStatus`
+   *  on the options object it passed, make later reads fail). */
+  onWrite?: (pr: FakePr, description: string) => void;
+  /** PRD #1798 M6: answers a request before the fake does (the request is still recorded). Return
+   *  undefined to let the fake answer. A test uses it for a response the options cannot express (a
+   *  real streamed Response over a byte cap, a slow create). */
+  intercept?: (req: { method: string; url: string }, pr: FakePr) => Promise<FetchResponse | undefined> | FetchResponse | undefined;
 }
 
-/** The SHA the Nth single-item GET answers: `heads[n]` when a sequence is set and in range, else the
- *  fixed `head` (or ""). Shared by the three driver fakes so the head-change model is identical. */
-function headForGet(opts: FakeForgeOpts, n: number): string {
-  if (opts.heads && n < opts.heads.length) return opts.heads[n]!;
-  return opts.head ?? "";
+/** A captured fake forge. `calls` holds the create POSTs and the body writes (PUT/PATCH), `reads`
+ *  the single-item GETs, and `all` every request in order. PRD #1798 M6: the description publisher
+ *  reads every PR it opens, so a count of the MRs a run opened reads `calls`, and a test of the
+ *  interlock's read/write order reads `all`. */
+export interface FakeForge {
+  calls: MrCall[];
+  reads: MrCall[];
+  all: MrCall[];
+  pr: FakePr;
 }
 
-/** A GitLab client whose transport is captured; opens MR !42 with no network. The GET (D5 PR-head
- *  read) answers `{ sha }` at `headStatus`, so an interlocked run can verify (or fail to verify) H. */
-export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient; calls: MrCall[] } {
+/** The shared transport of the three driver fakes: `detail` renders the GET body, `created` the
+ *  create response, `field` names the create/update body field that carries the description. */
+function fakeTransport(
+  opts: FakeForgeOpts,
+  detail: (pr: FakePr, head: string) => unknown,
+  created: () => unknown,
+  field: "description" | "body",
+): FakeForge & { fetchFn: FetchFn } {
   const calls: MrCall[] = [];
+  const reads: MrCall[] = [];
+  const all: MrCall[] = [];
+  const pr: FakePr = { head: opts.head ?? "", target: opts.target ?? "main", description: opts.existing ?? "" };
   const fetchFn: FetchFn = async (url, init) => {
-    calls.push({
-      url,
-      method: init.method,
-      headers: init.headers,
-      body: init.body,
-    });
+    const call = { url, method: init.method, headers: init.headers, body: init.body };
+    all.push(call);
+    const answer = await opts.intercept?.({ method: init.method, url }, pr);
+    if (answer) {
+      (init.method === "GET" ? reads : calls).push(call);
+      return answer;
+    }
     if (init.method === "GET") {
+      reads.push(call);
       const status = opts.headStatus ?? 200;
-      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
-      return { status, text: async () => JSON.stringify({ sha }) };
+      return { status, text: async () => JSON.stringify(detail(pr, pr.head)) };
     }
-    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab uses
-    // PUT). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
+    calls.push(call);
+    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab PUT,
+    // Forgejo/GitHub PATCH). Answer 2xx so updateMergeRequestDescription succeeds.
     if (init.method === "PUT" || init.method === "PATCH") {
-      return { status: opts.putStatus ?? 200, text: async () => "{}" };
+      const status = opts.putStatus ?? 200;
+      if (status >= 200 && status < 300) {
+        const next = String((JSON.parse(init.body ?? "{}") as Record<string, unknown>)[field] ?? "");
+        pr.description = next;
+        opts.onWrite?.(pr, next);
+      }
+      return { status, text: async () => "{}" };
     }
-    return {
-      status: 201,
-      text: async () =>
-        JSON.stringify({
-          iid: 42,
-          web_url: "https://gitlab.example.test/org/repo/-/merge_requests/42",
-        }),
-    };
+    if (opts.existing === undefined) {
+      pr.description = String((JSON.parse(init.body ?? "{}") as Record<string, unknown>)[field] ?? "");
+    }
+    return { status: 201, text: async () => JSON.stringify(created()) };
   };
-  return { gitlab: new GitLabClient({ fetchFn }), calls };
+  return { calls, reads, all, pr, fetchFn };
 }
 
-/** A Forgejo client whose transport is captured; opens PR #42 with no network. The GET (D5 PR-head
- *  read) answers `{ head: { sha } }` at `headStatus`. */
-export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient; calls: MrCall[] } {
-  const calls: MrCall[] = [];
-  const fetchFn: FetchFn = async (url, init) => {
-    calls.push({
-      url,
-      method: init.method,
-      headers: init.headers,
-      body: init.body,
-    });
-    if (init.method === "GET") {
-      const status = opts.headStatus ?? 200;
-      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
-      return { status, text: async () => JSON.stringify({ head: { sha } }) };
-    }
-    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (Forgejo uses
-    // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
-    if (init.method === "PUT" || init.method === "PATCH") {
-      return { status: opts.putStatus ?? 200, text: async () => "{}" };
-    }
-    return {
-      status: 201,
-      text: async () =>
-        JSON.stringify({
-          number: 42,
-          html_url: "https://forgejo.example.test/org/repo/pulls/42",
-        }),
-    };
-  };
-  return { forgejo: new ForgejoClient({ fetchFn }), calls };
+/** A GitLab client whose transport is captured; opens MR !42 with no network. The GET answers the
+ *  MR detail (`sha`, `target_branch`, `description`, `state`) at `headStatus`, so an interlocked run
+ *  can verify (or fail to verify) H and the publisher can read the description. */
+export function fakeGitlab(opts: FakeForgeOpts = {}): { gitlab: GitLabClient } & FakeForge {
+  const t = fakeTransport(
+    opts,
+    (pr, sha) => ({ sha, target_branch: pr.target, description: pr.description, state: "opened" }),
+    () => ({ iid: 42, web_url: "https://gitlab.example.test/org/repo/-/merge_requests/42" }),
+    "description",
+  );
+  return { gitlab: new GitLabClient({ fetchFn: t.fetchFn }), calls: t.calls, reads: t.reads, all: t.all, pr: t.pr };
 }
 
-/** A GitHub client whose transport is captured; opens PR #42 with no network. The GET (D5 PR-head
- *  read) answers `{ head: { sha } }` at `headStatus`. */
-export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient; calls: MrCall[] } {
-  const calls: MrCall[] = [];
-  const fetchFn: FetchFn = async (url, init) => {
-    calls.push({
-      url,
-      method: init.method,
-      headers: init.headers,
-      body: init.body,
-    });
-    if (init.method === "GET") {
-      const status = opts.headStatus ?? 200;
-      const sha = headForGet(opts, calls.filter((c) => c.method === "GET").length - 1);
-      return { status, text: async () => JSON.stringify({ head: { sha } }) };
-    }
-    // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the PR body (GitHub uses
-    // PATCH). Answer 2xx so updateMergeRequestDescription succeeds; the call stays captured in `calls`.
-    if (init.method === "PUT" || init.method === "PATCH") {
-      return { status: opts.putStatus ?? 200, text: async () => "{}" };
-    }
-    return {
-      status: 201,
-      text: async () =>
-        JSON.stringify({
-          number: 42,
-          html_url: "https://github.com/org/repo/pull/42",
-        }),
-    };
-  };
-  return { github: new GitHubClient({ fetchFn }), calls };
+/** A Forgejo client whose transport is captured; opens PR #42 with no network. The GET answers
+ *  `{ head: { sha }, base: { ref }, body, state }` at `headStatus`. */
+export function fakeForgejo(opts: FakeForgeOpts = {}): { forgejo: ForgejoClient } & FakeForge {
+  const t = fakeTransport(
+    opts,
+    (pr, sha) => ({ head: { sha }, base: { ref: pr.target }, body: pr.description, state: "open", merged: false }),
+    () => ({ number: 42, html_url: "https://forgejo.example.test/org/repo/pulls/42" }),
+    "body",
+  );
+  return { forgejo: new ForgejoClient({ fetchFn: t.fetchFn }), calls: t.calls, reads: t.reads, all: t.all, pr: t.pr };
+}
+
+/** A GitHub client whose transport is captured; opens PR #42 with no network. The GET answers
+ *  `{ head: { sha }, base: { ref }, body, state }` at `headStatus`. */
+export function fakeGitHub(opts: FakeForgeOpts = {}): { github: GitHubClient } & FakeForge {
+  const t = fakeTransport(
+    opts,
+    (pr, sha) => ({ head: { sha }, base: { ref: pr.target }, body: pr.description, state: "open", merged: false }),
+    () => ({ number: 42, html_url: "https://github.com/org/repo/pull/42" }),
+    "body",
+  );
+  return { github: new GitHubClient({ fetchFn: t.fetchFn }), calls: t.calls, reads: t.reads, all: t.all, pr: t.pr };
 }
 
 export function runner(
@@ -252,6 +257,8 @@ export function runnerWith(
     // Generous relative to the 5ms poll, so it is never reached while an answer is
     // actually being delivered.
     questionTimeoutMs: 600,
+    // PRD #1798 M6: no wall-clock wait before the publisher re-reads a PR whose head lags.
+    prDescriptionHeadLagMs: 0,
     gitlab,
     // Spread LAST so a test can override checkpointIntervalMs / now (PRD #267) and any
     // other RunnerOptions field. Optional: existing call sites pass nothing.

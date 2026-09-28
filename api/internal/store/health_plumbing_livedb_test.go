@@ -297,6 +297,74 @@ func TestClaimHealthEpisodeNoticeAtomicLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool, `UPDATE health_episodes SET closed_at = now() WHERE closed_at IS NULL`)
 }
 
+// TestReleaseHealthEpisodeNoticeLiveDB proves the release half of claim → send →
+// release-on-failure (issue #1499): releasing a claimed slot lets the SAME (episode, admin)
+// claim insert again (the retry), a repeat claim after that stays a no-op, releasing one
+// admin's slot leaves another admin's row on the same episode intact, and releasing a slot
+// that does not exist is not an error.
+func TestReleaseHealthEpisodeNoticeLiveDB(t *testing.T) {
+	ctx, pool, q := openHealthLiveDB(t)
+	mustExec(ctx, t, pool, `UPDATE health_episodes SET closed_at = now() WHERE closed_at IS NULL`)
+
+	u1, u2 := uuid.New(), uuid.New()
+	for _, u := range []uuid.UUID{u1, u2} {
+		mustExec(ctx, t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
+			u, fmt.Sprintf("release-%s@e2e", u))
+	}
+	ep, err := q.OpenHealthEpisode(ctx, ts(time.Now()))
+	if err != nil {
+		t.Fatalf("open episode: %v", err)
+	}
+
+	claim := func(u uuid.UUID) int64 {
+		t.Helper()
+		rows, err := q.ClaimHealthEpisodeNotice(ctx, store.ClaimHealthEpisodeNoticeParams{EpisodeID: ep, UserID: u})
+		if err != nil {
+			t.Fatalf("claim (%s): %v", u, err)
+		}
+		return rows
+	}
+	count := func(u uuid.UUID) int {
+		t.Helper()
+		var c int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM health_episode_notices WHERE episode_id = $1 AND user_id = $2`, ep, u).Scan(&c); err != nil {
+			t.Fatalf("count notices (%s): %v", u, err)
+		}
+		return c
+	}
+
+	if rows := claim(u1); rows != 1 {
+		t.Fatalf("first claim u1 rows = %d, want 1", rows)
+	}
+	if rows := claim(u2); rows != 1 {
+		t.Fatalf("first claim u2 rows = %d, want 1", rows)
+	}
+	if err := q.ReleaseHealthEpisodeNotice(ctx, store.ReleaseHealthEpisodeNoticeParams{EpisodeID: ep, UserID: u1}); err != nil {
+		t.Fatalf("release u1: %v", err)
+	}
+	if c := count(u1); c != 0 {
+		t.Fatalf("u1 rows after release = %d, want 0", c)
+	}
+	if c := count(u2); c != 1 {
+		t.Fatalf("u2 rows after releasing u1 = %d, want 1 (a release touches only its own slot)", c)
+	}
+	if rows := claim(u1); rows != 1 {
+		t.Fatalf("re-claim u1 after release rows = %d, want 1 (the retry)", rows)
+	}
+	if rows := claim(u1); rows != 0 {
+		t.Fatalf("repeat claim u1 rows = %d, want 0 (idempotent again once re-claimed)", rows)
+	}
+
+	// Releasing a slot that does not exist is a no-op, not an error.
+	if err := q.ReleaseHealthEpisodeNotice(ctx, store.ReleaseHealthEpisodeNoticeParams{EpisodeID: ep, UserID: uuid.New()}); err != nil {
+		t.Fatalf("release of a nonexistent slot: %v, want nil", err)
+	}
+	if c := count(u1) + count(u2); c != 2 {
+		t.Fatalf("rows after nonexistent release = %d, want 2 (untouched)", c)
+	}
+	mustExec(ctx, t, pool, `UPDATE health_episodes SET closed_at = now() WHERE closed_at IS NULL`)
+}
+
 // TestHealthBannerSnoozeLiveDB proves the snooze read reports "not snoozed" (pgx.ErrNoRows)
 // before any snooze, and that a re-snooze OVERWRITES the expiry (ON CONFLICT DO UPDATE) — the
 // per-admin, per-episode key the Danger banner reads.

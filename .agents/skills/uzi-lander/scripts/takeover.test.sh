@@ -48,6 +48,9 @@ case "$*" in
     esac ;;
   *'/issues/42/comments'*)
     if [ "$MODE" = prior_requested ]; then printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    elif [ "$MODE" = cr_reset_stale ] || [ "$MODE" = cr_reset_fresh ]; then
+      if [ "$MODE" = cr_reset_stale ]; then at=2026-01-01T00:00:00Z; else at=$(date -u +%Y-%m-%dT%H:%M:%SZ); fi
+      jq -n --arg at "$at" '[{user:{login:"coderabbitai[bot]"},created_at:$at,updated_at:$at,body:"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n**Next included review available in 12 minutes.**\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"}]'
     elif [ "$MODE" = outside_diff ]; then
       jq -n --arg h "$HEAD" '[{id:900,user:{login:"greptile-apps[bot]"},body:("<!-- greptile_outside_diff -->\n\n- <img alt=\"P1\">&nbsp;**Halt alert can be lost** `x.go:252` <a href=\"https://x/blob/" + $h + "/x.go#L252\">x</a>")}]'
     else echo '[]'; fi ;;
@@ -98,6 +101,13 @@ has head_clean 'LIVE_FINDINGS=0 (cr=0 gr=0 '
 # ...while ", 10 comments added" must not match the ", 0 comments added" clean test.
 snap head_findings
 has head_findings 'LIVE_FINDINGS=1 (cr=0 gr=1 '
+
+# The rate-limit walkthrough's "12 minutes" is relative to its last edit: an old one must not
+# read as a live 12-minute wait (it read 12 while the real wait was 57), a fresh one counts down.
+snap cr_reset_stale
+has cr_reset_stale 'CR_RESET_MIN=unknown (the walkthrough'
+snap cr_reset_fresh
+grep -qE '^CR_RESET_MIN=1[12] \(from the walkthrough edited ' "$WORK/cr_reset_fresh.out" || fail "fresh walkthrough reset not counted down: $(cat "$WORK/cr_reset_fresh.out")"
 
 # Every finding the head pass added is outside the diff (one Greptile ISSUE comment, no
 # inline comment, no review object): it is live, so the PR is never NEXT=ready (PR #1671).

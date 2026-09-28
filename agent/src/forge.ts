@@ -19,6 +19,16 @@
 
 import { errMessage } from "./util.js";
 
+/** What the transport answers: the subset of the fetch `Response` the drivers read. `body` is the
+ *  streaming body a real `Response` carries; it is OPTIONAL so a fake transport may answer with
+ *  `text()` alone (every existing fake does). A bounded read streams `body` when it is present and
+ *  stops at its cap; without it, it falls back to `text()` and checks the cap afterwards. */
+export interface FetchResponse {
+  status: number;
+  text(): Promise<string>;
+  body?: ReadableStream<Uint8Array> | null;
+}
+
 /** Injectable transport (default = global fetch). */
 export type FetchFn = (
   url: string,
@@ -30,7 +40,28 @@ export type FetchFn = (
     /** Pinned to "error" so a 3xx cannot replay the PAT header cross-origin. */
     redirect?: "error" | "follow" | "manual";
   },
-) => Promise<{ status: number; text(): Promise<string> }>;
+) => Promise<FetchResponse>;
+
+/** PRD #1798 M6 (H1): the byte cap on a single-MR/PR response (the detail read, the head read and
+ *  the create response). GitHub caps a PR body at 65,536 characters and GitLab a description at
+ *  1,048,576 (FORGE_BODY_MAX_CHARS), and JSON escapes a control character as `\u0001`: 6 bytes for
+ *  one character, more than any raw UTF-8 character takes (4 at most). So 6 bytes per character of
+ *  the largest of those limits, plus 64 KiB of headroom for the rest of the object. Forgejo's API
+ *  sets no body size limit, so a Forgejo body past this cap is refused (ForgeResponseTooLarge) and
+ *  treated like a failed read: the interlock and the description publisher take their
+ *  unreadable-MR paths, which fail closed wherever a closing directive is at stake. */
+export const MR_DETAIL_MAX_BYTES = 6 * 1_048_576 + 64 * 1024;
+
+/** PRD #1798 M6 (H1): the byte cap on the find-existing LIST read (findOpenMr on GitLab and GitHub).
+ *  The list is filtered to open MRs/PRs for one source and target branch, and both forges allow only
+ *  one open MR/PR per such pair, so it normally carries a single object: the cap admits one
+ *  worst-case object (MR_DETAIL_MAX_BYTES) with room to spare, while a list that grew past a few MiB
+ *  (a forge ignoring the filter, or a hostile answer) is refused instead of buffered. Only the first
+ *  element is ever used. */
+export const MR_LIST_MAX_BYTES = 8 * 1_048_576;
+
+/** The bytes an error body is read to before it is cut (the message keeps 512 characters). */
+const ERROR_BODY_MAX_BYTES = 4096;
 
 export interface CreateMrParams {
   /** The forge WEB url of the repo. Each driver derives its own API base + project
@@ -52,6 +83,23 @@ export interface MergeRequest {
   webUrl: string;
 }
 
+/** Normalised lifecycle state of an MR/PR (PRD #1798 D11). GitLab's `opened` maps to
+ *  `open`; GitHub/Forgejo report a merged PR as `closed` + a merged flag, mapped to
+ *  `merged`. `locked` is GitLab-only. */
+export type MergeRequestState = "open" | "closed" | "merged" | "locked";
+
+/** A forge-neutral single-MR/PR read (PRD #1798 D11): the fields the description
+ *  writer needs to bind a write to a snapshot. `description` is "" when the forge
+ *  reports no body (null). */
+export interface MergeRequestDetail {
+  /** Validated 40-hex source-branch head commit id. */
+  headSha: string;
+  /** The MR/PR's own target (base) branch, never the repo default branch. */
+  targetBranch: string;
+  description: string;
+  state: MergeRequestState;
+}
+
 export class ForgeError extends Error {
   constructor(
     readonly status: number,
@@ -59,6 +107,17 @@ export class ForgeError extends Error {
   ) {
     super(`forge API returned ${status}: ${detail}`);
     this.name = "ForgeError";
+  }
+}
+
+/** A response body over its byte cap (status 0: no forge status is at fault). It is a
+ *  deterministic answer, not a transport blip, so it is permanent and never retried:
+ *  classifyForgeError checks for it before reading a bare status 0 as a transport failure. Every
+ *  caller treats it as an unreadable MR/PR. */
+export class ForgeResponseTooLarge extends ForgeError {
+  constructor(readonly maxBytes: number) {
+    super(0, `response too large (over ${maxBytes} bytes)`);
+    this.name = "ForgeResponseTooLarge";
   }
 }
 
@@ -83,6 +142,12 @@ export interface ForgeClient {
    *  https-only, redirect:"error" and transient-5xx guards are inherited from `request`.
    *  Throws a ForgeError on a non-2xx so the caller can log-and-continue best-effort. */
   updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void>;
+  /** Forge-neutral read of one existing MR/PR (PRD #1798 D11): head SHA, target branch,
+   *  current description and normalised state. Same single-item resource and transport
+   *  guards as getMergeRequestHead. Throws a ForgeError on a non-200 (a 404 for a missing
+   *  MR/PR included), a transient status, or a body missing a valid head SHA, a target
+   *  branch or a known state. The PAT rides the auth header only. */
+  getMergeRequest(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<MergeRequestDetail>;
 }
 
 export interface ForgeClientOptions {
@@ -115,7 +180,8 @@ abstract class HttpForgeClient implements ForgeClient {
 
   async createMergeRequest(p: CreateMrParams, signal?: AbortSignal): Promise<MergeRequest> {
     const res = await this.request("POST", this.createUrl(p.repoUrl), p.pat, this.createBody(p), signal);
-    if (res.status === 201) return this.parseMr(await res.text());
+    // H1: the created object echoes the description, so it is capped like a detail read.
+    if (res.status === 201) return this.parseMr(await readCapped(res, MR_DETAIL_MAX_BYTES));
 
     // An MR/PR for this branch may already exist (a resume, or a prior finish that
     // pushed + opened before the state report landed). Which status the forge answers
@@ -157,7 +223,21 @@ abstract class HttpForgeClient implements ForgeClient {
   async getMergeRequestHead(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<string> {
     const res = await this.request("GET", this.headUrl(repoUrl, iid), pat, undefined, signal);
     if (res.status !== 200) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
-    return this.parseHead(await res.text());
+    // H1: the same resource as getMergeRequest, capped the same way. An over-cap answer throws
+    // ForgeResponseTooLarge, which the interlock treats as an unreadable head (hold, after a strip).
+    return this.parseHead(await readCapped(res, MR_DETAIL_MAX_BYTES));
+  }
+
+  /**
+   * Read one existing MR/PR through the shared transport (PRD #1798 D11). Same resource
+   * (`headUrl`) and the same non-200 handling as getMergeRequestHead; the per-driver bit
+   * is `parseMrDetail`.
+   */
+  async getMergeRequest(repoUrl: string, pat: string, iid: number, signal?: AbortSignal): Promise<MergeRequestDetail> {
+    const res = await this.request("GET", this.headUrl(repoUrl, iid), pat, undefined, signal);
+    if (res.status !== 200) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+    // H1: a hostile or broken forge must not make the worker buffer an unbounded body.
+    return this.parseMrDetail(await readCapped(res, MR_DETAIL_MAX_BYTES));
   }
 
   /**
@@ -181,14 +261,14 @@ abstract class HttpForgeClient implements ForgeClient {
     pat: string,
     body?: unknown,
     signal?: AbortSignal,
-  ): Promise<{ status: number; text(): Promise<string> }> {
+  ): Promise<FetchResponse> {
     // Guard 1: never send the PAT over a non-https URL. The credential rides a
     // header, and only TLS keeps it off the wire — a plaintext (or malformed) URL
     // is a hard error, never a best-effort send.
     if (!isHttps(url)) throw new ForgeError(0, "refusing to send the PAT to a non-https forge URL");
     const headers: Record<string, string> = { ...this.authHeaders(pat) };
     if (body !== undefined) headers["Content-Type"] = "application/json";
-    let res: { status: number; text(): Promise<string> };
+    let res: FetchResponse;
     try {
       res = await this.fetchFn(url, {
         method,
@@ -233,6 +313,10 @@ abstract class HttpForgeClient implements ForgeClient {
   /** Parse a 200 single-MR/PR response body into the validated 40-hex head SHA;
    *  throw a ForgeError when the head field is absent or malformed. */
   protected abstract parseHead(text: string): string;
+  /** Parse a 200 single-MR/PR response body into a MergeRequestDetail; throw a
+   *  ForgeError on malformed JSON, an invalid head SHA, a missing target branch, a
+   *  non-string description or an unknown state (PRD #1798 D11). */
+  protected abstract parseMrDetail(text: string): MergeRequestDetail;
 
   /** HTTP method for the single-item body rewrite. PATCH is correct for Forgejo and
    *  GitHub; GitLabClient overrides to PUT. */
@@ -275,7 +359,7 @@ export class GitLabClient extends HttpForgeClient {
     const q = `${this.createUrl(p.repoUrl)}?state=opened&source_branch=${encodeURIComponent(p.sourceBranch)}&target_branch=${encodeURIComponent(p.targetBranch)}`;
     const res = await this.request("GET", q, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
-    const list = safeJson(await res.text());
+    const list = safeJson(await readCapped(res, MR_LIST_MAX_BYTES));
     if (Array.isArray(list) && list.length > 0) return parseGitlabMr(list[0]);
     return undefined;
   }
@@ -295,6 +379,19 @@ export class GitLabClient extends HttpForgeClient {
     const head = parseGitlabHead(safeJson(text));
     if (!head) throw new ForgeError(200, "merge request response missing a valid head sha");
     return head;
+  }
+
+  protected parseMrDetail(text: string): MergeRequestDetail {
+    const obj = safeJson(text);
+    const headSha = parseGitlabHead(obj);
+    if (!headSha) throw new ForgeError(200, "merge request response missing a valid head sha");
+    const rec = obj as Record<string, unknown>;
+    return {
+      headSha,
+      targetBranch: requireBranch(rec["target_branch"], "merge request"),
+      description: bodyText(rec["description"], "merge request"),
+      state: gitlabState(rec["state"]),
+    };
   }
 
   /** GitLab rewrites the MR resource with PUT and a `description` field (not PATCH/`body`). */
@@ -334,7 +431,8 @@ export class ForgejoClient extends HttpForgeClient {
     const url = `${apiBase}/api/v1/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls/${encodeURIComponent(p.targetBranch)}/${encodeURIComponent(p.sourceBranch)}`;
     const res = await this.request("GET", url, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
-    const obj = safeJson(await res.text());
+    // A single-PR lookup: capped like a detail read.
+    const obj = safeJson(await readCapped(res, MR_DETAIL_MAX_BYTES));
     if (!obj || typeof obj !== "object") return undefined;
     if ((obj as Record<string, unknown>)["state"] !== "open") return undefined;
     return parseForgejoMr(obj);
@@ -355,6 +453,10 @@ export class ForgejoClient extends HttpForgeClient {
     const head = parseForgejoHead(safeJson(text));
     if (!head) throw new ForgeError(200, "pull request response missing a valid head sha");
     return head;
+  }
+
+  protected parseMrDetail(text: string): MergeRequestDetail {
+    return parsePrDetail(safeJson(text));
   }
 }
 
@@ -394,7 +496,7 @@ export class GitHubClient extends HttpForgeClient {
     const url = `${apiBase}/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}/pulls?state=open&head=${encodeURIComponent(head)}&base=${encodeURIComponent(p.targetBranch)}`;
     const res = await this.request("GET", url, p.pat, undefined, signal);
     if (res.status !== 200) return undefined;
-    const list = safeJson(await res.text());
+    const list = safeJson(await readCapped(res, MR_LIST_MAX_BYTES));
     if (!Array.isArray(list) || list.length === 0) return undefined;
     const first = list[0];
     if (!first || typeof first !== "object") return undefined;
@@ -417,6 +519,10 @@ export class GitHubClient extends HttpForgeClient {
     const head = parseGitHubHead(safeJson(text));
     if (!head) throw new ForgeError(200, "pull request response missing a valid head sha");
     return head;
+  }
+
+  protected parseMrDetail(text: string): MergeRequestDetail {
+    return parsePrDetail(safeJson(text));
   }
 }
 
@@ -561,6 +667,55 @@ function prHeadSha(obj: unknown): string | undefined {
   return isCommitSha(sha) ? sha : undefined;
 }
 
+/** GitLab MR `state` → normalised state (`opened` → `open`); unknown → ForgeError. */
+function gitlabState(v: unknown): MergeRequestState {
+  switch (v) {
+    case "opened":
+      return "open";
+    case "closed":
+    case "merged":
+    case "locked":
+      return v;
+    default:
+      throw new ForgeError(200, "merge request response has an unknown state");
+  }
+}
+
+/** Forgejo and GitHub share the PR shape the detail read needs: `head.sha`, `base.ref`,
+ *  `body`, and `state` open/closed with a merge marker (`merged: true`, or GitHub's
+ *  non-null `merged_at`) that turns a closed PR into `merged`. */
+function parsePrDetail(obj: unknown): MergeRequestDetail {
+  const headSha = prHeadSha(obj);
+  if (!headSha) throw new ForgeError(200, "pull request response missing a valid head sha");
+  const rec = obj as Record<string, unknown>;
+  const base = rec["base"];
+  const targetBranch = requireBranch(
+    base && typeof base === "object" ? (base as Record<string, unknown>)["ref"] : undefined,
+    "pull request",
+  );
+  const merged = rec["merged"] === true || (typeof rec["merged_at"] === "string" && rec["merged_at"] !== "");
+  const raw = rec["state"];
+  if (raw !== "open" && raw !== "closed") throw new ForgeError(200, "pull request response has an unknown state");
+  return {
+    headSha,
+    targetBranch,
+    description: bodyText(rec["body"], "pull request"),
+    state: merged ? "merged" : raw,
+  };
+}
+
+function requireBranch(v: unknown, what: string): string {
+  if (typeof v !== "string" || v === "") throw new ForgeError(200, `${what} response missing a target branch`);
+  return v;
+}
+
+/** A null/absent body is an empty description; any other non-string is malformed. */
+function bodyText(v: unknown, what: string): string {
+  if (v === null || v === undefined) return "";
+  if (typeof v !== "string") throw new ForgeError(200, `${what} response has a non-string description`);
+  return v;
+}
+
 function safeJson(text: string): unknown {
   try {
     return JSON.parse(text);
@@ -569,10 +724,56 @@ function safeJson(text: string): unknown {
   }
 }
 
-async function safeText(res: { text(): Promise<string> }): Promise<string> {
+/** An error body for a message: at most ERROR_BODY_MAX_BYTES are read (a streaming body is
+ *  cancelled past that), and a read failure is "". */
+async function safeText(res: FetchResponse): Promise<string> {
   try {
-    return (await res.text()).trim();
+    return (await readPrefix(res, ERROR_BODY_MAX_BYTES)).text.trim();
   } catch {
     return "";
   }
+}
+
+/**
+ * The body as UTF-8 text, read to at most `maxBytes` bytes. A streaming body stops being read at the
+ * first chunk that crosses the cap and is cancelled (the rest is never buffered); a transport
+ * without `body` (a test fake) is read with text() and its UTF-8 length checked against the cap.
+ * `over` reports that the body was longer than `maxBytes` (then `text` is the decoded prefix).
+ */
+async function readPrefix(res: FetchResponse, maxBytes: number): Promise<{ text: string; over: boolean }> {
+  const stream = res.body;
+  if (!stream) {
+    const text = await res.text();
+    if (Buffer.byteLength(text, "utf8") <= maxBytes) return { text, over: false };
+    return { text: Buffer.from(text, "utf8").subarray(0, maxBytes).toString("utf8"), over: true };
+  }
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  let over = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (total + value.byteLength > maxBytes) {
+        chunks.push(value.subarray(0, maxBytes - total));
+        total = maxBytes;
+        over = true;
+        break;
+      }
+      chunks.push(value);
+      total += value.byteLength;
+    }
+  } finally {
+    if (over) await reader.cancel().catch(() => undefined);
+    reader.releaseLock();
+  }
+  return { text: Buffer.concat(chunks, total).toString("utf8"), over };
+}
+
+/** The whole body, or a ForgeResponseTooLarge once it passes `maxBytes`. */
+async function readCapped(res: FetchResponse, maxBytes: number): Promise<string> {
+  const { text, over } = await readPrefix(res, maxBytes);
+  if (over) throw new ForgeResponseTooLarge(maxBytes);
+  return text;
 }

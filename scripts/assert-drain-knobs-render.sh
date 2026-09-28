@@ -136,6 +136,24 @@ else
   echo "OK (c): --set workers.drainDeadline override renders '$got_deadline_override'"
 fi
 
+# (d) issue #1815: workers.ephemeralWorkerDataSize renders its 20Gi default, and an
+# explicit numeric 0 reaches the controller (which refuses a non-positive size at boot)
+# instead of reading as unset under a `with` and silently keeping the default.
+got_eph=$(render_env "$CHART" "UZI_WORKER_EPHEMERAL_DATA_SIZE")
+if [ "$got_eph" != "20Gi" ]; then
+  echo "FAIL (d): UZI_WORKER_EPHEMERAL_DATA_SIZE is '$got_eph', expected the default '20Gi'" >&2
+  fail=1
+else
+  echo "OK (d): default render pins UZI_WORKER_EPHEMERAL_DATA_SIZE to '$got_eph'"
+fi
+got_eph_zero=$(render_env "$CHART" "UZI_WORKER_EPHEMERAL_DATA_SIZE" --set workers.ephemeralWorkerDataSize=0)
+if [ "$got_eph_zero" != "0" ]; then
+  echo "FAIL (d): --set workers.ephemeralWorkerDataSize=0 rendered '$got_eph_zero' -- an explicit zero was treated as unset" >&2
+  fail=1
+else
+  echo "OK (d): --set workers.ephemeralWorkerDataSize=0 reaches the controller as '0'"
+fi
+
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: the M5 drain knobs are NOT correctly wired from values.yaml into the controller Deployment (PRD #422 M5)" >&2
   exit 1

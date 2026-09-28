@@ -9,6 +9,8 @@
 // PRD #4 Decision Log for the reconciliation history.
 
 import type { EffortLevel } from "@anthropic-ai/claude-agent-sdk";
+// Type-only (erased at runtime): the sanitized-fields class lives beside the decoders that mint it.
+import type { SanitizedPrDescriptionFields } from "./client.js";
 
 /** All worker endpoints live under this prefix and take a Bearer join token. */
 export const WORKER_API_PREFIX = "/api/worker";
@@ -1300,6 +1302,21 @@ export interface ClaimResponse {
    *  re-presentation sends exactly these instead of a fresh toolchain detection, so a reclaimed
    *  worker never re-sends different requirements and conflicts. */
   resume_gate_presented?: GatePresentedRequirements;
+  /** PRD #1798 D9 step 2: the existing PR's description record (Go:
+   *  workersvc.ClaimPayload.PrDescription, `json:"pr_description,omitempty"`). Present for a
+   *  PR-producing run whose PR already exists (an mr_rework run, a run whose completion recorded
+   *  its MR, or a re-claimed issue run that already bound a version); absent when the PR has no
+   *  record or the server predates it. Its `published_version` fields are api-sanitized but
+   *  still untrusted text. WorkerClient.claimRun shape-checks it and DROPS a malformed one (with
+   *  a warning), so a present value is the decoded state whose fields are
+   *  {@link SanitizedPrDescriptionFields} instances.
+   *
+   *  ABSENT IS NOT AUTHORITATIVE: it means "no record reached this worker", which covers an older
+   *  server, a PR the api has no row for, and a malformed record this client dropped. It never
+   *  means "nothing protected is on the forge". A caller must not treat an absent value as safe to
+   *  write the PR description without first reading the forge's markers (and looking an unknown
+   *  region up) the way it would for an unknown record. */
+  pr_description?: PrDescriptionState;
 }
 
 /** PRD #1795: the approval-relevant requirements a gate presentation showed the human
@@ -2641,4 +2658,199 @@ export interface RecoverySettleResponse {
   outcome: string;
   reason?: string;
   final_head_sha?: string;
+}
+
+// ── PRD #1798 D9: plain-English PR description artifact ─────────────────────────────────────
+// Mirrors api/internal/apitypes/pr_description.go (snake_case JSON). In every RESPONSE the api
+// sends non-nil slices; a stage REQUEST carries RAW, untrusted fields the api sanitizes, and only
+// the sanitized fields a response returns may be published (D7). The two are distinct types:
+// {@link RawPrDescriptionFields} (what a stage sends, a plain interface) and
+// SanitizedPrDescriptionFields (what a version carries: a class in client.ts, nominal through an
+// ECMAScript #private field, whose instances only WorkerClient's response decoders create). Its
+// comment there lists what the compiler does and does not catch.
+
+/** Go: apitypes.PrDescriptionScopeNote. One difference from the ask. */
+export interface PrDescriptionScopeNote {
+  kind: "added" | "changed" | "dropped" | "deferred";
+  text: string;
+}
+
+/** Go: apitypes.PrDescriptionVerification. One check the lead REPORTED (D5); `verified_at_sha`
+ *  is 7-64 hex characters (the local HEAD it was reported at). */
+export interface PrDescriptionVerification {
+  command: string;
+  result: "pass" | "fail";
+  verified_at_sha: string;
+}
+
+/** Go: apitypes.PrDescriptionFields. The model- or lead-authored part of a PR description, as a
+ *  bare shape. Use {@link RawPrDescriptionFields} or {@link SanitizedPrDescriptionFields}. */
+interface PrDescriptionFields {
+  summary: string;
+  changes: string[];
+  scope_notes: PrDescriptionScopeNote[];
+  review_pointers: string[];
+  verification: PrDescriptionVerification[];
+}
+
+/** RAW fields: model- or lead-authored text the api has NOT sanitized yet. Only a stage request
+ *  carries them; they are never rendered (D7). A sanitized value is not assignable here (its
+ *  arrays are readonly): a refresh re-stages it through SanitizedPrDescriptionFields.toRaw(). */
+export type RawPrDescriptionFields = PrDescriptionFields;
+
+/** Go: apitypes.PrDescriptionSizeBucket. One size-line bucket's line counts (D3). */
+export interface PrDescriptionSizeBucket {
+  added: number;
+  deleted: number;
+}
+
+/** Go: apitypes.PrDescriptionSize. The deterministic size line (D3) as data. `unavailable`
+ *  marks "**Size:** unavailable", in which case every bucket must be zero (the api refuses a
+ *  stage with a non-zero bucket beside it). */
+export interface PrDescriptionSize {
+  unavailable: boolean;
+  files: number;
+  code: PrDescriptionSizeBucket;
+  tests: PrDescriptionSizeBucket;
+  docs: PrDescriptionSizeBucket;
+  config: PrDescriptionSizeBucket;
+  generated: PrDescriptionSizeBucket;
+  vendored: PrDescriptionSizeBucket;
+}
+
+/** Go: the stage `source` enum (workersvc.PrDescSource*). */
+export type PrDescriptionSource = "generated" | "lead_only" | "deterministic_only";
+
+/** Go: the version `state` enum. There is no worker-sent "abandoned": the api abandons a
+ *  version when its ack is a non-published outcome (unless the forge shows the version's own
+ *  region, see {@link PR_DESC_ACK_OUTCOMES}), or when a newer claim generation stages. */
+export type PrDescriptionVersionState = "pending" | "published" | "abandoned";
+
+/** Go: apitypes.PrDescriptionVersionDTO. One staged version. `mr_iid` is null until the version
+ *  names its PR; `rendered_region_sha256` is null until bound; `published_at` is null unless
+ *  published. Timestamps are RFC 3339 strings. */
+export interface PrDescriptionVersionDTO {
+  id: string;
+  run_id: string;
+  claim_generation: number;
+  mr_iid: number | null;
+  fields: SanitizedPrDescriptionFields;
+  size: PrDescriptionSize | null;
+  base_sha: string;
+  head_sha: string;
+  target_branch: string;
+  source: PrDescriptionSource;
+  rendered_region_sha256: string | null;
+  state: PrDescriptionVersionState;
+  created_at: string;
+  published_at: string | null;
+}
+
+/** The exact forge-write outcomes an ack may carry (Go: the ack `outcome` enum). Anything but
+ *  `published` abandons the acked version, with one exception: when the ack's
+ *  `observed_region_sha256` equals the acked version's OWN rendered region hash (the write landed
+ *  although the worker reports otherwise), the api publishes that version instead and names it
+ *  in the response's `recovered_version_id` (workersvc.AckPrDescription). The version is still
+ *  ABANDONED, with that id null, when the currently published version already rendered the same
+ *  region, when a newer publication supersedes it, or when lost-ack recovery published ANOTHER
+ *  pending version on this ack (then `recovered_version_id` names that other version). */
+export const PR_DESC_ACK_OUTCOMES = [
+  "published",
+  "skipped_human_edit",
+  "skipped_no_region",
+  "skipped_malformed",
+  "skipped_snapshot_moved",
+  "write_failed",
+] as const;
+export type PrDescriptionAckOutcome = (typeof PR_DESC_ACK_OUTCOMES)[number];
+
+/** Go: apitypes.PrDescriptionState. The per-PR record: the CAS counter, the version whose region
+ *  is on the forge (null before the first acknowledged publish) and the last write outcome (null
+ *  before the first ack). The bind / lookup / ack response body and the claim's pr_description.
+ *
+ *  Forward skew: `last_outcome` is a plain string, not {@link PrDescriptionAckOutcome}. It is a
+ *  history field nothing publishes from, so a newer api that adds an outcome must not make an
+ *  older worker refuse the whole state; the decoder keeps any string (compare it against
+ *  {@link PR_DESC_ACK_OUTCOMES} when it matters). The fields that DO drive publishing (the
+ *  version's fields, source and state, and the lookup `match`) stay strictly checked. */
+export interface PrDescriptionState {
+  mr_iid: number;
+  lock_version: number;
+  last_outcome: string | null;
+  published_version: PrDescriptionVersionDTO | null;
+}
+
+/** Go: apitypes.PrDescriptionStageRequest (POST /runs/{id}/pr-description/stage). `fields` are
+ *  RAW (the api sanitizes them; a deterministic_only stage's fields are discarded). `mr_iid` is
+ *  set only for a refresh (the PR already exists) and must be the run's own PR. */
+export interface PrDescriptionStageRequest {
+  claim_generation: number;
+  source: PrDescriptionSource;
+  fields: RawPrDescriptionFields;
+  size: PrDescriptionSize | null;
+  base_sha: string;
+  head_sha: string;
+  target_branch: string;
+  mr_iid?: number;
+}
+
+/** Go: apitypes.PrDescriptionStageResponse. The stored pending version; its `fields` are the
+ *  sanitized fields the renderer publishes. */
+export interface PrDescriptionStageResponse {
+  version: PrDescriptionVersionDTO;
+}
+
+/** Go: apitypes.PrDescriptionBindRequest (POST /runs/{id}/pr-description/bind). Binds the run's
+ *  pending version to its PR with the sha256 (64 lowercase hex) of the exact region text the
+ *  renderer will write. Idempotent for the same (version, mr_iid, rendered_region_sha256) while
+ *  the version is pending: a different hash, or a version no longer pending, is version_conflict. */
+export interface PrDescriptionBindRequest {
+  claim_generation: number;
+  version_id: string;
+  mr_iid: number;
+  rendered_region_sha256: string;
+}
+
+/** Go: apitypes.PrDescriptionBindResponse. The bound version plus the PR's current state. */
+export interface PrDescriptionBindResponse {
+  version: PrDescriptionVersionDTO;
+  pr: PrDescriptionState;
+}
+
+/** Go: apitypes.PrDescriptionLookupRequest (POST /runs/{id}/pr-description/lookup): classify a
+ *  region hash read from the forge against the PR's versions. */
+export interface PrDescriptionLookupRequest {
+  claim_generation: number;
+  mr_iid: number;
+  region_sha256: string;
+}
+
+/** Go: apitypes.PrDescriptionLookupResponse. `match` is published (a published version rendered
+ *  that region), pending (a pending version did: a lost ack) or none (an unknown protected
+ *  region). `pr` is null when the PR has no record yet. */
+export interface PrDescriptionLookupResponse {
+  match: "published" | "pending" | "none";
+  matched_version_id: string | null;
+  pr: PrDescriptionState | null;
+}
+
+/** Go: apitypes.PrDescriptionAckRequest (POST /runs/{id}/pr-description/ack): the forge write's
+ *  outcome for a bound version, compare-and-swapped on `expected_lock_version`.
+ *  `observed_region_sha256`, when set, is the region hash read on the forge before writing; a
+ *  pending version with that hash is acknowledged as published first (lost-ack recovery). */
+export interface PrDescriptionAckRequest {
+  claim_generation: number;
+  version_id: string;
+  outcome: PrDescriptionAckOutcome;
+  expected_lock_version: number;
+  observed_region_sha256?: string;
+}
+
+/** Go: apitypes.PrDescriptionAckResponse. The PR's state after the ack; `recovered_version_id`
+ *  names the version lost-ack recovery published (null when none). A REPLAYED ack (a retry whose
+ *  first response was lost) always answers null here, even when the original ack recovered a
+ *  version: null on a replay does not mean nothing was recovered. */
+export interface PrDescriptionAckResponse {
+  pr: PrDescriptionState;
+  recovered_version_id: string | null;
 }
