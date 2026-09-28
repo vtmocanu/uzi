@@ -244,10 +244,10 @@ counts toward the failure cap:
   whichever running Claude run holds the largest caches — and an actual
   write that failed disk-full (a recognised `ENOSPC`/`EDQUOT` signal, or
   git's own disk-full diagnostics, confirmed against the volume's own free
-  space and inodes, or a claim/resume preflight statfs still below the
-  floor after a reclaim pass) after uzi ran its background reclaim and
-  retried once — note this last case counts a park with no failed write at
-  all. Every counted case counts toward the run's lifetime disk-park cap,
+  space and inodes) after uzi ran its background reclaim and retried once,
+  or a claim/resume preflight whose re-sampled statfs is still below the
+  floor after a reclaim pass — note this last case counts a park with no
+  failed write at all. Every counted case counts toward the run's lifetime disk-park cap,
   `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means unlimited). Past the cap,
   the next counted disk-full park fails the run instead, with
   `fail_origin = data_volume_full`.
