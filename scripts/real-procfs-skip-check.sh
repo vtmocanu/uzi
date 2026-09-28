@@ -13,17 +13,21 @@
 #
 # SECOND DUTY: the same probe runs once BEFORE the command. Where enumeration is denied,
 # node cannot read its cgroup CPU quota either (libuv finds the cgroup through the proc
-# root), so os.availableParallelism() reports the host's CPU count and `node --test` runs
-# that many agent test files at once on a small quota, which fails timing-sensitive tests.
-# So on a denied probe, and only when UZI_AGENT_TEST_CONCURRENCY is unset or empty, this
-# exports UZI_AGENT_TEST_CONCURRENCY=1, which agent/package.json's test script turns into
-# --test-concurrency=1 (not settable through NODE_OPTIONS). A caller's value is kept.
+# root), so os.availableParallelism() reports the host's CPU count, and `node --test`, whose
+# default concurrency is availableParallelism() - 1, runs a host-sized batch of agent test
+# files at once on a small quota, which fails timing-sensitive tests. So on a denied probe
+# this exports UZI_AGENT_TEST_CONCURRENCY=1, which agent/package.json's test script turns
+# into --test-concurrency=1 (not settable through NODE_OPTIONS). A caller's value is kept
+# when it is a positive integer; any other value (empty, 0, text) is replaced by 1 with a
+# warning, since the npm script splices it into the node command line verbatim. Where the
+# probe says enumerable, the caller's value is left alone.
 #
 # Usage: scripts/real-procfs-skip-check.sh <command> [args...]
 #   UZI_REAL_PROCFS_PROBE_DIR    the directory to probe, before and after the command
 #                                (default: /proc); for this script's own test
 #                                (scripts/real-procfs-skip-check.test.sh) only.
-#   UZI_AGENT_TEST_CONCURRENCY   kept when set; set to 1 by a denied pre-run probe.
+#   UZI_AGENT_TEST_CONCURRENCY   kept when a positive integer (digits, no leading zero);
+#                                a denied pre-run probe sets 1 when it is unset or invalid.
 #
 # EXIT CODES:
 #   the command's own non-zero status, when it failed (the skip list still prints)
@@ -74,10 +78,19 @@ catch (err) {
 probed=0
 if command -v node > /dev/null 2>&1; then
   run_probe
-  if [ "$probe" -eq 3 ] && [ -z "${UZI_AGENT_TEST_CONCURRENCY:-}" ]; then
-    UZI_AGENT_TEST_CONCURRENCY=1
-    export UZI_AGENT_TEST_CONCURRENCY
-    echo "real-procfs-skip-check: $probe_dir is not enumerable, so node cannot read its cgroup CPU quota and over-reports availableParallelism; running agent test files serially (UZI_AGENT_TEST_CONCURRENCY=1), as an unconfined worker with this quota does"
+  if [ "$probe" -eq 3 ]; then
+    case "${UZI_AGENT_TEST_CONCURRENCY:-}" in
+      '')
+        UZI_AGENT_TEST_CONCURRENCY=1
+        export UZI_AGENT_TEST_CONCURRENCY
+        echo "real-procfs-skip-check: $probe_dir is not enumerable, so node cannot read its cgroup CPU quota and over-reports availableParallelism; running agent test files serially (UZI_AGENT_TEST_CONCURRENCY=1) rather than at the host CPU count"
+        ;;
+      *[!0-9]* | 0*)
+        echo "real-procfs-skip-check: warning: UZI_AGENT_TEST_CONCURRENCY='$UZI_AGENT_TEST_CONCURRENCY' is not a positive integer; $probe_dir is not enumerable, so using UZI_AGENT_TEST_CONCURRENCY=1" >&2
+        UZI_AGENT_TEST_CONCURRENCY=1
+        export UZI_AGENT_TEST_CONCURRENCY
+        ;;
+    esac
   fi
 fi
 

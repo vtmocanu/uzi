@@ -179,6 +179,56 @@ else
   run_case "denied + preset 3: concurrency kept" 0 "$DENIED" - \
     env UZI_AGENT_TEST_CONCURRENCY=3 "$CHECK" "$FAKE" concurrency "$SEEN" &&
     expect_seen "denied + preset 3: the command sees the caller's 3" "3"
+  # The npm script splices the value into node's argv verbatim, so a non-positive-integer
+  # preset is replaced by 1 (with a warning) where the cap matters.
+  rm -f "$SEEN"
+  run_case "denied + preset 'x2': concurrency replaced" 0 "$DENIED" - \
+    env UZI_AGENT_TEST_CONCURRENCY=x2 "$CHECK" "$FAKE" concurrency "$SEEN" && {
+    expect_seen "denied + preset 'x2': the command sees 1" "1"
+    expect_output "denied + preset 'x2': the replacement is warned" "UZI_AGENT_TEST_CONCURRENCY='x2' is not a positive integer"
+  }
+fi
+
+# (k) the other half of the cap: agent/package.json's test script must turn
+# UZI_AGENT_TEST_CONCURRENCY into --test-concurrency. The exact script string runs through
+# `sh -c` (as npm runs it) with a fake `node` first on PATH that prints its argv one per
+# line. UZI_AGENT_PACKAGE_JSON overrides the file, for mutation-testing this case only.
+# node (to parse the JSON) is required, never skipped.
+PKG="${UZI_AGENT_PACKAGE_JSON:-$ROOT/agent/package.json}"
+if ! command -v node > /dev/null 2>&1; then
+  echo "FAIL: package.json concurrency expansion: node is not on PATH"
+  failures=$((failures + 1))
+elif ! test_script="$(node -e '
+const pkg = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"));
+const s = pkg && pkg.scripts && pkg.scripts.test;
+if (typeof s !== "string" || s === "") { console.error("no scripts.test in " + process.argv[1]); process.exit(1); }
+process.stdout.write(s);' -- "$PKG")"; then
+  echo "FAIL: package.json concurrency expansion: cannot read scripts.test from $PKG"
+  failures=$((failures + 1))
+else
+  FAKEBIN="$TMP/fake-node-bin"
+  mkdir -p "$FAKEBIN"
+  # shellcheck disable=SC2016 # the single-quoted line is the fake node's own script
+  printf '%s\n' '#!/bin/sh' 'for a in "$@"; do printf "%s\n" "$a"; done' > "$FAKEBIN/node"
+  chmod +x "$FAKEBIN/node"
+  ARGV="$TMP/node-argv"
+  if env UZI_AGENT_TEST_CONCURRENCY=1 PATH="$FAKEBIN:$PATH" sh -c "$test_script" > "$ARGV" 2>&1 &&
+    grep -qx -- '--test-concurrency=1' "$ARGV"; then
+    echo "PASS: package.json test script: UZI_AGENT_TEST_CONCURRENCY=1 passes --test-concurrency=1"
+  else
+    echo "FAIL: package.json test script: UZI_AGENT_TEST_CONCURRENCY=1 did not pass --test-concurrency=1 to node ($PKG); argv:"
+    sed 's/^/    /' "$ARGV"
+    failures=$((failures + 1))
+  fi
+  # `--test` present proves the fake node was reached with the real argv.
+  if env -u UZI_AGENT_TEST_CONCURRENCY PATH="$FAKEBIN:$PATH" sh -c "$test_script" > "$ARGV" 2>&1 &&
+    grep -qx -- '--test' "$ARGV" && ! grep -q -- '^--test-concurrency' "$ARGV"; then
+    echo "PASS: package.json test script: unset UZI_AGENT_TEST_CONCURRENCY passes no --test-concurrency"
+  else
+    echo "FAIL: package.json test script: with UZI_AGENT_TEST_CONCURRENCY unset, node was not reached or still got --test-concurrency ($PKG); argv:"
+    sed 's/^/    /' "$ARGV"
+    failures=$((failures + 1))
+  fi
 fi
 
 # (h) end to end through the real TypeScript recorder: agent/test/real-procfs.ts's

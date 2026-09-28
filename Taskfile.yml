@@ -2333,8 +2333,9 @@ tasks:
       # guard's scratch TMPDIR, where it would count as a leftover. Its own hermetic test
       # runs first, so a gutted verdict table reddens here too.
       # Where the probe says denied, node cannot read its cgroup CPU quota either, so
-      # availableParallelism() reports host CPUs and --test runs that many files at once on
-      # a small quota. The wrapper then exports UZI_AGENT_TEST_CONCURRENCY=1 (unless set),
+      # availableParallelism() reports host CPUs and --test, whose default concurrency is
+      # availableParallelism() - 1, runs files sized to the host on a small quota. The
+      # wrapper then exports UZI_AGENT_TEST_CONCURRENCY=1 (unless set to a positive integer),
       # which the npm test script turns into --test-concurrency=1: node rejects that flag
       # in NODE_OPTIONS, so it has to go on the command line.
       - ../scripts/real-procfs-skip-check.test.sh
