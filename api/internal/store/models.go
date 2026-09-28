@@ -761,6 +761,24 @@ type RunReview struct {
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
 }
 
+type RunSalvage struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	ForgeType        string             `json:"forge_type"`
+	Branch           string             `json:"branch"`
+	Tip              string             `json:"tip"`
+	LiveRunID        pgtype.UUID        `json:"live_run_id"`
+	State            string             `json:"state"`
+	Attempts         int32              `json:"attempts"`
+	LastError        pgtype.Text        `json:"last_error"`
+	SalvageCreatedAt pgtype.Timestamptz `json:"salvage_created_at"`
+	PromotedAt       pgtype.Timestamptz `json:"promoted_at"`
+	ExpiresAt        pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RunSchedule struct {
 	ID                         uuid.UUID          `json:"id"`
 	UserID                     uuid.UUID          `json:"user_id"`

@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -504,8 +505,28 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// PRD #1867 M2: the connection delete cascades its repos and their runs, so a failed
+	// run's salvage row (live_run_id ON DELETE RESTRICT while a checkpoint or salvage ref
+	// may still exist on the forge) would otherwise error mid-cascade. Refuse with a 409
+	// naming the refs instead. Owner-scoped: a foreign id counts nothing and 404s below.
+	salvage, err := h.q.CountLiveSalvageForConnection(r.Context(), store.CountLiveSalvageForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count salvage refs for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if salvage > 0 {
+		h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, salvage)
+		return
+	}
 	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
 	if err != nil {
+		// A sweep recorded a salvage row between the count above and this delete: the
+		// RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
+		if isSalvageRestrict(err) {
+			h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
 		slog.Error("delete connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -945,15 +966,115 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+	// PRD #1867 M2: a failed run's salvage row holds live_run_id (ON DELETE RESTRICT) while
+	// its checkpoint or salvage ref may still exist on the forge; the runs.repo_id cascade
+	// would error on it. Refuse with a 409 naming the refs until they expire.
+	salvage, err := h.q.CountLiveSalvageForRepo(r.Context(), id)
+	if err != nil {
+		slog.Error("count salvage refs for repo delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if salvage > 0 {
+		h.writeRepoSalvageConflict(r.Context(), w, id, salvage)
+		return
+	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
 	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
 	if _, err := h.q.DeleteRepoForUser(r.Context(), store.DeleteRepoForUserParams{ID: id, UserID: user.ID}); err != nil {
+		// A sweep recorded a salvage row between the salvage count above and this delete:
+		// the RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
+		if isSalvageRestrict(err) {
+			h.writeRepoSalvageConflict(r.Context(), w, id, -1)
+			return
+		}
 		slog.Error("delete repo", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// salvageRefListCap bounds how many salvage refs a removal 409 names; the total is
+// reported alongside.
+const salvageRefListCap = 5
+
+// salvageRestrictConstraint is run_salvage's live pointer FK (migration 00264). The
+// handlers match it by name so only a salvage restriction maps to the salvage 409.
+const salvageRestrictConstraint = "run_salvage_live_run_id_fkey"
+
+// isSalvageRestrict reports whether err is the foreign-key violation (23503) raised when a
+// delete cascades onto a run that a live salvage row still points at.
+func isSalvageRestrict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == salvageRestrictConstraint
+}
+
+// writeRepoSalvageConflict writes the repo-removal salvage 409. count < 0 means the caller
+// hit the 23503 race and has no count yet, so it is re-read here.
+func (h *Handler) writeRepoSalvageConflict(ctx context.Context, w http.ResponseWriter, repoID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveSalvageForRepo(ctx, repoID)
+		if err != nil {
+			slog.Error("count salvage refs for repo delete", "error", err)
+		}
+		count = n
+	}
+	var refs []string
+	rows, err := h.q.ListLiveSalvageRefsForRepo(ctx, store.ListLiveSalvageRefsForRepoParams{RepoID: repoID, Lim: salvageRefListCap})
+	if err != nil {
+		slog.Error("list salvage refs for repo delete", "error", err)
+	}
+	for _, row := range rows {
+		refs = append(refs, row.Ref)
+	}
+	writeSalvageConflict(w, "repo", count, refs)
+}
+
+// writeConnectionSalvageConflict is writeRepoSalvageConflict for a forge connection
+// (owner-scoped).
+func (h *Handler) writeConnectionSalvageConflict(ctx context.Context, w http.ResponseWriter, connID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveSalvageForConnection(ctx, store.CountLiveSalvageForConnectionParams{ConnectionID: connID, UserID: userID})
+		if err != nil {
+			slog.Error("count salvage refs for connection delete", "error", err)
+		}
+		count = n
+	}
+	var refs []string
+	rows, err := h.q.ListLiveSalvageRefsForConnection(ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: connID, UserID: userID, Lim: salvageRefListCap})
+	if err != nil {
+		slog.Error("list salvage refs for connection delete", "error", err)
+	}
+	for _, row := range rows {
+		refs = append(refs, row.Ref)
+	}
+	writeSalvageConflict(w, "connection", count, refs)
+}
+
+// writeSalvageConflict writes the removal 409 for live salvage refs. what is "repo" or
+// "connection", count the total and refs the capped names. A lookup that failed or raced
+// still refuses: the count is floored at the number of names, and at 1.
+func writeSalvageConflict(w http.ResponseWriter, what string, count int64, refs []string) {
+	if refs == nil {
+		refs = []string{}
+	}
+	count = max(count, int64(len(refs)), 1)
+	named := ""
+	if len(refs) > 0 {
+		named = " (" + strings.Join(refs, ", ")
+		if int64(len(refs)) < count {
+			named += fmt.Sprintf(", and %d more", count-int64(len(refs)))
+		}
+		named += ")"
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]any{
+		"error": fmt.Sprintf("this %s has %d failed run(s) whose checkpointed commits are kept on the forge for recovery%s; "+
+			"they are removed automatically when they expire, so remove the %s after that", what, count, named, what),
+		"salvage_refs":  refs,
+		"salvage_count": count,
+	})
 }
 
 type patchRepoRequest struct {
