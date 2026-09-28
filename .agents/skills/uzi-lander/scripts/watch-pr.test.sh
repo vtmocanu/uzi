@@ -442,8 +442,8 @@ grep -q '^RESULT=ready$' "$WORK/ca-clean.out" || fail "clean recent_review head 
 # ...and with CodeRabbit comments far larger than a pipe buffer. A `printf | head -1` or
 # `printf | grep -q` under pipefail sees SIGPIPE when the reader exits early: the first
 # killed the script with 141 (set -e), the second read the head marker as absent.
-PAD=$(head -c 400000 /dev/zero | tr '\0' 'x')
-jq -n --arg h "$HEAD" --arg pad "$PAD" '[{user:{login:"coderabbitai[bot]"},body:("<!-- change_assessment_commit:\"" + $h + "\" -->\n<!-- walkthrough_start -->\n<!-- recent_review_start -->\n\nNo actionable comments were generated in the recent review.\n\n<!-- recent_review_end -->\n" + $pad),created_at:"2026-09-21T09:00:00Z"},{user:{login:"coderabbitai[bot]"},body:("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n**Next included review available in 5 minutes.**\n" + $pad + "\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"),created_at:"2026-09-21T08:00:00Z",updated_at:"2026-09-21T08:00:00Z"}]' > "$COMMENTS"
+head -c 400000 /dev/zero | tr '\0' x > "$WORK/pad.txt"   # --rawfile, not --arg: Linux caps one argv string at 128 KiB
+jq -n --arg h "$HEAD" --rawfile pad "$WORK/pad.txt" '[{user:{login:"coderabbitai[bot]"},body:("<!-- change_assessment_commit:\"" + $h + "\" -->\n<!-- walkthrough_start -->\n<!-- recent_review_start -->\n\nNo actionable comments were generated in the recent review.\n\n<!-- recent_review_end -->\n" + $pad),created_at:"2026-09-21T09:00:00Z"},{user:{login:"coderabbitai[bot]"},body:("<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\n<!-- This is an auto-generated comment: rate limited by coderabbit.ai -->\n**Next included review available in 5 minutes.**\n" + $pad + "\n<!-- end of auto-generated comment: rate limited by coderabbit.ai -->"),created_at:"2026-09-21T08:00:00Z",updated_at:"2026-09-21T08:00:00Z"}]' > "$COMMENTS"
 set +e
 bash "$SCRIPT" test/repo 42 0 1 --reviewer coderabbit --reviewer-grace 0 > "$WORK/ca-big.out" 2>&1
 rc=$?

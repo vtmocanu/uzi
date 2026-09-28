@@ -563,7 +563,7 @@ while [ "$i" -lt "$MAX" ]; do
   code_scanning_open "$REPO" "$PR"
   case "$CS_STATE" in
     ok) cs_open=$(printf '%s' "$CS_ITEMS" | jq 'length'); cs_shown="$cs_open"
-        blk_items=$(jq -nc --argjson a "$blk_items" --argjson b "$CS_ITEMS" '$a + $b') ;;
+        blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$CS_ITEMS") '($a|fromjson) + ($b|fromjson)') ;;
     unavailable) cs_shown=unavailable ;;
     *) unk code_scanning ;;
   esac
@@ -571,7 +571,7 @@ while [ "$i" -lt "$MAX" ]; do
      && ma=$(must_ack_json "$(printf '%s' "$issue_c" | jq -sc 'add')" "$(printf '%s' "$rev_raw" | jq -sc 'add')") \
      && acks=$(ack_read "$REPO" "$PR") && ua=$(unacked_json "$ma" "$acks") && [ -n "$ua" ]; then
     unacked=$(printf '%s' "$ua" | jq 'length')
-    blk_items=$(jq -nc --argjson a "$blk_items" --argjson b "$ua" '$a + $b')
+    blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$ua") '($a|fromjson) + ($b|fromjson)')
   else
     unk comment_acks
   fi
