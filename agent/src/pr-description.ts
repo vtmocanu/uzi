@@ -1671,7 +1671,9 @@ export function parseOwnedBlocks(body: string): ParsedBody {
  * Rebuild a body from a parse, replacing only the blocks named in `next`; every other byte
  * (before, between, after, and a block not replaced) is kept exactly. Returns undefined when `next`
  * names a block the parsed body does not carry: re-inserting a removed block is a caller decision
- * (D10: a removed region is a human removal, a missing completion block means a whole-body rewrite).
+ * (D10: a removed region is a human removal; an own-mode publication appends a missing completion
+ * block in place, keeping the region and all other text, and a refresh leaves it missing (D17);
+ * only the interlock's reconcile rewrites the body whole, when the block is still missing at its read).
  */
 export function composeBody(parts: OwnedBlocks, next: { region?: string; completion?: string }): string | undefined {
   if (next.region !== undefined && parts.region === undefined) return undefined;

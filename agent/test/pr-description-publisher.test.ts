@@ -15,6 +15,7 @@ import {
 } from "../src/pr-description-publisher.js";
 import {
   BODY_CAP_CHARS,
+  COMPLETION_START,
   REGION_END,
   REGION_START,
   STALENESS_START,
@@ -279,6 +280,28 @@ describe("publisher: preservation and human-edit protection (D10)", () => {
     assert.equal(r.forge.writes.length, 1);
     const written = r.forge.writes[0]!;
     assert.equal(written, before + pub.region + between + completion(true) + after);
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("a missing completion block is appended in place on an own-mode publication; region and other text are kept", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const before = "## Template\r\nFilled by a person.  \n\n";
+    const after = "\n\n<details>bot</details>\n\n## Summary by a review bot\nKeep\tme";
+    r.forge.pr.description = before + OLD_REGION + after;
+    assert.equal(parseOwnedBlocks(r.forge.pr.description).kind, "ok");
+    const pub = await r.publisher.prepare(makeSpec({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.writes.length, 1);
+    const written = r.forge.writes[0]!;
+    assert.equal(written, `${before}${pub.region}${after}\n\n${completion(true)}`, "appended in place, not rewritten whole");
+    assert.notEqual(written, renderBody(pub.region, completion(true)));
+    assert.equal(written.split(COMPLETION_START).length - 1, 1, "exactly one completion block");
+    assert.ok(written.startsWith(before), "the human text is kept byte for byte");
+    assert.ok(written.includes(after), "the bot text is kept byte for byte");
+    const parsed = parseOwnedBlocks(written);
+    assert.ok(parsed.kind === "ok");
+    assert.equal(parsed.kind === "ok" && parsed.completion, completion(true));
     assert.deepEqual(api.acks(), ["published"]);
   });
 
@@ -635,6 +658,22 @@ describe("publisher: refresh runs (D17) and the staleness line (D12)", () => {
     assert.ok(parsed.kind === "ok");
     assert.equal(parsed.kind === "ok" && parsed.region, pub.region);
     assert.equal(parsed.kind === "ok" && parsed.completion, completion(true), "only the staleness line changed: Closes is kept");
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("a marked PR with no completion block stays without one: the region is refreshed, other text kept", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const before = "## Template\r\nFilled by a person.  \n\n";
+    const after = "\n\n<details>bot</details>\n\n## Summary by a review bot\nKeep\tme";
+    r.forge.pr.head = H2;
+    r.forge.pr.description = before + OLD_REGION + after;
+    const pub = await r.publisher.prepare(refresh({ prior: await priorState() }), { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(r.forge.writes.length, 1);
+    const written = r.forge.writes[0]!;
+    assert.equal(written, before + pub.region + after);
+    assert.ok(!written.includes(COMPLETION_START), "no completion block is added on a refresh");
     assert.deepEqual(api.acks(), ["published"]);
   });
 

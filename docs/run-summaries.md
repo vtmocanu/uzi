@@ -139,13 +139,13 @@ the completion interlock's own reconcile is what then rewrites it whole); a
 directive elsewhere in the body that would close the issue on a run whose
 delivery must not close it; or, when the PR can't even be read back, a blind
 non-closing rewrite as a last resort. A completion block that's gone
-missing is different: the publisher repairs it in place, appending a fresh
+missing is different: an ordinary (non-refresh) publication repairs it in place, appending a fresh
 completion block and keeping everything else, and the interlock's own
 reconcile only rewrites the whole body if the block is *still* missing when
 it reads the PR (the publisher's write failed or was stopped, or a human
 deleted the block afterwards). A refresh run (`mr_rework`, or a `ci_fix`
 picking up an existing branch) never does either kind of whole-body
-rewrite: it only ever touches its own two blocks, or leaves a PR with no
+rewrite, and leaves a missing completion block missing: it only ever touches its own two blocks, or leaves a PR with no
 uzi markers untouched entirely.
 
 **Where to see it.** The run page shows a "Delivered" section of the same
