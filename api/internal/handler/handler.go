@@ -1217,6 +1217,18 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// control (the generator is tool-less, the text renders inert).
 		r.Post("/runs/{id}/summary/intent", h.WorkerSetIntentSummary)
 		r.Post("/runs/{id}/summary/plan", h.WorkerSetPlanSummary)
+		// Plain-English PR descriptions (PRD #1798 D9): stage the RAW fields (the api sanitizes
+		// them and returns the only publishable text), bind the version to the PR, look up a
+		// region hash read from the forge, and acknowledge the forge write (compare-and-swap on
+		// lock_version, with lost-ack recovery). Each is fenced on the run's live
+		// claim_generation and scoped to this worker's run; none touches the forge. Stage is the
+		// one that creates rows, so like /proposals and /findings it rides the per-worker
+		// proposal limiter; the per-run pending-version cap (409 too_many_versions) is the other
+		// half. Bind, lookup and ack create no rows and are bounded by the run's own versions.
+		r.With(proposalLimiter.PerWorkerMiddleware).Post("/runs/{id}/pr-description/stage", h.WorkerStagePrDescription)
+		r.Post("/runs/{id}/pr-description/bind", h.WorkerBindPrDescription)
+		r.Post("/runs/{id}/pr-description/lookup", h.WorkerLookupPrDescription)
+		r.Post("/runs/{id}/pr-description/ack", h.WorkerAckPrDescription)
 
 		// Durable recovery archive — worker side (PRD #1296 M2, D2/D4). Bearer-only
 		// (RequireWorker), authorized by the caller's worker identity against the

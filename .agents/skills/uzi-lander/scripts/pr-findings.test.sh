@@ -14,11 +14,26 @@ cat > "$WORK/bin/gh" <<'STUB'
 set -eu
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then echo deadbeefdeadbeefdeadbeefdeadbeefdeadbeef; exit 0; fi
 if [ "${1:-}" = api ]; then
+# Open code-scanning alerts: CS_MODE unset = none; alert = one; unavailable = 404; broken.
+case "$*" in *'/code-scanning/alerts'*)
+  case "${CS_MODE:-}" in
+    alert) echo '[{"number":51,"tool":{"name":"CodeQL"},"rule":{"id":"js/command-line-injection","severity":"error"},"most_recent_instance":{"location":{"path":"agent/src/js-deps.ts","start_line":576},"message":{"text":"This command line depends on a user-provided value."}}}]' ;;
+    unavailable) echo '{"message":"no analysis found","status":"404"}'; echo 'gh: no analysis found (HTTP 404)' >&2; exit 1 ;;
+    broken) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+    partial404) echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"live finding"}}}]'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1 ;;
+    # A valid alert page, then malformed output, then a 404: never "unavailable" (round-2 probe).
+    malformed404) echo '[{"number":1,"tool":{"name":"CodeQL"},"rule":{"id":"bug"},"most_recent_instance":{"message":{"text":"known open alert"}}}]'; printf '{'; echo 'gh: later page failed (HTTP 404)' >&2; exit 1 ;;
+    *) echo '[]' ;;
+  esac
+  exit 0 ;;
+esac
 # pushrace* modes: the PR #1698 race, shared with the other entrypoints' tests.
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
   case "$*" in
     *'graphql'*)
-      if [ "$MODE" = cr_resolved ]; then
+      if [ -n "${THREADS_JSON:-}" ]; then
+        printf '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":%s,"pageInfo":{"hasNextPage":false}}}}}}\n' "$THREADS_JSON"
+      elif [ "$MODE" = cr_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":12,"author":{"login":"coderabbitai"},"body":"🟡 **resolved finding**","path":"resolved.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
       elif [ "$MODE" = prior_pending_resolved ]; then
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":992,"author":{"login":"greptile-apps"},"body":"P1 finding","path":"old.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}'
@@ -32,18 +47,21 @@ case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; e
         echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'
       fi ;;
     *'/pulls/42/reviews'*)
+      # A first page printed, then a later page failed: unreadable, never "no reviews".
+      if [ "${REVIEW_PAGE_FAIL:-0}" = 1 ]; then echo '[]'; echo 'gh: later review page failed (HTTP 502)' >&2; exit 1; fi
       case "$MODE" in
         race|od_mixed) echo '[{"id":7,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
         in_progress) echo '[{"id":8,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         cr_resolved|head_unreadable) echo '[{"id":9,"user":{"login":"coderabbitai[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"APPROVED","body":""}]' ;;
         head_two_runs) echo '[{"id":77,"user":{"login":"greptile-apps[bot]"},"commit_id":"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef","state":"COMMENTED","body":""}]' ;;
-        *) echo '[]' ;;
+        *) if [ -n "${REVIEWS_FILE:-}" ]; then cat "$REVIEWS_FILE"; else echo '[]'; fi ;;
       esac ;;
     *'/issues/42/comments'*)
       case "$MODE" in
         prior_requested|prior_noanchor_requested) printf '[{"user":{"login":"lander","type":"User"},"created_at":"%s","body":"@greptileai review"}]\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" ;;
         issue_unreadable|od_issue_unreadable) exit 1 ;;
         od_only|od_mixed) jq -n --arg h deadbeefdeadbeefdeadbeefdeadbeefdeadbeef '[{id:900,user:{login:"greptile-apps[bot]"},body:("<!-- greptile_outside_diff -->\n\n- <img alt=\"P1\">&nbsp;**Outside bug** `out.go:5` <a href=\"https://x/blob/" + $h + "/out.go#L5\">x</a>")}]' ;;
+        clean) if [ -n "${COMMENTS_FILE:-}" ]; then cat "$COMMENTS_FILE"; else echo '[]'; fi ;;
         cr_ca_clean|cr_ca_findings) echo '[{"user":{"login":"coderabbitai[bot]"},"body":"<!-- walkthrough_start -->\n<!-- recent_review_start -->\nNo actionable comments were generated in the recent review. 🎉\n<!-- recent_review_end -->\n<!-- change_assessment_commit:\"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef\" -->"}]' ;;
         *) echo '[]' ;;
       esac ;;
@@ -92,6 +110,7 @@ exit 1
 STUB
 chmod +x "$WORK/bin/gh"
 export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
+export UZI_LANDER_STATE_DIR="$WORK/state"
 MODE="clean"; export MODE
 
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/out" 2>&1 \
@@ -123,17 +142,17 @@ if grep -q '^  GR  ' "$WORK/progress.out"; then fail "partial in-progress findin
 MODE="od_only"; export MODE
 set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/od-only.out" 2>&1; rc=$?; set -e
 [ "$rc" -eq 0 ] || fail "outside-diff-only pass was not confirmed, rc=$rc: $(cat "$WORK/od-only.out")"
-grep -qF '  GR  out.go:5  [P1] Outside bug (outside diff)' "$WORK/od-only.out" || fail "outside-diff finding not listed: $(cat "$WORK/od-only.out")"
+grep -qF '  GR  UNTRUSTED out.go:5  [P1] Outside bug (outside diff)' "$WORK/od-only.out" || fail "outside-diff finding not listed: $(cat "$WORK/od-only.out")"
 if grep -q 'review id is missing' "$WORK/od-only.out"; then fail "outside-diff tally still read as unscopable"; fi
-if grep -q '^  GR  old.go:8' "$WORK/od-only.out"; then fail "superseded inline comment listed: $(cat "$WORK/od-only.out")"; fi
+if grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/od-only.out"; then fail "superseded inline comment listed: $(cat "$WORK/od-only.out")"; fi
 
 # Mixed: one inline (scoped to the head review) plus one outside the diff = the tally of 2.
 MODE="od_mixed"; export MODE
 set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/od-mixed.out" 2>&1; rc=$?; set -e
 [ "$rc" -eq 0 ] || fail "mixed inline/outside pass was not confirmed, rc=$rc: $(cat "$WORK/od-mixed.out")"
-grep -qF '  GR  in.go:3' "$WORK/od-mixed.out" || fail "inline finding missing: $(cat "$WORK/od-mixed.out")"
-grep -qF '  GR  out.go:5  [P1] Outside bug (outside diff)' "$WORK/od-mixed.out" || fail "outside finding missing: $(cat "$WORK/od-mixed.out")"
-if grep -q '^  GR  old.go:8' "$WORK/od-mixed.out"; then fail "older-review comment listed: $(cat "$WORK/od-mixed.out")"; fi
+grep -qF '  GR  UNTRUSTED in.go:3' "$WORK/od-mixed.out" || fail "inline finding missing: $(cat "$WORK/od-mixed.out")"
+grep -qF '  GR  UNTRUSTED out.go:5  [P1] Outside bug (outside diff)' "$WORK/od-mixed.out" || fail "outside finding missing: $(cat "$WORK/od-mixed.out")"
+if grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/od-mixed.out"; then fail "older-review comment listed: $(cat "$WORK/od-mixed.out")"; fi
 
 # Unreadable issue comments on a reviewed head: outside-diff findings unknown, never clean.
 MODE="od_issue_unreadable"; export MODE
@@ -204,7 +223,7 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-none.out" 2>&1
 rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "unreviewed head exited rc=$rc, want 3: $(cat "$WORK/prior-none.out")"
-grep -q '^  GR  old.go:8' "$WORK/prior-none.out" || fail "an unsuperseded Greptile comment was dropped: $(cat "$WORK/prior-none.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/prior-none.out" || fail "an unsuperseded Greptile comment was dropped: $(cat "$WORK/prior-none.out")"
 
 # The same comment in a resolved thread is settled: not listed (#1710, 2026-09-26). The head
 # is still unreviewed, so rc stays 3.
@@ -214,7 +233,7 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/prior-resolved.out" 
 rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "unreviewed head exited rc=$rc, want 3: $(cat "$WORK/prior-resolved.out")"
-if grep -q '^  GR  old.go:8' "$WORK/prior-resolved.out"; then fail "a resolved Greptile thread was listed: $(cat "$WORK/prior-resolved.out")"; fi
+if grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/prior-resolved.out"; then fail "a resolved Greptile thread was listed: $(cat "$WORK/prior-resolved.out")"; fi
 
 # Resolved threads, but a newer Greptile review is running: still deferred, never clean.
 MODE="prior_pending_resolved"; export MODE
@@ -233,7 +252,7 @@ rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "unreadable Greptile history exited rc=$rc, want 3: $(cat "$WORK/prior-unreadable.out")"
 grep -q "earlier verdict UNREADABLE" "$WORK/prior-unreadable.out" || fail "unreadable Greptile history was not surfaced: $(cat "$WORK/prior-unreadable.out")"
-grep -q '^  GR  old.go:8' "$WORK/prior-unreadable.out" || fail "comment hidden on an unreadable history: $(cat "$WORK/prior-unreadable.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/prior-unreadable.out" || fail "comment hidden on an unreadable history: $(cat "$WORK/prior-unreadable.out")"
 
 # A Greptile review still RUNNING on a newer commit outranks an older verdict: deferred, and
 # the comment stays listed rather than being cleared by the verdict behind it.
@@ -244,7 +263,7 @@ rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "in-flight newer Greptile review exited rc=$rc, want 3: $(cat "$WORK/prior-pending.out")"
 grep -q 'after its last verdict; findings deferred' "$WORK/prior-pending.out" || fail "in-flight newer Greptile review was not surfaced: $(cat "$WORK/prior-pending.out")"
-grep -q '^  GR  old.go:8' "$WORK/prior-pending.out" || fail "comment cleared while a newer review was running: $(cat "$WORK/prior-pending.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/prior-pending.out" || fail "comment cleared while a newer review was running: $(cat "$WORK/prior-pending.out")"
 
 # A review REQUESTED after the last verdict outranks it: `@greptileai review` only becomes a
 # check-run ~12 s later, so until then the comment stays listed and the PR is deferred.
@@ -255,7 +274,7 @@ rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "just-requested Greptile review exited rc=$rc, want 3: $(cat "$WORK/prior-requested.out")"
 grep -q 'after its last verdict; findings deferred' "$WORK/prior-requested.out" || fail "just-requested Greptile review was not deferred: $(cat "$WORK/prior-requested.out")"
-grep -q '^  GR  old.go:8' "$WORK/prior-requested.out" || fail "comment cleared while a review was requested: $(cat "$WORK/prior-requested.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/prior-requested.out" || fail "comment cleared while a review was requested: $(cat "$WORK/prior-requested.out")"
 
 # An issue-comments listing that could not be READ is not "nobody asked for a review": the
 # trigger check fails closed, so the comment stays listed and the PR is unconfirmed.
@@ -266,7 +285,7 @@ rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "unreadable issue comments exited rc=$rc, want 3: $(cat "$WORK/issue-unreadable.out")"
 grep -q 'earlier verdict UNREADABLE' "$WORK/issue-unreadable.out" || fail "unreadable issue comments were not surfaced: $(cat "$WORK/issue-unreadable.out")"
-grep -q '^  GR  old.go:8' "$WORK/issue-unreadable.out" || fail "comment cleared on unreadable issue comments: $(cat "$WORK/issue-unreadable.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/issue-unreadable.out" || fail "comment cleared on unreadable issue comments: $(cat "$WORK/issue-unreadable.out")"
 
 # A head check-runs request that FAILED is not "Greptile never ran": with CodeRabbit having
 # approved the head, treating it as `absent` let a clean earlier verdict drop a real anchored
@@ -278,7 +297,7 @@ rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "unreadable head check-runs exited rc=$rc, want 3: $(cat "$WORK/head-unreadable.out")"
 grep -q 'check-runs on this head UNREADABLE' "$WORK/head-unreadable.out" || fail "unreadable head check-runs were not surfaced: $(cat "$WORK/head-unreadable.out")"
-grep -q '^  GR  old.go:8' "$WORK/head-unreadable.out" || fail "finding dropped on an unreadable head: $(cat "$WORK/head-unreadable.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/head-unreadable.out" || fail "finding dropped on an unreadable head: $(cat "$WORK/head-unreadable.out")"
 if grep -q 'last verdict on' "$WORK/head-unreadable.out"; then fail "an earlier verdict was consulted on an unreadable head: $(cat "$WORK/head-unreadable.out")"; fi
 
 # A Greptile run that FAILED on the head is Greptile evidence about this head: the raw count
@@ -289,7 +308,7 @@ PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/head-failed.out" 2>&
 rc=$?
 set -e
 [ "$rc" -eq 3 ] || fail "failed head Greptile run exited rc=$rc, want 3: $(cat "$WORK/head-failed.out")"
-grep -q '^  GR  old.go:8' "$WORK/head-failed.out" || fail "an older verdict overrode a failed head Greptile run: $(cat "$WORK/head-failed.out")"
+grep -q '^  GR  UNTRUSTED old.go:8' "$WORK/head-failed.out" || fail "an older verdict overrode a failed head Greptile run: $(cat "$WORK/head-failed.out")"
 if grep -q 'last verdict on' "$WORK/head-failed.out"; then fail "an earlier verdict was consulted past a failed head run: $(cat "$WORK/head-failed.out")"; fi
 
 # Two Greptile runs on the head (a re-trigger needs no push), listed newest first: the
@@ -298,7 +317,7 @@ MODE="head_two_runs"; export MODE
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/head-two-runs.out" 2>&1 \
   || fail "two head Greptile runs did not satisfy the gate: $(cat "$WORK/head-two-runs.out")"
 grep -q 'Greptile: completed on head.*1 comments added' "$WORK/head-two-runs.out" || fail "the newest head Greptile run was not the one read: $(cat "$WORK/head-two-runs.out")"
-grep -q '^  GR  retrigger.go:8' "$WORK/head-two-runs.out" || fail "the re-trigger's finding was hidden by the older clean run: $(cat "$WORK/head-two-runs.out")"
+grep -q '^  GR  UNTRUSTED retrigger.go:8' "$WORK/head-two-runs.out" || fail "the re-trigger's finding was hidden by the older clean run: $(cat "$WORK/head-two-runs.out")"
 
 # Signal (e): CodeRabbit dropped the final_review_risk block and marks the reviewed head with
 # change_assessment_commit:"<sha>" beside a clean recent_review block (#1502). pr-findings must
@@ -310,15 +329,18 @@ grep -q 'incremental pass covered the head' "$WORK/ca-clean.out" || fail "change
 if grep -q 'NOT REVIEWED on head by any bot' "$WORK/ca-clean.out"; then fail "a clean change_assessment head read as unreviewed: $(cat "$WORK/ca-clean.out")"; fi
 
 # ...and with a live CodeRabbit thread the same head is reviewed-with-findings: the finding is
-# listed as current (not the stale-carried note), and the head is still recognized as reviewed.
+# listed as current (not the stale-carried note), the head is still recognized as reviewed,
+# and the unresolved thread BLOCKS (exit 3) until it is resolved.
 MODE="cr_ca_findings"; export MODE
 set +e
 PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/ca-findings.out" 2>&1
 rc=$?
 set -e
-[ "$rc" -eq 0 ] || fail "change_assessment head with a live CR thread exited rc=$rc, want 0: $(cat "$WORK/ca-findings.out")"
+[ "$rc" -eq 3 ] || fail "change_assessment head with a live CR thread exited rc=$rc, want 3: $(cat "$WORK/ca-findings.out")"
+grep -q 'BLOCKED by every-author items: #42' "$WORK/ca-findings.out" || fail "the unresolved CR thread did not block: $(cat "$WORK/ca-findings.out")"
+if grep -q 'NOT REVIEWED on head' "$WORK/ca-findings.out"; then fail "the reviewed head read as unreviewed: $(cat "$WORK/ca-findings.out")"; fi
 grep -q 'incremental pass covered the head' "$WORK/ca-findings.out" || fail "change_assessment head not recognized as reviewed with findings: $(cat "$WORK/ca-findings.out")"
-grep -q '^  CR  ca.go:4' "$WORK/ca-findings.out" || fail "the current-head CR finding was not listed: $(cat "$WORK/ca-findings.out")"
+grep -q '^  CR  UNTRUSTED ca.go:4' "$WORK/ca-findings.out" || fail "the current-head CR finding was not listed: $(cat "$WORK/ca-findings.out")"
 if grep -q 'carried from an earlier review' "$WORK/ca-findings.out"; then fail "a current-head CR finding was mislabeled as carried/stale: $(cat "$WORK/ca-findings.out")"; fi
 
 # ---- Greptile's run landed on an OLDER commit than the head it reviewed (PR #1698) ------
@@ -349,7 +371,7 @@ done
 pf pushrace_review_findings
 [ "$rc" -eq 0 ] || fail "pushrace_review_findings exited rc=$rc: $(cat "$WORK/pushrace_review_findings.out")"
 grep -qF 'completed on head (review→deadbeef via run on bbbbbbbb) — 10 files reviewed, 1 comments added' "$WORK/pushrace_review_findings.out" || fail "review marker not named: $(cat "$WORK/pushrace_review_findings.out")"
-grep -q '^  GR  in.go:3' "$WORK/pushrace_review_findings.out" || fail "bound finding not listed: $(cat "$WORK/pushrace_review_findings.out")"
+grep -q '^  GR  UNTRUSTED in.go:3' "$WORK/pushrace_review_findings.out" || fail "bound finding not listed: $(cat "$WORK/pushrace_review_findings.out")"
 pf pushrace_findings_noreview
 [ "$rc" -eq 3 ] || fail "pushrace_findings_noreview exited rc=$rc: $(cat "$WORK/pushrace_findings_noreview.out")"
 grep -q 'review id is missing' "$WORK/pushrace_findings_noreview.out" || fail "missing review id not surfaced: $(cat "$WORK/pushrace_findings_noreview.out")"
@@ -362,14 +384,88 @@ grep -q 'review still in progress; findings deferred' "$WORK/pushrace_pending_fi
 # the title is the bold line after them, never a fragment of a shell command.
 CR_BODY="$HERE/lib/cr-details-title.fixture.md"; export CR_BODY
 pf cr_details
-grep -qxF '  CR  api/internal/store/migrations/00257_recovery_wait_vault_locked.sql:7  [🟠] Split constraint validation into a separate migration.' "$WORK/cr_details.out" \
+grep -qxF '  CR  UNTRUSTED api/internal/store/migrations/00257_recovery_wait_vault_locked.sql:7  [🟠] Split constraint validation into a separate migration.' "$WORK/cr_details.out" \
   || fail "cr_details: wrong CodeRabbit title: $(grep '^  CR  ' "$WORK/cr_details.out")"
 # No bold line outside <details>: the first non-empty prose line, still never the snippet.
 printf '<details>\n<summary>Script executed</summary>\n\n```bash\nrg x --glob '"'"'!node_modules/**'"'"' .\n```\n\n<details>\n<summary>nested</summary>\n**inside nested**\n</details>\n</details>\n\n<!-- marker -->\nPlain title line.\n' > "$WORK/nobold.md"
 CR_BODY="$WORK/nobold.md"
 pf cr_details
-grep -q '^  CR  .*:7  \[?\] Plain title line\.$' "$WORK/cr_details.out" \
+grep -q '^  CR  UNTRUSTED .*:7  \[?\] Plain title line\.$' "$WORK/cr_details.out" \
   || fail "cr_details fallback: wrong CodeRabbit title: $(grep '^  CR  ' "$WORK/cr_details.out")"
 unset CR_BODY
 
-echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker, Greptile run on an older commit, CodeRabbit title after <details>"
+# ---- Every author, not just the two review bots (PR #1817) --------------------------------
+# MODE=clean is a Greptile-clean head (exit 0); each item below must turn it into exit 3 with
+# the item listed as a sanitized UNTRUSTED row.
+pb() { MODE=clean; export MODE; set +e; PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/repo 42 > "$WORK/pb.$1" 2>&1; rc=$?; set -e; }
+ackc() { PATH="$WORK/bin:$PATH" bash "$HERE/ack-comments.sh" test/repo 42 "$@"; }
+digest() { ackc --show "$2" | grep -F "[$1 $2@" | sed -E "s/.*$2@([0-9a-f]+)\].*/\1/"; }
+pb base
+[ "$rc" -eq 0 ] || fail "every-author baseline not clean, rc=$rc: $(cat "$WORK/pb.base")"
+grep -qF '  every author: open_threads=0 code_scanning=0 unacknowledged=0' "$WORK/pb.base" || fail "every-author summary missing: $(cat "$WORK/pb.base")"
+# A reviews listing whose LATER page fails is unreadable, never "gate: satisfied".
+export REVIEW_PAGE_FAIL=1
+pb review_page_fail
+[ "$rc" -eq 3 ] || fail "a failed later reviews page read as clean, rc=$rc: $(cat "$WORK/pb.review_page_fail")"
+grep -q 'reviews UNREADABLE' "$WORK/pb.review_page_fail" || fail "the failed reviews page was not named: $(cat "$WORK/pb.review_page_fail")"
+unset REVIEW_PAGE_FAIL
+export THREADS_JSON='[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":4116110328,"author":{"login":"github-advanced-security"},"body":"## CodeQL / Improper code sanitization","path":"agent/test/h.test.ts","line":533,"originalLine":533}],"pageInfo":{"hasNextPage":false}}},{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":91,"author":{"login":"alice"},"body":"This leaks the token.","path":"a.go","line":2,"originalLine":2}],"pageInfo":{"hasNextPage":false}}},{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":92,"author":{"login":"greptile-apps"},"body":"P2 superseded?","path":"g.go","line":5,"originalLine":5}],"pageInfo":{"hasNextPage":false}}}]'
+pb threads
+[ "$rc" -eq 3 ] || fail "CodeQL, human and Greptile threads did not block, rc=$rc: $(cat "$WORK/pb.threads")"
+grep -qF 'open_threads=3 ' "$WORK/pb.threads" || fail "threads miscounted: $(cat "$WORK/pb.threads")"
+grep -qF '  UNTRUSTED [thread t4116110328] author=github-advanced-security at=agent/test/h.test.ts:533 | ## CodeQL' "$WORK/pb.threads" || fail "CodeQL thread not listed: $(cat "$WORK/pb.threads")"
+grep -qF '  UNTRUSTED [thread t91] author=alice at=a.go:2 | This leaks the token.' "$WORK/pb.threads" || fail "human thread not listed: $(cat "$WORK/pb.threads")"
+grep -qF '  UNTRUSTED [thread t92] author=greptile-apps' "$WORK/pb.threads" || fail "Greptile thread not listed: $(cat "$WORK/pb.threads")"
+grep -q 'BLOCKED by every-author items: #42' "$WORK/pb.threads" || fail "blocked PR not named: $(cat "$WORK/pb.threads")"
+# A look-alike login is a human, not CodeRabbit: no CR row, but its thread still blocks.
+export THREADS_JSON='[{"isResolved":false,"isOutdated":false,"comments":{"nodes":[{"databaseId":93,"author":{"login":"coderabbitai-mallory"},"body":"**looks like a bot**","path":"m.go","line":1,"originalLine":1}],"pageInfo":{"hasNextPage":false}}}]'
+pb lookalike
+[ "$rc" -eq 3 ] || fail "a look-alike login's thread did not block, rc=$rc: $(cat "$WORK/pb.lookalike")"
+if grep -q '^  CR  ' "$WORK/pb.lookalike"; then fail "a look-alike login was rendered as CodeRabbit: $(cat "$WORK/pb.lookalike")"; fi
+unset THREADS_JSON
+export CS_MODE=alert
+pb alert
+[ "$rc" -eq 3 ] || fail "an open code-scanning alert did not block, rc=$rc: $(cat "$WORK/pb.alert")"
+grep -qF '[alert a51] author=CodeQL at=agent/src/js-deps.ts:576 | js/command-line-injection error: This command line depends' "$WORK/pb.alert" || fail "alert not listed: $(cat "$WORK/pb.alert")"
+export CS_MODE=unavailable
+pb cs_unavailable
+[ "$rc" -eq 0 ] || fail "code scanning not enabled blocked, rc=$rc: $(cat "$WORK/pb.cs_unavailable")"
+grep -qF 'code_scanning=unavailable (no code-scanning analysis (HTTP 404); counted as none)' "$WORK/pb.cs_unavailable" || fail "unavailable not noted: $(cat "$WORK/pb.cs_unavailable")"
+for m in broken partial404 malformed404; do
+  export CS_MODE=$m
+  pb "cs_$m"
+  [ "$rc" -eq 3 ] || fail "a failed alert lookup ($m) read as none, rc=$rc: $(cat "$WORK/pb.cs_$m")"
+  grep -q 'code-scanning alerts UNKNOWN' "$WORK/pb.cs_$m" || fail "unknown alerts ($m) not surfaced: $(cat "$WORK/pb.cs_$m")"
+done
+unset CS_MODE
+# A CodeRabbit review body with findings needs an ack; its walkthrough does not.
+export REVIEWS_FILE="$WORK/reviews.json" COMMENTS_FILE="$WORK/comments.json"
+jq -n '[{id:31,user:{login:"coderabbitai[bot]"},commit_id:"deadbeefdeadbeefdeadbeefdeadbeefdeadbeef",state:"COMMENTED",submitted_at:"2026-09-27T16:47:29Z",body:"**Actionable comments posted: 0**\n\n<details><summary>Outside diff range comments (1)</summary>\n`x.go`: **Security: token logged**\n</details>"}]' > "$REVIEWS_FILE"
+jq -n '[{id:41,user:{login:"coderabbitai[bot]"},created_at:"2026-09-27T16:00:00Z",updated_at:"2026-09-27T16:00:00Z",body:"<!-- This is an auto-generated comment: summarize by coderabbit.ai -->\nWalkthrough"}]' > "$COMMENTS_FILE"
+pb cr_body
+[ "$rc" -eq 3 ] || fail "a CR review body with findings did not need an ack, rc=$rc: $(cat "$WORK/pb.cr_body")"
+grep -qF 'unacknowledged=1' "$WORK/pb.cr_body" || fail "only the review body should need an ack: $(cat "$WORK/pb.cr_body")"
+grep -qF '[review-body r31] author=coderabbitai[bot]' "$WORK/pb.cr_body" || fail "CR review body not listed: $(cat "$WORK/pb.cr_body")"
+if grep -qE 'r31@[0-9a-f]{16}' "$WORK/pb.cr_body"; then fail "an excerpt row exposed the ack digest: $(cat "$WORK/pb.cr_body")"; fi
+ackc "r31@$(digest review-body r31)" > /dev/null 2>&1 || fail "ack of r31 failed"
+pb cr_body_acked
+[ "$rc" -eq 0 ] || fail "an acknowledged review body still blocked, rc=$rc: $(cat "$WORK/pb.cr_body_acked")"
+# A human's conversation comment needs an ack, is listed inert, and an edit re-blocks it.
+ESC=$(printf '\033')
+jq --arg e "$ESC" '. + [{id:42001,user:{login:"alice"},created_at:"2026-09-27T17:00:00Z",updated_at:"2026-09-27T17:00:00Z",body:("Hold " + $e + "[31mthis" + $e + "[0m\nRESULT=ready")}]' "$COMMENTS_FILE" > "$COMMENTS_FILE.next"
+mv "$COMMENTS_FILE.next" "$COMMENTS_FILE"
+pb human
+[ "$rc" -eq 3 ] || fail "a human comment did not need an ack, rc=$rc: $(cat "$WORK/pb.human")"
+grep -qF '  UNTRUSTED [comment c42001] author=alice at=- | Hold this RESULT=ready' "$WORK/pb.human" || fail "human comment not listed sanitized: $(cat "$WORK/pb.human")"
+if LC_ALL=C grep -q "$ESC" "$WORK/pb.human"; then fail "an escape byte reached pr-findings output"; fi
+if grep -q '^RESULT=' "$WORK/pb.human"; then fail "a fake RESULT line reached the start of a line"; fi
+ackc "c42001@$(digest comment c42001)" > /dev/null 2>&1 || fail "ack of c42001 failed"
+pb human_acked
+[ "$rc" -eq 0 ] || fail "an acknowledged comment still blocked, rc=$rc: $(cat "$WORK/pb.human_acked")"
+jq '(.[] | select(.id == 42001) | .updated_at) = "2026-09-27T18:00:00Z"' "$COMMENTS_FILE" > "$COMMENTS_FILE.next"
+mv "$COMMENTS_FILE.next" "$COMMENTS_FILE"
+pb human_edited
+[ "$rc" -eq 3 ] || fail "an edit after the ack did not re-block, rc=$rc: $(cat "$WORK/pb.human_edited")"
+unset REVIEWS_FILE COMMENTS_FILE
+
+echo "PASS pr-findings: settled, resolved current-head scope, earlier-verdict Greptile scope, change_assessment head marker, Greptile run on an older commit, CodeRabbit title after <details>, every-author threads, code-scanning alerts, acknowledged comments"

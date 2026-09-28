@@ -249,6 +249,8 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		DeadlineAt: workersvc.RunDeadline(r.StartedAt, r.BudgetWallSeconds, r.BudgetPausedSeconds, r.Kind, r.Interactive, r.Status, globalTimeout, r.BudgetExtensionSeconds, r.BudgetFinalizeSeconds),
 		PlanMd:     textPtrValue(r.PlanMd.Valid, r.PlanMd.String),
 		PlanSource: r.PlanSource,
+		// PRD #1795 M1: the current plan-gate revision (0 → omitted).
+		GateRevision: r.GateRevision,
 		// PRD #362 M1: plain-English summaries. Intent/plan are nullable text; deltas
 		// are decoded below (tolerate-on-read) so a malformed value cannot fail the read.
 		SummaryIntent: textPtrValue(r.SummaryIntent.Valid, r.SummaryIntent.String),

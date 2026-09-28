@@ -15,12 +15,13 @@
 --      from forge_park_count, which belongs to the forge park alone. A PREVENTIVE disk park (the
 --      worker stopped the run before the volume filled, disk_park_preventive=true) does not bump
 --      it. NOT NULL DEFAULT 0, so every existing row is 0 (never disk-parked).
---   3. runs_fail_origin_check widened with a SEVENTEENTH value, 'data_volume_full' — the
+--   3. runs_fail_origin_check widened with an EIGHTEENTH value, 'data_volume_full' — the
 --      SERVER-DERIVED terminal origin a run gets when a counted disk park would exceed the cap.
 --      It is NOT worker-reportable (workersvc/failorigin.go workerReportableFailOrigins): the
---      server stamps it inside the park transaction. The sixteen values are carried verbatim
---      from 00250's Up. TestFailOriginVocabularyMatchesCheck parses THIS CHECK and asserts it
---      equals AllFailOrigins().
+--      server stamps it inside the park transaction. The seventeen values are carried
+--      verbatim from 00260_gate_revision.sql's Up (PRD #1795 added the seventeenth,
+--      'gate_presentation_refused'). TestFailOriginVocabularyMatchesCheck parses THIS CHECK and
+--      asserts it equals AllFailOrigins().
 --   4. runs.checkpoint_contains_latest — reserved for PRD #1809 M6 (D8): whether the checkpoint
 --      a park published contains the run's latest committed work. DISPLAY-ONLY: nothing
 --      decides on it (custody is released by its own evidence rules, not by this flag). NULL is
@@ -59,6 +60,7 @@ ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
         'history_rewritten',
         'task_undispatched',
         'plan_missing',
+        'gate_presentation_refused',
         'data_volume_full'
     ));
 
@@ -90,7 +92,8 @@ ALTER TABLE runs ADD CONSTRAINT runs_fail_origin_check
         'forge_unreachable',
         'history_rewritten',
         'task_undispatched',
-        'plan_missing'
+        'plan_missing',
+        'gate_presentation_refused'
     ));
 
 ALTER TABLE runs DROP COLUMN disk_park_count;

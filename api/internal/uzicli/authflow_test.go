@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -193,7 +194,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 			_, _ = io.WriteString(w, `{"server_side":true}`)
 		}))
 		defer srv.Close()
-		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, false)
+		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, false, nil)
 		if err != nil || !res.ServerSide {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
@@ -212,7 +213,7 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 			_, _ = io.WriteString(w, `{"server_side":true}`)
 		}))
 		defer srv.Close()
-		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, true)
+		res, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "cancel", "", nil, true, nil)
 		if err != nil || !res.ServerSide {
 			t.Fatalf("res=%+v err=%v", res, err)
 		}
@@ -233,9 +234,49 @@ func TestSubmitRunInputWireShape(t *testing.T) {
 		}))
 		defer srv.Close()
 		sel := &apitypes.AgentSelection{Source: "own", Exclusions: []string{"tester"}}
-		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", sel, false)
+		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", sel, false, nil)
 		if err != nil {
 			t.Fatal(err)
+		}
+	})
+
+	// PRD #1795 D5: an expected revision rides as expected_gate_revision; nil omits it (the
+	// "cancel, no selection" case above decodes strictly into the legacy shape).
+	t.Run("expected gate revision rides", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			var body map[string]json.RawMessage
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				t.Fatalf("decode request: %v", err)
+			}
+			if string(body["expected_gate_revision"]) != "3" {
+				t.Errorf("expected_gate_revision = %s, want 3", body["expected_gate_revision"])
+			}
+			w.WriteHeader(http.StatusAccepted)
+			_, _ = io.WriteString(w, `{"server_side":false}`)
+		}))
+		defer srv.Close()
+		rev := int64(3)
+		if _, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "reject_plan", "no", nil, false, &rev); err != nil {
+			t.Fatal(err)
+		}
+	})
+
+	// The typed 409 is surfaced as ExitConflict with the reason and the current revision.
+	t.Run("gate revision mismatch is typed", func(t *testing.T) {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusConflict)
+			_, _ = io.WriteString(w, `{"error":"the plan gate changed","reason":"gate_revision_mismatch","current_gate_revision":4}`)
+		}))
+		defer srv.Close()
+		rev := int64(3)
+		_, err := newTestClient(srv).SubmitRunInput(context.Background(), "r1", "approve_plan", "", nil, false, &rev)
+		var ee *ExitError
+		if !errors.As(err, &ee) {
+			t.Fatalf("err = %v, want *ExitError", err)
+		}
+		if ee.Code != ExitConflict || ee.Reason != ReasonGateRevisionMismatch || ee.CurrentGateRevision != 4 {
+			t.Errorf("got code=%d reason=%q current=%d, want %d/%q/4", ee.Code, ee.Reason, ee.CurrentGateRevision, ExitConflict, ReasonGateRevisionMismatch)
 		}
 	})
 }

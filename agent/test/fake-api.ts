@@ -217,6 +217,34 @@ export class FakeApi {
   // /messages batch appends "messages"; each recorded /state report appends `state:<status>`.
   readonly requestLog: string[] = [];
   private readonly stateHooks = new Map<string, (body: StateRequest) => void>();
+
+  // --- PRD #1795: gate revisions ------------------------------------------------------------
+  /** Model a revision-allocating api's awaiting_approval report (PRD #1795 M1): a new
+   *  presentation id allocates the next revision, the current id with an unchanged payload is an
+   *  idempotent retry, a historical id / changed payload / stale adoption is refused 409 with a
+   *  reason, and an id-less report allocates. The applied ACK carries top-level gate_revision.
+   *  Off by default, so every existing test sees an older api's exact wire. */
+  gateRevisions = false;
+  /** Stamp the approve/reject/revise rows set through setInputs/appendInputs like the api's M2
+   *  verdict inserts: bound(revision) while the run is awaiting_approval at a revision above 0,
+   *  no binding (legacy) at revision 0, unbound in any other status. A row that already carries
+   *  gate_binding or gate_revision is left as the test wrote it. */
+  stampGateBindings = false;
+  /** RUN_GATE_REFUSAL_MAX (0 = unlimited): the refusal that would push a run's count past it
+   *  fails the run (the 409 then carries run.status "failed"). Counted once per claim generation. */
+  gateRefusalMax = 0;
+  /** Every refused awaiting_approval report, in order. */
+  readonly gateRefusals: Array<{ runId: string; reason: string; generation: number | undefined }> = [];
+  private readonly gateByRun = new Map<string, FakeGate>();
+  /** PRD #1795: one-shot unrecorded answers with a gate revision (see answerStateOnce). */
+  private readonly stateAnswerOnce = new Map<
+    string,
+    { matches: (body: StateRequest) => boolean; httpStatus: number; runStatus: string; gateRevision: number }
+  >();
+  /** Reports matching a hook are persisted (recorded, revision allocated) and THEN held or dropped:
+   *  "drop" destroys the connection after persistence (a lost ACK), a promise holds the ACK until it
+   *  settles (the window between persistence and the response). One-shot. */
+  private readonly afterPersistHooks = new Map<string, { matches: (body: StateRequest) => boolean; action: "drop" | Promise<void> }>();
   // PRD #1247 M5b: the per-batch MessagesRequest wrapper as it landed (the runMatch handler
   // otherwise keeps only the flattened `messages[]`, discarding the top-level claim_generation
   // a capability worker stamps). Additive record; lets a runner test assert the batcher was
@@ -452,10 +480,21 @@ export class FakeApi {
       // runs.stop_kind for a reject_plan or cancel in the same statement.
       if (fresh.kind === "reject_plan") this.stopKindByRun.set(runId, "plan_rejected");
       if (fresh.kind === "cancel") this.stopKindByRun.set(runId, "cancelled");
-      return this.stampInputCreatedAt && fresh.created_at === undefined ? { ...fresh, created_at: this.stamp() } : fresh;
+      const bound = this.stampBinding(runId, fresh);
+      return this.stampInputCreatedAt && bound.created_at === undefined ? { ...bound, created_at: this.stamp() } : bound;
     });
     this.seenInputIds.set(runId, seen);
     this.inputsByRun.set(runId, inputs);
+  }
+
+  /** PRD #1795: the api's M2 binding for a verdict row inserted now (see stampGateBindings). */
+  private stampBinding(runId: string, row: UserInput): UserInput {
+    if (!this.stampGateBindings) return row;
+    if (row.kind !== "approve_plan" && row.kind !== "reject_plan" && row.kind !== "revise_plan") return row;
+    if (row.gate_binding !== undefined || row.gate_revision !== undefined) return row;
+    const revision = this.gateByRun.get(runId)?.revision ?? 0;
+    if (this.lastRecordedStatus.get(runId) !== "awaiting_approval") return { ...row, gate_binding: "unbound" };
+    return revision > 0 ? { ...row, gate_binding: "bound", gate_revision: revision } : row;
   }
 
   /** Issue #1604: a server timestamp (RFC 3339, microsecond precision like Postgres' timestamptz,
@@ -535,6 +574,66 @@ export class FakeApi {
     this.droppedStates.set(runId, matches);
     return () => {
       if (this.droppedStates.get(runId) === matches) this.droppedStates.delete(runId);
+    };
+  }
+
+  /** PRD #1795: persist the next /state report for this run matching `matches`, then (instead of
+   *  answering at once) destroy the connection ("drop": a lost ACK the client retries) or hold the
+   *  answer until `hold` settles (a verdict created in that window is stamped against the
+   *  just-persisted gate). One-shot. The dropStatesWhen hook drops BEFORE anything is recorded. */
+  afterPersistState(runId: string, matches: (body: StateRequest) => boolean, action: "drop" | Promise<void>): void {
+    this.afterPersistHooks.set(runId, { matches, action });
+  }
+
+  /** PRD #1795: answer the next /state report for this run matching `matches` with `httpStatus`
+   *  and a `{run: {status: runStatus}, gate_revision}` body WITHOUT recording it or touching the
+   *  modelled gate: an ACK that carries a gate revision yet does not say the gate was published (a
+   *  409, or a 200 whose run is not awaiting_approval). One-shot; `matches` runs when the report
+   *  arrives, so a test can create rows at exactly that moment. */
+  answerStateOnce(
+    runId: string,
+    matches: (body: StateRequest) => boolean,
+    answer: { httpStatus: number; runStatus: string; gateRevision: number },
+  ): void {
+    this.stateAnswerOnce.set(runId, { matches, ...answer });
+  }
+
+  /** PRD #1795: seed the run's gate as an api would hold it before this worker's claim (a gate an
+   *  earlier worker published). `presentationId` null is an id-less gate (an old worker, or a gate
+   *  published before the migration); `historical` ids are recorded as earlier presentations. */
+  seedGate(runId: string, gate: { revision: number; presentationId: string | null; payload: FakeGatePayload; historical?: string[] }): void {
+    const presentations = new Map<string, number>();
+    (gate.historical ?? []).forEach((id, i) => presentations.set(id, i + 1));
+    if (gate.presentationId !== null) presentations.set(gate.presentationId, gate.revision);
+    this.gateByRun.set(runId, {
+      revision: gate.revision,
+      currentId: gate.presentationId,
+      presentations,
+      snapshot: normalizePayload(gate.payload, undefined),
+      countedGeneration: undefined,
+      refusals: 0,
+    });
+  }
+
+  /** PRD #1795: the run's current gate revision and presentation id (0 / null before any gate). */
+  gateOf(runId: string): { revision: number; presentationId: string | null } {
+    const g = this.gateByRun.get(runId);
+    return { revision: g?.revision ?? 0, presentationId: g?.currentId ?? null };
+  }
+
+  /** PRD #1795: the gate-resume claim fields the api assembles for an awaiting_approval resume:
+   *  the current revision and id, and the requirement half of the IMMUTABLE presented snapshot. */
+  gateResumeFields(runId: string): Partial<ClaimResponse> {
+    const g = this.gateByRun.get(runId);
+    if (!g || g.revision <= 0) return {};
+    return {
+      resume_gate_revision: g.revision,
+      ...(g.currentId !== null ? { resume_gate_presentation_id: g.currentId } : {}),
+      resume_gate_presented: {
+        required_capabilities: g.snapshot.required_capabilities,
+        required_tools: g.snapshot.required_tools,
+        ...(g.snapshot.size_class !== undefined ? { size_class: g.snapshot.size_class } : {}),
+      },
     };
   }
 
@@ -1144,11 +1243,50 @@ export class FakeApi {
     send(res, 200, { accepted: incoming.length });
   }
 
-  private handleState(
+  /** PRD #1795 M1: classify an awaiting_approval report against the run's gate (the real
+   *  api's gate_revision.go), applying an accepted one's allocation / adoption. */
+  private classifyGate(runId: string, body: StateRequest): { revision: number } | { refused: string } {
+    const gate: FakeGate = this.gateByRun.get(runId) ?? {
+      revision: 0,
+      currentId: null,
+      presentations: new Map(),
+      snapshot: normalizePayload({}, undefined),
+      countedGeneration: undefined,
+      refusals: 0,
+    };
+    this.gateByRun.set(runId, gate);
+    const effective = normalizePayload(body, gate.snapshot);
+    const same = JSON.stringify(effective) === JSON.stringify(gate.snapshot);
+    const id = body.presentation_id;
+    const accept = (): { revision: number } => {
+      gate.refusals = 0;
+      gate.countedGeneration = undefined;
+      return { revision: gate.revision };
+    };
+    if (body.adopt_gate_revision !== undefined) {
+      if (id === undefined || gate.revision <= 0 || gate.revision !== body.adopt_gate_revision || gate.currentId !== null || !same) {
+        // A retry after a lost adoption ACK is a current-id retry.
+        if (id !== undefined && id === gate.currentId && same) return accept();
+        return { refused: "gate_adoption_stale" };
+      }
+      gate.currentId = id;
+      gate.presentations.set(id, gate.revision);
+      return accept();
+    }
+    if (id !== undefined && id === gate.currentId) return same ? accept() : { refused: "gate_presentation_conflict" };
+    if (id !== undefined && gate.presentations.has(id)) return { refused: "gate_presentation_historical" };
+    gate.revision++;
+    gate.currentId = id ?? null;
+    if (id !== undefined) gate.presentations.set(id, gate.revision);
+    gate.snapshot = effective;
+    return accept();
+  }
+
+  private async handleState(
     res: http.ServerResponse,
     runId: string,
     json: Record<string, unknown>,
-  ): void {
+  ): Promise<void> {
     this.stateAttempts++;
     if (this.strictDecodeStateRemaining > 0) {
       this.strictDecodeStateRemaining--;
@@ -1181,6 +1319,11 @@ export class FakeApi {
         error: "run already terminal",
         run: { id: runId, status: "cancelled" },
       });
+    }
+    const answer = this.stateAnswerOnce.get(runId);
+    if (answer && answer.matches(body)) {
+      this.stateAnswerOnce.delete(runId);
+      return send(res, answer.httpStatus, { gate_revision: answer.gateRevision, run: { id: runId, status: answer.runStatus } });
     }
     // m2 (#1197): a per-run predicate can knock out ONE matching report (see
     // failStateWhen). Checked BEFORE recording, so a refused report is not applied —
@@ -1232,6 +1375,29 @@ export class FakeApi {
     ) {
       return send(res, 409, { error: "run is not running", run: { id: runId, status: lastStatus } });
     }
+    // PRD #1795 M1: classify an awaiting_approval report under the modelled run-row lock, before
+    // anything is recorded: a refusal publishes nothing.
+    let gateRevision: number | undefined;
+    if (this.gateRevisions && body.status === "awaiting_approval") {
+      if ((body.presentation_id !== undefined || body.adopt_gate_revision !== undefined) && body.claim_generation === undefined)
+        return send(res, 400, { error: "presentation_id and adopt_gate_revision require claim_generation", reason: "claim_generation_required" });
+      const verdict = this.classifyGate(runId, body);
+      if ("refused" in verdict) {
+        const gate = this.gateByRun.get(runId)!;
+        this.gateRefusals.push({ runId, reason: verdict.refused, generation: body.claim_generation });
+        let status = lastStatus ?? "running";
+        if (gate.countedGeneration !== body.claim_generation) {
+          gate.countedGeneration = body.claim_generation;
+          gate.refusals++;
+          if (this.gateRefusalMax > 0 && gate.refusals > this.gateRefusalMax) {
+            status = "failed";
+            this.lastRecordedStatus.set(runId, "failed");
+          }
+        }
+        return send(res, 409, { run: { id: runId, status }, reason: verdict.refused });
+      }
+      gateRevision = verdict.revision;
+    }
     this.states.push({ runId, body });
     this.requestLog.push(`state:${body.status}`);
     this.lastRecordedStatus.set(runId, body.status);
@@ -1257,7 +1423,19 @@ export class FakeApi {
       this.appliedByRun.set(runId, applied);
     }
     this.stateHooks.get(runId)?.(body);
+    // PRD #1795: persisted; now lose or hold the answer if a test armed it.
+    const after = this.afterPersistHooks.get(runId);
+    if (after && after.matches(body)) {
+      this.afterPersistHooks.delete(runId);
+      if (after.action === "drop") {
+        res.destroy();
+        return;
+      }
+      await after.action;
+    }
     send(res, 200, {
+      // PRD #1795 M1 (decision 5): the revision this report was answered with, top-level.
+      ...(gateRevision !== undefined ? { gate_revision: gateRevision } : {}),
       run: {
         id: runId,
         // #1539: a statusless ack OMITS run.status entirely (undefined, not "") so readRunAck leaves
@@ -1286,6 +1464,45 @@ export class FakeApi {
         : {}),
     });
   }
+}
+
+/** PRD #1795: the approval-relevant payload of a gate presentation (plan_changed_files excluded). */
+export interface FakeGatePayload {
+  plan_md?: string;
+  milestones?: unknown;
+  required_capabilities?: string[] | null;
+  required_tools?: string[] | null;
+  size_class?: string;
+}
+
+interface NormalizedGatePayload {
+  plan_md: string;
+  milestones: unknown;
+  required_capabilities: string[];
+  required_tools: string[];
+  size_class: string | undefined;
+}
+
+interface FakeGate {
+  revision: number;
+  currentId: string | null;
+  presentations: Map<string, number>;
+  snapshot: NormalizedGatePayload;
+  countedGeneration: number | undefined;
+  refusals: number;
+}
+
+/** The effective presented payload: each field the report carries, else the previous snapshot's
+ *  (the fields the api's persist query keeps when a report omits them). */
+function normalizePayload(p: FakeGatePayload, prev: NormalizedGatePayload | undefined): NormalizedGatePayload {
+  const sorted = (v: string[] | null | undefined, fallback: string[]): string[] => (v ? [...v].sort() : fallback);
+  return {
+    plan_md: p.plan_md ?? prev?.plan_md ?? "",
+    milestones: p.milestones ?? prev?.milestones ?? null,
+    required_capabilities: sorted(p.required_capabilities, prev?.required_capabilities ?? []),
+    required_tools: sorted(p.required_tools, prev?.required_tools ?? []),
+    size_class: p.size_class ?? prev?.size_class,
+  };
 }
 
 function readBody(req: http.IncomingMessage): Promise<string> {

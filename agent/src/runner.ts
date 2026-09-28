@@ -37,6 +37,7 @@ import type {
   ClaimCodexSecrets,
   ClaimConfig,
   ClaimResponse,
+  GatePresentedRequirements,
   IterationBudget,
   Milestone,
   RunKind,
@@ -114,6 +115,7 @@ import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
+import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
@@ -546,6 +548,40 @@ class CredentialSwitchRetainedStop extends Error {
  *  read within the channel's bound. */
 const RESUMED_GATE_RECOVERY_REASON = "could not read plan-gate inputs after the resume";
 
+/** PRD #1795 (A3, decision 8): why a claim parks when the api refused its awaiting_approval report
+ *  (a historical presentation id, a changed payload under the current id, or a stale adoption). The
+ *  refused report published nothing, so the next claim re-presents; it is never retried here under
+ *  a fresh id. */
+const GATE_PRESENTATION_REFUSED_REASON = "the plan gate could not be re-presented";
+
+/** PRD #1795 M1: the 409 reasons a refused awaiting_approval report carries
+ *  (api/internal/workersvc/gate_revision.go GatePresentationRefusalReason). */
+const GATE_PRESENTATION_REFUSALS = new Set([
+  "gate_presentation_historical",
+  "gate_presentation_conflict",
+  "gate_adoption_stale",
+]);
+
+/** PRD #1795 M1: the register-response feature under which the api accepts `presentation_id` /
+ *  `adopt_gate_revision` on the awaiting_approval report. Never sent without it: an older api
+ *  strict-decodes the report and would 400 an unknown field. */
+const GATE_REVISION_FEATURE = "gate_revision_v1";
+
+/** PRD #1795 (decision 7): what a gate resume claim says about the persisted gate it re-presents,
+ *  kept until the claim's first gatePlan. Used only when that gate is the no-bump first gate of the
+ *  claim and shows the same persisted plan (an SDK same-gate reclaim). */
+interface GateResume {
+  revision: number;
+  /** The persisted current presentation id, reused; undefined for an id-less gate, adopted. */
+  presentationId: string | undefined;
+  /** The immutable presented requirements, re-sent instead of a fresh detection. */
+  presented: GatePresentedRequirements | undefined;
+  /** The persisted plan the claim carries: a first gate showing any other text mints a fresh id. */
+  planMd: string;
+}
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 /**
  * PRD #1391 Run B M4: phaseClone's FIRST `running` report came back refused (applied:false) with a
  * TERMINAL status — the run reached completed/failed/cancelled out from under this claim (a racing
@@ -722,18 +758,42 @@ export function composePushSecretBlockedReason(
  * Names the default branch once and points at docs/github-bot-setup.md. The branch name is
  * the only variable part and is clamped against a computed budget (MAX_FAILURE_REASON_LEN
  * minus the fixed prefix + suffix lengths), so the fixed suffix — the doc link and the
- * "Your diff is preserved below." pointer — always fits MAX_FAILURE_REASON_LEN and is never
- * truncated. Exported for a direct length-cap unit test.
+ * "Your diff is preserved below." pointer, or, when the diff was withheld, the "recoverable
+ * (export it with `uzi run export`)" tail — always fits MAX_FAILURE_REASON_LEN and is never
+ * truncated. The withheld align variant omits the token-scope parenthetical (the doc link
+ * covers it) to make that tail fit; its branch-name budget is then 13 characters, so a longer
+ * name is clamped with "…" rather than cutting the tail. Exported for a direct length-cap
+ * unit test.
+ *
+ * `stage` (issue #1769) names where the realign stopped. `"align"` (the default; byte-identical
+ * to the pre-#1769 text when the patch is preserved) is the merge/rebase path above. `"import"` means uzi could not even
+ * import the default branch's new objects into the runner clone (a self-contained Codex clone, or
+ * the probe that runs for every executor), so no merge or rebase was attempted and the reason
+ * must not claim one was. Its wording is executor-neutral for that reason.
  */
-export function composeBaseAlignConflictReason(defaultBranch: string, patchPreserved = true): string {
+export function composeBaseAlignConflictReason(
+  defaultBranch: string,
+  patchPreserved = true,
+  stage: "align" | "import" = "align",
+): string {
   const db = defaultBranch || "the default branch";
   const prefix = "This run's branch is behind the default branch (";
+  // The import wording drops the token-scope parenthetical (the doc link carries it) so that
+  // even the longer withheld tail fits the cap with room for the branch name.
+  const why = stage === "import"
+    ? ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+      "differ from the default. uzi could not import the default branch's new objects into " +
+      "the runner clone, so the run failed without pushing. "
+    : ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
+      // The withheld align variant drops the same parenthetical, for the same reason: with it,
+      // `why` plus the withheld tail alone exceed the cap, so the branch name collapsed to "…"
+      // and the final slice cut the recovery instruction off the end.
+      (patchPreserved ? "differ from the default (its scope is `repo`, without `workflow`, by design). " : "differ from the default. ") +
+      "uzi tried to merge then rebase the current default into the branch to realign those files, " +
+      "but could not realign and safely push it, so the run failed without pushing. ";
   const suffix =
-    ") on .github/workflows files, which uzi's GitHub bot token cannot push while they " +
-    "differ from the default (its scope is `repo`, without `workflow`, by design). uzi tried " +
-    "to merge then rebase the current default into the branch to realign those files, but could " +
-    "not realign and safely push it, so the run failed without pushing. The work is valid; a " +
-    "human can rebase and land it. See docs/github-bot-setup.md." +
+    why +
+    "The work is valid; a human can rebase and land it. See docs/github-bot-setup.md." +
     (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
   // Clamp the branch name (the only variable part) against the budget left after the fixed
   // prefix + suffix, so the doc link + preserved-diff pointer in `suffix` always survive.
@@ -1417,6 +1477,10 @@ export class RunRunner {
    *  regardless of planApprovalTimeoutMs (unlike keying off gateDeadlines). Cleared on a
    *  terminal verdict and, defensively, when the run reaches a terminal state. */
   private readonly gatedRuns = new Set<string>();
+  /** PRD #1795 (decision 7): per run, the gate resume data of a claim whose first gate may re-present
+   *  its persisted gate under the persisted presentation id (or adopt an id-less one). Consumed by
+   *  the claim's first gatePlan; cleared with gatedRuns. */
+  private readonly gateResumes = new Map<string, GateResume>();
   /** PRD #218 M1: the in-flight runs, so a graceful shutdown can abort each and let its
    *  catch fetch the committed work back before the container dies. Registered once the
    *  runner clone exists (there is nothing to fetch back before that) and deregistered
@@ -2520,6 +2584,7 @@ export class RunRunner {
       // leak either).
       this.gateDeadlines.delete(runId);
       this.gatedRuns.delete(runId);
+      this.gateResumes.delete(runId);
       // PRD #88: the clarification park's per-run state follows the SAME rule as the
       // gate maps above, and for the same reason main gives below — these are
       // in-memory per-run entries that would otherwise be held for the whole length of
@@ -4785,23 +4850,34 @@ export class RunRunner {
             // trackingRef, so those are unchanged; in the clobber-safety path (a branch that
             // edited a workflow) originalAgentTip carries that edit, so it is still preserved.
             const defTip = defaultTip;
-            const failBaseAlignConflict = async () => {
+            // issue #1769: `stage` "import" is the runner clone's object import
+            // (ensureRunnerCloneObjects, run for every executor) failing BEFORE any merge/rebase,
+            // so its status and reason never claim one ran;
+            // "align" (the default) keeps the merge/rebase status texts, and the patch-preserved
+            // reason, byte-identical.
+            const failBaseAlignConflict = async (stage: "align" | "import" = "align") => {
               const patch = await scanGatedPatch(
                 await this.git.workflowScopeDiff(alignBarePath, originalAgentTip),
                 "finalize_base_align_conflict",
               );
+              const what = stage === "import"
+                ? "could not import the default branch's new objects into the runner clone, so the branch was not realigned"
+                : "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded)";
               batcher.emit({
                 kind: "status",
                 agent: "worker",
                 payload: {
                   text: patch !== undefined
-                    ? "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing and preserving the diff for a human to land"
-                    : "could not realign the branch with the updated default branch and safely push it (merge and rebase conflicted, or the aligned branch could not be fast-forwarded); failing (the diff is withheld: it could not be preserved or did not scan clean)",
+                    ? `${what}; failing and preserving the diff for a human to land`
+                    : `${what}; failing (the diff is withheld: it could not be preserved or did not scan clean)`,
                 },
               });
-              runLog.info("run failed: finalize base-align conflict; preserving diff", {
-                run_id: runId,
-              });
+              runLog.info(
+                stage === "import"
+                  ? "run failed: finalize base-align could not import the default tip into the runner clone; preserving diff"
+                  : "run failed: finalize base-align conflict; preserving diff",
+                { run_id: runId },
+              );
               await closeBatcher();
               // PRD #1391 Run B M3 (N1): journal write-ahead so the typed base-align-conflict failure
               // — its fail_origin AND its preserved_patch (the canonicaliser handles the diff size) —
@@ -4809,7 +4885,7 @@ export class RunRunner {
               // diff a human needs to land.
               await journalTerminalReport({
                 status: "failed",
-                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined),
+                failure_reason: composeBaseAlignConflictReason(alignDefaultBranch, patch !== undefined, stage),
                 fail_origin: "finalize_base_align_conflict",
                 preserved_patch: patch,
               });
@@ -4948,6 +5024,27 @@ export class RunRunner {
                 text: "branch is behind the default branch on .github/workflows; aligning before pushing",
               },
             });
+
+            // issue #1769: a self-contained (Codex) clone has no alternate into the bare, so the
+            // fresh default tip `fetchDefaultTip` brought into the bare is not yet readable there.
+            // Import its objects once, before any strategy (overlay included) anchors it. A
+            // `--shared` (Claude) clone already resolves it and this is a probe only. A failure
+            // happens before any merge/rebase, so it fails typed with the import-stage reason.
+            try {
+              await this.git.ensureRunnerCloneObjects(
+                alignBarePath,
+                runnerClone.path,
+                defTip,
+                [runnerClone.baseCommit, runnerClone.defaultBranchCommit ?? ""],
+              );
+            } catch (e) {
+              runLog.warn(
+                "finalize base-align: could not import the default tip into the runner clone; preserving diff and failing typed",
+                { run_id: runId, error: errMessage(e) },
+              );
+              await failBaseAlignConflict("import");
+              return;
+            }
 
             // PRIMARY (issue #627): overlay ONLY the default tip's .github/workflows/ subtree
             // onto the agent tip. It cannot conflict and is a fast-forward (original agent SHAs
@@ -5356,6 +5453,20 @@ export class RunRunner {
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
       "main";
+    // PRD #1798 M1 (D3): the deterministic size line, computed HERE — after the push, align and
+    // history bridge (so the branch that will be published is final) and after the interlock permit
+    // (so the head is the landed tip, never a pre-align candidate) — from the worker-side tracking ref
+    // against the merge-base with the target branch. It is threaded into BOTH mrDescription calls
+    // (creation and the verified-head reconcile) so a body rewrite keeps it. computeSizeLine never
+    // throws; the extra catch only guards the tracking-ref read, so the size line can never fail a run.
+    let sizeLine: string | null;
+    try {
+      const sizeHead = await this.git.trackingTip(barePath, result.branch);
+      sizeLine = await computeSizeLine(this.git, barePath, targetBranch, sizeHead, runLog);
+    } catch (err) {
+      runLog.warn("PR size line unavailable", { run_id: runId, error: errMessage(err) });
+      sizeLine = SIZE_UNAVAILABLE;
+    }
     // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
     // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
     // path; each client derives its own API base + project from repo.url (D9).
@@ -5394,6 +5505,7 @@ export class RunRunner {
             renderCloses,
             claim.config?.completion_scope,
             bridged,
+            sizeLine ?? undefined,
           ),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal },
@@ -5439,6 +5551,7 @@ export class RunRunner {
           withCloses,
           claim.config?.completion_scope,
           bridged,
+          sizeLine ?? undefined,
         );
         const desc = banner ? `${banner}\n\n${base}` : base;
         await withForgeRetry(
@@ -5696,7 +5809,30 @@ export class RunRunner {
       // whose replayed verdicts cannot be judged: nothing replayed settles its first gate.
       if (!replayJudged || executor.resumesAtGate !== true || claim.resume_phase !== "awaiting_approval")
         this.gatedRuns.add(runId);
+      // PRD #1795 (decision 7): a claim whose first gate RE-PRESENTS the persisted gate (the no-bump
+      // first gate above: an SDK executor at resume_phase "awaiting_approval" with judged replays)
+      // keeps the gate's presentation: its first gatePlan reuses the persisted id (or adopts an
+      // id-less gate) with the presented requirements. The confirmed revision is seeded from the
+      // claim, so a pending reject or revise bound to that gate acts before it is re-presented
+      // (takeResumedGateEvent); a taken revise clears it and marks the run gated (a fresh id then).
+      const resumeRevision = claim.resume_gate_revision;
+      if (
+        !this.gatedRuns.has(runId) &&
+        typeof resumeRevision === "number" && Number.isSafeInteger(resumeRevision) && resumeRevision > 0
+      ) {
+        const id = claim.resume_gate_presentation_id;
+        this.gateResumes.set(runId, {
+          revision: resumeRevision,
+          presentationId: typeof id === "string" && UUID_RE.test(id) ? id : undefined,
+          presented: claim.resume_gate_presented ?? undefined,
+          planMd: claim.plan_md ?? "",
+        });
+        steering.setGateRevision(resumeRevision);
+      }
     }
+    // PRD #1795 (decision 9): bound/unbound verdict handling applies to a human-gated claim only (an
+    // autopilot gate never waits on a verdict). gatePlan re-asserts it for a gate forced to a human.
+    steering.setHumanGated(!(claim.auto_approve ?? false));
 
     // Last SDK session id the executor observed; carried on EVERY state report so
     // resume survives a lost report.
@@ -6044,7 +6180,7 @@ export class RunRunner {
     }
     let retained = false;
     try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
       flight.worktreePath = runnerClone.path;
       flight.branch = runnerClone.branch;
     } catch (err) {
@@ -6064,7 +6200,7 @@ export class RunRunner {
         // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
         // 404'd on a worker move (Gap 2).
         await this.reclaimTerminalOrphan(barePath, claim, err.clonePath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else if (err instanceof CapturePathMismatchError) {
@@ -6072,7 +6208,7 @@ export class RunRunner {
         // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
         // The SAME owner-derived validation decides; any unmet predicate fails closed.
         await this.reclaimTerminalOrphan(barePath, claim, err.journaledPath, err.branch, err.ownerRunId, err);
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim));
+        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, flight.executor));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
       } else {
@@ -10755,7 +10891,7 @@ export class RunRunner {
    * vs the repo's default branch. The working tree lives ONLY in this clone; the
    * worker fetches the agent branch back from it before pushing (fetchAgentBranch).
    */
-  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse) {
+  private async runnerCloneForClaim(barePath: string, claim: ClaimResponse, executor: Executor) {
     // PRD #218 M2: thread the run id as the tracking-ref OWNERSHIP anchor. The git layer
     // stays claim-agnostic — it consults the tracking ref only when its stamp matches
     // this run id, so neither a fresh run nor a different run on the same issue can
@@ -10778,6 +10914,11 @@ export class RunRunner {
     // cannot seed off a PRIOR (possibly plan-rejected) run's work. `?? undefined` maps the
     // wire's null (a never-published run) to the "do not adopt" sentinel the git layer reads.
     const expectedCheckpointTip = claim.checkpoint_tip ?? undefined;
+    // issue #1769: a Codex (sandboxed) run's command sandbox does not grant the worker bare,
+    // so its clone is dissociated from the bare at seed. Keyed on
+    // `executor.sandboxesCommands`, which the executor sets at construction: `executor.safety`
+    // is populated only inside run(), so it is still unset here. Claude/stub pass false.
+    const cloneOpts = { selfContained: executor.sandboxesCommands === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -10795,10 +10936,11 @@ export class RunRunner {
         runId,
         resume,
         expectedCheckpointTip,
+        cloneOpts,
       );
     if (claim.issue_iid == null)
       throw new Error("issue run claim is missing issue_iid");
-    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip);
+    return this.git.createOrAttachRunnerClone(barePath, claim.issue_iid, runId, resume, expectedCheckpointTip, cloneOpts);
   }
 
   /**
@@ -10915,6 +11057,10 @@ export class RunRunner {
     // replays it instead of re-presenting the superseded plan.
     settles?: number,
   ): Promise<PlanVerdict> {
+    // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
+    // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
+    // this one and a declined, failed or refused report confirms nothing.
+    steering.clearGateRevision();
     batcher.emit({ kind: "plan", agent: "lead", payload: { plan_md: planMd } });
     // Get the plan message onto the stream regardless of mode — it is the audit
     // record of what the agent intended, autopilot or not.
@@ -11030,28 +11176,73 @@ export class RunRunner {
     // best-effort (planChangedFiles swallows errors → []), computed EVERY round so a
     // revision gate reflects that round's tree (a revert between rounds clears the list).
     const planChangedFiles = await this.git.planChangedFiles(worktreePath);
+    // PRD #1795 (decision 9): this gate waits on a human (a CI-config ci_fix plan forces one even on
+    // an auto-approve claim), so bound/unbound verdict handling applies.
+    steering.setHumanGated(true);
+    // PRD #1795 (decision 7): the presentation this gate publishes. Only the no-bump first gate of a
+    // claim that re-presents its persisted gate (an SDK same-gate reclaim: gateResumes, showing the
+    // same persisted plan) keeps that gate's identity: it reuses the persisted id, or explicitly
+    // adopts an id-less gate, and re-sends the presented requirements instead of a fresh detection
+    // (which may differ, or an approval's override may have cleared the live set). Every other gate
+    // (a fresh plan, a revision, a resumed revise, a stub/Codex re-gate of identical text) mints a
+    // fresh id. The fields ride the report only when the api advertised gate_revision_v1; the
+    // client's retries resend this same body, so a lost ACK is answered under the same id.
+    const gateResume = this.gateResumes.get(runId);
+    this.gateResumes.delete(runId);
+    const reuse = !this.gatedRuns.has(runId) && gateResume?.planMd === planMd ? gateResume : undefined;
+    const presentation: Pick<StateRequest, "presentation_id" | "adopt_gate_revision"> = {};
+    if (this.client.protocolFeatures.includes(GATE_REVISION_FEATURE)) {
+      presentation.presentation_id = reuse?.presentationId ?? randomUUID();
+      if (reuse && reuse.presentationId === undefined) presentation.adopt_gate_revision = reuse.revision;
+    }
     const ack = await reportState({
       status: "awaiting_approval",
       plan_md: planMd,
+      ...presentation,
       ...(milestones?.length ? { milestones } : {}),
       // PRD #84 M4: the CANDIDATE requirement set rides the awaiting_approval report so
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
-      ...toolchainReportFields(toolchainDetection),
+      // PRD #1795: a re-presentation sends the requirements the human was shown instead.
+      ...(reuse ? presentedReportFields(reuse.presented) : toolchainReportFields(toolchainDetection)),
       // PRD #212 (Decision 3): ALWAYS send (empty [] when clean), NOT conditionally
       // spread — so each gate round REPLACES the server's list (M1's COALESCE clears on
       // empty), keeping a revision gate from showing a stale earlier round's writes.
       plan_changed_files: planChangedFiles,
     });
+    // PRD #1795 (A3, decision 8): a refused report (a historical id, a changed payload under the
+    // current id, a stale adoption) published nothing. Confirm nothing, take no verdict, and leave
+    // every receipt unapplied (a revise it answers stays replayable): park through the existing
+    // transient-recovery path so the next claim re-presents. Never retried here under a fresh id,
+    // which would publish a plan the refused gate never showed. The api's refusal cap bounds the
+    // loop (a run past it comes back `failed`, which the recovery path reads as terminal).
+    if (ack.applied !== true && ack.reason !== undefined && GATE_PRESENTATION_REFUSALS.has(ack.reason)) {
+      runLog.warn("plan gate: the api refused the gate presentation; parking for recovery", {
+        run_id: runId,
+        reason: ack.reason,
+        server_status: ack.status ?? "unknown",
+      });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: { text: `${GATE_PRESENTATION_REFUSED_REASON} (${ack.reason}) — the plan is not offered; parking so the next claim re-presents it` },
+      });
+      throw new TransientRecoveryError(GATE_PRESENTATION_REFUSED_REASON);
+    }
     // Issue #1604 (D2): the revised plan is durable, so the revise it answers is final now.
     if (settles !== undefined && ack.applied === true && ack.status === "awaiting_approval")
       steering.settleRevision(settles);
+    // PRD #1795 (decision 6): confirm the revision THIS gate's applied report was answered with; a
+    // verdict bound to exactly it may act, including one routed while the ACK was in flight (B1).
+    if (ack.applied === true && ack.status === "awaiting_approval" && ack.gateRevision !== undefined)
+      steering.setGateRevision(ack.gateRevision);
     if (this.gatedRuns.has(runId)) steering.bumpEpoch();
     else this.gatedRuns.add(runId);
     const epoch = steering.currentEpoch();
     runLog.info("plan gate: awaiting approval", {
       run_id: runId,
       gate_epoch: epoch,
+      gate_revision: ack.gateRevision ?? null,
     });
 
     // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
@@ -11079,6 +11270,7 @@ export class RunRunner {
       if (v.kind !== "revise") {
         this.gateDeadlines.delete(runId);
         this.gatedRuns.delete(runId);
+        this.gateResumes.delete(runId);
         // Issue #1604: no later verdict can act; each is final on arrival.
         steering.closeGate(v.kind);
       }
@@ -11542,6 +11734,19 @@ const FOLLOWUP_TERMINAL_STATUSES: ReadonlySet<string> = new Set([
   "cancelled",
 ]);
 
+/** PRD #1795 (decision 3): the requirement fields of a same-gate re-presentation, from the claim's
+ *  immutable presented snapshot, with toolchainReportFields' conditional shape (each array only when
+ *  non-empty). An absent snapshot sends none: the api then keeps the gate's own presented values,
+ *  which is exactly what the human saw. */
+function presentedReportFields(presented: GatePresentedRequirements | undefined): Partial<StateRequest> {
+  if (!presented) return {};
+  const fields: Partial<StateRequest> = {};
+  if (typeof presented.size_class === "string" && presented.size_class !== "") fields.size_class = presented.size_class;
+  if (presented.required_capabilities?.length) fields.required_capabilities = [...presented.required_capabilities];
+  if (presented.required_tools?.length) fields.required_tools = [...presented.required_tools];
+  return fields;
+}
+
 /** PRD #84 M4: the additive `StateRequest` fields for a plan-time toolchain detection.
  *  Each array field is included ONLY when non-empty — mirroring the `milestones?.length ?
  *  {milestones} : {}` conditional-spread discipline, so a run that detected nothing (or
@@ -11650,6 +11855,11 @@ export function mrDescription(
   // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
   // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
   bridged = false,
+  // PRD #1798 M1 (D3): the deterministic size line (`**Size:** ...`, or `**Size:** unavailable`),
+  // appended to EVERY kind's body: before the `---` footer in the issue arm, after the body (like the
+  // bridge note) in a per-kind arm. Absent/empty (no diff, or a caller that does not pass it) ⇒ the
+  // body is byte-identical to today.
+  sizeLine?: string,
 ): string {
   const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
   // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
@@ -11685,7 +11895,8 @@ export function mrDescription(
     selfImproveSection,
     promptGuardSection,
   });
-  if (kindBody !== undefined) return kindBody + bridgeNote;
+  const sizeNote = sizeLine ? `\n\n${sizeLine}` : "";
+  if (kindBody !== undefined) return kindBody + bridgeNote + sizeNote;
   // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
   // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
   // criteria to name in a warning block. Both absent/empty on a normal run.
@@ -11751,6 +11962,8 @@ export function mrDescription(
   if (gatesSection) body.push("", gatesSection);
   // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
   if (bridgeSentence) body.push("", bridgeSentence);
+  // PRD #1798 M1: the size line, after gates/bridge and before the `---` footer.
+  if (sizeLine) body.push("", sizeLine);
   body.push("", "---", footer);
   return body.join("\n");
 }

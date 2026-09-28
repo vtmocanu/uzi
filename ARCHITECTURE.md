@@ -932,9 +932,20 @@ chain in the diagram above, with no intervening `running`.
   `PLAN_MAX_REVISIONS` (default 3, enforced server- and worker-side; the server
   half is a run-row counter, for the concurrency reason in
   [ADR-106](adr/0106-revise-cap-atomicity.md)), the whole loop shares **one
-  absolute `WORKER_PLAN_APPROVAL_TIMEOUT` deadline** from first gate entry, and a
-  monotonic **gate epoch** bumped at each re-report ties every verdict to the plan
-  version the user saw so an approve/reject arriving mid-revision is discarded.
+  absolute `WORKER_PLAN_APPROVAL_TIMEOUT` deadline** from first gate entry, and
+  every verdict is tied to the exact plan it was sent against by a
+  server-allocated **gate revision** (issue #1795): the api mints a new
+  revision each time a gate publishes, stamps every verdict row with it
+  under the run-row lock at insert time (not a sibling read), and the worker
+  takes a bound verdict only on an exact match to the gate it currently
+  holds — closing a race the older mechanism admitted, where an approve
+  routed in the gap between report and acknowledgment could be misjudged.
+  Clients that display a plan (web, CLI, Slack) send back the revision they
+  showed, and a mismatch is refused (409) rather than silently applied to a
+  newer or older plan. The **gate epoch** bumped at each re-report, which
+  this replaces, stays as the legacy fallback for peers and rows that
+  predate the capability. See
+  [ADR-1795](adr/1795-gate-revision-bound-verdicts.md).
   Once approved the run resumes the same session into the implement ⇄ review loop
   (`RUN_MAX_ITERATIONS`, default 5). See
   [PRD #41](prds/done/41-plan-revision-gate.md) and

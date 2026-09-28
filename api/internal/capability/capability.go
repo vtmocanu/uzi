@@ -120,6 +120,14 @@ const WallParkV1 = "wall_park_v1"
 // InputReceiptsV1 advertises explicit ACK and applied receipts for steering inputs.
 const InputReceiptsV1 = "input_receipts_v1"
 
+// GateRevisionV1 is the PROTOCOL capability a worker self-reports (PRD #1795 M3) to declare it
+// matches plan-gate verdicts by the server-allocated gate revision: it mints a presentation id
+// per gate, reads the revision off the awaiting_approval ACK, and takes a bound verdict only on
+// an exact revision match. The api advertises its own support separately, as the
+// "gate_revision_v1" register-response feature, so a worker never sends the new report fields
+// to an api whose strict decoder would reject them.
+const GateRevisionV1 = "gate_revision_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -133,11 +141,12 @@ var protocolVocabulary = map[string]struct{}{
 	CredentialSwitchV1:         {},
 	WallParkV1:                 {},
 	InputReceiptsV1:            {},
+	GateRevisionV1:             {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

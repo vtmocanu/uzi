@@ -10,17 +10,16 @@ import (
 // A's heartbeat_outbox, #1247's claim_generation_fence (this api implements the fence, so it
 // advertises server support), #1391 Run B M3c's terminal_fence (the api now fences a terminal
 // transition on messages_through_seq contiguity), issue #1766 M2's recovery_cause_vault_locked
-// (unconditional), PRD #1809 M5's recovery_cause_data_volume_full (unconditional), PRD #1809
-// M6's run_checkpoint_durability (unconditional), and #1390
-// M2a's active_run_snapshot when the feature is enabled — in slice order (append order =
-// declaration order). terminal_fence sits AFTER claim_generation_fence, then
-// recovery_cause_vault_locked, then recovery_cause_data_volume_full, then
-// run_checkpoint_durability, and active_run_snapshot is
-// last. A drift here is a wire-contract
-// change a worker negotiates on.
+// (unconditional), #1795 M1's gate_revision_v1 (unconditional), PRD #1809 M5's
+// recovery_cause_data_volume_full (unconditional), PRD #1809 M6's run_checkpoint_durability
+// (unconditional), and #1390 M2a's active_run_snapshot when the feature is enabled — in slice
+// order (append order = declaration order). terminal_fence sits AFTER claim_generation_fence,
+// then recovery_cause_vault_locked, then gate_revision_v1, then recovery_cause_data_volume_full,
+// then run_checkpoint_durability, and active_run_snapshot is last. A drift here is a
+// wire-contract change a worker negotiates on.
 func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 	got := protocolFeatures(true)
-	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_data_volume_full", "run_checkpoint_durability", "active_run_snapshot"}
+	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability", "active_run_snapshot"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(true) = %v, want exactly %v", got, want)
 	}
@@ -36,7 +35,7 @@ func TestRegisterAdvertisesProtocolFeatures(t *testing.T) {
 // worker never sends the snapshot) while every other landed token stays exactly as it was.
 func TestProtocolFeaturesOmitsSnapshotWhenDisabled(t *testing.T) {
 	got := protocolFeatures(false)
-	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "recovery_cause_data_volume_full", "run_checkpoint_durability"}
+	want := []string{"recovery_park_cause", "recovery_release_exact_echo", "heartbeat_outbox", "claim_generation_fence", "terminal_fence", "recovery_cause_vault_locked", "gate_revision_v1", "recovery_cause_data_volume_full", "run_checkpoint_durability"}
 	if !slices.Equal(got, want) {
 		t.Fatalf("protocolFeatures(false) = %v, want exactly %v", got, want)
 	}

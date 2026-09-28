@@ -394,6 +394,33 @@ type PipelineStatus struct {
 	SyncedAt       pgtype.Timestamptz `json:"synced_at"`
 }
 
+type PrDescription struct {
+	RepoID             uuid.UUID          `json:"repo_id"`
+	MrIid              int64              `json:"mr_iid"`
+	PublishedVersionID pgtype.UUID        `json:"published_version_id"`
+	LockVersion        int64              `json:"lock_version"`
+	LastOutcome        pgtype.Text        `json:"last_outcome"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+}
+
+type PrDescriptionVersion struct {
+	ID                   uuid.UUID          `json:"id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	ClaimGeneration      int64              `json:"claim_generation"`
+	RepoID               uuid.UUID          `json:"repo_id"`
+	MrIid                pgtype.Int8        `json:"mr_iid"`
+	Fields               []byte             `json:"fields"`
+	Size                 []byte             `json:"size"`
+	BaseSha              string             `json:"base_sha"`
+	HeadSha              string             `json:"head_sha"`
+	TargetBranch         string             `json:"target_branch"`
+	Source               string             `json:"source"`
+	RenderedRegionSha256 pgtype.Text        `json:"rendered_region_sha256"`
+	State                string             `json:"state"`
+	CreatedAt            pgtype.Timestamptz `json:"created_at"`
+	PublishedAt          pgtype.Timestamptz `json:"published_at"`
+}
+
 type RecommendationDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	ReviewID      uuid.UUID          `json:"review_id"`
@@ -661,6 +688,12 @@ type Run struct {
 	ReleasedWorkerNonce         pgtype.Text        `json:"released_worker_nonce"`
 	DiskParkCount               int32              `json:"disk_park_count"`
 	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
+	GateRevision                int64              `json:"gate_revision"`
+	GatePresentationID          pgtype.UUID        `json:"gate_presentation_id"`
+	GatePresentedPayload        []byte             `json:"gate_presented_payload"`
+	GatePayloadDigest           []byte             `json:"gate_payload_digest"`
+	GateRefusalCount            int32              `json:"gate_refusal_count"`
+	GateRefusalGeneration       pgtype.Int8        `json:"gate_refusal_generation"`
 }
 
 type RunCompletionAttempt struct {
@@ -693,6 +726,13 @@ type RunCredentialEpoch struct {
 	Label           pgtype.Text        `json:"label"`
 	SelectReason    pgtype.Text        `json:"select_reason"`
 	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+}
+
+type RunGatePresentation struct {
+	RunID          uuid.UUID          `json:"run_id"`
+	PresentationID uuid.UUID          `json:"presentation_id"`
+	Revision       int64              `json:"revision"`
+	CreatedAt      pgtype.Timestamptz `json:"created_at"`
 }
 
 type RunMessage struct {
@@ -797,6 +837,8 @@ type RunUserInput struct {
 	ConsumedClaimGeneration pgtype.Int8        `json:"consumed_claim_generation"`
 	ConsumedWorkerID        pgtype.UUID        `json:"consumed_worker_id"`
 	AppliedAt               pgtype.Timestamptz `json:"applied_at"`
+	GateBinding             pgtype.Text        `json:"gate_binding"`
+	GateRevision            pgtype.Int8        `json:"gate_revision"`
 }
 
 type Skill struct {
@@ -825,6 +867,7 @@ type SlackRunMessage struct {
 	StatusTs                    pgtype.Text        `json:"status_ts"`
 	LimitPausedAt               pgtype.Timestamptz `json:"limit_paused_at"`
 	ParkKind                    pgtype.Text        `json:"park_kind"`
+	GateRevision                pgtype.Int8        `json:"gate_revision"`
 }
 
 type TaskReview struct {

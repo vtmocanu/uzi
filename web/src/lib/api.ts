@@ -273,6 +273,20 @@ export function isOutcomePendingConfirmation(err: unknown): boolean {
   );
 }
 
+// gateRevisionMismatchCurrent reads the 409 a plan-gate verdict gets when it named a gate
+// revision the run no longer shows (PRD #1795 D5): the owner acted on plan revision N but the
+// run has since re-presented (or left the gate). The typed body is {error, reason:
+// "gate_revision_mismatch", current_gate_revision}. Returns the run's current revision, or
+// null when the error is anything else, so the caller branches on this one reason and
+// surfaces every other failure as before. A non-numeric current revision reads as 0 (the
+// run shows no revision) rather than null, since the reason alone already identifies it.
+export function gateRevisionMismatchCurrent(err: unknown): number | null {
+  if (!(err instanceof ApiError) || err.status !== 409) return null;
+  const body = err.body as { reason?: string; current_gate_revision?: unknown } | null;
+  if (body?.reason !== "gate_revision_mismatch") return null;
+  return typeof body.current_gate_revision === "number" ? body.current_gate_revision : 0;
+}
+
 async function request<T>(
   method: string,
   path: string,
@@ -1176,6 +1190,12 @@ const realApi = {
     // no-live-poller cancel branch and the held outcome is discarded. Sent only when truthy
     // so an ordinary cancel body is unchanged (default false server-side).
     discardPendingOutcome?: boolean,
+    // PRD #1795 D5: the plan-gate revision the owner is acting on (the gate_revision of the
+    // run whose plan_md is on screen). Meaningful only with approve_plan / reject_plan /
+    // revise_plan (the server answers 400 on any other kind). A stale value is refused with
+    // a typed 409 (see gateRevisionMismatchCurrent) and nothing is written. Sent only when
+    // defined, so a run with no revision (a legacy or pre-gate run) keeps today's body.
+    expectedGateRevision?: number,
   ) =>
     request<{ server_side: boolean; id?: number; created_at?: string }>(
       "POST",
@@ -1189,6 +1209,7 @@ const realApi = {
         ...(selection ? { selection } : {}),
         ...(overrideCapabilities ? { override_capabilities: true } : {}),
         ...(discardPendingOutcome ? { discard_pending_outcome: true } : {}),
+        ...(expectedGateRevision !== undefined ? { expected_gate_revision: expectedGateRevision } : {}),
       },
     ),
 

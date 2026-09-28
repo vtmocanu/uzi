@@ -57,11 +57,14 @@ func openGateAnchor(runID uuid.UUID) store.SlackRunMessage {
 type submittedInput struct {
 	userID, runID uuid.UUID
 	kind, body    string
+	// expected is the PRD #1795 M5 expected gate revision the verdict carried (nil = none).
+	expected *int64
 }
 
 type submittedApproval struct {
 	userID, runID uuid.UUID
 	source        string
+	expected      *int64
 }
 
 // fakeSubmitter stands in for workersvc: it serves one run (for the stale check)
@@ -91,6 +94,15 @@ type fakeSubmitter struct {
 	// PRD #322 M4 steer.
 	steers   []submittedSteer
 	steerErr error
+
+	// currentGateRevision models the server's PRD #1795 expected-revision check: when > 0, a
+	// verdict whose expected revision is set and differs from it is refused with
+	// ErrGateRevisionMismatch (the call is still recorded, like any refused submit).
+	currentGateRevision int64
+}
+
+func (f *fakeSubmitter) revisionRefused(expected *int64) bool {
+	return f.currentGateRevision > 0 && expected != nil && *expected != f.currentGateRevision
 }
 
 // submittedSteer records a PRD #322 M4 steer follow_up submitted for a TARGET run.
@@ -121,12 +133,18 @@ type submittedAnswer struct {
 func (f *fakeSubmitter) GetRun(context.Context, uuid.UUID, uuid.UUID) (store.Run, error) {
 	return f.run, f.runErr
 }
-func (f *fakeSubmitter) SubmitInput(_ context.Context, userID, runID uuid.UUID, kind, body string) error {
-	f.submitted = append(f.submitted, submittedInput{userID, runID, kind, body})
+func (f *fakeSubmitter) SubmitInput(_ context.Context, userID, runID uuid.UUID, kind, body string, expected *int64) error {
+	f.submitted = append(f.submitted, submittedInput{userID, runID, kind, body, expected})
+	if f.revisionRefused(expected) {
+		return ErrGateRevisionMismatch
+	}
 	return f.submitErr
 }
-func (f *fakeSubmitter) SubmitApproval(_ context.Context, userID, runID uuid.UUID, source string) error {
-	f.approvals = append(f.approvals, submittedApproval{userID, runID, source})
+func (f *fakeSubmitter) SubmitApproval(_ context.Context, userID, runID uuid.UUID, source string, expected *int64) error {
+	f.approvals = append(f.approvals, submittedApproval{userID, runID, source, expected})
+	if f.revisionRefused(expected) {
+		return ErrGateRevisionMismatch
+	}
 	return f.approveErr
 }
 func (f *fakeSubmitter) SubmitAnswer(_ context.Context, userID, runID uuid.UUID, questionID, text string) error {
@@ -480,4 +498,98 @@ func containsID(ss []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// revisionAnchor is openGateAnchor stamped with the PRD #1795 M5 card revision.
+func revisionAnchor(runID uuid.UUID, rev int64) store.SlackRunMessage {
+	a := openGateAnchor(runID)
+	a.GateRevision = pgtype.Int8{Int64: rev, Valid: true}
+	return a
+}
+
+// A click on the live card carries the revision the card was stamped with (PRD #1795 M5),
+// for every verdict the click itself submits: each approve source and reject-without-reason.
+func TestGatekeeperClickPassesCardRevision(t *testing.T) {
+	for _, actionID := range []string{ActionGateApprove, ActionGateApproveOwn, ActionGateApproveRepo, ActionGateRejectNoReason} {
+		t.Run(actionID, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			gs := &fakeGateStore{user: user, anchor: revisionAnchor(runID, 7)}
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), currentGateRevision: 7}
+			fp := &fakePoster{}
+			g := NewGatekeeper(gs, sub, fp, nil)
+
+			g.HandleBlockAction(context.Background(), gateAction(actionID, runID))
+
+			if len(fp.ephemerals) != 0 || len(gs.gateSet) != 1 {
+				t.Fatalf("a matching revision must be accepted and resolve the gate: eph=%+v set=%+v", fp.ephemerals, gs.gateSet)
+			}
+			var got []*int64
+			for _, a := range sub.approvals {
+				got = append(got, a.expected)
+			}
+			for _, s := range sub.submitted {
+				got = append(got, s.expected)
+			}
+			if len(got) != 1 || got[0] == nil || *got[0] != 7 {
+				t.Fatalf("the click must submit exactly one verdict carrying the card's revision 7: approvals=%+v submitted=%+v", sub.approvals, sub.submitted)
+			}
+		})
+	}
+}
+
+// A legacy card (anchor gate_revision NULL: posted before revisions existed) sends NO expected
+// revision, keeping the pre-#1795 unbound verdict.
+func TestGatekeeperLegacyCardSendsNoRevision(t *testing.T) {
+	for _, actionID := range []string{ActionGateApproveRepo, ActionGateRejectNoReason} {
+		t.Run(actionID, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			gs := &fakeGateStore{user: user, anchor: openGateAnchor(runID)}
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID)}
+			g := NewGatekeeper(gs, sub, &fakePoster{}, nil)
+
+			g.HandleBlockAction(context.Background(), gateAction(actionID, runID))
+
+			if len(sub.approvals)+len(sub.submitted) != 1 {
+				t.Fatalf("the click must submit one verdict: approvals=%+v submitted=%+v", sub.approvals, sub.submitted)
+			}
+			for _, a := range sub.approvals {
+				if a.expected != nil {
+					t.Fatalf("a legacy card must send no expected revision, got %d", *a.expected)
+				}
+			}
+			for _, s := range sub.submitted {
+				if s.expected != nil {
+					t.Fatalf("a legacy card must send no expected revision, got %d", *s.expected)
+				}
+			}
+		})
+	}
+}
+
+// The server refusing the card's revision (a newer plan was presented before the notifier
+// re-carded) answers the superseded notice: the refused call is the only submit, the gate is
+// neither cleared nor edited, and no success is shown.
+func TestGatekeeperRevisionMismatchAnswersSuperseded(t *testing.T) {
+	for _, actionID := range []string{ActionGateApproveOwn, ActionGateRejectNoReason} {
+		t.Run(actionID, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			gs := &fakeGateStore{user: user, anchor: revisionAnchor(runID, 3)}
+			// The server is already at revision 4; the card shows revision 3.
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), currentGateRevision: 4}
+			fp := &fakePoster{}
+			g := NewGatekeeper(gs, sub, fp, nil)
+
+			g.HandleBlockAction(context.Background(), gateAction(actionID, runID))
+
+			if len(sub.approvals)+len(sub.submitted) != 1 {
+				t.Fatalf("only the refused call may be submitted: approvals=%+v submitted=%+v", sub.approvals, sub.submitted)
+			}
+			if len(gs.gateSet) != 0 || len(gs.gateSetIf) != 0 || len(fp.updateBlocks) != 0 {
+				t.Fatalf("a refused verdict must not resolve or edit the gate: set=%v setIf=%v edits=%v", gs.gateSet, gs.gateSetIf, fp.updateBlocks)
+			}
+			if len(fp.ephemerals) != 1 || fp.ephemerals[0].text != gateSupersededText {
+				t.Fatalf("a refused verdict must answer the superseded notice: %+v", fp.ephemerals)
+			}
+		})
+	}
 }

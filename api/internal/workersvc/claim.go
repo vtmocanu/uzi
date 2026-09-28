@@ -6,6 +6,9 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -172,6 +175,18 @@ type ClaimPayload struct {
 	// first gate is shown, while a replayed revise still acts. RFC 3339 on the wire (time.Time's
 	// JSON encoding; microsecond precision from Postgres).
 	ResumePlanAt *time.Time `json:"resume_plan_at,omitempty"`
+	// ResumeGateRevision, ResumeGatePresentationID and ResumeGatePresented (PRD #1795 M1, D4)
+	// ride ONLY the awaiting_approval gate resume of a run whose gate was published under a
+	// revision-allocating api (runs.gate_revision > 0); every other claim omits them, so an
+	// old worker's wire is unchanged. The revision is the gate the resumed worker re-presents.
+	// The presentation id is the persisted current id a same-gate SDK re-presentation reuses;
+	// it is absent (nil) for an id-less gate, which a new worker may explicitly adopt with
+	// adopt_gate_revision. ResumeGatePresented is the requirement half of the IMMUTABLE
+	// presented snapshot (never the live columns, which an approval's capability override may
+	// have cleared), so a reclaimed worker re-presents exactly what the human saw.
+	ResumeGateRevision       int64                      `json:"resume_gate_revision,omitempty"`
+	ResumeGatePresentationID *uuid.UUID                 `json:"resume_gate_presentation_id,omitempty"`
+	ResumeGatePresented      *GatePresentedRequirements `json:"resume_gate_presented,omitempty"`
 	// PlanSource is where PlanMd came from (runs.plan_source, PRD #209): 'agent' for a
 	// worker-authored plan (or a pre-#209 run), 'seeded' for a plan supplied at create
 	// time over the API. The worker needs it to disambiguate the two plan_approved
@@ -319,6 +334,15 @@ type ClaimPayload struct {
 	// Present only for kind=ci_fix (omitted for issue runs). Log tails are untrusted
 	// data — the worker frames them as quoted evidence, never instructions.
 	Pipeline *ClaimPipeline `json:"pipeline,omitempty"`
+
+	// PrDescription is the existing PR's description record (PRD #1798 D9 step 2) for a
+	// PR-producing run whose PR already exists: an mr_rework run (runs.mr_iid), a run whose
+	// completion recorded its MR, or a re-claimed issue run that already bound a version. It
+	// carries the PR's mr_iid, lock_version, last_outcome and the currently PUBLISHED version
+	// (sanitized fields, size, snapshot, rendered_region_sha256), so a refresh can bind at
+	// stage time and compare the forge region with the published hash. nil (omitted) when the
+	// PR has no record, so every other claim stays byte-identical to today's wire.
+	PrDescription *apitypes.PrDescriptionState `json:"pr_description,omitempty"`
 
 	Repo    ClaimRepo    `json:"repo"`
 	Secrets ClaimSecrets `json:"secrets"`

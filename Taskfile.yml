@@ -318,6 +318,10 @@ tasks:
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
       # the worker's Docker data-root. Before `scan:secrets` (deliberately last).
       - task: test:store-it-cleanup
+      # hermetic (~11s, fake docker, no daemon; Linux-only via `platforms`): the opt-in
+      # codex-git-trust wrapper's bind/cleanup/exit-code/signal contract (#1769). Its
+      # SIGTERM case waits out the 10s kill grace, so it is not sub-second.
+      - task: test:codex-git-trust-wrapper
       # Hermetic end-to-end tests for the repo-local uzi-watcher backup scripts. They use
       # fake uzi/kubectl commands and temporary git repos: no cluster, forge or live backup
       # directory is touched. This gates clone capture, bare-ref fallback, fail-closed
@@ -917,6 +921,19 @@ tasks:
       # Docker data-root. Sibling of test:e2e-reclaim.
       - ./e2e/run-store-it.test.sh
 
+  test:codex-git-trust-wrapper:
+    desc: hermetic test of e2e/codex-git-trust/run.sh's binds, cleanup exit codes, build network opt-in and process-group signals (fake docker)
+    platforms: [linux]
+    cmds:
+      # No real docker daemon: a fake `docker` on PATH records argv, its pid/pgid and the
+      # signals it receives. Asserts a missing bind source exits 2 before any docker call,
+      # an unverified cleanup maps 0/77 to 3, BUILD_NETWORK=host is the only forwarded
+      # value, every bind is a read-only --mount, and that `timeout --foreground` keeps
+      # docker run/build in the script's process group so a group SIGINT exits 130
+      # promptly. Prints a `cases=N passed=N` tally and fails below its case floor.
+      # Linux-only: reads each process's stat file and needs GNU timeout --foreground.
+      - ./e2e/codex-git-trust/run.test.sh
+
   test:e2e-driver:
     desc: hermetic behavioural test of the e2e phase-registry driver, tally-guarded (fake docker/curl/psql)
     cmds:
@@ -949,6 +966,7 @@ tasks:
     desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance and CHANGELOG union
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
@@ -2420,7 +2438,11 @@ tasks:
     # sandbox probe finds Landlock) required mode. Exit 77 is SKIP (no Docker/image/uid split),
     # never a pass. Set CODEX_GIT_TRUST_MOUNT_SRC=1 to use this tree's agent/src,
     # CODEX_GIT_TRUST_SRC_DIR for another source tree, and CODEX_GIT_TRUST_BIN_DIR to mount
-    # freshly built supervisor/fileop/sandbox binaries over an older image's.
+    # freshly built supervisor/fileop/sandbox binaries over an older image's. Every bind is a
+    # read-only `--mount type=bind` whose source must exist (a missing one exits 2, never 77);
+    # the container is removed and verified gone by exact name on every exit (exit 3 if not).
+    # Set CODEX_GIT_TRUST_BUILD_NETWORK=host to build with `--network host` where bridge
+    # egress hangs (build only; the fixture container always runs with --network none).
     cmds:
       - task: test:codex-git-trust:build
       - task: test:codex-git-trust:fixture

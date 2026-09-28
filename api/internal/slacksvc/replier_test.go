@@ -871,3 +871,122 @@ func TestReplierAwaitingInputScrubsAnswer(t *testing.T) {
 		t.Fatalf("a credential in an answer must be scrubbed before it leaves Slack: %+v", sub.answers)
 	}
 }
+
+// revisionAnchorRow is anchorRow stamped with the PRD #1795 M5 card revision.
+func revisionAnchorRow(runID uuid.UUID, gateState string, rev int64) store.SlackRunMessage {
+	m := anchorRow(runID, gateState)
+	m.GateRevision = pgtype.Int8{Int64: rev, Valid: true}
+	return m
+}
+
+// The revise and reasoned-reject replies carry the revision of the card they answer (PRD
+// #1795 M5); a legacy card (NULL revision) sends none.
+func TestReplierVerdictRepliesCarryCardRevision(t *testing.T) {
+	cases := []struct {
+		name  string
+		state string
+		kind  string
+		rev   int64 // 0 = legacy card (NULL)
+	}{
+		{"revise bound", gateStateRevisePending, "revise_plan", 5},
+		{"reject bound", gateStateRejectPending, "reject_plan", 5},
+		{"revise legacy", gateStateRevisePending, "revise_plan", 0},
+		{"reject legacy", gateStateRejectPending, "reject_plan", 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			anchor := anchorRow(runID, tc.state)
+			if tc.rev > 0 {
+				anchor = revisionAnchorRow(runID, tc.state, tc.rev)
+			}
+			fs := &fakeReplierStore{user: user, anchor: anchor}
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), currentGateRevision: 5}
+			fp := &fakePoster{}
+			r := NewReplier(fs, sub, fp, nil)
+
+			r.HandleMessage(context.Background(), reply("change it"))
+
+			if len(sub.submitted) != 1 || sub.submitted[0].kind != tc.kind {
+				t.Fatalf("want one %s: %+v", tc.kind, sub.submitted)
+			}
+			got := sub.submitted[0].expected
+			switch {
+			case tc.rev == 0 && got != nil:
+				t.Fatalf("a legacy card must send no expected revision, got %d", *got)
+			case tc.rev > 0 && (got == nil || *got != tc.rev):
+				t.Fatalf("the reply must carry the card's revision %d, got %v", tc.rev, got)
+			}
+			if len(fp.reactions) != 1 {
+				t.Fatalf("an accepted verdict reply is acked: %+v", fp.reactions)
+			}
+		})
+	}
+}
+
+// A verdict reply the server refuses for a changed revision answers the superseded notice,
+// is not acked, and (reject) does not resolve the gate; the refused call is the only submit.
+func TestReplierVerdictReplyRevisionMismatchAnswersSuperseded(t *testing.T) {
+	for _, state := range []string{gateStateRevisePending, gateStateRejectPending} {
+		t.Run(state, func(t *testing.T) {
+			runID, user := uuid.New(), store.User{ID: uuid.New()}
+			fs := &fakeReplierStore{user: user, anchor: revisionAnchorRow(runID, state, 2)}
+			// The server is already at revision 3; the card shows revision 2.
+			sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), currentGateRevision: 3}
+			fp := &fakePoster{}
+			r := NewReplier(fs, sub, fp, nil)
+
+			r.HandleMessage(context.Background(), reply("stale verdict"))
+
+			if len(sub.submitted) != 1 {
+				t.Fatalf("only the refused call may be submitted: %+v", sub.submitted)
+			}
+			if len(fp.reactions) != 0 {
+				t.Fatalf("a refused verdict must NOT be acked: %+v", fp.reactions)
+			}
+			if len(fs.gateSet) != 0 {
+				t.Fatalf("a refused verdict must not resolve the gate: %+v", fs.gateSet)
+			}
+			if len(fp.ephemerals) != 1 || fp.ephemerals[0].text != gateSupersededText {
+				t.Fatalf("a refused verdict must answer the superseded notice: %+v", fp.ephemerals)
+			}
+			for _, u := range fp.updateBlocks {
+				if strings.Contains(strings.ToLower(u.sectionText), "revising") || strings.Contains(strings.ToLower(u.sectionText), "rejected") {
+					t.Fatalf("a refused verdict must not show success on the card: %+v", fp.updateBlocks)
+				}
+			}
+		})
+	}
+}
+
+// A revise reply refused for a changed revision retires its card button-free (PRD #1795 M5
+// review): the CAS already cleared the anchor, so the notifier will never edit that card again,
+// and leaving its buttons live would invite clicks that can only be refused. The copy must be
+// true whether the gate changed or the run left it, and carries no em dash.
+func TestReplierReviseMismatchRetiresCard(t *testing.T) {
+	runID, user := uuid.New(), store.User{ID: uuid.New()}
+	fs := &fakeReplierStore{user: user, anchor: revisionAnchorRow(runID, gateStateRevisePending, 2)}
+	sub := &fakeSubmitter{run: awaitingRun(runID, user.ID), currentGateRevision: 3}
+	fp := &fakePoster{}
+	r := NewReplier(fs, sub, fp, nil)
+
+	r.HandleMessage(context.Background(), reply("stale feedback"))
+
+	if len(fp.updateBlocks) != 1 {
+		t.Fatalf("the refused revise must edit exactly its own card: %+v", fp.updateBlocks)
+	}
+	u := fp.updateBlocks[0]
+	if u.ts != "gate1" || u.channel != "D1" || len(u.actionIDs) != 0 {
+		t.Fatalf("the card must be edited in place, button-free: %+v", u)
+	}
+	if u.sectionText != gateNoLongerOpenText || u.fallback != gateNoLongerOpenText {
+		t.Fatalf("the retired card must read %q: %+v", gateNoLongerOpenText, u)
+	}
+	lower := strings.ToLower(u.sectionText)
+	if strings.Contains(lower, "changed") && !strings.Contains(lower, "no longer") {
+		t.Fatalf("the copy must not claim the gate changed (the run may have left it): %q", u.sectionText)
+	}
+	if strings.ContainsRune(u.sectionText, '—') {
+		t.Fatalf("user-facing copy must not carry an em dash: %q", u.sectionText)
+	}
+}

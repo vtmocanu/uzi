@@ -58,6 +58,15 @@ type SubmitInputOptions struct {
 	// cancel takes the atomic no-live-poller branch that discards the pending outcome. Inert on any
 	// kind other than cancel and on a cancel of a run with no pending outcome (today's path).
 	DiscardPendingOutcome bool
+	// ExpectedGateRevision is the PRD #1795 D5 expected plan-gate revision: the revision of the
+	// gate the client displayed when the owner acted. Legal only on approve_plan, reject_plan and
+	// revise_plan (ErrExpectedGateRevisionNotApplicable otherwise). When set, the verdict is
+	// written only while the run is awaiting_approval at exactly that revision; otherwise (a
+	// finished run included: the check precedes the terminal guard) it writes nothing (no
+	// selection, milestone freeze, revise_count, stop_kind, capability clear, server-side reject)
+	// and returns a *GateRevisionMismatchError naming the current revision.
+	// nil keeps the pre-#1795 behaviour.
+	ExpectedGateRevision *int64
 }
 
 // SubmitInputWithOptions is SubmitInput carrying the owner-authorized bypasses (PRD #84 M4 4c
@@ -85,6 +94,21 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {
 		return SubmitInputResult{}, err
+	}
+	// PRD #1795 M2 (D5): an expected gate revision is checked up front against the run just
+	// read, BEFORE the terminal guard, so a verdict sent against a gate the run no longer shows
+	// (a newer revision, no gate yet, or a run that has since finished) is answered with the
+	// typed mismatch naming the current revision rather than something unrelated (the terminal
+	// 409, the capability gate, the roster check). This read is not the guard: every verdict
+	// write below re-checks the same predicate atomically in SQL, under the run-row lock, and a
+	// 0-row result is answered as a mismatch too (verdictNotWritten / reviseNotWritten).
+	if opts.ExpectedGateRevision != nil {
+		if !gateVerdictKind(kind) {
+			return SubmitInputResult{}, ErrExpectedGateRevisionNotApplicable
+		}
+		if err := checkExpectedGateRevision(run, *opts.ExpectedGateRevision); err != nil {
+			return SubmitInputResult{}, err
+		}
 	}
 	if terminalStatuses[run.Status] {
 		return SubmitInputResult{}, ErrRunTerminal
@@ -119,20 +143,35 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 				return SubmitInputResult{}, err
 			}
 		}
-		var res SubmitInputResult
+		var (
+			res SubmitInputResult
+			row store.RunUserInput
+		)
 		if sel != nil {
-			res, err = s.submitApproval(ctx, run, *sel)
+			res, row, err = s.submitApproval(ctx, run, *sel, opts.ExpectedGateRevision)
 		} else {
-			res, err = s.enqueueRunInput(ctx, runID, kind, body)
+			res, row, err = s.enqueueGateApproval(ctx, run, body, opts.ExpectedGateRevision)
 		}
 		if err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				// No row: the expected-revision predicate refused (or the run vanished). With an
+				// expected revision this is a mismatch even when the re-read matches again: the
+				// approve was not written.
+				return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunNotFound)
+			}
 			return SubmitInputResult{}, err
 		}
 		if opts.OverrideCapabilities {
 			// Only reached once the approve fully succeeded, so a failed approve above never
-			// clears the requirement. Owner- and awaiting_approval-scoped in SQL.
-			if err := s.OverrideRunRequiredCapabilities(ctx, userID, runID); err != nil {
-				return SubmitInputResult{}, err
+			// clears the requirement. Owner-, awaiting_approval- AND revision-scoped in SQL
+			// (PRD #1795 M2): the clear applies only while the run still shows the gate the
+			// approve was bound to (revision 0 for a legacy pre-migration gate). An UNBOUND
+			// approve (sent while no gate was visible) can never act on a gate, so it clears
+			// nothing.
+			if rev, ok := approveClearRevision(row); ok {
+				if err := s.OverrideRunRequiredCapabilities(ctx, userID, runID, rev); err != nil {
+					return SubmitInputResult{}, err
+				}
 			}
 		}
 		return res, nil
@@ -391,9 +430,20 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 					reason = "plan rejected"
 				}
 				reason = truncateRunes(reason, maxFailureReasonRunes)
-				_, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
+				var rows int64
+				rows, err = s.q.RejectRunServerSide(ctx, store.RejectRunServerSideParams{
 					ID: runID, UserID: userID, FailureReason: pgconv.TextOrNull(reason),
+					ExpectedGateRevision: pgconv.Int8Ptr(opts.ExpectedGateRevision),
 				})
+				if err == nil && rows == 0 {
+					// PRD #1795 M2: the reject failed nothing, so never fall through to the
+					// failed fan-out (PublishState, notify, judge, scope settle, checkpoint
+					// delete) or report ServerSide success. With an expected revision it is a
+					// mismatch naming the re-read's revision, even if the re-read matches again.
+					// Without one the only predicates are owner + non-terminal, and the owner was
+					// just verified: the run finished (or vanished) under the submit.
+					return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunTerminal)
+				}
 			}
 			if err != nil {
 				return SubmitInputResult{}, err
@@ -445,9 +495,16 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// silently drop the cancel/reject verdict (the stop_reason sanitizing above would be
 		// moot if this INSERT never lands). NUL is never meaningful in an operator message.
 		cleanBody, _ := stripNUL(body)
+		// PRD #1795 M2: a reject_plan row is stamped with its gate binding in the same statement,
+		// and an expected revision (reject_plan only; cancel never carries one) joins the UPDATE
+		// predicate, so a mismatch stamps no stop_kind and enqueues nothing.
 		if _, err := s.q.CreateStopVerdictInput(ctx, store.CreateStopVerdictInputParams{
 			RunID: runID, Kind: kind, Body: pgconv.TextOrNull(cleanBody), StopKind: pgconv.TextOrNull(stopKindFor(kind)), StopReason: stopReason,
+			ExpectedGateRevision: pgconv.Int8Ptr(opts.ExpectedGateRevision),
 		}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return SubmitInputResult{}, s.verdictNotWritten(ctx, userID, runID, opts.ExpectedGateRevision, ErrRunNotFound)
+			}
 			return SubmitInputResult{}, err
 		}
 		return SubmitInputResult{ServerSide: false}, nil
@@ -492,9 +549,12 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	if kind == "revise_plan" {
 		row, err := s.q.CreateRunReviseInputIfUnderCap(ctx, store.CreateRunReviseInputIfUnderCapParams{
 			RunID: runID, Body: pgconv.TextOrNull(body), MaxRevisions: int32(s.p.PlanMaxRevisions), //nolint:gosec // G115: PlanMaxRevisions is a small bounded config int (env PLAN_MAX_REVISIONS), never near int32 range
+			ExpectedGateRevision: pgconv.Int8Ptr(opts.ExpectedGateRevision),
 		})
 		if errors.Is(err, pgx.ErrNoRows) {
-			return SubmitInputResult{}, ErrReviseCapReached
+			// PRD #1795 M2: with an expected revision a 0-row result is either the cap or a
+			// revision mismatch; the re-read tells them apart. Without one it is the cap.
+			return SubmitInputResult{}, s.reviseNotWritten(ctx, userID, runID, opts.ExpectedGateRevision)
 		}
 		if err != nil {
 			return SubmitInputResult{}, err
@@ -507,10 +567,25 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	return s.enqueueRunInput(ctx, runID, kind, body)
 }
 
+// enqueueGateApproval writes a selection-less approve_plan verdict through
+// CreateGateVerdictInput (PRD #1795 M2), which locks the run row and stamps the verdict with
+// the plan-gate binding it was sent against. expected is the D5 expected revision (nil = none);
+// a mismatch returns pgx.ErrNoRows and writes nothing.
+func (s *Service) enqueueGateApproval(ctx context.Context, run store.Run, body string, expected *int64) (SubmitInputResult, store.RunUserInput, error) {
+	row, err := s.q.CreateGateVerdictInput(ctx, store.CreateGateVerdictInputParams{
+		RunID: run.ID, Body: pgconv.TextOrNull(body), ExpectedGateRevision: pgconv.Int8Ptr(expected),
+	})
+	if err != nil {
+		return SubmitInputResult{}, store.RunUserInput{}, err
+	}
+	return SubmitInputResult{ServerSide: false, ID: row.ID, CreatedAt: row.CreatedAt.Time}, row, nil
+}
+
 // enqueueRunInput writes a plain worker-bound input row (no stop signal, no runs-row
 // touch) and returns the created row (PRD #95 S2) so the handler can surface id +
-// created_at for a follow_up's optimistic reconcile. Shared by the follow_up path and the
-// nil-selection approve_plan path so both go through one enqueue.
+// created_at for a follow_up's optimistic reconcile. It never writes a plan-gate verdict
+// (approve_plan / reject_plan / revise_plan): those are stamped with their gate binding by
+// the dedicated verdict queries (PRD #1795 M2).
 func (s *Service) enqueueRunInput(ctx context.Context, runID uuid.UUID, kind, body string) (SubmitInputResult, error) {
 	row, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{
 		RunID: runID, Kind: kind, Body: pgconv.TextOrNull(body),
@@ -640,13 +715,13 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 // client's text: the worker parses it back with parseAgentSelection, and a raw
 // pass-through would hand an unvalidated string to the process that builds the
 // agent map.
-func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSelection) (SubmitInputResult, error) {
+func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSelection, expected *int64) (SubmitInputResult, store.RunUserInput, error) {
 	roster, err := s.rosterFor(ctx, run, sel.Source, nil)
 	if err != nil {
-		return SubmitInputResult{}, err
+		return SubmitInputResult{}, store.RunUserInput{}, err
 	}
 	if err := validateSelection(sel, roster); err != nil {
-		return SubmitInputResult{}, err
+		return SubmitInputResult{}, store.RunUserInput{}, err
 	}
 	// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
 	// every approve_plan — both the selection-bearing path that reaches here and the
@@ -654,11 +729,11 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	// cannot run it, whichever path the client used.
 	exclusions, err := encodeJSONArray(sel.Exclusions)
 	if err != nil {
-		return SubmitInputResult{}, fmt.Errorf("encode agent exclusions: %w", err)
+		return SubmitInputResult{}, store.RunUserInput{}, fmt.Errorf("encode agent exclusions: %w", err)
 	}
 	body, err := json.Marshal(AgentSelection{Source: sel.Source, Exclusions: orEmpty(sel.Exclusions)})
 	if err != nil {
-		return SubmitInputResult{}, fmt.Errorf("encode agent selection: %w", err)
+		return SubmitInputResult{}, store.RunUserInput{}, fmt.Errorf("encode agent selection: %w", err)
 	}
 	// Issue #260 instrumentation: capture the live milestone freeze state on both sides of
 	// the approve-time freeze so a future human-gated dev-cluster run reveals what
@@ -696,9 +771,13 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 			completionContract = contract
 		}
 	}
-	if _, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
+	// PRD #1795 M2: the row is stamped with the gate binding of the row the UPDATE locked, and
+	// an expected revision joins the UPDATE predicate: a mismatch returns pgx.ErrNoRows having
+	// written no selection, no milestone/contract/budget freeze and no input.
+	row, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
 		RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
-		CompletionContract: completionContract,
+		CompletionContract:   completionContract,
+		ExpectedGateRevision: pgconv.Int8Ptr(expected),
 		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
 		// this run's effective budget from its frozen milestone count, atomically with the
 		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
@@ -708,8 +787,9 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 		MilestoneBudgetCap:       milestoneBudgetCap,
 		SizeBudgetFactorL:        sizeBudgetFactorL,
 		BudgetWallCeilingSeconds: budgetWallCeilingSeconds,
-	}); err != nil {
-		return SubmitInputResult{}, err
+	})
+	if err != nil {
+		return SubmitInputResult{}, store.RunUserInput{}, err
 	}
 	after, afterErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
 	if afterErr != nil {
@@ -740,7 +820,7 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	}
 	// Populated AFTER validateSelection accepted the selection: only a valid, accepted
 	// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
-	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, nil
+	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, row, nil
 }
 
 // capabilityGate is the AUTHORITATIVE, server-side PRD #84 M4 4c approval gate. A run at
@@ -801,8 +881,12 @@ func (s *Service) effectiveOwningWorkerCaps(ctx context.Context, run store.Run) 
 // hint-vs-inference split is a future refinement (Decision 6/12), and no runtime security
 // boundary is bypassed — the §300 guardrail still denies docker USE on a daemon-less worker
 // at run time.
-func (s *Service) OverrideRunRequiredCapabilities(ctx context.Context, userID, runID uuid.UUID) error {
-	_, err := s.q.ClearRunRequiredCapabilities(ctx, store.ClearRunRequiredCapabilitiesParams{ID: runID, UserID: userID})
+//
+// PRD #1795 M2: gateRevision scopes the clear to the plan-gate revision the approve was bound to
+// (0 for a legacy pre-migration gate), so a clear that lands after a newer gate was published is
+// a no-op rather than clearing requirements of a plan the owner never saw.
+func (s *Service) OverrideRunRequiredCapabilities(ctx context.Context, userID, runID uuid.UUID, gateRevision int64) error {
+	_, err := s.q.ClearRunRequiredCapabilities(ctx, store.ClearRunRequiredCapabilitiesParams{ID: runID, UserID: userID, GateRevision: gateRevision})
 	return err
 }
 

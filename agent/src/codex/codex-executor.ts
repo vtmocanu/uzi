@@ -1611,6 +1611,9 @@ export class CodexExecutor implements Executor {
    *  the runner never takes the legacy killAgentTree branch for a Codex run. This class
    *  deliberately does NOT implement `killAgentTree`. */
   safety?: CodexExecutionSafety;
+  /** issue #1769: set at construction (unlike `safety`), so the runner seeds a self-contained
+   *  clone the Codex command sandbox can read without the worker bare. */
+  readonly sandboxesCommands = true;
 
   /**
    * Issue #1766: the harness-agnostic entry the runner uses to settle the CURRENT epoch for a
@@ -1892,8 +1895,7 @@ export class CodexExecutor implements Executor {
       // drives `spawnBoundaryProcess`); it stays a fail-closed reject stub. The reconcile + eviction
       // closures write the SHARED released-token set and committed-generation cell, so credential
       // state is continuous across a recreation.
-      const launchEffectRoot = this.deps.launchEffectRoot ?? ((spec: CodexEffectLaunchSpec, deadlineMs?: number) =>
-        launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } }));
+      const launchEffectRoot = this.deps.launchEffectRoot ?? productionEffectLaunch;
       const spawnBoundaryRoot: SpawnRootSeam =
         this.deps.spawnBoundaryRoot ??
         ((): Promise<RegisteredRoot> =>
@@ -3885,6 +3887,33 @@ export function makeDefaultSpawnCommand(
         stderr,
       };
   };
+}
+
+/** The production effect-root launcher: the real M3a supervisor via `launchCodexEffectRoot`,
+ *  with the caller's deadline as the `started` deadline. */
+const productionEffectLaunch: EffectLaunch = (spec, deadlineMs) =>
+  launchCodexEffectRoot(spec, deadlineMs === undefined ? {} : { deadlines: { started: deadlineMs } });
+
+/**
+ * TEST SEAM (issue #1769 m3) — NOT called by production code. Builds the same boundary-process
+ * spawner {@link CodexExecutor} wires into `createCodexExecutionSafety` (`makeBoundaryProcessSpawner`,
+ * without a run command cache), so a fixture can drive a REAL boundary scope: a `command`
+ * identity request launches `commandEffectSpec(request.cwd, request.cwd, …)` (the command
+ * sandbox rooted at the request's cwd, under the supervisor), a `worker_pat` one launches the
+ * plain supervised spec, and both register as `boundary_action` roots.
+ *
+ * `launch` defaults to the production launcher (the real supervisor + command sandbox); a unit
+ * test may inject a fake. A fixture passes the result as `createCodexExecutionSafety`'s
+ * `spawnProcess`, then scopes `GitCache.withBoundaryProcessSpawner` to
+ * `(p) => safety.spawnBoundaryProcess(permit, p)` inside `safety.withBoundary(...)`, exactly as
+ * the runner does.
+ */
+export function boundaryProcessSpawnerForTest(
+  mode: CommandSandboxMode,
+  launch: EffectLaunch = productionEffectLaunch,
+  log?: Pick<Logger, "warn">,
+): SpawnBoundaryProcessSeam {
+  return makeBoundaryProcessSpawner(launch, mode, log);
 }
 
 function makeBoundaryProcessSpawner(

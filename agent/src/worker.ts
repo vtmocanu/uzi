@@ -362,6 +362,11 @@ export class Worker {
           // server-side at once (never failed), so advertising it is negotiation, not a toggle.
           "wall_park_v1",
           "input_receipts_v1",
+          // PRD #1795 M3: this image binds plan-gate verdicts to the gate revision (it matches a
+          // bound verdict by exact revision and mints/reuses presentation ids). Advertised
+          // UNCONDITIONALLY: the new report fields themselves are sent only when the api's register
+          // response advertises the gate_revision_v1 feature, so an older api never sees them.
+          "gate_revision_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the

@@ -88,7 +88,16 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   clone runner-owned), and the agent checks out + commits there. The worker then
   `fetch`es the agent branch **back** over `file://`+pack (never the local-copy path,
   so it never traverses the clone's alternates or a planted hook), and pushes from
-  its own bare with the PAT.
+  its own bare with the PAT. For a Codex run, whose command sandbox's Landlock
+  allowlist grants only the clone (not the bare it was seeded from), the seed
+  additionally dissociates the clone: it repacks the borrowed objects into the
+  clone under the bare lock, verifies the clone is self-contained with
+  alternates disabled, and only then drops `objects/info/alternates` — a
+  Codex command could otherwise fail to read objects it still borrowed from
+  the bare (see adr/1769-codex-self-contained-runner-clone.md). At finalize,
+  before base-align, the fresh default-branch tip's objects are streamed from
+  the bare into that self-contained clone as a pack; if that import fails, the
+  run fails as `finalize_base_align_conflict` with an import-stage reason.
 - **PATH + scratch isolation.** `/nix` is runner-owned and group-runner-writable,
   so the worker's credentialed-exec PATH is stripped to root-owned image dirs only
   (no `/nix`); the full `/nix`-bearing PATH reaches the runner via `UZI_RUNNER_PATH`.

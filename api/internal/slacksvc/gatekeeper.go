@@ -48,11 +48,16 @@ type GateStore interface {
 // the workersvc.AgentSelection.
 type PlanGateSubmitter interface {
 	GetRun(ctx context.Context, userID, runID uuid.UUID) (store.Run, error)
-	SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string) error
+	// SubmitInput enqueues a steering input. expectedGateRevision (PRD #1795 M5) is the plan-gate
+	// revision of the card a verdict (reject_plan / revise_plan) came from; nil sends none (a
+	// legacy card, or a non-verdict kind). A run no longer at that revision is refused with the
+	// ErrGateRevisionMismatch sentinel and nothing is written.
+	SubmitInput(ctx context.Context, userID, runID uuid.UUID, kind, body string, expectedGateRevision *int64) error
 	// SubmitApproval enqueues an approve_plan for `source` ("repo"|"own"); the server
 	// validates the source against the run's real roster and rejects with the
-	// ErrSelectionRejected sentinel when it no longer holds.
-	SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string) error
+	// ErrSelectionRejected sentinel when it no longer holds. expectedGateRevision is the
+	// card's revision, as for SubmitInput (ErrGateRevisionMismatch on a changed gate).
+	SubmitApproval(ctx context.Context, userID, runID uuid.UUID, source string, expectedGateRevision *int64) error
 	// SubmitAnswer enqueues an `answer` to the clarification question named by
 	// questionID, carrying the user's reply text (PRD #88 M3).
 	//
@@ -174,7 +179,7 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 	// and stops a stale Reject/Request-changes from overwriting the live anchor.
 	anchor, err := g.store.GetSlackRunMessage(ctx, runID)
 	if err != nil || !anchor.GateTs.Valid || anchor.GateTs.String != a.MessageTS {
-		g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
+		g.ephemeral(ctx, a, gateSupersededText)
 		return
 	}
 
@@ -183,10 +188,10 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 	// server never receives a client-supplied source string. The legacy/no-roster
 	// id maps to "own".
 	case ActionGateApprove, ActionGateApproveOwn:
-		g.approve(ctx, a, user.ID, runID, "own")
+		g.approve(ctx, a, user.ID, runID, "own", anchorGateRevision(anchor))
 
 	case ActionGateApproveRepo:
-		g.approve(ctx, a, user.ID, runID, "repo")
+		g.approve(ctx, a, user.ID, runID, "repo", anchorGateRevision(anchor))
 
 	case ActionGateReject:
 		// Enter reject-pending via compare-and-swap: keep the run parked (still
@@ -202,7 +207,7 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 			ExpectedGateTs: pgconv.Text(a.MessageTS), ExpectedGateState: pgconv.Text(gateStateOpen),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
+				g.ephemeral(ctx, a, gateSupersededText)
 				return
 			}
 			g.logf("set reject-pending", err)
@@ -227,7 +232,7 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 			ExpectedGateTs: pgconv.Text(a.MessageTS), ExpectedGateState: pgconv.Text(gateStateOpen),
 		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
-				g.ephemeral(ctx, a, "This gate was superseded — scroll down to the latest plan message.")
+				g.ephemeral(ctx, a, gateSupersededText)
 				return
 			}
 			g.logf("set revise-pending", err)
@@ -239,7 +244,11 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 		}
 
 	case ActionGateRejectNoReason:
-		if err := g.svc.SubmitInput(ctx, user.ID, runID, "reject_plan", ""); err != nil {
+		if err := g.svc.SubmitInput(ctx, user.ID, runID, "reject_plan", "", anchorGateRevision(anchor)); err != nil {
+			if errors.Is(err, ErrGateRevisionMismatch) {
+				g.ephemeral(ctx, a, gateSupersededText)
+				return
+			}
 			g.logf("submit reject", err)
 			g.ephemeral(ctx, a, "Couldn't record the rejection — try again from uzi.")
 			return
@@ -253,8 +262,17 @@ func (g *Gatekeeper) HandleBlockAction(ctx context.Context, a BlockAction) {
 // under the button, e.g. a requeue re-detected an empty roster) leaves the gate
 // OPEN with an ephemeral, so the presser can retry from a fresh state rather than
 // being stuck on a stale button.
-func (g *Gatekeeper) approve(ctx context.Context, a BlockAction, userID, runID uuid.UUID, source string) {
-	if err := g.svc.SubmitApproval(ctx, userID, runID, source); err != nil {
+//
+// expected is the revision the clicked card was stamped with (PRD #1795 M5; nil for a legacy
+// card). The anchor check above proves the click is on the anchor's CURRENT card; the revision
+// proves that card still shows the server's current gate. A mismatch (a newer plan was
+// presented before the notifier re-carded) answers the superseded notice and leaves the card.
+func (g *Gatekeeper) approve(ctx context.Context, a BlockAction, userID, runID uuid.UUID, source string, expected *int64) {
+	if err := g.svc.SubmitApproval(ctx, userID, runID, source, expected); err != nil {
+		if errors.Is(err, ErrGateRevisionMismatch) {
+			g.ephemeral(ctx, a, gateSupersededText)
+			return
+		}
 		if errors.Is(err, ErrSelectionRejected) {
 			g.ephemeral(ctx, a, "That agent choice is no longer valid for this run (the roster may have changed) — reopen the plan in uzi.")
 			return

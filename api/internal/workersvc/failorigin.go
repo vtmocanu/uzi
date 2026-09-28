@@ -92,6 +92,13 @@ var failOrigins = []string{
 	// neverJudgeFailOrigins and envPublishFailOrigins (judge_enqueue.go) — and it is not
 	// human-landable (no finalize ran, so there is no committed work to land).
 	"plan_missing",
+	// PRD #1795 M1: a run whose plan gate could not be re-presented — a historical presentation
+	// id, a changed payload on the current id, or a stale adoption refused — across more than
+	// RUN_GATE_REFUSAL_MAX claims. SERVER-DERIVED, NOT worker-reportable (stamped inside
+	// SetState's awaiting_approval transaction, so it is absent from workerReportableFailOrigins).
+	// Excluded from the judge (neverJudgeFailOrigins): a refusal is a protocol state, not an
+	// agent defect.
+	"gate_presentation_refused",
 	// PRD #1809 M5 (D6): a run whose worker's data volume stayed full across more than
 	// UZI_RUN_DISK_PARK_MAX counted 'data_volume_full' parks. SERVER-DERIVED, NOT
 	// worker-reportable (stamped directly inside SetState's disk-park transaction,

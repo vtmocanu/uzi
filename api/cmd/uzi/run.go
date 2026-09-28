@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"time"
@@ -374,11 +375,89 @@ func seededPlanFlag(env Env, cmd *cobra.Command) (*uzicli.CreateRunSeed, error) 
 	}, nil
 }
 
+// expectedGateRevisionFlag is the PRD #1795 D5 flag on `run approve|reject|revise`.
+const expectedGateRevisionFlag = "expected-gate-revision"
+
+// addExpectedGateRevisionFlag registers --expected-gate-revision on a plan-gate verdict command.
+func addExpectedGateRevisionFlag(cmd *cobra.Command) {
+	cmd.Flags().Int64(expectedGateRevisionFlag, 0,
+		"bind this verdict to the plan-gate revision you reviewed (the run's gate_revision); if the "+
+			"run has since shown a newer plan or left the gate, nothing is sent and the command exits 5. "+
+			"Omitted: the revision the run shows when this command starts is used, and only while it "+
+			"is awaiting approval")
+}
+
+// resolveExpectedGateRevision decides the expected_gate_revision a plan-gate verdict carries
+// (PRD #1795 D5). An explicit --expected-gate-revision wins. Without it, the run is read once,
+// at invocation: a run parked at awaiting_approval with a revision binds the verdict to that
+// revision, so a plan re-presented between this read and the write is refused rather than
+// approved unseen. Any other status sends nothing, so `uzi run reject` on a queued or running
+// run keeps today's server-side handling. A run the read cannot find sends nothing too: the
+// submit that follows answers the authoritative 404.
+func resolveExpectedGateRevision(cmd *cobra.Command, c uzicli.Client, runID string) (*int64, error) {
+	if cmd.Flags().Changed(expectedGateRevisionFlag) {
+		rev, _ := cmd.Flags().GetInt64(expectedGateRevisionFlag)
+		if rev < 0 {
+			return nil, uzicli.Exitf(uzicli.ExitUsage, "--%s must be a non-negative revision", expectedGateRevisionFlag)
+		}
+		return &rev, nil
+	}
+	run, err := c.GetRun(cmd.Context(), runID)
+	if err != nil {
+		var ee *uzicli.ExitError
+		if errors.As(err, &ee) && ee.Code == uzicli.ExitNotFound {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if run.Status != "awaiting_approval" || run.GateRevision <= 0 {
+		return nil, nil
+	}
+	rev := run.GateRevision
+	return &rev, nil
+}
+
+// gateRevisionMismatchError turns the typed 409 into the CLI's conflict exit. Nothing was
+// written server-side. The server answers it for three different situations, and the message
+// names only what the numbers support:
+//   - current 0: the run shows no plan gate with a revision (never gated under an allocating
+//     api, or the verdict named a revision against a run with none), so there is nothing to
+//     review;
+//   - current == expected: the write lost a race at the same revision (the gate may have been
+//     re-presented or left while this verdict was in flight). The run may still be at that
+//     gate, so the caller is told to re-check and retry, not that the plan changed;
+//   - otherwise: the run now shows another revision, which is the one to review.
+//
+// The error keeps Reason ReasonGateRevisionMismatch so a caller that composed the verdict
+// with an earlier write (`run approve --token`) can say what did land.
+func gateRevisionMismatchError(runID string, expected *int64, current int64) error {
+	var msg string
+	switch {
+	case current <= 0:
+		msg = fmt.Sprintf("run %s shows no plan gate with a revision to act on; the verdict was not applied "+
+			"(check the run's status)", runID)
+	case expected != nil && *expected == current:
+		msg = fmt.Sprintf("run %s: the verdict for plan revision %d was not applied because the gate changed "+
+			"while it was being sent; check the run's status and retry if it is still awaiting approval",
+			runID, current)
+	default:
+		msg = fmt.Sprintf("run %s now shows plan revision %d; review it before deciding (the verdict was not applied)",
+			runID, current)
+	}
+	return &uzicli.ExitError{
+		Code:                uzicli.ExitConflict,
+		Err:                 errors.New(msg),
+		Reason:              uzicli.ReasonGateRevisionMismatch,
+		CurrentGateRevision: current,
+	}
+}
+
 // submitInput sends one steering input and reports the outcome. server_side (a
 // cancel/reject applied without a live worker) is surfaced so the caller knows the
-// action took effect immediately rather than being queued.
-func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool) error {
-	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome)
+// action took effect immediately rather than being queued. expectedGateRevision binds a
+// plan-gate verdict to a gate revision (PRD #1795 D5; nil for every other kind).
+func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runID, kind, body string, sel *apitypes.AgentSelection, discardPendingOutcome bool, expectedGateRevision *int64) error {
+	res, err := c.SubmitRunInput(cmd.Context(), runID, kind, body, sel, discardPendingOutcome, expectedGateRevision)
 	if err != nil {
 		// PRD #1391 Run B M3d (D13): a cancel of a run whose executor journaled a terminal
 		// outcome on its worker, sent WITHOUT --discard-pending-outcome, comes back as a typed 409
@@ -389,6 +468,10 @@ func submitInput(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, 
 		if !discardPendingOutcome && errors.As(err, &ee) && ee.Reason == uzicli.ReasonOutcomePendingConfirmationRequired {
 			return uzicli.Exitf(uzicli.ExitConflict,
 				"run %s has a pending outcome held on its worker; re-run with --discard-pending-outcome to discard it and cancel", runID)
+		}
+		// PRD #1795 D5: the verdict named a gate revision the run no longer shows.
+		if errors.As(err, &ee) && ee.Reason == uzicli.ReasonGateRevisionMismatch {
+			return gateRevisionMismatchError(runID, expectedGateRevision, ee.CurrentGateRevision)
 		}
 		return err
 	}
@@ -531,6 +614,12 @@ func printRunFields(env Env, run apitypes.RunDTO, fields []string) error {
 	for _, f := range fields {
 		raw, ok := m[f]
 		if !ok {
+			// An omitempty field (gate_revision, PRD #1795) is absent from the marshaled map
+			// while it holds its zero value; it is still a real field, so read its zero value
+			// rather than calling a documented field unknown.
+			raw, ok = omittedRunFieldZero(f)
+		}
+		if !ok {
 			return uzicli.Exitf(uzicli.ExitUsage, "unknown field %q", f)
 		}
 		v, err := scalarField(f, raw)
@@ -552,6 +641,26 @@ func printRunFields(env Env, run apitypes.RunDTO, fields []string) error {
 // error if it is non-scalar (an array/object). `null` renders as the empty string (an
 // empty line); a JSON string is unquoted to its raw content; a number or bool prints its
 // literal bytes.
+// omittedRunFieldZero returns the JSON zero value of a top-level RunDTO field tagged omitempty,
+// for printRunFields: marshaling drops such a field while it is zero, and the key set is
+// otherwise derived from the marshaled map. ok is false for a name no field carries.
+func omittedRunFieldZero(name string) (json.RawMessage, bool) {
+	t := reflect.TypeOf(apitypes.RunDTO{})
+	for i := 0; i < t.NumField(); i++ {
+		f := t.Field(i)
+		tagName, opts, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if tagName != name || !strings.Contains(","+opts+",", ",omitempty,") {
+			continue
+		}
+		b, err := json.Marshal(reflect.Zero(f.Type).Interface())
+		if err != nil {
+			return nil, false
+		}
+		return b, true
+	}
+	return nil, false
+}
+
 func scalarField(name string, raw json.RawMessage) (string, error) {
 	trimmed := strings.TrimSpace(string(raw))
 	if trimmed == "null" {

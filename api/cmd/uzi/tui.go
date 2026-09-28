@@ -1385,6 +1385,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		m.applySteerResult(msg)
+		// PRD #1795 D5: a verdict refused because the plan moved on re-reads the run, so the
+		// gate the view shows (and the revision the next `y`/`n` binds to) catches up.
+		if _, ok := gateMismatch(msg.err); ok {
+			refetch := m.startDetailMetaReq() // mutates m's meta guard: call before returning m
+			return m, tea.Batch(m.fetchInputsCmd(m.detail.runID), refetch)
+		}
 		// Re-read the queue so the indicator reflects the write immediately rather
 		// than waiting for the run's next `input` frame.
 		return m, m.fetchInputsCmd(m.detail.runID)

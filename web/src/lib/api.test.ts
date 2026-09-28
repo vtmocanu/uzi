@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   api,
   ApiError,
+  gateRevisionMismatchCurrent,
   isOutcomePendingConfirmation,
   MOCK_MODE,
   setUnauthorizedHandler,
@@ -237,5 +238,63 @@ describe("submitRunInput threads discard_pending_outcome (PRD #1391 M3d)", () =>
     const init = fetchMock.mock.calls[0][1] as RequestInit;
     const body = JSON.parse(init.body as string) as Record<string, unknown>;
     expect(body).not.toHaveProperty("discard_pending_outcome");
+  });
+});
+
+// PRD #1795 D5: a plan-gate verdict carries the revision the owner is looking at, and only
+// when there is one; a run without a revision keeps today's body byte for byte.
+describe("submitRunInput threads expected_gate_revision (PRD #1795 M4)", () => {
+  const stubDoc = () => vi.stubGlobal("document", { cookie: "" });
+
+  it("adds expected_gate_revision when a revision is given", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, { server_side: false }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    stubDoc();
+
+    await api.submitRunInput("run-1", "approve_plan", "", undefined, undefined, undefined, 3);
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    expect(body.kind).toBe("approve_plan");
+    expect(body.expected_gate_revision).toBe(3);
+  });
+
+  it("omits expected_gate_revision when no revision is given", async () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, { server_side: false }),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    stubDoc();
+
+    await api.submitRunInput("run-1", "approve_plan");
+
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    const body = JSON.parse(init.body as string) as Record<string, unknown>;
+    // Paired with the positive case above, so this cannot pass vacuously.
+    expect(body.kind).toBe("approve_plan");
+    expect(body).not.toHaveProperty("expected_gate_revision");
+  });
+});
+
+describe("gateRevisionMismatchCurrent (PRD #1795 M4)", () => {
+  it("returns the current revision from the typed 409", () => {
+    const err = new ApiError(409, "the plan changed", {
+      error: "the plan changed",
+      reason: "gate_revision_mismatch",
+      current_gate_revision: 4,
+    });
+    expect(gateRevisionMismatchCurrent(err)).toBe(4);
+  });
+
+  it("is null for another 409 reason, another status, or a non-ApiError", () => {
+    expect(
+      gateRevisionMismatchCurrent(new ApiError(409, "x", { reason: "outcome_pending_confirmation_required" })),
+    ).toBeNull();
+    expect(
+      gateRevisionMismatchCurrent(new ApiError(400, "x", { reason: "gate_revision_mismatch", current_gate_revision: 2 })),
+    ).toBeNull();
+    expect(gateRevisionMismatchCurrent(new Error("boom"))).toBeNull();
   });
 });

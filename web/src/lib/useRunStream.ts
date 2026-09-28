@@ -224,6 +224,9 @@ export function useRunStream(runId: string) {
       // through to submitRunInput. Meaningful only with kind "cancel"; the server ignores
       // it otherwise. RunView's central cancel path sets it on the confirmed retry.
       discardPendingOutcome?: boolean,
+      // PRD #1795 D5: the plan-gate revision a verdict is bound to, threaded through to
+      // submitRunInput. Meaningful only with approve_plan / reject_plan / revise_plan.
+      expectedGateRevision?: number,
     ) => {
       // A follow-up shows in the steer queue immediately as Queued (PRD #95 S2):
       // optimistically prepend a temp entry (the queue is newest-first), then adopt
@@ -267,6 +270,7 @@ export function useRunStream(runId: string) {
         selection,
         overrideCapabilities,
         discardPendingOutcome,
+        expectedGateRevision,
       );
       void refreshRun();
     },

@@ -158,9 +158,9 @@ uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
 uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex]
-uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>] [--token <label>|auto|default|inherit]
-uzi run reject <run-id> [--message <text>]
-uzi run revise <run-id> [--message <text>]
+uzi run approve <run-id> [--agent-source own|repo] [--exclude-agents <a,b>] [--token <label>|auto|default|inherit] [--expected-gate-revision <n>]
+uzi run reject <run-id> [--message <text>] [--expected-gate-revision <n>]
+uzi run revise <run-id> [--message <text>] [--expected-gate-revision <n>]
 uzi run cancel <run-id>
 uzi run stop <run-id> [--message <text>]
 uzi run scope <run-id> --through <n>
@@ -498,6 +498,16 @@ uzi version
   (pass `--message` or pipe it on stdin). Revisions are capped by the run's revision
   limit; once it is exhausted — or the run has already finished — the server answers
   409 (exit 5).
+- **`--expected-gate-revision <n>` on `approve`/`reject`/`revise`** binds the
+  verdict to the exact plan-gate revision you reviewed (`uzi run get <run-id>
+  --field gate_revision`). Without it, the CLI reads the run right before
+  sending and uses whatever revision it finds while the run is
+  `awaiting_approval` — that only proves the verdict targets the gate current
+  at invocation, not a plan read earlier. A mismatch (a newer plan was shown,
+  or the run left the gate) is a 409 naming the current revision — **exit 5**,
+  same conflict class as an exhausted revision cap. `run approve --token
+  <label>` switches credentials before approving; if the revision check then
+  refuses, the switch is not rolled back and the error says so.
 - `uzi run cancel <run-id>` — cancel a run.
 - `uzi run stop <run-id>` — gracefully stop a run (finalize + optional MR). On an
   interactive run it finishes the current turn and finalizes; on a milestone-structured

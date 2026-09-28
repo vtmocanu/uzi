@@ -469,6 +469,15 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)
+	// PRD #1798: the run's PR's published description and last write outcome. runToDTO stays
+	// pure, so this detail-only overlay sets both here. Best-effort: a lookup error leaves both
+	// null rather than failing the read of an otherwise-fine run.
+	if desc, outcome, err := h.wsvc.RunPrDescription(r.Context(), run); err != nil {
+		slog.Error("run pr description", "run_id", run.ID, "error", err)
+	} else {
+		dto.PrDescription = desc
+		dto.PrDescriptionOutcome = outcome
+	}
 	// PRD #1353: the server-derived per-in-progress-milestone LIVE LANES, additive to
 	// milestones_agents and populated ONLY on this run-detail read for a non-terminal run
 	// (D9 — the board/list stay a single now-line). Best-effort: a derivation error leaves
@@ -850,9 +859,23 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	res, err := h.wsvc.SubmitInputWithOptions(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection, workersvc.SubmitInputOptions{
 		OverrideCapabilities:  req.OverrideCapabilities,
 		DiscardPendingOutcome: req.DiscardPendingOutcome,
+		ExpectedGateRevision:  req.ExpectedGateRevision,
 	})
 	if err != nil {
+		var mismatch *workersvc.GateRevisionMismatchError
 		switch {
+		case errors.As(err, &mismatch):
+			// PRD #1795 M2 (D5): the verdict named a plan-gate revision the run no longer shows
+			// (a newer gate, or no gate at all). Nothing was written. The typed reason and the
+			// current revision let the web/CLI/Slack refetch and ask the owner to review the
+			// plan that is actually on screen now.
+			httpx.JSON(w, http.StatusConflict, map[string]any{
+				"error":                 err.Error(),
+				"reason":                "gate_revision_mismatch",
+				"current_gate_revision": mismatch.Current,
+			})
+		case errors.Is(err, workersvc.ErrExpectedGateRevisionNotApplicable):
+			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrRunNotFound):
 			httpx.Error(w, http.StatusNotFound, "run not found")
 		case errors.Is(err, workersvc.ErrRunTerminal):

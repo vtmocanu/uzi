@@ -542,8 +542,13 @@ func TestSubmitInputApproveWithoutSelectionKeepsThePlainPath(t *testing.T) {
 	if fs.createdApproval != nil {
 		t.Fatal("a selectionless approve must not write the selection columns")
 	}
-	if fs.createdInput == nil || fs.createdInput.Kind != "approve_plan" {
-		t.Fatalf("approve not enqueued: %+v", fs.createdInput)
+	// PRD #1795 M2: the selection-less approve goes through the stamping CreateGateVerdictInput,
+	// never the plain (unbound-by-omission) CreateRunInput.
+	if fs.createdGateVerdict == nil || fs.createdGateVerdict.RunID != runID {
+		t.Fatalf("approve not enqueued through CreateGateVerdictInput: %+v", fs.createdGateVerdict)
+	}
+	if fs.createdInput != nil {
+		t.Fatalf("a selection-less approve must not use the plain CreateRunInput path: %+v", fs.createdInput)
 	}
 }
 

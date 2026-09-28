@@ -37,6 +37,12 @@
 // plan. A current-epoch revise beats a current-epoch approve/reject, so a batched
 // [revise, approve] yields one revision round and a fresh gate — never an approve of the
 // pre-feedback plan.
+//
+// PRD #1795: on a human-gated claim a verdict row carrying the api's gate binding is matched by
+// REVISION instead: a bound(N) verdict acts only at the gate whose applied awaiting_approval ACK
+// confirmed revision N (setGateRevision), bypassing the epoch and the #1604 replay cutoff; an
+// unbound approve (sent while no gate was visible) is disposed of; an unbound reject or revise and
+// every legacy row keep the epoch rules above; a malformed binding fails closed.
 
 import { RequestError, type InputReceipt, type WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
@@ -205,7 +211,47 @@ export class CredentialSwitchSignal extends Error {
  *  claim; created before the plan this resumed claim offers was shown; replayed on a claim that
  *  cannot say when that was (unjudged); arrived after the gate closed; or replaced in the buffer by
  *  a newer verdict at the same epoch. */
-type StaleWhy = "epoch" | "replay" | "unjudged" | "closed" | "superseded";
+type StaleWhy = "epoch" | "replay" | "unjudged" | "closed" | "superseded" | "unbound" | "malformed";
+
+/**
+ * PRD #1795 (D3): the gate binding a verdict row carries.
+ *  - `bound`: stamped with the gate revision the human saw; taken ONLY at the gate whose confirmed
+ *    revision equals it, whatever the epoch or the replay cutoff says.
+ *  - `unbound`: sent while no gate was visible. An unbound approve can never act on a human-gated
+ *    claim (disposed of on arrival); an unbound reject or revise keeps the legacy handling (A2).
+ *  - `legacy`: no binding recorded (an older api, a pre-migration row): today's epoch and
+ *    replay-cutoff handling, unchanged.
+ *  - `malformed`: any other shape. Fails closed: never treated as legacy.
+ */
+type GateBinding =
+  | { kind: "legacy" }
+  | { kind: "unbound" }
+  | { kind: "bound"; revision: number }
+  | { kind: "malformed" };
+
+const LEGACY_BINDING: GateBinding = { kind: "legacy" };
+
+/** PRD #1795 (D3): read a row's binding, fail closed. Only a row with NEITHER key is legacy; an
+ *  unknown `gate_binding`, `bound` without a positive integer revision, or a revision without
+ *  `bound` (including an `unbound` row carrying one, or an explicit null) is malformed. */
+function parseGateBinding(row: { gate_binding?: unknown; gate_revision?: unknown }): GateBinding {
+  const hasBinding = row.gate_binding !== undefined;
+  const hasRevision = row.gate_revision !== undefined;
+  if (!hasBinding && !hasRevision) return LEGACY_BINDING;
+  if (row.gate_binding === "unbound" && !hasRevision) return { kind: "unbound" };
+  const rev = row.gate_revision;
+  if (row.gate_binding === "bound" && typeof rev === "number" && Number.isSafeInteger(rev) && rev > 0)
+    return { kind: "bound", revision: rev };
+  return { kind: "malformed" };
+}
+
+/** PRD #1795: an approve sent while no plan was awaiting approval (an unbound approve on a
+ *  human-gated claim). It can never act on a gate presented later (B5). */
+const UNBOUND_APPROVE_NOTICE =
+  "Approval ignored — it was sent while no plan was awaiting approval; approve the plan once it is shown.";
+/** PRD #1795: a verdict whose gate binding cannot be read. Never treated as legacy. */
+const MALFORMED_BINDING_NOTICE =
+  "A plan verdict with an unreadable gate binding was ignored — re-send it if you still want it.";
 
 /** Issue #1604: a notice for a buffered reject replaced by a newer verdict at the same gate epoch. */
 const SUPERSEDED_REJECT_NOTICE = "an earlier plan rejection was superseded by a newer verdict";
@@ -739,7 +785,10 @@ export class SteeringChannel {
   private staleNotice(kind: "approve_plan" | "reject_plan" | "revise_plan", why: StaleWhy, receipted: boolean): string | undefined {
     // An approve already applied server-side stays recorded as the approval: say so, and name the
     // one input that still stops the run, instead of a notice implying it was withdrawn.
-    if (!receipted && kind === "approve_plan" && (why === "epoch" || why === "replay" || why === "unjudged"))
+    if (
+      !receipted && kind === "approve_plan" &&
+      (why === "epoch" || why === "replay" || why === "unjudged" || why === "unbound" || why === "malformed")
+    )
       return LEGACY_RECORDED_APPROVE_NOTICE;
     switch (why) {
       case "epoch":
@@ -754,6 +803,10 @@ export class SteeringChannel {
         return kind === "revise_plan" ? APPROVED_REVISE_NOTICE : kind === "reject_plan" ? APPROVED_REJECT_NOTICE : undefined;
       case "superseded":
         return kind === "reject_plan" ? SUPERSEDED_REJECT_NOTICE : undefined;
+      case "unbound":
+        return UNBOUND_APPROVE_NOTICE;
+      case "malformed":
+        return MALFORMED_BINDING_NOTICE;
     }
   }
 
@@ -774,16 +827,34 @@ export class SteeringChannel {
   /** True when a routed gate verdict is final on arrival (it was disposed of): any verdict after the
    *  gate closed; one created before the resumed claim's plan was shown (or with no comparable
    *  created_at); or, when the claim cannot say when that was, an approve or reject read before the
-   *  replayed backlog is drained and this claim has shown its first gate. */
+   *  replayed backlog is drained and this claim has shown its first gate.
+   *
+   *  PRD #1795, on a human-gated claim only: a malformed binding is disposed of (never legacy); an
+   *  unbound approve is disposed of (it can never act on a later gate, B5), while an unbound reject
+   *  or revise takes the legacy checks below (A2); a bound verdict bypasses the replay checks
+   *  (revision matching decides it; the closed gate and a cancel still win) and is disposed of here
+   *  only when it is already known stale: older than the confirmed revision, or than a bound
+   *  verdict already buffered. */
   private disposedOnArrival(
     kind: "approve_plan" | "reject_plan" | "revise_plan",
     id: number,
     receipted: boolean,
     createdAt: string | undefined,
+    binding: GateBinding,
   ): boolean {
     let why: StaleWhy | undefined;
+    const b = this.effectiveBinding(binding);
     if (this.closedBy !== undefined) why = "closed";
-    else if (this.replayUnjudged && kind !== "revise_plan") why = "unjudged";
+    else if (b.kind === "malformed") why = "malformed";
+    else if (b.kind === "unbound" && kind === "approve_plan") why = "unbound";
+    else if (b.kind === "bound") {
+      const buffered = this.bufferedVerdict ? this.effectiveBinding(this.bufferedVerdict.binding) : undefined;
+      if (
+        (this.confirmedGateRevision !== undefined && b.revision < this.confirmedGateRevision) ||
+        (kind !== "revise_plan" && buffered?.kind === "bound" && b.revision < buffered.revision)
+      )
+        why = "epoch";
+    } else if (this.replayUnjudged && kind !== "revise_plan") why = "unjudged";
     else if (this.replayCutoff !== undefined) {
       // Fail closed: a created_at that is absent or does not parse cannot be compared with the
       // cutoff, so the verdict is treated as older than the persisted plan.
@@ -1157,7 +1228,9 @@ export class SteeringChannel {
   /**
    * Issue #1604 (D3): the gate event a resumed claim acts on before offering any plan, in
    * precedence: a sticky cancel, a current-epoch revise, a buffered current-epoch reject. An
-   * approve stays buffered for the re-presented gate. Undefined when nothing is pending.
+   * approve stays buffered for the re-presented gate. Undefined when nothing is pending. PRD #1795:
+   * a bound revise or reject acts here only when bound to the revision the runner seeded from the
+   * claim (an SDK same-gate reclaim); otherwise it waits for a gate that confirms its revision.
    */
   takeResumedGateEvent(): PlanVerdict | undefined {
     if (this.cancelled) return { kind: "cancel" };
@@ -1165,7 +1238,7 @@ export class SteeringChannel {
     const revise = this.takeRevise(epoch);
     if (revise) return revise;
     const buffered = this.bufferedVerdict;
-    if (buffered?.verdict.kind === "reject" && buffered.epoch === epoch) {
+    if (buffered?.verdict.kind === "reject" && this.gateMatch(buffered.binding, epoch, buffered.epoch) === "take") {
       this.bufferedVerdict = undefined;
       return buffered.verdict;
     }
@@ -1197,7 +1270,16 @@ export class SteeringChannel {
   private gateEpoch = 0;
   /** An approve/reject that arrived before the executor asked for one (no lost wakeup),
    *  stamped with the epoch it landed under. Latest-wins if several land before a read. */
-  private bufferedVerdict: { verdict: PlanVerdict; epoch: number; id?: number } | undefined;
+  private bufferedVerdict: { verdict: PlanVerdict; epoch: number; binding: GateBinding; id?: number } | undefined;
+  /** PRD #1795 (decision 6): the gate revision THIS gate's applied awaiting_approval ACK confirmed,
+   *  or undefined when none is. Cleared at gatePlan entry (before the report) and whenever a revise
+   *  is taken; set only from the gate's own applied ACK (or, on an SDK same-gate reclaim, seeded
+   *  from the claim before the re-presentation). A bound verdict acts only on an exact match, so a
+   *  declined or refused report never authorizes a plan. */
+  private confirmedGateRevision: number | undefined;
+  /** PRD #1795 (decision 9): whether this claim's plan gate waits on a human (not autopilot). The
+   *  bound/unbound handling applies only then; otherwise every binding reads as legacy. */
+  private humanGated = false;
   /** Cancel is sticky and epoch-exempt: once seen it always wins, at any epoch. Also read by the
    *  executor's loop-top cancel re-check (PRD #1190 rework, via ctx.cancelRequested → isCancelled):
    *  a cancel that arrives AFTER the shared abort controller was already spent by a declined
@@ -1270,7 +1352,7 @@ export class SteeringChannel {
    *  REASON_CREDENTIAL_SWITCH. */
   private credentialSwitchInterrupt: (() => void) | undefined;
   /** FIFO queue of revision feedback (PRD #41), each stamped with its arrival epoch. */
-  private readonly reviseQueue: { feedback: string; epoch: number; id?: number }[] = [];
+  private readonly reviseQueue: { feedback: string; epoch: number; binding: GateBinding; id?: number }[] = [];
   /** The gate waiter parked on awaitGateEvent, with the epoch it is waiting for. `reject` releases
    *  it with a CredentialSwitchSignal when a held-state switch trips (PRD #1247 M5b): a run idling
    *  at the plan gate has no live SDK turn to abort, so the waiter itself must reject. */
@@ -1792,11 +1874,14 @@ export class SteeringChannel {
     // A current-epoch revise beats a buffered current-epoch approve/reject.
     const revise = this.takeRevise(epoch);
     if (revise) return revise;
-    // A buffered approve/reject: apply it at its own epoch, else discard as stale.
+    // A buffered approve/reject: apply it at its own epoch (a bound one at its own revision), else
+    // discard as stale. PRD #1795: a bound verdict for a revision not yet confirmed stays buffered.
     if (this.bufferedVerdict) {
-      const { verdict, epoch: e, id } = this.bufferedVerdict;
+      const { verdict, epoch: e, id, binding } = this.bufferedVerdict;
+      const match = this.gateMatch(binding, epoch, e);
+      if (match === "wait") return undefined;
       this.bufferedVerdict = undefined;
-      if (e === epoch) {
+      if (match === "take") {
         // A taken reject stays awaiting its result: the server settles it with the failed
         // transition. A taken approve is final: it is applied on its own, and the report after it
         // waits for that (issue #1604: the only approve ever applied is one a gate took).
@@ -1813,17 +1898,90 @@ export class SteeringChannel {
     return undefined;
   }
 
-  /** Drop the stale (prior-epoch) revises at the head, FIFO, noting each (each is then final and
-   *  applied on its own), and take the current-epoch revise, if any. A taken revise stays awaiting
-   *  its result until settleRevision. */
+  /** Drop the stale (prior-epoch) revises, FIFO, noting each (each is then final and applied on its
+   *  own), and take the first current-epoch revise, if any. PRD #1795: a bound revise is stale below
+   *  the confirmed revision, taken at it, and stays queued (skipped, not dropped) above it or while
+   *  nothing is confirmed. A taken revise stays awaiting its result until settleRevision, and taking
+   *  it clears the confirmed revision: the plan it answers is about to be replaced. */
   private takeRevise(epoch: number): PlanVerdict | undefined {
-    while (this.reviseQueue.length && this.reviseQueue[0]!.epoch !== epoch) {
-      const stale = this.reviseQueue.shift()!;
-      this.disposeStale("revise_plan", stale.id, "epoch");
+    for (let i = 0; i < this.reviseQueue.length; ) {
+      const r = this.reviseQueue[i]!;
+      const match = this.gateMatch(r.binding, epoch, r.epoch);
+      if (match === "wait") {
+        i++;
+        continue;
+      }
+      this.reviseQueue.splice(i, 1);
+      if (match === "stale") {
+        this.disposeStale("revise_plan", r.id, "epoch");
+        continue;
+      }
+      this.confirmedGateRevision = undefined;
+      return r.id === undefined ? { kind: "revise", feedback: r.feedback } : { kind: "revise", feedback: r.feedback, inputId: r.id };
     }
-    const r = this.reviseQueue.shift();
-    if (!r) return undefined;
-    return r.id === undefined ? { kind: "revise", feedback: r.feedback } : { kind: "revise", feedback: r.feedback, inputId: r.id };
+    return undefined;
+  }
+
+  /** PRD #1795 (decision 9): the binding as this claim applies it. Only a human-gated claim does
+   *  bound/unbound handling; for any other every row reads as legacy. */
+  private effectiveBinding(binding: GateBinding): GateBinding {
+    return this.humanGated ? binding : LEGACY_BINDING;
+  }
+
+  /** PRD #1795: whether a buffered or queued verdict stamped at `entryEpoch` with `binding` acts at
+   *  the gate awaited at `epoch`. A bound verdict matches the confirmed revision EXACTLY: equal is
+   *  taken, lower is stale, higher (or nothing confirmed yet, the window between persistence and
+   *  the ACK) waits. Every other binding keeps the epoch rule. */
+  private gateMatch(binding: GateBinding, epoch: number, entryEpoch: number): "take" | "wait" | "stale" {
+    const b = this.effectiveBinding(binding);
+    if (b.kind === "bound") {
+      const confirmed = this.confirmedGateRevision;
+      if (confirmed === undefined || b.revision > confirmed) return "wait";
+      return b.revision === confirmed ? "take" : "stale";
+    }
+    return entryEpoch === epoch ? "take" : "stale";
+  }
+
+  /**
+   * PRD #1795 (decision 6): the gate's applied awaiting_approval ACK confirmed revision `rev`, so a
+   * verdict bound to exactly `rev` may now act (and one bound below it is stale). The runner calls
+   * it only from that ACK, or on an SDK same-gate reclaim with the claim's resume_gate_revision
+   * before the re-presentation (so a pending bound reject or revise acts first).
+   */
+  setGateRevision(rev: number): void {
+    this.confirmedGateRevision = rev;
+  }
+
+  /** PRD #1795 (decision 6): no revision is confirmed. The runner calls it at gatePlan entry,
+   *  before the report, so a declined, failed or refused report confirms nothing. */
+  clearGateRevision(): void {
+    this.confirmedGateRevision = undefined;
+  }
+
+  /**
+   * PRD #1795 (decision 9): whether this claim's plan gate waits on a human. The runner sets it on
+   * the claim (not autopilot) and again at a gate forced to a human (a CI-config ci_fix plan). A
+   * claim turning human-gated disposes of what it would have disposed of on arrival: a buffered
+   * unbound approve and any malformed verdict.
+   */
+  setHumanGated(humanGated: boolean): void {
+    const became = humanGated && !this.humanGated;
+    this.humanGated = humanGated;
+    if (!became) return;
+    const buffered = this.bufferedVerdict;
+    if (buffered && (buffered.binding.kind === "malformed" || (buffered.binding.kind === "unbound" && buffered.verdict.kind === "approve"))) {
+      this.bufferedVerdict = undefined;
+      this.disposeStale(buffered.verdict.kind === "reject" ? "reject_plan" : "approve_plan", buffered.id, buffered.binding.kind);
+    }
+    for (let i = 0; i < this.reviseQueue.length; ) {
+      const r = this.reviseQueue[i]!;
+      if (r.binding.kind !== "malformed") {
+        i++;
+        continue;
+      }
+      this.reviseQueue.splice(i, 1);
+      this.disposeStale("revise_plan", r.id, "malformed");
+    }
   }
 
   /** Issue #1604: a buffered verdict replaced by a newer one is final: a reject is applied with a
@@ -1835,7 +1993,7 @@ export class SteeringChannel {
     this.disposeStale(
       buffered.verdict.kind === "reject" ? "reject_plan" : "approve_plan",
       buffered.id,
-      buffered.epoch === this.gateEpoch ? "superseded" : "epoch",
+      this.gateMatch(buffered.binding, this.gateEpoch, buffered.epoch) === "stale" ? "epoch" : "superseded",
     );
   }
 
@@ -1912,14 +2070,22 @@ export class SteeringChannel {
 
   /** Route one input. `receipted` is false for an older api pod's consume-on-read reply, whose
    *  rows are already applied server-side: no plan-gate receipt is tracked for them. */
-  private route(kind: string, body: string | null | undefined, id: number, receipted: boolean, createdAt: string | undefined): void {
+  private route(
+    kind: string,
+    body: string | null | undefined,
+    id: number,
+    receipted: boolean,
+    createdAt: string | undefined,
+    binding: GateBinding = LEGACY_BINDING,
+  ): void {
     // Issue #1604: every receipted revise_plan by kind, whatever becomes of it (see reviseIds).
     if (receipted && kind === "revise_plan") this.reviseIds.add(id);
     // Issue #1604: a gate verdict written against an earlier plan than the resumed claim's, or any
-    // verdict after the gate closed, is disposed of on arrival and never acts.
+    // verdict after the gate closed, is disposed of on arrival and never acts. PRD #1795: so is a
+    // malformed binding and an unbound approve on a human-gated claim.
     if (
       (kind === "approve_plan" || kind === "reject_plan" || (kind === "revise_plan" && !!body?.trim())) &&
-      this.disposedOnArrival(kind, id, receipted, createdAt)
+      this.disposedOnArrival(kind, id, receipted, createdAt, binding)
     )
       return;
     switch (kind) {
@@ -1932,6 +2098,7 @@ export class SteeringChannel {
         this.bufferedVerdict = {
           verdict: { kind: "approve", selection: parseAgentSelection(body) },
           epoch: this.gateEpoch,
+          binding,
           ...(receipted ? { id } : {}),
         };
         if (receipted) this.awaitingGateIds.add(id);
@@ -1943,6 +2110,7 @@ export class SteeringChannel {
         this.bufferedVerdict = {
           verdict: { kind: "reject", reason: body?.trim() || "plan rejected" },
           epoch: this.gateEpoch,
+          binding,
           ...(receipted ? { id } : {}),
         };
         if (receipted) this.awaitingGateIds.add(id);
@@ -1959,6 +2127,7 @@ export class SteeringChannel {
           this.reviseQueue.push({
             feedback: body.trim(),
             epoch: this.gateEpoch,
+            binding,
             ...(receipted ? { id } : {}),
           });
           if (receipted) this.awaitingGateIds.add(id);
@@ -2101,7 +2270,7 @@ export class SteeringChannel {
     for (const input of [...receipt.inputs].sort((a, b) => a.id - b.id)) {
       if (this.routedIds.has(input.id)) continue;
       this.routedIds.add(input.id);
-      this.route(input.kind, input.body ?? undefined, input.id, true, input.created_at);
+      this.route(input.kind, input.body ?? undefined, input.id, true, input.created_at, parseGateBinding(input));
     }
     held.phase = "routed";
     held.routedAt = this.now();
@@ -2144,7 +2313,7 @@ export class SteeringChannel {
             for (const input of inputs) {
               if (this.routedIds.has(input.id)) continue;
               this.routedIds.add(input.id);
-              this.route(input.kind, input.body ?? undefined, input.id, false, input.created_at);
+              this.route(input.kind, input.body ?? undefined, input.id, false, input.created_at, parseGateBinding(input));
             }
           } else if (inputs.length) {
             const batch = inputs.slice(0, MAX_INPUT_BATCH);

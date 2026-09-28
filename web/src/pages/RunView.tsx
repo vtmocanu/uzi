@@ -11,6 +11,7 @@ import { Link, useParams } from "react-router-dom";
 import {
   api,
   ApiError,
+  gateRevisionMismatchCurrent,
   isOutcomePendingConfirmation,
   preferForgeUrl,
   isTerminalRun,
@@ -81,7 +82,7 @@ import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type B
 import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
 import { ExternalLinkIcon } from "../components/icons";
-import { PlanPanel, SeededPlanPanel } from "./runView/PlanPanel";
+import { gateMismatchMessage, PlanPanel, SeededPlanPanel, type GateMismatch } from "./runView/PlanPanel";
 import { JudgePanel } from "./runView/JudgePanel";
 import { CompletionDecisionPanel } from "./runView/CompletionDecisionPanel";
 
@@ -1786,6 +1787,25 @@ function DiskFullParkBody({ retryAt, parkCount }: { retryAt: string | null; park
 // to owner-facing text, in plain terms rather than the wire slug. The api already filters
 // to this set, but an unrecognised value is rendered honestly (as itself) since the api is
 // deployed separately from the web.
+// PRD #1795 D5: how long a refused plan verdict holds the page busy for its refetch. Long
+// enough for a normal GET; short enough that a hung one cannot lock the gate indefinitely.
+const GATE_REFETCH_WAIT_MS = 5000;
+
+// settleWithin waits for `p` or `ms`, whichever comes first. A rejection of `p` inside the
+// window propagates; the timer is cleared either way.
+async function settleWithin(p: Promise<unknown>, ms: number): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([p, new Promise<void>((res) => (timer = setTimeout(res, ms)))]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// A refused plan verdict held for display (PRD #1795 D5). `settled` once its refetch landed or
+// the wait ran out; `anchor` is the run's status and gate revision as displayed then.
+type GateMismatchState = { runId: string; settled?: boolean; anchor?: { status: string; revision: number } } & GateMismatch;
+
 function outcomePendingReasonLabel(reason: string): string {
   switch (reason) {
     case "completion_permit_mismatch":
@@ -1868,6 +1888,61 @@ export function RunView() {
       setBusy(false);
     }
   };
+
+  // PRD #1795 D5: the plan-gate verdict path. A verdict bound to a revision the run no longer
+  // shows is refused with a typed 409 and nothing is written. That is not a failure to show on
+  // the page banner: the gate panel words the refusal (gateMismatchMessage), and the run is
+  // refetched so the panel renders the plan now at the gate. The refetch is awaited inside
+  // `act`, so `busy` stays up while it is in flight: a click in between cannot bind a verdict
+  // to the refused revision still on screen. The wait is bounded (GATE_REFETCH_WAIT_MS) so a
+  // hung GET cannot hold the page busy; past it, the page reads whatever the stream shows. A
+  // new object per refusal re-arms the panel even when the revision repeats. Any other error
+  // surfaces as before. Bound to the run that earned it, like the discard confirmation below.
+  // Resolves true only when the verdict was accepted.
+  const [gateMismatch, setGateMismatch] = useState<GateMismatchState | null>(null);
+  const gateAct = async (expected: number | undefined, fn: () => Promise<unknown>): Promise<boolean> => {
+    let accepted = false;
+    await act(async () => {
+      const requestRunId = id;
+      setGateMismatch(null);
+      try {
+        await fn();
+        accepted = true;
+      } catch (e) {
+        const current = gateRevisionMismatchCurrent(e);
+        if (current === null) throw e;
+        if (currentRunIdRef.current !== requestRunId) return;
+        const refusal: GateMismatchState = { runId: requestRunId, current, expected };
+        setGateMismatch(refusal);
+        await settleWithin(refreshRun(), GATE_REFETCH_WAIT_MS);
+        // The refetch has landed (or the wait ran out): the notice now anchors to the run as
+        // displayed, below. Only this refusal is marked; a newer one is left alone.
+        setGateMismatch((m) => (m === refusal ? { ...m, settled: true } : m));
+      }
+    });
+    return accepted;
+  };
+  const revisionMismatch = gateMismatch?.runId === id ? gateMismatch : null;
+  const runGateRevision = run?.gate_revision ?? 0;
+  const runStatus = run?.status;
+  // A refusal whose gate has been superseded by a later one is stale: drop it so the panel
+  // does not greet revision N+2 with a notice about N+1.
+  useEffect(() => {
+    if (gateMismatch && gateMismatch.current > 0 && runGateRevision > gateMismatch.current) setGateMismatch(null);
+  }, [gateMismatch, runGateRevision]);
+  // Once the refetch settles, the notice describes the run as it was then displayed (its
+  // status and gate revision). Any later change to either retires it: the page-level "no longer
+  // waiting" notice does not follow the run through its later states, and a refusal the rule
+  // above cannot retire (current 0 names no revision to compare) ends at the next change too.
+  useEffect(() => {
+    if (!gateMismatch?.settled || runStatus === undefined) return;
+    const anchor = gateMismatch.anchor;
+    if (!anchor) {
+      setGateMismatch({ ...gateMismatch, anchor: { status: runStatus, revision: runGateRevision } });
+    } else if (anchor.status !== runStatus || anchor.revision !== runGateRevision) {
+      setGateMismatch(null);
+    }
+  }, [gateMismatch, runStatus, runGateRevision]);
 
   // PRD #1391 Run B M3d (D13): the CENTRAL cancel path. ALL cancel entry points on this
   // page route through here so the held-outcome confirmation can never be skipped per-
@@ -2426,6 +2501,11 @@ export function RunView() {
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      {/* PRD #1795 D5: a refused plan verdict whose refetch shows the run has left the gate.
+          The panel that would word it has unmounted, so the page says it instead. */}
+      {revisionMismatch && run.status !== "awaiting_approval" && (
+        <Alert tone="info" message={gateMismatchMessage(revisionMismatch, false)} />
+      )}
 
       {/* PRD #1391 Run B M3d (D13): a finished outcome is held on the run's worker because
           the api could not land it. Surface it near the status so the owner knows why the
@@ -2759,11 +2839,22 @@ export function RunView() {
           workers={workers}
           busy={busy}
           canSteer={canSteer}
-          onApprove={(selection, overrideCapabilities) =>
-            act(() => submit("approve_plan", "", selection, overrideCapabilities))
+          revisionMismatch={revisionMismatch}
+          onApprove={(selection, overrideCapabilities, expectedGateRevision) =>
+            void gateAct(expectedGateRevision, () =>
+              submit("approve_plan", "", selection, overrideCapabilities, undefined, expectedGateRevision),
+            )
           }
-          onReject={(reason) => act(() => submit("reject_plan", reason))}
-          onRequestChanges={(feedback) => act(() => submit("revise_plan", feedback))}
+          onReject={(reason, expectedGateRevision) =>
+            void gateAct(expectedGateRevision, () =>
+              submit("reject_plan", reason, undefined, undefined, undefined, expectedGateRevision),
+            )
+          }
+          onRequestChanges={(feedback, expectedGateRevision) =>
+            gateAct(expectedGateRevision, () =>
+              submit("revise_plan", feedback, undefined, undefined, undefined, expectedGateRevision),
+            )
+          }
           onCancel={() => cancelRun()}
         />
       )}
