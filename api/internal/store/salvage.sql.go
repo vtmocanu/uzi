@@ -37,13 +37,21 @@ func (q *Queries) CountLiveSalvageForConnection(ctx context.Context, arg CountLi
 const countLiveSalvageForRepo = `-- name: CountLiveSalvageForRepo :one
 SELECT count(*) FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
-WHERE r.repo_id = $1::uuid
+JOIN repos p ON p.id = r.repo_id
+JOIN forge_connections c ON c.id = p.connection_id
+WHERE r.repo_id = $1::uuid AND c.user_id = $2::uuid
 `
 
+type CountLiveSalvageForRepoParams struct {
+	RepoID uuid.UUID `json:"repo_id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
 // The repo-removal guard: salvage rows whose live pointer references one of the repo's runs
-// (exactly the rows the runs.repo_id cascade would RESTRICT on).
-func (q *Queries) CountLiveSalvageForRepo(ctx context.Context, repoID uuid.UUID) (int64, error) {
-	row := q.db.QueryRow(ctx, countLiveSalvageForRepo, repoID)
+// (exactly the rows the runs.repo_id cascade would RESTRICT on). Owner-scoped through the
+// repo's connection, so a foreign repo id counts nothing.
+func (q *Queries) CountLiveSalvageForRepo(ctx context.Context, arg CountLiveSalvageForRepoParams) (int64, error) {
+	row := q.db.QueryRow(ctx, countLiveSalvageForRepo, arg.RepoID, arg.UserID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -78,8 +86,9 @@ func (q *Queries) GetRunSalvage(ctx context.Context, runID uuid.UUID) (RunSalvag
 
 const insertRunSalvage = `-- name: InsertRunSalvage :execrows
 INSERT INTO run_salvage (run_id, user_id, repo_id, forge_type, branch, tip, live_run_id, state)
-VALUES ($1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
-        $6::text, $7::uuid, $8::text)
+SELECT $1::uuid, $2::uuid, $3::uuid, $4::text, $5::text,
+       $6::text, $7::uuid, $8::text
+WHERE $8::text IN ('pending', 'skipped_secret')
 ON CONFLICT (run_id) DO NOTHING
 `
 
@@ -96,7 +105,9 @@ type InsertRunSalvageParams struct {
 
 // Record a candidate. 'pending' carries live_run_id = run_id (the RESTRICT pointer, which
 // fails with 23503 if the run was deleted first, leaving no row); 'skipped_secret' carries
-// NULL. Idempotent on run_id: a second insert is a 0-row no-op.
+// NULL. Only those two states can be inserted: any other state inserts nothing (0 rows),
+// so a row can reach a later state only through the transitions below. Idempotent on
+// run_id: a second insert is a 0-row no-op.
 func (q *Queries) InsertRunSalvage(ctx context.Context, arg InsertRunSalvageParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertRunSalvage,
 		arg.RunID,
@@ -117,8 +128,9 @@ func (q *Queries) InsertRunSalvage(ctx context.Context, arg InsertRunSalvagePara
 const listLiveSalvageRefsForConnection = `-- name: ListLiveSalvageRefsForConnection :many
 SELECT s.run_id,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text
-             ELSE 'refs/uzi-checkpoints/' || s.branch END)::text AS ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
+       (CASE WHEN s.state = 'pending'
+             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id
@@ -135,8 +147,9 @@ type ListLiveSalvageRefsForConnectionParams struct {
 }
 
 type ListLiveSalvageRefsForConnectionRow struct {
-	RunID uuid.UUID `json:"run_id"`
-	Ref   string    `json:"ref"`
+	RunID       uuid.UUID `json:"run_id"`
+	SalvageRef  string    `json:"salvage_ref"`
+	RetainedRef string    `json:"retained_ref"`
 }
 
 // The refs the forge-connection-removal 409 names (see ListLiveSalvageRefsForRepo).
@@ -149,7 +162,7 @@ func (q *Queries) ListLiveSalvageRefsForConnection(ctx context.Context, arg List
 	items := []ListLiveSalvageRefsForConnectionRow{}
 	for rows.Next() {
 		var i ListLiveSalvageRefsForConnectionRow
-		if err := rows.Scan(&i.RunID, &i.Ref); err != nil {
+		if err := rows.Scan(&i.RunID, &i.SalvageRef, &i.RetainedRef); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -163,29 +176,36 @@ func (q *Queries) ListLiveSalvageRefsForConnection(ctx context.Context, arg List
 const listLiveSalvageRefsForRepo = `-- name: ListLiveSalvageRefsForRepo :many
 SELECT s.run_id,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text
-             ELSE 'refs/uzi-checkpoints/' || s.branch END)::text AS ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
+       (CASE WHEN s.state = 'pending'
+             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
-WHERE r.repo_id = $1::uuid
+JOIN repos p ON p.id = r.repo_id
+JOIN forge_connections c ON c.id = p.connection_id
+WHERE r.repo_id = $1::uuid AND c.user_id = $2::uuid
 ORDER BY s.created_at ASC, s.run_id ASC
-LIMIT $2::int
+LIMIT $3::int
 `
 
 type ListLiveSalvageRefsForRepoParams struct {
 	RepoID uuid.UUID `json:"repo_id"`
+	UserID uuid.UUID `json:"user_id"`
 	Lim    int32     `json:"lim"`
 }
 
 type ListLiveSalvageRefsForRepoRow struct {
-	RunID uuid.UUID `json:"run_id"`
-	Ref   string    `json:"ref"`
+	RunID       uuid.UUID `json:"run_id"`
+	SalvageRef  string    `json:"salvage_ref"`
+	RetainedRef string    `json:"retained_ref"`
 }
 
-// The refs the repo-removal 409 names: the salvage ref once created, else the branch-scoped
-// checkpoint ref still awaiting promotion. Bounded by lim.
+// The refs the repo-removal 409 names, per live row: salvage_ref is the run-scoped salvage
+// ref once created (” before), retained_ref the branch-scoped checkpoint ref while the row
+// is still pending (” once promoted), since a pending row's branch ref may still exist even
+// after its salvage ref was created. Owner-scoped like the count. Bounded by lim rows.
 func (q *Queries) ListLiveSalvageRefsForRepo(ctx context.Context, arg ListLiveSalvageRefsForRepoParams) ([]ListLiveSalvageRefsForRepoRow, error) {
-	rows, err := q.db.Query(ctx, listLiveSalvageRefsForRepo, arg.RepoID, arg.Lim)
+	rows, err := q.db.Query(ctx, listLiveSalvageRefsForRepo, arg.RepoID, arg.UserID, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
@@ -193,7 +213,7 @@ func (q *Queries) ListLiveSalvageRefsForRepo(ctx context.Context, arg ListLiveSa
 	items := []ListLiveSalvageRefsForRepoRow{}
 	for rows.Next() {
 		var i ListLiveSalvageRefsForRepoRow
-		if err := rows.Scan(&i.RunID, &i.Ref); err != nil {
+		if err := rows.Scan(&i.RunID, &i.SalvageRef, &i.RetainedRef); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -330,14 +350,21 @@ func (q *Queries) ListSalvageDueExpiry(ctx context.Context, arg ListSalvageDueEx
 const listSalvageDuePending = `-- name: ListSalvageDuePending :many
 SELECT run_id, user_id, repo_id, forge_type, branch, tip, live_run_id, state, attempts, last_error, salvage_created_at, promoted_at, expires_at, created_at, updated_at FROM run_salvage
 WHERE state = 'pending'
+  AND (salvage_created_at IS NULL OR expires_at > $1::timestamptz)
 ORDER BY updated_at ASC, run_id ASC
-LIMIT $1::int
+LIMIT $2::int
 `
 
+type ListSalvageDuePendingParams struct {
+	Now pgtype.Timestamptz `json:"now"`
+	Lim int32              `json:"lim"`
+}
+
 // The promotion pass: pending rows, least recently touched first (a failed attempt bumps
-// updated_at, so retries rotate).
-func (q *Queries) ListSalvageDuePending(ctx context.Context, lim int32) ([]RunSalvage, error) {
-	rows, err := q.db.Query(ctx, listSalvageDuePending, lim)
+// updated_at, so retries rotate). A pending row whose created salvage ref is already due
+// for expiry (ListSalvageDueExpiry at the same now) is excluded, so no row is in both lists.
+func (q *Queries) ListSalvageDuePending(ctx context.Context, arg ListSalvageDuePendingParams) ([]RunSalvage, error) {
+	rows, err := q.db.Query(ctx, listSalvageDuePending, arg.Now, arg.Lim)
 	if err != nil {
 		return nil, err
 	}
@@ -490,11 +517,14 @@ type SettleSalvageParams struct {
 	RunID uuid.UUID `json:"run_id"`
 }
 
-// Settle a live row into a terminal state that holds no ref: 'unavailable', 'refused',
-// 'disabled' (no salvage ref was created) or 'expired' (the salvage ref was CAS-deleted or
-// confirmed absent). Clears the live pointer. Any other target state matches no row (0
-// rows). Settling a row with a created salvage ref to anything but 'expired' violates
-// run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
+// Settle a live row into a terminal state and clear the live pointer: 'unavailable' or
+// 'refused' (no salvage ref was created), 'disabled' (the forge left UZI_SALVAGE_FORGES;
+// the caller CAS-deleted any created salvage ref and the branch ref first) or 'expired'
+// (the salvage ref was CAS-deleted or confirmed absent). Any other target state matches no
+// row (0 rows). Settling a row with a created salvage ref to 'unavailable' or 'refused'
+// violates run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
+// So a created row that a later Promote finds unavailable or refused is settled by the
+// caller as 'expired', and only after its salvage ref is confirmed deleted or absent.
 func (q *Queries) SettleSalvage(ctx context.Context, arg SettleSalvageParams) (int64, error) {
 	result, err := q.db.Exec(ctx, settleSalvage, arg.State, arg.RunID)
 	if err != nil {

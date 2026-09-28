@@ -26,10 +26,13 @@ LIMIT @lim::int;
 -- name: InsertRunSalvage :execrows
 -- Record a candidate. 'pending' carries live_run_id = run_id (the RESTRICT pointer, which
 -- fails with 23503 if the run was deleted first, leaving no row); 'skipped_secret' carries
--- NULL. Idempotent on run_id: a second insert is a 0-row no-op.
+-- NULL. Only those two states can be inserted: any other state inserts nothing (0 rows),
+-- so a row can reach a later state only through the transitions below. Idempotent on
+-- run_id: a second insert is a 0-row no-op.
 INSERT INTO run_salvage (run_id, user_id, repo_id, forge_type, branch, tip, live_run_id, state)
-VALUES (@run_id::uuid, @user_id::uuid, @repo_id::uuid, @forge_type::text, @branch::text,
-        @tip::text, sqlc.narg(live_run_id)::uuid, @state::text)
+SELECT @run_id::uuid, @user_id::uuid, @repo_id::uuid, @forge_type::text, @branch::text,
+       @tip::text, sqlc.narg(live_run_id)::uuid, @state::text
+WHERE @state::text IN ('pending', 'skipped_secret')
 ON CONFLICT (run_id) DO NOTHING;
 
 -- name: GetRunSalvage :one
@@ -37,9 +40,11 @@ SELECT * FROM run_salvage WHERE run_id = @run_id::uuid;
 
 -- name: ListSalvageDuePending :many
 -- The promotion pass: pending rows, least recently touched first (a failed attempt bumps
--- updated_at, so retries rotate).
+-- updated_at, so retries rotate). A pending row whose created salvage ref is already due
+-- for expiry (ListSalvageDueExpiry at the same now) is excluded, so no row is in both lists.
 SELECT * FROM run_salvage
 WHERE state = 'pending'
+  AND (salvage_created_at IS NULL OR expires_at > @now::timestamptz)
 ORDER BY updated_at ASC, run_id ASC
 LIMIT @lim::int;
 
@@ -87,11 +92,14 @@ SET state = 'promoted',
 WHERE run_id = @run_id::uuid AND state = 'pending' AND salvage_created_at IS NOT NULL;
 
 -- name: SettleSalvage :execrows
--- Settle a live row into a terminal state that holds no ref: 'unavailable', 'refused',
--- 'disabled' (no salvage ref was created) or 'expired' (the salvage ref was CAS-deleted or
--- confirmed absent). Clears the live pointer. Any other target state matches no row (0
--- rows). Settling a row with a created salvage ref to anything but 'expired' violates
--- run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
+-- Settle a live row into a terminal state and clear the live pointer: 'unavailable' or
+-- 'refused' (no salvage ref was created), 'disabled' (the forge left UZI_SALVAGE_FORGES;
+-- the caller CAS-deleted any created salvage ref and the branch ref first) or 'expired'
+-- (the salvage ref was CAS-deleted or confirmed absent). Any other target state matches no
+-- row (0 rows). Settling a row with a created salvage ref to 'unavailable' or 'refused'
+-- violates run_salvage_created_keeps_live_check (23514): a public ref is never forgotten.
+-- So a created row that a later Promote finds unavailable or refused is settled by the
+-- caller as 'expired', and only after its salvage ref is confirmed deleted or absent.
 UPDATE run_salvage
 SET state = @state::text,
     live_run_id = NULL,
@@ -113,21 +121,29 @@ WHERE run_id = @run_id::uuid
 
 -- name: CountLiveSalvageForRepo :one
 -- The repo-removal guard: salvage rows whose live pointer references one of the repo's runs
--- (exactly the rows the runs.repo_id cascade would RESTRICT on).
+-- (exactly the rows the runs.repo_id cascade would RESTRICT on). Owner-scoped through the
+-- repo's connection, so a foreign repo id counts nothing.
 SELECT count(*) FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
-WHERE r.repo_id = @repo_id::uuid;
+JOIN repos p ON p.id = r.repo_id
+JOIN forge_connections c ON c.id = p.connection_id
+WHERE r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid;
 
 -- name: ListLiveSalvageRefsForRepo :many
--- The refs the repo-removal 409 names: the salvage ref once created, else the branch-scoped
--- checkpoint ref still awaiting promotion. Bounded by lim.
+-- The refs the repo-removal 409 names, per live row: salvage_ref is the run-scoped salvage
+-- ref once created ('' before), retained_ref the branch-scoped checkpoint ref while the row
+-- is still pending ('' once promoted), since a pending row's branch ref may still exist even
+-- after its salvage ref was created. Owner-scoped like the count. Bounded by lim rows.
 SELECT s.run_id,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text
-             ELSE 'refs/uzi-checkpoints/' || s.branch END)::text AS ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
+       (CASE WHEN s.state = 'pending'
+             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
-WHERE r.repo_id = @repo_id::uuid
+JOIN repos p ON p.id = r.repo_id
+JOIN forge_connections c ON c.id = p.connection_id
+WHERE r.repo_id = @repo_id::uuid AND c.user_id = @user_id::uuid
 ORDER BY s.created_at ASC, s.run_id ASC
 LIMIT @lim::int;
 
@@ -144,8 +160,9 @@ WHERE c.id = @connection_id::uuid AND c.user_id = @user_id::uuid;
 -- The refs the forge-connection-removal 409 names (see ListLiveSalvageRefsForRepo).
 SELECT s.run_id,
        (CASE WHEN s.salvage_created_at IS NOT NULL
-             THEN 'refs/uzi-salvage/' || s.run_id::text
-             ELSE 'refs/uzi-checkpoints/' || s.branch END)::text AS ref
+             THEN 'refs/uzi-salvage/' || s.run_id::text ELSE '' END)::text AS salvage_ref,
+       (CASE WHEN s.state = 'pending'
+             THEN 'refs/uzi-checkpoints/' || s.branch ELSE '' END)::text AS retained_ref
 FROM run_salvage s
 JOIN runs r ON r.id = s.live_run_id
 JOIN repos p ON p.id = r.repo_id

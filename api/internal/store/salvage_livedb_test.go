@@ -157,74 +157,161 @@ func salvagePgErr(err error) (code, constraint string) {
 	return "", ""
 }
 
-// The CHECKs: unknown state, malformed tip, a live state without its pointer, a
-// secret-skipped row with one, an over-long error, and the created-salvage invariant.
+// The CHECKs: unknown state, malformed tip and branch, a live state without its pointer, a
+// secret-skipped row with one, a pointer at another run, an over-long error, promoted
+// without a created salvage, the created/expires pair, and the created-salvage invariant.
+// Plus InsertRunSalvage's own restriction to the two recordable states.
 func TestRunSalvageChecksLiveDB(t *testing.T) {
 	f := openSalvageLiveDB(t)
 	repo := f.repo("gitlab")
+	const branch = "agent/issue-7"
 
 	// Positive control: a well-formed pending row inserts.
 	ok := f.failedRun(repo)
 	f.mustInsert(ok, repo, "pending")
 
 	run := f.failedRun(repo)
-	if _, err := f.insert(run, repo, "bogus"); err == nil {
-		t.Fatalf("an unknown state must be rejected by the state CHECK")
-	} else if code, _ := salvagePgErr(err); code != "23514" {
+	// InsertRunSalvage records only pending or skipped_secret: any other state, known or
+	// not, inserts nothing and raises nothing.
+	for _, st := range []string{"promoted", "unavailable", "refused", "failed", "expired", "disabled", "bogus"} {
+		live := pgtype.UUID{}
+		if st == "promoted" {
+			live = pgtype.UUID{Bytes: run, Valid: true}
+		}
+		n, err := f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
+			RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: branch, Tip: salvageTip,
+			LiveRunID: live, State: st,
+		})
+		if err != nil || n != 0 {
+			t.Fatalf("InsertRunSalvage(%s) = (%d, %v), want (0, nil)", st, n, err)
+		}
+	}
+	if _, err := f.q.GetRunSalvage(f.ctx, run); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("a refused state must leave no row, GetRunSalvage err = %v", err)
+	}
+	// The state CHECK itself, bypassing the query.
+	_, err := f.pool.Exec(f.ctx,
+		`INSERT INTO run_salvage (run_id, user_id, repo_id, forge_type, branch, tip, state)
+		 VALUES ($1, $2, $3, 'gitlab', $4, $5, 'bogus')`, run, f.user, repo, branch, salvageTip)
+	if code, _ := salvagePgErr(err); code != "23514" {
 		t.Fatalf("unknown state: %v, want 23514", err)
 	}
 	// 'pending' without its pointer.
-	_, err := f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
-		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: "b", Tip: salvageTip, State: "pending",
+	_, err = f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
+		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: branch, Tip: salvageTip, State: "pending",
 	})
 	if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_live_states_pointer_check" {
 		t.Fatalf("pending without live_run_id: %v, want 23514 on run_salvage_live_states_pointer_check", err)
 	}
 	// 'skipped_secret' with a pointer.
 	_, err = f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
-		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: "b", Tip: salvageTip,
+		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: branch, Tip: salvageTip,
 		LiveRunID: pgtype.UUID{Bytes: run, Valid: true}, State: "skipped_secret",
 	})
 	if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_skipped_secret_no_pointer_check" {
 		t.Fatalf("skipped_secret with live_run_id: %v, want 23514 on run_salvage_skipped_secret_no_pointer_check", err)
 	}
+	// A pointer at another (existing) run.
+	_, err = f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
+		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: branch, Tip: salvageTip,
+		LiveRunID: pgtype.UUID{Bytes: ok, Valid: true}, State: "pending",
+	})
+	if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_live_run_is_own_check" {
+		t.Fatalf("live_run_id at another run: %v, want 23514 on run_salvage_live_run_is_own_check", err)
+	}
 	// A malformed tip.
 	_, err = f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
-		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: "b", Tip: "HEAD",
+		RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: branch, Tip: "HEAD",
 		LiveRunID: pgtype.UUID{Bytes: run, Valid: true}, State: "pending",
 	})
 	if code, _ := salvagePgErr(err); code != "23514" {
 		t.Fatalf("malformed tip: %v, want 23514", err)
+	}
+	// The branch format: exactly what workersvc.checkpointBranch derives (agent/issue-<n>,
+	// uzi/self-improve/<canonical run uuid>), nothing else.
+	for _, good := range []string{"agent/issue-1", "agent/issue-1867", "uzi/self-improve/" + uuid.New().String()} {
+		r := f.failedRun(repo)
+		if n, err := f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
+			RunID: r, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: good, Tip: salvageTip, State: "skipped_secret",
+		}); err != nil || n != 1 {
+			t.Fatalf("branch %q = (%d, %v), want (1, nil)", good, n, err)
+		}
+	}
+	for _, bad := range []string{
+		"", "main", "b", "agent/issue-", "agent/issue-7x", "agent/issue-7/x", "refs/uzi-checkpoints/agent/issue-7",
+		"uzi/self-improve/", "uzi/self-improve/" + strings.ToUpper(uuid.New().String()),
+		"uzi/self-improve/" + uuid.New().String() + "0", "uzi/self-improve/" + uuid.New().String()[1:],
+	} {
+		_, err = f.q.InsertRunSalvage(f.ctx, store.InsertRunSalvageParams{
+			RunID: run, UserID: f.user, RepoID: repo, ForgeType: "gitlab", Branch: bad, Tip: salvageTip, State: "skipped_secret",
+		})
+		if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_branch_format_check" {
+			t.Fatalf("branch %q: %v, want 23514 on run_salvage_branch_format_check", bad, err)
+		}
 	}
 	// An over-long last_error written directly (the queries bound it themselves).
 	_, err = f.pool.Exec(f.ctx, `UPDATE run_salvage SET last_error = $2 WHERE run_id = $1`, ok, strings.Repeat("e", 513))
 	if code, _ := salvagePgErr(err); code != "23514" {
 		t.Fatalf("513-char last_error: %v, want 23514", err)
 	}
+	// 'promoted' needs a created salvage ref.
+	_, err = f.pool.Exec(f.ctx, `UPDATE run_salvage SET state = 'promoted' WHERE run_id = $1`, ok)
+	if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_promoted_created_check" {
+		t.Fatalf("promoted without salvage_created_at: %v, want 23514 on run_salvage_promoted_created_check", err)
+	}
+	// salvage_created_at and expires_at are set together.
+	for _, col := range []string{"salvage_created_at", "expires_at"} {
+		_, err = f.pool.Exec(f.ctx, `UPDATE run_salvage SET `+col+` = now() WHERE run_id = $1`, ok)
+		if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_created_expires_pair_check" {
+			t.Fatalf("%s without its pair: %v, want 23514 on run_salvage_created_expires_pair_check", col, err)
+		}
+	}
 
-	// The invariant: once salvage_created_at is set, only 'expired' may drop the pointer.
+	// The invariant: once salvage_created_at is set, only 'expired' or 'disabled' may drop
+	// the pointer.
 	now := time.Now()
 	if n := f.created(ok, now, now.Add(time.Hour)); n != 1 {
 		t.Fatalf("RecordSalvageCreated = %d rows, want 1", n)
 	}
-	for _, st := range []string{"pending", "promoted"} {
+	for _, st := range []string{"pending", "promoted", "failed", "unavailable", "refused"} {
 		mustExec(f.ctx, t, f.pool, `UPDATE run_salvage SET state = $2 WHERE run_id = $1`, ok, st)
 		_, err = f.pool.Exec(f.ctx, `UPDATE run_salvage SET live_run_id = NULL WHERE run_id = $1`, ok)
-		if code, _ := salvagePgErr(err); code != "23514" {
-			t.Fatalf("clearing live_run_id on a created %s row: %v, want 23514", st, err)
+		if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_created_keeps_live_check" {
+			t.Fatalf("clearing live_run_id on a created %s row: %v, want 23514 on run_salvage_created_keeps_live_check", st, err)
 		}
 	}
 	mustExec(f.ctx, t, f.pool, `UPDATE run_salvage SET state = 'pending' WHERE run_id = $1`, ok)
-	// SettleSalvage to a no-ref state is refused by the invariant; 'expired' is accepted.
-	_, err = f.q.SettleSalvage(f.ctx, store.SettleSalvageParams{RunID: ok, State: "unavailable"})
-	if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_created_keeps_live_check" {
-		t.Fatalf("settling a created row to unavailable: %v, want 23514 on run_salvage_created_keeps_live_check", err)
+	// SettleSalvage to unavailable/refused is refused by the invariant.
+	for _, st := range []string{"unavailable", "refused"} {
+		_, err = f.q.SettleSalvage(f.ctx, store.SettleSalvageParams{RunID: ok, State: st})
+		if code, c := salvagePgErr(err); code != "23514" || c != "run_salvage_created_keeps_live_check" {
+			t.Fatalf("settling a created row to %s: %v, want 23514 on run_salvage_created_keeps_live_check", st, err)
+		}
 	}
+	// 'expired' and 'disabled' are accepted on a created row (pending and promoted alike).
 	if n, err := f.q.SettleSalvage(f.ctx, store.SettleSalvageParams{RunID: ok, State: "expired"}); err != nil || n != 1 {
 		t.Fatalf("SettleSalvage(expired) on a created row = (%d, %v), want (1, nil)", n, err)
 	}
 	if row := f.get(ok); row.State != "expired" || row.LiveRunID.Valid {
 		t.Fatalf("after expiry: state=%s live=%v, want expired + NULL", row.State, row.LiveRunID.Valid)
+	}
+	for _, promoted := range []bool{false, true} {
+		r := f.failedRun(repo)
+		f.mustInsert(r, repo, "pending")
+		if n := f.created(r, now, now.Add(time.Hour)); n != 1 {
+			t.Fatalf("RecordSalvageCreated = %d rows, want 1", n)
+		}
+		if promoted {
+			if n, err := f.q.MarkSalvagePromoted(f.ctx, store.MarkSalvagePromotedParams{RunID: r, PromotedAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil || n != 1 {
+				t.Fatalf("MarkSalvagePromoted = (%d, %v), want (1, nil)", n, err)
+			}
+		}
+		if n, err := f.q.SettleSalvage(f.ctx, store.SettleSalvageParams{RunID: r, State: "disabled"}); err != nil || n != 1 {
+			t.Fatalf("SettleSalvage(disabled) on a created row (promoted=%v) = (%d, %v), want (1, nil)", promoted, n, err)
+		}
+		if row := f.get(r); row.State != "disabled" || row.LiveRunID.Valid || !row.SalvageCreatedAt.Valid {
+			t.Fatalf("after disable: %+v, want disabled + NULL pointer + created kept", row)
+		}
 	}
 }
 
@@ -381,22 +468,32 @@ func TestRunSalvageTransitionsLiveDB(t *testing.T) {
 	e := f.failedRun(repo) // created, expiry in the future
 	f.mustInsert(e, repo, "pending")
 	f.created(e, now, now.Add(24*time.Hour))
+	g := f.failedRun(repo) // pending, not created
+	f.mustInsert(g, repo, "pending")
 	mine := map[uuid.UUID]bool{}
 	for _, id := range f.runs {
 		mine[id] = true
 	}
-	pending, err := f.q.ListSalvageDuePending(f.ctx, 10000)
-	if err != nil {
-		t.Fatalf("ListSalvageDuePending: %v", err)
-	}
-	gotPending := map[uuid.UUID]bool{}
-	for _, row := range pending {
-		if mine[row.RunID] {
-			gotPending[row.RunID] = true
+	duePending := func(at time.Time) map[uuid.UUID]bool {
+		t.Helper()
+		pending, err := f.q.ListSalvageDuePending(f.ctx, store.ListSalvageDuePendingParams{Now: pgtype.Timestamptz{Time: at, Valid: true}, Lim: 10000})
+		if err != nil {
+			t.Fatalf("ListSalvageDuePending: %v", err)
 		}
+		got := map[uuid.UUID]bool{}
+		for _, row := range pending {
+			if mine[row.RunID] {
+				got[row.RunID] = true
+			}
+		}
+		return got
 	}
-	if len(gotPending) != 2 || !gotPending[d] || !gotPending[e] {
-		t.Fatalf("ListSalvageDuePending (this test's rows) = %v, want exactly {d, e}", gotPending)
+	// d is due for expiry, so it is NOT in the promotion list: no row is in both.
+	if got := duePending(now); len(got) != 2 || !got[e] || !got[g] {
+		t.Fatalf("ListSalvageDuePending(now) (this test's rows) = %v, want exactly {e, g}", got)
+	}
+	if got := duePending(now.Add(25 * time.Hour)); len(got) != 1 || !got[g] {
+		t.Fatalf("ListSalvageDuePending(now+25h) (this test's rows) = %v, want exactly {g}", got)
 	}
 	due, err := f.q.ListSalvageDueExpiry(f.ctx, store.ListSalvageDueExpiryParams{Now: pgtype.Timestamptz{Time: now, Valid: true}, Lim: 10000})
 	if err != nil {
@@ -518,7 +615,9 @@ func TestListSalvageCandidatesLiveDB(t *testing.T) {
 	}
 }
 
-// The delete-guard reads: count and ref names per repo and per (owner-scoped) connection.
+// The delete-guard reads: count and ref names per (owner-scoped) repo and connection. A
+// pending row names its branch ref, a created-but-pending row both refs, a promoted row
+// only its salvage ref.
 func TestLiveSalvageRefsLiveDB(t *testing.T) {
 	f := openSalvageLiveDB(t)
 	repo := f.repo("gitlab")
@@ -526,36 +625,64 @@ func TestLiveSalvageRefsLiveDB(t *testing.T) {
 	if err := f.pool.QueryRow(f.ctx, `SELECT connection_id FROM repos WHERE id = $1`, repo).Scan(&conn); err != nil {
 		t.Fatalf("connection: %v", err)
 	}
+	now := time.Now()
 	pending := f.failedRun(repo)
 	f.mustInsert(pending, repo, "pending")
 	created := f.failedRun(repo)
 	f.mustInsert(created, repo, "pending")
-	now := time.Now()
 	f.created(created, now, now.Add(time.Hour))
+	promoted := f.failedRun(repo)
+	f.mustInsert(promoted, repo, "pending")
+	f.created(promoted, now, now.Add(time.Hour))
+	if n, err := f.q.MarkSalvagePromoted(f.ctx, store.MarkSalvagePromotedParams{RunID: promoted, PromotedAt: pgtype.Timestamptz{Time: now, Valid: true}}); err != nil || n != 1 {
+		t.Fatalf("MarkSalvagePromoted = (%d, %v), want (1, nil)", n, err)
+	}
 	settled := f.failedRun(repo)
 	f.mustInsert(settled, repo, "skipped_secret")
+	foreign := uuid.New()
 
-	if n, err := f.q.CountLiveSalvageForRepo(f.ctx, repo); err != nil || n != 2 {
-		t.Fatalf("CountLiveSalvageForRepo = (%d, %v), want (2, nil)", n, err)
-	}
-	if n, err := f.q.CountLiveSalvageForConnection(f.ctx, store.CountLiveSalvageForConnectionParams{ConnectionID: conn, UserID: f.user}); err != nil || n != 2 {
-		t.Fatalf("CountLiveSalvageForConnection = (%d, %v), want (2, nil)", n, err)
-	}
-	if n, err := f.q.CountLiveSalvageForConnection(f.ctx, store.CountLiveSalvageForConnectionParams{ConnectionID: conn, UserID: uuid.New()}); err != nil || n != 0 {
-		t.Fatalf("CountLiveSalvageForConnection(foreign owner) = (%d, %v), want (0, nil)", n, err)
-	}
-	want := map[string]bool{"refs/uzi-checkpoints/agent/issue-7": true, "refs/uzi-salvage/" + created.String(): true}
-	byRepo, err := f.q.ListLiveSalvageRefsForRepo(f.ctx, store.ListLiveSalvageRefsForRepoParams{RepoID: repo, Lim: 5})
-	if err != nil || len(byRepo) != 2 {
-		t.Fatalf("ListLiveSalvageRefsForRepo = (%v, %v), want 2 rows", byRepo, err)
-	}
-	for _, r := range byRepo {
-		if !want[r.Ref] {
-			t.Fatalf("unexpected repo ref %q (want %v)", r.Ref, want)
+	for _, tc := range []struct {
+		user uuid.UUID
+		want int64
+	}{{f.user, 3}, {foreign, 0}} {
+		if n, err := f.q.CountLiveSalvageForRepo(f.ctx, store.CountLiveSalvageForRepoParams{RepoID: repo, UserID: tc.user}); err != nil || n != tc.want {
+			t.Fatalf("CountLiveSalvageForRepo(owner=%v) = (%d, %v), want (%d, nil)", tc.user == f.user, n, err, tc.want)
+		}
+		if n, err := f.q.CountLiveSalvageForConnection(f.ctx, store.CountLiveSalvageForConnectionParams{ConnectionID: conn, UserID: tc.user}); err != nil || n != tc.want {
+			t.Fatalf("CountLiveSalvageForConnection(owner=%v) = (%d, %v), want (%d, nil)", tc.user == f.user, n, err, tc.want)
 		}
 	}
-	byConn, err := f.q.ListLiveSalvageRefsForConnection(f.ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: conn, UserID: f.user, Lim: 1})
-	if err != nil || len(byConn) != 1 || !want[byConn[0].Ref] {
-		t.Fatalf("ListLiveSalvageRefsForConnection(lim 1) = (%v, %v), want 1 known ref", byConn, err)
+	type refs struct{ salvage, retained string }
+	want := map[uuid.UUID]refs{
+		pending:  {"", "refs/uzi-checkpoints/agent/issue-7"},
+		created:  {"refs/uzi-salvage/" + created.String(), "refs/uzi-checkpoints/agent/issue-7"},
+		promoted: {"refs/uzi-salvage/" + promoted.String(), ""},
+	}
+	byRepo, err := f.q.ListLiveSalvageRefsForRepo(f.ctx, store.ListLiveSalvageRefsForRepoParams{RepoID: repo, UserID: f.user, Lim: 5})
+	if err != nil || len(byRepo) != 3 {
+		t.Fatalf("ListLiveSalvageRefsForRepo = (%v, %v), want 3 rows", byRepo, err)
+	}
+	for _, r := range byRepo {
+		if got := (refs{r.SalvageRef, r.RetainedRef}); got != want[r.RunID] {
+			t.Fatalf("repo refs for %s = %+v, want %+v", r.RunID, got, want[r.RunID])
+		}
+	}
+	byConn, err := f.q.ListLiveSalvageRefsForConnection(f.ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: conn, UserID: f.user, Lim: 5})
+	if err != nil || len(byConn) != 3 {
+		t.Fatalf("ListLiveSalvageRefsForConnection = (%v, %v), want 3 rows", byConn, err)
+	}
+	for _, r := range byConn {
+		if got := (refs{r.SalvageRef, r.RetainedRef}); got != want[r.RunID] {
+			t.Fatalf("connection refs for %s = %+v, want %+v", r.RunID, got, want[r.RunID])
+		}
+	}
+	if rows, err := f.q.ListLiveSalvageRefsForConnection(f.ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: conn, UserID: f.user, Lim: 1}); err != nil || len(rows) != 1 {
+		t.Fatalf("ListLiveSalvageRefsForConnection(lim 1) = (%v, %v), want 1 row", rows, err)
+	}
+	if rows, err := f.q.ListLiveSalvageRefsForRepo(f.ctx, store.ListLiveSalvageRefsForRepoParams{RepoID: repo, UserID: foreign, Lim: 5}); err != nil || len(rows) != 0 {
+		t.Fatalf("ListLiveSalvageRefsForRepo(foreign owner) = (%v, %v), want none", rows, err)
+	}
+	if rows, err := f.q.ListLiveSalvageRefsForConnection(f.ctx, store.ListLiveSalvageRefsForConnectionParams{ConnectionID: conn, UserID: foreign, Lim: 5}); err != nil || len(rows) != 0 {
+		t.Fatalf("ListLiveSalvageRefsForConnection(foreign owner) = (%v, %v), want none", rows, err)
 	}
 }

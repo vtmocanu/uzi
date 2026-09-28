@@ -75,21 +75,22 @@ func (f *salvageRemoveFixture) connRepoRun(projectID int64) (conn, repo, run uui
 }
 
 // salvage inserts a run_salvage row directly in state, with the live pointer set for the
-// live states and salvage_created_at set when created.
+// live states and salvage_created_at (with its expires_at) set when created.
 func (f *salvageRemoveFixture) salvage(run, repo uuid.UUID, state string, created bool) {
 	f.t.Helper()
 	var live any
 	if state == "pending" || state == "promoted" {
 		live = run
 	}
-	var createdAt any
+	var createdAt, expiresAt any
 	if created {
-		createdAt = time.Now()
+		now := time.Now()
+		createdAt, expiresAt = now, now.Add(time.Hour)
 	}
 	cliMustExec(f.t, f.pool,
-		`INSERT INTO run_salvage (run_id, user_id, repo_id, forge_type, branch, tip, live_run_id, state, salvage_created_at)
-		 VALUES ($1, $2, $3, 'gitlab', 'agent/issue-7', $4, $5, $6, $7)`,
-		run, f.owner, repo, salvageTestTip, live, state, createdAt)
+		`INSERT INTO run_salvage (run_id, user_id, repo_id, forge_type, branch, tip, live_run_id, state, salvage_created_at, expires_at)
+		 VALUES ($1, $2, $3, 'gitlab', 'agent/issue-7', $4, $5, $6, $7, $8)`,
+		run, f.owner, repo, salvageTestTip, live, state, createdAt, expiresAt)
 }
 
 func (f *salvageRemoveFixture) exists(table string, id uuid.UUID) bool {
@@ -116,8 +117,9 @@ type salvageConflictBody struct {
 	SalvageCount int64    `json:"salvage_count"`
 }
 
-// assertSalvage409 checks a 409 carrying the salvage body naming wantRef.
-func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what, wantRef string) {
+// assertSalvage409 checks a 409 carrying the salvage body for one run naming exactly
+// wantRefs, in order.
+func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what string, wantRefs ...string) {
 	t.Helper()
 	if rec.Code != http.StatusConflict {
 		t.Fatalf("%s = %d, want 409\nbody: %s", what, rec.Code, rec.Body.String())
@@ -126,11 +128,16 @@ func assertSalvage409(t *testing.T, rec *httptest.ResponseRecorder, what, wantRe
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("%s: decode 409 body: %v\n%s", what, err, rec.Body.String())
 	}
-	if body.SalvageCount != 1 || len(body.SalvageRefs) != 1 || body.SalvageRefs[0] != wantRef {
-		t.Fatalf("%s: salvage body = %+v, want count 1 naming %q", what, body, wantRef)
+	if body.SalvageCount != 1 || strings.Join(body.SalvageRefs, "\n") != strings.Join(wantRefs, "\n") {
+		t.Fatalf("%s: salvage body = %+v, want count 1 naming %q", what, body, wantRefs)
 	}
-	if !strings.Contains(body.Error, wantRef) || !strings.Contains(body.Error, "checkpointed commits") {
-		t.Fatalf("%s: error text %q must name %q and the checkpointed commits", what, body.Error, wantRef)
+	for _, ref := range wantRefs {
+		if !strings.Contains(body.Error, ref) {
+			t.Fatalf("%s: error text %q must name %q", what, body.Error, ref)
+		}
+	}
+	if !strings.Contains(body.Error, "checkpointed commits") || strings.Contains(body.Error, "more run") {
+		t.Fatalf("%s: error text %q must name the checkpointed commits and no further runs", what, body.Error)
 	}
 }
 
@@ -142,11 +149,14 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 		name    string
 		state   string
 		created bool
-		ref     func(run uuid.UUID) string
+		refs    func(run uuid.UUID) []string
 	}{
-		{"pending", "pending", false, func(uuid.UUID) string { return "refs/uzi-checkpoints/agent/issue-7" }},
-		{"created-pending", "pending", true, func(run uuid.UUID) string { return "refs/uzi-salvage/" + run.String() }},
-		{"promoted", "promoted", true, func(run uuid.UUID) string { return "refs/uzi-salvage/" + run.String() }},
+		{"pending", "pending", false, func(uuid.UUID) []string { return []string{"refs/uzi-checkpoints/agent/issue-7"} }},
+		// Created but not yet promoted: the branch ref may still exist beside the salvage ref.
+		{"created-pending", "pending", true, func(run uuid.UUID) []string {
+			return []string{"refs/uzi-salvage/" + run.String(), "refs/uzi-checkpoints/agent/issue-7"}
+		}},
+		{"promoted", "promoted", true, func(run uuid.UUID) []string { return []string{"refs/uzi-salvage/" + run.String()} }},
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -154,9 +164,9 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 			f.salvage(run, repo, tc.state, tc.created)
 
 			rec := cookieReq(t, f.router, http.MethodDelete, "/api/repos/"+repo.String(), f.jwt, "")
-			assertSalvage409(t, rec, "DELETE repo", tc.ref(run))
+			assertSalvage409(t, rec, "DELETE repo", tc.refs(run)...)
 			rec = cookieReq(t, f.router, http.MethodDelete, "/api/forge/connections/"+conn.String(), f.jwt, "")
-			assertSalvage409(t, rec, "DELETE connection", tc.ref(run))
+			assertSalvage409(t, rec, "DELETE connection", tc.refs(run)...)
 
 			for _, c := range []struct {
 				table string
@@ -182,14 +192,16 @@ func TestDeleteWithLiveSalvageIs409LiveDB(t *testing.T) {
 	}
 }
 
-// Settled rows (expired, unavailable, failed, skipped_secret) hold no live pointer and
+// Settled rows (expired, disabled, unavailable, failed, skipped_secret) hold no live pointer and
 // block neither route; the rows survive the cascade as provenance.
 func TestDeleteWithSettledSalvageSucceedsLiveDB(t *testing.T) {
 	f := newSalvageRemoveFixture(t)
-	for i, state := range []string{"expired", "unavailable", "failed", "skipped_secret"} {
+	// expired and disabled are seeded with a created (since removed) salvage ref.
+	for i, state := range []string{"expired", "disabled", "unavailable", "failed", "skipped_secret"} {
+		created := state == "expired" || state == "disabled"
 		t.Run(state+"/repo", func(t *testing.T) {
 			_, repo, run := f.connRepoRun(int64(1867_10 + i))
-			f.salvage(run, repo, state, state == "expired")
+			f.salvage(run, repo, state, created)
 			if rec := cookieReq(t, f.router, http.MethodDelete, "/api/repos/"+repo.String(), f.jwt, ""); rec.Code != http.StatusNoContent {
 				t.Fatalf("DELETE repo with a %s salvage row = %d, want 204\nbody: %s", state, rec.Code, rec.Body.String())
 			}
@@ -199,7 +211,7 @@ func TestDeleteWithSettledSalvageSucceedsLiveDB(t *testing.T) {
 		})
 		t.Run(state+"/connection", func(t *testing.T) {
 			conn, repo, run := f.connRepoRun(int64(1867_20 + i))
-			f.salvage(run, repo, state, state == "expired")
+			f.salvage(run, repo, state, created)
 			if rec := cookieReq(t, f.router, http.MethodDelete, "/api/forge/connections/"+conn.String(), f.jwt, ""); rec.Code != http.StatusNoContent {
 				t.Fatalf("DELETE connection with a %s salvage row = %d, want 204\nbody: %s", state, rec.Code, rec.Body.String())
 			}

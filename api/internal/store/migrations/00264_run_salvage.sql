@@ -16,8 +16,14 @@
 -- 00223). While a remote ref may still exist for the row (pending, promoted), the pointer is
 -- set, so deleting the run (directly, or via the repo / forge-connection / owner cascade)
 -- fails with 23503 on run_salvage_live_run_id_fkey instead of silently dropping the only
--- record of a public ref. Settling the row (the ref was CAS-deleted, confirmed absent, or
--- never created) clears the pointer, which lifts the restriction.
+-- record of a public ref. Settling the row clears the pointer, which lifts the restriction.
+-- Settling does NOT always mean no ref is left on the forge. A created salvage ref settles
+-- only as 'expired' (CAS-deleted or confirmed absent) or 'disabled' (the forge left
+-- UZI_SALVAGE_FORGES and the salvage and branch refs were CAS-deleted). But a 'failed' row
+-- (the attempt cap was reached before any salvage ref was created) clears the pointer while
+-- its branch-scoped refs/uzi-checkpoints/<branch> may REMAIN on the forge: a known leftover,
+-- the same status quo as a failed checkpoint cleanup today. 'unavailable' and 'refused'
+-- created no salvage ref.
 --
 -- The repo-removal and forge-connection-removal handlers turn that restriction into an
 -- owner-facing 409 naming the refs, and map a 23503 on this constraint (a sweep inserting a
@@ -34,15 +40,19 @@ CREATE TABLE run_salvage (
     -- The forge kind of the repo's connection when the row was recorded (the per-forge
     -- UZI_SALVAGE_FORGES switch is keyed on it).
     forge_type text NOT NULL,
-    -- The run's checkpoint branch (agent/issue-<n> or uzi/self-improve/<run-id>): the
-    -- branch-scoped ref is refs/uzi-checkpoints/<branch>.
-    branch text NOT NULL,
+    -- The run's checkpoint branch (agent/issue-<n> or uzi/self-improve/<run-id>, exactly
+    -- what workersvc.checkpointBranch derives): the branch-scoped ref is
+    -- refs/uzi-checkpoints/<branch>.
+    branch text NOT NULL CONSTRAINT run_salvage_branch_format_check
+        CHECK (branch ~ '^(agent/issue-[0-9]+|uzi/self-improve/[0-9a-f-]{36})$'),
     -- The recorded checkpoint tip (runs.checkpoint_tip at enqueue). Promotion is bound to
     -- it: a branch ref at any other tip is never promoted, a salvage ref at any other tip is
     -- never overwritten. Full lowercase hex object id (SHA-1, or SHA-256 for a sha256 repo).
     tip text NOT NULL CHECK (tip ~ '^[0-9a-f]{40}([0-9a-f]{24})?$'),
-    -- The LIVE pointer: ON DELETE RESTRICT while a remote ref may exist for this row.
-    live_run_id uuid CONSTRAINT run_salvage_live_run_id_fkey REFERENCES runs(id) ON DELETE RESTRICT,
+    -- The LIVE pointer: ON DELETE RESTRICT while a remote ref may exist for this row. It
+    -- only ever points at the row's own run.
+    live_run_id uuid CONSTRAINT run_salvage_live_run_id_fkey REFERENCES runs(id) ON DELETE RESTRICT
+        CONSTRAINT run_salvage_live_run_is_own_check CHECK (live_run_id IS NULL OR live_run_id = run_id),
     state text NOT NULL CHECK (state IN (
         'pending',        -- recorded; promotion not yet confirmed (retried by the sweep)
         'promoted',       -- salvage ref created and the branch ref removed
@@ -57,16 +67,24 @@ CREATE TABLE run_salvage (
     -- Bounded (and scrubbed by the caller) last broker error, shown on the run.
     last_error text CHECK (last_error IS NULL OR char_length(last_error) <= 512),
     -- Set once, when the salvage ref is confirmed to exist at the tip. From then on the row
-    -- keeps its live pointer until the salvage ref is removed ('expired').
+    -- keeps its live pointer until the salvage ref is removed ('expired' or 'disabled').
     salvage_created_at timestamptz,
     promoted_at timestamptz,
     expires_at timestamptz,
     created_at timestamptz NOT NULL DEFAULT now(),
     updated_at timestamptz NOT NULL DEFAULT now(),
-    -- A created salvage ref is public until it is removed: only 'expired' may drop the live
-    -- pointer once salvage_created_at is set.
+    -- A created salvage ref is public until it is removed: once salvage_created_at is set,
+    -- only 'expired' or 'disabled' (both settle only after the salvage ref is CAS-deleted or
+    -- confirmed absent) may drop the live pointer.
     CONSTRAINT run_salvage_created_keeps_live_check
-        CHECK (NOT (salvage_created_at IS NOT NULL AND state <> 'expired' AND live_run_id IS NULL)),
+        CHECK (NOT (salvage_created_at IS NOT NULL AND state NOT IN ('expired', 'disabled')
+                    AND live_run_id IS NULL)),
+    -- 'promoted' means the salvage ref was created first.
+    CONSTRAINT run_salvage_promoted_created_check
+        CHECK (state <> 'promoted' OR salvage_created_at IS NOT NULL),
+    -- The creation time and the expiry are recorded together, never one without the other.
+    CONSTRAINT run_salvage_created_expires_pair_check
+        CHECK ((salvage_created_at IS NULL) = (expires_at IS NULL)),
     -- A live row (a remote ref may exist) always holds the pointer.
     CONSTRAINT run_salvage_live_states_pointer_check
         CHECK (state NOT IN ('pending', 'promoted') OR live_run_id IS NOT NULL),
