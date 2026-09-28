@@ -2771,10 +2771,20 @@ export class RunRunner {
       // `executor.safety`, so a Claude/stub run (no safety) is untouched. Best-effort +
       // idempotent (disposeTools is), so a standalone-backstop dispose never double-disposes,
       // and a dispose failure can never convert a completed run into a failed one.
+      let terminalDisposeUnproven = false;
       if (executor.safety) {
-        await executor.safety
-          .dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs })
-          .catch((e) => runLog.warn("codex terminal dispose failed", { error: errMessage(e) }));
+        try {
+          const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
+          if (disposal.kind === "incomplete") {
+            terminalDisposeUnproven = true;
+            flight.preserveRecoveryClone = true;
+            runLog.warn("codex terminal dispose incomplete; retaining runner clone", { errors: disposal.errors });
+          }
+        } catch (e) {
+          terminalDisposeUnproven = true;
+          flight.preserveRecoveryClone = true;
+          runLog.warn("codex terminal dispose failed; retaining runner clone", { error: errMessage(e) });
+        }
       }
       // PRD #218 M1: drop the shutdown-registry entry. A terminal run (or a parked one)
       // must not stay abortable — shutdown() iterating a stale entry would abort a
@@ -2945,7 +2955,7 @@ export class RunRunner {
       // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
       // removed with it even on a park; a retained predecessor keeps its pair until the retention
       // sweep deletes both.
-      const removeSkills = flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts;
+      const removeSkills = !terminalDisposeUnproven && (flight.predecessorCapture ? false : ownAttemptRetired || !preserveResumeArtifacts);
       if (flight.worktreePath && removeSkills) {
         await fs
           .rm(skillsPluginDir(flight.worktreePath), { recursive: true, force: true })
