@@ -503,14 +503,15 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 // boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
 // D4): a non-terminal run with a server-derived current_activity, a run held on its Codex
 // account (PRD #1590), whose second line is the account action, a vault_locked park (issue
-// #1766), whose second line is the vault park sentence, or a run held on credential_disabled
+// #1766), whose second line is the vault park sentence, a data_volume_full park (PRD #1809),
+// whose second line is the disk park sentence, or a run held on credential_disabled
 // (PRD #1732), whose second line is its next step. It has no milestone
 // precondition (D5) — the board reads current_activity directly. Used both by the row window
 // math (which must reserve a physical line for it) and by renderBoard.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		credentialDisabledLine(r.RunDTO) != ""
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != ""
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -544,6 +545,12 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// narrow terminal. The 240-rune Plain cap (D7 sanitize backstop) sits above the full
 	// sentence's length so the wide form is never cut.
 	if line := fitVaultParkLine(r.RunDTO, m.width-4); line != "" {
+		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
+	// PRD #1809 M5: a data_volume_full park, in the same slot, ink and shedding as the vault
+	// park above (the two are distinct recovery_wait causes, so at most one draws).
+	if line := fitDiskParkLine(r.RunDTO, m.width-4); line != "" {
 		out := paintSeg(m.pal.tungsten, bg, false, "  ▸ ") + paintSeg(m.pal.wait, bg, false, m.renderer.Plain(line, 240))
 		return padSeg(clampVisual(out, m.width), m.width, bg)
 	}

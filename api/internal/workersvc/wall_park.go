@@ -51,7 +51,10 @@ func (s *Service) WorkerNameForRun(ctx context.Context, run store.Run) (*string,
 // a captured head the server park recorded none, RecordWallParkCapturedHead keeps it (fenced on the
 // generation, deliberately NOT on claim_released_at, so it admits exactly the flight the server
 // parked). A genuinely reclaimed run surfaces as ErrRunNotOwned -> the handler's 404.
-func (s *Service) ReportWallPark(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string, published bool, claimGen *int64) (store.Run, bool, error) {
+//
+// checkpointContainsLatest is the park's durability report (PRD #1809 M6, D8), stored on a parked
+// answer exactly as SetState stores it for the other parks (setCheckpointDurability). Display-only.
+func (s *Service) ReportWallPark(ctx context.Context, wkr store.Worker, runID uuid.UUID, capturedHead string, published bool, claimGen *int64, checkpointContainsLatest *bool) (store.Run, bool, error) {
 	_ = published // informational (the degraded-park feed message, M2); the store transition ignores it.
 	// NUL-strip BEFORE the trim (a NUL is not whitespace), the same order every worker-authored text
 	// field uses; hold_captured_head accepts arbitrary worker input and a NUL would raise 22021.
@@ -91,12 +94,18 @@ func (s *Service) ReportWallPark(ctx context.Context, wkr store.Worker, runID uu
 						current = refreshed
 					}
 				}
+				if v, ok := s.setCheckpointDurability(ctx, wkr, current, "paused", checkpointContainsLatest); ok {
+					current.CheckpointContainsLatest = v
+				}
 				return current, true, nil
 			}
 			// Not parked (the owner extended in the window, or the run moved on): retain live, restart.
 			return current, false, nil
 		}
 		return store.Run{}, false, err
+	}
+	if v, ok := s.setCheckpointDurability(ctx, wkr, run, "paused", checkpointContainsLatest); ok {
+		run.CheckpointContainsLatest = v
 	}
 	return run, true, nil
 }

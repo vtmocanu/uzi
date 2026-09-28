@@ -67,7 +67,7 @@ import {
 import { makeMemoryToolHandlers, memoryToolNames, type MemoryToolHandlers } from "../memory-tools.js";
 import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsToolHandlers } from "../findings-tools.js";
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
-import { provisionRunTools } from "../provision-run.js";
+import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
 import { asText } from "../tool-evidence.js";
 import type {
   BoundaryRequest,
@@ -2464,7 +2464,7 @@ export class CodexExecutor implements Executor {
       // Remove the per-run provisioning dir (the synthesized devbox.json + profile symlinks).
       // The nix STORE is global (on the data volume), NOT here, so this never evicts the
       // warm-start cache. Best-effort, mirroring sdk-executor. Absent ⇒ nothing was provisioned.
-      if (provisionDir) await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+      if (provisionDir) await removeProvisionDir(provisionDir, this.log);
     }
   }
 

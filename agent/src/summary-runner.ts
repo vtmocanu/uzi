@@ -28,26 +28,16 @@ import { CODEX_PR_DESCRIPTION_MODEL } from "./codex/pr-description-model.js"; //
 import type { DeliveryContext } from "./pr-description-context.js";
 import { isValidModel } from "./models.js";
 import { errMessage } from "./util.js";
+import { summaryModelTimeoutMs } from "./config.js";
 import type { Logger } from "./log.js";
 
 // Wall-clock cap on a single summary model turn. DEFAULT 60s (not the judge's 5 min):
 // the plan summary blocks entry into `awaiting_approval` up to this cap (Decision 2),
 // so a decision-support gate cannot afford a 5-minute stall — and Haiku, the default
-// model, is fast. Overridable via SUMMARY_MODEL_TIMEOUT_MS (env), or per-instance via
-// the constructor for deterministic tests.
-const DEFAULT_SUMMARY_MODEL_TIMEOUT_MS = 60_000;
-
-/** Parse a positive-integer millisecond value from the environment, ignoring anything
- *  non-numeric or non-positive (so a typo falls back to the default rather than a 0/NaN
- *  timeout that would fire instantly). */
-function envTimeoutMs(): number {
-  const raw = process.env.SUMMARY_MODEL_TIMEOUT_MS;
-  if (!raw) return DEFAULT_SUMMARY_MODEL_TIMEOUT_MS;
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_SUMMARY_MODEL_TIMEOUT_MS;
-}
-
-const SUMMARY_MODEL_TIMEOUT_MS = envTimeoutMs();
+// model, is fast. Overridable via SUMMARY_MODEL_TIMEOUT_MS (env, parsed by config.ts's
+// summaryModelTimeoutMs, the one parser), or per-instance via the constructor for
+// deterministic tests.
+const SUMMARY_MODEL_TIMEOUT_MS = summaryModelTimeoutMs(process.env);
 
 /** PRD #1798 M5: the Claude model the editor pass runs on when the claim carries no usable
  *  `summary_model`. The api resolves `summary_model` (user value, else the instance setting,

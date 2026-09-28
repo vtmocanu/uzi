@@ -1,5 +1,6 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { rmSync } from "node:fs";
 
 import { Worker } from "../src/worker.js";
 import type { Config } from "../src/config.js";
@@ -52,6 +53,13 @@ interface Harness {
   execs: Array<{ argv: string[]; idle: boolean }>;
 }
 
+/** The controller's lazily created DOCKER_CONFIG dir (the real one, under TMPDIR), seen
+ *  through the exec spy and removed after the file, as dind-prune.test.ts does (PRD #1809 M2). */
+const configDirs = new Set<string>();
+after(() => {
+  for (const d of configDirs) rmSync(d, { recursive: true, force: true });
+});
+
 function build(client: Partial<WorkerClient>, runner: RunRunner, chatRunner: ChatRunner): Harness {
   const gate = new DindPruneGate();
   const pressure = { on: false };
@@ -70,7 +78,8 @@ function build(client: Partial<WorkerClient>, runner: RunRunner, chatRunner: Cha
       pressure.on
         ? { epochS: Math.floor(Date.now() / 1000) + 1 + n++, bytesUsed: 95, bytesTotal: 100, inodesUsed: 1, inodesTotal: 100 }
         : null,
-    exec: async (argv) => {
+    exec: async (argv, opts) => {
+      if (opts.env.DOCKER_CONFIG) configDirs.add(opts.env.DOCKER_CONFIG);
       execs.push({ argv: [...argv], idle: worker.isIdle() });
       return "";
     },

@@ -29,6 +29,13 @@ const (
 	// at least this many consecutive polls warns.
 	diskPressureStreakWarn = 2
 
+	// fleet.rundisk (PRD #1809 M6, D8): a fresh worker warns when its largest reported run HOME
+	// reaches this fraction of its data volume's total bytes (one run is then close to filling
+	// the volume on its own), or when less than runDiskInodeFreeWarn of its data-volume inodes
+	// are free.
+	runDiskWarnFraction  = 0.40
+	runDiskInodeFreeWarn = 0.05
+
 	// db check: a ping slower than this warns; the pool warns when acquired connections
 	// reach this fraction of the max.
 	dbPingWarn      = 250 * time.Millisecond

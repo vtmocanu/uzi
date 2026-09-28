@@ -8,7 +8,7 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { IterationBudget, Milestone, MilestoneProgress } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // PRD #634 M6 — the WORKER half of run-scope steering: the scope-ceiling HONOR GATE at
 // the implement-loop top (sdk-executor.ts, PRD #634 M3/M4). The gate reads the server's
@@ -34,10 +34,7 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 // `.uzi-skills-<basename>` the executor materializes, and `node --test` runs files
 // concurrently, so a literal shared across files races on that dir. This file's basename
 // prefix is distinct from the two siblings' on purpose.
-let nonexistentWorktreeSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-scope-honor-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-scope-honor");
 
 // --- scripted SDK messages ---------------------------------------------------
 

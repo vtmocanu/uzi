@@ -20,6 +20,7 @@
     }
   ],
   "retaining_unpublished_work": true,
+  "disk_pressure_threshold": 1.5,
   "template_declared": "x",
   "template_reported": "x",
   "version": "x",
@@ -45,6 +46,17 @@
   "stats_disk_dind_total_bytes": 1,
   "stats_disk_dind_inodes": 1,
   "stats_disk_dind_total_inodes": 1,
+  "stats_disk_data_inodes": 1,
+  "stats_disk_data_total_inodes": 1,
+  "run_disk": [
+    {
+      "run_id": "x",
+      "home_bytes": 1,
+      "cache_bytes": 1,
+      "truncated": true,
+      "sampled_at": "2020-01-02T03:04:05Z"
+    }
+  ],
   "anthropic_secret_id": "x",
   "anthropic_secret_label": "x",
   "anthropic_bind_mode": "x",

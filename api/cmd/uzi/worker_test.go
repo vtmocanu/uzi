@@ -757,3 +757,44 @@ func TestWorkerNamesAreSanitizedForTheTerminal(t *testing.T) {
 		})
 	}
 }
+
+// TestWorkerListShowsLargestRunColumn pins the LARGEST RUN column (PRD #1809 M6, D8): "-" when the
+// worker reports no run sizes, the largest run's HOME size as one compact field otherwise, and a
+// trailing "+" when that size walk was truncated (a lower bound). It sits before OUTBOX.
+func TestWorkerListShowsLargestRunColumn(t *testing.T) {
+	const gib = int64(1) << 30
+	fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{
+		{ID: "w1", Name: "idle", Status: "online"},
+		{ID: "w2", Name: "busy", Status: "online", RunDisk: []apitypes.WorkerRunDiskDTO{
+			{RunID: "r1", HomeBytes: 5 * gib, CacheBytes: 3 * gib},
+			{RunID: "r2", HomeBytes: gib},
+		}},
+		{ID: "w3", Name: "partial", Status: "online", RunDisk: []apitypes.WorkerRunDiskDTO{
+			{RunID: "r3", HomeBytes: 512 * 1024 * 1024, Truncated: true},
+		}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "worker", "list")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	lines := strings.Split(out, "\n")
+	if !strings.Contains(lines[0], "LARGEST RUN") || strings.Index(lines[0], "LARGEST RUN") > strings.Index(lines[0], "OUTBOX") {
+		t.Fatalf("header lacks LARGEST RUN before OUTBOX:\n%s", out)
+	}
+	// The cell is the second-to-last field (OUTBOX, "-" for all three, is last).
+	cellOf := func(name string) string {
+		t.Helper()
+		for _, line := range lines {
+			if f := strings.Fields(line); len(f) > 2 && f[1] == name {
+				return f[len(f)-2]
+			}
+		}
+		t.Fatalf("no row for %s in %q", name, out)
+		return ""
+	}
+	for name, want := range map[string]string{"idle": "-", "busy": "5.0GiB", "partial": "512.0MiB+"} {
+		if got := cellOf(name); got != want {
+			t.Errorf("%s LARGEST RUN = %q, want %q\n%s", name, got, want, out)
+		}
+	}
+}

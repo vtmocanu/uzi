@@ -128,11 +128,31 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
 	}
+	// DISK (PRD #1809 M5): a data_volume_full park, emit-only-when-parked, with its next retry
+	// and the run's lifetime disk-park count.
+	if line := diskParkLine(r); line != "" {
+		rows = append(rows, []string{"DISK", line})
+	}
+	// HOME (PRD #1809 M6, D8): the run's HOME and cache size on its worker, emit-only-when-
+	// reported (the server sets them only from a fresh worker report).
+	if line := runDiskSizeLine(r); line != "" {
+		rows = append(rows, []string{"HOME", line})
+	}
+	// CHECKPOINT (PRD #1809 M6, D8): whether the parked run's published checkpoint holds its
+	// latest committed work, emit-only-while-parked-and-reported.
+	if line := checkpointDurabilityLine(r); line != "" {
+		rows = append(rows, []string{"CHECKPOINT", line})
+	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
+	}
+	// FAIL_ORIGIN (PRD #1809 M5): the typed fail_origin, emit-only-when-set, so a run that
+	// failed on a data volume that stayed full says so beside its free-text reason.
+	if r.FailOrigin != nil && *r.FailOrigin != "" {
+		rows = append(rows, []string{"FAIL_ORIGIN", failOriginCell(r)})
 	}
 	// The run's inferred scheduling requirement set (PRD #84 M4), the CLI twin of the
 	// three DTO fields added in 4c. All three are model/inference-derived, hence UNTRUSTED,
@@ -1706,7 +1726,8 @@ func steerKindLabel(kind string) string {
 // variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
 // it is "forge_unreachable" the recovery suffix names the forge instead of the transient
 // empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account, and
-// "vault_locked" (issue #1766) names the vault unlock the run is waiting for.
+// "vault_locked" (issue #1766) names the vault unlock the run is waiting for, and
+// "data_volume_full" (PRD #1809) names the disk space it is waiting for.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1753,6 +1774,11 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// run page's "Waiting for vault unlock" heading use).
 	if len(recoveryCause) > 0 && recoveryCause[0] == vaultLockedCause {
 		recoveringSuffix = " (run waiting for vault unlock)"
+	}
+	// PRD #1809 M5: a run parked on a full worker data volume waits for disk space (the words
+	// diskParkLine and the web run page's "Waiting for disk space" heading use).
+	if len(recoveryCause) > 0 && recoveryCause[0] == dataVolumeFullCause {
+		recoveringSuffix = " (run waiting for disk space)"
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -1869,6 +1895,110 @@ func fitVaultParkLine(r apitypes.RunDTO, width int) string {
 	return floor
 }
 
+// runDiskSizeLine renders a run's HOME and cache size on its worker (PRD #1809 M6, D8) for
+// `uzi run get`'s HOME row, e.g. "4.2 GiB (cache 3.0 GiB)". "at least" leads when the worker's
+// size walk was truncated (both numbers are lower bounds). "" when the server sent no size (no
+// fresh report from the run's worker).
+func runDiskSizeLine(r apitypes.RunDTO) string {
+	if r.HomeBytes == nil {
+		return ""
+	}
+	line := humanBytes(*r.HomeBytes)
+	if r.CacheBytes != nil {
+		line += " (cache " + humanBytes(*r.CacheBytes) + ")"
+	}
+	if r.DiskTruncated {
+		line = "at least " + line
+	}
+	return line
+}
+
+// parkedStatuses are the park statuses a checkpoint-durability report describes (PRD #1809 M6).
+var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: true, statusPaused: true}
+
+// checkpointDurabilityLine is the parked run's checkpoint-durability sentence (PRD #1809 M6, D8):
+// whether the checkpoint its latest park published contains the run's latest committed work. The
+// api clears the flag on every claim and running report, so it only describes the park that
+// reported it; it is shown only while the run is parked. "" when the run is not parked or the
+// worker did not report it.
+func checkpointDurabilityLine(r apitypes.RunDTO) string {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] {
+		return ""
+	}
+	if *r.CheckpointContainsLatest {
+		return "contains the latest work"
+	}
+	return "does NOT contain the latest committed work (the worker keeps it)"
+}
+
+// dataVolumeFullCause is the RecoveryWaitCause of a run parked because its worker's data
+// volume was full or about to fill (PRD #1809 M5, D6), and the fail_origin of a run that failed
+// because the volume stayed full past the server's disk-park cap. Like the vault park it
+// resumes at its timer-based retry (RecoveryRetryNotBefore); the worker's reclaim frees space
+// in the meantime.
+const dataVolumeFullCause = "data_volume_full"
+
+// isDiskFullPark reports whether a recovery_wait run is parked on a full data volume (PRD #1809).
+func isDiskFullPark(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == dataVolumeFullCause
+}
+
+// diskParkLead is the load-bearing opening every disk park rendering starts with.
+const diskParkLead = "waiting for disk space"
+
+// diskParkCountClause is "counted disk parks: N", the run's lifetime count of COUNTED disk
+// parks. A preventive park is not counted, so N can stay 0 across several parks, and the cap is
+// not on the DTO, so no surface renders "N of MAX" for this cause.
+func diskParkCountClause(r apitypes.RunDTO) string {
+	return "counted disk parks: " + itoa(r.DiskParkCount)
+}
+
+// diskParkLine is the data_volume_full park sentence (PRD #1809 M5) `uzi run get`'s DISK row,
+// the `run logs --follow` notice and the TUI share, "" for any other run. The retry clause is
+// HH:MM on the viewer's local wall clock (vaultRetryClause), dropped without a retry stamp.
+func diskParkLine(r apitypes.RunDTO) string {
+	if !isDiskFullPark(r) {
+		return ""
+	}
+	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " +
+		vaultRetryClause(r) + "; " + diskParkCountClause(r)
+}
+
+// fitDiskParkLine is diskParkLine shed to fit a physical width, for the TUI's one-row slots,
+// in the same order as fitVaultParkLine: the full sentence, then "waiting for disk space:
+// resumes at its next retry (HH:MM); counted disk parks: N", then the floor "waiting for disk space ·
+// retry HH:MM" (the bare lead without a stamp). The floor is never cut here; the caller's
+// clampVisual is the narrow-terminal backstop. "" for any run that is not a disk park.
+func fitDiskParkLine(r apitypes.RunDTO, width int) string {
+	full := diskParkLine(r)
+	if full == "" {
+		return ""
+	}
+	floor := diskParkLead
+	if r.RecoveryRetryNotBefore != nil {
+		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+	}
+	short := diskParkLead + ": resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
+	for _, cand := range []string{full, short} {
+		if visualWidth(cand) <= width {
+			return cand
+		}
+	}
+	return floor
+}
+
+// failOriginCell is `uzi run get`'s FAIL_ORIGIN cell: the typed fail_origin enum, with a plain
+// explanation for data_volume_full (PRD #1809 M5), whose raw name does not say that uzi parked
+// and retried before giving up. N is the counted parks only (preventive parks are uncounted). The enum is server-coerced, but an unrecognised value from a
+// newer server still prints as itself, through sanitizeTTY like the STOP_KIND row.
+func failOriginCell(r apitypes.RunDTO) string {
+	origin := strOr(r.FailOrigin, "")
+	if origin == dataVolumeFullCause {
+		return origin + " (the worker's data volume stayed full after " + itoa(r.DiskParkCount) + " counted disk parks)"
+	}
+	return sanitizeTTY(origin)
+}
+
 // codexAccountUnavailableCause is the RecoveryWaitCause of a run held on its Codex
 // subscription account (PRD #1590). Unlike the forge park it has no retry clock: the run
 // resumes when the account does, so no surface renders a countdown for it.
@@ -1948,7 +2078,8 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // runStatusCell is the STATUS cell of the run tables (`uzi run list`, `uzi admin runs`):
 // displayRunStatus, plus the short Codex account action in parentheses for a run held on its
 // Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
-// Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way.
+// Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way, and
+// (PRD #1809) a data_volume_full park adds "(waiting for disk space)".
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
@@ -1956,6 +2087,8 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 		s += " (" + short + ")"
 	} else if isVaultLockedPark(r.RunDTO) {
 		s += " (waiting for vault unlock)"
+	} else if isDiskFullPark(r.RunDTO) {
+		s += " (waiting for disk space)"
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.

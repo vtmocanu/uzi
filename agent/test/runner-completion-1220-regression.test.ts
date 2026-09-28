@@ -7,7 +7,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { type Executor, type RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 import {
   api,
   fakeGitlab,
@@ -61,10 +61,7 @@ const DECLARED_FOUR = ["m1", "m2", "m3", "m4"];
 // The distinctive missing-milestone title the fixed path must name back to the lead.
 const M5_TITLE = "docs, specifications and adversarial regression";
 
-let seq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-1220-wt-${process.pid}-${seq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-1220");
 
 // --- scripted SDK messages (mirrors runner-completion-attempt.test.ts's helpers) ---
 function submitPlanWithMilestones(

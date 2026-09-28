@@ -1,6 +1,6 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -10,10 +10,15 @@ import {
   MAX_SCAN_DEPTH,
 } from "../src/toolchain-detect.js";
 
+/** Every fixture dir in this file lives under ONE per-file root, removed when the file
+ *  ends, so no fixture outlives the run in TMPDIR (PRD #1809 M2). */
+const scratchRoot = mkdtempSync(join(tmpdir(), "toolchain-"));
+after(() => rmSync(scratchRoot, { recursive: true, force: true }));
+
 /** Build a throwaway fixture clone from a {relative path → content} map. Mirrors the
  *  `mkClone` helper in js-deps.test.ts. */
 function mkClone(files: Record<string, string>): string {
-  const root = mkdtempSync(join(tmpdir(), "toolchain-"));
+  const root = mkdtempSync(join(scratchRoot, "clone-"));
   for (const [rel, content] of Object.entries(files)) {
     const abs = join(root, rel);
     mkdirSync(dirname(abs), { recursive: true });

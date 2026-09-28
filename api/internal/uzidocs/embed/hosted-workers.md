@@ -170,6 +170,12 @@ Both are cluster-driven, like cordoning; there's no button for either. An
 admin can turn the self-heal off entirely via chart config if it's ever not
 wanted.
 
+This full-volume recycle is the **last resort**. Before a volume gets anywhere
+near it, a run's own build caches are bounded and reclaimed on their own —
+see [Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for
+the cache drop, in-run cache cap, periodic reclaim, admission stop, and the
+bounded `data_volume_full` park that exist to make this recycle rare.
+
 ## Message outbox
 
 A hosted worker gets the same [message outbox](./worker-setup.md#message-outbox) as

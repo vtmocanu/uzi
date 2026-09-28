@@ -243,6 +243,41 @@ describe("SteeringChannel — pause (PRD #1190 M2)", () => {
   });
 });
 
+// PRD #1809 D4 — the hard disk-pressure layer's worker-local `disk` stop. requestDiskStop() drops
+// the in-flight turn exactly like a `now`/`wall` pause and records mode "disk", which the executor
+// routes to the data_volume_full disk park. It is not an owner pause: no input clears or replaces it,
+// and it is never seeded from a claim.
+describe("SteeringChannel — disk stop (PRD #1809 D4)", () => {
+  it("requestDiskStop() aborts the turn with a PauseNowSignal, fires the re-armable interrupt, and records 'disk'", () => {
+    const { ch, cancel } = makeChannel([[]]);
+    let fired = 0;
+    ch.onPauseNow(() => {
+      fired++;
+    });
+    ch.requestDiskStop();
+    assert.strictEqual(ch.getPauseMode(), "disk");
+    assert.ok(cancel.signal.reason instanceof PauseNowSignal, "the turn drop is a pause-now abort, not a cancel");
+    assert.strictEqual(fired, 1);
+    ch.requestDiskStop();
+    assert.strictEqual(fired, 1, "idempotent");
+  });
+
+  it("an owner pause or pause_cancel arriving after it neither clears nor replaces the disk stop", async () => {
+    const { ch } = makeChannel([[inp("pause", "now"), inp("pause", "milestone"), inp("pause_cancel")]]);
+    ch.requestDiskStop();
+    ch.start();
+    await tick();
+    assert.strictEqual(ch.getPauseMode(), "disk");
+    await ch.stop();
+  });
+
+  it("is never seeded from a claim", () => {
+    const { ch } = makeChannel([[]]);
+    ch.seedPauseRequested("disk");
+    assert.strictEqual(ch.getPauseMode(), null);
+  });
+});
+
 // PRD #1497 M2 — the wall-clock park. The sweep files a system-authored `pause` input whose body is
 // "wall". It aborts the in-flight turn EXACTLY like `now` (so the run parks in seconds, not at the
 // next milestone), records mode "wall", and is STICKY-STICKY: `pause_cancel` cannot clear it (only

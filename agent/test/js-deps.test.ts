@@ -1,6 +1,6 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { chmodSync, mkdirSync, mkdtempSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -19,9 +19,14 @@ import {
 } from "../src/js-deps.js";
 import { setprivRunnerArgs } from "../src/runner-uid.js";
 
+/** Every fixture dir in this file lives under ONE per-file root, removed when the file
+ *  ends, so no fixture outlives the run in TMPDIR (PRD #1809 M2). */
+const scratchRoot = mkdtempSync(join(tmpdir(), "js-deps-"));
+after(() => rmSync(scratchRoot, { recursive: true, force: true }));
+
 /** Build a throwaway fixture clone from a {relative path → content} map. */
 function mkClone(files: Record<string, string>): string {
-  const root = mkdtempSync(join(tmpdir(), "js-deps-"));
+  const root = mkdtempSync(join(scratchRoot, "clone-"));
   for (const [rel, content] of Object.entries(files)) {
     const abs = join(root, rel);
     mkdirSync(dirname(abs), { recursive: true });
@@ -403,7 +408,7 @@ describe("installJsDeps: a claimed success is corroborated against node_modules"
 });
 
 describe("execInstall (the real exec boundary): status only, output never", () => {
-  const root = mkdtempSync(join(tmpdir(), "js-deps-exec-"));
+  const root = mkdtempSync(join(scratchRoot, "exec-"));
   const base = { cwd: root, env: { PATH: process.env.PATH }, timeoutMs: 5000 };
 
   it("maps exit 0 to ok", async () => {
@@ -534,7 +539,7 @@ describe("discoverJsProjects: the search is BOUNDED, and says so when it stops e
     // Neither other bound catches this shape: nothing here is a project (so
     // MAX_PROJECT_DIRS never trips) and everything is at depth 1 (so MAX_SCAN_DEPTH never
     // trips). Only the read cap ends the walk.
-    const root = mkdtempSync(join(tmpdir(), "js-deps-wide-"));
+    const root = mkdtempSync(join(scratchRoot, "wide-"));
     for (let i = 0; i < MAX_SCAN_DIRS + 20; i++) mkdirSync(join(root, `d${i}`));
     const { projects, truncated } = await discoverJsProjects(root);
     assert.deepEqual(projects, []);

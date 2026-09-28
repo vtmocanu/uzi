@@ -5,12 +5,12 @@
 // unchanged — synthesize a packages-only devbox.json OUTSIDE the clone, install in
 // a secret-scrubbed subprocess, and filter `devbox shellenv` to the allowlist.
 
-import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { RunContext } from "./executor.js";
 import { provisionTools } from "./provision.js";
 import { extractRepoDevboxPackages, mergeToolPackages, filterDeniedPackages } from "./repo-tools.js";
+import { rmHomeTree } from "./rmtree.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** Reason prefix for a FATAL provisioning failure. Tier-1 (uzi-stored) failure
@@ -22,6 +22,19 @@ export const REASON_PROVISION_FAILED = "tool provisioning failed before the agen
 // anything not UUID-shaped so a malformed id can never traverse out (defense in
 // depth — the id is a server-issued UUID). Same guard the runner applies to the
 // per-run HOME.
+
+/**
+ * PRD #1809 M3: remove a per-run provision dir (`<dataDir>/provision/<runId>`), best-effort
+ * and logged. Through {@link rmHomeTree}, not `fs.rm`: the install runs as the agent uid
+ * under the PRD #51 split, so the dir holds agent-owned, possibly read-only subtrees that a
+ * plain `fs.rm` as the worker cannot remove (the provision-dir leak). Never throws: every
+ * caller is a cleanup that must not fail the run.
+ */
+export async function removeProvisionDir(dir: string, log: Logger): Promise<void> {
+  await rmHomeTree(dir).catch((err) =>
+    log.warn("provision dir cleanup failed", { provision_dir: dir, error: errMessage(err) }),
+  );
+}
 
 export interface ProvisionRunDeps {
   /** Root for per-run provisioning dirs, OUTSIDE any clone (Decision 3). */
@@ -108,7 +121,7 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
   try {
     return await install(toolPackages);
   } catch (err) {
-    await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+    await removeProvisionDir(provisionDir, deps.log);
     if (tier2Added > 0) {
       // The failed merged set carried this repo's opt-in extras — DEGRADE rather
       // than fail the run. Phrase the warning causation-neutrally: the extras may
@@ -128,7 +141,7 @@ export async function provisionRunTools(ctx: RunContext, deps: ProvisionRunDeps)
       try {
         return await install(tier1);
       } catch (retryErr) {
-        await fs.rm(provisionDir, { recursive: true, force: true }).catch(() => undefined);
+        await removeProvisionDir(provisionDir, deps.log);
         throw new Error(`${REASON_PROVISION_FAILED}: ${errMessage(retryErr)}`);
       }
     }

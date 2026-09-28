@@ -164,6 +164,68 @@ describe("HOME cleanup under the real uid split (#1607)", () => {
     assert.equal(out, "700", "the runner-private dir must stay owner-only after a partial pass");
   });
 
+  // PRD #1809 M1: a process-ending park drops the run's caches from its preserved HOME. The
+  // exact split shape: a worker-owned HOME, a runner-owned `0555` module cache with a
+  // runner-cmd-private dir inside it (so one agent uid cannot finish alone), the build
+  // cache, and the runner-private transcript that must survive.
+  it("rmHomeSubtree drops the runner-owned caches and keeps the HOME root, siblings and transcript (#1809)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-000000001809");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    asRunner(
+      `set -e
+       umask 002
+       h="$1"
+       mod="$h/go/pkg/mod/gopkg.in/inf.v0@v0.9.1"
+       mkdir -p "$mod" "$h/go/pkg/mod/cache/download" "$h/go/bin" "$h/.cache/go-build/0a" "$h/.cache/other" \\
+         "$h/.claude/projects/-app"
+       echo 'package inf' > "$mod/dec.go"
+       echo o > "$h/.cache/go-build/0a/obj"
+       echo s > "$h/.cache/other/state"
+       echo b > "$h/go/bin/gopls"
+       echo '{}' > "$h/.claude/projects/-app/session.jsonl"
+       chmod 0700 "$h/.claude/projects" "$h/.claude/projects/-app"`,
+      home,
+    );
+    asCommand(
+      `set -e
+       umask 077
+       mkdir -p "$1/go/pkg/mod/cache/download/cmd-private"
+       echo x > "$1/go/pkg/mod/cache/download/cmd-private/out"`,
+      home,
+    );
+    asRunner(`chmod 0444 "$1/go/pkg/mod/gopkg.in/inf.v0@v0.9.1/dec.go" && chmod 0555 "$1/go/pkg/mod/gopkg.in/inf.v0@v0.9.1" "$1/go/pkg/mod/gopkg.in"`, home);
+    const rootMode = (await fs.lstat(home)).mode;
+
+    assert.equal(await rmtree.rmHomeSubtree(home, "go/pkg/mod"), "removed");
+    assert.equal(await rmtree.rmHomeSubtree(home, ".cache/go-build"), "removed");
+    assert.equal(await rmtree.rmHomeSubtree(home, ".npm/_cacache"), "absent");
+
+    // Checked as runner: the worker cannot see inside runner-private dirs.
+    asRunner(
+      `set -e; h="$1"
+       test ! -e "$h/go/pkg/mod"; test ! -e "$h/.cache/go-build"; test -d "$h/go/pkg"
+       test -f "$h/go/bin/gopls"; test -f "$h/.cache/other/state"; test -f "$h/.claude/projects/-app/session.jsonl"`,
+      home,
+    );
+    assert.equal((await fs.lstat(home)).mode, rootMode, "the HOME root's mode is never widened");
+    await rmtree.rmHomeTree(home);
+  });
+
+  it("rmHomeSubtree refuses a runner-planted symlinked `.cache` and never touches its target (#1809)", async () => {
+    const home = path.join(HOME_ROOT, "00000000-0000-4000-8000-00000000180a");
+    await fs.mkdir(home);
+    await fs.chmod(home, 0o2775);
+    const target = path.join(SENTINEL_DIR, "go-build");
+    await fs.mkdir(target, { recursive: true });
+    await fs.writeFile(path.join(target, "keep.txt"), "keep\n");
+    asRunner(`ln -s "$2" "$1/.cache"`, home, SENTINEL_DIR);
+    await assert.rejects(rmtree.rmHomeSubtree(home, ".cache/go-build"), /refusing/);
+    assert.equal(await fs.readFile(path.join(target, "keep.txt"), "utf8"), "keep\n", "the symlink target's contents survive");
+    await assertSentinelIntact();
+    await rmtree.rmHomeTree(home);
+  });
+
   it("the startup reclaim removes only API-confirmed-terminal HOMEs", async () => {
     const terminal = await makeLeakedHome("00000000-0000-4000-8000-00000000000a", 0o2770);
     const running = await makeLeakedHome("00000000-0000-4000-8000-00000000000b", 0o2770);

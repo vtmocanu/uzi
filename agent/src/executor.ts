@@ -24,14 +24,14 @@ import type {
   ReviewCommentsSnapshot,
   RunKind,
 } from "./protocol.js";
-import type { AnswerVerdict, PlanVerdict } from "./steering.js";
+import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
 import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
 import type { Delta } from "./summary-runner.js";
 import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
-import { provisionRunTools } from "./provision-run.js";
+import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -468,7 +468,18 @@ export interface RunContext {
    * ACK's pauseRequested regressed — an ACK-independent fallback. Absent on the stub/test executors
    * ⇒ no fallback (the ACK's pauseRequested is then the sole park trigger, as before).
    */
-  pauseModeRequested?(): "milestone" | "now" | "wall" | null;
+  pauseModeRequested?(): PauseMode;
+  /**
+   * PRD #1809 D4 (soft layer): called by the executor at every implement turn boundary, before
+   * the next turn is driven. `processAlive` is the executor's quiet-point probe (true while any
+   * process of the run is alive: its CLI process groups, plus every process attributed to the run
+   * by HOME or working directory, run-procs.ts; unknown is alive); the runner's cache governor calls
+   * it only when the run's caches are over its cap, trims them at a quiet point, and resolves
+   * "park" when the run stays over the cap: the executor then throws a preventive
+   * DiskParkSignal (cache-cap.ts) and the runner parks the run so its caches are dropped. Absent on the
+   * stub/test executors and when the cap is off ⇒ no cap.
+   */
+  cacheCapBoundary?(processAlive: () => Promise<boolean>): Promise<"continue" | "park">;
   /**
    * PRD #1497 M2: park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park (D4), NOT
    * handlePausePark's publish-or-stay contract. The runner's implementation reaps the agent tree,
@@ -786,6 +797,15 @@ export interface Executor {
    * it; the SDK executor also self-reaps in its own run() finally.
    */
   killAgentTree?(): void;
+  /**
+   * PRD #1809 D4: SIGKILL the run's processes that {@link killAgentTree}'s process-group reap
+   * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
+   * every live process attributed to the run by `HOME` or working directory (run-procs.ts). The
+   * runner awaits it right after killAgentTree at the mid-run disk parks, before every park cache
+   * drop (D2), and at the finalize security reap before the push. Never rejects. Absent on the
+   * stub/test and Codex executors.
+   */
+  reapAttributedProcesses?(): Promise<void>;
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;
@@ -1233,10 +1253,7 @@ export class StubExecutor implements Executor {
         log: this.log,
         provision: this.opts.provision,
       });
-      if (provisionDir)
-        await fs
-          .rm(provisionDir, { recursive: true, force: true })
-          .catch(() => undefined);
+      if (provisionDir) await removeProvisionDir(provisionDir, this.log);
     }
 
     const isCIFix = ctx.kind === "ci_fix";

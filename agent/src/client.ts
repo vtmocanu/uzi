@@ -711,6 +711,20 @@ export class WorkerClient {
     return this.workerOutboxMaxPendingValue;
   }
 
+  /** PRD #1809 D5: the last valid `disk_pressure_threshold` a heartbeat response carried. */
+  private diskPressureThresholdValue: number | undefined;
+
+  /**
+   * PRD #1809 D5: the api's recycle threshold (`UZI_DISK_PRESSURE_THRESHOLD`) as the last
+   * heartbeat response that carried a valid one reported it: a finite fraction in (0, 1].
+   * Undefined until such a response arrives (an older api never sends it; the disk
+   * controller then assumes the api default). A later response with the field absent or
+   * garbled leaves the last good value in place.
+   */
+  get diskPressureThreshold(): number | undefined {
+    return this.diskPressureThresholdValue;
+  }
+
   /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
@@ -865,12 +879,14 @@ export class WorkerClient {
   }
 
   /**
-   * POST one heartbeat and decode the custody flag from its response (issue #1759):
-   * `{"worker": {"retaining_unpublished_work": bool, ...}}`. Returns the flag only when
-   * the body decodes and the field is a boolean, else undefined, which the DinD prune
-   * treats as "may be retaining" (fail-closed). A non-2xx still throws exactly like
-   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat
-   * whose body does not parse is still a successful heartbeat.
+   * POST one heartbeat and decode its response (issue #1759, PRD #1809 D5):
+   * `{"worker": {"retaining_unpublished_work": bool, "disk_pressure_threshold": number, ...}}`.
+   * Returns the custody flag only when the body decodes and the field is a boolean, else
+   * undefined, which the DinD prune treats as "may be retaining" (fail-closed). The
+   * threshold is recorded on {@link diskPressureThreshold} only when it is a finite number in
+   * (0, 1]; anything else keeps the last good value. A non-2xx still throws exactly like
+   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat whose
+   * body does not parse is still a successful heartbeat.
    */
   private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
     const path = `${WORKER_API_PREFIX}/heartbeat`;
@@ -886,6 +902,10 @@ export class WorkerClient {
     if (typeof decoded !== "object" || decoded === null) return undefined;
     const worker = (decoded as { worker?: unknown }).worker;
     if (typeof worker !== "object" || worker === null) return undefined;
+    const threshold = (worker as { disk_pressure_threshold?: unknown }).disk_pressure_threshold;
+    if (typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0 && threshold <= 1) {
+      this.diskPressureThresholdValue = threshold;
+    }
     const retaining = (worker as { retaining_unpublished_work?: unknown }).retaining_unpublished_work;
     return typeof retaining === "boolean" ? retaining : undefined;
   }
@@ -948,6 +968,16 @@ export class WorkerClient {
       generation > 0 &&
       (this.hasCredentialSwitchCapability || this.hasFeature("claim_generation_fence"))
     );
+  }
+
+  /**
+   * PRD #1809 D6: whether a /state report for a run at `generation` would carry
+   * `claim_generation` on the wire (the send-gate above). The data-volume-full park is fenced
+   * on it server-side and 400s without it, so the runner takes that park only when this is true
+   * (never for a chat claim, whose generation is the legacy 0).
+   */
+  stampsClaimGeneration(generation?: number): boolean {
+    return this.includeClaimGeneration(generation);
   }
 
   /**
@@ -1743,7 +1773,7 @@ export class WorkerClient {
    *  treated as refused, the safe default). */
   async reportWallPark(
     runId: string,
-    args: { head: string; published: boolean; claimGeneration?: number },
+    args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
   ): Promise<{ status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
@@ -1754,6 +1784,8 @@ export class WorkerClient {
     return this.withGenerationFallback(included, async (includeField) => {
       const body: WallParkRequest = { head: args.head, published: args.published };
       if (includeField) body.claim_generation = args.claimGeneration;
+      // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
+      if (args.checkpointContainsLatest !== undefined) body.checkpoint_contains_latest = args.checkpointContainsLatest;
       const res = await this.fetchRaw("POST", path, body);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);

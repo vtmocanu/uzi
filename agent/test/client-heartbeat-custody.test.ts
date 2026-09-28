@@ -114,3 +114,50 @@ describe("heartbeat custody flag (issue #1759)", () => {
     assert.strictEqual(c.hasFeature("heartbeat_outbox"), false, "the fallback still clears the feature set");
   });
 });
+
+// PRD #1809 D5: the heartbeat response also carries the api's recycle threshold
+// (`worker.disk_pressure_threshold`), from which the worker derives its soft threshold. The
+// client keeps the last valid value; absent (an older api) or garbage never replaces it, and
+// never disturbs the custody flag decoded from the same body.
+describe("heartbeat disk pressure threshold (PRD #1809 D5)", () => {
+  it("records a present threshold alongside the custody flag", async () => {
+    const c = client();
+    assert.strictEqual(c.diskPressureThreshold, undefined, "nothing before the first heartbeat");
+    reply(() => ok({ worker: { retaining_unpublished_work: true, disk_pressure_threshold: 0.85 } }));
+    assert.strictEqual(await c.heartbeat(), true, "the custody flag is unchanged by the new field");
+    assert.strictEqual(c.diskPressureThreshold, 0.85);
+    reply(() => ok({ worker: { retaining_unpublished_work: false, disk_pressure_threshold: 1 } }));
+    await c.heartbeat();
+    assert.strictEqual(c.diskPressureThreshold, 1, "1 is inside (0, 1]");
+  });
+
+  it("stays undefined on an api that never sends it (the controller then assumes 0.90)", async () => {
+    const c = client();
+    reply(() => ok({ worker: { retaining_unpublished_work: false } }));
+    assert.strictEqual(await c.heartbeat(), false);
+    assert.strictEqual(c.diskPressureThreshold, undefined);
+  });
+
+  it("rejects garbage and keeps the last good value", async () => {
+    const c = client();
+    reply(() => ok({ worker: { disk_pressure_threshold: 0.9 } }));
+    await c.heartbeat();
+    const garbage: Reply[] = [
+      ok({ worker: { disk_pressure_threshold: 0 } }),
+      ok({ worker: { disk_pressure_threshold: -0.5 } }),
+      ok({ worker: { disk_pressure_threshold: 1.5 } }),
+      ok({ worker: { disk_pressure_threshold: "0.8" } }),
+      ok({ worker: { disk_pressure_threshold: null } }),
+      ok({ worker: {} }),
+      ok({ disk_pressure_threshold: 0.5 }), // not under `worker`
+      { status: 200, body: '{"worker":{"disk_pressure_threshold":1e999}}' }, // Infinity
+      { status: 200, body: "{not json" },
+      { status: 204 },
+    ];
+    for (const b of garbage) {
+      reply(() => b);
+      assert.strictEqual(await c.heartbeat(), undefined, `custody stays fail-closed for ${JSON.stringify(b)}`);
+      assert.strictEqual(c.diskPressureThreshold, 0.9, `last good value kept for ${JSON.stringify(b)}`);
+    }
+  });
+});

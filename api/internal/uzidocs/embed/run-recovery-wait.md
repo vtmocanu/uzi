@@ -223,15 +223,85 @@ resumes.
 - The repo board's run badge carries no vault-specific tooltip; check the
   run page for the detail above.
 
+## Worker data volume full
+
+A `recovery_wait` park can also come from the worker's own storage: its
+data volume filled up, or came close enough that uzi decided not to wait
+for it to. Unlike every park above, this one can also **fail** the run
+outright, after enough repeated parks — a full data volume is a
+recoverable, bounded condition, not an unlimited retry.
+
+Two kinds of park share the cause `data_volume_full`, and only one of them
+counts toward the failure cap:
+
+- A **preventive**, uncounted park: the soft, per-run cache cap. At a turn
+  boundary, a run whose own caches stay over their per-run cap across a
+  few turn boundaries in a row is parked before it can fill the volume. A
+  run that keeps triggering this park alone cannot be failed by it.
+- A **counted** park: everything else that reaches this park, including
+  the hard, per-tick pressure stop — a background check on every stats
+  tick that finds the volume at or over a hard threshold and stops
+  whichever running Claude run holds the largest caches — and an actual
+  write that failed disk-full (a recognised `ENOSPC`/`EDQUOT` signal, or
+  git's own disk-full diagnostics, confirmed against the volume's own free
+  space and inodes) after uzi ran its background reclaim and retried once,
+  or a claim/resume preflight whose re-sampled statfs is still below the
+  floor after a reclaim pass — note this last case counts a park with no
+  failed write at all. Every counted case counts toward the run's lifetime disk-park cap,
+  `UZI_RUN_DISK_PARK_MAX` (default 3; `0` means unlimited). Past the cap,
+  the next counted disk-full park fails the run instead, with
+  `fail_origin = data_volume_full`.
+
+Both kinds park and resume on the same capped exponential backoff as an
+empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`);
+there is no separate timer for this cause.
+
+**Custody differs by when the park happens.** Every data-volume-full park
+that lands **before your repo has been cloned** first releases this run's
+recovery-custody hold — the same release-then-park sequence a
+[forge-unreachable park](#forge-unreachable-at-clone) uses, and for the
+same reason: nothing has been cloned yet, so there is nothing for this
+worker to hold custody over, and the release must be positively confirmed
+before the park is allowed to proceed (an unconfirmed release takes the
+plain failed path instead of risking a leaked hold). A park that lands
+**mid-run**, once your repo is cloned and work is underway, keeps the run's
+custody hold instead: only this worker holds the committed work the park
+is protecting, so releasing it could let another worker, or a recycle,
+remove that work before it is recovered.
+
+### Where you'll see it
+
+- The run page's park panel reads **waiting for disk space**: the
+  worker's data volume is full or nearly full, uzi frees space (including
+  this run's own build caches), and the run resumes at its next retry. No
+  action is needed. The board and run list show only a generic recovery
+  wait status; see the STATUS-cell and `uzi tui` rows below for where the
+  disk-specific wording does appear.
+- `uzi run get <id>` — a `DISK` row with that sentence and the run's
+  lifetime count of **counted** disk parks (`counted disk parks: N`); a
+  preventive park never moves this number, so it can read 0 across several
+  parks. See [`uzi run get`'s disk and checkpoint
+  rows](cli.md#disk-usage-and-checkpoint-durability) for the related `HOME`
+  and `CHECKPOINT` rows every parked run can show.
+- `uzi run list` / `uzi admin runs` — the STATUS cell appends `(waiting for
+  disk space)`.
+- `uzi tui` — this park stays in ON THE FLOOR, like any other
+  self-resolving recovery park.
+- If the volume stays full past the park cap, the run fails instead: `uzi
+  run get`'s `FAIL_ORIGIN` row reads `data_volume_full (the worker's data
+  volume stayed full after N counted disk parks)`.
+
 ## Other waiting states
 
 - `recovery_wait`: a positively-empty SDK turn or a transient provider error
   persisted through bounded retries, the forge was unreachable at clone/fetch
   (see [Forge unreachable at clone](#forge-unreachable-at-clone) above), a
   Codex credential refresh or release found the owner's vault locked (see
-  [Vault locked](#vault-locked) above), or the Codex subscription account is
-  unavailable (see [Codex account unavailable](#codex-account-unavailable)
-  above). The server retries automatically after a backoff, except the
+  [Vault locked](#vault-locked) above), the worker's own data volume filled
+  up or came close to it (see [Worker data volume full](#worker-data-volume-full)
+  above), or the Codex subscription account is unavailable (see [Codex
+  account unavailable](#codex-account-unavailable) above). The server
+  retries automatically after a backoff, except the
   Codex account hold, which has no timer and instead resumes when the
   account does.
 - `limit_wait`: a usage-limit window must reset. See

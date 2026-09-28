@@ -322,6 +322,10 @@ UPDATE workers SET
     stats_disk_dind_total_bytes  = sqlc.narg('stats_disk_dind_total_bytes'),
     stats_disk_dind_inodes       = sqlc.narg('stats_disk_dind_inodes'),
     stats_disk_dind_total_inodes = sqlc.narg('stats_disk_dind_total_inodes'),
+    -- data-volume inode sample (PRD #1809 M6, D8): used + total inodes beside the byte pair,
+    -- same write-every-tick-incl-NULL discipline; display-only, never a disk_pressure input.
+    stats_disk_data_inodes       = sqlc.narg('stats_disk_data_inodes'),
+    stats_disk_data_total_inodes = sqlc.narg('stats_disk_data_total_inodes'),
     -- Disk-pressure debounce streak (PRD #837 M4). Increment (bounded to 100 so a
     -- perpetually-full worker can't overflow the counter) when THIS tick's sample is
     -- over threshold, else reset to 0 — so a single under-threshold (or absent) sample
@@ -1229,6 +1233,12 @@ UPDATE runs SET
     -- stale_requeue_generation = claim_generation, so leaving a stale value here could refund a
     -- requeue_count charged against a generation this claim has already replaced.
     stale_requeue_generation = NULL,
+    -- PRD #1809 M6 (D8): a claim starts a new flight, so the previous park's checkpoint-durability
+    -- report no longer describes this run. Cleared here AND on every running report
+    -- (SetRunRunning) so a later park the worker does not report on (a server-side
+    -- credential_disabled park of this claimed run, a sweeper wall park, a completion hold) shows
+    -- "not reported" instead of an older park's value. Display-only.
+    checkpoint_contains_latest = NULL,
     -- Exit contract (PRD #47 Decision 3): leaving 'queued' clears any health flag
     -- the detector raised (e.g. "no worker online"). health_notified_at is NOT reset.
     health = 'ok', health_reason = NULL, health_since = NULL
@@ -1391,6 +1401,26 @@ WHERE id = @id AND user_id = @user_id;
 -- snapshot fields in place rather than duplicating the epoch. secret_id/label/select_reason are
 -- the credential the claim actually spent; applied_at defaults to now() and is refreshed on a
 -- re-record so it names the last apply of that generation.
+--
+-- The settled_switch CTE is the D14 successful-APPLICATION clear (issue #1422). Released is not
+-- applied: ReleaseCredentialSwitch keeps the switch stamp, and only this epoch write, which proves
+-- the reclaimed generation's credential is live, clears credential_switch_requested_at/_generation.
+-- Folding the clear into the epoch statement makes the two atomic: no epoch lands without the
+-- clear and no clear without the epoch. The fence is two conjuncts. claim_generation =
+-- @claim_generation keeps a stale claim (the run already reclaimed past it) from clearing a stamp
+-- that belongs to a later flight. credential_switch_generation < @claim_generation keeps a new
+-- request stamped AT the current generation (the owner switched again after this reclaim) from
+-- being cleared by this generation's own epoch write, a re-record included. A NULL stamp fails
+-- the comparison, so a claim with no pending switch touches no runs row.
+WITH settled_switch AS (
+    UPDATE runs
+    SET credential_switch_requested_at = NULL,
+        credential_switch_generation   = NULL,
+        updated_at                     = now()
+    WHERE id = @run_id
+      AND claim_generation = @claim_generation
+      AND credential_switch_generation < @claim_generation
+)
 INSERT INTO run_credential_epochs (run_id, claim_generation, secret_id, label, select_reason, applied_at)
 VALUES (@run_id, @claim_generation, sqlc.narg('secret_id'), sqlc.narg('label'), sqlc.narg('select_reason'), now())
 ON CONFLICT (run_id, claim_generation) DO UPDATE
@@ -1551,6 +1581,14 @@ UPDATE runs SET
     -- survive to reach the worker's ACK.
     hold_reason                    = NULL,
     hold_captured_head             = NULL,
+    -- PRD #1809 M6 (D8): the run is executing again, so the last park's checkpoint-durability
+    -- report is over: it describes only the park that reported it. Every resume reaches running
+    -- here (paused/limit_wait/recovery_wait -> queued -> claimed -> running, and the in-place
+    -- awaiting_* windows), and the source guards above refuse a stale running report onto a
+    -- parked run, so the clear never lands on the park it would erase. ClaimRun clears it too
+    -- (a claimed run a server-side park catches before its first running report). A running ->
+    -- running heartbeat re-clears an already-NULL column (a no-op). Display-only.
+    checkpoint_contains_latest     = NULL,
     started_at       = COALESCE(started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
@@ -2488,6 +2526,47 @@ WHERE id = @id AND worker_id = @worker_id
   AND kind <> 'judge'
 RETURNING *;
 
+-- name: ParkRunDataVolumeFull :one
+-- PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
+-- ParkRunForgeUnreachable — same 'recovery_wait' transition, same backoff-shaping
+-- recovery_wait_count bump, same health-trio reset and session_id COALESCE, same positive
+-- source guard (status = 'running') — with its own cause and counter:
+--
+--   - recovery_wait_cause = 'data_volume_full' — the TYPED cause the surfaces render the
+--     disk-full wording off of.
+--   - disk_park_count = disk_park_count + 1 when @counted — the DISK-ONLY lifetime counter the
+--     cap (UZI_RUN_DISK_PARK_MAX) decides on, bumped in the SAME statement as the transition so
+--     a counted park cannot land without its counter advancing. A PREVENTIVE park (the worker
+--     stopped the run before the volume filled; @counted = false) leaves it untouched, so
+--     repeated preventive parks can never walk a run into the cap. forge_park_count is never
+--     touched here: it belongs to the forge park alone.
+--
+-- RETURNING * so the service reads back the counter and the stamped recovery_retry_not_before
+-- for the ack. Run INSIDE the disk-park transaction after the run row is FOR UPDATE locked and
+-- its status/generation/release verified in Go, so the guards below are the belt-and-braces
+-- backstop rather than the race barrier (the row lock is). The generation and released-claim
+-- conjuncts are SetRunRecoveryWait's (sqlc.narg, never @name, for the same parser reason).
+-- It does NOT touch recovery_custody_holds: unlike the pre-clone forge park, a disk park can
+-- land mid-run with work only this worker holds, so the generation's hold stays open (D6: the
+-- park still holds custody).
+UPDATE runs SET
+    status                    = 'recovery_wait',
+    status_since              = now(),
+    recovery_wait_count       = recovery_wait_count + 1,
+    recovery_wait_cause       = 'data_volume_full',
+    disk_park_count           = disk_park_count + CASE WHEN sqlc.arg('counted')::boolean THEN 1 ELSE 0 END,
+    recovery_retry_not_before = @retry_not_before,
+    session_id                = COALESCE(sqlc.narg('session_id'), session_id),
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at                = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND status = 'running'
+  AND kind <> 'judge'
+  AND claim_released_at IS NULL
+  AND (sqlc.narg('claim_generation')::bigint IS NULL
+       OR claim_generation = sqlc.narg('claim_generation')::bigint)
+RETURNING *;
+
 -- name: LockOpenCustodyHoldsForRunWorkerGeneration :many
 -- PRD #1392 M1 (D3): the forge park's EXACT-hold cardinality lock. Returns the ids of every
 -- OPEN custody hold on @run_id at @generation held live by @worker_id, FOR UPDATE, so the
@@ -2889,9 +2968,9 @@ WHERE id = @id
 -- old flight is rejected until ClaimRun reclaims and clears it. The switch stamp
 -- (credential_switch_requested_at/_generation) is deliberately KEPT on this release transition — it
 -- is visible as "released, awaiting reclaim" (D14). It is cleared by any TERMINAL transition now
--- (PRD #1247 D11 fix round, beside the pause-clears). The successful-APPLICATION clear at the next
--- epoch write on reclaim (D14) is NOT yet implemented — deferred to issue #1422 (M9); until it
--- lands the stamp lingers past a same-run reclaim (a stale DTO state only, no signal leak). codex
+-- (PRD #1247 D11 fix round, beside the pause-clears), and by the successful APPLICATION: the
+-- next epoch write on reclaim (RecordRunCredentialEpoch's settled_switch CTE, D14, issue #1422)
+-- clears it once the reclaimed generation's credential is live. codex
 -- cap/epoch are revoked/bumped like every other park->queued transition; health is reset because
 -- 'queued' is on the detector's allowlist. Status_since is NOT NULL (migration 00163), so the
 -- banked interval is never NULL.

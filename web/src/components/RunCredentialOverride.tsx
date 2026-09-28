@@ -34,9 +34,10 @@ function overrideText(o: CredentialOverride): string {
 }
 
 // RunCredentialOverride renders the run's chosen override (mode + label) and, when the
-// DTO still reports one, the pending held-state switch. Step A already suppresses a
-// stale/applied switch server-side, so this renders exactly what the DTO says: a null
-// credential_switch shows no badge (the whole point of the lingering-stamp fixture).
+// DTO still reports one, the pending held-state switch. An applied switch is cleared
+// server-side (the reclaim's epoch write clears the stamp in the DB, issue #1422, and
+// Step A suppresses rows stamped before that landed), so this renders exactly what the
+// DTO says: a null credential_switch shows no badge (the lingering-stamp fixture).
 export function RunCredentialOverride({
   run,
 }: {

@@ -164,7 +164,7 @@ func TestReportWallParkLiveDB(t *testing.T) {
 
 	t.Run("a fenced report parks and answers paused", func(t *testing.T) {
 		id := mkRun(988001, "running", "", false, "")
-		run, applied, err := svc.ReportWallPark(env.ctx, wkr, id, "head-1", true, &gen)
+		run, applied, err := svc.ReportWallPark(env.ctx, wkr, id, "head-1", true, &gen, nil)
 		if err != nil || !applied {
 			t.Fatalf("ReportWallPark = (applied %v, %v), want (true, nil)", applied, err)
 		}
@@ -179,7 +179,7 @@ func TestReportWallParkLiveDB(t *testing.T) {
 	t.Run("a report the fence rejects (server already parked) is idempotent paused + records the head", func(t *testing.T) {
 		// The server already parked it: paused, budget_exhausted, released, head NULL.
 		id := mkRun(988002, "paused", "budget_exhausted", true, "")
-		run, applied, err := svc.ReportWallPark(env.ctx, wkr, id, "head-2", true, &gen)
+		run, applied, err := svc.ReportWallPark(env.ctx, wkr, id, "head-2", true, &gen, nil)
 		if err != nil || !applied {
 			t.Fatalf("idempotent ReportWallPark = (applied %v, %v), want (true, nil)", applied, err)
 		}

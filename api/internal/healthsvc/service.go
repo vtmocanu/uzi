@@ -72,6 +72,8 @@ const (
 type Store interface {
 	// fleet.roll + fleet.disk read every worker with its roll-health join.
 	ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow, error)
+	// fleet.rundisk (PRD #1809 M6): each listed worker's largest fresh run HOME size (per_worker 1).
+	ListLargestRunDiskForWorkers(ctx context.Context, arg store.ListLargestRunDiskForWorkersParams) ([]store.WorkerRunDisk, error)
 	// fleet.capacity: owners waiting with zero usable (online, non-draining, fresh) workers.
 	ListOwnersWaitingNoCapacity(ctx context.Context, heartbeatCutoff pgtype.Timestamptz) ([]store.ListOwnersWaitingNoCapacityRow, error)
 	// queue.waiting: oldest waiting_worker run's health_since (nullable).
@@ -240,6 +242,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkFleetRoll(now, workers, controllerReportOK),
 		s.checkFleetCapacity(ctx, now, healthState),
 		s.checkFleetDisk(now, workers),
+		s.checkFleetRunDisk(ctx, now, workers),
 		s.checkQueueWaiting(ctx, now, healthState),
 		s.checkQueueUndispatched(ctx, now),
 		controllerReport,
