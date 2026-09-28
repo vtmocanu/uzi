@@ -33,7 +33,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   watcher to return at the new gate.
 - **One trail line per state change, nothing in between.** `S/trail.sh '#PR' <state>`
   appends and prints `#1428: run completed → pr opened → ci green → cr rate-limited(57m) →
-  waiting → cr clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
+  greptile pending → greptile clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
   Use its vocabulary (header of the script). Say more only for a decision or a blocker.
 - **Full autonomy is the default.** Wait for the chosen reviewer, fix small findings locally, trigger
   a rework for big ones, rebase and renumber when needed, merge when ready, watch `main`:
@@ -204,7 +204,7 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    - **Rate-limited (exit 5).** Switch without waiting. A large or trust-boundary PR: post
      `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`, and the buddy
      reviews the same head. A small PR: the buddy alone, with `--reviewer none`. Only when
-     the user asks to wait for CodeRabbit, run
+     the user asks for CodeRabbit on that PR, run
      `S/cr-rate-limit.sh OWNER/REPO PR --trigger-review`: it posts the exact two-word quota
      query, waits for the authoritative countdown or "Reviews are available now," then posts
      `@coderabbitai review` itself exactly once under a per-PR lock when safe and immediately
@@ -382,7 +382,7 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 
 ## Waiting, uniformly
 
-Every long wait (a CR reset, a laggy `mr_rework`, a re-review, CI) is a background poller
+Every long wait (a CR reset, only when the user asked for CodeRabbit on that PR; a laggy `mr_rework`, a re-review, CI) is a background poller
 whose exit re-invokes you, never a foreground `--watch` or a long `sleep`; the harness reaps
 long processes, and a killed short poll simply re-fires. The patient path is the default
 (except a CodeRabbit rate limit, which switches reviewer at once); a user reply that
