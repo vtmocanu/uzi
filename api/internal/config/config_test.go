@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/base64"
 	"reflect"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -1012,5 +1014,51 @@ func TestLoadCodexUsagePollInterval(t *testing.T) {
 				t.Fatalf("CodexUsagePollInterval = %v, want %v", cfg.CodexUsagePollInterval, tc.want)
 			}
 		})
+	}
+}
+
+// TestLoadSalvageForges pins UZI_SALVAGE_FORGES (PRD #1867): unset is off, entries are
+// trimmed, lower-cased and de-duplicated, and an unknown forge refuses to start.
+func TestLoadSalvageForges(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if len(cfg.SalvageForges) != 0 {
+		t.Fatalf("SalvageForges default = %v, want empty (off)", cfg.SalvageForges)
+	}
+
+	accept := map[string][]string{
+		"":                          nil,
+		" , ,":                      nil,
+		"github":                    {"github"},
+		" GitHub , gitlab,FORGEJO ": {"github", "gitlab", "forgejo"},
+		"gitlab,,gitlab, Gitlab":    {"gitlab"},
+		"forgejo,github":            {"forgejo", "github"},
+	}
+	for raw, want := range accept {
+		t.Setenv("UZI_SALVAGE_FORGES", raw)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_SALVAGE_FORGES=%q: %v", raw, err)
+		}
+		if !slices.Equal(cfg.SalvageForges, want) {
+			t.Errorf("UZI_SALVAGE_FORGES=%q -> %v, want %v", raw, cfg.SalvageForges, want)
+		}
+	}
+
+	for _, raw := range []string{"gitea", "github,bitbucket", "git hub", "github;gitlab", "*"} {
+		t.Setenv("UZI_SALVAGE_FORGES", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_SALVAGE_FORGES") {
+			t.Errorf("UZI_SALVAGE_FORGES=%q: Load() err = %v, want a UZI_SALVAGE_FORGES error", raw, err)
+		}
 	}
 }

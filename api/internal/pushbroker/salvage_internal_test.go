@@ -29,22 +29,21 @@ func TestEmptyPackTrailer(t *testing.T) {
 	}
 }
 
-func TestPromoteResultString(t *testing.T) {
-	cases := map[PromoteResult]string{
-		PromoteFailed:                "failed",
-		PromoteDone:                  "done",
-		PromoteSalvagedBranchPending: "salvaged_branch_pending",
-		PromoteUnavailable:           "unavailable",
-		PromoteRefused:               "refused",
-		PromoteResult(99):            "PromoteResult(99)",
+func TestSalvageResultString(t *testing.T) {
+	cases := map[SalvageResult]string{
+		SalvageFailed:      "failed",
+		SalvageCreated:     "created",
+		SalvageUnavailable: "unavailable",
+		SalvageRefused:     "refused",
+		SalvageResult(99):  "SalvageResult(99)",
 	}
 	for r, want := range cases {
 		if got := r.String(); got != want {
-			t.Errorf("PromoteResult(%d).String() = %q, want %q", int(r), got, want)
+			t.Errorf("SalvageResult(%d).String() = %q, want %q", int(r), got, want)
 		}
 	}
-	var zero PromoteResult
-	if zero != PromoteFailed {
-		t.Fatalf("zero PromoteResult = %v, want PromoteFailed", zero)
+	var zero SalvageResult
+	if zero != SalvageFailed {
+		t.Fatalf("zero SalvageResult = %v, want SalvageFailed", zero)
 	}
 }

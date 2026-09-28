@@ -13,6 +13,7 @@ import (
 	"net/mail"
 	"net/url"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -725,6 +726,14 @@ type Config struct {
 	RecoveryMaxConcurrentUploads   int           // UZI_RECOVERY_MAX_CONCURRENT_UPLOADS — concurrent uploads per API process. Default 2.
 	RecoveryMaxConcurrentDownloads int           // UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS — concurrent downloads per API process. Default 2.
 	RecoveryRequestDeadline        time.Duration // UZI_RECOVERY_REQUEST_DEADLINE — per upload/download request+transaction deadline. Default 120s.
+
+	// SalvageForges (PRD #1867, UZI_SALVAGE_FORGES) is the comma list of forge kinds
+	// (github, gitlab, forgejo; trimmed and lower-cased) whose failed runs the salvage sweep
+	// copies into refs/uzi-salvage/<run-id>. Default empty: OFF. It is enabled per forge only
+	// after the maintainer real-forge check for that forge passes (PRD #1867 M6). An unknown
+	// entry refuses to start (config.Load errors). It gates only the enqueue: salvage refs
+	// already created keep expiring after UZI_RECOVERY_READY_RETENTION.
+	SalvageForges []string
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1239,6 +1248,12 @@ func Load() (Config, error) {
 	cfg.RecoveryMaxConcurrentDownloads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS", 2)
 	cfg.RecoveryRequestDeadline = parseDuration("UZI_RECOVERY_REQUEST_DEADLINE", 120*time.Second)
 
+	salvageForges, err := parseSalvageForges(getenv("UZI_SALVAGE_FORGES", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.SalvageForges = salvageForges
+
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
 		return Config{}, err
@@ -1247,6 +1262,29 @@ func Load() (Config, error) {
 	cfg.CookieSecure = originIsHTTPS(cfg.FrontendOrigin)
 
 	return cfg, nil
+}
+
+// parseSalvageForges parses UZI_SALVAGE_FORGES: a comma list, each entry trimmed and
+// lower-cased, empty entries ignored, duplicates collapsed. Every entry must be a forge
+// kind uzi supports (github, gitlab, forgejo); anything else is an error so a typo refuses
+// to start rather than silently leaving salvage off for that forge. Empty returns nil (off).
+func parseSalvageForges(raw string) ([]string, error) {
+	var out []string
+	for _, part := range strings.Split(raw, ",") {
+		kind := strings.ToLower(strings.TrimSpace(part))
+		if kind == "" {
+			continue
+		}
+		switch kind {
+		case "github", "gitlab", "forgejo":
+		default:
+			return nil, fmt.Errorf("UZI_SALVAGE_FORGES: unknown forge %q (want a comma list of github, gitlab, forgejo)", kind)
+		}
+		if !slices.Contains(out, kind) {
+			out = append(out, kind)
+		}
+	}
+	return out, nil
 }
 
 // OIDCEnabled reports whether the OIDC SSO login flow is configured. Boot

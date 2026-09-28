@@ -20,7 +20,7 @@ import (
 
 // Regression tests for the forge-credential redirect boundary on every go-git HTTP
 // operation the broker performs: reference listing, fetch, manual receive-pack
-// (publish, CAS delete, salvage promote and DeleteRef) and the refspec delete push.
+// (publish, CAS delete, salvage create and DeleteRef) and the refspec delete push.
 // The remote is a real smart-HTTP server (git http-backend behind an httptest TLS proxy) so each
 // operation's earlier discovery steps succeed and the redirect lands on exactly the
 // request under test; the forbidden destination counts requests and must see ZERO.
@@ -231,20 +231,20 @@ func brokerOps() []brokerOp {
 			}
 		}
 	}
-	// promoteSetup puts a run tip on origin's checkpoint ref over file://, so Promote
-	// creates the salvage ref and CAS-deletes the branch ref over the HTTP remote.
-	promoteSetup := func(t *testing.T, f *gitFixture) func(string) error {
+	// salvageSetup puts a run tip on origin's checkpoint ref over file://, so
+	// CreateSalvageRef creates the salvage ref over the HTTP remote.
+	salvageSetup := func(t *testing.T, f *gitFixture) func(string) error {
 		t.Helper()
 		f.commit("a.txt", "base\n", "base")
 		f.pushMain()
 		tip := f.commit("b.txt", "one\n", "c1")
 		f.git("push", "origin", tip+":refs/uzi-checkpoints/main")
 		return func(u string) error {
-			res, err := pushbroker.Promote(context.Background(), pushbroker.PromoteOptions{
+			res, err := pushbroker.CreateSalvageRef(context.Background(), pushbroker.CreateSalvageRefOptions{
 				CloneURL: u, Branch: "main", Tip: tip, RunID: salvageRunID, Username: "uzi-bot", PAT: redirectTestPAT(),
 			})
-			if err == nil && res != pushbroker.PromoteDone {
-				return fmt.Errorf("promote = %v, want done", res)
+			if err == nil && res != pushbroker.SalvageCreated {
+				return fmt.Errorf("create salvage ref = %v, want created", res)
 			}
 			return err
 		}
@@ -271,13 +271,11 @@ func brokerOps() []brokerOp {
 		{"delete push", "git-receive-pack", 1, deleteSetup(false)},
 		{"cas delete list", "git-upload-pack", 1, deleteSetup(true)},
 		{"cas delete receive-pack", "git-receive-pack", 1, deleteSetup(true)},
-		{"promote list", "git-upload-pack", 1, promoteSetup},
-		{"promote create receive-pack", "git-receive-pack", 1, promoteSetup},
-		{"promote branch delete list", "git-upload-pack", 2, promoteSetup},
-		{"promote branch delete receive-pack", "git-receive-pack", 2, promoteSetup},
-		{"promote confirm list", "git-upload-pack", 3, promoteSetup},
+		{"salvage create list", "git-upload-pack", 1, salvageSetup},
+		{"salvage create receive-pack", "git-receive-pack", 1, salvageSetup},
 		{"delete ref list", "git-upload-pack", 1, deleteRefSetup},
 		{"delete ref receive-pack", "git-receive-pack", 1, deleteRefSetup},
+		{"delete ref confirm list", "git-upload-pack", 2, deleteRefSetup},
 	}
 }
 

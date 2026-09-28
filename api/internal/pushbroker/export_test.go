@@ -29,11 +29,11 @@ func ForwardPackForTest(ctx context.Context, cloneURL, ref string, oldTip, newTi
 	return forwardPack(ctx, remote, nil, plumbing.ReferenceName(ref), old, plumbing.NewHash(newTip), pack)
 }
 
-// PromoteWithBenignDeleteForTest runs Promote with a branch-ref delete that reports
-// success WITHOUT deleting, the shape of a refusal casDelete classifies benign (e.g. a
-// forge's transient "cannot lock ref") while the ref stays at the tip.
-func PromoteWithBenignDeleteForTest(ctx context.Context, o PromoteOptions) (PromoteResult, error) {
-	return promote(ctx, o, func(context.Context, *git.Remote, transport.AuthMethod, plumbing.ReferenceName, plumbing.Hash) error {
+// DeleteRefWithBenignDeleteForTest runs DeleteRef with a CAS delete that reports success
+// WITHOUT deleting, the shape of a refusal casDelete classifies benign (e.g. a forge's
+// transient "cannot lock ref") while the ref stays at the tip.
+func DeleteRefWithBenignDeleteForTest(ctx context.Context, o DeleteRefOptions) error {
+	return deleteRef(ctx, o, func(context.Context, *git.Remote, transport.AuthMethod, plumbing.ReferenceName, plumbing.Hash) error {
 		return nil
 	})
 }

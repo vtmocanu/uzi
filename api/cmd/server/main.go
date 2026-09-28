@@ -368,6 +368,9 @@ func run() error {
 		// which flips 'available' captures past their (capture-time-set) expires_at to 'expired'
 		// AND reclaims their bytes. Non-positive disables the pass.
 		RecoveryReadyRetention: cfg.RecoveryReadyRetention,
+		// PRD #1867 failed-run salvage: the forge kinds whose failed runs the run_salvage
+		// pass enqueues (UZI_SALVAGE_FORGES). Empty is off; it gates only the enqueue.
+		SalvageForges: cfg.SalvageForges,
 	})
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
@@ -785,6 +788,16 @@ func run() error {
 		sweeper.Pass{
 			Name: "ephemeral_workers_reap",
 			Run:  ephemeralProv.ReapPass,
+		},
+		// Failed-run checkpoint salvage (PRD #1867): records failed runs on the
+		// UZI_SALVAGE_FORGES forges, creates their run-scoped refs/uzi-salvage/<run-id>
+		// (create-only: it never deletes or moves a branch checkpoint or recovery ref) and
+		// CAS-deletes each salvage ref once it expires. Bounded to 20s and 5 broker items
+		// per tick. Always registered: with the setting empty and no rows it is two empty
+		// SELECTs and no forge call.
+		sweeper.Pass{
+			Name: "run_salvage",
+			Run:  wsvc.SweepSalvage,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484
