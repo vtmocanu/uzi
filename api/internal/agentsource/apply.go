@@ -249,8 +249,10 @@ func planApply(defs []agenttmpl.Definition, current []store.AgentTemplate) []pla
 		case DiffOverride:
 			row := shared[e.Name]
 			if row.Scope == "builtin" {
+				// Keep the builtin's product-only tools (PRD #1849 D5): upstream cannot
+				// name them, so a verbatim write would strip them from the row.
 				ops = append(ops, plannedOp{
-					Name: e.Name, Action: ActionOverrideBuiltin, Def: defByName[e.Name], Row: row, Detail: e.Detail,
+					Name: e.Name, Action: ActionOverrideBuiltin, Def: agenttmpl.WithProductTools(defByName[e.Name]), Row: row, Detail: e.Detail,
 				})
 			} else {
 				ops = append(ops, plannedOp{

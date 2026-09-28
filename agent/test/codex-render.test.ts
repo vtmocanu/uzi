@@ -416,6 +416,11 @@ describe("renderCodexRun — prompts", () => {
     for (const prompt of rendered.perRolePrompts.values()) {
       assert.match(prompt, /\.uzi\/scratch\//);
       assert.match(prompt, /mktemp -d \.uzi\/scratch\/snap\.XXXXXX/);
+      // PRD #1849 M2: the uzi runtime facts the upstream-verbatim bodies no longer carry.
+      assert.ok(prompt.includes("scratch=.uzi/scratch"), "names the $scratch value");
+      assert.ok(prompt.includes("does not permit\na detached checkout"), "forbids a detached checkout");
+      assert.ok(prompt.includes("export can find the parent checkout; never run Git there."), "never run Git in an export");
+      assert.ok(prompt.includes("cannot run in the export"), "report what an export cannot run");
     }
   });
 

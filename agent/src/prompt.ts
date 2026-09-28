@@ -39,8 +39,11 @@ const UNTRUSTED_FRAME =
  */
 const RUN_SCRATCH_GUIDANCE = [
   "Put temporary file-tool and shell artifacts, including test logs and review exports,",
-  "under `.uzi/scratch/` in this worktree. Use `mktemp .uzi/scratch/gate-log.XXXXXX`",
-  "for gate logs. File tools deny paths outside the worktree; shell screening differs,",
+  "under `.uzi/scratch/` in this worktree: it is the scratch directory this runtime",
+  "provides, so where a role's guidance says to set `scratch`, use `scratch=.uzi/scratch`.",
+  "Use `mktemp .uzi/scratch/gate-log.XXXXXX` for gate logs. This runtime does not permit",
+  "a detached checkout or any other nested worktree: review from an export instead.",
+  "File tools deny paths outside the worktree; shell screening differs,",
   "so keep shell artifacts here too. An outside-path denial points back to this dir.",
   "Scratch is available to this run only while the identical runner clone is retained",
   "through a park/resume. Fresh reseed and cross-worker recovery start empty. Retirement",
@@ -53,8 +56,10 @@ const RUN_SCRATCH_GUIDANCE = [
   "`snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)` and",
   "`git archive \"$sha\" | tar -x -C \"$snap\"`. Check both archive and extraction",
   "status, remove that snapshot after review, and create a new one for each review.",
-  "Exports contain no Git metadata or installed dependencies. Run Git-dependent gates",
-  "in the real checkout under the frozen gate discipline.",
+  "Exports contain no Git metadata or installed dependencies. Git commands run inside an",
+  "export can find the parent checkout; never run Git there. Run Git-dependent gates",
+  "in the real checkout under the frozen gate discipline, and report any check that",
+  "cannot run in the export rather than claiming it ran.",
 ].join("\n");
 
 export const LEAD_GUARDRAIL_APPEND = [

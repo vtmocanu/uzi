@@ -2793,3 +2793,12 @@ tasks:
     dir: api
     cmds:
       - go run ./cmd/roleparity
+
+  # Same contract as nudge:roles: never in a gate, exits 0 on any drift. It
+  # compares each builtin byte for byte with the upstream product-agents/ file at
+  # the commit library/manifest.json pins (PRD #1849), so it needs network access
+  # to the upstream repo; it exits 2 only when it cannot fetch or read it.
+  nudge:builtins:
+    desc: 'builtin-parity NUDGE - builtins vs upstream product-agents at the pinned sha (PRD #1849; never gates)'
+    cmds:
+      - ./scripts/builtin-parity.sh

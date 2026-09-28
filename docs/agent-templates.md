@@ -163,10 +163,9 @@ sandbox tweaks land without a manual step. A builtin an admin has
 **Reset** it, so customizations remain durable across upgrades.
 
 Editing a builtin marks it customized and opts it out of that automatic
-tracking until it is reset. That includes opening a builtin and saving it
-**unchanged** — saving is an edit, so it stops the template tracking shipped
-changes even if you changed nothing; reset it if you didn't mean to take
-ownership. **Reset to default** returns a builtin to pristine: it re-applies
+tracking until it is reset. Saving it with exactly the shipped description,
+model, tools and body is not an edit: the template stays pristine and keeps
+tracking shipped changes. **Reset to default** returns a builtin to pristine: it re-applies
 the shipped body *and* re-enables tracking, so the template picks up future
 shipped changes on boot again.
 
@@ -176,6 +175,13 @@ model, tools, or prompt body no longer matches what this uzi version ships for
 it. (A pristine builtin refreshes on boot, so it already matches and carries
 no badge.) Open the template before resetting: the editor shows exactly what's
 different, so you're not resetting blind.
+
+The shipped builtin roles other than `lead` are copied unchanged from uzi's
+upstream role library, the same `product-agents/` files an
+[agent source](./agent-source.md) sync reads. uzi adds its own runtime rules
+(the run's scratch directory, the review-snapshot recipe, the safety rules) to
+every agent when a run starts, so those rules are not part of the stored
+template.
 
 A builtin can also arrive by a third route: an admin-configured
 [agent source](./agent-source.md) repo an admin has approved a sync from. A

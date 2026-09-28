@@ -88,17 +88,19 @@ func TestBuiltinsParseAndValid(t *testing.T) {
 // against the embedded source, replacing the old golden test's byte-match (which
 // compared against .claude/agents/). Render of the parsed definition must
 // reproduce the on-disk builtin exactly, so the renderer stays the canonical
-// serializer for what boot-seeds into the database.
+// serializer for what boot-seeds into the database. It round-trips the FILE's
+// parse, before productToolDelta: the file mirrors upstream, and the delta is
+// applied on top (TestBuiltinsCarryProductToolDelta pins that half).
 func TestBuiltinsRoundTripRender(t *testing.T) {
 	for _, name := range builtinNames {
 		t.Run(name, func(t *testing.T) {
-			def, ok := BuiltinByName(name)
-			if !ok {
-				t.Fatalf("builtin %q not found", name)
-			}
 			want, err := builtinFS.ReadFile("builtins/" + name + ".md")
 			if err != nil {
 				t.Fatalf("read embedded builtin: %v", err)
+			}
+			def, err := parse(want)
+			if err != nil {
+				t.Fatalf("parse embedded builtin: %v", err)
 			}
 			if got := Render(def); string(got) != string(want) {
 				t.Errorf("Render(%q) does not round-trip the embedded file\n--- got ---\n%s\n--- want ---\n%s",
