@@ -5,7 +5,8 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 import { execFileSync } from "node:child_process";
 import { StubExecutor, type ExecutorResult, type RunContext } from "../src/executor.js";
-import { REASON_WORKER_RESIDUE_BLOCKED, type ExecutorFactory } from "../src/runner.js";
+import { REASON_WORKER_RESIDUE_BLOCKED, type ExecutorFactory, type RunRunner } from "../src/runner.js";
+import type { StateRequest } from "../src/protocol.js";
 import type { RecoveryCoordinator } from "../src/recovery.js";
 import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
 import type { CheckRunner } from "../src/self-improve.js";
@@ -598,5 +599,121 @@ describe("issue #1783: finalize re-proves after its runner-clone steps, before t
     assert.equal(dockerTeardownAtChecks, 1, "one Docker teardown at finalize_checks");
     assert.equal(mrsWhenTornDown, 0, "it ran before the MR was opened");
     assert.ok(mrCalls.length >= 1, "the run went on to open its MR");
+  });
+});
+
+// ─── limit park: a blocked sink never claims durability and never settles custody ─────────
+
+/** The api feature that lets a park report carry `checkpoint_contains_latest` (PRD #1809 D8). */
+const CHECKPOINT_DURABILITY_FEATURE = "run_checkpoint_durability";
+
+const limitWaitBodies = (runId: string): StateRequest[] =>
+  api.states.filter((s) => s.runId === runId && s.body.status === "limit_wait").map((s) => s.body);
+
+/** Commit work, leave some uncommitted (so the park's wip marker runs), then hit the usage limit. */
+const limitFactory: ExecutorFactory = (runId) => ({
+  homeDir: path.join(homeDir, runId),
+  executor: {
+    run: async (ctx: RunContext): Promise<ExecutorResult> => {
+      commitWork(ctx.worktreePath);
+      fs.writeFileSync(path.join(ctx.worktreePath, "UNCOMMITTED.txt"), "in progress\n");
+      const { LimitReachedError } = await import("../src/limit.js");
+      throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+    },
+  },
+});
+
+/** Count the credentialed settles and record every pre-report reap verdict (`limitReaped`). */
+function spySettle(runner: RunRunner): { settles: () => number; reaps: boolean[] } {
+  const r = runner as unknown as Record<string, (...a: unknown[]) => Promise<unknown>>;
+  let settles = 0;
+  const reaps: boolean[] = [];
+  const settle = r.settleRecoveryGeneration!.bind(runner);
+  r.settleRecoveryGeneration = async (...a) => {
+    settles += 1;
+    return await settle(...a);
+  };
+  const reap = r.reapRecoveryProviderForSettle!.bind(runner);
+  r.reapRecoveryProviderForSettle = async (...a) => {
+    const ok = (await reap(...a)) as boolean;
+    reaps.push(ok);
+    return ok;
+  };
+  return { settles: () => settles, reaps };
+}
+
+describe("issue #1783 / PRD #1809 D8: a blocked limit-park sink reports no checkpoint_contains_latest", () => {
+  for (const [label, blockSite] of [
+    ["the first proof (park)", "park"],
+    ["the re-proof after the wip marker (park:after_runner_git)", "park:after_runner_git"],
+  ] as const) {
+    it(`blocked at ${label}: the limit_wait body carries no checkpoint_contains_latest key, even with the feature`, async () => {
+      client.protocolFeatures = [CHECKPOINT_DURABILITY_FEATURE];
+      const { gitlab } = fakeGitlab();
+      const q = siteQuiescer(blockSite);
+      const pub = spyPublish();
+      const claim = gitlabClaim(blockSite === "park" ? 1890 : 1891, { wait_on_limit: true });
+      await runnerWith(limitFactory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun: q.quiesceRun }).execute(claim);
+      assert.equal(q.blockedCount(), 1, `the ${blockSite} proof ran and blocked`);
+      assert.equal(pub.calls(), 0, "nothing published");
+      const [park, ...more] = limitWaitBodies(claim.run_id);
+      assert.ok(park, "the park stands (limit_wait reported)");
+      assert.deepEqual(more, []);
+      assert.ok(!("checkpoint_contains_latest" in park), `no durability claim, got ${JSON.stringify(park)}`);
+    });
+  }
+
+  it("positive control: a quiescent sink with the feature DOES carry checkpoint_contains_latest", async () => {
+    client.protocolFeatures = [CHECKPOINT_DURABILITY_FEATURE];
+    const { gitlab } = fakeGitlab();
+    const q = siteQuiescer("none");
+    const pub = spyPublish();
+    const claim = gitlabClaim(1892, { wait_on_limit: true });
+    await runnerWith(limitFactory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun: q.quiesceRun }).execute(claim);
+    assert.equal(q.blockedCount(), 0);
+    assert.ok(pub.calls() >= 1, "the park published a checkpoint");
+    const [park] = limitWaitBodies(claim.run_id);
+    assert.ok(park, "the park stands (limit_wait reported)");
+    assert.equal(park.checkpoint_contains_latest, true, JSON.stringify(park));
+  });
+});
+
+describe("issue #1783 / PRD #1809 D8: a REFUSED limit park whose sink blocked never runs the credentialed settle", () => {
+  for (const [label, blockSite] of [
+    ["the first proof (park)", "park"],
+    ["the re-proof after the wip marker (park:after_runner_git)", "park:after_runner_git"],
+  ] as const) {
+    it(`blocked at ${label}, park coerced to failed: limitReaped was true, yet no settle`, async () => {
+      const { gitlab } = fakeGitlab();
+      const q = siteQuiescer(blockSite);
+      const { recovery, captures } = fakeRecovery();
+      const claim = gitlabClaim(blockSite === "park" ? 1893 : 1894, { wait_on_limit: true });
+      // The server declines the park (a designed refusal path) and fails the run instead, so
+      // handleLimitReached returns parked=false and the non-parked branch decides the settle.
+      api.overrideStateStatus(claim.run_id, "failed");
+      const runner = runnerWith(limitFactory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun: q.quiesceRun, recovery });
+      const spy = spySettle(runner);
+      await runner.execute(claim);
+      assert.deepEqual(spy.reaps, [true], "the pre-report reap passed (limitReaped === true)");
+      assert.equal(q.blockedCount(), 1, `the ${blockSite} proof ran and blocked`);
+      assert.ok(limitWaitBodies(claim.run_id).length >= 1, "the park was asked for");
+      assert.equal(spy.settles(), 0, "settleRecoveryGeneration never ran");
+      assert.equal(captures(), 0, "no credentialed capture");
+    });
+  }
+
+  it("positive control: the same refused park with a quiescent sink DOES settle", async () => {
+    const { gitlab } = fakeGitlab();
+    const q = siteQuiescer("none");
+    const { recovery } = fakeRecovery();
+    const claim = gitlabClaim(1895, { wait_on_limit: true });
+    api.overrideStateStatus(claim.run_id, "failed");
+    const runner = runnerWith(limitFactory, gitlab, undefined, undefined, { ...RUNNER_OPTS, quiesceRun: q.quiesceRun, recovery });
+    const spy = spySettle(runner);
+    await runner.execute(claim);
+    assert.deepEqual(spy.reaps, [true], "the pre-report reap passed (limitReaped === true)");
+    assert.equal(q.blockedCount(), 0);
+    assert.ok(limitWaitBodies(claim.run_id).length >= 1, "the park was asked for");
+    assert.equal(spy.settles(), 1, "the non-parked branch settled once");
   });
 });

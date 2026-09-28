@@ -2272,8 +2272,11 @@ export class RunRunner {
           // registry stickily (codex/registry.ts) so re-reaping cannot recover it anyway, while a
           // Claude/stub killAgentTree cannot fail. Best-effort; runs after the report landed.
           // issue #1783: limitReaped is also false when the pre-report reap could not prove the
-          // clone quiescent, so a surviving run-owned process never sees a PAT-bearing settle.
-          if (limitReaped) await this.settleRecoveryGeneration(claim, flight, runLog);
+          // clone quiescent. Since PRD #1809 D8 the park sink runs BEFORE the report on every
+          // waiting path, including a refused park that lands here, so a sink whose own proof or
+          // re-proof blocked (parkResidueBlocked) skips the settle too: a surviving run-owned
+          // process never sees a PAT-bearing settle on either leg.
+          if (limitReaped && !parkResidueBlocked) await this.settleRecoveryGeneration(claim, flight, runLog);
         }
       } else if (err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk")) {
         // PRD #1809 D4: the cache cap parks a run that stayed over it (preventive), or the hard

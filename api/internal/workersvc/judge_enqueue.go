@@ -201,7 +201,7 @@ func (s *Service) maybeEnqueueJudge(ctx context.Context, run store.Run) {
 	// failure with no agent behavior to retrospect. Three disjoint sets, differing ONLY in whether
 	// the skip is gated on iteration_count:
 	//   - neverJudgeFailOrigins (forge_unreachable/task_undispatched/gate_presentation_refused/
-	//     worker_residue_blocked):
+	//     data_volume_full/worker_residue_blocked):
 	//     never a real agent defect, so it skips REGARDLESS of iteration_count. A forge cap-fail on
 	//     a RESUMED run carries iteration_count > 0 (iteration_count is only ever advanced, never
 	//     reset), so gating it on == 0 would wrongly judge it — SC3 requires "no judge run"
