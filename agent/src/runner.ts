@@ -84,7 +84,7 @@ import {
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
-import { GitLabClient, ForgejoClient, GitHubClient, ForgeResponseTooLarge, type ForgeClient } from "./forge.js";
+import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
@@ -5020,18 +5020,17 @@ export class RunRunner {
     // here rather than add its own check at one of those sites.
     const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
     const createCloses = renderCloses && !nonClosingDelivery;
-    // H1: a forge response over its byte cap is a deterministic answer, not a blip: never retried
-    // (classifyForgeError alone would read its status 0 as a transport failure). Both the publisher
+    // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
+    // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
     // and the interlock then treat the MR as unreadable; on the create path it fails the create.
-    const classifyDescriptionError = (e: unknown): "transient" | "permanent" =>
-      e instanceof ForgeResponseTooLarge ? "permanent" : classifyForgeError(e);
-    // The publisher passes its budgeted signal (one time budget for the whole publication).
+    // The publisher passes the signal of its current budget (prepare() and publish() each run under
+    // their own), so a retry stops waiting once that budget is spent.
     const forgeRetry = <T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> =>
       withForgeRetry(fn, {
         log: runLog,
         signal: signal ?? boundarySignal,
         label: "PR description",
-        classify: classifyDescriptionError,
+        classify: classifyForgeError,
       });
     // The landed head the description describes (D2: after the push, align and bridge, so the branch
     // is final). A read failure leaves it empty: the size line then reads unavailable.
@@ -5064,6 +5063,9 @@ export class RunRunner {
         mode: refreshRun ? "refresh" : "own",
         interlockIssueIid: scanIid,
         completionCloses: createCloses,
+        // An interlocked run's reconcile below reads the PR and has its own blind fallback, so a
+        // publisher blind rewrite there would only destroy human text.
+        blindFallback: !interlocked,
         prior: claim.pr_description,
         lead: result.prSummary,
         facts: async (s) => {
@@ -5122,7 +5124,7 @@ export class RunRunner {
           title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
           description: description.initialBody(completionFor(renderCloses)),
         }, boundarySignal),
-      { log: runLog, signal: boundarySignal, classify: classifyDescriptionError },
+      { log: runLog, signal: boundarySignal, classify: classifyForgeError },
     );
     batcher.emit({
       kind: "status",
@@ -5138,8 +5140,9 @@ export class RunRunner {
     // PRD #1798 M6 (amended D10, M1): a NON-interlocked issue run whose completion is non-closing (an
     // owner partial, a #634 scope cap) must not complete while its PR still closes the issue. The
     // publisher scanned the body and tried the whole-body non-closing rewrite; when it reports a
-    // closing directive left on the PR (the rewrite failed or was not confirmed), fail closed. An
-    // interlocked run's own reconcile below owns this for it.
+    // closing directive left on the PR (the rewrite failed or was not confirmed), or it never read
+    // the PR and its blind whole-body non-closing rewrite failed too (nothing observed is not proof
+    // of nothing closing), fail closed. An interlocked run's own reconcile below owns this for it.
     if (!interlocked && scanIid !== undefined && !createCloses && published.closingRemains) {
       runLog.warn("PR description: a closing directive remains on a non-closing merge request; failing the run", {
         run_id: runId,
@@ -5194,7 +5197,7 @@ export class RunRunner {
           }),
         ownRegion,
         nonClosing: !closes && scanIid !== undefined ? { issueIid: scanIid, repoPath } : undefined,
-        forgeRetry: (fn) => withForgeRetry(fn, { log: runLog, signal: boundarySignal, classify: classifyDescriptionError }),
+        forgeRetry: (fn) => withForgeRetry(fn, { log: runLog, signal: boundarySignal, classify: classifyForgeError }),
         log: runLog,
       });
     };

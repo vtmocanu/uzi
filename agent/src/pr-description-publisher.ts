@@ -6,8 +6,8 @@
 // version to the PR, reads the forge before and after writing (D11), and acknowledges what the
 // forge ended up showing (D9). Every failure here is ADVISORY: nothing in this module fails or
 // holds a run. The interlock's own reconcile (reconcileCompletion) reports a typed result and the
-// runner decides whether to hold or fail closed. One outcome the runner does act on: on an issue run
-// whose completion block is non-closing, `closingRemains` reports that the PR may still carry a
+// runner decides whether to hold or fail closed. One outcome the runner does act on: on a
+// NON-interlocked issue run whose completion block is non-closing, `closingRemains` reports that the PR may still carry a
 // closing directive uzi could not remove, or could not rule out because it never saw the body and
 // its blind rewrite failed (amended D10), and the runner fails the run closed.
 //
@@ -18,10 +18,13 @@
 // restarts. A 409 `stale_claim` or `run_terminal` from any route stops the publication: no further
 // api call and no forge write (the interlock's writes are the runner's and are unaffected).
 //
-// One forge write sits outside the budget: when a scanning publication (see closingRemains) never
-// read the PR, it falls back to the blind whole-body non-closing rewrite reconcileCompletion uses,
-// under the caller's signal (spec.signal) rather than the spent or failed budget. It is a safety
-// write, not a region update, and a stopped publication never makes it.
+// One forge write sits outside the budget: when a scanning publication (see closingRemains) that
+// the caller enabled it for (spec.blindFallback: a NON-interlocked run, whose closingRemains the
+// runner acts on) never read the PR, it falls back to the blind whole-body non-closing rewrite
+// reconcileCompletion uses, under the caller's signal (spec.signal) rather than the spent or failed
+// budget. It is a safety write, not a region update. An interlocked run never makes it: its own
+// reconcile reads the PR afterwards and has its own blind fallback, so the write would only destroy
+// human text.
 //
 // The publication, in the spec's steps:
 //
@@ -115,8 +118,8 @@ export interface PublisherDeps {
   /** How long to wait before re-reading once when read 1's head is not the landed head (a forge
    *  may lag a push by a moment, GitLab especially). 0 disables the re-read. Default 2 s. */
   headLagRetryMs?: number;
-  /** The forge-and-api share of the publication's one time budget, added to the editor pass's own
-   *  deadline. Default FORGE_BUDGET_MS. */
+  /** The forge-and-api share of each of the publication's time budgets (prepare()'s, and the fresh
+   *  one publish() starts), added to the editor pass's own deadline. Default FORGE_BUDGET_MS. */
   forgeBudgetMs?: number;
 }
 
@@ -156,6 +159,11 @@ export interface PublicationSpec {
   interlockIssueIid?: number;
   /** Whether the completion block this run writes closes the issue. */
   completionCloses: boolean;
+  /** Whether a scanning publication that never read the PR writes the blind whole-body
+   *  non-closing rewrite (see the header). The runner sets it for a NON-interlocked run only: an
+   *  interlocked run's reconcile owns the body after publish() and falls back blind on its own.
+   *  Absent means off: the unread PR is left as it is and closingRemains reports it. */
+  blindFallback?: boolean;
   /** claim.pr_description: the PR's record as the api delivered it. Absent is NOT authoritative. */
   prior?: PrDescriptionState;
   /** The lead's structured claims (D4), stamped with verifiedAtSha. */
@@ -186,9 +194,10 @@ export interface PublishOutcome {
    * when the body the PR is last known to carry has one (the rewrite failed, was never attempted,
    * e.g. a publication stopped after reading the PR, or could not be confirmed by a re-read), and
    * when no read of the PR ever succeeded and the blind whole-body non-closing rewrite that then
-   * follows failed or was not attempted (a stopped publication): nothing observed is not proof of
-   * nothing closing. After a blind rewrite lands, the body it wrote is what is judged. False when
-   * the publication does not scan. The runner fails such a run closed (amended D10).
+   * follows failed or was not attempted (spec.blindFallback off, or a stopped publication):
+   * nothing observed is not proof of nothing closing. After a blind rewrite lands, the body it
+   * wrote is what is judged. False when the publication does not scan. The runner fails such a
+   * NON-interlocked run closed (amended D10); an interlocked run's own reconcile owns the body.
    */
   closingRemains: boolean;
 }
@@ -866,13 +875,17 @@ export class PrDescriptionPublication {
 
   /**
    * A scanning publication that never read the PR (read 1 failed, was over the byte cap, or the
-   * budget ran out first) cannot tell whether an adopted body closes the issue, so it writes the
-   * blind whole-body non-closing rewrite reconcileCompletion falls back to: uzi's region and the
-   * run's non-closing completion block, nothing preserved. It runs under spec.signal, not the
-   * budget (see the header). A stopped publication makes no forge write. True when it was written.
+   * budget ran out first) cannot tell whether an adopted body closes the issue, so, when
+   * spec.blindFallback allows it (a non-interlocked run), it writes the blind whole-body
+   * non-closing rewrite reconcileCompletion falls back to: uzi's region and the run's non-closing
+   * completion block, nothing preserved. It runs under spec.signal, not the budget (see the
+   * header). True when it was written.
    */
   private async blindIfUnread(mrIid: number): Promise<boolean> {
-    if (!this.scans() || this.forgeBody !== undefined || this.stopped) return false;
+    if (this.spec.blindFallback !== true || !this.scans() || this.forgeBody !== undefined) return false;
+    // No current path reaches here stopped with no body read (a stop before read 1 returns from
+    // publishInner without throwing); kept so a stopped publication can never make this write.
+    if (this.stopped) return false;
     const { spec, deps } = this;
     const completion = spec.completion();
     const body = this.initialBody(completion);

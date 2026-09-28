@@ -84,14 +84,17 @@ class FakeForge implements PublisherForge {
   /** Runs after a write lands, so a test can model a concurrent edit the confirm read sees. */
   afterWrite?: (pr: FakeForge["pr"]) => void;
 
-  async getMergeRequest(_url?: string, _pat?: string, _iid?: number, _signal?: AbortSignal): Promise<MergeRequestDetail> {
+  async getMergeRequest(_url?: string, _pat?: string, _iid?: number, signal?: AbortSignal): Promise<MergeRequestDetail> {
+    // Like the real client's fetch: a call under an aborted signal fails before it reaches the forge.
+    if (signal?.aborted) throw new ForgeError(0, "aborted");
     this.reads++;
     this.beforeRead?.(this.reads, this.pr);
     if (this.failRead?.(this.reads)) throw new ForgeError(503, "down");
     return { headSha: this.pr.head, targetBranch: this.pr.target, description: this.pr.description, state: "open" };
   }
 
-  async updateMergeRequestDescription(_url: string, _pat: string, _iid: number, description: string): Promise<void> {
+  async updateMergeRequestDescription(_url: string, _pat: string, _iid: number, description: string, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) throw new ForgeError(0, "aborted");
     if (this.failWrite) throw new ForgeError(500, "write refused");
     this.writes.push(description);
     this.pr.description = description;
@@ -142,6 +145,7 @@ function makeSpec(over: Partial<PublicationSpec> = {}): PublicationSpec {
     repoPath: "o/r",
     mode: "own",
     completionCloses: true,
+    blindFallback: true,
     facts: async () => ({ baseSha: BASE, size: { line: SIZE_LINE, size: SIZE } }),
     context: async () => CTX,
     completion: (st) => completion(true, st),
@@ -838,6 +842,17 @@ describe("publisher: closingRemains on a non-closing issue publication", () => {
     assert.equal(closingDirectiveFor(r.forge.pr.description, IID, "o/r"), false);
     assert.equal(out.closingRemains, false);
     assert.deepEqual(api.acks(), [], "a blind rewrite binds and acks nothing");
+  });
+
+  it("blindFallback off (an interlocked run): an unread PR is never rewritten blind, and closingRemains fails closed", async () => {
+    const r = rig();
+    r.forge.pr.description = `Notes from the maintainer.\n\n${completion(false)}`;
+    r.forge.failRead = (n) => n === 1;
+    const pub = await r.publisher.prepare(nonClosing({ blindFallback: false }), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    assert.equal(out.wrote, false);
+    assert.deepEqual(r.forge.writes, [], "no blind write: the interlock's reconcile owns the body");
+    assert.equal(out.closingRemains, true);
   });
 
   it("no read ever succeeds and the blind rewrite is refused: closingRemains (nothing observed is not proof)", async () => {

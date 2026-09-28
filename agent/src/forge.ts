@@ -43,10 +43,13 @@ export type FetchFn = (
 ) => Promise<FetchResponse>;
 
 /** PRD #1798 M6 (H1): the byte cap on a single-MR/PR response (the detail read, the head read and
- *  the create response). A forge caps a description at about 1,048,576 characters
- *  (FORGE_BODY_MAX_CHARS), and JSON escapes a control character as `\u0001`: 6 bytes for one
- *  character, more than any raw UTF-8 character takes (4 at most). So 6 bytes per character, plus
- *  64 KiB of headroom for the rest of the object. */
+ *  the create response). GitHub caps a PR body at 65,536 characters and GitLab a description at
+ *  1,048,576 (FORGE_BODY_MAX_CHARS), and JSON escapes a control character as `\u0001`: 6 bytes for
+ *  one character, more than any raw UTF-8 character takes (4 at most). So 6 bytes per character of
+ *  the largest of those limits, plus 64 KiB of headroom for the rest of the object. Forgejo's API
+ *  sets no body size limit, so a Forgejo body past this cap is refused (ForgeResponseTooLarge) and
+ *  treated like a failed read: the interlock and the description publisher take their
+ *  unreadable-MR paths, which fail closed wherever a closing directive is at stake. */
 export const MR_DETAIL_MAX_BYTES = 6 * 1_048_576 + 64 * 1024;
 
 /** PRD #1798 M6 (H1): the byte cap on the find-existing LIST read (findOpenMr on GitLab and GitHub).
@@ -108,9 +111,9 @@ export class ForgeError extends Error {
 }
 
 /** A response body over its byte cap (status 0: no forge status is at fault). It is a
- *  deterministic answer, not a transport blip, so it is permanent and never retried: the runner's
- *  forge retries classify it permanent before classifyForgeError (which reads a bare status 0 as a
- *  transport failure). Every caller treats it as an unreadable MR/PR. */
+ *  deterministic answer, not a transport blip, so it is permanent and never retried:
+ *  classifyForgeError checks for it before reading a bare status 0 as a transport failure. Every
+ *  caller treats it as an unreadable MR/PR. */
 export class ForgeResponseTooLarge extends ForgeError {
   constructor(readonly maxBytes: number) {
     super(0, `response too large (over ${maxBytes} bytes)`);

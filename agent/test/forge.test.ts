@@ -865,6 +865,27 @@ describe("getMergeRequest — the byte-capped detail read (H1)", () => {
     assert.deepStrictEqual(mr, { headSha: MR_HEAD, targetBranch: "release/2.x", description: "Ünïcödé 🎉 body", state: "open" });
   });
 
+  it("a legitimate worst-case description (1,048,576 control characters, ~6 MB of JSON) streamed through a real Response is read, not refused", async () => {
+    // JSON escapes each control character as `\u0001`: 6 bytes per character. A cap of 4 bytes per
+    // character (4 MiB + headroom) would refuse this body.
+    const description = "\u0001".repeat(MiB);
+    const json = new TextEncoder().encode(JSON.stringify({ sha: MR_HEAD, target_branch: "main", description, state: "opened" }));
+    assert.ok(json.byteLength > 6 * MiB, `fixture is ${json.byteLength} bytes`);
+    let offset = 0;
+    const stream = new ReadableStream<Uint8Array>({
+      pull(ctl) {
+        if (offset >= json.byteLength) return ctl.close();
+        ctl.enqueue(json.subarray(offset, offset + MiB));
+        offset += MiB;
+      },
+    });
+    const fetchFn: FetchFn = async () => new Response(stream, { status: 200 });
+    const mr = await new GitLabClient({ fetchFn }).getMergeRequest(base.repoUrl, PAT, 42);
+    assert.strictEqual(mr.description.length, MiB);
+    assert.ok(mr.description === description, "the description round-trips unchanged");
+    assert.strictEqual(mr.headSha, MR_HEAD);
+  });
+
   it("a transport without a streaming body (text() only) is still refused over the cap", async () => {
     const big = JSON.stringify({ sha: MR_HEAD, target_branch: "main", description: "x".repeat(MR_DETAIL_MAX_BYTES), state: "opened" });
     const fetchFn: FetchFn = async () => ({ status: 200, text: async () => big });

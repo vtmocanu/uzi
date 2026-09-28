@@ -122,6 +122,28 @@ describe("RunRunner — completion interlock over a preserved body (PRD #1798 M6
     assert.match(parsed.kind === "ok" ? (parsed.completion ?? "") : "", /Closes #1824/, "a completed run's PR carries Closes");
   });
 
+  it("verified head: the publisher's first read fails, and no blind rewrite destroys the human text (the interlock owns it)", async () => {
+    const existing = adoptedBody(1826, "Notes from the maintainer.");
+    let gets = 0;
+    const { gitlab, pr, calls } = fakeGitlab({
+      head: H,
+      existing,
+      // ONLY the publisher's read 1 is refused; every later read (the interlock's) succeeds.
+      intercept: (req) => (req.method === "GET" && ++gets === 1 ? { status: 403, text: async () => "{}" } : undefined),
+    });
+    const claim = interlockedClaim(1826);
+    api.setCompletionPermitResponse(true);
+    git.trackingTip = (async () => H) as typeof git.trackingTip;
+
+    await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(pr.description.startsWith("Notes from the maintainer.\n\n"), "the human text survives");
+    assert.ok(pr.description.endsWith("\n\nA review bot's summary."));
+    assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "one write: the interlock's Closes add, no blind rewrite");
+    assert.match(pr.description, /Closes #1826/);
+  });
+
   it("verified head: when the Closes write cannot be confirmed (nor the strip), the run fails closed and never reports completed", async () => {
     const { gitlab } = fakeGitlab({ head: H, putStatus: 403, existing: "Legacy body with no markers." });
     const claim = interlockedClaim(1825);
