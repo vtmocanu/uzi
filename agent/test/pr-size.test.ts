@@ -7,11 +7,12 @@ import path from "node:path";
 import { GitCache } from "../src/git.js";
 import {
   classifyPath,
-  computeSizeLine,
+  computeSize,
   isSourceUnsupported,
   lookupAttributes,
   parseNumstatZ,
   renderSizeLine,
+  sizeTotals,
   SIZE_UNAVAILABLE,
   type AttrGitRunner,
   type NumstatEntry,
@@ -20,7 +21,8 @@ import {
   type SizeLineGit,
 } from "../src/pr-size.js";
 import { StubExecutor } from "../src/executor.js";
-import { mrDescription } from "../src/runner.js";
+import { mrCompletionBlock } from "../src/runner.js";
+import { renderBody, renderRegion } from "../src/pr-description.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { api, fakeGitlab, git as harnessGit, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 
@@ -483,7 +485,120 @@ describe("renderSizeLine (PRD #1798 D3)", () => {
   it("an empty diff renders no line", () => assert.strictEqual(renderSizeLine([], new Map()), null));
 });
 
-describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () => {
+// PRD #1798 D9: the structured size must carry exactly the numbers the rendered line prints. Parse
+// the line back (grouping and U+2212 undone) and compare bucket by bucket; a bucket the line omits
+// must be zero in the structured size.
+const BUCKET_NAMES: readonly SizeBucket[] = ["code", "tests", "docs", "config", "generated", "vendored"];
+function assertSizeMatchesLine(size: ReturnType<typeof sizeTotals>, line: string | null): void {
+  assert.strictEqual(size.unavailable, false);
+  if (line === null) {
+    assert.strictEqual(size.files, 0);
+    for (const b of BUCKET_NAMES) assert.deepStrictEqual(size[b], { added: 0, deleted: 0 }, b);
+    return;
+  }
+  const num = (raw: string) => Number(raw.replaceAll(",", ""));
+  const parts = line.replace(/^\*\*Size:\*\* /, "").split(" · ");
+  const filesPart = parts.pop()!;
+  const fm = /^([\d,]+) files?$/.exec(filesPart);
+  assert.ok(fm, filesPart);
+  assert.strictEqual(size.files, num(fm[1]!), "files");
+  const seen = new Map<string, { added: number; deleted: number }>();
+  for (const p of parts) {
+    const m = new RegExp(`^([a-z]+) \\+([\\d,]+) ${MINUS}([\\d,]+)$`).exec(p);
+    assert.ok(m, p);
+    seen.set(m[1]!, { added: num(m[2]!), deleted: num(m[3]!) });
+  }
+  for (const b of BUCKET_NAMES) assert.deepStrictEqual(size[b], seen.get(b) ?? { added: 0, deleted: 0 }, b);
+}
+
+describe("sizeTotals: the structured size beside the rendered line (PRD #1798 D9)", () => {
+  const e = (p: string, added: number, deleted: number, binary = false): NumstatEntry => ({ path: p, added, deleted, binary });
+  const vendoredA = new Map<string, PathAttributes>([["src/a.ts", { "linguist-vendored": "set" }]]);
+  const big: NumstatEntry[] = [e("a.ts", 1, 0), e("a.test.ts", 1, 0), e("a.md", 1, 0), e("a.yml", 1, 0), e("a.snap", 1, 0)];
+  for (let i = 0; i < 995; i++) big.push(e(`v/${i}.c`, 0, 1));
+  const bigAttrs = new Map<string, PathAttributes>(big.filter((x) => x.path.startsWith("v/")).map((x) => [x.path, { "linguist-vendored": "set" }]));
+  const cases: [string, NumstatEntry[], Map<string, PathAttributes>][] = [
+    ["mixed buckets", [e("src/a.ts", 1500, 20), e("src/b.ts", 310, 3), e("a_test.go", 40, 2), e("go.sum", 7, 7), e("README.md", 5, 0)], new Map()],
+    ["attribute-classified", [e("src/a.ts", 2, 1)], vendoredA],
+    ["binary only", [e("logo.png", 0, 0, true)], new Map()],
+    ["all six buckets, 1,000 files", big, bigAttrs],
+    ["empty diff", [], new Map()],
+  ];
+  for (const [name, entries, attrs] of cases) {
+    it(`${name}: equals the rendered line's numbers`, () => {
+      assertSizeMatchesLine(sizeTotals(entries, attrs), renderSizeLine(entries, attrs));
+    });
+  }
+  it("pins one case literally", () => {
+    assert.deepStrictEqual(sizeTotals([e("src/a.ts", 3, 1), e("docs/x.md", 0, 4), e("logo.png", 0, 0, true)], new Map()), {
+      unavailable: false,
+      files: 3,
+      code: { added: 3, deleted: 1 },
+      tests: { added: 0, deleted: 0 },
+      docs: { added: 0, deleted: 4 },
+      config: { added: 0, deleted: 0 },
+      generated: { added: 0, deleted: 0 },
+      vendored: { added: 0, deleted: 0 },
+    });
+  });
+});
+
+describe("computeSize: line plus structured size, same failure contract (PRD #1798 D9)", () => {
+  const head = "c".repeat(40);
+  const ok: SizeLineGit = {
+    sizeMergeBase: async () => "d".repeat(40),
+    diffNumstatZ: async () => "1\t0\tsrc/a.ts\0" + "2\t5\tdocs/b.md\0" + "4\t0\tstore/q.sql.go\0",
+    checkAttrZ: async (_bare, _head, paths) =>
+      new Map(paths.map((p) => [p, p.endsWith(".sql.go") ? { "linguist-generated": "set" } : { "linguist-generated": "unspecified" }])),
+  };
+  const UNAVAILABLE = {
+    unavailable: true,
+    files: 0,
+    code: { added: 0, deleted: 0 },
+    tests: { added: 0, deleted: 0 },
+    docs: { added: 0, deleted: 0 },
+    config: { added: 0, deleted: 0 },
+    generated: { added: 0, deleted: 0 },
+    vendored: { added: 0, deleted: 0 },
+  };
+
+  it("the line and the size carry the same numbers", async () => {
+    const got = await computeSize(ok, "/bare", "main", head, nullLogger());
+    assert.strictEqual(got.line, `**Size:** code +1 ${MINUS}0 · docs +2 ${MINUS}5 · generated +4 ${MINUS}0 · 3 files`);
+    assertSizeMatchesLine(got.size, got.line);
+  });
+
+  it("an empty diff: no line, a zero (available) size", async () => {
+    const got = await computeSize({ ...ok, diffNumstatZ: async () => "" }, "/bare", "main", head);
+    assert.strictEqual(got.line, null);
+    assert.deepStrictEqual(got.size, { ...UNAVAILABLE, unavailable: false });
+  });
+
+  it("every failure: the unavailable line and a zeroed unavailable size, one warn each", async () => {
+    const warns: string[] = [];
+    const log = { warn: (msg: string) => void warns.push(msg) };
+    const failures: [SizeLineGit, string | null][] = [
+      [{ ...ok, checkAttrZ: async () => { throw new Error("git check-attr failed"); } }, head],
+      [{ ...ok, checkAttrZ: async () => new Map([["src/a.ts", {}]]) }, head],
+      [{ ...ok, diffNumstatZ: async () => "not numstat" }, head],
+      [{ ...ok, sizeMergeBase: async () => { throw new Error("no merge base"); } }, head],
+      [ok, null],
+    ];
+    for (const [g, h] of failures) {
+      const got = await computeSize(g, "/bare", "main", h, log);
+      assert.strictEqual(got.line, SIZE_UNAVAILABLE);
+      assert.deepStrictEqual(got.size, UNAVAILABLE);
+    }
+    assert.strictEqual(warns.length, failures.length);
+  });
+});
+
+/** computeSize's rendered line alone (the size line the region carries). */
+async function sizeLine(...args: Parameters<typeof computeSize>): Promise<string | null> {
+  return (await computeSize(...args)).line;
+}
+
+describe("computeSize end to end on a real bare clone (PRD #1798 M1)", () => {
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x00, 0x00, 0x01, 0x02, 0x00, 0xff]);
   const helper = Array.from({ length: 20 }, (_, i) => `line ${i}`).join("\n") + "\n";
 
@@ -509,11 +624,13 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
       const raw = await gc.diffNumstatZ(fx.bare, fx.base, fx.head);
       assert.ok(raw.includes("\0test/helper.go\0src/helper.go\0"), JSON.stringify(raw));
       assert.strictEqual(await gc.sizeMergeBase(fx.bare, "main", fx.head), fx.base);
-      const line = await computeSizeLine(gc, fx.bare, "main", fx.head, nullLogger());
+      const line = await sizeLine(gc, fx.bare, "main", fx.head, nullLogger());
       // code: src/keep.ts +2, src/helper.go (renamed from test/) +0 −0, img/logo.png binary.
       // docs: the deleted docs/gone.md (old path) −3. generated: store/runs.sql.go via .gitattributes.
       // config: .gitattributes itself is code (no rule matches it).
       assert.strictEqual(line, `**Size:** code +3 ${MINUS}0 · docs +0 ${MINUS}3 · generated +2 ${MINUS}0 · 6 files`);
+      const computed = await computeSize(gc, fx.bare, "main", fx.head, nullLogger());
+      assertSizeMatchesLine(computed.size, line!);
     } finally {
       fx.cleanup();
     }
@@ -522,7 +639,7 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
   it("an empty diff yields no line", async () => {
     const fx = makeRepo({ "a.ts": "x\n" }, {});
     try {
-      assert.strictEqual(await computeSizeLine(newGitCache(fx.root), fx.bare, "main", fx.head), null);
+      assert.strictEqual(await sizeLine(newGitCache(fx.root), fx.bare, "main", fx.head), null);
     } finally {
       fx.cleanup();
     }
@@ -537,15 +654,15 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
       diffNumstatZ: async () => "1\t0\tsrc/a.ts\0",
       checkAttrZ: async (_bare, _head, paths) => new Map(paths.map((p) => [p, { "linguist-generated": "unspecified" }])),
     };
-    assert.strictEqual(await computeSizeLine(ok, "/bare", "main", head, log), `**Size:** code +1 ${MINUS}0 · 1 file`);
+    assert.strictEqual(await sizeLine(ok, "/bare", "main", head, log), `**Size:** code +1 ${MINUS}0 · 1 file`);
     const failures: SizeLineGit[] = [
       { ...ok, checkAttrZ: async () => { throw new Error("git check-attr failed: fatal: bad object"); } },
       { ...ok, diffNumstatZ: async () => { throw new Error("git diff failed"); } },
       { ...ok, sizeMergeBase: async () => { throw new Error("no merge base"); } },
       { ...ok, diffNumstatZ: async () => "not numstat" },
     ];
-    for (const g of failures) assert.strictEqual(await computeSizeLine(g, "/bare", "main", head, log), SIZE_UNAVAILABLE);
-    assert.strictEqual(await computeSizeLine(ok, "/bare", "main", null, log), SIZE_UNAVAILABLE);
+    for (const g of failures) assert.strictEqual(await sizeLine(g, "/bare", "main", head, log), SIZE_UNAVAILABLE);
+    assert.strictEqual(await sizeLine(ok, "/bare", "main", null, log), SIZE_UNAVAILABLE);
     assert.strictEqual(warns.length, 5);
   });
 
@@ -560,43 +677,49 @@ describe("computeSizeLine end to end on a real bare clone (PRD #1798 M1)", () =>
       diffNumstatZ: async () => "1\t0\tsrc/a.ts\0" + "4\t0\tstore/q.sql.go\0",
       checkAttrZ: async () => new Map([["src/a.ts", { "linguist-generated": "unspecified" }]]),
     };
-    assert.strictEqual(await computeSizeLine(partial, "/bare", "main", head, log), SIZE_UNAVAILABLE);
+    assert.strictEqual(await sizeLine(partial, "/bare", "main", head, log), SIZE_UNAVAILABLE);
     assert.strictEqual(warns.length, 1);
     assert.strictEqual(warns[0]!.msg, "PR size line unavailable");
     assert.match(JSON.stringify(warns[0]!.meta), /store\/q\.sql\.go/);
     // An entirely empty map (every path missing) is unavailable too.
-    assert.strictEqual(await computeSizeLine({ ...partial, checkAttrZ: async () => new Map() }, "/bare", "main", head, log), SIZE_UNAVAILABLE);
+    assert.strictEqual(await sizeLine({ ...partial, checkAttrZ: async () => new Map() }, "/bare", "main", head, log), SIZE_UNAVAILABLE);
   });
 });
 
-describe("mrDescription carries the size line (PRD #1798 M1)", () => {
+describe("a new MR body carries the size line (PRD #1798 M1)", () => {
   const SIZE = `**Size:** code +1 ${MINUS}0 · 1 file`;
-  it("issue arm: before the --- footer; absent ⇒ byte-identical to today", () => {
+  // PRD #1798 M6: the size line lives in the description region, which precedes the completion
+  // block (the publisher's initialBody is renderBody(region, mrCompletionBlock(...))).
+  const REGION = `<!-- uzi:description:start v1 -->\n${SIZE}\n<!-- uzi:description:end -->`;
+  it("issue arm: the size region before the completion block", () => {
     const claim = makeClaim({ issue_iid: 1, issue_title: "Do the thing" });
-    const without = mrDescription(claim, "agent/issue-1");
-    const withSize = mrDescription(claim, "agent/issue-1", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, SIZE);
-    assert.strictEqual(mrDescription(claim, "agent/issue-1", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, ""), without);
-    assert.strictEqual(withSize, without.replace("\n\n---\n", `\n\n${SIZE}\n\n---\n`));
+    const completion = mrCompletionBlock(claim, "agent/issue-1");
+    assert.strictEqual(renderRegion({ sizeLine: SIZE }).text, REGION);
+    assert.strictEqual(renderBody(renderRegion({ sizeLine: SIZE }).text, completion), `${REGION}\n\n${completion}`);
+    assert.ok(completion.startsWith("<!-- uzi:completion:start v1 -->\n"), completion);
   });
-  it("per-kind arm: appended after the body", () => {
+  it("per-kind arm: the same size region before the completion block", () => {
     const claim = makeClaim({ kind: "prompt", issue_iid: null, issue_title: "Prompt run" } as Parameters<typeof makeClaim>[0]);
-    const without = mrDescription(claim, "uzi/prompt/x");
-    const withSize = mrDescription(claim, "uzi/prompt/x", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, SIZE);
-    assert.strictEqual(withSize, `${without}\n\n${SIZE}`);
+    const completion = mrCompletionBlock(claim, "uzi/prompt/x");
+    assert.strictEqual(renderBody(renderRegion({ sizeLine: SIZE }).text, completion), `${REGION}\n\n${completion}`);
   });
 });
 
 describe("RunRunner puts the size line in the opened MR body (PRD #1798 M1)", () => {
   installHarness();
-  it("the created MR's description carries a **Size:** line before the footer", async () => {
+  it("the created MR's description opens with a size-only region carrying the **Size:** line", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(7);
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
     const body = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     // StubExecutor commits one markdown file; the line is computed from the landed tracking tip
-    // against the merge-base with main, and sits before the `---` footer.
-    assert.match(body.description, /\n\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n\n---\n/);
+    // against the merge-base with main, and sits in the region before the completion block.
+    // PRD #1798 M6: the region also ends with the deterministic provenance line (D12).
+    assert.match(
+      body.description,
+      /^<!-- uzi:description:start v1 -->\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n\nDescribes `[0-9a-f]{7}` against `main`\.\n<!-- uzi:description:end -->\n\n<!-- uzi:completion:start v1 -->\n/,
+    );
   });
 });
 
@@ -607,7 +730,7 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     // via updateMergeRequestDescription to add Closes. That rewrite must keep the size line.
     const H = "1111111111111111111111111111111111111111";
     const SIZE = `**Size:** code +3 ${MINUS}1 · tests +2 ${MINUS}0 · 2 files`;
-    const { gitlab, calls } = fakeGitlab({ head: H });
+    const { gitlab, calls, all } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1798, { config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setCompletionPermitResponse(true);
     harnessGit.trackingTip = (async () => H) as typeof harnessGit.trackingTip;
@@ -619,11 +742,14 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     await runner(new StubExecutor(nullLogger()), gitlab).execute(claim);
 
     assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "completed"));
-    assert.deepStrictEqual(calls.map((c) => c.method), ["POST", "GET", "PUT", "GET"]);
+    // PRD #1798 M6: create, the publisher's read and revalidate, the head verify, then the reconcile's
+    // read, write and confirm, then the post-add head re-verify.
+    assert.deepStrictEqual(all.map((c) => c.method), ["POST", "GET", "GET", "GET", "GET", "PUT", "GET", "GET"]);
     const post = JSON.parse(calls.find((c) => c.method === "POST")!.body ?? "{}") as { description: string };
     const put = JSON.parse(calls.find((c) => c.method === "PUT")!.body ?? "{}") as { description: string };
-    assert.ok(post.description.includes(`\n\n${SIZE}\n\n---\n`), post.description);
+    const region = `<!-- uzi:description:start v1 -->\n${SIZE}\n\nDescribes \`1111111\` against \`main\`.\n<!-- uzi:description:end -->\n\n`;
+    assert.ok(post.description.startsWith(region), post.description);
     assert.match(put.description, /Closes #1798/, "the PUT is the verified-head reconcile");
-    assert.ok(put.description.includes(`\n\n${SIZE}\n\n---\n`), `the reconcile body lost the size line:\n${put.description}`);
+    assert.ok(put.description.startsWith(region), `the reconcile body lost the size line:\n${put.description}`);
   });
 });

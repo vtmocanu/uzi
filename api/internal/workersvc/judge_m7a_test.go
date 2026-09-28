@@ -161,12 +161,14 @@ func TestPreStartInfraFailOriginsExact(t *testing.T) {
 }
 
 // TestNeverJudgeFailOriginsExact pins neverJudgeFailOrigins to its EXACT membership: the
-// server-derived origins with no agent attempt to retrospect — forge_unreachable (PRD #1392)
-// and task_undispatched (issue #1367, a handoff reaped before it was ever claimed). An
-// accidental add (a genuinely judgeable origin slipping into the regardless-of-iteration skip)
-// or drop (either falling out, re-exposing SC3) reddens here.
+// server-derived origins with no agent attempt to retrospect — forge_unreachable (PRD #1392),
+// task_undispatched (issue #1367, a handoff reaped before it was ever claimed),
+// gate_presentation_refused (PRD #1795 M1, the plan-gate refusal cap) and data_volume_full (PRD
+// #1809 M5, a worker data volume that stayed full). An accidental add (a genuinely judgeable
+// origin slipping into the regardless-of-iteration skip) or drop (any falling out, re-exposing
+// SC3) reddens here.
 func TestNeverJudgeFailOriginsExact(t *testing.T) {
-	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins, "forge_unreachable", "task_undispatched", "gate_presentation_refused")
+	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins, "forge_unreachable", "task_undispatched", "gate_presentation_refused", "data_volume_full")
 }
 
 // TestEnvPublishFailOriginsExact pins envPublishFailOrigins (issue #1418) to its EXACT membership:

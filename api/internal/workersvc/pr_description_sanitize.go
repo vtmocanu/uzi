@@ -102,10 +102,12 @@ var (
 	// cross-project, external-tracker or URL reference. It runs over views of the text with the
 	// emphasis, code, bracket and escape markers removed or blanked (see
 	// neutralizeClosingDirectives), so `_Fixes_ #12`, `Fix**es** #12` and `Fixes [#12]` match.
-	// Group 1 is the keyword; the whole match is only a locator.
+	// Group 1 is the keyword; the whole match is only a locator. A reference is `#N` or `!N` (Forgejo
+	// reads `[#!]N` and `owner/repo[#!]N` after a close keyword, and its issues and pull requests share
+	// one numbering, so `Fixes !7` closes issue 7), with or without a path.
 	prDescClosing = regexp.MustCompile(`(?i)\b(clos(?:e[sd]?|ing)|fix(?:e[sd]|ing)?|resolv(?:e[sd]?|ing)|implement(?:s|ed|ing)?)\b` +
 		`[\s\p{Z}]*:?[\s\p{Z}]*(?:issues?[\s\p{Z}]*)?` +
-		`(?:#\d+|gh-\d+|[\w.-]+(?:/[\w.-]+)*#\d+|[A-Za-z][A-Za-z0-9_]+-\d+|https?://[^\s<>()]*?/(?:issues|work_items)/\d+)`)
+		`(?:[#!]\d+|gh-\d+|[\w.-]+(?:/[\w.-]+)*[#!]\d+|[A-Za-z][A-Za-z0-9_]+-\d+|https?://[^\s<>()]*?/(?:issues|work_items)/\d+)`)
 )
 
 // prDescHTMLNames are the HTML element names prDescHTMLTag removes, lowercase only, so a

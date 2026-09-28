@@ -112,6 +112,7 @@
   "recovery_retry_not_before": null,
   "forge_park_count": 0,
   "forge_park_max": 0,
+  "disk_park_count": 0,
   "model": null,
   "override_subagent_model": false,
   "priority": "",

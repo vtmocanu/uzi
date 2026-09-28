@@ -12,7 +12,9 @@ import type { ActiveSnapshot, OutboxHeartbeatEntry, StateAck, StateRequest, Work
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController } from "./dind-prune.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
-import { StatsCollector } from "./stats.js";
+import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
+import type { DiskPressureController } from "./disk-reclaim.js";
+import type { RunDiskSampler } from "./run-disk.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
@@ -70,6 +72,13 @@ export class Worker {
     // UZI_DIND_PRUNE_ENABLED=true (createDindPrune). Its gate pauses BOTH claim loops while
     // a prune holds it; the heartbeat feeds it the custody flag; run() starts its loop.
     private readonly dindPrune?: DindPruneController,
+    // PRD #1809 D5/D7: the disk-pressure controller, present when UZI_DISK_RECLAIM or
+    // UZI_DISK_ADMISSION is on. The heartbeat feeds it each data-volume sample, the run lane
+    // asks it before every claim, and run() starts its periodic reclaim loop.
+    private readonly diskPressure?: DiskPressureController,
+    // PRD #1809 D8: the background per-run HOME measure. The heartbeat attaches its latest
+    // finished sample as `stats.run_disk` and never waits on it.
+    private readonly runDisk?: RunDiskSampler,
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -155,7 +164,9 @@ export class Worker {
     // issue #1759 M3: the DinD prune loop, only when enabled (createDindPrune returned a
     // controller). Its loop never throws.
     const dindPrune = this.dindPrune ? this.dindPrune.loop(signal) : Promise.resolve();
-    await Promise.all([heartbeat, settlement, dindPrune, this.claimLoop(signal), this.chatClaimLoop(signal)]);
+    // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
+    const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
+    await Promise.all([heartbeat, settlement, dindPrune, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal)]);
   }
 
   /** issue #1582 M2: sweep the settlement journal now, then every `settlementSweepMs` until the
@@ -356,6 +367,11 @@ export class Worker {
           // UNCONDITIONALLY: the new report fields themselves are sent only when the api's register
           // response advertises the gate_revision_v1 feature, so an older api never sees them.
           "gate_revision_v1",
+          // Issue #1423: this image stamps claim_generation and advice_run_id on its advice POSTs
+          // (/review and /task-review). Advertised UNCONDITIONALLY: the api refuses an unstamped
+          // advice post only from a worker advertising this, never on credential_switch_v1, which
+          // shipped before advice posts were stamped, so older images keep posting mid-upgrade.
+          "advice_claim_fence_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
@@ -427,6 +443,8 @@ export class Worker {
     const stats = new StatsCollector({ dataDir: this.config.dataDir });
     while (!signal.aborted) {
       let ok = false;
+      let sample: WorkerStats | undefined;
+      let sampledAtMs: number | undefined;
       try {
         // PRD #1391 M5: report per-run outbox depth alongside the resource sample. The
         // client sends the array only when the server negotiated `heartbeat_outbox`,
@@ -435,8 +453,14 @@ export class Worker {
         // PRD #1390 M2a: the active-run snapshot rides the same send (built here so its
         // epoch is drawn from the ONE monotonic counter the claim loop also draws from).
         const sentAtMs = Date.now();
+        sampledAtMs = sentAtMs;
+        sample = this.collectStats(stats);
+        // PRD #1809 D8: the latest finished per-run HOME sample (the call starts the next one in
+        // the background when due; it never awaits a measure).
+        const runDisk = this.runDisk?.current();
+        if (sample && runDisk) sample.run_disk = runDisk;
         const retaining = await this.client.heartbeat(
-          this.collectStats(stats),
+          sample,
           this.outboxEntries(),
           this.buildActiveSnapshot(),
         );
@@ -450,6 +474,13 @@ export class Worker {
       } catch (err) {
         this.log.warn("heartbeat failed", { error: errMessage(err) });
       }
+      // PRD #1809 D5: the data volume's used fraction from THIS tick's sample, checked
+      // against the soft threshold derived from the api's latest threshold (read after the
+      // heartbeat so a new value applies at once). Fed whether or not the heartbeat landed:
+      // the volume fills regardless of the api.
+      // PRD #1809 D4: with the time the sample was taken (just before collectStats), so the hard
+      // pressure stop can tell a sample from before a park it caused from one after it.
+      this.diskPressure?.observe(dataVolumeUsedFraction(sample), sampledAtMs);
       // PRD #1391 M2: the re-arm trigger — on EACH successful heartbeat, drain the
       // outbox (single-flight). FIRE-AND-FORGET, like the boot drain: `drainOutbox`
       // replays the ENTIRE per-run backlog with no time budget, so awaiting it here
@@ -633,6 +664,14 @@ export class Worker {
         continue;
       }
       loggedAtCapacity = false;
+      // PRD #1809 D5: while the data volume is at or over the soft threshold, take no new
+      // claim (the controller logs the transition and has already requested a reclaim). An
+      // unknown sample never blocks, and the stop is bounded (DiskPressureController).
+      // Same sleep-and-continue shape as the gates above.
+      if (this.diskPressure?.claimsBlocked()) {
+        await sleep(this.config.pollIntervalMs, signal);
+        continue;
+      }
       // issue #1759 M3: while the DinD prune holds the claim gate, take no claim (same
       // sleep-and-continue shape as the overflow gate above). Otherwise count this claim as
       // in flight until its run is in `active` (or it returned nothing / failed), so the

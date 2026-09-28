@@ -23,17 +23,27 @@ import (
 // M2: 'vault_locked' (migration 00257) is reported by a worker whose codex refresh/release was
 // answered 409 vault_locked (the owner's vault is locked); it takes the ordinary park too, but
 // it is the ONE cause that park persists (recoveryCauseStored), so the surfaces can say "waiting
-// for the vault to be unlocked" rather than the generic transient wording.
+// for the vault to be unlocked" rather than the generic transient wording. PRD #1809 M5 (D6):
+// 'data_volume_full' (migration 00261) is reported by a worker whose write to its data volume
+// failed disk-full after a reclaim and one retry, or that stopped the run preventively before the
+// volume filled; SetState routes it to its own park transaction (parkDataVolumeFull), which stores
+// the cause and counts it toward the disk-only lifetime cap (UZI_RUN_DISK_PARK_MAX).
 var recoveryWaitCauses = map[string]bool{
-	"forge_unreachable":      true,
-	"empty_turn":             true,
-	"provider_outage":        true,
-	recoveryCauseVaultLocked: true,
+	"forge_unreachable":         true,
+	"empty_turn":                true,
+	"provider_outage":           true,
+	recoveryCauseVaultLocked:    true,
+	recoveryCauseDataVolumeFull: true,
 }
 
 // recoveryCauseVaultLocked is the issue #1766 cause for a run parked because its owner's vault
 // is locked (the worker's codex refresh/release was answered 409 vault_locked).
 const recoveryCauseVaultLocked = "vault_locked"
+
+// recoveryCauseDataVolumeFull is the PRD #1809 M5 (D6) cause for a run parked because its
+// worker's data volume is (or was about to be) full. It is also the server-derived fail_origin a
+// run gets past the disk park cap (failOrigins).
+const recoveryCauseDataVolumeFull = "data_volume_full"
 
 // recoveryCauseCodexAccountUnavailable is the PRD #1590 cause for a Codex run held on its
 // quarantined subscription account or a same-alias re-login (D1/D2).

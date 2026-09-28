@@ -671,6 +671,32 @@ workers:
   # schedule instead of by luck. The controller's render.go states the three
   # mechanisms and a unit test enforces it.
   ephemeralRequest: 512Mi
+  # The /data PVC size of a RUN-BOUND worker (issue #1815 → the controller's
+  # UZI_WORKER_EPHEMERAL_DATA_SIZE). NAMING: "ephemeral" here means run-bound (the
+  # worker, PVCs included, is removed once its run is terminal), NOT ephemeral-storage;
+  # this key is unrelated to ephemeralRequest just above. The name spells out
+  # "WorkerData" for exactly that reason.
+  #
+  # It REPLACES the size preset's DataSize for a run-bound worker, on both tiers: the
+  # worker's CPU/memory still follow its preset (the api's UZI_EPHEMERAL_DEFAULT_SIZE
+  # unless the run asks for one), but /data does not, because a run-bound worker holds
+  # one clone for one run and its disk need tracks the repository, not the size. So an
+  # ephemeral `s` or `m` worker gets MORE than its preset's /data (5Gi / 10Gi → 20Gi)
+  # and an ephemeral `l` worker gets 20Gi, NOT l's 25Gi. Persistent workers are
+  # untouched. Motivation: on 2026-09-27 an ephemeral `m` worker (10Gi /data) running a
+  # uzi-on-uzi issue run hit 95% during `task gate:api` (Go build cache ~6.6G + module
+  # cache ~1.9G).
+  #
+  # CEILING: it must fit BOTH tiers' limitRange.maxPVCStorage (25Gi today), since a
+  # run-bound worker lands in either tier. worker-invariants.yaml refuses to render a
+  # larger value (the empty/default path included), and the controller's boot check
+  # (kube.ValidatePVCCeilings) refuses to start against the live ceilings.
+  #
+  # CHANGING IT NEVER RESIZES AN EXISTING PVC: PVCs here are never patched (a size
+  # change is delete + reprovision). Run-bound workers are short-lived, so the new size
+  # arrives with the next one provisioned. Empty falls back to the controller's
+  # built-in 20Gi.
+  ephemeralWorkerDataSize: 20Gi
   # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
   # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
   # changes. OpenShift/OKD MUST set it (the render fails otherwise when
@@ -711,6 +737,12 @@ workers:
   # scheduling one, and no test in this repo can see it. If `l` should not be
   # available here, the fix is to scope it off the tier, not to under-budget.
   #
+  # A RUN-BOUND worker's /data is a separate term (ephemeralWorkerDataSize above, 20Gi,
+  # issue #1815) that replaces the preset's DataSize for that worker. 20Gi <= l's 25Gi,
+  # so the per-worker worst case is still `l`'s and this number is unchanged.
+  # TestShippedPVCDefaultsFitEachTiersStorageQuota (controller/internal/kube) renders
+  # both worker shapes at every preset and checks the fleet against this value.
+  #
   # THE NIX TERM IS 20Gi, NOT THE 4Gi THIS COMMENT CARRIED UNTIL ISSUE #224. PRD #87
   # bumped nixSize (controller/internal/preset/preset.go) for the prebaked Chromium
   # closure and did not follow the value into this arithmetic, so the quota was
@@ -750,15 +782,19 @@ workers:
   #
   # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 12Gi) or that preset
   # stops being admissible — which would surface as a worker that provisions and never
-  # appears. maxPVCStorage likewise >= l's /data (25Gi).
+  # appears. maxPVCStorage likewise >= l's /data (25Gi) and >= ephemeralWorkerDataSize
+  # (a run-bound worker's /data, 20Gi).
   #
-  # maxPVCStorage IS AT ITS CEILING TODAY: `l`'s DataSize is 25Gi (nixSize is 20Gi), so
+  # maxPVCStorage IS AT ITS CEILING TODAY: `l`'s DataSize is 25Gi (nixSize and a
+  # run-bound worker's /data are 20Gi), so
   # LOWERING this value makes `l` workers' claims inadmissible and
   # nothing renders red — the rejection happens at admission, in the cluster, and the
-  # worker simply never appears. The two guards that catch it are
+  # worker simply never appears. The guards that catch it are
   # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset, for the two
-  # sizes compiled into the controller; it reads this value out of this file) and the
-  # chart's own worker-invariants.yaml (for chart-supplied PVC sizes). Raise quota.requestsStorage above whenever you raise this.
+  # sizes compiled into the controller; it reads this value out of this file),
+  # TestEphemeralDataDefaultFitsTheChartsLimitRangeMax (controller/internal/kube, for the
+  # run-bound /data default) and the chart's own worker-invariants.yaml (for
+  # chart-supplied PVC sizes, ephemeralWorkerDataSize included). Raise quota.requestsStorage above whenever you raise this.
   limitRange:
     enabled: true
     default:
@@ -930,15 +966,19 @@ workers:
       max:
         cpu: "4"
         memory: 12Gi
-      # THREE claimants sit at or under this ceiling: `l`'s DataSize (25Gi) exactly,
-      # dindDataSize below and nixSize (20Gi each). Raising any of them past it without
-      # raising this makes that claim inadmissible, and nothing renders red — the
-      # LimitRange rejects it at admission and the worker provisions and never appears.
-      # dindDataSize is guarded against this value in worker-invariants.yaml; the other
-      # two are Go constants a chart cannot read and are guarded by
-      # TestPresetPVCSizesFitTheChartsLimitRangeMax (controller/internal/preset), which
-      # reads this value out of this file. Raise quota.requestsStorage above whenever you
-      # raise this.
+      # FOUR claimants sit at or under this ceiling: `l`'s DataSize (25Gi) exactly,
+      # dindDataSize below, nixSize and a run-bound worker's /data
+      # (workers.ephemeralWorkerDataSize, issue #1815; 20Gi each). Raising any of them
+      # past it without raising this makes that claim inadmissible, and nothing renders
+      # red — the LimitRange rejects it at admission and the worker provisions and never
+      # appears. dindDataSize and ephemeralWorkerDataSize are guarded against this value
+      # in worker-invariants.yaml; the other two are Go constants a chart cannot read and
+      # are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
+      # (controller/internal/preset), which reads this value out of this file. The
+      # run-bound /data replaces DataSize for that worker and 20Gi <= l's 25Gi, so this
+      # tier's per-worker worst case (and quota.requestsStorage) is unchanged;
+      # TestShippedPVCDefaultsFitEachTiersStorageQuota (controller/internal/kube) checks
+      # it. Raise quota.requestsStorage above whenever you raise this.
       maxPVCStorage: 25Gi
     # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
     # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).

@@ -488,7 +488,8 @@ func (s *Service) recordRunCredentialTx(ctx context.Context, run store.Run, cred
 // prior epoch naming the SAME token is a same-token reclaim → not a switch. A prior epoch with no
 // recorded secret (never happens for a successful claim) is treated conservatively as NOT a switch,
 // so a message is never emitted on evidence that cannot name the prior token. Robust and decoupled
-// from the #1422-deferred switch-stamp clear.
+// from the switch stamp, which the same epoch write clears (issue #1422): detection keys on the
+// epoch journal, never on the stamp.
 func priorEpochIsDifferentToken(ctx context.Context, q *store.Queries, runID uuid.UUID, gen int64, current uuid.UUID) (bool, error) {
 	prior, err := q.GetPriorRunCredentialEpoch(ctx, store.GetPriorRunCredentialEpochParams{RunID: runID, ClaimGeneration: gen})
 	if err != nil {

@@ -1,6 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mrTitle, mrDescription } from "../src/runner.js";
+import { mrTitle, mrCompletionBlock } from "../src/runner.js";
 import { makeClaim } from "./helpers.js";
 import type { ClaimConfig } from "../src/protocol.js";
 
@@ -36,7 +36,7 @@ function body(opts: {
   scopeCapped?: { completedCount: number; total?: number };
 }): string {
   const claim = makeClaim({ issue_iid: 7, issue_title: "Do the thing" });
-  return mrDescription(
+  return mrCompletionBlock(
     claim,
     BRANCH,
     undefined,
@@ -74,7 +74,7 @@ describe("GitLab default closing pattern oracle (#1801)", () => {
   });
 });
 
-describe("mrDescription: non-closing bodies carry no GitLab closing directive (#1801)", () => {
+describe("mrCompletionBlock: non-closing bodies carry no GitLab closing directive (#1801)", () => {
   const cases: Array<[string, Parameters<typeof body>[0]]> = [
     // An interlocked run creates its MR with renderCloses=false, and the held / completion-unverified
     // reconcile re-renders exactly this body (the unverified banner is prepended by the runner).

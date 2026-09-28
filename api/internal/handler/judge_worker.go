@@ -152,6 +152,17 @@ type workerReviewRequest struct {
 	Model           string            `json:"model"`
 	Status          string            `json:"status"`
 	Recommendations []workerReviewRec `json:"recommendations"`
+	// ClaimGeneration is the judge flight's claim generation (issue #1423): the write is
+	// fenced on it so a superseded flight cannot overwrite the current verdict. An
+	// advice_claim_fence_v1 worker must stamp it together with advice_run_id; a worker without
+	// that capability (a credential_switch_v1 worker included) may omit it (nil).
+	ClaimGeneration *int64 `json:"claim_generation"`
+	// AdviceRunID is the judge run the posting flight holds (issue #1423). Generations are
+	// per-run counters, so without it a stale flight of an earlier judge run could match a
+	// re-judge's generation; a mismatch with the authorized judge run is a 409 stale_claim.
+	// An advice_claim_fence_v1 worker must stamp it (omitting it is the same 409 as omitting
+	// claim_generation); a worker without that capability may omit it. A present value must be a uuid (400 otherwise).
+	AdviceRunID *string `json:"advice_run_id"`
 }
 
 type workerReviewRec struct {
@@ -184,10 +195,18 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub)
+	claim, err := adviceClaim(req.ClaimGeneration, req.AdviceRunID)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := h.wsvc.PostReview(r.Context(), wkr, targetID, sub, claim)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotFound) {
 			httpx.Error(w, http.StatusNotFound, "run not found")
+			return
+		}
+		if writeAdviceClaimRefusal(w, err) {
 			return
 		}
 		slog.Error("worker run review", "error", err)
@@ -200,6 +219,42 @@ func (h *Handler) WorkerRunReview(w http.ResponseWriter, r *http.Request) {
 	// review is the source of truth and re-running is cheap.
 	h.notifyReviewReady(r.Context(), targetID, res, sub)
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+// adviceClaim builds the issue #1423 advice-post fence from the request's optional
+// claim_generation and advice_run_id. A present advice_run_id that is not a uuid is a
+// request error (400); whether it names the authorized advice run is the service's call.
+func adviceClaim(gen *int64, runID *string) (workersvc.AdviceClaim, error) {
+	claim := workersvc.AdviceClaim{Generation: gen}
+	if runID != nil {
+		id, err := uuid.Parse(*runID)
+		if err != nil {
+			return workersvc.AdviceClaim{}, errors.New("advice_run_id must be a uuid")
+		}
+		claim.RunID = &id
+	}
+	return claim, nil
+}
+
+// writeAdviceClaimRefusal answers the issue #1423 claim-fence refusals shared by the judge
+// review and task-review advice POSTs, and reports whether it wrote a response. Nothing was
+// persisted in either case, so the caller must not notify.
+//   - ErrMissingClaimGeneration: an advice_claim_fence_v1 worker omitted claim_generation or advice_run_id,
+//     so the fence could not engage; 409 with an error the worker fixes by stamping both.
+//   - ErrStaleClaim: the advice run's claim was released, superseded (a reclaim bumped its
+//     generation), reassigned to another worker, or the stamped advice_run_id is not the
+//     authorized advice run; the same {"disposition":"stale_claim"} 409 WorkerRunMessages answers,
+//     which the worker reads to abandon the old flight rather than fail the run.
+func writeAdviceClaimRefusal(w http.ResponseWriter, err error) bool {
+	switch {
+	case errors.Is(err, workersvc.ErrMissingClaimGeneration):
+		httpx.Error(w, http.StatusConflict, "an advice_claim_fence_v1 worker must stamp claim_generation and advice_run_id on every advice post")
+	case errors.Is(err, workersvc.ErrStaleClaim):
+		httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
+	default:
+		return false
+	}
+	return true
 }
 
 // judgeReviewNotificationKind is the notification kind the judge produces at review

@@ -1,10 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { mrTitle, mrDescription } from "../src/runner.js";
-import { makeClaim } from "./helpers.js";
-import type { ClaimConfig } from "../src/protocol.js";
+import { mrTitle, mrCompletionBlock } from "../src/runner.js";
+import { makeClaim, nullLogger } from "./helpers.js";
+import type { ClaimConfig, PrDescriptionSize } from "../src/protocol.js";
+import { PrDescriptionPublisher } from "../src/pr-description-publisher.js";
+import { parseOwnedBlocks } from "../src/pr-description.js";
 
-// PRD #1227 M2/M3 — the agent half of owner completion decisions. mrTitle / mrDescription render
+const ZERO = { added: 0, deleted: 0 };
+const SIZE: PrDescriptionSize = { unavailable: false, files: 1, code: { added: 1, deleted: 0 }, tests: ZERO, docs: ZERO, config: ZERO, generated: ZERO, vendored: ZERO };
+
+// PRD #1227 M2/M3 — the agent half of owner completion decisions. mrTitle / mrCompletionBlock render
 // the run's owner decisions (claim.config.completion_scope): `deferred` drives a `[partial]`,
 // non-closing partial-delivery body (scope_reduced), and `accepted` drives an accept warning block.
 // These are DIRECT-CALL unit tests on the exported renderers, so the byte-level assertions the PRD
@@ -23,7 +28,7 @@ const ACCEPTED: NonNullable<ClaimConfig["completion_scope"]>["accepted"] = [
   { id: "m2.c1", milestone_id: "m2", text: "Second milestone", reason: "acceptable as-is" },
 ];
 
-/** mrDescription with the issue-arm defaults and an explicit renderCloses + completion_scope, so a
+/** mrCompletionBlock with the issue-arm defaults and an explicit renderCloses + completion_scope, so a
  *  test controls exactly the two axes under test without a wall of positional undefineds. */
 function render(
   scope: ClaimConfig["completion_scope"],
@@ -31,7 +36,7 @@ function render(
   iid = 1,
 ): string {
   const claim = makeClaim({ issue_iid: iid, issue_title: "Do the thing" });
-  return mrDescription(claim, BRANCH, undefined, undefined, undefined, undefined, undefined, undefined, renderCloses, scope);
+  return mrCompletionBlock(claim, BRANCH, undefined, undefined, undefined, undefined, undefined, undefined, renderCloses, scope);
 }
 
 describe("mrTitle — owner completion decisions (PRD #1227 M2)", () => {
@@ -52,7 +57,7 @@ describe("mrTitle — owner completion decisions (PRD #1227 M2)", () => {
   });
 });
 
-describe("mrDescription — owner PARTIAL (PRD #1227 M2)", () => {
+describe("mrCompletionBlock — owner PARTIAL (PRD #1227 M2)", () => {
   it("renders a partial-delivery body listing each deferred milestone + reason and NO Closes", () => {
     const body = render({ deferred: DEFERRED }, true);
     assert.match(body, /Implements part of #1 \(partial delivery — owner scope decision/);
@@ -62,7 +67,8 @@ describe("mrDescription — owner PARTIAL (PRD #1227 M2)", () => {
   });
 
   // MUTATION-MINDED (PRD M2): a partial NEVER closes, even when renderCloses would otherwise be true.
-  // Restoring unconditional closing language (dropping the effectiveCloses guard) must FAIL this.
+  // Restoring unconditional closing language (dropping the renderer's issueArm partial arms in
+  // agent/src/pr-description.ts, which never write Closes) must FAIL this.
   it("emits NO `Closes #<iid>` for a partial body even when renderCloses=true", () => {
     const body = render({ deferred: DEFERRED }, true);
     assert.doesNotMatch(body, /Closes #/, "an owner partial must never close the issue, regardless of renderCloses");
@@ -71,7 +77,7 @@ describe("mrDescription — owner PARTIAL (PRD #1227 M2)", () => {
 
   it("a partial takes precedence over the #634 scopeCapped count body", () => {
     const claim = makeClaim({ issue_iid: 1, issue_title: "Do the thing" });
-    const body = mrDescription(
+    const body = mrCompletionBlock(
       claim,
       BRANCH,
       undefined,
@@ -90,7 +96,7 @@ describe("mrDescription — owner PARTIAL (PRD #1227 M2)", () => {
   });
 });
 
-describe("mrDescription — owner ACCEPT (PRD #1227 M3)", () => {
+describe("mrCompletionBlock — owner ACCEPT (PRD #1227 M3)", () => {
   it("accept-only: closes the issue AND appends a warning block naming id + text + reason", () => {
     const body = render({ accepted: ACCEPTED }, true);
     assert.match(body, /Closes #1/, "an accept-only run still closes the issue");
@@ -108,19 +114,75 @@ describe("mrDescription — owner ACCEPT (PRD #1227 M3)", () => {
   });
 });
 
-describe("mrDescription — no completion_scope is byte-identical to today", () => {
-  it("renders the exact legacy issue body (Closes present when renderCloses is true)", () => {
+describe("mrCompletionBlock — no completion_scope renders the plain completion block", () => {
+  it("renders the exact issue completion block (Closes present when renderCloses is true)", async () => {
+    // PRD #1798 M6: the completion block ends in the maintainer-approved footer (2026-09-27),
+    // byte-pinned, and it is pinned through the LIVE path too: the body a new MR is created with is
+    // the publisher's initialBody over this block (runner.ts phasePublish).
     const expected = [
+      "<!-- uzi:completion:start v1 -->",
       "Related to #1.",
       "",
       "Closes #1",
       "",
       "---",
-      "Opened automatically by the uzi agent from branch `agent/issue-1`. Please review and merge manually — the agent never merges.",
+      "Opened by uzi from `agent/issue-1`. A human reviews and merges; uzi never merges.",
+      "<!-- uzi:completion:end -->",
     ].join("\n");
     assert.strictEqual(render(undefined, true), expected);
     // An empty completion_scope (both arrays absent) must render identically to no completion_scope.
     assert.strictEqual(render({}, true), expected);
     assert.strictEqual(render({ deferred: [], accepted: [] }, true), expected);
+
+    const publisher = new PrDescriptionPublisher({
+      forge: {
+        getMergeRequest: async () => {
+          throw new Error("not read");
+        },
+        updateMergeRequestDescription: async () => {
+          throw new Error("not written");
+        },
+      },
+      api: {
+        stagePrDescription: async () => {
+          throw new Error("no api");
+        },
+        bindPrDescription: async () => {
+          throw new Error("no api");
+        },
+        lookupPrDescription: async () => {
+          throw new Error("no api");
+        },
+        ackPrDescription: async () => {
+          throw new Error("no api");
+        },
+      },
+      pass: null,
+      log: nullLogger(),
+      emit: () => {},
+    });
+    const claim = makeClaim({ issue_iid: 1, issue_title: "Do the thing" });
+    const pub = await publisher.prepare(
+      {
+        runId: claim.run_id,
+        claimGeneration: 1,
+        claim,
+        repoUrl: "https://gitlab.example.test/o/r",
+        pat: "pat",
+        mode: "own",
+        completionCloses: true,
+        facts: async () => ({ baseSha: "b".repeat(40), size: { line: "**Size:** code +1 −0 · 1 file", size: SIZE } }),
+        context: async () => {
+          throw new Error("no editor pass");
+        },
+        completion: () => render(undefined, true),
+      },
+      { headSha: "a".repeat(40), targetBranch: "main" },
+    );
+    const created = pub.initialBody(render(undefined, true));
+    assert.ok(created.endsWith(`\n\n${expected}`), created);
+    const parsed = parseOwnedBlocks(created);
+    assert.equal(parsed.kind === "ok" && parsed.completion, expected);
+    assert.equal(parsed.kind === "ok" && parsed.after, "", "the footer closes the body");
   });
 });

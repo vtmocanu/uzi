@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
@@ -659,6 +659,35 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
       assert.ok(rig.boundaries.includes("park"), `park boundary recorded; got ${JSON.stringify(rig.boundaries)}`);
       assert.ok(statuses(claim.run_id).includes("limit_wait"), "the run parked at limit_wait");
       assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the registry was disposed once even on the park path");
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  // PRD #1809 D2: the park cache drop is Claude-only. A Codex run's caches live on its own
+  // per-run volume, so a Codex park leaves its HOME exactly as it was.
+  it("a Codex park does not drop the run caches from its HOME (PRD #1809)", async () => {
+    const { gitlab } = fakeGitlab();
+    const restore = spyPublishLands();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1809-codex-park-"));
+    try {
+      const rig = codexRig();
+      const home = path.join(homeRoot, "home");
+      const caches = [".cache/go-build", "go/pkg/mod", ".npm/_cacache"];
+      const exec = new FakeCodexExecutor(rig.safety, async () => {
+        for (const rel of caches) {
+          fs.mkdirSync(path.join(home, rel), { recursive: true });
+          fs.writeFileSync(path.join(home, rel, "entry"), "cached\n");
+        }
+        throw new LimitReachedError({ resetsAtMs: Date.now() + 5 * 3600_000, rateLimitType: "five_hour" });
+      });
+      const claim = gitlabClaim(1809, { wait_on_limit: true });
+      await runnerWith(() => ({ executor: exec, homeDir: home }), gitlab).execute(claim);
+      assert.ok(statuses(claim.run_id).includes("limit_wait"), "precondition: the run parked at limit_wait");
+      for (const rel of caches) {
+        assert.ok(fs.existsSync(path.join(home, rel, "entry")), `${rel} must be untouched on a Codex park`);
+      }
     } finally {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
@@ -1401,11 +1430,18 @@ function trackedFile(iid: number, file: string): string | null {
   }
 }
 
+/** Every enabledRecovery() recoveryRoot, removed when the file ends (PRD #1809 M2). */
+const recoveryRoots: string[] = [];
+after(() => {
+  for (const r of recoveryRoots.splice(0)) fs.rmSync(r, { recursive: true, force: true });
+});
+
 /** A recovery-ENABLED coordinator, so the credentialed pre-report reap would really run if a vault
  *  path reached it (a token-less harness short-circuits it and hides the call). */
 function enabledRecovery(): { coord: ReturnType<typeof makeRecoveryCoordinator>["coord"]; archive: FakeRecoveryClient } {
   const archive = new FakeRecoveryClient();
-  const { coord } = makeRecoveryCoordinator(archive, new FakeRecoveryGit());
+  const { coord, root } = makeRecoveryCoordinator(archive, new FakeRecoveryGit());
+  recoveryRoots.push(root);
   return { coord, archive };
 }
 

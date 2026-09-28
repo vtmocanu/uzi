@@ -132,9 +132,47 @@ LIMIT @lim;
 -- a service-level transaction. The recommendation rows arrive already validated +
 -- scrubbed in Go; the table CHECK on category/confidence is the backstop. provenance
 -- (produced_by_*) is the same judge run + owner for every row, passed as scalars.
-WITH upserted AS (
+--
+-- Issue #1423: the write is FENCED on the JUDGE (advice) run's claim, mirroring the
+-- InsertRunMessage fence. When @judge_run_id is NOT NULL (every production caller), the
+-- review lands ONLY while that judge run is still claimed by the posting worker (@worker_id,
+-- checked in this statement so a release + reclaim by another worker between the service's
+-- authorize read and this write cannot let a legacy unstamped post through), its claim is
+-- UNRELEASED (claim_released_at IS NULL), the run is NON-TERMINAL (status NOT IN
+-- ('completed', 'failed', 'cancelled'), the same terminal set as
+-- GetActiveJudgeRunForWorkerTarget) and, when the caller stamps @claim_generation, still
+-- at that generation. The status conjunct is needed because SetRunCompleted marks a run
+-- 'completed' WITHOUT clearing worker_id, claim_generation or claim_released_at, so a
+-- delayed post authorized while the judge run was active would otherwise still match after
+-- it finished and could overwrite a newer judge run's review. A superseded
+-- flight (stale requeue + same-worker reclaim bumped runs.claim_generation), a released
+-- one or a finished one therefore writes NOTHING: `upserted` yields no row, `cleared` deletes nothing,
+-- `inserted` is guarded by EXISTS(upserted) so no recommendation row lands, and the final
+-- SELECT returns no row (pgx.ErrNoRows, which the service maps to ErrStaleClaim). A NULL
+-- @judge_run_id is the unfenced seeder path (tests that seed a review with no judge run).
+--
+-- `live` takes FOR SHARE on the judge run row, a strengthening over the message fence: it
+-- serializes against ClaimRun's `claim_generation = claim_generation + 1` row UPDATE, so a
+-- reclaim that commits while this statement waits makes Postgres re-check the predicate on
+-- the NEW row version (READ COMMITTED EvalPlanQual) instead of passing on the old snapshot,
+-- and a reclaim that starts after the lock waits until this write commits. The same lock
+-- serializes against a terminal-status UPDATE (SetRunCompleted, a fail or a cancel): one
+-- that commits while this statement waits makes the EvalPlanQual re-check see the terminal
+-- status and fence the write out; one that starts after the lock waits for this write.
+WITH live AS (
+    SELECT r.id FROM runs r
+    WHERE r.id = sqlc.narg('judge_run_id')::uuid
+      AND r.worker_id = sqlc.arg('worker_id')::uuid
+      AND r.claim_released_at IS NULL
+      AND r.status NOT IN ('completed', 'failed', 'cancelled')
+      AND (sqlc.narg('claim_generation')::bigint IS NULL
+           OR r.claim_generation = sqlc.narg('claim_generation')::bigint)
+    FOR SHARE
+),
+upserted AS (
     INSERT INTO run_reviews (target_run_id, judge_run_id, user_id, verdict, summary_md, judge_model, status)
-    VALUES (@target_run_id, @judge_run_id, @user_id, @verdict, @summary_md, @judge_model, @status)
+    SELECT @target_run_id, sqlc.narg('judge_run_id')::uuid, @user_id, @verdict, @summary_md, @judge_model, @status
+    WHERE sqlc.narg('judge_run_id')::uuid IS NULL OR EXISTS (SELECT 1 FROM live)
     ON CONFLICT (target_run_id) DO UPDATE
         SET judge_run_id = EXCLUDED.judge_run_id,
             verdict      = EXCLUDED.verdict,
@@ -154,6 +192,7 @@ inserted AS (
            sqlc.narg('produced_by_run_id'), sqlc.narg('produced_by_user_id')
     FROM jsonb_to_recordset(@recommendations::jsonb)
         AS x(category text, target text, rationale_md text, confidence text)
+    WHERE EXISTS (SELECT 1 FROM upserted)
 )
 SELECT id FROM upserted;
 

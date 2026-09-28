@@ -132,7 +132,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 				rows = append(rows, []string{
 					w.ID, w.OwnerEmail, cellText(w.Name), w.Status,
 					version, upgradeCell(w.WorkerDTO), blockingCell(w.WorkerDTO),
-					reportedRunsCell(w.WorkerDTO), outboxCell(w.WorkerDTO),
+					reportedRunsCell(w.WorkerDTO), largestRunCell(w.WorkerDTO), outboxCell(w.WorkerDTO),
 				})
 			}
 			// VERSION / UPGRADE / BLOCKING (PRD #1484 M3): the roll health the admin list finally
@@ -142,8 +142,10 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			// #1391 M5): the depth of a worker's locally-buffered updates waiting to replay —
 			// "-" in the steady state, a count while the api was unreachable. RUNS/UPGRADE/OUTBOX
 			// share their renderers with `uzi worker list` (worker.go), read off the embedded
-			// WorkerDTO.
-			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "UPGRADE", "BLOCKING", "RUNS", "OUTBOX"}, rows)
+			// WorkerDTO. LARGEST RUN (PRD #1809 M6, D8) is the HOME size of each worker's largest
+			// run, the same largestRunCell `uzi worker list` uses; it is the fleet-wide view the
+			// fleet.rundisk health check's action points at.
+			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "UPGRADE", "BLOCKING", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 

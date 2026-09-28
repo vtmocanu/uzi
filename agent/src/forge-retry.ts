@@ -11,7 +11,7 @@
 // permanent patterns FIRST and they win, and an unmatched error defaults to
 // permanent (fail fast — the safe default).
 
-import { ForgeError } from "./forge.js";
+import { ForgeError, ForgeResponseTooLarge } from "./forge.js";
 
 /**
  * The push/MR-create backoff schedule (~30s total). N sleeps ⇒ N+1 attempts.
@@ -107,6 +107,9 @@ const TRANSIENT_PATTERNS: RegExp[] = [
  */
 export function classifyForgeError(err: unknown): "transient" | "permanent" {
   if (err instanceof ForgeError) {
+    // PRD #1798: an over-cap response is deterministic (the same resource is just as large on a
+    // retry), so it is permanent even though it carries no HTTP status.
+    if (err instanceof ForgeResponseTooLarge) return "permanent";
     if (err.status === 0) return "transient";
     if (err.status >= 500 || err.status === 408 || err.status === 429) return "transient";
     return "permanent";

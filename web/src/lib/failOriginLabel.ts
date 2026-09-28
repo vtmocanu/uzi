@@ -22,7 +22,9 @@ const labels: Record<string, string> = {
   forge_unreachable: "forge unreachable",
   gate_presentation_refused: "plan gate refused",
   history_rewritten: "history rewritten",
+  task_undispatched: "task undispatched",
   plan_missing: "plan missing",
+  data_volume_full: "data volume full",
   unknown: "unknown",
 };
 

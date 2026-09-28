@@ -15,7 +15,7 @@ A run's owner can now choose the Anthropic credential for **one run** (or one sc
 3. **Attribution is a journal with provenance stamped on the frames, not inferred after the fact** (D7): every claim gets an epoch row, every message frame carries the generation it was produced under, and the usage fold keys off that, not off the run's current token or a timestamp.
 4. **Auto-failover while parked is a bounded, mode-gated re-evaluation** (D8): it only ever promotes a run whose *next* claim would resolve through the pool, and it never moves more than one run per owner per sweep tick.
 
-A fifth item is not a seam to preserve but a **known incompleteness to not paper over**: the switch-state stamp's *successful-application* clear is deferred to issue #1422 (D14).
+A fifth item was a **known incompleteness, not papered over** at the first landing: the switch-state stamp's *successful-application* clear (D14). Issue #1422 has since implemented it at the epoch write (see below).
 
 ## Why this needs its own record
 
@@ -72,7 +72,9 @@ Decision 6e (the original park-time lowering in `decideLimitPark`, `api/internal
 
 **What would break silently:** a future promoter that reads `runs.anthropic_select_reason` (the *previous* claim's reason) instead of `effectiveNextClaimMode` to decide whether to promote — the moment an owner repoints a worker or sets a per-run override while the run sits parked, that reason goes stale and a `pinned` run could be promoted as if it were still `auto`.
 
-## The known incompleteness: the switch stamp's successful-application clear (D14, deferred to #1422)
+## The known incompleteness: the switch stamp's successful-application clear (D14, implemented in #1422)
+
+**Resolved by issue #1422.** `RecordRunCredentialEpoch` now carries a data-modifying CTE (`settled_switch`) that clears both switch columns in the same statement that writes the epoch, fenced on `claim_generation = @claim_generation` (a stale claim cannot clear a later flight's stamp) and `credential_switch_generation < @claim_generation` (a request stamped at the current generation survives that generation's own epoch write). This is the shape recommended below. There is no backfill: a row stamped and reclaimed before the fix keeps its columns until a terminal transition or a later epoch write, which is why the Step A read-side suppression stays. The rest of this section is the record as first landed.
 
 `credential_switch_requested_at`/`credential_switch_generation` are meant to read three states over a switch's lifecycle: **requested** (stamped, not yet released), **released** (the worker let go, awaiting reclaim), and — once the reclaim actually lands and a fresh `run_credential_epochs` row is written for the new generation — cleared, because the switch has now been **applied**. That third transition, "clear the stamp exactly when the next epoch write proves the new token is live," is **not implemented in this landing**. Issue #1422 tracks it.
 
@@ -86,7 +88,7 @@ What **is** implemented, so this gap is DB residue only — never a stuck run, a
 - A future worker-driven write path is obligated to carry `claim_generation` in its predicate, the same way `SetRunRunning`/`AppendMessages`/every state report already do (Seam 2).
 - A future usage-fold change is obligated to key on the frame's stamped generation, never on the run's current token (Seam 3).
 - A future promoter (park-time or duration-time) is obligated to consult `effectiveNextClaimMode`, never `anthropic_select_reason` (Seam 4).
-- Issue #1422 remains open; until it lands, a same-run release-then-reclaim leaves the `credential_switch_requested_at`/`credential_switch_generation` DB columns un-cleared on a still-running run — invisible to every render surface (Step A suppresses the derived DTO field on the detail read, and the raw derivation reads `"requested"`, not `"released"`, post-reclaim), so cosmetic DB residue only, per the incompleteness section above.
+- Issue #1422 clears the `credential_switch_requested_at`/`credential_switch_generation` DB columns at the reclaimed generation's epoch write, so a same-run release-then-reclaim no longer leaves them set. Step A's read-side suppression stays as belt-and-braces for rows stamped and reclaimed before that landed (no backfill).
 
 ## Linked from ARCHITECTURE.md
 

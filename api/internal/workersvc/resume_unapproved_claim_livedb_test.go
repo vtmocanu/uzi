@@ -162,13 +162,18 @@ func TestResumeUnapprovedNoSessionClaimLiveDB(t *testing.T) {
 	}
 
 	// The new claim's GET /inputs replays the revise (read-only, receipt mode), not a
-	// credential-switch signal: the lingering switch stamp belongs to generation 1.
+	// credential-switch signal: the switch stamp belonged to generation 1, and this claim's
+	// generation-2 epoch write settled it (D14, issue #1422).
 	res, err := svc.ConsumeInputs(ctx, wkr, runID)
 	if err != nil {
 		t.Fatalf("ConsumeInputs: %v", err)
 	}
 	if res.CredentialSwitch != nil || !res.Receipts {
 		t.Fatalf("GET /inputs = %+v, want a receipt-mode replay with no switch signal", res)
+	}
+	var stamped bool
+	if err := pool.QueryRow(ctx, `SELECT credential_switch_requested_at IS NOT NULL OR credential_switch_generation IS NOT NULL FROM runs WHERE id = $1`, runID).Scan(&stamped); err != nil || stamped {
+		t.Fatalf("switch stamp after the generation-2 claim = (%v, %v), want it cleared by the epoch write", stamped, err)
 	}
 	if len(res.Inputs) != 1 || res.Inputs[0].ID != revise || res.Inputs[0].Kind != "revise_plan" {
 		t.Fatalf("GET /inputs replayed %+v, want only the revise %d", res.Inputs, revise)

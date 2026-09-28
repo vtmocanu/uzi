@@ -1349,6 +1349,20 @@ export interface ImplementPromptInput {
 }
 
 /**
+ * PRD #1798 M2 (D4): the one short paragraph asking the lead to fill signal_done's optional
+ * `pr_summary` with plain, behaviour-level claims. Shared by the Claude implement prompt
+ * (buildImplementPrompt) and the Codex implement prompt (codex-executor implementPrompt) so
+ * both harnesses ask for the same thing (D13).
+ */
+export const PR_SUMMARY_GUIDANCE = [
+  "When the run opens a pull request, also fill `signal_done`'s `pr_summary` with plain,",
+  "behaviour-level claims a reader of the PR can check: `what` and `why` in user-visible terms,",
+  "`changes` by behaviour or area (not a file list), `verification` listing ONLY the checks",
+  "you actually ran with their real result, and `scope_notes` for anything added, changed,",
+  "dropped or deferred against the ask. Leave out anything you cannot state plainly.",
+].join("\n");
+
+/**
  * Phase 2: one implement⇄review loop turn, delivered via SDK session resume so
  * the lead keeps its full planning context. A follow-up correction is fenced as
  * untrusted data, exactly like the issue fields.
@@ -1465,6 +1479,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     "Commit your work locally on the branch (never push). When the work is complete",
     "and the review is satisfied, call the `signal_done` tool exactly once.",
   );
+  lines.push("", PR_SUMMARY_GUIDANCE);
   // issue #279: ISSUE RUNS ONLY (input.reportOnly gates it, on the same discriminator the
   // signal_done schema uses). Teach the lead the evidence-run path so it declares
   // report_only instead of committing an empty change and opening an empty merge request.

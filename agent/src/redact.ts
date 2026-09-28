@@ -32,7 +32,7 @@ const MIN_SECRET_LEN = 8;
 
 // An ANSI CSI escape sequence, or one control (Cc) / format (Cf) character: what a terminal
 // renderer deletes or interprets without printing, so text either side of it reads as adjacent.
-const INVISIBLE_SRC = String.raw`\x1b\[[0-?]*[ -/]*[@-~]|[\p{Cc}\p{Cf}]`;
+export const INVISIBLE_SRC = String.raw`\x1b\[[0-?]*[ -/]*[@-~]|[\p{Cc}\p{Cf}]`;
 const INVISIBLE = new RegExp(INVISIBLE_SRC, "gu");
 const INVISIBLE_TEST = new RegExp(INVISIBLE_SRC, "u");
 

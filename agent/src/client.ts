@@ -3,6 +3,20 @@ import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
   type ActiveSnapshot,
+  type PrDescriptionAckRequest,
+  type PrDescriptionAckResponse,
+  type PrDescriptionBindRequest,
+  type PrDescriptionBindResponse,
+  type PrDescriptionLookupRequest,
+  type PrDescriptionLookupResponse,
+  type PrDescriptionScopeNote,
+  type PrDescriptionSize,
+  type PrDescriptionStageRequest,
+  type PrDescriptionStageResponse,
+  type PrDescriptionState,
+  type PrDescriptionVerification,
+  type PrDescriptionVersionDTO,
+  type RawPrDescriptionFields,
   type ClaimRequest,
   type PublishResponse,
   type PublishResult,
@@ -98,6 +112,356 @@ export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
   return (parsed as { reason?: unknown }).reason === "vault_locked" ? "vault_locked" : undefined;
+}
+
+// ── PRD #1798 D9: typed errors for the pr-description routes ─────────────────────────────────
+// Each HTTP error extends RequestError (status + truncated body stay readable, and isTransient
+// still treats the 429 as transient), so a caller can branch on the class without parsing the
+// body. The status map is api/internal/handler/worker_pr_description.go's writePrDescriptionError.
+
+/** The 409 `reason` codes writePrDescriptionError sends, verbatim. */
+const PR_DESC_CONFLICT_REASONS = [
+  "stale_claim",
+  "lock_conflict",
+  "version_conflict",
+  "too_many_versions",
+  "run_terminal",
+  "repo_required",
+] as const;
+export type PrDescriptionConflictReason = (typeof PR_DESC_CONFLICT_REASONS)[number];
+
+/** HTTP 409 from a pr-description route with a known `reason`: stale_claim (the claim generation
+ *  is not live), lock_conflict (the ack lost the lock_version compare-and-swap), version_conflict
+ *  (the version cannot take this transition, or the PR named is not the run's own),
+ *  too_many_versions (the stage cap), run_terminal, repo_required. A 409 without a known reason
+ *  stays a plain {@link RequestError}. */
+export class PrDescriptionConflict extends RequestError {
+  constructor(
+    base: RequestError,
+    readonly reason: PrDescriptionConflictReason,
+  ) {
+    super(base.method, base.path, base.status, base.body);
+    this.name = "PrDescriptionConflict";
+  }
+}
+
+/** Upper bound on {@link PrDescriptionRateLimited.retryAfterMs}: a caller that sleeps on it
+ *  must not be parked for hours (or on Infinity) by a hostile or broken `Retry-After`. */
+const PR_DESC_MAX_RETRY_AFTER_MS = 60_000;
+
+/** HTTP 429 from a pr-description route. Only the stage route carries its own limiter (the
+ *  per-worker bucket it shares with proposals and findings), but a 429 on any of the four routes
+ *  maps here. `retryAfterMs` is the server's `Retry-After` (whole seconds) when it sent a
+ *  parseable one, clamped to {@link PR_DESC_MAX_RETRY_AFTER_MS}. */
+export class PrDescriptionRateLimited extends RequestError {
+  constructor(
+    base: RequestError,
+    readonly retryAfterMs: number | undefined,
+  ) {
+    super(base.method, base.path, base.status, base.body);
+    this.name = "PrDescriptionRateLimited";
+  }
+}
+
+/** HTTP 400 from a pr-description route: an invalid body, an over-cap raw field, a bad enum, sha,
+ *  size or target branch. Not retryable: the same request fails the same way. */
+export class PrDescriptionInvalid extends RequestError {
+  constructor(base: RequestError) {
+    super(base.method, base.path, base.status, base.body);
+    this.name = "PrDescriptionInvalid";
+  }
+}
+
+/** HTTP 404 from a pr-description route: the run is not held by this worker, or the named version
+ *  is not this run's. */
+export class PrDescriptionNotFound extends RequestError {
+  constructor(base: RequestError) {
+    super(base.method, base.path, base.status, base.body);
+    this.name = "PrDescriptionNotFound";
+  }
+}
+
+/** A 2xx pr-description response whose body does not match the api's shape. NOT a RequestError
+ *  and NOT transient ({@link isTransient} returns false for it): the api answered and applied the
+ *  request, so a blind retry of a stage would create a second version. The message names the
+ *  route only; the body (untrusted text) is not carried. */
+export class PrDescriptionMalformedResponse extends Error {
+  constructor(
+    readonly path: string,
+    readonly op: "stage" | "bind" | "lookup" | "ack",
+  ) {
+    super(`POST ${path} returned a malformed pr-description ${op} response`);
+    this.name = "PrDescriptionMalformedResponse";
+  }
+}
+
+function conflictReason(body: string): PrDescriptionConflictReason | undefined {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(body);
+  } catch {
+    return undefined;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
+  const reason = (parsed as { reason?: unknown }).reason;
+  return (PR_DESC_CONFLICT_REASONS as readonly unknown[]).includes(reason)
+    ? (reason as PrDescriptionConflictReason)
+    : undefined;
+}
+
+/** Map a pr-description route's error response to its typed error. Any other status (5xx, 401,
+ *  413, ...) stays the plain RequestError. */
+function prDescriptionError(err: RequestError, retryAfter: string | null): RequestError {
+  switch (err.status) {
+    case 400:
+      return new PrDescriptionInvalid(err);
+    case 404:
+      return new PrDescriptionNotFound(err);
+    case 409: {
+      const reason = conflictReason(err.body);
+      return reason === undefined ? err : new PrDescriptionConflict(err, reason);
+    }
+    case 429: {
+      const secs = retryAfter !== null && /^\d+$/.test(retryAfter.trim()) ? Number(retryAfter.trim()) : undefined;
+      return new PrDescriptionRateLimited(
+        err,
+        secs === undefined ? undefined : Math.min(secs * 1000, PR_DESC_MAX_RETRY_AFTER_MS),
+      );
+    }
+    default:
+      return err;
+  }
+}
+
+// ── Sanitized PR-description fields (PRD #1798 D7) ──────────────────────────────────────────
+// The mint token: a module-private symbol, so only code in THIS file can construct the class
+// below (the constructor refuses any other value at runtime, and its parameter type,
+// `typeof MINT`, is a unique symbol no other module can name or produce).
+const MINT: unique symbol = Symbol("SanitizedPrDescriptionFields.mint");
+
+/**
+ * SANITIZED fields: the api-returned text of a staged version, the only text the renderer may
+ * publish (D7). Instances are created only by WorkerClient's response decoders below (stage /
+ * bind / lookup / ack, and claimRun's pr_description), from JSON that passed the shape check;
+ * each instance and its arrays are frozen. JSON.stringify yields the plain fields; toRaw() gives
+ * a mutable {@link RawPrDescriptionFields} copy for a refresh re-stage.
+ *
+ * Nominal, not structural: the ECMAScript #private field makes the class type assignable only
+ * from a real instance, so raw fields, `{ ...sanitized }` and `{ ...sanitized, summary: raw.summary }`
+ * (or `...raw`) are compile errors in a sanitized slot (test/client-pr-description.test.ts pins
+ * each with @ts-expect-error).
+ *
+ * What the compiler does NOT catch, measured by that test file: `Object.assign({}, sanitized,
+ * raw)` compiles into a sanitized slot, because its declared return type is the intersection
+ * `{} & SanitizedPrDescriptionFields & Raw`, and an intersection is assignable to each member;
+ * and an `any` (an untyped `JSON.parse`, an `as any`) assigned to the slot compiles too. Neither
+ * produces an instance at runtime, and {@link SanitizedPrDescriptionFields.is} (an unforgeable
+ * #private brand check, not `instanceof`) returns false for both. `structuredClone(sanitized)` and
+ * `new Proxy(sanitized, handler)` compile into a sanitized slot with no cast at all (both are
+ * declared to return their argument's type), yet the clone is a plain object and the proxy has
+ * no #private slot, so `is()` is false for each. (A proxy cannot report different text for the
+ * frozen data members: the Proxy invariants make such a `get` throw, as the test file pins.)
+ * And a MAPPED type over the class (`Readonly<SanitizedPrDescriptionFields>`, `Pick<...>`) drops
+ * the #private brand: it is structural, so `Pick` of the data members accepts raw fields and
+ * `Readonly<>` accepts raw fields plus a `toRaw` function. So a renderer parameter is typed exactly `SanitizedPrDescriptionFields`
+ * (never a mapped type of it), its fields come ONLY from a DTO a WorkerClient pr-description call
+ * or claimRun returned, never from a value the caller assembled, and the renderer calls
+ * {@link SanitizedPrDescriptionFields.is} at runtime before writing.
+ */
+export class SanitizedPrDescriptionFields {
+  readonly summary: string;
+  readonly changes: readonly string[];
+  readonly scope_notes: readonly Readonly<PrDescriptionScopeNote>[];
+  readonly review_pointers: readonly string[];
+  readonly verification: readonly Readonly<PrDescriptionVerification>[];
+  readonly #sanitized = true;
+
+  constructor(mint: typeof MINT, fields: RawPrDescriptionFields) {
+    if (mint !== MINT) throw new TypeError("SanitizedPrDescriptionFields is created only by the WorkerClient decoders");
+    this.summary = fields.summary;
+    this.changes = Object.freeze([...fields.changes]);
+    this.scope_notes = Object.freeze(fields.scope_notes.map((n) => Object.freeze({ kind: n.kind, text: n.text })));
+    this.review_pointers = Object.freeze([...fields.review_pointers]);
+    this.verification = Object.freeze(
+      fields.verification.map((e) =>
+        Object.freeze({ command: e.command, result: e.result, verified_at_sha: e.verified_at_sha }),
+      ),
+    );
+    Object.freeze(this);
+  }
+
+  /** True only for a real instance (the #private brand check cannot be forged by a prototype). */
+  static is(v: unknown): v is SanitizedPrDescriptionFields {
+    return typeof v === "object" && v !== null && #sanitized in v && v.#sanitized;
+  }
+
+  /** A mutable plain copy, typed RAW: re-staging sends it back through the api's sanitizer. */
+  toRaw(): RawPrDescriptionFields {
+    return {
+      summary: this.summary,
+      changes: [...this.changes],
+      scope_notes: this.scope_notes.map((n) => ({ kind: n.kind, text: n.text })),
+      review_pointers: [...this.review_pointers],
+      verification: this.verification.map((e) => ({
+        command: e.command,
+        result: e.result,
+        verified_at_sha: e.verified_at_sha,
+      })),
+    };
+  }
+}
+
+// Response decoders: the api promises these shapes (non-nil slices in every response); a body that
+// does not match is refused rather than cast, because the stage response's sanitized fields are the
+// only text the renderer may publish (D7) and a bind/ack state drives the compare-and-swap. Each
+// decoder BUILDS a fresh value from the checked keys only, so an unknown key is dropped at every
+// level (the version, its fields and their list entries, the size and its buckets): the fields are
+// minted as a frozen SanitizedPrDescriptionFields instance and the size is rebuilt frozen. None is exported: minting from arbitrary input stays
+// inside this module, on HTTP response bodies only.
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+const isInt = (v: unknown): v is number => typeof v === "number" && Number.isSafeInteger(v);
+const isStrOrNull = (v: unknown): v is string | null => v === null || typeof v === "string";
+const isStrArray = (v: unknown): v is string[] => Array.isArray(v) && v.every((x) => typeof x === "string");
+
+function isBucket(v: unknown): boolean {
+  return isRecord(v) && isInt(v.added) && isInt(v.deleted);
+}
+
+function isSize(v: unknown): v is PrDescriptionSize {
+  return (
+    isRecord(v) &&
+    typeof v.unavailable === "boolean" &&
+    isInt(v.files) &&
+    ["code", "tests", "docs", "config", "generated", "vendored"].every((b) => isBucket(v[b]))
+  );
+}
+
+/** Rebuild a checked size from its known keys only (an unknown top-level or bucket key is
+ *  dropped), frozen with each bucket, so the decoded DTO never aliases the wire object. */
+function decodeSize(v: PrDescriptionSize): PrDescriptionSize {
+  const bucket = (b: PrDescriptionSize["code"]) => Object.freeze({ added: b.added, deleted: b.deleted });
+  return Object.freeze({
+    unavailable: v.unavailable,
+    files: v.files,
+    code: bucket(v.code),
+    tests: bucket(v.tests),
+    docs: bucket(v.docs),
+    config: bucket(v.config),
+    generated: bucket(v.generated),
+    vendored: bucket(v.vendored),
+  });
+}
+
+function decodeFields(v: unknown): SanitizedPrDescriptionFields | undefined {
+  const ok =
+    isRecord(v) &&
+    typeof v.summary === "string" &&
+    isStrArray(v.changes) &&
+    isStrArray(v.review_pointers) &&
+    Array.isArray(v.scope_notes) &&
+    v.scope_notes.every(
+      (n) =>
+        isRecord(n) &&
+        typeof n.text === "string" &&
+        ["added", "changed", "dropped", "deferred"].includes(n.kind as string),
+    ) &&
+    Array.isArray(v.verification) &&
+    v.verification.every(
+      (e) =>
+        isRecord(e) &&
+        typeof e.command === "string" &&
+        typeof e.verified_at_sha === "string" &&
+        (e.result === "pass" || e.result === "fail"),
+    );
+  // The checks above establish RawPrDescriptionFields' shape; the constructor copies only its keys.
+  return ok ? new SanitizedPrDescriptionFields(MINT, v as unknown as RawPrDescriptionFields) : undefined;
+}
+
+function decodeVersion(v: unknown): PrDescriptionVersionDTO | undefined {
+  if (!isRecord(v)) return undefined;
+  const fields = decodeFields(v.fields);
+  const { source, state } = v;
+  if (
+    fields === undefined ||
+    typeof v.id !== "string" ||
+    typeof v.run_id !== "string" ||
+    !isInt(v.claim_generation) ||
+    !(v.mr_iid === null || isInt(v.mr_iid)) ||
+    !(v.size === null || isSize(v.size)) ||
+    typeof v.base_sha !== "string" ||
+    typeof v.head_sha !== "string" ||
+    typeof v.target_branch !== "string" ||
+    (source !== "generated" && source !== "lead_only" && source !== "deterministic_only") ||
+    !isStrOrNull(v.rendered_region_sha256) ||
+    (state !== "pending" && state !== "published" && state !== "abandoned") ||
+    typeof v.created_at !== "string" ||
+    !isStrOrNull(v.published_at)
+  ) {
+    return undefined;
+  }
+  return {
+    id: v.id,
+    run_id: v.run_id,
+    claim_generation: v.claim_generation,
+    mr_iid: v.mr_iid,
+    fields,
+    size: v.size === null ? null : decodeSize(v.size),
+    base_sha: v.base_sha,
+    head_sha: v.head_sha,
+    target_branch: v.target_branch,
+    source,
+    rendered_region_sha256: v.rendered_region_sha256,
+    state,
+    created_at: v.created_at,
+    published_at: v.published_at,
+  };
+}
+
+// last_outcome accepts ANY string (forward skew: a newer api's new outcome must not drop the whole
+// state; nothing publishes from it). The published version stays strictly checked.
+function decodePrState(v: unknown): PrDescriptionState | undefined {
+  if (!isRecord(v) || !isInt(v.mr_iid) || !isInt(v.lock_version) || !isStrOrNull(v.last_outcome)) return undefined;
+  let published_version: PrDescriptionVersionDTO | null = null;
+  if (v.published_version !== null) {
+    const pv = decodeVersion(v.published_version);
+    if (pv === undefined) return undefined;
+    published_version = pv;
+  }
+  return { mr_iid: v.mr_iid, lock_version: v.lock_version, last_outcome: v.last_outcome, published_version };
+}
+
+function decodeStage(v: unknown): PrDescriptionStageResponse | undefined {
+  const version = isRecord(v) ? decodeVersion(v.version) : undefined;
+  return version === undefined ? undefined : { version };
+}
+
+function decodeBind(v: unknown): PrDescriptionBindResponse | undefined {
+  if (!isRecord(v)) return undefined;
+  const version = decodeVersion(v.version);
+  const pr = decodePrState(v.pr);
+  return version === undefined || pr === undefined ? undefined : { version, pr };
+}
+
+function decodeLookup(v: unknown): PrDescriptionLookupResponse | undefined {
+  if (!isRecord(v) || !isStrOrNull(v.matched_version_id)) return undefined;
+  const match = v.match;
+  if (match !== "published" && match !== "pending" && match !== "none") return undefined;
+  let pr: PrDescriptionState | null = null;
+  if (v.pr !== null) {
+    const decoded = decodePrState(v.pr);
+    if (decoded === undefined) return undefined;
+    pr = decoded;
+  }
+  return { match, matched_version_id: v.matched_version_id, pr };
+}
+
+function decodeAck(v: unknown): PrDescriptionAckResponse | undefined {
+  if (!isRecord(v) || !isStrOrNull(v.recovered_version_id)) return undefined;
+  const pr = decodePrState(v.pr);
+  return pr === undefined ? undefined : { pr, recovered_version_id: v.recovered_version_id };
 }
 
 const sleepReal = (ms: number): Promise<void> =>
@@ -347,6 +711,20 @@ export class WorkerClient {
     return this.workerOutboxMaxPendingValue;
   }
 
+  /** PRD #1809 D5: the last valid `disk_pressure_threshold` a heartbeat response carried. */
+  private diskPressureThresholdValue: number | undefined;
+
+  /**
+   * PRD #1809 D5: the api's recycle threshold (`UZI_DISK_PRESSURE_THRESHOLD`) as the last
+   * heartbeat response that carried a valid one reported it: a finite fraction in (0, 1].
+   * Undefined until such a response arrives (an older api never sends it; the disk
+   * controller then assumes the api default). A later response with the field absent or
+   * garbled leaves the last good value in place.
+   */
+  get diskPressureThreshold(): number | undefined {
+    return this.diskPressureThresholdValue;
+  }
+
   /** The advertised features as an array (PRD #1392 D7): the runner reads this to pick a
    *  capability-aware degradation for a pre-clone forge-unreachable park. Backed by
    *  `serverFeatures` so the two views never diverge and a rollback clear empties both. The
@@ -501,12 +879,14 @@ export class WorkerClient {
   }
 
   /**
-   * POST one heartbeat and decode the custody flag from its response (issue #1759):
-   * `{"worker": {"retaining_unpublished_work": bool, ...}}`. Returns the flag only when
-   * the body decodes and the field is a boolean, else undefined, which the DinD prune
-   * treats as "may be retaining" (fail-closed). A non-2xx still throws exactly like
-   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat
-   * whose body does not parse is still a successful heartbeat.
+   * POST one heartbeat and decode its response (issue #1759, PRD #1809 D5):
+   * `{"worker": {"retaining_unpublished_work": bool, "disk_pressure_threshold": number, ...}}`.
+   * Returns the custody flag only when the body decodes and the field is a boolean, else
+   * undefined, which the DinD prune treats as "may be retaining" (fail-closed). The
+   * threshold is recorded on {@link diskPressureThreshold} only when it is a finite number in
+   * (0, 1]; anything else keeps the last good value. A non-2xx still throws exactly like
+   * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat whose
+   * body does not parse is still a successful heartbeat.
    */
   private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
     const path = `${WORKER_API_PREFIX}/heartbeat`;
@@ -522,6 +902,10 @@ export class WorkerClient {
     if (typeof decoded !== "object" || decoded === null) return undefined;
     const worker = (decoded as { worker?: unknown }).worker;
     if (typeof worker !== "object" || worker === null) return undefined;
+    const threshold = (worker as { disk_pressure_threshold?: unknown }).disk_pressure_threshold;
+    if (typeof threshold === "number" && Number.isFinite(threshold) && threshold > 0 && threshold <= 1) {
+      this.diskPressureThresholdValue = threshold;
+    }
     const retaining = (worker as { retaining_unpublished_work?: unknown }).retaining_unpublished_work;
     return typeof retaining === "boolean" ? retaining : undefined;
   }
@@ -542,7 +926,21 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", `${WORKER_API_PREFIX}/runs/claim`, body);
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", `${WORKER_API_PREFIX}/runs/claim`, res);
-    return (await res.json()) as ClaimResponse;
+    const claim = (await res.json()) as ClaimResponse;
+    // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
+    // same check as the bind / lookup / ack responses). The warning carries the run id only,
+    // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
+    // 200 body returning as it did before this check existed, rather than throwing here.
+    if (isRecord(claim) && claim.pr_description !== undefined) {
+      const pr = decodePrState(claim.pr_description);
+      if (pr === undefined) {
+        delete claim.pr_description;
+        this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
+      } else {
+        claim.pr_description = pr;
+      }
+    }
+    return claim;
   }
 
   /** Claim the oldest queued CHAT run for this worker's user (the disjoint chat
@@ -570,6 +968,16 @@ export class WorkerClient {
       generation > 0 &&
       (this.hasCredentialSwitchCapability || this.hasFeature("claim_generation_fence"))
     );
+  }
+
+  /**
+   * PRD #1809 D6: whether a /state report for a run at `generation` would carry
+   * `claim_generation` on the wire (the send-gate above). The data-volume-full park is fenced
+   * on it server-side and 400s without it, so the runner takes that park only when this is true
+   * (never for a chat claim, whose generation is the legacy 0).
+   */
+  stampsClaimGeneration(generation?: number): boolean {
+    return this.includeClaimGeneration(generation);
   }
 
   /**
@@ -1136,17 +1544,68 @@ export class WorkerClient {
   }
 
   /** Post the judge's verdict + recommendations (POST /worker/runs/:id/review). The
-   *  server validates + scrubs; a bad enum is a 400. `targetRunId` is the reviewed run. */
-  async postReview(targetRunId: string, review: ReviewRequest): Promise<void> {
-    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`, review);
+   *  server validates + scrubs; a bad enum is a 400. `targetRunId` is the reviewed run.
+   *  `claimGeneration` is the JUDGE run's claim generation and `adviceRunId` the judge run's
+   *  id (issue #1423): the server fences the write on both, so a superseded flight's post is
+   *  refused with a 409 `{disposition:"stale_claim"}` (see isStaleClaimRefusal) and persists
+   *  nothing. */
+  async postReview(targetRunId: string, review: ReviewRequest, claimGeneration?: number, adviceRunId?: string): Promise<void> {
+    await this.postAdvice(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/review`,
+      review,
+      claimGeneration,
+      adviceRunId,
+    );
   }
 
   /** Post a diff-review's structured findings (POST /worker/runs/:id/task-review, PRD
    *  #400 M4b). `targetRunId` is the reviewed task run (claim.review_target_run_id). The
    *  server caps/scrubs the findings and validates `severity`; report-only — nothing is
-   *  pushed. Mirrors postReview. */
-  async postTaskReview(targetRunId: string, review: TaskReviewRequest): Promise<void> {
-    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/task-review`, review);
+   *  pushed. Mirrors postReview, including the claim fence (issue #1423): `adviceRunId` is
+   *  the REVIEW run's id. */
+  async postTaskReview(
+    targetRunId: string,
+    review: TaskReviewRequest,
+    claimGeneration?: number,
+    adviceRunId?: string,
+  ): Promise<void> {
+    await this.postAdvice(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(targetRunId)}/task-review`,
+      review,
+      claimGeneration,
+      adviceRunId,
+    );
+  }
+
+  /** The shared advice-post path (issue #1423): stamp `claim_generation` through the same
+   *  send-gate and strict-decode fallback as postMessages, so `0`/undefined is never sent, a
+   *  capability worker stamps optimistically, and a rolled-back api's strict-decode 400 is
+   *  retried ONCE with the field stripped. `advice_run_id` rides ONLY with the generation:
+   *  when claim_generation is not on the wire (not included, or the stripped retry) neither
+   *  is advice_run_id, so an older api that predates both still strict-decodes the retry
+   *  (the same degradation reportState applies to its presentation fields). The server's
+   *  requirement is keyed on advice_claim_fence_v1 (advertised by this image, see worker.ts),
+   *  not credential_switch_v1: a worker advertising it must send BOTH on the wire, and the
+   *  server refuses an omission of either with the same missing-generation 409. An older
+   *  credential_switch_v1-only image that omits both keeps posting during an upgrade. The
+   *  caller's request object is never mutated. */
+  private async postAdvice(
+    path: string,
+    review: ReviewRequest | TaskReviewRequest,
+    claimGeneration?: number,
+    adviceRunId?: string,
+  ): Promise<void> {
+    const included = this.includeClaimGeneration(claimGeneration);
+    await this.withGenerationFallback(included, (includeField) => {
+      const body = { ...review };
+      delete body.claim_generation;
+      delete body.advice_run_id;
+      if (includeField) {
+        body.claim_generation = claimGeneration;
+        if (adviceRunId) body.advice_run_id = adviceRunId;
+      }
+      return this.postJSON(path, body);
+    });
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).
@@ -1365,7 +1824,7 @@ export class WorkerClient {
    *  treated as refused, the safe default). */
   async reportWallPark(
     runId: string,
-    args: { head: string; published: boolean; claimGeneration?: number },
+    args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
   ): Promise<{ status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
@@ -1376,6 +1835,8 @@ export class WorkerClient {
     return this.withGenerationFallback(included, async (includeField) => {
       const body: WallParkRequest = { head: args.head, published: args.published };
       if (includeField) body.claim_generation = args.claimGeneration;
+      // PRD #1809 D8: the caller passes it only when the api advertised run_checkpoint_durability.
+      if (args.checkpointContainsLatest !== undefined) body.checkpoint_contains_latest = args.checkpointContainsLatest;
       const res = await this.fetchRaw("POST", path, body);
       if (res.status === 200 || res.status === 409) {
         const fields = await readRunAck(res);
@@ -1417,6 +1878,96 @@ export class WorkerClient {
     body: { summary: string; deltas: { kind: "added" | "changed" | "dropped"; text: string }[]; plan_md: string },
   ): Promise<void> {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/summary/plan`, body);
+  }
+
+  // ── Plain-English PR descriptions (PRD #1798 D9) ───────────────────────────────────────────
+  // Four worker->api calls, none of which touches the forge: three writes (stage, bind, ack) and
+  // one read (lookup). Every request carries the claim's claim_generation (the api fences each on
+  // the live generation: 409 stale_claim otherwise). Errors are typed: PrDescriptionInvalid (400),
+  // PrDescriptionNotFound (404), PrDescriptionConflict (409 with a known reason),
+  // PrDescriptionRateLimited (429; only stage has its own limiter, but any route's 429 maps
+  // there); anything else is the plain RequestError. A 2xx response that does not match the api's
+  // shape throws PrDescriptionMalformedResponse (non-transient) rather than being cast.
+  //
+  // ONE attempt each; the client retries nothing. Only stage is non-idempotent: it creates a row
+  // per call, so a blind retry after a lost response could stage twice and burn the per-run
+  // version cap, and it must never be retried. The other three are safe to replay: bind is
+  // idempotent for the same (version, mr_iid, rendered_region_sha256) while the version is
+  // pending, lookup is a read, and a replayed ack whose response was lost returns 200 with the
+  // current state (workersvc.AckPrDescription checks prDescAckAlreadyApplied /
+  // prDescOwnRecoveryAlreadyApplied before the lock compare-and-swap) only when the PR's
+  // lock_version advanced EXACTLY ONCE past the replay's expected_lock_version (anything else is
+  // 409 version_conflict); that replay response's recovered_version_id is always null, so it
+  // does not say whether the original ack recovered a version.
+  // Their retry policy belongs to the lifecycle (M6), which knows the forge state around them.
+
+  /** Stage a pending version (POST /worker/runs/:id/pr-description/stage). `req.fields` are RAW;
+   *  the returned version's `fields` are the api-sanitized text, the only text the renderer may
+   *  publish (D7). */
+  async stagePrDescription(
+    runId: string,
+    req: PrDescriptionStageRequest,
+    signal?: AbortSignal,
+  ): Promise<PrDescriptionStageResponse> {
+    return this.postPrDescription(runId, "stage", req, decodeStage, signal);
+  }
+
+  /** Bind the run's pending version to its PR with the rendered region's sha256
+   *  (POST /worker/runs/:id/pr-description/bind). Returns the bound version plus the PR state. */
+  async bindPrDescription(
+    runId: string,
+    req: PrDescriptionBindRequest,
+    signal?: AbortSignal,
+  ): Promise<PrDescriptionBindResponse> {
+    return this.postPrDescription(runId, "bind", req, decodeBind, signal);
+  }
+
+  /** Classify a region hash read from the forge against the PR's versions
+   *  (POST /worker/runs/:id/pr-description/lookup). */
+  async lookupPrDescription(
+    runId: string,
+    req: PrDescriptionLookupRequest,
+    signal?: AbortSignal,
+  ): Promise<PrDescriptionLookupResponse> {
+    return this.postPrDescription(runId, "lookup", req, decodeLookup, signal);
+  }
+
+  /** Acknowledge the forge write for a bound version, compare-and-swapped on
+   *  `expected_lock_version` (POST /worker/runs/:id/pr-description/ack). Any outcome but
+   *  `published` abandons the version, except when `observed_region_sha256` equals the acked
+   *  version's own rendered hash: the forge shows its region, so the api publishes it instead
+   *  and names it in `recovered_version_id`. It still abandons it when the published version
+   *  already rendered the same region, when a newer publication supersedes it, or when lost-ack
+   *  recovery published another pending version on this ack (see PR_DESC_ACK_OUTCOMES). */
+  async ackPrDescription(
+    runId: string,
+    req: PrDescriptionAckRequest,
+    signal?: AbortSignal,
+  ): Promise<PrDescriptionAckResponse> {
+    return this.postPrDescription(runId, "ack", req, decodeAck, signal);
+  }
+
+  private async postPrDescription<T>(
+    runId: string,
+    op: "stage" | "bind" | "lookup" | "ack",
+    body: unknown,
+    decode: (v: unknown) => T | undefined,
+    signal?: AbortSignal,
+  ): Promise<T> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pr-description/${op}`;
+    const res = await this.fetchRaw("POST", path, body, this.httpTimeoutMs, signal);
+    if (res.status >= 400) {
+      throw prDescriptionError(await this.toError("POST", path, res), res.headers.get("Retry-After"));
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(await res.text());
+    } catch {
+      parsed = undefined;
+    }
+    const out = decode(parsed);
+    if (out === undefined) throw new PrDescriptionMalformedResponse(path, op);
+    return out;
   }
 
   // ── Cross-run agent memory (PRD #90) ───────────────────────────────────────
@@ -1859,8 +2410,11 @@ export function isTransientStatus(status: number): boolean {
   return status >= 500 || status === 408 || status === 429;
 }
 
-/** Retryable: transport failures, 5xx, and 408/429; permanent otherwise. */
+/** Retryable: transport failures, 5xx, and 408/429; permanent otherwise (including a malformed
+ *  2xx pr-description response, {@link PrDescriptionMalformedResponse}). */
 export function isTransient(err: unknown): boolean {
+  // A malformed 2xx pr-description body: the api answered, so retrying could re-apply a write.
+  if (err instanceof PrDescriptionMalformedResponse) return false;
   if (err instanceof RequestError) {
     return isTransientStatus(err.status);
   }

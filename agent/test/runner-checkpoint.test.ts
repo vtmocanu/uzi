@@ -1022,11 +1022,11 @@ describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue
 
 describe("RunRunner — report_only after a checkpoint is refused (issue #299)", () => {
   // This pins the SAME-WORKER leg of the union guard: a run that publishes a checkpoint
-  // mid-run (lastPublishedTip advances on the confirmed publish) and THEN declares
+  // mid-run (landedCheckpoint is set on the confirmed publish) and THEN declares
   // report_only must FAIL, because a report-only completion opens no branch/MR and would
   // orphan the published refs/uzi-checkpoints/<branch>. hasCommittedCheckpoint is NOT stubbed
   // here (the fixture bare carries no mirrored checkpoint ref — the publish went through
-  // the client spy), so the guard trips on lastPublishedTip alone.
+  // the client spy), so the guard trips on landedCheckpoint alone.
   it("fails a report_only completion after this worker published a checkpoint", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(67);

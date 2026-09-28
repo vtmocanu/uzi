@@ -254,3 +254,46 @@ export async function resolvePrdInput(
     return NO_PRD;
   }
 }
+
+/** The one git read {@link resolvePrdInputFromBare} needs (git.ts Git.readBare), kept narrow so
+ *  this module stays free of the git implementation. */
+export interface BarePrdReader {
+  readBare(
+    barePath: string,
+    args: readonly string[],
+    opts: { maxBytes: number; timeoutMs?: number; signal?: AbortSignal },
+  ): Promise<{ text: string; truncated: boolean }>;
+}
+
+/**
+ * PRD #1798: the linked PRD read from the immutable bare snapshot at `headSha`, for the finalize
+ * delivery context. Unlike {@link resolvePrdInput} it never opens the agent-writable worktree, so a
+ * FIFO, device or symlink the agent left at the PRD path cannot block the read (git stores none of
+ * them as file content), and the text is the one the published description describes. Bounded by
+ * MAX_PRD_BYTES, `timeoutMs` and `signal`. Never throws: any failure returns the nulls fallback.
+ */
+export async function resolvePrdInputFromBare(
+  git: BarePrdReader,
+  barePath: string,
+  headSha: string,
+  issueDescription: string,
+  issueIid: number | null | undefined,
+  opts: { timeoutMs: number; signal?: AbortSignal },
+  log: WarnLogger = NOOP_LOG,
+): Promise<PrdInput> {
+  try {
+    const core = findValidPrdCore(issueDescription ?? "", issueIid);
+    if (!core || !/^[0-9a-f]{7,64}$/iu.test(headSha)) return NO_PRD;
+    const { text } = await git.readBare(barePath, ["show", `${headSha}:${core}`], {
+      maxBytes: MAX_PRD_BYTES,
+      timeoutMs: opts.timeoutMs,
+      signal: opts.signal,
+    });
+    return { prdPath: core, prdText: text };
+  } catch (err) {
+    log.warn("prd-link: PRD not readable from the bare snapshot; falling back to title+body", {
+      error: (err as Error).message,
+    });
+    return NO_PRD;
+  }
+}

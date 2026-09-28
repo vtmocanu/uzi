@@ -698,7 +698,8 @@ type RunDTO struct {
 	// non-null values are "forge_unreachable" (the forge stayed unreachable at clone),
 	// "codex_account_unavailable" (PRD #1590, held on its Codex account) and "vault_locked"
 	// (issue #1766, the owner's vault is locked; the run resumes at its next retry once the
-	// vault is unlocked);
+	// vault is unlocked) and "data_volume_full" (PRD #1809 M5, the worker's data volume was full
+	// or about to fill; the run resumes at its next retry, see DiskParkCount);
 	// "empty_turn"/"provider_outage" are reserved. Clients render an unrecognised value
 	// honestly (a newer server may ship a cause this client has not heard of), the same rule
 	// as RateLimitType.
@@ -746,6 +747,31 @@ type RunDTO struct {
 	// zero. It is one server constant, but unlike LimitWaitCount's cap it IS on the row because
 	// the forge wording ("N of MAX") needs the denominator inline.
 	ForgeParkMax int `json:"forge_park_max"`
+	// DiskParkCount is how many COUNTED 'data_volume_full' parks this run has taken in its
+	// lifetime (PRD #1809 M5, D6), the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides
+	// on — distinct from ForgeParkCount and from the backoff-shaping recovery_wait_count. A
+	// preventive disk park (the worker stopped the run before its volume filled) does not count.
+	// 0 for a run that has never taken a counted disk park.
+	DiskParkCount int `json:"disk_park_count"`
+	// CheckpointContainsLatest is the worker's report, on the run's latest park, of whether the
+	// checkpoint that park published contains the run's latest committed work (PRD #1809 M6, D8).
+	// false means it does not (the recovery pin or the fetch-back failed): the worker keeps the
+	// latest work under its custody hold. Absent when not reported (older worker, no checkpoint
+	// published on that park, or a server-side park, which never carries a report). It is cleared
+	// when the run is claimed again or reports running (ClaimRun, SetRunRunning), so it only ever
+	// describes the park that reported it; clients show it only while the run is parked.
+	// Display-only.
+	CheckpointContainsLatest *bool `json:"checkpoint_contains_latest,omitempty"`
+	// HomeBytes / CacheBytes are the run's HOME size on its CURRENT worker (runs.worker_id) and, of
+	// that, the rebuildable caches (PRD #1809 M6, D8), from that worker's run_disk heartbeat report
+	// measured (sampled_at) within the last 25 minutes. Another worker's report is never
+	// substituted, so a run with no current worker, or whose worker has not reported it recently,
+	// has them absent. SINGLE-RUN READ ONLY: set by GET /api/runs/{id} and absent on every list
+	// row (no per-row size lookup on a list). DiskTruncated means the worker's size walk was cut
+	// short, so both sizes are lower bounds. Display-only.
+	HomeBytes     *int64 `json:"home_bytes,omitempty"`
+	CacheBytes    *int64 `json:"cache_bytes,omitempty"`
+	DiskTruncated bool   `json:"disk_truncated,omitempty"`
 	// Model is the model frozen onto the run at fire time by the schedule that created it
 	// (PRD #300): nil means the run inherited the owner's per-user Worker default. Surfaced
 	// read-only so a scheduled run's model is confirmable.

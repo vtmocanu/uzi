@@ -16,10 +16,17 @@ import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
+import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
-import { reclaimStrandedRunHomes } from "./home-reclaim.js";
+import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
+import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
+import { RunDiskSampler } from "./run-disk.js";
+import { DataVolumeGuard } from "./disk-full.js";
+import { RunDiskLocks } from "./run-disk-locks.js";
+import { DiskGovernor } from "./cache-cap.js";
+import { sampleVolume } from "./stats.js";
 import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
@@ -381,6 +388,18 @@ async function main(): Promise<void> {
   });
   const git = new GitCache(config.dataDir, log);
 
+  // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
+  // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
+  // resume, and runs one D7 reclaim before the one retry. The reclaim is the DiskPressureController
+  // built further down (after the runner it needs); bound late through `reclaimNow`, which stays
+  // undefined when the reclaim is off (UZI_DISK_RECLAIM=0): the retry then runs without a pass.
+  let reclaimNow: (() => Promise<void>) | undefined;
+  const dataVolume = new DataVolumeGuard({
+    dataDir: config.dataDir,
+    reclaim: () => reclaimNow?.() ?? Promise.resolve(),
+    log,
+  });
+
   // PRD #1391 M2: the worker-owned message outbox and the shared re-arm registry,
   // built + initialised BEFORE the runners/worker so a boot backlog is already
   // loadable and every batcher can spill into the same store. `init()` mints/loads the
@@ -391,6 +410,9 @@ async function main(): Promise<void> {
   const outbox = new Outbox({
     root: config.outboxDataDir,
     log,
+    // PRD #1809 D6: say when a reserve that cannot be (re)written failed because the data volume
+    // is full. The outbox keeps its custody; a park still goes through the claim-fenced state call.
+    classifyWriteFailure: (err, destination) => dataVolume.classify(err, destination),
     runMaxBytes: config.outboxRunMaxBytes,
     maxBytes: config.outboxMaxBytes,
     retentionMs: config.outboxRetentionMs,
@@ -451,6 +473,55 @@ async function main(): Promise<void> {
       codexCommandSandbox: config.codexCommandSandbox,
       codexSandboxDegraded: config.codexHarness.degraded,
     });
+  // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
+  // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
+  // present) gets a REAL Codex advice pass instead of the missing-token fallback. PRD #1798 M5
+  // also hands it to the run lane's PR-description editor pass (the RunRunner below), which,
+  // unlike judge/review, is skipped outright under the stub executor. Built
+  // HERE — one of the two sites semgrep/codex-fixed-constructor.yml allows to construct a
+  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option.
+  //
+  // UNLIKE the run lane's `buildRunExecutor` (PRD #1429 M6, above this function): this
+  // factory is always built, and a codex-bound judge/review claim always constructs the
+  // REAL CodexAdviceHarness, regardless of `config.executor`. The judge/review e2e path
+  // proves itself through the packaged-only LOOPBACK app-server provider
+  // (`CODEX_M3B_LOOPBACK_PROVIDER_NAME`, wired via `appServerAuthOpenAIBaseUrlForTest`),
+  // not through a generic stub — so there is no judge-lane equivalent of the run lane's
+  // stub-before-codex short-circuit. `stubJudgeQueryFn` below only ever gates the CLAUDE
+  // judge's `queryFn`; the Codex judge/review path (`runCodexAdviceModelPass`) takes no
+  // `queryFn` at all and is unaffected by it.
+  //
+  // (This comment used to say makeExecutor "unconditionally" selected the real
+  // CodexExecutor the same way, with UZI_EXECUTOR=stub "only ever" affecting the Claude
+  // path. That was the M6 bug this PRD fixes, not an intended parallel: the run lane's
+  // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
+  // reaches the codex branch. Only this judge/review advice lane keeps the old
+  // always-real-CodexAdviceHarness shape.)
+  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
+
+  // PRD #1809 D7: the per-run lock the runner and the disk reclaim share (run-disk-locks.ts).
+  const diskLocks = new RunDiskLocks();
+  // The reclaim's memo of runs whose caches it found gone; the runner forgets a run there
+  // each time it starts executing it (disk-reclaim.ts CachesDroppedMemo).
+  const cachesDropped = new CachesDroppedMemo();
+  // PRD #1809 D4: the per-run cache cap (UZI_RUN_CACHE_CAP_ENABLED) and the mid-turn pressure stop
+  // (UZI_DISK_HARD_STOP_ENABLED). The cap reads the data volume's size at each check; the pressure
+  // stop is fed every stats tick through the DiskPressureController below, and runs the D7 reclaim
+  // (bound late, like the data-volume guard's) after the run it stopped has parked.
+  const diskGovernor = new DiskGovernor({
+    config: {
+      capEnabled: config.runCacheCapEnabled,
+      capFraction: config.runCacheCapFraction,
+      lowWater: config.runCacheLowWater,
+      maxConcurrentRuns: config.maxConcurrentRuns,
+      hardStopEnabled: config.diskHardStopEnabled,
+      hardMargin: config.diskHardMargin,
+    },
+    log,
+    volumeTotalBytes: () => sampleVolume(config.dataDir)?.bytesTotal,
+    thresholdOf: () => client.diskPressureThreshold,
+    reclaim: () => reclaimNow?.() ?? Promise.resolve(),
+  });
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
@@ -467,6 +538,17 @@ async function main(): Promise<void> {
     gapFillMax: config.gapFillMax,
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     activeRuns,
+    // PRD #1798 M5: the PR-description editor pass, on the same HOME root as the executor's own
+    // SummaryRunner and the judge (the uid split needs its setgid agent-home parent), with the
+    // production Codex factory for a Codex claim.
+    summaryRunner: new SummaryRunner(log, { homeRoot: sdkHomeRoot, codexAdviceHarnessFactory }),
+    // Under the stub executor the pass never runs: the e2e spends nothing on either harness (the
+    // Codex advice path takes no queryFn, so a stub queryFn could not neutralize it).
+    skipDeliverySummary: config.executor === "stub",
+    diskLocks,
+    cachesDropped,
+    dataVolume,
+    diskGovernor,
   });
 
   // The chat lane (PRD #39). Per-session executor factory (PRD #42 Decision 4): each
@@ -514,30 +596,6 @@ async function main(): Promise<void> {
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
   });
 
-  // PRD #1429 M3: the Codex advice-harness factory judge/review thread into
-  // runReadOnlyModelPass (model-pass.ts) so a Codex judge/review claim (secrets.codex
-  // present) gets a REAL Codex advice pass instead of the missing-token fallback. Built
-  // HERE — one of the two sites semgrep/codex-fixed-constructor.yml allows to construct a
-  // Codex class (the other is codex/codex-executor.ts itself) — and injected as an option.
-  //
-  // UNLIKE the run lane's `buildRunExecutor` (PRD #1429 M6, above this function): this
-  // factory is always built, and a codex-bound judge/review claim always constructs the
-  // REAL CodexAdviceHarness, regardless of `config.executor`. The judge/review e2e path
-  // proves itself through the packaged-only LOOPBACK app-server provider
-  // (`CODEX_M3B_LOOPBACK_PROVIDER_NAME`, wired via `appServerAuthOpenAIBaseUrlForTest`),
-  // not through a generic stub — so there is no judge-lane equivalent of the run lane's
-  // stub-before-codex short-circuit. `stubJudgeQueryFn` below only ever gates the CLAUDE
-  // judge's `queryFn`; the Codex judge/review path (`runCodexAdviceModelPass`) takes no
-  // `queryFn` at all and is unaffected by it.
-  //
-  // (This comment used to say makeExecutor "unconditionally" selected the real
-  // CodexExecutor the same way, with UZI_EXECUTOR=stub "only ever" affecting the Claude
-  // path. That was the M6 bug this PRD fixes, not an intended parallel: the run lane's
-  // stub now DOES short-circuit a codex-bound claim to StubExecutor before it ever
-  // reaches the codex branch. Only this judge/review advice lane keeps the old
-  // always-real-CodexAdviceHarness shape.)
-  const codexAdviceHarnessFactory = makeProductionCodexAdviceHarnessFactory(client, log, sdkHomeRoot);
-
   // The judge lane (PRD #46): a slim runner for `judge` claims. It reuses the SDK
   // HOME root but needs no executor/clone — it fetches the trace, calls the model
   // once, and posts a verdict. Under UZI_E2E_EXECUTOR=stub the model call is the
@@ -546,6 +604,8 @@ async function main(): Promise<void> {
   // token and zero spend.
   const judgeRunner = new JudgeRunner(client, log, {
     homeRoot: sdkHomeRoot,
+    // The configured cap, so the disk reclaim's model-pass age bound is derived from it.
+    modelTimeoutMs: config.judgeModelTimeoutMs,
     // PRD #1390 M2a: a judge attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
     // PRD #1391 Run B M3b (D6): journal the judge's terminal STATE write-ahead (never the verdict).
@@ -564,6 +624,7 @@ async function main(): Promise<void> {
   // review), mirroring the judge lane so the e2e can drive it with a dummy token.
   const reviewRunner = new ReviewRunner(client, git, log, {
     homeRoot: sdkHomeRoot,
+    modelTimeoutMs: config.reviewModelTimeoutMs,
     // PRD #1390 M2a: a review attempt holds a run slot, so it is listed in the snapshot.
     activeRuns,
     // PRD #1391 Run B M3b (D6): journal the review's terminal STATE write-ahead (never the review POST).
@@ -588,6 +649,70 @@ async function main(): Promise<void> {
     log,
   });
   if (dindPrune) log.info("dind prune enabled", { docker_host_wired: true });
+  // A run's api status for both HOME reclaims. A 404 is the API ANSWERING not-found (the
+  // run's row is gone, which is exactly what the oldest stranded HOMEs look like): return
+  // undefined so a sweep SKIPS without counting it toward the outage bail; every other error
+  // (down / 5xx / timeout) propagates as a genuine could-not-ask that DOES count (PRD #108
+  // B2/B3, home-reclaim.ts RunStatusLookup contract).
+  const runStatusOf: RunStatusLookup = async (runId) => {
+    try {
+      return (await client.getChatRun(runId)).status;
+    } catch (err) {
+      if (err instanceof RequestError && err.status === 404) return undefined;
+      throw err;
+    }
+  };
+  // PRD #1809 D5/D7: the running disk reclaim (off with UZI_DISK_RECLAIM=0) and the admission
+  // stop (off with UZI_DISK_ADMISSION=0), independently. The startup sweep below is separate
+  // and stays.
+  // A stranded model-pass HOME is collected only once it is older than the longest pass
+  // can live (disk-reclaim.ts modelPassMinAgeMs), derived from the configured caps.
+  const passMinAgeMs = modelPassMinAgeMs([
+    config.judgeModelTimeoutMs,
+    config.reviewModelTimeoutMs,
+    config.summaryModelTimeoutMs,
+  ]);
+  const diskPressure =
+    config.diskReclaimEnabled || config.diskAdmissionEnabled || config.diskHardStopEnabled
+      ? new DiskPressureController({
+          softMargin: config.diskSoftMargin,
+          thresholdOf: () => client.diskPressureThreshold,
+          intervalMs: config.diskReclaimIntervalMs,
+          admission: config.diskAdmissionEnabled,
+          admissionMaxWaitMs: config.diskAdmissionMaxWaitMs,
+          log,
+          // PRD #1809 D4: the hard pressure stop sees every stats tick's sample.
+          onSample: (usedFraction, sampledAtMs) => diskGovernor.observe(usedFraction, sampledAtMs),
+          ...(config.diskReclaimEnabled
+            ? {
+                reclaim: () =>
+                  runDiskReclaimPass({
+                    homeRoot: sdkHomeRoot,
+                    provisionRoot: path.join(config.dataDir, "provision"),
+                    statusOf: runStatusOf,
+                    isRunLive: (runId) => runner.isExecuting(runId),
+                    locks: diskLocks,
+                    log,
+                    cachesDropped,
+                    modelPassMinAgeMs: passMinAgeMs,
+                  }),
+              }
+            : {}),
+        })
+      : undefined;
+  if (diskPressure && config.diskReclaimEnabled) reclaimNow = () => diskPressure.reclaimNow();
+  // PRD #1809 D8: the per-run HOME size on the heartbeat, measured in the background at most
+  // every UZI_RUN_DISK_SAMPLE_INTERVAL (0 turns it off).
+  const runDisk =
+    config.runDiskSampleIntervalMs > 0
+      ? new RunDiskSampler({
+          homeRoot: sdkHomeRoot,
+          intervalMs: config.runDiskSampleIntervalMs,
+          isRunLive: (runId) => runner.isExecuting(runId),
+          statusOf: runStatusOf,
+          log,
+        })
+      : undefined;
   worker = new Worker(
     config,
     client,
@@ -602,6 +727,8 @@ async function main(): Promise<void> {
     activeRuns,
     undefined,
     dindPrune,
+    diskPressure,
+    runDisk,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these
@@ -643,19 +770,7 @@ async function main(): Promise<void> {
   if (config.homeReclaimEnabled) {
     await reclaimStrandedRunHomes(
       sdkHomeRoot,
-      async (runId) => {
-        try {
-          return (await client.getChatRun(runId)).status;
-        } catch (err) {
-          // A 404 is the API ANSWERING not-found — the run's row is gone, which is
-          // exactly what the oldest stranded HOMEs look like. Return undefined so the
-          // sweep SKIPS without counting it toward the outage bail; let every other
-          // error (down / 5xx / timeout) propagate as a genuine could-not-ask that
-          // DOES count (PRD #108 B2/B3, home-reclaim.ts RunStatusLookup contract).
-          if (err instanceof RequestError && err.status === 404) return undefined;
-          throw err;
-        }
-      },
+      runStatusOf,
       log,
     ).catch((err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }));
   }

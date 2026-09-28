@@ -972,8 +972,8 @@ func TestFailCredentialSwitchLiveDB(t *testing.T) {
 //
 // SCOPE (PRD m9): this is TERMINAL settlement only. The post-reclaim applied-settlement case
 // (credential_switch_generation=G while claim_generation=G+1) already yields a nil signal via
-// PendingCredentialSwitchSignal's generation-mismatch guard; clearing its lingering DTO
-// "requested" is PRD m9 (D14 epoch-write attribution), NOT this fix round.
+// PendingCredentialSwitchSignal's generation-mismatch guard; clearing the stamp itself is the
+// D14 epoch-write clear (issue #1422), pinned by TestEpochWriteSettlesAppliedCredentialSwitchLiveDB.
 func TestTerminalTransitionSettlesCredentialSwitchSignalLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	o := seedReevalOwner(t, env, BindModeAuto, false)
@@ -1073,5 +1073,90 @@ func TestSetStateBranchMovedSupersedeUnderFenceLiveDB(t *testing.T) {
 	}
 	if got.StopKind.String != "branch_moved" {
 		t.Fatalf("returned stop_kind = %q, want branch_moved", got.StopKind.String)
+	}
+}
+
+// TestEpochWriteSettlesAppliedCredentialSwitchLiveDB (PRD #1247 D14, issue #1422) pins the
+// successful-APPLICATION clear folded into RecordRunCredentialEpoch (its settled_switch CTE):
+// released is not applied, so the stamp survives ReleaseCredentialSwitch and is cleared only by
+// the reclaimed generation's epoch write. Each case reddens one half of the CTE's fence:
+//   - applied: reverting the CTE leaves the stamp on the reclaimed run.
+//   - same-generation request: dropping `credential_switch_generation < @claim_generation` lets a
+//     generation's own epoch write clear a request stamped AT that generation.
+//   - stale claim: dropping `claim_generation = @claim_generation` lets a late epoch write from a
+//     superseded flight (generation G+1, run already at G+2) clear a stamp older than itself. The
+//     stale write goes through the non-transactional path (emitSwitchMessage=false), which has no
+//     Go-side fence, so only the SQL conjunct stands between it and the stamp.
+func TestEpochWriteSettlesAppliedCredentialSwitchLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	svc := fenceSvc(env)
+	g := int64(4)
+
+	cases := []struct {
+		name string
+		// prepare seeds the run and returns the run snapshot the epoch write records against.
+		prepare     func(t *testing.T, o reevalOwner, issueIID int64) store.Run
+		txPath      bool
+		wantCleared bool
+	}{
+		{"applied: release then reclaim then epoch write clears the stamp", func(t *testing.T, o reevalOwner, issueIID int64) store.Run {
+			id := seedHeldRun(t, env, o, issueIID, "running", g, true /*withStamp*/, false /*released*/)
+			gg := g
+			wkr := store.Worker{ID: o.workerID, UserID: o.userID}
+			released, applied, err := svc.SetState(env.ctx, wkr, id, StateRequest{State: "credential_switch", ClaimGeneration: &gg})
+			if err != nil || !applied {
+				t.Fatalf("release: applied=%v err=%v", applied, err)
+			}
+			if !released.CredentialSwitchRequestedAt.Valid || released.CredentialSwitchGeneration.Int64 != g {
+				t.Fatalf("precondition: the release must KEEP the stamp (released is not applied), got (%v, %v)",
+					released.CredentialSwitchRequestedAt, released.CredentialSwitchGeneration)
+			}
+			claimed, err := env.q.ClaimRun(env.ctx, env.codexClaimParams(o.userID, o.workerID, nil))
+			if err != nil {
+				t.Fatalf("ClaimRun: %v", err)
+			}
+			if claimed.ID != id || claimed.ClaimGeneration != g+1 || claimed.ClaimReleasedAt.Valid {
+				t.Fatalf("reclaim = (id %s, gen %d, released %v), want (%s, %d, false)", claimed.ID, claimed.ClaimGeneration, claimed.ClaimReleasedAt.Valid, id, g+1)
+			}
+			if !claimed.CredentialSwitchRequestedAt.Valid {
+				t.Fatal("precondition: the reclaim alone must not clear the stamp (only the epoch write applies it)")
+			}
+			return claimed
+		}, true, true},
+		{"same-generation request survives its own generation's epoch write", func(t *testing.T, o reevalOwner, issueIID int64) store.Run {
+			id := seedHeldRun(t, env, o, issueIID, "running", g, true /*withStamp at g*/, false)
+			return mustRun(t, env, id)
+		}, true, false},
+		{"stale claim's epoch write does not clear a later flight's stamp", func(t *testing.T, o reevalOwner, issueIID int64) store.Run {
+			// The run is at g+2 with the stamp at g; the stale write records generation g+1.
+			id := seedHeldRun(t, env, o, issueIID, "running", g+2, false, false)
+			env.exec(`UPDATE runs SET credential_switch_requested_at = now(), credential_switch_generation = $2 WHERE id = $1`, id, g)
+			stale := mustRun(t, env, id)
+			stale.ClaimGeneration = g + 1
+			return stale
+		}, false, false},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			o := seedReevalOwner(t, env, BindModeAuto, false)
+			run := tc.prepare(t, o, int64(5700+i))
+			if _, err := svc.recordRunCredential(env.ctx, run, claimCred{ID: o.altTok, Label: "alt"}, secretChoice{reason: selectReasonRunPinned}, tc.txPath); err != nil {
+				t.Fatalf("recordRunCredential: %v", err)
+			}
+			var epochs int
+			if err := env.pool.QueryRow(env.ctx, `SELECT count(*) FROM run_credential_epochs WHERE run_id = $1 AND claim_generation = $2`,
+				run.ID, run.ClaimGeneration).Scan(&epochs); err != nil || epochs != 1 {
+				t.Fatalf("epoch rows at generation %d = (%d, %v), want (1, nil)", run.ClaimGeneration, epochs, err)
+			}
+			after := mustRun(t, env, run.ID)
+			cleared := !after.CredentialSwitchRequestedAt.Valid && !after.CredentialSwitchGeneration.Valid
+			if cleared != tc.wantCleared {
+				t.Fatalf("switch stamp = (%v, %v) cleared=%v, want cleared=%v",
+					after.CredentialSwitchRequestedAt, after.CredentialSwitchGeneration, cleared, tc.wantCleared)
+			}
+			if tc.wantCleared && PendingCredentialSwitchSignal(after) != nil {
+				t.Fatal("an applied switch must not signal a pending switch")
+			}
+		})
 	}
 }

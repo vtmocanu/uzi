@@ -212,6 +212,39 @@ func TestLoadForgeInteractiveRateMax(t *testing.T) {
 	}
 }
 
+// TestLoadRunDiskParkMax pins the PRD #1809 M5 (D6) disk park cap: unset is the default of 3
+// counted parks, a positive override is honoured, 0 is the legal "unlimited" off switch (the
+// forge cap's convention), and a negative or malformed value falls back to the default.
+func TestLoadRunDiskParkMax(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	for _, tc := range []struct {
+		env  string
+		want int
+	}{
+		{"", 3},
+		{"5", 5},
+		{"0", 0},
+		{"-1", 3},
+		{"nonsense", 3},
+	} {
+		t.Setenv("UZI_RUN_DISK_PARK_MAX", tc.env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_RUN_DISK_PARK_MAX=%q: %v", tc.env, err)
+		}
+		if cfg.RunDiskParkMax != tc.want {
+			t.Errorf("RunDiskParkMax for UZI_RUN_DISK_PARK_MAX=%q = %d, want %d", tc.env, cfg.RunDiskParkMax, tc.want)
+		}
+	}
+}
+
 // TestProposalConfirmStuckTimeoutClamped pins the load-bearing ordering invariant:
 // the stuck-confirming sweep timeout must sit safely above the forge HTTP timeout, so
 // a slow CreateIssue can never be reverted mid-flight and re-confirmed into a

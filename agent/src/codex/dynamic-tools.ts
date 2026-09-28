@@ -97,6 +97,25 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
           milestones_completed: { type: "array", items: STRING },
           prd_done_path: STRING,
           proposal: objectSchema({ title: STRING, body: STRING }, ["title", "body"], false),
+          // PRD #1798 M2 (D4): the lead's plain-English PR claims, every member optional. Parsed
+          // (and clamped) by signals.ts parsePrSummary, the same parser the Claude tool uses.
+          pr_summary: objectSchema({
+            what: STRING,
+            why: STRING,
+            changes: { type: "array", items: STRING },
+            verification: {
+              type: "array",
+              items: objectSchema({ command: STRING, result: { type: "string", enum: ["pass", "fail"] } }, ["command", "result"], false),
+            },
+            scope_notes: {
+              type: "array",
+              items: objectSchema({
+                kind: { type: "string", enum: ["added", "changed", "dropped", "deferred"] },
+                text: STRING,
+              }, ["kind", "text"], false),
+            },
+            review_pointers: { type: "array", items: STRING },
+          }, [], false),
         }, [], false),
       };
     case "ask_user":

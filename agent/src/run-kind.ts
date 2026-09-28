@@ -1,14 +1,15 @@
 // Typed run-kind profile table (PRD #983 M4b). Collapses the per-kind if-chains that
 // used to live in runner.ts (clone-branch derivation, MR title, MR body) into one
 // Record keyed over the RunKind union, so exhaustiveness is enforced by the Record and
-// each kind's behaviour reads as one row instead of a scattered comparison. Every value
-// here is lifted VERBATIM from the branch it replaces — this is a behaviour-preserving
-// refactor, not a change in what any kind produces.
+// each kind's behaviour reads as one row instead of a scattered comparison. The clone-branch
+// and title values were lifted verbatim from the branches they replaced; PRD #1798 (D14) then
+// shrank each kind's MR body to the one-line `completionLine` the completion block renders.
 //
 // RUN_KINDS stays the wire type in protocol.ts (mirrored from the DB runs_kind_check
 // constraint); it is imported here, not moved.
 
 import { type RunKind, type ClaimResponse } from "./protocol.js";
+import { codeSpan, urlOrCodeSpan } from "./pr-description.js";
 import { selfImproveBranch } from "./self-improve.js";
 
 /**
@@ -26,18 +27,12 @@ export function resolveRunKind(kind: RunKind | undefined): RunKind {
   return kind ?? "issue";
 }
 
-/** The context bag `mrBody` consumes, assembled once by the caller exactly as the old
- *  `mrDescription` chain did before it branched on kind. `repoMarker` and `footer` are
- *  precomputed by the caller (they depend on the agent selection and branch, not the
- *  kind); `selfImproveSection`/`promptGuardSection` are the caller's own params; `branch`
- *  and `baseBranch` are the source/target ref context the issue-less arms render. */
-interface MrBodyCtx {
+/** The context a kind's `completionLine` renders from: the source branch and, for a task, the
+ *  branch it was cut from. The agents line, sections, bridge sentence and footer are rendered
+ *  around the line by the completion block (pr-description.ts renderCompletionBlock). */
+interface CompletionLineCtx {
   branch: string;
   baseBranch?: string;
-  repoMarker: string[];
-  footer: string;
-  selfImproveSection?: string;
-  promptGuardSection?: string;
 }
 
 /**
@@ -50,13 +45,14 @@ interface MrBodyCtx {
  * - `mrTitle` — the raw MR title (NO `[partial]` prefix; the caller applies that only to
  *   the trimmed issue title and the issue fallback). `undefined` falls through to
  *   `Work on issue #<iid>`.
- * - `mrBody` — the MR description; `undefined` falls through to the issue body (the
- *   scopeCapped / gates / Closes arm).
+ * - `completionLine` — PRD #1798 D14: the kind's ONE-line sentence in the PR's completion block;
+ *   `undefined` falls through to the issue arm (the scopeCapped / gates / Closes arm). Branch and
+ *   ref interpolations go through codeSpan (closing keywords broken, backticks fenced).
  */
 interface RunKindProfile {
   cloneBranch?: (claim: ClaimResponse, runId: string) => { branch: string; slug: string } | undefined;
   mrTitle?: (claim: ClaimResponse) => string | undefined;
-  mrBody?: (claim: ClaimResponse, ctx: MrBodyCtx) => string | undefined;
+  completionLine?: (claim: ClaimResponse, ctx: CompletionLineCtx) => string | undefined;
 }
 
 /** The minimal identity needed to derive a run's canonical runner-clone { branch, slug }.
@@ -149,17 +145,11 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
       claim.pipeline
         ? `Fix CI: pipeline #${claim.pipeline.id} on ${claim.pipeline.ref}`
         : undefined,
-    mrBody: (claim, ctx) =>
+    // The failing pipeline ref and URL (D14), rendered here by the renderer, never by the model. The
+    // URL is a bare autolink only when it is plainly an http(s) URL (urlOrCodeSpan), else a code span.
+    completionLine: (claim) =>
       claim.pipeline
-        ? [
-            `Fixes the failed CI pipeline for \`${claim.pipeline.ref}\`.`,
-            "",
-            `Failing pipeline: ${claim.pipeline.web_url}`,
-            ...ctx.repoMarker,
-            "",
-            "---",
-            ctx.footer,
-          ].join("\n")
+        ? `CI fix for the failing pipeline on ${codeSpan(claim.pipeline.ref)}: ${urlOrCodeSpan(claim.pipeline.web_url)}`
         : undefined,
   },
 
@@ -172,30 +162,15 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
     // A self_improve MR references its tracking issue but does NOT `Closes` it — the issue
     // is a stable container reused across cycles (PRD #46 Decision 10). No mrTitle: the
     // issue fallback `Work on issue #<iid>` is the intended empty-title behaviour.
-    mrBody: (claim, ctx) =>
-      [
-        "Autonomous self-improvement change (PRD #46). Picks one top improvement per cycle.",
-        "",
-        `Tracking issue: #${claim.issue_iid}`,
-        ...ctx.repoMarker,
-        ctx.selfImproveSection ?? "",
-      ].join("\n"),
+    completionLine: (claim) =>
+      `Autonomous self-improvement change (PRD #46), one top improvement per cycle. Tracking issue: #${claim.issue_iid} (a stable container this PR never closes).`,
   },
 
   prompt: {
     cloneBranch: (_claim, runId) => deriveCloneKey({ kind: "prompt", runId }),
     mrTitle: () => "Scheduled prompt run",
-    mrBody: (_claim, ctx) =>
-      [
-        "Ad-hoc scheduled prompt run (PRD #241 Decision 10). This run was created from a",
-        "schedule's stored prompt against this repository — there is no tracking issue, so",
-        "this MR references the task but closes nothing.",
-        ...ctx.repoMarker,
-        ctx.promptGuardSection ?? "",
-        "",
-        "---",
-        ctx.footer,
-      ].join("\n"),
+    completionLine: () =>
+      "Ad-hoc scheduled prompt run (PRD #241) from a schedule's stored prompt. There is no tracking issue, so this PR closes nothing.",
   },
 
   task: {
@@ -208,18 +183,8 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
       return key;
     },
     mrTitle: () => "Handoff task",
-    mrBody: (_claim, ctx) => {
-      const base = ctx.baseBranch;
-      return [
-        "Handoff task (PRD #400). This run worked inline context on the server-named",
-        `\`${ctx.branch}\` branch${base ? ` (branched from \`${base}\`)` : ""} and opened this merge request because it was created with \`--mr\`.`,
-        "There is no tracking issue, so this MR closes nothing.",
-        ...ctx.repoMarker,
-        "",
-        "---",
-        ctx.footer,
-      ].join("\n");
-    },
+    completionLine: (_claim, ctx) =>
+      `Handoff task (PRD #400) on ${codeSpan(ctx.branch)}${ctx.baseBranch ? ` (branched from ${codeSpan(ctx.baseBranch)})` : ""}, opened because it was created with \`--mr\`. There is no tracking issue, so this PR closes nothing.`,
   },
 
   mr_rework: {
@@ -232,14 +197,7 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
       return key;
     },
     mrTitle: () => "MR rework",
-    mrBody: (_claim, ctx) =>
-      [
-        "Automated MR rework (PRD #700). This run addressed review feedback on the existing",
-        `\`${ctx.branch}\` branch. There is no tracking issue, so this MR closes nothing.`,
-        ...ctx.repoMarker,
-        "",
-        "---",
-        ctx.footer,
-      ].join("\n"),
+    completionLine: (_claim, ctx) =>
+      `Automated MR rework (PRD #700) addressing review feedback on ${codeSpan(ctx.branch)}. There is no tracking issue, so this PR closes nothing.`,
   },
 };

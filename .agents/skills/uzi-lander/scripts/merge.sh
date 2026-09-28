@@ -201,7 +201,7 @@ reviews_all=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" 2>/dev/null | jq
 ua=""
 if ma=$(must_ack_json "$issue_all" "$reviews_all") && acks=$(ack_read "$REPO" "$PR"); then ua=$(unacked_json "$ma" "$acks") || ua=""; fi
 [ -n "$ua" ] || { echo "cannot read the comment acknowledgements of #$PR; not merging"; exit 2; }
-blk=$(jq -nc --argjson a "$ot" --argjson b "$cs_items" --argjson c "$ua" '$a + $b + $c')
+blk=$(jq -nc --rawfile a <(printf '%s' "$ot") --rawfile b <(printf '%s' "$cs_items") --rawfile c <(printf '%s' "$ua") '($a|fromjson) + ($b|fromjson) + ($c|fromjson)')
 if [ "$(printf '%s' "$blk" | jq 'length')" -gt 0 ]; then
   print_items "$blk"
   echo "BLOCKED: open_threads=$(printf '%s' "$ot" | jq length) code_scanning=$(printf '%s' "$cs_items" | jq length) unacknowledged=$(printf '%s' "$ua" | jq length) on #$PR — resolve each thread, fix or dismiss each alert, read each comment in full (ack-comments.sh $REPO $PR --show ID) and ack that version (ID@DIGEST); not merging"

@@ -9,7 +9,7 @@ import type { EmittedMessage, RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { PauseNowSignal } from "../src/steering.js";
 import type { IterationBudget, Milestone } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // PRD #1190 M2 — the WORKER half of pause/resume: the loop-top pause branch (sdk-executor.ts).
 // The SERVER decides the boundary and answers `pauseRequested` on the running-report ACK; the
@@ -29,10 +29,7 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 // A worktree path UNIQUE PER PROCESS AND PER CALL that deliberately never exists (see the long
 // note in scope-ceiling-honor.test.ts — a per-file-unique basename is a race fix for the
 // sibling skills plugin dir the executor materializes, since node --test runs files concurrently).
-let nonexistentWorktreeSeq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-pause-honor-wt-${process.pid}-${nonexistentWorktreeSeq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-pause-honor");
 
 function assistantText(text: string, sessionId = "sess-1"): SDKMessage {
   return { type: "assistant", session_id: sessionId, message: { content: [{ type: "text", text }] } } as unknown as SDKMessage;

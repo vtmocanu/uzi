@@ -33,7 +33,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   watcher to return at the new gate.
 - **One trail line per state change, nothing in between.** `S/trail.sh '#PR' <state>`
   appends and prints `#1428: run completed → pr opened → ci green → cr rate-limited(57m) →
-  waiting → cr clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
+  greptile pending → greptile clean → rebase+renumber → pushed → admin-merged 3f2a… → main ci green`.
   Use its vocabulary (header of the script). Say more only for a decision or a blocker.
 - **Full autonomy is the default.** Wait for the chosen reviewer, fix small findings locally, trigger
   a rework for big ones, rebase and renumber when needed, merge when ready, watch `main`:
@@ -50,22 +50,28 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   decision itself. When a step turns out to be mechanical, put it in a script.
 - **Scale the reviewer before waiting.** Small/mechanical non-Renovate PRs get one local
   reviewer pinned to the head for initial review, then `watch-pr.sh --reviewer none`; small
-  fixes made after findings need step 4's two reviews. For a `renovate/*` PR
+  fixes made after findings need step 4's buddy review. For a `renovate/*` PR
   or our replacement for a red Renovate PR, decide whether an independent review adds
   value from the effective diff and risk. Exact version pins plus generated lockfile churn
   may rely on green CI; code/config semantics, install scripts, native binaries, security or
   toolchain risk, and unexplained lockfile changes need review. State the decision. Reserve
   CodeRabbit/Greptile for large or high-risk work, and get user approval before requesting
   a review bot for Renovate-class work. Read references/renovate.md before landing one.
-- **Absent user = time is cheap.** In a large/high-risk bot lane, when the choice is wait
-  for CodeRabbit or switch reviewer, say it in one line with the default, start the patient
-  path in the same turn, and let a reply override it.
+- **Prefer CodeRabbit; wait for it only when the live reset is 15 minutes or less.**
+  Its quota refills hourly. Otherwise switch at once: a large or trust-boundary PR goes to
+  Greptile (the buddy reviews too); a small PR to the buddy alone (step 3).
 - **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
   repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
   and message you instead of double-driving it. A PR another live session holds stops you
   at `NEXT=claimed_by_other`: talk to them (SendMessage), do not take it.
 - **Never in the `main` worktree.** Every local edit happens in a sibling worktree
   (`land-prep.sh` makes one); auto-clean worktrees you created once the PR merges.
+- **Run the scripts from a fresh `origin/main` worktree**, not the long-lived `main/`
+  checkout: `git fetch origin main && git worktree add --detach ../uzi-lander-tools
+  origin/main`. `takeover.sh` prints `SKILL_SCRIPTS_STALE=1` when its own copy differs.
+- **Never use `git stash` in landing work.** The stash list is shared by every worktree of
+  the repo, so a `pop` can apply another session's entry. Commit work in progress in your
+  own worktree, or save a patch file.
 - **Run long local checks from a pinned worktree.** An e2e or Docker check runs in a
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
   land-prep rebases that tree in place, so a check still running there tests a mixed tree.
@@ -93,16 +99,17 @@ this lander's second pair of eyes.
 - **Longer loops.** With a Claude lander and a Codex buddy, a user-authorized
   multi-round loop runs `peers.py budget allow buddy --replies N` once, not a reset
   per round. A correlated `ask`/`dispatch` reply needs no allowance.
-- **Issues you file** (follow-ups, inherited or incidental findings): the buddy
-  reviews the final draft, then add the `reviewed` label. Solo: a local reviewer.
+- **Issues you file** (follow-ups, inherited or incidental findings) **and skill or
+  script PRs you open**: the buddy reviews the final draft, then add the `reviewed`
+  label, so the user sees both agents agreed. Solo: a local reviewer.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 
 | Lane | Required exact-head reviews |
 |---|---|
 | Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
-| After a local fix | the buddy plus CodeRabbit (Greptile when CR is rate-limited) |
-| CodeRabbit rate-limited | switch to Greptile (step 3); the buddy reviews too |
+| After a small local fix | the buddy's `APPROVE` of the fixed head, plus green CI; a fix too big for that goes to `uzi run rework` (step 4) |
+| CodeRabbit rate-limited | live reset ≤ 15 min: wait for CodeRabbit; otherwise a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too, a small PR takes the buddy alone |
 | Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
 | Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
@@ -136,16 +143,20 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 ## The loop
 
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
-   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled 60`.
+   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_input,paused 60 MAX`,
+   with `MAX` polls covering the run's remaining budget (`budget_total_seconds` minus
+   `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
+   `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
+   `uzi run extend` or `uzi run resume`, which leave no poller running.
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can; `awaiting_approval` → the plan gate
-   is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` / `paused` → one
-   trail line, keep polling. `failed` / `cancelled` → `uzi-watcher`. `completed` → the PR
-   is `uzi run get RUN --field mr_web_url`; trail `pr opened`; re-snapshot.
-   A run that hits its wall-clock time limit lands in the `paused` bucket above with
-   `hold_reason: budget_exhausted` (PRD #1497), never `failed` — do not wait for a
-   `failed` state the clock no longer produces; extend it (`uzi run extend RUN --by
-   2h`) or recover it like any other park.
+   is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
+   keep polling (they resume on their own). `paused` stops the poller because it never
+   resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
+   with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
+   extend RUN --by 2h`) and re-arm the poller; an owner pause waits for its owner.
+   `failed` / `cancelled` → `uzi-watcher`. `completed` → the PR is `uzi run get RUN
+   --field mr_web_url`; trail `pr opened`; re-snapshot.
 2. **Choose the review lane, then wait for readiness.** For a Renovate-class PR, inspect
    the effective diff against the current base and decide whether review is needed. If not,
    state why and use `--reviewer none`; green CI is the independent signal. If review adds
@@ -201,16 +212,18 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    CodeRabbit or Greptile; `--reviewer none` is an intentional local-review or
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
    OWNER/REPO`, then batch fixes into one push.
-   - **Rate-limited (exit 5).** Tell the user in one line with the default wait and the
-     local alternative. When quota timing matters, run
+   - **Rate-limited (exit 5).** Read the live reset first: `S/cr-rate-limit.sh OWNER/REPO PR
+     --query` (never the walkthrough's figure). `CR_RESET_MIN` ≤ 15 → wait for CodeRabbit
+     (below). Longer or `unknown` → switch: a large or trust-boundary PR posts
+     `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`, and the buddy
+     reviews the same head; a small PR takes the buddy alone, with `--reviewer none`. To
+     wait, run
      `S/cr-rate-limit.sh OWNER/REPO PR --trigger-review`: it posts the exact two-word quota
      query, waits for the authoritative countdown or "Reviews are available now," then posts
      `@coderabbitai review` itself exactly once under a per-PR lock when safe and immediately
      execs `watch-pr.sh --reviewer coderabbit`. The atomic flag closes both background-callback
      gaps; never wait, post, or start the reviewer poller as separate agent steps. Its final exit
      is the `watch-pr.sh` result, so branch directly on step 2's exit table.
-     On `greptile`, post `@greptileai review`, then use `--reviewer greptile
-     --reviewer-grace 2`; on `local`, dispatch a local reviewer and use `--reviewer none`.
    - **Full review offered (exit 7).** CodeRabbit answered the normal trigger with
      “Already reviewed the last commit.” Decide whether the existing coverage plus a local
      review is sufficient for this risk class. If a bot review is still warranted, post
@@ -235,16 +248,26 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    later hand a finding back to rework. Then decide, per finding set:
    - **small / quick** (localized, no design change): fix locally by default, one push per
      PR via `S/land-prep.sh OWNER/REPO PR` (it re-checks the rework lane and pushes with a
-     lease), trail `fix local → pushed`. Before merging, require two clean reviews of that
-     exact SHA: the buddy (`peers.py buddy ping` restores a lost reply route) plus
-     CodeRabbit (Greptile when CR is rate-limited). A later rebase-only push keeps them
-     via the rebase lane (*Buddy*). Skill-maintenance `[skip-cr]` PRs keep
-     their own rule below;
+     lease), trail `fix local → pushed`. Before merging, require the buddy's clean review
+     of that exact SHA (`peers.py buddy ping` restores a lost reply route) plus green CI; no
+     bot re-review. A later rebase-only push keeps it via the rebase lane (*Buddy*).
+     Skill-maintenance `[skip-cr]` PRs keep their own rule below;
    - **big** (design-level, many files, needs the plan's context): `uzi run rework RUN -m
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
+     Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
      A 409 "disabled" means rework is off for that run: `uzi run mr-rework RUN --enabled`,
-     then retry; do not downgrade a big fix to a local one because the lane was off;
+     then retry; do not downgrade a big fix to a local one because the lane was off.
+     **A rework already running** (uzi starts one on new bot comments; a second `uzi run
+     rework` then fails "already working this branch"): steer it with `uzi run follow-up
+     REWORK_RUN -m 'GUIDANCE'` instead, and wait on that run itself
+     (`.agents/skills/uzi-watcher/scripts/watch-run.sh REWORK_RUN completed,failed,cancelled 60`):
+     it predates any `$SINCE` you capture now, so `wait-mrrework.sh` would not see it.
+     A finding an earlier cycle declined that resurfaces
+     with no new evidence: ask for a reasoned reply on the thread and no code change.
+     **Steer with facts and acceptance criteria.** Steer text reaches the rework's
+     validators as operator constraints, so name an identifier as binding only when
+     compatibility needs that exact name; otherwise call it an example;
    - **skip**: false positive, deliberate, or inherited base artifact; a real inherited bug
      is fixed or filed (sweepable: `bug`+`uzi`), never silently skipped.
    Decide, then report the decisions in one message (finding, label, choice, why) and
@@ -272,7 +295,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
    Union and collapse keep every existing blank line; only their own joins follow `[Unreleased]`'s convention.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
-   usual for a shared list), `git rebase --continue`, re-run with `--skip-rebase`. Exit 6 = the
+   usual for a shared list), `git -c merge.conflictStyle=diff3 rebase --continue` (a later
+   CHANGELOG stop needs the diff3 base to auto-union), re-run with `--skip-rebase`. Exit 6 = the
    renumber helper reported references to fix by hand. Exit 7 = a gate failed (log path
    printed; a missing or lockfile-stale `node_modules` is reinstalled first with
    `npm ci --ignore-scripts`). On macOS, treat Codex session-store failures as platform limitations only
@@ -342,6 +366,21 @@ and they precede every merge (step 6):
   `text` messages (`uzi run logs RUN --json`) for checks it marks NOT RUN or failed, and run
   them on a capable host before merging. Skipping one needs the user's explicit exception,
   naming what stays unvalidated.
+- **Rollout compatibility.** When the diff makes the api refuse or require something new from
+  workers, check it against the pinned released worker (`workers.image.tag` in
+  `deploy/chart/values.yaml`): the api rolls first and the fleet drains later. A new
+  requirement keyed on a capability released workers already advertise breaks them for the
+  whole roll; it needs a new capability or a documented staged rollout (uzi-watcher's
+  plan-trap check, applied again to the diff). A fix changes planned behaviour, so it is
+  the user's call (*Stance*).
+- **The PR description is yours to edit.** A uzi rework cannot change it, so disclosures a
+  rework reports (deferred items, behaviour changes, follow-ups) reach the PR body only
+  through you: `gh pr edit PR --body-file FILE`, keeping the existing text.
+- **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
+  lines near a known alert, compare rule and path with `main`'s alerts
+  (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the
+  PR-ref copy only after the buddy or the user agrees, with a comment naming `main`'s
+  alert number.
 - **Attribute a failing local check before blaming the PR.** Re-run the same selection on
   unmodified `main` in its own pinned worktree. Treat it as pre-existing only on matching
   failure evidence (same step, same error, same logs), not a similar symptom. Checks that
@@ -382,15 +421,19 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
 
 ## Waiting, uniformly
 
-Every long wait (a CR reset, a laggy `mr_rework`, a re-review, CI) is a background poller
+Every long wait (a CR reset of 15 minutes or less, a laggy `mr_rework`, a re-review, CI) is a background poller
 whose exit re-invokes you, never a foreground `--watch` or a long `sleep`; the harness reaps
-long processes, and a killed short poll simply re-fires. The patient path is the default;
-a user reply that arrives first wins.
+long processes, and a killed short poll simply re-fires. The patient path is the default
+(except a CodeRabbit reset over 15 minutes, which switches reviewer at once); a user reply that
+arrives first wins.
 Branch on the poller's own `EXIT=`/`RESULT=` line, never on the harness's task status: a
 `script > log; echo "EXIT=$?"` wrapper always completes with 0.
 
 ## Keep this skill and its scripts current
 
+- **Test a script change on Linux before pushing.** CI and the workers are Linux:
+  `S/test-linux.sh [TEST.sh ...]` runs `test:uzi-lander` (or the named tests) in
+  `ubuntu:24.04` against the working tree.
 - **Never hand-roll a poll loop inline.** Every wait goes through a bundled poller; an
   ad-hoc heredoc is where the path typos and fail-open reads came from. When a poller
   lacks a signal, stop state, flag or exit code, extend the script: keep its existing exit

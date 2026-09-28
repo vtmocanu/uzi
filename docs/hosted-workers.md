@@ -43,6 +43,11 @@ actually get. Every size also gets the same 20Gi tools cache (`/nix`),
 regardless of size or type — the one number that doesn't change with your
 choice.
 
+An ephemeral (run-bound) worker, the kind uzi provisions for a single run and
+removes when that run finishes, is the exception on `/data`: its `/data` is
+its own setting, 20Gi by default and set by the operator, whatever size the
+worker runs at. Its CPU and memory still follow its size.
+
 **M** is the default because it matches what a self-run worker gets out of
 the box. **Every size costs you the same, 1 of your quota below** — there's
 no personal cost to picking bigger. Size for your actual workload anyway,
@@ -169,6 +174,12 @@ Two things now self-heal without you deleting and re-provisioning by hand:
 Both are cluster-driven, like cordoning; there's no button for either. An
 admin can turn the self-heal off entirely via chart config if it's ever not
 wanted.
+
+This full-volume recycle is the **last resort**. Before a volume gets anywhere
+near it, a run's own build caches are bounded and reclaimed on their own —
+see [Worker disk safety](./worker-setup.md#worker-disk-safety-prd-1809) for
+the cache drop, in-run cache cap, periodic reclaim, admission stop, and the
+bounded `data_volume_full` park that exist to make this recycle rare.
 
 ## Message outbox
 

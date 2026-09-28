@@ -7,6 +7,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -127,11 +128,31 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	if line := vaultParkLine(r); line != "" {
 		rows = append(rows, []string{"VAULT", line})
 	}
+	// DISK (PRD #1809 M5): a data_volume_full park, emit-only-when-parked, with its next retry
+	// and the run's lifetime disk-park count.
+	if line := diskParkLine(r); line != "" {
+		rows = append(rows, []string{"DISK", line})
+	}
+	// HOME (PRD #1809 M6, D8): the run's HOME and cache size on its worker, emit-only-when-
+	// reported (the server sets them only from a fresh worker report).
+	if line := runDiskSizeLine(r); line != "" {
+		rows = append(rows, []string{"HOME", line})
+	}
+	// CHECKPOINT (PRD #1809 M6, D8): whether the parked run's published checkpoint holds its
+	// latest committed work, emit-only-while-parked-and-reported.
+	if line := checkpointDurabilityLine(r); line != "" {
+		rows = append(rows, []string{"CHECKPOINT", line})
+	}
 	if r.HealthReason != nil && *r.HealthReason != "" {
 		rows = append(rows, []string{"HEALTH_REASON", sanitizeTTY(*r.HealthReason)})
 	}
 	if r.FailureReason != nil && *r.FailureReason != "" {
 		rows = append(rows, []string{"FAILURE_REASON", sanitizeTTY(*r.FailureReason)})
+	}
+	// FAIL_ORIGIN (PRD #1809 M5): the typed fail_origin, emit-only-when-set, so a run that
+	// failed on a data volume that stayed full says so beside its free-text reason.
+	if r.FailOrigin != nil && *r.FailOrigin != "" {
+		rows = append(rows, []string{"FAIL_ORIGIN", failOriginCell(r)})
 	}
 	// The run's inferred scheduling requirement set (PRD #84 M4), the CLI twin of the
 	// three DTO fields added in 4c. All three are model/inference-derived, hence UNTRUSTED,
@@ -176,6 +197,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// and every one is emit-only-when-set, so a pre-feature run or one whose summaries
 	// have not landed yet is byte-for-byte unchanged. Routed through cellText below.
 	rows = append(rows, summaryRows(r)...)
+	// PRD #1798 M7: the run's published PR description, the `run get` twin of RunView's
+	// "Delivered" section. Emit-only-when-present like the summary rows above.
+	rows = append(rows, prDescriptionRows(r)...)
 	// PRD-link lifecycle (#150), the CLI twin of the fields exposed on the DTO in the
 	// prior commit. Both rows are emit-only-when-set: a run that moved no PRD, or one
 	// predating the feature, must not print a blank row. PRD_MOVE carries the run's own
@@ -1168,6 +1192,150 @@ func summaryRows(r apitypes.RunDTO) [][]string {
 	return rows
 }
 
+// prDescriptionRows is the CLI surface of the run's published PR description (PRD #1798 M7):
+// the summary (DELIVERED), the size line (SIZE) and, when the PR's last description write did
+// not publish, a plain note saying why (PR_UPDATE). The web twin is DeliveredCard
+// (web/src/pages/runView/DeliveredCard.tsx); `--json` already carries the whole artifact.
+//
+// The fields are lead- or model-authored UNTRUSTED text that the api sanitized for the forge's
+// markdown, so each is first unescaped for display (displayPrText) and then goes through
+// cellText, the same untrusted-text path as the PRD #362 summary rows: control, bidi and format
+// runes stripped (the sanitizer's U+200B breakers included; a terminal forms no mention or
+// closing directive), newlines and tabs folded, length capped. Nothing is emitted when the run
+// has neither a published description nor a non-published outcome, so such a run's detail is
+// unchanged. When nothing was ever published but the write was skipped or failed (the api
+// returns a nil description with that outcome), the PR_UPDATE row is emitted alone.
+func prDescriptionRows(r apitypes.RunDTO) [][]string {
+	var rows [][]string
+	if d := r.PrDescription; d != nil {
+		if s := cellText(displayPrText(d.Fields.Summary)); s != "" {
+			rows = append(rows, []string{"DELIVERED", s})
+			// PRD #1798 D8 rung 2: a lead_only summary is the lead's own claims, not checked against
+			// the diff. The PR body carries that note; so must this surface (web twin: DeliveredCard).
+			if d.Source == "lead_only" {
+				rows = append(rows, []string{"UNCHECKED", "Summary written by the agent, not checked against the diff."})
+			}
+		}
+		if body := prSizeBody(d.Size); body != "" {
+			rows = append(rows, []string{"SIZE", body})
+		}
+	}
+	if note := prDescriptionOutcomeNote(r.PrDescriptionOutcome); note != "" {
+		rows = append(rows, []string{"PR_UPDATE", cellText(note)})
+	}
+	return rows
+}
+
+// prDescEncoding matches, in ONE left-to-right alternation, the two encodings the api sanitizer
+// applies as a CommonMark forge reads them: a backslash escape (a backslash before ASCII
+// punctuation; a backslash before anything else is literal in CommonMark and is kept) or one of
+// the entities an HTML-escaping writer emits (the sanitizer itself only emits `&lt;`). Replaced
+// output is never rescanned, so `&amp;lt;` reads as the literal text `&lt;` (never `<`), and the
+// sanitizer's `\&lt;` (from the lead's `\<`) reads `&lt;`: the escaped `&` consumes the ampersand.
+var prDescEncoding = regexp.MustCompile("\\\\([!-/:-@\\[-`{-~])|&(lt|gt|amp|quot|#39|#x27|apos);")
+
+var prDescEntity = map[string]string{"lt": "<", "gt": ">", "amp": "&", "quot": `"`, "#39": "'", "#x27": "'", "apos": "'"}
+
+// displayPrText undoes the forge-markdown encoding the api sanitizer applied to a PR
+// description field (api/internal/workersvc/pr_description_sanitize.go, step 3) in one pass. The
+// result is display text, as hostile as the lead wrote it, and must still go through the
+// untrusted-text path (cellText).
+func displayPrText(s string) string {
+	return prDescEncoding.ReplaceAllStringFunc(s, func(m string) string {
+		if m[0] == '\\' {
+			return m[1:]
+		}
+		return prDescEntity[m[1:len(m)-1]]
+	})
+}
+
+// prSizeBuckets is the size line's bucket order (D3), matching agent/src/pr-size.ts.
+var prSizeBuckets = []struct {
+	name   string
+	bucket func(*apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket
+}{
+	{"code", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Code }},
+	{"tests", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Tests }},
+	{"docs", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Docs }},
+	{"config", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Config }},
+	{"generated", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Generated }},
+	{"vendored", func(s *apitypes.PrDescriptionSize) apitypes.PrDescriptionSizeBucket { return s.Vendored }},
+}
+
+// prSizeBody is the size line after its "Size: " label, in the agent's format
+// (agent/src/pr-size.ts renderSizeLine, PRD #1798 D3): `code +1,810 −12 · tests +40 −0 · 2 files`,
+// buckets with no added and no deleted lines omitted, U+2212 minus, U+00B7 separator, en-US
+// thousands separators; "unavailable" for an unavailable size; "" (no row) for a nil size or
+// one with no files. Pinned with the web's prSizeLine to fixtures/pr-size-line/cases.json.
+func prSizeBody(size *apitypes.PrDescriptionSize) string {
+	if size == nil {
+		return ""
+	}
+	if size.Unavailable {
+		return "unavailable"
+	}
+	if size.Files <= 0 {
+		return ""
+	}
+	var parts []string
+	for _, b := range prSizeBuckets {
+		v := b.bucket(size)
+		if v.Added == 0 && v.Deleted == 0 {
+			continue
+		}
+		parts = append(parts, b.name+" +"+groupThousands(v.Added)+" \u2212"+groupThousands(v.Deleted))
+	}
+	noun := "files"
+	if size.Files == 1 {
+		noun = "file"
+	}
+	parts = append(parts, groupThousands(size.Files)+" "+noun)
+	return strings.Join(parts, " \u00b7 ")
+}
+
+// groupThousands formats n with en-US thousands separators (1810 → "1,810").
+func groupThousands(n int64) string {
+	neg := n < 0
+	if neg {
+		n = -n
+	}
+	digits := strconv.FormatInt(n, 10)
+	var b strings.Builder
+	if neg {
+		b.WriteByte('-')
+	}
+	for i, c := range digits {
+		if i > 0 && (len(digits)-i)%3 == 0 {
+			b.WriteByte(',')
+		}
+		b.WriteRune(c)
+	}
+	return b.String()
+}
+
+// prDescriptionOutcomeNote is the PR's last description-write outcome, other than published, as
+// one plain sentence ("" for published or none). Mirrors the web's prDescriptionOutcomeNote. An
+// outcome this binary does not know (a newer server) is named rather than dropped; the caller
+// runs the whole note through cellText.
+func prDescriptionOutcomeNote(outcome *string) string {
+	if outcome == nil || *outcome == "" || *outcome == "published" {
+		return ""
+	}
+	switch *outcome {
+	case "skipped_human_edit":
+		return "Last PR update skipped: a human edited the description."
+	case "skipped_no_region":
+		return "Last PR update skipped: the description no longer has a uzi section."
+	case "skipped_malformed":
+		return "Last PR update skipped: the uzi section of the description was damaged."
+	case "skipped_snapshot_moved":
+		return "Last PR update skipped: the branch moved before the update was written."
+	case "write_failed":
+		return "Last PR update failed: the forge did not accept the new description."
+	}
+	return "Last PR update was not published (" + *outcome + ")."
+}
+
 // deltaGlyph is the one-rune prefix for a plan-summary delta kind, mirroring the web's
 // added/changed/dropped affordance in ASCII the table rail can hold. An unrecognised
 // kind (a newer server than this binary) renders a neutral bullet rather than being
@@ -1563,7 +1731,8 @@ func steerKindLabel(kind string) string {
 // variadic tail so the ~two dozen existing call sites that do not have it stay valid. When
 // it is "forge_unreachable" the recovery suffix names the forge instead of the transient
 // empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account, and
-// "vault_locked" (issue #1766) names the vault unlock the run is waiting for.
+// "vault_locked" (issue #1766) names the vault unlock the run is waiting for, and
+// "data_volume_full" (PRD #1809) names the disk space it is waiting for.
 func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
@@ -1610,6 +1779,11 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 	// run page's "Waiting for vault unlock" heading use).
 	if len(recoveryCause) > 0 && recoveryCause[0] == vaultLockedCause {
 		recoveringSuffix = " (run waiting for vault unlock)"
+	}
+	// PRD #1809 M5: a run parked on a full worker data volume waits for disk space (the words
+	// diskParkLine and the web run page's "Waiting for disk space" heading use).
+	if len(recoveryCause) > 0 && recoveryCause[0] == dataVolumeFullCause {
+		recoveringSuffix = " (run waiting for disk space)"
 	}
 	if consumedAt == nil {
 		if terminalRunStatuses[runStatus] {
@@ -1726,6 +1900,110 @@ func fitVaultParkLine(r apitypes.RunDTO, width int) string {
 	return floor
 }
 
+// runDiskSizeLine renders a run's HOME and cache size on its worker (PRD #1809 M6, D8) for
+// `uzi run get`'s HOME row, e.g. "4.2 GiB (cache 3.0 GiB)". "at least" leads when the worker's
+// size walk was truncated (both numbers are lower bounds). "" when the server sent no size (no
+// fresh report from the run's worker).
+func runDiskSizeLine(r apitypes.RunDTO) string {
+	if r.HomeBytes == nil {
+		return ""
+	}
+	line := humanBytes(*r.HomeBytes)
+	if r.CacheBytes != nil {
+		line += " (cache " + humanBytes(*r.CacheBytes) + ")"
+	}
+	if r.DiskTruncated {
+		line = "at least " + line
+	}
+	return line
+}
+
+// parkedStatuses are the park statuses a checkpoint-durability report describes (PRD #1809 M6).
+var parkedStatuses = map[string]bool{statusLimitWait: true, statusRecoveryWait: true, statusPaused: true}
+
+// checkpointDurabilityLine is the parked run's checkpoint-durability sentence (PRD #1809 M6, D8):
+// whether the checkpoint its latest park published contains the run's latest committed work. The
+// api clears the flag on every claim and running report, so it only describes the park that
+// reported it; it is shown only while the run is parked. "" when the run is not parked or the
+// worker did not report it.
+func checkpointDurabilityLine(r apitypes.RunDTO) string {
+	if r.CheckpointContainsLatest == nil || !parkedStatuses[r.Status] {
+		return ""
+	}
+	if *r.CheckpointContainsLatest {
+		return "contains the latest work"
+	}
+	return "does NOT contain the latest committed work (the worker keeps it)"
+}
+
+// dataVolumeFullCause is the RecoveryWaitCause of a run parked because its worker's data
+// volume was full or about to fill (PRD #1809 M5, D6), and the fail_origin of a run that failed
+// because the volume stayed full past the server's disk-park cap. Like the vault park it
+// resumes at its timer-based retry (RecoveryRetryNotBefore); the worker's reclaim frees space
+// in the meantime.
+const dataVolumeFullCause = "data_volume_full"
+
+// isDiskFullPark reports whether a recovery_wait run is parked on a full data volume (PRD #1809).
+func isDiskFullPark(r apitypes.RunDTO) bool {
+	return r.Status == statusRecoveryWait && strOr(r.RecoveryWaitCause, "") == dataVolumeFullCause
+}
+
+// diskParkLead is the load-bearing opening every disk park rendering starts with.
+const diskParkLead = "waiting for disk space"
+
+// diskParkCountClause is "counted disk parks: N", the run's lifetime count of COUNTED disk
+// parks. A preventive park is not counted, so N can stay 0 across several parks, and the cap is
+// not on the DTO, so no surface renders "N of MAX" for this cause.
+func diskParkCountClause(r apitypes.RunDTO) string {
+	return "counted disk parks: " + itoa(r.DiskParkCount)
+}
+
+// diskParkLine is the data_volume_full park sentence (PRD #1809 M5) `uzi run get`'s DISK row,
+// the `run logs --follow` notice and the TUI share, "" for any other run. The retry clause is
+// HH:MM on the viewer's local wall clock (vaultRetryClause), dropped without a retry stamp.
+func diskParkLine(r apitypes.RunDTO) string {
+	if !isDiskFullPark(r) {
+		return ""
+	}
+	return diskParkLead + ": the worker's data volume is full or nearly full; uzi frees space on the worker and the run resumes at " +
+		vaultRetryClause(r) + "; " + diskParkCountClause(r)
+}
+
+// fitDiskParkLine is diskParkLine shed to fit a physical width, for the TUI's one-row slots,
+// in the same order as fitVaultParkLine: the full sentence, then "waiting for disk space:
+// resumes at its next retry (HH:MM); counted disk parks: N", then the floor "waiting for disk space ·
+// retry HH:MM" (the bare lead without a stamp). The floor is never cut here; the caller's
+// clampVisual is the narrow-terminal backstop. "" for any run that is not a disk park.
+func fitDiskParkLine(r apitypes.RunDTO, width int) string {
+	full := diskParkLine(r)
+	if full == "" {
+		return ""
+	}
+	floor := diskParkLead
+	if r.RecoveryRetryNotBefore != nil {
+		floor += " · retry " + r.RecoveryRetryNotBefore.Local().Format("15:04")
+	}
+	short := diskParkLead + ": resumes at " + vaultRetryClause(r) + "; " + diskParkCountClause(r)
+	for _, cand := range []string{full, short} {
+		if visualWidth(cand) <= width {
+			return cand
+		}
+	}
+	return floor
+}
+
+// failOriginCell is `uzi run get`'s FAIL_ORIGIN cell: the typed fail_origin enum, with a plain
+// explanation for data_volume_full (PRD #1809 M5), whose raw name does not say that uzi parked
+// and retried before giving up. N is the counted parks only (preventive parks are uncounted). The enum is server-coerced, but an unrecognised value from a
+// newer server still prints as itself, through sanitizeTTY like the STOP_KIND row.
+func failOriginCell(r apitypes.RunDTO) string {
+	origin := strOr(r.FailOrigin, "")
+	if origin == dataVolumeFullCause {
+		return origin + " (the worker's data volume stayed full after " + itoa(r.DiskParkCount) + " counted disk parks)"
+	}
+	return sanitizeTTY(origin)
+}
+
 // codexAccountUnavailableCause is the RecoveryWaitCause of a run held on its Codex
 // subscription account (PRD #1590). Unlike the forge park it has no retry clock: the run
 // resumes when the account does, so no surface renders a countdown for it.
@@ -1805,7 +2083,8 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // runStatusCell is the STATUS cell of the run tables (`uzi run list`, `uzi admin runs`):
 // displayRunStatus, plus the short Codex account action in parentheses for a run held on its
 // Codex account (PRD #1590), so the list says what the held run needs without a `run get`.
-// Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way.
+// Issue #1766: a vault_locked park adds "(waiting for vault unlock)" the same way, and
+// (PRD #1809) a data_volume_full park adds "(waiting for disk space)".
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
 	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
@@ -1813,6 +2092,8 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 		s += " (" + short + ")"
 	} else if isVaultLockedPark(r.RunDTO) {
 		s += " (waiting for vault unlock)"
+	} else if isDiskFullPark(r.RunDTO) {
+		s += " (waiting for disk space)"
 	}
 	if isCredentialDisabledHold(r.RunDTO) {
 		// PRD #1732 D14: say why the run is paused, so it does not read as an owner pause.

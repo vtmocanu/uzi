@@ -1667,6 +1667,44 @@ Workers page states that divergence when it exists.
 `-` is not a problem to fix. It is what a locally built image and an unstamped control
 plane both look like, which is most of a development setup.
 
+### Disk usage and checkpoint durability
+
+`uzi worker list` and `uzi admin workers` (the cross-user list) both carry a
+`LARGEST RUN` column (PRD #1809 M6, D8): the HOME size of the worker's
+largest run, so a run growing toward filling the data volume is visible
+before it does. It reads a compact size (e.g. `4.2GiB`), a trailing `+`
+when the worker's size walk was truncated (the number is then a lower
+bound), or `-` when the worker reports no run sizes at all (an older
+worker, or no fresh report yet). The run id and cache bytes behind it ride
+`--json` (the `run_disk` field) for scripting; this is the same figure the
+`fleet.rundisk` [admin health](admin-health.md#the-checks) check's action
+points an admin at.
+
+`uzi run get` gains three rows, each emitted only when the server has
+something to say:
+
+| Row | When it appears | What it shows |
+|---|---|---|
+| `HOME` | the server has a fresh worker report of the run's size | the run's HOME and cache size, e.g. `4.2 GiB (cache 3.0 GiB)`; `at least` leads when the size walk was truncated (both numbers are then lower bounds) |
+| `CHECKPOINT` | the run is parked (`limit_wait`, `recovery_wait`, or `paused`) and the worker reported it | whether the checkpoint published for this park contains the run's latest committed work: `contains the latest work`, or `does NOT contain the latest committed work (the worker keeps it)` |
+| `DISK` | the run is parked with cause `data_volume_full` | the [waiting-for-disk-space sentence](run-recovery-wait.md#worker-data-volume-full), the next retry time, and the run's lifetime count of counted disk parks |
+
+`CHECKPOINT` shows while the run is actually parked (`limit_wait`,
+`recovery_wait`, or `paused`); the API clears the underlying flag on every
+claim and every `running` report, so a resumed run reports "not reported"
+until its next park, rather than carrying a stale value forward. `uzi run
+list` / `uzi admin runs` append `(waiting for disk space)` to the STATUS
+cell for a `data_volume_full` park, the same pattern as `(waiting for
+vault unlock)`.
+
+A run that **fails** because its worker's data volume stayed full past the
+disk-park cap gets a `FAIL_ORIGIN` row reading `data_volume_full (the
+worker's data volume stayed full after N counted disk parks)` instead of
+the bare enum — see [Worker data volume
+full](run-recovery-wait.md#worker-data-volume-full) for the full park and
+failure behavior, and [`UZI_RUN_DISK_PARK_MAX`](configuration.md#server-api)
+for the cap.
+
 `set-token` takes a **label** (the name from `token list`), not an id, and
 takes effect on that worker's next claim — no restart and no re-minted join
 token. Passing both a label and `--default`, or neither, is a usage error

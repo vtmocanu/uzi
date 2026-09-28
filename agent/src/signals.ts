@@ -80,6 +80,13 @@ export interface ScannedSignals {
    *  absent value leaves it undefined and never throws), so a plain signal_done still scans to
    *  exactly `{ done: true }`. */
   proposal?: Proposal;
+  /** PRD #1798 M2 (D4): the lead's structured, plain-English claims about the PR it is handing
+   *  off, from signal_done's `pr_summary`. MAIN-THREAD-ONLY, behind the same isSubagentFrame
+   *  guard as `summary`. Defensively parsed by parsePrSummary (malformed members dropped, raw
+   *  caps clamped, never throws, never affects `done`); set ONLY when at least one member
+   *  parsed, so a plain signal_done still scans to exactly `{ done: true }`. The scan never sets
+   *  `verifiedAtSha`: the executor stamps it from the worktree HEAD when it latches done. */
+  prSummary?: PrSummaryClaim;
   /** PRD #88: the questions an ask_user call carried, if the message made one.
    *  Present and non-empty ⇒ the executor parks the run. */
   questions?: AskUserQuestion[];
@@ -117,6 +124,51 @@ export interface ScannedSignals {
    *  one. Absent unless the tool fired on the lead's own frame. */
   checkpoint?: boolean;
 }
+
+/** PRD #1798 D4: one verification check the lead says it actually ran, with its outcome. */
+export interface PrSummaryVerification {
+  command: string;
+  result: "pass" | "fail";
+}
+
+/** PRD #1798 D4: how the delivered scope differs from the ask. */
+export type PrSummaryScopeKind = "added" | "changed" | "dropped" | "deferred";
+
+/** PRD #1798 D4: one scope difference between the ask and what the branch delivers. */
+export interface PrSummaryScopeNote {
+  kind: PrSummaryScopeKind;
+  text: string;
+}
+
+/** PRD #1798 M2 (D4): the lead's structured claims from signal_done's `pr_summary`, as the
+ *  worker carries them to the runner. Every member is optional; a member is present only when
+ *  it parsed to something non-empty. Strings are trimmed and clamped to the api's RAW caps
+ *  (PR_SUMMARY_TEXT_MAX_BYTES / PR_SUMMARY_ITEM_MAX_BYTES / PR_SUMMARY_MAX_LIST_ENTRIES), so the
+ *  worker never posts a body the api refuses as over-cap. These are CLAIMS, not facts: the api
+ *  sanitizes them and the renderer presents them as the lead's own statements.
+ *
+ *  `verifiedAtSha` is never taken from the model: the executor stamps the run worktree's HEAD
+ *  (lowercase 40-hex) at the moment it latches the done signal, and leaves it absent when HEAD
+ *  could not be read. */
+export interface PrSummaryClaim {
+  what?: string;
+  why?: string;
+  changes?: string[];
+  verification?: PrSummaryVerification[];
+  scope_notes?: PrSummaryScopeNote[];
+  review_pointers?: string[];
+  verifiedAtSha?: string;
+}
+
+/** PRD #1798 M2: worker-side mirrors of the api's RAW pr-description caps
+ *  (api/internal/workersvc/pr_description_sanitize.go MaxPrDescSummaryRawBytes,
+ *  MaxPrDescItemRawBytes, MaxPrDescListRawEntries). Not shared across the TS/Go boundary: if
+ *  an api constant changes, change its mirror here. `what`/`why` use the summary cap; every
+ *  list item (a change, a verification command, a scope-note text, a review pointer) uses the
+ *  item cap; every list keeps at most its first PR_SUMMARY_MAX_LIST_ENTRIES valid entries. */
+const PR_SUMMARY_TEXT_MAX_BYTES = 4000;
+const PR_SUMMARY_ITEM_MAX_BYTES = 1000;
+const PR_SUMMARY_MAX_LIST_ENTRIES = 50;
 
 /** Options for the signal server's tool schemas. */
 export interface SignalServerOptions {
@@ -264,6 +316,55 @@ export function buildSignalMcpServer(
           "title + body of the issue to file on the server's behalf. Omit it entirely otherwise.",
       ),
   };
+  // PRD #1798 M2 (D4): the lead's structured claims for the pull request description. UNGATED on
+  // run kind, like `proposal`: every run kind that ends in a pushed branch (issue, ci_fix,
+  // self_improve, task) opens a PR, the field is optional, and a run that opens none (a
+  // report-only or prompt run) simply leaves it unset; the runner reads it only where it
+  // renders a PR description. Every member is optional so an older prompt, or a lead that
+  // omits it, still completes. Parsed defensively by parsePrSummary; nothing here is trusted.
+  doneShape["pr_summary"] = z
+    .object({
+      what: z
+        .string()
+        .optional()
+        .describe("What the change does, in one or two plain sentences a user of the product would understand."),
+      why: z
+        .string()
+        .optional()
+        .describe("Why it was needed: the problem or request it answers, in plain words."),
+      changes: z
+        .array(z.string())
+        .optional()
+        .describe("The changes by behaviour or area (not a file list), one short plain sentence each."),
+      verification: z
+        .array(
+          z.object({
+            command: z.string().describe("The exact check you ran, e.g. `npm test` or `task gate:api`."),
+            result: z.enum(["pass", "fail"]).describe("Its actual outcome."),
+          }),
+        )
+        .optional()
+        .describe("ONLY the checks you actually ran this run, each with its real result. Never list a check you did not run."),
+      scope_notes: z
+        .array(
+          z.object({
+            kind: z.enum(["added", "changed", "dropped", "deferred"]),
+            text: z.string(),
+          }),
+        )
+        .optional()
+        .describe("How what you delivered differs from what was asked: added, changed, dropped or deferred. Omit when it matches."),
+      review_pointers: z
+        .array(z.string())
+        .optional()
+        .describe("At most a couple of places a reviewer should look hardest, and why."),
+    })
+    .optional()
+    .describe(
+      "OPTIONAL, on a run that opens a pull request: plain, behaviour-level claims the worker uses to write " +
+        "the PR description. Describe what changed for a user, not the code; list only verification you " +
+        "actually ran, with its result. Omit it on a report-only or proposal run.",
+    );
   if (opts.prdDonePath) {
     doneShape["prd_done_path"] = z
       .string()
@@ -690,6 +791,86 @@ function parseProposal(raw: unknown): Proposal | undefined {
   return { title, body };
 }
 
+/** Truncate `s` to at most `maxBytes` UTF-8 bytes, cutting only at a code point boundary. */
+function clampUtf8Bytes(s: string, maxBytes: number): string {
+  const buf = Buffer.from(s, "utf8");
+  if (buf.length <= maxBytes) return s;
+  let cut = maxBytes;
+  // Back off past continuation bytes (10xxxxxx) so the cut never splits a code point.
+  while (cut > 0 && ((buf[cut] ?? 0) & 0xc0) === 0x80) cut--;
+  return buf.subarray(0, cut).toString("utf8");
+}
+
+/** A trimmed, byte-clamped non-empty string, or undefined for anything else. */
+function claimText(raw: unknown, maxBytes: number): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const t = clampUtf8Bytes(raw.trim(), maxBytes).trim();
+  return t === "" ? undefined : t;
+}
+
+/** Map a list through `parse`, dropping entries it rejects and keeping at most the first
+ *  PR_SUMMARY_MAX_LIST_ENTRIES survivors. A non-array or an all-malformed list yields undefined. */
+function claimList<T>(raw: unknown, parse: (entry: unknown) => T | undefined): T[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: T[] = [];
+  for (const entry of raw) {
+    if (out.length >= PR_SUMMARY_MAX_LIST_ENTRIES) break;
+    const v = parse(entry);
+    if (v !== undefined) out.push(v);
+  }
+  return out.length > 0 ? out : undefined;
+}
+
+const PR_SUMMARY_SCOPE_KINDS: ReadonlySet<string> = new Set(["added", "changed", "dropped", "deferred"]);
+
+/**
+ * PRD #1798 M2 (D4): defensively parse signal_done's `pr_summary`. Never throws. A non-object
+ * yields undefined; every member is parsed on its own and dropped when malformed (a non-string
+ * `what`, a verification entry without a command or with a result other than "pass"/"fail", a
+ * scope note with an unknown kind, a blank list item). Text is trimmed and clamped to the api's
+ * raw caps. Returns undefined unless at least one member survived, and never carries
+ * `verifiedAtSha` (the executor stamps that from the worktree, never from the model).
+ */
+function parsePrSummary(raw: unknown): PrSummaryClaim | undefined {
+  const p = asRecord(raw);
+  if (!p || Array.isArray(raw)) return undefined;
+  const out: PrSummaryClaim = {};
+  const what = claimText(p["what"], PR_SUMMARY_TEXT_MAX_BYTES);
+  if (what !== undefined) out.what = what;
+  const why = claimText(p["why"], PR_SUMMARY_TEXT_MAX_BYTES);
+  if (why !== undefined) out.why = why;
+  const item = (e: unknown): string | undefined => claimText(e, PR_SUMMARY_ITEM_MAX_BYTES);
+  const changes = claimList(p["changes"], item);
+  if (changes) out.changes = changes;
+  const verification = claimList<PrSummaryVerification>(p["verification"], (e) => {
+    const r = asRecord(e);
+    const command = claimText(r?.["command"], PR_SUMMARY_ITEM_MAX_BYTES);
+    const result = r?.["result"];
+    if (command === undefined || (result !== "pass" && result !== "fail")) return undefined;
+    return { command, result };
+  });
+  if (verification) out.verification = verification;
+  const scopeNotes = claimList<PrSummaryScopeNote>(p["scope_notes"], (e) => {
+    const r = asRecord(e);
+    const kind = r?.["kind"];
+    const text = claimText(r?.["text"], PR_SUMMARY_ITEM_MAX_BYTES);
+    if (typeof kind !== "string" || !PR_SUMMARY_SCOPE_KINDS.has(kind) || text === undefined) return undefined;
+    return { kind: kind as PrSummaryScopeKind, text };
+  });
+  if (scopeNotes) out.scope_notes = scopeNotes;
+  const pointers = claimList(p["review_pointers"], item);
+  if (pointers) out.review_pointers = pointers;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
+/** PRD #1798 M2: the worktree HEAD as a `verifiedAtSha` value, or undefined unless it is exactly
+ *  a 40-hex object id (normalised to lowercase). */
+export function normalizeVerifiedSha(raw: unknown): string | undefined {
+  if (typeof raw !== "string") return undefined;
+  const t = raw.trim().toLowerCase();
+  return /^[0-9a-f]{40}$/.test(t) ? t : undefined;
+}
+
 function asRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === "object"
     ? (v as Record<string, unknown>)
@@ -814,6 +995,14 @@ export function scanSignals(message: unknown): ScannedSignals {
       // `done` — a malformed declaration still means the run finished.
       const proposal = parseProposal(input?.["proposal"]);
       if (proposal !== undefined) out.proposal = proposal;
+      // PRD #1798 M2 (D4). Extracted HERE, in the same signal_done branch and therefore behind
+      // the same main-thread guard as summary above: the claims shape the PR description a
+      // human reads, so a subagent frame must never be able to declare them. Set ONLY when at
+      // least one member parsed (parsePrSummary drops everything malformed and never throws),
+      // so a plain signal_done still scans to exactly `{ done: true }` and a malformed
+      // declaration never affects `done`.
+      const prSummary = parsePrSummary(input?.["pr_summary"]);
+      if (prSummary !== undefined) out.prSummary = prSummary;
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
       // guards, for the same reason prd_done_path is nested inside signal_done's

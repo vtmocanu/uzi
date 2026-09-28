@@ -24,12 +24,14 @@ import type {
   ReviewCommentsSnapshot,
   RunKind,
 } from "./protocol.js";
-import type { AnswerVerdict, PlanVerdict } from "./steering.js";
+import type { AnswerVerdict, PauseMode, PlanVerdict } from "./steering.js";
+import { normalizeVerifiedSha, type PrSummaryClaim } from "./signals.js";
+import type { Delta } from "./summary-runner.js";
 import { buildRepoInstructionsContext, type PriorWork } from "./prompt.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import { LimitReachedError } from "./limit.js";
-import { provisionRunTools } from "./provision-run.js";
+import { provisionRunTools, removeProvisionDir } from "./provision-run.js";
 import type { provisionTools } from "./provision.js";
 import { AGENT_GIT_IDENTITY, gitEnv } from "./git.js";
 import { runnerCommand, runnerPath, runnerTmpdir } from "./runner-uid.js";
@@ -466,7 +468,18 @@ export interface RunContext {
    * ACK's pauseRequested regressed — an ACK-independent fallback. Absent on the stub/test executors
    * ⇒ no fallback (the ACK's pauseRequested is then the sole park trigger, as before).
    */
-  pauseModeRequested?(): "milestone" | "now" | "wall" | null;
+  pauseModeRequested?(): PauseMode;
+  /**
+   * PRD #1809 D4 (soft layer): called by the executor at every implement turn boundary, before
+   * the next turn is driven. `processAlive` is the executor's quiet-point probe (true while any
+   * process of the run is alive: its CLI process groups, plus every process attributed to the run
+   * by HOME or working directory, run-procs.ts; unknown is alive); the runner's cache governor calls
+   * it only when the run's caches are over its cap, trims them at a quiet point, and resolves
+   * "park" when the run stays over the cap: the executor then throws a preventive
+   * DiskParkSignal (cache-cap.ts) and the runner parks the run so its caches are dropped. Absent on the
+   * stub/test executors and when the cap is off ⇒ no cap.
+   */
+  cacheCapBoundary?(processAlive: () => Promise<boolean>): Promise<"continue" | "park">;
   /**
    * PRD #1497 M2: park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park (D4), NOT
    * handlePausePark's publish-or-stay contract. The runner's implementation reaps the agent tree,
@@ -697,6 +710,22 @@ export interface ExecutorResult {
    *  prompt completion path. Absent when the run produced no proposal, which is the common
    *  case (a normal/mr-mode run). StubExecutor never sets it. */
   proposal?: Proposal;
+  /** PRD #1798 M2 (D4): the lead's structured, plain-English PR claims from signal_done's
+   *  `pr_summary` (last-wins across the run's main-thread signal_done calls), parsed and clamped
+   *  to the api's raw caps by signals.ts. `verifiedAtSha` is the run worktree's HEAD read by the
+   *  executor when it latched done (absent when HEAD could not be read). NOT gated on run kind;
+   *  the runner reads it only where it renders a PR description. Absent when the lead declared
+   *  none, which an older prompt or a terse lead does. StubExecutor never sets it. */
+  prSummary?: PrSummaryClaim;
+  /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
+   *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
+   *  latched from the LAST successful generation of this run. Absent whenever that pass did not
+   *  run or did not succeed, which is normal: a resumed run past its gate and every Codex run
+   *  never produce one. */
+  summaryPlan?: string;
+  /** PRD #1798 M2: the tagged deltas (added / changed / dropped) that accompanied
+   *  `summaryPlan`, from the same generation. Present only alongside `summaryPlan`. */
+  summaryDeltas?: Delta[];
   /** PRD #634 M3: set when the operator's scope ceiling truncated the run at the loop top.
    *  `completedCount` frozen milestones were completed and are the committed slice; `total`
    *  is the frozen count (may be absent on a pre-approved resume where the local frozen list
@@ -768,6 +797,15 @@ export interface Executor {
    * it; the SDK executor also self-reaps in its own run() finally.
    */
   killAgentTree?(): void;
+  /**
+   * PRD #1809 D4: SIGKILL the run's processes that {@link killAgentTree}'s process-group reap
+   * misses (the pinned Claude CLI runs every Bash command detached, in its own session and group):
+   * every live process attributed to the run by `HOME` or working directory (run-procs.ts). The
+   * runner awaits it right after killAgentTree at the mid-run disk parks, before every park cache
+   * drop (D2), and at the finalize security reap before the push. Never rejects. Absent on the
+   * stub/test and Codex executors.
+   */
+  reapAttributedProcesses?(): Promise<void>;
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;
@@ -1065,6 +1103,47 @@ export interface StubExecutorOptions {
  * plan→approve→work→MR path is provable end-to-end without a live Anthropic
  * session (mirrors SdkExecutor's gate handling).
  */
+/**
+ * PRD #1798 M2: read the run worktree's HEAD for a pr_summary's `verifiedAtSha`. Runs git AS
+ * the runner uid (the worktree is the runner-owned clone; see StubExecutor.git for why a
+ * worker-uid git there is wrong) with gitEnv()'s replacement env. Returns the lowercase 40-hex
+ * id, or undefined on ANY failure (no repo, unborn HEAD, timeout, odd output). Never throws.
+ */
+export async function readWorktreeHeadSha(worktreePath: string): Promise<string | undefined> {
+  try {
+    const env: NodeJS.ProcessEnv = { ...gitEnv(), PATH: runnerPath() };
+    const tmp = runnerTmpdir();
+    if (tmp) env.TMPDIR = tmp;
+    const wrapped = runnerCommand("git", ["-C", worktreePath, "rev-parse", "--verify", "HEAD^{commit}"]);
+    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, { env, timeout: 30_000 });
+    return normalizeVerifiedSha(String(stdout));
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * PRD #1798 M2: stamp a latched pr_summary with the worktree HEAD at the done signal. Returns a
+ * NEW claim (the input is not mutated) carrying `verifiedAtSha` when HEAD was readable, the
+ * claim unchanged (minus any stale stamp) when it was not, and undefined for no claim, in which
+ * case git is not run at all. Never throws.
+ */
+export async function stampPrSummaryHead(
+  claim: PrSummaryClaim | undefined,
+  worktreePath: string,
+  readHead: (worktreePath: string) => Promise<string | undefined> = readWorktreeHeadSha,
+): Promise<PrSummaryClaim | undefined> {
+  if (claim === undefined) return undefined;
+  const { verifiedAtSha: _stale, ...rest } = claim;
+  let sha: string | undefined;
+  try {
+    sha = normalizeVerifiedSha(await readHead(worktreePath));
+  } catch {
+    sha = undefined;
+  }
+  return sha === undefined ? rest : { ...rest, verifiedAtSha: sha };
+}
+
 export class StubExecutor implements Executor {
   constructor(
     private readonly log: Logger,
@@ -1174,10 +1253,7 @@ export class StubExecutor implements Executor {
         log: this.log,
         provision: this.opts.provision,
       });
-      if (provisionDir)
-        await fs
-          .rm(provisionDir, { recursive: true, force: true })
-          .catch(() => undefined);
+      if (provisionDir) await removeProvisionDir(provisionDir, this.log);
     }
 
     const isCIFix = ctx.kind === "ci_fix";

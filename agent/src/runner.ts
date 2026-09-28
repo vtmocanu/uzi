@@ -75,6 +75,11 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { rmHomeTree } from "./rmtree.js";
+import { dropRunCaches } from "./run-caches.js";
+import type { RunDiskLocks } from "./run-disk-locks.js";
+import type { CachesDroppedMemo } from "./disk-reclaim.js";
+import { DataVolumeFullError, type DataVolumeGuard } from "./disk-full.js";
+import { DiskParkSignal, type DiskGovernor } from "./cache-cap.js";
 import {
   SteeringChannel,
   PauseNowSignal,
@@ -110,7 +115,17 @@ import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
 import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
-import { computeSizeLine, SIZE_UNAVAILABLE } from "./pr-size.js";
+import { computeSize } from "./pr-size.js";
+import { buildDeliveryContext } from "./pr-description-context.js";
+import { resolvePrdInputFromBare } from "./prd-link.js";
+import {
+  PrDescriptionPublisher,
+  reconcileCompletion,
+  repoPathFromUrl,
+  type ReconcileResult,
+} from "./pr-description-publisher.js";
+import { renderCompletionBlock, type KindSection } from "./pr-description.js";
+import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
@@ -160,6 +175,15 @@ const CREDENTIAL_SWITCH_CAPTURE_ATTEMPTS = 3;
 const COMPLETION_INTERLOCK_UNHELD_REASON =
   "completion interlock: could not verify the final head or park the run for recovery";
 
+/** PRD #1798 M6 (amended D10, M1): the STATIC failure_reason of a NON-interlocked issue run whose
+ *  completion is non-closing (an owner partial, a scope cap) when the description publisher reports
+ *  that the PR still carries a closing directive for the issue outside uzi's completion block (the
+ *  rewrite failed or could not be confirmed). Completing would leave a partial delivery that closes
+ *  its issue on merge. Before PRD #1798 such a body was never rewritten, so this failure is new and
+ *  intentional. Content-free, like COMPLETION_INTERLOCK_UNHELD_REASON. */
+const NON_CLOSING_BODY_UNCONFIRMED_REASON =
+  "completion interlock: a closing directive could not be removed from a non-closing merge request";
+
 /** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
  *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
  *  by the executor-owned safety facade when a durability sink could not reap/reconcile (sink
@@ -191,8 +215,14 @@ function isInputReceiptError(err: unknown): boolean {
 
 /** Issue #1766: the typed cause a recovery park is taken for. `transient` is the #1197 empty-turn
  *  recovery (unchanged); `vault_locked` is a Codex credential deferral by a locked owner vault,
- *  which parks credential-free (see RunRunner.handleRecoveryExhausted). */
-type RecoveryParkCause = { kind: "transient" } | { kind: "vault_locked" };
+ *  which parks credential-free (see RunRunner.handleRecoveryExhausted). `data_volume_full` is
+ *  PRD #1809 D4's MID-RUN disk park (the cache cap's preventive park, or the hard pressure stop's
+ *  counted one); it keeps the custody hold. The pre-clone D6 disk park is a separate flow
+ *  (RunRunner.handleDataVolumeFull). */
+type RecoveryParkCause =
+  | { kind: "transient" }
+  | { kind: "vault_locked" }
+  | { kind: "data_volume_full"; preventive: boolean };
 
 /** Issue #1766: how many doublings a vault-lock park's retry wait may grow by before it is capped
  *  (base recoveryRetryMs x 16). */
@@ -432,6 +462,31 @@ export class ForgeUnreachableAtCloneError extends Error {
   }
 }
 
+/** PRD #1809 D6: the wording a pre-clone park uses on the feed and in its logs. The forge park
+ *  and the data-volume-full park share one report/dispatch/reconcile flow and differ only here. */
+interface PreCloneParkCopy {
+  /** The feed and park-log wording. */
+  reason: string;
+  /** The prefix the shared report/dispatch/reconcile log lines carry. */
+  log: string;
+}
+const FORGE_PARK_COPY: PreCloneParkCopy = { reason: "forge unreachable at clone", log: "forge park" };
+const DATA_VOLUME_PARK_COPY: PreCloneParkCopy = { reason: "the worker's data volume is full", log: "data-volume park" };
+
+/** PRD #1809 D6 (N3): how long the data-volume handling waits for the D7 reclaim pass before it
+ *  moves on (re-samples, or retries once). reclaimNow can await an in-flight pass and then a fresh
+ *  one, each under a 10-minute deadline, so an unbounded wait could hold a claim ~20 minutes. */
+const DATA_VOLUME_RECLAIM_WAIT_MS = 2 * 60_000;
+
+/** PRD #1809 D6: the api feature that accepts `recovery_cause: "data_volume_full"`. An api without
+ *  it 400s the cause, so the worker sends the untyped `recovery_wait` park instead. */
+const DATA_VOLUME_FULL_FEATURE = "recovery_cause_data_volume_full";
+
+/** PRD #1809 D8: the api feature that accepts `checkpoint_contains_latest` on a park report. The
+ *  /state decode is strict, so an api without it would 400 the field: it is sent only when
+ *  advertised. */
+const CHECKPOINT_DURABILITY_FEATURE = "run_checkpoint_durability";
+
 /**
  * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
  * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
@@ -559,6 +614,19 @@ class RunningAckTerminalError extends Error {
   constructor(readonly runStatus: string) {
     super(`first running report refused with a terminal status (${runStatus})`);
     this.name = "RunningAckTerminalError";
+  }
+}
+
+/**
+ * PRD #1809 D6 (N4): a worker shutdown ended a pre-clone data-volume reclaim wait. executeClaim
+ * leaves the run non-terminal for the server to requeue, with NO park report (a counted
+ * data_volume_full park would spend the run's cap on the worker's own drain) and no custody
+ * release. Local, thrown and caught entirely within this file.
+ */
+class DataVolumeWaitShutdown extends Error {
+  constructor(readonly operation: string) {
+    super(`worker shut down during the data-volume reclaim wait (${operation})`);
+    this.name = "DataVolumeWaitShutdown";
   }
 }
 
@@ -1051,6 +1119,12 @@ interface RunFlight {
    *  (`preserveSession`), never on `parked` alone (D4). The finally reads it to gate exactly the
    *  two resume-artifact removals; false is the safe default for every other path. */
   preClonePark: boolean;
+  /** PRD #1809 D6: what a pre-clone park was taken for (its feed/log wording), set with
+   *  `preClonePark`. Undefined reads as the forge-unreachable park. */
+  preCloneParkReason?: string;
+  /** PRD #1809 D4 (N3): a mid-run disk park already dropped the run's caches before its capture,
+   *  so the finally's park drop only finishes what that one could not. */
+  cachesDroppedEarly?: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
   /** Issue #1600: the budget off the latest REFUSED wall park's 409, held until the executor
@@ -1058,6 +1132,13 @@ interface RunFlight {
   wallParkRefresh?: WallParkRefresh;
   lastPublish: number;
   lastPublishedTip: string | undefined;
+  /** PRD #1809 D8 (N1): THIS worker confirmed-landed a checkpoint mid-run (a time/milestone
+   *  checkpoint or an owner-pause publish). Separate from `lastPublishedTip`, which after a failed
+   *  fetch-back stays un-advanced (the packed tip is older than the clone HEAD) even though a
+   *  checkpoint DID land: the report-only orphan guards read this, not the tip. Not
+   *  `lastCheckpointRefTip`: that one is seeded from `claim.checkpoint_tip` (a prior/cross-worker
+   *  checkpoint, possibly a marker-only `wip(park):` one PRD #759 ignores). */
+  landedCheckpoint?: boolean;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
    *  knows it — seeded from `claim.checkpoint_tip`, advanced to the declared overlay/real tip on
    *  every CONFIRMED publish. Fed to `checkpointPack` as the overlay's `prevCheckpointTip` so a
@@ -1158,6 +1239,13 @@ export interface CheckpointTestHooks {
   scanDeadlineMs?: number;
   /** Observe the flight bookkeeping right after a confirmed PINNED publish. */
   afterPinnedPublish?: (state: { publishedTip: string; lastPublishedTip?: string; checkpointFloor?: string }) => void;
+  /** Observe the flight bookkeeping right after a confirmed UNPINNED (overlay/plain) publish. */
+  afterUnpinnedPublish?: (state: {
+    cloneTip: string | null;
+    fetchedTip: string | null;
+    lastPublishedTip?: string;
+    checkpointFloor?: string;
+  }) => void;
 }
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
@@ -1254,12 +1342,44 @@ export interface RunnerOptions {
    *  on terminal / requeue. The worker reads the registry to build the ActiveSnapshot.
    *  Undefined ⇒ no tracking (tests that never negotiate the feature). */
   activeRuns?: ActiveRunRegistry;
+  /** PRD #1809 D7 — the per-run lock shared with the disk reclaim. Each execution waits on it
+   *  before it builds the run's executor (and so before it touches the run's HOME), so a
+   *  resume never starts while the reclaim is deleting that run's files. Undefined ⇒ no
+   *  reclaim runs in this process (tests). */
+  diskLocks?: RunDiskLocks;
+  /** PRD #1809 D7 — the disk reclaim's memo of runs whose caches it found gone. Each execution
+   *  forgets its run there while holding `diskLocks`, since the run may rebuild its caches
+   *  before it parks again. Undefined ⇒ nothing to forget. */
+  cachesDropped?: CachesDroppedMemo;
+  /** PRD #1809 D6 — the data-volume guard: classifies a failed write as data-volume disk-full,
+   *  preflights the volume at claim and resume, and runs the D7 reclaim before the one retry.
+   *  Undefined ⇒ no disk-full handling (today's behaviour; tests that do not exercise it). */
+  dataVolume?: DataVolumeGuard;
+  /** PRD #1809 D6 (N3) — the bound on how long the data-volume handling waits for a D7 reclaim
+   *  pass before it moves on. Default 2 minutes; a non-positive value falls back to it. */
+  dataVolumeReclaimWaitMs?: number;
+  /** PRD #1809 D4 — the worker's cache governor: the per-run cache cap checked at every implement
+   *  turn boundary (soft layer) and the per-tick pressure stop (hard layer). Each running Claude
+   *  run that can take the fenced disk park is registered with it for its flight. Undefined ⇒ no
+   *  cap and no pressure stop (tests that do not exercise them; both layers disabled). */
+  diskGovernor?: DiskGovernor;
   /** PRD #1391 Run B M4 — the wall-clock budget for the queued-duplicate ownership-probe retry: a
    *  TRANSIENT probe failure retries with backoff up to this bound (the api's claim grace minus a
    *  margin), a held/queued row is re-probed until it, then the attempt ends without executing.
    *  Measured against the injectable `now`, so a test can shrink it. Default 20s — well under the
    *  api's claimed-never-started grace so a probe never outlives the claim. */
   queuedDuplicateProbeBudgetMs?: number;
+  /** PRD #1798 M5: the SummaryRunner whose generateDeliverySummary writes the PR description.
+   *  main.ts injects one on the SDK HOME root with the production Codex factory. There is NO
+   *  default: without one the pass never runs and the description falls back to the lead's claims
+   *  or the size line alone (D8), rather than a live SDK call from a HOME under os.tmpdir(). */
+  summaryRunner?: SummaryRunner;
+  /** PRD #1798 M5: never run the editor pass (main.ts sets it under UZI_EXECUTOR=stub, so an e2e
+   *  spends nothing on either harness: the Codex advice path ignores the stub queryFn). */
+  skipDeliverySummary?: boolean;
+  /** PRD #1798 M6: how long the description publisher waits before re-reading a PR whose head is
+   *  not yet the landed head (a forge may lag a push by a moment). Default 2 s; tests pass 0. */
+  prDescriptionHeadLagMs?: number;
 }
 
 /**
@@ -1318,6 +1438,14 @@ export class RunRunner {
    *  Named distinctly from the `activeRuns` shutdown Map below — that tracks abortable
    *  controllers, this tracks the snapshot phase. */
   private readonly snapshotRegistry: ActiveRunRegistry | undefined;
+  /** PRD #1809 D7 — see RunnerOptions.diskLocks. */
+  private readonly diskLocks: RunDiskLocks | undefined;
+  /** PRD #1809 D7 — see RunnerOptions.cachesDropped. */
+  private readonly cachesDropped: CachesDroppedMemo | undefined;
+  /** PRD #1809 D6 — see RunnerOptions.dataVolume. */
+  private readonly dataVolume: DataVolumeGuard | undefined;
+  /** PRD #1809 D4 — see RunnerOptions.diskGovernor. */
+  private readonly diskGovernor: DiskGovernor | undefined;
   private readonly detect: (
     worktreePath: string,
   ) => Promise<DetectedRepoAgents>;
@@ -1345,6 +1473,10 @@ export class RunRunner {
   private readonly setTimer: (cb: () => void, ms: number) => () => void;
   /** issue #1597 M2: arms the repeating mid-turn checkpoint tick (see RunnerOptions.setTickTimer). */
   private readonly setTickTimer: (cb: () => void, ms: number) => () => void;
+  /** PRD #1798 M5: see {@link RunRunner.deliverySummaryRunner}. */
+  private readonly deliverySummary: SummaryRunner | null;
+  /** PRD #1798 M6: see RunnerOptions.prDescriptionHeadLagMs. */
+  private readonly prDescriptionHeadLagMs: number | undefined;
   /** PRD #41: absolute plan-approval deadline (epoch ms) per runId, set on the FIRST
    *  gate entry and reused across every revision round so N rounds share ONE budget (not
    *  24h per round). Cleared when the gate resolves terminally (approve/reject/cancel/
@@ -1395,6 +1527,11 @@ export class RunRunner {
    *  DURING the shutdown drain (a late claim) is aborted immediately rather than running
    *  to completion past the grace window. */
   private shuttingDownGlobal = false;
+  /** PRD #1809 D6 (N3): aborted by `shutdown()` beside `shuttingDownGlobal`, so a pre-clone wait
+   *  (the data-volume reclaim wait, before the flight joins `activeRuns`) can end on a shutdown. */
+  private readonly shutdownSignal = new AbortController();
+  /** PRD #1809 D6 (N3): see RunnerOptions.dataVolumeReclaimWaitMs. */
+  private readonly dataVolumeReclaimWaitMs: number;
 
   constructor(
     private readonly client: WorkerClient,
@@ -1475,6 +1612,14 @@ export class RunRunner {
         : 20_000;
     // PRD #1390 M2a: the shared active-run registry the worker reads to build snapshots.
     this.snapshotRegistry = opts.activeRuns;
+    this.diskLocks = opts.diskLocks;
+    this.cachesDropped = opts.cachesDropped;
+    this.dataVolume = opts.dataVolume;
+    this.diskGovernor = opts.diskGovernor?.enabled ? opts.diskGovernor : undefined;
+    this.dataVolumeReclaimWaitMs =
+      opts.dataVolumeReclaimWaitMs && opts.dataVolumeReclaimWaitMs > 0
+        ? opts.dataVolumeReclaimWaitMs
+        : DATA_VOLUME_RECLAIM_WAIT_MS;
     this.checkpointIntervalMs = opts.checkpointIntervalMs ?? 20 * 60_000;
     this.checkpointTickIntervalMs = opts.checkpointTickIntervalMs ?? 5 * 60_000;
     this.checkpointTestHooks = opts.checkpointTestHooks;
@@ -1493,6 +1638,17 @@ export class RunRunner {
     };
     this.setTimer = opts.setTimer ?? realTimer;
     this.setTickTimer = opts.setTickTimer ?? realTimer;
+    // PRD #1798 M5: the injected PR-description editor pass, or null when none is injected or it
+    // must never run (stub).
+    this.deliverySummary = opts.skipDeliverySummary ? null : (opts.summaryRunner ?? null);
+    this.prDescriptionHeadLagMs = opts.prDescriptionHeadLagMs;
+  }
+
+  /** PRD #1798 M5: the SummaryRunner the finalize path runs the PR-description editor pass on, or
+   *  null when none was injected or the pass is disabled (`skipDeliverySummary`), in which case the
+   *  description falls back to the lead's claims or the size line alone (D8). */
+  deliverySummaryRunner(): SummaryRunner | null {
+    return this.deliverySummary;
   }
 
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
@@ -1539,6 +1695,17 @@ export class RunRunner {
     });
   }
 
+  /**
+   * PRD #1809 D7: whether this runner is executing `runId` right now, from the moment
+   * {@link execute} is entered (before its executor or HOME exists) until its last cleanup
+   * settles. A run parked at a gate stays executing (its execute promise is live); a run
+   * whose park returned from execute does not. The disk reclaim never touches a run for
+   * which this is true.
+   */
+  isExecuting(runId: string): boolean {
+    return this.executionTails.has(runId);
+  }
+
   async execute(claim: ClaimResponse): Promise<void> {
     const runId = claim.run_id;
     // Defense in depth (PRD #42): runId becomes a path segment in the per-run HOME
@@ -1557,6 +1724,21 @@ export class RunRunner {
     // the second even while the second is waiting for the first's cleanup.
     this.executionTails.set(runId, tail);
     try {
+      // PRD #1809 D7: wait out an in-progress disk reclaim of THIS run before anything builds
+      // its executor or touches its HOME. Holding the lock only this long is enough: the
+      // executionTails entry installed above already makes every later reclaim see the run as
+      // executing (isExecuting) and skip it, so the only deletion that can overlap this
+      // execution is one that checked before that entry existed, and that one holds the lock.
+      // Forgetting the reclaim's cache-drop memo entry under the same lock orders it after any
+      // drop in progress (whose memo add runs under that lock), so the entry cannot outlive
+      // this execution's rebuilt caches.
+      if (this.diskLocks) {
+        const releaseDisk = await this.diskLocks.acquire(runId);
+        this.cachesDropped?.forget(runId);
+        releaseDisk();
+      } else {
+        this.cachesDropped?.forget(runId);
+      }
       if (previous) {
         await previous;
         // PRD #1391 Run B M4 — the generation-aware queued-duplicate router. A SECOND (or later) claim
@@ -1791,6 +1973,13 @@ export class RunRunner {
     // finally removes it (a park that RETURNS from executeClaim — limit_wait/recovery/
     // pre-clone — is a requeue, so it stops being listed there too). Idempotent per run id.
     this.snapshotRegistry?.add(runId, claim.claim_generation ?? 0);
+    // PRD #1809 D4: watch this run's caches for its flight. Claude runs only (a Codex run has
+    // `executor.safety`; its caches live on its own per-run volume) with a HOME, and only runs
+    // that can take the claim-fenced disk park (a claim generation to fence it with): anything
+    // else keeps today's handling. Unregistered at the end of the finally below.
+    if (this.diskGovernor && runHome && !executor.safety && this.dataVolumeParkable(claim)) {
+      this.diskGovernor.register(runId, { home: runHome, requestStop: () => steering.requestDiskStop() });
+    }
     try {
       await this.phaseClone(claim, flight);
       const sessionId = await this.phaseResume(claim, flight);
@@ -1863,34 +2052,28 @@ export class RunRunner {
         // once handleLimitReached reports `failed` (or the server coerces a park to `failed`)
         // the reconcile is refused (409), which would block the reap and leak the
         // exact-generation hold as source_only. The credentialed settle runs AFTER the report
-        // on the non-parked branch below. The PARKED path keeps its OWN park-boundary reconcile
-        // (limit_wait is actively-claimed, so its second reconcile is authorized) — a blocked
-        // pre-reap here poisons the registry (codex/registry.ts) so the park publish's reap also
-        // fails, but the park still stands (D4).
+        // on the non-parked branch below. The PARKED path keeps its OWN park-boundary reconcile:
+        // since PRD #1809 D8 it runs inside the park sink (parkSink below), which handleLimitReached
+        // calls BEFORE the limit_wait report, so that second reconcile also runs while the run is
+        // still `running` (actively-claimed) and is authorized. A blocked pre-reap here poisons the
+        // registry (codex/registry.ts) so the park publish's reap also fails, but the park still
+        // stands (D4).
         const limitReaped = await this.reapRecoveryProviderForSettle(
           claim,
           flight,
           runLog,
           "terminal",
         );
-        flight.parked = await this.handleLimitReached(
-          err,
-          claim,
-          batcher,
-          reportState,
-          runLog,
-        );
-        // parked === true is the ONLY thing that preserves on-disk state; see the
-        // carve-out in the finally.
-        //
-        // PRD #218 M1: fetch the agent's committed work back into the worker bare
-        // BEFORE the finally's carve-out — the tracking ref is where the next claim's
-        // reseed (M2) reads it from, and it survives the `fs.rm` that the clone does
-        // not. Only when the run actually parked (a resume is coming) and a clone
-        // existed to fetch from. Best-effort: a park that fails is worse than a park
-        // that loses work (D4), so a failed fetch-back must not undo the park.
-        if (flight.parked) {
-          if (flight.barePath && flight.worktreePath && flight.branch) {
+        // PRD #1809 D8: the park's durability publish runs BEFORE the limit_wait report (it used to
+        // run after it), so the report can say whether the published checkpoint contains the run's
+        // latest committed work. handleLimitReached calls it after the limit_wait feed line and
+        // before the report, on the waiting path only (an opted-out run fails without a publish).
+        let parkSinkRan = false;
+        let parkPublished = false;
+        let parkHoldsLatest = false;
+        const parkSink = async (): Promise<Pick<StateRequest, "checkpoint_contains_latest">> => {
+          if (!(flight.barePath && flight.worktreePath && flight.branch)) return {};
+          parkSinkRan = true;
           const barePath = flight.barePath;
           const worktreePath = flight.worktreePath;
           const branch = flight.branch;
@@ -1900,8 +2083,8 @@ export class RunRunner {
           // run() finally reaps first — kept consistent with the done/shutdown fetch-back
           // sites) followed by the publish body, byte-for-byte. For a Codex run the facade
           // quiesces+reaps the provider root (after its per-sink auth-mode reconcile) and holds
-          // the permit across the whole publish body.
-          let parkPublished = false;
+          // the permit across the whole publish body. The run is still `running` here, which is
+          // actively-claimed, so the boundary's reconcile is authorized.
           try {
             await this.reapForSink(
               executor,
@@ -1914,7 +2097,10 @@ export class RunRunner {
                 // Best-effort — commitWipMarker swallows every error and the .catch is belt-and-
                 // braces so nothing here can undo the park (D4).
                 await this.git.commitWipMarker(worktreePath).catch(() => false);
-                await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                const fetched = await this.fetchBackBestEffort(barePath, worktreePath, branch, runId, runLog);
+                // PRD #1809 D8: what the publish below packs is the tracking ref; it holds the
+                // latest work only when this fetch-back landed and the ref equals the clone HEAD.
+                parkHoldsLatest = await this.trackingHoldsLatest(fetched, barePath, worktreePath, branch);
                 // PRD #1416 M3 (C5): bridge a divergent tracking tip BEFORE the park publish so a
                 // reseed on resume adopts B (the rewritten work), not the published tip. Best-effort:
                 // a park that fails is worse than a park that loses work (D4), so it NEVER throws —
@@ -1938,7 +2124,8 @@ export class RunRunner {
               },
             );
           } catch (err) {
-            // A NON-boundary throw propagates exactly as before. A CodexBoundaryError means the
+            // A NON-boundary throw propagates to handleLimitReached, which logs it and still
+            // reports the park (without the durability field). A CodexBoundaryError means the
             // Codex boundary could not reap/publish — nothing landed on origin, the same
             // durability consequence as a publish failure (parkPublished stays false); it must
             // NOT undo the park.
@@ -1948,6 +2135,26 @@ export class RunRunner {
               error: errMessage(err),
             });
           }
+          return this.checkpointDurabilityField(parkPublished ? parkHoldsLatest : undefined);
+        };
+        flight.parked = await this.handleLimitReached(
+          err,
+          claim,
+          batcher,
+          reportState,
+          runLog,
+          parkSink,
+        );
+        // parked === true is the ONLY thing that preserves on-disk state; see the
+        // carve-out in the finally.
+        //
+        // PRD #218 M1: the agent's committed work was fetched back into the worker bare
+        // above (parkSink), BEFORE the finally's carve-out — the tracking ref is where the next
+        // claim's reseed (M2) reads it from, and it survives the `fs.rm` that the clone does
+        // not. Best-effort: a park that fails is worse than a park that loses work (D4), so a
+        // failed fetch-back must not undo the park.
+        if (flight.parked) {
+          if (parkSinkRan) {
           // issue #1030: the park-publish result is EXPLICIT on the feed — a success line, and a
           // failure line naming the durability consequence (a resume on another worker restarts
           // from the default branch). The false case covers a real publish failure, an empty
@@ -1955,13 +2162,18 @@ export class RunRunner {
           // landed on refs/uzi-checkpoints/<branch>. publishCheckpointBestEffort ALSO emits the
           // specific HTTP/skip outcome (deduped). This batcher.emit lands because
           // handleLimitReached FLUSHES (not closes) the batcher on the park branch.
+          // PRD #1809 D8: "published" keeps meaning only that a ref landed; a published checkpoint
+          // older than the run's latest work says so.
+          if (parkPublished && !parkHoldsLatest) this.logStaleParkCheckpoint(runLog, runId, "limit");
           batcher.emit({
             kind: "status",
             agent: "worker",
             payload: {
-              text: parkPublished
-                ? "park checkpoint published to origin"
-                : "park checkpoint NOT published — a resume on another worker will restart from the default branch",
+              text: !parkPublished
+                ? "park checkpoint NOT published — a resume on another worker will restart from the default branch"
+                : parkHoldsLatest
+                  ? "park checkpoint published to origin"
+                  : "park checkpoint published to origin, but the latest committed work is not in that checkpoint; the worker keeps it until it is recovered",
             },
           });
           }
@@ -1992,6 +2204,27 @@ export class RunRunner {
           // Claude/stub killAgentTree cannot fail. Best-effort; runs after the report landed.
           if (limitReaped) await this.settleRecoveryGeneration(claim, flight, runLog);
         }
+      } else if (err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk")) {
+        // PRD #1809 D4: the cache cap parks a run that stayed over it (preventive), or the hard
+        // pressure layer stopped this run's turn (a `disk` stop; a PauseNowSignal that escaped the
+        // implement loop, e.g. from a reclaim wait, is the same stop). Take the mid-run
+        // data_volume_full recovery park: reap the tree, capture what is committed, park. The run
+        // keeps its custody hold (a clone exists), and the finally drops its caches on the park.
+        flight.parked = await this.handleRecoveryExhausted(
+          err,
+          claim,
+          flight,
+          executor,
+          batcher,
+          reportState,
+          runLog,
+          // N1: a hard stop requested while the soft boundary measured or trimmed makes the park
+          // COUNTED, whatever the soft layer concluded: the sticky `disk` mode says it was asked.
+          {
+            kind: "data_volume_full",
+            preventive: err instanceof DiskParkSignal && err.preventive && steering.getPauseMode() !== "disk",
+          },
+        );
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -2165,10 +2398,12 @@ export class RunRunner {
             claim,
             flight,
             await this.currentRestorePointHead(flight),
-          ).catch((e) =>
+          ).catch(async (e) =>
             runLog.warn("recovery: shutdown generation-evidence pin failed (custody retained)", {
               run_id: runId,
               error: errMessage(e),
+              // PRD #1809 D6: name a pin that failed because the data volume is full.
+              ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
             }),
           );
         }
@@ -2219,6 +2454,29 @@ export class RunRunner {
         if (outcome === "fail") {
           await this.reportGenericFailure(claim, flight, err);
         }
+      } else if (err instanceof DataVolumeFullError) {
+        // PRD #1809 D6: a write to the data volume stayed disk-full after the D7 reclaim and one
+        // retry (or the claim preflight found the volume full). Caught BEFORE the generic terminal
+        // path so a full volume parks the run rather than failing it. The park goes through the
+        // claim-fenced pre-clone park flow; `fail` (no claim generation to fence the park with, a
+        // 400, an unrecognised ack) takes today's failed path with the batcher still open.
+        const outcome = await this.handleDataVolumeFull(err, claim, flight, reportState, runLog, runHome);
+        if (outcome === "fail") {
+          await this.reportGenericFailure(claim, flight, err);
+        }
+      } else if (err instanceof DataVolumeWaitShutdown) {
+        // PRD #1809 D6 (N4): the worker began draining while a pre-clone run waited on the D7
+        // reclaim. Today's pre-clone shutdown posture (reconcileForgeParkByProbe's drain arm):
+        // report nothing, so the run stays non-terminal and the server requeues it, keep HOME and
+        // the SDK session only when a resume transcript is resolvable here (D4), and close the
+        // batcher so this execution can drain. The custody hold is left open, as any interrupted
+        // claim leaves it.
+        runLog.info("run interrupted by worker shutdown during the data-volume reclaim wait; leaving it for requeue", {
+          run_id: flight.runId,
+          operation: err.operation,
+        });
+        await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
+        await batcher.close().catch(() => undefined);
       } else if (err instanceof ServerWallParkedError) {
         // PRD #1497 M2 (D5/D16/D17): a fenced report revealed the run was SERVER-PARKED at its
         // wall-clock limit (paused + budget_exhausted). Caught BEFORE the StaleClaimError arm below:
@@ -2498,14 +2756,32 @@ export class RunRunner {
           runLog.warn("run HOME cleanup failed", { error: errMessage(e) }),
         );
       }
+      // PRD #1809 D2: a park that ended the run's process keeps its HOME for the resume but
+      // drops the rebuildable caches in it (RUN_CACHE_SUBTREES only; the transcript and every
+      // other file stay). Keyed on `parked`, NOT `preserveSession`: a shutdown interrupt or a
+      // failed pause expects a quick same-worker re-claim, so its warm caches are kept. Claude
+      // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
+      // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
+      if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety) {
+        // "Only a park that ended the run's processes drops": the park's process-group reap misses
+        // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
+        // session and group), so a detached `go test &` could still be writing the caches this
+        // drop removes. Reap every process attributed to the run (run-procs.ts) first. Never
+        // rejects; after a disk park's own reap it finds nothing left.
+        await executor.reapAttributedProcesses?.();
+        // A disk park already dropped them before its capture (N3): this pass only finishes what
+        // that one could not, and says nothing when there was nothing left.
+        await dropRunCaches(runHome, runLog, flight.cachesDroppedEarly ? { quietNoop: true } : {});
+      }
       if (flight.preClonePark) {
         // PRD #1392 M2: a pre-clone forge-unreachable park. It preserves HOME/session only when a
         // resume transcript is resolvable (D4); say which, so an operator reading disk pressure
         // (or the absence of it) can connect it to the park rather than to a leak.
+        const reason = flight.preCloneParkReason ?? FORGE_PARK_COPY.reason;
         runLog.info(
           flight.preserveSession
-            ? "run parked (forge unreachable at clone); preserving its plugin dir and HOME for a same-worker resume"
-            : "run parked (forge unreachable at clone); no clone or session to preserve",
+            ? `run parked (${reason}); preserving its plugin dir and HOME for a same-worker resume`
+            : `run parked (${reason}); no clone or session to preserve`,
           {
             run_home: runHome,
           },
@@ -2532,6 +2808,9 @@ export class RunRunner {
           },
         );
       }
+      // PRD #1809 D4: last, after the park's cache drop above, so a hard stop's follow-up
+      // reclaim and its "fresh sample" wait start from the dropped HOME. A no-op when unwatched.
+      this.diskGovernor?.unregister(runId);
     }
   }
 
@@ -2924,34 +3203,8 @@ export class RunRunner {
     if (features.includes("recovery_release_exact_echo")) {
       // Older-api fallback (D7): an older api's park touches NO custody (fact 13), so the worker
       // must first release its own exact-generation hold and require POSITIVE proof of an
-      // exact-generation release before it dares park. NO release_evidence — the proof is the
-      // echo, and an older api need not accept the field.
-      let rel;
-      try {
-        rel = await this.client.releaseRecoveryCustody(flight.runId, gen);
-      } catch (relErr) {
-        runLog.warn("forge park fallback: exact release call failed; taking the failed path (no park)", {
-          run_id: flight.runId,
-          error: errMessage(relErr),
-        });
-        return "fail";
-      }
-      const proven =
-        gen !== undefined &&
-        rel.released === true &&
-        rel.generation === gen &&
-        rel.holds_released === 1 &&
-        rel.retained !== true;
-      if (!proven) {
-        runLog.warn("forge park fallback: exact release not positively confirmed; taking the failed path (no park)", {
-          run_id: flight.runId,
-          released: rel.released,
-          echoed_generation: rel.generation,
-          holds_released: rel.holds_released,
-          retained: rel.retained,
-        });
-        return "fail";
-      }
+      // exact-generation release before it dares park.
+      if (!(await this.releasePreCloneHoldWithProof(flight, gen, runLog, FORGE_PARK_COPY))) return "fail";
       // With proof, send the UNTYPED recovery_wait report; the flight reportState closure it routes
       // through (reportForgeParkAndDispatch) stamps claim_generation unconditionally (PRD #1247 M5b).
       const body: StateRequest = { status: "recovery_wait" };
@@ -2966,6 +3219,324 @@ export class RunRunner {
   }
 
   /**
+   * PRD #1392 M2 (D7) / PRD #1809 D6 — release THIS claim generation's custody hold before a
+   * pre-clone park, and report whether the release is POSITIVELY proven to have settled exactly
+   * that generation (released && generation===gen && holds_released===1 && !retained). ClaimRun
+   * opens a hold for every custody-capable claim, and a pre-clone generation adopted no source,
+   * so nothing else would ever release it: a park that leaves it open keeps the worker
+   * custody-held forever (recycle skipped, DeleteWorker refused). NO release_evidence: the
+   * worker's release endpoint allowlists only publication/forge_no_output, and an older api need
+   * not accept the field; the proof is the echo. A throw or a missing proof returns false, and the
+   * caller takes today's failed path (never a park that could leak the hold).
+   */
+  private async releasePreCloneHoldWithProof(
+    flight: RunFlight,
+    gen: number | undefined,
+    runLog: Logger,
+    copy: PreCloneParkCopy,
+  ): Promise<boolean> {
+    let rel;
+    try {
+      rel = await this.client.releaseRecoveryCustody(flight.runId, gen);
+    } catch (relErr) {
+      runLog.warn(`${copy.log}: exact release call failed; taking the failed path (no park)`, {
+        run_id: flight.runId,
+        error: errMessage(relErr),
+      });
+      return false;
+    }
+    const proven =
+      gen !== undefined &&
+      rel.released === true &&
+      rel.generation === gen &&
+      rel.holds_released === 1 &&
+      rel.retained !== true;
+    if (!proven) {
+      runLog.warn(`${copy.log}: exact release not positively confirmed; taking the failed path (no park)`, {
+        run_id: flight.runId,
+        released: rel.released,
+        echoed_generation: rel.generation,
+        holds_released: rel.holds_released,
+        retained: rel.retained,
+      });
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * PRD #1809 D6 — run `op`, a write whose destination is `destination`; when it fails and the
+   * data-volume guard classifies the failure as data-volume disk-full, run the D7 reclaim once and
+   * retry `op` once. A retry that is still classified full throws {@link DataVolumeFullError}
+   * (executeClaim parks the run on it); any other failure, and an "unknown" or "not_disk_full"
+   * verdict, rethrows the error unchanged, so the caller keeps today's handling. With no guard
+   * wired this is just `op()`.
+   *
+   * Each attempt samples the volume BEFORE `op` and classifies with the lower of that sample and
+   * the one taken after the failure (N1): git removes a failed cold clone's partial bare before it
+   * returns, so the after-failure sample alone can show room the failing write never had.
+   *
+   * The reclaim wait is bounded and abortable ({@link awaitDataVolumeReclaim}). On a timeout the
+   * retry still runs. When the owner cancels the run during the wait, the retry is skipped and the
+   * full verdict already in hand parks the run: the park is claim-fenced, and a stamped stop
+   * verdict turns it into a cancel server-side. A worker shutdown or any other abort of the flight
+   * (a pause, a credential switch, a claim fence) ends the wait by throwing to that reason's own
+   * handling instead, never a counted disk park.
+   */
+  private async withDataVolumeRetry<T>(
+    flight: RunFlight,
+    operation: string,
+    destination: string,
+    op: () => Promise<T>,
+  ): Promise<T> {
+    const guard = this.dataVolume;
+    if (!guard) return await op();
+    let before = guard.sample();
+    try {
+      return await op();
+    } catch (err) {
+      const verdict = await guard.classify(err, destination, before);
+      if (verdict !== "data_volume_full") {
+        // "unknown" is only returned for an error that carries a disk-full signal.
+        if (verdict === "unknown") {
+          flight.runLog.warn("a write failed with a disk-full signal but the data volume could not be sampled; keeping today's handling", {
+            run_id: flight.runId,
+            operation,
+          });
+        }
+        throw err;
+      }
+      flight.runLog.warn("data volume full; running a reclaim pass and retrying once", {
+        run_id: flight.runId,
+        operation,
+        cause: "data_volume_full",
+        error: errMessage(err),
+      });
+      const wait = await this.awaitDataVolumeReclaim(guard, flight, operation);
+      if (wait === "cancelled") throw new DataVolumeFullError(operation, err);
+      before = guard.sample();
+      try {
+        return await op();
+      } catch (retryErr) {
+        if ((await guard.classify(retryErr, destination, before)) === "data_volume_full") {
+          throw new DataVolumeFullError(operation, retryErr);
+        }
+        throw retryErr;
+      }
+    }
+  }
+
+  /**
+   * PRD #1809 D6 (N3) — wait for one D7 reclaim pass, bounded by `dataVolumeReclaimWaitMs` and cut
+   * short by a worker shutdown or any abort of `flight.cancel`. Pre-clone the flight is not yet in
+   * `activeRuns`, so `shutdown()` reaches it only through the runner's own shutdown signal. The
+   * pass itself is not aborted: it belongs to the disk-pressure controller and keeps running; only
+   * this run stops waiting for it.
+   *
+   * How the wait ends decides what happens next (N1/N4):
+   *  - "reclaimed" / "timeout": the caller re-checks (retry or re-sample).
+   *  - "cancelled": ONLY an owner cancel (the sticky `steering.isCancelled()`). The caller parks on
+   *    the full verdict without a retry; the api's stamped stop turns that park into a cancel.
+   *  - a worker shutdown throws {@link DataVolumeWaitShutdown}: the run is left for requeue.
+   *  - any other abort of `flight.cancel` (a pause-now or wall pause, a credential switch, a claim
+   *    fence) rethrows the abort's reason, so executeClaim's catch hands it to that reason's own
+   *    arm exactly as if the signal had escaped anywhere else. None of these is a counted disk park.
+   */
+  private async awaitDataVolumeReclaim(
+    guard: DataVolumeGuard,
+    flight: RunFlight,
+    operation: string,
+  ): Promise<"reclaimed" | "timeout" | "cancelled"> {
+    type Outcome = "reclaimed" | "timeout" | "cancelled" | "shutdown" | "aborted";
+    const interrupted = (): Outcome | undefined =>
+      this.shuttingDownGlobal
+        ? "shutdown"
+        : flight.steering.isCancelled()
+          ? "cancelled"
+          : flight.cancel.signal.aborted
+            ? "aborted"
+            : undefined;
+    const early = interrupted();
+    const outcome =
+      early ??
+      (await new Promise<Outcome>((resolve) => {
+        const signals = [flight.cancel.signal, this.shutdownSignal.signal];
+        const onAbort = (): void => finish(interrupted() ?? "aborted");
+        const timer = setTimeout(() => finish("timeout"), this.dataVolumeReclaimWaitMs);
+        timer.unref?.();
+        let done = false;
+        const finish = (o: Outcome): void => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          for (const s of signals) s.removeEventListener("abort", onAbort);
+          resolve(o);
+        };
+        for (const s of signals) s.addEventListener("abort", onAbort, { once: true });
+        // guard.reclaim never throws.
+        void guard.reclaim().then(() => finish("reclaimed"));
+      }));
+    if (outcome === "reclaimed") return outcome;
+    const log = {
+      run_id: flight.runId,
+      operation,
+      cause: "data_volume_full",
+      outcome,
+      ...(outcome === "timeout" ? { wait_ms: this.dataVolumeReclaimWaitMs } : {}),
+    };
+    switch (outcome) {
+      case "timeout":
+        flight.runLog.warn("data volume reclaim pass did not finish in time; moving on without it", log);
+        return outcome;
+      case "cancelled":
+        flight.runLog.warn("data volume reclaim wait ended by the owner's cancel; parking on the full verdict without a retry", log);
+        return outcome;
+      case "shutdown":
+        flight.runLog.warn("data volume reclaim wait ended by a worker shutdown; leaving the run for requeue", log);
+        throw new DataVolumeWaitShutdown(operation);
+      case "aborted": {
+        const reason: unknown = flight.cancel.signal.reason;
+        flight.runLog.warn("data volume reclaim wait interrupted; handing the run to the interrupt's own handling", {
+          ...log,
+          reason: reason instanceof Error ? reason.name : String(reason),
+        });
+        throw reason instanceof Error ? reason : new Error(`run interrupted during the data-volume reclaim wait (${operation})`);
+      }
+    }
+  }
+
+  /**
+   * PRD #1809 D6 — the claim/resume preflight. When the api can take the typed park and the run
+   * can be fenced for it, sample the data volume before the clone/fetch; below its floor, run the
+   * D7 reclaim (bounded and abortable, as in {@link withDataVolumeRetry}) and re-sample, and still
+   * below → {@link DataVolumeFullError}, parked like the typed handling. An owner cancel during the
+   * wait parks at once on the full sample; a shutdown or any other abort throws to its own handling. Gated on the feature: against an older api
+   * the untyped park carries no cap, so a preflight there would only add parks the typed handling
+   * does not need; the retry around the clone still guards it. An unknown sample never parks.
+   */
+  private async preflightDataVolume(claim: ClaimResponse, flight: RunFlight): Promise<void> {
+    const guard = this.dataVolume;
+    if (!guard || !this.dataVolumeParkable(claim)) return;
+    if (!this.client.protocolFeatures.includes(DATA_VOLUME_FULL_FEATURE)) return;
+    if (guard.preflight() !== "data_volume_full") return;
+    flight.runLog.warn("data volume below its floor at claim; running a reclaim pass before the clone", {
+      run_id: flight.runId,
+      cause: "data_volume_full",
+    });
+    const wait = await this.awaitDataVolumeReclaim(guard, flight, "preflight");
+    if (wait === "cancelled") throw new DataVolumeFullError("preflight");
+    if (guard.preflight() === "data_volume_full") throw new DataVolumeFullError("preflight");
+  }
+
+  /**
+   * PRD #1809 D4 — the mid-run disk park's report. The TYPED `{recovery_wait, recovery_cause:
+   * data_volume_full}` when the api advertises `recovery_cause_data_volume_full`, stamped with the
+   * claim generation it is fenced on, and `disk_park_preventive: true` for the cache cap's park
+   * (uncounted toward the api's disk-park cap; a hard pressure stop omits it and is counted). An
+   * older api gets the untyped `{recovery_wait}`, as the pre-clone disk park falls back (M5).
+   */
+  private diskParkBody(claim: ClaimResponse, preventive: boolean): StateRequest {
+    if (!this.client.protocolFeatures.includes(DATA_VOLUME_FULL_FEATURE)) return { status: "recovery_wait" };
+    return {
+      status: "recovery_wait",
+      recovery_cause: "data_volume_full",
+      claim_generation: claim.claim_generation,
+      ...(preventive ? { disk_park_preventive: true } : {}),
+    };
+  }
+
+  /**
+   * PRD #1809 D6 — whether this claim may take the data-volume-full park at all. The api fences
+   * the park on the claim generation and 400s it without one, so a claim whose reports carry no
+   * generation (a chat claim, a pre-#1247 claim with generation 0, or a client that would strip
+   * it) keeps today's handling instead.
+   */
+  private dataVolumeParkable(claim: ClaimResponse): boolean {
+    return this.client.stampsClaimGeneration(claim.claim_generation);
+  }
+
+  /**
+   * PRD #1809 D6 — park a run whose data-volume write stayed disk-full. Every such park happens
+   * BEFORE the clone/fetch (the preflight, or the retry around ensureClone), so it is a pre-clone
+   * park and takes the forge pre-clone park's release-then-park sequence (ADR-1392 D3/D7):
+   *
+   *   1. release THIS generation's custody hold and require positive proof of an exact release
+   *      ({@link releasePreCloneHoldWithProof}). The api's data_volume_full park settles no hold
+   *      (a mid-run disk park must keep custody), and no later path releases a pre-clone
+   *      generation's hold, so without this the hold stays open forever and the worker counts as
+   *      custody-held. Needs `recovery_release_exact_echo` (every api that has the typed cause
+   *      advertises it); without it, or without proof, the run takes today's failed path.
+   *   2. report the park through the shared claim-fenced report and ack dispatch (D10): the TYPED
+   *      `{recovery_wait, recovery_cause: data_volume_full}` when the api advertises
+   *      `recovery_cause_data_volume_full` (a counted park; `disk_park_preventive` is M4's and is
+   *      never sent here), else the untyped `{recovery_wait}`. The reportState closure stamps
+   *      claim_generation.
+   *
+   * The release is not atomic with the park; that is safe because the released generation adopted
+   * nothing: a park that then fails (400, unrecognised ack) or turns into a stop leaves no work
+   * behind the released hold. Before the clone the failed path has no settle of its own to run
+   * (reapRecoveryProviderForSettle returns false while `flight.barePath` is unset), so this release
+   * is the only one the generation gets. The arms that return "fail" BEFORE the release (no claim
+   * generation, no exact-release echo, no positive proof) therefore leave the pre-clone hold open,
+   * as every other pre-clone failure does today.
+   *
+   * N2: every such park is pre-clone by construction. The release is guarded on it: a
+   * DataVolumeFullError that arrives with a clone in place (`flight.barePath` set) releases nothing
+   * and takes today's failed path with a warn, because a hold over a clone may cover adopted work
+   * (M4's mid-run park is a separate path).
+   */
+  private async handleDataVolumeFull(
+    err: DataVolumeFullError,
+    claim: ClaimResponse,
+    flight: RunFlight,
+    reportState: RunFlight["reportState"],
+    runLog: Logger,
+    runHome: string | undefined,
+  ): Promise<"parked" | "stop" | "fail"> {
+    if (!this.dataVolumeParkable(claim)) {
+      runLog.warn("data volume full, but this claim carries no claim generation to fence a park; taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+      });
+      return "fail";
+    }
+    if (flight.barePath !== undefined) {
+      runLog.warn("data volume full after the clone; a pre-clone disk park cannot release this custody hold, taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+      });
+      return "fail";
+    }
+    const features = this.client.protocolFeatures;
+    if (!features.includes("recovery_release_exact_echo")) {
+      runLog.warn("data volume full, but the api cannot prove an exact custody release; taking today's failed path", {
+        run_id: flight.runId,
+        operation: err.operation,
+        cause: "data_volume_full",
+        protocol_features: features,
+      });
+      return "fail";
+    }
+    const typed = features.includes(DATA_VOLUME_FULL_FEATURE);
+    runLog.warn("data volume full after a reclaim and a retry; releasing this generation's custody and parking the run", {
+      run_id: flight.runId,
+      operation: err.operation,
+      cause: "data_volume_full",
+      typed,
+      detail: err.message,
+    });
+    if (!(await this.releasePreCloneHoldWithProof(flight, claim.claim_generation, runLog, DATA_VOLUME_PARK_COPY))) {
+      return "fail";
+    }
+    const body: StateRequest = typed
+      ? { status: "recovery_wait", recovery_cause: "data_volume_full", claim_generation: claim.claim_generation }
+      : { status: "recovery_wait" };
+    return await this.reportForgeParkAndDispatch(body, claim, flight, reportState, runLog, runHome, DATA_VOLUME_PARK_COPY);
+  }
+
+  /**
    * PRD #1392 M2 — send the forge park report ONCE and dispatch on the ack (D10). A generic 400
    * (an api that rejects the fields) → today's failed path, never park. A transport failure AFTER
    * the send is an UNKNOWN outcome, never a failure: reconcile via the ownership probe.
@@ -2977,6 +3548,7 @@ export class RunRunner {
     reportState: RunFlight["reportState"],
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<"parked" | "stop" | "fail"> {
     let ack: StateAck;
     try {
@@ -2984,7 +3556,7 @@ export class RunRunner {
     } catch (reportErr) {
       if (reportErr instanceof RequestError && reportErr.status === 400) {
         // The api rejected the negotiated fields (predates them) → today's failed path.
-        runLog.warn("forge park report rejected 400; taking the failed path (no park)", {
+        runLog.warn(`${copy.log} report rejected 400; taking the failed path (no park)`, {
           run_id: flight.runId,
         });
         return "fail";
@@ -2992,13 +3564,13 @@ export class RunRunner {
       // Transport failure / exhausted-transient throw: the server MAY have committed release +
       // park and lost the ack, so reconcile via the read-only ownership probe until it is known.
       // NEVER clean a possibly-parked session on an unknown outcome (D10).
-      runLog.warn("forge park report failed transport; reconciling by ownership probe", {
+      runLog.warn(`${copy.log} report failed transport; reconciling by ownership probe`, {
         run_id: flight.runId,
         error: errMessage(reportErr),
       });
-      return await this.reconcileForgeParkByProbe(body, claim, flight, reportState, runLog, runHome);
+      return await this.reconcileForgeParkByProbe(body, claim, flight, reportState, runLog, runHome, copy);
     }
-    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome);
+    return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy);
   }
 
   /**
@@ -3014,28 +3586,29 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<"parked" | "stop" | "fail"> {
     const { batcher } = flight;
     if (ack.reason === "stale_claim") {
       // #1247: the run moved on under this worker. Stop silently, no further report.
-      runLog.info("forge park: ack stale_claim; stopping silently", { run_id: flight.runId });
+      runLog.info(`${copy.log}: ack stale_claim; stopping silently`, { run_id: flight.runId });
       await batcher.close().catch(() => undefined);
       return "stop";
     }
     if (ack.reason === "custody_unsettled") {
       // Fail-safe: leave the batcher OPEN and take today's failed path.
-      runLog.info("forge park: ack custody_unsettled; taking today's failed path", { run_id: flight.runId });
+      runLog.info(`${copy.log}: ack custody_unsettled; taking today's failed path`, { run_id: flight.runId });
       return "fail";
     }
     if (ack.status === "recovery_wait") {
-      await this.finishForgePark(ack.recoveryRetryNotBefore, claim, flight, runLog, runHome);
+      await this.finishForgePark(ack.recoveryRetryNotBefore, claim, flight, runLog, runHome, copy);
       return "parked";
     }
     if (ack.status && TERMINAL_RUN_STATUSES.has(ack.status)) {
       // cancelled, or failed when the cap branch committed the terminal state, or any other
       // authoritative terminal status: close the still-open batcher, no park event, no second
       // report. The finally does the (empty, pre-clone) cleanup.
-      runLog.info("forge park: ack was authoritative terminal; cleaning up without a park", {
+      runLog.info(`${copy.log}: ack was authoritative terminal; cleaning up without a park`, {
         run_id: flight.runId,
         status: ack.status,
       });
@@ -3044,7 +3617,7 @@ export class RunRunner {
     }
     // Any other 409 (or an unmodelled non-park, non-terminal status): today's failed path,
     // batcher left OPEN.
-    runLog.info("forge park: unrecognised ack; taking today's failed path", {
+    runLog.info(`${copy.log}: unrecognised ack; taking today's failed path`, {
       run_id: flight.runId,
       status: ack.status,
       reason: ack.reason,
@@ -3090,20 +3663,22 @@ export class RunRunner {
     flight: RunFlight,
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<void> {
     const { batcher } = flight;
     const when = retryAt ? `retry at ${retryAt}` : "retry after backoff";
     batcher.emit({
       kind: "status",
       agent: "worker",
-      payload: { text: `forge unreachable at clone; parked, ${when}` },
+      payload: { text: `${copy.reason}; parked, ${when}` },
     });
     await batcher.flush().catch(() => undefined);
     await batcher.close().catch(() => undefined);
     await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
     flight.parked = true;
     flight.preClonePark = true;
-    runLog.info("run parked: forge unreachable at clone", {
+    flight.preCloneParkReason = copy.reason;
+    runLog.info(`run parked: ${copy.reason}`, {
       run_id: flight.runId,
       preserve_session: flight.preserveSession,
       retry_not_before: retryAt ?? null,
@@ -3126,6 +3701,7 @@ export class RunRunner {
     reportState: RunFlight["reportState"],
     runLog: Logger,
     runHome: string | undefined,
+    copy: PreCloneParkCopy = FORGE_PARK_COPY,
   ): Promise<"parked" | "stop" | "fail"> {
     const { batcher } = flight;
     for (;;) {
@@ -3136,7 +3712,7 @@ export class RunRunner {
         // re-claim can resume — without this the finally computes preserveResumeArtifacts=false and
         // removes runHome on this UNKNOWN outcome. The batcher must still close so this execution
         // can drain.
-        runLog.info("forge park reconcile interrupted by worker shutdown; leaving the run for requeue", {
+        runLog.info(`${copy.log} reconcile interrupted by worker shutdown; leaving the run for requeue`, {
           run_id: flight.runId,
         });
         await this.preserveForgeParkSessionIfResolvable(claim, flight, runLog, runHome);
@@ -3149,13 +3725,13 @@ export class RunRunner {
       } catch (probeErr) {
         if (probeErr instanceof RequestError && probeErr.status === 404) {
           // Not owned / reclaimed = stale_claim. Stop; do NOT clean a possibly-parked session.
-          runLog.info("forge park reconcile: ownership 404 (stale_claim); stopping silently", {
+          runLog.info(`${copy.log} reconcile: ownership 404 (stale_claim); stopping silently`, {
             run_id: flight.runId,
           });
           await batcher.close().catch(() => undefined);
           return "stop";
         }
-        runLog.warn("forge park reconcile: ownership probe failed transport; retrying", {
+        runLog.warn(`${copy.log} reconcile: ownership probe failed transport; retrying`, {
           run_id: flight.runId,
           error: errMessage(probeErr),
         });
@@ -3167,11 +3743,11 @@ export class RunRunner {
       }
       const status = probe.status;
       if (status === "recovery_wait") {
-        await this.finishForgePark(probe.recovery_retry_not_before, claim, flight, runLog, runHome);
+        await this.finishForgePark(probe.recovery_retry_not_before, claim, flight, runLog, runHome, copy);
         return "parked";
       }
       if (TERMINAL_RUN_STATUSES.has(status)) {
-        runLog.info("forge park reconcile: run is terminal; cleaning up without a park", {
+        runLog.info(`${copy.log} reconcile: run is terminal; cleaning up without a park`, {
           run_id: flight.runId,
           status,
         });
@@ -3182,15 +3758,15 @@ export class RunRunner {
         // The transaction did not land; resend the SAME report (idempotent) and dispatch its ack.
         try {
           const ack = await reportState(body);
-          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome);
+          return await this.dispatchForgeParkAck(ack, claim, flight, runLog, runHome, copy);
         } catch (reportErr) {
           if (reportErr instanceof RequestError && reportErr.status === 400) {
-            runLog.warn("forge park reconcile: resend rejected 400; taking the failed path (no park)", {
+            runLog.warn(`${copy.log} reconcile: resend rejected 400; taking the failed path (no park)`, {
               run_id: flight.runId,
             });
             return "fail";
           }
-          runLog.warn("forge park reconcile: resend failed transport; re-probing", {
+          runLog.warn(`${copy.log} reconcile: resend failed transport; re-probing`, {
             run_id: flight.runId,
             error: errMessage(reportErr),
           });
@@ -3408,7 +3984,10 @@ export class RunRunner {
     }
     const runnerClone = flight.runnerClone!;
     const barePath = flight.barePath!;
-    const lastPublishedTip = flight.lastPublishedTip;
+    // PRD #1809 D8 (N1): whether THIS worker landed a checkpoint, read by the report-only orphan
+    // guards below. Not `lastPublishedTip !== undefined`: a checkpoint that landed after a failed
+    // fetch-back leaves lastPublishedTip unset (it tracks the clone HEAD for hasNewWork).
+    const landedCheckpoint = flight.landedCheckpoint === true;
     const ciFixHumanApproved = flight.ciFixHumanApproved;
     // A ci_fix run that judged the failure not a code problem (PRD #6) completes
     // with the diagnosis and NO push/MR — there is nothing to land.
@@ -3448,7 +4027,7 @@ export class RunRunner {
       // an accepted edge resting on the convention "a genuine zero-code run never
       // checkpoints"; enforce that convention here instead. Detection is the UNION of
       // two signals, each covering a gap the other has:
-      //   - lastPublishedTip: a checkpoint THIS worker confirmed-landed mid-run (set only
+      //   - landedCheckpoint: a checkpoint THIS worker confirmed-landed mid-run (set only
       //     on a landed publish), which may not yet be mirrored into the bare's local ref.
       //   - hasCommittedCheckpoint: origin's checkpoint ref, mirrored into the bare at
       //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
@@ -3459,7 +4038,7 @@ export class RunRunner {
       // so it still completes report-only below. Refuse loudly, mirroring the
       // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
       const publishedCheckpoint =
-        lastPublishedTip !== undefined ||
+        landedCheckpoint ||
         (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
       if (publishedCheckpoint) {
         batcher.emit({
@@ -3572,7 +4151,7 @@ export class RunRunner {
         // committed milestone still blocks.
         if (result.scopeCapped) {
           const publishedCheckpoint =
-            lastPublishedTip !== undefined ||
+            landedCheckpoint ||
             (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
           if (!publishedCheckpoint) {
             batcher.emit({
@@ -3644,14 +4223,14 @@ export class RunRunner {
         // ALREADY published committed work to a checkpoint ref on origin
         // (refs/uzi-checkpoints/<branch>), completing report-only would orphan that ref.
         // This mirrors the declared report_only terminal above: detect via the UNION of
-        // lastPublishedTip (a checkpoint THIS worker confirmed-landed mid-run) and
+        // landedCheckpoint (a checkpoint THIS worker confirmed-landed mid-run) and
         // hasCommittedCheckpoint (origin's checkpoint ref, mirrored into the bare at
         // clone/fetch time — catches a prior/cross-worker landing; per PRD #759 it ignores
         // a marker-only `wip(park):` checkpoint while a real committed milestone still
         // blocks). A genuine zero-code prompt run trips NEITHER and still completes
         // report-only below.
         const publishedCheckpoint =
-          lastPublishedTip !== undefined ||
+          landedCheckpoint ||
           (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
         if (publishedCheckpoint) {
           batcher.emit({
@@ -3713,7 +4292,7 @@ export class RunRunner {
     // path the change touched, folding both into the MR description. Best-effort —
     // gathered before the push so the MR opens with its evidence, and a suite that
     // can't run is reported "skipped", never failing the run.
-    let selfImproveSection: string | undefined;
+    let selfImproveSection: KindSection | undefined;
     // PRD #686 M4: uzi's SELF_IMPROVE_CHECKS (go test ./..., web/agent npm test,
     // web build) are hardcoded to uzi's OWN layout and are meaningless against an
     // arbitrary target repo, so this evidence block runs ONLY in dogfood mode. In
@@ -3795,7 +4374,7 @@ export class RunRunner {
     // SELF_IMPROVE_CHECKS here — those are uzi's own gate suite and are meaningless
     // against an arbitrary repo. Best-effort, gathered before the push like the
     // self_improve evidence above.
-    let promptGuardSection: string | undefined;
+    let promptGuardSection: KindSection | undefined;
     if (claim.kind === "prompt") {
       // null (diff failed) → fail CLOSED with a loud "guard-path check unavailable"
       // note, exactly as the self_improve path does above (M5 audit).
@@ -4804,8 +5383,10 @@ export class RunRunner {
     // PRD #1227 M2: an OWNER PARTIAL run (the frozen contract's owner decisions deferred ≥1 milestone)
     // is a scope_reduced partial delivery that must NEVER close its issue — not even after PR-head
     // verification. It is threaded to reconcileMrDescription(!isOwnerPartial) below so the verified-head
-    // reconcile re-renders the NON-closing partial body instead of adding Closes; mrDescription's own
-    // effectiveCloses guard is the belt-and-suspenders. Absent/empty ⇒ false ⇒ the accept-closing and
+    // reconcile re-renders the NON-closing partial body instead of adding Closes; the renderer's issueArm
+    // (agent/src/pr-description.ts), which never writes Closes on a partial arm, decides the rendered Closes
+    // line itself (renderCloses/withCloses go into issueArm), and nonClosingDelivery below gates the
+    // closing-directive scans, strips and fail-closed paths. Absent/empty ⇒ false ⇒ the accept-closing and
     // full-delivery paths add Closes after verify exactly as before.
     const isOwnerPartial = (claim.config?.completion_scope?.deferred?.length ?? 0) > 0;
     // H, the exact landed head. Set ONLY on the interlocked granted path; it rides the completed
@@ -4847,12 +5428,17 @@ export class RunRunner {
     // failed strip cannot guarantee the MR is non-closing; a hold is a nominally non-closing parked
     // state, so we must not enter it here. Failing is the safe direction — loud and terminal — rather
     // than parking a possibly-closing MR on an unverified head that a human could merge.
-    const failInterlockedClosed = async (reason: string): Promise<void> => {
+    // PRD #1798 M6 (M1): a non-interlocked non-closing run whose PR still closes its issue fails the
+    // same way, with its own static reason.
+    const failInterlockedClosed = async (
+      reason: string,
+      failureReason: string = COMPLETION_INTERLOCK_UNHELD_REASON,
+    ): Promise<void> => {
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
       // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
       // survives an outage as this exact outcome, not a generic agent_failure.
-      await journalTerminalReport({ status: "failed", failure_reason: COMPLETION_INTERLOCK_UNHELD_REASON });
+      await journalTerminalReport({ status: "failed", failure_reason: failureReason });
       runLog.info("run failed closed: completion interlock could not guarantee a non-closing MR", {
         run_id: runId,
         reason,
@@ -4919,20 +5505,6 @@ export class RunRunner {
       claim.repo.default_branch?.trim() ||
       (await this.git.defaultBranchName(barePath)) ||
       "main";
-    // PRD #1798 M1 (D3): the deterministic size line, computed HERE — after the push, align and
-    // history bridge (so the branch that will be published is final) and after the interlock permit
-    // (so the head is the landed tip, never a pre-align candidate) — from the worker-side tracking ref
-    // against the merge-base with the target branch. It is threaded into BOTH mrDescription calls
-    // (creation and the verified-head reconcile) so a body rewrite keeps it. computeSizeLine never
-    // throws; the extra catch only guards the tracking-ref read, so the size line can never fail a run.
-    let sizeLine: string | null;
-    try {
-      const sizeHead = await this.git.trackingTip(barePath, result.branch);
-      sizeLine = await computeSizeLine(this.git, barePath, targetBranch, sizeHead, runLog);
-    } catch (err) {
-      runLog.warn("PR size line unavailable", { run_id: runId, error: errMessage(err) });
-      sizeLine = SIZE_UNAVAILABLE;
-    }
     // Pick the forge client from the claim's forge_type (absent ⇒ gitlab, R8), so
     // the worker opens an MR on GitLab and a PR on Forgejo/GitHub from the same code
     // path; each client derives its own API base + project from repo.url (D9).
@@ -4946,11 +5518,151 @@ export class RunRunner {
         : claim.repo.forge_type === "github"
           ? this.github
           : this.gitlab;
+
+    // ── PRD #1798 M6: the PR description (D8-D12, D15, D17) ──────────────────────
+    // The completion block this run writes, with or without `Closes #N` and the unverified banner.
+    // mrCompletionBlock's wording; the publisher and the reconcile compose the region and the
+    // preserved text around it.
+    const completionFor = (withCloses: boolean, opts?: MrDescriptionOptions): string =>
+      mrCompletionBlock(
+        claim,
+        result.branch,
+        result.agentSelection,
+        selfImproveSection,
+        promptGuardSection,
+        result.gatesUnverified,
+        result.gatesDiscoveryTruncated,
+        result.scopeCapped,
+        withCloses,
+        claim.config?.completion_scope,
+        bridged,
+        opts,
+      );
+    const runKind = resolveRunKind(claim.kind);
+    // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
+    // fresh ci-fix/pipeline-N one) refreshes only the region and never authors closing semantics.
+    const refreshRun =
+      runKind === "mr_rework" ||
+      (runKind === "ci_fix" && !!claim.pipeline && result.branch === claim.pipeline.ref);
+    const repoPath = repoPathFromUrl(claim.repo.url);
+    // Amended D10: an issue run whose completion block is non-closing (an interlocked run until its
+    // head is verified, an owner partial, a scope-capped run) has its whole body scanned for a
+    // closing directive for the issue.
+    const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
+    // The ONE non-closing-delivery predicate: this run delivers less than its issue asked for, so no
+    // body it writes may close the issue, verified head or not. It gates the closing-directive scans,
+    // strips and fail-closed paths below (the publisher's non-closing scan via createCloses, the
+    // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
+    // rendered Closes line itself is decided by renderCloses/withCloses going into the renderer's
+    // issueArm (agent/src/pr-description.ts), whose partial arms never write it. Any new partial or
+    // blocker arm (a delivery that must not close its issue) needs BOTH: a matching non-closing arm in
+    // issueArm (setting this flag alone still renders `Closes #N`, and the publisher's scan skips uzi's
+    // own completion block), and this flag set here rather than its own check at one of those sites.
+    const nonClosingDelivery = isOwnerPartial || !!result.scopeCapped;
+    const createCloses = renderCloses && !nonClosingDelivery;
+    // H1: a forge response over its byte cap (ForgeResponseTooLarge) is a deterministic answer, not
+    // a blip: classifyForgeError classifies it permanent, so it is never retried. Both the publisher
+    // and the interlock then treat the MR as unreadable; on the create path it fails the create.
+    // The publisher passes the signal of its current budget (prepare() and publish() each run under
+    // their own), so a retry stops waiting once that budget is spent.
+    const forgeRetry = <T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> =>
+      withForgeRetry(fn, {
+        log: runLog,
+        signal: signal ?? boundarySignal,
+        label: "PR description",
+        classify: classifyForgeError,
+      });
+    // The landed head the description describes (D2: after the push, align and bridge, so the branch
+    // is final). A read failure leaves it empty: the size line then reads unavailable.
+    let landedHead = "";
+    try {
+      landedHead = (await this.git.trackingTip(barePath, result.branch)) ?? "";
+    } catch (err) {
+      runLog.warn("PR description: the landed head is unreadable", { run_id: runId, error: errMessage(err) });
+    }
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: this.client,
+      pass: this.deliverySummaryRunner(),
+      log: runLog,
+      emit: (text) => batcher.emit({ kind: "status", agent: "worker", payload: { text } }),
+      forgeRetry,
+      headLagRetryMs: this.prDescriptionHeadLagMs,
+    });
+    // Step 1: context + editor pass + stage, before createMergeRequest (D2). Never throws; every
+    // failure falls down the D8 ladder. The size line is computed per snapshot, so a regeneration for
+    // the PR's actual target (read back after create) recomputes it against that target.
+    const description = await publisher.prepare(
+      {
+        runId,
+        claimGeneration: flight.claimGeneration,
+        claim,
+        repoUrl: claim.repo.url,
+        pat: claim.secrets.forge_pat,
+        repoPath,
+        mode: refreshRun ? "refresh" : "own",
+        interlockIssueIid: scanIid,
+        completionCloses: createCloses,
+        // An interlocked run's reconcile below reads the PR, and its reconcile (or the strip that
+        // follows an unconfirmed one) falls back blind, so a publisher blind rewrite there would
+        // only destroy human text.
+        blindFallback: !interlocked,
+        prior: claim.pr_description,
+        lead: result.prSummary,
+        facts: async (s) => {
+          const size = await computeSize(this.git, barePath, s.targetBranch, s.headSha || null, runLog);
+          let baseSha: string | null = null;
+          try {
+            if (s.headSha) baseSha = await this.git.sizeMergeBase(barePath, s.targetBranch, s.headSha);
+          } catch {
+            baseSha = null;
+          }
+          return { size, baseSha };
+        },
+        context: async (s, deadlineMs, previous) => {
+          // From the bare snapshot at the described head, never the agent-writable worktree: a FIFO
+          // left at the PRD path would block an open there with no deadline (CodeRabbit on #1825).
+          const prd = await resolvePrdInputFromBare(
+            this.git,
+            barePath,
+            s.headSha,
+            claim.issue_description ?? "",
+            claim.issue_iid,
+            { timeoutMs: deadlineMs - Date.now(), signal: boundarySignal },
+            runLog,
+          );
+          // flight.redactText scrubs every claim secret: the forge PAT, the Anthropic token, the join
+          // token, the git basic credential and, on a Codex run, the Codex access token and capability.
+          return buildDeliveryContext({
+            git: this.git,
+            barePath,
+            targetBranch: s.targetBranch,
+            headSha: s.headSha,
+            deadlineMs,
+            signal: boundarySignal,
+            redact: redactText,
+            issueTitle: claim.issue_title ?? "",
+            issueBody: claim.issue_description ?? "",
+            prdText: prd.prdText,
+            summaryPlan: result.summaryPlan,
+            summaryDeltas: result.summaryDeltas,
+            planMd: claim.plan_md ?? null,
+            prSummary: result.prSummary,
+            previous,
+            log: runLog,
+          });
+        },
+        completion: (staleness) => completionFor(renderCloses, { staleness }),
+        signal: boundarySignal,
+      },
+      { headSha: landedHead, targetBranch },
+    );
     // PRD #284 Layer A/D3: wrap the WHOLE createMergeRequest call (POST → duplicate
     // → findOpenMr GET) in the retry loop, not just its final thrown status. It is
     // already idempotent — on a duplicate it adopts the existing MR/PR — but a
     // transient findOpenMr failure after a duplicate POST would otherwise fail a run
-    // whose MR actually exists; retrying the whole call re-runs it instead.
+    // whose MR actually exists; retrying the whole call re-runs it instead. Create
+    // failures stay fatal. Step 2: a new PR is created with the final body.
     const mr = await withForgeRetry(
       () =>
         forge.createMergeRequest({
@@ -4959,28 +5671,35 @@ export class RunRunner {
           sourceBranch: result.branch,
           targetBranch,
           title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
-          description: mrDescription(
-            claim,
-            result.branch,
-            result.agentSelection,
-            selfImproveSection,
-            promptGuardSection,
-            result.gatesUnverified,
-            result.gatesDiscoveryTruncated,
-            result.scopeCapped,
-            renderCloses,
-            claim.config?.completion_scope,
-            bridged,
-            sizeLine ?? undefined,
-          ),
+          description: description.initialBody(completionFor(renderCloses)),
         }, boundarySignal),
-      { log: runLog, signal: boundarySignal },
+      { log: runLog, signal: boundarySignal, classify: classifyForgeError },
     );
     batcher.emit({
       kind: "status",
       agent: "worker",
       payload: { text: `merge request opened: !${mr.iid} ${mr.webUrl}` },
     });
+    // Steps 3-9: read, bind, revalidate, write, confirm, ack. Advisory: never throws, never fails or
+    // holds the run. For an interlocked run it writes the NON-closing creation completion block; the
+    // interlock below then owns that block.
+    const published = await description.publish(mr.iid);
+    // uzi's own region: what a whole-body rewrite below writes (never text read back from the forge).
+    const ownRegion = published.region;
+    // PRD #1798 M6 (amended D10, M1): a NON-interlocked issue run whose completion is non-closing (an
+    // owner partial, a #634 scope cap) must not complete while its PR still closes the issue. The
+    // publisher scanned the body and tried the whole-body non-closing rewrite; when it reports a
+    // closing directive left on the PR (the rewrite failed or was not confirmed), or it never read
+    // the PR and its blind whole-body non-closing rewrite then failed or was not attempted (a
+    // stopped publication; nothing observed is not proof of nothing closing), fail closed. An
+    // interlocked run's own reconcile below owns this for it.
+    if (!interlocked && scanIid !== undefined && !createCloses && published.closingRemains) {
+      runLog.warn("PR description: a closing directive remains on a non-closing merge request; failing the run", {
+        run_id: runId,
+      });
+      await failInterlockedClosed("closing directive remains on a non-closing MR", NON_CLOSING_BODY_UNCONFIRMED_REASON);
+      return;
+    }
 
     // ── PRD #1226 M4 (D5): PR-head verification (create-then-verify) ────────────
     // For an interlocked run (completionHead set on the granted path) the MR now exists; read its
@@ -4994,58 +5713,54 @@ export class RunRunner {
     // create-then-verify state (a human merge closing the issue on an unverified head) is structurally
     // impossible for it. reconcileMrDescription ADDS the canonical `Closes #N` body ONLY after the PR
     // head is verified to equal H, and the head is then RE-READ to bind that add to the verified head
-    // (a change in the read→add window strips Closes and holds); if the add FAILS the run HOLDS rather
-    // than reporting completion (the completion contract requires the merged MR to carry Closes). The
-    // hold branches strip Closes and add the unverified banner FIRST and REQUIRE that write to succeed:
+    // (a change in the read→add window strips Closes and holds); if the add is not CONFIRMED (the
+    // write failed, its re-read failed, or the re-read did not carry the written block) the add may
+    // have landed, so the run strips Closes and holds rather than reporting completion (the completion
+    // contract requires the merged MR to carry Closes). The hold branches strip Closes and add the unverified banner FIRST and REQUIRE that write to succeed:
     // `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`, so a failed
     // strip cannot prove the MR is non-closing and we fail CLOSED instead of holding (stripClosesThenHold
     // → failInterlockedClosed). The whole block is skipped for a legacy run (completionHead ===
     // undefined), so its completion is byte-for-byte unchanged.
     const UNVERIFIED_BANNER =
       "> ⚠️ **Completion unverified.** uzi could not confirm this merge request's head matches the permitted completion head, so the run was held for owner review. This merge request does NOT close its issue and must not be merged as a completion until re-verified.";
-    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<boolean> => {
-      try {
-        const base = mrDescription(
-          claim,
-          result.branch,
-          result.agentSelection,
-          selfImproveSection,
-          promptGuardSection,
-          result.gatesUnverified,
-          result.gatesDiscoveryTruncated,
-          result.scopeCapped,
-          withCloses,
-          claim.config?.completion_scope,
-          bridged,
-          sizeLine ?? undefined,
-        );
-        const desc = banner ? `${banner}\n\n${base}` : base;
-        await withForgeRetry(
-          () =>
-            forge.updateMergeRequestDescription(
-              claim.repo.url,
-              claim.secrets.forge_pat,
-              mr.iid,
-              desc,
-              boundarySignal,
-            ),
-          { log: runLog, signal: boundarySignal },
-        );
-        return true;
-      } catch (e) {
-        runLog.warn(
-          "completion interlock: could not reconcile the MR description; leaving the created MR as-is",
-          { run_id: runId, error: errMessage(e) },
-        );
-        return false;
-      }
+    // PRD #1798 M6 (D10): the reconcile reads the MR, replaces ONLY its completion block (preserving
+    // the region and every byte outside the blocks), writes, and re-reads: `confirmed` only when the
+    // re-read body carries exactly the completion block it wrote. Malformed or missing completion markers get
+    // a whole-body rewrite. A NON-closing block on an issue run (a hold, an owner partial, a scope cap)
+    // scans the whole result for a closing directive uzi does not write; one forces a whole-body
+    // non-closing rewrite (re-read and re-scanned), and `closing` means it could not be removed. On a
+    // non-closing write a failed read falls back to the blind whole-body rewrite (today's behaviour),
+    // reported as `blind`: accepted by a hold's strip, never enough to complete.
+    const reconcileMrDescription = async (withCloses: boolean, banner?: string): Promise<ReconcileResult> => {
+      const closes = withCloses && !nonClosingDelivery;
+      return reconcileCompletion({
+        forge,
+        repoUrl: claim.repo.url,
+        pat: claim.secrets.forge_pat,
+        mrIid: mr.iid,
+        signal: boundarySignal,
+        completion: (headSha) =>
+          completionFor(withCloses, {
+            banner,
+            staleness:
+              headSha && published.describedSha ? { describedSha: published.describedSha, headSha } : undefined,
+          }),
+        ownRegion,
+        nonClosing: !closes && scanIid !== undefined ? { issueIid: scanIid, repoPath } : undefined,
+        forgeRetry: (fn) => withForgeRetry(fn, { log: runLog, signal: boundarySignal, classify: classifyForgeError }),
+        log: runLog,
+      });
     };
     // PRD #1225 (CodeRabbit !1254): strip any `Closes #N` (writing the unverified banner) BEFORE a
-    // hold. If that write FAILS we cannot guarantee the MR is non-closing — `createMergeRequest` can
-    // ADOPT a pre-existing MR that already carried `Closes #N` — so fail CLOSED rather than hold a
-    // possibly-closing MR on an unverified head.
+    // hold. If that write FAILS, or cannot be confirmed non-closing, we cannot guarantee the MR is
+    // non-closing — `createMergeRequest` can ADOPT a pre-existing MR that already carried `Closes #N`,
+    // and a human may have typed one anywhere in the body (amended D10) — so fail CLOSED rather than
+    // hold a possibly-closing MR on an unverified head. `blind` (the MR was unreadable, so a
+    // non-closing whole body was written without a re-read) is accepted here, as before: that body
+    // carries no closing directive by construction.
     const stripClosesThenHold = async (holdReason: string, failReason: string): Promise<void> => {
-      if (!(await reconcileMrDescription(false, UNVERIFIED_BANNER))) {
+      const stripped = await reconcileMrDescription(false, UNVERIFIED_BANNER);
+      if (stripped !== "confirmed" && stripped !== "blind") {
         await failInterlockedClosed(failReason);
         return;
       }
@@ -5084,14 +5799,45 @@ export class RunRunner {
       // Verified: ADD the canonical `Closes #N` body. The interlocked MR was created WITHOUT Closes,
       // so this is the ONLY place a completion's closing line is written (it is also a REPAIR on an
       // ADOPTED MR whose body a prior hold rewrote to the unverified variant). The completion contract
-      // requires the merged MR to carry Closes, so if this write FAILS we hold rather than report
-      // completion.
+      // requires the merged MR to carry Closes, so if this add is not confirmed we strip it and hold
+      // (failing closed when the strip is not confirmed) rather than report completion.
       // PRD #1227 M2: an OWNER PARTIAL (scope_reduced) run must NEVER close its issue even on a verified
       // head, so it re-renders its NON-closing partial body here (reconcileMrDescription(false)) instead
       // of adding Closes; the head is still verified (permit binding) — only the Closes-add is
       // suppressed. An accept-only/full-delivery run has isOwnerPartial=false and adds Closes as before.
-      if (!(await reconcileMrDescription(!isOwnerPartial))) {
-        await holdOrFailInterlocked("could not assert the verified-head completion body");
+      // PRD #1798 M6 (amended D10): the partial's non-closing write is scanned; a closing directive it
+      // cannot remove fails the run closed rather than holding or completing a closing MR.
+      const verified = await reconcileMrDescription(!isOwnerPartial);
+      // PRD #1798 M6 (ADR 1225): whether this reconcile ADDED `Closes #N` (reconcileMrDescription's
+      // own `closes`: always !nonClosingDelivery here, since the verified reconcile asks for Closes
+      // unless the delivery is partial).
+      const addedCloses = !nonClosingDelivery;
+      if (verified === "closing") {
+        await failInterlockedClosed("could not remove a closing directive from a non-closing MR");
+        return;
+      }
+      if (verified === "unconfirmed") {
+        // The reconcile could not be confirmed, so the MR may carry Closes: the one this reconcile
+        // ADDED (a write attempted but unconfirmed, a confirm read that failed, a re-read that did not
+        // carry the written block), or, on a non-closing delivery, an adopted closing block. Either
+        // way the hold strips first and fails closed when the strip is not confirmed; a plain hold
+        // here would keep `Closes #N` on an unverified head. This is EVERY non-confirmed result of a
+        // Closes add: a closing reconcile scans nothing and never falls back blind, so it answers only
+        // `confirmed` or `unconfirmed` (reconcileCompletion reports `blind` and `closing` only for a
+        // non-closing write).
+        await stripClosesThenHold(
+          "could not assert the verified-head completion body",
+          addedCloses
+            ? "could not strip Closes after an unconfirmed add"
+            : "could not strip Closes from an unconfirmed non-closing MR",
+        );
+        return;
+      }
+      if (verified === "blind") {
+        // L3: the MR was unreadable, so a non-closing body was written with no re-read. It carries no
+        // closing directive by construction, but nothing confirmed the completion: hold, never
+        // complete.
+        await holdOrFailInterlocked("could not confirm the verified-head completion body");
         return;
       }
       // BIND the Closes add to the verified head (CodeRabbit !1254): re-read the PR head AFTER writing
@@ -5616,14 +6362,29 @@ export class RunRunner {
     // PARK the run instead of failing it; a PERMANENT verdict (401/403/404) is rethrown unchanged
     // and still fails immediately. `flight.barePath` is assigned ONLY on success, so a park leaves
     // it undefined (no clone, no worktree, no plugin dir exist pre-clone).
+    // PRD #1809 D6: preflight the data volume at claim and at resume (every claim runs this
+    // phase), before the clone/fetch writes to it. An optimisation only: free-space checks cannot
+    // remove races, so the typed handling around ensureClone below is the guarantee.
+    await this.preflightDataVolume(claim, flight);
     let barePath: string;
     try {
-      barePath = flight.barePath = await this.git.ensureClone(
-        claim.repo.clone_url,
-        claim.secrets.forge_pat,
-        claim.secrets.forge_username,
+      // PRD #1809 D6: a clone/fetch that fails because the data volume is full runs the D7
+      // reclaim and retries once; still full → DataVolumeFullError, which executeClaim parks
+      // (recovery_wait, cause data_volume_full). Classified BEFORE the forge verdict below: a
+      // disk-full git error reads "permanent" to classifyForgeError and would fail the run (#1798).
+      barePath = flight.barePath = await this.withDataVolumeRetry(
+        flight,
+        "clone/fetch",
+        this.git.barePathFor(claim.repo.clone_url),
+        () =>
+          this.git.ensureClone(
+            claim.repo.clone_url,
+            claim.secrets.forge_pat,
+            claim.secrets.forge_username,
+          ),
       );
     } catch (err) {
+      if (err instanceof DataVolumeFullError) throw err;
       if (classifyForgeError(err) === "transient") {
         throw new ForgeUnreachableAtCloneError(errMessage(err), err);
       }
@@ -6136,10 +6897,13 @@ export class RunRunner {
         // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
         // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
         // iteration can become publish-eligible on a later tip-unmoved iteration).
+        // PRD #1809 D8: whether the tracking ref (what the publish packs) holds cloneTip: the tip was
+        // unmoved since the last fetch-back, or this fetch-back landed.
+        let fetchedBack = tipUnmovedSinceFetch;
         if (!tipUnmovedSinceFetch) {
           // Fetch back, credential-free (#218's helper): brings the committed work into
           // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
-          await this.fetchBackBestEffort(
+          fetchedBack = await this.fetchBackBestEffort(
             barePath,
             runnerClone.path,
             runnerClone.branch,
@@ -6272,6 +7036,7 @@ export class RunRunner {
                 const tipSha = scanned.range.tipSha;
                 const bridgedTip = bridgeOutcome.kind === "bridged" && bridgeOutcome.bridge === tipSha;
                 flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
+                flight.landedCheckpoint = true;
                 flight.checkpointFloor = tipSha;
                 this.checkpointTestHooks?.afterPinnedPublish?.({
                   publishedTip: tipSha,
@@ -6286,16 +7051,33 @@ export class RunRunner {
                   });
                 }
               } else if (published) {
-                flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+                // PRD #1809 D8: the publish packed the tracking ref, which holds cloneTip only when the
+                // fetch-back landed (or the tip was unmoved since the last one). After a failed
+                // fetch-back the checkpoint is the OLDER tracking tip `fetchedTip`: cloneTip was never
+                // published, so it is neither lastPublishedTip (hasNewWork stays true and the next
+                // checkpoint retries, and a pause cannot shortcut on it) nor the floor.
+                const packedClone = fetchedBack && cloneTip !== null && fetchedTip === cloneTip;
+                if (packedClone) flight.lastPublishedTip = cloneTip;
+                // N1: a checkpoint landed either way; the report-only orphan guards key on this.
+                flight.landedCheckpoint = true;
                 // PRD #1416 M3 (C2): advance the checkpoint floor C to the DURABLE published floor on
                 // EVERY confirmed publish (PRD line 62). When this tick BRIDGED, C is already B (the
                 // helper set it) and cloneTip is the un-bridged H — so DO NOT regress C back to H;
-                // otherwise C is the confirmed checkpoint tip cloneTip. lastPublishedTip stays cloneTip
-                // (H) above: it drives hasNewWork, a separate concern from the floor.
+                // otherwise C is the confirmed checkpoint tip: cloneTip, or the older tracking tip a
+                // failed fetch-back left. lastPublishedTip (H when it was packed, above) drives
+                // hasNewWork, a separate concern from the floor.
                 flight.checkpointFloor =
                   bridgeOutcome.kind === "bridged"
                     ? bridgeOutcome.bridge
-                    : (cloneTip ?? flight.checkpointFloor);
+                    : packedClone
+                      ? cloneTip
+                      : (fetchedTip ?? flight.checkpointFloor);
+                this.checkpointTestHooks?.afterUnpinnedPublish?.({
+                  cloneTip,
+                  fetchedTip,
+                  lastPublishedTip: flight.lastPublishedTip,
+                  checkpointFloor: flight.checkpointFloor,
+                });
                 // PRD #267 M3: make the time-based publish observable, only for the time path so
                 // we do not double-log the milestone case.
                 if (!opts.reap) {
@@ -6499,6 +7281,11 @@ export class RunRunner {
       cancelRequested: () => steering.isCancelled(),
       pauseModeRequested: () => steering.getPauseMode(),
       onPauseNow: (cb) => steering.onPauseNow(cb),
+      // PRD #1809 D4 (soft layer): the per-run cache cap at every implement turn boundary. The
+      // governor answers "continue" for a run it does not watch (a Codex or unfenced run).
+      ...(this.diskGovernor
+        ? { cacheCapBoundary: (processAlive: () => Promise<boolean>) => this.diskGovernor!.boundary(runId, processAlive) }
+        : {}),
       // PRD #1247 M5b: re-arm the in-flight turn drop for a held-state credential switch (the
       // analog of onPauseNow), and restore the gate phase after a switch resume (D13). Absent
       // resume_phase ⇒ undefined (a fresh run, or an older server), which the executor treats as
@@ -6988,9 +7775,17 @@ export class RunRunner {
         )
       : undefined;
     let result: ExecutorResult;
+    let diskParked = false;
     try {
       result = await executor.run(ctx);
+    } catch (err) {
+      diskParked = err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk");
+      throw err;
     } finally {
+      // PRD #1809 D4 (N4): the run has left its implement loop, so it is no longer a hard-stop
+      // candidate (a finalizing run is not stoppable). A stop that it never turned into a disk park
+      // is released, so the hard layer can stop another run.
+      this.diskGovernor?.leftLoop(flight.runId, diskParked);
       await ticker?.stop();
       await runningReportChain;
     }
@@ -7001,7 +7796,14 @@ export class RunRunner {
     // this run's subprocess tree (per-run instance, Decision 4); a concurrent
     // sibling's tree is untouched. The SDK executor also self-reaps in its run()
     // finally; this is the explicit, load-bearing call at the security boundary.
+    // The group kill alone misses a subprocess the agent backgrounded from a Bash
+    // command (the pinned CLI runs each one detached, in its own session and
+    // group), so the attributed reap (PRD #1809 D4, run-procs.ts: every process
+    // carrying this run's HOME or working inside its trees) follows it, awaited
+    // before this returns to the push. A process that has dropped both (another
+    // HOME and a working directory outside the run) is beyond either reap.
     executor.killAgentTree?.();
+    await executor.reapAttributedProcesses?.();
     flight.result = result;
     return result;
   }
@@ -7021,6 +7823,7 @@ export class RunRunner {
    */
   shutdown(): void {
     this.shuttingDownGlobal = true;
+    if (!this.shutdownSignal.signal.aborted) this.shutdownSignal.abort();
     for (const a of this.activeRuns.values()) {
       a.shuttingDown = true;
       a.cancel.abort();
@@ -7120,18 +7923,70 @@ export class RunRunner {
     }
   }
 
+  /** PRD #1809 D6: `{cause: "data_volume_full"}` for a log line when the data-volume guard
+   *  attributes `err` (a write to `destination`) to a full data volume, else nothing. */
+  private async diskFullCauseOf(err: unknown, destination: string): Promise<{ cause?: "data_volume_full" }> {
+    return (await this.dataVolume?.classify(err, destination)) === "data_volume_full" ? { cause: "data_volume_full" } : {};
+  }
+
   private async fetchBackBestEffort(
     barePath: string,
     worktreePath: string,
     branch: string,
     runId: string,
     runLog: Logger,
-  ): Promise<void> {
-    await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId).catch((e) =>
+  ): Promise<boolean> {
+    try {
+      await this.git.fetchAgentBranch(barePath, worktreePath, branch, runId);
+      return true;
+    } catch (e) {
+      // PRD #1809 D6: name a fetch-back that failed because the data volume (where the worker
+      // bare lives) is full, and start a reclaim pass so the resume has room. Not awaited and not
+      // retried here: this runs inside park/shutdown boundaries with their own deadlines, and a
+      // reclaim pass can take minutes. The run is never failed for it (best-effort, as before).
+      const full = (await this.dataVolume?.classify(e, barePath)) === "data_volume_full";
       runLog.warn("fetch-back on interruption failed; work may not be recoverable", {
         error: errMessage(e),
-      }),
-    );
+        ...(full ? { cause: "data_volume_full" } : {}),
+      });
+      if (full) void this.dataVolume?.reclaim();
+      return false;
+    }
+  }
+
+  /**
+   * PRD #1809 D8: the `checkpoint_contains_latest` field for a park report, or nothing. Omitted
+   * when no checkpoint was published on this park (`containsLatest` undefined) and when the api
+   * did not advertise {@link CHECKPOINT_DURABILITY_FEATURE}.
+   */
+  private checkpointDurabilityField(containsLatest: boolean | undefined): Pick<StateRequest, "checkpoint_contains_latest"> {
+    if (containsLatest === undefined || !this.client.protocolFeatures.includes(CHECKPOINT_DURABILITY_FEATURE)) return {};
+    return { checkpoint_contains_latest: containsLatest };
+  }
+
+  /**
+   * PRD #1809 D8: whether the worker bare's tracking ref (what a checkpoint publish packs) holds
+   * the run's latest committed work: the park's fetch-back landed and the ref now equals the
+   * clone's HEAD. Read after the fetch-back and BEFORE the park-sink bridge, which may move the
+   * ref to a bridge commit carrying the same tree. False on any failure (never throws).
+   */
+  private async trackingHoldsLatest(
+    fetchedBack: boolean,
+    barePath: string,
+    worktreePath: string,
+    branch: string,
+  ): Promise<boolean> {
+    if (!fetchedBack) return false;
+    return this.git.verifyRunnerTrackingCovers(barePath, worktreePath, branch).catch(() => false);
+  }
+
+  /** PRD #1809 D8: log a park whose published checkpoint is older than the run's latest work. */
+  private logStaleParkCheckpoint(runLog: Logger, runId: string, park: string): void {
+    runLog.warn("park checkpoint does not contain the run's latest committed work; the worker keeps it until it is recovered", {
+      run_id: runId,
+      park,
+      checkpoint_contains_latest: false,
+    });
   }
 
   /**
@@ -8090,6 +8945,9 @@ export class RunRunner {
     batcher: MessageBatcher,
     reportState: (body: StateRequest) => Promise<StateAck>,
     runLog: Logger,
+    /** PRD #1809 D8: the park's durability publish, run after the limit_wait feed line and
+     *  before the park report on the waiting path; returns extra park-report fields. */
+    beforePark?: () => Promise<Pick<StateRequest, "checkpoint_contains_latest">>,
   ): Promise<boolean> {
     const detail = describeLimit(err);
     // The structured fields ride BOTH the park and the opt-out failure report. The
@@ -8164,9 +9022,21 @@ export class RunRunner {
     // on those paths.
     await batcher.flush().catch(() => undefined);
 
+    // PRD #1809 D8: the durability publish, so the report can carry what it published. A throw is
+    // logged and the park is still reported, without the field.
+    const durability = beforePark
+      ? await beforePark().catch((e: unknown) => {
+          runLog.warn("park checkpoint step failed; reporting the park without it", {
+            run_id: claim.run_id,
+            error: errMessage(e),
+          });
+          return {};
+        })
+      : {};
+
     let ack: StateAck;
     try {
-      ack = await reportState({ status: "limit_wait", ...limitFields });
+      ack = await reportState({ status: "limit_wait", ...limitFields, ...durability });
     } catch (e) {
       // The park request never landed. Clean up: this run is not parked, and a
       // preserved HOME nothing will ever claim is an unbounded leak.
@@ -8909,7 +9779,26 @@ export class RunRunner {
     cause: RecoveryParkCause = { kind: "transient" },
   ): Promise<boolean> {
     const vault = cause.kind === "vault_locked";
+    // PRD #1809 D4: the mid-run disk park (the cache cap's preventive park, or the hard pressure
+    // stop's counted one). The transient park's steps, with the typed cause on the park report and
+    // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
+    // data_volume_full park.
+    const disk = cause.kind === "data_volume_full" ? cause : undefined;
     executor.killAgentTree?.();
+    if (disk) {
+      // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
+      // command detached, in its own session and process group. Kill every process attributed to
+      // the run by HOME or working directory too (run-procs.ts), before anything is captured.
+      await executor.reapAttributedProcesses?.();
+      // N3: drop the rebuildable caches NOW, before the capture and fetch-back below: they are not
+      // part of the capture, and on a truly full volume the capture's own writes need the space.
+      // Claude runs only (a Codex run's caches sit on its own volume). The finally's park drop then
+      // finds them gone. Never throws.
+      if (flight.runHome && !executor.safety) {
+        await dropRunCaches(flight.runHome, runLog, { message: "run caches dropped before the disk park's capture" });
+        flight.cachesDroppedEarly = true;
+      }
+    }
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     let capture: { verified: boolean; published: boolean } | undefined;
@@ -9188,11 +10077,38 @@ export class RunRunner {
         // Cancellation/shutdown may have arrived during local git or publish.
         if (flight.active?.shuttingDown || flight.steering.isCancelled()) continue;
         try {
-          const parkBody: StateRequest =
-            vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
+          const parkBody: StateRequest = {
+            ...(vault && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
-              : { status: "recovery_wait" };
+              : disk
+                ? this.diskParkBody(claim, disk.preventive)
+                : { status: "recovery_wait" }),
+            // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before
+            // the publish packed it, so a checkpoint published here holds the latest committed work.
+            // Nothing published: the field is omitted (the work is on this worker only).
+            ...this.checkpointDurabilityField(capture.published ? true : undefined),
+          };
           const ack = await reportState(parkBody);
+          if (ack.status === "recovery_wait" && disk) {
+            runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
+              run_id: flight.runId,
+              cause: "data_volume_full",
+              preventive: disk.preventive,
+              typed: parkBody.recovery_cause !== undefined,
+              published: capture.published,
+            });
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: disk.preventive
+                  ? "paused because this run's build caches stayed over their size cap; the caches are dropped and it resumes automatically"
+                  : "paused because the worker's data volume is nearly full; this run's build caches are dropped and it resumes automatically",
+              },
+            });
+            // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
+            return true;
+          }
           if (ack.status === "recovery_wait") {
             if (vault) {
               // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would
@@ -9364,13 +10280,18 @@ export class RunRunner {
     // durability, unsafe on the seededFrom:"tracking" leg): the publish below always runs; only the
     // redundant fetch-back is skipped when there is nothing new to move.
     let markerCreated = false;
+    // PRD #1809 D8: whether the tracking ref the publish packs holds the clone's HEAD (read before
+    // the bridge below, which may move the ref to a bridge commit carrying the same tree). Unknown
+    // without a runner clone to compare against.
+    let holdsLatest: boolean | undefined;
     if (barePath && branch && runnerClone) {
       markerCreated = await this.git.commitWipMarker(runnerClone.path).catch(() => false);
       const preTip = await this.git
         .branchTip(runnerClone.path, branch)
         .catch(() => null);
+      let fetched = true; // nothing new to move: the ref is what the reseed left
       if (preTip !== null && preTip !== runnerClone.baseCommit) {
-        await this.fetchBackBestEffort(
+        fetched = await this.fetchBackBestEffort(
           barePath,
           runnerClone.path,
           branch,
@@ -9378,6 +10299,7 @@ export class RunRunner {
           runLog,
         );
       }
+      holdsLatest = await this.trackingHoldsLatest(fetched, barePath, runnerClone.path, branch);
       // PRD #1416 M3 (C7): bridge a divergent tracking tip BEFORE the pause-park publish so a resume
       // adopts B (the rewritten work), not the published tip. handlePausePark is checkpoint-first and
       // does NOT route through the doCheckpointPublish/reapForSink machinery C1/C5/C6 cover, so it is
@@ -9405,6 +10327,8 @@ export class RunRunner {
         : null;
       if (cloneTip !== null && cloneTip === flight.lastPublishedTip) {
         published = true;
+        // The clone's tip is the one a prior publish confirmed landed: the checkpoint holds it.
+        holdsLatest = true;
       } else {
         published = await this.publishCheckpointBestEffort(
           flight,
@@ -9412,7 +10336,13 @@ export class RunRunner {
           branch,
           undefined,
         );
-        if (published) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+        // PRD #1809 D8: the publish packed the tracking ref. When that ref does not hold the clone's
+        // HEAD (the fetch-back failed), the checkpoint is OLDER than cloneTip: recording cloneTip as
+        // published would let a later pause with no new commit take the shortcut above and report a
+        // stale checkpoint as holding the latest work.
+        if (published && holdsLatest !== false) flight.lastPublishedTip = cloneTip ?? flight.lastPublishedTip;
+        // N1: the pause's checkpoint landed even when it is older than the clone HEAD.
+        if (published) flight.landedCheckpoint = true;
       }
     }
 
@@ -9445,9 +10375,13 @@ export class RunRunner {
       return false;
     }
 
+    // PRD #1809 D8: a published pause checkpoint older than the clone's HEAD is reported as such.
+    // The pause still parks: its custody handling is unchanged (the pin below; the hold settles on
+    // the resume-terminal or the reconciler).
+    if (holdsLatest === false) this.logStaleParkCheckpoint(runLog, flight.runId, "pause");
     let ack: StateAck;
     try {
-      ack = await reportState({ status: "paused" });
+      ack = await reportState({ status: "paused", ...this.checkpointDurabilityField(holdsLatest) });
     } catch (e) {
       // The park report never landed. Not parked: the loop keeps running (its next report
       // self-heals), exactly as handleLimitReached cleans up when its park report throws.
@@ -9481,10 +10415,12 @@ export class RunRunner {
       claim,
       flight,
       await this.currentRestorePointHead(flight),
-    ).catch((e) =>
+    ).catch(async (e) =>
       runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
         run_id: flight.runId,
         error: errMessage(e),
+        // PRD #1809 D6: name a pin that failed because the data volume is full.
+        ...(await this.diskFullCauseOf(e, this.git.recoveryRoot)),
       }),
     );
     return true;
@@ -9809,6 +10745,11 @@ export class RunRunner {
         // PRD #1497 M1 (D16): stamp the claim-lane generation so the fence refuses a
         // released/superseded stale flight's reclaimed run (the SAME value the reportState closure stamps).
         claimGeneration: flight.claimGeneration,
+        // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before the
+        // publish packed it, so a published wall checkpoint holds the latest committed work; on a
+        // degraded park nothing verified was published and the field is omitted.
+        checkpointContainsLatest: this.checkpointDurabilityField(head !== null && published ? true : undefined)
+          .checkpoint_contains_latest,
       }));
       if (budgetTotalSeconds !== undefined) refresh.totalSeconds = budgetTotalSeconds;
       if (budgetUsedSeconds !== undefined) refresh.usedSeconds = budgetUsedSeconds;
@@ -11091,17 +12032,29 @@ export function mrTitle(
   return `${prefix}Work on issue #${claim.issue_iid}`;
 }
 
-/** MR body: links + closes the issue (issue run) or links the failing pipeline
- *  (ci_fix, PRD #6), states the primary directive (humans merge), and — when the
- *  run used the repo's own agents (PRD #37 Decision 3b) — a marker so the human
- *  reviewer knows the internal review loop was performed by repo-authored agents,
- *  not by uzi's built-in reviewer. */
-export function mrDescription(
+/** PRD #1798: the options mrCompletionBlock takes after its positional parameters. All optional.
+ *  `banner` is the completion-unverified banner (PRD #1225), rendered INSIDE the completion block;
+ *  `staleness` is the D12 staleness line's two SHAs. */
+export interface MrDescriptionOptions {
+  banner?: string;
+  staleness?: { describedSha: string; headSha: string };
+}
+
+/**
+ * PRD #1798 M6: the completion block of a run's MR body, which carries every deterministic line the
+ * MR body has always owned: `Related to #N.` and `Closes #N` (issue arm), the partial and accepted
+ * warnings (PRD #1227), the gates-unverified section, the history-bridge sentence (PRD #1416), the
+ * completion-unverified banner (PRD #1225), the agents line (PRD #37 Decision 3b), the kind's
+ * one-liner (D14) and the footer. The publisher and the interlock's reconcile compose the region and
+ * the preserved text around it (a new PR's body is renderBody(region, this block)). A thin wrapper
+ * over pr-description.ts renderCompletionBlock; exported for the direct rendering tests.
+ */
+export function mrCompletionBlock(
   claim: ClaimResponse,
   branch: string,
   agentSelection?: { source: AgentSource; agents: string[] },
-  selfImproveSection?: string,
-  promptGuardSection?: string,
+  selfImproveSection?: KindSection,
+  promptGuardSection?: KindSection,
   gatesUnverified?: string[],
   gatesDiscoveryTruncated?: boolean,
   scopeCapped?: { completedCount: number; total?: number },
@@ -11111,155 +12064,45 @@ export function mrDescription(
   // "no `Closes` on an unverified head" invariant structural for the fixed text this function writes.
   // #1801: that only holds if no OTHER fixed line is a closing directive on some forge; GitLab's default
   // pattern also closes on `Implement(s|ed|ing)`, so the reference line reads `Related to #N.`.
-  // Interpolated owner text (deferred titles/reasons, accepted criteria) is not scanned here (PRD #1798).
-  // Defaults true so the sole issue-arm caller keeps today's behavior.
+  // PRD #1798 D7: interpolated owner text (deferred titles/reasons, accepted criteria) is escaped
+  // with its closing keywords and mentions broken (pr-description.ts escapeInline).
   renderCloses = true,
   // PRD #1227 M2/M3: the run's owner completion decisions. `deferred` (non-empty ⇒ owner PARTIAL,
   // scope_reduced) drives a partial-delivery body that lists each deferred milestone + reason and
   // NEVER closes the issue — it takes precedence over the #634 scopeCapped count body. `accepted`
   // (non-empty) appends a warning block naming each owner-accepted unmet criterion (id + text +
-  // reason), present in ANY branch — including on a closing accept-only PR. Absent/empty ⇒ no partial,
-  // no accept, so the body is byte-identical to today.
+  // reason), present in ANY branch — including on a closing accept-only PR.
   completionScope?: ClaimConfig["completion_scope"],
   // PRD #1416 M3 (Part D): the pushed history contains an ancestry bridge (derived from history via
-  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is appended to the
-  // body of EVERY kind's MR — never "the worker bridged it", because the agent's own `git merge -s
-  // ours <P>` bridge is equally possible. Defaults false so a non-bridged MR is byte-identical to today.
+  // rangeContainsBridge, NOT a flight-local flag). When true, ONE GENERIC sentence is rendered in the
+  // completion block of EVERY kind's MR — never "the worker bridged it", because the agent's own
+  // `git merge -s ours <P>` bridge is equally possible.
   bridged = false,
-  // PRD #1798 M1 (D3): the deterministic size line (`**Size:** ...`, or `**Size:** unavailable`),
-  // appended to EVERY kind's body: before the `---` footer in the issue arm, after the body (like the
-  // bridge note) in a per-kind arm. Absent/empty (no diff, or a caller that does not pass it) ⇒ the
-  // body is byte-identical to today.
-  sizeLine?: string,
+  opts?: MrDescriptionOptions,
 ): string {
-  const footer = `Opened automatically by the uzi agent from branch \`${branch}\`. Please review and merge manually — the agent never merges.`;
-  // One generic sentence, rendered into whichever body arm runs below (a per-kind body or the issue
-  // body) so the note is path- AND kind-independent. Empty when not bridged (body unchanged). #1416
-  // FIX 6: the issue arm renders it WITHIN the body (before the `---` footer); the bridgeNote form
-  // (with its leading blank line) is kept for the per-kind arm, which appends it to a body that
-  // already carries its own footer.
-  const bridgeSentence = bridged
-    ? "This branch contains a history bridge: a published commit was restored as an ancestor so the branch fast-forwards without a force-push, and `git log --first-parent` still reads as the intended history."
-    : "";
-  const bridgeNote = bridgeSentence ? `\n\n${bridgeSentence}` : "";
-  const repoMarker =
-    agentSelection?.source === "repo"
-      ? [
-          "",
-          "> ⚠️ This run used agent definitions from the repository's own " +
-            `\`.claude/agents/\` (${agentSelection.agents.join(", ") || "none"}). The internal ` +
-            "review was performed by those repo-authored agents, not by uzi's built-in " +
-            "reviewer — review this change accordingly.",
-        ]
-      : [];
-  // PRD #983 M4b: the per-kind MR bodies (self_improve's tracking-issue reference,
-  // ci_fix's pipeline body, prompt/task/mr_rework's issue-less bodies) live in
-  // RUN_KIND_PROFILES.mrBody, each returning its exact array-`.join("\n")` string from
-  // one explicit context bag. A row's undefined — ci_fix with no pipeline, and the
-  // issue/chat/judge kinds that carry no mrBody — falls through to the issue body below
-  // (the scopeCapped / gates / Closes arm), which stays here as the richest arm.
-  const kindBody = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].mrBody?.(claim, {
+  // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
+  // RUN_KIND_PROFILES.completionLine. A row's undefined — ci_fix with no pipeline, and the
+  // issue/chat/judge kinds that carry none — takes the issue arm (Related / Closes / partial /
+  // accepted / gates) inside renderCompletionBlock.
+  const kindLine = RUN_KIND_PROFILES[resolveRunKind(claim.kind)].completionLine?.(claim, {
     branch,
-    baseBranch: claim.base_branch?.trim(),
-    repoMarker,
-    footer,
-    selfImproveSection,
-    promptGuardSection,
+    baseBranch: claim.base_branch?.trim() || undefined,
   });
-  const sizeNote = sizeLine ? `\n\n${sizeLine}` : "";
-  if (kindBody !== undefined) return kindBody + bridgeNote + sizeNote;
-  // PRD #1227 M2/M3: the owner completion decisions. `deferred` non-empty ⇒ owner PARTIAL
-  // (scope_reduced): the issue is NOT fully delivered. `accepted` non-empty ⇒ owner-waived unmet
-  // criteria to name in a warning block. Both absent/empty on a normal run.
-  const deferred = completionScope?.deferred ?? [];
-  const accepted = completionScope?.accepted ?? [];
-  const isOwnerPartial = deferred.length > 0;
-  const hasAccepted = accepted.length > 0;
-  // An owner partial NEVER closes the issue, regardless of the caller's renderCloses — this makes
-  // "a partial never closes" structural in the renderer too, not only in the create-then-verify flow.
-  const effectiveCloses = renderCloses && !isOwnerPartial;
-  // Body selection, in precedence order:
-  //   1. PRD #1227 owner partial (deferred) — partial-delivery body listing each deferred milestone +
-  //      reason; NO Closes. Takes precedence over the #634 scopeCapped count body.
-  //   2. PRD #634 operator scope (scopeCapped) — the existing count-only partial body, UNCHANGED.
-  //   3. normal — `Related to #N.` with the Closes pair gated on effectiveCloses.
-  const body = isOwnerPartial
-    ? [
-        `Implements part of #${claim.issue_iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
-        "",
-        "> ⚠️ **Partial delivery — owner scope decision (PRD #1227).** The owner reduced this run's",
-        "> completion scope. The milestone(s) below were DEFERRED BY THE OWNER and are NOT delivered by",
-        "> this merge request, so it does not close the issue:",
-        ...deferred.map(
-          (d) => `> - \`${d.milestone_id}\` — ${d.title}: ${d.reason}`,
-        ),
-        ...repoMarker,
-      ]
-    : scopeCapped
-      ? // PRD #634 M3: a partial delivery from an operator scope directive does NOT close the
-        // issue — it delivered only the approved slice of milestones — so the closing line is
-        // replaced with a partial-delivery statement and a scope-note blockquote is inserted.
-        [
-          `Implements part of #${claim.issue_iid} (partial delivery — see the scope note below; this MR does NOT close the issue).`,
-          "",
-          "> ⚠️ **Partial delivery — operator scope directive.** The operator narrowed this run's",
-          `> scope mid-flight. ${scopeCapped.completedCount}${typeof scopeCapped.total === "number" ? ` of ${scopeCapped.total}` : ""} approved milestone(s) were completed and`,
-          "> are included here; any remaining milestones were deferred to a follow-up run. Review this",
-          "> as a partial implementation — it does not complete the issue.",
-          ...repoMarker,
-        ]
-      : [
-          // #1801: NOT `Implements issue #N.` — GitLab's default closing pattern treats Implement(s)
-          // as a closing keyword, which made this "non-closing" body close the issue on merge.
-          `Related to #${claim.issue_iid}.`,
-          // PRD #1226 M4 (D5): the closing line is CONDITIONAL. When effectiveCloses is true (a legacy
-          // run at creation, or an interlocked run's verified-head reconcile — PRD #1225) this spreads
-          // to exactly the prior `"", "Closes #N"` pair, so the legacy body is byte-for-byte unchanged.
-          ...(effectiveCloses ? ["", `Closes #${claim.issue_iid}`] : []),
-          ...repoMarker,
-        ];
-  // PRD #1227 M3 (D3): WHENEVER the owner accepted unmet criteria, append a warning block naming each
-  // by id + criterion text + owner reason. Present in ANY branch above — including on a closing
-  // accept-only PR, so a closing PR carries the reason the unmet criteria were waived.
-  if (hasAccepted) {
-    body.push(
-      "",
-      "> ⚠️ **Accepted unmet criteria — owner decision (PRD #1227).** The owner accepted the following",
-      "> unmet criteria as-is with the reason given; they are NOT met by this merge request:",
-      ...accepted.map((a) => `> - \`${a.id}\` — ${a.text}: ${a.reason}`),
-    );
-  }
-  const gatesSection = gatesUnverifiedMrSection(gatesUnverified, gatesDiscoveryTruncated);
-  if (gatesSection) body.push("", gatesSection);
-  // #1416 FIX 6: render the bridge sentence WITHIN the body, before the `---` footer.
-  if (bridgeSentence) body.push("", bridgeSentence);
-  // PRD #1798 M1: the size line, after gates/bridge and before the `---` footer.
-  if (sizeLine) body.push("", sizeLine);
-  body.push("", "---", footer);
-  return body.join("\n");
-}
-
-/** Issue #293 M2: an "unverified gates" note for the MR body, or "" when every
- *  component's deps installed AND discovery saw the whole tree. Dir names arrive already
- *  clamped (safeDirLabel). The truncation caveat (review F1) fires even when `dirs` is
- *  empty: a capped discovery means components it never reached could be unverified too,
- *  which named dirs alone cannot say. */
-function gatesUnverifiedMrSection(dirs?: string[], discoveryTruncated?: boolean): string {
-  const named = dirs ?? [];
-  if (named.length === 0 && !discoveryTruncated) return "";
-  const parts: string[] = [];
-  if (named.length > 0) {
-    const list = named.map((d) => `\`${d}\``).join(", ");
-    parts.push(
-      `JS dependencies did not install in: ${list}. Gates that need them (e.g. \`vitest\`, \`knip\`) could not run on this change, so treat those gates as unverified, not passing.`,
-    );
-  }
-  if (discoveryTruncated) {
-    parts.push(
-      "Dependency discovery stopped at its scan cap, so components beyond it were never checked and their gates may also be unverified.",
-    );
-  }
-  return `> ⚠️ **Quality gates unverified.** ${parts.join(" ")}`;
+  return renderCompletionBlock({
+    issueIid: claim.issue_iid,
+    branch,
+    kindLine,
+    kindSections: [selfImproveSection, promptGuardSection],
+    closes: renderCloses,
+    completionScope,
+    scopeCapped,
+    repoAgents: agentSelection?.source === "repo",
+    gatesUnverified,
+    gatesDiscoveryTruncated,
+    bridged,
+    banner: opts?.banner,
+    staleness: opts?.staleness,
+  });
 }
 
 /** Feed text for an autopilot run's resolved default selection (PRD #37 Decision

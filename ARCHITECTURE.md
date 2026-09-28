@@ -902,7 +902,10 @@ chain in the diagram above, with no intervening `running`.
   only its bound run and torn down by dropping the row (busy-guarded,
   GC-backstopped) on the run's terminal transition. Its fresh per-worker PVCs close
   the cross-run persistence residual [ADR-91](adr/0091-runner-cross-run-persistence-residual.md)
-  records. Size-aware provisioning and #529's Path 2 remain deferred. See
+  records. Its `/data` PVC is sized independently of its CPU/memory preset, by the
+  controller-owned `UZI_WORKER_EPHEMERAL_DATA_SIZE` (chart
+  `workers.ephemeralWorkerDataSize`, default 20Gi, issue #1815), which replaces the
+  preset's `/data` size for run-bound workers only. Size-aware provisioning and #529's Path 2 remain deferred. See
   `prds/done/529-ephemeral-workers.md` and
   `prds/done/747-ephemeral-saturation-burst.md`.
 - **claimed → running, before the plan turn** — once `provisionRunTools` sets up

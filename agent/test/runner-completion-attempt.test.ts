@@ -7,7 +7,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
-import { nullLogger } from "./helpers.js";
+import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 
 // PRD #1226 M3: the checkpoint-first same-lead completion attempt loop + post-attempt failure
 // routing. The SDK boundary is faked (queryFn), and the completion seams
@@ -19,10 +19,7 @@ const OAUTH = "dummy-oauth-token-do-not-scan-0000";
 const FAKE_PAT = "dummy-forge-pat-do-not-scan-1111";
 const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 
-let seq = 0;
-function nonexistentWorktree(): string {
-  return path.join(os.tmpdir(), `uzi-completion-wt-${process.pid}-${seq++}`);
-}
+const nonexistentWorktree = nonexistentWorktreeFactory("uzi-completion");
 
 // --- scripted SDK messages (subset of sdk-executor.test.ts's helpers) ---
 function assistantText(text: string, sessionId = "sess-1"): SDKMessage {

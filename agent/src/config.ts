@@ -61,6 +61,83 @@ export interface Config {
    */
   homeReclaimEnabled: boolean;
   /**
+   * PRD #1809 D7: the running disk reclaim (UZI_DISK_RECLAIM, default on;
+   * `0`/`false`/`no`/`off` disables it). When on, the worker runs the non-destructive
+   * reclaim pass every {@link diskReclaimIntervalMs} and whenever its data volume reaches
+   * the soft threshold. Independent of {@link diskAdmissionEnabled}.
+   */
+  diskReclaimEnabled: boolean;
+  /**
+   * PRD #1809 D5: the admission stop (UZI_DISK_ADMISSION, default on; `0`/`false`/`no`/`off`
+   * disables it): the run lane claims no new run while the data volume is at or over the
+   * soft threshold, for at most {@link diskAdmissionMaxWaitMs} after a reclaim has run.
+   * Independent of {@link diskReclaimEnabled}.
+   */
+  diskAdmissionEnabled: boolean;
+  /**
+   * PRD #1809 D5: how long the admission stop may hold once a reclaim pass has run since
+   * the volume crossed the soft threshold (UZI_DISK_ADMISSION_MAX_WAIT, default 15m). Past
+   * it claims reopen, with a warning, until the next fresh crossing: the run lane cannot
+   * restrict a claim to this worker's own parked runs, so an unbounded stop could idle a
+   * single-worker install below the api's recycle threshold forever.
+   */
+  diskAdmissionMaxWaitMs: number;
+  /**
+   * The model passes' wall-clock caps, in ms. Judge and review are the runners' fixed 5
+   * minutes (main.ts passes these to them); summary is SUMMARY_MODEL_TIMEOUT_MS, parsed
+   * exactly as summary-runner.ts parses it (default 60 s). PRD #1809 D7 derives the disk
+   * reclaim's model-pass age bound from the longest of the three.
+   */
+  judgeModelTimeoutMs: number;
+  reviewModelTimeoutMs: number;
+  summaryModelTimeoutMs: number;
+  /** PRD #1809 D7: the periodic reclaim cadence (UZI_DISK_RECLAIM_INTERVAL, default 10m). */
+  diskReclaimIntervalMs: number;
+  /**
+   * PRD #1809 D8: how often the background per-run HOME measure runs for the heartbeat's
+   * `run_disk` (UZI_RUN_DISK_SAMPLE_INTERVAL, default 10m; `0` turns the sampler off). The
+   * heartbeat only reads the latest finished sample, so this never delays a heartbeat. 10m, the
+   * reclaim cadence, because one sample may walk up to 500k dirents per HOME (rmtree.ts
+   * MEASURE_MAX_ENTRIES) for every live or parked run on the data volume the running builds use,
+   * and the reading is informational: the cache cap and the pressure layers never read it.
+   */
+  runDiskSampleIntervalMs: number;
+  /**
+   * PRD #1809 D5: the soft threshold's distance below the api's recycle threshold
+   * (UZI_DISK_SOFT_MARGIN, default 0.10, so 0.80 against the default 0.90). A fraction in
+   * [0, 1); anything else falls back to the default.
+   */
+  diskSoftMargin: number;
+  /**
+   * PRD #1809 D4: the hard mid-turn stop's distance below the recycle threshold
+   * (UZI_DISK_HARD_MARGIN, default 0.03). Read by the D4 hard layer (cache-cap.ts).
+   */
+  diskHardMargin: number;
+  /**
+   * PRD #1809 D4: the soft layer, the per-run cache cap (UZI_RUN_CACHE_CAP_ENABLED, default on;
+   * `0`/`false`/`no`/`off` disables it). When on, a Claude run whose caches exceed the cap is
+   * trimmed at a proven quiet point between turns, and parked when it stays over.
+   */
+  runCacheCapEnabled: boolean;
+  /**
+   * PRD #1809 D4: the share of the data volume all running runs' caches may use together
+   * (UZI_RUN_CACHE_CAP_FRACTION, default 0.5). One run's cap is this fraction of the volume's
+   * size divided by WORKER_MAX_CONCURRENT_RUNS. A fraction in (0, 1]; anything else falls back.
+   */
+  runCacheCapFraction: number;
+  /**
+   * PRD #1809 D4: where a trim stops, as a fraction of the cap (UZI_RUN_CACHE_LOW_WATER, default
+   * 0.6): a trim evicts until the run's caches are at or under this share of its cap. A fraction
+   * strictly in (0, 1); anything else falls back.
+   */
+  runCacheLowWater: number;
+  /**
+   * PRD #1809 D4: the hard layer, the mid-turn pressure stop (UZI_DISK_HARD_STOP_ENABLED, default
+   * on; `0`/`false`/`no`/`off` disables it). When on, a data volume at or over the api threshold
+   * minus {@link diskHardMargin} stops the Claude run with the largest caches and parks it.
+   */
+  diskHardStopEnabled: boolean;
+  /**
    * The UZI_WORKER_TOKEN_FILE path, if the join token was delivered by file. The
    * shipping compose default is a read-only secret mount the entrypoint forces to
    * 0400 worker-owned, so it persists (the post-read unlink no-ops) and the cap-less
@@ -306,6 +383,41 @@ function positiveInt(env: NodeJS.ProcessEnv, key: string, fallback: number): num
   return Number.isInteger(n) && n > 0 ? n : fallback;
 }
 
+/** SUMMARY_MODEL_TIMEOUT_MS, the one parser (summary-runner.ts reads it through this too): a
+ *  finite number of ms that is still positive once floored, else the 60 s default, so a typo falls back
+ *  rather than giving a 0/NaN timeout that would fire instantly. */
+export function summaryModelTimeoutMs(env: NodeJS.ProcessEnv): number {
+  const raw = env.SUMMARY_MODEL_TIMEOUT_MS;
+  if (!raw) return 60_000;
+  const n = Number(raw);
+  // Checked after the floor: "0.5" or "1e-3" is positive but floors to a 0 timeout.
+  const ms = Number.isFinite(n) ? Math.floor(n) : 0;
+  return ms > 0 ? ms : 60_000;
+}
+
+/** Parse a margin fraction in [0, 1) (e.g. UZI_DISK_SOFT_MARGIN); blank or anything
+ *  outside the range falls back, matching positiveInt's lenient shape. */
+function marginFraction(env: NodeJS.ProcessEnv, key: string, fallback: number): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 && n < 1 ? n : fallback;
+}
+
+/** Parse a fraction strictly above 0 and below 1 (or up to and including 1 with `includeOne`),
+ *  e.g. UZI_RUN_CACHE_LOW_WATER; blank or anything outside the range falls back. */
+function openFraction(
+  env: NodeJS.ProcessEnv,
+  key: string,
+  fallback: number,
+  opts: { includeOne: boolean },
+): number {
+  const raw = env[key]?.trim();
+  if (!raw) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 && (opts.includeOne ? n <= 1 : n < 1) ? n : fallback;
+}
+
 function isLogLevel(v: string): v is LogLevel {
   return v === "debug" || v === "info" || v === "warn" || v === "error";
 }
@@ -416,6 +528,21 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // defaults to `""`. Set-but-empty means "the deployment mentions this var and
     // expressed no opinion", which is the default, not the opposite of it.
     homeReclaimEnabled: parseBoolDefaultTrue(env.UZI_HOME_RECLAIM),
+    // PRD #1809 D5/D7: both default ON, with the same empty-means-default rule as above.
+    diskReclaimEnabled: parseBoolDefaultTrue(env.UZI_DISK_RECLAIM),
+    diskAdmissionEnabled: parseBoolDefaultTrue(env.UZI_DISK_ADMISSION),
+    diskAdmissionMaxWaitMs: duration(env, "UZI_DISK_ADMISSION_MAX_WAIT", "15m"),
+    judgeModelTimeoutMs: 5 * 60_000,
+    reviewModelTimeoutMs: 5 * 60_000,
+    summaryModelTimeoutMs: summaryModelTimeoutMs(env),
+    diskReclaimIntervalMs: duration(env, "UZI_DISK_RECLAIM_INTERVAL", "10m"),
+    runDiskSampleIntervalMs: duration(env, "UZI_RUN_DISK_SAMPLE_INTERVAL", "10m"),
+    diskSoftMargin: marginFraction(env, "UZI_DISK_SOFT_MARGIN", 0.1),
+    diskHardMargin: marginFraction(env, "UZI_DISK_HARD_MARGIN", 0.03),
+    runCacheCapEnabled: parseBoolDefaultTrue(env.UZI_RUN_CACHE_CAP_ENABLED),
+    runCacheCapFraction: openFraction(env, "UZI_RUN_CACHE_CAP_FRACTION", 0.5, { includeOne: true }),
+    runCacheLowWater: openFraction(env, "UZI_RUN_CACHE_LOW_WATER", 0.6, { includeOne: false }),
+    diskHardStopEnabled: parseBoolDefaultTrue(env.UZI_DISK_HARD_STOP_ENABLED),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),

@@ -1,6 +1,7 @@
 import http from "node:http";
 import { randomUUID } from "node:crypto";
 import type { AddressInfo } from "node:net";
+import type { FakePrDescApi, PrDescOp } from "./fake-pr-desc-api.js";
 import type {
   ClaimResponse,
   OutgoingMessage,
@@ -312,6 +313,9 @@ export class FakeApi {
   // returns only {worker_id}). Set to an arbitrary value (an array, a non-array, or an array
   // with non-string entries) so a test can drive register()'s Array.isArray + string-filter guard.
   private registerProtocolFeatures: unknown = undefined;
+
+  /** PRD #1798 M6: the in-memory pr-description api (fake-pr-desc-api.ts); unset ⇒ the routes 404. */
+  prDescription: FakePrDescApi | undefined;
 
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
@@ -1153,6 +1157,14 @@ export class FakeApi {
       if (!o || o.httpStatus === 404) return send(res, 404, { error: "run not found for this worker" });
       if (o.httpStatus !== 200 || !o.identity) return send(res, o.httpStatus, { error: "injected orphan failure" });
       return send(res, 200, o.identity);
+    }
+
+    // PRD #1798 M6: the pr-description routes, answered by an in-memory model when a test installs
+    // one (prDescription); without one they fall through to the 404 below, like an older api.
+    const prDescMatch = /^\/api\/worker\/runs\/([^/]+)\/pr-description\/(stage|bind|lookup|ack)$/.exec(p);
+    if (req.method === "POST" && prDescMatch && this.prDescription) {
+      const out = this.prDescription.handle(prDescMatch[2] as PrDescOp, prDescMatch[1] as string, json);
+      return send(res, out.status, out.body);
     }
 
     // PRD #1226 M4 (D5): the completion-permit endpoint. Records the request and answers the

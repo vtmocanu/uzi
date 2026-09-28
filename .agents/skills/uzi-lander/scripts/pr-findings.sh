@@ -254,13 +254,13 @@ for n in "$@"; do
   fi
   code_scanning_open "$repo" "$n"
   case "$CS_STATE" in
-    ok) b_cs=$(printf '%s' "$CS_ITEMS" | jq 'length'); blk_items=$(jq -nc --argjson a "$blk_items" --argjson b "$CS_ITEMS" '$a + $b') ;;
+    ok) b_cs=$(printf '%s' "$CS_ITEMS" | jq 'length'); blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$CS_ITEMS") '($a|fromjson) + ($b|fromjson)') ;;
     unavailable) b_cs="unavailable (${CS_NOTE}; counted as none)" ;;
     *) b_cs="unknown"; echo "  🔴 code-scanning alerts UNKNOWN (${CS_NOTE}) — NOT confirmed clean"; unconfirmed="${unconfirmed} #${n}" ;;
   esac
   if [ "$reviews_ok" -eq 1 ] && [ "$gr_issue" != "x" ] && ma=$(must_ack_json "$gr_issue" "$reviews_all") \
      && acks=$(ack_read "$repo" "$n") && ua=$(unacked_json "$ma" "$acks") && [ -n "$ua" ]; then
-    b_unacked=$(printf '%s' "$ua" | jq 'length'); blk_items=$(jq -nc --argjson a "$blk_items" --argjson b "$ua" '$a + $b')
+    b_unacked=$(printf '%s' "$ua" | jq 'length'); blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$ua") '($a|fromjson) + ($b|fromjson)')
   else
     echo "  🔴 comments, review bodies or the ack store UNREADABLE — acknowledgements unknown; NOT confirmed clean"
     unconfirmed="${unconfirmed} #${n}"

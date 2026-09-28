@@ -15,6 +15,7 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
 import { killRunnerGroup, runnerCommand } from "./runner-uid.js";
 import { buildCheckEnv } from "./sdk-env.js";
+import type { CheckStatus, KindSection, KindSectionLine } from "./pr-description.js";
 
 // Re-exported so the existing importers (runner.ts, the tests) keep one obvious home for
 // the self-improve check vocabulary; sdk-env.ts is the definition.
@@ -115,8 +116,6 @@ export const SELF_IMPROVE_CHECKS: SelfImproveCheck[] = [
   { name: "agent: npm run typecheck", cwd: "agent", command: "npm", args: ["run", "typecheck"], requires: "node_modules" },
   { name: "agent: npm test", cwd: "agent", command: "npm", args: ["test"], requires: "node_modules" },
 ];
-
-export type CheckStatus = "passed" | "failed" | "skipped";
 
 export interface CheckResult {
   name: string;
@@ -322,22 +321,27 @@ export function missingDeclaredDeps(cwd: string): string[] {
 // guard path touched ⇒ no lines. Factored out so the self_improve section and the
 // PRD #241 prompt-run section share ONE copy of this warning text (a duplicated
 // safety warning is the copy-drift this repo guards against).
-function guardCriticalWarningLines(guardHits: string[] | null): string[] {
+//
+// PRD #1798 (H1): the lines are STRUCTURED (pr-description.ts KindSectionLine). The
+// paths come from `git diff --name-only -z`, so they are agent-chosen and may carry
+// newlines, backticks, `<`, `@` or a closing keyword; each is handed to the renderer
+// as a `path` slot, which renders it as an escaped code span, never interpolated here.
+function guardCriticalWarningLines(guardHits: readonly string[] | null): KindSectionLine[] {
   if (guardHits === null) {
     return [
-      "> ⚠️ **Guard-path check: UNAVAILABLE (diff failed).** The worker could not compute the",
-      "> changed-file list, so it could not check for guard-critical paths. Review this change",
-      "> for any touch of guardrails, auth, secret/vault, worker token assembly, or compose",
-      "> secret wiring MANUALLY before merging.",
+      { fixed: "> ⚠️ **Guard-path check: UNAVAILABLE (diff failed).** The worker could not compute the" },
+      { fixed: "> changed-file list, so it could not check for guard-critical paths. Review this change" },
+      { fixed: "> for any touch of guardrails, auth, secret/vault, worker token assembly, or compose" },
+      { fixed: "> secret wiring MANUALLY before merging." },
     ];
   }
   if (guardHits.length > 0) {
     return [
-      "> ⚠️ **Guard-critical paths touched — review with extra care.** This change modifies",
-      "> files on uzi's security-critical surface (guardrails, auth, secret/vault, worker",
-      "> token assembly, or compose secret wiring). Verify it does not weaken any guardrail",
-      "> before merging:",
-      ...guardHits.map((f) => `> - \`${f}\``),
+      { fixed: "> ⚠️ **Guard-critical paths touched — review with extra care.** This change modifies" },
+      { fixed: "> files on uzi's security-critical surface (guardrails, auth, secret/vault, worker" },
+      { fixed: "> token assembly, or compose secret wiring). Verify it does not weaken any guardrail" },
+      { fixed: "> before merging:" },
+      ...guardHits.map((path) => ({ path })),
     ];
   }
   return [];
@@ -350,63 +354,50 @@ function guardCriticalWarningLines(guardHits: string[] | null): string[] {
 // gate suite is meaningless there and is not run. The flag itself IS still safe on
 // any repo because GUARD_CRITICAL_PATTERNS match uzi's own source paths only, so it
 // fires exactly when a prompt run actually touches uzi's guard surface (i.e. targets
-// the uzi repo) and is an empty no-op otherwise. Returns "" when nothing is flagged
-// (guardHits is [] — a computed diff that touched no guard path) so a clean prompt
-// MR carries no self-improvement-style boilerplate.
-export function guardCriticalMrSection(guardHits: string[] | null): string {
+// the uzi repo) and is an empty no-op otherwise. Returns an empty section when nothing
+// is flagged (guardHits is [] — a computed diff that touched no guard path) so a clean
+// prompt MR carries no self-improvement-style boilerplate.
+export function guardCriticalMrSection(guardHits: readonly string[] | null): KindSection {
   const warning = guardCriticalWarningLines(guardHits);
-  if (warning.length === 0) return "";
-  return ["", "---", "### Guard-critical paths", "", ...warning].join("\n");
+  if (warning.length === 0) return [];
+  return [{ fixed: "---" }, { fixed: "### Guard-critical paths" }, { fixed: "" }, ...warning];
 }
 
 // selfImproveMrSection composes the MR-description addendum for a self_improve run:
 // the guard-critical flag (when any path was touched) and the test-suite evidence.
 // guardHits is null when the changed-file diff could NOT be computed — that surfaces
 // loudly (fail-closed) so a diff failure never silently suppresses the flag on a
-// guard-touching MR (M5 audit). Returns "" only when there is nothing to add (no
-// checks, no hits) — the caller always has at least the checks, so it is non-empty.
-export function selfImproveMrSection(guardHits: string[] | null, checks: CheckResult[]): string {
-  const lines: string[] = ["", "---", "### Self-improvement run"];
+// guard-touching MR (M5 audit). Structured like guardCriticalMrSection: each check
+// result is a `check` slot the renderer escapes.
+export function selfImproveMrSection(guardHits: readonly string[] | null, checks: CheckResult[]): KindSection {
+  const lines: KindSectionLine[] = [{ fixed: "---" }, { fixed: "### Self-improvement run" }];
 
   const guardWarning = guardCriticalWarningLines(guardHits);
-  if (guardWarning.length > 0) lines.push("", ...guardWarning);
+  if (guardWarning.length > 0) lines.push({ fixed: "" }, ...guardWarning);
 
   if (checks.length > 0) {
-    lines.push("", "**Test evidence** (run by the worker — this repo has no CI):", "");
-    for (const c of checks) {
-      lines.push(`- ${checkEmoji(c.status)} ${c.name} — ${c.status} (${c.detail})`);
-    }
+    lines.push({ fixed: "" }, { fixed: "**Test evidence** (run by the worker — this repo has no CI):" }, { fixed: "" });
+    for (const c of checks) lines.push({ check: c });
     // A skipped check proves NOTHING. Say so plainly, so a reviewer never reads a
     // wall of "skipped" as a wall of "passed" (M8): the worker image may lack the
     // toolchain (no Go) or the fresh clone its dependencies (no node_modules).
     const skipped = checks.filter((c) => c.status === "skipped");
     if (skipped.length > 0) {
       lines.push(
-        "",
-        `> ⚠️ **${skipped.length} of ${checks.length} checks were SKIPPED — skipped is NOT passed.**`,
-        "> Those suites did not run here (the worker lacks the toolchain or the freshly cloned",
-        "> worktree has no installed dependencies), so this MR carries NO evidence for them.",
-        "> Run them yourself before merging.",
+        { fixed: "" },
+        { fixed: `> ⚠️ **${skipped.length} of ${checks.length} checks were SKIPPED — skipped is NOT passed.**` },
+        { fixed: "> Those suites did not run here (the worker lacks the toolchain or the freshly cloned" },
+        { fixed: "> worktree has no installed dependencies), so this MR carries NO evidence for them." },
+        { fixed: "> Run them yourself before merging." },
       );
     }
   }
 
   lines.push(
-    "",
-    "The bot cannot merge to `main` (protected-branch merge rights are humans only). A human must review and merge.",
+    { fixed: "" },
+    { fixed: "The bot cannot merge to `main` (protected-branch merge rights are humans only). A human must review and merge." },
   );
-  return lines.join("\n");
-}
-
-function checkEmoji(status: CheckStatus): string {
-  switch (status) {
-    case "passed":
-      return "✅";
-    case "failed":
-      return "❌";
-    default:
-      return "⚠️";
-  }
+  return lines;
 }
 
 function errText(err: unknown): string {

@@ -1823,6 +1823,19 @@ export interface WorkerReportedRun {
   claim_generation: number;
 }
 
+/** One run's disk size on a worker (PRD #1809 M6, D8): the bytes under the run's HOME and, of
+ *  those, the rebuildable caches. truncated means the worker's size walk was cut short, so both
+ *  numbers are lower bounds. sampled_at is when the worker's measurement finished (not when the
+ *  heartbeat carrying it arrived); entries measured more than 15 minutes ago are dropped. Nested
+ *  in Worker.run_disk, largest HOME first. */
+export interface WorkerRunDisk {
+  run_id: string;
+  home_bytes: number;
+  cache_bytes: number;
+  truncated: boolean;
+  sampled_at: string;
+}
+
 export interface Worker {
   id: string;
   name: string;
@@ -1874,6 +1887,10 @@ export interface Worker {
   // teardown is deferred. Distinct from busy/active_runs — it consumes no run slot.
   // Optional in TS (mocks/older payloads may omit it); the api always sends it.
   retaining_unpublished_work?: boolean;
+  // disk_pressure_threshold (PRD #1809 D5): the api's UZI_DISK_PRESSURE_THRESHOLD, set only
+  // on the worker's own heartbeat response (the worker derives its reclaim/admission and hard-stop
+  // thresholds from it); absent from every list/admin response.
+  disk_pressure_threshold?: number;
   // Worker template (PRD #18): the choice recorded at issuance and the value the
   // worker self-reports at register. Either may be null (no choice / older
   // image); a mismatch is surfaced as a drift badge, never a rejection.
@@ -1964,6 +1981,14 @@ export interface Worker {
   stats_disk_dind_total_bytes: number | null;
   stats_disk_dind_inodes: number | null;
   stats_disk_dind_total_inodes: number | null;
+  // Data-volume inodes (PRD #1809 M6, D8): used/total inodes of /data, null until the worker
+  // reports them. Optional so a pre-M6 fixture stays valid. Display-only.
+  stats_disk_data_inodes?: number | null;
+  stats_disk_data_total_inodes?: number | null;
+  // run_disk (PRD #1809 M6, D8): the worker's largest runs by HOME size (at most 5, largest
+  // first) from its latest heartbeat. A handler overlay like reported_runs, so optional; [] on
+  // the real wire when the worker reports none.
+  run_disk?: WorkerRunDisk[];
   // Which Anthropic credential this worker's RUN-lane claims spend (PRD #104 M3).
   // Both null means unbound: the worker spends its owner's default token, which is
   // every worker's state until someone binds one. The label rides alongside the id
@@ -2644,7 +2669,9 @@ export interface Run {
    *  (PRD #1590: held on its Codex account) and "vault_locked" (issue #1766: a Codex
    *  credential refresh or release found the run owner's vault locked; the run resumes at its
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
-   *  while it stays locked); "empty_turn"/"provider_outage"
+   *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
+   *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
+   *  "empty_turn"/"provider_outage"
    *  are reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
@@ -2682,6 +2709,24 @@ export interface Run {
    *  limit_wait_count's cap it IS on the row because the forge wording ("N of MAX") needs
    *  the denominator inline. */
   forge_park_max: number;
+  /** PRD #1809 M5: how many COUNTED `data_volume_full` parks this run has taken in its
+   *  lifetime — the DISK-ONLY counter the UZI_RUN_DISK_PARK_MAX cap decides on, distinct
+   *  from forge_park_count. A preventive disk park (the worker stopped the run before its
+   *  data volume filled) does not count. 0 for a run that has never taken a counted disk park. */
+  disk_park_count?: number;
+  /** PRD #1809 M6 (D8): the worker's report, on the run's latest park, of whether the checkpoint
+   *  that park published contains the run's latest committed work. false: it does not (the worker
+   *  keeps the latest work under its custody hold). Absent when not reported. The server clears
+   *  it when the run is claimed again or reports running, so it only ever describes the park that
+   *  reported it; a later park the worker did not report on (a server-side park) reads absent. */
+  checkpoint_contains_latest?: boolean;
+  /** PRD #1809 M6 (D8): the run's HOME size on its CURRENT worker and, of that, the rebuildable
+   *  caches, from that worker's report measured within the last 15 minutes. Set on the single-run
+   *  read (GET /api/runs/{id}) only, never on list rows; absent with no current worker or no fresh
+   *  report. disk_truncated: the worker's size walk was cut short, so both sizes are lower bounds. */
+  home_bytes?: number;
+  cache_bytes?: number;
+  disk_truncated?: boolean;
   /** PRD #84 M4: the run's inferred/hinted scheduling requirements, surfaced RAW so the
    *  web derives the plan-gate readiness display from them plus the assigned worker's
    *  capabilities (there is no server-computed "capability_block" field — the 409 the

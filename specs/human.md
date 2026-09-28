@@ -940,6 +940,39 @@ Tracked as GitHub issue vtmocanu/uzi#1795; decision record `adr/1795-gate-revisi
 
 - A plan-gate approve, reject or request-changes applies only to the plan revision it was sent against; a client that shows a plan (web, CLI, Slack) sends back the revision it displayed, and a stale one is refused rather than applied to a different plan. (AI-synced 2026-09-27)
 
+## Feature #1798 — Plain-English PR descriptions
+
+Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-descriptions.md`.
+
+- Every PR uzi opens gets a plain-English description plus a computed size
+  line; a human can see what it does and how big it is from the description
+  alone. (AI-synced 2026-09-28)
+- A Claude run and a Codex run produce the same layout. (AI-synced 2026-09-28)
+- Generated or lead-written text can never close an issue. (AI-synced 2026-09-28)
+- Text outside uzi's own blocks is preserved on an ordinary refresh; a few
+  named cases (no uzi markers yet, malformed markers — the publisher skips
+  such a PR and the interlock's own reconcile rewrites it whole — a closing
+  directive found outside the completion block, a blind rewrite of an
+  unreadable PR) rewrite the whole body instead. A missing completion block
+  is repaired in place instead: the publisher appends a fresh one and keeps
+  everything else, and only a completion block still missing when the
+  interlock's reconcile reads the PR gets the whole-body rewrite.
+  (AI-synced 2026-09-28)
+- The footer wording ("Opened by uzi from `<branch>`. A human reviews and
+  merges; uzi never merges.") was approved by the maintainer on 2026-09-27.
+  (AI-synced 2026-09-28)
+
+## Feature #1809 — Worker disk safety for long runs
+
+Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.md`; ADR at `adr/1809-per-run-cache-bounds.md`.
+
+- A run's rebuildable caches (Go build and module cache, npm cache) stay per run, never shared between runs, and are bounded while the run lives. (AI-synced 2026-09-28)
+- A park that ends a Claude run's process drops those caches and keeps everything a resume needs (session, config, unknown files); a gate-parked run is untouched, and the park itself leaves Codex runs' caches alone. (AI-synced 2026-09-28)
+- The worker's periodic reclaim drops the same caches from any worker-owned HOME of a run parked with its process ended, and removes terminal runs' leftovers. (AI-synced 2026-09-28)
+- A full data volume at clone/fetch or at the claim/resume check, the cache cap (uncounted) and the hard disk stop (counted) park the run in `recovery_wait` with the cause `data_volume_full`; it fails with that cause only after a bounded number of counted waits. A disk-full write later in the run (e.g. a build mid-turn) fails the run with its own error, not this wait. (AI-synced 2026-09-28)
+- Each live or parked run's HOME and cache size is visible before it can fill a volume: `uzi run get` for any run, each worker's largest run in the worker lists, the run page's park panels; admin health warns on a large run (`fleet.rundisk`). (AI-synced 2026-09-28)
+- The in-run cache cap, the hard disk stop, the periodic reclaim and the admission stop each have an off switch; the park-time cache drop and the claim/resume disk check are always on. (AI-synced 2026-09-28)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
