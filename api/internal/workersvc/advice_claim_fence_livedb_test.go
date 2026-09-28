@@ -86,7 +86,7 @@ func TestPostReviewClaimGenerationFenceLiveDB(t *testing.T) {
 	}
 
 	// 1. The superseded flight (stamped G) writes nothing: no review, no recommendation rows.
-	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("stale-first"), AdviceClaim{Generation: i64(adviceStaleGen)}); !errors.Is(err, ErrStaleClaim) {
+	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("stale-first"), AdviceClaim{Generation: i64(adviceStaleGen), RunID: &judgeID}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("stale-generation post err = %v, want ErrStaleClaim", err)
 	}
 	if n, r := reviews(), recs(); n != 0 || r != 0 {
@@ -101,8 +101,18 @@ func TestPostReviewClaimGenerationFenceLiveDB(t *testing.T) {
 		t.Fatalf("capability nil-gen post persisted reviews=%d recommendations=%d, want 0/0", n, r)
 	}
 
+	// 2b. A capability worker that stamps the CURRENT generation but omits the advice run id is
+	// refused the same way: without the run id a stale flight of an ended judge run of this
+	// target at a colliding per-run generation would resolve to this judge run.
+	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("capable-no-run-id"), AdviceClaim{Generation: i64(adviceLiveGen)}); !errors.Is(err, ErrMissingClaimGeneration) {
+		t.Fatalf("capability run-id-less post err = %v, want ErrMissingClaimGeneration", err)
+	}
+	if n, r := reviews(), recs(); n != 0 || r != 0 {
+		t.Fatalf("capability run-id-less post persisted reviews=%d recommendations=%d, want 0/0", n, r)
+	}
+
 	// 3. The current flight (stamped G+1) lands.
-	res, err := svc.PostReview(env.ctx, capable, targetID, sub("current"), AdviceClaim{Generation: i64(adviceLiveGen)})
+	res, err := svc.PostReview(env.ctx, capable, targetID, sub("current"), AdviceClaim{Generation: i64(adviceLiveGen), RunID: &judgeID})
 	if err != nil {
 		t.Fatalf("live-generation post: %v", err)
 	}
@@ -112,7 +122,7 @@ func TestPostReviewClaimGenerationFenceLiveDB(t *testing.T) {
 	}
 
 	// 4. With a review present, a stale post leaves it (and its recommendations) unchanged.
-	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("stale-overwrite"), AdviceClaim{Generation: i64(adviceStaleGen)}); !errors.Is(err, ErrStaleClaim) {
+	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("stale-overwrite"), AdviceClaim{Generation: i64(adviceStaleGen), RunID: &judgeID}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("stale overwrite err = %v, want ErrStaleClaim", err)
 	}
 	if reviews() != 1 || recs() != 2 || summary() != "current" {
@@ -140,7 +150,7 @@ func TestPostReviewClaimGenerationFenceLiveDB(t *testing.T) {
 
 	// 7. A RELEASED claim fences out even the current generation, and a legacy nil-gen post.
 	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, judgeID)
-	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("released"), AdviceClaim{Generation: i64(adviceLiveGen)}); !errors.Is(err, ErrStaleClaim) {
+	if _, err := svc.PostReview(env.ctx, capable, targetID, sub("released"), AdviceClaim{Generation: i64(adviceLiveGen), RunID: &judgeID}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("released-claim post err = %v, want ErrStaleClaim", err)
 	}
 	if _, err := svc.PostReview(env.ctx, legacy, targetID, sub("released-legacy"), AdviceClaim{}); !errors.Is(err, ErrStaleClaim) {
@@ -190,7 +200,7 @@ func TestPostTaskReviewClaimGenerationFenceLiveDB(t *testing.T) {
 	}
 
 	// 1. The superseded flight (stamped G) writes nothing.
-	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("stale-first"), AdviceClaim{Generation: i64(adviceStaleGen)}); !errors.Is(err, ErrStaleClaim) {
+	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("stale-first"), AdviceClaim{Generation: i64(adviceStaleGen), RunID: &reviewID}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("stale-generation post err = %v, want ErrStaleClaim", err)
 	}
 	if n, f := reviews(), findings(); n != 0 || f != 0 {
@@ -208,8 +218,17 @@ func TestPostTaskReviewClaimGenerationFenceLiveDB(t *testing.T) {
 		t.Fatalf("capability nil-gen post persisted reviews=%d findings=%d, want 0/0", n, f)
 	}
 
+	// 2b. A capability worker that stamps the CURRENT generation but omits the advice run id is
+	// refused the same way, nothing written.
+	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("capable-no-run-id"), AdviceClaim{Generation: i64(adviceLiveGen)}); !errors.Is(err, ErrMissingClaimGeneration) {
+		t.Fatalf("capability run-id-less post err = %v, want ErrMissingClaimGeneration", err)
+	}
+	if n, f := reviews(), findings(); n != 0 || f != 0 {
+		t.Fatalf("capability run-id-less post persisted reviews=%d findings=%d, want 0/0", n, f)
+	}
+
 	// 3. The current flight (stamped G+1) lands.
-	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("current"), AdviceClaim{Generation: i64(adviceLiveGen)}); err != nil {
+	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("current"), AdviceClaim{Generation: i64(adviceLiveGen), RunID: &reviewID}); err != nil {
 		t.Fatalf("live-generation post: %v", err)
 	}
 	if reviews() != 1 || findings() != 2 || summary() != "current" {
@@ -217,7 +236,7 @@ func TestPostTaskReviewClaimGenerationFenceLiveDB(t *testing.T) {
 	}
 
 	// 4. With a review present, a stale post leaves it unchanged.
-	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("stale-overwrite"), AdviceClaim{Generation: i64(adviceStaleGen)}); !errors.Is(err, ErrStaleClaim) {
+	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("stale-overwrite"), AdviceClaim{Generation: i64(adviceStaleGen), RunID: &reviewID}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("stale overwrite err = %v, want ErrStaleClaim", err)
 	}
 	if reviews() != 1 || findings() != 2 || summary() != "current" {
@@ -245,7 +264,7 @@ func TestPostTaskReviewClaimGenerationFenceLiveDB(t *testing.T) {
 
 	// 7. A RELEASED claim fences out even the current generation, and a legacy nil-gen post.
 	env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, reviewID)
-	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("released"), AdviceClaim{Generation: i64(adviceLiveGen)}); !errors.Is(err, ErrStaleClaim) {
+	if err := svc.PostTaskReview(env.ctx, capable, taskID, sub("released"), AdviceClaim{Generation: i64(adviceLiveGen), RunID: &reviewID}); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("released-claim post err = %v, want ErrStaleClaim", err)
 	}
 	if err := svc.PostTaskReview(env.ctx, legacy, taskID, sub("released-legacy"), AdviceClaim{}); !errors.Is(err, ErrStaleClaim) {

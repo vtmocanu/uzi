@@ -36,7 +36,7 @@ func TestPostReviewPassesAdviceRunAndClaimGeneration(t *testing.T) {
 	fs := judgeFenceStore(owner, judgeID, target)
 	svc := New(fs, newBox(t), testParams())
 	if _, err := svc.PostReview(context.Background(), capabilityWorker(), target,
-		ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{Generation: i64(7)}); err != nil {
+		ReviewSubmission{Verdict: "ok", Status: "complete"}, AdviceClaim{Generation: i64(7), RunID: &judgeID}); err != nil {
 		t.Fatalf("PostReview: %v", err)
 	}
 	got := fs.upsertedReview
@@ -75,7 +75,7 @@ func TestPostReviewFencedOutIsStaleClaim(t *testing.T) {
 	_, err := svc.PostReview(context.Background(), capabilityWorker(), target, ReviewSubmission{
 		Verdict: "issues", Status: "complete",
 		Recommendations: []ReviewRecommendation{{Category: "enable_tool", Target: "gh", RationaleMd: "r"}},
-	}, AdviceClaim{Generation: i64(3)})
+	}, AdviceClaim{Generation: i64(3), RunID: &judgeID})
 	if !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("err = %v, want ErrStaleClaim", err)
 	}
@@ -121,7 +121,7 @@ func TestPostTaskReviewPassesAdviceRunAndClaimGeneration(t *testing.T) {
 	fs := taskReviewFenceStore(owner, reviewID, target)
 	svc := New(fs, newBox(t), testParams())
 	if err := svc.PostTaskReview(context.Background(), capabilityWorker(), target,
-		TaskReviewSubmission{Status: "complete"}, AdviceClaim{Generation: i64(9)}); err != nil {
+		TaskReviewSubmission{Status: "complete"}, AdviceClaim{Generation: i64(9), RunID: &reviewID}); err != nil {
 		t.Fatalf("PostTaskReview: %v", err)
 	}
 	got := fs.upsertTaskReviewParams
@@ -141,7 +141,7 @@ func TestPostTaskReviewFencedOutIsStaleClaim(t *testing.T) {
 	fs := taskReviewFenceStore(owner, reviewID, target)
 	fs.upsertTaskReviewErr = pgx.ErrNoRows
 	svc := New(fs, newBox(t), testParams())
-	err := svc.PostTaskReview(context.Background(), capabilityWorker(), target, TaskReviewSubmission{Status: "complete"}, AdviceClaim{Generation: i64(2)})
+	err := svc.PostTaskReview(context.Background(), capabilityWorker(), target, TaskReviewSubmission{Status: "complete"}, AdviceClaim{Generation: i64(2), RunID: &reviewID})
 	if !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("err = %v, want ErrStaleClaim", err)
 	}
@@ -219,6 +219,21 @@ func TestAdviceRunIDFence(t *testing.T) {
 			wrote, _, err := l.post(t, capabilityWorker(), uuid.New(), AdviceClaim{RunID: &other})
 			if !errors.Is(err, ErrMissingClaimGeneration) || wrote {
 				t.Fatalf("err = %v wrote = %v, want ErrMissingClaimGeneration and no write", err, wrote)
+			}
+		})
+		// A capability worker that stamps the generation but OMITS the advice run id would let
+		// a stale post of ended run A (same target, same per-run generation) resolve to the
+		// active run B, so the omission is refused exactly like a missing generation.
+		t.Run(l.name+"/capability worker missing run id is refused", func(t *testing.T) {
+			wrote, _, err := l.post(t, capabilityWorker(), uuid.New(), AdviceClaim{Generation: i64(1)})
+			if !errors.Is(err, ErrMissingClaimGeneration) || wrote {
+				t.Fatalf("err = %v wrote = %v, want ErrMissingClaimGeneration and no write", err, wrote)
+			}
+		})
+		t.Run(l.name+"/legacy worker may omit the run id", func(t *testing.T) {
+			wrote, _, err := l.post(t, worker(), uuid.New(), AdviceClaim{})
+			if err != nil || !wrote {
+				t.Fatalf("err = %v wrote = %v, want the legacy post to reach the upsert", err, wrote)
 			}
 		})
 		t.Run(l.name+"/matching id lands with the posting worker fenced", func(t *testing.T) {

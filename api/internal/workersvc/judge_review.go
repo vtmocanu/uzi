@@ -76,14 +76,16 @@ type ReviewResult struct {
 }
 
 // AdviceClaim is the claim a judge or task-review flight stamps on its advice POST (issue
-// #1423). Both fields are optional on the wire (nil = not stamped).
+// #1423). Both fields are nil (not stamped) for a legacy worker; a credential_switch_v1
+// worker must stamp BOTH, and omitting either is ErrMissingClaimGeneration.
 //   - Generation is the advice run's claim_generation the flight holds; the upsert is fenced
 //     on it in the same statement as the write.
 //   - RunID is the advice run the flight holds. Generations are PER-RUN counters, so a stale
 //     flight of an earlier judge run A (gen 1) and a re-judge B of the same target claimed by
 //     the same worker (also gen 1) would otherwise be indistinguishable: authorization
 //     resolves (worker, target) to the ACTIVE run B, and A's generation would match B's.
-//     Stamping the run id makes that post ErrStaleClaim instead of landing under B.
+//     Stamping the run id makes that post ErrStaleClaim instead of landing under B, which is
+//     why a capability worker may not omit it.
 type AdviceClaim struct {
 	Generation *int64
 	RunID      *uuid.UUID
@@ -91,11 +93,12 @@ type AdviceClaim struct {
 
 // checkAdviceClaim applies the pre-write half of the advice-post fence, AFTER authorization
 // (ErrRunNotFound wins over everything here): a credential_switch_v1 worker that omits the
-// generation is ErrMissingClaimGeneration, then a stamped advice run id that is not the
-// authorized advice run is ErrStaleClaim. The generation / unreleased-claim / owning-worker
-// half runs inside the upsert itself.
+// generation or the advice run id is ErrMissingClaimGeneration, then a stamped advice run id
+// that is not the authorized advice run is ErrStaleClaim. A legacy worker may omit both. The
+// generation / unreleased-claim / owning-worker / non-terminal-status half runs inside the
+// upsert itself.
 func checkAdviceClaim(wkr store.Worker, adviceRunID uuid.UUID, claim AdviceClaim) error {
-	if claim.Generation == nil && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+	if (claim.Generation == nil || claim.RunID == nil) && slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
 		return ErrMissingClaimGeneration
 	}
 	if claim.RunID != nil && *claim.RunID != adviceRunID {

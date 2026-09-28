@@ -107,7 +107,7 @@ func TestAdvicePostDecodesClaimGeneration(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			st := newAdviceFakeStore()
 			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
-			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":11`))
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":11,"advice_run_id":"`+st.adviceRunID.String()+`"`))
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d %s, want 200", rec.Code, rec.Body.String())
 			}
@@ -133,7 +133,7 @@ func TestAdvicePostStaleClaimIs409Disposition(t *testing.T) {
 			st := newAdviceFakeStore()
 			st.upsertErr = pgx.ErrNoRows // the fence persisted nothing
 			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
-			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":3`))
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":3,"advice_run_id":"`+st.adviceRunID.String()+`"`))
 			if rec.Code != http.StatusConflict || adviceDisposition(rec) != "stale_claim" {
 				t.Fatalf("stale post = %d %s, want 409 disposition stale_claim", rec.Code, rec.Body.String())
 			}
@@ -155,6 +155,31 @@ func TestAdvicePostMissingGenerationIs409(t *testing.T) {
 			}
 			if st.reviewParams != nil || st.taskParams != nil {
 				t.Fatal("an unstamped capability post must write nothing")
+			}
+		})
+	}
+}
+
+// A capability worker that stamps claim_generation but omits advice_run_id is refused with the
+// byte-identical response a missing generation gets (same 409, same error, no disposition) and
+// nothing written: without the run id a stale post of an ended advice run could resolve to the
+// active run of the same target at a colliding per-run generation.
+func TestAdvicePostMissingAdviceRunIDIsMissingGeneration(t *testing.T) {
+	for _, tc := range adviceCases {
+		t.Run(tc.name, func(t *testing.T) {
+			wantSt := newAdviceFakeStore()
+			wantWkr := store.Worker{ID: uuid.New(), UserID: wantSt.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			want := advicePost(adviceRouter(wantSt, wantWkr), wantSt.targetID, tc.path, adviceBody(tc.body, ""))
+
+			st := newAdviceFakeStore()
+			wkr := store.Worker{ID: uuid.New(), UserID: st.owner, ProtocolCapabilities: []string{capability.CredentialSwitchV1}}
+			rec := advicePost(adviceRouter(st, wkr), st.targetID, tc.path, adviceBody(tc.body, `,"claim_generation":1`))
+			if rec.Code != http.StatusConflict || rec.Code != want.Code || rec.Body.String() != want.Body.String() {
+				t.Fatalf("run-id-less capability post = %d %s, want the missing-generation response %d %s",
+					rec.Code, rec.Body.String(), want.Code, want.Body.String())
+			}
+			if st.reviewParams != nil || st.taskParams != nil {
+				t.Fatal("a capability post without advice_run_id must write nothing")
 			}
 		})
 	}

@@ -241,7 +241,7 @@ export class JudgeRunner {
       // RETURN, not a throw: throwing here would fall through to the catch's deterministic-
       // fallback `completed` report. This is now the FAST PATH (it skips the model call); the
       // guard against a stale overwrite is the server's atomic fence on postReview, which
-      // refuses a superseded or released flight's write (issue #1423).
+      // refuses a superseded, released or already-terminal flight's write (issue #1423).
       if (runningAck?.staleClaim) {
         this.log.warn("judge claim superseded (stale) at running report; abandoning without posting", {
           run_id: judgeRunId,
@@ -296,10 +296,12 @@ export class JudgeRunner {
       // an idempotent running report (SetRunRunning preserves status_since) before the advice
       // write; a stale ack abandons before postReview. This probe is now the FAST PATH: the guard
       // is the server fence (issue #1423), which checks the judge run's claim generation,
-      // unreleased claim and owning worker atomically in the same statement as the review upsert
-      // (and the stamped run id against the authorized run, so an EARLIER run's colliding generation
-      // cannot land under a re-run), so a supersession landing between this probe and the post is
-      // refused there (409 stale_claim, handled below).
+      // unreleased claim, owning worker and non-terminal status atomically in the same statement
+      // as the review upsert (and the stamped run id against the authorized run, so an EARLIER
+      // run's colliding generation cannot land under a re-run; a credential_switch_v1 worker must
+      // stamp advice_run_id with the generation, or the post is refused like a missing
+      // generation), so a supersession landing between this probe and the post is refused there
+      // (409 stale_claim, handled below).
       // A probe throw still PROPAGATES to the advice-phase catch (safeReportFailed, itself
       // generation-fenced), posting NO advice: ownership is unknown during a transport failure,
       // and in the api-unreachable case postReview would fail anyway.
@@ -317,9 +319,10 @@ export class JudgeRunner {
         await this.client.postReview(targetId, review, claim.claim_generation, judgeRunId);
       } catch (err) {
         // Issue #1423: the server fence refused the write because this flight's claim was
-        // superseded (reclaimed at a newer generation) or released. Nothing was persisted and the
-        // run belongs to another flight, so abandon exactly like the staleClaim probes above:
-        // no completed report and NO safeReportFailed (that would fail the current flight's run).
+        // superseded (reclaimed at a newer generation), released, reassigned, or its judge run
+        // already reached a terminal status. Nothing was persisted and the run belongs to another
+        // flight, so abandon exactly like the staleClaim probes above: no completed report and
+        // NO safeReportFailed (that would fail the current flight's run).
         if (isStaleClaimRefusal(err)) {
           this.log.warn("judge claim superseded (stale) at review post; abandoning", { run_id: judgeRunId });
           return;
