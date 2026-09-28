@@ -2,7 +2,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { buildEnvironmentFactsBlock, buildImplementPrompt, buildPlanPrompt } from "../src/prompt.js";
-import type { EnvFacts } from "../src/env-probe.js";
+import { environmentFactsSummary, type EnvFacts } from "../src/env-probe.js";
 
 const RULE =
   "When a specific gate is blocked by a verified environment limit, do not repeat it unchanged. Record it as not run or blocked, run the checks that remain valid, and name the CI or other test lane that must complete validation.";
@@ -29,7 +29,7 @@ describe("buildEnvironmentFactsBlock", () => {
   });
   it("words each status", () => {
     const b = buildEnvironmentFactsBlock({ ...ALL_OK, proc: "unverified", home: "limited", tmp: "limited" });
-    assert.ok(b.includes("- /proc enumeration: not verified (the probe failed or timed out)."));
+    assert.ok(b.includes("- /proc enumeration: could not be confirmed."));
     assert.ok(b.includes("- $HOME is not writable."));
     assert.ok(b.includes("- $TMPDIR is not writable."));
     const u = buildEnvironmentFactsBlock({ ...ALL_OK, home: "unverified" });
@@ -107,5 +107,33 @@ describe("buildImplementPrompt environment facts", () => {
       buildImplementPrompt({ ...base, first: true, environmentFacts: ALL_OK }),
       buildImplementPrompt({ ...base, first: true }),
     );
+  });
+});
+
+describe("environmentFactsSummary (issue #1866 M2 status line)", () => {
+  it("names every fact and the harness on one line", () => {
+    assert.equal(
+      environmentFactsSummary({ harness: "codex", dockerWired: false, proc: "limited", home: "ok", tmp: "unverified" }),
+      "environment facts (codex): /proc limited; $HOME ok; $TMPDIR not verified; docker not wired",
+    );
+    assert.equal(
+      environmentFactsSummary({ ...ALL_OK, home: "limited" }),
+      "environment facts (claude): /proc ok; $HOME limited; $TMPDIR ok; docker wired",
+    );
+  });
+  it("is empty exactly when the prompt block is empty", () => {
+    const statuses = ["ok", "limited", "unverified"] as const;
+    for (const harness of ["claude", "codex"] as const)
+      for (const dockerWired of [true, false])
+        for (const proc of statuses)
+          for (const home of statuses)
+            for (const tmp of statuses) {
+              const facts: EnvFacts = { harness, dockerWired, proc, home, tmp };
+              assert.equal(
+                environmentFactsSummary(facts) === "",
+                buildEnvironmentFactsBlock(facts) === "",
+                JSON.stringify(facts),
+              );
+            }
   });
 });

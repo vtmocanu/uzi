@@ -29,6 +29,26 @@ export interface EnvFacts {
   tmp: EnvFactStatus;
 }
 
+const STATUS_WORD: Readonly<Record<EnvFactStatus, string>> = {
+  ok: "ok",
+  limited: "limited",
+  unverified: "not verified",
+};
+
+/**
+ * issue #1866 M2: the one-line worker status summary of the facts, e.g.
+ * `environment facts (claude): /proc limited; $HOME ok; $TMPDIR not verified; docker not wired`.
+ * Empty exactly when the prompt block is empty (everything ok and Docker wired), so a run whose
+ * prompt carries no facts block emits no status line either.
+ */
+export function environmentFactsSummary(facts: EnvFacts): string {
+  if (facts.proc === "ok" && facts.home === "ok" && facts.tmp === "ok" && facts.dockerWired) return "";
+  return (
+    `environment facts (${facts.harness}): /proc ${STATUS_WORD[facts.proc]}; $HOME ${STATUS_WORD[facts.home]}; ` +
+    `$TMPDIR ${STATUS_WORD[facts.tmp]}; docker ${facts.dockerWired ? "wired" : "not wired"}`
+  );
+}
+
 interface ProbeFs {
   readdirSync(path: string): readonly unknown[];
   mkdtempSync(prefix: string): string;
@@ -316,4 +336,21 @@ export function spawnRunnerProbe(opts: { cwd: string; deps?: RunnerProbeDeps }):
       });
       child.on("close", (code) => void finish(code ?? -1));
     });
+}
+
+/** TEST ONLY: see {@link setDefaultEnvProbeSpawnerForTests}. */
+let testDefaultSpawner: ((cwd: string) => EnvProbeSpawner) | undefined;
+
+/** TEST ONLY: install (or, with undefined, clear) the spawner factory {@link defaultEnvProbeSpawner}
+ *  returns, so the test preload keeps executor rigs that inject no spawner from starting a real
+ *  probe process per run. No environment variable or config reads one; production code never
+ *  calls this setter. */
+export function setDefaultEnvProbeSpawnerForTests(factory: ((cwd: string) => EnvProbeSpawner) | undefined): void {
+  testDefaultSpawner = factory;
+}
+
+/** The Claude harness's default probe spawner for a run rooted at `cwd`: {@link spawnRunnerProbe},
+ *  unless a test installed a factory with {@link setDefaultEnvProbeSpawnerForTests}. */
+export function defaultEnvProbeSpawner(cwd: string): EnvProbeSpawner {
+  return testDefaultSpawner ? testDefaultSpawner(cwd) : spawnRunnerProbe({ cwd });
 }

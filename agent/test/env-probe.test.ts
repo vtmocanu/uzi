@@ -13,12 +13,15 @@ import {
   ENV_PROBE_SCRIPT,
   EnvProbeCleanupError,
   ProbeCleanupError,
+  defaultEnvProbeSpawner,
   probeEnv,
   probeFacts,
   runEnvProbe,
+  setDefaultEnvProbeSpawnerForTests,
   spawnRunnerProbe,
   type EnvProbeSpawner,
 } from "../src/env-probe.js";
+import { restoreHermeticEnvProbe } from "./setup/hermetic-proc.js";
 
 type FakeFs = Parameters<typeof probeFacts>[0];
 
@@ -235,6 +238,8 @@ class FakeChild extends EventEmitter {
 function harness(opts: {
   present: boolean | undefined;
   exitOnKill?: boolean;
+  /** The code the child closes with after a kill (default null, i.e. killed by a signal). */
+  closeCodeOnKill?: number | null;
   output?: string;
   pid?: number | undefined;
   spawnError?: boolean;
@@ -265,7 +270,11 @@ function harness(opts: {
       },
       killGroup: (pid) => {
         if (pid !== undefined) kills.push(pid);
-        if (opts.exitOnKill && spawned) setImmediate(() => spawned!.emit("close", null));
+        if (opts.exitOnKill && spawned) {
+          const child = spawned;
+          spawned = undefined; // close once: a follow-up kill finds nothing left to close
+          setImmediate(() => child.emit("close", opts.closeCodeOnKill ?? null));
+        }
         return true;
       },
       groupPresent: () => opts.present,
@@ -295,7 +304,23 @@ describe("spawnRunnerProbe", () => {
     const r = await p;
     assert.equal(r.cleanedUp, false);
     assert.notEqual(r.code, 0);
-    assert.ok(h.kills.includes(4242));
+    assert.deepEqual(h.kills, [4242, 4242], "the abort kill, then the one follow-up kill of the still-present group");
+  });
+  it("sends one follow-up kill and reports cleanedUp false when the group outlives a clean exit", async () => {
+    const h = harness({ present: true, output: line("ok", "ok", "ok") });
+    const r = await h.spawner(ENV_PROBE_ARGV, {}, new AbortController().signal);
+    assert.equal(r.cleanedUp, false);
+    assert.equal(r.code, 0, "no abort and no kill before close: the exit code is kept");
+    assert.deepEqual(h.kills, [4242], "only the follow-up kill");
+  });
+  it("never reports a zero exit for a probe it killed", async () => {
+    const h = harness({ present: false, exitOnKill: true, closeCodeOnKill: 0 });
+    const ac = new AbortController();
+    const p = h.spawner(ENV_PROBE_ARGV, {}, ac.signal);
+    ac.abort();
+    const r = await p;
+    assert.equal(r.code, -1, "a killed probe that closed with 0 reads as a failure");
+    assert.equal(r.cleanedUp, true);
   });
   it("reports cleanedUp false when presence is unknown", async () => {
     const h = harness({ present: undefined, exitOnKill: true });
@@ -339,5 +364,56 @@ describe("spawnRunnerProbe", () => {
   it("feeds runEnvProbe: an unconfirmed cleanup rejects", async () => {
     const h = harness({ present: true, exitOnKill: true });
     await assert.rejects(runEnvProbe(h.spawner, {}, { ...OPTS, timeoutMs: 10 }), EnvProbeCleanupError);
+  });
+});
+
+// Issue #1866 M2 (review follow-up): the real runner spawn, single-uid in tests, end to end.
+describe("spawnRunnerProbe with the real runner spawn", () => {
+  const OK_OPTS = { harness: "claude" as const, dockerWired: true, timeoutMs: 20_000 };
+  function withDir(fn: (dir: string) => Promise<void>): Promise<void> {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-envprobe-real-"));
+    return fn(dir).finally(() => fs.rmSync(dir, { recursive: true, force: true }));
+  }
+  it("confirms cleanup and measures a writable HOME and TMPDIR", async () =>
+    withDir(async (dir) => {
+      const facts = await runEnvProbe(
+        spawnRunnerProbe({ cwd: dir }),
+        { PATH: process.env.PATH ?? "", HOME: dir, TMPDIR: dir },
+        OK_OPTS,
+      );
+      // Resolving at all proves the cleanup path: an unconfirmed cleanup throws.
+      assert.equal(facts.home, "ok");
+      assert.equal(facts.tmp, "ok");
+      assert.deepEqual(fs.readdirSync(dir), [], "the probe removed its own directories");
+    }));
+  it("the production default (no test factory installed) is the real runner probe", async () =>
+    withDir(async (dir) => {
+      setDefaultEnvProbeSpawnerForTests(undefined);
+      try {
+        const facts = await runEnvProbe(
+          defaultEnvProbeSpawner(dir),
+          { PATH: process.env.PATH ?? "", HOME: dir, TMPDIR: dir },
+          OK_OPTS,
+        );
+        assert.equal(facts.home, "ok");
+        assert.equal(facts.tmp, "ok");
+      } finally {
+        restoreHermeticEnvProbe();
+      }
+    }));
+  it("an installed test factory replaces the default", async () => {
+    let cwdSeen = "";
+    const fake: EnvProbeSpawner = async () => ({ code: 0, stdout: line("limited", "ok", "ok"), cleanedUp: true });
+    setDefaultEnvProbeSpawnerForTests((cwd) => {
+      cwdSeen = cwd;
+      return fake;
+    });
+    try {
+      const facts = await runEnvProbe(defaultEnvProbeSpawner("/work/x"), {}, OK_OPTS);
+      assert.equal(facts.proc, "limited");
+      assert.equal(cwdSeen, "/work/x");
+    } finally {
+      restoreHermeticEnvProbe();
+    }
   });
 });

@@ -1120,7 +1120,7 @@ export function buildEnvironmentFactsBlock(facts: EnvFacts | undefined): string 
   const codex = facts.harness === "codex";
   const bullets: string[] = [];
   if (facts.proc === "limited") bullets.push("- /proc cannot be enumerated from your commands.");
-  else if (facts.proc === "unverified") bullets.push("- /proc enumeration: not verified (the probe failed or timed out).");
+  else if (facts.proc === "unverified") bullets.push("- /proc enumeration: could not be confirmed.");
   let dirLine = false;
   if (facts.home === "limited") {
     bullets.push(codex ? "- A command's own private $HOME is not writable." : "- $HOME is not writable.");
