@@ -18,6 +18,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -70,7 +71,11 @@ func composeFiledFindingGroup(parts []groupDraftPart, edited *string, operation 
 	marker := "\n\n<!-- uzi-finding-group-operation: " + operation.String() + " -->"
 	body := roster.String()
 	if edited != nil {
-		body += "\n## Description\n\n" + *edited
+		userText := *edited
+		if strings.HasPrefix(userText, roster.String()) {
+			userText = strings.TrimPrefix(userText, roster.String())
+		}
+		body += "\n## Description\n\n" + termsafe.SanitizeTTY(userText)
 	} else {
 		_, defaultBody := composeFindingGroupDraft(parts)
 		if at := strings.Index(defaultBody, "\n## Evidence\n"); at >= 0 {
@@ -125,12 +130,16 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dispositionIDs := make([]string, 0, len(members))
-	parts := make([]groupDraftPart, 0, len(members))
 	for _, member := range members {
 		dispositionIDs = append(dispositionIDs, member.DispositionID.String())
+	}
+	parts := make([]groupDraftPart, 0, len(members))
+	for _, member := range members {
 		finding, e := h.q.GetIncidentalFinding(ctx, store.GetIncidentalFindingParams{ID: member.FindingID, UserID: user.ID})
 		if e != nil {
-			h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+			if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+				return
+			}
 			slog.Error("file finding group: evidence", "error", e)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
@@ -140,36 +149,46 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	title, _ := composeFindingGroupDraft(parts)
 	if req.Title != nil {
-		title = issuedraft.SanitizeTitle(*req.Title)
+		title = issuedraft.SanitizeTitle(termsafe.SanitizeTTY(*req.Title))
 	}
 	if title == "" {
-		h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+		if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+			return
+		}
 		httpx.Error(w, http.StatusBadRequest, "title must be non-empty")
 		return
 	}
 	description, fits := composeFiledFindingGroup(parts, req.Description, op.ID)
 	if !fits {
-		h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+		if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+			return
+		}
 		httpx.Error(w, http.StatusBadRequest, "description is too large")
 		return
 	}
 	marker, err := h.settings.FindingLabel(ctx)
 	if err != nil {
-		h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+		if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+			return
+		}
 		slog.Error("file finding group: marker", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	repo, err := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: op.RepoID, UserID: user.ID})
 	if err != nil {
-		h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+		if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+			return
+		}
 		slog.Error("file finding group: repo", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
-		h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+		if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+			return
+		}
 		slog.Error("file finding group: forge connection", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -185,7 +204,9 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 			return
 		}
-		h.releaseDefinitiveFindingGroup(user.ID, op.ID)
+		if !h.releaseFindingGroupOrReport(w, user.ID, op.ID, dispositionIDs, "pre_call") {
+			return
+		}
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
 		return
 	}
@@ -248,6 +269,14 @@ func writeStoppedFindingGroup(w http.ResponseWriter, operation uuid.UUID, ids []
 		OperationID: operation.String(), DispositionIDs: ids, Phase: phase,
 		Warning: "Filing stopped before a confirmed issue result. Inspect the forge before releasing this operation after its deadline.",
 	})
+}
+
+func (h *Handler) releaseFindingGroupOrReport(w http.ResponseWriter, user, operation uuid.UUID, ids []string, phase string) bool {
+	if h.releaseDefinitiveFindingGroup(user, operation) {
+		return true
+	}
+	writeStoppedFindingGroup(w, operation, ids, phase)
+	return false
 }
 
 func (h *Handler) releaseDefinitiveFindingGroup(user, operation uuid.UUID) bool {

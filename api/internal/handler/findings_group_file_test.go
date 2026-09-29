@@ -36,6 +36,28 @@ func TestComposeFiledFindingGroupKeepsRosterAndMarker(t *testing.T) {
 	}
 }
 
+func TestComposeFiledFindingGroupStripsPreviewRoster(t *testing.T) {
+	parts := []groupDraftPart{{title: "first", location: "src/one.go", evidence: "evidence"}}
+	previewParts := []groupDraftPart{{title: "first", location: issuedraft.SafeInlineCode("src/one.go"), evidence: "evidence"}}
+	_, preview := composeFindingGroupDraft(previewParts)
+	body, ok := composeFiledFindingGroup(parts, &preview, uuid.New())
+	if !ok || strings.Count(body, "## Findings") != 1 {
+		t.Fatalf("preview roster duplicated: %q", body)
+	}
+	if !strings.Contains(body, "evidence") {
+		t.Fatalf("preview evidence lost: %q", body)
+	}
+}
+
+func TestComposeFiledFindingGroupStripsBidiEdit(t *testing.T) {
+	parts := []groupDraftPart{{title: "first", location: "src/one.go"}}
+	edited := "safe\u202etxt.exe"
+	body, ok := composeFiledFindingGroup(parts, &edited, uuid.New())
+	if !ok || strings.ContainsRune(body, '\u202e') {
+		t.Fatalf("bidi edit survived: %q", body)
+	}
+}
+
 func TestFindingGroupDeadlineHasPositiveFloor(t *testing.T) {
 	now := time.Now()
 	if got := findingGroupDeadline(now, -time.Minute, 3*time.Minute); got != now.Add(6*time.Minute) {
