@@ -460,6 +460,7 @@ SELECT
     d.filed_issue_iid                AS filed_issue_iid,
     d.filed_issue_url                AS filed_issue_url,
     d.resolved_at                    AS resolved_at,
+    d.group_operation_id             AS group_operation_id,
     count(DISTINCT f.run_id)         AS seen_in_runs,
     latest.id                        AS latest_finding_id
 FROM finding_dispositions d
@@ -498,20 +499,21 @@ type ListFindingsBacklogParams struct {
 }
 
 type ListFindingsBacklogRow struct {
-	DispositionID   uuid.UUID          `json:"disposition_id"`
-	UserID          uuid.UUID          `json:"user_id"`
-	RepoID          uuid.UUID          `json:"repo_id"`
-	RepoPath        string             `json:"repo_path"`
-	Location        string             `json:"location"`
-	Status          string             `json:"status"`
-	LastTitle       string             `json:"last_title"`
-	DismissReason   pgtype.Text        `json:"dismiss_reason"`
-	SetVia          pgtype.Text        `json:"set_via"`
-	FiledIssueIid   pgtype.Int8        `json:"filed_issue_iid"`
-	FiledIssueUrl   string             `json:"filed_issue_url"`
-	ResolvedAt      pgtype.Timestamptz `json:"resolved_at"`
-	SeenInRuns      int64              `json:"seen_in_runs"`
-	LatestFindingID pgtype.UUID        `json:"latest_finding_id"`
+	DispositionID    uuid.UUID          `json:"disposition_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	RepoPath         string             `json:"repo_path"`
+	Location         string             `json:"location"`
+	Status           string             `json:"status"`
+	LastTitle        string             `json:"last_title"`
+	DismissReason    pgtype.Text        `json:"dismiss_reason"`
+	SetVia           pgtype.Text        `json:"set_via"`
+	FiledIssueIid    pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl    string             `json:"filed_issue_url"`
+	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
+	GroupOperationID pgtype.UUID        `json:"group_operation_id"`
+	SeenInRuns       int64              `json:"seen_in_runs"`
+	LatestFindingID  pgtype.UUID        `json:"latest_finding_id"`
 }
 
 // The per-repo Findings backlog (D7, M4), DISPOSITION-DRIVEN so a filed/dismissed
@@ -576,6 +578,7 @@ func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBackl
 			&i.FiledIssueIid,
 			&i.FiledIssueUrl,
 			&i.ResolvedAt,
+			&i.GroupOperationID,
 			&i.SeenInRuns,
 			&i.LatestFindingID,
 		); err != nil {

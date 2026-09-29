@@ -380,6 +380,7 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/findings/", noLimiter},
 	// PRD #1183 M3: the per-status tally read — owner-scoped, no forge call, no spend → noLimiter.
 	{"GET", "/api/findings/stats", noLimiter},
+	{"GET", "/api/findings/issue-draft", noLimiter},
 	{"GET", "/api/findings/{id}/issue-draft", noLimiter},
 	{"GET", "/api/forge/config", noLimiter},
 	{"GET", "/api/forge/connections/", noLimiter},

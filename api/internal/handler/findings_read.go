@@ -104,6 +104,17 @@ func (h *Handler) GetFindingIssueDraft(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	dispositionID, err := store.FindingDispositionForEvidence(ctx, h.pool, user.ID, findingID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "finding not found")
+		} else {
+			slog.Error("finding issue draft: get disposition", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+
 	// The draft is built by the SAME buildFindingDraft that FileFinding (M5) uses for its
 	// default filed text, so this preview is byte-identical to what an omitted body files.
 	// The reporting run supplies the provenance footer (kind + issue iid) and the repo path,
@@ -112,9 +123,10 @@ func (h *Handler) GetFindingIssueDraft(w http.ResponseWriter, r *http.Request) {
 	draft := h.buildFindingDraft(ctx, finding)
 
 	httpx.JSON(w, http.StatusOK, apitypes.IncidentalFindingIssueDraftDTO{
-		Title:       draft.Title,
-		Description: draft.Description,
-		Location:    draft.Location,
+		DispositionID: dispositionID.String(),
+		Title:         draft.Title,
+		Description:   draft.Description,
+		Location:      draft.Location,
 		// The stored, already-sanitised label suggestions seed the editable selection; the
 		// server-mandated marker is added at file time (M5, D5), never surfaced here as an
 		// editable chip.

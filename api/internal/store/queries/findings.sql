@@ -224,6 +224,7 @@ SELECT
     d.filed_issue_iid                AS filed_issue_iid,
     d.filed_issue_url                AS filed_issue_url,
     d.resolved_at                    AS resolved_at,
+    d.group_operation_id             AS group_operation_id,
     count(DISTINCT f.run_id)         AS seen_in_runs,
     latest.id                        AS latest_finding_id
 FROM finding_dispositions d

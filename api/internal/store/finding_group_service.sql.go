@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 )
 
 // ErrFindingGroupUnavailable deliberately covers missing, foreign, stale, and invalid
@@ -39,6 +40,47 @@ type FindingGroupClaimOperation struct {
 	CreatedAt time.Time
 	IssueIID  *int64
 	IssueURL  string
+}
+
+// FindingGroupDraftMember is one owned coordinate and its latest evidence, if any.
+type FindingGroupDraftMember struct {
+	DispositionID    uuid.UUID
+	RepoID           uuid.UUID
+	Location         string
+	Status           string
+	GroupOperationID pgtype.UUID
+	FindingID        pgtype.UUID
+}
+
+// ReadFindingGroupDraftMembers returns owned dispositions in id order. The caller
+// checks cardinality before inspecting status, so unknown and foreign ids coincide.
+func ReadFindingGroupDraftMembers(ctx context.Context, db DBTX, user uuid.UUID, ids []uuid.UUID) ([]FindingGroupDraftMember, error) {
+	rows, err := db.Query(ctx, `SELECT d.id,d.repo_id,d.location,d.status,d.group_operation_id,
+   (SELECT f.id FROM findings f WHERE f.user_id=d.user_id AND f.repo_id=d.repo_id AND f.location=d.location
+    ORDER BY f.created_at DESC,f.id DESC LIMIT 1)
+   FROM finding_dispositions d WHERE d.user_id=$1 AND d.id=ANY($2::uuid[]) ORDER BY d.id`, user, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	members := []FindingGroupDraftMember{}
+	for rows.Next() {
+		var m FindingGroupDraftMember
+		if err := rows.Scan(&m.DispositionID, &m.RepoID, &m.Location, &m.Status, &m.GroupOperationID, &m.FindingID); err != nil {
+			return nil, err
+		}
+		members = append(members, m)
+	}
+	return members, rows.Err()
+}
+
+// FindingDispositionForEvidence resolves even an older evidence row by its coordinate.
+func FindingDispositionForEvidence(ctx context.Context, db DBTX, user, evidence uuid.UUID) (uuid.UUID, error) {
+	var id uuid.UUID
+	err := db.QueryRow(ctx, `SELECT d.id FROM findings f JOIN finding_dispositions d
+   ON d.user_id=f.user_id AND d.repo_id=f.repo_id AND d.location=f.location
+   WHERE f.id=$1 AND f.user_id=$2`, evidence, user).Scan(&id)
+	return id, err
 }
 
 // ClaimFindingGroup atomically claims 1-50 unique open dispositions in one repo.

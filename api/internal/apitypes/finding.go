@@ -46,21 +46,22 @@ import "time"
 // All four are omitempty: a resolved/dismissed coordinate may carry no evidence, and an open one
 // no reason/provenance.
 type IncidentalFindingDTO struct {
-	DispositionID   string                 `json:"disposition_id"`
-	FindingID       *string                `json:"finding_id,omitempty"`
-	Location        string                 `json:"location"`
-	RepoID          string                 `json:"repo_id"`
-	RepoPath        string                 `json:"repo_path"`
-	Status          string                 `json:"status"`
-	LastTitle       string                 `json:"last_title"`
-	SeenInRuns      int                    `json:"seen_in_runs"`
-	DismissReason   string                 `json:"dismiss_reason,omitempty"`
-	SetVia          string                 `json:"set_via,omitempty"`
-	FiledIssueIID   *int64                 `json:"filed_issue_iid,omitempty"`
-	FiledIssueURL   string                 `json:"filed_issue_url,omitempty"`
-	ResolvedAt      *time.Time             `json:"resolved_at,omitempty"`
-	EvidencePreview string                 `json:"evidence_preview,omitempty"`
-	Occurrences     []FindingOccurrenceDTO `json:"occurrences,omitempty"`
+	DispositionID    string                 `json:"disposition_id"`
+	GroupOperationID *string                `json:"group_operation_id,omitempty"`
+	FindingID        *string                `json:"finding_id,omitempty"`
+	Location         string                 `json:"location"`
+	RepoID           string                 `json:"repo_id"`
+	RepoPath         string                 `json:"repo_path"`
+	Status           string                 `json:"status"`
+	LastTitle        string                 `json:"last_title"`
+	SeenInRuns       int                    `json:"seen_in_runs"`
+	DismissReason    string                 `json:"dismiss_reason,omitempty"`
+	SetVia           string                 `json:"set_via,omitempty"`
+	FiledIssueIID    *int64                 `json:"filed_issue_iid,omitempty"`
+	FiledIssueURL    string                 `json:"filed_issue_url,omitempty"`
+	ResolvedAt       *time.Time             `json:"resolved_at,omitempty"`
+	EvidencePreview  string                 `json:"evidence_preview,omitempty"`
+	Occurrences      []FindingOccurrenceDTO `json:"occurrences,omitempty"`
 }
 
 // FindingOccurrenceDTO is one run's report of a finding coordinate (PRD #1183 M3): the finding

@@ -54,6 +54,7 @@ func (h *Handler) mountJudgeRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 		// apitypes.TriageDTO. Repo-scoped like the badge, ignores ?run=. A static segment, so it
 		// never collides with the {id} routes below.
 		r.Get("/stats", h.FindingsStats)
+		r.Get("/issue-draft", h.GetFindingGroupIssueDraft)
 		r.Get("/{id}/issue-draft", h.GetFindingIssueDraft)
 		// Writes: filing rides the per-user forge limiter (mirroring FileIssue); every dismiss
 		// path is a LOCAL write (no forge call, no spend) and carries no limiter.

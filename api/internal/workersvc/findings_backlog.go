@@ -205,6 +205,10 @@ func mapIncidentalFindingRow(r store.ListFindingsBacklogRow) apitypes.Incidental
 		id := uuid.UUID(r.LatestFindingID.Bytes).String()
 		dto.FindingID = &id
 	}
+	if r.GroupOperationID.Valid {
+		id := uuid.UUID(r.GroupOperationID.Bytes).String()
+		dto.GroupOperationID = &id
+	}
 	if r.FiledIssueIid.Valid {
 		iid := r.FiledIssueIid.Int64
 		dto.FiledIssueIID = &iid
