@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"strings"
 	"testing"
-	"time"
 	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
@@ -17,7 +16,6 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
-	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -28,7 +26,7 @@ import (
 // Seam. The worker-forge handlers reach a forge driver through TWO concrete
 // collaborators — h.wsvc.ForgeConnForRun (a *workersvc.Service over a Store) and
 // h.svc.ForgeForConnection (a *forgesvc.Service that decrypts the sealed token and
-// calls forge.New). Neither is an interface at the handler, so a fake forge cannot
+// builds a forge driver). Neither is an interface at the handler, so a fake forge cannot
 // be substituted directly. The seam that IS available is the one forge/gitlab_test.go
 // uses: build a REAL gitlab driver against an httptest server standing in for the
 // GitLab REST API, and make the fake Store hand back a ForgeConn whose BaseUrl is
@@ -75,7 +73,7 @@ func newForgeHandler(t *testing.T, st workersvc.Store, box *secretbox.Box) *Hand
 	t.Helper()
 	return &Handler{
 		wsvc: workersvc.New(st, box, workersvc.Params{}),
-		svc:  forgesvc.New(nil, box, 5*time.Second, nil),
+		svc:  newZeroWaitForgeService(nil, box),
 	}
 }
 

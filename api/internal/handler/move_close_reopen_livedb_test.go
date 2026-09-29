@@ -17,7 +17,6 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
-	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -167,7 +166,7 @@ func newMoveFixture(ctx context.Context, t *testing.T, stub *moveStub) moveFixtu
 		box:      box,
 		cfg:      config.Config{},
 		settings: settings.New(&settingsStore{}, time.Minute),
-		svc:      forgesvc.New(q, box, 5*time.Second, nil),
+		svc:      newZeroWaitForgeService(q, box),
 		wsvc:     workersvc.New(q, box, workersvc.Params{}),
 	}
 	return f
