@@ -8962,10 +8962,11 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       assert.ok(texts[1]!.includes(REMEDIATE), "the follow-up is the next turn's prompt");
       assert.equal(rig.providerLaunches(), 1, "no epoch was recreated for the remediation turn");
       assert.deepEqual(persistAtGate, [persistAtGate[0], persistAtGate[0]], "no session persist between the two gate calls");
-      assert.deepEqual(events.slice(0, 2), ["gate", "gate"], "no checkpoint before the gate proceeds");
       if (interlocked) {
         assert.equal(attempts, 1);
-        assert.ok(events.indexOf("checkpoint:reap") > 1, "the done checkpoint follows the proceed decision");
+        assert.deepEqual(events, ["gate", "gate", "checkpoint:reap", "attempt"], "the done checkpoint and attempt follow the proceed decision");
+      } else {
+        assert.deepEqual(events, ["gate", "gate"], "no checkpoint or attempt on a non-interlocked run");
       }
     });
 

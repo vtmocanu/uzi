@@ -1175,6 +1175,8 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
       },
     });
     for (const t of [...d.pushedTips, ...d.pub.tips]) assert.equal(publishedTipContains(d.bare, t, S), false, "no published tip has S");
+    assert.ok(d.statuses().includes("checkpoint publish skipped: secret_found"), "the tick scanned and flagged S: " + JSON.stringify(d.statuses()));
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
   });
 
   /** R5 body: S is held off a checkpoint by the publish scan under a local-only tick bridge, the agent
@@ -1559,6 +1561,28 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     });
     for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
     assert.equal(d.pub.count(), 0);
+    assert.ok(d.statuses().includes("checkpoint publish skipped: secret_found"), "the tick flagged S: " + JSON.stringify(d.statuses()));
+    assert.ok(d.statuses().some((t) => /checkpoint publish skipped: secret_remediation_pending/.test(t)), "the overlay publish was held: " + JSON.stringify(d.statuses()));
+  });
+
+  it("(tick-path) the mid-turn tick's finding log withholds a secret-shaped filename gitleaks flags in the path list", { skip }, async () => {
+    const name = "heroku_api_key" + "=" + "aaaa1111-bbbb-2222-cccc-3333dddd4444" + ".env";
+    let skew = 0;
+    const d = await drive({
+      iid: 1932_290,
+      forge: "github",
+      configureRunner: (r) => {
+        // Open the checkpoint time gate so the reap:false checkpoint scans (as the mid-turn tick does).
+        (r as unknown as { now: () => number }).now = () => Date.now() + skew;
+      },
+      body: async (ctx) => {
+        commitIn(ctx.worktreePath, name, `TOKEN=${runtimeSecret()}\n`);
+        skew = 3_600_000;
+        await ctx.checkpoint!({ reap: false }); // the tick scans, flags the commit and logs the finding
+      },
+    });
+    assert.ok(d.statuses().includes("checkpoint publish skipped: secret_found"), "the tick scanned: " + JSON.stringify(d.statuses()));
+    assert.ok(!d.everything().includes("aaaa1111-bbbb-2222-cccc-3333dddd4444"), "filename absent from the tick log, feed and reason");
   });
 
   it("(stale) GitLab: a failed fetch-back at the gate does not falsely block a tick-flagged commit the lead removed", { skip }, async () => {

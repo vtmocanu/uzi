@@ -9647,6 +9647,9 @@ export class RunRunner {
         if (scan.trusted) {
           this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
         }
+        // D6(c) on this log surface too: a committed filename can itself be a secret. The path
+        // scan runs in the same scope as the range scan, and fails closed (withholds) on abort.
+        const withholdPaths = await (scanScope ?? ((fn) => fn()))(() => this.withholdPathsFor(scan.findings));
         this.reportPublishOutcome(
           flight,
           "secret:found",
@@ -9655,7 +9658,7 @@ export class RunRunner {
             trusted: scan.trusted,
             findings: scan.findings
               .slice(0, 20)
-              .map((f) => renderSecretFinding(f, { redact: flight.redactText })),
+              .map((f) => renderSecretFinding(f, { redact: flight.redactText, withholdPaths })),
           },
         );
         return { kind: "blocked", outcome: "secret_found" };

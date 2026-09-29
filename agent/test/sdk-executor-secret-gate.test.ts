@@ -173,5 +173,7 @@ describe("SdkExecutor secret remediation gate (Issue #1932)", () => {
     const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(makeCtx({ checkpoint: async (o) => { checkpoints.push(o); } }));
     assert.strictEqual(result.branch, "agent/issue-5");
     assert.strictEqual(prompts.length, 2);
+    // A non-interlocked done path takes no done checkpoint; pin that the absent gate adds none.
+    assert.deepStrictEqual(checkpoints, []);
   });
 });
