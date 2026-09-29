@@ -366,6 +366,32 @@ func ListPendingFindingGroupsForRepo(ctx context.Context, db DBTX, repo uuid.UUI
 	return ops, rows.Err()
 }
 
+// ListPendingFindingGroupsByIDs checks only marker IDs observed in this fetch.
+// The repo join enforces the connection owner; callers cap ids before querying.
+func ListPendingFindingGroupsByIDs(ctx context.Context, db DBTX, repo uuid.UUID, ids []uuid.UUID) ([]FindingGroupClaimOperation, error) {
+	if len(ids) == 0 || len(ids) > 1000 {
+		return nil, ErrFindingGroupUnavailable
+	}
+	rows, err := db.Query(ctx, `SELECT o.id,o.user_id,o.repo_id,o.phase,o.deadline_at,o.created_at,o.issue_iid,o.issue_url
+        FROM finding_group_operations o JOIN repos r ON r.id=o.repo_id
+        JOIN forge_connections c ON c.id=r.connection_id AND c.user_id=o.user_id
+        WHERE o.repo_id=$1 AND o.id=ANY($2::uuid[])
+          AND o.phase IN ('in_flight','returned_uncertain') AND o.issue_iid IS NULL`, repo, ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ops := make([]FindingGroupClaimOperation, 0)
+	for rows.Next() {
+		var o FindingGroupClaimOperation
+		if err := rows.Scan(&o.ID, &o.UserID, &o.RepoID, &o.Phase, &o.Deadline, &o.CreatedAt, &o.IssueIID, &o.IssueURL); err != nil {
+			return nil, err
+		}
+		ops = append(ops, o)
+	}
+	return ops, rows.Err()
+}
+
 // FindingGroupRepoPendingStats counts all owner-scoped pending operations without
 // loading their rows into the sync pass.
 func FindingGroupRepoPendingStats(ctx context.Context, db DBTX, repo uuid.UUID) (int64, *time.Time, error) {

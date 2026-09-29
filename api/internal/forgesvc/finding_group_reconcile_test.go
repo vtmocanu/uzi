@@ -11,6 +11,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -33,7 +34,11 @@ func TestMatchFindingGroupIssue(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			match, found := indexFindingGroupIssues(tc.issues)[id]
+			index, err := indexFindingGroupIssues(tc.issues)
+			if err != nil {
+				t.Fatal(err)
+			}
+			match, found := index[id]
 			ok := found && !match.ambiguous && match.issue.IID > 0 && match.issue.WebURL != ""
 			if ok != tc.want {
 				t.Fatalf("match = %v, want %v", ok, tc.want)
@@ -126,7 +131,10 @@ func TestPendingFindingGroupsCursorWrapsPastUnmatched(t *testing.T) {
 		first int
 		last  int
 	}{{100, 0, 99}, {1, 100, 100}, {100, 0, 99}} {
-		ops, finish := svc.pendingFindingGroups(context.Background(), repo)
+		ops, finish, err := svc.pendingFindingGroups(context.Background(), repo)
+		if err != nil {
+			t.Fatal(err)
+		}
 		if len(ops) != want.count || ops[0].ID != db.ops[want.first].ID || ops[len(ops)-1].ID != db.ops[want.last].ID {
 			t.Fatalf("pass %d: selected %d ops, wanted indices %d..%d", pass, len(ops), want.first, want.last)
 		}
@@ -147,7 +155,10 @@ func TestPendingFindingGroupsLogsStatsAfterSyncCancellation(t *testing.T) {
 
 	svc := &Service{groupDB: db}
 	ctx, cancel := context.WithCancel(context.Background())
-	_, finish := svc.pendingFindingGroups(ctx, repo)
+	_, finish, err := svc.pendingFindingGroups(ctx, repo)
+	if err != nil {
+		t.Fatal(err)
+	}
 	cancel()
 	finish()
 	log := output.String()
@@ -162,12 +173,163 @@ func TestFindingGroupIndexKeepsDistinctMarkers(t *testing.T) {
 	marker := func(id uuid.UUID) string {
 		return fmt.Sprintf("<!-- uzi-finding-group-operation: %s -->", id)
 	}
-	index := indexFindingGroupIssues([]forge.Issue{{
+	index, err := indexFindingGroupIssues([]forge.Issue{{
 		IID: 7, WebURL: "https://example.com/issues/7",
 		Description: marker(first) + marker(second),
 	}})
+	if err != nil {
+		t.Fatal(err)
+	}
 	if index[first].ambiguous || index[second].ambiguous ||
 		index[first].issue.IID != 7 || index[second].issue.IID != 7 {
 		t.Fatalf("distinct markers should each identify the issue: %#v", index)
+	}
+}
+
+type markerPageDB struct {
+	*pendingPageDB
+	recorded         uuid.UUID
+	settled          uuid.UUID
+	iid              int64
+	url              string
+	candidateQueries int
+}
+
+func (db *markerPageDB) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
+	if !strings.Contains(query, "o.id=ANY") {
+		return db.pendingPageDB.Query(ctx, query, args...)
+	}
+	db.candidateQueries++
+	ids := args[1].([]uuid.UUID)
+	var matches []store.FindingGroupClaimOperation
+	for _, op := range db.ops {
+		for _, id := range ids {
+			if op.ID == id && op.Phase == "in_flight" && db.settled != id {
+				matches = append(matches, op)
+			}
+		}
+	}
+	return &pendingPageRows{ops: matches}, nil
+}
+
+func (db *markerPageDB) Exec(_ context.Context, _ string, args ...interface{}) (pgconn.CommandTag, error) {
+	db.iid = args[0].(int64)
+	db.url = args[1].(string)
+	db.recorded = args[2].(uuid.UUID)
+	return pgconn.NewCommandTag("UPDATE 1"), nil
+}
+
+func (db *markerPageDB) Begin(context.Context) (pgx.Tx, error) {
+	return &markerTx{db: db}, nil
+}
+
+type markerTx struct {
+	pgx.Tx
+	db *markerPageDB
+}
+
+func (tx *markerTx) QueryRow(_ context.Context, query string, _ ...interface{}) pgx.Row {
+	switch {
+	case strings.Contains(query, "SELECT repo_id,issue_iid,issue_url"):
+		return markerRow{values: []any{tx.db.ops[100].RepoID, tx.db.iid, tx.db.url}}
+	case strings.Contains(query, "finding_group_members"):
+		return markerRow{values: []any{int64(1)}}
+	default:
+		return markerRow{values: []any{int64(1)}}
+	}
+}
+func (tx *markerTx) Exec(_ context.Context, _ string, _ ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.NewCommandTag("UPDATE 1"), nil
+}
+func (tx *markerTx) Commit(context.Context) error {
+	tx.db.settled = tx.db.recorded
+	return nil
+}
+func (tx *markerTx) Rollback(context.Context) error { return nil }
+
+type markerRow struct{ values []any }
+
+func (r markerRow) Scan(dest ...interface{}) error {
+	for i, value := range r.values {
+		switch d := dest[i].(type) {
+		case *uuid.UUID:
+			*d = value.(uuid.UUID)
+		case *int64:
+			*d = value.(int64)
+		case *string:
+			*d = value.(string)
+		}
+	}
+	return nil
+}
+
+func TestIncrementalSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
+	repo, user := uuid.New(), uuid.New()
+	start := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
+	for i := 0; i < 101; i++ {
+		db.ops = append(db.ops, store.FindingGroupClaimOperation{
+			ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight",
+			CreatedAt: start.Add(time.Duration(i) * time.Second),
+		})
+	}
+	target := db.ops[100].ID
+	svc := newTestService(&fakeStore{})
+	svc.SetFindingGroupDB(db)
+	marker := "<!-- uzi-finding-group-operation: " + target.String() + " -->"
+	first := &fakeForge{findingIssues: []forge.Issue{{
+		IID: 301, WebURL: "https://example.com/301", Description: marker,
+		UpdatedAt: start.Add(200 * time.Second),
+	}}}
+	marks, err := svc.IncrementalSync(context.Background(), repo, 7, first, Marks{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if db.recorded != target || db.settled != target || db.candidateQueries != 1 {
+		t.Fatalf("operation 101: recorded=%s settled=%s candidate queries=%d", db.recorded, db.settled, db.candidateQueries)
+	}
+	if !marks.Finding.Equal(start.Add(200 * time.Second)) {
+		t.Fatalf("finding mark = %v", marks.Finding)
+	}
+	second := &fakeForge{findingIssues: []forge.Issue{{
+		IID: 302, WebURL: "https://example.com/302", UpdatedAt: start.Add(201 * time.Second),
+	}}}
+	next, err := svc.IncrementalSync(context.Background(), repo, 7, second, marks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !next.Finding.Equal(start.Add(201*time.Second)) || db.settled != target {
+		t.Fatalf("second pass: mark=%v settled=%s", next.Finding, db.settled)
+	}
+}
+
+func TestFindingGroupMarkerLimitFailsBeforeCacheWrites(t *testing.T) {
+	repo := uuid.New()
+	cache := &fakeStore{}
+	svc := newTestService(cache)
+	svc.SetFindingGroupDB(&markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{{
+		ID: uuid.New(), UserID: uuid.New(), RepoID: repo, Phase: "in_flight", CreatedAt: time.Now(),
+	}}}})
+	issue := forge.Issue{Description: strings.Repeat("a", findingGroupDescriptionLimit+1), UpdatedAt: time.Now()}
+	start := Marks{Finding: time.Now().Add(-time.Hour)}
+	got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{issue}}, start)
+	if err == nil || got != start || len(cache.upserts) != 0 {
+		t.Fatalf("mark=%v error=%v cache writes=%d", got, err, len(cache.upserts))
+	}
+}
+
+func TestFindingGroupCandidateLimitHoldsFindingMark(t *testing.T) {
+	repo, user := uuid.New(), uuid.New()
+	op := store.FindingGroupClaimOperation{ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight", CreatedAt: time.Now()}
+	db := &markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{op}}}
+	cache := &fakeStore{}
+	svc := newTestService(cache)
+	svc.SetFindingGroupDB(db)
+	marker := "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->"
+	start := Marks{Finding: time.Now().Add(-time.Hour)}
+	issue := forge.Issue{IID: 77, Description: strings.Repeat(marker, findingGroupCandidateLimit+1), UpdatedAt: time.Now()}
+	got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{issue}}, start)
+	if err == nil || got != start || len(cache.upserts) != 0 || db.candidateQueries != 0 || db.recorded != uuid.Nil {
+		t.Fatalf("mark=%v error=%v writes=%d queries=%d recorded=%s", got, err, len(cache.upserts), db.candidateQueries, db.recorded)
 	}
 }

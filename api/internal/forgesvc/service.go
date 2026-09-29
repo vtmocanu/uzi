@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -230,9 +231,9 @@ func (s *Service) SetFindingGroupDB(db findingGroupDB) { s.groupDB = db }
 
 // pendingFindingGroups settles durable records before any forge observation. The
 // returned closure emits one warning after the pass if claims remain.
-func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([]store.FindingGroupClaimOperation, func()) {
+func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([]store.FindingGroupClaimOperation, func(), error) {
 	if s.groupDB == nil {
-		return nil, func() {}
+		return nil, func() {}, nil
 	}
 	var reconcileErr error
 	finish := func() {
@@ -280,7 +281,7 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	s.groupCursorMu.Unlock()
 	if err != nil {
 		reconcileErr = err
-		return nil, finish
+		return nil, finish, err
 	}
 	// Settle durable issue identities before spending work on uncertain claims.
 	for _, op := range ops {
@@ -293,31 +294,47 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 		}
 		// A failed or raced settlement stays claimed for a later pass.
 	}
-	unresolved := make([]store.FindingGroupClaimOperation, 0, len(ops))
-	for _, op := range ops {
-		if (op.IssueIID == nil || op.IssueURL == "") && (op.Phase == "in_flight" || op.Phase == "returned_uncertain") {
-			unresolved = append(unresolved, op)
-		}
-	}
-	return unresolved, finish
+	return ops, finish, nil
 }
 
-// The exact marker is indexed once per fetched finding issue. A repeated marker,
-// even within one description, is ambiguous and must leave its operation pending.
-var findingGroupMarkerRe = regexp.MustCompile(`<!-- uzi-finding-group-operation: ([0-9a-f-]{36}) -->`)
+// Bound marker parsing before any cache write or watermark advance.
+const (
+	findingGroupMarkerPrefix     = "<!-- uzi-finding-group-operation: "
+	findingGroupMarkerSuffix     = " -->"
+	findingGroupDescriptionLimit = 1 << 20
+	findingGroupCandidateLimit   = 1000
+)
 
 type findingGroupMatch struct {
 	issue     forge.Issue
 	ambiguous bool
 }
 
-func indexFindingGroupIssues(issues []forge.Issue) map[uuid.UUID]findingGroupMatch {
+// A repeated exact marker, even in one description, is ambiguous.
+func indexFindingGroupIssues(issues []forge.Issue) (map[uuid.UUID]findingGroupMatch, error) {
 	index := make(map[uuid.UUID]findingGroupMatch)
+	candidates := 0
 	for _, issue := range issues {
-		for _, parts := range findingGroupMarkerRe.FindAllStringSubmatch(issue.Description, -1) {
-			id, err := uuid.Parse(parts[1])
-			if err != nil || id.String() != parts[1] {
+		if len(issue.Description) > findingGroupDescriptionLimit {
+			return nil, errors.New("finding group issue description exceeds reconciliation limit")
+		}
+		description := issue.Description
+		for {
+			at := strings.Index(description, findingGroupMarkerPrefix)
+			if at < 0 {
+				break
+			}
+			description = description[at+len(findingGroupMarkerPrefix):]
+			if len(description) < 36+len(findingGroupMarkerSuffix) || description[36:36+len(findingGroupMarkerSuffix)] != findingGroupMarkerSuffix {
 				continue
+			}
+			id, err := uuid.Parse(description[:36])
+			if err != nil || id.String() != description[:36] {
+				continue
+			}
+			candidates++
+			if candidates > findingGroupCandidateLimit {
+				return nil, errors.New("finding group marker candidate limit exceeded")
 			}
 			if previous, exists := index[id]; exists {
 				previous.ambiguous = true
@@ -327,23 +344,43 @@ func indexFindingGroupIssues(issues []forge.Issue) map[uuid.UUID]findingGroupMat
 			}
 		}
 	}
-	return index
+	return index, nil
 }
 
-func (s *Service) recordFindingGroupMatches(ctx context.Context, ops []store.FindingGroupClaimOperation, issues []forge.Issue) {
-	index := indexFindingGroupIssues(issues)
+func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUID, issues []forge.Issue) error {
+	if s.groupDB == nil {
+		return nil
+	}
+	index, err := indexFindingGroupIssues(issues)
+	if err != nil || len(index) == 0 {
+		return err
+	}
+	ids := make([]uuid.UUID, 0, len(index))
+	for id := range index {
+		ids = append(ids, id)
+	}
+	ops, err := store.ListPendingFindingGroupsByIDs(ctx, s.groupDB, repoID, ids)
+	if err != nil {
+		return err
+	}
 	for _, op := range ops {
-		match, ok := index[op.ID]
+		match := index[op.ID]
 		issue := match.issue
-		if !ok || match.ambiguous || issue.IID <= 0 || issue.WebURL == "" {
+		if match.ambiguous || issue.IID <= 0 || issue.WebURL == "" {
 			continue
 		}
 		recorded, err := store.RecordFindingGroupIssue(ctx, s.groupDB, op.UserID, op.ID, issue.IID, issue.WebURL)
-		if err != nil || !recorded {
+		if err != nil {
+			return err
+		}
+		if !recorded {
 			continue
 		}
-		_, _ = store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
+		if _, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID); err != nil {
+			return err
+		}
 	}
+	return nil
 }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
@@ -674,8 +711,11 @@ func (m Marks) Advance(next Marks) Marks {
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
-	pendingGroups, finishGroups := s.pendingFindingGroups(ctx, repoID)
+	pendingGroups, finishGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
+	if pendingErr != nil {
+		return Marks{}, pendingErr
+	}
 	uziLabel := s.uziLabel(ctx)
 	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{uziLabel}})
 	if err != nil {
@@ -715,7 +755,11 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		findingMark = maxUpdatedAt(findingIssues)
 		groupIssues = findingIssues
 	}
-	s.recordFindingGroupMatches(ctx, pendingGroups, groupIssues)
+	if len(pendingGroups) > 0 {
+		if err := s.recordFindingGroupMatches(ctx, repoID, groupIssues); err != nil {
+			return Marks{}, err
+		}
+	}
 
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return Marks{}, err
@@ -768,8 +812,11 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
-	pendingGroups, finishGroups := s.pendingFindingGroups(ctx, repoID)
+	pendingGroups, finishGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
+	if pendingErr != nil {
+		return m, pendingErr
+	}
 	uziLabel := s.uziLabel(ctx)
 	opts := forge.ListIssuesOptions{Labels: []string{uziLabel}}
 	if !m.PRD.IsZero() {
@@ -803,7 +850,11 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 	if findingLabel != uziLabel {
 		groupIssues = findingIssues
 	}
-	s.recordFindingGroupMatches(ctx, pendingGroups, groupIssues)
+	if len(pendingGroups) > 0 {
+		if err := s.recordFindingGroupMatches(ctx, repoID, groupIssues); err != nil {
+			return m, err
+		}
+	}
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}
