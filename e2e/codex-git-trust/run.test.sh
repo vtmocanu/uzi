@@ -24,7 +24,7 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/run.sh"
-MIN_CASES=43
+MIN_CASES=51
 
 [ -f "$SCRIPT" ] || { echo "run.sh not found at $SCRIPT" >&2; exit 2; }
 [ -r /proc/self/stat ] || { echo "ERROR: needs /proc (Linux only)" >&2; exit 2; }
