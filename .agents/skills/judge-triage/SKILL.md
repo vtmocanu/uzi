@@ -65,7 +65,10 @@ Then:
    - **Won't do** (`wont-do`) — valid but not worth acting on, OR already
      covered by guidance that existed when the rec was judged (the miss was
      non-compliance, not a gap). Guidance that landed after `judged_at` makes
-     it **Already fixed** instead: compare the covering commit's date first.
+     it **Already fixed** instead: compare the covering commit's date first,
+     then confirm it reached that run (released and deployed, not a customized
+     template row, repo instructions enabled). If delivery cannot be shown, do
+     not call the miss non-compliance.
    - **Security-class** (credential exposure, secret leak): follow
      `.github/SECURITY.md`; propose a private draft advisory, never a public
      issue. Create it after authorization with the required advisory fields.
