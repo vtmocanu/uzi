@@ -18,8 +18,11 @@ design rationale is in [ADR-1906](../adr/1906-isolated-fetch-lane.md).
 to a site list, and no way to bind a run exists in this release: that arrives
 with job creation in [PRD #1908](../prds/1908-repo-less-jobs-api.md) (this PRD's
 milestone M8). Turning the lane on renders the namespace, the fetcher and the
-policies, and the api starts to provision lane workers only for bound runs, so
-until then the lane is idle. Live acceptance on a real cluster (this PRD's
+policies. The api provisions lane workers only for bound runs, so until then the
+lane is idle. Its lane trigger is gated on the ephemeral-worker switch, not on
+the chart value: with the lane off in the chart, a bound run would still get a
+lane worker row that the controller never renders, and the run would stay
+queued. Live acceptance on a real cluster (this PRD's
 milestone M9) has not been done: the network guarantees below are what the
 chart and code are built to enforce, not something a maintainer has yet
 measured on a running cluster.
@@ -74,9 +77,11 @@ The chart refuses to render (`helm template` fails) unless:
 | `workers.fqdnEgress.enabled: true` | The model host is admitted through the same FQDN provider the standard tier uses (`workers.fqdnEgress.provider`: Antrea or OVN-Kubernetes). Without it a lane pod cannot reach its model. |
 | `api.tls.enabled: true` | The fetcher dials the api over https only; its service token and every run credential cross that hop. `workers.allowPlaintextAPI` does not apply to it. |
 | `workers.isolatedLane.clusterCIDRs.pod`, `.service` and `.node`, each non-empty | The fetcher's NetworkPolicy allows the internet minus these ranges and the fetcher refuses them itself, so an internal address is blocked twice. IPv4 and IPv6 ranges both go here. |
+| Under `workers.fqdnEgress.provider: ovn`, a non-empty `workers.fqdnEgress.ovn.exceptCIDRs` | The lane's external-egress policy is `0.0.0.0/0` minus these ranges; an empty list would admit in-cluster addresses. |
 | A namespace distinct from `workers.namespace`, `workers.docker.namespace` and the release namespace | The lane's default-deny policy selects every pod in it. |
 
-Also needed, and not checked by the chart:
+Also needed. The chart checks the model host and the token source (a bad value
+fails the render); the rest it does not check:
 
 - **Ephemeral (run-bound) workers must be enabled** on the instance (the
   `ephemeral_workers_enabled` admin setting; see [Hosted
@@ -159,13 +164,18 @@ On every request, and on every redirect hop:
   run's totals, so parallel fetches cannot overshoot a total. The limits are the
   [research fetch caps](admin-settings.md#research-fetch-caps): 25 MiB per file,
   200 MiB and 100 files per run, 4 concurrent fetches, and 500 requests
-  (`fetch_max_run_attempts`), which count refusals too. A refused admission
+  (`fetch_max_run_attempts`), which count refusals too. The per-file limit is
+  the smaller of `fetch_max_file_bytes` and the fetcher's own ceiling (25 MiB
+  unless `workers.isolatedLane.fetcher.maxFileBytes` raises it), so raising the
+  setting alone has no effect above 25 MiB. A refused admission
   returns `admission_refused` with the reason (`run_bytes`, `run_files`,
   `concurrency` or `attempts`).
-- **Every attempt is logged, or it did not happen.** The fetcher reports each
-  admitted attempt, allowed or refused, and returns content only after the api
-  acknowledged the log write. If the api cannot be reached, the fetch is refused
-  (`control_unavailable` or `log_failed`).
+- **Every admitted attempt is logged, or it did not happen.** The fetcher reports
+  each admitted attempt, allowed or refused, and returns content only after the
+  api acknowledged the log write. If the api cannot be reached, the fetch is
+  refused (`control_unavailable` or `log_failed`). A request refused before or at
+  admission counts toward the attempts cap but writes no source-log row, so the
+  cap can be used up with fewer rows than requests.
 - **The credential dies with the claim.** It is revoked when the run leaves the
   running state (any park, requeue or terminal status), and a re-claim issues a
   new one, so a token from an earlier claim no longer works. The run is always
@@ -182,12 +192,13 @@ another user's run reads as not found. The URLs, content type and reason are
 site- or agent-controlled text: the api stores them escaped and the CLI strips
 control characters when it renders them, but treat them as untrusted.
 
-The reason codes a refusal carries include `off_list`, `redirect_off_list`,
+The reason codes a refused row carries include `off_list`, `redirect_off_list`,
 `private_address`, `not_https`, `userinfo`, `ip_literal`, `port`, `invalid_url`,
 `url_too_long`, `too_many_redirects`, `content_encoding`, `too_large`,
 `upstream_status` (the site answered a non-2xx status), `dns_failed`,
-`connect_failed`, `tls`, `timeout`, `admission_refused`, `credential_invalid`,
-`control_unavailable`, `log_failed` and `busy`.
+`connect_failed`, `tls` and `timeout`. The fetch tool may also answer `admission_refused`,
+`credential_invalid`, `control_unavailable`, `log_failed` or `busy`; those
+refusals happen before a row is written, so they never appear in the log.
 
 ## What is not guaranteed
 

@@ -598,7 +598,7 @@ A few worth knowing:
   ([PRD #1906](../prds/1906-official-sources-web-research.md)): one row per web
   fetch the run attempted, oldest first, with `STARTED`, `VERDICT` (`allowed` or
   `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
-  `FINAL URL` (after redirects). The command follows every page of the log.
+  `FINAL URL` (after redirects). The command follows every page of the log; a read taken while the run is still fetching can miss a row that commits late.
   Owner-only: another user's run reads as not found (exit 4), and a run that
   never fetched, which is every run until runs can be bound to a site list, shows
   no rows. URLs are cut in the table; `--json` prints them whole with each file's
