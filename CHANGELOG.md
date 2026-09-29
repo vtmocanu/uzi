@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Agents wait for long gates and report only what they observed.**
+  Judge recommendations and past review findings showed runs losing long quality gates at the turn boundary and leads reporting checkpoints or gates they had not seen finish. The lead and every subagent now learn that a command still running at turn end is lost, Claude-harness agents get a bounded way to wait past the two-minute Bash timeout, and agents are told the worker has no forge CLI. The lead template now checks exhaustive and reuse claims before submitting a plan, keeps validators to focused tests while its gate runs, keeps committed, reviewed, checkpointed and signalled states apart, and names accepted risks in the PR summary. The built-in lead refreshes on the next boot unless customized.
+
 - **Built-in agents synced to skills v0.42.0.**
   The built-in coder, reviewer, tester, auditor, documenter, fact-checker and architect gain rules drawn from judge recommendations and CodeRabbit/Greptile findings: bound every loop, retry and cleanup; never read an ambiguous 404, empty or timeout reply as success; check every surface a new state reaches and both rollout orders; wait for a backgrounded gate; prove a probe's tool exists; back every/never/only claims with the enforcing code. The built-in coder now runs on the `sonnet` tier (upstream v0.41.0). Unmodified built-in roles refresh on the next boot.
 

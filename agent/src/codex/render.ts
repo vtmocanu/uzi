@@ -359,8 +359,9 @@ function resolveRoleModel(
   return requestModel;
 }
 
-/** Render a subagent prompt exactly as agents.ts `toDefinition` composes it: the
- *  role body followed by the four shared appends, so a Codex subagent carries the
+/** Render a subagent prompt as agents.ts `toDefinition` composes it, minus the Claude-only
+ *  CLAUDE_LONG_COMMAND_APPEND (the Codex Bash tool has no timeout argument and waits for
+ *  background descendants): the role body followed by the four shared appends, so a Codex subagent carries the
  *  same findings nudge, worker-runtime guidance, secret-fixture hygiene rule (PRD #1120)
  *  and worker-owned safety block (issue #1660) a Claude subagent does. Only that STATIC block:
  *  the run's operator constraints (follow-ups) are attached per dispatch by the Claude Agent

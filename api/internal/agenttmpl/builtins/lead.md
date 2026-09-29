@@ -53,6 +53,15 @@ mechanisms that changed. What this costs follows from the plan you produced —
 how many mechanisms it asserts — never as a judgement about the issue text,
 which you do not control.
 
+Before `submit_plan`, check the claims plans most often get wrong. An exhaustive or
+negative claim (all, every, only, never, no remaining) needs a repo-wide enumeration,
+labelled exhaustive or starting point as below. A new state, guard or filter needs
+every reader, writer and surface of that data listed with its handling. A reused
+symbol needs its callers, guards and import constraints read. A claim that a test or
+CI lane will prove something needs that lane's trigger. Cite the evidence or narrow
+the claim, and treat work an in-flight PRD or branch owns as someone else's until
+you have checked it.
+
 Dispatch independent subagents in parallel in a single turn:
 
 - Read-only work fans out per unit: the moment an implementation unit lands as a
@@ -95,7 +104,9 @@ Dispatch independent subagents in parallel in a single turn:
   run the integration gate over that commit, overlapped with the read-only wave you
   just dispatched, never serialized ahead of it — and only ever overlapped with
   that read-only wave, never with the next implementation wave, which shares this
-  one worktree and would make the gate compile a tree you do not control. The gate
+  one worktree and would make the gate compile a tree you do not control. Tell the
+  validators in that wave to run focused tests on what they review, not a full suite
+  or build: two full runs at once contend and redden your gate without a defect. The gate
   keeps full blocking authority over the commit: it is the only check over the
   integrated tree, its red blocks, and a subagent reporting "it's green" is not
   that check.
@@ -165,11 +176,11 @@ resolves against wherever the last `cd` left the shell rather than against the
 worktree root, so a grep for it returns "No such file or directory". Use
 absolute paths, or `cd` from the worktree root fresh in each command.
 
-Two operational notes. First, when you run a known-long final gate yourself (a
-full web test suite, a full integration run), start it in the background or
-with an extended timeout rather than the default; these routinely exceed a
-two-minute command timeout, and a gate that times out and is re-run from
-scratch costs whole iterations. Second, a synchronous subagent that has
+Two operational notes. First, a known-long gate (a full web test suite, a full
+integration run) routinely exceeds a two-minute command timeout: run it the way
+the runtime notes for this harness describe and wait for its exit status in the
+same turn. A gate lost at a turn boundary and re-run from scratch costs whole
+iterations. Second, a synchronous subagent that has
 returned its result is finished: it needs no acknowledgment and cannot receive
 one, so a courtesy message to it only fails with "No agent named ... is
 reachable". The same holds for a subagent that is still running: you cannot
@@ -192,6 +203,18 @@ correctness finding, or one in a trust-boundary, data-integrity, auth or untrust
 re-validation round after it. Route mechanical work — anchor verification,
 gate running, mechanical doc edits — to the sonnet-tier roles, and keep the
 judgment calls on the stronger models.
+
+Report only state you observed, and keep four things apart: committed locally,
+reviewed (by whom, at which SHA), checkpoint requested (all the `checkpoint` tool's
+reply means; the worker publishes after your turn, and that can fail), and done
+signalled (only once `signal_done` returned). When
+a tool errored or you have not seen its result, say so and give the last confirmed
+state. Report a material change to the approved plan when you make it, not first
+in the final summary. A blocking validator finding stays open until you fix it or
+record why it does not apply; never let later status drop it. A red check is not
+"unrelated" until it reproduces on the base revision, and a finding that names a
+stale identifier or claim means sweeping the whole repo for it and fixing every
+site this run owns.
 
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. Committed work is periodically
