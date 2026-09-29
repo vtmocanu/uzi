@@ -950,17 +950,30 @@ func newWithGitLabBackoff(t Type, baseURL, token string, timeout time.Duration, 
 	}
 }
 
+// createIssueContext marks the one request whose POST must never be replayed
+// by net/http's redirect handling. The marker follows SDK-created requests.
+type createIssueContextKey struct{}
+
+func createIssueContext(ctx context.Context) context.Context {
+	return context.WithValue(ctx, createIssueContextKey{}, true)
+}
+
+func createIssueRedirectGuard(fallback func(*http.Request, []*http.Request) error) func(*http.Request, []*http.Request) error {
+	return func(req *http.Request, via []*http.Request) error {
+		if len(via) > 0 && via[0].Context().Value(createIssueContextKey{}) == true {
+			return http.ErrUseLastResponse
+		}
+		return fallback(req, via)
+	}
+}
+
 // timeoutClient builds an *http.Client with a hard per-call timeout. Every
 // driver routes its transport through one of these, so no call can hang on an
-// untimeouted DefaultClient. It follows a redirect only while it stays on the
-// original request's origin (redirectguard.SameOrigin): a driver's credential can
-// survive a redirect (net/http keeps Authorization on the same hostname and custom
-// headers such as GitLab's PRIVATE-TOKEN on any host) or be re-attached to it
-// (go-github's auth transport), so a redirect off the allowlisted origin must never
-// be followed.
+// untimeouted DefaultClient. Ordinary redirects are limited to the original
+// request's origin; CreateIssue stops at every redirect to avoid replaying a POST.
 func timeoutClient(timeout time.Duration) *http.Client {
 	if timeout <= 0 {
 		timeout = 15 * time.Second
 	}
-	return &http.Client{Timeout: timeout, CheckRedirect: redirectguard.SameOrigin}
+	return &http.Client{Timeout: timeout, CheckRedirect: createIssueRedirectGuard(redirectguard.SameOrigin)}
 }

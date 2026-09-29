@@ -88,6 +88,61 @@ func TestGitLabCreateIssueDoesNotRetryAfterPossibleCreation(t *testing.T) {
 	}
 }
 
+func TestCreateIssueNeverReplaysRedirect(t *testing.T) {
+	const token = "test-secret-value-123456"
+	for _, driver := range []struct {
+		name string
+		path string
+		new  func(*testing.T, map[string]http.HandlerFunc) Forge
+	}{
+		{"gitlab", "/api/v4/projects/7/issues", func(t *testing.T, routes map[string]http.HandlerFunc) Forge {
+			return newTestDriver(t, newMockGitLab(t, routes), token)
+		}},
+		{"github", "/repos/acme/widgets/issues", func(t *testing.T, routes map[string]http.HandlerFunc) Forge {
+			return newGitHubDriver(t, newMockGitHub(t, routes), token)
+		}},
+		{"forgejo", "/repos/acme/widgets/issues", func(t *testing.T, routes map[string]http.HandlerFunc) Forge {
+			return newForgejoDriver(t, newMockForgejo(t, routes), token)
+		}},
+	} {
+		for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+			t.Run(fmt.Sprintf("%s/%d", driver.name, status), func(t *testing.T) {
+				posts, replayed := 0, 0
+				// Redirect to the same URL: a replay would receive 422 and could
+				// falsely classify the already-persisted issue as rejected.
+				d := driver.new(t, map[string]http.HandlerFunc{
+					driver.path: func(w http.ResponseWriter, r *http.Request) {
+						if r.Method != http.MethodPost {
+							t.Errorf("method = %s, want POST", r.Method)
+						}
+						posts++
+						if posts == 1 {
+							w.Header().Set("Location", r.URL.Path)
+							w.WriteHeader(status)
+							return
+						}
+						replayed++
+						w.WriteHeader(http.StatusUnprocessableEntity)
+					},
+				})
+				_, err := d.CreateIssue(context.Background(), 7, "title", "body", nil)
+				if err == nil {
+					t.Fatal("expected uncertain create result")
+				}
+				if IsCreateIssueDefinitiveRejection(err) {
+					t.Fatalf("persisted issue classified as rejected: %v", err)
+				}
+				if posts != 1 || replayed != 0 {
+					t.Fatalf("POSTs = %d, replayed = %d; want 1 and 0", posts, replayed)
+				}
+				if strings.Contains(err.Error(), token) || strings.Contains(fmt.Sprintf("%+v", err), token) {
+					t.Fatal("create error leaked token")
+				}
+			})
+		}
+	}
+}
+
 func issueReject(status int, token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

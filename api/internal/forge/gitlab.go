@@ -65,7 +65,7 @@ func newGitLab(baseURL, token string, timeout time.Duration, backoff ...retryabl
 	hc := timeoutClient(timeout)
 	// Stop at an off-origin redirect instead of failing it: the SDK's retry policy
 	// re-sends a GET whose redirect check errored, five times with backoff.
-	hc.CheckRedirect = redirectguard.StopOffOrigin
+	hc.CheckRedirect = createIssueRedirectGuard(redirectguard.StopOffOrigin)
 	client, err := gitlab.NewClient(token, gitLabClientOptions(baseURL, hc, backoff...)...)
 	if err != nil {
 		// NewClient failure can only stem from the base URL here; still route
@@ -383,7 +383,7 @@ func (g *gitLab) CreateIssue(ctx context.Context, projectID int64, title, descri
 	}
 	// Issue creation has no idempotency key. A retry after a 5xx can create a
 	// duplicate, and a later 4xx cannot prove the first POST was rejected.
-	i, resp, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx),
+	i, resp, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(createIssueContext(ctx)),
 		gitlab.WithRequestRetry(func(context.Context, *http.Response, error) (bool, error) {
 			return false, nil
 		}))
