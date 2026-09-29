@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/hashicorp/go-retryablehttp"
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
@@ -924,8 +925,21 @@ type Forge interface {
 // allowlist-validated by the caller (the SSRF guard lives in config, not here).
 // timeout bounds every HTTP call the driver makes.
 func New(t Type, baseURL, token string, timeout time.Duration) (Forge, error) {
+	return newWithGitLabBackoff(t, baseURL, token, timeout, nil)
+}
+
+// NewWithGitLabBackoff builds a driver with a per-client GitLab retry wait policy.
+// Other forge types keep their normal construction path.
+func NewWithGitLabBackoff(t Type, baseURL, token string, timeout time.Duration, backoff retryablehttp.Backoff) (Forge, error) {
+	return newWithGitLabBackoff(t, baseURL, token, timeout, backoff)
+}
+
+func newWithGitLabBackoff(t Type, baseURL, token string, timeout time.Duration, backoff retryablehttp.Backoff) (Forge, error) {
 	switch t {
 	case TypeGitLab:
+		if backoff != nil {
+			return newGitLab(baseURL, token, timeout, backoff)
+		}
 		return newGitLab(baseURL, token, timeout)
 	case TypeForgejo:
 		return newForgejo(baseURL, token, timeout), nil

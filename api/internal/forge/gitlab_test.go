@@ -46,6 +46,13 @@ func newTestDriver(t *testing.T, m *mockGitLab, token string) Forge {
 	return d
 }
 
+func TestGitLabDefaultClientOptionsKeepSDKRetryPolicy(t *testing.T) {
+	options := gitLabClientOptions("http://example.com", timeoutClient(time.Second))
+	if len(options) != 2 {
+		t.Fatalf("default GitLab client options = %d, want base URL and HTTP client only", len(options))
+	}
+}
+
 func TestVerifyToken(t *testing.T) {
 	m := newMockGitLab(t, map[string]http.HandlerFunc{
 		"/api/v4/user": func(w http.ResponseWriter, _ *http.Request) {
