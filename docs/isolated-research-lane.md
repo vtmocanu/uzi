@@ -164,18 +164,20 @@ On every request, and on every redirect hop:
   run's totals, so parallel fetches cannot overshoot a total. The limits are the
   [research fetch caps](admin-settings.md#research-fetch-caps): 25 MiB per file,
   200 MiB and 100 files per run, 4 concurrent fetches, and 500 requests
-  (`fetch_max_run_attempts`), which count refusals too. The per-file limit is
+  (`fetch_max_run_attempts`), which count cap refusals too. The per-file limit is
   the smaller of `fetch_max_file_bytes` and the fetcher's own ceiling (25 MiB
-  unless `workers.isolatedLane.fetcher.maxFileBytes` raises it), so raising the
-  setting alone has no effect above 25 MiB. A refused admission
+  unless `workers.isolatedLane.fetcher.maxFileBytes` sets another value), so
+  raising the setting alone has no effect above that ceiling. A refused admission
   returns `admission_refused` with the reason (`run_bytes`, `run_files`,
   `concurrency` or `attempts`).
 - **Every admitted attempt is logged, or it did not happen.** The fetcher reports
   each admitted attempt, allowed or refused, and returns content only after the
   api acknowledged the log write. If the api cannot be reached, the fetch is
-  refused (`control_unavailable` or `log_failed`). A request refused before or at
-  admission counts toward the attempts cap but writes no source-log row, so the
-  cap can be used up with fewer rows than requests.
+  refused (`control_unavailable` or `log_failed`). An admission refused by a
+  cap counts toward the attempts cap but writes no source-log row; a request
+  refused before admission neither counts nor writes a row. A `log_failed`
+  attempt was counted but its row is unconfirmed. So the cap can be used up with
+  fewer rows than requests.
 - **The credential dies with the claim.** It is revoked when the run leaves the
   running state (any park, requeue or terminal status), and a re-claim issues a
   new one, so a token from an earlier claim no longer works. The run is always
@@ -194,11 +196,14 @@ control characters when it renders them, but treat them as untrusted.
 
 The reason codes a refused row carries include `off_list`, `redirect_off_list`,
 `private_address`, `not_https`, `userinfo`, `ip_literal`, `port`, `invalid_url`,
-`url_too_long`, `too_many_redirects`, `content_encoding`, `too_large`,
+`url_too_long` (a redirect hop or the escaped URL), `too_many_redirects`, `content_encoding`, `too_large`,
 `upstream_status` (the site answered a non-2xx status), `dns_failed`,
-`connect_failed`, `tls` and `timeout`. The fetch tool may also answer `admission_refused`,
-`credential_invalid`, `control_unavailable`, `log_failed` or `busy`; those
-refusals happen before a row is written, so they never appear in the log.
+`connect_failed`, `tls` and `timeout`. The fetch tool may also answer
+`bad_request`, `url_too_long` (the requested URL itself is too long),
+`admission_refused`, `credential_invalid`, `control_unavailable` or `busy`;
+those refusals happen before a row is written, so they never appear in the log.
+`log_failed` means the fetcher could not confirm the log write: the row may or
+may not exist.
 
 ## What is not guaranteed
 
