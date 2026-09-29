@@ -1,0 +1,159 @@
+---
+title: Egress profiles
+order: 65
+audience: operator
+---
+
+# Egress profiles
+
+An egress profile is a named site list: the hosts an official-sources research
+run may read from ([PRD #1906](../prds/1906-official-sources-web-research.md)).
+Admins create and edit profiles; a run will name one profile, never a list of
+domains.
+
+**Not enabled yet.** This release stores and validates profiles and the fetch
+caps. The pieces that use them (the fetch service, the no-internet worker lane,
+and binding a run to a profile) land in later milestones. Until then a profile
+changes nothing about how any run reaches the network.
+
+## Managing profiles
+
+| What | How |
+|---|---|
+| List profiles | `uzi admin egress-profile list`, or `GET /api/admin/egress-profiles` |
+| Show one profile | `uzi admin egress-profile show <name>`, or `GET /api/admin/egress-profiles/<name>` |
+| Create | `POST /api/admin/egress-profiles` |
+| Replace | `PUT /api/admin/egress-profiles/<name>` |
+| Delete | `DELETE /api/admin/egress-profiles/<name>` |
+
+Reads work from an admin browser session or an admin-scoped (`uza_`) CLI token.
+Create, replace and delete are cookie-only admin writes, like every other admin
+write: a CLI token gets `401`, so the CLI is read-only. The web Admin page for
+editing profiles is a later milestone; until it lands, the writes are reachable
+only from a signed-in admin browser session.
+
+A create body:
+
+```json
+{
+  "name": "vendor-x-docs",
+  "description": "Vendor X official documentation and datasheets",
+  "hosts": ["docs.vendor-x.com", "*.cdn.vendor-x.com"],
+  "multi_publisher_override": []
+}
+```
+
+A replace (`PUT`) body is the same without `name`: the name is fixed once
+created, and every `PUT` replaces the description, hosts and overrides in full.
+
+- **Name:** 1 to 64 characters of lowercase letters, digits and hyphens,
+  starting with a letter or digit.
+- **Description:** optional, at most 500 characters, no control characters,
+  invisible formatting characters, or leading or trailing spaces.
+- **Hosts:** 1 to 200 entries, each at most 253 characters.
+
+A refused write stores nothing and answers `422` with every problem at once:
+
+```json
+{
+  "error": "the egress profile is invalid: see problems",
+  "reason": "invalid_egress_profile",
+  "problems": [
+    {"field": "hosts[1]", "entry": "*.github.io", "code": "public_suffix_wildcard", "message": "..."}
+  ]
+}
+```
+
+## Host entries
+
+An entry is an exact host (`docs.vendor-x.com`) or a wildcard over a base
+domain (`*.vendor-x.com`).
+
+**Wildcards match subdomains only.** `*.vendor-x.com` matches
+`docs.vendor-x.com` and `a.b.vendor-x.com`, but not `vendor-x.com` itself. List
+both when you want both.
+
+**Entries are normalized** when a profile is written, and hosts are normalized
+the same way when they are checked: lowercase, the IDNA ASCII form
+(`bücher.de` is stored as `xn--bcher-kva.de`), one trailing dot removed, and
+surrounding spaces trimmed. Duplicates after normalization are folded into one.
+
+**Refused entries**, with the `code` a `422` carries:
+
+| Entry | Code |
+|---|---|
+| An IP address (`10.0.0.1`, `[::1]`) | `ip_address` |
+| A port (`docs.vendor-x.com:8443`) | `port` |
+| A URL (`https://docs.vendor-x.com`) | `scheme` |
+| A path, query or fragment (`docs.vendor-x.com/guide`) | `path` |
+| User information (`user@docs.vendor-x.com`) | `userinfo` |
+| A bare `*` | `bare_wildcard` |
+| `*` anywhere but as the whole leftmost label (`docs.*.vendor-x.com`) | `wildcard_position` |
+| An empty label (`docs..vendor-x.com`) | `empty_label` |
+| A single-label name (`intranet`) | `single_label` |
+| A name ending in a numeric label (`1.2.3.999`) | `numeric_tld` |
+| A top-level or registry domain as a host (`co.uk`) | `public_suffix_host` |
+| Anything else that is not a valid host name (`exa_mple.com`) | `invalid_host` |
+
+## Public suffix wildcards
+
+A wildcard whose base is a public suffix is refused (`public_suffix_wildcard`):
+it would cover sites run by unrelated owners. The check uses the Public Suffix
+List built into uzi (both its ICANN and private sections, pinned with the
+`golang.org/x/net` module), so `*.com`, `*.co.uk`, `*.github.io`,
+`*.cloudfront.net` and `*.s3.amazonaws.com` are all refused.
+
+A few parents are not public suffixes themselves but their subdomains belong to
+many different customers. A wildcard at or under one of these is refused too
+(`shared_parent_wildcard`), with no override: `amazonaws.com`, `azure.com`,
+`windows.net`, `googleusercontent.com`, `fastly.net`, `sharepoint.com`. List
+the exact hosts instead.
+
+## Multi-publisher hosts
+
+The fetch service checks each request's host, not its path. On a host where
+many publishers serve content under the same name (code hosting, path-style
+object storage, documentation and package hosting, forums), allowing the host
+allows every publisher on it: allowing `github.com` allows every repository,
+not just the vendor's.
+
+uzi carries a short built-in list of such hosts. An entry that reaches one is
+refused (`multi_publisher_needs_override`) unless the same entry is also listed
+in `multi_publisher_override`. An overridden entry is stored, and every read of
+the profile carries a warning for it (`code: multi_publisher_override`); `uzi
+admin egress-profile show` prints it as a `warning:` line. An override naming
+an entry that is not in `hosts` is refused (`override_not_in_hosts`); one
+naming an entry that is not multi-publisher is dropped.
+
+The built-in list:
+
+- **Exact hosts** (their other subdomains are the operator's own sites, so
+  `docs.github.com` is not flagged): `github.com`, `gist.github.com`,
+  `codeload.github.com`, `raw.githubusercontent.com`,
+  `gist.githubusercontent.com`, `objects.githubusercontent.com`, `gitlab.com`,
+  `bitbucket.org`, `codeberg.org`, `s3.amazonaws.com` and the regional
+  path-style S3 endpoints (`s3.<region>.amazonaws.com`,
+  `s3-<region>.amazonaws.com`), `storage.googleapis.com`,
+  `storage.cloud.google.com`, `dl.dropboxusercontent.com`, `docs.google.com`,
+  `drive.google.com`, `sites.google.com`, `readthedocs.io`, `readthedocs.org`,
+  `gitbook.io`, `docs.rs`, `pkg.go.dev`, `pypi.org`, `www.npmjs.com`,
+  `huggingface.co`, `hub.docker.com`.
+- **Whole domains** (the subdomains are shared too): `stackoverflow.com`,
+  `stackexchange.com`, `reddit.com`, `quora.com`, `medium.com`,
+  `substack.com`, `wordpress.com`, `blogspot.com`, `sourceforge.net`,
+  `dropbox.com`, `npmjs.com`.
+
+A wildcard is flagged when it could reach a listed host: `*.github.com` covers
+`gist.github.com`. A platform that gives each publisher its own subdomain is
+one publisher per host, so an exact subdomain such as `vendor.readthedocs.io`
+or `bucket.s3.amazonaws.com` is not flagged.
+
+The list cannot be complete: a vendor's community forum, for example, is not
+on it. Review each profile for hosts where other people can publish.
+
+## Fetch caps
+
+Four [admin settings](./admin-settings.md#research-fetch-caps) bound what one
+research run may download: 25 MiB per file, 200 MiB and 100 files per run, and
+4 concurrent fetches per run by default. Like the profiles, nothing reads them
+until the research lane is enabled.

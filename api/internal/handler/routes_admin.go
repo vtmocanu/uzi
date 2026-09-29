@@ -112,6 +112,12 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// with it the position-to-name mapping the mount tests pin, for no behavioural
 			// gain.
 			r.With(authLimiter.PerUserMiddleware).Get("/cli-tokens", h.AdminListCLITokens)
+			// Egress profiles (PRD #1906 M1): the named site lists an official-sources
+			// research run will be bound to. Reads only here, so a uza_ token can list and
+			// show them (`uzi admin egress-profile list|show`); create/edit/delete are
+			// cookie-only writes in the group below. No limiter: a local read.
+			r.Get("/egress-profiles", h.AdminListEgressProfiles)
+			r.Get("/egress-profiles/{name}", h.AdminGetEgressProfile)
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 		r.Group(func(r chi.Router) {
@@ -192,6 +198,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// verbs" — a uza_/uzc_ Bearer 401s/403s before the handler). 409 when no episode
 			// is open. No forge limiter — a local per-(episode, caller) upsert, no egress.
 			r.Post("/health/snooze", h.PostAdminHealthSnooze)
+			// Egress profile writes (PRD #1906 M1): create, full replace, delete. Cookie-only
+			// admin writes, so a uza_ Bearer 401s before the handler and the CLI stays
+			// read-only; the web Admin page is the editor. The name is immutable (a run will
+			// reference a list by name). No limiter: a local write, no egress.
+			r.Post("/egress-profiles", h.AdminCreateEgressProfile)
+			r.Put("/egress-profiles/{name}", h.AdminUpdateEgressProfile)
+			r.Delete("/egress-profiles/{name}", h.AdminDeleteEgressProfile)
 		})
 	})
 }

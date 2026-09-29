@@ -229,6 +229,13 @@ type Client interface {
 	// snapshot (PRD #602 M6): GET /api/admin/agent-source. READ-ONLY — the sync/
 	// apply writes stay web-only (cookie-only), so the CLI never triggers a fetch.
 	AdminAgentSource(ctx context.Context) (apitypes.AgentSourceDTO, error)
+	// AdminListEgressProfiles / AdminGetEgressProfile read the admin egress profiles
+	// (PRD #1906 M1): GET /api/admin/egress-profiles[/{name}], in the admin READ group,
+	// so a uza_ token reads them and a masked uzc_/non-admin is a 403 (exit 3). READ-ONLY:
+	// create/edit/delete are cookie-only admin writes, done from the web Admin page. An
+	// unknown name is a 404 (exit 4).
+	AdminListEgressProfiles(ctx context.Context) ([]apitypes.EgressProfileDTO, error)
+	AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error)
 	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
 	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
 	// (category, target), attribution hidden — the reply is an unenveloped

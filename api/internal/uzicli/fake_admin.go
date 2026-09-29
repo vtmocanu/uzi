@@ -80,6 +80,26 @@ func (f *FakeClient) AdminBlockedRepos(context.Context) (apitypes.AdminBlockedRe
 	return f.BlockedReposV, nil
 }
 
+func (f *FakeClient) AdminListEgressProfiles(context.Context) ([]apitypes.EgressProfileDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.EgressProfiles, nil
+}
+
+func (f *FakeClient) AdminGetEgressProfile(_ context.Context, name string) (apitypes.EgressProfileDTO, error) {
+	f.LastEgressProfileName = name
+	if f.Err != nil {
+		return apitypes.EgressProfileDTO{}, f.Err
+	}
+	for _, p := range f.EgressProfiles {
+		if p.Name == name {
+			return p, nil
+		}
+	}
+	return apitypes.EgressProfileDTO{}, Exitf(ExitNotFound, "egress profile %s not found", name)
+}
+
 func (f *FakeClient) AdminAgentSource(context.Context) (apitypes.AgentSourceDTO, error) {
 	if f.Err != nil {
 		return apitypes.AgentSourceDTO{}, f.Err

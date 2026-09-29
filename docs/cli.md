@@ -155,6 +155,7 @@ uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
+uzi admin egress-profile list | show <name>
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -757,6 +758,17 @@ A few worth knowing:
   triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
   need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
   the cross-user Mark done and Undo stay cookie-only in the web UI.
+- **`admin egress-profile list` and `admin egress-profile show <name>` read the
+  [egress profiles](egress-profiles.md)** (PRD #1906), the named site lists for
+  official-sources research. `list` prints `NAME`, `HOSTS` (entry count),
+  `OVERRIDES` (multi-publisher entries admitted by an explicit override),
+  `UPDATED` and `DESCRIPTION`. `show` prints the profile's fields, then one
+  `HOST`/`OVERRIDE` row per entry, then a `warning:` line for each overridden
+  multi-publisher host. An entry is an exact host or `*.base`, which matches
+  proper subdomains of base but not base itself. An unknown name exits 4. Names,
+  descriptions and hosts go through the same sanitizing cell path as every other
+  untrusted field. Read-only, `uza_`-token, same ceiling as every other `admin`
+  verb: creating, editing and deleting a profile are cookie-only admin writes.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);

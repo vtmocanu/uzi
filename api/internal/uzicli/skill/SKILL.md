@@ -247,6 +247,8 @@ uzi admin agent-source get
 uzi admin agent-source status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]
 uzi admin review stats
+uzi admin egress-profile list
+uzi admin egress-profile show <name>
 uzi skill status [--target claude|codex|all]
 uzi skill install [--force] [--target claude|codex|all]
 uzi skill install-hook [--target claude|codex|all]
@@ -1448,6 +1450,14 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   forwarding as `uzi review backlog`, but no `--run`: an anchor names a run). `stats` is
   the all-users triage tally. Same `uza_`-token, read-only ceiling as every other `uzi
   admin` verb; the cross-user Mark done / Undo stay cookie-only in the web UI.
+- `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
+  instance's egress profiles: named site lists for official-sources research. `list`
+  prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's
+  fields, then one `HOST`/`OVERRIDE` row per entry and a `warning:` line for each
+  multi-publisher host admitted by an explicit override. An entry is an exact host or
+  `*.base`, which matches proper subdomains of base but not base itself. Unknown name:
+  exit 4. Creating and editing a list is web-only (cookie-only admin writes). Same
+  `uza_`-token ceiling as every other `uzi admin` verb.
 
 ### PR and CI views
 

@@ -58,6 +58,11 @@ type FakeClient struct {
 	GuardrailV      apitypes.GuardrailImpactDTO
 	BlockedReposV   apitypes.AdminBlockedReposDTO
 	AgentSourceV    apitypes.AgentSourceDTO
+	// EgressProfiles drives AdminListEgressProfiles and AdminGetEgressProfile (PRD #1906
+	// M1); a name not in the list is an ExitNotFound error, like the server's 404.
+	// LastEgressProfileName records the name AdminGetEgressProfile was asked for.
+	EgressProfiles        []apitypes.EgressProfileDTO
+	LastEgressProfileName string
 
 	// ListRunsCalls / AdminListRunsCalls count real ListRuns / AdminListRuns
 	// invocations (PRD #1130 M1). Purely additive, no mutex like the rest of this

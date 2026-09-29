@@ -201,6 +201,22 @@ is editable) on every instance, including compose ones — it's simply inert
 there, since hosting itself is off unless an admin turns it on for the
 deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
+## Research fetch caps
+
+Four limits bound what one official-sources research run may download (see
+[Egress profiles](./egress-profiles.md)). The run lane that uses them is not
+enabled yet, so today they are stored and validated but nothing reads them.
+
+| Setting | Default | Controls |
+|---|---|---|
+| `fetch_max_file_bytes` | 26214400 (25 MiB) | The largest single download, counted after decoding. 1 to 1073741824 (1 GiB). |
+| `fetch_max_run_bytes` | 209715200 (200 MiB) | The total one run may download. 1 to 10737418240 (10 GiB). |
+| `fetch_max_run_files` | 100 | How many downloads one run may make. 1 to 10000. |
+| `fetch_max_concurrent_per_run` | 4 | How many fetches one run may have in flight at once. 1 to 32. |
+
+There is no "unlimited" value: `0` is refused. The Admin settings page has no
+card for these yet; they keep their defaults until one lands.
+
 ## Run health
 
 uzi can flag a run that looks stuck, looping, or close to its timeout — see

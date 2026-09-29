@@ -102,6 +102,31 @@ func (c *HTTPClient) AdminAgentSource(ctx context.Context) (apitypes.AgentSource
 	return env.AgentSource, nil
 }
 
+// AdminListEgressProfiles reads every egress profile (PRD #1906 M1): GET
+// /api/admin/egress-profiles. The envelope is {"egress_profiles": [...]}.
+func (c *HTTPClient) AdminListEgressProfiles(ctx context.Context) ([]apitypes.EgressProfileDTO, error) {
+	var env struct {
+		EgressProfiles []apitypes.EgressProfileDTO `json:"egress_profiles"`
+	}
+	if err := c.get(ctx, "/api/admin/egress-profiles", &env); err != nil {
+		return nil, err
+	}
+	return env.EgressProfiles, nil
+}
+
+// AdminGetEgressProfile reads one egress profile by name (PRD #1906 M1): GET
+// /api/admin/egress-profiles/{name}. The name is path-escaped, so an argument can never
+// address a different route; an unknown name is the server's 404 (exit 4).
+func (c *HTTPClient) AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error) {
+	var env struct {
+		EgressProfile apitypes.EgressProfileDTO `json:"egress_profile"`
+	}
+	if err := c.get(ctx, "/api/admin/egress-profiles/"+url.PathEscape(name), &env); err != nil {
+		return apitypes.EgressProfileDTO{}, err
+	}
+	return env.EgressProfile, nil
+}
+
 func (c *HTTPClient) AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error) {
 	var out apitypes.AdminUsageDTO
 	if err := c.get(ctx, "/api/admin/usage", &out); err != nil {

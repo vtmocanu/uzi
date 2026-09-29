@@ -67,7 +67,12 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 204 as of this commit. Issue #1751 M2 added POST
+// 209 as of this commit. PRD #1906 M1 added the egress-profile admin routes: GET
+// /api/admin/egress-profiles and GET /api/admin/egress-profiles/{name} in the admin READ
+// group, and POST /api/admin/egress-profiles, PUT and DELETE
+// /api/admin/egress-profiles/{name} in the cookie-only admin WRITE group. All five are
+// local DB reads or writes with no forge call and no token spend → noLimiter, like the
+// settings GET/PUT they sit beside. It was 204 until then. Issue #1751 M2 added POST
 // /api/worker/runs/{id}/recovery-holds/{holdID}/settle-live — the live twin of /settle below,
 // mounted on the same proposalLimiter.PerWorkerMiddleware (noLimiter to this per-USER probe).
 // It was 203 until then. PRD #1650 M2 retired the notifications inbox read path (GET
@@ -251,6 +256,13 @@ type routeMount struct {
 // across `c309e8a0`, every SHA-BOUND claim here survived (the `ad6c63d9` figures at :27
 // and below) and every UNBOUND one rotted (three of three, each way).
 var wantRouteMounts = []routeMount{
+	// PRD #1906 M1: egress profiles (named site lists). Reads in the admin read group,
+	// writes cookie-only; every one a local DB statement with no forge call → noLimiter.
+	{"GET", "/api/admin/egress-profiles", noLimiter},
+	{"GET", "/api/admin/egress-profiles/{name}", noLimiter},
+	{"POST", "/api/admin/egress-profiles", noLimiter},
+	{"PUT", "/api/admin/egress-profiles/{name}", noLimiter},
+	{"DELETE", "/api/admin/egress-profiles/{name}", noLimiter},
 	// PRD #685 M1: admin clear of a branding logo — cookie-only admin DB delete, no
 	// forge call → noLimiter, like the settings PUT and guardrail-override it sits
 	// beside.

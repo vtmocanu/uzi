@@ -259,6 +259,18 @@ type CustodyEpisodeNotice struct {
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
 }
 
+type EgressProfile struct {
+	ID                     uuid.UUID          `json:"id"`
+	Name                   string             `json:"name"`
+	Description            string             `json:"description"`
+	Hosts                  []string           `json:"hosts"`
+	MultiPublisherOverride []string           `json:"multi_publisher_override"`
+	CreatedBy              pgtype.UUID        `json:"created_by"`
+	UpdatedBy              pgtype.UUID        `json:"updated_by"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type FindingDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	UserID        uuid.UUID          `json:"user_id"`

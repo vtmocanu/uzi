@@ -267,6 +267,15 @@ const (
 	// settings blip must not silently disable a default-on feature. The per-user opt-in
 	// lives on users.ci_autofix_enabled, not here.
 	KeyCiAutofixEnabled = "ci_autofix_enabled"
+	// Fetch caps for official-sources research runs (PRD #1906 Open question 1). Admin
+	// integers read by the api's per-run fetch admission (a later milestone): the largest
+	// single download in bytes (counted decoded), the per-run byte and file totals, and
+	// how many fetches one run may have in flight. No seeded row: an absent row
+	// synthesizes to the defaults below. Bounds live in settings_fetch_caps.go.
+	KeyFetchMaxFileBytes     = "fetch_max_file_bytes"
+	KeyFetchMaxRunBytes      = "fetch_max_run_bytes"
+	KeyFetchMaxRunFiles      = "fetch_max_run_files"
+	KeyFetchMaxConcurrentRun = "fetch_max_concurrent_per_run"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -396,6 +405,12 @@ const (
 	// PRD #914. CI autofix ships ON: an admin global kill-switch (default true), the
 	// admin-side gate. The per-user opt-in (users.ci_autofix_enabled) is separate.
 	DefaultCiAutofixEnabled = "true"
+	// PRD #1906 Open question 1 (resolved 2026-09-29): 25 MiB per file, 200 MiB and 100
+	// files per run, 4 concurrent fetches per run.
+	DefaultFetchMaxFileBytes     = "26214400"  // 25 MiB
+	DefaultFetchMaxRunBytes      = "209715200" // 200 MiB
+	DefaultFetchMaxRunFiles      = "100"
+	DefaultFetchMaxConcurrentRun = "4"
 )
 
 // Defaults maps every known key to its compiled-in default. This is the single
@@ -526,6 +541,13 @@ var Defaults = map[string]string{
 	// keys: an absent row synthesizes to the default (true), so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.
 	KeyCiAutofixEnabled: DefaultCiAutofixEnabled,
+	// PRD #1906 fetch caps. Same no-seeded-row pattern: an absent row synthesizes to
+	// these defaults, so All/AdminView surface them on every instance and no migration
+	// seeds them.
+	KeyFetchMaxFileBytes:     DefaultFetchMaxFileBytes,
+	KeyFetchMaxRunBytes:      DefaultFetchMaxRunBytes,
+	KeyFetchMaxRunFiles:      DefaultFetchMaxRunFiles,
+	KeyFetchMaxConcurrentRun: DefaultFetchMaxConcurrentRun,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed
