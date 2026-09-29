@@ -211,8 +211,10 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		}
 		isolated := c.trigger == triggerIsolatedLane
 		if isolated && docker {
-			// The lane never gets a DinD sidecar (its pods run in the no-internet namespace, not
-			// the privileged tier), so a profile-bound run that requires docker has no worker.
+			// The lane never gets a DinD sidecar (the controller honours Isolated by rendering lane
+			// pods into the no-internet namespace, not the privileged tier), so a profile-bound run
+			// that requires docker has no worker. ListIsolatedQueuedRunsForEphemeral already
+			// excludes such runs; this guard is the backstop, not the normal path.
 			slog.Warn("ephemeral provisioner: profile-bound run requires docker, which the isolated lane never provides; skipping",
 				"run_id", c.id, "trigger", c.trigger, "required_capabilities", c.caps)
 			continue

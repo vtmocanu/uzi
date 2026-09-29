@@ -344,3 +344,75 @@ func TestLaneMirrorsLiveDB(t *testing.T) {
 		t.Fatalf("queuedReason = %q, want %q", got, reasonWaitingIsolatedLane)
 	}
 }
+
+// TestProfileBoundFailedAssemblySettlesLiveDB: a recovery-capable lane worker's claim of a
+// profile-bound run opens no custody hold, so when assembly then fails terminally (the owner's
+// Anthropic secret is gone) finishRunClaim must expect zero holds and fail the run, not refuse
+// with the custody-count mismatch and leave it claimed.
+func TestProfileBoundFailedAssemblySettlesLiveDB(t *testing.T) {
+	f := newIsoFix(t)
+	run := f.queuedRun(t, 450, true)
+	lane := f.seedWorker(t, laneWorkerSpec{hosted: true, ephemeral: true, boundRun: run, isolated: true,
+		protoCaps: []string{capability.IsolatedFetchV1, capability.RecoveryArchiveV1}})
+	f.env.exec(`DELETE FROM user_secrets WHERE user_id = $1 AND kind = 'anthropic_token'`, f.userID)
+	p, err := f.svc.Claim(f.env.ctx, lane, nil)
+	if err != nil {
+		t.Fatalf("Claim = %v, want the failed assembly settled (not %v)", err, errClaimRecoveryCustody)
+	}
+	if p != nil {
+		t.Fatalf("Claim delivered run %s, want no payload", p.RunID)
+	}
+	var status string
+	if err := f.env.pool.QueryRow(f.env.ctx, `SELECT status FROM runs WHERE id = $1`, run).Scan(&status); err != nil {
+		t.Fatal(err)
+	}
+	if status != "failed" {
+		t.Fatalf("run status = %q, want failed", status)
+	}
+}
+
+type fakeEphemeralSettings struct {
+	on  bool
+	err error
+}
+
+func (f fakeEphemeralSettings) EphemeralWorkersEnabled(context.Context) (bool, error) {
+	return f.on, f.err
+}
+
+// TestIsolatedLaneQueuedReasonLiveDB: the queued reason of a profile-bound run is truthful. A
+// run requiring docker names docker (the lane never has it) whatever the kill-switch says;
+// with the instance ephemeral kill-switch off the reason says provisioning is off; with it on,
+// or unreadable, the generic lane wait stands.
+func TestIsolatedLaneQueuedReasonLiveDB(t *testing.T) {
+	f := newIsoFix(t)
+	plain := f.queuedRun(t, 460, true)
+	docker := f.queuedRun(t, 461, true)
+	f.env.exec(`UPDATE runs SET required_capabilities = '{docker}' WHERE id = $1`, docker)
+	rows, err := f.env.q.ListActiveRunsForHealth(f.env.ctx, codexCuratedModelsSlice())
+	if err != nil {
+		t.Fatal(err)
+	}
+	byID := map[uuid.UUID]store.ListActiveRunsForHealthRow{}
+	for _, r := range rows {
+		byID[r.ID] = r
+	}
+	for _, tc := range []struct {
+		name     string
+		settings EphemeralSettingsReader
+		run      uuid.UUID
+		want     string
+	}{
+		{"switch on", fakeEphemeralSettings{on: true}, plain, reasonWaitingIsolatedLane},
+		{"switch off", fakeEphemeralSettings{on: false}, plain, reasonIsolatedLaneProvisioningOff},
+		{"switch unreadable", fakeEphemeralSettings{err: errors.New("cold cache")}, plain, reasonWaitingIsolatedLane},
+		{"no reader", nil, plain, reasonWaitingIsolatedLane},
+		{"docker, switch on", fakeEphemeralSettings{on: true}, docker, reasonIsolatedLaneNeedsDocker},
+		{"docker, switch off", fakeEphemeralSettings{on: false}, docker, reasonIsolatedLaneNeedsDocker},
+	} {
+		f.svc.ephemeralSettings = tc.settings
+		if got := f.svc.queuedReason(f.env.ctx, time.Now(), byID[tc.run]); got != tc.want {
+			t.Errorf("%s: queuedReason = %q, want %q", tc.name, got, tc.want)
+		}
+	}
+}

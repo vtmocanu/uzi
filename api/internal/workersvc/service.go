@@ -1650,6 +1650,14 @@ type CapabilityScheduleReader interface {
 	CapabilityAwareScheduling(ctx context.Context) (bool, error)
 }
 
+// EphemeralSettingsReader is the narrow settings view the health detector reads for the
+// instance ephemeral-worker kill-switch (PRD #1906 M5): with it off the provisioner creates no
+// isolated-lane worker, so a profile-bound run's queued reason says so. *settings.Cache
+// satisfies it. Optional (nil-safe): a nil reader reports the generic lane wait.
+type EphemeralSettingsReader interface {
+	EphemeralWorkersEnabled(ctx context.Context) (bool, error)
+}
+
 // CompletionInterlockReader is the narrow settings view createRun reads for the
 // completion-interlock switch (PRD #1226 M1, D1; #1626). *settings.Cache satisfies it.
 // Kept its own interface (interface segregation, like CapabilityScheduleReader) so a
@@ -1719,6 +1727,9 @@ type Service struct {
 	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
+	// ephemeralSettings reads the instance ephemeral-worker kill-switch for the queued reason
+	// of a profile-bound run (PRD #1906 M5). Optional (nil-safe); set via SetEphemeralSettings.
+	ephemeralSettings EphemeralSettingsReader
 	// completionInterlock reads the completion-interlock switch createRun consults to decide
 	// whether to stamp completion_contract_version=1 on a new unseeded issue
 	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
@@ -1935,6 +1946,10 @@ func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlis
 // tests) defaults the flag ON — capability matching is enforced — so the omission is
 // safe rather than a silent disable.
 func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabilitySettings = r }
+
+// SetEphemeralSettings wires the instance ephemeral-worker kill-switch reader the health
+// detector consults for a profile-bound run's queued reason (PRD #1906 M5).
+func (s *Service) SetEphemeralSettings(r EphemeralSettingsReader) { s.ephemeralSettings = r }
 
 // SetCompletionInterlockSettings wires the completion-interlock rollout-switch reader
 // createRun consults (PRD #1226 M1, D1). Call once at startup, before serving, with the
@@ -5123,6 +5138,16 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 			return store.Run{}, ErrRunNotOwned
 		}
 		return store.Run{}, err
+	}
+	// PRD #1906 M5 (Decision D-D): the purpose check, defence in depth behind ClaimRun's
+	// two-way isolated-lane clause and assembleClaim's backstop. A profile-bound run held by a
+	// worker outside the lane, or an unbound run held by a lane worker, is not a flight either
+	// side should be able to report on, so every worker-facing run operation treats it as not
+	// owned rather than acting on it.
+	if run.EgressProfileID.Valid != wkr.IsolatedLane {
+		slog.Warn("run and worker on different sides of the isolated lane", "run", runID, "worker", wkr.ID,
+			"profile_bound", run.EgressProfileID.Valid, "isolated_lane", wkr.IsolatedLane)
+		return store.Run{}, ErrRunNotOwned
 	}
 	return run, nil
 }

@@ -114,7 +114,8 @@ type claimTestHooks struct {
 	afterChatAssembly func(ctx context.Context, run store.Run)
 }
 
-// This matches ClaimRun's hold CTE, using the boolean passed to that claim.
+// This matches the kind and capability half of ClaimRun's hold CTE, using the boolean passed
+// to that claim. Callers holding the run use runClaimOpenedCustody, which adds the egress clause.
 func claimOpenedCustody(kind string, recoveryCapable bool) bool {
 	if !recoveryCapable {
 		return false
@@ -125,6 +126,13 @@ func claimOpenedCustody(kind string, recoveryCapable bool) bool {
 	default:
 		return false
 	}
+}
+
+// runClaimOpenedCustody is claimOpenedCustody for a concrete claimed run. It mirrors the whole
+// hold CTE, including its PRD #1906 M5 clause: a profile-bound run (egress_profile_id set)
+// publishes no code and never opens a hold, whatever the claiming worker advertises.
+func runClaimOpenedCustody(run store.Run, recoveryCapable bool) bool {
+	return !run.EgressProfileID.Valid && claimOpenedCustody(run.Kind, recoveryCapable)
 }
 
 // assembleAndFinishRunClaim is the run lane's single post-ClaimRun tail, shared by both
@@ -263,7 +271,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
 	// changes concurrently.
 	holdClass = holdClass && (assemblyErr == nil || origin == "credential_unavailable" || transient) &&
-		claimOpenedCustody(run.Kind, true)
+		runClaimOpenedCustody(run, true)
 	decision := assemblyErr
 	if credDisabled {
 		// A distinct non-terminal outcome: never a transient requeue, never the account
@@ -291,7 +299,7 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 	}
 
 	expected := 0
-	if claimOpenedCustody(run.Kind, identity.recoveryCapable) {
+	if runClaimOpenedCustody(run, identity.recoveryCapable) {
 		expected = 1
 	}
 	holds, err := q.LockOpenCustodyHoldsForRunWorkerGeneration(ctx, store.LockOpenCustodyHoldsForRunWorkerGenerationParams{

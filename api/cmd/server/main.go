@@ -545,6 +545,11 @@ func run() error {
 	// reverts to best-effort claiming while the docker allowlist above stays enforced.
 	wsvc.SetCapabilitySettings(settingsCache)
 
+	// Ephemeral-worker kill-switch (PRD #1906 M5): the health detector reads it so a queued
+	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
+	// provisioner will never create.
+	wsvc.SetEphemeralSettings(settingsCache)
+
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
 	// issue run, so an admin flip takes effect within the cache TTL. Default ON for

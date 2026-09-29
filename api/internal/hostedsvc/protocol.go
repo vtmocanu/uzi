@@ -63,9 +63,9 @@ type DesiredWorker struct {
 	// COALESCEd from the nullable docker_enabled column, so a NULL (external rows
 	// never reach this poll) and an explicit false both mean "no sidecar".
 	Docker bool `json:"docker"`
-	// Isolated is the isolated-lane dimension (PRD #1906 M5): true → the controller renders the
-	// worker into the no-internet lane namespace (its default-deny NetworkPolicy allows only
-	// DNS, the api, the fetcher and the model host). Mapped from the server-set
+	// Isolated is the isolated-lane dimension (PRD #1906 M5), a contract the controller honours:
+	// true → it renders the worker into the no-internet lane namespace (whose default-deny
+	// NetworkPolicy allows only DNS, the api, the fetcher and the model host). Mapped from the server-set
 	// workers.isolated_lane column, which only the ephemeral provisioner writes, for a worker
 	// bound to a profile-bound run. A pod-shape dimension orthogonal to Template, like Docker,
 	// and never true together with it (the provisioner never gives a lane worker a sidecar).

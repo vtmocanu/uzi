@@ -7029,6 +7029,10 @@ LIMIT @max_rows;
 --   * r.status = 'queued' AND r.egress_profile_id IS NOT NULL — a profile-bound run nothing has
 --     claimed. (The schema already forbids a profile-bound chat or Codex run; the Codex test is
 --     repeated so a Codex-indicating row, which ClaimRun refuses, never gets a pod.)
+--   * NOT 'docker' = ANY(r.required_capabilities) — the lane never gets a DinD sidecar, so a
+--     profile-bound run that requires docker has no worker to provision. Excluded HERE so such
+--     runs cannot fill the LIMIT window ahead of servable ones every tick; ProvisionPass keeps its
+--     Go docker guard as the backstop, not the normal path.
 --   * NO per-user opt-in (u.ephemeral_workers_enabled): the lane IS the only placement for such a
 --     run, so the opt-in that chooses burst workers over waiting does not apply. The instance
 --     kill-switch is still honoured, in Go, before this query runs (ProvisionPass), and so is the
@@ -7042,6 +7046,7 @@ FROM runs r
 WHERE r.status = 'queued'
   AND r.egress_profile_id IS NOT NULL
   AND r.kind <> 'chat'
+  AND NOT ('docker' = ANY(r.required_capabilities))
   AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
   AND NOT EXISTS (
       SELECT 1 FROM workers w2

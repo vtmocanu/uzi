@@ -212,6 +212,12 @@ WHERE w.ephemeral
 --       run is profile-bound, so ClaimRun's isolated-lane clause bars it from the run forever
 --       (and it holds the run's one uq_workers_ephemeral_run slot, which would starve the right
 --       trigger). No deadline: it can never make progress, so it goes on the next tick.
+--   (e) lane worker without the lane protocol (PRD #1906 M5): an isolated_lane worker that has
+--       registered (online_since set; register writes protocol_capabilities in the same UPDATE)
+--       but does not advertise 'isolated_fetch_v1' (an old image, or a fetcher env it could not
+--       load). ClaimRun's lane clause requires that capability, so it can never claim its bound
+--       run, yet it holds the run's uq_workers_ephemeral_run slot and one per-user slot. No
+--       deadline, like (d); the busy and custody guards above still apply.
 DELETE FROM workers w
 WHERE w.ephemeral
   AND NOT EXISTS (
@@ -246,6 +252,8 @@ WHERE w.ephemeral
           WHERE r.id = w.ephemeral_run_id
             AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
       )
+      OR (w.isolated_lane AND w.online_since IS NOT NULL
+          AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
   );
 
 -- name: CreateHostedWorker :one

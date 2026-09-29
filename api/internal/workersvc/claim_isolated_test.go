@@ -71,3 +71,51 @@ func TestStripForIsolation(t *testing.T) {
 		}
 	}
 }
+
+// PRD #1906 M5 (Decision 9): assembleClaim's Go backstop of ClaimRun's two-way lane clause
+// refuses a run and worker on different sides of the isolated lane, before any read (the
+// Service has no store), with the terminal lane-mismatch error.
+func TestAssembleClaimRefusesLaneMismatch(t *testing.T) {
+	bound := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	s := &Service{}
+	for name, tc := range map[string]struct {
+		run store.Run
+		wkr store.Worker
+	}{
+		"bound run, ordinary worker": {store.Run{ID: uuid.New(), Kind: runkind.Issue, Harness: "claude", EgressProfileID: bound}, store.Worker{ID: uuid.New()}},
+		"unbound run, lane worker":   {store.Run{ID: uuid.New(), Kind: runkind.Issue, Harness: "claude"}, store.Worker{ID: uuid.New(), IsolatedLane: true}},
+	} {
+		p, err := s.assembleClaim(context.Background(), tc.wkr, tc.run)
+		if p != nil || !errors.Is(err, errIsolatedLaneMismatch) || !errors.Is(err, errCredentialUnavailable) {
+			t.Errorf("%s: assembleClaim = %v, %v; want the terminal lane mismatch", name, p, err)
+		}
+	}
+}
+
+// PRD #1906 M5 (Decision D-D): runOwnedByWorker's purpose check. A run the store says the
+// worker holds is still not owned when its binding disagrees with the worker's lane marker, so
+// no worker-facing run operation acts on it; an agreeing pair is owned.
+func TestRunOwnedByWorkerPurposeCheck(t *testing.T) {
+	bound := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	for name, tc := range map[string]struct {
+		bound, lane, owned bool
+	}{
+		"bound run, lane worker":       {bound: true, lane: true, owned: true},
+		"unbound run, ordinary worker": {bound: false, lane: false, owned: true},
+		"bound run, ordinary worker":   {bound: true, lane: false, owned: false},
+		"unbound run, lane worker":     {bound: false, lane: true, owned: false},
+	} {
+		run := store.Run{ID: uuid.New(), Kind: runkind.Issue, Status: "running", ClaimGeneration: 3}
+		if tc.bound {
+			run.EgressProfileID = bound
+		}
+		s := New(&fakeStore{runOwned: run}, nil, testParams())
+		status, _, gen, err := s.RunOwnership(context.Background(), store.Worker{ID: uuid.New(), IsolatedLane: tc.lane}, run.ID)
+		switch {
+		case tc.owned && (err != nil || status != "running" || gen != 3):
+			t.Errorf("%s: RunOwnership = %q, %d, %v; want the owned run", name, status, gen, err)
+		case !tc.owned && !errors.Is(err, ErrRunNotOwned):
+			t.Errorf("%s: RunOwnership = %q, %v; want ErrRunNotOwned", name, status, err)
+		}
+	}
+}

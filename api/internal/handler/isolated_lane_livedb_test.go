@@ -189,7 +189,9 @@ func TestOrdinaryTriggersSkipProfileBoundRunsLiveDB(t *testing.T) {
 		t.Fatalf("saturation trigger: bound listed=%v, unbound listed=%v; want false, true", got[satBound], got[satUnbound])
 	}
 
-	// And the lane trigger lists exactly the bound ones of this user.
+	// And the lane trigger lists the bound run it can serve, and neither unbound run. gapBound
+	// requires docker, which the lane never has, so the lane trigger excludes it too (see
+	// TestLaneTriggerSkipsDockerRunsLiveDB).
 	lane, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{MaxRows: 1000, MaxPerUser: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -199,8 +201,8 @@ func TestOrdinaryTriggersSkipProfileBoundRunsLiveDB(t *testing.T) {
 		laneIDs = append(laneIDs, r.ID)
 	}
 	got := runIDs(laneIDs)
-	if !got[gapBound] || !got[satBound] || got[gapUnbound] || got[satUnbound] {
-		t.Fatalf("lane trigger lists bound %v/%v unbound %v/%v; want the bound runs only", got[gapBound], got[satBound], got[gapUnbound], got[satUnbound])
+	if got[gapBound] || !got[satBound] || got[gapUnbound] || got[satUnbound] {
+		t.Fatalf("lane trigger lists docker-bound %v, bound %v, unbound %v/%v; want only the servable bound run", got[gapBound], got[satBound], got[gapUnbound], got[satUnbound])
 	}
 }
 
@@ -319,5 +321,94 @@ func TestLaneWorkerRoutesLiveDB(t *testing.T) {
 				t.Errorf("%s: lane worker %s %s = %d, want 2xx", name, c.method, c.path, got)
 			}
 		}
+	}
+}
+
+// TestLaneTriggerSkipsDockerRunsLiveDB: the lane trigger never lists a profile-bound run that
+// requires docker (the lane has no DinD sidecar, so nothing could serve it). With a one-row
+// window and an OLDER docker-requiring run ahead of a servable one, the servable run is the one
+// returned and the pass provisions it, so docker runs cannot hold the window every tick.
+func TestLaneTriggerSkipsDockerRunsLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, false)
+	prof := fx.boundProfile()
+	dockerRun := fx.boundQueuedRun(prof, []string{"docker"})
+	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET created_at = now() - interval '2 hours' WHERE id = $1`, dockerRun); err != nil {
+		t.Fatal(err)
+	}
+	servable := fx.boundQueuedRun(prof, nil)
+
+	rows, err := fx.q.ListIsolatedQueuedRunsForEphemeral(fx.ctx, store.ListIsolatedQueuedRunsForEphemeralParams{MaxRows: 1, MaxPerUser: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || rows[0].ID != servable {
+		var ids []uuid.UUID
+		for _, r := range rows {
+			ids = append(ids, r.ID)
+		}
+		t.Fatalf("lane trigger (window 1) = %v, want only the servable run %s (docker run %s excluded)", ids, servable, dockerRun)
+	}
+
+	if _, err := fx.provisioner(true, 5).ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass: %v", err)
+	}
+	if iso, _, found := fx.laneOf(servable); !found || !iso {
+		t.Fatalf("servable run's lane worker found=%v isolated=%v, want a lane worker", found, iso)
+	}
+	if _, _, found := fx.laneOf(dockerRun); found {
+		t.Fatal("a docker-requiring profile-bound run got a lane worker")
+	}
+}
+
+// TestReapLaneWorkerWithoutFetchProtocolLiveDB: an online lane worker that does not advertise
+// isolated_fetch_v1 can never claim its bound run, so it is reaped on the next tick (freeing
+// the run's one slot); a lane worker advertising it, a lane worker not yet online, and a busy
+// lane worker (its run is in flight on it) are all kept.
+func TestReapLaneWorkerWithoutFetchProtocolLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	prof := fx.boundProfile()
+	seed := func(run uuid.UUID, online bool, caps []string) uuid.UUID {
+		id := uuid.New()
+		a, b := uuid.New(), uuid.New()
+		status, since := "offline", pgtype.Timestamptz{}
+		if online {
+			status, since = "online", pgtype.Timestamptz{Time: time.Now(), Valid: true}
+		}
+		if _, err := fx.pool.Exec(fx.ctx,
+			`INSERT INTO workers (id, user_id, name, token_hash, kind, template_declared, hosted_size, docker_enabled,
+			                      ephemeral, ephemeral_run_id, isolated_lane, status, online_since, last_heartbeat_at,
+			                      protocol_capabilities)
+			 VALUES ($1, $2, $3, $4, 'hosted', 'base', 'm', false, true, $5, true, $6, $7, now(), $8)`,
+			id, fx.userID, "lane-"+id.String(), append(a[:], b[:]...), run, status, since, caps); err != nil {
+			t.Fatalf("seed lane worker: %v", err)
+		}
+		return id
+	}
+	noFetch := seed(fx.boundQueuedRun(prof, nil), true, []string{"recovery_archive_v1"})
+	withFetch := seed(fx.boundQueuedRun(prof, nil), true, []string{"isolated_fetch_v1", "recovery_archive_v1"})
+	notOnline := seed(fx.boundQueuedRun(prof, nil), false, []string{})
+	busyRun := fx.boundQueuedRun(prof, nil)
+	busy := seed(busyRun, true, []string{})
+	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET status = 'running', worker_id = $2 WHERE id = $1`, busyRun, busy); err != nil {
+		t.Fatal(err)
+	}
+
+	// A long deadline, so only the no-protocol arm can fire on these just-created workers.
+	prov := hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, nil, hostedsvc.EphemeralConfig{ProvisionDeadline: time.Hour})
+	if _, err := prov.ReapPass(fx.ctx); err != nil {
+		t.Fatalf("ReapPass: %v", err)
+	}
+	exists := func(id uuid.UUID) bool {
+		var n int
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM workers WHERE id = $1`, id).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n == 1
+	}
+	if exists(noFetch) {
+		t.Fatal("an online lane worker without isolated_fetch_v1 was kept")
+	}
+	if !exists(withFetch) || !exists(notOnline) || !exists(busy) {
+		t.Fatalf("kept: with the protocol=%v, not yet online=%v, busy=%v; want all true", exists(withFetch), exists(notOnline), exists(busy))
 	}
 }
