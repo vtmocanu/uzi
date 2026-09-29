@@ -101,19 +101,29 @@ func (q *Queries) CreateProduct(ctx context.Context, arg CreateProductParams) (P
 
 const createProductToken = `-- name: CreateProductToken :one
 INSERT INTO product_tokens (user_id, product_id, name, token_hash, token_prefix, scopes, expires_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+SELECT $1::uuid,
+       p.id,
+       $2::text,
+       $3::bytea,
+       $4::text,
+       $5::text[],
+       $6::timestamptz
+  FROM products p
+ WHERE p.id = $7::uuid
+   AND p.enabled
+   AND p.deleted_at IS NULL
 RETURNING id, user_id, product_id, name, token_prefix, scopes, revoked,
           created_at, last_used_at, last_used_ip, expires_at
 `
 
 type CreateProductTokenParams struct {
 	UserID      uuid.UUID          `json:"user_id"`
-	ProductID   uuid.UUID          `json:"product_id"`
 	Name        string             `json:"name"`
 	TokenHash   []byte             `json:"token_hash"`
 	TokenPrefix string             `json:"token_prefix"`
 	Scopes      []string           `json:"scopes"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	ProductID   uuid.UUID          `json:"product_id"`
 }
 
 type CreateProductTokenRow struct {
@@ -132,15 +142,22 @@ type CreateProductTokenRow struct {
 
 // Mint a product token. The SERVER sets expires_at from the user's choice among the
 // offered lifetimes (D10, NULL = never); the client never proposes a timestamp.
+//
+// GUARDED BY THE PRODUCT'S STATE: the row is inserted only when the product exists, is
+// enabled and is not soft-deleted, so no caller can mint a token for a disabled or
+// deleted product whatever it checked beforehand. For any other product the INSERT ...
+// SELECT selects nothing and the query returns no row (pgx.ErrNoRows). The minting
+// handler also re-reads the product inside its transaction to tell the cases apart for
+// its status code; this guard is what holds if that check is ever skipped or raced.
 func (q *Queries) CreateProductToken(ctx context.Context, arg CreateProductTokenParams) (CreateProductTokenRow, error) {
 	row := q.db.QueryRow(ctx, createProductToken,
 		arg.UserID,
-		arg.ProductID,
 		arg.Name,
 		arg.TokenHash,
 		arg.TokenPrefix,
 		arg.Scopes,
 		arg.ExpiresAt,
+		arg.ProductID,
 	)
 	var i CreateProductTokenRow
 	err := row.Scan(
@@ -185,11 +202,11 @@ SELECT id, name, description, enabled, deleted_at, created_by, created_at, updat
 `
 
 // One product by id, soft-deleted included, ROW-LOCKED for the rest of the transaction.
-// The admin PATCH (PRD #1907 M4) accepts description and/or enabled and writes both
-// through UpdateProduct, so it reads the row, merges the fields the request left out,
-// then writes: without the lock two concurrent PATCHes of different fields would each
-// write back the other's stale value (a lost update). Must run on a transaction-bound
-// Queries; on a bare pool the lock is released as soon as the statement ends.
+// The admin DELETE (PRD #1907 M4) reads the pre-delete enabled flag under this lock, so
+// its stopped_token_count is 0 for a product that was already disabled (its tokens were
+// already refused), with the row locked from that read to the soft delete. Must run on
+// a transaction-bound Queries; on a bare pool the lock is released as soon as the
+// statement ends.
 func (q *Queries) GetProductForUpdate(ctx context.Context, id uuid.UUID) (Product, error) {
 	row := q.db.QueryRow(ctx, getProductForUpdate, id)
 	var i Product
@@ -284,7 +301,10 @@ SELECT t.id,
   FROM product_tokens t
   JOIN users u ON u.id = t.user_id
   JOIN products p ON p.id = t.product_id
- ORDER BY t.revoked ASC, u.email ASC, t.created_at DESC, t.id ASC
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT $1::int
 `
 
 type ListAllProductTokensForAdminRow struct {
@@ -313,9 +333,18 @@ type ListAllProductTokensForAdminRow struct {
 //
 // Revoked rows and tokens of soft-deleted products are INCLUDED: they are the incident
 // trail (D9), so an audit view that hid them would hide exactly what an investigation
-// needs. Revoked rows sort last.
-func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context) ([]ListAllProductTokensForAdminRow, error) {
-	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin)
+// needs.
+//
+// BOUNDED (PRD #1907 M4 security audit, H1): revoked rows are kept forever, so a user
+// looping mint -> revoke grows this table without bound, and an unbounded list would
+// grow every admin load with it. Rows are therefore ordered ACTIVE first (not revoked
+// and not expired, the NULL trap spelled out: a never-expiring token is active), then
+// newest first, and cut at sqlc.arg(max_rows), which the handler passes as its named
+// constant. Every active token sorts ahead of every inactive one, so the cut drops the
+// oldest revoked/expired history first; the per-user mint limiter bounds how fast that
+// history can grow.
+func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int32) ([]ListAllProductTokensForAdminRow, error) {
+	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin, maxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -554,9 +583,9 @@ UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked
 `
 
 // The panic button's product half (D8): revoke every un-revoked product token of one
-// user. Nothing calls it yet: PRD #1907 M5 wires it into the existing revoke-all
-// handler (POST /api/me/cli-tokens/revoke-all), in the SAME transaction as
-// RevokeAllCLITokens. Idempotent, and scoped to $1.
+// user. Called by the existing revoke-all handler (POST /api/me/cli-tokens/revoke-all,
+// handler.RevokeAllCLITokens) in the SAME transaction as RevokeAllCLITokens, so the
+// button revokes both token kinds or neither. Idempotent, and scoped to $1.
 func (q *Queries) RevokeAllProductTokens(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, revokeAllProductTokens, userID)
 	return err
@@ -627,26 +656,31 @@ func (q *Queries) TouchProductToken(ctx context.Context, arg TouchProductTokenPa
 
 const updateProduct = `-- name: UpdateProduct :one
 UPDATE products
-   SET description = $2,
-       enabled = $3,
+   SET description = COALESCE($1::text, description),
+       enabled = COALESCE($2::boolean, enabled),
        updated_at = now()
- WHERE id = $1
+ WHERE id = $3
    AND deleted_at IS NULL
 RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at
 `
 
 type UpdateProductParams struct {
-	ID          uuid.UUID `json:"id"`
-	Description string    `json:"description"`
-	Enabled     bool      `json:"enabled"`
+	Description pgtype.Text `json:"description"`
+	Enabled     pgtype.Bool `json:"enabled"`
+	ID          uuid.UUID   `json:"id"`
 }
 
-// Admin edit of the mutable fields (description, enabled). Guarded by
-// deleted_at IS NULL so a soft-deleted product can never be re-enabled (no row: the
-// handler maps it to 404/409); the products_deleted_is_disabled CHECK backs this up.
+// Admin edit of the mutable fields (description, enabled). Each is a NULLABLE argument:
+// NULL keeps the column's current value (COALESCE against the row being updated), so a
+// PATCH naming one field never reads-then-writes the other: the COALESCE is evaluated
+// on the row version the UPDATE writes, so a concurrent PATCH of a different field is
+// not overwritten (TestUpdateProductConcurrentPatchesLiveDB interleaves two
+// transactions to pin this). Guarded by deleted_at IS NULL so a soft-deleted
+// product can never be re-enabled (no row: the handler maps it to 404 for an unknown id
+// and 409 for a deleted one); the products_deleted_is_disabled CHECK backs this up.
 // The name is immutable here: it is the label users recognise tokens by.
 func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (Product, error) {
-	row := q.db.QueryRow(ctx, updateProduct, arg.ID, arg.Description, arg.Enabled)
+	row := q.db.QueryRow(ctx, updateProduct, arg.Description, arg.Enabled, arg.ID)
 	var i Product
 	err := row.Scan(
 		&i.ID,

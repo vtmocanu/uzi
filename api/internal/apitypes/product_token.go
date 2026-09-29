@@ -28,6 +28,28 @@ type ProductDTO struct {
 	ActiveTokenCount int64      `json:"active_token_count"`
 }
 
+// AdminDeleteProductResponse is the DELETE /api/admin/products/{id} response (PRD #1907
+// M4): the soft-deleted product plus StoppedTokenCount, the number of its tokens this
+// delete made unusable. That is the product's active (not revoked, not expired) tokens
+// when the product was enabled at deletion, and 0 when it was already disabled: those
+// tokens were already refused, so the delete stopped none of them. Product's own
+// active_token_count keeps its registry meaning (active tokens, whatever the product's
+// state), so the two differ exactly for an already-disabled product.
+type AdminDeleteProductResponse struct {
+	Product           ProductDTO `json:"product"`
+	StoppedTokenCount int64      `json:"stopped_token_count"`
+}
+
+// MintableProductDTO is one entry of the user mint picker (GET
+// /api/me/product-tokens/products, PRD #1907 M5): an enabled, live product a user may
+// mint a token for. Deliberately only the three fields the picker shows: no token
+// counts, no creator, no state (every listed product is enabled and not deleted).
+type MintableProductDTO struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+}
+
 // ProductTokenDTO is the metadata-only view of one product token, the per-user
 // list row (Settings > Access). As for CLI tokens, token_prefix + last_used_at +
 // last_used_ip are the whole forensic surface: there is no per-request audit log.

@@ -106,13 +106,24 @@ func (h *Handler) AdminListProducts(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"products": out})
 }
 
+// maxAdminProductTokenRows bounds one GET /api/admin/product-tokens response (PRD #1907
+// M4 security audit, H1). Revoked rows are kept for the audit trail, so without a bound
+// a user looping mint -> revoke would grow every admin load forever.
+const maxAdminProductTokenRows = 1000
+
 // AdminListProductTokens is the product-credential inventory, the sibling of
-// AdminListCLITokens: every product token in the factory with its owner and product,
-// metadata only. The store query projects its columns without token_hash, so the hash
-// is not even in the row type this reads. Revoked tokens and tokens of soft-deleted
-// products are included; they are the incident trail (D9).
+// AdminListCLITokens: product tokens with their owner and product, metadata only. The
+// store query projects its columns without token_hash, so the hash is not even in the
+// row type this reads. Revoked tokens and tokens of soft-deleted products are included;
+// they are the incident trail (D9).
+//
+// BOUNDED: at most maxAdminProductTokenRows (1000) rows per load, ACTIVE tokens (not
+// revoked, not expired) first and then newest first, so every live credential is listed
+// ahead of the oldest revoked/expired history, which is what the cut drops. The JSON
+// shape is unchanged ({"tokens": [...]}). The per-user mint limiter (authLimiter on
+// POST /api/me/product-tokens) bounds how fast any one user can add rows.
 func (h *Handler) AdminListProductTokens(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.q.ListAllProductTokensForAdmin(r.Context())
+	rows, err := h.q.ListAllProductTokensForAdmin(r.Context(), maxAdminProductTokenRows)
 	if err != nil {
 		slog.Error("admin list product tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -241,26 +252,31 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 		desc = &d
 	}
 
+	// UpdateProduct takes each field as a nullable argument and COALESCEs NULL to the
+	// column's current value in the same statement, so no read-merge happens here and two
+	// concurrent PATCHes of different fields cannot overwrite each other.
+	params := store.UpdateProductParams{ID: id}
+	if desc != nil {
+		params.Description = pgtype.Text{String: *desc, Valid: true}
+	}
+	if req.Enabled != nil {
+		params.Enabled = pgtype.Bool{Bool: *req.Enabled, Valid: true}
+	}
 	var (
 		updated store.Product
 		active  int64
 	)
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
-		cur, err := q.GetProductForUpdate(r.Context(), id)
-		if err != nil {
-			return err
-		}
-		if cur.DeletedAt.Valid {
+		var err error
+		updated, err = q.UpdateProduct(r.Context(), params)
+		if errors.Is(err, pgx.ErrNoRows) {
+			// No live row: unknown (ErrNoRows from GetProduct, a 404) or soft-deleted.
+			if _, err := q.GetProduct(r.Context(), id); err != nil {
+				return err
+			}
 			return errProductDeleted
 		}
-		params := store.UpdateProductParams{ID: id, Description: cur.Description, Enabled: cur.Enabled}
-		if desc != nil {
-			params.Description = *desc
-		}
-		if req.Enabled != nil {
-			params.Enabled = *req.Enabled
-		}
-		if updated, err = q.UpdateProduct(r.Context(), params); err != nil {
+		if err != nil {
 			return err
 		}
 		active, err = q.CountActiveProductTokensForProduct(r.Context(), id)
@@ -292,12 +308,14 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 // disabled in one statement, so every one of its tokens is refused on its next
 // request, while the token rows stay for the audit trail.
 //
-// The response is {product, stopped_token_count}: stopped_token_count is the number of
-// the product's tokens that were neither revoked nor expired at deletion, i.e. the
-// tokens this delete leaves unusable (for a product that was already disabled they were
-// already refused). It is counted in the deleting transaction, after the product row
-// is locked by the UPDATE; the delete confirm in the UI reads the same figure ahead of
-// time from GET /api/admin/products' active_token_count.
+// The response is apitypes.AdminDeleteProductResponse, {product, stopped_token_count}:
+// stopped_token_count is the number of tokens this delete made unusable. For a product
+// that was enabled at deletion that is its tokens neither revoked nor expired; for a
+// product that was ALREADY DISABLED it is 0, because the disable had already refused
+// those tokens. The pre-delete enabled flag is read under GetProductForUpdate's row lock
+// in the deleting transaction. product.active_token_count keeps its registry meaning (active tokens,
+// whatever the state), which is the figure the UI's delete confirm reads ahead of time
+// from GET /api/admin/products.
 //
 // An unknown id is a 404; an already-deleted product is a 409 (it exists and is
 // listed, see AdminPatchProduct).
@@ -313,25 +331,34 @@ func (h *Handler) AdminDeleteProduct(w http.ResponseWriter, r *http.Request) {
 	}
 	var (
 		deleted store.Product
+		active  int64
 		stopped int64
 	)
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
+		cur, err := q.GetProductForUpdate(r.Context(), id)
+		if err != nil {
+			return err // ErrNoRows: unknown id
+		}
+		if cur.DeletedAt.Valid {
+			return errProductDeleted
+		}
 		n, err := q.SoftDeleteProduct(r.Context(), id)
 		if err != nil {
 			return err
 		}
 		if n == 0 {
-			// Unknown (ErrNoRows below) or already deleted.
-			if _, err := q.GetProduct(r.Context(), id); err != nil {
-				return err
-			}
-			return errProductDeleted
+			return errProductDeleted // unreachable under the row lock; fail closed
 		}
 		if deleted, err = q.GetProduct(r.Context(), id); err != nil {
 			return err
 		}
-		stopped, err = q.CountActiveProductTokensForProduct(r.Context(), id)
-		return err
+		if active, err = q.CountActiveProductTokensForProduct(r.Context(), id); err != nil {
+			return err
+		}
+		if cur.Enabled {
+			stopped = active
+		}
+		return nil
 	})
 	switch {
 	case errors.Is(err, pgx.ErrNoRows):
@@ -346,9 +373,9 @@ func (h *Handler) AdminDeleteProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	slog.Info("admin deleted product", "actor_id", actor.ID, "product_id", id, "stopped_tokens", stopped)
-	httpx.JSON(w, http.StatusOK, map[string]any{
-		"product":             productDTO(deleted, stopped),
-		"stopped_token_count": stopped,
+	httpx.JSON(w, http.StatusOK, apitypes.AdminDeleteProductResponse{
+		Product:           productDTO(deleted, active),
+		StoppedTokenCount: stopped,
 	})
 }
 

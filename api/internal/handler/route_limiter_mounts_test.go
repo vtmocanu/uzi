@@ -67,7 +67,11 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 211 as of this commit. PRD #1907 M4 added the admin product registry: GET
+// 215 as of this commit. PRD #1907 M5 added the user's product-token routes, all
+// cookie-only (RequireAuth): GET /api/me/product-tokens/, GET
+// /api/me/product-tokens/products and DELETE /api/me/product-tokens/{id} (noLimiter), and
+// the mint, POST /api/me/product-tokens/, on authLimiter.PerUserMiddleware.
+// It was 211 until then. PRD #1907 M4 added the admin product registry: GET
 // /api/admin/products and GET /api/admin/product-tokens (both authLimiter per-user), and
 // the cookie-only writes POST /api/admin/products, PATCH and DELETE
 // /api/admin/products/{id} and POST /api/admin/product-tokens/{id}/revoke (noLimiter).
@@ -236,10 +240,11 @@ type routeMount struct {
 // endpoint: POST /api/vault/unlock and POST /api/vault/passphrase.
 //
 // NOTE on authLimiter: it is mounted BOTH ways. Its per-IP Middleware sits on
-// /register, /login, /config, the OIDC pair and /cli/start; SEVEN routes take its
+// /register, /login, /config, the OIDC pair and /cli/start; EIGHT routes take its
 // PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase,
-// /admin/cli-tokens, /admin/products, /admin/product-tokens and /v1/whoami (the last
-// through the /api/v1 subtree's r.Use, so every future /api/v1 route inherits it).
+// /admin/cli-tokens, /admin/products, /admin/product-tokens, the product-token mint
+// POST /me/product-tokens/ and /v1/whoami (the last through the /api/v1 subtree's
+// r.Use, so every future /api/v1 route inherits it).
 // This table covers the per-user mounts ONLY —
 // the per-IP ones read as noLimiter here and are not guarded by this file.
 // e2e/run-e2e.sh asserts a 429 on /api/auth/login, which is the per-IP mount and closes
@@ -277,6 +282,9 @@ var wantRouteMounts = []routeMount{
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
+	// PRD #1907 M5: revoke one of the caller's own product tokens, a cookie-only,
+	// owner-scoped DB write → noLimiter, like the CLI-token revoke above.
+	{"DELETE", "/api/me/product-tokens/{id}", noLimiter},
 	{"DELETE", "/api/me/memory/{id}", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token", noLimiter},
 	{"DELETE", "/api/me/secrets/anthropic_token/{id}", noLimiter},
@@ -378,6 +386,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/forge/connections/{id}/projects", limForge},
 	{"GET", "/api/health", noLimiter},
 	{"GET", "/api/me/cli-tokens/", noLimiter},
+	// PRD #1907 M5: the caller's own product-token list and the mint picker, cookie-only
+	// metadata reads with no forge call → noLimiter, like the CLI-token list above.
+	{"GET", "/api/me/product-tokens/", noLimiter},
+	{"GET", "/api/me/product-tokens/products", noLimiter},
 	{"GET", "/api/me/judge/category-stats", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},
 	{"GET", "/api/me/judge/stats", noLimiter},
@@ -613,6 +625,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/forge/connections/{id}/verify", limForge},
 	{"POST", "/api/me/cli-tokens/", noLimiter},
 	{"POST", "/api/me/cli-tokens/revoke-all", noLimiter},
+	// PRD #1907 M5: the product-token MINT rides the credential-surface limiter per user
+	// (a (pattern, user) bucket), on top of the handler's per-product cap (D15).
+	{"POST", "/api/me/product-tokens/", limAuth},
 	{"POST", "/api/me/secrets/anthropic_token", noLimiter},
 	// PRD #1147 M1 codex credential creates: owner-scoped DB write, no forge call, no
 	// spendable mint (M1 ships dark) → noLimiter, exactly like the anthropic create above.

@@ -179,13 +179,13 @@ func TestProductTokenAuthLookupLiveDB(t *testing.T) {
 		p := newProduct(ctx, t, q, user)
 		m := mintProductToken(ctx, t, q, user, p.ID, neverExpires)
 		authOK(ctx, t, q, m, p.Name)
-		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: p.ID, Description: p.Description, Enabled: false}); err != nil {
+		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: p.ID, Enabled: pgtype.Bool{Bool: false, Valid: true}}); err != nil {
 			t.Fatalf("disable: %v", err)
 		}
 		authClosed(ctx, t, q, m.hash, "disabled product")
 		// Re-enabling a disabled (not deleted) product restores its tokens: the disable,
 		// not some side effect, is what closed it.
-		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: p.ID, Description: p.Description, Enabled: true}); err != nil {
+		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: p.ID, Enabled: pgtype.Bool{Bool: true, Valid: true}}); err != nil {
 			t.Fatalf("re-enable: %v", err)
 		}
 		authOK(ctx, t, q, m, p.Name)
@@ -350,7 +350,7 @@ func TestProductTokenSchemaConstraintsLiveDB(t *testing.T) {
 		if n, err := q.SoftDeleteProduct(ctx, d.ID); err != nil || n != 0 {
 			t.Fatalf("second soft delete: n=%d err=%v, want 0 rows", n, err)
 		}
-		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: d.ID, Description: "x", Enabled: true}); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: d.ID, Description: pgtype.Text{String: "x", Valid: true}, Enabled: pgtype.Bool{Bool: true, Valid: true}}); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("UpdateProduct on a deleted product must match no row, got %v", err)
 		}
 		_, err := pool.Exec(ctx, `UPDATE products SET enabled = true WHERE id = $1`, d.ID)
@@ -494,7 +494,7 @@ func TestProductTokenLifecycleQueriesLiveDB(t *testing.T) {
 	})
 
 	t.Run("admin list and admin revoke", func(t *testing.T) {
-		rows, err := q.ListAllProductTokensForAdmin(ctx)
+		rows, err := q.ListAllProductTokensForAdmin(ctx, 1_000_000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -535,7 +535,7 @@ func TestProductTokenLifecycleQueriesLiveDB(t *testing.T) {
 
 	t.Run("product lists", func(t *testing.T) {
 		disabled := newProduct(ctx, t, q, owner)
-		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: disabled.ID, Description: "off", Enabled: false}); err != nil {
+		if _, err := q.UpdateProduct(ctx, store.UpdateProductParams{ID: disabled.ID, Description: pgtype.Text{String: "off", Valid: true}, Enabled: pgtype.Bool{Bool: false, Valid: true}}); err != nil {
 			t.Fatal(err)
 		}
 		deleted := newProduct(ctx, t, q, owner)
@@ -618,5 +618,87 @@ func TestProductTokenMintLockLiveDB(t *testing.T) {
 	}
 	if err := try(same); err != nil {
 		t.Fatalf("same pair after the holder committed: %v", err)
+	}
+}
+
+// TestUpdateProductConcurrentPatchesLiveDB pins UpdateProduct's COALESCE shape against
+// a lost update. Transaction A sets only the description and holds the row; transaction
+// B sets only enabled and is proven BLOCKED on A's row lock (pg_stat_activity) before A
+// commits. When A commits, B's UPDATE re-evaluates on A's row version, so its COALESCE
+// keeps A's description: both writes survive. A read-merge-write (B reading the
+// description first, then writing it back) would restore the old description here.
+func TestUpdateProductConcurrentPatchesLiveDB(t *testing.T) {
+	ctx, pool, q := productLiveDB(t)
+	user, _ := newProductUser(ctx, t, pool)
+	p := newProduct(ctx, t, q, user)
+
+	txA, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txA.Rollback(ctx) }()
+	if _, err := store.New(txA).UpdateProduct(ctx, store.UpdateProductParams{
+		ID: p.ID, Description: pgtype.Text{String: "from A", Valid: true},
+	}); err != nil {
+		t.Fatalf("A: %v", err)
+	}
+
+	txB, err := pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = txB.Rollback(ctx) }()
+	var pidB int32
+	if err := txB.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&pidB); err != nil {
+		t.Fatal(err)
+	}
+	bDone := make(chan error, 1)
+	go func() {
+		_, err := store.New(txB).UpdateProduct(ctx, store.UpdateProductParams{
+			ID: p.ID, Enabled: pgtype.Bool{Bool: false, Valid: true},
+		})
+		bDone <- err
+	}()
+
+	// B must be waiting on A's row lock, or this is not the interleaving under test.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		var waiting bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1 AND wait_event_type = 'Lock')`,
+			pidB).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting {
+			break
+		}
+		select {
+		case err := <-bDone:
+			t.Fatalf("B finished (%v) without waiting on A's row lock", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("B never blocked on A's row lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if err := txA.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := <-bDone; err != nil {
+		t.Fatalf("B: %v", err)
+	}
+	if err := txB.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := q.GetProduct(ctx, p.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Description != "from A" || got.Enabled {
+		t.Fatalf("after two concurrent single-field PATCHes: description=%q enabled=%t, want %q and false (both writes kept)",
+			got.Description, got.Enabled, "from A")
 	}
 }

@@ -868,7 +868,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// chi's Mount installs an mALL stub there — so the Route must register BEFORE
 		// the Put or it clobbers the PUT method (the two were Route-then-Put inline).
 		h.mountJudgeRoutes(r, forgeLimiter)
-		h.mountMeRoutes(r)
+		h.mountMeRoutes(r, authLimiter)
 		h.mountSchedulesRoutes(r, forgeLimiter)
 		h.mountVaultRoutes(r, authLimiter)
 		h.mountSlackRoutes(r, slackDMLimiter)

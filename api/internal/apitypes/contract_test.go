@@ -155,6 +155,10 @@ func contractCases() []contractCase {
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),
 		newContractCase[V1WhoamiDTO]("v1_whoami"),
+		// PRD #1907 M4/M5: the typed admin delete response (its nested product carries the
+		// present-as-null deleted_at) and the user mint picker entry (all strings, no null).
+		newContractCase[AdminDeleteProductResponse]("admin_delete_product"),
+		newContractCase[MintableProductDTO]("mintable_product"),
 	}
 }
 
