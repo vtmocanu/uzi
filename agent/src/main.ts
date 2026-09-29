@@ -31,7 +31,7 @@ import { errMessage } from "./util.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from "./docker-wiring.js";
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
-import { probeLandlockAvailability, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
+import { landlockProbeForMode, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
 import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launcher.js";
 import { workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
@@ -329,7 +329,7 @@ async function main(): Promise<void> {
   // probeCodexRuntime keeps its no-exec contract. Each failing precondition logs a
   // distinct reason.
   const uidSplit = uidSplitActive();
-  const landlock = probeLandlockAvailability();
+  const landlock = landlockProbeForMode(config.codexCommandSandbox);
   config.codexHarness = resolveCodexHarnessAvailability({
     receiptCapable: config.codexProbe.capable,
     receiptReason: config.codexProbe.reason,

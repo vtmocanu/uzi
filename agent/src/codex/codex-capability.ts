@@ -11,7 +11,7 @@
 // A Landlock ERROR (any other errno / ABI < 1) or a failed probe is FATAL in
 // `required` and `best-effort` (D8), so it must NOT advertise — advertising it would
 // produce a claimed-then-failed run, the exact dishonesty this milestone removes.
-// `off` never calls Landlock in the sandbox, so its probe result is informational.
+// `off` never calls Landlock at all: startup skips the probe (outcome `skipped`).
 //
 // This wrapper spawns `uzi-codex-command-sandbox --probe`, so it lives in its OWN
 // module: it must never be imported into codex-runtime-probe.ts, whose no-exec /
@@ -39,8 +39,9 @@ const PROBE_EXIT_ERROR = 11;
 
 /** The Landlock probe outcome. `probe-failed` is distinct from the sandbox's own
  *  `error` classification: it means the `--probe` process could not be run at all
- *  (binary missing, spawn error, timeout, or an unexpected exit code). */
-export type LandlockProbeOutcome = "available" | "unavailable" | "error" | "probe-failed";
+ *  (binary missing, spawn error, timeout, or an unexpected exit code). `skipped`
+ *  means the mode is `off`, so no probe ran. */
+export type LandlockProbeOutcome = "available" | "unavailable" | "error" | "probe-failed" | "skipped";
 
 /** The resolved advertisement decision. `advertise` gates `codex_harness_v1`;
  *  `degraded` is true when advertising with commands unconfined: mode `off`, or
@@ -79,6 +80,16 @@ export function probeLandlockAvailability(
     default:
       return "probe-failed";
   }
+}
+
+/** The startup Landlock probe for a configured mode: `off` never applies Landlock,
+ *  so it skips the `--probe` spawn (up to a 10 s synchronous wait) and reports
+ *  `skipped`; every other mode runs the probe. */
+export function landlockProbeForMode(
+  mode: CommandSandboxMode,
+  probe: () => LandlockProbeOutcome = probeLandlockAvailability,
+): LandlockProbeOutcome {
+  return mode === "off" ? "skipped" : probe();
 }
 
 /** Inputs to {@link resolveCodexHarnessAvailability} — the three combined signals
