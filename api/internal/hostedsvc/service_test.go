@@ -513,6 +513,41 @@ func TestPollCarriesDiskPressureAndEphemeral(t *testing.T) {
 	}
 }
 
+// TestPollCarriesIsolated pins PRD #1906 M5's lane dimension: workers.isolated_lane reaches
+// DesiredWorker.Isolated, and an ordinary worker beside it stays false, so a dropped or
+// hardcoded mapping reddens here as well as on the wire golden.
+func TestPollCarriesIsolated(t *testing.T) {
+	st := newFakeStore()
+	svc := newTestService(t, st)
+	laneID, plainID := uuid.New(), uuid.New()
+	st.workers = append(st.workers,
+		store.ListHostedWorkersForControllerRow{
+			ID: laneID, TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+			HostedSize: pgtype.Text{String: "m", Valid: true}, HostedGeneration: 1,
+			Ephemeral: true, IsolatedLane: true,
+		},
+		store.ListHostedWorkersForControllerRow{
+			ID: plainID, TemplateDeclared: pgtype.Text{String: "base", Valid: true},
+			HostedSize: pgtype.Text{String: "m", Valid: true}, HostedGeneration: 1,
+			Ephemeral: true,
+		},
+	)
+	resp, err := svc.Poll(context.Background())
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	byID := map[string]DesiredWorker{}
+	for _, w := range resp.Workers {
+		byID[w.ID] = w
+	}
+	if !byID[laneID.String()].Isolated {
+		t.Fatalf("lane worker = %+v, want Isolated=true", byID[laneID.String()])
+	}
+	if byID[plainID.String()].Isolated {
+		t.Fatalf("ordinary ephemeral worker = %+v, want Isolated=false", byID[plainID.String()])
+	}
+}
+
 // A registration for a worker with no token row at all deletes nothing and must not
 // error — the worker still registered successfully.
 func TestNoteRegisteredForWorkerWithNoRowIsNotAnError(t *testing.T) {

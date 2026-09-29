@@ -102,9 +102,9 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 }
 
 const createEphemeralHostedWorker = `-- name: CreateEphemeralHostedWorker :one
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode)
-VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode, isolated_lane)
+VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8, $9::boolean)
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
 `
 
 type CreateEphemeralHostedWorkerParams struct {
@@ -116,6 +116,7 @@ type CreateEphemeralHostedWorkerParams struct {
 	DockerEnabled     pgtype.Bool `json:"docker_enabled"`
 	EphemeralRunID    uuid.UUID   `json:"ephemeral_run_id"`
 	AnthropicBindMode string      `json:"anthropic_bind_mode"`
+	IsolatedLane      bool        `json:"isolated_lane"`
 }
 
 // Insert a run-bound EPHEMERAL hosted worker (PRD #529 M2). It is CreateHostedWorker
@@ -137,6 +138,9 @@ type CreateEphemeralHostedWorkerParams struct {
 // anthropic_bind_mode is now caller-supplied (issue #804): the provisioner passes `auto`
 // when the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool) and
 // `default` otherwise, so an auto worker never parks a run in pool_wait on an empty pool.
+//
+// isolated_lane (PRD #1906 M5) is the provisioner's own decision (the bound run is
+// profile-bound), never a worker input: this INSERT is the only writer of the column.
 func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEphemeralHostedWorkerParams) (Worker, error) {
 	row := q.db.QueryRow(ctx, createEphemeralHostedWorker,
 		arg.UserID,
@@ -147,6 +151,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		arg.DockerEnabled,
 		arg.EphemeralRunID,
 		arg.AnthropicBindMode,
+		arg.IsolatedLane,
 	)
 	var i Worker
 	err := row.Scan(
@@ -193,6 +198,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
@@ -200,7 +206,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, $7)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
 `
 
 type CreateHostedWorkerParams struct {
@@ -292,6 +298,7 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
@@ -425,6 +432,9 @@ SELECT w.id,
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= $2, false)::boolean AS disk_pressure,
        w.ephemeral,
+       -- isolated_lane (PRD #1906 M5): the server-set lane marker, mapped to DesiredWorker.Isolated
+       -- so the controller renders the worker into the isolated lane's namespace.
+       w.isolated_lane,
        -- custody_held (PRD #1296 M4, D3/D9): does this worker hold any OPEN custody hold?
        -- A distinct desired-worker signal, independent of busy/draining_since — a held
        -- worker is NOT free, and both ordinary controller teardown and the data-PVC recycle
@@ -458,6 +468,7 @@ type ListHostedWorkersForControllerRow struct {
 	DrainingSince    pgtype.Timestamptz `json:"draining_since"`
 	DiskPressure     bool               `json:"disk_pressure"`
 	Ephemeral        bool               `json:"ephemeral"`
+	IsolatedLane     bool               `json:"isolated_lane"`
 	CustodyHeld      bool               `json:"custody_held"`
 	TokenCiphertext  []byte             `json:"token_ciphertext"`
 }
@@ -499,6 +510,7 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 			&i.DrainingSince,
 			&i.DiskPressure,
 			&i.Ephemeral,
+			&i.IsolatedLane,
 			&i.CustodyHeld,
 			&i.TokenCiphertext,
 		); err != nil {
@@ -616,6 +628,11 @@ WHERE w.ephemeral
               WHERE r.id = w.ephemeral_run_id
                 AND r.worker_id IS NOT NULL AND r.worker_id <> w.id
           ))
+      OR EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
+      )
   )
 `
 
@@ -631,6 +648,10 @@ WHERE w.ephemeral
 //	(b) never booted past the provision deadline: online_since NULL and created_at old.
 //	(c) idle-stolen: online past the deadline and the bound run is claimed by a SIBLING
 //	    (worker_id set and != this worker), so this worker will never get work.
+//	(d) lane mismatch (PRD #1906 M5): the worker's isolated_lane differs from whether its bound
+//	    run is profile-bound, so ClaimRun's isolated-lane clause bars it from the run forever
+//	    (and it holds the run's one uq_workers_ephemeral_run slot, which would starve the right
+//	    trigger). No deadline: it can never make progress, so it goes on the next tick.
 func (q *Queries) ReapEphemeralWorkers(ctx context.Context, deadlineCutoff pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, reapEphemeralWorkers, deadlineCutoff)
 	if err != nil {

@@ -137,6 +137,15 @@ const GateRevisionV1 = "gate_revision_v1"
 // vocabulary below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
 const AdviceClaimFenceV1 = "advice_claim_fence_v1"
 
+// IsolatedFetchV1 is the PROTOCOL capability a worker self-reports (PRD #1906 M4/M5) to declare it
+// runs the isolated research runner (the fixed tool set and the fetch_url tool) and is wired to a
+// fetcher. It is one of the TWO facts ClaimRun's dedicated isolated-lane clause keys on for a
+// profile-bound run; the other, workers.isolated_lane, is server-set at provisioning and never a
+// worker self-report, so a worker that advertises this capability on its own still cannot claim a
+// profile-bound run. Like the other protocol capabilities it lives in the protocol vocabulary
+// below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
+const IsolatedFetchV1 = "isolated_fetch_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -152,11 +161,12 @@ var protocolVocabulary = map[string]struct{}{
 	InputReceiptsV1:            {},
 	GateRevisionV1:             {},
 	AdviceClaimFenceV1:         {},
+	IsolatedFetchV1:            {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, IsolatedFetchV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

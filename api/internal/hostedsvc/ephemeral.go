@@ -32,6 +32,9 @@ const ephemeralProvisionBatch int32 = 50
 const (
 	triggerCapabilityGap = "capability_gap"
 	triggerSaturation    = "saturation"
+	// triggerIsolatedLane (PRD #1906 M5, D-B): a queued profile-bound run, which only a lane
+	// worker can claim. It provisions a lane worker (isolated_lane = true, never docker).
+	triggerIsolatedLane = "isolated_lane"
 )
 
 // durationToInterval converts a Go duration to a pgtype.Interval for the saturation
@@ -110,7 +113,8 @@ func NewEphemeralProvisioner(pool *pgxpool.Pool, q *store.Queries, box *secretbo
 // returns the number of ephemeral workers actually created this tick.
 //
 // Flag-off footprint is exactly ONE settings read: with the instance kill-switch off it
-// returns (0, nil) before touching the database. When on, it unions the capability-gap and
+// returns (0, nil) before touching the database. When on, it unions the isolated-lane trigger
+// set (PRD #1906 M5: profile-bound runs, no opt-in needed) with the capability-gap and
 // saturation trigger sets for opted-in users and, for each, provisions one run-bound
 // ephemeral worker under the per-user cap. A hard error on one run is logged and does not
 // abort the whole pass — the sibling sweeper passes have the same resilience — so one bad
@@ -152,6 +156,16 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list saturation queued runs: %w", err)
 	}
+	// PRD #1906 M5 (D-B): the isolated-lane trigger. It skips the per-user opt-in (the lane is
+	// the only placement a profile-bound run has) but not the kill-switch above or the per-user
+	// cap. The two ordinary triggers exclude profile-bound runs, so the sets are disjoint.
+	laneRuns, err := p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
+		MaxRows:    ephemeralProvisionBatch,
+		MaxPerUser: int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+	})
+	if err != nil {
+		return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)
+	}
 
 	// Capability-gap first: it is permanent starvation (nothing can ever serve the run),
 	// so under a full batch it takes priority over saturation runs, which are transient and
@@ -162,9 +176,17 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		caps    []string
 		trigger string
 	}
-	candidates := make([]ephemeralCandidate, 0, len(gapRuns)+len(satRuns))
-	seen := make(map[uuid.UUID]struct{}, len(gapRuns)+len(satRuns))
+	candidates := make([]ephemeralCandidate, 0, len(laneRuns)+len(gapRuns)+len(satRuns))
+	seen := make(map[uuid.UUID]struct{}, len(laneRuns)+len(gapRuns)+len(satRuns))
+	// Lane runs first: like a capability gap, nothing but a provisioned worker can ever serve them.
+	for _, run := range laneRuns {
+		seen[run.ID] = struct{}{}
+		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerIsolatedLane})
+	}
 	for _, run := range gapRuns {
+		if _, dup := seen[run.ID]; dup {
+			continue
+		}
 		seen[run.ID] = struct{}{}
 		candidates = append(candidates, ephemeralCandidate{id: run.ID, userID: run.UserID, caps: run.RequiredCapabilities, trigger: triggerCapabilityGap})
 	}
@@ -187,7 +209,15 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 				"run_id", c.id, "trigger", c.trigger, "required_capabilities", c.caps, "error", rerr)
 			continue
 		}
-		ok, perr := p.provisionOne(ctx, c.userID, c.id, template, docker)
+		isolated := c.trigger == triggerIsolatedLane
+		if isolated && docker {
+			// The lane never gets a DinD sidecar (its pods run in the no-internet namespace, not
+			// the privileged tier), so a profile-bound run that requires docker has no worker.
+			slog.Warn("ephemeral provisioner: profile-bound run requires docker, which the isolated lane never provides; skipping",
+				"run_id", c.id, "trigger", c.trigger, "required_capabilities", c.caps)
+			continue
+		}
+		ok, perr := p.provisionOne(ctx, c.userID, c.id, template, docker, isolated)
 		if perr != nil {
 			slog.Error("ephemeral provisioner: provision failed; continuing with the rest of the pass",
 				"run_id", c.id, "trigger", c.trigger, "error", perr)
@@ -196,7 +226,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		if ok {
 			created++
 			slog.Info("ephemeral provisioner: provisioned run-bound worker",
-				"run_id", c.id, "trigger", c.trigger, "template", template, "docker", docker)
+				"run_id", c.id, "trigger", c.trigger, "template", template, "docker", docker, "isolated", isolated)
 		}
 	}
 	return created, nil
@@ -220,7 +250,10 @@ func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
 // advisory lock is taken FIRST, before the cap count it protects, so ephemeral and
 // persistent provisions for one user serialize (same lock class + key) and the cap
 // count is never a decorative TOCTOU.
-func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID uuid.UUID, template string, docker bool) (bool, error) {
+//
+// isolated marks a lane worker (PRD #1906 M5): the caller passes true only for the isolated-lane
+// trigger, whose run is profile-bound, and never together with docker.
+func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID uuid.UUID, template string, docker, isolated bool) (bool, error) {
 	tx, err := p.pool.Begin(ctx)
 	if err != nil {
 		return false, err
@@ -280,6 +313,7 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		DockerEnabled:     pgtype.Bool{Bool: docker, Valid: true},
 		EphemeralRunID:    runID,
 		AnthropicBindMode: mode,
+		IsolatedLane:      isolated,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

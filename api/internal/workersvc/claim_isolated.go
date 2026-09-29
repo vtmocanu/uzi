@@ -21,6 +21,12 @@ import (
 // transaction source to mint the credential with.
 var errIsolatedClaimRefused = fmt.Errorf("%w: profile-bound run cannot be claimed", errCredentialUnavailable)
 
+// errIsolatedLaneMismatch wraps errCredentialUnavailable (terminal) for a claim whose run and
+// worker sit on different sides of the isolated lane (PRD #1906 M5, Decision 9): a
+// profile-bound run on a worker without workers.isolated_lane, or an unbound run on a lane
+// worker. ClaimRun's two-way clause never returns such a pair; this is the Go backstop.
+var errIsolatedLaneMismatch = fmt.Errorf("%w: run and worker are on different sides of the isolated lane", errCredentialUnavailable)
+
 // isolateClaim turns an assembled claim into a profile-bound research claim (PRD #1906
 // M3, Decisions 5, 7, 10 and 12). In one transaction it snapshots the run's site list at
 // its FIRST claim (a later claim keeps that snapshot, so an admin edit never changes a

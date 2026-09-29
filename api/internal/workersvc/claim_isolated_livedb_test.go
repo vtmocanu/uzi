@@ -75,7 +75,13 @@ func (f *isoFix) queuedRun(t *testing.T, iid int64, bound bool) uuid.UUID {
 
 func (f *isoFix) claim(t *testing.T, want uuid.UUID) *ClaimPayload {
 	t.Helper()
-	p, err := f.svc.Claim(f.env.ctx, f.wkr, nil)
+	return f.claimAs(t, f.wkr, want)
+}
+
+// claimAs claims as wkr and requires the claim to deliver run want.
+func (f *isoFix) claimAs(t *testing.T, wkr store.Worker, want uuid.UUID) *ClaimPayload {
+	t.Helper()
+	p, err := f.svc.Claim(f.env.ctx, wkr, nil)
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
@@ -113,8 +119,10 @@ func (f *isoFix) cred(t *testing.T, run uuid.UUID) isoCred {
 func TestIsolatedClaimMintsCredentialLiveDB(t *testing.T) {
 	f := newIsoFix(t)
 	run := f.queuedRun(t, 301, true)
+	// PRD #1906 M5: only a lane worker (server-set isolated_lane, isolated_fetch_v1) claims it.
+	lane := f.laneWorker(t, run)
 
-	p := f.claim(t, run)
+	p := f.claimAs(t, lane, run)
 	g := p.IsolatedFetch
 	if g == nil || !strings.HasPrefix(g.Credential, fetchctl.CredentialPrefix) {
 		t.Fatalf("isolated_fetch = %+v, want a uzf_ credential", g)
@@ -153,7 +161,7 @@ func TestIsolatedClaimMintsCredentialLiveDB(t *testing.T) {
 		t.Fatal("the requeue did not revoke the credential")
 	}
 
-	p2 := f.claim(t, run)
+	p2 := f.claimAs(t, lane, run)
 	g2 := p2.IsolatedFetch
 	if g2 == nil || g2.Credential == g.Credential {
 		t.Fatalf("re-claim grant = %+v, want a rotated credential", g2)

@@ -2767,6 +2767,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// run is unaffected. Deliberately NOT folded into WorkerCaps — it is a separate
 		// column and a separate, override-proof clause.
 		WorkerProtocolCaps: wkr.ProtocolCapabilities,
+		// PRD #1906 M5 (Decision 9): the server-set lane marker, read by ClaimRun's two-way
+		// isolated-lane clause (a profile-bound run only on a lane worker, a lane worker only a
+		// profile-bound run). It comes from the worker ROW RequireWorker loaded, which only the
+		// provisioner writes, never from anything the worker sent.
+		WorkerIsolatedLane: wkr.IsolatedLane,
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
 		IsEphemeral:           wkr.Ephemeral,
 		EphemeralRunID:        wkr.EphemeralRunID,

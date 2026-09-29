@@ -1089,6 +1089,10 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))
+		// PRD #1906 M5 (D-D): an isolated-lane worker reaches only the lifecycle routes its
+		// research runner needs (laneWorkerAllowlist); every other route here, a new one
+		// included, answers it 403. Ordinary workers pass through untouched.
+		r.Use(laneWorkerRouteGuard)
 		r.Post("/register", h.WorkerRegister)
 		r.Post("/heartbeat", h.WorkerHeartbeat)
 		r.Post("/runs/claim", h.WorkerClaim)

@@ -794,7 +794,7 @@ FROM runs WHERE id = @id AND user_id = @user_id AND repo_id = @repo_id;
 -- hold is a side effect. target and hold share target's single snapshot/lock, so the hold's
 -- t.claim_generation + 1 equals the UPDATE's own increment.
 WITH target AS (
-    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation FROM runs r
+    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = @user_id
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
@@ -990,6 +990,22 @@ WITH target AS (
                 )
           )
       )
+      -- PRD #1906 M5 (Decision 9): the NON-BYPASSABLE isolated-lane claim clause, TWO-WAY. A
+      -- profile-bound run (egress_profile_id IS NOT NULL) may be claimed ONLY by a lane worker
+      -- (@worker_isolated_lane: workers.isolated_lane, set by the api at provisioning and never
+      -- from a worker report), and a lane worker claims ONLY profile-bound runs. The lane worker
+      -- must ALSO advertise 'isolated_fetch_v1' (it runs the isolated research runner), and a
+      -- Codex-indicating run is never claimable as a profile-bound run (Decision 10; its web search
+      -- is server-side), checked on all three Codex facts like the harness clause above. Like the
+      -- completion and Codex clauses it is a DEDICATED, standalone predicate INTENTIONALLY OUTSIDE
+      -- fn_worker_can_claim, required_capabilities, ClearRunRequiredCapabilities and the
+      -- @capability_aware kill-switch: none of them can put a profile-bound run on a worker outside
+      -- the lane. The same three lines are mirrored for the spread peer below, in
+      -- CountOnlineWorkersClaimableForRun and (as the lane half) in the CountOnlineWorkersSatisfying*
+      -- rungs.
+      AND ((r.egress_profile_id IS NOT NULL) = @worker_isolated_lane::boolean)
+      AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(@worker_protocol_caps::text[]))
+      AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
@@ -1109,6 +1125,11 @@ WITH target AS (
                           )
                     )
                 )
+                -- PRD #1906 M5: MIRROR the isolated-lane clause for the peer, or fleet-spread could
+                -- DEFER a run to a peer on the wrong side of the lane that could never claim it.
+                AND ((r.egress_profile_id IS NOT NULL) = p.isolated_lane)
+                AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(p.protocol_capabilities))
+                AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = @worker_id)
                     < (SELECT count(*) FROM runs mr
@@ -1204,6 +1225,9 @@ hold AS (
     FROM target t
     WHERE @recovery_capable::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+      -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
+      -- push), so it never opens a custody hold, whatever the claiming worker advertises.
+      AND t.egress_profile_id IS NULL
     RETURNING 1
 )
 UPDATE runs SET
@@ -6397,6 +6421,8 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- lane; NULL-safe via COALESCE), and the exemption is keyed on review_target_run_id/kind (task-review,
 -- judge and chat are exempt), NEVER on all of kind='task'. Cast ::boolean so sqlc types it as a usable
 -- bool (an expression is interface{} without the cast, per .claude/rules/go.md).
+-- PRD #1906 M5: egress_profile_id rides this read so the queued arm names the isolated lane for a
+-- profile-bound run (only a lane worker can claim it) instead of an ordinary worker reason.
 -- PRD #1590 M2 (D2, A1): codex_account_gated projects ClaimRun's Codex account gate onto each
 -- row (the SAME predicate text, evaluated over a self-join aliased r so the copies stay
 -- byte-identical), so the queued arm names the account hold instead of a worker reason for a
@@ -6408,6 +6434,7 @@ SELECT id, user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       egress_profile_id,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
@@ -6608,6 +6635,11 @@ WHERE run.id = @run_id
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   )
+  -- PRD #1906 M5: MIRROR ClaimRun's isolated-lane clause (both ways, the protocol capability,
+  -- and no Codex-indicating profile-bound run), reading the candidate's OWN columns.
+  AND ((run.egress_profile_id IS NOT NULL) = w.isolated_lane)
+  AND (run.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(w.protocol_capabilities))
+  AND (run.egress_profile_id IS NULL OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL))
   AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
@@ -6703,6 +6735,10 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND @required_capabilities::text[] <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false));
 
 -- name: CountOnlineWorkersSatisfyingProtocol :one
@@ -6728,6 +6764,10 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities);
 
 -- name: CountOnlineWorkersSatisfyingCodexHarness :one
@@ -6753,6 +6793,10 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities);
 
 -- name: CountOnlineWorkersSatisfyingCodexCompletion :one
@@ -6763,6 +6807,10 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities)
@@ -6791,6 +6839,10 @@ WHERE w.user_id = @user_id
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities);
 
@@ -6842,6 +6894,11 @@ FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   AND r.kind <> 'chat'
+  -- PRD #1906 M5 (D-B): never a profile-bound run. Only a lane worker can claim one
+  -- (ClaimRun's isolated-lane clause), so an ordinary ephemeral worker bound to it would take the
+  -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
+  -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
+  AND r.egress_profile_id IS NULL
   AND cardinality(r.required_capabilities) > 0
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -6926,6 +6983,11 @@ FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   AND r.kind <> 'chat'
+  -- PRD #1906 M5 (D-B): never a profile-bound run. Only a lane worker can claim one
+  -- (ClaimRun's isolated-lane clause), so an ordinary ephemeral worker bound to it would take the
+  -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
+  -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
+  AND r.egress_profile_id IS NULL
   AND now() - r.status_since > @saturation_delay::interval
   AND EXISTS (
       SELECT 1 FROM workers w
@@ -6955,6 +7017,39 @@ WHERE r.status = 'queued'
   AND (SELECT count(*) FROM workers wc
        WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
 ORDER BY r.status_since ASC
+LIMIT @max_rows;
+
+-- name: ListIsolatedQueuedRunsForEphemeral :many
+-- The ISOLATED-LANE trigger of the ephemeral auto-provisioner (PRD #1906 M5, D-B). A
+-- profile-bound run (egress_profile_id IS NOT NULL) can be claimed ONLY by a lane worker
+-- (ClaimRun's isolated-lane clause), and only the api provisions one, so every queued
+-- profile-bound run with no bound worker is a candidate: no online worker could ever serve it.
+--
+-- Each predicate, and why it is here:
+--   * r.status = 'queued' AND r.egress_profile_id IS NOT NULL — a profile-bound run nothing has
+--     claimed. (The schema already forbids a profile-bound chat or Codex run; the Codex test is
+--     repeated so a Codex-indicating row, which ClaimRun refuses, never gets a pod.)
+--   * NO per-user opt-in (u.ephemeral_workers_enabled): the lane IS the only placement for such a
+--     run, so the opt-in that chooses burst workers over waiting does not apply. The instance
+--     kill-switch is still honoured, in Go, before this query runs (ProvisionPass), and so is the
+--     per-user cap (the fairness filter here, the locked count in provisionOne).
+--   * NOT EXISTS (an ephemeral worker already bound to this run) — the one-per-run skip, the
+--     cheap pre-filter in front of uq_workers_ephemeral_run.
+--   * (SELECT count(...)) < @max_per_user — the same cross-user FAIRNESS filter (never the cap)
+--     as the two sibling triggers, counted the same way as CountEphemeralHostedWorkersForUser.
+SELECT r.id, r.user_id, r.required_capabilities
+FROM runs r
+WHERE r.status = 'queued'
+  AND r.egress_profile_id IS NOT NULL
+  AND r.kind <> 'chat'
+  AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w2
+      WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
+  )
+  AND (SELECT count(*) FROM workers wc
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
+ORDER BY r.created_at ASC
 LIMIT @max_rows;
 
 -- name: RunHasVerdictSinceGateOpened :one

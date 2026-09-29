@@ -166,6 +166,10 @@ const (
 	// Codex worker at all. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
 	reasonNoCustomCodexCapableWorker     = "no worker supporting custom Codex models is online"
 	reasonNoCodexCompletionCapableWorker = "no online worker implements the Codex completion interlock (codex_completion_interlock_v1); provision a capable worker"
+	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
+	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
+	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
+	reasonWaitingIsolatedLane = "waiting for an isolated research-lane worker to pick up this run"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -744,6 +748,12 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// limit it is owner-account state no worker can clear, so it precedes every worker reason.
 	if r.CodexAccountGated {
 		return reasonCodexAccountUnavailable
+	}
+	// PRD #1906 M5: a profile-bound run is claimable ONLY by an api-provisioned lane worker, so
+	// the ordinary fleet rungs below (online, capable, busy workers) cannot describe it; every one
+	// of them excludes lane workers. Placed after the owner-account blocks, which still gate it.
+	if r.EgressProfileID.Valid {
+		return reasonWaitingIsolatedLane
 	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
 	if err != nil {

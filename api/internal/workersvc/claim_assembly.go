@@ -189,6 +189,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
 		return nil, errIsolatedClaimRefused
 	}
+	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A
+	// profile-bound run on a worker outside the lane, or an unbound run on a lane worker, means
+	// the SQL gate did not hold: refuse before anything is opened rather than deliver it.
+	if isolated != wkr.IsolatedLane {
+		return nil, errIsolatedLaneMismatch
+	}
 	if run.Kind == runkind.Judge {
 		// PRD #1429 M3: the judge lane now threads the CLAIMING worker through too —
 		// assembleJudgeClaim's Codex branch needs it (codexClaimSecrets is worker-scoped),

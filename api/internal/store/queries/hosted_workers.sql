@@ -61,6 +61,9 @@ SELECT w.id,
         AND w.last_heartbeat_at IS NOT NULL
         AND w.last_heartbeat_at >= @heartbeat_cutoff, false)::boolean AS disk_pressure,
        w.ephemeral,
+       -- isolated_lane (PRD #1906 M5): the server-set lane marker, mapped to DesiredWorker.Isolated
+       -- so the controller renders the worker into the isolated lane's namespace.
+       w.isolated_lane,
        -- custody_held (PRD #1296 M4, D3/D9): does this worker hold any OPEN custody hold?
        -- A distinct desired-worker signal, independent of busy/draining_since — a held
        -- worker is NOT free, and both ordinary controller teardown and the data-PVC recycle
@@ -151,8 +154,11 @@ SELECT count(*) FROM workers WHERE user_id = @user_id AND kind = 'hosted' AND ep
 -- anthropic_bind_mode is now caller-supplied (issue #804): the provisioner passes `auto`
 -- when the owner has ≥1 auto_eligible anthropic_token (a non-empty auto-select pool) and
 -- `default` otherwise, so an auto worker never parks a run in pool_wait on an empty pool.
-INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode)
-VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled, true, @ephemeral_run_id::uuid, @anthropic_bind_mode)
+--
+-- isolated_lane (PRD #1906 M5) is the provisioner's own decision (the bound run is
+-- profile-bound), never a worker input: this INSERT is the only writer of the column.
+INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode, isolated_lane)
+VALUES (@user_id, @name, @token_hash, @template_declared, 'hosted', @hosted_size, @docker_enabled, true, @ephemeral_run_id::uuid, @anthropic_bind_mode, @isolated_lane::boolean)
 RETURNING *;
 
 -- name: DeleteEphemeralWorkerForRun :execrows
@@ -202,6 +208,10 @@ WHERE w.ephemeral
 --   (b) never booted past the provision deadline: online_since NULL and created_at old.
 --   (c) idle-stolen: online past the deadline and the bound run is claimed by a SIBLING
 --       (worker_id set and != this worker), so this worker will never get work.
+--   (d) lane mismatch (PRD #1906 M5): the worker's isolated_lane differs from whether its bound
+--       run is profile-bound, so ClaimRun's isolated-lane clause bars it from the run forever
+--       (and it holds the run's one uq_workers_ephemeral_run slot, which would starve the right
+--       trigger). No deadline: it can never make progress, so it goes on the next tick.
 DELETE FROM workers w
 WHERE w.ephemeral
   AND NOT EXISTS (
@@ -231,6 +241,11 @@ WHERE w.ephemeral
               WHERE r.id = w.ephemeral_run_id
                 AND r.worker_id IS NOT NULL AND r.worker_id <> w.id
           ))
+      OR EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
+      )
   );
 
 -- name: CreateHostedWorker :one

@@ -319,3 +319,15 @@ func TestEffectiveWorkerCaps_DoesNotMutateInput(t *testing.T) {
 		t.Errorf("EffectiveWorkerCaps([jvm], true) = %v, want [jvm docker]", got)
 	}
 }
+
+// TestFilterProtocol_KeepsIsolatedFetchV1 pins PRD #1906 M5: isolated_fetch_v1 survives
+// FilterProtocol (so a lane worker's advertisement is stored and ClaimRun's lane clause can
+// read it), last in the stable order, and is never a scheduler capability.
+func TestFilterProtocol_KeepsIsolatedFetchV1(t *testing.T) {
+	if got := FilterProtocol([]string{IsolatedFetchV1, AdviceClaimFenceV1}); !reflect.DeepEqual(got, []string{AdviceClaimFenceV1, IsolatedFetchV1}) {
+		t.Errorf("FilterProtocol([isolated fetch, advice fence]) = %v, want [%q %q]", got, AdviceClaimFenceV1, IsolatedFetchV1)
+	}
+	if got := Filter([]string{IsolatedFetchV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", IsolatedFetchV1, got)
+	}
+}

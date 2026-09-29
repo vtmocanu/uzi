@@ -685,7 +685,7 @@ func (q *Queries) ClaimAutopilotTerminalComment(ctx context.Context, id uuid.UUI
 
 const claimRun = `-- name: ClaimRun :one
 WITH target AS (
-    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation FROM runs r
+    SELECT r.id, r.user_id, r.repo_id, r.kind, r.claim_generation, r.egress_profile_id FROM runs r
     WHERE r.user_id = $2
       AND r.kind <> 'chat'
       -- PRD #400 Decision 6: a task run is claimable ONLY after the CLI has seeded its
@@ -881,13 +881,29 @@ WITH target AS (
                 )
           )
       )
+      -- PRD #1906 M5 (Decision 9): the NON-BYPASSABLE isolated-lane claim clause, TWO-WAY. A
+      -- profile-bound run (egress_profile_id IS NOT NULL) may be claimed ONLY by a lane worker
+      -- (@worker_isolated_lane: workers.isolated_lane, set by the api at provisioning and never
+      -- from a worker report), and a lane worker claims ONLY profile-bound runs. The lane worker
+      -- must ALSO advertise 'isolated_fetch_v1' (it runs the isolated research runner), and a
+      -- Codex-indicating run is never claimable as a profile-bound run (Decision 10; its web search
+      -- is server-side), checked on all three Codex facts like the harness clause above. Like the
+      -- completion and Codex clauses it is a DEDICATED, standalone predicate INTENTIONALLY OUTSIDE
+      -- fn_worker_can_claim, required_capabilities, ClearRunRequiredCapabilities and the
+      -- @capability_aware kill-switch: none of them can put a profile-bound run on a worker outside
+      -- the lane. The same three lines are mirrored for the spread peer below, in
+      -- CountOnlineWorkersClaimableForRun and (as the lane half) in the CountOnlineWorkersSatisfying*
+      -- rungs.
+      AND ((r.egress_profile_id IS NOT NULL) = $13::boolean)
+      AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY($11::text[]))
+      AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
       -- PRD #529 Decision 4: an ephemeral worker exists to serve exactly one run and
       -- must never take foreign work — otherwise it could hold a non-owning run when
       -- its bound run terminates, blocking the busy-guarded teardown (M4). So an
       -- ephemeral claimant (@is_ephemeral) matches ONLY its bound run
       -- (@ephemeral_run_id); a non-ephemeral worker short-circuits true and the
       -- (NULL) run id is never compared.
-      AND (NOT $13::boolean OR r.id = $14::uuid)
+      AND (NOT $14::boolean OR r.id = $15::uuid)
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -905,7 +921,7 @@ WITH target AS (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $15
+          OR r.updated_at < $16
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -1000,6 +1016,11 @@ WITH target AS (
                           )
                     )
                 )
+                -- PRD #1906 M5: MIRROR the isolated-lane clause for the peer, or fleet-spread could
+                -- DEFER a run to a peer on the wrong side of the lane that could never claim it.
+                AND ((r.egress_profile_id IS NOT NULL) = p.isolated_lane)
+                AND (r.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(p.protocol_capabilities))
+                AND (r.egress_profile_id IS NULL OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL))
                 AND pa.active < p.max_concurrent_runs
                 AND pa.active * (SELECT w.max_concurrent_runs FROM workers w WHERE w.id = $1)
                     < (SELECT count(*) FROM runs mr
@@ -1029,7 +1050,7 @@ WITH target AS (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $16
+            AND (a.reported_at >= $17
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -1039,8 +1060,8 @@ WITH target AS (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($17::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($18::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($18::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($19::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -1071,7 +1092,7 @@ WITH target AS (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $19) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $20) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1091,10 +1112,13 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $20::text, $1, t.id, now(), now()
+           $1, $21::text, $1, t.id, now(), now()
     FROM target t
-    WHERE $21::boolean
+    WHERE $22::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
+      -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
+      -- push), so it never opens a custody hold, whatever the claiming worker advertises.
+      AND t.egress_profile_id IS NULL
     RETURNING 1
 )
 UPDATE runs SET
@@ -1150,6 +1174,7 @@ type ClaimRunParams struct {
 	CustodyHoldLimit      int32              `json:"custody_hold_limit"`
 	WorkerProtocolCaps    []string           `json:"worker_protocol_caps"`
 	CodexCuratedModels    []string           `json:"codex_curated_models"`
+	WorkerIsolatedLane    bool               `json:"worker_isolated_lane"`
 	IsEphemeral           bool               `json:"is_ephemeral"`
 	EphemeralRunID        pgtype.UUID        `json:"ephemeral_run_id"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
@@ -1210,6 +1235,7 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.CustodyHoldLimit,
 		arg.WorkerProtocolCaps,
 		arg.CodexCuratedModels,
+		arg.WorkerIsolatedLane,
 		arg.IsEphemeral,
 		arg.EphemeralRunID,
 		arg.SpreadCutoff,
@@ -1824,6 +1850,11 @@ WHERE run.id = $1
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   )
+  -- PRD #1906 M5: MIRROR ClaimRun's isolated-lane clause (both ways, the protocol capability,
+  -- and no Codex-indicating profile-bound run), reading the candidate's OWN columns.
+  AND ((run.egress_profile_id IS NOT NULL) = w.isolated_lane)
+  AND (run.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(w.protocol_capabilities))
+  AND (run.egress_profile_id IS NULL OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL))
   AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
@@ -1888,6 +1919,10 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND $2::text[] <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
 `
 
@@ -1932,6 +1967,10 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities)
@@ -1958,6 +1997,10 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
 `
 
@@ -1991,6 +2034,10 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
 `
@@ -2025,6 +2072,10 @@ WHERE w.user_id = $1
   AND w.status = 'online'
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
+  -- PRD #1906 M5: the lane half of ClaimRun's isolated-lane clause. These rungs only run for an
+  -- UNBOUND run (queuedReason answers a profile-bound run before them), and a lane worker never
+  -- claims an unbound run, so it is never a satisfier here.
+  AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
 `
 
@@ -3284,7 +3335,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
 `
 
 type CreateWorkerParams struct {
@@ -3371,6 +3422,7 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
@@ -5571,7 +5623,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -5621,12 +5673,13 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -5681,12 +5734,13 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -5737,12 +5791,13 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -5797,6 +5852,7 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
@@ -5846,7 +5902,7 @@ UPDATE workers SET
     END,
     updated_at            = now()
 WHERE id = $16
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
 `
 
 type HeartbeatWorkerParams struct {
@@ -5939,6 +5995,7 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
@@ -6463,6 +6520,7 @@ SELECT id, user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
+       egress_profile_id,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
@@ -6535,6 +6593,7 @@ type ListActiveRunsForHealthRow struct {
 	CodexSecretID             pgtype.UUID        `json:"codex_secret_id"`
 	WorkerID                  pgtype.UUID        `json:"worker_id"`
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
+	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	CodexCustomRoot           bool               `json:"codex_custom_root"`
 	CodexAccountGated         bool               `json:"codex_account_gated"`
 }
@@ -6586,6 +6645,8 @@ type ListActiveRunsForHealthRow struct {
 // lane; NULL-safe via COALESCE), and the exemption is keyed on review_target_run_id/kind (task-review,
 // judge and chat are exempt), NEVER on all of kind='task'. Cast ::boolean so sqlc types it as a usable
 // bool (an expression is interface{} without the cast, per .claude/rules/go.md).
+// PRD #1906 M5: egress_profile_id rides this read so the queued arm names the isolated lane for a
+// profile-bound run (only a lane worker can claim it) instead of an ordinary worker reason.
 // PRD #1590 M2 (D2, A1): codex_account_gated projects ClaimRun's Codex account gate onto each
 // row (the SAME predicate text, evaluated over a self-join aliased r so the copies stay
 // byte-identical), so the queued arm names the account hold instead of a worker reason for a
@@ -6628,6 +6689,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.CodexSecretID,
 			&i.WorkerID,
 			&i.ReleasedWorkerID,
+			&i.EgressProfileID,
 			&i.CodexCustomRoot,
 			&i.CodexAccountGated,
 		); err != nil {
@@ -6685,7 +6747,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -6803,6 +6865,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.StatsDiskDindTotalInodes,
 			&i.Worker.StatsDiskDataInodes,
 			&i.Worker.StatsDiskDataTotalInodes,
+			&i.Worker.IsolatedLane,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -7125,6 +7188,71 @@ func (q *Queries) ListInputReceiptRows(ctx context.Context, arg ListInputReceipt
 			&i.GateBinding,
 			&i.GateRevision,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listIsolatedQueuedRunsForEphemeral = `-- name: ListIsolatedQueuedRunsForEphemeral :many
+SELECT r.id, r.user_id, r.required_capabilities
+FROM runs r
+WHERE r.status = 'queued'
+  AND r.egress_profile_id IS NOT NULL
+  AND r.kind <> 'chat'
+  AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+  AND NOT EXISTS (
+      SELECT 1 FROM workers w2
+      WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
+  )
+  AND (SELECT count(*) FROM workers wc
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < $1::int
+ORDER BY r.created_at ASC
+LIMIT $2
+`
+
+type ListIsolatedQueuedRunsForEphemeralParams struct {
+	MaxPerUser int32 `json:"max_per_user"`
+	MaxRows    int32 `json:"max_rows"`
+}
+
+type ListIsolatedQueuedRunsForEphemeralRow struct {
+	ID                   uuid.UUID `json:"id"`
+	UserID               uuid.UUID `json:"user_id"`
+	RequiredCapabilities []string  `json:"required_capabilities"`
+}
+
+// The ISOLATED-LANE trigger of the ephemeral auto-provisioner (PRD #1906 M5, D-B). A
+// profile-bound run (egress_profile_id IS NOT NULL) can be claimed ONLY by a lane worker
+// (ClaimRun's isolated-lane clause), and only the api provisions one, so every queued
+// profile-bound run with no bound worker is a candidate: no online worker could ever serve it.
+//
+// Each predicate, and why it is here:
+//   - r.status = 'queued' AND r.egress_profile_id IS NOT NULL — a profile-bound run nothing has
+//     claimed. (The schema already forbids a profile-bound chat or Codex run; the Codex test is
+//     repeated so a Codex-indicating row, which ClaimRun refuses, never gets a pod.)
+//   - NO per-user opt-in (u.ephemeral_workers_enabled): the lane IS the only placement for such a
+//     run, so the opt-in that chooses burst workers over waiting does not apply. The instance
+//     kill-switch is still honoured, in Go, before this query runs (ProvisionPass), and so is the
+//     per-user cap (the fairness filter here, the locked count in provisionOne).
+//   - NOT EXISTS (an ephemeral worker already bound to this run) — the one-per-run skip, the
+//     cheap pre-filter in front of uq_workers_ephemeral_run.
+//   - (SELECT count(...)) < @max_per_user — the same cross-user FAIRNESS filter (never the cap)
+//     as the two sibling triggers, counted the same way as CountEphemeralHostedWorkersForUser.
+func (q *Queries) ListIsolatedQueuedRunsForEphemeral(ctx context.Context, arg ListIsolatedQueuedRunsForEphemeralParams) ([]ListIsolatedQueuedRunsForEphemeralRow, error) {
+	rows, err := q.db.Query(ctx, listIsolatedQueuedRunsForEphemeral, arg.MaxPerUser, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListIsolatedQueuedRunsForEphemeralRow{}
+	for rows.Next() {
+		var i ListIsolatedQueuedRunsForEphemeralRow
+		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -8464,6 +8592,11 @@ FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   AND r.kind <> 'chat'
+  -- PRD #1906 M5 (D-B): never a profile-bound run. Only a lane worker can claim one
+  -- (ClaimRun's isolated-lane clause), so an ordinary ephemeral worker bound to it would take the
+  -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
+  -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
+  AND r.egress_profile_id IS NULL
   AND now() - r.status_since > $1::interval
   AND EXISTS (
       SELECT 1 FROM workers w
@@ -8602,6 +8735,11 @@ FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   AND r.kind <> 'chat'
+  -- PRD #1906 M5 (D-B): never a profile-bound run. Only a lane worker can claim one
+  -- (ClaimRun's isolated-lane clause), so an ordinary ephemeral worker bound to it would take the
+  -- run's one uq_workers_ephemeral_run slot and never claim it, and the lane trigger
+  -- (ListIsolatedQueuedRunsForEphemeral) could then never provision the worker that can.
+  AND r.egress_profile_id IS NULL
   AND cardinality(r.required_capabilities) > 0
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -8701,7 +8839,7 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -8792,6 +8930,7 @@ type ListWorkersByUserRow struct {
 	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
 	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
 	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane             bool               `json:"isolated_lane"`
 	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                     bool               `json:"busy"`
 	ActiveRuns               int64              `json:"active_runs"`
@@ -8880,6 +9019,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.StatsDiskDindTotalInodes,
 			&i.StatsDiskDataInodes,
 			&i.StatsDiskDataTotalInodes,
+			&i.IsolatedLane,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -11177,7 +11317,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -11229,7 +11369,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -11286,6 +11426,7 @@ type RegisterWorkerRow struct {
 	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
 	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
 	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane             bool               `json:"isolated_lane"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -11390,6 +11531,7 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
@@ -14910,7 +15052,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -14994,6 +15136,7 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.StatsDiskDindTotalInodes,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
 	)
 	return i, err
 }
