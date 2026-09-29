@@ -240,8 +240,9 @@ services:
       # Read-only layer cache from the public images release.yml publishes (the same
       # refs ci.yml's build-agent reads). The agent image is ~2.6 GiB of pinned nix,
       # devbox and Chromium before any uzi source, and was rebuilt cold on every run.
-      # Anonymous pull, no credential; a miss (offline, a builder that cannot import a
-      # registry cache, or layers changed since the last release) just builds cold.
+      # Anonymous pull, no credential. Import is best-effort where the builder supports
+      # it: layers changed since the last release rebuild, and a builder without
+      # registry-cache import ignores these refs.
       cache_from:
         - type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${WORKER_TEMPLATE:-base}:buildcache
         - type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${WORKER_TEMPLATE:-base}:buildcache-release
