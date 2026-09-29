@@ -6,7 +6,9 @@
 // Revoke all is the ONE panic button on Settings → Access: since PRD #1907 D8 the same
 // endpoint also revokes every product token, so its confirm counts both kinds
 // (productTokenActiveCount, reported by the sibling ProductTokens) and it tells the
-// parent (onRevokedAll) so that list refetches.
+// parent (onRevokedAll) so that list refetches. A count that is unknown (null: a list
+// failed to load or was cut) keeps the button available and drops that number from the
+// confirm, since hiding the panic button on a load blip is the unsafe failure.
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
@@ -26,7 +28,7 @@ export function CliTokens({
   productTokenActiveCount = 0,
   onRevokedAll,
 }: {
-  productTokenActiveCount?: number;
+  productTokenActiveCount?: number | null;
   onRevokedAll?: () => void;
 } = {}) {
   const { user } = useAuth();
@@ -114,6 +116,7 @@ export function CliTokens({
     setError("");
     try {
       await api.revokeCliToken(id);
+      setMinted((m) => (m?.row.id === id ? null : m));
       await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke token"));
@@ -125,6 +128,8 @@ export function CliTokens({
     setConfirmingAll(false);
     try {
       await api.revokeAllCliTokens();
+      // The just-minted secret, if still on screen, is dead now: retire its panel.
+      setMinted(null);
       // Refresh the sibling product-token list even if our own reload then fails.
       onRevokedAll?.();
       await reload();
@@ -133,8 +138,11 @@ export function CliTokens({
     }
   };
 
-  const activeCount = tokens.filter((t) => !t.revoked).length;
-  const revokableCount = activeCount + productTokenActiveCount;
+  // null when the CLI list could not be read (see the header on unknown counts).
+  const activeCount = loadError ? null : tokens.filter((t) => !t.revoked).length;
+  const canRevokeAll =
+    activeCount === null || productTokenActiveCount === null || activeCount + productTokenActiveCount > 0;
+  const loadFailed = data === null && loadError !== "";
 
   return (
     <Card className="space-y-5">
@@ -212,7 +220,7 @@ export function CliTokens({
         <div className="flex items-center justify-between gap-2">
           <SectionTitle>Your tokens</SectionTitle>
           {/* The panic button. Enabled only when there is something to revoke. */}
-          {revokableCount > 0 && !confirmingAll && (
+          {canRevokeAll && !confirmingAll && (
             <Button variant="danger" size="sm" onClick={() => setConfirmingAll(true)}>
               Revoke all
             </Button>
@@ -251,7 +259,7 @@ export function CliTokens({
           <div className="space-y-2">
             <Skeletons />
           </div>
-        ) : tokens.length === 0 ? (
+        ) : loadFailed ? null : tokens.length === 0 ? (
           <EmptyState
             icon={<KeyIcon />}
             title="No CLI tokens yet"
@@ -270,14 +278,20 @@ export function CliTokens({
 }
 
 // "all 2 CLI tokens and 1 product token": both kinds counted, since the one endpoint
-// revokes both (D8). Only the kinds the user actually holds are named.
-function revokeAllSummary(cli: number, product: number): string {
+// revokes both (D8). Only the kinds the user actually holds are named; a kind whose count
+// is unknown (null) is named without a number ("every product token").
+function revokeAllSummary(cli: number | null, product: number | null): string {
   const n = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
-  const parts = [
-    cli > 0 ? n(cli, "CLI token") : "",
-    product > 0 ? n(product, "product token") : "",
-  ].filter(Boolean);
-  return `all ${parts.join(" and ")}`;
+  if (cli !== null && product !== null) {
+    const parts = [
+      cli > 0 ? n(cli, "CLI token") : "",
+      product > 0 ? n(product, "product token") : "",
+    ].filter(Boolean);
+    return `all ${parts.join(" and ")}`;
+  }
+  const part = (count: number | null, noun: string) =>
+    count === null ? `every ${noun}` : count > 0 ? `all ${n(count, noun)}` : "";
+  return [part(cli, "CLI token"), part(product, "product token")].filter(Boolean).join(" and ");
 }
 
 function Skeletons() {

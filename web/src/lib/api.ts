@@ -1768,10 +1768,12 @@ const realApi = {
 
   // ── Product tokens (PRD #1907) — cookie-only, owner-scoped ─────────────────
   // uzp_ tokens a user mints for an admin-registered product; they reach /api/v1
-  // only. The list carries no value (revoked and expired rows included, newest
-  // first); the mint returns the plaintext once. revokeAllCliTokens above also
-  // revokes every product token of the caller (D8), in one transaction.
-  listProductTokens: () => request<{ tokens: ProductToken[] }>("GET", "/me/product-tokens"),
+  // only. The list carries no value (revoked and expired rows included) and is
+  // capped at 200 rows, active first, then newest; `truncated` is true when the
+  // server cut it. The mint returns the plaintext once. revokeAllCliTokens above
+  // also revokes every product token of the caller (D8), in one transaction.
+  listProductTokens: () =>
+    request<{ tokens: ProductToken[]; truncated: boolean }>("GET", "/me/product-tokens"),
   listMintableProducts: () =>
     request<{ products: MintableProduct[] }>("GET", "/me/product-tokens/products"),
   createProductToken: (input: {
@@ -1793,8 +1795,9 @@ const realApi = {
     request<{ product: Product }>("PATCH", `/admin/products/${id}`, patch),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
+  // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.
   adminListProductTokens: () =>
-    request<{ tokens: AdminProductToken[] }>("GET", "/admin/product-tokens"),
+    request<{ tokens: AdminProductToken[]; truncated: boolean }>("GET", "/admin/product-tokens"),
   adminRevokeProductToken: (id: string) =>
     request<null>("POST", `/admin/product-tokens/${id}/revoke`),
 

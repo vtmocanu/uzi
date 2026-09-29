@@ -20,14 +20,24 @@ import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { useDemoMode } from "../lib/demoMode";
 import { maskIp } from "../lib/demoMask";
+import { PRODUCT_NAME_MAX_BYTES, productTextError } from "../lib/productText";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select } from "./ui";
 import { PackageIcon } from "./icons";
 
-// The scope vocabulary in the user's words (D5). Order is the display order.
+// The scope vocabulary in the user's words (D5). Order is the display order. /api/v1
+// has only /whoami today; the job endpoints arrive with PRD #1908, so each hint says
+// what the permission WILL allow rather than promising a capability that is not there.
 const SCOPES: { value: ProductTokenScope; label: string; hint: string }[] = [
-  { value: "jobs:read", label: "Read jobs", hint: "See job status and results." },
-  { value: "jobs:run", label: "Run jobs", hint: "Start and cancel jobs as you." },
+  { value: "jobs:read", label: "Read jobs", hint: "Will allow reading job status once job endpoints ship." },
+  { value: "jobs:run", label: "Run jobs", hint: "Will allow starting jobs as you once job endpoints ship." },
 ];
+const SCOPE_LABEL = Object.fromEntries(SCOPES.map((s) => [s.value, s.label])) as Record<
+  ProductTokenScope,
+  string
+>;
+
+// The per-user list cap (the server's; `truncated` reports the cut).
+const USER_LIST_CAP = 200;
 
 // D10: 90 days is the default; "never" is allowed for unattended products but is
 // never preselected.
@@ -55,25 +65,32 @@ export function ProductTokens({
   // list refetches without owning that button here.
   reloadKey?: number;
   // Reports how many tokens are active, so the shared Revoke all can count and offer
-  // itself even when the user holds no CLI token.
-  onActiveCountChange?: (count: number) => void;
+  // itself even when the user holds no CLI token. null means "unknown" (the list
+  // failed to load, or was cut while every listed row is active): the parent then
+  // keeps Revoke all available and words its confirm without a product count.
+  onActiveCountChange?: (count: number | null) => void;
 }) {
   const { data, loading, error: loadError, reload } = useAsyncData<{
     tokens: ProductToken[];
+    truncated: boolean;
     products: MintableProduct[];
   }>(
     async () => {
-      const [{ tokens }, { products }] = await Promise.all([
+      const [{ tokens, truncated }, { products }] = await Promise.all([
         api.listProductTokens(),
         api.listMintableProducts(),
       ]);
-      return { tokens, products };
+      return { tokens, truncated: truncated === true, products };
     },
     [reloadKey],
     { fallback: "Failed to load product tokens" },
   );
   const tokens = data?.tokens ?? [];
+  const truncated = data?.truncated ?? false;
   const products = data?.products ?? [];
+  // The first load failed: there is no list to speak about, so only the error shows
+  // (an empty state here would claim "no products" / "no tokens" it cannot know).
+  const loadFailed = data === null && loadError !== "";
   const [error, setError] = useState("");
 
   const [productId, setProductId] = useState("");
@@ -100,10 +117,24 @@ export function ProductTokens({
     if (minted) mintedRef.current?.focus();
   }, [minted]);
 
+  // A parent-driven reload means Revoke all just ran, which revoked the token this panel
+  // shows: drop the panel with it, so a dead secret is not left on screen to be copied.
+  // Adjusted during render (React's prop-change pattern), not in an effect.
+  const [seenReloadKey, setSeenReloadKey] = useState(reloadKey);
+  if (reloadKey !== seenReloadKey) {
+    setSeenReloadKey(reloadKey);
+    setMinted(null);
+  }
+
+  // Rows come active first, so the count is exact unless the cut may have dropped
+  // active rows too (every listed row active), or the list could not be read.
   const activeCount = tokens.filter(isProductTokenActive).length;
+  const countKnown =
+    loadError === "" && data !== null && !(truncated && activeCount === tokens.length);
   useEffect(() => {
-    if (data) onActiveCountChange?.(activeCount);
-  }, [data, activeCount, onActiveCountChange]);
+    if (loading && data === null && loadError === "") return; // nothing to report yet
+    onActiveCountChange?.(countKnown ? activeCount : null);
+  }, [loading, data, loadError, countKnown, activeCount, onActiveCountChange]);
 
   const ids = useId();
   const productHintId = `${ids}-product-hint`;
@@ -112,7 +143,10 @@ export function ProductTokens({
   const toggleScope = (s: ProductTokenScope, on: boolean) =>
     setScopes((prev) => (on ? [...new Set([...prev, s])] : prev.filter((x) => x !== s)));
 
-  const canCreate = !busy && chosenProductId !== "" && name.trim() !== "" && scopes.length > 0;
+  const nameError = productTextError("Name", name, PRODUCT_NAME_MAX_BYTES);
+  const nameErrorId = `${ids}-name-error`;
+  const canCreate =
+    !busy && chosenProductId !== "" && name.trim() !== "" && nameError === null && scopes.length > 0;
 
   const create = async (e: FormEvent) => {
     e.preventDefault();
@@ -154,6 +188,8 @@ export function ProductTokens({
     setError("");
     try {
       await api.revokeProductToken(id);
+      // Revoking the token whose secret is still on screen retires that panel too.
+      setMinted((m) => (m?.row.id === id ? null : m));
       await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke token"));
@@ -206,7 +242,7 @@ export function ProductTokens({
         </div>
       )}
 
-      {loading ? null : products.length === 0 ? (
+      {loading || loadFailed ? null : products.length === 0 ? (
         <EmptyState
           icon={<PackageIcon />}
           title="No products to connect yet"
@@ -246,9 +282,15 @@ export function ProductTokens({
                 id="product-token-name"
                 placeholder="e.g. production, staging"
                 value={name}
-                maxLength={200}
+                aria-invalid={nameError !== null || undefined}
+                aria-describedby={nameError ? nameErrorId : undefined}
                 onChange={(e) => setName(e.target.value)}
               />
+              {nameError && (
+                <p id={nameErrorId} className="text-xs text-warn">
+                  {nameError}
+                </p>
+              )}
             </Field>
           </div>
 
@@ -290,7 +332,8 @@ export function ProductTokens({
               </Field>
               {expiry === "never" && (
                 <p id={expiryHintId} className="text-xs text-warn">
-                  It stays valid until you or an admin revoke it, or the product is disabled.
+                  It stays valid until you or an admin revoke it, the product is disabled or
+                  deleted, or your account is deactivated.
                 </p>
               )}
             </div>
@@ -302,30 +345,38 @@ export function ProductTokens({
         </form>
       )}
 
-      <div className="space-y-3">
-        <SectionTitle>Your product tokens</SectionTitle>
-        {loading ? (
-          <div className="space-y-2">
-            <div className="h-14 animate-pulse rounded-lg bg-raised" />
-            <div className="h-14 animate-pulse rounded-lg bg-raised" />
-          </div>
-        ) : tokens.length === 0 ? (
-          <p className="text-sm text-faint">You have no product tokens.</p>
-        ) : (
-          <ul className="space-y-2">
-            {tokens.map((t) => (
-              <ProductTokenRow
-                key={t.id}
-                token={t}
-                // The mint picker lists exactly the enabled, live products, so an
-                // active token whose product is missing from it is being refused.
-                productUnavailable={!products.some((p) => p.id === t.product_id)}
-                onRevoke={() => revoke(t.id)}
-              />
-            ))}
-          </ul>
-        )}
-      </div>
+      {!loadFailed && (
+        <div className="space-y-3">
+          <SectionTitle>Your product tokens</SectionTitle>
+          {truncated && (
+            <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
+              Showing your first {USER_LIST_CAP} product tokens, active first; older tokens are not
+              listed.
+            </p>
+          )}
+          {loading ? (
+            <div className="space-y-2">
+              <div className="h-14 animate-pulse rounded-lg bg-raised" />
+              <div className="h-14 animate-pulse rounded-lg bg-raised" />
+            </div>
+          ) : tokens.length === 0 ? (
+            <p className="text-sm text-faint">You have no product tokens.</p>
+          ) : (
+            <ul className="space-y-2">
+              {tokens.map((t) => (
+                <ProductTokenRow
+                  key={t.id}
+                  token={t}
+                  // The mint picker lists exactly the enabled, live products, so an
+                  // active token whose product is missing from it is being refused.
+                  productUnavailable={!products.some((p) => p.id === t.product_id)}
+                  onRevoke={() => revoke(t.id)}
+                />
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
     </Card>
   );
 }
@@ -339,7 +390,7 @@ export function ProductTokenBadges({ token }: { token: ProductToken }) {
     <>
       {token.scopes.map((s) => (
         <Badge key={s} tone={s === "jobs:run" ? "info" : "neutral"}>
-          {s}
+          {SCOPE_LABEL[s] ?? s}
         </Badge>
       ))}
       {token.revoked && <Badge tone="danger">revoked</Badge>}

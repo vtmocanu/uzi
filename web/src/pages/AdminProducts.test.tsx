@@ -78,7 +78,7 @@ beforeEach(() => {
     user: { id: "u-admin", is_admin: true } as User,
   } as unknown as ReturnType<typeof useAuth>);
   mockApi.adminListProducts.mockResolvedValue({ products: [aProduct()] });
-  mockApi.adminListProductTokens.mockResolvedValue({ tokens: [aToken()] });
+  mockApi.adminListProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken()] });
 });
 
 afterEach(() => {
@@ -96,6 +96,7 @@ describe("AdminProducts list", () => {
       ],
     });
     mockApi.adminListProductTokens.mockResolvedValue({
+      truncated: false,
       tokens: [
         aToken(),
         aToken({ id: "pt2", product_id: "prod-c", name: "importer", owner_email: "dan@uzi.local", revoked: true }),
@@ -109,7 +110,7 @@ describe("AdminProducts list", () => {
     expect(within(helpdesk).getByText("mira@uzi.local")).toBeTruthy();
     expect(within(helpdesk).getByText("support-prod")).toBeTruthy();
     expect(within(helpdesk).getByText(CLS + "4c1e…")).toBeTruthy();
-    expect(within(helpdesk).getByText("jobs:run")).toBeTruthy();
+    expect(within(helpdesk).getByText("Run jobs")).toBeTruthy();
     expect(within(helpdesk).getByText(/from 10\.20\.3\.14/)).toBeTruthy();
     expect(within(helpdesk).getByText("never expires")).toBeTruthy();
 
@@ -191,5 +192,100 @@ describe("AdminProducts writes", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Revoke support-prod" }));
     await waitFor(() => expect(mockApi.adminRevokeProductToken).toHaveBeenCalledWith("pt1"));
     await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenCalledTimes(2));
+  });
+});
+
+describe("AdminProducts register form (review item 1)", () => {
+  it("takes the description on one line, since the server refuses any newline", async () => {
+    renderPage();
+    const desc = await screen.findByLabelText(/^Description/);
+    expect(desc.tagName).toBe("INPUT");
+  });
+
+  it("flags a pasted tab or invisible character and blocks Register before the server 400s", async () => {
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "CRM sync" } });
+    const register = screen.getByRole("button", { name: "Register product" }) as HTMLButtonElement;
+    expect(register.disabled).toBe(false);
+
+    fireEvent.change(screen.getByLabelText(/^Description/), { target: { value: "a\tb" } });
+    expect(
+      screen.getByText("Description can’t contain tabs, line breaks or invisible formatting characters."),
+    ).toBeTruthy();
+    expect(register.disabled).toBe(true);
+
+    fireEvent.change(screen.getByLabelText(/^Description/), { target: { value: "Syncs." } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "CRM\u202Esync" } });
+    expect(
+      screen.getByText("Name can’t contain tabs, line breaks or invisible formatting characters."),
+    ).toBeTruthy();
+    expect(register.disabled).toBe(true);
+    fireEvent.click(register);
+    expect(mockApi.adminCreateProduct).not.toHaveBeenCalled();
+  });
+
+  it("counts the description in bytes, not characters", async () => {
+    renderPage();
+    // 334 x U+20AC is 334 characters but 1002 bytes.
+    fireEvent.change(await screen.findByLabelText(/^Description/), {
+      target: { value: "\u20ac".repeat(334) },
+    });
+    expect(screen.getByText(/Description is 1002 bytes; the limit is 1000/)).toBeTruthy();
+  });
+});
+
+describe("AdminProducts first-load failure (review item 2's twin)", () => {
+  it("shows only the error, not a false No products registered", async () => {
+    mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "database unavailable"));
+    renderPage();
+    expect((await screen.findByRole("alert")).textContent).toBe("database unavailable");
+    expect(screen.queryByText("No products registered")).toBeNull();
+  });
+
+  it("still shows the empty state on a successful empty load (control)", async () => {
+    mockApi.adminListProducts.mockResolvedValue({ products: [] });
+    mockApi.adminListProductTokens.mockResolvedValue({ truncated: false, tokens: [] });
+    renderPage();
+    expect(await screen.findByText("No products registered")).toBeTruthy();
+  });
+});
+
+describe("AdminProducts toggle keeps focus while busy (review item 4)", () => {
+  it("marks the switch aria-disabled, not natively disabled, and focus stays on it", async () => {
+    let settle!: (v: { product: Product }) => void;
+    mockApi.adminUpdateProduct.mockReturnValue(new Promise((r) => (settle = r)));
+    renderPage();
+    const sw = (await screen.findByRole("switch", { name: "Disable Helpdesk assistant" })) as HTMLButtonElement;
+    sw.focus();
+    fireEvent.click(sw);
+
+    await waitFor(() => expect(sw.getAttribute("aria-disabled")).toBe("true"));
+    expect(sw.disabled).toBe(false);
+    expect(document.activeElement).toBe(sw);
+    // A second click while in flight is ignored.
+    fireEvent.click(sw);
+    expect(mockApi.adminUpdateProduct).toHaveBeenCalledTimes(1);
+
+    settle({ product: aProduct({ enabled: false }) });
+    await waitFor(() => expect(sw.getAttribute("aria-disabled")).toBeNull());
+  });
+});
+
+describe("AdminProducts truncated inventory", () => {
+  it("says the first 1000 are shown and does not claim a product has no tokens", async () => {
+    mockApi.adminListProducts.mockResolvedValue({
+      products: [aProduct(), aProduct({ id: "prod-b", name: "Metrics export", active_token_count: 4 })],
+    });
+    mockApi.adminListProductTokens.mockResolvedValue({ truncated: true, tokens: [aToken()] });
+    renderPage();
+    expect(
+      await screen.findByText(
+        "Showing the first 1000 tokens, active first; older tokens are not listed.",
+      ),
+    ).toBeTruthy();
+    const metrics = await productCard("Metrics export");
+    expect(within(metrics).getByText(/its tokens may be beyond the list/)).toBeTruthy();
+    // Paired with the positive in "AdminProducts list", where the same card shape says it.
+    expect(within(metrics).queryByText("No tokens minted for this product.")).toBeNull();
   });
 });

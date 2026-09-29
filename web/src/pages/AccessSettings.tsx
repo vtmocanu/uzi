@@ -12,7 +12,9 @@ import { CliTokens } from "../components/CliTokens";
 import { ProductTokens } from "../components/ProductTokens";
 
 export function AccessSettings() {
-  const [productActive, setProductActive] = useState(0);
+  // 0 until ProductTokens reports; null once it reports an unknown count (a failed or
+  // cut list), which keeps Revoke all offered without a product number.
+  const [productActive, setProductActive] = useState<number | null>(0);
   const [reloadKey, setReloadKey] = useState(0);
   const onRevokedAll = useCallback(() => setReloadKey((k) => k + 1), []);
   return (

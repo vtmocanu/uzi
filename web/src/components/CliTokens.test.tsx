@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { CliTokens } from "./CliTokens";
 import { api, type CliToken, type User } from "../lib/api";
+import { ApiError } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importActual) => {
@@ -222,6 +223,30 @@ describe("CliTokens revoke", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
     expect(screen.getByText(/Revoke all 1 product token\?/)).toBeTruthy();
+  });
+
+  it("keeps Revoke all when the product count is unknown, naming no product number", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "a" })] });
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={null} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke all 1 CLI token and every product token\?/)).toBeTruthy();
+  });
+
+  it("on a failed CLI load shows only the error and keeps Revoke all available", async () => {
+    mockApi.listCliTokens.mockRejectedValue(new ApiError(500, "database unavailable"));
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={0} />
+      </MemoryRouter>,
+    );
+    expect((await screen.findByRole("alert")).textContent).toBe("database unavailable");
+    expect(screen.queryByText("No CLI tokens yet")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke every CLI token\?/)).toBeTruthy();
   });
 
   it("hides Revoke all when there is nothing active to revoke", async () => {

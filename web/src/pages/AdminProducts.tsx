@@ -16,6 +16,11 @@ import { useAsyncData } from "../lib/useAsyncData";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail, maskIp } from "../lib/demoMask";
 import {
+  PRODUCT_DESCRIPTION_MAX_BYTES,
+  PRODUCT_NAME_MAX_BYTES,
+  productTextError,
+} from "../lib/productText";
+import {
   Alert,
   Badge,
   Button,
@@ -25,7 +30,6 @@ import {
   Input,
   ListSkeleton,
   SectionTitle,
-  Textarea,
   Toggle,
 } from "../components/ui";
 import { AdminShell } from "../components/AdminShell";
@@ -38,23 +42,31 @@ import { PackageIcon } from "../components/icons";
 
 const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
+// The admin inventory cap (the server's; `truncated` reports the cut).
+const ADMIN_LIST_CAP = 1000;
+
 export function AdminProducts() {
   const { data, loading, error: loadError, reload } = useAsyncData<{
     products: Product[];
     tokens: AdminProductToken[];
+    truncated: boolean;
   }>(
     async () => {
-      const [{ products }, { tokens }] = await Promise.all([
+      const [{ products }, { tokens, truncated }] = await Promise.all([
         api.adminListProducts(),
         api.adminListProductTokens(),
       ]);
-      return { products, tokens };
+      return { products, tokens, truncated: truncated === true };
     },
     [],
     { fallback: "Failed to load products" },
   );
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
+  const truncated = data?.truncated ?? false;
+  // The first load failed: show only the error, never a "No products registered"
+  // empty state the page cannot know to be true.
+  const loadFailed = data === null && loadError !== "";
 
   // Live products first, soft-deleted ones last (the audit trail), server order within.
   const products = [...(data?.products ?? [])].sort(
@@ -97,9 +109,15 @@ export function AdminProducts() {
         }
       />
 
+      {truncated && (
+        <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
+          Showing the first {ADMIN_LIST_CAP} tokens, active first; older tokens are not listed.
+        </p>
+      )}
+
       {loading ? (
         <ListSkeleton rows={3} />
-      ) : products.length === 0 ? (
+      ) : loadFailed ? null : products.length === 0 ? (
         <EmptyState
           icon={<PackageIcon />}
           title="No products registered"
@@ -112,6 +130,7 @@ export function AdminProducts() {
               key={p.id}
               product={p}
               tokens={tokensByProduct.get(p.id) ?? []}
+              listTruncated={truncated}
               onToggle={(enabled) =>
                 run(async () => {
                   await api.adminUpdateProduct(p.id, { enabled });
@@ -141,10 +160,15 @@ function CreateProduct({ onCreate }: { onCreate: (name: string, description: str
   const [name, setName] = useState("");
   const [description, setDescription] = useState("");
   const [busy, setBusy] = useState(false);
+  // Inline mirrors of the server's gate (byte caps, no control characters), so a value
+  // the server is certain to refuse never leaves the form.
+  const nameError = productTextError("Name", name, PRODUCT_NAME_MAX_BYTES);
+  const descriptionError = productTextError("Description", description, PRODUCT_DESCRIPTION_MAX_BYTES);
+  const canSubmit = !busy && name.trim() !== "" && nameError === null && descriptionError === null;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
-    if (busy || name.trim() === "") return;
+    if (!canSubmit) return;
     setBusy(true);
     const ok = await onCreate(name.trim(), description.trim());
     setBusy(false);
@@ -163,21 +187,34 @@ function CreateProduct({ onCreate }: { onCreate: (name: string, description: str
             id="product-name"
             placeholder="e.g. Helpdesk assistant"
             value={name}
-            maxLength={200}
+            aria-invalid={nameError !== null || undefined}
+            aria-describedby={nameError ? "product-name-error" : undefined}
             onChange={(e) => setName(e.target.value)}
           />
+          {nameError && (
+            <p id="product-name-error" className="text-xs text-warn">
+              {nameError}
+            </p>
+          )}
         </Field>
+        {/* One line on purpose: the server refuses any newline in a description (it is
+            printed in listings, where a line break could forge a row). */}
         <Field label="Description (shown to users when they mint a token)" htmlFor="product-description">
-          <Textarea
+          <Input
             id="product-description"
-            rows={2}
             placeholder="What it does with uzi, so users know what they are connecting."
             value={description}
-            maxLength={1000}
+            aria-invalid={descriptionError !== null || undefined}
+            aria-describedby={descriptionError ? "product-description-error" : undefined}
             onChange={(e) => setDescription(e.target.value)}
           />
+          {descriptionError && (
+            <p id="product-description-error" className="text-xs text-warn">
+              {descriptionError}
+            </p>
+          )}
         </Field>
-        <Button type="submit" disabled={busy || name.trim() === ""}>
+        <Button type="submit" disabled={!canSubmit}>
           {busy ? "Registering…" : "Register product"}
         </Button>
       </form>
@@ -198,12 +235,15 @@ function DeletedBadge({ deletedAt }: { deletedAt: string }) {
 function ProductCard({
   product,
   tokens,
+  listTruncated,
   onToggle,
   onDelete,
   onRevoke,
 }: {
   product: Product;
   tokens: AdminProductToken[];
+  // The inventory was cut server-side, so an empty `tokens` does not mean none exist.
+  listTruncated: boolean;
   onToggle: (enabled: boolean) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
@@ -256,6 +296,9 @@ function ProductCard({
                 <Toggle
                   checked={product.enabled}
                   disabled={busy}
+                  // Keep keyboard focus on the switch while its own request is in flight
+                  // (a native disabled button is blurred), as ScheduleListRow does.
+                  focusableWhenDisabled
                   label={`${product.enabled ? "Disable" : "Enable"} ${product.name}`}
                   onChange={(next) => act(() => onToggle(next))}
                 />
@@ -310,7 +353,11 @@ function ProductCard({
         )}
 
         {tokens.length === 0 ? (
-          <p className="text-sm text-faint">No tokens minted for this product.</p>
+          <p className="text-sm text-faint">
+            {listTruncated
+              ? `None of this product’s tokens are among the first ${ADMIN_LIST_CAP} listed; its tokens may be beyond the list.`
+              : "No tokens minted for this product."}
+          </p>
         ) : (
           <ProductTokenTable tokens={tokens} onRevoke={onRevoke} />
         )}

@@ -6,6 +6,11 @@ import type {
   ProductTokenScope,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import {
+  hasUnsafeProductChar,
+  PRODUCT_DESCRIPTION_MAX_BYTES,
+  PRODUCT_NAME_MAX_BYTES,
+} from "../../lib/productText";
 import { mockProducts, mockProductTokens } from "../data";
 import { delay, requireAdmin, requireSession, users } from "./shared";
 
@@ -21,9 +26,10 @@ let productTokens: OwnedProductToken[] = mockProductTokens.map((t) => ({ ...t, s
 let productCounter = 0;
 let productTokenCounter = 0;
 
-const MAX_NAME_BYTES = 200;
-const MAX_DESCRIPTION_BYTES = 1000;
 const ACTIVE_CAP = 10;
+// The server's list caps (active first, then newest; `truncated` reports the cut).
+const USER_LIST_CAP = 200;
+const ADMIN_LIST_CAP = 1000;
 const EXPIRY_MS: Record<Exclude<ProductTokenExpiry, "never">, number> = {
   "30d": 30 * 86_400_000,
   "90d": 90 * 86_400_000,
@@ -31,6 +37,40 @@ const EXPIRY_MS: Record<Exclude<ProductTokenExpiry, "never">, number> = {
 };
 
 const byteLength = (s: string) => new TextEncoder().encode(s).length;
+
+// The server's name/description gate: trimmed, byte-capped, and termsafe-clean (no
+// control or Cf character, newline and tab included). Returns the trimmed value.
+function validName(raw: string): string {
+  const n = raw.trim();
+  if (n === "" || byteLength(n) > PRODUCT_NAME_MAX_BYTES) {
+    throw new ApiError(400, `name must be non-empty and at most ${PRODUCT_NAME_MAX_BYTES} bytes`);
+  }
+  if (hasUnsafeProductChar(n)) {
+    throw new ApiError(400, "name must not contain control characters (tabs, newlines, terminal escape sequences)");
+  }
+  return n;
+}
+function validDescription(raw: string): string {
+  const d = raw.trim();
+  if (byteLength(d) > PRODUCT_DESCRIPTION_MAX_BYTES) {
+    throw new ApiError(400, `description must be at most ${PRODUCT_DESCRIPTION_MAX_BYTES} bytes`);
+  }
+  if (hasUnsafeProductChar(d)) {
+    throw new ApiError(400, "description must not contain control characters (tabs, newlines, terminal escape sequences)");
+  }
+  return d;
+}
+
+// Active first, then newest (created_at desc), capped, the way both list queries order
+// and cut their rows.
+function capped<T extends ProductToken>(rows: T[], cap: number): { tokens: T[]; truncated: boolean } {
+  const sorted = [...rows].sort(
+    (a, b) =>
+      Number(isActive(b)) - Number(isActive(a)) || Date.parse(b.created_at) - Date.parse(a.created_at),
+  );
+  return { tokens: sorted.slice(0, cap), truncated: sorted.length > cap };
+}
+
 const isActive = (t: ProductToken) =>
   !t.revoked && (t.expires_at === null || Date.parse(t.expires_at) > Date.now());
 const stripOwner = ({ user_id: _user_id, ...t }: OwnedProductToken): ProductToken => t;
@@ -55,9 +95,12 @@ export function revokeAllProductTokensOf(userId: string): void {
 export const productTokensApi = {
   listProductTokens: async () => {
     const me = requireSession();
-    return delay({
-      tokens: productTokens.filter((t) => t.user_id === me.id).map(stripOwner),
-    });
+    return delay(
+      capped(
+        productTokens.filter((t) => t.user_id === me.id).map(stripOwner),
+        USER_LIST_CAP,
+      ),
+    );
   },
   listMintableProducts: async () => {
     requireSession();
@@ -74,10 +117,7 @@ export const productTokensApi = {
     expiry: ProductTokenExpiry;
   }) => {
     const me = requireSession();
-    const name = input.name.trim();
-    if (name === "" || byteLength(name) > MAX_NAME_BYTES) {
-      throw new ApiError(400, "name must be non-empty and at most 200 bytes");
-    }
+    const name = validName(input.name);
     const scopes = [...new Set(input.scopes)];
     if (scopes.length === 0 || scopes.some((s) => s !== "jobs:run" && s !== "jobs:read")) {
       throw new ApiError(400, 'scopes must be a non-empty subset of "jobs:run" and "jobs:read"');
@@ -138,20 +178,16 @@ export const productTokensApi = {
   },
   adminCreateProduct: async (name: string, description: string) => {
     requireAdmin();
-    const n = name.trim();
-    if (n === "" || byteLength(n) > MAX_NAME_BYTES) {
-      throw new ApiError(400, "name must be non-empty and at most 200 bytes");
-    }
-    if (byteLength(description) > MAX_DESCRIPTION_BYTES) {
-      throw new ApiError(400, "description must be at most 1000 bytes");
-    }
-    if (products.some((p) => p.deleted_at === null && p.name === n)) {
+    const n = validName(name);
+    const desc = validDescription(description);
+    // Case-insensitive among live products, like the server's unique index.
+    if (products.some((p) => p.deleted_at === null && p.name.toLowerCase() === n.toLowerCase())) {
       throw new ApiError(409, "a product with this name already exists");
     }
     const p: StoredProduct = {
       id: `prod-new-${++productCounter}`,
       name: n,
-      description,
+      description: desc,
       enabled: true,
       deleted_at: null,
       created_at: new Date().toISOString(),
@@ -168,12 +204,7 @@ export const productTokensApi = {
     if (p.deleted_at !== null) {
       throw new ApiError(409, "product is deleted; a deleted product cannot be changed or re-enabled");
     }
-    if (patch.description !== undefined) {
-      if (byteLength(patch.description) > MAX_DESCRIPTION_BYTES) {
-        throw new ApiError(400, "description must be at most 1000 bytes");
-      }
-      p.description = patch.description;
-    }
+    if (patch.description !== undefined) p.description = validDescription(patch.description);
     if (patch.enabled !== undefined) p.enabled = patch.enabled;
     return delay({ product: withCount(p) });
   },
@@ -193,7 +224,7 @@ export const productTokensApi = {
       ...t,
       owner_email: users.find((u) => u.id === t.user_id)?.email ?? "",
     }));
-    return delay({ tokens });
+    return delay(capped(tokens, ADMIN_LIST_CAP));
   },
   adminRevokeProductToken: async (id: string) => {
     requireAdmin();
