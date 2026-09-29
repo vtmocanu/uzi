@@ -113,7 +113,7 @@ SET status = 'filed',
     close_synced_at = NULL,
     resolved_at = now()
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
-  AND status = 'filing';
+  AND status = 'filing' AND group_operation_id IS NULL;
 
 -- name: RevertFindingFiling :execrows
 -- Undo a claim whose forge CreateIssue FAILED (M5), filing → open, so the coordinate is
@@ -124,7 +124,7 @@ UPDATE finding_dispositions
 SET status = 'open',
     filing_since = NULL
 WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
-  AND status = 'filing';
+  AND status = 'filing' AND group_operation_id IS NULL;
 
 -- name: SweepStrandedFilingFindings :execrows
 -- Boot/interval reaper for filing claims stranded by a crash (M5 review, mirror of
@@ -145,7 +145,7 @@ WHERE user_id = @user_id AND repo_id = @repo_id AND location = @location
 UPDATE finding_dispositions
 SET status = 'open',
     filing_since = NULL
-WHERE status = 'filing' AND filing_since IS NOT NULL AND filing_since < @cutoff;
+WHERE status = 'filing' AND group_operation_id IS NULL AND filing_since IS NOT NULL AND filing_since < @cutoff;
 
 -- name: DismissFinding :execrows
 -- The user's triage: dismiss a coordinate with a reason (M5), open → dismissed. Guarded

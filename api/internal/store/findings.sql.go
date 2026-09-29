@@ -712,7 +712,7 @@ UPDATE finding_dispositions
 SET status = 'open',
     filing_since = NULL
 WHERE user_id = $1 AND repo_id = $2 AND location = $3
-  AND status = 'filing'
+  AND status = 'filing' AND group_operation_id IS NULL
 `
 
 type RevertFindingFilingParams struct {
@@ -743,7 +743,7 @@ SET status = 'filed',
     close_synced_at = NULL,
     resolved_at = now()
 WHERE user_id = $3 AND repo_id = $4 AND location = $5
-  AND status = 'filing'
+  AND status = 'filing' AND group_operation_id IS NULL
 `
 
 type SettleFindingFiledParams struct {
@@ -781,7 +781,7 @@ const sweepStrandedFilingFindings = `-- name: SweepStrandedFilingFindings :execr
 UPDATE finding_dispositions
 SET status = 'open',
     filing_since = NULL
-WHERE status = 'filing' AND filing_since IS NOT NULL AND filing_since < $1
+WHERE status = 'filing' AND group_operation_id IS NULL AND filing_since IS NOT NULL AND filing_since < $1
 `
 
 // Boot/interval reaper for filing claims stranded by a crash (M5 review, mirror of
