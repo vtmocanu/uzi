@@ -37,6 +37,12 @@ exec "$REAL_DATE" "$@"
 STUB
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
+set -eu
+# Advance only the future-reset exact-query wait; other scenarios keep a no-op sleep.
+if [ "${EXACT_WAIT_CLOCK_STEP:-0}" -gt 0 ]; then
+  now=$(cat "$TEST_CLOCK")
+  printf '%s\n' "$((now + EXACT_WAIT_CLOCK_STEP))" > "$TEST_CLOCK"
+fi
 exit 0
 STUB
 cat > "$WORK/bin/stat" <<'STUB'
@@ -203,6 +209,16 @@ rm -f "$POSTED"
 bash "$SCRIPT" test/repo 42 --query --wait --interval 0 --max-wait-min 1 > "$WORK/exact-wait.out" 2>&1
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/exact-wait.out" || fail "exact reset did not release the wait"
 if grep -q '^CR_RESUMED=1$' "$WORK/exact-wait.out"; then fail "stale status ended exact wait early"; fi
+
+# A future exact reply must enter the query wait arm despite stale Review completed status.
+RESET_MIN=1; export RESET_MIN
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED"
+EXACT_WAIT_CLOCK_STEP=20 bash "$SCRIPT" test/repo 42 --query --wait --interval 0 --max-wait-min 2 > "$WORK/exact-future-wait.out" 2>&1
+grep -q '^CR_RESET_MIN=1$' "$WORK/exact-future-wait.out" || fail "future exact reset was not one minute: $(cat "$WORK/exact-future-wait.out")"
+grep -q 'waiting on exact quota reset at ' "$WORK/exact-future-wait.out" || fail "future exact reset did not enter query wait: $(cat "$WORK/exact-future-wait.out")"
+grep -q '^CR_RESET_ELAPSED=1$' "$WORK/exact-future-wait.out" || fail "future exact reset did not release the wait: $(cat "$WORK/exact-future-wait.out")"
+if grep -q '^CR_RESUMED=1$' "$WORK/exact-future-wait.out"; then fail "stale status ended future exact wait early"; fi
 
 # "Reviews are available now" is an authoritative zero-minute reply, even with stale limited status.
 MODE="available"; AVAILABLE_NOW=1; export MODE AVAILABLE_NOW
