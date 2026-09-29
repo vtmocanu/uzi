@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Product tokens and a stable `/api/v1` ([#1907](https://github.com/vtmocanu/uzi/issues/1907)).**
   Admins register external products under Admin > Products; users mint `uzp_` product tokens for them in Settings > Access (scopes, expiry, at most 10 active per product, shown once). A product token works only on `/api/v1` (today `GET /api/v1/whoami`, described in `api/openapi/v1.yaml`), never carries admin authority, and is refused everywhere else. Revoke all now also revokes product tokens; admins can revoke one, or disable or delete the product. The `uzi` CLI refuses a `uzp_` token with a clear error.
 
+### Changed
+
+- **Built-in agents synced to skills v0.42.0.**
+  The built-in coder, reviewer, tester, auditor, documenter, fact-checker and architect gain rules drawn from judge recommendations and CodeRabbit/Greptile findings: bound every loop, retry and cleanup; never read an ambiguous 404, empty or timeout reply as success; check every surface a new state reaches and both rollout orders; wait for a backgrounded gate; prove a probe's tool exists; back every/never/only claims with the enforcing code. The built-in coder now runs on the `sonnet` tier (upstream v0.41.0). Unmodified built-in roles refresh on the next boot.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

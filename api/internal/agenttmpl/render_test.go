@@ -142,14 +142,14 @@ func TestCoderInheritsAllTools(t *testing.T) {
 	if len(coder.Tools) != 0 {
 		t.Errorf("coder.Tools = %v, want empty (inherit all)", coder.Tools)
 	}
-	if coder.Model != "opus" {
-		t.Errorf("coder.Model = %q, want %q", coder.Model, "opus")
+	if coder.Model != "sonnet" {
+		t.Errorf("coder.Model = %q, want %q", coder.Model, "sonnet")
 	}
 	rendered := string(Render(coder))
 	if strings.Contains(rendered, "\ntools:") {
 		t.Error("rendered coder must not contain a tools line")
 	}
-	if !strings.Contains(rendered, "\nmodel: opus\n") {
+	if !strings.Contains(rendered, "\nmodel: sonnet\n") {
 		t.Error("rendered coder must contain the model line")
 	}
 }
