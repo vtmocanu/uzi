@@ -2,7 +2,8 @@ name: Go build cache (per job class)
 description: >-
   Restore GOCACHE + GOMODCACHE (plus optional extra paths) under a key private to
   one job class, so each job warms from a cache built with its own flags. Pair it
-  with the "Save Go cache" step at the end of the job; only a push to main saves.
+  with ./.github/actions/go-cache-save at the end of the job; only a push to main
+  saves. Never fails the job: any cache error falls back to a cold build.
 
 # Why not setup-go's built-in cache: it keys on go.sum alone, so every Go job of a
 # module restores ONE entry, and after a primary-key hit no job saves. The entry is
@@ -11,10 +12,15 @@ description: >-
 # plain builds apart.
 #
 # Keys end in the commit SHA, so each main push saves a fresh entry and a PR (which
-# can read its base branch's caches, never write them) restores the newest one by
-# prefix. Older entries are never read again, so the repo cache's LRU eviction
-# drops them first. The Go version is in every restore prefix, so a toolchain bump
-# starts cold; a go.sum change falls back to the newest entry of the same class.
+# reads its base branch's caches and cannot write to them) restores the newest one
+# by prefix. Superseded entries are expected to go unread and to age out under the
+# repo cache's eviction; that is expected behaviour, not an API guarantee, so
+# per-class size, hit rate and total usage are measured over several main pushes
+# (epic #1892). The Go version is in every restore prefix, so a toolchain bump
+# starts cold. A go.sum change falls back to the newest entry of the same class:
+# GOCACHE is content-addressed and Go trims its unused entries after five days,
+# but GOMODCACHE has no such trim and keeps old module versions until the Go
+# version changes.
 
 inputs:
   class:
@@ -30,7 +36,7 @@ inputs:
 
 outputs:
   key:
-    description: The exact key to save under.
+    description: The exact key to save under (empty if resolving it failed).
     value: ${{ steps.vars.outputs.key }}
   paths:
     description: The newline-separated paths to save.
@@ -44,6 +50,7 @@ runs:
   steps:
     - name: Resolve Go cache key and paths
       id: vars
+      continue-on-error: true
       shell: bash
       env:
         CLASS: ${{ inputs.class }}
@@ -66,13 +73,16 @@ runs:
         } >> "${GITHUB_OUTPUT}"
     - name: Restore Go cache
       id: restore
+      if: steps.vars.outcome == 'success'
+      continue-on-error: true
       uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
       with:
         path: ${{ steps.vars.outputs.paths }}
         key: ${{ steps.vars.outputs.key }}
-        # Fall back across a go.sum change too: the Go cache is content-addressed,
-        # so entries for unchanged packages stay valid, and Go's own trim drops
-        # entries unused for five days.
         restore-keys: |
           ${{ steps.vars.outputs.prefix }}
           ${{ steps.vars.outputs.fallback }}
+    - name: Warn on a Go cache restore failure
+      if: steps.vars.outcome == 'failure' || steps.restore.outcome == 'failure'
+      shell: bash
+      run: echo "::warning title=go-cache::Go cache restore failed; this job builds cold."

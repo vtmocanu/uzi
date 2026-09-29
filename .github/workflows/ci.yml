@@ -113,11 +113,11 @@ jobs:
           sqlc generate
           git diff --exit-code -- internal/store
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   lint-api:
     runs-on: ubuntu-latest
@@ -164,11 +164,11 @@ jobs:
           task deadcode:api
           task vulncheck:api
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   test-api:
     runs-on: ubuntu-latest
@@ -205,11 +205,11 @@ jobs:
       - name: coverage-xml:api
         run: task coverage-xml:api
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   # The live-DB gate. The *LiveDB tests self-skip unless UZI_TEST_DATABASE_URL is
   # set, so `go test` above prints a green `ok` while every one of them is skipped.
@@ -305,11 +305,11 @@ jobs:
             fi
           done
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   # --------------------------------------------------------- Go controller ----
   validate-controller:
@@ -337,11 +337,11 @@ jobs:
           task vet:controller
           task build:controller
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   lint-controller:
     runs-on: ubuntu-latest
@@ -373,11 +373,11 @@ jobs:
           task deadcode:controller
           task vulncheck:controller
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   test-controller:
     runs-on: ubuntu-latest
@@ -403,11 +403,11 @@ jobs:
       - name: coverage-xml:controller
         run: task coverage-xml:controller
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   # ---------------------------------------------------------- Vite/React web ----
   validate-web:
@@ -655,11 +655,11 @@ jobs:
       - name: test:release-scripts (release-train fixture)
         run: task test:release-scripts
       - name: Save Go cache (main only)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
-        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
         with:
-          path: ${{ steps.gocache.outputs.paths }}
           key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   # ------------------------------------------------------------- Helm chart ----
   helm-chart:
