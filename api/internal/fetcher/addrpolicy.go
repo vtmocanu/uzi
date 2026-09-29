@@ -42,10 +42,7 @@ var blockedPrefixes = mustPrefixes(
 	"64:ff9b::/96",   // NAT64 well-known prefix
 	"64:ff9b:1::/48", // NAT64 local-use prefix
 	"100::/64",       // discard-only
-	"2001::/32",      // Teredo
-	"2001:2::/48",    // benchmarking
-	"2001:10::/28",   // ORCHID (deprecated)
-	"2001:20::/28",   // ORCHIDv2
+	"2001::/23",      // IETF protocol assignments: not globally reachable by default; covers Teredo 2001::/32, benchmarking, ORCHID
 	"2001:db8::/32",  // documentation
 	"2002::/16",      // 6to4
 	"3fff::/20",      // documentation

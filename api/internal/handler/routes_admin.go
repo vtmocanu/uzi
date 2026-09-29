@@ -13,8 +13,8 @@ import (
 // mountAdminRoutes registers the admin read/write split (PRD #64): session-or-CLI
 // reads under RequireAdminRO, cookie-only writes under RequireAdmin.
 func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.Limiter) {
-	// Admin split by ROUTING (PRD #64): 9 reads reachable by a session OR an
-	// admin-scoped CLI token, 4 writes cookie-only. The read/write split is
+	// Admin split by ROUTING (PRD #64): reads reachable by a session OR an
+	// admin-scoped CLI token, writes cookie-only. The read/write split is
 	// enforced by the middleware chain, not a handler flag, so "a read-only token
 	// reaches a write handler" is structurally impossible: the write group's
 	// RequireAuth is cookie-only, and a Bearer request 401s before any handler

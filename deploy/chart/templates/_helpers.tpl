@@ -574,15 +574,15 @@ true
   is 2000::/3 (global unicast), not ::/0, matching addrpolicy.go, which admits IPv6 only
   inside 2000::/3. Everything outside it (loopback, IPv4-mapped and -compatible, NAT64,
   discard, SRv6, unique-local, link-local, site-local, multicast) is therefore never
-  allowed; what remains to except are addrpolicy.go's ranges INSIDE 2000::/3 (Teredo,
-  benchmarking, ORCHID, documentation, 6to4) and the lane's IPv6 cluster CIDRs that fall
+  allowed; what remains to except are addrpolicy.go's ranges INSIDE 2000::/3 (IETF protocol
+  assignments 2001::/23, documentation, 6to4) and the lane's IPv6 cluster CIDRs that fall
   inside 2000::/3. A cluster CIDR outside it (fd00::/8 and the like) is already excluded,
   and must not be listed: an ipBlock except has to lie within its cidr, or the apiserver
   rejects the policy. "Inside 2000::/3" is a first hextet written with four hex digits
   starting 2 or 3 (0x2000-0x3fff); a shorter first hextet is below 0x1000.
 */ -}}
 {{- define "uzi.isolatedLaneExceptV6" -}}
-{{- $out := list "2001::/32" "2001:2::/48" "2001:10::/28" "2001:20::/28" "2001:db8::/32" "2002::/16" "3fff::/20" -}}
+{{- $out := list "2001::/23" "2001:db8::/32" "2002::/16" "3fff::/20" -}}
 {{- range fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) -}}
 {{- if regexMatch "^[23][0-9a-fA-F]{3}:" . -}}
 {{- $out = append $out . -}}

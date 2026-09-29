@@ -14,7 +14,7 @@ var requiredBlocked = []string{
 	"172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16", "198.18.0.0/15", "224.0.0.0/4",
 	"240.0.0.0/4",
 	"::/96", "::1/128", "100::/64", "fc00::/7", "fe80::/10", "fec0::/10", "64:ff9b::/96",
-	"64:ff9b:1::/48", "2002::/16", "2001::/32", "ff00::/8",
+	"64:ff9b:1::/48", "2002::/16", "2001::/23", "ff00::/8",
 }
 
 func TestBlockedPrefixesCoverRequiredRanges(t *testing.T) {
@@ -66,6 +66,21 @@ func lastAddr(p netip.Prefix) netip.Addr {
 	}
 	a, _ := netip.AddrFromSlice(b)
 	return a
+}
+
+// 2001::/23 is IETF protocol assignment space, not globally reachable by default, so an
+// address in it outside the sub-ranges IANA lists individually (Teredo, benchmarking,
+// ORCHID) is still refused.
+func TestAddressPolicyRefusesIETFProtocolAssignments(t *testing.T) {
+	var p AddressPolicy
+	for _, s := range []string{"2001:100::1", "2001:1::1", "2001:1ff:ffff::1"} {
+		if p.Allowed(netip.MustParseAddr(s)) {
+			t.Errorf("%s (in 2001::/23) allowed", s)
+		}
+	}
+	if !p.Allowed(netip.MustParseAddr("2001:200::1")) {
+		t.Error("2001:200::1, just past 2001::/23, refused")
+	}
 }
 
 // Only global unicast is admitted: the stdlib predicates refuse what no list names.

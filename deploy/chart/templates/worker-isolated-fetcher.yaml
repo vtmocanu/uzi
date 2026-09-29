@@ -271,7 +271,7 @@ spec:
   IETF-assigned, documentation, 6to4 relay, benchmarking, multicast, reserved) and the
   configured IPv4 cluster ranges; IPv6 2000::/3 only (so no loopback, IPv4-mapped, NAT64,
   unique-local, link-local, site-local or multicast address is ever allowed) minus the
-  refused ranges inside it (uzi.isolatedLaneExceptV6: Teredo, benchmarking, ORCHID,
+  refused ranges inside it (uzi.isolatedLaneExceptV6: IETF protocol assignments 2001::/23,
   documentation, 6to4) and any IPv6 cluster range inside it. Rules are OR'd, so DNS and
   the api stay reachable through their selectors although their addresses are excluded
   from the internet rule.
