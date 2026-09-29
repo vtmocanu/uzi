@@ -444,22 +444,25 @@ All of it is in one repo. M1 and M2 touch disjoint files. A single uzi run execu
   pointer. Promotion happens only below the cap, so an expiry always gets a fast retry
   first.
 - 2026-09-29: **Kept dormant after merge (maintainer decision).** Salvage merged as PR
-  #1877 (`4ee8d5df`). PR #1819 (PRD #1810) landed about 100 minutes after this run started, and its
+  #1877 (`4ee8d5df`). PR #1819 (PRD #1810) landed while this run was in flight, and its
   retention closes most of the gap in the Problem. What salvage adds is the window between a
   custody hold settling and the copy's expiry (see the "remaining distinct value" entry above).
   Salvage ships off (`UZI_SALVAGE_FORGES` empty) and stays off:
-  - enabling it extends how long unscanned checkpoints stay public (ADR-1597);
+  - enabling it extends how long a possibly unscanned checkpoint stays public (ADR-1597);
   - M6 has not been run on any real forge.
 
   A revert was considered and deferred. The reason to keep it is that a stable
   `refs/uzi-salvage/<run-id>` is the prerequisite for a possible "retry a failed run with
   guidance" feature. Revisit when that feature is picked up, or when a real loss happens that
   #1810's retention did not cover.
-  - **The revert window closes at the next release.** Until a tag contains `4ee8d5df`, a
-    revert can delete migration `00268` outright. After that, it needs a new migration that
-    drops the table.
-  - **Enabling needs:** a chart value that passes `UZI_SALVAGE_FORGES` to the api (none
-    exists; the chart has only `api.secretEnv`), then M6 per forge, GitHub first.
+  - **A revert gets harder once `00268` is applied anywhere that matters.** The boot runner
+    is strict goose, so deleting an applied migration makes that database refuse to boot. No
+    release contains `4ee8d5df` yet, but a persistent database that ran `main` may already
+    have applied it. Deleting `00268` outright is safe only for databases known not to have
+    it; otherwise a revert needs a new migration that drops the table. Every released
+    install needs that after the next release.
+  - **Enabling needs:** set `UZI_SALVAGE_FORGES` through the chart's `api.config` (or the
+    compose environment), after M6 passes for that forge, GitHub first.
   - **The sweeper pass still runs while off.** `processSalvage` (the create/expire phase) is
     not gated on the setting, so existing rows keep expiring; with no rows it has nothing to
     do.
