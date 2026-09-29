@@ -107,7 +107,7 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 
 ### M2: `RequireV1Caller` and structural isolation
 
-**Status (2026-09-29): done.** Evidence: `TestV1IsolationLiveDB` (route walk over both routers), `TestV1AdminStripLiveDB`, `TestV1CallerLiveDB`, `TestRequireV1CallerProductTokenPath`, `TestRequireV1CallerCLITokenScopeUser`, `TestRequireV1CallerRefusals`, `TestRequireScope`. The four mutation runs (RequireUser accepting `product_tokens`, IsAdmin clear removed, each restored) are recorded in the PR, not here.
+**Status (2026-09-29): done.** Evidence: `TestV1IsolationLiveDB` (route walk over both routers), `TestV1AdminStripLiveDB`, `TestV1CallerLiveDB`, `TestRequireV1CallerProductTokenPath`, `TestRequireV1CallerCLITokenScopeUser`, `TestRequireV1CallerRefusals`, `TestRequireScope`. Mutation runs at eeef4b1b (2026-09-29, live DB): (a) `RequireUser` taught to accept a `uzp_` token, then `TestV1IsolationLiveDB` went RED (a real `uzp_` got 403 where an unknown one got 401 on internal routes), restored GREEN; (b) the `IsAdmin` clear removed from `RequireV1Caller`: `TestV1AdminStripLiveDB` and `TestRequireV1CallerProductTokenPath` / `TestRequireV1CallerCLITokenScopeUser` RED ("IsAdmin survived RequireV1Caller"), restored GREEN.
 
 - Middleware per D2/D3/D4, `V1Principal` in context, `RequireScope` per D5.
 - **Isolation test (the load-bearing one):** a `*LiveDB` handler test mints a real `uzp_` token, walks **both** production routers (`Routes()` and `WorkerRoutes()`) with `chi.Walk`, and for every route outside `/api/v1` asserts that a request carrying the `uzp_` token gets **exactly the same response** (status and body) as the same request carrying an unknown random Bearer token of the same shape, and causes no handler side effect. This holds for public routes too (`/api/health`, `/api/version`, `/api/branding`, the login and `cli/*` auth routes answer both callers the same way), so no exemption list is needed. It iterates the live route tables, so a route added later is covered automatically. `/api/ws` is covered explicitly.
@@ -137,7 +137,7 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 
 ### M5: User minting in Settings > Access
 
-**Status (2026-09-29): done.** Evidence: `TestMintUseRevokeProductTokenLiveDB` (mint, `whoami`, revoke, 401), `TestRevokeAllKillsCLIAndProductTokensLiveDB`, `TestMintProductTokenCapLiveDB`, `TestMintProductTokenCapRaceLiveDB`, `TestMintProductTokenExpiryChoicesLiveDB`, `TestProductTokenRoutesRefuseBearerLiveDB`; web `ProductTokens.test.tsx` and the Revoke all cases in `CliTokens.test.tsx`.
+**Status (2026-09-29): done.** Evidence: `TestMintUseRevokeProductTokenLiveDB` (mint, `whoami`, revoke, 401), `TestRevokeAllKillsCLIAndProductTokensLiveDB`, `TestMintProductTokenCapLiveDB`, `TestMintProductTokenCapRaceLiveDB` (RED with the `LockProductTokenMint` call removed: two 201s and 11 active rows; GREEN restored), `TestMintProductTokenExpiredFreesCapLiveDB`, `TestMintProductTokenExpiryChoicesLiveDB`, `TestProductTokenRoutesRefuseBearerLiveDB`; web `ProductTokens.test.tsx` and the Revoke all cases in `CliTokens.test.tsx`.
 
 - Cookie-only `/api/me/product-tokens`: list, mint (D10 expiry, D11 name validation, D15 cap), revoke one.
 - The existing `POST /api/me/cli-tokens/revoke-all` and its web button revoke CLI and product tokens in one transaction (D8). Both entry points are tested: the endpoint directly, and the web button's call.
