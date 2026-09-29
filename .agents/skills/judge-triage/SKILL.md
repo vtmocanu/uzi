@@ -68,9 +68,9 @@ Then:
      it **Already fixed** instead: compare the covering commit's date first,
      then confirm it reached that run (released and deployed, not a customized
      template row, repo instructions enabled). If delivery cannot be shown, do
-     not call the miss non-compliance. A group whose occurrences fall on both
-     sides of that date gets per-run verdicts (`<run-id> <rec-id>`), not the
-     group form.
+     not call the miss non-compliance. A group whose occurrences differ in
+     judgment date or in whether the guidance reached them gets per-run
+     verdicts (`<run-id> <rec-id>`), not the group form.
    - **Security-class** (credential exposure, secret leak): follow
      `.github/SECURITY.md`; propose a private draft advisory, never a public
      issue. Create it after authorization with the required advisory fields.
