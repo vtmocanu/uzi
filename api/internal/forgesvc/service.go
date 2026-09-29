@@ -7,10 +7,10 @@ package forgesvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"regexp"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -173,12 +173,14 @@ type ForgeBuilder func(forge.Type, string, string, time.Duration) (forge.Forge, 
 
 // Service bundles the dependencies for building forge clients and syncing.
 type Service struct {
-	q            IssueStore
-	box          *secretbox.Box
-	timeout      time.Duration
-	labels       LabelConfig
-	forgeBuilder ForgeBuilder
-	groupDB      findingGroupDB
+	q             IssueStore
+	box           *secretbox.Box
+	timeout       time.Duration
+	labels        LabelConfig
+	groupDB       findingGroupDB
+	groupCursorMu sync.Mutex
+	groupCursors  map[uuid.UUID]store.FindingGroupCursor
+	forgeBuilder  ForgeBuilder
 
 	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
@@ -234,71 +236,106 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	}
 	var reconcileErr error
 	finish := func() {
-		remaining, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID)
+		// The sync context may have expired during forge work. Keep diagnostics
+		// bounded, but give the aggregate its own chance to report count and age.
+		statsCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		count, oldest, err := store.FindingGroupRepoPendingStats(statsCtx, s.groupDB, repoID)
 		if err != nil {
-			slog.Warn("finding group reconciliation pending", "repo_id", repoID, "error", err)
+			reconcileErr = errors.Join(reconcileErr, err)
+		}
+		if count == 0 && reconcileErr == nil {
 			return
 		}
-		if len(remaining) == 0 {
-			return
+		attrs := []any{"repo_id", repoID, "pending_group_operations", count}
+		if oldest != nil {
+			age := time.Since(*oldest)
+			if age < 0 {
+				age = 0
+			}
+			attrs = append(attrs, "oldest_age", age)
 		}
-		age := time.Since(remaining[0].CreatedAt)
-		if age < 0 {
-			age = 0
-		}
-		attrs := []any{"repo_id", repoID, "pending_group_operations", len(remaining), "oldest_age", age}
 		if reconcileErr != nil {
 			attrs = append(attrs, "error", reconcileErr)
 		}
 		slog.Warn("finding group reconciliation pending", attrs...)
 	}
-	ops, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID)
+	// Serialize cursor selection so concurrent syncs advance the page.
+	s.groupCursorMu.Lock()
+	if s.groupCursors == nil {
+		s.groupCursors = make(map[uuid.UUID]store.FindingGroupCursor)
+	}
+	var after *store.FindingGroupCursor
+	if cursor, ok := s.groupCursors[repoID]; ok {
+		after = &cursor
+	}
+	ops, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID, after)
+	if err == nil && len(ops) == 0 && after != nil {
+		ops, err = store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID, nil)
+	}
+	if err == nil && len(ops) > 0 {
+		last := ops[len(ops)-1]
+		s.groupCursors[repoID] = store.FindingGroupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+	}
+	s.groupCursorMu.Unlock()
 	if err != nil {
 		reconcileErr = err
 		return nil, finish
 	}
-	if len(ops) == 0 {
-		return nil, func() {}
+	// Settle durable issue identities before spending work on uncertain claims.
+	for _, op := range ops {
+		if op.IssueIID == nil || op.IssueURL == "" {
+			continue
+		}
+		_, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr, err)
+		}
+		// A failed or raced settlement stays claimed for a later pass.
 	}
 	unresolved := make([]store.FindingGroupClaimOperation, 0, len(ops))
 	for _, op := range ops {
-		if op.IssueIID != nil && op.IssueURL != "" {
-			ok, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
-			if err == nil && ok {
-				continue
-			}
-			if err != nil {
-				reconcileErr = err
-			}
-			// A failed or raced settlement stays claimed.
-			continue
-		}
-		if op.Phase == "in_flight" || op.Phase == "returned_uncertain" {
+		if (op.IssueIID == nil || op.IssueURL == "") && (op.Phase == "in_flight" || op.Phase == "returned_uncertain") {
 			unresolved = append(unresolved, op)
 		}
 	}
 	return unresolved, finish
 }
 
-// matchFindingGroupIssue accepts exactly one occurrence in the fetched labelled
-// slice. An invalid issue identity or a second occurrence leaves the claim intact.
-func matchFindingGroupIssue(op uuid.UUID, issues []forge.Issue) (forge.Issue, bool) {
-	marker := "<!-- uzi-finding-group-operation: " + op.String() + " -->"
-	var match forge.Issue
-	count := 0
+// The exact marker is indexed once per fetched finding issue. A repeated marker,
+// even within one description, is ambiguous and must leave its operation pending.
+var findingGroupMarkerRe = regexp.MustCompile(`<!-- uzi-finding-group-operation: ([0-9a-f-]{36}) -->`)
+
+type findingGroupMatch struct {
+	issue     forge.Issue
+	ambiguous bool
+}
+
+func indexFindingGroupIssues(issues []forge.Issue) map[uuid.UUID]findingGroupMatch {
+	index := make(map[uuid.UUID]findingGroupMatch)
 	for _, issue := range issues {
-		count += strings.Count(issue.Description, marker)
-		if strings.Contains(issue.Description, marker) {
-			match = issue
+		for _, parts := range findingGroupMarkerRe.FindAllStringSubmatch(issue.Description, -1) {
+			id, err := uuid.Parse(parts[1])
+			if err != nil || id.String() != parts[1] {
+				continue
+			}
+			if previous, exists := index[id]; exists {
+				previous.ambiguous = true
+				index[id] = previous
+			} else {
+				index[id] = findingGroupMatch{issue: issue}
+			}
 		}
 	}
-	return match, count == 1 && match.IID > 0 && match.WebURL != ""
+	return index
 }
 
 func (s *Service) recordFindingGroupMatches(ctx context.Context, ops []store.FindingGroupClaimOperation, issues []forge.Issue) {
+	index := indexFindingGroupIssues(issues)
 	for _, op := range ops {
-		issue, ok := matchFindingGroupIssue(op.ID, issues)
-		if !ok {
+		match, ok := index[op.ID]
+		issue := match.issue
+		if !ok || match.ambiguous || issue.IID <= 0 || issue.WebURL == "" {
 			continue
 		}
 		recorded, err := store.RecordFindingGroupIssue(ctx, s.groupDB, op.UserID, op.ID, issue.IID, issue.WebURL)

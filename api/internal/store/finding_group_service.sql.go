@@ -331,13 +331,26 @@ func GetPendingFindingGroup(ctx context.Context, db DBTX, user, id uuid.UUID) (F
 	return o, err
 }
 
-// ListPendingFindingGroupsForRepo is scoped by the repository's owner, not by a
-// caller-supplied user ID. It returns only operations this sync may reconcile.
-func ListPendingFindingGroupsForRepo(ctx context.Context, db DBTX, repo uuid.UUID) ([]FindingGroupClaimOperation, error) {
-	rows, err := db.Query(ctx, `SELECT o.id,o.user_id,o.repo_id,o.phase,o.deadline_at,o.created_at,o.issue_iid,o.issue_url
+// FindingGroupCursor identifies the last operation selected in a repo pass.
+type FindingGroupCursor struct {
+	CreatedAt time.Time
+	ID        uuid.UUID
+}
+
+// ListPendingFindingGroupsForRepo returns at most 100 owner-scoped pending
+// operations after the cursor. An empty page tells the caller to wrap to the start.
+func ListPendingFindingGroupsForRepo(ctx context.Context, db DBTX, repo uuid.UUID, after *FindingGroupCursor) ([]FindingGroupClaimOperation, error) {
+	query := `SELECT o.id,o.user_id,o.repo_id,o.phase,o.deadline_at,o.created_at,o.issue_iid,o.issue_url
         FROM finding_group_operations o JOIN repos r ON r.id=o.repo_id
         JOIN forge_connections c ON c.id=r.connection_id AND c.user_id=o.user_id
-        WHERE o.repo_id=$1 AND o.phase NOT IN ('released','settled') ORDER BY o.created_at,o.id`, repo)
+        WHERE o.repo_id=$1 AND o.phase NOT IN ('released','settled')`
+	args := []interface{}{repo}
+	if after != nil {
+		query += " AND (o.created_at,o.id)>($2,$3)"
+		args = append(args, after.CreatedAt, after.ID)
+	}
+	query += " ORDER BY o.created_at,o.id LIMIT 100"
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -351,6 +364,18 @@ func ListPendingFindingGroupsForRepo(ctx context.Context, db DBTX, repo uuid.UUI
 		ops = append(ops, o)
 	}
 	return ops, rows.Err()
+}
+
+// FindingGroupRepoPendingStats counts all owner-scoped pending operations without
+// loading their rows into the sync pass.
+func FindingGroupRepoPendingStats(ctx context.Context, db DBTX, repo uuid.UUID) (int64, *time.Time, error) {
+	var count int64
+	var oldest *time.Time
+	err := db.QueryRow(ctx, `SELECT count(*),min(o.created_at) FROM finding_group_operations o
+        JOIN repos r ON r.id=o.repo_id
+        JOIN forge_connections c ON c.id=r.connection_id AND c.user_id=o.user_id
+        WHERE o.repo_id=$1 AND o.phase NOT IN ('released','settled')`, repo).Scan(&count, &oldest)
+	return count, oldest, err
 }
 
 func FindingGroupPendingStats(ctx context.Context, db DBTX, user uuid.UUID) (int64, *time.Time, error) {
