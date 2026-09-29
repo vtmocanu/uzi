@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -25,18 +26,59 @@ import (
 //
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 
+// rcFake answers ListIssues the way a forge does: it honours the label filter (AND),
+// the state filter and the inclusive UpdatedAfter bound, and records every call's
+// options so a test can tell the complete-set fetch from the filtered ones.
 type rcFake struct {
 	forgetest.BaseFake
 	mu     sync.Mutex
 	issues []forge.Issue
 	lists  int
+	calls  []forge.ListIssuesOptions
+	// unfilteredErr fails only the complete-set fetch (no label, all states, no bound).
+	unfilteredErr error
 }
 
-func (f *rcFake) ListIssues(context.Context, int64, forge.ListIssuesOptions) ([]forge.Issue, error) {
+func (f *rcFake) ListIssues(_ context.Context, _ int64, opts forge.ListIssuesOptions) ([]forge.Issue, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.lists++
-	return append([]forge.Issue(nil), f.issues...), nil
+	f.calls = append(f.calls, opts)
+	if isUnfilteredList(opts) && f.unfilteredErr != nil {
+		return nil, f.unfilteredErr
+	}
+	var out []forge.Issue
+	for _, is := range f.issues {
+		if opts.UpdatedAfter != nil && is.UpdatedAt.Before(*opts.UpdatedAfter) {
+			continue
+		}
+		if opts.State != forge.StateAll && is.State != string(opts.State) {
+			continue
+		}
+		hasAll := true
+		for _, l := range opts.Labels {
+			if !slices.Contains(is.Labels, l) {
+				hasAll = false
+			}
+		}
+		if hasAll {
+			out = append(out, is)
+		}
+	}
+	return out, nil
+}
+
+// unfilteredCalls counts the complete-set fetches made so far.
+func (f *rcFake) unfilteredCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	n := 0
+	for _, c := range f.calls {
+		if isUnfilteredList(c) {
+			n++
+		}
+	}
+	return n
 }
 
 func (f *rcFake) set(issues ...forge.Issue) {
@@ -467,5 +509,179 @@ func TestFindingGroupReconcileWarnCarriesPendingCountAndOldestAgeLiveDB(t *testi
 	}
 	if _, ok := capture.find("finding group reconciliation pending", e.repoID); ok {
 		t.Error("WARN emitted with no pending operations")
+	}
+}
+
+// ── regression: marker reconciliation runs over the COMPLETE issue list, in FullSync only ─────
+
+func (e *rcEnv) cachedIssueRows() int {
+	e.t.Helper()
+	var n int
+	if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM issues WHERE repo_id=$1`, e.repoID).Scan(&n); err != nil {
+		e.t.Fatal(err)
+	}
+	return n
+}
+
+func (e *rcEnv) requireInFlightUntouched(op uuid.UUID) {
+	e.t.Helper()
+	if p, iid := e.phase(op); p != "in_flight" || iid != nil {
+		e.t.Errorf("operation %s = %s iid=%v, want in_flight untouched", op, p, iid)
+	}
+}
+
+func (e *rcEnv) requireNoCursor() {
+	e.t.Helper()
+	e.svc.groupCursorMu.Lock()
+	defer e.svc.groupCursorMu.Unlock()
+	if _, ok := e.svc.groupCursors[e.repoID]; ok {
+		e.t.Error("failed FullSync advanced the group cursor")
+	}
+}
+
+// The marker is on two issues. The finding-labelled, UpdatedAfter-bounded fetch sees only the
+// newer one, and the older one has lost its label, so no filtered fetch shows the duplicate.
+func TestFindingGroupReconcileDuplicateHiddenFromFilteredFetchesStaysClaimedLiveDB(t *testing.T) {
+	e := newRCEnv(t)
+	op, ids := e.inFlight(e.user, 2)
+	now := time.Now().UTC().Truncate(time.Second)
+	older := rcIssue(1601, "first "+rcMarker(op.ID))
+	older.Labels, older.UpdatedAt = nil, now.Add(-time.Hour)
+	newer := rcIssue(1602, "second "+rcMarker(op.ID))
+	newer.UpdatedAt = now
+	e.fake.set(older, newer)
+
+	if _, err := e.svc.IncrementalSync(e.ctx, e.repoID, 7001, e.fake, Marks{Finding: now.Add(-time.Minute)}); err != nil {
+		t.Fatalf("IncrementalSync: %v", err)
+	}
+	e.requireClaimed(ids)
+	e.requireInFlightUntouched(op.ID)
+	if err := e.fullSync(); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	e.requireClaimed(ids)
+	e.requireInFlightUntouched(op.ID)
+	if got := e.fake.unfilteredCalls(); got != 1 {
+		t.Errorf("unfiltered calls = %d, want 1 (the FullSync)", got)
+	}
+}
+
+// A created issue without the finding label is invisible to the labelled fetches; the
+// complete set finds it on the next FullSync whether it is open or closed.
+func TestFindingGroupReconcileSettlesUnlabelledIssueLiveDB(t *testing.T) {
+	for _, state := range []string{"opened", "closed"} {
+		t.Run(state, func(t *testing.T) {
+			e := newRCEnv(t)
+			op, ids := e.inFlight(e.user, 2)
+			issue := rcIssue(1701, "body "+rcMarker(op.ID))
+			issue.Labels, issue.State = nil, state
+			e.fake.set(issue)
+			if err := e.fullSync(); err != nil {
+				t.Fatalf("FullSync: %v", err)
+			}
+			e.requireSettled(1701, ids)
+			if p, _ := e.phase(op.ID); p != "settled" {
+				t.Errorf("phase = %s, want settled", p)
+			}
+		})
+	}
+}
+
+func TestFindingGroupReconcileUnfilteredFetchOnlyWhenMatchableLiveDB(t *testing.T) {
+	t.Run("no pending op", func(t *testing.T) {
+		e := newRCEnv(t)
+		if err := e.fullSync(); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.fake.unfilteredCalls(); got != 0 {
+			t.Errorf("unfiltered calls = %d, want 0", got)
+		}
+	})
+	t.Run("only a recorded op", func(t *testing.T) {
+		e := newRCEnv(t)
+		op, ids := e.inFlight(e.user, 1)
+		if ok, err := store.RecordFindingGroupIssue(e.ctx, e.pool, e.user, op.ID, 1801, "https://forge.e2e/g/rc/-/issues/1801"); err != nil || !ok {
+			t.Fatalf("record: %v %v", ok, err)
+		}
+		if err := e.fullSync(); err != nil {
+			t.Fatal(err)
+		}
+		e.requireSettled(1801, ids)
+		if got := e.fake.unfilteredCalls(); got != 0 {
+			t.Errorf("unfiltered calls = %d, want 0", got)
+		}
+	})
+	t.Run("only a pre_call op", func(t *testing.T) {
+		e := newRCEnv(t)
+		op, ids := e.claim(e.user, 1)
+		if err := e.fullSync(); err != nil {
+			t.Fatal(err)
+		}
+		e.requireClaimed(ids)
+		if p, _ := e.phase(op.ID); p != "pre_call" {
+			t.Errorf("phase = %s, want pre_call", p)
+		}
+		if got := e.fake.unfilteredCalls(); got != 0 {
+			t.Errorf("unfiltered calls = %d, want 0", got)
+		}
+	})
+	t.Run("an in_flight op makes exactly one FullSync call and no incremental call", func(t *testing.T) {
+		e := newRCEnv(t)
+		e.inFlight(e.user, 1)
+		if _, err := e.svc.IncrementalSync(e.ctx, e.repoID, 7001, e.fake, Marks{}); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.fake.unfilteredCalls(); got != 0 {
+			t.Errorf("after IncrementalSync unfiltered calls = %d, want 0", got)
+		}
+		if err := e.fullSync(); err != nil {
+			t.Fatal(err)
+		}
+		if got := e.fake.unfilteredCalls(); got != 1 {
+			t.Errorf("after FullSync unfiltered calls = %d, want 1", got)
+		}
+	})
+}
+
+// A failed complete-set fetch, or one over a cap, fails the whole FullSync: claims stay, the
+// cache is not written and the cursor does not advance.
+func TestFindingGroupReconcileCompleteSetFailureFailsFullSyncLiveDB(t *testing.T) {
+	longMarkerIssue := func(op uuid.UUID) forge.Issue {
+		is := rcIssue(1901, strings.Repeat(rcMarker(op), findingGroupCandidateLimit+1))
+		is.Labels = nil
+		return is
+	}
+	tests := []struct {
+		name  string
+		setup func(e *rcEnv, op uuid.UUID)
+	}{
+		{"fetch error", func(e *rcEnv, _ uuid.UUID) { e.fake.unfilteredErr = fmt.Errorf("forge pagination cap") }},
+		{"candidate cap", func(e *rcEnv, op uuid.UUID) { e.fake.set(rcIssue(1900, "unrelated"), longMarkerIssue(op)) }},
+		{"description cap", func(e *rcEnv, _ uuid.UUID) {
+			big := rcIssue(1902, strings.Repeat("a", findingGroupDescriptionLimit+1))
+			big.Labels = nil
+			e.fake.set(rcIssue(1900, "unrelated"), big)
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newRCEnv(t)
+			op, ids := e.inFlight(e.user, 2)
+			e.fake.set(rcIssue(1900, "unrelated"))
+			tc.setup(e, op.ID)
+			marks, err := e.svc.FullSync(e.ctx, e.repoID, 7001, e.fake)
+			if err == nil {
+				t.Fatal("FullSync succeeded, want the pass to fail closed")
+			}
+			if marks != (Marks{}) {
+				t.Errorf("marks = %v, want zero", marks)
+			}
+			e.requireClaimed(ids)
+			e.requireInFlightUntouched(op.ID)
+			if n := e.cachedIssueRows(); n != 0 {
+				t.Errorf("cache rows written = %d, want 0", n)
+			}
+			e.requireNoCursor()
+		})
 	}
 }

@@ -310,7 +310,12 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	return ops, finish, advance, nil
 }
 
-// Bound marker parsing before any cache write or watermark advance.
+// Bound marker parsing before any cache write or watermark advance. The caps
+// apply to the COMPLETE unfiltered issue list that FullSync reconciles markers
+// over (see reconcileFindingGroupMarkers): a description or candidate count over
+// a cap fails the whole FullSync with marks held rather than skipping the
+// offending issue, because a skipped issue could be the second carrier of an
+// op's marker and hiding it would make an ambiguous marker look unique.
 const (
 	findingGroupMarkerPrefix     = "<!-- uzi-finding-group-operation: "
 	findingGroupMarkerSuffix     = " -->"
@@ -394,6 +399,43 @@ func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUI
 		}
 	}
 	return nil
+}
+
+// reconcileFindingGroupMarkers settles unconfirmed group operations whose issue
+// was created but whose iid was never recorded, by matching the durable marker
+// in issue descriptions. Only FullSync calls it, and only with the COMPLETE
+// issue list: one unfiltered, all-states ListIssues. An UpdatedAfter-filtered
+// set can return only one of two issues carrying the same marker, and a
+// label-filtered set omits an issue that was de-labeled or never labeled; either
+// hides a duplicate and turns an ambiguous marker into a unique one. Ambiguity,
+// the candidate cap and the description cap are therefore all evaluated over the
+// same complete set inside recordFindingGroupMatches.
+//
+// It makes NO forge request unless some op in pending can actually be matched:
+// ListPendingFindingGroupsByIDs only matches phase in_flight or
+// returned_uncertain with no recorded iid, so a recorded op (settled by
+// pendingFindingGroups) or a pre_call op never triggers the fetch. Any error,
+// including the driver's own pagination cap, is returned so the caller keeps its
+// marks and claims.
+func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, pending []store.FindingGroupClaimOperation) error {
+	if s.groupDB == nil {
+		return nil
+	}
+	matchable := false
+	for _, op := range pending {
+		if op.IssueIID == nil && (op.Phase == "in_flight" || op.Phase == "returned_uncertain") {
+			matchable = true
+			break
+		}
+	}
+	if !matchable {
+		return nil
+	}
+	all, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{})
+	if err != nil {
+		return err
+	}
+	return s.recordFindingGroupMatches(ctx, repoID, all)
 }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
@@ -705,6 +747,12 @@ func (m Marks) Advance(next Marks) Marks {
 // the any-state fetch keys on the uzi label now that the PRD label has lost its
 // special meaning.)
 //
+// FullSync is also the only path that settles unconfirmed finding-group
+// operations by marker (reconcileFindingGroupMarkers): it makes one extra
+// unfiltered all-states fetch, only while a matchable operation is pending, and
+// a failure of that fetch (or a cap in it) fails the whole pass with the zero
+// Marks, no cache writes and the claims retained.
+//
 // The third fetch closes a gap the first two structurally left open: a filed finding
 // issue carries only the finding marker label, never the uzi label, so once it CLOSES
 // the uzi fetch (uzi-labelled) never returns it and the open fetch (state=opened) no
@@ -758,7 +806,6 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	findingLabel := s.findingLabel(ctx)
 	var findingExtra []forge.Issue
 	var findingMark time.Time
-	groupIssues := issues
 	if findingLabel != uziLabel {
 		findingIssues, ferr := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{findingLabel}})
 		if ferr != nil {
@@ -766,12 +813,12 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		}
 		findingExtra = withoutLabel(findingIssues, uziLabel)
 		findingMark = maxUpdatedAt(findingIssues)
-		groupIssues = findingIssues
 	}
-	if len(pendingGroups) > 0 {
-		if err := s.recordFindingGroupMatches(ctx, repoID, groupIssues); err != nil {
-			return Marks{}, err
-		}
+	// Marker reconciliation runs over the complete issue list, after every
+	// fetch above succeeded and before any cache write. An error returns the
+	// zero Marks, leaves the cache untouched and does not advance the cursor.
+	if err := s.reconcileFindingGroupMarkers(ctx, repoID, forgeProjectID, f, pendingGroups); err != nil {
+		return Marks{}, err
 	}
 	advanceGroups()
 
@@ -826,7 +873,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
-	pendingGroups, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
+	_, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
 	if pendingErr != nil {
 		return m, pendingErr
@@ -860,15 +907,9 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 			return m, err
 		}
 	}
-	groupIssues := issues
-	if findingLabel != uziLabel {
-		groupIssues = findingIssues
-	}
-	if len(pendingGroups) > 0 {
-		if err := s.recordFindingGroupMatches(ctx, repoID, groupIssues); err != nil {
-			return m, err
-		}
-	}
+	// No marker matching here: an UpdatedAfter-filtered, label-filtered page is
+	// not the complete set marker uniqueness needs. pendingFindingGroups above
+	// already settled recorded iids; unrecorded ops wait for FullSync.
 	advanceGroups()
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err

@@ -1087,6 +1087,9 @@ func TestFileFindingGroupTimeoutAndReconcilerNoMatchStayClaimedLiveDB(t *testing
 	if _, err := e.svc.FullSync(e.ctx, e.repoID, fgProjectID, e.fake); err != nil {
 		t.Fatalf("FullSync: %v", err)
 	}
+	// The incremental pass only settles operations whose issue iid is already recorded; it
+	// never matches markers (that needs FullSync's complete issue list), so this unrecorded
+	// operation must stay claimed here too.
 	if _, err := e.svc.IncrementalSync(e.ctx, e.repoID, fgProjectID, e.fake, forgesvc.Marks{}); err != nil {
 		t.Fatalf("IncrementalSync: %v", err)
 	}

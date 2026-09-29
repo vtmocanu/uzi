@@ -81,17 +81,23 @@ func (db *pendingPageDB) Query(_ context.Context, _ string, args ...interface{})
 
 func (db *pendingPageDB) QueryRow(ctx context.Context, _ string, _ ...interface{}) pgx.Row {
 	db.statsCtxErr = ctx.Err()
-	return pendingStatsRow{count: int64(len(db.ops)), oldest: db.ops[0].CreatedAt}
+	row := pendingStatsRow{count: int64(len(db.ops))}
+	if len(db.ops) > 0 {
+		oldest := db.ops[0].CreatedAt
+		row.oldest = &oldest
+	}
+	return row
 }
 
+// pendingStatsRow mirrors count(*),min(created_at): a NULL minimum for no rows.
 type pendingStatsRow struct {
 	count  int64
-	oldest time.Time
+	oldest *time.Time
 }
 
 func (r pendingStatsRow) Scan(dest ...interface{}) error {
 	*dest[0].(*int64) = r.count
-	*dest[1].(**time.Time) = &r.oldest
+	*dest[1].(**time.Time) = r.oldest
 	return nil
 }
 
@@ -231,6 +237,17 @@ func (db *markerPageDB) Exec(_ context.Context, _ string, args ...interface{}) (
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
+// recordedOp is the operation RecordFindingGroupIssue last touched, so the settlement
+// transaction fake answers for the op under test whatever the fixture size.
+func (db *markerPageDB) recordedOp() store.FindingGroupClaimOperation {
+	for _, op := range db.ops {
+		if op.ID == db.recorded {
+			return op
+		}
+	}
+	return store.FindingGroupClaimOperation{}
+}
+
 func (db *markerPageDB) Begin(context.Context) (pgx.Tx, error) {
 	if db.beginErr != nil {
 		return nil, db.beginErr
@@ -246,7 +263,7 @@ type markerTx struct {
 func (tx *markerTx) QueryRow(_ context.Context, query string, _ ...interface{}) pgx.Row {
 	switch {
 	case strings.Contains(query, "SELECT repo_id,issue_iid,issue_url"):
-		return markerRow{values: []any{tx.db.ops[100].RepoID, tx.db.iid, tx.db.url}}
+		return markerRow{values: []any{tx.db.recordedOp().RepoID, tx.db.iid, tx.db.url}}
 	case strings.Contains(query, "finding_group_members"):
 		return markerRow{values: []any{int64(1)}}
 	default:
@@ -283,7 +300,7 @@ func (r markerRow) Scan(dest ...interface{}) error {
 	return nil
 }
 
-func TestIncrementalSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
+func TestFullSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
 	repo, user := uuid.New(), uuid.New()
 	start := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
 	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
@@ -297,29 +314,25 @@ func TestIncrementalSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
 	svc := newTestService(&fakeStore{})
 	svc.SetFindingGroupDB(db)
 	marker := "<!-- uzi-finding-group-operation: " + target.String() + " -->"
-	first := &fakeForge{findingIssues: []forge.Issue{{
+	first := &fakeForge{allIssues: []forge.Issue{{
 		IID: 301, WebURL: "https://example.com/301", Description: marker,
 		UpdatedAt: start.Add(200 * time.Second),
 	}}}
-	marks, err := svc.IncrementalSync(context.Background(), repo, 7, first, Marks{})
-	if err != nil {
+	if _, err := svc.FullSync(context.Background(), repo, 7, first); err != nil {
 		t.Fatal(err)
 	}
-	if db.recorded != target || db.settled != target || db.candidateQueries != 1 {
-		t.Fatalf("operation 101: recorded=%s settled=%s candidate queries=%d", db.recorded, db.settled, db.candidateQueries)
+	if db.recorded != target || db.settled != target || db.candidateQueries != 1 || len(first.unfilteredListCalls()) != 1 {
+		t.Fatalf("operation 101: recorded=%s settled=%s candidate queries=%d unfiltered=%d",
+			db.recorded, db.settled, db.candidateQueries, len(first.unfilteredListCalls()))
 	}
-	if !marks.Finding.Equal(start.Add(200 * time.Second)) {
-		t.Fatalf("finding mark = %v", marks.Finding)
-	}
-	second := &fakeForge{findingIssues: []forge.Issue{{
+	second := &fakeForge{allIssues: []forge.Issue{{
 		IID: 302, WebURL: "https://example.com/302", UpdatedAt: start.Add(201 * time.Second),
 	}}}
-	next, err := svc.IncrementalSync(context.Background(), repo, 7, second, marks)
-	if err != nil {
+	if _, err := svc.FullSync(context.Background(), repo, 7, second); err != nil {
 		t.Fatal(err)
 	}
-	if !next.Finding.Equal(start.Add(201*time.Second)) || db.settled != target {
-		t.Fatalf("second pass: mark=%v settled=%s", next.Finding, db.settled)
+	if db.settled != target || db.candidateQueries != 1 {
+		t.Fatalf("second pass: settled=%s candidate queries=%d", db.settled, db.candidateQueries)
 	}
 }
 
@@ -353,7 +366,7 @@ func TestIncrementalSyncSettlementFailureHoldsMarks(t *testing.T) {
 	}
 }
 
-func TestIncrementalSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
+func TestFullSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 	repo, user := uuid.New(), uuid.New()
 	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
 	startTime := time.Now().Add(-time.Hour)
@@ -368,14 +381,13 @@ func TestIncrementalSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 	svc := newTestService(cache)
 	svc.SetFindingGroupDB(db)
 	marker := "<!-- uzi-finding-group-operation: " + db.ops[0].ID.String() + " -->"
-	start := Marks{Finding: startTime}
 	for pass := 0; pass < 2; pass++ {
-		got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{{
+		got, err := svc.FullSync(context.Background(), repo, 7, &fakeForge{allIssues: []forge.Issue{{
 			IID: 44, WebURL: "https://example.com/issues/44", Description: marker,
 			UpdatedAt: startTime.Add(200 * time.Second),
-		}}}, start)
-		if err == nil || got != start || len(cache.upserts) != 0 {
-			t.Fatalf("pass %d: mark=%v error=%v writes=%d", pass, got, err, len(cache.upserts))
+		}}})
+		if err == nil || got != (Marks{}) || len(cache.upserts) != 0 || len(cache.deleteCalls) != 0 {
+			t.Fatalf("pass %d: marks=%v error=%v writes=%d evictions=%d", pass, got, err, len(cache.upserts), len(cache.deleteCalls))
 		}
 	}
 	if db.ops[0].Phase != "issue_recorded" || db.candidateQueries != 1 {
@@ -386,33 +398,162 @@ func TestIncrementalSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 	}
 }
 
-func TestFindingGroupMarkerLimitFailsBeforeCacheWrites(t *testing.T) {
-	repo := uuid.New()
-	cache := &fakeStore{}
-	svc := newTestService(cache)
-	svc.SetFindingGroupDB(&markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{{
-		ID: uuid.New(), UserID: uuid.New(), RepoID: repo, Phase: "in_flight", CreatedAt: time.Now(),
-	}}}})
-	issue := forge.Issue{Description: strings.Repeat("a", findingGroupDescriptionLimit+1), UpdatedAt: time.Now()}
-	start := Marks{Finding: time.Now().Add(-time.Hour)}
-	got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{issue}}, start)
-	if err == nil || got != start || len(cache.upserts) != 0 {
-		t.Fatalf("mark=%v error=%v cache writes=%d", got, err, len(cache.upserts))
+// requireFullSyncHeld asserts a FullSync failed closed: an error, the zero Marks, no
+// cache write or eviction, the claim untouched and the group cursor not advanced.
+func requireFullSyncHeld(t *testing.T, svc *Service, cache *fakeStore, db *markerPageDB, repo uuid.UUID, marks Marks, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("FullSync succeeded, want the pass to fail closed")
+	}
+	if marks != (Marks{}) || len(cache.upserts) != 0 || len(cache.deleteCalls) != 0 {
+		t.Fatalf("marks=%v writes=%d evictions=%d", marks, len(cache.upserts), len(cache.deleteCalls))
+	}
+	if db.candidateQueries != 0 || db.recorded != uuid.Nil || db.ops[0].Phase != "in_flight" || db.ops[0].IssueIID != nil {
+		t.Fatalf("claim changed: queries=%d recorded=%s phase=%s", db.candidateQueries, db.recorded, db.ops[0].Phase)
+	}
+	if _, advanced := svc.groupCursors[repo]; advanced {
+		t.Fatal("failed pass advanced the group cursor")
 	}
 }
 
-func TestFindingGroupCandidateLimitHoldsFindingMark(t *testing.T) {
-	repo, user := uuid.New(), uuid.New()
-	op := store.FindingGroupClaimOperation{ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight", CreatedAt: time.Now()}
+func newHeldFixture() (*Service, *fakeStore, *markerPageDB, store.FindingGroupClaimOperation, uuid.UUID) {
+	repo := uuid.New()
+	op := store.FindingGroupClaimOperation{ID: uuid.New(), UserID: uuid.New(), RepoID: repo, Phase: "in_flight", CreatedAt: time.Now()}
 	db := &markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{op}}}
 	cache := &fakeStore{}
 	svc := newTestService(cache)
 	svc.SetFindingGroupDB(db)
+	return svc, cache, db, op, repo
+}
+
+func TestFindingGroupMarkerLimitFailsFullSyncBeforeCacheWrites(t *testing.T) {
+	svc, cache, db, _, repo := newHeldFixture()
+	issue := forge.Issue{Description: strings.Repeat("a", findingGroupDescriptionLimit+1), UpdatedAt: time.Now()}
+	// The uzi/open/finding fetches also return rows: none of them may reach the cache.
+	f := &fakeForge{allIssues: []forge.Issue{issue}, issues: []forge.Issue{issueAt(1, time.Now())}}
+	marks, err := svc.FullSync(context.Background(), repo, 7, f)
+	requireFullSyncHeld(t, svc, cache, db, repo, marks, err)
+}
+
+func TestFindingGroupCandidateLimitFailsFullSyncAndHoldsClaim(t *testing.T) {
+	svc, cache, db, op, repo := newHeldFixture()
 	marker := "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->"
-	start := Marks{Finding: time.Now().Add(-time.Hour)}
 	issue := forge.Issue{IID: 77, Description: strings.Repeat(marker, findingGroupCandidateLimit+1), UpdatedAt: time.Now()}
-	got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{issue}}, start)
-	if err == nil || got != start || len(cache.upserts) != 0 || db.candidateQueries != 0 || db.recorded != uuid.Nil {
-		t.Fatalf("mark=%v error=%v writes=%d queries=%d recorded=%s", got, err, len(cache.upserts), db.candidateQueries, db.recorded)
+	f := &fakeForge{allIssues: []forge.Issue{issue}, issues: []forge.Issue{issueAt(1, time.Now())}}
+	marks, err := svc.FullSync(context.Background(), repo, 7, f)
+	requireFullSyncHeld(t, svc, cache, db, repo, marks, err)
+}
+
+func TestFullSyncUnfilteredFetchErrorFailsClosed(t *testing.T) {
+	svc, cache, db, _, repo := newHeldFixture()
+	f := &fakeForge{allErr: fmt.Errorf("forge pagination cap"), issues: []forge.Issue{issueAt(1, time.Now())}}
+	marks, err := svc.FullSync(context.Background(), repo, 7, f)
+	requireFullSyncHeld(t, svc, cache, db, repo, marks, err)
+	if len(f.unfilteredListCalls()) != 1 {
+		t.Fatalf("unfiltered calls = %d, want 1", len(f.unfilteredListCalls()))
 	}
+}
+
+// ── regression: markers are matched over the COMPLETE issue list only ─────────────────────
+
+// The marker sits on two issues with different updated_at. An incremental pass whose
+// watermark returns only the newer one must not settle the op, and neither may a later
+// FullSync whose label-filtered fetches also show only one carrier: the unfiltered
+// complete set exposes the duplicate.
+func TestDuplicateMarkerHiddenFromFilteredFetchesNeverSettles(t *testing.T) {
+	svc, _, db, op, repo := newHeldFixture()
+	marker := "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->"
+	now := time.Now().UTC().Truncate(time.Second)
+	older := forge.Issue{IID: 501, WebURL: "https://example.com/501", Description: marker, UpdatedAt: now.Add(-time.Hour)}
+	newer := forge.Issue{IID: 502, WebURL: "https://example.com/502", Description: marker, UpdatedAt: now}
+	watermark := Marks{Finding: now.Add(-time.Minute)}
+
+	inc := &fakeForge{findingIssues: []forge.Issue{newer}}
+	if _, err := svc.IncrementalSync(context.Background(), repo, 7, inc, watermark); err != nil {
+		t.Fatalf("IncrementalSync: %v", err)
+	}
+	if len(inc.unfilteredListCalls()) != 0 {
+		t.Fatalf("IncrementalSync made %d unfiltered calls", len(inc.unfilteredListCalls()))
+	}
+	full := &fakeForge{findingIssues: []forge.Issue{newer}, allIssues: []forge.Issue{older, newer}}
+	if _, err := svc.FullSync(context.Background(), repo, 7, full); err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if db.recorded != uuid.Nil || db.settled != uuid.Nil || db.ops[0].Phase != "in_flight" || db.ops[0].IssueIID != nil {
+		t.Fatalf("ambiguous marker moved the op: recorded=%s settled=%s phase=%s", db.recorded, db.settled, db.ops[0].Phase)
+	}
+}
+
+// A created issue that lost (or never had) the finding label is invisible to the
+// label-filtered fetches; the complete set still finds it, open or closed.
+func TestFullSyncSettlesCreatedIssueWithoutFindingLabel(t *testing.T) {
+	for _, state := range []string{"opened", "closed"} {
+		t.Run(state, func(t *testing.T) {
+			svc, _, db, op, repo := newHeldFixture()
+			marker := "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->"
+			created := forge.Issue{
+				IID: 601, State: state, WebURL: "https://example.com/601", Description: marker,
+				UpdatedAt: time.Now(),
+			}
+			f := &fakeForge{allIssues: []forge.Issue{created}}
+			if _, err := svc.FullSync(context.Background(), repo, 7, f); err != nil {
+				t.Fatalf("FullSync: %v", err)
+			}
+			if db.recorded != op.ID || db.settled != op.ID || db.iid != 601 {
+				t.Fatalf("recorded=%s settled=%s iid=%d, want op settled on #601", db.recorded, db.settled, db.iid)
+			}
+		})
+	}
+}
+
+// The complete-set fetch is made only when an operation could actually be matched.
+func TestFullSyncUnfilteredFetchOnlyWhenMatchableOpPending(t *testing.T) {
+	iid := int64(31)
+	mk := func(phase string, recorded bool) *markerPageDB {
+		repoOps := []store.FindingGroupClaimOperation{}
+		if phase != "" {
+			op := store.FindingGroupClaimOperation{ID: uuid.New(), UserID: uuid.New(), RepoID: uuid.New(), Phase: phase, CreatedAt: time.Now().Add(-time.Minute)}
+			if recorded {
+				op.IssueIID, op.IssueURL = &iid, "https://example.com/issues/31"
+			}
+			repoOps = append(repoOps, op)
+		}
+		return &markerPageDB{pendingPageDB: &pendingPageDB{ops: repoOps}}
+	}
+	tests := []struct {
+		name string
+		db   *markerPageDB
+		want int
+	}{
+		{"no pending op", mk("", false), 0},
+		{"only a recorded op", mk("issue_recorded", true), 0},
+		{"only a pre_call op", mk("pre_call", false), 0},
+		{"an in_flight unrecorded op", mk("in_flight", false), 1},
+		{"a returned_uncertain unrecorded op", mk("returned_uncertain", false), 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			svc := newTestService(&fakeStore{})
+			svc.SetFindingGroupDB(tc.db)
+			f := &fakeForge{}
+			if _, err := svc.FullSync(context.Background(), uuid.New(), 7, f); err != nil {
+				t.Fatalf("FullSync: %v", err)
+			}
+			if got := len(f.unfilteredListCalls()); got != tc.want {
+				t.Fatalf("unfiltered calls = %d, want %d", got, tc.want)
+			}
+		})
+	}
+	t.Run("incremental never fetches the complete set", func(t *testing.T) {
+		db := mk("in_flight", false)
+		svc := newTestService(&fakeStore{})
+		svc.SetFindingGroupDB(db)
+		f := &fakeForge{}
+		if _, err := svc.IncrementalSync(context.Background(), uuid.New(), 7, f, Marks{}); err != nil {
+			t.Fatalf("IncrementalSync: %v", err)
+		}
+		if got := len(f.unfilteredListCalls()); got != 0 {
+			t.Fatalf("unfiltered calls = %d, want 0", got)
+		}
+	})
 }
