@@ -7,9 +7,17 @@
   allow list cut down to that single name: no forge host (a lane claim carries no forge
   credential), no package hosts, no wildcard (uzi.validateIsolatedLane refuses one).
 
-  The drop belt goes first for the same reason as there: an FQDN Allow admits whatever
-  addresses the DNS answer carried, so a hostile answer mapping the model host to the
-  metadata address would otherwise open it through this rule.
+  Rules are evaluated in order, first match wins:
+    1. the lane floor's three in-cluster peers (DNS, the api, uzi-fetcher), as Allow rules
+       rendered from the SAME helper as the floor (uzi.isolatedLaneFloorEgress). They are
+       here only so that step 2 can drop the cluster's own ranges without cutting the
+       lane off from them; they admit nothing the floor does not.
+    2. the drop belt: fqdnEgress.denyCIDRs, the lane's clusterCIDRs (pod, service, node)
+       and the IPv6 metadata address fd00:ec2::254. It precedes the FQDN Allow for the
+       same reason as in worker-fqdn-egress.yaml: an FQDN Allow admits whatever addresses
+       the DNS answer carried, so a hostile answer mapping the model host to the metadata
+       address, a node, or an in-cluster pod would otherwise open it through step 3.
+    3. the model host, by exact name, on TCP 443.
 
   An Antrea Allow jumps past the k8s NetworkPolicy tables, so the lane floor
   (worker-isolated-networkpolicy.yaml) needs no external rule of its own.
@@ -30,6 +38,7 @@ spec:
         matchLabels:
           app.kubernetes.io/name: uzi-hosted-worker
   egress:
+    {{- include "uzi.isolatedLaneFloorEgress" (dict "root" . "antrea" true) | nindent 4 }}
     {{- range .Values.workers.fqdnEgress.denyCIDRs }}
     - name: {{ .name }}
       action: Drop
@@ -37,6 +46,18 @@ spec:
         - ipBlock:
             cidr: {{ .cidr }}
     {{- end }}
+    {{- range $i, $c := fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) }}
+    - name: drop-lane-cluster-{{ $i }}
+      action: Drop
+      to:
+        - ipBlock:
+            cidr: {{ $c }}
+    {{- end }}
+    - name: drop-lane-cloud-metadata-v6
+      action: Drop
+      to:
+        - ipBlock:
+            cidr: fd00:ec2::254/128
     - name: allow-model-host
       action: Allow
       to:
@@ -47,16 +68,31 @@ spec:
 {{- else if and (eq $provider "ovn") (.Capabilities.APIVersions.Has "k8s.ovn.org/v1/EgressFirewall") }}
 {{- /*
   The same destination on OVN-Kubernetes, as the COMPOSED pair worker-ovn-egress.yaml
-  explains: (a) a NetworkPolicy opening the floor to external addresses on TCP 443 only
-  (0.0.0.0/0 minus fqdnEgress.ovn.exceptCIDRs), and (b) the lane namespace's
+  explains: (a) a NetworkPolicy opening the floor to external addresses on TCP 443 only,
+  and (b) the lane namespace's
   EgressFirewall `default` narrowing that to the model host. Either half alone is wrong,
   so both sit behind ONE guard: where the cluster does not serve EgressFirewall, neither
   renders and the lane reaches no external address at all (it fails closed: the first
   model call times out), rather than (a) opening the internet unfiltered.
+
+  (a)'s address set is 0.0.0.0/0 minus fqdnEgress.ovn.exceptCIDRs AND minus
+  uzi.isolatedLaneExceptV4 (every non-public IPv4 range uzi-fetcher refuses, plus the
+  lane's own IPv4 clusterCIDRs). The EgressFirewall filters only traffic LEAVING the
+  cluster, so (a) alone decides what a lane pod reaches in-cluster on 443: without the
+  lane's cluster ranges here, a lane pod could dial any pod or Service on 443 whenever
+  exceptCIDRs is incomplete. IPv6 entries are dropped from the list, since an except must
+  lie within its IPv4 cidr; the rule has no IPv6 block, so no IPv6 address is allowed.
 */}}
 {{- if not .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
 {{- fail "workers.fqdnEgress.provider is ovn but workers.fqdnEgress.ovn.exceptCIDRs is empty. The isolated lane's external-egress NetworkPolicy would then admit in-cluster pod, service and node addresses too. List the pod, service, node and link-local CIDRs." }}
 {{- end }}
+{{- $except := list }}
+{{- range .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
+{{- if not (contains ":" .) }}
+{{- $except = append $except . }}
+{{- end }}
+{{- end }}
+{{- $except = uniq (concat $except (fromJsonArray (include "uzi.isolatedLaneExceptV4" .))) }}
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
 metadata:
@@ -76,7 +112,7 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-              {{- range .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
+              {{- range $except }}
               - {{ . }}
               {{- end }}
       ports:

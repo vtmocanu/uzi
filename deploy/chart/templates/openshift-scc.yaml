@@ -144,8 +144,13 @@ subjects:
 {{- end }}
 {{- if include "uzi.isolatedLaneEnabled" . }}
 {{- /*
-  The isolated lane (PRD #1906 M6): its pods are rendered like the kube-native tier's
-  (uid 10001, restricted), so its worker SA gets the same minimal SCC.
+  The isolated lane (PRD #1906 M6): its worker SA gets `use` on the kube-native tier's SCC
+  above. That SCC is minimal (uid 10001, no added capability) only in the single-uid
+  posture; under workers.uidSplit.enabled it is the wider uid-split envelope (RunAsAny,
+  the uid-split capabilities). What holds a lane pod to the restricted shape in BOTH
+  postures is the lane namespace's Pod Security `restricted` label, ENFORCED
+  unconditionally (worker-isolated-namespace.yaml): admission rejects a root start or an
+  added capability there whatever this SCC would admit.
 */}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

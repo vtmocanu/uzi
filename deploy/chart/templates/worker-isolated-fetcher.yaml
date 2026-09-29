@@ -153,12 +153,15 @@ spec:
               value: "/etc/uzi/fetcher/token"
             # The cluster's pod, service and node ranges, refused by the fetcher's own
             # address check on top of its built-in private ranges. The NetworkPolicy below
-            # excludes the same list, so an internal destination is blocked twice.
+            # keeps every one of them out of its internet allow (excepted, or outside
+            # 2000::/3), so an internal destination is blocked twice.
             - name: UZI_FETCHER_BLOCKED_CIDRS
               value: {{ join "," $blocked | quote }}
+            # int64 | toString: a YAML integer arrives as a float64, and a bare quote would
+            # render 52428800 as "5.24288e+07", which the fetcher's ParseInt refuses.
             {{- with .Values.workers.isolatedLane.fetcher.maxFileBytes }}
             - name: UZI_FETCHER_MAX_FILE_BYTES
-              value: {{ . | quote }}
+              value: {{ . | int64 | toString | quote }}
             {{- end }}
             {{- with .Values.workers.isolatedLane.fetcher.timeout }}
             - name: UZI_FETCHER_TIMEOUT
@@ -166,7 +169,7 @@ spec:
             {{- end }}
             {{- with .Values.workers.isolatedLane.fetcher.maxInflight }}
             - name: UZI_FETCHER_MAX_INFLIGHT
-              value: {{ . | quote }}
+              value: {{ . | int64 | toString | quote }}
             {{- end }}
           # GET /healthz answers 200 without touching the api, on the TLS listener.
           readinessProbe:
@@ -254,21 +257,19 @@ spec:
   fetcher port; plus api.networkPolicy.probeCIDRs, when set, for the kubelet's probes (the
   same reason the api admits them).
 
-  EGRESS: DNS; the api's worker port; and TCP 443 to 0.0.0.0/0 and ::/0 MINUS the
-  configured cluster ranges and every private, loopback, link-local, unique-local,
-  multicast, reserved, NAT64, 6to4, Teredo and IPv4-mapped range. Rules are OR'd, so DNS
-  and the api stay reachable through their selectors although their addresses are
-  excluded from the internet rule.
+  EGRESS: DNS; the api's worker port; and TCP 443 to the same address space the fetcher's
+  own check admits (api/internal/fetcher/addrpolicy.go): IPv4 0.0.0.0/0 minus every range
+  that check refuses (uzi.isolatedLaneExceptV4: private, CGNAT, loopback, link-local,
+  IETF-assigned, documentation, 6to4 relay, benchmarking, multicast, reserved) and the
+  configured IPv4 cluster ranges; IPv6 2000::/3 only (so no loopback, IPv4-mapped, NAT64,
+  unique-local, link-local, site-local or multicast address is ever allowed) minus the
+  refused ranges inside it (uzi.isolatedLaneExceptV6: Teredo, benchmarking, ORCHID,
+  documentation, 6to4) and any IPv6 cluster range inside it. Rules are OR'd, so DNS and
+  the api stay reachable through their selectors although their addresses are excluded
+  from the internet rule.
 */}}
-{{- $v4 := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.168.0.0/16" "224.0.0.0/4" "240.0.0.0/4" }}
-{{- $v6 := list "::ffff:0:0/96" "64:ff9b::/96" "64:ff9b:1::/48" "2001::/32" "2002::/16" "fc00::/7" "fe80::/10" "ff00::/8" }}
-{{- range $blocked }}
-{{- if contains ":" . }}
-{{- $v6 = append $v6 . }}
-{{- else }}
-{{- $v4 = append $v4 . }}
-{{- end }}
-{{- end }}
+{{- $v4 := fromJsonArray (include "uzi.isolatedLaneExceptV4" .) }}
+{{- $v6 := fromJsonArray (include "uzi.isolatedLaneExceptV6" .) }}
 ---
 apiVersion: networking.k8s.io/v1
 kind: NetworkPolicy
@@ -333,13 +334,13 @@ spec:
         - ipBlock:
             cidr: 0.0.0.0/0
             except:
-              {{- range uniq $v4 }}
+              {{- range $v4 }}
               - {{ . }}
               {{- end }}
         - ipBlock:
-            cidr: ::/0
+            cidr: 2000::/3
             except:
-              {{- range uniq $v6 }}
+              {{- range $v6 }}
               - {{ . }}
               {{- end }}
       ports:

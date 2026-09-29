@@ -1084,10 +1084,12 @@ workers:
     # only from a real failure.
     modelHost: api.anthropic.com
     # The cluster's own address ranges, IPv4 and IPv6 alike. REQUIRED with the lane on.
-    # uzi-fetcher's NetworkPolicy allows TCP 443 to 0.0.0.0/0 and ::/0 MINUS these
-    # (plus the fixed private, link-local, unique-local, NAT64, 6to4, Teredo and
-    # multicast ranges in worker-isolated-fetcher.yaml), and the fetcher refuses them
-    # itself (UZI_FETCHER_BLOCKED_CIDRS), so an internal destination is blocked twice.
+    # uzi-fetcher's NetworkPolicy allows TCP 443 to 0.0.0.0/0 and 2000::/3 MINUS these
+    # (plus every non-public range the fetcher's own address check refuses, see
+    # uzi.isolatedLaneExceptV4/V6 in _helpers.tpl), and the fetcher refuses them itself
+    # (UZI_FETCHER_BLOCKED_CIDRS), so an internal destination is blocked twice. They are
+    # also dropped ahead of the lane's model-host FQDN rule (Antrea) and excepted from
+    # the lane's external-egress policy (OVN).
     # Example: pod: [10.244.0.0/16], service: [10.96.0.0/12], node: [192.0.2.0/24]
     clusterCIDRs:
       pod: []
@@ -1124,14 +1126,23 @@ workers:
       replicaCount: 1
       # The TLS listener (UZI_FETCHER_ADDR), the container port and the Service port.
       port: 8443
+      # Memory bound (api/internal/fetcher/server.go DefaultMaxInflight): fetch bodies
+      # take at most about maxInflight x 2 x maxFileBytes (each in-flight fetch holds one
+      # body in a buffer that can grow to twice the per-file cap). At the defaults that is
+      # 16 x 2 x 25 MiB = 800 MiB, so the limit is 1Gi: the worst case plus ~224 MiB for
+      # the runtime, TLS and header buffers and idle connections, which that bound does
+      # not cover. Raising maxInflight or maxFileBytes raises the bound; raise this limit
+      # with them, or the kernel OOM-kills the fetcher under load.
       resources:
         requests:
           cpu: 50m
           memory: 64Mi
         limits:
-          memory: 256Mi
+          memory: 1Gi
       # Empty => the fetcher's own defaults (25 MiB per file, 60s per fetch, 16
-      # concurrent fetches). maxFileBytes is a byte count; timeout a Go duration.
+      # concurrent fetches). maxFileBytes is a byte count and maxInflight a count, each
+      # a positive whole number (the render refuses anything else); timeout a Go
+      # duration.
       maxFileBytes: ""
       timeout: ""
       maxInflight: ""

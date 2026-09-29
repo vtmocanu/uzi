@@ -492,6 +492,106 @@ true
 {{- end -}}
 
 {{- /*
+  uzi.isolatedLaneFloorEgress: the isolated lane's three in-cluster egress rules (cluster DNS,
+  the api's worker port, uzi-fetcher), as a YAML list. Called with
+  (dict "root" $ "antrea" false) by the lane floor (worker-isolated-networkpolicy.yaml)
+  and with "antrea" true by the lane's Antrea model-egress policy, which needs the same
+  three peers as named Allow rules ahead of its drop belt (see there). One definition, so
+  the two can never admit different in-cluster peers.
+*/ -}}
+{{- define "uzi.isolatedLaneFloorEgress" -}}
+{{- $r := .root -}}
+# DNS, the same peer as the restricted tier's. Also what lets the FQDN provider learn
+# the model host's addresses (Antrea snoops the responses).
+- {{ if .antrea }}name: allow-lane-dns
+  action: Allow
+  {{ end }}to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ $r.Values.workers.networkPolicy.dns.namespace }}
+      podSelector:
+        matchLabels:
+          {{- toYaml $r.Values.workers.networkPolicy.dns.podSelector | nindent 10 }}
+  ports:
+    {{- range $r.Values.workers.networkPolicy.dns.ports }}
+    - protocol: UDP
+      port: {{ . }}
+    - protocol: TCP
+      port: {{ . }}
+    {{- end }}
+# The api's worker port (register, claim, heartbeat, the run's own routes).
+# Selector-based: an FQDN rule cannot match an in-cluster Service.
+- {{ if .antrea }}name: allow-lane-api
+  action: Allow
+  {{ end }}to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ $r.Release.Namespace }}
+      podSelector:
+        matchLabels:
+          {{- include "uzi.selectorLabels" $r | nindent 10 }}
+          app.kubernetes.io/component: api
+  ports:
+    - protocol: TCP
+      port: {{ include "uzi.workerAPIPort" $r }}
+# uzi-fetcher, on its container port (the policy sees the post-DNAT pod address and
+# port). The lane's only path to web content.
+- {{ if .antrea }}name: allow-lane-fetcher
+  action: Allow
+  {{ end }}to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ $r.Release.Namespace }}
+      podSelector:
+        matchLabels:
+          {{- include "uzi.selectorLabels" $r | nindent 10 }}
+          app.kubernetes.io/component: fetcher
+  ports:
+    - protocol: TCP
+      port: {{ $r.Values.workers.isolatedLane.fetcher.port }}
+{{- end -}}
+
+{{- /*
+  uzi.isolatedLaneExceptV4: what an isolated-lane IPv4 internet allow (cidr 0.0.0.0/0) must
+  except, as a JSON list: every non-public IPv4 range uzi-fetcher's own address policy
+  refuses (api/internal/fetcher/addrpolicy.go blockedPrefixes, the IPv4 half, entry for
+  entry) followed by the lane's IPv4 cluster CIDRs. Used by the fetcher's NetworkPolicy and
+  by the lane's OVN external-egress policy; scripts/assert-chart-render.sh compares the
+  rendered list with addrpolicy.go, so a range added there fails CI until it is added here.
+*/ -}}
+{{- define "uzi.isolatedLaneExceptV4" -}}
+{{- $out := list "0.0.0.0/8" "10.0.0.0/8" "100.64.0.0/10" "127.0.0.0/8" "169.254.0.0/16" "172.16.0.0/12" "192.0.0.0/24" "192.0.2.0/24" "192.88.99.0/24" "192.168.0.0/16" "198.18.0.0/15" "198.51.100.0/24" "203.0.113.0/24" "224.0.0.0/4" "240.0.0.0/4" -}}
+{{- range fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) -}}
+{{- if not (contains ":" .) -}}
+{{- $out = append $out . -}}
+{{- end -}}
+{{- end -}}
+{{- toJson (uniq $out) -}}
+{{- end -}}
+
+{{- /*
+  uzi.isolatedLaneExceptV6: the except list of the fetcher's IPv6 internet allow, whose cidr
+  is 2000::/3 (global unicast), not ::/0, matching addrpolicy.go, which admits IPv6 only
+  inside 2000::/3. Everything outside it (loopback, IPv4-mapped and -compatible, NAT64,
+  discard, SRv6, unique-local, link-local, site-local, multicast) is therefore never
+  allowed; what remains to except are addrpolicy.go's ranges INSIDE 2000::/3 (Teredo,
+  benchmarking, ORCHID, documentation, 6to4) and the lane's IPv6 cluster CIDRs that fall
+  inside 2000::/3. A cluster CIDR outside it (fd00::/8 and the like) is already excluded,
+  and must not be listed: an ipBlock except has to lie within its cidr, or the apiserver
+  rejects the policy. "Inside 2000::/3" is a first hextet written with four hex digits
+  starting 2 or 3 (0x2000-0x3fff); a shorter first hextet is below 0x1000.
+*/ -}}
+{{- define "uzi.isolatedLaneExceptV6" -}}
+{{- $out := list "2001::/32" "2001:2::/48" "2001:10::/28" "2001:20::/28" "2001:db8::/32" "2002::/16" "3fff::/20" -}}
+{{- range fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) -}}
+{{- if regexMatch "^[23][0-9a-fA-F]{3}:" . -}}
+{{- $out = append $out . -}}
+{{- end -}}
+{{- end -}}
+{{- toJson (uniq $out) -}}
+{{- end -}}
+
+{{- /*
   uzi.validateIsolatedLane: every precondition of the lane, checked once, at render time.
   Each one, left unchecked, renders a lane that is either unreachable or wider than
   promised, and nothing else reports it.
@@ -525,6 +625,20 @@ true
 {{- end -}}
 {{- if not (has $l.fetcher.token.source (list "generated" "existing")) -}}
 {{- fail (printf "workers.isolatedLane.fetcher.token.source must be generated or existing, got %q" ($l.fetcher.token.source | toString)) -}}
+{{- end -}}
+{{- /*
+  The fetcher parses these with strconv (a positive decimal integer) and refuses to start
+  otherwise. A YAML integer reaches the template as a float64, which `toString` would
+  print as 5.24288e+07, so worker-isolated-fetcher.yaml renders int64 | toString; this
+  refuses what that conversion cannot carry (a unit suffix, zero, a negative number).
+*/ -}}
+{{- range $k := list "maxFileBytes" "maxInflight" -}}
+{{- $v := index $l.fetcher $k -}}
+{{- if $v -}}
+{{- if or (le (int64 $v) 0) (not (regexMatch "^[0-9]+(\\.0+)?$|^[0-9](\\.[0-9]+)?e\\+[0-9]+$" (toString $v))) -}}
+{{- fail (printf "workers.isolatedLane.fetcher.%s must be a positive whole number (a byte count for maxFileBytes, a count for maxInflight), got %q" $k (toString $v)) -}}
+{{- end -}}
+{{- end -}}
 {{- end -}}
 {{- end -}}
 {{- end -}}

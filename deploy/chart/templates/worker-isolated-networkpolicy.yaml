@@ -35,46 +35,5 @@ spec:
   # Nothing dials a lane worker.
   ingress: []
   egress:
-    # DNS, the same peer as the restricted tier's. Also what lets the FQDN provider learn
-    # the model host's addresses (Antrea snoops the responses).
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Values.workers.networkPolicy.dns.namespace }}
-          podSelector:
-            matchLabels:
-              {{- toYaml .Values.workers.networkPolicy.dns.podSelector | nindent 14 }}
-      ports:
-        {{- range .Values.workers.networkPolicy.dns.ports }}
-        - protocol: UDP
-          port: {{ . }}
-        - protocol: TCP
-          port: {{ . }}
-        {{- end }}
-    # The api's worker port (register, claim, heartbeat, the run's own routes).
-    # Selector-based: an FQDN rule cannot match an in-cluster Service.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Release.Namespace }}
-          podSelector:
-            matchLabels:
-              {{- include "uzi.selectorLabels" . | nindent 14 }}
-              app.kubernetes.io/component: api
-      ports:
-        - protocol: TCP
-          port: {{ include "uzi.workerAPIPort" . }}
-    # uzi-fetcher, on its container port (the policy sees the post-DNAT pod address and
-    # port). The lane's only path to web content.
-    - to:
-        - namespaceSelector:
-            matchLabels:
-              kubernetes.io/metadata.name: {{ .Release.Namespace }}
-          podSelector:
-            matchLabels:
-              {{- include "uzi.selectorLabels" . | nindent 14 }}
-              app.kubernetes.io/component: fetcher
-      ports:
-        - protocol: TCP
-          port: {{ .Values.workers.isolatedLane.fetcher.port }}
+    {{- include "uzi.isolatedLaneFloorEgress" (dict "root" . "antrea" false) | nindent 4 }}
 {{- end }}

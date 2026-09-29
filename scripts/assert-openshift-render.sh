@@ -323,7 +323,9 @@ ok "the default mount path is unaffected by an old worker image tag"
 
 # --- (h) the isolated lane (PRD #1906 M6) ---------------------------------------------------
 # Its guards must refuse, lane off must render none of it, the lane policy must ignore the
-# two widening knobs, and under provider ovn its composed pair must render only together.
+# two widening knobs, the fetcher's numeric env must render as plain integers, and under
+# provider ovn its composed pair must render only together, with the lane's own cluster
+# ranges and the fixed non-public ranges excepted from its external allow.
 cat > "$WORK/lane.yaml" <<'LANE'
 workers:
   fqdnEgress:
@@ -331,9 +333,9 @@ workers:
   isolatedLane:
     enabled: true
     clusterCIDRs:
-      pod: [10.128.0.0/14, "fd01::/48"]
+      pod: [10.128.0.0/14, "fd01::/48", "2a05:d014:1::/56"]
       service: [172.30.0.0/16]
-      node: [192.0.2.0/24]
+      node: [100.70.0.0/24]
 LANE
 refuse "workers.isolatedLane.enabled is true but workers.enabled is false" --set workers.isolatedLane.enabled=true
 refuse "needs workers.isolatedLane.clusterCIDRs.pod, .service and .node" -f "$WORK/workers.yaml" \
@@ -369,12 +371,35 @@ knobs() { q "$WORK/lane-knobs.yaml" "[select(.kind == \"NetworkPolicy\" and .met
 [ "$(knobs uzi-worker-isolated-default-deny)" = 0 ] && ok "allowWebService and extraEgress reach the restricted policy but not the lane's" || bad "the lane policy carries allowWebService or extraEgress"
 n=$(q "$WORK/lane-knobs.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-default-deny") | .spec.egress | length')
 [ "$n" = 3 ] && ok "the lane policy keeps exactly 3 egress rules with both knobs on" || bad "the lane policy has $n egress rules with both knobs on"
-got=$(q "$WORK/lane-on.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-fetcher") | [.spec.egress[] | select(.to[0].ipBlock) | .to[].ipBlock.except[] | select(. == "10.128.0.0/14" or . == "fd01::/48" or . == "172.30.0.0/16" or . == "192.0.2.0/24")] | sort | join(",")')
-[ "$got" = "10.128.0.0/14,172.30.0.0/16,192.0.2.0/24,fd01::/48" ] && ok "the fetcher policy excepts every configured cluster CIDR, v6 included" || bad "the fetcher policy excepts '$got' of the configured CIDRs"
+# fd01::/48 lies outside the fetcher's IPv6 allow (2000::/3), so it is excluded without being
+# listed, and MUST NOT be listed: an except outside its cidr makes the apiserver reject the
+# policy. 2a05:d014:1::/56 lies inside it, so it must be an except of the 2000::/3 block.
+got=$(q "$WORK/lane-on.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-fetcher") | [.spec.egress[] | select(.to[0].ipBlock) | .to[].ipBlock.except[] | select(. == "10.128.0.0/14" or . == "fd01::/48" or . == "172.30.0.0/16" or . == "100.70.0.0/24" or . == "2a05:d014:1::/56")] | sort | join(",")')
+[ "$got" = "10.128.0.0/14,100.70.0.0/24,172.30.0.0/16,2a05:d014:1::/56" ] && ok "the fetcher policy excepts every configured cluster CIDR inside its allow, v6 included, and lists none outside it" || bad "the fetcher policy excepts '$got' of the configured CIDRs"
+got=$(q "$WORK/lane-on.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-fetcher") | [.spec.egress[] | select(.to[0].ipBlock) | .to[] | .ipBlock.cidr + ":" + ([.ipBlock.except[] | select(test(":") != (parent | parent | .cidr | test(":")))] | length | tostring)] | join(",")')
+[ "$got" = "0.0.0.0/0:0,2000::/3:0" ] && ok "the fetcher's internet ipBlocks are 0.0.0.0/0 and 2000::/3, each with same-family excepts only" || bad "the fetcher's internet ipBlocks render '$got'"
+
+# The fetcher's numeric env: a YAML integer reaches the template as a float64, which a bare
+# quote renders as "5.24288e+07" and the fetcher's strconv.ParseInt refuses (crash-loop).
+cat > "$WORK/lane-nums.yaml" <<'NUMS'
+workers:
+  isolatedLane:
+    fetcher:
+      maxFileBytes: 52428800
+      maxInflight: 8
+NUMS
+render "$WORK/lane-nums.out" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" -f "$WORK/lane-nums.yaml"
+got=$(q "$WORK/lane-nums.out" 'select(.kind == "Deployment" and .metadata.name == "uzi-fetcher") | [.spec.template.spec.containers[0].env[] | select(.name == "UZI_FETCHER_MAX_FILE_BYTES" or .name == "UZI_FETCHER_MAX_INFLIGHT") | .name + "=" + .value] | join(",")')
+[ "$got" = "UZI_FETCHER_MAX_FILE_BYTES=52428800,UZI_FETCHER_MAX_INFLIGHT=8" ] && ok "the fetcher's numeric env renders as plain integers (52428800, 8)" || bad "the fetcher's numeric env renders '$got', want UZI_FETCHER_MAX_FILE_BYTES=52428800,UZI_FETCHER_MAX_INFLIGHT=8"
+refuse "workers.isolatedLane.fetcher.maxFileBytes must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" --set-string workers.isolatedLane.fetcher.maxFileBytes=25MiB
+refuse "workers.isolatedLane.fetcher.maxInflight must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" --set workers.isolatedLane.fetcher.maxInflight=-1
 
 # Provider ovn: the lane's pair renders only where the cluster serves EgressFirewall, and then
 # allows the model host alone.
-LANEOVN="--set workers.fqdnEgress.provider=ovn --set workers.fqdnEgress.ovn.allowWildcards=true --set workers.fqdnEgress.ovn.exceptCIDRs={10.128.0.0/14,172.30.0.0/16,192.0.2.0/24,169.254.0.0/16}"
+# exceptCIDRs here deliberately shares NO entry with the lane's clusterCIDRs, so the check
+# below proves the lane's own cluster ranges are excepted whatever exceptCIDRs lists; its
+# IPv6 entry is the sentinel for the lane dropping IPv6 excepts from its 0.0.0.0/0 block.
+LANEOVN="--set workers.fqdnEgress.provider=ovn --set workers.fqdnEgress.ovn.allowWildcards=true --set workers.fqdnEgress.ovn.exceptCIDRs={10.200.0.0/16,169.254.0.0/16,fd99::/16}"
 # shellcheck disable=SC2086 # LANEOVN is a deliberate word list of --set flags
 render "$WORK/lane-ovn-nocap.yaml" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" $LANEOVN
 [ "$(q "$WORK/lane-ovn-nocap.yaml" '[select(.kind == "EgressFirewall" and .metadata.namespace == "uzi-workers")] | length')" = 1 ] || { echo "BROKEN: the restricted tier's EgressFirewall is absent under provider ovn" >&2; exit 2; }
@@ -386,8 +411,20 @@ got=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "EgressFirewall" and .metadata.na
 [ "$got" = "api.anthropic.com:TCP/443" ] && ok "lane EgressFirewall allows api.anthropic.com on TCP/443 and nothing else" || bad "lane EgressFirewall allows '$got'"
 last=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "EgressFirewall" and .metadata.namespace == "uzi-workers-isolated") | .spec.egress[-1] | .type + " " + .to.cidrSelector')
 [ "$last" = "Deny 0.0.0.0/0" ] && ok "lane EgressFirewall ends with Deny 0.0.0.0/0" || bad "lane EgressFirewall last rule is '$last'"
-got=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-external-egress") | .spec.egress[0] | .to[0].ipBlock.cidr + " except " + (.to[0].ipBlock.except | join(",")) + " ports " + ([.ports[] | .protocol + "/" + (.port | tostring)] | join(","))')
-[ "$got" = "0.0.0.0/0 except 10.128.0.0/14,172.30.0.0/16,192.0.2.0/24,169.254.0.0/16 ports TCP/443" ] && ok "lane external-egress policy: 0.0.0.0/0 minus exceptCIDRs, TCP/443 only" || bad "lane external-egress policy renders '$got'"
+# The EgressFirewall filters only traffic leaving the cluster, so this NetworkPolicy alone
+# decides which in-cluster addresses a lane pod reaches on 443: its except list must hold
+# exceptCIDRs AND the lane's IPv4 clusterCIDRs AND the fixed non-public IPv4 ranges, and no
+# IPv6 entry (an except outside 0.0.0.0/0 makes the apiserver reject the policy).
+got=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-external-egress") | (.spec.egress | length | tostring) + " " + (.spec.egress[0].to | length | tostring) + " " + .spec.egress[0].to[0].ipBlock.cidr + " ports " + ([.spec.egress[0].ports[] | .protocol + "/" + (.port | tostring)] | join(","))')
+[ "$got" = "1 1 0.0.0.0/0 ports TCP/443" ] && ok "lane external-egress policy: one rule, 0.0.0.0/0 only, TCP/443 only" || bad "lane external-egress policy renders '$got'"
+exc=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-external-egress") | .spec.egress[0].to[0].ipBlock.except | join(" ")')
+[ -n "$exc" ] || { echo "BROKEN: the lane external-egress policy has no except list" >&2; exit 2; }
+missing=""
+for c in 10.200.0.0/16 169.254.0.0/16 10.128.0.0/14 172.30.0.0/16 100.70.0.0/24 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 100.64.0.0/10 198.18.0.0/15; do
+  case " $exc " in *" $c "*) ;; *) missing="$missing $c" ;; esac
+done
+[ -z "$missing" ] && ok "lane external-egress excepts exceptCIDRs, the lane's IPv4 cluster CIDRs and the fixed private ranges" || bad "lane external-egress does not except:$missing (it excepts: $exc)"
+case "$exc" in *:*) bad "lane external-egress lists an IPv6 except in its 0.0.0.0/0 block: $exc" ;; *) ok "lane external-egress lists no IPv6 except" ;; esac
 [ "$(q "$WORK/lane-ovn.yaml" '[select(.apiVersion == "crd.antrea.io/v1beta1")] | length')" = 0 ] && ok "provider ovn renders no Antrea lane policy" || bad "provider ovn still renders an Antrea policy"
 
 # OpenShift: the lane namespace opts out of label sync and its worker SA may use the SCC.

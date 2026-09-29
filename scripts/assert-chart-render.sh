@@ -422,15 +422,27 @@ check_codex_egress "$RENDER" || exit $?
 #       egress rules: the restricted tier's DNS rule, its api rule, and the same api rule
 #       re-aimed at the fetcher's component and container port. No ipBlock, no web peer,
 #       nothing appended (so neither allowWebService, on in ci-render, nor extraEgress);
-#   (c) the lane's Antrea policy allows exactly one fqdn, api.anthropic.com, on TCP/443;
+#   (c) the lane's Antrea policy: every rule names a peer; its Allow rules are the floor's
+#       three in-cluster rules (signature-equal) plus exactly one fqdn, api.anthropic.com,
+#       on TCP/443; its ipBlock-only Drop belt holds 169.254.169.254/32, fd00:ec2::254/128
+#       and every configured cluster range, and precedes the fqdn Allow;
 #   (d) uzi-fetcher's policy admits ingress from the lane's worker pods (and the api's
-#       probe CIDRs) on the fetcher port only; its egress is DNS, the api, and TCP/443 to
-#       0.0.0.0/0 and ::/0 whose except lists hold every fixed private range AND every CIDR
-#       the fetcher itself is told to refuse (UZI_FETCHER_BLOCKED_CIDRS); and by address
-#       arithmetic 169.254.169.254, fd00:ec2::254 and each configured range fall outside
-#       every allowed ipBlock while two public addresses fall inside (non-vacuity);
+#       probe CIDRs) on the fetcher port only, every rule with a `from` peer; its egress
+#       rules all name a peer and are DNS, the api, and TCP/443 to 0.0.0.0/0 and 2000::/3
+#       whose except lists hold every range api/internal/fetcher/addrpolicy.go refuses
+#       (read from that file; IPv6 ones only when inside 2000::/3) AND every CIDR the
+#       fetcher itself is told to refuse (UZI_FETCHER_BLOCKED_CIDRS); and by address
+#       arithmetic 169.254.169.254, fd00:ec2::254 and every one of those ranges fall
+#       outside every allowed ipBlock while two public addresses fall inside;
 #   (e) the api admits the lane's worker pods and the fetcher pods on its worker port;
-#   (f) the controller and the api carry the lane's env.
+#   (f) the controller and the api carry the lane's env;
+#   (g) the lane namespace holds exactly the lane's two policy objects (by apiVersion,
+#       kind and name) and the render has no cluster-scoped network policy: policies are
+#       additive, so any other one could open what (b)-(c) close;
+#   (h) wiring: the controller's fetcher URL host is on the fetcher certificate; the
+#       fetcher's env names are ones api/internal/fetcher/config.go reads, the required
+#       ones present; the token-hash and token-file Secret keys exist; and every file-path
+#       env resolves through a volumeMount to the right key of the right Secret.
 #
 # PARSED, NOT GREPPED. `flatten` turns the block-style YAML helm emits into one
 # `doc<TAB>path<TAB>value` line per scalar (path like
@@ -650,22 +662,57 @@ $_want
 --- got
 $_got"
 
-  # (c) the model host.
-  [ "$(field "$_flat" "$_model" metadata.namespace)" = "$_lane_ns" ] || _fail "the model-egress policy is not in $_lane_ns"
-  _allows=$(awk -F '\t' -v d="$_model" '
-    $1 != d || index($2, "spec.egress[") != 1 { next }
-    { r = $2; sub(/^spec\.egress\[/, "", r); sub(/].*$/, "", r) }
-    $2 ~ /\.action$/ { A[r] = $3 }
-    $2 ~ /\.fqdn$/ { F[r] = F[r] $3 }
-    $2 ~ /\.ports\[[0-9]+\]\.protocol$/ { P[r] = P[r] $3 "/" }
-    $2 ~ /\.ports\[[0-9]+\]\.port$/ { P[r] = P[r] $3 "," }
-    END { for (r in A) if (A[r] != "Drop") print A[r] " " F[r] " " P[r] }
-  ' "$_flat" | LC_ALL=C sort | tr '\n' ';')
-  [ "$_allows" = "Allow api.anthropic.com TCP/443,;" ] || _fail "the lane's Antrea policy must allow exactly api.anthropic.com on TCP/443 and nothing else; its non-Drop rules are: $_allows"
-
-  # (d) the fetcher's own policy.
+  # (c) the model host. The Antrea policy's rules, in order: Allow rules for the floor's
+  # three in-cluster peers (signature-equal to the floor's, so they admit nothing it does
+  # not), a Drop belt, then the one FQDN Allow. Every rule names a peer (a rule without
+  # `to` matches every destination), every Drop is ipBlock-only with no port narrowing,
+  # the belt holds the metadata addresses and every configured cluster range, and no Drop
+  # follows the FQDN Allow (a DNS answer for the model host must not reach a dropped
+  # address through it).
   _blocked=$(awk -F '\t' -v d="$_fdep" '$1 == d && $3 == "UZI_FETCHER_BLOCKED_CIDRS" { p = $2; sub(/name$/, "value", p); want = p } $1 == d && $2 == want { print $3; exit }' "$_flat" | tr ',' ' ')
   [ -n "$_blocked" ] || _fail "the fetcher Deployment carries no UZI_FETCHER_BLOCKED_CIDRS"
+  [ "$(field "$_flat" "$_model" metadata.namespace)" = "$_lane_ns" ] || _fail "the model-egress policy is not in $_lane_ns"
+  _mn=$(count_items "$_flat" "$_model" spec.egress)
+  _in_allow=""; _fqdn_at=""; _fqdn_n=0; _last_drop=-1; _drops=" "
+  i=0
+  while [ "$i" -lt "$_mn" ]; do
+    _core=$(sig "$_flat" "$_model" "spec.egress[$i]" | tr ';' '\n' | awk 'NF && !/^(name|action)=/' | tr '\n' ';')
+    _act=$(field "$_flat" "$_model" "spec.egress[$i].action")
+    if ! printf '%s' "$_core" | tr ';' '\n' | grep -q '^to\['; then
+      _fail "the lane's Antrea rule $i ($_act) has no \`to\` peer, so it matches every destination: $_core"
+    fi
+    case "$_act" in
+      Drop)
+        _last_drop=$i
+        _extra=$(printf '%s' "$_core" | tr ';' '\n' | awk 'NF && !/^to\[[0-9]+\]\.ipBlock\.cidr=/')
+        [ -z "$_extra" ] || _fail "the lane's Antrea Drop rule $i is not ipBlock-only (a port or selector narrows the belt): $_core"
+        _drops="$_drops$(values_under "$_flat" "$_model" "spec.egress[$i].to" ipBlock.cidr | tr '\n' ' ')" ;;
+      Allow)
+        if [ -n "$(values_under "$_flat" "$_model" "spec.egress[$i].to" fqdn)" ]; then
+          _fqdn_at=$i; _fqdn_n=$((_fqdn_n + 1))
+          [ "$_core" = "ports[0].port=443;ports[0].protocol=TCP;to[0].fqdn=api.anthropic.com;" ] \
+            || _fail "the lane's Antrea FQDN rule $i must allow exactly api.anthropic.com on TCP/443: $_core"
+        else
+          _in_allow="$_in_allow$_core
+"
+        fi ;;
+      *) _fail "the lane's Antrea rule $i has action '$_act', want Allow or Drop" ;;
+    esac
+    i=$((i + 1))
+  done
+  [ "$_fqdn_n" = 1 ] || _fail "the lane's Antrea policy has $_fqdn_n FQDN Allow rules, want exactly 1 (api.anthropic.com)"
+  [ "$_last_drop" -lt "${_fqdn_at:-0}" ] || _fail "the lane's Antrea Drop rule $_last_drop follows the FQDN Allow (rule ${_fqdn_at:-none}), so the model host's DNS answer can open a dropped address"
+  _in_sorted=$(printf '%s' "$_in_allow" | awk NF | LC_ALL=C sort)
+  [ "$_in_sorted" = "$_got" ] || _fail "the lane's Antrea in-cluster Allow rules are not exactly the floor's three (an Antrea Allow skips the floor, so any difference widens the lane):
+--- want (the floor's)
+$_got
+--- got
+$_in_sorted"
+  for _c in 169.254.169.254/32 fd00:ec2::254/128 $_blocked; do
+    in_list "$_c" "$_drops" || _fail "the lane's Antrea drop belt does not drop $_c"
+  done
+
+  # (d) the fetcher's own policy.
   _probe=$(values_under "$_flat" "$_anp" spec.ingress ipBlock.cidr | tr '\n' ' ')
   _in=$(awk -F '\t' -v d="$_fnp" '
     $1 != d || index($2, "spec.ingress[") != 1 { next }
@@ -674,11 +721,11 @@ $_got"
     $2 ~ /\.from\[[0-9]+\]\./ {
       f = $2; sub(/^spec\.ingress\[[0-9]+\]\.from\[/, "", f); sub(/].*$/, "", f)
       t = $2; sub(/^spec\.ingress\[[0-9]+\]\.from\[[0-9]+\]\./, "", t)
-      k = r SUBSEP f; E[k] = E[k] t "=" $3 ";"; F[k] = r
+      k = r SUBSEP f; E[k] = E[k] t "=" $3 ";"; F[k] = r; H[r] = 1
     }
     END {
       for (k in F) print "peer " E[k]
-      for (r in R) print "ports " P[r]
+      for (r in R) { print "ports " P[r]; if (!(r in H)) print "nopeer " r }
     }
   ' "$_flat")
   _lane_peer="namespaceSelector.matchLabels.kubernetes.io/metadata.name=$_lane_ns;podSelector.matchLabels.app.kubernetes.io/name=uzi-hosted-worker;"
@@ -688,6 +735,7 @@ $_got"
       "ports TCP/$_fport/") ;;
       "ports "*) echo "FAIL: isolated lane: a fetcher ingress rule's ports are '${_l#ports }', want exactly TCP/$_fport" ;;
       "peer $_lane_peer") ;;
+      "nopeer "*) echo "FAIL: isolated lane: fetcher ingress rule ${_l#nopeer } has no \`from\` peer, so it admits every source" ;;
       "peer ipBlock.cidr="*";") _c=${_l#peer ipBlock.cidr=}; _c=${_c%;}
         in_list "$_c" "$_probe" || echo "FAIL: isolated lane: fetcher ingress admits ipBlock $_c, which is not one of the api's probe CIDRs ($_probe)" ;;
       *) echo "FAIL: isolated lane: fetcher ingress admits an unexpected peer: ${_l#peer }" ;;
@@ -705,7 +753,9 @@ $_got"
   i=0
   while [ "$i" -lt "$_ne" ]; do
     _s=$(sig "$_flat" "$_fnp" "spec.egress[$i]")
-    if [ "$_s" = "$_dns" ]; then _dns_seen=1
+    if ! printf '%s' "$_s" | tr ';' '\n' | grep -q '^to\['; then
+      _fail "fetcher egress rule $i has no \`to\` peer, so it admits every destination: $_s"
+    elif [ "$_s" = "$_dns" ]; then _dns_seen=1
     elif [ "$_s" = "$_api_want" ]; then _api_seen=1
     else
       _pp=$(printf '%s' "$_s" | tr ';' '\n' | awk -F= '/^ports\[/ { print }' | tr '\n' ';')
@@ -729,20 +779,31 @@ $_got"
   [ "$_api_seen" = 1 ] || _fail "fetcher egress has no rule for the api on TCP/$_aport (want: $_api_want)"
   [ "$_ip_seen" = 1 ] || _fail "fetcher egress has no internet (ipBlock, TCP/443) rule"
   _cidrs=$(printf '%s' "$_rules" | awk 'NF { print $1 }' | LC_ALL=C sort | tr '\n' ' ')
-  [ "$_cidrs" = "0.0.0.0/0 ::/0 " ] || _fail "fetcher internet ipBlocks are '$_cidrs', want exactly 0.0.0.0/0 and ::/0"
+  [ "$_cidrs" = "0.0.0.0/0 2000::/3 " ] || _fail "fetcher internet ipBlocks are '$_cidrs', want exactly 0.0.0.0/0 and 2000::/3 (the fetcher's own check admits IPv6 only in 2000::/3)"
   _x4=$(printf '%s' "$_rules" | awk '$1 == "0.0.0.0/0" { for (i = 2; i <= NF; i++) print $i }' | tr '\n' ' ')
-  _x6=$(printf '%s' "$_rules" | awk '$1 == "::/0" { for (i = 2; i <= NF; i++) print $i }' | tr '\n' ' ')
-  for _c in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 224.0.0.0/4 240.0.0.0/4; do
-    in_list "$_c" "$_x4" || _fail "fetcher egress 0.0.0.0/0 does not except $_c"
+  _x6=$(printf '%s' "$_rules" | awk '$1 == "2000::/3" { for (i = 2; i <= NF; i++) print $i }' | tr '\n' ' ')
+  # The fixed ranges come from the fetcher's own address policy, so the chart cannot drift
+  # from the code: every IPv4 range, and every IPv6 range inside 2000::/3, must be an
+  # except by name; every range (IPv6 outside 2000::/3 included) must fall outside the
+  # allow by arithmetic. The configured cluster ranges get the same treatment.
+  _policy_go="$SCRIPT_DIR/../api/internal/fetcher/addrpolicy.go"
+  _fixed=$(awk '/^var blockedPrefixes = mustPrefixes\(/ { f = 1; next } f && /^\)/ { f = 0 } f && match($0, /"[^"]+"/) { print substr($0, RSTART + 1, RLENGTH - 2) }' "$_policy_go" 2>/dev/null | tr '\n' ' ') || true
+  if [ "$(printf '%s' "$_fixed" | wc -w)" -lt 20 ]; then
+    echo "BROKEN: isolated lane: could not read blockedPrefixes from $_policy_go (got: $_fixed)" >&2; rm -f "$_flat" "$_flat.in"; return 2
+  fi
+  for _c in $_fixed $_blocked; do
+    _a=${_c%/*}
+    case "$_c" in
+      *:*) _rc=0; cidr_allowed "$_a" "2000::/3" || _rc=$?
+           case "$_rc" in
+             0) in_list "$_c" "$_x6" || _fail "fetcher egress 2000::/3 does not except $_c (addrpolicy.go or clusterCIDRs)" ;;
+             1) ;;
+             *) echo "BROKEN: isolated lane: cannot evaluate $_c against 2000::/3" >&2; rm -f "$_flat" "$_flat.in"; return 2 ;;
+           esac ;;
+      *) in_list "$_c" "$_x4" || _fail "fetcher egress 0.0.0.0/0 does not except $_c (addrpolicy.go or clusterCIDRs)" ;;
+    esac
   done
-  for _c in fc00::/7 fe80::/10 64:ff9b::/96 2002::/16; do
-    in_list "$_c" "$_x6" || _fail "fetcher egress ::/0 does not except $_c"
-  done
-  for _c in $_blocked; do
-    case "$_c" in *:*) _x="$_x6" ;; *) _x="$_x4" ;; esac
-    in_list "$_c" "$_x" || _fail "fetcher egress does not except the configured cluster range $_c (UZI_FETCHER_BLOCKED_CIDRS)"
-  done
-  for _a in 169.254.169.254 fd00:ec2::254 $(for _c in $_blocked; do printf '%s ' "${_c%/*}"; done); do
+  for _a in 169.254.169.254 fd00:ec2::254 $(for _c in $_fixed $_blocked; do printf '%s ' "${_c%/*}"; done); do
     _rc=0; cidr_allowed "$_a" "$_rules" || _rc=$?
     case "$_rc" in
       0) _fail "fetcher egress admits $_a through an ipBlock" ;;
@@ -774,9 +835,139 @@ $_got"
   [ -n "$(_env "$_cdep" UZI_WORKER_ISOLATED_FETCHER_CA_FILE)" ] || _fail "the controller carries no UZI_WORKER_ISOLATED_FETCHER_CA_FILE"
   [ -n "$(_env "$_adep" UZI_FETCHER_TOKEN_SHA256)" ] || _fail "the api carries no UZI_FETCHER_TOKEN_SHA256"
 
+  # (g) the lane namespace holds exactly the lane's two policy objects, and the render
+  # carries no cluster-scoped network policy. A second policy there is additive (an
+  # `egress: [{}]` NetworkPolicy or an Antrea Allow 0.0.0.0/0 opens the lane whatever the
+  # floor says), so the inventory is by apiVersion, kind and name. A "policy object" is a
+  # kind ending in Policy or Firewall, or anything in a network-policy API group.
+  _inv=$(awk -F '\t' -v ns="$_lane_ns" '
+    $2 == "kind" { K[$1] = $3 } $2 == "apiVersion" { A[$1] = $3 } $2 == "metadata.name" { N[$1] = $3 } $2 == "metadata.namespace" { S[$1] = $3 }
+    END {
+      for (d in K) {
+        g = A[d]; if (index(g, "/")) sub(/\/[^\/]*$/, "", g); else g = ""
+        pol = (K[d] ~ /(Policy|Firewall)$/ || g ~ /^(networking\.k8s\.io|policy\.networking\.k8s\.io|crd\.antrea\.io|k8s\.ovn\.org|cilium\.io|crd\.projectcalico\.org|projectcalico\.org)$/)
+        clus = (K[d] ~ /^(ClusterNetworkPolicy|AdminNetworkPolicy|BaselineAdminNetworkPolicy|GlobalNetworkPolicy|CiliumClusterwideNetworkPolicy)$/)
+        if (clus) print A[d] " " K[d] " " N[d] " (cluster-scoped)"
+        else if (pol && S[d] == ns) print A[d] " " K[d] " " N[d]
+      }
+    }' "$_flat" | LC_ALL=C sort)
+  _inv_want="crd.antrea.io/v1beta1 NetworkPolicy uzi-worker-isolated-model-egress
+networking.k8s.io/v1 NetworkPolicy uzi-worker-isolated-default-deny"
+  [ "$_inv" = "$_inv_want" ] || _fail "the policy objects in $_lane_ns (plus any cluster-scoped network policy) are not exactly the lane's two:
+--- want
+$_inv_want
+--- got
+$_inv"
+
+  # (h) wiring: each name one component writes must be one the other reads.
+  #   (i) the controller's fetcher URL names a host on the fetcher's certificate and the
+  #       fetcher Service's port;
+  #  (ii) the fetcher's env names are all ones api/internal/fetcher/config.go reads (a
+  #       typo is silently ignored there), with the required ones present, no envFrom;
+  # (iii) the Secret keys the api (token hash) and the fetcher (token file) reference exist
+  #       in the Secret the chart renders (or one a rendered InfisicalSecret manages);
+  #  (iv) every file-path env (api CA, serving pair, token, and the controller's fetcher CA)
+  #       resolves through a volumeMount to the right key of the right Secret.
+  _cert=$(docs_of "$_flat" Certificate uzi-fetcher-tls); _one "fetcher Certificate" "$_cert" || return 2
+  _svc=$(docs_of "$_flat" Service uzi-fetcher); _one "fetcher Service" "$_svc" || return 2
+  _url=$(_env "$_cdep" UZI_WORKER_ISOLATED_FETCHER_URL)
+  _host=${_url#https://}; _host=${_host%%/*}; _uport=${_host##*:}; _host=${_host%:*}
+  _dnsn=$(values_under "$_flat" "$_cert" spec.dnsNames dnsNames | tr '\n' ' ')
+  in_list "$_host" "$_dnsn" || _fail "the controller's fetcher URL host $_host is not among the fetcher Certificate's dnsNames ($_dnsn): lane workers would fail TLS name verification"
+  [ "$_uport" = "$(field "$_flat" "$_svc" 'spec.ports[0].port')" ] || _fail "the controller's fetcher URL port $_uport is not the fetcher Service's port"
+
+  _config_go="$SCRIPT_DIR/../api/internal/fetcher/config.go"
+  _known=$(grep -o 'get("UZI_[A-Z0-9_]*")' "$_config_go" 2>/dev/null | sed 's/^get("//; s/")$//' | LC_ALL=C sort -u | tr '\n' ' ') || true
+  if [ "$(printf '%s' "$_known" | wc -w)" -lt 8 ]; then
+    echo "BROKEN: isolated lane: could not read the env names $_config_go reads (got: $_known)" >&2; rm -f "$_flat" "$_flat.in"; return 2
+  fi
+  _fenv=$(awk -F '\t' -v d="$_fdep" '$1 == d && $2 ~ /^spec\.template\.spec\.containers\[0\]\.env\[[0-9]+\]\.name$/ { print $3 }' "$_flat")
+  for _n in $_fenv; do
+    in_list "$_n" "$_known" || _fail "the fetcher's env $_n is not read by api/internal/fetcher/config.go (it reads: $_known)"
+  done
+  for _n in UZI_FETCHER_TLS_CERT UZI_FETCHER_TLS_KEY UZI_API_URL UZI_FETCHER_TOKEN_FILE UZI_API_CA_FILE UZI_FETCHER_BLOCKED_CIDRS; do
+    in_list "$_n" "$_fenv" || _fail "the fetcher's env lacks $_n"
+  done
+  _dup=$(printf '%s\n' "$_fenv" | LC_ALL=C sort | uniq -d | tr '\n' ' ')
+  [ -z "$_dup" ] || _fail "the fetcher's env sets $_dup more than once (the last one wins)"
+  if awk -F '\t' -v d="$_fdep" '$1 == d && index($2, "spec.template.spec.containers[0].envFrom") == 1 { f = 1 } END { exit !f }' "$_flat"; then
+    _fail "the fetcher's container has envFrom, which injects env names this check cannot see"
+  fi
+  case "$(_env "$_fdep" UZI_API_URL)" in https://*) ;; *) _fail "the fetcher's UZI_API_URL is not https (the fetcher refuses to start)" ;; esac
+
+  # _skey <secret> <key>: 0 = a rendered Secret carries the key, or a rendered cert-manager
+  # Certificate writes that Secret and the key is one it writes (tls.crt, tls.key, ca.crt);
+  # 1 = neither holds; 3 = not rendered, but a rendered InfisicalSecret manages it (its
+  # keys are external); 2 = nothing in the render produces the Secret.
+  _skey() {
+    _sd=$(docs_of "$_flat" Secret "$1" | head -n 1)
+    if [ -n "$_sd" ]; then
+      awk -F '\t' -v d="$_sd" -v k="$2" '$1 == d && ($2 == "data." k || $2 == "stringData." k) { f = 1 } END { exit !f }' "$_flat" && return 0
+      return 1
+    fi
+    if awk -F '\t' -v n="$1" '$2 == "kind" && $3 == "Certificate" { C[$1] = 1 } $2 == "spec.secretName" && $3 == n { S[$1] = 1 } END { for (d in S) if (d in C) f = 1; exit !f }' "$_flat"; then
+      case "$2" in tls.crt|tls.key|ca.crt) return 0 ;; *) return 1 ;; esac
+    fi
+    awk -F '\t' -v n="$1" '$2 == "spec.managedSecretReference.secretName" && $3 == n { f = 1 } END { exit !f }' "$_flat" && return 3
+    return 2
+  }
+  # _refcheck <what> <secret> <key>
+  _refcheck() {
+    _rc=0; _skey "$2" "$3" || _rc=$?
+    case "$_rc" in
+      0|3) ;;
+      1) _fail "$1 references key $3 of Secret $2, which the rendered Secret does not carry" ;;
+      *) _fail "$1 references Secret $2, which the chart neither renders nor manages through an InfisicalSecret" ;;
+    esac
+  }
+  # _mounted <doc> <file>: "<secretName> <key>" of the Secret projection that puts <file>
+  # into the doc's first container; empty when no volumeMount + secret volume does.
+  _mounted() {
+    awk -F '\t' -v d="$1" -v f="$2" '
+      BEGIN { dir = f; sub(/\/[^\/]*$/, "", dir); base = f; sub(/^.*\//, "", base) }
+      $1 != d { next }
+      $2 ~ /^spec\.template\.spec\.containers\[0\]\.volumeMounts\[[0-9]+\]\.mountPath$/ && $3 == dir { m = $2; sub(/mountPath$/, "name", m); MP[m] = 1 }
+      $2 ~ /^spec\.template\.spec\.containers\[0\]\.volumeMounts\[[0-9]+\]\.name$/ { MN[$2] = $3 }
+      $2 ~ /^spec\.template\.spec\.volumes\[[0-9]+\]\.name$/ { v = $2; sub(/\.name$/, "", v); VN[$3] = v }
+      $2 ~ /^spec\.template\.spec\.volumes\[[0-9]+\]\.secret\.secretName$/ { v = $2; sub(/\.secret\.secretName$/, "", v); SN[v] = $3 }
+      $2 ~ /^spec\.template\.spec\.volumes\[[0-9]+\]\.secret\.items\[[0-9]+\]\.(key|path)$/ {
+        v = $2; sub(/\.secret\.items.*$/, "", v); it = $2; sub(/\.(key|path)$/, "", it); HI[v] = 1; IV[it] = v
+        if ($2 ~ /\.key$/) IK[it] = $3; else IP[it] = $3
+      }
+      END {
+        for (m in MP) mv = MN[m]
+        if (mv == "" || !(mv in VN)) exit
+        v = VN[mv]; if (!(v in SN)) exit
+        if (!(v in HI)) { print SN[v] " " base; exit }
+        for (it in IP) if (IV[it] == v && IP[it] == base) { print SN[v] " " IK[it]; exit }
+      }' "$_flat"
+  }
+  _certsecret=$(field "$_flat" "$_cert" spec.secretName)
+  _apicert=$(docs_of "$_flat" Certificate uzi-api-tls | head -n 1)
+  _apisecret=$([ -n "$_apicert" ] && field "$_flat" "$_apicert" spec.secretName)
+  _hash_name=$(awk -F '\t' -v d="$_adep" '$1 == d && $3 == "UZI_FETCHER_TOKEN_SHA256" && $2 ~ /\.env\[[0-9]+\]\.name$/ { p = $2; sub(/name$/, "valueFrom.secretKeyRef.name", p); want = p } $1 == d && $2 == want { print $3; exit }' "$_flat")
+  _hash_key=$(_env "$_adep" UZI_FETCHER_TOKEN_SHA256)
+  [ -n "$_hash_name" ] && [ -n "$_hash_key" ] || _fail "the api's UZI_FETCHER_TOKEN_SHA256 is not a secretKeyRef with a name and a key"
+  [ -z "$_hash_name" ] || _refcheck "the api's UZI_FETCHER_TOKEN_SHA256" "$_hash_name" "$_hash_key"
+  # _filecheck <what> <doc> <env> <want-secret (empty = any)> <want-key (empty = any)>
+  _filecheck() {
+    _path=$(_env "$2" "$3")
+    _m=$(_mounted "$2" "$_path")
+    if [ -z "$_m" ]; then _fail "$1 $3=$_path is not a file any Secret volumeMount provides"; return 0; fi
+    _ms=${_m% *}; _mk=${_m#* }
+    [ -z "$4" ] || [ "$_ms" = "$4" ] || _fail "$1 $3=$_path comes from Secret $_ms, want $4"
+    [ -z "$5" ] || [ "$_mk" = "$5" ] || _fail "$1 $3=$_path is key $_mk of Secret $_ms, want key $5"
+    _refcheck "$1 $3" "$_ms" "$_mk"
+  }
+  _filecheck "the fetcher's" "$_fdep" UZI_API_CA_FILE "$_apisecret" ca.crt
+  _filecheck "the fetcher's" "$_fdep" UZI_FETCHER_TLS_CERT "$_certsecret" tls.crt
+  _filecheck "the fetcher's" "$_fdep" UZI_FETCHER_TLS_KEY "$_certsecret" tls.key
+  _filecheck "the fetcher's" "$_fdep" UZI_FETCHER_TOKEN_FILE "$_hash_name" ""
+  _filecheck "the controller's" "$_cdep" UZI_WORKER_ISOLATED_FETCHER_CA_FILE "$_certsecret" ca.crt
+
   rm -f "$_flat" "$_flat.in"
   if [ "$_bad" -ne 0 ]; then return 1; fi
-  echo "OK: isolated lane -- $_lane_ns is restricted and default-deny with egress exactly {DNS, api, fetcher}; its only external rule is api.anthropic.com TCP/443; the fetcher's internet rule excludes every fixed and configured range (169.254.169.254 and fd00:ec2::254 outside it); the api admits the lane and the fetcher"
+  echo "OK: isolated lane -- $_lane_ns is restricted and default-deny with egress exactly {DNS, api, fetcher} and holds no other policy object; its Antrea policy re-allows only those three, drops the metadata addresses and every cluster range, then allows api.anthropic.com TCP/443; the fetcher's internet rule excludes every addrpolicy.go and configured range and every rule names a peer; the api admits the lane and the fetcher; the fetcher URL, env names, Secret keys and mounted files line up"
   return 0
 }
 
