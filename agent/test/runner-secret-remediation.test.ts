@@ -1456,6 +1456,61 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.ok(d.pins.length >= 1, "recovery pin kept");
   });
 
+  for (const forge of ["gitlab", "github"] as const) {
+    it(`(tick1) ${forge}: a tick-flagged commit still reachable is not shipped when the gate scan is untrusted`, { skip }, async () => {
+      let S = "";
+      const acts: string[] = [];
+      const d = await drive({
+        iid: forge === "gitlab" ? 1932_270 : 1932_271,
+        forge,
+        configure: untrustedWhen(/scanRemediationRange/),
+        // GitHub's reap:true overlay path is unscanned, so seed what the mid-turn scan would record.
+        seedFlight: (f) => {
+          if (forge !== "github") return;
+          (f as { secretRemediation?: object }).secretRemediation ??= {
+            attempts: 0,
+            flaggedCommits: [S],
+            flaggedFindings: [{ file: "cfg.env", startLine: 1, commit: S, ruleId: "github-pat" }],
+          };
+        },
+        body: async (ctx, gate) => {
+          const w = ctx.worktreePath;
+          S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+          if (forge === "gitlab") await ctx.checkpoint!({ reap: true }); // the checkpoint scan flags S: flaggedCommits only
+          commitIn(w, "later.txt", "benign\n");
+          acts.push((await gate()).action); // untrusted gate scan, nothing known
+          if (forge === "github") await ctx.checkpoint!({ reap: true }); // done checkpoint: must not publish S
+        },
+      });
+      assert.deepEqual(acts, ["fail"]);
+      assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+      assert.equal(d.failed()?.preserved_patch, undefined);
+      assert.equal(d.pushes(), 0);
+      for (const t of [...d.pushedTips, ...d.pub.tips]) assert.equal(publishedTipContains(d.bare, t, S), false);
+    });
+  }
+
+  it("(tick2) a tick-flagged commit the lead removed from history does not block a clean run", { skip }, async () => {
+    const acts: string[] = [];
+    const d = await drive({
+      iid: 1932_272,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        const base = gitIn(w, ["rev-parse", "HEAD"]);
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: true }); // flags S
+        gitIn(w, ["reset", "-q", "--hard", base]); // S is no longer an ancestor
+        commitIn(w, "ok.txt", "fine\n");
+        acts.push((await gate()).action);
+      },
+    });
+    assert.deepEqual(acts, ["proceed"]);
+    assert.equal(d.failed(), undefined, JSON.stringify(d.failed()));
+    assert.ok(d.completed());
+    assert.equal(d.pushes(), 1);
+  });
+
   it("the gate is a no-op proceed on a clean branch and leaves the checkpoint behavior unchanged", { skip }, async () => {
     const decisions: SecretRemediationDecision[] = [];
     const d = await drive({

@@ -1472,7 +1472,8 @@ interface RunFlight {
    *  branch, D5, and a re-check after EVERY finalize bridge (which can wrap the pushed tip over a
    *  local-only floor and re-add hidden content) fail while any is still an ancestor. The mid-turn
    *  checkpoint scan and the post-bridge scan record their trusted findings here too (without setting
-   *  `known`/`everKnown`); a commit only those recorded is re-checked when a bridge is in play.
+   *  `known`/`everKnown`); the gate (untrusted path), D5 and the pre-push re-check still fail on any
+   *  of them that is an ancestor of the tip.
    *  `overflow` =
    *  the flagged-commit list hit its cap, after which the gate and D5 fail closed. */
   secretRemediation?: {
@@ -4664,8 +4665,10 @@ export class RunRunner {
     //  (b) `known` is non-empty: a trusted finding the gate still knows (including at-floor ones,
     //      which are not remediable and so never reach `blocked`; the agent may since have reset the
     //      clone to a clean-scanned commit, and `known` is what still fails that run), OR
-    //  (b2) any retained flagged commit (flaggedCommits) is still an ancestor of the finalize tracking
-    //      tip, whatever the floors say (checkpointFloor can be a local-only bridge), OR
+    //  (b2) any retained flagged commit (flaggedCommits, whether the gate or only the mid-turn
+    //      checkpoint scan recorded it) is still an ancestor of the finalize tracking tip, whatever
+    //      the floors say (checkpointFloor can be a local-only bridge); an unreadable tip fails
+    //      closed, OR
     //  (c) a finding was known at some point and the finalize tracking tip is not the tip of the
     //      last CLEAN trusted gate scan (the branch moved after it). The agent is reaped by now, so
     //      the final branch is RE-SCANNED here with the gate's scan core (no re-fetch: the finalize
@@ -4686,15 +4689,23 @@ export class RunRunner {
         // or a bridge, so fail closed (reason = the recorded findings, or a fixed untrusted reason).
         if ((remediationState.flaggedFindings?.length ?? 0) > 0) remediationFindings = remediationState.flaggedFindings;
         else rescanUntrusted = true;
-      } else if (remediationState.everKnown === true) {
+      } else if (remediationState.everKnown === true || (remediationState.flaggedCommits?.length ?? 0) > 0) {
         const finalizeTip = await this.git.trackingTip(barePath, result.branch);
+        if (finalizeTip === null && remediationState.everKnown !== true) {
+          // Only a mid-turn-flagged commit is recorded and the tip is unreadable: fail closed.
+          rescanUntrusted = true;
+        }
         if (finalizeTip !== null) {
           // Authoritative on every forge: a flagged commit still in the tip's ancestry fails, whatever
           // floor exclusion a re-scan range would apply (a floor can be a local-only bridge).
           const still = await this.reachableFlaggedFindings(remediationState, barePath, finalizeTip);
           if (still.length > 0) remediationFindings = still;
         }
-        if (!remediationFindings && (finalizeTip === null || finalizeTip !== remediationState.cleanTip)) {
+        if (
+          !remediationFindings &&
+          remediationState.everKnown === true &&
+          (finalizeTip === null || finalizeTip !== remediationState.cleanTip)
+        ) {
           let rescanWhy = "tracking_tip_missing";
           if (finalizeTip !== null) {
             try {
@@ -5279,14 +5290,12 @@ export class RunRunner {
     // contains a flagged commit, so the bridged tip can re-add content the earlier gates cleared.
     // Reports push_secret_blocked (no push, no preserved_patch) and returns "blocked" on a reachable
     // flagged commit; an unreadable tracking tip after a known finding fails closed the same way.
-    // A flagged commit the mid-turn checkpoint scan recorded (`everKnown` unset: the remediation gate
-    // never saw it) is re-checked only when a bridge is in play (`bridgeInPlay`): a plain push of an
-    // unbridged tip is the pre-existing contract: the done-point gate (wired by the executors) fails such a
-    // run for non-interactive runs, and an unbridged tip with only tick-flagged commits and no gate call is a
-    // known pre-existing gap, filed separately.
-    const recheckFlaggedBeforePush = async (scanBare: string, bridgeInPlay: boolean): Promise<"blocked" | "ok"> => {
+    // Every recorded flagged commit is re-checked on every push path, including one only the mid-turn
+    // checkpoint scan recorded (`everKnown` unset): ancestry decides, so an untrusted gate scan, or a
+    // forge with no finalize scan, cannot let a flagged commit through.
+    const recheckFlaggedBeforePush = async (scanBare: string): Promise<"blocked" | "ok"> => {
       const st = flight.secretRemediation;
-      if (!st || (st.everKnown !== true && (!bridgeInPlay || (st.flaggedCommits?.length ?? 0) === 0))) return "ok";
+      if (!st || (st.everKnown !== true && (st.flaggedCommits?.length ?? 0) === 0)) return "ok";
       const tip = await this.git.trackingTip(scanBare, result.branch);
       if (tip === null) {
         runLog.warn("pre-push flagged-commit re-check: tracking tip unreadable with flagged commits recorded; failing closed", {
@@ -5627,7 +5636,7 @@ export class RunRunner {
               // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
               const alignBridgeScan = await needsBridgeScan(o.kind, alignBarePath);
               if (
-                (await recheckFlaggedBeforePush(alignBarePath, alignBridgeScan)) === "blocked" ||
+                (await recheckFlaggedBeforePush(alignBarePath)) === "blocked" ||
                 (alignBridgeScan && (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked")
               ) {
                 throw new PushSecretBlockedSignal();
@@ -5928,7 +5937,7 @@ export class RunRunner {
       // failHistoryRewritten site above).
       const finalizeBridgeScan = await needsBridgeScan(o.kind, finalizeBarePath);
       if (
-        (await recheckFlaggedBeforePush(finalizeBarePath, finalizeBridgeScan)) === "blocked" ||
+        (await recheckFlaggedBeforePush(finalizeBarePath)) === "blocked" ||
         (finalizeBridgeScan && (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked")
       ) {
         return;
@@ -9750,7 +9759,9 @@ export class RunRunner {
    * Decision table (state on `flight.secretRemediation`):
    *  - no bare / any thrown error with no known finding => proceed (finalize's scan stays the guard)
    *  - untrusted scan (failed fetch-back, tracking tip != clone tip, unresolved range, untrusted
-   *    gitleaks) => proceed when nothing is known, else blocked = known and fail
+   *    gitleaks) => proceed when nothing is known, else blocked = known and fail; a mid-turn-flagged
+   *    commit (flaggedCommits) still reachable from the clone or tracking tip (or an unreadable tip)
+   *    fails too, by ancestry
    *  - trusted and clean => clear `known`, remember the scanned tip as `cleanTip`, proceed (finalize
    *    RE-SCANS the final branch when a finding was ever known and its tip != `cleanTip`)
    *  - trusted, ANY finding reachable from a published floor (confirmed-published real tip,
@@ -9772,11 +9783,38 @@ export class RunRunner {
     if (state.blocked && state.blocked.length > 0) return { action: "fail" };
     if (!barePath) return { action: "proceed" };
     const branch = runnerClone.branch;
-    const failOrProceed = (why: string): SecretRemediationDecision => {
+    const failOrProceed = async (why: string): Promise<SecretRemediationDecision> => {
       if (state.known && state.known.length > 0) {
         state.blocked = state.known;
         runLog.warn("pre-exit secret scan could not be trusted after a known finding; failing", { run_id: runId, why });
         return { action: "fail" };
+      }
+      // A commit only the mid-turn scan flagged: ancestry decides, no trusted scan needed. A flagged
+      // commit is never published, so blocking on it cannot wedge on public content.
+      if ((state.flaggedCommits?.length ?? 0) > 0 || state.overflow === true) {
+        let reachable: SecretFinding[] | undefined = [];
+        try {
+          const tips: string[] = [];
+          for (const t of [await this.git.branchTip(runnerClone.path, branch), await this.git.trackingTip(barePath, branch)]) {
+            if (t !== null && !tips.includes(t)) tips.push(t);
+          }
+          if (tips.length === 0) reachable = undefined;
+          for (const t of tips) {
+            for (const f of await this.reachableFlaggedFindings(state, barePath, t)) {
+              if (!reachable!.includes(f)) reachable!.push(f);
+            }
+          }
+        } catch {
+          reachable = undefined;
+        }
+        if (reachable === undefined || reachable.length > 0 || state.overflow === true) {
+          state.blocked = reachable && reachable.length > 0 ? reachable : (state.flaggedFindings ?? []);
+          runLog.warn("pre-exit secret scan untrusted with a flagged commit still reachable (or unreadable); failing", {
+            run_id: runId,
+            why,
+          });
+          return { action: "fail" };
+        }
       }
       runLog.warn("pre-exit secret scan could not run or is untrusted; proceeding (finalize scan stays the guard)", {
         run_id: runId,
@@ -9789,10 +9827,10 @@ export class RunRunner {
       const cloneTip = await this.git.branchTip(runnerClone.path, branch);
       const trackTip = await this.git.trackingTip(barePath, branch);
       if (!fetched || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
-        return failOrProceed("tracking_tip_stale");
+        return await failOrProceed("tracking_tip_stale");
       }
       const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip);
-      if (!scanned.trusted) return failOrProceed(scanned.why);
+      if (!scanned.trusted) return await failOrProceed(scanned.why);
       const { range, floorCandidates } = scanned;
       let findings = scanned.findings;
       if (findings.length === 0) {
@@ -9893,7 +9931,7 @@ export class RunRunner {
         }),
       };
     } catch (e) {
-      return failOrProceed(`gate_threw: ${errMessage(e)}`);
+      return await failOrProceed(`gate_threw: ${errMessage(e)}`);
     }
   }
 

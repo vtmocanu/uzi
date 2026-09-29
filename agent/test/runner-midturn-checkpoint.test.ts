@@ -105,6 +105,15 @@ const finalStatus = (runId: string): string | undefined =>
     (st) => st === "completed" || st === "failed",
   )[0];
 
+/** The terminal contract for a run whose tick-flagged commit is still in the branch history:
+ *  failed push_secret_blocked, with no preserved patch (it could carry the secret). */
+function assertPushSecretBlocked(runId: string, label?: string): void {
+  assert.equal(finalStatus(runId), "failed", label);
+  const failed = api.states.find((s) => s.runId === runId && s.body.status === "failed")?.body;
+  assert.equal(failed?.fail_origin, "push_secret_blocked", label);
+  assert.equal(failed?.preserved_patch, undefined, label);
+}
+
 /** A GitHub-PAT-shaped value ASSEMBLED AT RUNTIME (never a complete token literal in source). The
  *  36-char body is hex (18 random bytes): uniformly distributed, with no modulo bias. */
 function runtimeSecret(): string {
@@ -781,7 +790,8 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         {},
         logger,
       ).execute(claim);
-      assert.equal(finalStatus(claim.run_id), "completed");
+      // issue #1932: a tick-flagged commit still in the pushed history now fails push_secret_blocked
+      assertPushSecretBlocked(claim.run_id);
       assert.equal(tickOutcome, "secret_found");
       assert.equal(publishesDuringTurn, 0, "no publishCheckpoint call");
       assert.equal(trackingAfterTick, commitB, "the fetch-back is kept");
@@ -870,7 +880,8 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
-      assert.equal(finalStatus(claim.run_id), "completed");
+      // issue #1932: a tick-flagged commit still in the pushed history now fails push_secret_blocked
+      assertPushSecretBlocked(claim.run_id);
       assert.equal(tickOutcome, "secret_found");
       assert.equal(publishesDuringTurn, 0);
     } finally {
@@ -1814,7 +1825,8 @@ describe("mid-turn checkpoint review follow-ups (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
-      assert.equal(finalStatus(claim.run_id), "completed");
+      // issue #1932: a tick-flagged commit still in the pushed history now fails push_secret_blocked
+      assertPushSecretBlocked(claim.run_id);
       return { seen, tips: pub.count() };
     } finally {
       pub.restore();
@@ -2600,7 +2612,8 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
         }),
         ctl,
       ).execute(claim);
-      assert.equal(finalStatus(claim.run_id), "completed");
+      // issue #1932: a tick-flagged commit still in the pushed history now fails push_secret_blocked
+      assertPushSecretBlocked(claim.run_id);
       assert.deepEqual(seen, ["secret_found", "time_gate_closed", "time_gate_closed"]);
       assert.equal(shimCalls(shim).filter((c) => c.startsWith("git ")).length, 1, "one gitleaks run, not one per tick");
       assert.equal(pub.count(), 0);
@@ -2657,7 +2670,8 @@ describe("mid-turn checkpoint round 4 (issue #1597 M2)", () => {
           }),
           ctl,
         ).execute(claim);
-        assert.equal(finalStatus(claim.run_id), "completed", label);
+        // issue #1932: a tick-flagged commit still in the pushed history now fails push_secret_blocked
+        assertPushSecretBlocked(claim.run_id, label);
         assert.deepEqual(seen, ["published", "secret_found"], label);
       } finally {
         pub.restore();
