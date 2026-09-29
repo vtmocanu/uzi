@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -49,12 +50,37 @@ func TestComposeFiledFindingGroupStripsPreviewRoster(t *testing.T) {
 	}
 }
 
+func TestComposeFiledFindingGroupStripsScrubbedPreviewRoster(t *testing.T) {
+	parts := []groupDraftPart{{title: "first", location: "glpat-" + "12345678901234567890", evidence: "evidence"}}
+	previewParts := []groupDraftPart{{title: "first", location: issuedraft.SafeInlineCode(parts[0].location), evidence: "evidence"}}
+	_, preview := composeFindingGroupDraft(previewParts)
+	body, ok := composeFiledFindingGroup(parts, &preview, uuid.New())
+	if !ok || strings.Count(body, "## Findings") != 1 {
+		t.Fatalf("scrubbed preview roster duplicated: %q", body)
+	}
+}
+
 func TestComposeFiledFindingGroupStripsBidiEdit(t *testing.T) {
 	parts := []groupDraftPart{{title: "first", location: "src/one.go"}}
 	edited := "safe\u202etxt.exe"
 	body, ok := composeFiledFindingGroup(parts, &edited, uuid.New())
 	if !ok || strings.ContainsRune(body, '\u202e') {
 		t.Fatalf("bidi edit survived: %q", body)
+	}
+}
+
+func TestReleaseFindingGroupOrReportReturnsRecoveryID(t *testing.T) {
+	op := uuid.New()
+	w := httptest.NewRecorder()
+	called := false
+	if releaseFindingGroupOrReport(w, op, []string{"member"}, "pre_call", func() bool {
+		called = true
+		return false
+	}) {
+		t.Fatal("reported a refused release as successful")
+	}
+	if !called || w.Code != 202 || !strings.Contains(w.Body.String(), op.String()) || !strings.Contains(w.Body.String(), "member") {
+		t.Fatalf("missing pending operation response: called=%v code=%d body=%s", called, w.Code, w.Body.String())
 	}
 }
 
