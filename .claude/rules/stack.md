@@ -44,6 +44,8 @@ docker compose --profile agent up    # additionally start a worker (needs join t
                         # `down -v` and never `-p uzi`.
 ```
 
+- **Read `run-e2e.sh`'s summary table, not its cleanup line.** A quarantine `LEAK` row keeps the rundir and prints `[cleanup] red run — rundir kept`, yet the suite exits 0 with `All E2E checks passed.`: a LEAK never fails it. Only a `FAIL` row does.
+
 ### smoke.sh recipe
 
 `smoke.sh` has no isolation of its own, and the obvious way to give it some reaches
