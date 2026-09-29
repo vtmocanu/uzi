@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
+  It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
