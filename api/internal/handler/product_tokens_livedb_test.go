@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -75,9 +76,11 @@ func mptMint(t *testing.T, routes http.Handler, jwt string, productID uuid.UUID,
 	return mptDecodeMint(t, cookieReq(t, routes, http.MethodPost, mptBase, jwt, mptMintBody(productID, "ci runner", expiry)))
 }
 
-// mptList returns GET /api/me/product-tokens/ (raw body plus rows by id), strictly
-// decoded: a key the DTO lacks (a "token" value, a hash) fails the decode.
-func mptList(t *testing.T, routes http.Handler, jwt string) (string, map[string]apitypes.ProductTokenDTO) {
+// mptListOrdered returns GET /api/me/product-tokens/ as served: the raw body, the rows
+// in response order and the truncated flag, strictly decoded: a key the envelope or the
+// DTO lacks (a "token" value, a hash) fails the decode, and so does a missing
+// truncated key.
+func mptListOrdered(t *testing.T, routes http.Handler, jwt string) (string, []apitypes.ProductTokenDTO, bool) {
 	t.Helper()
 	rec := cookieReq(t, routes, http.MethodGet, mptBase, jwt, "")
 	if rec.Code != http.StatusOK {
@@ -85,15 +88,27 @@ func mptList(t *testing.T, routes http.Handler, jwt string) (string, map[string]
 	}
 	raw := rec.Body.String()
 	var body struct {
-		Tokens []apitypes.ProductTokenDTO `json:"tokens"`
+		Tokens    []apitypes.ProductTokenDTO `json:"tokens"`
+		Truncated *bool                      `json:"truncated"`
 	}
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
 		t.Fatalf("decode product-token list %q: %v", raw, err)
 	}
-	out := make(map[string]apitypes.ProductTokenDTO, len(body.Tokens))
-	for _, tk := range body.Tokens {
+	if body.Truncated == nil {
+		t.Fatalf("GET %s has no truncated key: %q", mptBase, raw)
+	}
+	return raw, body.Tokens, *body.Truncated
+}
+
+// mptList returns GET /api/me/product-tokens/ (raw body plus rows by id), decoded as
+// strictly as mptListOrdered.
+func mptList(t *testing.T, routes http.Handler, jwt string) (string, map[string]apitypes.ProductTokenDTO) {
+	t.Helper()
+	raw, tokens, _ := mptListOrdered(t, routes, jwt)
+	out := make(map[string]apitypes.ProductTokenDTO, len(tokens))
+	for _, tk := range tokens {
 		out[tk.ID] = tk
 	}
 	return raw, out
@@ -288,6 +303,91 @@ func TestMintProductTokenCapLiveDB(t *testing.T) {
 	mptMint(t, routes, jwt, productID, "")
 	if n := mptActiveCount(t, pool, user, productID); n != maxActiveProductTokensPerProduct {
 		t.Errorf("active tokens after revoke + mint = %d, want %d", n, maxActiveProductTokensPerProduct)
+	}
+}
+
+// TestMintProductTokenExpiredFreesCapLiveDB: an EXPIRED token does not count toward the
+// D15 cap. The user holds the cap's worth of active tokens (an 11th mint is a 409);
+// three of them are then forced past their expiry, and the next mint succeeds. Dropping
+// the expiry clause from CountActiveProductTokensForUserProduct turns that mint into a
+// 409.
+func TestMintProductTokenExpiredFreesCapLiveDB(t *testing.T) {
+	h, pool := v1LiveDB(t)
+	routes, _ := v1Routers(h)
+	user := cliSeedUser(t, pool, false)
+	jwt := cliMintJWT(t, pool, user)
+	productID := v1SeedProduct(t, h.q, user)
+
+	ids := make([]uuid.UUID, 0, maxActiveProductTokensPerProduct)
+	for range maxActiveProductTokensPerProduct {
+		ids = append(ids, uuid.MustParse(mptMint(t, routes, jwt, productID, "").ProductToken.ID))
+	}
+	if rec := cookieReq(t, routes, http.MethodPost, mptBase, jwt, mptMintBody(productID, "over the cap", "")); rec.Code != http.StatusConflict {
+		t.Fatalf("mint over the cap = %d %q, want 409 (the fixture must start AT the cap)", rec.Code, rec.Body.String())
+	}
+	const expire = 3
+	cliMustExec(t, pool, `UPDATE product_tokens SET expires_at = now() - interval '1 minute' WHERE id = ANY($1)`, ids[:expire])
+	if n := mptActiveCount(t, pool, user, productID); n != maxActiveProductTokensPerProduct-expire {
+		t.Fatalf("active tokens after expiring %d = %d, want %d", expire, n, maxActiveProductTokensPerProduct-expire)
+	}
+
+	rec := cookieReq(t, routes, http.MethodPost, mptBase, jwt, mptMintBody(productID, "after expiry", ""))
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("mint with %d of %d tokens expired = %d %q, want 201 (expired tokens do not count toward the cap)",
+			expire, maxActiveProductTokensPerProduct, rec.Code, rec.Body.String())
+	}
+	if n := mptActiveCount(t, pool, user, productID); n != maxActiveProductTokensPerProduct-expire+1 {
+		t.Errorf("active tokens after the mint = %d, want %d", n, maxActiveProductTokensPerProduct-expire+1)
+	}
+}
+
+// TestListMyProductTokensBoundLiveDB pins the bound on GET /api/me/product-tokens (PRD
+// #1907 M5 security audit, H1): ACTIVE tokens come before revoked and expired ones even
+// when those are newer, newest first within each group; "truncated" is false while the
+// list fits the bound (exactly at it included) and true, with exactly bound rows, once
+// it does not (bound lowered through the test override).
+func TestListMyProductTokensBoundLiveDB(t *testing.T) {
+	h, pool := v1LiveDB(t)
+	routes, _ := v1Routers(h)
+	user := cliSeedUser(t, pool, false)
+	jwt := cliMintJWT(t, pool, user)
+	productID := v1SeedProduct(t, h.q, user)
+
+	// Oldest to newest: two active, then one expired and one revoked.
+	var minted []string
+	for range 4 {
+		minted = append(minted, mptMint(t, routes, jwt, productID, "").ProductToken.ID)
+	}
+	for i, id := range minted {
+		cliMustExec(t, pool, `UPDATE product_tokens SET created_at = now() - interval '1 hour' + make_interval(secs => $2) WHERE id = $1`, id, float64(i))
+	}
+	cliMustExec(t, pool, `UPDATE product_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1`, minted[2])
+	if rec := cookieReq(t, routes, http.MethodDelete, mptBase+minted[3], jwt, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("revoke = %d %q", rec.Code, rec.Body.String())
+	}
+	want := []string{minted[1], minted[0], minted[3], minted[2]}
+
+	order := func(tokens []apitypes.ProductTokenDTO) []string {
+		ids := make([]string, 0, len(tokens))
+		for _, tk := range tokens {
+			ids = append(ids, tk.ID)
+		}
+		return ids
+	}
+
+	_, tokens, truncated := mptListOrdered(t, routes, jwt)
+	if got := order(tokens); !slices.Equal(got, want) || truncated {
+		t.Fatalf("list = %v truncated=%t, want active newest-first then inactive newest-first %v, not truncated", got, truncated, want)
+	}
+
+	t.Cleanup(func() { h.myProductTokenRowsOverride = 0 })
+	h.myProductTokenRowsOverride = 4 // == len(want): exactly at the bound
+	if _, tokens, truncated := mptListOrdered(t, routes, jwt); !slices.Equal(order(tokens), want) || truncated {
+		t.Errorf("with bound %d over %d rows: %v truncated=%t, want every row, not truncated", len(want), len(want), order(tokens), truncated)
+	}
+	h.myProductTokenRowsOverride = 2
+	if _, tokens, truncated := mptListOrdered(t, routes, jwt); !slices.Equal(order(tokens), want[:2]) || !truncated {
+		t.Errorf("with bound 2 over %d rows: %v truncated=%t, want the two active rows %v, truncated", len(want), order(tokens), truncated, want[:2])
 	}
 }
 

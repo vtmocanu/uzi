@@ -339,10 +339,12 @@ type ListAllProductTokensForAdminRow struct {
 // looping mint -> revoke grows this table without bound, and an unbounded list would
 // grow every admin load with it. Rows are therefore ordered ACTIVE first (not revoked
 // and not expired, the NULL trap spelled out: a never-expiring token is active), then
-// newest first, and cut at sqlc.arg(max_rows), which the handler passes as its named
-// constant. Every active token sorts ahead of every inactive one, so the cut drops the
-// oldest revoked/expired history first; the per-user mint limiter bounds how fast that
-// history can grow.
+// newest first, and cut at sqlc.arg(max_rows); the handler passes its named constant
+// PLUS ONE and reports "truncated" when the extra row came back. Every active token
+// sorts ahead of every inactive one, so the cut drops revoked/expired history (oldest
+// first) before any active token; once the ACTIVE tokens alone exceed the bound, the
+// oldest active tokens are cut too, and "truncated" is what tells the admin. The
+// per-user mint limiter bounds how fast rows can be added.
 func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int32) ([]ListAllProductTokensForAdminRow, error) {
 	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin, maxRows)
 	if err != nil {
@@ -430,8 +432,16 @@ SELECT t.id,
   FROM product_tokens t
   JOIN products p ON p.id = t.product_id
  WHERE t.user_id = $1
- ORDER BY t.created_at DESC, t.id ASC
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT $2::int
 `
+
+type ListProductTokensForUserParams struct {
+	UserID  uuid.UUID `json:"user_id"`
+	MaxRows int32     `json:"max_rows"`
+}
 
 type ListProductTokensForUserRow struct {
 	ID          uuid.UUID          `json:"id"`
@@ -450,9 +460,18 @@ type ListProductTokensForUserRow struct {
 // The per-user product-token list (Settings > Access), metadata only: the value is never
 // stored and the hash is not projected. Joined for the product name. Includes tokens
 // of disabled or soft-deleted products (they still exist, and the user may want to
-// revoke them). Newest first.
-func (q *Queries) ListProductTokensForUser(ctx context.Context, userID uuid.UUID) ([]ListProductTokensForUserRow, error) {
-	rows, err := q.db.Query(ctx, listProductTokensForUser, userID)
+// revoke them).
+//
+// BOUNDED (PRD #1907 M5 security audit, H1): revoked rows are kept forever and a user
+// can loop mint -> revoke, so an unbounded list would grow every Settings > Access load
+// without limit. Rows are ordered ACTIVE first (not revoked and not expired, the NULL
+// trap spelled out: a never-expiring token is active), then newest first, and cut at
+// sqlc.arg(max_rows). The handler passes its named constant PLUS ONE and reports
+// "truncated" when the extra row came back. The D15 cap (10 active per product) bounds
+// the active rows per product, not the product count, so the cut can in principle reach
+// active rows too; "truncated" is what tells the user.
+func (q *Queries) ListProductTokensForUser(ctx context.Context, arg ListProductTokensForUserParams) ([]ListProductTokensForUserRow, error) {
+	rows, err := q.db.Query(ctx, listProductTokensForUser, arg.UserID, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}

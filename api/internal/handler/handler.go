@@ -53,6 +53,13 @@ type Handler struct {
 	// accessor falls back to h.q. Deliberately narrow (see agentTemplateWriteStore)
 	// rather than making Handler.q an interface.
 	tmplWriteStore agentTemplateWriteStore
+	// myProductTokenRowsOverride and adminProductTokenRowsOverride, when positive,
+	// replace maxMyProductTokenRows / maxAdminProductTokenRows as the row bound of GET
+	// /api/me/product-tokens and GET /api/admin/product-tokens (PRD #1907), so a LiveDB
+	// test reaches the "truncated" path with a handful of rows. Zero in production (New
+	// leaves them unset); read only through productTokenListBound.
+	myProductTokenRowsOverride    int32
+	adminProductTokenRowsOverride int32
 	// vaultNoticeStore, when non-nil, replaces h.q for VaultLock's pre-ack of the
 	// vault-lock notice (PRD #890 D6), so that one DB touch can be faked in a unit test
 	// without a live database. nil in production — the accessor falls back to h.q.

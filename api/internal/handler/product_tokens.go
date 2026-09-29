@@ -173,23 +173,56 @@ func productTokenDTO(id, productID uuid.UUID, productName, name, prefix string, 
 	return dto
 }
 
+// maxMyProductTokenRows bounds one GET /api/me/product-tokens response (PRD #1907 M5
+// security audit, H1). Revoked rows are kept, so a user looping mint -> revoke would
+// otherwise grow their own list without limit.
+const maxMyProductTokenRows = 200
+
+// productTokenListBound is a product-token list's row bound: the test override when it
+// is positive, else the named constant def.
+func productTokenListBound(override, def int32) int32 {
+	if override > 0 {
+		return override
+	}
+	return def
+}
+
+// cutProductTokenList trims rows, fetched with a LIMIT of bound+1, to bound and reports
+// whether the extra row came back, i.e. whether the list was cut.
+func cutProductTokenList[T any](rows []T, bound int32) ([]T, bool) {
+	if len(rows) > int(bound) {
+		return rows[:bound], true
+	}
+	return rows, false
+}
+
 // ListMyProductTokens returns the caller's product tokens, metadata only (the value is
-// never stored). Revoked and expired tokens are included, newest first, exactly as the
-// CLI-token list includes revoked ones: the list is where a user sees what was revoked
-// and when a token was last used. Tokens of disabled or deleted products are included
-// too; they still exist.
+// never stored). Revoked and expired tokens are included, exactly as the CLI-token list
+// includes revoked ones: the list is where a user sees what was revoked and when a token
+// was last used. Tokens of disabled or deleted products are included too; they still
+// exist.
+//
+// BOUNDED: at most maxMyProductTokenRows (200) rows, ACTIVE tokens (not revoked, not
+// expired) first, then newest first, so the cut drops revoked/expired history before
+// any active token. The query is asked for one row more than the bound, so the response
+// says whether anything was cut: {"tokens": [...], "truncated": bool}.
 func (h *Handler) ListMyProductTokens(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	rows, err := h.q.ListProductTokensForUser(r.Context(), user.ID)
+	bound := productTokenListBound(h.myProductTokenRowsOverride, maxMyProductTokenRows)
+	rows, err := h.q.ListProductTokensForUser(r.Context(), store.ListProductTokensForUserParams{
+		UserID:  user.ID,
+		MaxRows: bound + 1,
+	})
 	if err != nil {
 		slog.Error("list product tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	rows, truncated := cutProductTokenList(rows, bound)
 	out := make([]apitypes.ProductTokenDTO, 0, len(rows))
 	for _, t := range rows {
 		var ip fmt.Stringer
@@ -199,7 +232,7 @@ func (h *Handler) ListMyProductTokens(w http.ResponseWriter, r *http.Request) {
 		out = append(out, productTokenDTO(t.ID, t.ProductID, t.ProductName, t.Name, t.TokenPrefix,
 			t.Scopes, t.Revoked, t.CreatedAt, t.LastUsedAt, t.ExpiresAt, ip))
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": out})
+	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": out, "truncated": truncated})
 }
 
 // ListMintableProducts is the mint picker: every enabled, non-deleted product, with only

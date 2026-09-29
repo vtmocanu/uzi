@@ -159,3 +159,62 @@ func TestMintProductTokenRefusesBeforeTheDatabase(t *testing.T) {
 		})
 	}
 }
+
+// TestProductTokenListsAskForBoundPlusOne pins both product-token list bounds without a
+// database: each handler asks its store query for its named constant PLUS ONE rows (the
+// extra row is how it detects a cut), and an uncut result is served as
+// {"tokens": [], "truncated": false}. The fake DB captures the Query args and returns
+// no rows.
+func TestProductTokenListsAskForBoundPlusOne(t *testing.T) {
+	if maxMyProductTokenRows != 200 || maxAdminProductTokenRows != 1000 {
+		t.Fatalf("bounds moved: my=%d admin=%d; PRD #1907's audit fixed them at 200 and 1000",
+			maxMyProductTokenRows, maxAdminProductTokenRows)
+	}
+	userID := uuid.New()
+	for _, c := range []struct {
+		name     string
+		serve    func(h *Handler) http.HandlerFunc
+		wantArgs []any
+	}{
+		{"GET /api/me/product-tokens", func(h *Handler) http.HandlerFunc { return h.ListMyProductTokens },
+			[]any{userID, int32(maxMyProductTokenRows + 1)}},
+		{"GET /api/admin/product-tokens", func(h *Handler) http.HandlerFunc { return h.AdminListProductTokens },
+			[]any{int32(maxAdminProductTokenRows + 1)}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			db := &fakeViewerListDB{}
+			h := &Handler{q: store.New(db)}
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req = req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: userID}))
+			rec := httptest.NewRecorder()
+			c.serve(h)(rec, req)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d %q, want 200", rec.Code, rec.Body.String())
+			}
+			if !db.called || !slices.Equal(db.gotArgs, c.wantArgs) {
+				t.Errorf("store query args = %#v, want %#v (the bound plus one)", db.gotArgs, c.wantArgs)
+			}
+			if got := strings.TrimSpace(rec.Body.String()); got != `{"tokens":[],"truncated":false}` {
+				t.Errorf("body = %s, want {\"tokens\":[],\"truncated\":false}", got)
+			}
+		})
+	}
+}
+
+// TestCutProductTokenList: the bound+1 fetch is cut to bound and flagged only when the
+// extra row came back; a result at or under the bound is served whole.
+func TestCutProductTokenList(t *testing.T) {
+	for _, c := range []struct {
+		n, wantLen int
+		bound      int32
+		wantCut    bool
+	}{{0, 0, 2, false}, {2, 2, 2, false}, {3, 2, 2, true}} {
+		rows, cut := cutProductTokenList(make([]int, c.n), c.bound)
+		if len(rows) != c.wantLen || cut != c.wantCut {
+			t.Errorf("cut(%d rows, bound %d) = %d rows, %t; want %d, %t", c.n, c.bound, len(rows), cut, c.wantLen, c.wantCut)
+		}
+	}
+	if productTokenListBound(0, 200) != 200 || productTokenListBound(5, 200) != 5 {
+		t.Error("productTokenListBound must use the override only when it is positive")
+	}
+}

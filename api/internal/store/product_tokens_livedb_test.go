@@ -430,7 +430,7 @@ func TestProductTokenLifecycleQueriesLiveDB(t *testing.T) {
 	}
 
 	t.Run("list own", func(t *testing.T) {
-		rows, err := q.ListProductTokensForUser(ctx, owner)
+		rows, err := q.ListProductTokensForUser(ctx, store.ListProductTokensForUserParams{UserID: owner, MaxRows: 1000})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -457,9 +457,18 @@ func TestProductTokenLifecycleQueriesLiveDB(t *testing.T) {
 				t.Fatalf("owner list missing %s: %v", id, ids)
 			}
 		}
+		// Active first (the ordering TestProductTokenListsActiveFirstLiveDB pins), then
+		// newest first within each group.
+		inactive := func(r store.ListProductTokensForUserRow) bool {
+			return r.Revoked || (r.ExpiresAt.Valid && !r.ExpiresAt.Time.After(time.Now()))
+		}
 		for i := 1; i < len(rows); i++ {
-			if rows[i-1].CreatedAt.Time.Before(rows[i].CreatedAt.Time) {
-				t.Fatalf("owner list not newest first at %d", i)
+			a, b := inactive(rows[i-1]), inactive(rows[i])
+			if a && !b {
+				t.Fatalf("owner list puts inactive %s ahead of active %s", rows[i-1].ID, rows[i].ID)
+			}
+			if a == b && rows[i-1].CreatedAt.Time.Before(rows[i].CreatedAt.Time) {
+				t.Fatalf("owner list not newest first within a group at %d", i)
 			}
 		}
 	})
@@ -701,4 +710,114 @@ func TestUpdateProductConcurrentPatchesLiveDB(t *testing.T) {
 		t.Fatalf("after two concurrent single-field PATCHes: description=%q enabled=%t, want %q and false (both writes kept)",
 			got.Description, got.Enabled, "from A")
 	}
+}
+
+// TestProductTokenListsActiveFirstLiveDB pins the bound on both product-token lists (PRD
+// #1907 M4/M5 security audit, H1): ListProductTokensForUser and
+// ListAllProductTokensForAdmin order ACTIVE tokens (not revoked, not expired; a NULL
+// expiry IS active) ahead of revoked and expired ones, newest first within each group,
+// and cut at max_rows, so a small max_rows drops the inactive rows first.
+//
+// Every inactive fixture row is made NEWER than every active one (created_at set
+// explicitly), so a query ordered by created_at alone returns the inactive rows first
+// and fails here. The admin list reads the whole shared table, so its case dates this
+// test's rows 100 years ahead: they are then the newest rows in the table (a rerun's rows
+// are newer still), and the only rows a small max_rows can reach are this test's own.
+// The rows are deleted again on cleanup.
+func TestProductTokenListsActiveFirstLiveDB(t *testing.T) {
+	ctx, pool, q := productLiveDB(t)
+	owner, _ := newProductUser(ctx, t, pool)
+	p := newProduct(ctx, t, q, owner)
+	t.Cleanup(func() {
+		mustExec(context.Background(), t, pool, `DELETE FROM product_tokens WHERE user_id = $1`, owner)
+	})
+
+	// In created_at order, oldest first: the three active rows, then the three inactive.
+	activeNever := mintProductToken(ctx, t, q, owner, p.ID, neverExpires)
+	activeFuture := mintProductToken(ctx, t, q, owner, p.ID, expiresIn(time.Hour))
+	activeNewest := mintProductToken(ctx, t, q, owner, p.ID, neverExpires)
+	expired := mintProductToken(ctx, t, q, owner, p.ID, expiresIn(time.Hour))
+	revokedNever := mintProductToken(ctx, t, q, owner, p.ID, neverExpires)
+	revokedNewest := mintProductToken(ctx, t, q, owner, p.ID, expiresIn(time.Hour))
+	mustExec(ctx, t, pool, `UPDATE product_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1`, expired.row.ID)
+	mustExec(ctx, t, pool, `UPDATE product_tokens SET revoked = true WHERE id = ANY($1)`,
+		[]uuid.UUID{revokedNever.row.ID, revokedNewest.row.ID})
+	ordered := []mintedProductToken{activeNever, activeFuture, activeNewest, expired, revokedNever, revokedNewest}
+	setAges := func(base string) {
+		t.Helper()
+		for i, m := range ordered {
+			mustExec(ctx, t, pool,
+				`UPDATE product_tokens SET created_at = `+base+` + make_interval(secs => $2) WHERE id = $1`,
+				m.row.ID, float64(i))
+		}
+	}
+	wantActive := []uuid.UUID{activeNewest.row.ID, activeFuture.row.ID, activeNever.row.ID}
+	const nActive int32 = 3 // len(wantActive), typed for max_rows
+	wantInactive := []uuid.UUID{revokedNewest.row.ID, revokedNever.row.ID, expired.row.ID}
+	wantAll := append(slices.Clone(wantActive), wantInactive...)
+
+	t.Run("user list", func(t *testing.T) {
+		setAges("now() - interval '1 hour'")
+		list := func(maxRows int32) []uuid.UUID {
+			t.Helper()
+			rows, err := q.ListProductTokensForUser(ctx, store.ListProductTokensForUserParams{UserID: owner, MaxRows: maxRows})
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := make([]uuid.UUID, 0, len(rows))
+			for _, r := range rows {
+				ids = append(ids, r.ID)
+			}
+			return ids
+		}
+		if got := list(100); !slices.Equal(got, wantAll) {
+			t.Fatalf("full user list = %v, want active newest-first %v then inactive newest-first %v", got, wantActive, wantInactive)
+		}
+		if got := list(nActive); !slices.Equal(got, wantActive) {
+			t.Fatalf("user list cut at %d = %v, want exactly the active rows %v (inactive rows cut first)", len(wantActive), got, wantActive)
+		}
+		if got := list(nActive + 1); !slices.Equal(got, wantAll[:len(wantActive)+1]) {
+			t.Fatalf("user list cut at %d = %v, want the active rows then the newest inactive one %v", len(wantActive)+1, got, wantAll[:len(wantActive)+1])
+		}
+	})
+
+	t.Run("admin list", func(t *testing.T) {
+		setAges("now() + interval '100 years'")
+		list := func(maxRows int32) []store.ListAllProductTokensForAdminRow {
+			t.Helper()
+			rows, err := q.ListAllProductTokensForAdmin(ctx, maxRows)
+			if err != nil {
+				t.Fatal(err)
+			}
+			return rows
+		}
+		// The cut: only the active rows survive a max_rows equal to their count, although
+		// every inactive row of this test is newer than all of them.
+		cut := list(nActive)
+		var got []uuid.UUID
+		for _, r := range cut {
+			got = append(got, r.ID)
+		}
+		if !slices.Equal(got, wantActive) {
+			t.Fatalf("admin list cut at %d = %v, want exactly this test's active rows %v (inactive rows cut first)", len(wantActive), got, wantActive)
+		}
+		// Uncut: every active row of this test precedes every inactive one, and each group
+		// is newest first. Other tests' rows interleave, so only the relative order of this
+		// test's own rows is asserted.
+		pos := map[uuid.UUID]int{}
+		for i, r := range list(1_000_000) {
+			pos[r.ID] = i
+		}
+		for _, id := range wantAll {
+			if _, ok := pos[id]; !ok {
+				t.Fatalf("uncut admin list is missing %s", id)
+			}
+		}
+		for i := 1; i < len(wantAll); i++ {
+			if pos[wantAll[i-1]] >= pos[wantAll[i]] {
+				t.Fatalf("uncut admin list puts %s (position %d) at or after %s (position %d); want order %v",
+					wantAll[i-1], pos[wantAll[i-1]], wantAll[i], pos[wantAll[i]], wantAll)
+			}
+		}
+	})
 }

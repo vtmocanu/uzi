@@ -118,17 +118,21 @@ const maxAdminProductTokenRows = 1000
 // they are the incident trail (D9).
 //
 // BOUNDED: at most maxAdminProductTokenRows (1000) rows per load, ACTIVE tokens (not
-// revoked, not expired) first and then newest first, so every live credential is listed
-// ahead of the oldest revoked/expired history, which is what the cut drops. The JSON
-// shape is unchanged ({"tokens": [...]}). The per-user mint limiter (authLimiter on
-// POST /api/me/product-tokens) bounds how fast any one user can add rows.
+// revoked, not expired) first and then newest first. The cut drops revoked/expired
+// history before any active token, but past 1000 ACTIVE tokens the oldest active ones
+// are cut as well. The query is asked for one row more than the bound, so the response
+// says whether anything was cut: {"tokens": [...], "truncated": bool}. The per-user mint
+// limiter (authLimiter on POST /api/me/product-tokens) bounds how fast any one user can
+// add rows.
 func (h *Handler) AdminListProductTokens(w http.ResponseWriter, r *http.Request) {
-	rows, err := h.q.ListAllProductTokensForAdmin(r.Context(), maxAdminProductTokenRows)
+	bound := productTokenListBound(h.adminProductTokenRowsOverride, maxAdminProductTokenRows)
+	rows, err := h.q.ListAllProductTokensForAdmin(r.Context(), bound+1)
 	if err != nil {
 		slog.Error("admin list product tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	rows, truncated := cutProductTokenList(rows, bound)
 	out := make([]apitypes.AdminProductTokenDTO, 0, len(rows))
 	for _, t := range rows {
 		dto := apitypes.AdminProductTokenDTO{
@@ -157,7 +161,7 @@ func (h *Handler) AdminListProductTokens(w http.ResponseWriter, r *http.Request)
 		}
 		out = append(out, dto)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": out})
+	httpx.JSON(w, http.StatusOK, map[string]any{"tokens": out, "truncated": truncated})
 }
 
 // AdminCreateProduct registers a product: {name, description}. The creating admin is

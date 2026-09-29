@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PRD #1907 M4: the admin product registry and product-credential inventory, driven
@@ -79,8 +81,9 @@ func apListProducts(t *testing.T, routes http.Handler, jwt string) map[string]ap
 	return out
 }
 
-// apListProductTokens returns GET /api/admin/product-tokens (raw body plus rows by id).
-func apListProductTokens(t *testing.T, routes http.Handler, jwt string) (string, map[string]apitypes.AdminProductTokenDTO) {
+// apListProductTokens returns GET /api/admin/product-tokens (raw body, rows by id, and
+// the response's truncated flag).
+func apListProductTokens(t *testing.T, routes http.Handler, jwt string) (string, map[string]apitypes.AdminProductTokenDTO, bool) {
 	t.Helper()
 	rec := cookieReq(t, routes, http.MethodGet, "/api/admin/product-tokens", jwt, "")
 	if rec.Code != http.StatusOK {
@@ -88,18 +91,60 @@ func apListProductTokens(t *testing.T, routes http.Handler, jwt string) (string,
 	}
 	raw := rec.Body.String()
 	var body struct {
-		Tokens []apitypes.AdminProductTokenDTO `json:"tokens"`
+		Tokens    []apitypes.AdminProductTokenDTO `json:"tokens"`
+		Truncated *bool                           `json:"truncated"`
 	}
 	dec := json.NewDecoder(strings.NewReader(raw))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(&body); err != nil {
 		t.Fatalf("decode product tokens: %v", err)
 	}
+	if body.Truncated == nil {
+		t.Fatalf("GET /api/admin/product-tokens has no truncated key: %q", raw)
+	}
 	out := make(map[string]apitypes.AdminProductTokenDTO, len(body.Tokens))
 	for _, tk := range body.Tokens {
 		out[tk.ID] = tk
 	}
-	return raw, out
+	return raw, out, *body.Truncated
+}
+
+// apInventoryRows returns the admin inventory rows by id for assertions that a specific
+// row is listed. The route's response is used when it is complete; when it says
+// truncated (the shared database holds more than maxAdminProductTokenRows tokens, and
+// active-first ordering may push this test's revoked/expired rows past the cut) the
+// SAME store query the handler runs is read with a bound no test database reaches, so
+// the D9 claim (a deleted product's rows, revoked and expired ones included, are
+// still in the inventory) stays pinned without depending on the table's global size.
+func apInventoryRows(t *testing.T, q *store.Queries, httpRows map[string]apitypes.AdminProductTokenDTO, truncated bool) map[string]apitypes.AdminProductTokenDTO {
+	t.Helper()
+	if !truncated {
+		return httpRows
+	}
+	t.Logf("GET /api/admin/product-tokens is truncated on this shared database; asserting the rows via ListAllProductTokensForAdmin")
+	rows, err := q.ListAllProductTokensForAdmin(context.Background(), 1_000_000_000)
+	if err != nil {
+		t.Fatalf("ListAllProductTokensForAdmin: %v", err)
+	}
+	out := make(map[string]apitypes.AdminProductTokenDTO, len(rows))
+	for _, r := range rows {
+		out[r.ID.String()] = apitypes.AdminProductTokenDTO{
+			ProductTokenDTO: apitypes.ProductTokenDTO{
+				ID:          r.ID.String(),
+				ProductID:   r.ProductID.String(),
+				ProductName: r.ProductName,
+				Name:        r.Name,
+				TokenPrefix: r.TokenPrefix,
+				Scopes:      r.Scopes,
+				Revoked:     r.Revoked,
+				CreatedAt:   r.CreatedAt.Time,
+				ExpiresAt:   timePtr(r.ExpiresAt.Valid, r.ExpiresAt.Time),
+			},
+			UserID:     r.UserID.String(),
+			OwnerEmail: r.OwnerEmail,
+		}
+	}
+	return out
 }
 
 func apWhoami(t *testing.T, routes http.Handler, token string) int {
@@ -346,7 +391,8 @@ func TestAdminProductActionsKillTokenOnNextWhoamiLiveDB(t *testing.T) {
 		if !ok || got.DeletedAt == nil || got.Enabled {
 			t.Errorf("GET /api/admin/products after delete: listed=%t %+v, want listed, deleted, disabled", ok, got)
 		}
-		raw, rows := apListProductTokens(t, routes, jwt)
+		raw, httpRows, truncated := apListProductTokens(t, routes, jwt)
+		rows := apInventoryRows(t, h.q, httpRows, truncated)
 		for _, want := range []struct {
 			tok     v1Product
 			revoked bool
@@ -399,9 +445,96 @@ func TestAdminProductActionsKillTokenOnNextWhoamiLiveDB(t *testing.T) {
 		if rec := cookieReq(t, routes, http.MethodPost, path, jwt, ""); rec.Code != http.StatusNotFound {
 			t.Errorf("second revoke = %d %q, want 404 (already revoked)", rec.Code, rec.Body.String())
 		}
-		_, rows := apListProductTokens(t, routes, jwt)
+		_, httpRows, truncated := apListProductTokens(t, routes, jwt)
+		rows := apInventoryRows(t, h.q, httpRows, truncated)
 		if row, ok := rows[pt.tokenID.String()]; !ok || !row.Revoked {
 			t.Errorf("inventory row after revoke: listed=%t revoked=%t, want listed and revoked", ok, row.Revoked)
+		}
+	})
+}
+
+// TestAdminDeleteDisabledProductStopsNothingLiveDB pins AdminDeleteProduct's
+// stopped_token_count for a product that was ALREADY DISABLED: its tokens were refused
+// since the disable, so the delete stopped none of them (0), while the product's own
+// active_token_count keeps its registry meaning (the N un-revoked, unexpired rows). An
+// unconditional stopped = active reports N here.
+func TestAdminDeleteDisabledProductStopsNothingLiveDB(t *testing.T) {
+	h, pool := v1LiveDB(t)
+	routes, _ := v1Routers(h)
+	admin := cliSeedUser(t, pool, true)
+	jwt := cliMintJWT(t, pool, admin)
+
+	p := apCreate(t, routes, jwt, "Disabled "+uuid.NewString(), "")
+	owner := cliSeedUser(t, pool, false)
+	const n = 3
+	for range n {
+		v1MintProductToken(t, h.q, owner, uuid.MustParse(p.ID), producttoken.Scopes, nil)
+	}
+	if rec := cookieReq(t, routes, http.MethodPatch, "/api/admin/products/"+p.ID, jwt, `{"enabled":false}`); rec.Code != http.StatusOK {
+		t.Fatalf("PATCH enabled=false = %d %q", rec.Code, rec.Body.String())
+	}
+
+	rec := cookieReq(t, routes, http.MethodDelete, "/api/admin/products/"+p.ID, jwt, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("DELETE = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	resp := apDecodeProduct(t, rec.Code, rec.Body.String())
+	if resp.StoppedTokenCount == nil {
+		t.Fatalf("DELETE response has no stopped_token_count: %q", rec.Body.String())
+	}
+	if *resp.StoppedTokenCount != 0 {
+		t.Errorf("stopped_token_count = %d, want 0 (the product was already disabled, so the delete stopped none of its %d tokens)", *resp.StoppedTokenCount, n)
+	}
+	if resp.Product.ActiveTokenCount != n {
+		t.Errorf("product.active_token_count = %d, want %d (active rows, whatever the product's state)", resp.Product.ActiveTokenCount, n)
+	}
+	if resp.Product.Enabled || resp.Product.DeletedAt == nil {
+		t.Errorf("DELETE response product %+v, want disabled with deleted_at set", resp.Product)
+	}
+}
+
+// TestAdminListProductTokensTruncatedLiveDB pins the inventory's "truncated" flag: false
+// (and present) whenever the table fits the bound, and true with exactly bound rows,
+// all of them active, once it does not (bound lowered through the test override so a
+// handful of rows reach it).
+func TestAdminListProductTokensTruncatedLiveDB(t *testing.T) {
+	h, pool := v1LiveDB(t)
+	routes, _ := v1Routers(h)
+	admin := cliSeedUser(t, pool, true)
+	jwt := cliMintJWT(t, pool, admin)
+	owner := cliSeedUser(t, pool, false)
+	pid := v1SeedProduct(t, h.q, owner)
+	for range 3 {
+		v1MintProductToken(t, h.q, owner, pid, producttoken.Scopes, nil)
+	}
+
+	t.Run("default bound", func(t *testing.T) {
+		// The table is shared, so the expectation is derived from its size; -p 1 keeps
+		// other packages from writing between the count and the request.
+		var total int64
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM product_tokens`).Scan(&total); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		_, rows, truncated := apListProductTokens(t, routes, jwt)
+		if want := total > maxAdminProductTokenRows; truncated != want {
+			t.Errorf("truncated = %t with %d rows in the table, want %t (bound %d)", truncated, total, want, maxAdminProductTokenRows)
+		}
+		if want := min(total, maxAdminProductTokenRows); int64(len(rows)) != want {
+			t.Errorf("listed %d rows with %d in the table, want %d", len(rows), total, want)
+		}
+	})
+
+	t.Run("lowered bound", func(t *testing.T) {
+		h.adminProductTokenRowsOverride = 2
+		t.Cleanup(func() { h.adminProductTokenRowsOverride = 0 })
+		_, rows, truncated := apListProductTokens(t, routes, jwt)
+		if !truncated || len(rows) != 2 {
+			t.Fatalf("with bound 2 over at least 3 tokens: %d rows, truncated=%t; want 2 rows, truncated", len(rows), truncated)
+		}
+		for _, r := range rows {
+			if r.Revoked || (r.ExpiresAt != nil && !r.ExpiresAt.After(time.Now())) {
+				t.Errorf("row %+v survived the cut, want only active rows (active first)", r)
+			}
 		}
 	})
 }
