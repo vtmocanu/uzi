@@ -515,6 +515,9 @@ jobs:
       - name: npm ci
         working-directory: agent
         run: npm ci
+      - name: Controlled failed-leg probe (temporary)
+        if: matrix.shard == 2
+        run: exit 1
       # The agent tests shell out to `git init`/clone and bash; ubuntu-latest ships
       # both (the GitLab alpine job had to `apk add git bash`).
       - name: test:agent shard
