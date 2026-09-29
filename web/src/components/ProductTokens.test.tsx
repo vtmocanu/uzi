@@ -113,6 +113,19 @@ describe("ProductTokens mint form", () => {
     );
   });
 
+  it("trims a trailing U+0085 from the name as Go's TrimSpace does, instead of refusing it", async () => {
+    mockApi.createProductToken.mockResolvedValue({
+      token: MINTED,
+      product_token: aToken({ id: "new", name: "prod" }),
+    });
+    renderCard();
+    await fillAndMint("Helpdesk assistant", "prod\u0085");
+    expect(screen.queryByText(/can’t contain tabs, line breaks/)).toBeNull();
+    await waitFor(() =>
+      expect(mockApi.createProductToken).toHaveBeenCalledWith(expect.objectContaining({ name: "prod" })),
+    );
+  });
+
   it("requires at least one scope before it can mint", async () => {
     renderCard();
     fireEvent.change(await screen.findByLabelText("Product"), { target: { value: "prod-a" } });
@@ -315,9 +328,10 @@ describe("ProductTokens truncated list", () => {
         <ProductTokens onActiveCountChange={onCount} />
       </MemoryRouter>,
     );
+    // The count comes from the rows returned, not a cap hard-coded in the client.
     expect(
       await screen.findByText(
-        "Showing your first 200 product tokens, active first; older tokens are not listed.",
+        "Showing your first 2 product tokens, active first; older tokens are not listed.",
       ),
     ).toBeTruthy();
     await waitFor(() => expect(onCount).toHaveBeenLastCalledWith(null));

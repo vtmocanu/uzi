@@ -173,6 +173,44 @@ describe("CliTokens mint is show-once", () => {
   });
 });
 
+describe("CliTokens show-once panel is retired with its token", () => {
+  const SECRET = "uzc_showoncesecret01";
+
+  async function mintLaptop() {
+    mockApi.createCliToken.mockResolvedValue({ token: SECRET, cli_token: aToken({ id: "new", name: "laptop" }) });
+    renderPage();
+    fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner/), { target: { value: "laptop" } });
+    // The reload after the mint lists the new row.
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "new", name: "laptop" })] });
+    fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+    // Positive first, so the absence asserted below is not vacuous.
+    expect(await screen.findByText(SECRET)).toBeTruthy();
+  }
+
+  it("drops the panel when that token is revoked", async () => {
+    await mintLaptop();
+    mockApi.revokeCliToken.mockResolvedValue(null);
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "new", name: "laptop", revoked: true })] });
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    await waitFor(() => expect(mockApi.revokeCliToken).toHaveBeenCalledWith("new"));
+    await waitFor(() => expect(screen.queryByText(SECRET)).toBeNull());
+    expect(screen.queryByText(/once and never again/i)).toBeNull();
+  });
+
+  it("drops the panel after a confirmed Revoke all", async () => {
+    await mintLaptop();
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "new", name: "laptop", revoked: true })] });
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    // Arming the confirm alone leaves the secret on screen.
+    expect(screen.getByText(SECRET)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+    await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(SECRET)).toBeNull());
+    expect(screen.queryByText(/once and never again/i)).toBeNull();
+  });
+});
+
 describe("CliTokens revoke", () => {
   it("revokes a single token and reloads", async () => {
     mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "t9", name: "laptop" })] });

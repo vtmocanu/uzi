@@ -20,7 +20,7 @@ import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { useDemoMode } from "../lib/demoMode";
 import { maskIp } from "../lib/demoMask";
-import { PRODUCT_NAME_MAX_BYTES, productTextError } from "../lib/productText";
+import { PRODUCT_NAME_MAX_BYTES, productTextError, trimProductText } from "../lib/productText";
 import { Alert, Badge, Button, Card, EmptyState, Field, Input, SectionTitle, Select } from "./ui";
 import { PackageIcon } from "./icons";
 
@@ -35,9 +35,6 @@ const SCOPE_LABEL = Object.fromEntries(SCOPES.map((s) => [s.value, s.label])) as
   ProductTokenScope,
   string
 >;
-
-// The per-user list cap (the server's; `truncated` reports the cut).
-const USER_LIST_CAP = 200;
 
 // D10: 90 days is the default; "never" is allowed for unattended products but is
 // never preselected.
@@ -146,7 +143,7 @@ export function ProductTokens({
   const nameError = productTextError("Name", name, PRODUCT_NAME_MAX_BYTES);
   const nameErrorId = `${ids}-name-error`;
   const canCreate =
-    !busy && chosenProductId !== "" && name.trim() !== "" && nameError === null && scopes.length > 0;
+    !busy && chosenProductId !== "" && trimProductText(name) !== "" && nameError === null && scopes.length > 0;
 
   const create = async (e: FormEvent) => {
     e.preventDefault();
@@ -156,7 +153,7 @@ export function ProductTokens({
     try {
       const { token, product_token } = await api.createProductToken({
         product_id: chosenProductId,
-        name: name.trim(),
+        name: trimProductText(name),
         // Stable order on the wire whatever order the boxes were ticked in.
         scopes: SCOPES.map((s) => s.value).filter((s) => scopes.includes(s)),
         expiry,
@@ -350,7 +347,7 @@ export function ProductTokens({
           <SectionTitle>Your product tokens</SectionTitle>
           {truncated && (
             <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
-              Showing your first {USER_LIST_CAP} product tokens, active first; older tokens are not
+              Showing your first {tokens.length} product tokens, active first; older tokens are not
               listed.
             </p>
           )}

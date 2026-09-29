@@ -19,6 +19,7 @@ import {
   PRODUCT_DESCRIPTION_MAX_BYTES,
   PRODUCT_NAME_MAX_BYTES,
   productTextError,
+  trimProductText,
 } from "../lib/productText";
 import {
   Alert,
@@ -42,9 +43,6 @@ import { PackageIcon } from "../components/icons";
 
 const plural = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
-// The admin inventory cap (the server's; `truncated` reports the cut).
-const ADMIN_LIST_CAP = 1000;
-
 export function AdminProducts() {
   const { data, loading, error: loadError, reload } = useAsyncData<{
     products: Product[];
@@ -63,7 +61,9 @@ export function AdminProducts() {
   );
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const truncated = data?.truncated ?? false;
+  // When the server cut the inventory, how many tokens it did list (the notices name
+  // this number rather than a hard-coded cap that could drift from the server's).
+  const truncatedAt = data?.truncated ? data.tokens.length : null;
   // The first load failed: show only the error, never a "No products registered"
   // empty state the page cannot know to be true.
   const loadFailed = data === null && loadError !== "";
@@ -109,9 +109,9 @@ export function AdminProducts() {
         }
       />
 
-      {truncated && (
+      {truncatedAt !== null && (
         <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
-          Showing the first {ADMIN_LIST_CAP} tokens, active first; older tokens are not listed.
+          Showing the first {truncatedAt} tokens, active first; older tokens are not listed.
         </p>
       )}
 
@@ -130,7 +130,7 @@ export function AdminProducts() {
               key={p.id}
               product={p}
               tokens={tokensByProduct.get(p.id) ?? []}
-              listTruncated={truncated}
+              truncatedAt={truncatedAt}
               onToggle={(enabled) =>
                 run(async () => {
                   await api.adminUpdateProduct(p.id, { enabled });
@@ -164,13 +164,13 @@ function CreateProduct({ onCreate }: { onCreate: (name: string, description: str
   // the server is certain to refuse never leaves the form.
   const nameError = productTextError("Name", name, PRODUCT_NAME_MAX_BYTES);
   const descriptionError = productTextError("Description", description, PRODUCT_DESCRIPTION_MAX_BYTES);
-  const canSubmit = !busy && name.trim() !== "" && nameError === null && descriptionError === null;
+  const canSubmit = !busy && trimProductText(name) !== "" && nameError === null && descriptionError === null;
 
   const submit = async (e: FormEvent) => {
     e.preventDefault();
     if (!canSubmit) return;
     setBusy(true);
-    const ok = await onCreate(name.trim(), description.trim());
+    const ok = await onCreate(trimProductText(name), trimProductText(description));
     setBusy(false);
     if (ok) {
       setName("");
@@ -235,15 +235,16 @@ function DeletedBadge({ deletedAt }: { deletedAt: string }) {
 function ProductCard({
   product,
   tokens,
-  listTruncated,
+  truncatedAt,
   onToggle,
   onDelete,
   onRevoke,
 }: {
   product: Product;
   tokens: AdminProductToken[];
-  // The inventory was cut server-side, so an empty `tokens` does not mean none exist.
-  listTruncated: boolean;
+  // Non-null when the inventory was cut server-side (the number listed), so an empty
+  // `tokens` does not mean none exist.
+  truncatedAt: number | null;
   onToggle: (enabled: boolean) => Promise<boolean>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
@@ -354,8 +355,8 @@ function ProductCard({
 
         {tokens.length === 0 ? (
           <p className="text-sm text-faint">
-            {listTruncated
-              ? `None of this product’s tokens are among the first ${ADMIN_LIST_CAP} listed; its tokens may be beyond the list.`
+            {truncatedAt !== null
+              ? `None of this product’s tokens are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
               : "No tokens minted for this product."}
           </p>
         ) : (

@@ -152,6 +152,18 @@ describe("AdminProducts writes", () => {
     await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("CRM sync", "Syncs."));
   });
 
+  it("trims a trailing U+0085 as Go's TrimSpace does, instead of refusing it", async () => {
+    mockApi.adminCreateProduct.mockResolvedValueOnce({ product: aProduct({ id: "new", name: "Acme" }) });
+    renderPage();
+    fireEvent.change(await screen.findByLabelText("Name"), { target: { value: "Acme\u0085" } });
+    fireEvent.change(screen.getByLabelText(/^Description/), { target: { value: "\u0085Syncs.\u0085" } });
+    expect(screen.queryByText(/can’t contain tabs, line breaks/)).toBeNull();
+    const register = screen.getByRole("button", { name: "Register product" }) as HTMLButtonElement;
+    expect(register.disabled).toBe(false);
+    fireEvent.click(register);
+    await waitFor(() => expect(mockApi.adminCreateProduct).toHaveBeenLastCalledWith("Acme", "Syncs."));
+  });
+
   it("disables an enabled product through the toggle", async () => {
     mockApi.adminUpdateProduct.mockResolvedValue({ product: aProduct({ enabled: false }) });
     renderPage();
@@ -272,19 +284,25 @@ describe("AdminProducts toggle keeps focus while busy (review item 4)", () => {
 });
 
 describe("AdminProducts truncated inventory", () => {
-  it("says the first 1000 are shown and does not claim a product has no tokens", async () => {
+  it("names the number the server listed and does not claim a product has no tokens", async () => {
     mockApi.adminListProducts.mockResolvedValue({
       products: [aProduct(), aProduct({ id: "prod-b", name: "Metrics export", active_token_count: 4 })],
     });
-    mockApi.adminListProductTokens.mockResolvedValue({ truncated: true, tokens: [aToken()] });
+    // The count comes from the rows returned, not a cap hard-coded in the client.
+    mockApi.adminListProductTokens.mockResolvedValue({
+      truncated: true,
+      tokens: [aToken(), aToken({ id: "tok-2", name: "second" }), aToken({ id: "tok-3", name: "third" })],
+    });
     renderPage();
     expect(
-      await screen.findByText(
-        "Showing the first 1000 tokens, active first; older tokens are not listed.",
-      ),
+      await screen.findByText("Showing the first 3 tokens, active first; older tokens are not listed."),
     ).toBeTruthy();
     const metrics = await productCard("Metrics export");
-    expect(within(metrics).getByText(/its tokens may be beyond the list/)).toBeTruthy();
+    expect(
+      within(metrics).getByText(
+        "None of this product’s tokens are among the first 3 listed; its tokens may be beyond the list.",
+      ),
+    ).toBeTruthy();
     // Paired with the positive in "AdminProducts list", where the same card shape says it.
     expect(within(metrics).queryByText("No tokens minted for this product.")).toBeNull();
   });
