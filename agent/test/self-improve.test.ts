@@ -545,6 +545,8 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     "Never weaken uzi's guardrails",
     "go test ./...",
     "npm test` in web/ and agent/",
+    "task gate:<component>",
+    "api/internal/agenttmpl/builtins/",
   ];
 
   it("generic (dogfood false) omits every uzi-literal directive", () => {
@@ -574,6 +576,11 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     assert.ok(p.includes("uzi's own repository"));
     assert.ok(p.includes("Never weaken uzi's guardrails"));
     assert.ok(p.includes("go test ./..."));
+    // Learned from judge-rec triage: gate through the Taskfile, re-check a recommendation
+    // against the current tree, and never edit the verbatim upstream builtins.
+    assert.ok(p.includes("`task gate:repo` plus `task gate:<component>`"));
+    assert.ok(p.includes("still holds on the current code"));
+    assert.ok(p.includes("verbatim upstream copies: never edit them"));
     // The generic-only wording must NOT appear in the dogfood variant.
     assert.ok(!p.includes("self-improvement task on this repository."), "dogfood intro must not use the generic phrasing");
   });
