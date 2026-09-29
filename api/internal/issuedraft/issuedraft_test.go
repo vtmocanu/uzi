@@ -4,6 +4,10 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/producttoken"
 )
 
 func baseInput() Input {
@@ -235,6 +239,37 @@ func TestScrubSecretShapes(t *testing.T) {
 	keep := "commit 9fceb02d0 ver 550e8400-e29b-41d4-a716-446655440000"
 	if ScrubSecretShapes(keep) != keep {
 		t.Fatalf("a SHA/UUID was wrongly redacted: %q", ScrubSecretShapes(keep))
+	}
+}
+
+// TestScrubSecretShapesMintedUziPrefixes ranges over the EXPORTED minted uzi class
+// prefixes (uzc_/uza_ from clitoken, uzw_ from jointoken, uzp_ from producttoken,
+// PRD #1907), so this package's own copy of the uz[capw]_ pattern is bound to every
+// credential class uzi mints, not to string copies of them. secretscrub's
+// TestMintedPrefixesScrubbedOnBothPaths binds the same prefixes across all three
+// copies; this is the in-package half.
+func TestScrubSecretShapesMintedUziPrefixes(t *testing.T) {
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix)
+	body := strings.Repeat("Ab1-_", 5) // 25 chars over the whole body class, assembled at runtime
+	for _, p := range prefixes {
+		tok := p + body
+		out := ScrubSecretShapes("trace leaked " + tok + " here")
+		if strings.Contains(out, tok) || strings.Contains(out, body) {
+			t.Errorf("%s: token not fully redacted: %q", p, out)
+		}
+		if !strings.Contains(out, "[redacted]") {
+			t.Errorf("%s: expected a [redacted] marker: %q", p, out)
+		}
+	}
+	// A real minted product token rides into the filed body scrubbed.
+	tok, _, _, err := producttoken.Generate()
+	if err != nil {
+		t.Fatalf("producttoken.Generate: %v", err)
+	}
+	in := baseInput()
+	in.RationaleMd = "the trace printed UZI_TOKEN=" + tok
+	if d := Render(in); strings.Contains(d.Description, tok) {
+		t.Fatalf("a minted uzp_ token quoted in rationale must be scrubbed in the filed body:\n%s", d.Description)
 	}
 }
 

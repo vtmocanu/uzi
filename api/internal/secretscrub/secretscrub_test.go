@@ -2,9 +2,12 @@
 // scrub paths — secretscrub.Scrub (outbound Slack / persisted text) and
 // workersvc.ScrubKnownTokens (CI failure snapshots) — so a new minted prefix or a
 // changed prefix VALUE that lacks a matching scrub pattern reddens the gate
-// (PRD #954 M1, S2). It is an EXTERNAL test package on purpose (D4): it imports
-// clitoken, jointoken and workersvc, none of which secretscrub may import back —
-// secretscrub is deliberately import-light because low-level paths depend on it.
+// (PRD #954 M1, S2). The minted-prefix binding also covers the THIRD copy of the uzi
+// pattern, issuedraft.ScrubSecretShapes (judge-recommendation issue drafts), since
+// PRD #1907 added uzp_ and every copy had to learn it. It is an EXTERNAL test
+// package on purpose (D4): it imports clitoken, jointoken, producttoken, issuedraft
+// and workersvc, none of which secretscrub may import back — secretscrub is
+// deliberately import-light because low-level paths depend on it.
 package secretscrub_test
 
 import (
@@ -12,7 +15,9 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -46,16 +51,56 @@ func assertScrubbedBothPaths(t *testing.T, token string) {
 	}
 }
 
+// assertScrubbedIssueDraft is the third path for the minted uzi prefixes only:
+// issuedraft.ScrubSecretShapes carries its own copy of the uz[capw]_ pattern. It is
+// not folded into assertScrubbedBothPaths because issuedraft's forge families are
+// deliberately different (its GitHub pattern needs a 36+ char body), so the forge
+// test below could not share it.
+func assertScrubbedIssueDraft(t *testing.T, token string) {
+	t.Helper()
+	out := issuedraft.ScrubSecretShapes("leak " + token + " end")
+	if strings.Contains(out, token) {
+		t.Errorf("issuedraft.ScrubSecretShapes left %q in %q", token, out)
+	}
+	if !strings.Contains(out, "[redacted]") {
+		t.Errorf("issuedraft.ScrubSecretShapes produced no [redacted] placeholder for %q: %q", token, out)
+	}
+}
+
 // TestMintedPrefixesScrubbedOnBothPaths ranges over the EXPORTED minted-prefix
-// constants (not string copies) so a fourth prefix added to clitoken.Prefixes —
-// the same line a new prefix is registered — automatically extends this binding.
+// constants (not string copies) so a prefix added to clitoken.Prefixes, or a new
+// token class's exported Prefix added to this list, automatically extends the
+// binding to all three scrub copies (secretscrub, the CI-fix snapshot and the issue
+// draft). The name predates the third path.
 func TestMintedPrefixesScrubbedOnBothPaths(t *testing.T) {
-	// clitoken.Prefixes = {uzc_, uza_}; jointoken.Prefix = uzw_ (const, no slice needed).
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix)
+	// clitoken.Prefixes = {uzc_, uza_}; jointoken.Prefix = uzw_; producttoken.Prefix =
+	// uzp_ (PRD #1907). The last two are consts, no slice needed.
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix)
 	for _, p := range prefixes {
 		t.Run(p, func(t *testing.T) {
 			assertScrubbedBothPaths(t, p+body)
+			assertScrubbedIssueDraft(t, p+body)
 		})
+	}
+	// A real minted product token (not only the prefix plus a fixed body): its
+	// RawURLEncoding body may carry '-' and '_', which every copy's body class must
+	// cover or the tail of a live token would survive.
+	for i := 0; i < 20; i++ {
+		tok, _, _, err := producttoken.Generate()
+		if err != nil {
+			t.Fatalf("producttoken.Generate: %v", err)
+		}
+		assertScrubbedBothPaths(t, tok)
+		assertScrubbedIssueDraft(t, tok)
+		if out := secretscrub.Scrub(tok); out != "[redacted]" {
+			t.Errorf("secretscrub.Scrub left part of a minted token: %q", out)
+		}
+		if out := workersvc.ScrubKnownTokens(tok); out != "[REDACTED]" {
+			t.Errorf("workersvc.ScrubKnownTokens left part of a minted token: %q", out)
+		}
+		if out := issuedraft.ScrubSecretShapes(tok); out != "[redacted]" {
+			t.Errorf("issuedraft.ScrubSecretShapes left part of a minted token: %q", out)
+		}
 	}
 }
 

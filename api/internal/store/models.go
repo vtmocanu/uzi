@@ -458,6 +458,32 @@ type PrDescriptionVersion struct {
 	PublishedAt          pgtype.Timestamptz `json:"published_at"`
 }
 
+type Product struct {
+	ID          uuid.UUID          `json:"id"`
+	Name        string             `json:"name"`
+	Description string             `json:"description"`
+	Enabled     bool               `json:"enabled"`
+	DeletedAt   pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy   pgtype.UUID        `json:"created_by"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+}
+
+type ProductToken struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	ProductID   uuid.UUID          `json:"product_id"`
+	Name        string             `json:"name"`
+	TokenHash   []byte             `json:"token_hash"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scopes      []string           `json:"scopes"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+}
+
 type RecommendationDisposition struct {
 	ID            uuid.UUID          `json:"id"`
 	ReviewID      uuid.UUID          `json:"review_id"`

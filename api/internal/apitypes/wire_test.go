@@ -878,6 +878,42 @@ func TestAdminCLITokenDTOTags(t *testing.T) {
 		"created_at", "last_used_at", "last_used_ip", "expires_at")
 }
 
+// productTokenDTOKeys is the exact per-user product-token key set (PRD #1907). Like
+// TestAdminCLITokenDTOTags these are SECURITY pins: neither the row nor the admin row
+// may ever carry "token_hash" or "token", and an exact key set makes adding one a
+// build failure rather than a review catch.
+var productTokenDTOKeys = []string{
+	"id", "product_id", "product_name", "name", "token_prefix", "scopes", "revoked",
+	"created_at", "last_used_at", "last_used_ip", "expires_at",
+}
+
+func TestProductTokenDTOTags(t *testing.T) {
+	assertTags(t, "ProductTokenDTO", ProductTokenDTO{}, productTokenDTOKeys...)
+}
+
+func TestAdminProductTokenDTOTags(t *testing.T) {
+	want := append(append([]string{}, productTokenDTOKeys...), "user_id", "owner_email")
+	assertTags(t, "AdminProductTokenDTO", AdminProductTokenDTO{}, want...)
+}
+
+// The mint response is the ONE place the token value appears, once.
+func TestMintProductTokenResponseTags(t *testing.T) {
+	assertTags(t, "MintProductTokenResponse", MintProductTokenResponse{}, "token", "product_token")
+}
+
+func TestProductDTOTags(t *testing.T) {
+	assertTags(t, "ProductDTO", ProductDTO{},
+		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count")
+}
+
+// /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries
+// no email and no admin flag.
+func TestV1WhoamiDTOTags(t *testing.T) {
+	assertTags(t, "V1WhoamiDTO", V1WhoamiDTO{}, "user", "product", "scopes")
+	assertTags(t, "V1WhoamiUserDTO", V1WhoamiUserDTO{}, "id", "display_name")
+	assertTags(t, "V1WhoamiProductDTO", V1WhoamiProductDTO{}, "id", "name")
+}
+
 func TestUsageDTOTags(t *testing.T) {
 	assertTags(t, "UsageDTO", UsageDTO{},
 		"input_tokens", "cache_read_tokens", "cache_creation_tokens", "output_tokens", "cost_usd",

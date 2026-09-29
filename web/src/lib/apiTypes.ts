@@ -1462,6 +1462,65 @@ export interface CliTokenMint {
   cli_token: CliToken;
 }
 
+// ── Product tokens (PRD #1907) ──────────────────────────────────────────────
+// A uzp_ Bearer a user mints for an admin-registered external product. It acts as
+// that user on /api/v1 only (every internal /api route refuses it) and carries a
+// non-empty subset of these scopes. Mirrors api/internal/apitypes/product_token.go.
+export type ProductTokenScope = "jobs:run" | "jobs:read";
+
+// Product is one registered external product (apitypes.ProductDTO). deleted_at is
+// null for a live product; a soft-deleted product is always disabled and stays listed
+// for the audit trail. active_token_count counts tokens neither revoked nor expired.
+export interface Product {
+  id: string;
+  name: string;
+  description: string;
+  enabled: boolean;
+  deleted_at: string | null;
+  created_at: string;
+  active_token_count: number;
+}
+
+// ProductToken is the metadata-only view of one product token (the per-user list row,
+// apitypes.ProductTokenDTO). As for CliToken, token_prefix + last_used_at +
+// last_used_ip are the whole forensic surface; expires_at null means never expires.
+// The token value is never a field here (see ProductTokenMint).
+export interface ProductToken {
+  id: string;
+  product_id: string;
+  product_name: string;
+  name: string;
+  token_prefix: string;
+  scopes: ProductTokenScope[];
+  revoked: boolean;
+  created_at: string;
+  last_used_at: string | null;
+  last_used_ip: string | null;
+  expires_at: string | null;
+}
+
+// AdminProductToken is one row of the admin product-credential inventory
+// (apitypes.AdminProductTokenDTO): the per-user row plus owner attribution.
+export interface AdminProductToken extends ProductToken {
+  user_id: string;
+  owner_email: string;
+}
+
+// ProductTokenMint is the mint response (apitypes.MintProductTokenResponse): the
+// plaintext token shown exactly once, plus the new row's metadata.
+export interface ProductTokenMint {
+  token: string;
+  product_token: ProductToken;
+}
+
+// V1Whoami is GET /api/v1/whoami (apitypes.V1WhoamiDTO): the caller's user, the
+// product for a uzp_ caller (null for a uzc_ caller acting directly), and its scopes.
+export interface V1Whoami {
+  user: { id: string; display_name: string };
+  product: { id: string; name: string } | null;
+  scopes: ProductTokenScope[];
+}
+
 // ── CLI browser-login consent flow (PRD #64 M5/M6) ────────────────────────────
 // The `/cli-auth` consent page reads a pending request and approves/denies it.
 // status mirrors the server enum; a stale-but-pending row reports "expired".

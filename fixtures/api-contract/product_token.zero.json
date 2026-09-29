@@ -1,0 +1,13 @@
+{
+  "id": "",
+  "product_id": "",
+  "product_name": "",
+  "name": "",
+  "token_prefix": "",
+  "scopes": null,
+  "revoked": false,
+  "created_at": "0001-01-01T00:00:00Z",
+  "last_used_at": null,
+  "last_used_ip": null,
+  "expires_at": null
+}
