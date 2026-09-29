@@ -103,7 +103,7 @@ func TestLandlockCodexPackageExecutable(t *testing.T) {
 
 	tmp := privateTmp(t)
 	script := `"$CODEX" --version || exit 10
-if touch "$PROBE" 2>/dev/null; then exit 11; fi
+if ( : > "$PROBE" ) 2>/dev/null; then exit 11; fi
 exit 0`
 	args, err := json.Marshal([]string{"--root", root, "--tmp", tmp, "--cwd", root, "--mode", "required", "--", "/bin/sh", "-c", script})
 	if err != nil {
