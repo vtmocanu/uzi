@@ -7,8 +7,10 @@ package forgesvc
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -176,6 +178,7 @@ type Service struct {
 	timeout      time.Duration
 	labels       LabelConfig
 	forgeBuilder ForgeBuilder
+	groupDB      findingGroupDB
 
 	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
@@ -212,6 +215,98 @@ func NewWithForgeBuilder(q IssueStore, box *secretbox.Box, timeout time.Duration
 		s.forgeBuilder = builder
 	}
 	return s
+}
+
+// findingGroupDB supports repo-scoped reads and atomic settlement.
+type findingGroupDB interface {
+	store.DBTX
+	store.FindingGroupDB
+}
+
+// SetFindingGroupDB enables group filing reconciliation. Call at startup.
+func (s *Service) SetFindingGroupDB(db findingGroupDB) { s.groupDB = db }
+
+// pendingFindingGroups settles durable records before any forge observation. The
+// returned closure emits one warning after the pass if claims remain.
+func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([]store.FindingGroupClaimOperation, func()) {
+	if s.groupDB == nil {
+		return nil, func() {}
+	}
+	var reconcileErr error
+	finish := func() {
+		remaining, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID)
+		if err != nil {
+			slog.Warn("finding group reconciliation pending", "repo_id", repoID, "error", err)
+			return
+		}
+		if len(remaining) == 0 {
+			return
+		}
+		age := time.Since(remaining[0].CreatedAt)
+		if age < 0 {
+			age = 0
+		}
+		attrs := []any{"repo_id", repoID, "pending_group_operations", len(remaining), "oldest_age", age}
+		if reconcileErr != nil {
+			attrs = append(attrs, "error", reconcileErr)
+		}
+		slog.Warn("finding group reconciliation pending", attrs...)
+	}
+	ops, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID)
+	if err != nil {
+		reconcileErr = err
+		return nil, finish
+	}
+	if len(ops) == 0 {
+		return nil, func() {}
+	}
+	unresolved := make([]store.FindingGroupClaimOperation, 0, len(ops))
+	for _, op := range ops {
+		if op.IssueIID != nil && op.IssueURL != "" {
+			ok, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
+			if err == nil && ok {
+				continue
+			}
+			if err != nil {
+				reconcileErr = err
+			}
+			// A failed or raced settlement stays claimed.
+			continue
+		}
+		if op.Phase == "in_flight" || op.Phase == "returned_uncertain" {
+			unresolved = append(unresolved, op)
+		}
+	}
+	return unresolved, finish
+}
+
+// matchFindingGroupIssue accepts exactly one occurrence in the fetched labelled
+// slice. An invalid issue identity or a second occurrence leaves the claim intact.
+func matchFindingGroupIssue(op uuid.UUID, issues []forge.Issue) (forge.Issue, bool) {
+	marker := "<!-- uzi-finding-group-operation: " + op.String() + " -->"
+	var match forge.Issue
+	count := 0
+	for _, issue := range issues {
+		count += strings.Count(issue.Description, marker)
+		if strings.Contains(issue.Description, marker) {
+			match = issue
+		}
+	}
+	return match, count == 1 && match.IID > 0 && match.WebURL != ""
+}
+
+func (s *Service) recordFindingGroupMatches(ctx context.Context, ops []store.FindingGroupClaimOperation, issues []forge.Issue) {
+	for _, op := range ops {
+		issue, ok := matchFindingGroupIssue(op.ID, issues)
+		if !ok {
+			continue
+		}
+		recorded, err := store.RecordFindingGroupIssue(ctx, s.groupDB, op.UserID, op.ID, issue.IID, issue.WebURL)
+		if err != nil || !recorded {
+			continue
+		}
+		_, _ = store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
+	}
 }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
@@ -542,6 +637,8 @@ func (m Marks) Advance(next Marks) Marks {
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
+	pendingGroups, finishGroups := s.pendingFindingGroups(ctx, repoID)
+	defer finishGroups()
 	uziLabel := s.uziLabel(ctx)
 	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{uziLabel}})
 	if err != nil {
@@ -571,6 +668,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 	findingLabel := s.findingLabel(ctx)
 	var findingExtra []forge.Issue
 	var findingMark time.Time
+	groupIssues := issues
 	if findingLabel != uziLabel {
 		findingIssues, ferr := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{findingLabel}})
 		if ferr != nil {
@@ -578,7 +676,9 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		}
 		findingExtra = withoutLabel(findingIssues, uziLabel)
 		findingMark = maxUpdatedAt(findingIssues)
+		groupIssues = findingIssues
 	}
+	s.recordFindingGroupMatches(ctx, pendingGroups, groupIssues)
 
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return Marks{}, err
@@ -631,6 +731,8 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
+	pendingGroups, finishGroups := s.pendingFindingGroups(ctx, repoID)
+	defer finishGroups()
 	uziLabel := s.uziLabel(ctx)
 	opts := forge.ListIssuesOptions{Labels: []string{uziLabel}}
 	if !m.PRD.IsZero() {
@@ -660,6 +762,11 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 			return m, err
 		}
 	}
+	groupIssues := issues
+	if findingLabel != uziLabel {
+		groupIssues = findingIssues
+	}
+	s.recordFindingGroupMatches(ctx, pendingGroups, groupIssues)
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}

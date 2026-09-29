@@ -330,6 +330,29 @@ func GetPendingFindingGroup(ctx context.Context, db DBTX, user, id uuid.UUID) (F
 		Scan(&o.ID, &o.UserID, &o.RepoID, &o.Phase, &o.Deadline, &o.CreatedAt, &o.IssueIID, &o.IssueURL)
 	return o, err
 }
+
+// ListPendingFindingGroupsForRepo is scoped by the repository's owner, not by a
+// caller-supplied user ID. It returns only operations this sync may reconcile.
+func ListPendingFindingGroupsForRepo(ctx context.Context, db DBTX, repo uuid.UUID) ([]FindingGroupClaimOperation, error) {
+	rows, err := db.Query(ctx, `SELECT o.id,o.user_id,o.repo_id,o.phase,o.deadline_at,o.created_at,o.issue_iid,o.issue_url
+        FROM finding_group_operations o JOIN repos r ON r.id=o.repo_id
+        JOIN forge_connections c ON c.id=r.connection_id AND c.user_id=o.user_id
+        WHERE o.repo_id=$1 AND o.phase NOT IN ('released','settled') ORDER BY o.created_at,o.id`, repo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	ops := []FindingGroupClaimOperation{}
+	for rows.Next() {
+		var o FindingGroupClaimOperation
+		if err := rows.Scan(&o.ID, &o.UserID, &o.RepoID, &o.Phase, &o.Deadline, &o.CreatedAt, &o.IssueIID, &o.IssueURL); err != nil {
+			return nil, err
+		}
+		ops = append(ops, o)
+	}
+	return ops, rows.Err()
+}
+
 func FindingGroupPendingStats(ctx context.Context, db DBTX, user uuid.UUID) (int64, *time.Time, error) {
 	var count int64
 	var oldest *time.Time
