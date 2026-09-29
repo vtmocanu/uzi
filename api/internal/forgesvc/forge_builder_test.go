@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 func TestForgeForConnectionUsesInstanceGitLabBackoff(t *testing.T) {
 	const token = "glpat-" + "fake-retry-secret-0123456789"
 	var requests int
+	var backoffCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		requests++
 		if got := r.Header.Get("PRIVATE-TOKEN"); got != token {
@@ -34,6 +36,7 @@ func TestForgeForConnectionUsesInstanceGitLabBackoff(t *testing.T) {
 	svc := NewWithForgeBuilder(nil, box, 5*time.Second, nil, func(kind forge.Type, baseURL, pat string, timeout time.Duration) (forge.Forge, error) {
 		return forge.NewWithGitLabBackoff(kind, baseURL, pat, timeout,
 			func(min, max time.Duration, attempt int, resp *http.Response) time.Duration {
+				backoffCalls.Add(1)
 				if resp != nil && resp.StatusCode == http.StatusTooManyRequests {
 					return retryablehttp.DefaultBackoff(min, max, attempt, resp)
 				}
@@ -54,6 +57,9 @@ func TestForgeForConnectionUsesInstanceGitLabBackoff(t *testing.T) {
 	}
 	if requests != 6 {
 		t.Errorf("requests = %d, want 6", requests)
+	}
+	if got := backoffCalls.Load(); got != 5 {
+		t.Errorf("backoff calls = %d, want 5", got)
 	}
 	if strings.Contains(err.Error(), token) {
 		t.Errorf("error contains plaintext token: %v", err)
