@@ -1090,7 +1090,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         nullRecheck = true;
       },
     });
-    assert.ok(d.logs.some((l) => /tracking tip unreadable after a known finding/.test(JSON.stringify(l))), "the null-tip arm ran");
+    assert.ok(d.logs.some((l) => /tracking tip unreadable with flagged commits recorded/.test(JSON.stringify(l))), "the null-tip arm ran");
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
     assert.equal(d.failed()?.preserved_patch, undefined);
     assert.equal(d.pushes(), 0);
@@ -1227,6 +1227,75 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
       assert.equal(publishedTipContains(d.bare, t, X2), false);
     }
   });
+
+  it("(na-untrusted) N1: after a known finding, an untrusted post-bridge scan fails closed instead of pushing", { skip }, async () => {
+    const iid = 1932_265;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    let X = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      configure: untrustedWhen(/scanBridgedRangeAndBlock/),
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        X = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        gitIn(w, ["cherry-pick", "--allow-empty", X]);
+        await ctx.checkpoint!({ reap: true });
+        gitIn(w, ["reset", "-q", "--hard", P]);
+        commitIn(w, "d.txt", "d\n");
+        assert.equal((await gate()).action, "proceed");
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.ok(d.logs.some((l) => /post-bridge secret scan untrusted after a known finding/.test(JSON.stringify(l))));
+    assert.equal(d.pushes(), 0);
+  });
+
+  it("(ov) an overflowed flagged-commit list fails finalize closed even when the gate saw a clean branch", { skip }, async () => {
+    const d = await drive({
+      iid: 1932_266,
+      forge: "gitlab",
+      seedFlight: (f) => {
+        f.secretRemediation = { attempts: 0, overflow: true };
+      },
+      body: async (ctx, gate) => {
+        commitIn(ctx.worktreePath, "ok.txt", "ok\n");
+        assert.equal((await gate()).action, "proceed");
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.pushes(), 0);
+  });
+
+  for (const forge of ["gitlab", "github"] as const) {
+    it(`(q5) ${forge}: a rewrite that drops a published commit editing a default-branch secret-shaped line is bridged and pushed`, { skip }, async () => {
+      const iid = forge === "gitlab" ? 1932_281 : 1932_282;
+      fs.writeFileSync(path.join(fx.originPath, "fixture.env"), `TOKEN=${runtimeSecret()}\n`);
+      gitIn(fx.originPath, ["add", "fixture.env"]);
+      gitIn(fx.originPath, ["commit", "-q", "-m", "fixture on main"]);
+      const mainTip = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+      gitIn(fx.originPath, ["checkout", "-q", "-b", `agent/issue-${iid}`]);
+      fs.writeFileSync(path.join(fx.originPath, "fixture.env"), "TOKEN=\n");
+      gitIn(fx.originPath, ["commit", "-q", "-am", "C: blank the fixture"]);
+      gitIn(fx.originPath, ["checkout", "-q", "main"]);
+      const d = await drive({
+        iid,
+        forge,
+        body: async (ctx) => {
+          const w = ctx.worktreePath;
+          gitIn(w, ["fetch", "-q", "origin"]);
+          gitIn(w, ["reset", "-q", "--hard", mainTip]);
+          commitIn(w, "e.txt", "e\n");
+        },
+      });
+      assert.equal(d.failed(), undefined, JSON.stringify(d.failed()));
+      assert.ok(d.completed());
+      assert.equal(d.pushes(), 1);
+    });
+  }
 
   it("(y2) R1 GitLab: a never-flagged secret under a local-only bridge is scanned (not hidden by the bridge), not remediable, and cannot be pushed", { skip }, async () => {
     const iid = 1932_244;

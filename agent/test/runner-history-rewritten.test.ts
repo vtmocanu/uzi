@@ -310,12 +310,11 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
         forge_type: "gitlab",
       },
     });
-  /** A stub that fails the FIRST call open (the github top-of-finalize scan) then returns a trusted
-   *  finding on every later call (the post-bridge scan). Returns a counter to assert both ran. */
+  /** Stubs both scans and returns a counter of calls across them: the top-of-finalize
+   *  `secretScanRange` (GitHub only) fails open (untrusted); the post-bridge merge-aware
+   *  `secretScanCheckpointRange` returns a trusted finding. Assert on the counter that both ran. */
   const countingLeakStub = (): { calls: () => number } => {
     let n = 0;
-    // The top-of-finalize scan (GitHub only) is `secretScanRange`; the post-bridge scan is the
-    // merge-aware `secretScanCheckpointRange` (issue #1932).
     git.secretScanRange = (async () => {
       n++;
       return { trusted: false, findings: [] };

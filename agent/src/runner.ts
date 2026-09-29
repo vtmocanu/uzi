@@ -4681,6 +4681,11 @@ export class RunRunner {
         remediationFindings = remediationState.blocked;
       } else if (remediationState.known && remediationState.known.length > 0) {
         remediationFindings = remediationState.known;
+      } else if (remediationState.overflow === true) {
+        // The flagged-commit list hit its cap: an unrecorded flagged commit could hide behind a floor
+        // or a bridge, so fail closed (reason = the recorded findings, or a fixed untrusted reason).
+        if ((remediationState.flaggedFindings?.length ?? 0) > 0) remediationFindings = remediationState.flaggedFindings;
+        else rescanUntrusted = true;
       } else if (remediationState.everKnown === true) {
         const finalizeTip = await this.git.trackingTip(barePath, result.branch);
         if (finalizeTip !== null) {
@@ -5248,6 +5253,16 @@ export class RunRunner {
         await reportPushSecretBlocked(reason);
         return "blocked";
       }
+      if (!trusted && flight.secretRemediation?.everKnown === true) {
+        // D5: after a known finding an untrusted re-scan of the bridged tip fails closed. The scan is
+        // merge-aware, so untrusted here is a real instrument failure, not the bridge itself.
+        runLog.warn("post-bridge secret scan untrusted after a known finding; failing closed", {
+          run_id: runId,
+          why: untrustedWhy,
+        });
+        await reportRemediationBlocked(undefined, false);
+        return "blocked";
+      }
       if (!trusted) {
         runLog.warn(
           "post-bridge secret scan: not trustworthy; pushing and relying on the GH013 remote backstop where it exists",
@@ -5265,13 +5280,15 @@ export class RunRunner {
     // flagged commit; an unreadable tracking tip after a known finding fails closed the same way.
     // A flagged commit the mid-turn checkpoint scan recorded (`everKnown` unset: the remediation gate
     // never saw it) is re-checked only when a bridge is in play (`bridgeInPlay`): a plain push of an
-    // unbridged tip is the pre-existing contract, and the done-point gate is what fails such a run.
+    // unbridged tip is the pre-existing contract: the done-point gate (wired by the executors) fails such a
+    // run for non-interactive runs, and an unbridged tip with only tick-flagged commits and no gate call is a
+    // known pre-existing gap, filed separately.
     const recheckFlaggedBeforePush = async (scanBare: string, bridgeInPlay: boolean): Promise<"blocked" | "ok"> => {
       const st = flight.secretRemediation;
       if (!st || (st.everKnown !== true && (!bridgeInPlay || (st.flaggedCommits?.length ?? 0) === 0))) return "ok";
       const tip = await this.git.trackingTip(scanBare, result.branch);
       if (tip === null) {
-        runLog.warn("pre-push flagged-commit re-check: tracking tip unreadable after a known finding; failing closed", {
+        runLog.warn("pre-push flagged-commit re-check: tracking tip unreadable with flagged commits recorded; failing closed", {
           run_id: runId,
         });
         await reportRemediationBlocked(undefined, false);
