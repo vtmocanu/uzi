@@ -741,7 +741,7 @@ Completes Feature #64/#175: `uzi version` reported both versions and never compa
   [user 2026-08-03, chosen from three placements]
 - The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
 - The server's version is probed on a cache, never once per command. [user 2026-08-03]
-- The remedy offered is `brew upgrade uzi-cli`. [user 2026-08-03]
+- The warning's remedy follows the CLI's stamped channel: `-rc.N` builds say `brew upgrade uzi-cli-rc`; stable builds say `brew upgrade uzi-cli`. (AI-synced 2026-09-29, #1890)
 
 ## Feature #325 — TUI redesign ("factory shift board")
 
@@ -806,7 +806,7 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 
 Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
 
-- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit; surfaces meant for stable users (the Homebrew formula, the GitHub Release marked latest, the in-app update check) never surface a candidate. [user, #1265]
+- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit. Stable-facing update surfaces (the `uzi-cli` formula, the GitHub Release marked latest, and the TUI update prompt for stable installs) never surface a candidate; the TUI update prompt for a `uzi-cli-rc` install offers newer candidates only. (AI-synced 2026-09-29, #1890)
 
 ## Feature #1349 — Recovery custody hardening
 

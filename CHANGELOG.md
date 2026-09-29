@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **RC channel update prompts and correct Homebrew upgrade commands ([#1890](https://github.com/vtmocanu/uzi/issues/1890)).**
+  The TUI offers newer release candidates to `uzi-cli-rc` installs while stable installs stay on stable releases. The CLI version-skew warning now names the matching formula, and an RC install is never offered a stable-formula upgrade action.
+
 - **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
   It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
 
