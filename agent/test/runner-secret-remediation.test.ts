@@ -682,6 +682,187 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.equal(d.pushes(), 0);
   });
 
+  it("(q) clause (b): a known at-floor finding still fails finalize after the agent resets the clone to a clean-scanned commit", { skip }, async () => {
+    const decisions: SecretRemediationDecision[] = [];
+    let floor = "";
+    const d = await drive({
+      iid: 1932_230,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        const x = commitIn(w, "x.txt", "clean\n");
+        decisions.push(await gate()); // clean at X: cleanTip = X
+        const flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        floor = commitIn(w, "b.txt", "b\n");
+        await ctx.checkpoint!({ reap: false }); // fetch-back only: the floor commit lands in the bare
+        gitIn(w, ["reset", "-q", "--hard", flagged]);
+        commitIn(w, "c.txt", "c\n");
+        decisions.push(await gate()); // finding reachable from the floor: known, at-floor, not remediable
+        gitIn(w, ["reset", "-q", "--hard", x]); // the finalize tip equals cleanTip again
+      },
+      seedFlight: (f) => {
+        if (floor) f.checkpointFloor = floor;
+      },
+    });
+    assert.deepEqual(decisions.map((x) => x.action), ["proceed", "proceed"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.match(d.failed()?.failure_reason ?? "", /\(rule github-pat\)/);
+    assert.equal(d.pushes(), 0);
+    assert.equal(d.failed()?.preserved_patch, undefined);
+  });
+
+  it("(r) an unknown ancestry counts as at-floor: no remediation turn, finalize fails", { skip }, async () => {
+    const decisions: SecretRemediationDecision[] = [];
+    let base = "";
+    const d = await drive({
+      iid: 1932_231,
+      forge: "gitlab",
+      configure: (g) => {
+        (g as unknown as { ancestry: unknown }).ancestry = async () => "unknown";
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        base = gitIn(w, ["rev-parse", "HEAD"]);
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        decisions.push(await gate());
+      },
+      seedFlight: (f) => {
+        f.checkpointFloor = base;
+      },
+    });
+    assert.deepEqual(decisions.map((x) => x.action), ["proceed"]);
+    assert.ok(!d.statuses().some((t) => /returning to the lead/.test(t)), "no remediation turn was requested");
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.equal(d.pushes(), 0);
+  });
+
+  it("(s) the follow-up names the checkpoint floor when it is a scan floor of the range", { skip }, async () => {
+    let floor = "";
+    let followUp = "";
+    await drive({
+      iid: 1932_232,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        floor = commitIn(w, "m.txt", "m\n"); // clean, strictly above the exclude floor
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        const first = await gate();
+        assert.equal(first.action, "remediate");
+        followUp = (first as { followUp: string }).followUp;
+      },
+      seedFlight: (f) => {
+        if (floor) f.checkpointFloor = floor;
+      },
+    });
+    assert.ok(floor.length === 40);
+    assert.ok(followUp.includes(`Never rewrite commits at or below ${floor}`), followUp);
+    assert.ok(followUp.includes(`--autosquash ${floor}`), followUp);
+  });
+
+  it("(s2) the follow-up names the range exclude SHA when the checkpoint floor is not an ancestor of the tip", { skip }, async () => {
+    let base = "";
+    let stray = "";
+    let followUp = "";
+    await drive({
+      iid: 1932_233,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        base = gitIn(w, ["rev-parse", "HEAD"]);
+        stray = commitIn(w, "stray.txt", "s\n");
+        await ctx.checkpoint!({ reap: false }); // the stray commit lands in the bare
+        gitIn(w, ["reset", "-q", "--hard", base]);
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        const first = await gate();
+        assert.equal(first.action, "remediate");
+        followUp = (first as { followUp: string }).followUp;
+      },
+      seedFlight: (f) => {
+        if (stray) f.checkpointFloor = stray;
+      },
+    });
+    assert.ok(stray.length === 40 && base.length === 40);
+    assert.ok(followUp.includes(`Never rewrite commits at or below ${base}`), followUp);
+    assert.ok(!followUp.includes(stray), "the non-ancestor floor is not named");
+  });
+
+  it("(t) clause (c), clean re-scan: a benign commit after the last clean gate is scanned at finalize and the run pushes", { skip }, async () => {
+    let flagged = "";
+    const d = await drive({
+      iid: 1932_234,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(w, flagged, "cfg.env", "TOKEN=\n");
+        assert.equal((await gate()).action, "proceed");
+        commitIn(w, "late.txt", "benign\n"); // no re-gate
+      },
+    });
+    assert.ok(d.completed(), JSON.stringify(d.failed()));
+    assert.equal(d.failed(), undefined);
+    assert.equal(d.pushes(), 1);
+  });
+
+  it("(u) clause (c), findings on re-scan: a post-gate commit that re-adds a secret fails naming the NEW finding only", { skip }, async () => {
+    let flagged = "";
+    let late = "";
+    const d = await drive({
+      iid: 1932_235,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(w, flagged, "cfg.env", "TOKEN=\n");
+        assert.equal((await gate()).action, "proceed");
+        late = commitIn(w, "late.env", `TOKEN=${runtimeSecret()}\n`); // no re-gate
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    const reason = d.failed()?.failure_reason ?? "";
+    assert.ok(reason.includes(late.slice(0, 12)), reason);
+    assert.match(reason, /late\.env/);
+    assert.ok(!reason.includes(flagged.slice(0, 12)), "the rewritten-out commit is not named");
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    assert.ok(d.pins.length >= 1, "recovery pin kept");
+  });
+
+  it("(v) clause (c), untrusted re-scan: fails with the fixed reason and names no stale commit", { skip }, async () => {
+    let flagged = "";
+    let untrusted = false;
+    const d = await drive({
+      iid: 1932_236,
+      forge: "gitlab",
+      configure: (g) => {
+        const orig = g.secretScanCheckpointRange.bind(g);
+        g.secretScanCheckpointRange = (async (...args: Parameters<GitCache["secretScanCheckpointRange"]>) =>
+          untrusted ? { trusted: false, findings: [], reason: "deadline" as const } : orig(...args)) as GitCache["secretScanCheckpointRange"];
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(w, flagged, "cfg.env", "TOKEN=\n");
+        assert.equal((await gate()).action, "proceed");
+        commitIn(w, "late.txt", "benign\n"); // no re-gate
+        untrusted = true; // only the finalize re-scan sees the untrusted scanner
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    const reason = d.failed()?.failure_reason ?? "";
+    assert.match(reason, /the re-scan of the final branch could not be trusted/);
+    assert.match(reason, /uzi run export/);
+    assert.ok(reason.length <= 512, String(reason.length));
+    assert.ok(!reason.includes(flagged.slice(0, 12)), "no stale commit named");
+    assert.doesNotMatch(reason, /flagged\s+[0-9a-f]{12}/);
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    assert.ok(d.pins.length >= 1, "recovery pin kept");
+  });
+
   it("the gate is a no-op proceed on a clean branch and leaves the checkpoint behavior unchanged", { skip }, async () => {
     const decisions: SecretRemediationDecision[] = [];
     const d = await drive({

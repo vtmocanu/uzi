@@ -1440,9 +1440,12 @@ interface RunFlight {
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
-   *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted scan that still
-   *  suppress every checkpoint publish; `blocked` = findings that make finalize fail terminally
-   *  (`push_secret_blocked`, no push); `cleanTip` = the tracking tip of the last CLEAN trusted scan;
+   *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
+   *  still suppress every checkpoint publish, and that make finalize fail (`push_secret_blocked`,
+   *  no push) while non-empty; `blocked` = findings that make finalize fail terminally (cap
+   *  exhausted, or an untrusted rescan after a known finding); `cleanTip` = the tracking tip of the
+   *  last CLEAN trusted gate scan, used by the reap-publish hold and to decide at finalize whether
+   *  the branch moved since (a moved branch is RE-SCANNED there, never failed on this field alone);
    *  `everKnown` = a finding has been known at some point in this run; `withholdPaths` = the
    *  gitleaks text scan of the finding paths was untrusted or flagged them (render no path). */
   secretRemediation?: {
@@ -1451,9 +1454,6 @@ interface RunFlight {
     blocked?: SecretFinding[];
     cleanTip?: string;
     everKnown?: boolean;
-    /** The findings of the most recent trusted flagging scan, kept after `known` is cleared by a
-     *  clean rescan so finalize can name them when the branch moved after the clean scan. */
-    lastFindings?: SecretFinding[];
     withholdPaths?: boolean;
   };
 }
@@ -4594,14 +4594,19 @@ export class RunRunner {
     // (push_secret_blocked, no push, no preserved_patch, recovery pin kept for `uzi run export`) when
     //  (a) the gate set `blocked` (cap exhausted / untrusted rescan after a known finding), OR
     //  (b) `known` is non-empty: a trusted finding the gate still knows (including at-floor ones,
-    //      which are not remediable and so never reach `blocked`), OR
+    //      which are not remediable and so never reach `blocked`; the agent may since have reset the
+    //      clone to a clean-scanned commit, and `known` is what still fails that run), OR
     //  (c) a finding was known at some point and the finalize tracking tip is not the tip of the
-    //      last CLEAN trusted gate scan (the branch moved after the clean scan, e.g. the still-alive
-    //      agent reset back to the flagged commit).
+    //      last CLEAN trusted gate scan (the branch moved after it). The agent is reaped by now, so
+    //      the final branch is RE-SCANNED here with the gate's scan core (no re-fetch: the finalize
+    //      fetch already ran): clean => finalize proceeds; findings => fail naming the NEW findings;
+    //      an untrusted re-scan => fail with a fixed reason (never a stale commit).
     // Nothing has been pushed or published between executor.run returning and this point.
     const remediationState = flight.secretRemediation;
     if (remediationState) {
       let remediationFindings: SecretFinding[] | undefined;
+      let rescanUntrusted = false;
+      let withholdFromState = remediationState.withholdPaths === true;
       if (remediationState.blocked && remediationState.blocked.length > 0) {
         remediationFindings = remediationState.blocked;
       } else if (remediationState.known && remediationState.known.length > 0) {
@@ -4609,33 +4614,58 @@ export class RunRunner {
       } else if (remediationState.everKnown === true) {
         const finalizeTip = await this.git.trackingTip(barePath, result.branch);
         if (finalizeTip === null || finalizeTip !== remediationState.cleanTip) {
-          remediationFindings = remediationState.lastFindings ?? [];
+          let rescanWhy = "tracking_tip_missing";
+          if (finalizeTip !== null) {
+            try {
+              const rescan = await this.scanRemediationRange(flight, barePath, result.branch, finalizeTip);
+              if (!rescan.trusted) {
+                rescanWhy = rescan.why;
+              } else {
+                rescanWhy = "";
+                if (rescan.findings.length > 0) {
+                  remediationFindings = rescan.findings;
+                  withholdFromState = false; // the new findings get their own path check below
+                }
+              }
+            } catch (e) {
+              rescanWhy = `rescan_threw: ${errMessage(e)}`;
+            }
+          }
+          if (rescanWhy !== "") {
+            rescanUntrusted = true;
+            runLog.warn("finalize secret re-scan after a known finding could not be trusted; failing", {
+              run_id: runId,
+              why: rescanWhy,
+            });
+          }
         }
       }
-      if (remediationFindings) {
-        const withholdPaths =
-          remediationState.withholdPaths === true || (await this.withholdPathsFor(remediationFindings));
-        const reason =
-          remediationFindings.length > 0
-            ? composeLocalScanBlockedReason(remediationFindings, { redact: redactText, withholdPaths })
-            : "the pre-push secret scan flagged this branch earlier in the run, and the branch changed after the last clean scan; failing without pushing — the diff is withheld because it may carry the secret";
-        batcher.emit({
-          kind: "status",
-          agent: "worker",
-          payload: {
-            text:
-              remediationFindings.length > 0
-                ? `the pre-push secret scan flagged ${renderSecretFindings(remediationFindings, { redact: redactText, withholdPaths })}; failing early without pushing — the diff is withheld because it may carry the secret`
-                : "the branch changed after the last clean secret scan; failing early without pushing — the diff is withheld because it may carry the secret",
-          },
-        });
-        runLog.info(
-          "run failed: the pre-exit secret remediation gate blocked the branch; withholding diff (it may carry the secret)",
-          {
+      if (remediationFindings || rescanUntrusted) {
+        let reason: string;
+        let statusText: string;
+        if (remediationFindings) {
+          const withholdPaths = withholdFromState || (await this.withholdPathsFor(remediationFindings));
+          reason = composeLocalScanBlockedReason(remediationFindings, { redact: redactText, withholdPaths });
+          statusText = `the pre-push secret scan flagged ${renderSecretFindings(remediationFindings, { redact: redactText, withholdPaths })}; failing early without pushing — the diff is withheld because it may carry the secret`;
+          runLog.info(
+            "run failed: the pre-exit secret remediation gate blocked the branch; withholding diff (it may carry the secret)",
+            {
+              run_id: runId,
+              findings: remediationFindings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
+            },
+          );
+        } else {
+          reason = (
+            "This run's branch was not pushed: a secret finding was flagged earlier in the run and the branch changed after the last clean scan, but the re-scan of the final branch could not be trusted. " +
+            "The diff is withheld because it may carry the detected secret; if a durable-recovery archive of this run is available, export it with `uzi run export`."
+          );
+          statusText =
+            "a secret finding was flagged earlier and the branch changed after the last clean scan, but the re-scan of the final branch could not be trusted; failing early without pushing — the diff is withheld because it may carry the secret";
+          runLog.info("run failed: the final-branch secret re-scan was untrusted after a known finding; withholding diff", {
             run_id: runId,
-            findings: remediationFindings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
-          },
-        );
+          });
+        }
+        batcher.emit({ kind: "status", agent: "worker", payload: { text: statusText } });
         await closeBatcher();
         await reportPushSecretBlocked(reason);
         return;
@@ -9494,6 +9524,39 @@ export class RunRunner {
   }
 
   /**
+   * issue #1932: the scan core shared by the pre-exit remediation gate and the D5 finalize re-scan.
+   * Resolves the checkpoint range with the run's floors (checkpoint floor, attempted / confirmed /
+   * published checkpoint tips), requires its tip to equal `expectedTip` (the tracking tip the caller
+   * holds), and runs the local gitleaks range scan. Credential-free; it fetches nothing, so a caller
+   * that needs a fresh tracking ref fetches first. Trusted only when the range resolved AND the scan
+   * is trustworthy.
+   */
+  private async scanRemediationRange(
+    flight: RunFlight,
+    barePath: string,
+    branch: string,
+    expectedTip: string,
+  ): Promise<
+    | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
+    | { trusted: false; why: string }
+  > {
+    const floorCandidates = [
+      flight.checkpointFloor,
+      flight.lastAttemptedCheckpointRefTip,
+      flight.publishedTip,
+      flight.lastCheckpointRefTip,
+    ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
+    const range = await this.git.resolveCheckpointRange(barePath, branch, {
+      confirmedTip: flight.lastCheckpointRefTip,
+      extraFloors: floorCandidates,
+    });
+    if (!range || range.tipSha !== expectedTip) return { trusted: false, why: "range_unresolved" };
+    const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
+    if (!scan.trusted) return { trusted: false, why: scan.reason ?? "scan_untrusted" };
+    return { trusted: true, range, findings: scan.findings, floorCandidates };
+  }
+
+  /**
    * issue #1932 D2 — the pre-exit secret remediation gate (`RunContext.secretRemediationGate`).
    * Called by the executor at the done point, BEFORE any done checkpoint. Credential-free only
    * (a file:// fetch-back and local gitleaks; no PAT, no overlay), so it is legal with the agent
@@ -9504,7 +9567,7 @@ export class RunRunner {
    *  - untrusted scan (failed fetch-back, tracking tip != clone tip, unresolved range, untrusted
    *    gitleaks) => proceed when nothing is known, else blocked = known and fail
    *  - trusted and clean => clear `known`, remember the scanned tip as `cleanTip`, proceed (finalize
-   *    still fails if a finding was ever known and the finalize tip != `cleanTip`)
+   *    RE-SCANS the final branch when a finding was ever known and its tip != `cleanTip`)
    *  - trusted, ANY finding reachable from a floor (checkpoint floor, confirmed/attempted checkpoint
    *    tip, published tip; including floors no longer ancestors of the tip; an unknown ancestry
    *    counts as reachable) => proceed with no remediation, `known` set so every checkpoint publish
@@ -9541,32 +9604,21 @@ export class RunRunner {
       if (!fetched || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
         return failOrProceed("tracking_tip_stale");
       }
-      const floorCandidates = [
-        flight.checkpointFloor,
-        flight.lastAttemptedCheckpointRefTip,
-        flight.publishedTip,
-        flight.lastCheckpointRefTip,
-      ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
-      const range = await this.git.resolveCheckpointRange(barePath, branch, {
-        confirmedTip: flight.lastCheckpointRefTip,
-        extraFloors: floorCandidates,
-      });
-      if (!range || range.tipSha !== cloneTip) return failOrProceed("range_unresolved");
-      const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
-      if (!scan.trusted) return failOrProceed(scan.reason ?? "scan_untrusted");
-      if (scan.findings.length === 0) {
+      const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip);
+      if (!scanned.trusted) return failOrProceed(scanned.why);
+      const { range, floorCandidates } = scanned;
+      if (scanned.findings.length === 0) {
         state.known = undefined;
         state.cleanTip = range.tipSha;
         return { action: "proceed" };
       }
-      const findings = scan.findings;
+      const findings = scanned.findings;
       // issue #1932 D6(c): a committed filename can itself be a secret. Scan the raw path list with
       // gitleaks before rendering anything; an untrusted or flagging scan withholds EVERY path on
       // every surface (prompt, feed, failure_reason, log).
       const withholdPaths = await this.withholdPathsFor(findings);
       state.withholdPaths = withholdPaths;
       state.everKnown = true;
-      state.lastFindings = findings;
       let atFloor = false;
       for (const f of findings) {
         let reachable = typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit);

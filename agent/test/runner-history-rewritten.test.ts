@@ -4,7 +4,7 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
-import { makeClaim, nullLogger } from "./helpers.js";
+import { makeClaim, nullLogger, recordingLogger } from "./helpers.js";
 import { type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import { GitHubClient } from "../src/forge.js";
@@ -17,6 +17,7 @@ import {
   git,
   installHarness,
   runner,
+  runnerWith,
 } from "./runner-harness.js";
 import { RunRunner, composeHistoryRewrittenReason } from "../src/runner.js";
 
@@ -340,6 +341,38 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     assert.doesNotMatch(reason, /GH013/, "the gitlab reason is forge-neutral: no GH013");
     assert.doesNotMatch(reason, /GitHub Push Protection/i, "the gitlab reason is forge-neutral: no GitHub Push Protection");
     assert.match(reason, /pre-push secret scan \(gitleaks default ruleset\) flagged/i, "the reason cites the pre-push scan");
+  });
+
+  it("(GitLab) the post-bridge block withholds a secret-shaped filename the path scan flags (issue #1932 B2)", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/pb-gitlab-hostile-name";
+    const P = publishBranch(branch);
+    const body = "aaaa1111-bbbb-2222-cccc-3333dddd4444";
+    const name = "heroku_api_key" + "=" + body + ".env";
+    git.secretScanRange = (async () => ({
+      trusted: true as const,
+      findings: [{ commit: "deadbeef", file: name, startLine: 1, ruleId: "generic-api-key" }],
+    })) as typeof git.secretScanRange;
+    // The path-list scan flags a text that carries the secret-shaped name (deterministic, no shim).
+    git.scanPatchForSecrets = (async (text: string) => ({
+      trusted: true as const,
+      findings: text.includes(body) ? [{ ruleId: "generic-api-key", startLine: 1 }] : [],
+    })) as unknown as typeof git.scanPatchForSecrets;
+    const { logger, lines } = recordingLogger();
+    const claim = gitlabClaimTyped(branch);
+    await runnerWith(() => ({ executor: rewritingExecutor({}) }), gitlab, undefined, logger).execute(claim);
+
+    assert.strictEqual(gitIn(fx.originPath, ["rev-parse", branch]), P, "nothing was pushed");
+    const failed = failedBody(claim.run_id);
+    assert.strictEqual(failed.fail_origin, "push_secret_blocked");
+    assert.match(failed.failure_reason ?? "", /\[path withheld\]/);
+    const everything = JSON.stringify([
+      api.messages(claim.run_id),
+      api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body),
+      lines,
+    ]);
+    assert.ok(!everything.includes(body), "the filename is absent from failure_reason, feed and log");
+    assert.ok(lines.length > 0, "the log was captured");
   });
 
   it("(GitLab, OMITTED forge_type) a trusted post-bridge finding still gets forge-neutral wording (finding 8, R8)", async () => {
