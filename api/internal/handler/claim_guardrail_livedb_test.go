@@ -6,12 +6,10 @@ import (
 	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -64,7 +62,7 @@ func newClaimGuardFixture(ctx context.Context, t *testing.T) claimGuardFixture {
 
 	// Real forgesvc + real privcheck.Service + a real workersvc wired with the guard
 	// via SetRepoGuard — the M6 seam under test, no fakes on the guard path.
-	svc := forgesvc.New(q, box, 5*time.Second, nil)
+	svc := newZeroWaitForgeService(q, box)
 	pcheck := privcheck.NewService(q, svc)
 	wsvc := workersvc.New(q, box, workersvc.Params{})
 	wsvc.SetRepoGuard(pcheck)

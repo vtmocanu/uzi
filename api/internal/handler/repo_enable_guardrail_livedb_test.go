@@ -11,14 +11,12 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/config"
-	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -163,7 +161,7 @@ func newEnableGuardFixture(ctx context.Context, t *testing.T) enableGuardFixture
 
 	// A real forgesvc builds the real GitLab driver against the fake server, and a
 	// real privcheck.Service runs GuardRepo through it — no fakes on the guard path.
-	svc := forgesvc.New(q, box, 5*time.Second, nil)
+	svc := newZeroWaitForgeService(q, box)
 	pcheck := privcheck.NewService(q, svc)
 
 	f := enableGuardFixture{

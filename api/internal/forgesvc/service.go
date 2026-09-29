@@ -166,12 +166,16 @@ type LabelConfig interface {
 	FindingLabel(ctx context.Context) (string, error)
 }
 
+// ForgeBuilder constructs a forge client from its type, base URL, token, and timeout.
+type ForgeBuilder func(forge.Type, string, string, time.Duration) (forge.Forge, error)
+
 // Service bundles the dependencies for building forge clients and syncing.
 type Service struct {
-	q       IssueStore
-	box     *secretbox.Box
-	timeout time.Duration
-	labels  LabelConfig
+	q            IssueStore
+	box          *secretbox.Box
+	timeout      time.Duration
+	labels       LabelConfig
+	forgeBuilder ForgeBuilder
 
 	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
@@ -197,7 +201,17 @@ type ReworkCanceller interface {
 // every forge HTTP call; labels resolves the configured uzi label the sync
 // filters on (nil is tolerated and falls back to the compiled-in default).
 func New(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig) *Service {
-	return &Service{q: q, box: box, timeout: timeout, labels: labels}
+	return &Service{q: q, box: box, timeout: timeout, labels: labels, forgeBuilder: forge.New}
+}
+
+// NewWithForgeBuilder constructs a Service with a supplied forge client builder.
+// A nil builder uses the same default as New.
+func NewWithForgeBuilder(q IssueStore, box *secretbox.Box, timeout time.Duration, labels LabelConfig, builder ForgeBuilder) *Service {
+	s := New(q, box, timeout, labels)
+	if builder != nil {
+		s.forgeBuilder = builder
+	}
+	return s
 }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
@@ -239,7 +253,7 @@ func (s *Service) EncryptToken(pat string) ([]byte, error) {
 // ForgeForToken builds a driver from a plaintext token (the connect/verify path,
 // before the token is stored).
 func (s *Service) ForgeForToken(forgeType forge.Type, baseURL, token string) (forge.Forge, error) {
-	return forge.New(forgeType, baseURL, token, s.timeout)
+	return s.forgeBuilder(forgeType, baseURL, token, s.timeout)
 }
 
 // ForgeForConnection builds a driver from a stored connection by decrypting its
@@ -249,7 +263,7 @@ func (s *Service) ForgeForConnection(forgeType, baseURL string, tokenCiphertext 
 	if err != nil {
 		return nil, err
 	}
-	return forge.New(forge.Type(forgeType), baseURL, string(plain), s.timeout)
+	return s.ForgeForToken(forge.Type(forgeType), baseURL, string(plain))
 }
 
 // AutoMove applies a single-column move forge-first, then updates the issue

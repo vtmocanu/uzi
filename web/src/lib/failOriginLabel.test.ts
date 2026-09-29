@@ -10,6 +10,10 @@ describe("failOriginLabel", () => {
     expect(failOriginLabel("worker_residue_blocked")).toBe("worker residue blocked");
   });
 
+  it("labels the skills_plugin_load_failed origin (issue #1888)", () => {
+    expect(failOriginLabel("skills_plugin_load_failed")).toBe("skills plugin load failed");
+  });
+
   it("labels the data_volume_full origin (PRD #1809)", () => {
     expect(failOriginLabel("data_volume_full")).toBe("data volume full");
   });

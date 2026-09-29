@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/hashicorp/go-retryablehttp"
 	gitlab "gitlab.com/gitlab-org/api/client-go/v3"
 
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
@@ -60,15 +61,12 @@ type gitLab struct {
 // honors 429 + Retry-After and backs off on 5xx; we route it through our
 // timeout client so no call can hang forever. baseURL is assumed
 // allowlist-checked by the caller.
-func newGitLab(baseURL, token string, timeout time.Duration) (*gitLab, error) {
+func newGitLab(baseURL, token string, timeout time.Duration, backoff ...retryablehttp.Backoff) (*gitLab, error) {
 	hc := timeoutClient(timeout)
 	// Stop at an off-origin redirect instead of failing it: the SDK's retry policy
 	// re-sends a GET whose redirect check errored, five times with backoff.
 	hc.CheckRedirect = redirectguard.StopOffOrigin
-	client, err := gitlab.NewClient(token,
-		gitlab.WithBaseURL(baseURL),
-		gitlab.WithHTTPClient(hc),
-	)
+	client, err := gitlab.NewClient(token, gitLabClientOptions(baseURL, hc, backoff...)...)
 	if err != nil {
 		// NewClient failure can only stem from the base URL here; still route
 		// it through a redactor in case the token ever appears.
@@ -88,6 +86,15 @@ func newGitLab(baseURL, token string, timeout time.Duration) (*gitLab, error) {
 		token:     token,
 		logClient: logClient,
 	}, nil
+}
+
+// gitLabClientOptions leaves the SDK retry policy untouched for ordinary drivers.
+func gitLabClientOptions(baseURL string, hc *http.Client, backoff ...retryablehttp.Backoff) []gitlab.ClientOptionFunc {
+	options := []gitlab.ClientOptionFunc{gitlab.WithBaseURL(baseURL), gitlab.WithHTTPClient(hc)}
+	if len(backoff) != 0 {
+		options = append(options, gitlab.WithCustomBackoff(backoff[0]))
+	}
+	return options
 }
 
 // wrapErr adds op context and routes the error through the PAT redactor so no

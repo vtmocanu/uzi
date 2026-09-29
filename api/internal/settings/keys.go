@@ -208,9 +208,9 @@ const (
 	// "update available" / "far behind" / "security" are DERIVED at read time with
 	// zero egress — the SAME poll→persist→derive core as the agent-source keys above,
 	// a different target. Two independent CONFIG toggles plus an interval (in
-	// Defaults); the optional token is the only secret; the six remote-fact keys are
+	// Defaults); the optional token is the only secret; the remote-fact keys are
 	// ENGINE-written (absent from Defaults, never secret — the release-check Runner
-	// sets them via UpsertAppSetting, then Cache.Invalidate()).
+	// sets them in one transaction, then invalidates the cache).
 	KeyReleaseCheckEnabled       = "release_check_enabled"        // master gate: off → the api never calls github.com
 	KeyReleaseCheckBannerEnabled = "release_check_banner_enabled" // governs only the escalation banner (cosmetic)
 	KeyReleaseCheckInterval      = "release_check_interval"       // poll cadence, a Go duration with a 1m floor
@@ -219,20 +219,25 @@ const (
 	// OUT of Defaults so it never leaks through a value read.
 	KeyReleaseCheckToken = "release_check_token"
 	// Engine-managed remote-fact keys (PRD #836 M1). Persisted by the release-check
-	// Runner from the releases/latest payload; kept out of Defaults (engine pattern,
+	// Runner from the stable latest and RC releases payloads; kept out of Defaults (engine pattern,
 	// like the agent-source remote-fact keys) so a generic PUT can never write them.
 	// "Update available"/"far behind"/"security" are DERIVED from these plus the
 	// running version, never stored — see releasecheck.UpdateAvailable / FarBehind /
 	// Security.
-	KeyReleaseLatestTag   = "release_latest_tag"   // v-prefixed tag_name of the latest upstream release
-	KeyReleaseLatestName  = "release_latest_name"  // release name
-	KeyReleaseLatestBody  = "release_latest_body"  // markdown release notes (the ### Security scan + notes excerpt)
-	KeyReleaseNotesURL    = "release_notes_url"    // html_url of the latest release
-	KeyReleasePublishedAt = "release_published_at" // RFC3339 publish timestamp of the latest release
-	KeyReleaseCheckedAt   = "release_checked_at"   // RFC3339 timestamp of the last check
+	KeyReleaseLatestTag     = "release_latest_tag"   // v-prefixed tag_name of the latest upstream release
+	KeyReleaseLatestName    = "release_latest_name"  // release name
+	KeyReleaseLatestBody    = "release_latest_body"  // markdown release notes (the ### Security scan + notes excerpt)
+	KeyReleaseNotesURL      = "release_notes_url"    // html_url of the latest release
+	KeyReleasePublishedAt   = "release_published_at" // RFC3339 publish timestamp of the latest release
+	KeyReleaseCheckedAt     = "release_checked_at"   // RFC3339 timestamp of the last check
+	KeyReleaseRCTag         = "release_rc_tag"
+	KeyReleaseRCName        = "release_rc_name"
+	KeyReleaseRCBody        = "release_rc_body"
+	KeyReleaseRCNotesURL    = "release_rc_notes_url"
+	KeyReleaseRCPublishedAt = "release_rc_published_at"
 	// KeyReleaseBannerSnoozeTag records the release tag an admin snoozed the escalation
 	// banner for (PRD #836 M6). Engine/admin-written via the snooze endpoint's
-	// UpsertAppSetting — kept OUT of Defaults (like the six remote-fact keys) and never
+	// UpsertAppSetting — kept OUT of Defaults (like the remote-fact keys) and never
 	// secret. "banner_snoozed" is DERIVED at read time: true iff this equals the current
 	// latest_tag, so a newer upstream release changes latest_tag and the snooze
 	// auto-expires with no admin action.
@@ -500,7 +505,7 @@ var Defaults = map[string]string{
 	// an absent row synthesizes to these defaults (master + banner ON, 6h cadence), so
 	// All/AdminView surface them on every instance and no migration seeds them. The
 	// token (release_check_token) is a SecretKeys member, deliberately NOT here; the
-	// six engine-written remote-fact keys are likewise absent (only the release-check
+	// engine-written remote-fact keys are likewise absent (only the release-check
 	// Runner writes them).
 	KeyReleaseCheckEnabled:       DefaultReleaseCheckEnabled,
 	KeyReleaseCheckBannerEnabled: DefaultReleaseCheckBannerEnabled,

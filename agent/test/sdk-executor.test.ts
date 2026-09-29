@@ -5619,3 +5619,175 @@ describe("SdkExecutor run-start environment probe (issue #1866 M2)", () => {
     assert.deepStrictEqual(factsStatus(probe.emits), []);
   });
 });
+
+// issue #1888: the init frame's `plugin_errors` (SDK 0.3.284+). The only plugin the worker
+// passes is the run's skills plugin, so a run that SELECTED skills fails closed before working
+// without them, and a run with no skills warns once per worker attempt and continues.
+describe("SdkExecutor skills plugin load errors (issue #1888)", () => {
+  const union: ClaimSkill[] = [{ name: "team-runbook", description: "cicd norms.", body: "# CICD\n" }];
+  const PREFIX = "skills_plugin_load_failed: ";
+  const WARNING = "skills plugin failed to load (";
+  // A secret-shaped value assembled at runtime so no scanner sees a complete literal.
+  const SECRET = "sk-" + "fake" + "-" + "Q".repeat(40);
+
+  let worktree: string;
+  beforeEach(() => {
+    worktree = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-wt-"));
+  });
+  afterEach(() => {
+    fs.rmSync(worktree, { recursive: true, force: true });
+    fs.rmSync(skillsPluginDir(worktree), { recursive: true, force: true });
+  });
+
+  function init(pluginErrors?: unknown): SDKMessage {
+    const frame: Record<string, unknown> = { type: "system", subtype: "init", model: "m", session_id: "sess-1" };
+    if (pluginErrors !== undefined) frame["plugin_errors"] = pluginErrors;
+    return frame as unknown as SDKMessage;
+  }
+
+  function drive(scripts: Script[], withSkills: boolean, overrides: Partial<RunContext> = {}) {
+    const { queryFn, turns } = fakeTurns(scripts);
+    const probe = makeCtx({
+      worktreePath: worktree,
+      agents: [lead, coder],
+      skills: withSkills ? union : [],
+      config: { skill_max_bytes: 65536, skills_max_per_run: 32 },
+      ...overrides,
+    });
+    return { probe, turns, run: new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx) };
+  }
+
+  const warnings = (emits: EmittedMessage[]): string[] =>
+    emits
+      .filter((m) => m.kind === "status" && m.agent === "worker" && String(m.payload["text"]).startsWith(WARNING))
+      .map((m) => String(m.payload["text"]));
+
+  function hasUnsafe(text: string): boolean {
+    for (const ch of text) {
+      const c = ch.codePointAt(0) ?? 0;
+      if (c < 0x20 || (c >= 0x7f && c <= 0x9f) || (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069)) return true;
+    }
+    return false;
+  }
+
+  it("(a) a skills run whose plugin reports load errors fails closed naming the plugin", async () => {
+    const { probe, turns, run } = drive(
+      [
+        [
+          init([{ plugin: "uzi-skills", type: "manifest-validation-error", message: "bad manifest" }]),
+          assistantText("worked without the skills"),
+          submitPlan("plan"),
+          resultSuccess(),
+        ],
+        [signalDone(), resultSuccess()],
+      ],
+      true,
+    );
+    await assert.rejects(run, (err: Error) => {
+      assert.ok(err.message.startsWith(PREFIX), err.message);
+      assert.ok(err.message.includes("uzi-skills (manifest-validation-error): bad manifest"), err.message);
+      assert.ok(err.message.length <= 512, `${err.message.length}`);
+      return true;
+    });
+    assert.strictEqual(probe.gated.length, 0, "stopped before the plan reached the gate");
+    assert.strictEqual(turns.length, 1, "no further turn ran");
+    // The early stop: no frame after the init frame was processed. The fake SDK ignores the
+    // abort and keeps yielding, so the assistant text that follows the init would be emitted if
+    // the turn read on. (The submit_plan signal alone cannot show this: the reducer drops signal
+    // tool uses from the stream, and the gate is only reached after the turn, where the post-loop
+    // trip check throws anyway.)
+    assert.ok(
+      !JSON.stringify(probe.emits).includes("worked without the skills"),
+      "a frame after the init frame was processed",
+    );
+    // Only the count reaches the persisted init frame.
+    const initFrame = probe.emits.find((m) => m.payload["event"] === "init");
+    assert.strictEqual(initFrame?.payload["plugin_error_count"], 1);
+  });
+
+  it("(a2) the same failure on an implement turn propagates rather than retrying", async () => {
+    const { probe, turns, run } = drive(
+      [
+        [init(), submitPlan("plan"), resultSuccess()],
+        [init([{ plugin: "uzi-skills", type: "generic-error", message: "went away" }]), signalDone(), resultSuccess()],
+      ],
+      true,
+    );
+    await assert.rejects(run, (err: Error) => err.message.startsWith(PREFIX) && err.message.includes("went away"));
+    assert.strictEqual(probe.gated.length, 1);
+    assert.strictEqual(turns.length, 2);
+  });
+
+  it("(b) a malformed-only plugin_errors array still fails a skills run closed with generic detail", async () => {
+    const { run } = drive([[init([null, 42]), submitPlan("plan"), resultSuccess()]], true);
+    await assert.rejects(run, (err: Error) => {
+      assert.ok(err.message.startsWith(PREFIX), err.message);
+      assert.ok(err.message.includes("(unnamed plugin) (malformed-entry): (malformed plugin error entry)"), err.message);
+      return true;
+    });
+  });
+
+  it("(c) a run with no skills warns exactly once across turns and completes", async () => {
+    const errs = [{ plugin: "uzi-skills", type: "path-not-found", message: "gone" }];
+    const { probe, run } = drive(
+      [
+        [init(errs), submitPlan("plan"), resultSuccess()],
+        [init(errs), signalDone(), resultSuccess()],
+      ],
+      false,
+    );
+    await run;
+    assert.deepStrictEqual(warnings(probe.emits), [
+      "skills plugin failed to load (uzi-skills (path-not-found): gone); continuing without it",
+    ]);
+  });
+
+  it("(d) an init frame without plugin_errors neither fails nor warns", async () => {
+    const { probe, run } = drive(
+      [
+        [init(), submitPlan("plan"), resultSuccess()],
+        [init(), signalDone(), resultSuccess()],
+      ],
+      true,
+    );
+    await run;
+    assert.deepStrictEqual(warnings(probe.emits), []);
+    const initFrame = probe.emits.find((m) => m.payload["event"] === "init");
+    assert.ok(initFrame && !("plugin_error_count" in initFrame.payload));
+  });
+
+  const hostile = [
+    { plugin: "evil\u001b[2J", type: "t\u202e", message: `x\n${SECRET}\u0007` + "m".repeat(10_000), path: `/p/${SECRET}` },
+  ];
+  const redactText = (s: string): string => s.split(SECRET).join("[REDACTED]");
+
+  it("(e) hostile detail: the failure reason is redacted, sanitized and bounded", async () => {
+    const { run } = drive([[init(hostile), submitPlan("plan"), resultSuccess()]], true, { redactText });
+    await assert.rejects(run, (err: Error) => {
+      assert.ok(err.message.startsWith(PREFIX), err.message);
+      assert.ok(!err.message.includes(SECRET.slice(0, 8)), err.message);
+      assert.ok(!hasUnsafe(err.message), err.message);
+      assert.ok(err.message.length <= 512, `${err.message.length}`);
+      return true;
+    });
+  });
+
+  it("(e2) hostile detail: the warning status line is redacted, sanitized and bounded", async () => {
+    const { probe, run } = drive(
+      [
+        [init(hostile), submitPlan("plan"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ],
+      false,
+      { redactText },
+    );
+    await run;
+    const lines = warnings(probe.emits);
+    assert.strictEqual(lines.length, 1);
+    assert.ok(!lines[0]!.includes(SECRET.slice(0, 8)), lines[0]);
+    assert.ok(!hasUnsafe(lines[0]!), lines[0]);
+    assert.ok(lines[0]!.length <= 512, `${lines[0]!.length}`);
+    // No entry text anywhere in the persisted stream beyond the warning's bounded detail.
+    assert.ok(!JSON.stringify(probe.emits).includes(SECRET.slice(0, 8)));
+  });
+});

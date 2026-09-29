@@ -61,12 +61,14 @@ a newer release ships, so it can't accidentally silence a future warning.
 
 ## Release candidates
 
-A release candidate (`vX.Y.Z-rc.N`) never shows up as an available update. GitHub's
-`releases/latest`, which the check reads, excludes prereleases server-side, so a candidate
-release never becomes "the latest" the api polls for. And on an instance that runs a
-candidate itself (possible if it opts into the RC-first release train), the check compares
-versions by semver, which orders `X.Y.Z-rc.N` before `X.Y.Z`, so a candidate never shows as
-"behind" its own eventual stable.
+The instance update signal and the `uzi-cli` TUI prompt use GitHub's
+`releases/latest`, which excludes prereleases. Stable users never see a candidate
+as an available update. Separately, the api checks the published releases list
+for the newest `vX.Y.Z-rc.N` and makes it available to the TUI. An
+`uzi-cli-rc` install is prompted only for a newer candidate and upgrades with
+`brew upgrade uzi-cli-rc`. A stable release alone does not prompt an RC install.
+The check clears its cached RC fact when no candidate remains in the published
+release list, as happens after stable promotion prunes superseded RC entries.
 
 ## Air-gapped and privacy installs
 

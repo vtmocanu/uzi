@@ -106,6 +106,28 @@ func TestSkewWarning(t *testing.T) {
 	}
 }
 
+func TestSkewWarningUsesStampedChannel(t *testing.T) {
+	for _, tc := range []struct {
+		name, cli, server, formula string
+	}{
+		{"rc", "v0.85.0-rc.2", "0.85.0-rc.3", "uzi-cli-rc"},
+		{"rc with build metadata", "v0.85.0-rc.2+build", "0.85.0-rc.3", "uzi-cli-rc"},
+		{"stable", "v0.84.0", "0.85.0", "uzi-cli"},
+		{"other prerelease", "v0.85.0-beta.2", "0.85.0", "uzi-cli"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			msg, ok := SkewWarning(tc.cli, tc.server)
+			if !ok {
+				t.Fatal("expected a skew warning")
+			}
+			want := "Run: brew upgrade " + tc.formula
+			if !strings.Contains(msg, want) {
+				t.Fatalf("warning = %q, want %q", msg, want)
+			}
+		})
+	}
+}
+
 // TestSkewWarningDifferential is the test that makes the table above evidence rather
 // than decoration: each broken reference must disagree with `want` on EXACTLY the
 // rows flagged for it. Exactly, not "at least N" — a count cannot see WHICH row it
@@ -381,7 +403,7 @@ func TestVersionCacheNullServersMapIsAMiss(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, versionCheckFile), []byte(`{"servers":null}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, versionCheckFile), []byte(`{"servers":null}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); fresh {
@@ -401,7 +423,7 @@ func TestVersionCacheCorruptFileIsAMiss(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, versionCheckFile), []byte("{not json"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, versionCheckFile), []byte("{not json"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if v, fresh := s.CachedServerVersion(testURL, time.Now(), VersionCheckTTL); fresh {
@@ -451,7 +473,7 @@ func TestVersionCacheIsBounded(t *testing.T) {
 // file. A password in a URL must never reach the filesystem.
 func TestVersionCacheDoesNotPersistTheURL(t *testing.T) {
 	s := NewStore(t.TempDir())
-	const hostile = "http://alice:hunter2@127.0.0.1:8080"
+	const hostile = "http://alice:hunter2@127.0.0.1:8080" //nolint:gosec // G101: deliberately fake URL credentials test redaction from the persisted cache.
 	if _, err := s.RecordServerVersion(hostile, "0.14.0", "v0.11.8", time.Now()); err != nil {
 		t.Fatalf("record: %v", err)
 	}
@@ -533,7 +555,7 @@ func TestVersionCacheWriteDoesNotFollowASymlink(t *testing.T) {
 		t.Fatalf("record: %v", err)
 	}
 
-	got, err := os.ReadFile(outside)
+	got, err := os.ReadFile(outside) //nolint:gosec // G304: outside is a test-controlled path used to verify symlink-write behavior.
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -46,6 +46,7 @@ import type { EmittedMessage } from "./executor.js";
 import type { SdkQueryFn } from "./sdk-executor.js"; // type-only — erased at runtime, so no import cycle
 import type { HarnessAttribution, HarnessItem } from "./harness.js";
 import { projectInit, projectItem, projectResult } from "./harness-messages.js";
+import { parsePluginErrors } from "./plugin-errors.js";
 
 /** One-shot user-turn prompt stream: the SDK consumes a single user message. */
 export async function* promptStream(text: string): AsyncGenerator<unknown> {
@@ -337,7 +338,13 @@ export function mapSdkMessage(message: unknown): EmittedMessage[] {
       // Only the init frame is useful as a status heartbeat; other system
       // subtypes (task_*, hook_*, status) are not persisted in M3.
       if (msg["subtype"] === "init") {
-        return [projectInit(asString(msg["model"]))];
+        return [
+          projectInit(
+            asString(msg["model"]),
+            undefined,
+            parsePluginErrors(msg["plugin_errors"])?.length,
+          ),
+        ];
       }
       return [];
     default:

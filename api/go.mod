@@ -22,6 +22,7 @@ require (
 	github.com/golang-jwt/jwt/v5 v5.3.1
 	github.com/google/go-github/v92 v92.0.0
 	github.com/google/uuid v1.6.0
+	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/pressly/goose/v3 v3.28.0
 	github.com/robfig/cron/v3 v3.0.1
@@ -64,7 +65,6 @@ require (
 	github.com/gorilla/css v1.0.1 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hashicorp/go-cleanhttp v0.5.2 // indirect
-	github.com/hashicorp/go-retryablehttp v0.7.8 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
 	github.com/inconshreveable/mousetrap v1.1.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect

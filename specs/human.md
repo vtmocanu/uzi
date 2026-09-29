@@ -1,10 +1,10 @@
 # uzi — Human Requirements (Contract)
 
-Requirements and decisions stated by the user. This is the contract: every item
-here must hold in any rebuild. AI runs may make terse sync/hygiene edits to keep
-this file factually current (retire a removed feature, rename a retired term, fix
-a stale line), tagging each such edit `(AI-synced YYYY-MM-DD)`; introducing a new
-requirement or changing an existing one's meaning still needs user approval.
+Product requirements and decisions. This is the contract: every item
+here must hold in any rebuild. AI has full authority over this file and needs no
+approval to edit it, form and substance alike: adding a requirement, rewording
+one, or changing what one means (`CLAUDE.md`, "Specs contract"). Keep entries
+terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 ## Project
 
@@ -166,6 +166,7 @@ Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/done/16-agent-skills.md`.
 - First builtin skill: `ci-cd-norms`, researched from an internal knowledge base and reference repos — an organization's CI/CD norm, with a reference app as the worked exception.
 - Repos may carry skills the worker detects. Per-repo opt-in, default off. [capability: user; opt-in/default-off shape AI-proposed, user-accepted]
 - Builtin skills ship with uzi; editable and resettable like builtin agent templates.
+- A Claude run whose skills plugin the SDK reports as failed to load (issue #1888) never works without its selected skills: a run with selected skills fails with the `skills_plugin_load_failed` fail origin (never judged, not retried automatically), even when the reported error detail is malformed; a run with no selected skills gets a warning status line (once per start or resume) and continues. The SDK's error text is redacted, stripped of control characters and bounded before it is shown. (AI-synced 2026-09-29)
 
 ## Feature #17 — Builtin lead template (opus) + worker model selection
 
@@ -741,7 +742,7 @@ Completes Feature #64/#175: `uzi version` reported both versions and never compa
   [user 2026-08-03, chosen from three placements]
 - The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
 - The server's version is probed on a cache, never once per command. [user 2026-08-03]
-- The remedy offered is `brew upgrade uzi-cli`. [user 2026-08-03]
+- The warning's remedy follows the CLI's stamped channel: `-rc.N` builds say `brew upgrade uzi-cli-rc`; stable builds say `brew upgrade uzi-cli`. (AI-synced 2026-09-29, #1890)
 
 ## Feature #325 — TUI redesign ("factory shift board")
 
@@ -806,7 +807,7 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 
 Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
 
-- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit; surfaces meant for stable users (the Homebrew formula, the GitHub Release marked latest, the in-app update check) never surface a candidate. [user, #1265]
+- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit. Stable-facing update surfaces (the `uzi-cli` formula, the GitHub Release marked latest, and the TUI update prompt for stable installs) never surface a candidate; the TUI update prompt for a `uzi-cli-rc` install offers newer candidates only. (AI-synced 2026-09-29, #1890)
 
 ## Feature #1349 — Recovery custody hardening
 
@@ -996,6 +997,7 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 Tracked as GitHub issue vtmocanu/uzi#1864.
 
 - A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
+- A Codex run's finalize publish runs under its own finite boundary deadline sized for the full publish (push, PR description, merge request), not the 30 s checkpoint deadline; a finalize deadline failure names the finalize step that was running when it fired, and the worker logs each finalize step's duration. (AI-synced 2026-09-29)
 
 ## Startup admin seed
 

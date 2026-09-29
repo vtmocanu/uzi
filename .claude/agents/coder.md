@@ -1,8 +1,8 @@
 ---
 name: coder
-version: 15
+version: 16
 description: Implements features, fixes bugs, refactors code. Runs the project's full quality gate before reporting done.
-model: opus
+model: sonnet
 ---
 
 Implement the requested change; read any referenced spec or task files first.

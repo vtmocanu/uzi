@@ -157,6 +157,8 @@ var d7UntrustedFields = []string{
 	// serverVersion they are the model field names, not the wire names (Version/Name/NotesURL),
 	// so this guard supplements the hostile-value render test rather than replacing it.
 	"latestVersion",
+	"latestRC",
+	"latest",
 	"latestName",
 	"latestNotesURL",
 	// Forge PullDTO / RepoDTO text drawn on the `pulls` screen (PRD #1255 M4a, D7): the PR

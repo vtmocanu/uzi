@@ -133,10 +133,15 @@ export function projectResult(f: {
  * `session_id` differed from the requested one. The server uses it to open a new
  * usage lineage. When it is not true the key is omitted, keeping the payload
  * byte-identical to a pre-#1562 init frame.
+ *
+ * issue #1888: `pluginErrorCount` > 0 appends `plugin_error_count: N`, the number of
+ * plugin load errors the init frame reported. Only the count is persisted — the
+ * error text is untrusted and never enters this frame. Absent/0 omits the key.
  */
 export function projectInit(
   model: string | undefined,
   freshSession?: boolean,
+  pluginErrorCount?: number,
 ): EmittedMessage {
   const em: EmittedMessage = {
     kind: "status",
@@ -144,5 +149,8 @@ export function projectInit(
     payload: { event: "init", model },
   };
   if (freshSession === true) em.payload["fresh_session"] = true;
+  if (pluginErrorCount !== undefined && pluginErrorCount > 0) {
+    em.payload["plugin_error_count"] = pluginErrorCount;
+  }
   return em;
 }

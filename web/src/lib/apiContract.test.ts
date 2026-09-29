@@ -44,8 +44,11 @@ import type {
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
   HealthDoc,
+  BuildInfo,
 } from "./apiTypes";
 
+import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
+import buildInfoFull from "../../../fixtures/api-contract/build_info.full.json";
 import runZero from "../../../fixtures/api-contract/run.zero.json";
 import runFull from "../../../fixtures/api-contract/run.full.json";
 import runListItemZero from "../../../fixtures/api-contract/run_list_item.zero.json";
@@ -185,6 +188,16 @@ type Widen<T> = T extends string
 type ZeroOf<T, NeverNull extends keyof T = never> = {
   [K in keyof T]: K extends NeverNull ? Widen<T[K]> | null : Widen<T[K]>;
 };
+
+// ── Build info: the public version response, including optional latest_rc. ──
+const _buildInfoMissing: never = null as unknown as Exclude<keyof BuildInfo, keyof typeof buildInfoFull>;
+const _buildInfoExtra: never = null as unknown as Exclude<keyof typeof buildInfoFull, keyof BuildInfo>;
+const _buildInfoZero: ZeroOf<BuildInfo> = buildInfoZero;
+const _buildInfoFull: Widen<BuildInfo> = buildInfoFull;
+void _buildInfoMissing;
+void _buildInfoExtra;
+void _buildInfoZero;
+void _buildInfoFull;
 
 // ── Run ─────────────────────────────────────────────────────────────────────
 // ZeroOf exemptions for Run (all normalized to [] by a mapper in runToDTO):
@@ -1040,6 +1053,7 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // pointers and checks is a non-omitempty slice (a null nil-slice marshal the registry
   // normalizes to []), so its zero.json carries nulls.
   { stem: "health_doc", nullable: true },
+  { stem: "build_info", nullable: false },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

@@ -44,8 +44,9 @@ func (h *Handler) GetReleaseCheck(w http.ResponseWriter, r *http.Request) {
 // PostReleaseCheck runs "Check now" (PRD #836 M3): the SAME CheckForUpdate the interval
 // Runner calls (one fn, two triggers). Cookie-only admin write. It mirrors
 // PostAgentSourceUpdateCheck — run the check, then always rebuild and return the
-// refreshed DTO so the card's facts/checked-at update. On an error status nothing was
-// persisted (last-good facts stay), and the token-scrubbed message rides in the status.
+// refreshed DTO so the card's facts/checked-at update. An RC fetch error can
+// persist fresh stable facts while retaining the last good RC facts; its
+// token-scrubbed message still rides in the error status.
 func (h *Handler) PostReleaseCheck(w http.ResponseWriter, r *http.Request) {
 	if h.releaseCheck == nil {
 		httpx.Error(w, http.StatusInternalServerError, "release check not configured")
@@ -65,8 +66,8 @@ func (h *Handler) PostReleaseCheck(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// On an error status the check persisted nothing, so releaseCheckDTO derived Status
-	// from the PRIOR facts ("ok"/"never"). Override it so the web's error branch fires,
+	// releaseCheckDTO derives Status from the persisted facts, which can be fresh
+	// stable facts even when an RC fetch failed. Override it so the web's error branch fires,
 	// and surface the (token-scrubbed) reason — SanitizeTTY defensively, as the
 	// agent-source update-check error is. "error" is the same status-string literal
 	// the release-check Result and PostAgentSourceUpdateCheck use.

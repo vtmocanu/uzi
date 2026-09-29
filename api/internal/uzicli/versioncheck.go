@@ -106,9 +106,28 @@ func SkewWarning(cliVersion, serverVersion string) (string, bool) {
 	// instruction has been EXECUTED. `uzi:` (colon) and `uzi-cli` (hyphen) each miss
 	// that class by one character. If a future reword reddens that test, reword
 	// again — never register.
+	formula := "uzi-cli"
+	if isRCPrerelease(cli) {
+		formula = "uzi-cli-rc"
+	}
 	return fmt.Sprintf(
-		"uzi: CLI %s is behind server %s; some fields may be missing. Run: brew upgrade uzi-cli",
-		cliVersion, serverVersion), true
+		"uzi: CLI %s is behind server %s; some fields may be missing. Run: brew upgrade %s",
+		cliVersion, serverVersion, formula), true
+}
+
+// isRCPrerelease accepts the formula's exact -rc.N channel, including a version
+// carrying build metadata. The caller has already validated the full SemVer.
+func isRCPrerelease(v string) bool {
+	n, ok := strings.CutPrefix(semver.Prerelease(v), "-rc.")
+	if !ok || n == "" || n[0] == '0' {
+		return false
+	}
+	for _, digit := range n {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 // CompareServerVersion reports how the CLI version compares to the server version
@@ -135,7 +154,7 @@ func CompareServerVersion(cliVersion, serverVersion string) (cmp int, ok bool) {
 // The failure direction is what makes an hour safe, and it is asymmetric: because
 // the cache stores the SERVER's version and never the verdict (see
 // versionCheckEntry), the CLI-upgrade direction self-heals INSTANTLY — the new
-// binary re-reads its own version every run, so `brew upgrade uzi-cli` clears the
+// binary re-reads its own version every run, so upgrading the matching formula clears the
 // warning on the very next command with no TTL wait. The only staleness a longer TTL
 // buys is the other direction: the server is upgraded and we stay quiet for up to an
 // hour. Silence-when-we-should-warn, never a false warning.
@@ -191,7 +210,7 @@ type versionCheckState struct {
 // timeout before every command, forever. That is strictly worse than doing nothing.
 //
 // It records the SERVER'S VERSION, never the verdict. A cached `skew: true` is not
-// cleared by `brew upgrade uzi-cli`, so the user would be told to upgrade for up to
+// cleared by upgrading the matching formula, so the user would be told to upgrade for up to
 // a TTL after they did. Recomputing against the live binary's own version each run
 // self-heals, because the CLI side is what changed.
 //

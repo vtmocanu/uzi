@@ -4,6 +4,7 @@ import { failOriginForReason, RunRunner } from "../src/runner.js";
 import { REASON_PROVISION_FAILED } from "../src/provision-run.js";
 import { REASON_NO_TOKEN } from "../src/sdk-executor.js";
 import { REASON_PLAN_MISSING } from "../src/plan-missing.js";
+import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "../src/plugin-errors.js";
 import { FakeApi } from "./fake-api.js";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
@@ -38,6 +39,15 @@ describe("failOriginForReason", () => {
     assert.strictEqual(failOriginForReason(REASON_PLAN_MISSING), "plan_missing");
     // Exact match, not a prefix: nothing appended to the constant is authored as plan_missing.
     assert.strictEqual(failOriginForReason(`${REASON_PLAN_MISSING}: extra`), undefined);
+  });
+
+  it("maps the skills-plugin load failure prefix to skills_plugin_load_failed (issue #1888)", () => {
+    assert.strictEqual(
+      failOriginForReason(`${REASON_SKILLS_PLUGIN_LOAD_FAILED}: the run's skills plugin failed to load (x)`),
+      "skills_plugin_load_failed",
+    );
+    // Prefix with its `: ` separator only: the bare constant is not an authored reason.
+    assert.strictEqual(failOriginForReason(REASON_SKILLS_PLUGIN_LOAD_FAILED), undefined);
   });
 
   it("returns undefined for an ordinary agent failure (server defaults to agent_failure)", () => {
