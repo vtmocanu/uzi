@@ -2285,7 +2285,8 @@ that counts output lines, say. It is a poor substitute for upgrading.
 
 If a laptop is lost, **Settings → Access → Revoke all** is the one-click
 answer — it stops every `uzi` CLI and CI job using one of your tokens at
-once. If you'd rather keep some, the token list gives you what you need to
+once. Since PRD #1907 it revokes your **product tokens** too (see below), in
+the same step, so nothing of yours stays live. If you'd rather keep some, the token list gives you what you need to
 decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
 you don't recognise, and treat an unfamiliar `last_used_ip` as the signal to
 revoke, not just a curiosity.
@@ -2295,3 +2296,13 @@ revoke, not just a curiosity.
 There is no per-request audit log for CLI tokens — `last_used_ip` (updated at
 most once a minute) is the only detection control the design has, not a full
 trail.
+
+**Product tokens (`uzp_…`) are a separate credential.** A token you mint in
+**Settings → Access → Product tokens** for an external product works only on
+`/api/v1` and is not a CLI token: `uzi` cannot use one, so `UZI_TOKEN` must
+hold a CLI token (`uzc_` or `uza_`), and the CLI refuses a `uzp_` value with an
+error saying so. Like CLI tokens, product tokens are **not** revoked by a
+password change or logout; Revoke all, revoking one token, an admin, disabling
+or deleting the product, or deactivating the account does revoke them. Minting
+and admin product management are browser-only; the CLI has just the read-only
+`uzi admin products`. See [Product tokens](./product-tokens.md).

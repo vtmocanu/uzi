@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Product tokens and a stable `/api/v1` ([#1907](https://github.com/vtmocanu/uzi/issues/1907)).**
+  Admins register external products under Admin > Products; users mint `uzp_` product tokens for them in Settings > Access (scopes, expiry, at most 10 active per product, shown once). A product token works only on `/api/v1` (today `GET /api/v1/whoami`, described in `api/openapi/v1.yaml`), never carries admin authority, and is refused everywhere else. Revoke all now also revokes product tokens; admins can revoke one, or disable or delete the product. The `uzi` CLI refuses a `uzp_` token with a clear error.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
@@ -55,9 +60,6 @@ through `[0.52.0]`.)
 
 - **RC channel update prompts and correct Homebrew upgrade commands ([#1890](https://github.com/vtmocanu/uzi/issues/1890)).**
   The TUI offers newer release candidates to `uzi-cli-rc` installs while stable installs stay on stable releases. The CLI version-skew warning now names the matching formula, and an RC install is never offered a stable-formula upgrade action.
-
-- **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
-  It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
 
 - **A run whose skills plugin fails to load now stops instead of working without its skills ([#1888](https://github.com/vtmocanu/uzi/issues/1888)).**
   When the Claude SDK reports skills-plugin load errors at session start, a run with selected skills fails with the new `fail_origin` `skills_plugin_load_failed` (never judged), and its failure reason names the plugin, error type, path and a trimmed message, redacted and bounded. An error report the worker cannot parse still counts as a failure. A run without selected skills posts a warning and continues. Claude runs only.

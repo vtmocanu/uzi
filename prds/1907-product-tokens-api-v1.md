@@ -97,6 +97,8 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 
 ### M1: Data model, token class and scrubbing
 
+**Status (2026-09-29): done.** Evidence: migration `00269_product_tokens.sql`; `TestProductTokenAuthLookupLiveDB`, `TestProductTokenAuthDeletedAtTermLiveDB` and `TestProductTokenSchemaConstraintsLiveDB` (NULL-expiry trap, revoked, expired, disabled, deleted, inactive user, each failing closed); `TestProductTokenLifecycleQueriesLiveDB`; `producttoken` package tests; `TestMintedPrefixesScrubbedOnBothPaths` ranges over `producttoken.Prefix` and all three scrub copies use `uz[capw]_`.
+
 - Migration (draft number, renumbered at merge): `products` (`id`, `name` unique, `description`, `enabled`, `deleted_at`, `created_by` FK `ON DELETE SET NULL`, timestamps) and `product_tokens` (`id`, `user_id` FK `ON DELETE CASCADE`, `product_id` FK `ON DELETE RESTRICT`, `name`, `token_hash bytea UNIQUE`, `token_prefix`, `scopes text[]` with a known-scope CHECK and a non-empty CHECK, `revoked`, `created_at`, `last_used_at`, `last_used_ip`, `expires_at`).
 - sqlc queries: the auth lookup (joins product and user, carries the NULL-expiry trap, filters `enabled`, `deleted_at IS NULL` and `is_active`), touch (≤1/min like `TouchCLIToken`), mint (with the D15 active-token count), list-own, revoke-own, admin revoke-one, admin list, and a revoke-all-own that the existing revoke-all handler calls in the same transaction as its CLI-token revoke.
 - `producttoken` package: generate (`uzp_` prefix, 256-bit random body, sha256), parse, constant-time compare. Mirrors `clitoken`, and exports its prefix.
@@ -104,6 +106,8 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 - **Done when:** migration applies and rolls back on a live DB; store tests cover the NULL-expiry trap, revoked, expired, disabled product, deleted product, inactive user, each failing closed; the scrub test covers `uzp_` on all three paths.
 
 ### M2: `RequireV1Caller` and structural isolation
+
+**Status (2026-09-29): done.** Evidence: `TestV1IsolationLiveDB` (route walk over both routers), `TestV1AdminStripLiveDB`, `TestV1CallerLiveDB`, `TestRequireV1CallerProductTokenPath`, `TestRequireV1CallerCLITokenScopeUser`, `TestRequireV1CallerRefusals`, `TestRequireScope`. The four mutation runs (RequireUser accepting `product_tokens`, IsAdmin clear removed, each restored) are recorded in the PR, not here.
 
 - Middleware per D2/D3/D4, `V1Principal` in context, `RequireScope` per D5.
 - **Isolation test (the load-bearing one):** a `*LiveDB` handler test mints a real `uzp_` token, walks **both** production routers (`Routes()` and `WorkerRoutes()`) with `chi.Walk`, and for every route outside `/api/v1` asserts that a request carrying the `uzp_` token gets **exactly the same response** (status and body) as the same request carrying an unknown random Bearer token of the same shape, and causes no handler side effect. This holds for public routes too (`/api/health`, `/api/version`, `/api/branding`, the login and `cli/*` auth routes answer both callers the same way), so no exemption list is needed. It iterates the live route tables, so a route added later is covered automatically. `/api/ws` is covered explicitly.
@@ -114,12 +118,16 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 
 ### M3: `/api/v1` mount, `whoami`, OpenAPI and fixtures
 
+**Status (2026-09-29): done.** Evidence: `routes_v1.go`, `api/openapi/v1.yaml`, `TestV1OpenAPIRouteParity` (both directions) and `TestV1OpenAPISchemasMatchDTOs`, `TestV1WhoamiLiveDB`, `TestV1SubtreeRequiresV1CallerLiveDB`, `TestV1RateLimitPerUserLiveDB`, fixtures `fixtures/api-contract/v1_whoami.full.json` and `v1_whoami.zero.json` pinned by `apitypes/contract_test.go`.
+
 - Mount `/api/v1` with `RequireV1Caller` then the D15 per-user limiter; `GET /api/v1/whoami` (D13).
 - `api/openapi/v1.yaml` describing it; recorded fixtures for its DTO under `fixtures/api-contract/`.
 - Route/spec parity test (D12), in both directions.
 - **Done when:** removing `whoami` from the spec (or from the router) reddens the parity test, and the fixture test pins the DTO shape.
 
 ### M4: Product registry (admin)
+
+**Status (2026-09-29): done.** Evidence: `TestAdminProductRegistryLiveDB`, `TestAdminProductRoutesAuthLiveDB`, `TestAdminProductActionsKillTokenOnNextWhoamiLiveDB` (disable, soft delete and admin revoke each 401 on the next `whoami`), `TestAdminDeleteDisabledProductStopsNothingLiveDB`, `TestAdminListProductTokensTruncatedLiveDB`; web `AdminProducts.test.tsx`. The admin Products page is the credential inventory (see the Decision Log).
 
 - Admin API, cookie-only writes: create, list, update (description, enabled), soft delete (D9), and revoke one product token (D8). Name and description validated per D11.
 - `GET /api/admin/products` also readable by `uza_` (read-only, like `/api/admin/cli-tokens`).
@@ -129,12 +137,16 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 
 ### M5: User minting in Settings > Access
 
+**Status (2026-09-29): done.** Evidence: `TestMintUseRevokeProductTokenLiveDB` (mint, `whoami`, revoke, 401), `TestRevokeAllKillsCLIAndProductTokensLiveDB`, `TestMintProductTokenCapLiveDB`, `TestMintProductTokenCapRaceLiveDB`, `TestMintProductTokenExpiryChoicesLiveDB`, `TestProductTokenRoutesRefuseBearerLiveDB`; web `ProductTokens.test.tsx` and the Revoke all cases in `CliTokens.test.tsx`.
+
 - Cookie-only `/api/me/product-tokens`: list, mint (D10 expiry, D11 name validation, D15 cap), revoke one.
 - The existing `POST /api/me/cli-tokens/revoke-all` and its web button revoke CLI and product tokens in one transaction (D8). Both entry points are tested: the endpoint directly, and the web button's call.
 - Web: a **Product tokens** section beside CLI tokens: pick an enabled product, name, scopes (checkboxes), expiry; the token is shown once with a copy button; the list shows product, prefix, scopes, last used, last IP, expiry, revoke. Mock-mode data added.
 - **Done when:** mint, use on `whoami`, revoke, and 401 afterwards pass end to end (live-DB handler test plus a web component test); Revoke all kills a live `uzp_` token.
 
 ### M6: Docs, spec and ADR
+
+**Status (2026-09-29): done.** Evidence: `docs/product-tokens.md`, `docs/cli.md` "Managing tokens", the mirror refreshed by `task docs:sync`, `adr/1907-product-api-v1-contract.md`, `specs/human.md` entry. The optional items shipped: `uzi admin products` and the `uzp_` CLI error. `task check-docs:web` and `TestEmbeddedDocsMatchSource` are run by the docs author and the gate.
 
 - New `docs/product-tokens.md` (audience `user`, with an operator section for product registration): what a product token is, what it can and cannot reach, revocation (including that password change and logout do not revoke it), expiry, the Revoke all change. `docs/cli.md` "Managing tokens" updated. `task docs:sync` run and the mirror committed.
 - The D12 ADR written.
@@ -143,6 +155,8 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 - **Done when:** `task check-docs:web` and `task gate:api` (`TestEmbeddedDocsMatchSource`) pass.
 
 ### M7: Hosted k8s acceptance (maintainer-owned)
+
+**Status (2026-09-29): not done; maintainer-owned.** Nothing here has been verified on a hosted k8s deployment.
 
 - On a hosted k8s deployment running this release: register a product, mint a `uzp_` token in the browser, call `GET /api/v1/whoami` through the public ingress, confirm the same token is refused on a sample of internal routes (a run list, `/api/ws`), revoke it, and confirm 401.
 - **Done when:** the maintainer records the results on the issue. Part of completion, not an optional post-release step.
@@ -205,3 +219,12 @@ This PRD does not depend on PRD #1906. PRD #1910 replaces M5's copy-paste with c
   - Display strings validated with `termsafe` and byte caps (D11). Per-user rate limit plus a per-product active-token cap (D15), replacing the per-token bucket that more tokens could multiply.
   - The in-repo OpenAPI diff checker is dropped as over-engineering for one endpoint; PRD #1908 adds a pinned tool with its first real endpoints (D12). CLI parity becomes optional. `check:token-literals` is not extended for `uzp_` (D16).
   - Hosted k8s acceptance is part of completion (M7).
+- 2026-09-29, implementation decisions:
+  - `/api/v1` reuses the existing general per-user limiter (`authLimiter`, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW`, default 10 per minute) rather than a new one. Mounted with `r.Use` on the subtree, it keys one budget per user across all of `/api/v1`. Enough for `whoami`; PRD #1908, whose job polling needs more, is where a dedicated limiter belongs (`TestV1RateLimitPerUserLiveDB`).
+  - No web credential inventory existed to extend, so the admin Products page lists product tokens per product, each with an admin revoke action.
+  - The mint picker is `GET /api/me/product-tokens/products` (enabled, live products) rather than a separate `/api/products`, keeping every user-facing product-token route under one cookie-only mount.
+  - The cap race is closed by a transaction-scoped `pg_advisory_xact_lock` keyed on (user_id, product_id), taken before the count, with count and insert in one transaction. `FOR UPDATE` cannot lock rows that do not exist yet, so two concurrent mints at 9 active tokens both passed the count. The lock class is `store.ProductTokenMintLockClass`, taken by the `LockProductTokenMint` query. Proven by `TestMintProductTokenCapRaceLiveDB` and its mutation (lock removed, test red).
+  - Review finding: the token lists are bounded, with a `truncated` flag. `GET /api/me/product-tokens` returns at most 200 rows and the admin list 1000, active tokens first and then newest first, so the cut drops revoked and expired history before any active token; the web UI shows a notice when the flag is set.
+  - Admin PATCH of a product is a single `COALESCE` update (NULL keeps the current value), with no read-merge, so concurrent PATCHes of different fields cannot overwrite each other (`TestUpdateProductConcurrentPatchesLiveDB`). A soft-deleted product cannot be changed or re-enabled (409).
+  - Delete's `stopped_token_count` is 0 for an already-disabled product, because the disable had already refused its tokens (`TestAdminDeleteDisabledProductStopsNothingLiveDB`).
+  - The optional M6 items shipped: the read-only `uzi admin products`, and a clear CLI error when `UZI_TOKEN` holds a `uzp_` token.
