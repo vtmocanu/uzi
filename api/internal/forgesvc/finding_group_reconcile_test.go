@@ -31,12 +31,13 @@ func TestMatchFindingGroupIssue(t *testing.T) {
 		{"two issues", []forge.Issue{valid, valid}, false},
 		{"repeated in issue", []forge.Issue{{IID: 42, WebURL: valid.WebURL, Description: marker + marker}}, false},
 		{"invalid identity", []forge.Issue{{Description: marker}}, false},
+		{"unwanted marker repeated", []forge.Issue{valid, {Description: strings.Repeat("<!-- uzi-finding-group-operation: "+uuid.NewString()+" -->", 2)}}, true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			index, err := indexFindingGroupIssues(tc.issues)
-			if err != nil {
-				t.Fatal(err)
+			index := indexFindingGroupIssues(tc.issues, map[uuid.UUID]struct{}{id: {}})
+			if len(index) > 1 {
+				t.Fatalf("indexed %d ids, want only the wanted one", len(index))
 			}
 			match, found := index[id]
 			ok := found && !match.ambiguous && match.issue.IID > 0 && match.issue.WebURL != ""
@@ -183,13 +184,10 @@ func TestFindingGroupIndexKeepsDistinctMarkers(t *testing.T) {
 	marker := func(id uuid.UUID) string {
 		return fmt.Sprintf("<!-- uzi-finding-group-operation: %s -->", id)
 	}
-	index, err := indexFindingGroupIssues([]forge.Issue{{
+	index := indexFindingGroupIssues([]forge.Issue{{
 		IID: 7, WebURL: "https://example.com/issues/7",
 		Description: marker(first) + marker(second),
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
+	}}, map[uuid.UUID]struct{}{first: {}, second: {}})
 	if index[first].ambiguous || index[second].ambiguous ||
 		index[first].issue.IID != 7 || index[second].issue.IID != 7 {
 		t.Fatalf("distinct markers should each identify the issue: %#v", index)
@@ -300,7 +298,9 @@ func (r markerRow) Scan(dest ...interface{}) error {
 	return nil
 }
 
-func TestFullSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
+// Only the current page's operations are matched. An operation on a later page is not
+// matched while another page is current, and settles once FullSync rotates to it.
+func TestFullSyncMatchesMarkerOnLaterPageAfterRotation(t *testing.T) {
 	repo, user := uuid.New(), uuid.New()
 	start := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
 	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
@@ -313,26 +313,25 @@ func TestFullSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
 	target := db.ops[100].ID
 	svc := newTestService(&fakeStore{})
 	svc.SetFindingGroupDB(db)
-	marker := "<!-- uzi-finding-group-operation: " + target.String() + " -->"
-	first := &fakeForge{allIssues: []forge.Issue{{
-		IID: 301, WebURL: "https://example.com/301", Description: marker,
-		UpdatedAt: start.Add(200 * time.Second),
-	}}}
+	carrier := forge.Issue{
+		IID: 301, WebURL: "https://example.com/301",
+		Description: "<!-- uzi-finding-group-operation: " + target.String() + " -->",
+		UpdatedAt:   start.Add(200 * time.Second),
+	}
+	first := &fakeForge{allIssues: []forge.Issue{carrier}}
 	if _, err := svc.FullSync(context.Background(), repo, 7, first); err != nil {
 		t.Fatal(err)
 	}
-	if db.recorded != target || db.settled != target || db.candidateQueries != 1 || len(first.unfilteredListCalls()) != 1 {
-		t.Fatalf("operation 101: recorded=%s settled=%s candidate queries=%d unfiltered=%d",
-			db.recorded, db.settled, db.candidateQueries, len(first.unfilteredListCalls()))
+	if db.recorded != uuid.Nil || db.candidateQueries != 0 || len(first.unfilteredListCalls()) != 1 {
+		t.Fatalf("first page matched operation 101: recorded=%s candidate queries=%d unfiltered=%d",
+			db.recorded, db.candidateQueries, len(first.unfilteredListCalls()))
 	}
-	second := &fakeForge{allIssues: []forge.Issue{{
-		IID: 302, WebURL: "https://example.com/302", UpdatedAt: start.Add(201 * time.Second),
-	}}}
+	second := &fakeForge{allIssues: []forge.Issue{carrier}}
 	if _, err := svc.FullSync(context.Background(), repo, 7, second); err != nil {
 		t.Fatal(err)
 	}
-	if db.settled != target || db.candidateQueries != 1 {
-		t.Fatalf("second pass: settled=%s candidate queries=%d", db.settled, db.candidateQueries)
+	if db.recorded != target || db.settled != target || db.candidateQueries != 1 {
+		t.Fatalf("second page: recorded=%s settled=%s candidate queries=%d", db.recorded, db.settled, db.candidateQueries)
 	}
 }
 
@@ -427,39 +426,66 @@ func newHeldFixture() (*Service, *fakeStore, *markerPageDB, store.FindingGroupCl
 	return svc, cache, db, op, repo
 }
 
-func TestFindingGroupDescriptionLimitSkipsScanNotSync(t *testing.T) {
-	svc, cache, db, _, repo := newHeldFixture()
-	issue := forge.Issue{Description: strings.Repeat("a", findingGroupDescriptionLimit+1), UpdatedAt: time.Now()}
-	f := &fakeForge{allIssues: []forge.Issue{issue}, issues: []forge.Issue{issueAt(1, time.Now())}}
-	marks, err := svc.FullSync(context.Background(), repo, 7, f)
-	requireScanSkipped(t, svc, cache, db, repo, marks, err)
+// requireSyncedAndSettled asserts a FullSync ran the issue sync and settled op on iid.
+func requireSyncedAndSettled(t *testing.T, cache *fakeStore, db *markerPageDB, op uuid.UUID, iid int64, marks Marks, err error) {
+	t.Helper()
+	if err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if marks.PRD.IsZero() || len(cache.upserts) == 0 || len(cache.deleteCalls) == 0 {
+		t.Fatalf("issue sync did not run: marks=%v writes=%d evictions=%d", marks, len(cache.upserts), len(cache.deleteCalls))
+	}
+	if db.recorded != op || db.settled != op || db.iid != iid {
+		t.Fatalf("recorded=%s settled=%s iid=%d, want op settled on #%d", db.recorded, db.settled, db.iid, iid)
+	}
 }
 
-func TestFindingGroupCandidateLimitSkipsScanAndHoldsClaim(t *testing.T) {
+// An oversized description in an unrelated issue neither fails the sync nor stops the
+// pending operation from settling on its own issue.
+func TestFindingGroupOversizedDescriptionDoesNotBlockSettlement(t *testing.T) {
+	svc, cache, db, op, repo := newHeldFixture()
+	big := forge.Issue{IID: 76, Description: strings.Repeat("a", 2<<20), UpdatedAt: time.Now()}
+	genuine := forge.Issue{IID: 78, WebURL: "https://example.com/78", Description: "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->", UpdatedAt: time.Now()}
+	f := &fakeForge{allIssues: []forge.Issue{big, genuine}, issues: []forge.Issue{issueAt(1, time.Now())}}
+	marks, err := svc.FullSync(context.Background(), repo, 7, f)
+	requireSyncedAndSettled(t, cache, db, op.ID, 78, marks, err)
+}
+
+// A wanted marker repeated many times is ambiguous: the op stays claimed, and the sync
+// still runs.
+func TestFindingGroupRepeatedWantedMarkerStaysClaimedAndSyncs(t *testing.T) {
 	svc, cache, db, op, repo := newHeldFixture()
 	marker := "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->"
-	issue := forge.Issue{IID: 77, Description: strings.Repeat(marker, findingGroupCandidateLimit+1), UpdatedAt: time.Now()}
+	issue := forge.Issue{IID: 77, WebURL: "https://example.com/77", Description: strings.Repeat(marker, 1001), UpdatedAt: time.Now()}
 	f := &fakeForge{allIssues: []forge.Issue{issue}, issues: []forge.Issue{issueAt(1, time.Now())}}
 	marks, err := svc.FullSync(context.Background(), repo, 7, f)
-	requireScanSkipped(t, svc, cache, db, repo, marks, err)
+	if err != nil {
+		t.Fatalf("FullSync: %v", err)
+	}
+	if marks.PRD.IsZero() || len(cache.upserts) == 0 {
+		t.Fatalf("issue sync did not run: marks=%v writes=%d", marks, len(cache.upserts))
+	}
+	if db.recorded != uuid.Nil || db.ops[0].Phase != "in_flight" || db.ops[0].IssueIID != nil {
+		t.Fatalf("ambiguous marker moved the op: recorded=%s phase=%s", db.recorded, db.ops[0].Phase)
+	}
 }
 
-// Anyone who can open an issue can plant marker-shaped text naming operations that do
-// not exist. Past the candidate cap that must not stop the issue sync, or the planted
-// issue would freeze the cache, manual Refresh and the poller's follow-up syncs.
-func TestFindingGroupPlantedUnrelatedMarkersDoNotFailFullSync(t *testing.T) {
+// Markers naming operations that are not pending on this page (settled long ago, or
+// planted in an unrelated issue by anyone who can open one) are ignored: however many
+// there are, the pending operation still settles on its own issue.
+func TestFindingGroupUnwantedMarkersAreIgnored(t *testing.T) {
 	svc, cache, db, op, repo := newHeldFixture()
 	var planted strings.Builder
-	for i := 0; i <= findingGroupCandidateLimit; i++ {
+	for i := 0; i <= 1000; i++ {
 		planted.WriteString("<!-- uzi-finding-group-operation: " + uuid.NewString() + " -->")
 	}
 	genuine := forge.Issue{IID: 78, WebURL: "https://example.com/78", Description: "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->", UpdatedAt: time.Now()}
 	f := &fakeForge{
-		allIssues: []forge.Issue{{IID: 77, Description: planted.String(), UpdatedAt: time.Now()}, genuine},
+		allIssues: []forge.Issue{{IID: 77, WebURL: "https://example.com/77", Description: planted.String(), UpdatedAt: time.Now()}, genuine},
 		issues:    []forge.Issue{issueAt(1, time.Now())},
 	}
 	marks, err := svc.FullSync(context.Background(), repo, 7, f)
-	requireScanSkipped(t, svc, cache, db, repo, marks, err)
+	requireSyncedAndSettled(t, cache, db, op.ID, 78, marks, err)
 }
 
 func TestFullSyncUnfilteredFetchErrorSkipsScanNotSync(t *testing.T) {

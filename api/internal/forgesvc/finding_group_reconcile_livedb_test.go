@@ -660,63 +660,78 @@ func TestFindingGroupReconcileUnfilteredFetchOnlyWhenMatchableLiveDB(t *testing.
 	})
 }
 
-// A failed complete-set fetch, or one over a cap, settles nothing: claims stay and the op
-// is untouched. The issue sync itself still succeeds, so the cache is written and the
-// group cursor rotates. Planted markers naming unrelated operations are the reason: they
-// are issue text anyone can write, and must not stop the sync.
-func TestFindingGroupReconcileIncompleteScanKeepsClaimsLiveDB(t *testing.T) {
-	longMarkerIssue := func(op uuid.UUID) forge.Issue {
-		is := rcIssue(1901, strings.Repeat(rcMarker(op), findingGroupCandidateLimit+1))
-		is.Labels = nil
-		return is
+// A failed complete-set fetch settles nothing: claims stay and the op is untouched. The
+// issue sync itself still succeeds, so the cache is written and the group cursor rotates.
+func TestFindingGroupReconcileFetchErrorKeepsClaimsAndSyncsLiveDB(t *testing.T) {
+	e := newRCEnv(t)
+	op, ids := e.inFlight(e.user, 2)
+	e.fake.set(rcIssue(1900, "unrelated"))
+	e.fake.unfilteredErr = fmt.Errorf("forge pagination cap")
+	marks, err := e.svc.FullSync(e.ctx, e.repoID, 7001, e.fake)
+	if err != nil {
+		t.Fatalf("FullSync failed on an incomplete marker scan: %v", err)
 	}
-	plantedIssue := func() forge.Issue {
+	if marks == (Marks{}) {
+		t.Error("marks are zero, want the issue sync's marks")
+	}
+	e.requireClaimed(ids)
+	e.requireInFlightUntouched(op.ID)
+	if n := e.cachedIssueRows(); n == 0 {
+		t.Error("no cache rows written, want the issue sync to run")
+	}
+	e.svc.groupCursorMu.Lock()
+	_, rotated := e.svc.groupCursors[e.repoID]
+	e.svc.groupCursorMu.Unlock()
+	if !rotated {
+		t.Error("incomplete scan did not rotate the group cursor")
+	}
+}
+
+// Issue text nobody at uzi controls must not stop settlement: markers for operations
+// that are not pending (settled long ago, or planted by anyone who can open an issue)
+// are ignored however many there are, and an oversized unrelated description is just
+// scanned. A wanted marker repeated in one issue is still ambiguous.
+func TestFindingGroupReconcileUntrustedIssueTextLiveDB(t *testing.T) {
+	planted := func() forge.Issue {
 		var b strings.Builder
-		for i := 0; i <= findingGroupCandidateLimit; i++ {
+		for i := 0; i <= 1000; i++ {
 			b.WriteString(rcMarker(uuid.New()))
 		}
 		is := rcIssue(1903, b.String())
 		is.Labels = nil
 		return is
 	}
-	tests := []struct {
-		name  string
-		setup func(e *rcEnv, op uuid.UUID)
-	}{
-		{"fetch error", func(e *rcEnv, _ uuid.UUID) { e.fake.unfilteredErr = fmt.Errorf("forge pagination cap") }},
-		{"candidate cap", func(e *rcEnv, op uuid.UUID) { e.fake.set(rcIssue(1900, "unrelated"), longMarkerIssue(op)) }},
-		{"planted unrelated markers", func(e *rcEnv, op uuid.UUID) {
-			e.fake.set(rcIssue(1900, "unrelated"), plantedIssue(), rcIssue(1904, rcMarker(op)))
-		}},
-		{"description cap", func(e *rcEnv, _ uuid.UUID) {
-			big := rcIssue(1902, strings.Repeat("a", findingGroupDescriptionLimit+1))
-			big.Labels = nil
-			e.fake.set(rcIssue(1900, "unrelated"), big)
-		}},
+	big := func() forge.Issue {
+		is := rcIssue(1902, strings.Repeat("a", 2<<20))
+		is.Labels = nil
+		return is
 	}
-	for _, tc := range tests {
+	for _, tc := range []struct {
+		name    string
+		issues  func(op uuid.UUID) []forge.Issue
+		settles bool
+	}{
+		{"unwanted markers", func(op uuid.UUID) []forge.Issue { return []forge.Issue{planted(), rcIssue(1904, rcMarker(op))} }, true},
+		{"oversized description", func(op uuid.UUID) []forge.Issue { return []forge.Issue{big(), rcIssue(1904, rcMarker(op))} }, true},
+		{"repeated wanted marker", func(op uuid.UUID) []forge.Issue {
+			return []forge.Issue{rcIssue(1904, strings.Repeat(rcMarker(op), 1001))}
+		}, false},
+	} {
 		t.Run(tc.name, func(t *testing.T) {
 			e := newRCEnv(t)
 			op, ids := e.inFlight(e.user, 2)
-			e.fake.set(rcIssue(1900, "unrelated"))
-			tc.setup(e, op.ID)
-			marks, err := e.svc.FullSync(e.ctx, e.repoID, 7001, e.fake)
-			if err != nil {
-				t.Fatalf("FullSync failed on an incomplete marker scan: %v", err)
+			e.fake.set(append([]forge.Issue{rcIssue(1900, "unrelated")}, tc.issues(op.ID)...)...)
+			if _, err := e.svc.FullSync(e.ctx, e.repoID, 7001, e.fake); err != nil {
+				t.Fatalf("FullSync: %v", err)
 			}
-			if marks == (Marks{}) {
-				t.Error("marks are zero, want the issue sync's marks")
-			}
-			e.requireClaimed(ids)
-			e.requireInFlightUntouched(op.ID)
 			if n := e.cachedIssueRows(); n == 0 {
 				t.Error("no cache rows written, want the issue sync to run")
 			}
-			e.svc.groupCursorMu.Lock()
-			_, rotated := e.svc.groupCursors[e.repoID]
-			e.svc.groupCursorMu.Unlock()
-			if !rotated {
-				t.Error("incomplete scan did not rotate the group cursor")
+			if tc.settles {
+				e.requireSettled(1904, ids)
+			} else {
+				e.requireClaimed(ids)
+				e.requireInFlightUntouched(op.ID)
 			}
 		})
 	}

@@ -310,25 +310,25 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	return ops, finish, advance, nil
 }
 
-// Bound marker parsing. The caps apply to the COMPLETE unfiltered issue list that
-// FullSync reconciles markers over (see reconcileFindingGroupMarkers): a
-// description or candidate count over a cap abandons the whole scan rather than
-// skipping the offending issue, because a skipped issue could be the second
-// carrier of an op's marker and hiding it would make an ambiguous marker look
-// unique. An abandoned scan settles nothing, but it does not fail the issue sync:
-// anyone who can open an issue can plant marker-shaped text, and that must not
-// stop the cache refresh or the poller's follow-up work.
+// Marker reconciliation scans the COMPLETE unfiltered issue list (see
+// reconcileFindingGroupMarkers), but it indexes only markers naming a matchable
+// operation on the current pending page. A marker for any other id (an operation
+// settled long ago, one on another page, or text planted in an unrelated issue)
+// cannot hide a second carrier of a wanted marker, so ignoring it is safe; and
+// counting it would let settled group issues, or anyone who can open an issue,
+// grow the scan without bound. The wanted set is at most one pending page, and a
+// wanted id saturates at ambiguous on its second carrier, so the scan needs no
+// candidate or description cap.
 const (
-	findingGroupMarkerPrefix     = "<!-- uzi-finding-group-operation: "
-	findingGroupMarkerSuffix     = " -->"
-	findingGroupDescriptionLimit = 1 << 20
-	findingGroupCandidateLimit   = 1000
+	findingGroupMarkerPrefix = "<!-- uzi-finding-group-operation: "
+	findingGroupMarkerSuffix = " -->"
 )
 
 // errFindingGroupScanIncomplete marks a marker scan that could not see the
-// complete issue set (the fetch failed or a cap was hit). FullSync keeps every
-// unconfirmed claim and carries on with the issue sync; any other
-// reconciliation error, a database write in particular, still fails the pass.
+// complete issue set (the unfiltered fetch failed, including on the driver's own
+// pagination cap). FullSync keeps every unconfirmed claim and carries on with the
+// issue sync; any other reconciliation error, a database write in particular,
+// still fails the pass.
 var errFindingGroupScanIncomplete = errors.New("finding group marker scan incomplete")
 
 type findingGroupMatch struct {
@@ -336,14 +336,11 @@ type findingGroupMatch struct {
 	ambiguous bool
 }
 
-// A repeated exact marker, even in one description, is ambiguous.
-func indexFindingGroupIssues(issues []forge.Issue) (map[uuid.UUID]findingGroupMatch, error) {
+// indexFindingGroupIssues maps each wanted operation id to the issue carrying its
+// marker. A repeated exact marker, even in one description, is ambiguous.
+func indexFindingGroupIssues(issues []forge.Issue, want map[uuid.UUID]struct{}) map[uuid.UUID]findingGroupMatch {
 	index := make(map[uuid.UUID]findingGroupMatch)
-	candidates := 0
 	for _, issue := range issues {
-		if len(issue.Description) > findingGroupDescriptionLimit {
-			return nil, errors.New("finding group issue description exceeds reconciliation limit")
-		}
 		description := issue.Description
 		for {
 			at := strings.Index(description, findingGroupMarkerPrefix)
@@ -358,9 +355,8 @@ func indexFindingGroupIssues(issues []forge.Issue) (map[uuid.UUID]findingGroupMa
 			if err != nil || id.String() != description[:36] {
 				continue
 			}
-			candidates++
-			if candidates > findingGroupCandidateLimit {
-				return nil, errors.New("finding group marker candidate limit exceeded")
+			if _, wanted := want[id]; !wanted {
+				continue
 			}
 			if previous, exists := index[id]; exists {
 				previous.ambiguous = true
@@ -370,17 +366,14 @@ func indexFindingGroupIssues(issues []forge.Issue) (map[uuid.UUID]findingGroupMa
 			}
 		}
 	}
-	return index, nil
+	return index
 }
 
-func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUID, issues []forge.Issue) error {
+func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, want map[uuid.UUID]struct{}) error {
 	if s.groupDB == nil {
 		return nil
 	}
-	index, err := indexFindingGroupIssues(issues)
-	if err != nil {
-		return errors.Join(errFindingGroupScanIncomplete, err)
-	}
+	index := indexFindingGroupIssues(issues, want)
 	if len(index) == 0 {
 		return nil
 	}
@@ -418,35 +411,33 @@ func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUI
 // issue list: one unfiltered, all-states ListIssues. An UpdatedAfter-filtered
 // set can return only one of two issues carrying the same marker, and a
 // label-filtered set omits an issue that was de-labeled or never labeled; either
-// hides a duplicate and turns an ambiguous marker into a unique one. Ambiguity,
-// the candidate cap and the description cap are therefore all evaluated over the
-// same complete set inside recordFindingGroupMatches.
+// hides a duplicate and turns an ambiguous marker into a unique one. Ambiguity is
+// therefore evaluated over the complete set inside recordFindingGroupMatches.
 //
-// It makes NO forge request unless some op in pending can actually be matched:
-// ListPendingFindingGroupsByIDs only matches phase in_flight or
-// returned_uncertain with no recorded iid, so a recorded op (settled by
-// pendingFindingGroups) or a pre_call op never triggers the fetch. A failed
-// fetch (including the driver's own pagination cap) or a marker cap returns
-// errFindingGroupScanIncomplete with nothing recorded, so every claim stays.
+// It matches only the page's matchable operations (phase in_flight or
+// returned_uncertain with no recorded iid) and makes NO forge request when there
+// are none: a recorded op (settled by pendingFindingGroups) or a pre_call op
+// never triggers the fetch. Operations on other pages are matched as FullSync
+// rotates to them. A failed fetch returns errFindingGroupScanIncomplete with
+// nothing recorded, so every claim stays.
 func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, pending []store.FindingGroupClaimOperation) error {
 	if s.groupDB == nil {
 		return nil
 	}
-	matchable := false
+	want := make(map[uuid.UUID]struct{})
 	for _, op := range pending {
 		if op.IssueIID == nil && (op.Phase == "in_flight" || op.Phase == "returned_uncertain") {
-			matchable = true
-			break
+			want[op.ID] = struct{}{}
 		}
 	}
-	if !matchable {
+	if len(want) == 0 {
 		return nil
 	}
 	all, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{})
 	if err != nil {
 		return errors.Join(errFindingGroupScanIncomplete, err)
 	}
-	return s.recordFindingGroupMatches(ctx, repoID, all)
+	return s.recordFindingGroupMatches(ctx, repoID, all, want)
 }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
@@ -761,7 +752,7 @@ func (m Marks) Advance(next Marks) Marks {
 // FullSync is also the only path that settles unconfirmed finding-group
 // operations by marker (reconcileFindingGroupMarkers): it makes one extra
 // unfiltered all-states fetch, only while a matchable operation is pending. A
-// failure of that fetch (or a cap in it) settles nothing and keeps every claim,
+// failure of that fetch settles nothing and keeps every claim,
 // but the issue sync below still runs and reports its marks: the marks bound
 // only the label-filtered fetches, which match no markers, so advancing them
 // hides nothing from a later scan. A database error while recording a match
