@@ -1381,6 +1381,23 @@ describe("#1604 review — resumed-gate edges", () => {
     }));
 });
 
+describe("shutdown at an observed plan gate", () => {
+  for (const planApprovalTimeoutMs of [0, 60_000]) {
+    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs}`, () =>
+      scenario(async (s) => {
+        const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
+        assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
+        assert.equal(s.gates(flight)[0]?.plan_md, PLAN_V1, "the submitted plan was offered for approval");
+        assert.equal(s.rowsOf("cancel").length, 0, "no cancel was sent before shutdown");
+
+        flight.runner.shutdown();
+        assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
+        await flight.done;
+        assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");
+      }));
+  }
+});
+
 describe("#1604 round 3 — a disposed approve is never applied, so no later claim reads it as approval (B1)", () => {
   // Round 4 (finding 2): a disposed approve is settled through /inputs/discarded (disposition
   // superseded), which the server never counts as approval and leaves out of the replay list, so the
