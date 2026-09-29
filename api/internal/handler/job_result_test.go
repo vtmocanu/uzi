@@ -1,8 +1,11 @@
 package handler
 
 import (
+	"errors"
+	"runtime"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -117,4 +120,69 @@ func TestValidateAndScrubJobResult(t *testing.T) {
 			t.Fatalf("file not sanitized: %q", f)
 		}
 	})
+}
+
+// TestDecodeJobResultBytesCapsFindingsWhileStreaming pins the streaming findings cap: a body of
+// far more than JobResultMaxFindings elements is refused, and the refusal does not materialise
+// them (a plain struct decode of 1.4M empty findings costs ~190 MiB of heap).
+func TestDecodeJobResultBytesCapsFindingsWhileStreaming(t *testing.T) {
+	body := []byte(`{"claim_generation":1,"status":"completed","findings":[` +
+		strings.Repeat("{},", (4<<20)/3) + `{}]}`)
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+	_, err := decodeJobResultBytes(body)
+	runtime.ReadMemStats(&after)
+	if !errors.Is(err, errJobResultTooManyFindings) {
+		t.Fatalf("err = %v, want errJobResultTooManyFindings", err)
+	}
+	if grew := after.TotalAlloc - before.TotalAlloc; grew > 8<<20 {
+		t.Fatalf("refusing the over-count body allocated %d bytes; findings are being materialised", grew)
+	}
+
+	atCap := []byte(`{"claim_generation":1,"status":"completed","findings":[` +
+		strings.Repeat(`{"severity":"info","message_md":"x"},`, workersvc.JobResultMaxFindings-1) +
+		`{"severity":"info","message_md":"x"}]}`)
+	req, err := decodeJobResultBytes(atCap)
+	if err != nil || len(req.Findings) != workersvc.JobResultMaxFindings || req.ClaimGeneration == nil {
+		t.Fatalf("a body at the cap must decode: %d findings, err %v", len(req.Findings), err)
+	}
+	for name, b := range map[string]string{
+		"unknown top-level field": `{"status":"completed","extra":1}`,
+		"unknown finding field":   `{"status":"completed","findings":[{"severity":"info","message_md":"x","bogus":1}]}`,
+		"trailing value":          `{"status":"completed"} {}`,
+		"not an object":           `[]`,
+	} {
+		if _, err := decodeJobResultBytes([]byte(b)); err == nil {
+			t.Fatalf("%s: want an error", name)
+		}
+	}
+}
+
+// TestJobFindingURLStaysInsideDBCap pins that the url is capped AFTER the scrub: growth from the
+// redactor and a multibyte rune straddling the boundary must not push it past octet_length <= 2048.
+func TestJobFindingURLStaysInsideDBCap(t *testing.T) {
+	secret := "glpat-" + "AbCdEfGhIj" + "0123456789"
+	prefix := "https://e.com/"
+	inputs := map[string]string{
+		"multibyte at boundary": prefix + strings.Repeat("€", (workersvc.JobFindingURLMaxBytes-len(prefix))/3),
+		"secret packed":         prefix + "?k=" + strings.Repeat(secret+"&", (workersvc.JobFindingURLMaxBytes-len(prefix)-3)/(len(secret)+1)),
+		"multibyte and secret":  prefix + strings.Repeat("é"+secret, (workersvc.JobFindingURLMaxBytes-len(prefix))/(len(secret)+2)),
+		// Each 7-byte slack token scrubs to the 10-byte "[redacted]" plus its "/": the scrubbed
+		// text is 2046 bytes when the 3-byte euro sign starts at byte 2046 and ends at 2049, past
+		// the cap, while the raw URL is well inside it.
+		"scrub growth then straddling rune": prefix + strings.Repeat("xoxb-1/", 100) + strings.Repeat("a", 932) + "\u20ac",
+	}
+	for name, u := range inputs {
+		if len(u) > workersvc.JobFindingURLMaxBytes {
+			t.Fatalf("%s: fixture is %d bytes, over the pre-scrub cap", name, len(u))
+		}
+		fs, err := validateAndScrubJobFinding(workerJobFindingBody{Severity: "info", MessageMd: "x", URL: &u})
+		if err != nil {
+			continue // a refusal is fine; a 500 is not, and only an over-cap value can cause one
+		}
+		if fs.URL == nil || len(*fs.URL) > workersvc.JobFindingURLMaxBytes || !utf8.ValidString(*fs.URL) {
+			t.Fatalf("%s: stored url is %d bytes (valid utf8 %v)", name, len(*fs.URL), utf8.ValidString(*fs.URL))
+		}
+	}
 }

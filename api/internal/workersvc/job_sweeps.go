@@ -99,7 +99,7 @@ func (s *Service) FailJobsPastWallDeadline(ctx context.Context, globalTimeout ti
 	rows, err := s.q.FailJobsPastWallDeadline(ctx, store.FailJobsPastWallDeadlineParams{
 		FailureReason:        pgconv.TextOrNull(jobFailPastWallDeadline),
 		Now:                  pgconv.Time(s.now()),
-		GlobalTimeoutSeconds: int32(globalTimeout.Seconds()), //nolint:gosec // G115: RUN_TIMEOUT is a small bounded duration
+		GlobalTimeoutSeconds: int32(globalTimeout.Seconds()),
 		GraceSeconds:         jobWallBackstopGraceSeconds,
 	})
 	if err != nil {

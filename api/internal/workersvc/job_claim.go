@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -25,6 +26,19 @@ type ClaimJobInput struct {
 	Content string `json:"content"`
 }
 
+// jobCredentialErr converts an empty auto pool into a TERMINAL credential failure for a job.
+// The run lane treats errAutoPoolEmpty as transient and requeues into pool_wait, but a job never
+// parks (PRD #1908 D-E) and RequeueClaimAssemblyExact excludes it from pool_wait, so a requeue
+// would match no row, roll the claim back and strand the run in 'claimed' for the never-started
+// sweep to requeue into the same loop. The error deliberately does NOT wrap errAutoPoolEmpty:
+// finishRunClaim then fails the run closed with fail_origin 'credential_unavailable'.
+func jobCredentialErr(err error) error {
+	if errors.Is(err, errAutoPoolEmpty) {
+		return fmt.Errorf("%w: the worker's auto credential pool has no usable token, and a job does not wait for one", errCredentialUnavailable)
+	}
+	return err
+}
+
 // assembleJobClaim builds the claim payload for an already-claimed kind='job' run (PRD #1908).
 // A job has no repo, no forge connection, no memory and no skills, so it forks in assembleClaim
 // BEFORE GetRunClaimContext (which INNER-JOINs repos) and before any PAT decrypt: the payload
@@ -41,13 +55,20 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		// fail closed rather than run without a credential.
 		return nil, fmt.Errorf("%w: a job run cannot use the Codex harness", errCredentialUnavailable)
 	}
+	// A requeued job is claimed again (worker death, the never-started sweep). job_results is
+	// keyed by run_id and never otherwise cleared, so drop an earlier flight's result and findings
+	// before this flight starts: the no-result invariant must judge THIS flight. ClaimRun already
+	// bumped the claim generation, so an older flight cannot write one back after this.
+	if err := s.q.ClearJobResultForRun(ctx, run.ID); err != nil {
+		return nil, fmt.Errorf("clear earlier job result: %w", err)
+	}
 	choice, err := s.claimSecretID(ctx, wkr, run)
 	if err != nil {
-		return nil, err
+		return nil, jobCredentialErr(err)
 	}
 	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
 	if err != nil {
-		return nil, err
+		return nil, jobCredentialErr(err)
 	}
 	// emitSwitchMessage=false: a job is not credential-switchable (D-E), so it never emits a
 	// 'credential_switch' message and last_seq cannot diverge from run.LastSeq.

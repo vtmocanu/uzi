@@ -8636,21 +8636,26 @@ FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   AND r.kind <> 'chat'
-  AND (cardinality(r.required_capabilities) > 0 OR r.kind = 'job')
+  -- PRD #1908 (D-A): the two conjuncts below are the ORIGINAL non-job predicate, kept
+  -- byte-for-byte. They are wrapped in an OR so a repo-less 'job' (whose required_capabilities is
+  -- always '{}', so the first conjunct is false for it) is decided by the job arm instead. AND
+  -- binds tighter than OR, so ` + "`" + `TRUE AND a AND b OR c` + "`" + ` reads (a AND b) OR c; TRUE only gives the
+  -- original leading AND something to attach to.
+  AND (
+      TRUE
+  AND cardinality(r.required_capabilities) > 0
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
         AND NOT w.ephemeral
-        AND r.kind <> 'job'
         AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
-  -- PRD #1908 (D-A): a repo-less 'job' is placeable ONLY on an online, non-draining,
-  -- non-ephemeral, NON-docker worker advertising 'job_runner_v1' (ClaimRun's non-bypassable
-  -- job-runner clause), so the capability-subset test above is skipped for it (r.kind <> 'job')
-  -- and THIS block decides instead. Non-job runs are unaffected (the OR is true).
-  AND (r.kind <> 'job' OR NOT EXISTS (
+  -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
+  -- worker advertising 'job_runner_v1' (ClaimRun's non-bypassable job-runner clause). Only a job
+  -- reaches it; for every other kind the arm is false and the original predicate decides alone.
+  OR (r.kind = 'job' AND NOT EXISTS (
       SELECT 1 FROM workers wj
       WHERE wj.user_id = r.user_id
         AND wj.status = 'online'
@@ -8659,6 +8664,7 @@ WHERE r.status = 'queued'
         AND NOT COALESCE(wj.docker_enabled, false)
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
   ))
+  )
   AND NOT EXISTS (
       SELECT 1 FROM workers w2
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
@@ -13217,6 +13223,11 @@ WHERE id = $11 AND worker_id = $12
   -- non-released row (the interlocked path is completeRunWithPermit, fenced on its own locked row),
   -- so this never blocks a legitimate completion.
   AND status <> 'paused' AND claim_released_at IS NULL
+  -- PRD #1908: a job is completed only from a live (claimed or running) status. In particular the
+  -- issue #329 supersede arm below must never flip a job the wall backstop failed with
+  -- fail_origin 'run_timeout' to completed: the runner's result POST is refused as terminal, so
+  -- that flip would yield a completed job with no result.
+  AND (kind <> 'job' OR status IN ('claimed', 'running'))
   -- issue #329: a genuine worker completion (it opened the MR) supersedes a
   -- wall-clock RUN_TIMEOUT failure. Scoped to fail_origin='run_timeout' ONLY: a
   -- human 'cancelled' still wins, and a worker's own 'failed'/'worker_lost' is never

@@ -25,7 +25,6 @@ const (
 	JobFindingURLMaxBytes        = 2048     // job_findings.url CHECK
 	JobFindingFileMaxBytes       = 1024     // job_findings.file CHECK
 	JobFindingMaxLine            = 1 << 24  // a sane ceiling well inside int4
-	JobResultStatusMaxBytes      = 32
 	jobNoResultFailureReasonText = "The job finished without submitting a result."
 )
 
@@ -114,6 +113,23 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 		}
 	}
 	return tx.Commit(ctx)
+}
+
+// CheckJobResultTarget is the cheap pre-body check of the job-result route: the run must be held
+// by wkr (ErrRunNotFound otherwise) and be a kind='job' run (ErrNotJobRun). It is a plain read;
+// SubmitJobResult's FOR UPDATE fence remains the authority for claim generation and status.
+func (s *Service) CheckJobResultTarget(ctx context.Context, wkr store.Worker, runID uuid.UUID) error {
+	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrRunNotFound
+		}
+		return err
+	}
+	if run.Kind != runkind.Job {
+		return ErrNotJobRun
+	}
+	return nil
 }
 
 func jobTextPtr(p *string) pgtype.Text {

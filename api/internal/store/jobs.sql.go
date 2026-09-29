@@ -12,6 +12,22 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const clearJobResultForRun = `-- name: ClearJobResultForRun :exec
+WITH f AS (DELETE FROM job_findings jf WHERE jf.run_id = $1::uuid)
+DELETE FROM job_results jr WHERE jr.run_id = $1::uuid
+`
+
+// Drops a job run's result and findings in ONE statement. Claim assembly runs it for every job
+// claim: job_results is keyed by run_id and a requeued job (worker death, never-started sweep) is
+// claimed again, so a result an EARLIER flight posted would otherwise satisfy the no-result
+// invariant for a later flight that posts nothing. The claim generation was bumped by ClaimRun
+// before assembly, so an older flight can no longer write a result after this clear (the ingest
+// fences on the generation under the run row lock).
+func (q *Queries) ClearJobResultForRun(ctx context.Context, runID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, clearJobResultForRun, runID)
+	return err
+}
+
 const countActiveJobRunsForUser = `-- name: CountActiveJobRunsForUser :one
 SELECT count(*)
   FROM runs
@@ -290,7 +306,7 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = $3 AND worker_id = $4
   AND kind = 'job'
-  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND status IN ('claimed', 'running')
   AND claim_released_at IS NULL
   AND NOT EXISTS (SELECT 1 FROM job_results jr WHERE jr.run_id = runs.id)
 `
@@ -303,11 +319,20 @@ type FailJobRunWithoutResultParams struct {
 }
 
 // The no-result invariant (PRD #1908): a job run the worker reports `completed` while no
-// job_results row exists is failed instead, fail_origin 'job_no_result'. ONE statement, so the
-// result probe and the transition cannot interleave with a result ingest. workersvc runs it just
+// job_results row exists is failed instead, fail_origin 'job_no_result'. workersvc runs it just
 // before SetRunCompleted for a kind='job' run: 1 row means the run failed here; 0 rows means a
-// result exists (or the run is not this worker's live, non-terminal job) and SetRunCompleted
-// proceeds exactly as for any other kind. The SET list mirrors SetRunFailed's terminal columns.
+// result exists (or the run is not this worker's live job) and SetRunCompleted proceeds exactly as
+// for any other kind. The SET list mirrors SetRunFailed's terminal columns.
+//
+// The probe and the transition are ONE statement, but that alone does not serialise them against
+// a result ingest: under READ COMMITTED a result committing between this statement's snapshot and
+// its write would be missed. The race-free property comes from the caller: setState requires
+// claim_generation on every job state report (ErrMissingClaimGeneration otherwise), so this runs
+// on the FOR UPDATE fenced path, holding the run row lock that SubmitJobResult also takes before
+// it writes the result. Do not call it on an unfenced path.
+//
+// The live-status guard matches SetRunCompleted's job arm: only a claimed or running job (never
+// queued, paused or terminal) with an unreleased claim.
 func (q *Queries) FailJobRunWithoutResult(ctx context.Context, arg FailJobRunWithoutResultParams) (int64, error) {
 	result, err := q.db.Exec(ctx, failJobRunWithoutResult,
 		arg.FailureReason,
@@ -843,16 +868,16 @@ func (q *Queries) LockJobCreate(ctx context.Context, userID uuid.UUID) error {
 
 const lockUnservableEphemeralJobWorkers = `-- name: LockUnservableEphemeralJobWorkers :many
 SELECT w.id AS worker_id, r.id AS run_id, r.user_id AS user_id,
-       CASE WHEN w.online_since IS NULL THEN 'ephemeral_worker_never_registered'
+       CASE WHEN w.last_heartbeat_at IS NULL THEN 'ephemeral_worker_never_registered'
             ELSE 'no_job_capable_worker' END::text AS cause
   FROM workers w
   JOIN runs r ON r.id = w.ephemeral_run_id AND r.kind = 'job'
  WHERE w.ephemeral
    AND (
-        (w.online_since IS NOT NULL
-         AND w.status = 'online'
-         AND NOT ('job_runner_v1' = ANY(w.protocol_capabilities)))
-        OR (w.online_since IS NULL AND w.created_at < $1)
+        (w.last_heartbeat_at IS NOT NULL
+         AND NOT (NOT COALESCE(w.docker_enabled, false)
+                  AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
+        OR (w.last_heartbeat_at IS NULL AND w.created_at < $1)
    )
    AND NOT EXISTS (
        SELECT 1 FROM runs br
@@ -876,14 +901,19 @@ type LockUnservableEphemeralJobWorkersRow struct {
 
 // PRD #1908 D-A2. The ephemeral workers bound to a kind='job' run that can never serve it,
 // locked FOR UPDATE (worker rows, id order) so the fail-and-delete that follows in the same
-// transaction serialises with the worker's own register/heartbeat. Two shapes:
+// transaction serialises with the worker's own register/heartbeat. Two shapes, told apart by
+// last_heartbeat_at, the ONLY registration signal the stale sweep does not clear (RegisterWorker
+// stamps it and MarkStaleWorkersOffline leaves it; the uptime anchor column is display-only, PRD
+// #251, is nulled by that sweep, and is deliberately not read here):
 //
-//	(a) the worker registered and is online, but its protocol_capabilities lack 'job_runner_v1'
-//	    (an old worker image): ClaimRun's job clause will never let it claim, and the gap
-//	    trigger would provision another one forever. cause = 'no_job_capable_worker'.
-//	(b) the worker never registered by the provision deadline (online_since IS NULL and
-//	    created_at older than @deadline_cutoff): the same shape ReapEphemeralWorkers would
-//	    delete silently, leaving the still-queued job to be re-provisioned every deadline.
+//	(a) the worker REGISTERED AT LEAST ONCE (last_heartbeat_at IS NOT NULL), online or since gone
+//	    stale, and does not satisfy ClaimRun's job clause: a docker worker, or one whose
+//	    protocol_capabilities lack 'job_runner_v1' (an old worker image). ClaimRun will never
+//	    let it claim, and the gap trigger would provision another one forever.
+//	    cause = 'no_job_capable_worker'.
+//	(b) the worker NEVER registered by the provision deadline (last_heartbeat_at IS NULL and
+//	    created_at older than @deadline_cutoff): the shape ReapEphemeralWorkers would delete
+//	    silently, leaving the still-queued job to be re-provisioned every deadline.
 //	    cause = 'ephemeral_worker_never_registered'.
 //
 // A worker holding ANY non-terminal run is left alone (the ReapEphemeralWorkers busy guard), and

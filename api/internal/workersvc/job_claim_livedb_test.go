@@ -332,6 +332,45 @@ func TestJobClaimPayloadLiveDB(t *testing.T) {
 	}
 }
 
+// TestJobEmptyAutoPoolFailsClosedLiveDB: a job claimed by an auto-bound worker whose owner pooled no
+// token is FAILED closed (credential_unavailable), never requeued into pool_wait. A job never parks
+// (D-E) and RequeueClaimAssemblyExact excludes it from pool_wait, so a requeue would match no row,
+// roll the claim back and strand the run in 'claimed' for the never-started sweep to re-claim, in a
+// loop the wall backstop never breaks (claimed_at resets).
+//
+// MUTATION CHECK: removing jobCredentialErr's errAutoPoolEmpty arm makes Claim return an error and
+// leaves the run 'claimed', and this test goes red.
+func TestJobEmptyAutoPoolFailsClosedLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t) // one enabled, non-default token that is not pooled: the auto pool is empty
+	v, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	e.exec(`UPDATE workers SET anthropic_bind_mode = 'auto' WHERE id = $1`, workerID)
+	wkr := store.Worker{ID: workerID, UserID: u, Name: "auto", Status: "online", ProtocolCapabilities: []string{jobCap}, AnthropicBindMode: BindModeAuto}
+
+	pl, err := e.svc.Claim(e.ctx, wkr, nil)
+	if err != nil || pl != nil {
+		t.Fatalf("Claim = %+v, %v; want idle with no error (the claim must settle, not loop)", pl, err)
+	}
+	run := mustRun(t, e.codexTestEnv, v.ID)
+	if run.Status != "failed" || run.FailOrigin.String != "credential_unavailable" || run.FailureReason.String == "" || !run.FinishedAt.Valid {
+		t.Fatalf("job = %s / %q / reason %q / finished %v; want failed / credential_unavailable with a reason", run.Status, run.FailOrigin.String, run.FailureReason.String, run.FinishedAt.Valid)
+	}
+	if run.RequeueCount != 0 {
+		t.Fatalf("requeue_count = %d, want 0", run.RequeueCount)
+	}
+	// A second claim finds nothing: the job is terminal, not re-queued.
+	if pl, err := e.svc.Claim(e.ctx, wkr, nil); err != nil || pl != nil {
+		t.Fatalf("second Claim = %+v, %v; want idle", pl, err)
+	}
+	if got := e.status(t, v.ID); got != "failed" {
+		t.Fatalf("status after the second claim = %q, want failed", got)
+	}
+}
+
 // TestJobEndToEndEphemeralProvisionRegisterClaimLiveDB: a job with only an old-image worker online
 // is a gap-trigger candidate; a run-bound ephemeral worker inserted exactly as the provisioner does
 // it, registered with job_runner_v1 through the real register path, claims it.
@@ -536,6 +575,103 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		}
 		if e.workerExists(t, w.ID) {
 			t.Fatal("the stale ephemeral row must still be deleted")
+		}
+	})
+
+	// goStale reproduces what MarkStaleWorkersOffline does to a registered worker whose heartbeats
+	// stopped: offline, online_since cleared. last_heartbeat_at stays (it is the registration
+	// signal), and the row is old enough to be past the provision deadline.
+	goStale := func(e jobEnv, t *testing.T, id uuid.UUID) {
+		t.Helper()
+		e.exec(`UPDATE workers SET status = 'offline', online_since = NULL, last_heartbeat_at = now() - interval '1 hour' WHERE id = $1`, id)
+		e.ageWorker(t, id, 20*time.Minute)
+	}
+
+	t.Run("registered capable worker gone heartbeat-stale: NOT failed as never-registered", func(t *testing.T) {
+		e := setupJobLiveDB(t, 0)
+		u := e.seedJobUser(t)
+		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+		w := e.seedEphemeralWorker(t, u, v.ID)
+		e.registerEphemeral(t, w, jobCap)
+		goStale(e, t, w.ID)
+		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 0 {
+			t.Fatalf("pass = %d, %v; want 0 (the worker registered, it merely went stale)", n, err)
+		}
+		if e.status(t, v.ID) != "queued" || !e.workerExists(t, w.ID) {
+			t.Fatal("a stale but job-capable ephemeral worker must leave its job queued and its row for the reaper")
+		}
+	})
+
+	t.Run("registered incapable worker gone offline: failed as no_job_capable_worker", func(t *testing.T) {
+		e := setupJobLiveDB(t, 0)
+		u := e.seedJobUser(t)
+		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+		w := e.seedEphemeralWorker(t, u, v.ID)
+		e.registerEphemeral(t, w) // old image
+		goStale(e, t, w.ID)
+		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 1 {
+			t.Fatalf("pass = %d, %v; want 1", n, err)
+		}
+		run := mustRun(t, e.codexTestEnv, v.ID)
+		if run.Status != "failed" || run.FailOrigin.String != "no_job_capable_worker" {
+			t.Fatalf("job = %s / %q; want failed / no_job_capable_worker, not never-registered", run.Status, run.FailOrigin.String)
+		}
+		if e.workerExists(t, w.ID) {
+			t.Fatal("the unservable worker row must be deleted")
+		}
+	})
+
+	t.Run("docker ephemeral advertising job_runner_v1 is unservable", func(t *testing.T) {
+		e := setupJobLiveDB(t, 0)
+		u := e.seedJobUser(t)
+		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+		w := e.seedEphemeralWorker(t, u, v.ID)
+		e.registerEphemeral(t, w, jobCap)
+		e.exec(`UPDATE workers SET docker_enabled = true WHERE id = $1`, w.ID)
+		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 1 {
+			t.Fatalf("pass = %d, %v; want 1", n, err)
+		}
+		if run := mustRun(t, e.codexTestEnv, v.ID); run.FailOrigin.String != "no_job_capable_worker" {
+			t.Fatalf("fail_origin = %q; a docker worker can never claim a job", run.FailOrigin.String)
+		}
+	})
+
+	// CALIBRATION (each FailUnservedJobRun race-guard conjunct alone): drop `AND worker_id IS NULL`
+	// and the "queued but already bound" subtest fails; drop `AND status = 'queued'` and the
+	// "unbound but not queued" subtest fails.
+	t.Run("queued job already bound to a worker (requeue affinity): untouched", func(t *testing.T) {
+		e := setupJobLiveDB(t, 0)
+		u := e.seedJobUser(t)
+		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+		w := e.seedEphemeralWorker(t, u, v.ID)
+		e.registerEphemeral(t, w) // incapable
+		other := e.seedWorkerRow(t, u, false, nil, jobCap)
+		e.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, v.ID, other)
+		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 0 {
+			t.Fatalf("pass = %d, %v; want 0 failed jobs", n, err)
+		}
+		after := mustRun(t, e.codexTestEnv, v.ID)
+		if after.Status != "queued" || after.FailOrigin.Valid {
+			t.Fatalf("job = %s / %+v; a job bound to a worker must not be failed by the D-A2 pass", after.Status, after.FailOrigin)
+		}
+		if e.workerExists(t, w.ID) {
+			t.Fatal("the stale ephemeral row must still be deleted")
+		}
+	})
+
+	t.Run("unbound job that is not queued (cancelled): untouched", func(t *testing.T) {
+		e := setupJobLiveDB(t, 0)
+		u := e.seedJobUser(t)
+		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+		w := e.seedEphemeralWorker(t, u, v.ID)
+		e.registerEphemeral(t, w) // incapable
+		e.exec(`UPDATE runs SET status = 'cancelled', finished_at = now() WHERE id = $1`, v.ID)
+		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 0 {
+			t.Fatalf("pass = %d, %v; want 0 failed jobs", n, err)
+		}
+		after := mustRun(t, e.codexTestEnv, v.ID)
+		if after.Status != "cancelled" || after.FailOrigin.Valid {
+			t.Fatalf("job = %s / %+v; a cancelled job must stay cancelled", after.Status, after.FailOrigin)
 		}
 	})
 

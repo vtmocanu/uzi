@@ -65,8 +65,27 @@ func (h *Handler) WorkerJobResult(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	var req workerJobResultRequest
-	if err := decodeJobResultBody(w, r, &req); err != nil {
+	// Cheap ownership and kind check BEFORE the body is read, so a worker token cannot make the
+	// api buffer and decode a multi-MiB body for a run it does not hold or that is not a job. The
+	// in-transaction fence in SubmitJobResult stays the authority.
+	if err := h.wsvc.CheckJobResultTarget(r.Context(), wkr, runID); err != nil {
+		switch {
+		case errors.Is(err, workersvc.ErrRunNotFound):
+			httpx.Error(w, http.StatusNotFound, "run not found")
+		case errors.Is(err, workersvc.ErrNotJobRun):
+			httpx.ErrorReason(w, http.StatusForbidden, "this route is only available for job runs", notForJobReason)
+		default:
+			slog.Error("worker job result target check", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		}
+		return
+	}
+	req, err := decodeJobResultBody(w, r)
+	if err != nil {
+		if errors.Is(err, errJobResultTooManyFindings) {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
 		httpx.RespondDecodeError(w, err, "invalid request body")
 		return
 	}
@@ -98,22 +117,85 @@ func (h *Handler) WorkerJobResult(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
-// decodeJobResultBody reads one JSON value with unknown fields refused, under the job-result body
+// errJobResultTooManyFindings is decodeJobResultBody's refusal of a findings array longer than
+// JobResultMaxFindings, raised while streaming, before the excess elements are materialised.
+var errJobResultTooManyFindings = fmt.Errorf("at most %d findings", workersvc.JobResultMaxFindings)
+
+// decodeJobResultBody reads one JSON object with unknown fields refused, under the job-result body
 // cap (an over-cap body is an *http.MaxBytesError, answered 413 by RespondDecodeError).
-func decodeJobResultBody(w http.ResponseWriter, r *http.Request, dst any) error {
+func decodeJobResultBody(w http.ResponseWriter, r *http.Request) (workerJobResultRequest, error) {
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, jobResultMaxBodyBytes))
+	if err != nil {
+		return workerJobResultRequest{}, err
+	}
+	return decodeJobResultBytes(body)
+}
+
+// decodeJobResultBytes streams the findings array element by element and stops at the first
+// element past JobResultMaxFindings, so a body of millions of `{}` elements never allocates them
+// all (a plain struct decode would materialise every element before any count check). Every other
+// field, and each finding, decodes strictly (unknown fields refused).
+func decodeJobResultBytes(body []byte) (workerJobResultRequest, error) {
+	var req workerJobResultRequest
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.DisallowUnknownFields()
+	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
+		return req, errors.New("request body must be a JSON object")
+	}
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return req, err
+		}
+		key, _ := keyTok.(string)
+		switch key {
+		case "claim_generation":
+			err = dec.Decode(&req.ClaimGeneration)
+		case "status":
+			err = dec.Decode(&req.Status)
+		case "report_md":
+			err = dec.Decode(&req.ReportMd)
+		case "findings":
+			err = decodeJobFindingsStream(dec, &req.Findings)
+		default:
+			err = fmt.Errorf("unknown field %q", key)
+		}
+		if err != nil {
+			return req, err
+		}
+	}
+	if _, err := dec.Token(); err != nil { // the closing brace
+		return req, err
+	}
+	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
+		return req, errors.New("request body must contain one JSON value")
+	}
+	return req, nil
+}
+
+func decodeJobFindingsStream(dec *json.Decoder, dst *[]workerJobFindingBody) error {
+	tok, err := dec.Token()
 	if err != nil {
 		return err
 	}
-	dec := json.NewDecoder(bytes.NewReader(body))
-	dec.DisallowUnknownFields()
-	if err := dec.Decode(dst); err != nil {
-		return err
+	if tok == nil { // findings: null
+		return nil
 	}
-	if _, err := dec.Token(); !errors.Is(err, io.EOF) {
-		return errors.New("request body must contain one JSON value")
+	if tok != json.Delim('[') {
+		return errors.New("findings must be an array")
 	}
-	return nil
+	for dec.More() {
+		if len(*dst) >= workersvc.JobResultMaxFindings {
+			return errJobResultTooManyFindings
+		}
+		var f workerJobFindingBody
+		if err := dec.Decode(&f); err != nil {
+			return err
+		}
+		*dst = append(*dst, f)
+	}
+	_, err = dec.Token() // the closing bracket
+	return err
 }
 
 // validateAndScrubJobResult is the job-result ingest gate (PRD #1908, the task-review discipline):
@@ -169,7 +251,9 @@ func validateAndScrubJobFinding(f workerJobFindingBody) (workersvc.JobFindingSub
 		if len(*f.URL) > workersvc.JobFindingURLMaxBytes {
 			return workersvc.JobFindingSubmission{}, fmt.Errorf("url exceeds %d bytes", workersvc.JobFindingURLMaxBytes)
 		}
-		u := scrubThenBoundSelfReported(*f.URL, workersvc.JobFindingURLMaxBytes)
+		// Cap after the scrub: the redactor can grow the string and the bounder can overshoot on a
+		// multibyte rune, and the DB octet_length(url) <= 2048 CHECK would 500 the whole ingest.
+		u := capUTF8(scrubThenBoundSelfReported(*f.URL, workersvc.JobFindingURLMaxBytes), workersvc.JobFindingURLMaxBytes)
 		if err := validateJobFindingURL(u); err != nil {
 			return workersvc.JobFindingSubmission{}, err
 		}

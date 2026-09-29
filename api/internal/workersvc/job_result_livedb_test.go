@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -146,22 +147,31 @@ func TestJobNoResultInvariantLiveDB(t *testing.T) {
 			t.Fatalf("SetState completed: %v", err)
 		}
 	}
-	for _, tc := range []struct {
-		name string
-		gen  *int64
-	}{{"generation-fenced", i64Ptr(1)}, {"legacy no generation", nil}} {
-		t.Run("no result fails/"+tc.name, func(t *testing.T) {
+	t.Run("no result fails/generation-fenced", func(t *testing.T) {
+		runID := e.seedRawJob(t, u, "running", &workerID, time.Minute, 600)
+		complete(t, runID, i64Ptr(1))
+		run := mustRun(t, e.codexTestEnv, runID)
+		if run.Status != "failed" || !run.FailOrigin.Valid || run.FailOrigin.String != "job_no_result" {
+			t.Fatalf("status = %q fail_origin = %+v, want failed / job_no_result", run.Status, run.FailOrigin)
+		}
+		if !run.FailureReason.Valid || run.FailureReason.String == "" || !run.FinishedAt.Valid {
+			t.Fatalf("failure_reason = %+v finished_at = %+v, want a reason and a finish time", run.FailureReason, run.FinishedAt)
+		}
+	})
+	// The no-result check is race-free only on the FOR UPDATE fenced path, which needs the
+	// generation: a job state report that omits it is refused, and changes nothing.
+	t.Run("a job report without claim_generation is refused", func(t *testing.T) {
+		for _, state := range []string{"completed", "running", "failed"} {
 			runID := e.seedRawJob(t, u, "running", &workerID, time.Minute, 600)
-			complete(t, runID, tc.gen)
-			run := mustRun(t, e.codexTestEnv, runID)
-			if run.Status != "failed" || !run.FailOrigin.Valid || run.FailOrigin.String != "job_no_result" {
-				t.Fatalf("status = %q fail_origin = %+v, want failed / job_no_result", run.Status, run.FailOrigin)
+			_, _, err := e.svc.SetState(e.ctx, wkr, runID, StateRequest{State: state})
+			if !errors.Is(err, ErrMissingClaimGeneration) {
+				t.Fatalf("%s without generation: err = %v, want ErrMissingClaimGeneration", state, err)
 			}
-			if !run.FailureReason.Valid || run.FailureReason.String == "" || !run.FinishedAt.Valid {
-				t.Fatalf("failure_reason = %+v finished_at = %+v, want a reason and a finish time", run.FailureReason, run.FinishedAt)
+			if run := mustRun(t, e.codexTestEnv, runID); run.Status != "running" || run.FailOrigin.Valid {
+				t.Fatalf("%s without generation changed the run: %s / %+v", state, run.Status, run.FailOrigin)
 			}
-		})
-	}
+		}
+	})
 	t.Run("with a result completes", func(t *testing.T) {
 		runID := e.seedRawJob(t, u, "running", &workerID, time.Minute, 600)
 		if err := e.svc.SubmitJobResult(e.ctx, wkr, runID, 1, JobResultSubmission{Status: "completed", ReportMD: "done"}); err != nil {
@@ -182,4 +192,101 @@ func TestJobNoResultInvariantLiveDB(t *testing.T) {
 			t.Fatalf("chat status = %q fail_origin = %+v, want completed", run.Status, run.FailOrigin)
 		}
 	})
+}
+
+// TestTimedOutJobNeverCompletesLiveDB: a job the wall backstop failed (run_timeout, claim kept) must
+// not be flipped to completed by a late `completed` report. The runner's result POST is refused as
+// terminal, so the issue #329 supersede arm of SetRunCompleted would otherwise yield a completed
+// job with no result.
+//
+// MUTATION CHECK: removing the `kind <> 'job' OR status IN ('claimed', 'running')` conjunct from
+// SetRunCompleted turns the run completed, and this test goes red.
+func TestTimedOutJobNeverCompletesLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	wkr := jobWorker(workerID, u)
+	runID := e.seedRawJob(t, u, "running", &workerID, time.Hour, 60)
+	if n, err := e.svc.FailJobsPastWallDeadline(e.ctx, time.Hour); err != nil || n != 1 {
+		t.Fatalf("FailJobsPastWallDeadline = %d, %v; want 1", n, err)
+	}
+	if err := e.svc.SubmitJobResult(e.ctx, wkr, runID, 1, JobResultSubmission{Status: "completed", ReportMD: "late"}); !errors.Is(err, ErrRunTerminal) {
+		t.Fatalf("late result: err = %v, want ErrRunTerminal", err)
+	}
+	if _, _, err := e.svc.SetState(e.ctx, wkr, runID, StateRequest{State: "completed", ClaimGeneration: i64Ptr(1)}); err != nil {
+		t.Fatalf("late completed report: %v", err)
+	}
+	run := mustRun(t, e.codexTestEnv, runID)
+	if run.Status != "failed" || run.FailOrigin.String != "run_timeout" {
+		t.Fatalf("timed-out job = %s / %q; want it to stay failed / run_timeout", run.Status, run.FailOrigin.String)
+	}
+	if n := e.countRows(t, "job_results", runID); n != 0 {
+		t.Fatalf("job_results rows = %d, want 0", n)
+	}
+}
+
+// TestJobLiveStatusGuardLiveDB: FailJobRunWithoutResult and SetRunCompleted agree on which job
+// rows a worker report can move: only claimed or running, never queued (a requeued job whose old
+// flight reports late) or paused.
+func TestJobLiveStatusGuardLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	for _, status := range []string{"queued", "paused"} {
+		runID := e.seedRawJob(t, u, status, &workerID, 0, 600)
+		n, err := e.q.FailJobRunWithoutResult(e.ctx, store.FailJobRunWithoutResultParams{ID: runID, WorkerID: pgconv.UUID(workerID)})
+		if err != nil || n != 0 {
+			t.Fatalf("FailJobRunWithoutResult on a %s job = %d, %v; want 0 rows", status, n, err)
+		}
+		n, err = e.q.SetRunCompleted(e.ctx, store.SetRunCompletedParams{ID: runID, WorkerID: pgconv.UUID(workerID)})
+		if err != nil || n != 0 {
+			t.Fatalf("SetRunCompleted on a %s job = %d, %v; want 0 rows", status, n, err)
+		}
+		if got := e.status(t, runID); got != status {
+			t.Fatalf("a %s job moved to %s", status, got)
+		}
+	}
+}
+
+// TestJobReclaimClearsEarlierResultLiveDB: a requeued job that is claimed again starts with no
+// result, so a result an earlier flight posted cannot satisfy the no-result invariant for a later
+// flight that posts nothing.
+//
+// MUTATION CHECK: removing ClearJobResultForRun from assembleJobClaim leaves the earlier result in
+// place, the second flight's bare `completed` succeeds, and this test goes red.
+func TestJobReclaimClearsEarlierResultLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	e.makeTokenDefault(t, u)
+	v, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	wkr := store.Worker{ID: workerID, UserID: u, Name: "w", Status: "online", ProtocolCapabilities: []string{jobCap}}
+
+	pl, err := e.svc.Claim(e.ctx, wkr, nil)
+	if err != nil || pl == nil || pl.ClaimGeneration != 1 {
+		t.Fatalf("first claim = %+v, %v", pl, err)
+	}
+	e.exec(`UPDATE runs SET status = 'running', started_at = now() WHERE id = $1`, v.ID)
+	if err := e.svc.SubmitJobResult(e.ctx, wkr, v.ID, 1, JobResultSubmission{Status: "completed", ReportMD: "flight one", Findings: []JobFindingSubmission{{Severity: "info", MessageMD: "f"}}}); err != nil {
+		t.Fatal(err)
+	}
+	// The worker dies: the run is requeued (RequeueWorkerRuns keeps worker affinity) and claimed again.
+	e.exec(`UPDATE runs SET status = 'queued', claim_released_at = NULL WHERE id = $1`, v.ID)
+	pl, err = e.svc.Claim(e.ctx, wkr, nil)
+	if err != nil || pl == nil || pl.ClaimGeneration != 2 {
+		t.Fatalf("second claim = %+v, %v; want generation 2", pl, err)
+	}
+	if n, f := e.countRows(t, "job_results", v.ID), e.countRows(t, "job_findings", v.ID); n != 0 || f != 0 {
+		t.Fatalf("after the re-claim job_results = %d, job_findings = %d; want both cleared", n, f)
+	}
+	e.exec(`UPDATE runs SET status = 'running' WHERE id = $1`, v.ID)
+	if _, _, err := e.svc.SetState(e.ctx, wkr, v.ID, StateRequest{State: "completed", ClaimGeneration: i64Ptr(2)}); err != nil {
+		t.Fatal(err)
+	}
+	if run := mustRun(t, e.codexTestEnv, v.ID); run.Status != "failed" || run.FailOrigin.String != "job_no_result" {
+		t.Fatalf("second flight without a result = %s / %q; want failed / job_no_result", run.Status, run.FailOrigin.String)
+	}
 }

@@ -1061,6 +1061,9 @@ type Store interface {
 	// satisfied. A per-run lookup like CountOnlineWorkersSatisfyingCodexHarness above, and off the
 	// hot path for the same reason.
 	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, userID uuid.UUID) (int64, error)
+	// ClearJobResultForRun drops a job run's result and findings at claim assembly (PRD #1908):
+	// a result from an earlier flight must not satisfy a later flight's no-result invariant.
+	ClearJobResultForRun(ctx context.Context, runID uuid.UUID) error
 	// ListJobInputsForClaim reads a claimed job's named inputs for claim assembly (PRD #1908).
 	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
 	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
@@ -3741,6 +3744,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.ClaimGeneration == nil &&
 		stateUsesGenerationFence(req.State, owned) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
+		return owned, false, ErrMissingClaimGeneration
+	}
+	// PRD #1908: a job's no-result check (FailJobRunWithoutResult) is race-free against a result
+	// ingest only on the FOR UPDATE fenced path below, which engages when the report stamps a
+	// generation. Every job_runner_v1 worker is new, so require it on every fenced mutating job
+	// report and refuse its omission whatever capabilities the worker advertises.
+	if req.ClaimGeneration == nil && owned.Kind == runkind.Job && stateUsesForUpdateFence(req.State, owned) {
 		return owned, false, ErrMissingClaimGeneration
 	}
 	// PRD #1247 M5 (D3): the released-generation fence. A CAPABILITY worker stamps
