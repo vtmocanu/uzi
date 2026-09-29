@@ -253,6 +253,11 @@ func SettleFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.UU
 	return true, nil
 }
 
+// ReleaseFindingGroupDefinitive reopens a pre-call claim or a definitively rejected write.
+func ReleaseFindingGroupDefinitive(ctx context.Context, db FindingGroupDB, user, id uuid.UUID) (bool, error) {
+	return releaseFindingGroup(ctx, db, user, id, false)
+}
+
 // ReleaseFindingGroupAfterDeadline requires an owner-confirmed request. The DB
 // enforces the deadline and absence of any recorded issue.
 func ReleaseFindingGroupAfterDeadline(ctx context.Context, db FindingGroupDB, user, id uuid.UUID) (bool, error) {
@@ -275,7 +280,7 @@ func releaseFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.U
 		return false, err
 	}
 	if (phase != "pre_call" && phase != "in_flight" && phase != "returned_uncertain") ||
-		(afterDeadline && !expired) || (!afterDeadline && phase == "returned_uncertain") {
+		(afterDeadline && !expired) || (!afterDeadline && (expired || phase == "returned_uncertain")) {
 		return false, nil
 	}
 	var n, linked int64
@@ -307,6 +312,15 @@ func releaseFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.U
 		return false, err
 	}
 	return true, nil
+}
+
+// GetFindingGroupOperation includes terminal phases for owner-scoped release responses.
+func GetFindingGroupOperation(ctx context.Context, db DBTX, user, id uuid.UUID) (FindingGroupClaimOperation, error) {
+	var o FindingGroupClaimOperation
+	err := db.QueryRow(ctx, `SELECT id,user_id,repo_id,phase,deadline_at,created_at,issue_iid,issue_url
+        FROM finding_group_operations WHERE id=$1 AND user_id=$2`, id, user).
+		Scan(&o.ID, &o.UserID, &o.RepoID, &o.Phase, &o.Deadline, &o.CreatedAt, &o.IssueIID, &o.IssueURL)
+	return o, err
 }
 
 func GetPendingFindingGroup(ctx context.Context, db DBTX, user, id uuid.UUID) (FindingGroupClaimOperation, error) {

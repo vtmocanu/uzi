@@ -598,6 +598,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #333 M5: filing a forge issue from a finding is a forge WRITE on the caller's
 	// connection, so it carries the per-user forge budget, mirroring the recommendation
 	// file route below.
+	{"POST", "/api/findings/issue", limForge},
+	{"POST", "/api/findings/filing-operations/{operation-id}/release", noLimiter},
 	{"POST", "/api/findings/{id}/issue", limForge},
 	// PRD #333 M5: dismissing a finding is a LOCAL write — no forge call, no spend — so it
 	// carries no per-user limiter, like the recommendation disposition write.
