@@ -271,7 +271,7 @@ function makeSignalToolHandlers(): {
         content: [
           {
             type: "text",
-            text: "Checkpoint requested; the worker publishes it after this turn ends. Stop now and end your turn.",
+            text: "Checkpoint requested; the worker attempts to publish it after this turn ends. Stop now and end your turn.",
           },
         ],
       };
