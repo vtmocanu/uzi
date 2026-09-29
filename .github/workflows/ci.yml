@@ -615,7 +615,8 @@ jobs:
   #
   # `changes` runs on PRs and exposes one boolean per component; each build job gates
   # on its own flag AND on that component's validate/test/lint gates, so a broken
-  # source never reaches a (slow) image build.
+  # source never reaches a (slow) image build. Exception: build-agent gates on
+  # validate-agent only (see its comment).
   changes:
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request'
@@ -728,9 +729,14 @@ jobs:
   # A cache miss (the :buildcache tag absent -- e.g. before the first release that
   # builds the agent, or a fork PR) is tolerated by build-push-action: the build just
   # runs cold, exactly as before this line existed.
+  #
+  # NOT gated on test-agent: that suite runs ~7 min while this build takes ~2-4 min,
+  # so waiting for it made an agent PR ~3 min slower. Nothing is dropped: test-agent is
+  # still a required check, this build is not, and it pushes nothing. validate-agent
+  # (~20 s: lint, typecheck) stays as the cheap fail-fast.
   build-agent:
     runs-on: ubuntu-latest
-    needs: [changes, validate-agent, test-agent]
+    needs: [changes, validate-agent]
     if: needs.changes.outputs.agent == 'true'
     strategy:
       fail-fast: false
