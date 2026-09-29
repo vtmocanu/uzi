@@ -12,13 +12,14 @@ vi.mock("../../lib/api", async (importOriginal) => {
 
 const mockApi = vi.mocked(api);
 
-// Only the four fetch-cap keys are read by the card; the rest of AppSettings is irrelevant.
+// Only the five fetch-cap keys are read by the card; the rest of AppSettings is irrelevant.
 function settings(over: Partial<AppSettings> = {}): AppSettings {
   return {
     fetch_max_file_bytes: "26214400",
     fetch_max_run_bytes: "209715200",
     fetch_max_run_files: "100",
     fetch_max_concurrent_per_run: "4",
+    fetch_max_run_attempts: "500",
     ...over,
   } as AppSettings;
 }
@@ -39,6 +40,7 @@ function renderCard(s = settings(), onSaved = vi.fn()) {
 const fileInput = () => screen.getByLabelText("Largest single download (MiB)") as HTMLInputElement;
 const runInput = () => screen.getByLabelText("Total download per run (MiB)") as HTMLInputElement;
 const filesInput = () => screen.getByLabelText("Downloads per run") as HTMLInputElement;
+const attemptsInput = () => screen.getByLabelText("Fetch attempts per run") as HTMLInputElement;
 const concInput = () => screen.getByLabelText("Fetches in flight per run") as HTMLInputElement;
 const saveBtn = () => screen.getByRole("button", { name: "Save fetch caps" }) as HTMLButtonElement;
 
@@ -54,6 +56,7 @@ describe("FetchCapsCard", () => {
     expect(runInput().value).toBe("200");
     expect(filesInput().value).toBe("100");
     expect(concInput().value).toBe("4");
+    expect(attemptsInput().value).toBe("500");
     expect(saveBtn().disabled).toBe(true);
   });
 
@@ -85,6 +88,9 @@ describe("FetchCapsCard", () => {
     ["too many files", filesInput, "10001", "Must be between 1 and 10000"],
     ["a fractional count", filesInput, "2.5", "Enter a whole number"],
     ["too many in flight", concInput, "33", "Must be between 1 and 32"],
+    ["zero attempts", attemptsInput, "0", "Must be between 1 and 100000"],
+    ["too many attempts", attemptsInput, "100001", "Must be between 1 and 100000"],
+    ["a fractional attempt count", attemptsInput, "1.5", "Enter a whole number"],
   ])("refuses %s before it reaches the api", (_name, input, value, message) => {
     renderCard();
     fireEvent.change(input(), { target: { value } });
@@ -102,6 +108,7 @@ describe("FetchCapsCard", () => {
     fireEvent.change(runInput(), { target: { value: "10240" } });
     fireEvent.change(filesInput(), { target: { value: "1" } });
     fireEvent.change(concInput(), { target: { value: "32" } });
+    fireEvent.change(attemptsInput(), { target: { value: "100000" } });
     expect(saveBtn().disabled).toBe(false);
     fireEvent.click(saveBtn());
     await waitFor(() =>
@@ -110,6 +117,7 @@ describe("FetchCapsCard", () => {
         fetch_max_run_bytes: String(10 * 2 ** 30),
         fetch_max_run_files: "1",
         fetch_max_concurrent_per_run: "32",
+        fetch_max_run_attempts: "100000",
       }),
     );
   });
@@ -121,6 +129,15 @@ describe("FetchCapsCard", () => {
     fireEvent.change(concInput(), { target: { value: "8" } });
     fireEvent.click(saveBtn());
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ fetch_max_concurrent_per_run: "8" }));
+  });
+
+  it("saves the attempt cap alone at its lower bound", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(settings({ fetch_max_run_attempts: "1" })));
+    renderCard();
+    fireEvent.change(attemptsInput(), { target: { value: "1" } });
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ fetch_max_run_attempts: "1" }));
+    expect(await screen.findByText("Fetch caps saved.")).toBeTruthy();
   });
 
   it("links to the Site lists page", () => {

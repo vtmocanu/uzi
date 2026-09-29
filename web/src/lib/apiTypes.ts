@@ -1010,6 +1010,8 @@ export interface AppSettings {
   fetch_max_run_bytes: string;
   fetch_max_run_files: string;
   fetch_max_concurrent_per_run: string;
+  // How many fetch attempts one research run may make, allowed or refused (PRD #1906 M3).
+  fetch_max_run_attempts: string;
   // Instance branding config (PRD #685). All six round-trip through GET/PUT
   // /admin/settings as raw strings like every other setting — the API serves the
   // whole settings surface as strings, so app_logo_keep_name/brand_plaque are the

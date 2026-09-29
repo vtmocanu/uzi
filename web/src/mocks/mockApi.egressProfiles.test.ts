@@ -133,5 +133,10 @@ describe("mockApi fetch-cap settings keep the server's bounds", () => {
       status: 400,
     });
     await expect(api.updateSettings({ fetch_max_concurrent_per_run: "33" })).rejects.toMatchObject({ status: 400 });
+    expect(res.settings.fetch_max_run_attempts).toBe("500");
+    const attempts = await api.updateSettings({ fetch_max_run_attempts: "100000" });
+    expect(attempts.settings.fetch_max_run_attempts).toBe("100000");
+    await expect(api.updateSettings({ fetch_max_run_attempts: "0" })).rejects.toMatchObject({ status: 400 });
+    await expect(api.updateSettings({ fetch_max_run_attempts: "100001" })).rejects.toMatchObject({ status: 400 });
   });
 });

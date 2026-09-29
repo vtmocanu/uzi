@@ -61,6 +61,7 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
   fetch_max_run_bytes: "209715200",
   fetch_max_run_files: "100",
   fetch_max_concurrent_per_run: "4",
+  fetch_max_run_attempts: "500",
   app_logo_mode: "default",
   app_logo_preset: "",
   app_logo_keep_name: "true",

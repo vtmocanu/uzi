@@ -64,6 +64,7 @@ const FETCH_CAP_BOUNDS: Record<string, [number, number]> = {
   fetch_max_run_bytes: [1, 10 * 2 ** 30],
   fetch_max_run_files: [1, 10000],
   fetch_max_concurrent_per_run: [1, 32],
+  fetch_max_run_attempts: [1, 100000],
 };
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
@@ -143,11 +144,12 @@ const SEED_APP_SETTINGS: AppSettings = {
   // Issue #534 M2: GitHub Projects v2 sync instance kill-switch, default OFF.
   github_project_sync_enabled: "false",
   // PRD #1906: research fetch caps at the server defaults (25 MiB per file, 200 MiB and
-  // 100 files per run, 4 concurrent fetches per run).
+  // 100 files per run, 4 concurrent fetches per run, 500 fetch attempts per run).
   fetch_max_file_bytes: "26214400",
   fetch_max_run_bytes: "209715200",
   fetch_max_run_files: "100",
   fetch_max_concurrent_per_run: "4",
+  fetch_max_run_attempts: "500",
   // PRD #685: instance branding config, all string-space. Fresh installs are
   // unbranded (app_logo_mode "default", brand_mode "none").
   app_logo_mode: "default",
@@ -253,11 +255,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // seed default ("57600") fills it on load — but reject a malformed non-string, so a bad blob
     // can't violate the AppSettings contract. Mirrors the health_near_timeout_pct tolerance.
     (a.run_extension_cap_seconds === undefined || typeof a.run_extension_cap_seconds === "string") &&
-    // PRD #1906: the four fetch caps joined without a key bump; a blob that predates them
+    // PRD #1906: the five fetch caps joined without a key bump; a blob that predates them
     // (undefined) is filled from the seed on load, a malformed non-string is refused.
-    ["fetch_max_file_bytes", "fetch_max_run_bytes", "fetch_max_run_files", "fetch_max_concurrent_per_run"].every(
-      (k) => a[k] === undefined || typeof a[k] === "string",
-    ) &&
+    Object.keys(FETCH_CAP_BOUNDS).every((k) => a[k] === undefined || typeof a[k] === "string") &&
     typeof a.docker_repo_allowlist === "string";
   return okUser && okApp;
 }

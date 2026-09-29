@@ -68,6 +68,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   fetch_max_run_bytes: "209715200",
   fetch_max_run_files: "100",
   fetch_max_concurrent_per_run: "4",
+  fetch_max_run_attempts: "500",
   // PRD #685 branding config keys (owned by the Branding tab; unbranded defaults).
   app_logo_mode: "default",
   app_logo_preset: "",

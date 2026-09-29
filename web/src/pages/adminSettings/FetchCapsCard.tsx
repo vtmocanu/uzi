@@ -6,9 +6,14 @@ import { Alert, Button, Card, Field, Input, SectionTitle } from "../../component
 
 const MIB = 1024 * 1024;
 
-type CapKey = "fetch_max_file_bytes" | "fetch_max_run_bytes" | "fetch_max_run_files" | "fetch_max_concurrent_per_run";
+type CapKey =
+  | "fetch_max_file_bytes"
+  | "fetch_max_run_bytes"
+  | "fetch_max_run_files"
+  | "fetch_max_run_attempts"
+  | "fetch_max_concurrent_per_run";
 
-// The four research fetch caps (PRD #1906 Open question 1). Bounds copy
+// The five research fetch caps (PRD #1906 Open question 1). Bounds copy
 // api/internal/settings/settings_fetch_caps.go (fetchCapBounds); the server stays the
 // source of truth and re-validates every write. The two byte caps are edited in MiB and
 // stored in bytes.
@@ -39,6 +44,14 @@ const FIELDS: {
     hint: "1 to 10000.",
     unit: "count",
     max: 10000,
+  },
+  {
+    // Placed beside "Downloads per run" so the two per-run counts share a grid row.
+    key: "fetch_max_run_attempts",
+    label: "Fetch attempts per run",
+    hint: "Allowed or refused, so a run cannot retry without end. 1 to 100000.",
+    unit: "count",
+    max: 100000,
   },
   {
     key: "fetch_max_concurrent_per_run",
