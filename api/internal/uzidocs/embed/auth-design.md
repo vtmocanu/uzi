@@ -72,7 +72,7 @@ uzi can also authenticate against a single external OIDC provider (Keycloak or P
 
 ## Rate limiting and the X-Forwarded-For trust model
 
-`api/internal/middleware/ratelimit.go` is an in-process, per-`(route, client IP)` fixed-window limiter (`RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW`, default 10/minute) applied to `/api/auth/register` and `/api/auth/login`. No Redis dependency.
+`api/internal/middleware/ratelimit.go` is an in-process, per-`(route, client IP)` fixed-window limiter (`RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW`, default 10/minute) applied to `/api/auth/register` and `/api/auth/login`; its per-user variant, sized by the same settings, guards credential-surface routes (for example token minting) and all of `/api/v1`. No Redis dependency.
 
 The "client IP" is read from `X-Forwarded-For`, but only when the direct TCP peer (`RemoteAddr`) falls inside `TRUSTED_PROXIES`. `web/nginx.conf` overwrites `X-Forwarded-For` with `$remote_addr` before proxying to `api` — so any header a browser or attacker sent is discarded at the edge, and the API only ever sees the value nginx itself set. A request that reaches `api` directly (bypassing nginx) has its `X-Forwarded-For` ignored entirely and falls back to `RemoteAddr`.
 

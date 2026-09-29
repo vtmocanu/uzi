@@ -47,6 +47,8 @@ fi
 
 upstream="${1:?usage: refresh-role-manifest.sh <upstream-checkout> <upstream-sha>}"
 upstream_sha="${2:?upstream sha required}"
+# Absolute: the parity step runs from api/, where a relative checkout path no longer resolves.
+upstream="$(cd "$upstream" && pwd)" || { echo "upstream checkout not found: $1" >&2; exit 2; }
 roles_yaml="$upstream/skills/agent-kit/agent-team/roles.yaml"
 product="$upstream/product-agents"
 sync_py="${ROLE_SYNC_PY:-$upstream/skills/agent-kit/agent-team/scripts/sync.py}"

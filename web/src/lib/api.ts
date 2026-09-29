@@ -46,7 +46,17 @@ import type {
   CliToken,
   CliTokenMint,
   CliTokenScope,
+  AdminDeleteProductResponse,
+  AdminProductToken,
+  MintableProduct,
+  Product,
+  ProductToken,
+  ProductTokenMint,
+  ProductTokenExpiry,
+  ProductTokenScope,
   CreatedIssue,
+  FindingGroupDraft,
+  FindingGroupFileResult,
   EgressProfile,
   EgressProfileProblem,
   EgressProfileWriteInput,
@@ -1667,6 +1677,19 @@ const realApi = {
   // friendly "already filed" state — the backlog is the source of truth.
   fileFinding: (id: string, body?: { title?: string; description?: string; labels?: string[] }) =>
     request<IncidentalFindingFileResult>("POST", `/findings/${id}/issue`, body ?? {}),
+  // findingGroupIssueDraft reads the deterministic, human-editable draft for filing several
+  // findings as ONE issue (issue #1724). Keyed on DISPOSITION ids, sent as one comma-separated
+  // `ids` param (1-50, one repo). 400 mixed repositories / invalid ids, 404 unknown id, 409
+  // "finding not fileable" (a member is not open, has no evidence, or is already grouped).
+  findingGroupIssueDraft: (ids: string[]) =>
+    request<FindingGroupDraft>("GET", `/findings/issue-draft?ids=${encodeURIComponent(ids.join(","))}`),
+  // fileFindingGroup is the human-gated grouped forge write (issue #1724). `ids` are disposition
+  // ids; title/description/labels are optional user EDITS re-sanitised server-side. 201 returns the
+  // created issue; 202 returns the same shape WITHOUT `issue` (uncertain or stopped: `warning` says
+  // to inspect the forge), which request() decodes like any 2xx. 409 = a member was already filed
+  // or is being filed; 502 = the forge rejected the create.
+  fileFindingGroup: (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) =>
+    request<FindingGroupFileResult>("POST", "/findings/issue", body),
   // dismissFinding triages one coordinate to `dismissed` with a required reason from the
   // closed enum (M5). A LOCAL write — no forge call, no token spend. Keys on the evidence
   // id (finding_id), like fileFinding.
@@ -1796,6 +1819,41 @@ const realApi = {
   // The panic button for a lost laptop: one query revokes every un-revoked token
   // of the caller. Idempotent (a second call is a no-op 204).
   revokeAllCliTokens: () => request<null>("POST", "/me/cli-tokens/revoke-all"),
+
+  // ── Product tokens (PRD #1907) — cookie-only, owner-scoped ─────────────────
+  // uzp_ tokens a user mints for an admin-registered product; they reach /api/v1
+  // only. The list carries no value (revoked and expired rows included) and is
+  // capped at 200 rows, active first, then newest; `truncated` is true when the
+  // server cut it. The mint returns the plaintext once. revokeAllCliTokens above
+  // also revokes every product token of the caller (D8), in one transaction.
+  listProductTokens: () =>
+    request<{ tokens: ProductToken[]; truncated: boolean }>("GET", "/me/product-tokens"),
+  listMintableProducts: () =>
+    request<{ products: MintableProduct[] }>("GET", "/me/product-tokens/products"),
+  createProductToken: (input: {
+    product_id: string;
+    name: string;
+    scopes: ProductTokenScope[];
+    expiry: ProductTokenExpiry;
+  }) => request<ProductTokenMint>("POST", "/me/product-tokens", input),
+  revokeProductToken: (id: string) => request<null>("DELETE", `/me/product-tokens/${id}`),
+
+  // ── Product registry (PRD #1907 M4) — admin, cookie-only writes ────────────
+  // Delete is soft (D9): the row stays listed with deleted_at set, disabled, and
+  // its tokens' rows stay for the audit trail. Create and update answer
+  // {product}, delete the bare {product, stopped_token_count}.
+  adminListProducts: () => request<{ products: Product[] }>("GET", "/admin/products"),
+  adminCreateProduct: (name: string, description: string) =>
+    request<{ product: Product }>("POST", "/admin/products", { name, description }),
+  adminUpdateProduct: (id: string, patch: { description?: string; enabled?: boolean }) =>
+    request<{ product: Product }>("PATCH", `/admin/products/${id}`, patch),
+  adminDeleteProduct: (id: string) =>
+    request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
+  // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.
+  adminListProductTokens: () =>
+    request<{ tokens: AdminProductToken[]; truncated: boolean }>("GET", "/admin/product-tokens"),
+  adminRevokeProductToken: (id: string) =>
+    request<null>("POST", `/admin/product-tokens/${id}/revoke`),
 
   // ── CLI browser-login consent flow (PRD #64) ───────────────────────────────
   // The `/cli-auth` page's three calls. getCliAuthRequest is a cookie-only read

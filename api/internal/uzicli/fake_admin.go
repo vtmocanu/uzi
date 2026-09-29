@@ -46,6 +46,13 @@ func (f *FakeClient) AdminListCLITokens(context.Context) ([]apitypes.AdminCLITok
 	return f.AdminCLITokens, nil
 }
 
+func (f *FakeClient) AdminListProducts(context.Context) ([]apitypes.ProductDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.AdminProducts, nil
+}
+
 func (f *FakeClient) AdminUsage(context.Context) (apitypes.AdminUsageDTO, error) {
 	if f.Err != nil {
 		return apitypes.AdminUsageDTO{}, f.Err

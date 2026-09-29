@@ -1614,7 +1614,8 @@ export class SteeringChannel {
    *     written against a plan version that has since been revised).
    * Only one gate is awaited at a time (one plan turn is in flight per run).
    */
-  awaitGateEvent(epoch: number): Promise<PlanVerdict> {
+  awaitGateEvent(epoch: number, signal?: AbortSignal): Promise<PlanVerdict> {
+    if (signal?.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("gate wait aborted"));
     // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced. Checked
     // first: an event taken now would mark inputs ready with no lane left to apply them.
     if (this.flightEnded) return Promise.reject(this.flightEnded);
@@ -1625,7 +1626,19 @@ export class SteeringChannel {
     // here, so the idempotency guard can never swallow it.
     if (this.pendingSwitchGeneration !== undefined) return Promise.reject(new CredentialSwitchSignal());
     return new Promise<PlanVerdict>((resolve, reject) => {
-      this.gateWaiter = { epoch, resolve, reject };
+      const done = (): void => {
+        signal?.removeEventListener("abort", onAbort);
+        if (this.gateWaiter === waiter) this.gateWaiter = undefined;
+      };
+      const waiter = {
+        epoch,
+        resolve: (v: PlanVerdict): void => { done(); resolve(v); },
+        reject: (err: Error): void => { done(); reject(err); },
+      };
+      const onAbort = (): void => waiter.reject(signal?.reason instanceof Error ? signal.reason : new Error("gate wait aborted"));
+      this.gateWaiter = waiter;
+      signal?.addEventListener("abort", onAbort, { once: true });
+      if (signal?.aborted) onAbort();
     });
   }
 

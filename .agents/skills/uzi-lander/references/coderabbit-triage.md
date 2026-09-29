@@ -24,12 +24,13 @@ deliberate / mock-only** label, and your choice from these:
   cannot handle. Batch every fix for one PR into ONE push (each push is one CodeRabbit
   review); `scripts/land-prep.sh` does the lease-guarded push.
 - **Rework on demand** — `uzi run rework RUN -m 'GUIDANCE'` (PRD #1202) starts ONE
-  `mr_rework` cycle on the SAME PR branch, skipping the per-MR cap, the quiet period, and
-  the one-active-rework guard. The right call for a **big** finding set (design-level,
+  `mr_rework` cycle on the SAME PR branch, skipping the per-MR cap and the quiet period;
+  it keeps the one-active-rework guard and ignores the per-run auto-rework setting. The right call for a **big** finding set (design-level,
   many files, needs the plan's context) that is still this PR's to fix. Capture
   `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` first, then `scripts/wait-mrrework.sh OWNER/REPO
   PR 45 60 "$SINCE"`, then review its commit like any other diff (`mr-rework.md` step 3).
-  A 409 (exit 5) means disabled / not reworkable / already running / nothing new.
+  A 409 (exit 5) means the admin kill-switch is off / not reworkable / already running /
+  nothing new.
 - **Skip** — record the reason (deliberate behavior, a false positive, a base-realignment
   artifact, not worth it). A skip is a legitimate outcome, not a failure. **But a
   pre-existing / inherited finding that is a REAL bug is NOT a free skip:** fix it (in the PR

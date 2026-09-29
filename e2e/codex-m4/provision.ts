@@ -122,19 +122,39 @@ function defaultEtcLstat(p: string): { present: boolean } {
   return { present: lstatSync(p, { throwIfNoEntry: false }) !== undefined };
 }
 
-/** The minimal command runner the version assertion needs; injectable for tests. */
-export type VersionRunner = (bin: string, args: readonly string[]) => { status: number | null; stdout: string };
+/** How a spawned process ended, as spawnSync reports it. `signal` and `error` are optional so a
+ *  test fake can return only a status; an absent one is reported as `null`/`none`. */
+export interface SpawnOutcome {
+  readonly status: number | null;
+  readonly signal?: NodeJS.Signals | null;
+  readonly error?: Error;
+}
 
-function defaultVersionRunner(bin: string, args: readonly string[]): { status: number | null; stdout: string } {
+/** True unless the process exited 0 with no spawn error. */
+function spawnFailed(r: SpawnOutcome): boolean {
+  return r.status !== 0 || r.error !== undefined;
+}
+
+/** `<status> (signal <signal>, error <error>)`: all three facts, so a spawn that never ran
+ *  (e.g. EACCES, status and signal both null) is distinguishable from a crash or a kill. */
+function describeSpawnOutcome(r: SpawnOutcome): string {
+  const error = r.error === undefined ? "none" : r.error.message;
+  return `${String(r.status)} (signal ${String(r.signal ?? null)}, error ${error})`;
+}
+
+/** The minimal command runner the version assertion needs; injectable for tests. */
+export type VersionRunner = (bin: string, args: readonly string[]) => SpawnOutcome & { stdout: string };
+
+function defaultVersionRunner(bin: string, args: readonly string[]): SpawnOutcome & { stdout: string } {
   const r = spawnSync(bin, [...args], { encoding: "utf8" });
-  return { status: r.status, stdout: String(r.stdout ?? "") };
+  return { status: r.status, signal: r.signal, error: r.error, stdout: String(r.stdout ?? "") };
 }
 
 /** HARD failure unless `<codexBin> --version` is exactly `codex-cli <version>`. */
 export function assertBinaryVersion(codexBin: string, version: string, run: VersionRunner = defaultVersionRunner): void {
   const r = run(codexBin, ["--version"]);
-  if (r.status !== 0) {
-    throw new CodexProvisionError(`codex --version exited ${String(r.status)} at ${codexBin}`);
+  if (spawnFailed(r)) {
+    throw new CodexProvisionError(`codex --version exited ${describeSpawnOutcome(r)} at ${codexBin}`);
   }
   const text = r.stdout.trim();
   if (text !== `codex-cli ${version}`) {
@@ -159,14 +179,14 @@ export interface InstallRequest {
 /** The rootless install step; injectable so a test can drive {@link resolveCodexBin}'s post-
  *  install branches (e.g. an installer that "succeeds" but leaves an INCOMPLETE layout) without
  *  a real network install. Production uses {@link defaultInstaller} (spawns install-codex.sh). */
-export type Installer = (req: InstallRequest) => { status: number | null; stderr: string };
+export type Installer = (req: InstallRequest) => SpawnOutcome & { stderr: string };
 
-function defaultInstaller(req: InstallRequest): { status: number | null; stderr: string } {
+function defaultInstaller(req: InstallRequest): SpawnOutcome & { stderr: string } {
   const install = spawnSync(INSTALL_SCRIPT, [req.arch], {
     encoding: "utf8",
     env: { ...process.env, UZI_CODEX_PREFIX: req.prefix, UZI_CODEX_LOCK: req.lockPath },
   });
-  return { status: install.status, stderr: String(install.stderr ?? "") };
+  return { status: install.status, signal: install.signal, error: install.error, stderr: String(install.stderr ?? "") };
 }
 
 /** Injectable seams for {@link resolveCodexBin}; production uses the real fs/spawn defaults. */
@@ -225,8 +245,8 @@ export function resolveCodexBin(deps: ProvisionDeps = {}): ProvisionResult {
   if (decision === "reinstall") {
     mkdirSync(cachePrefix, { recursive: true });
     const install = installer({ arch, prefix: cachePrefix, lockPath });
-    if (install.status !== 0) {
-      throw new CodexProvisionError(`install-codex.sh ${arch} exited ${String(install.status)}: ${install.stderr}`);
+    if (spawnFailed(install)) {
+      throw new CodexProvisionError(`install-codex.sh ${arch} exited ${describeSpawnOutcome(install)}: ${install.stderr}`);
     }
     writeFileSync(receiptPath, `${JSON.stringify(expected, null, 2)}\n`, "utf8");
   }

@@ -53,6 +53,13 @@ type Handler struct {
 	// accessor falls back to h.q. Deliberately narrow (see agentTemplateWriteStore)
 	// rather than making Handler.q an interface.
 	tmplWriteStore agentTemplateWriteStore
+	// myProductTokenRowsOverride and adminProductTokenRowsOverride, when positive,
+	// replace maxMyProductTokenRows / maxAdminProductTokenRows as the row bound of GET
+	// /api/me/product-tokens and GET /api/admin/product-tokens (PRD #1907), so a LiveDB
+	// test reaches the "truncated" path with a handful of rows. Zero in production (New
+	// leaves them unset); read only through productTokenListBound.
+	myProductTokenRowsOverride    int32
+	adminProductTokenRowsOverride int32
 	// vaultNoticeStore, when non-nil, replaces h.q for VaultLock's pre-ack of the
 	// vault-lock notice (PRD #890 D6), so that one DB touch can be faked in a unit test
 	// without a live database. nil in production — the accessor falls back to h.q.
@@ -810,6 +817,15 @@ func (h *Handler) attachReleaseInfo(ctx context.Context, info *apitypes.BuildInf
 		NotesURL:    st.NotesURL,
 		Security:    releasecheck.Security(st.Body),
 	}
+	if st.RCTag != "" {
+		info.LatestRC = &apitypes.LatestReleaseDTO{
+			Version:     st.RCTag,
+			Name:        st.RCName,
+			PublishedAt: st.RCPublishedAt,
+			NotesURL:    st.RCNotesURL,
+			Security:    releasecheck.Security(st.RCBody),
+		}
+	}
 	ua := releasecheck.UpdateAvailable(h.version, st.LatestTag)
 	info.UpdateAvailable = &ua
 	fb := releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock())
@@ -859,7 +875,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		// chi's Mount installs an mALL stub there — so the Route must register BEFORE
 		// the Put or it clobbers the PUT method (the two were Route-then-Put inline).
 		h.mountJudgeRoutes(r, forgeLimiter)
-		h.mountMeRoutes(r)
+		h.mountMeRoutes(r, authLimiter)
 		h.mountSchedulesRoutes(r, forgeLimiter)
 		h.mountVaultRoutes(r, authLimiter)
 		h.mountSlackRoutes(r, slackDMLimiter)
@@ -868,6 +884,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountForgeRoutes(r, forgeLimiter)
 		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
+		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
+		// only) and a per-user limit; read mountV1Routes before adding anything here.
+		h.mountV1Routes(r, authLimiter)
 
 		// Runs (PRD #64): the core CLI loop is RequireUser — list/get/messages/inputs,
 		// /{id}/review (Decision 21), and the forge FileIssue write (PRD #365 M1). The

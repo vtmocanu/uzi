@@ -550,9 +550,19 @@ var realRuleAdders = ruleAdders{path: addPathRule, fd: addFdRule}
 // run's cache directory through fds.cache (never the cache root above it).
 // Neither is named by path here, so a rename or symlink swap of the --tmp or
 // --cache path after adoption cannot redirect its rule.
+//
+// /opt/uzi-codex is the root-owned pinned Codex package, granted read/execute
+// only so the codex-m4 P leg and a command can exec the pinned binary. It holds
+// no credentials or session state: CODEX_HOME and sessions live in the
+// launcher's runner-owned 0700 ownedDataRoot. A sandboxed command's env is fully
+// replaced and credential-free, and it runs as runner-cmd (10003), not the
+// provider credential's uid (10002). no_new_privs precedes restrict_self and
+// install-codex.sh strips setuid/setgid, so exec gains no privilege. This
+// ruleset has no network rules, so the binary adds no egress that curl or git
+// lack. /opt/uzi-codex must stay off PATH (agent/test/templates-guardrails.test.ts).
 func addRules(ruleset int, root string, fds grantFds, handled uint64, add ruleAdders) error {
 	read := uint64(unix.LANDLOCK_ACCESS_FS_EXECUTE | unix.LANDLOCK_ACCESS_FS_READ_FILE | unix.LANDLOCK_ACCESS_FS_READ_DIR)
-	for _, path := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain"} {
+	for _, path := range []string{"/bin", "/sbin", "/usr", "/lib", "/lib64", "/etc", "/nix", "/opt/uzi-toolchain", "/opt/uzi-codex"} {
 		if err := add.path(ruleset, path, read&handled); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
 		}

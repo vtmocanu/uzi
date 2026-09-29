@@ -67,6 +67,18 @@ func (c *HTTPClient) AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCL
 	return env.Tokens, nil
 }
 
+// AdminListProducts reads the product registry (PRD #1907 M4), soft-deleted products
+// included.
+func (c *HTTPClient) AdminListProducts(ctx context.Context) ([]apitypes.ProductDTO, error) {
+	var env struct {
+		Products []apitypes.ProductDTO `json:"products"`
+	}
+	if err := c.get(ctx, "/api/admin/products", &env); err != nil {
+		return nil, err
+	}
+	return env.Products, nil
+}
+
 // GuardrailImpact reads the live guardrail pre-flight impact count. The endpoint
 // persists nothing; it re-sweeps the forge and returns how many enabled repos
 // would be refused under the new guardrail (PRD #66 M3).

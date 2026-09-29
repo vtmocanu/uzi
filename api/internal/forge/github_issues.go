@@ -93,9 +93,13 @@ func (g *github) CreateIssue(ctx context.Context, projectID int64, title, descri
 		// pre-resolution (the PRD trigger label is never EnsureLabels'd, so this matters).
 		req.Labels = append([]string(nil), labels...)
 	}
-	i, _, err := g.client.Issues.Create(ctx, slug.owner, slug.repo, req)
+	i, resp, err := g.client.Issues.Create(createIssueContext(ctx), slug.owner, slug.repo, req)
 	if err != nil {
-		return Issue{}, g.wrapErr("create issue", err)
+		wrapped := g.wrapErr("create issue", err)
+		if resp != nil && resp.Response != nil {
+			return Issue{}, createIssueError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toGitHubIssue(i), nil
 }

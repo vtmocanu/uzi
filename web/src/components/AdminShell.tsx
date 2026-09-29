@@ -1,4 +1,4 @@
-// AdminShell: one header + tab bar shared by the admin surfaces (Users,
+// AdminShell: one header + tab bar shared by the admin surfaces (Users, Products,
 // Rate limits, Tool allowlist, Blocked repos, Site lists, Instance, Branding, Health). The same
 // treatment SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
@@ -17,6 +17,8 @@ import { useHealthStatus } from "../lib/useAdminHealth";
 // carries the health severity pip when checks need attention.
 const TABS = [
   { to: "/admin/users", label: "Users" },
+  // PRD #1907: products sit beside Users, the other "who can act on this instance" tab.
+  { to: "/admin/products", label: "Products" },
   { to: "/admin/rate-limits", label: "Rate limits" },
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },

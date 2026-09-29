@@ -1,0 +1,92 @@
+name: Go build cache (per job class)
+description: >-
+  Restore GOCACHE + GOMODCACHE (plus optional extra paths) under a key private to
+  one job class, so each job warms from a cache built with its own flags. Pair it
+  with ./.github/actions/go-cache-save at the end of the job; only a push to main
+  saves. Never fails the job: any cache error falls back to a cold build.
+
+# Why not setup-go's built-in cache: it keys on go.sum alone, so every Go job of a
+# module restores ONE entry, and after a primary-key hit no job saves. The entry is
+# whatever the first job to save happened to build (race or not, coverage or not),
+# so the other jobs compile cold. A key per job class keeps -race, coverage and
+# plain builds apart.
+#
+# Keys end in the commit SHA, so each main push saves a fresh entry and a PR (which
+# reads its base branch's caches and cannot write to them) restores the newest one
+# by prefix. Superseded entries are expected to go unread and to age out under the
+# repo cache's eviction; that is expected behaviour, not an API guarantee, so
+# per-class size, hit rate and total usage are measured over several main pushes
+# (epic #1892). The Go version is in every restore prefix, so a toolchain bump
+# starts cold. A go.sum change falls back to the newest entry of the same class:
+# GOCACHE is content-addressed and Go trims its unused entries after five days,
+# but GOMODCACHE has no such trim and keeps old module versions until the Go
+# version changes.
+
+inputs:
+  class:
+    description: Job-class name, unique per job (e.g. api-test).
+    required: true
+  module:
+    description: Go module directory whose go.sum keys the cache (api or controller).
+    required: true
+  extra-paths:
+    description: Extra newline-separated paths to cache (e.g. the golangci-lint cache).
+    required: false
+    default: ""
+
+outputs:
+  key:
+    description: The exact key to save under (empty if resolving it failed).
+    value: ${{ steps.vars.outputs.key }}
+  paths:
+    description: The newline-separated paths to save.
+    value: ${{ steps.vars.outputs.paths }}
+  cache-hit:
+    description: '"true" when the exact key was restored (nothing new to save).'
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve Go cache key and paths
+      id: vars
+      continue-on-error: true
+      shell: bash
+      env:
+        CLASS: ${{ inputs.class }}
+        GO_SUM_HASH: ${{ hashFiles(format('{0}/go.sum', inputs.module)) }}
+        EXTRA_PATHS: ${{ inputs.extra-paths }}
+      run: |
+        set -euo pipefail
+        test -n "${GO_SUM_HASH}" || { echo "go-cache: no go.sum for this module" >&2; exit 2; }
+        # Resolve everything before writing any output, and write `key` last: a
+        # failure part-way must leave `key` empty, which is what the save gate checks.
+        gover=$(go env GOVERSION)
+        gocache=$(go env GOCACHE)
+        gomodcache=$(go env GOMODCACHE)
+        fallback="go-${CLASS}-${RUNNER_OS}-${gover}-"
+        prefix="${fallback}${GO_SUM_HASH}-"
+        {
+          echo "fallback=${fallback}"
+          echo "prefix=${prefix}"
+          echo "paths<<GO_CACHE_PATHS_EOF"
+          printf '%s\n%s\n' "${gocache}" "${gomodcache}"
+          if [ -n "${EXTRA_PATHS}" ]; then printf '%s\n' "${EXTRA_PATHS}"; fi
+          echo "GO_CACHE_PATHS_EOF"
+          echo "key=${prefix}${GITHUB_SHA}"
+        } >> "${GITHUB_OUTPUT}"
+    - name: Restore Go cache
+      id: restore
+      if: steps.vars.outcome == 'success'
+      continue-on-error: true
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.vars.outputs.paths }}
+        key: ${{ steps.vars.outputs.key }}
+        restore-keys: |
+          ${{ steps.vars.outputs.prefix }}
+          ${{ steps.vars.outputs.fallback }}
+    - name: Warn on a Go cache restore failure
+      if: steps.vars.outcome == 'failure' || steps.restore.outcome == 'failure'
+      shell: bash
+      run: echo "::warning title=go-cache::Go cache restore failed; this job builds cold."

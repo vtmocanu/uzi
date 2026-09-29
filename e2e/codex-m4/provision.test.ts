@@ -23,6 +23,7 @@ import {
   receiptMatches,
   resolveArch,
   resolveCodexBin,
+  type Installer,
   type Receipt,
 } from "./provision.js";
 
@@ -131,9 +132,37 @@ describe("assertBinaryVersion", () => {
     );
   });
   it("hard-fails on a non-zero exit", () => {
-    assert.throws(() => assertBinaryVersion("/bin/codex", "0.153.2", () => ({ status: 1, stdout: "" })), /exited 1/);
+    assert.throws(
+      () => assertBinaryVersion("/bin/codex", "0.153.2", () => ({ status: 1, stdout: "" })),
+      /codex --version exited 1 \(signal null, error none\) at \/bin\/codex$/,
+    );
+  });
+  it("names status, signal and the spawn error when the binary could not be executed (EACCES)", () => {
+    assert.throws(
+      () =>
+        assertBinaryVersion("/bin/codex", "0.153.2", () => ({ status: null, signal: null, error: eacces("/bin/codex"), stdout: "" })),
+      /codex --version exited null \(signal null, error spawnSync \/bin\/codex EACCES\) at \/bin\/codex$/,
+    );
+  });
+  it("hard-fails on a spawn error even when status is 0", () => {
+    assert.throws(
+      () =>
+        assertBinaryVersion("/bin/codex", "0.153.2", () => ({ status: 0, error: eacces("/bin/codex"), stdout: "codex-cli 0.153.2\n" })),
+      /exited 0 \(signal null, error spawnSync \/bin\/codex EACCES\)/,
+    );
+  });
+  it("names the terminating signal", () => {
+    assert.throws(
+      () => assertBinaryVersion("/bin/codex", "0.153.2", () => ({ status: null, signal: "SIGKILL", stdout: "" })),
+      /codex --version exited null \(signal SIGKILL, error none\) at \/bin\/codex$/,
+    );
   });
 });
+
+/** The Error spawnSync attaches when exec(2) of `bin` is refused with EACCES. */
+function eacces(bin: string): Error {
+  return Object.assign(new Error(`spawnSync ${bin} EACCES`), { code: "EACCES", errno: -13, syscall: `spawnSync ${bin}`, path: bin });
+}
 
 describe("resolveCodexBin incomplete-package hard fail", () => {
   it("throws CodexProvisionError when provisioning leaves an INCOMPLETE layout (no real install)", () => {
@@ -169,25 +198,49 @@ describe("resolveCodexBin incomplete-package hard fail", () => {
     }
   });
 
-  it("throws when the injected installer itself fails (non-zero status)", () => {
-    const cachePrefix = mkdtempSync(path.join(tmpdir(), "codex-m4-provision-"));
-    const lockPath = path.join(cachePrefix, "codex-package.lock");
-    writeFileSync(lockPath, LOCK, "utf8");
-    try {
-      assert.throws(
-        () =>
-          resolveCodexBin({
-            nodeArch: "x64",
-            lockPath,
-            cachePrefix,
-            etcLstat: () => ({ present: false }),
-            exists: () => false,
-            installer: () => ({ status: 7, stderr: "boom" }),
-          }),
-        /install-codex\.sh amd64 exited 7: boom/,
-      );
-    } finally {
-      rmSync(cachePrefix, { recursive: true, force: true });
-    }
-  });
+  const installerCases: ReadonlyArray<{ name: string; outcome: ReturnType<Installer>; expected: RegExp }> = [
+    {
+      name: "non-zero status",
+      outcome: { status: 7, stderr: "boom" },
+      expected: /install-codex\.sh amd64 exited 7 \(signal null, error none\): boom$/,
+    },
+    {
+      name: "spawn error (EACCES)",
+      outcome: { status: null, signal: null, error: eacces("install-codex.sh"), stderr: "" },
+      expected: /install-codex\.sh amd64 exited null \(signal null, error spawnSync install-codex\.sh EACCES\): $/,
+    },
+    {
+      name: "spawn error with status 0",
+      outcome: { status: 0, error: eacces("install-codex.sh"), stderr: "" },
+      expected: /install-codex\.sh amd64 exited 0 \(signal null, error spawnSync install-codex\.sh EACCES\)/,
+    },
+    {
+      name: "terminating signal",
+      outcome: { status: null, signal: "SIGKILL", stderr: "" },
+      expected: /install-codex\.sh amd64 exited null \(signal SIGKILL, error none\): $/,
+    },
+  ];
+  for (const c of installerCases) {
+    it(`throws when the injected installer itself fails (${c.name})`, () => {
+      const cachePrefix = mkdtempSync(path.join(tmpdir(), "codex-m4-provision-"));
+      const lockPath = path.join(cachePrefix, "codex-package.lock");
+      writeFileSync(lockPath, LOCK, "utf8");
+      try {
+        assert.throws(
+          () =>
+            resolveCodexBin({
+              nodeArch: "x64",
+              lockPath,
+              cachePrefix,
+              etcLstat: () => ({ present: false }),
+              exists: () => false,
+              installer: () => c.outcome,
+            }),
+          (err: unknown) => err instanceof CodexProvisionError && c.expected.test(err.message),
+        );
+      } finally {
+        rmSync(cachePrefix, { recursive: true, force: true });
+      }
+    });
+  }
 });

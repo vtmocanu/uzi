@@ -1,0 +1,451 @@
+// @vitest-environment jsdom
+import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
+import { ProductTokens } from "./ProductTokens";
+import { AccessSettings } from "../pages/AccessSettings";
+import { api, type MintableProduct, type ProductToken, type User } from "../lib/api";
+import { ApiError } from "../lib/apiError";
+import { useAuth } from "../auth/AuthContext";
+
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    api: {
+      listProductTokens: vi.fn(),
+      listMintableProducts: vi.fn(),
+      createProductToken: vi.fn(),
+      revokeProductToken: vi.fn(),
+      listCliTokens: vi.fn(),
+      createCliToken: vi.fn(),
+      revokeCliToken: vi.fn(),
+      revokeAllCliTokens: vi.fn(),
+    },
+  };
+});
+vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
+
+const mockApi = vi.mocked(api);
+
+const NOW = Date.now();
+const daysAgo = (d: number) => new Date(NOW - d * 86_400_000).toISOString();
+
+// Token-shaped values are assembled at runtime (source hygiene: no complete
+// uzp_ token literal in tracked source).
+const CLS = "uz" + "p_";
+const MINTED = CLS + "f00dfeedf00dfeedf00dfeedf00dfeed";
+
+const PRODUCTS: MintableProduct[] = [
+  { id: "prod-a", name: "Helpdesk assistant", description: "Opens jobs from tickets." },
+  { id: "prod-b", name: "Metrics export", description: "Reads results." },
+];
+
+function aToken(over: Partial<ProductToken> = {}): ProductToken {
+  return {
+    id: "pt1",
+    product_id: "prod-a",
+    product_name: "Helpdesk assistant",
+    name: "support-prod",
+    token_prefix: CLS + "4c1e",
+    scopes: ["jobs:run", "jobs:read"],
+    revoked: false,
+    created_at: daysAgo(10),
+    last_used_at: daysAgo(1),
+    last_used_ip: "10.20.3.14",
+    expires_at: daysAgo(-80),
+    ...over,
+  };
+}
+
+function renderCard() {
+  return render(
+    <MemoryRouter>
+      <ProductTokens />
+    </MemoryRouter>,
+  );
+}
+
+// Scoped to the product-token form: on AccessSettings the CLI card has a "Name" too.
+async function fillAndMint(productName = "Helpdesk assistant", name = "prod") {
+  const form = within(await screen.findByRole("form", { name: "Create a product token" }));
+  fireEvent.change(form.getByLabelText("Product"), {
+    target: { value: PRODUCTS.find((p) => p.name === productName)!.id },
+  });
+  fireEvent.change(form.getByLabelText("Name"), { target: { value: name } });
+  fireEvent.click(form.getByRole("button", { name: "Create product token" }));
+}
+
+beforeEach(() => {
+  vi.mocked(useAuth).mockReturnValue({
+    user: { id: "u1", is_admin: false } as User,
+  } as unknown as ReturnType<typeof useAuth>);
+  mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [] });
+  mockApi.listMintableProducts.mockResolvedValue({ products: PRODUCTS });
+  mockApi.listCliTokens.mockResolvedValue({ tokens: [] });
+});
+
+afterEach(() => {
+  cleanup();
+  vi.clearAllMocks();
+});
+
+describe("ProductTokens mint form", () => {
+  it("defaults the expiry to 90 days and sends the chosen product, name, scopes and expiry", async () => {
+    mockApi.createProductToken.mockResolvedValue({
+      token: MINTED,
+      product_token: aToken({ id: "new", name: "prod" }),
+    });
+    renderCard();
+
+    const expiry = (await screen.findByLabelText("Expires after")) as HTMLSelectElement;
+    expect(expiry.value).toBe("90d");
+    fireEvent.click(screen.getByRole("checkbox", { name: /Run jobs/ }));
+    await fillAndMint("Metrics export", "prod");
+
+    await waitFor(() =>
+      expect(mockApi.createProductToken).toHaveBeenCalledWith({
+        product_id: "prod-b",
+        name: "prod",
+        scopes: ["jobs:read", "jobs:run"],
+        expiry: "90d",
+      }),
+    );
+  });
+
+  it("trims a trailing U+0085 from the name as Go's TrimSpace does, instead of refusing it", async () => {
+    mockApi.createProductToken.mockResolvedValue({
+      token: MINTED,
+      product_token: aToken({ id: "new", name: "prod" }),
+    });
+    renderCard();
+    await fillAndMint("Helpdesk assistant", "prod\u0085");
+    expect(screen.queryByText(/can’t contain tabs, line breaks/)).toBeNull();
+    await waitFor(() =>
+      expect(mockApi.createProductToken).toHaveBeenCalledWith(expect.objectContaining({ name: "prod" })),
+    );
+  });
+
+  it("requires at least one scope before it can mint", async () => {
+    renderCard();
+    fireEvent.change(await screen.findByLabelText("Product"), { target: { value: "prod-a" } });
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "prod" } });
+    const create = screen.getByRole("button", { name: "Create product token" }) as HTMLButtonElement;
+    expect(create.disabled).toBe(false);
+
+    fireEvent.click(screen.getByRole("checkbox", { name: /Read jobs/ }));
+    expect(create.disabled).toBe(true);
+    expect(screen.getByText("Pick at least one permission.")).toBeTruthy();
+  });
+
+  it("shows the server's 409 cap message verbatim", async () => {
+    const capMsg =
+      "you already have 10 active tokens for this product; revoke one before minting another";
+    mockApi.createProductToken.mockRejectedValue(new ApiError(409, capMsg));
+    renderCard();
+    await fillAndMint();
+    expect((await screen.findByRole("alert")).textContent).toBe(capMsg);
+  });
+
+  it("explains the empty state when there is no product to mint for", async () => {
+    mockApi.listMintableProducts.mockResolvedValue({ products: [] });
+    renderCard();
+    expect(await screen.findByText("No products to connect yet")).toBeTruthy();
+    expect(screen.getByText(/Admin → Products/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Create product token" })).toBeNull();
+  });
+});
+
+describe("ProductTokens mint is show-once", () => {
+  it("shows the token once with a copy button and warning, and drops it on Done", async () => {
+    mockApi.createProductToken.mockResolvedValue({
+      token: MINTED,
+      product_token: aToken({ id: "new", name: "prod" }),
+    });
+    renderCard();
+    await fillAndMint();
+
+    // Scoped by the secret itself: several regions carry role="status" (web.md).
+    const status = (await screen.findByText(MINTED)).closest<HTMLElement>('[role="status"]')!;
+    expect(status).not.toBeNull();
+    expect(within(status).getByText(MINTED)).toBeTruthy();
+    expect(within(status).getByText(/once and never again/)).toBeTruthy();
+    expect(within(status).getByText(/won’t see this value again/)).toBeTruthy();
+    expect(within(status).getByRole("button", { name: "Copy" })).toBeTruthy();
+    await waitFor(() => expect(document.activeElement).toBe(status));
+
+    fireEvent.click(within(status).getByRole("button", { name: "Done" }));
+    // Present a moment ago (asserted above), gone now.
+    expect(screen.queryByText(MINTED)).toBeNull();
+  });
+
+  it("does not bring the token back on a fresh mount (a page refresh)", async () => {
+    mockApi.createProductToken.mockResolvedValue({
+      token: MINTED,
+      product_token: aToken({ id: "new", name: "prod" }),
+    });
+    const first = renderCard();
+    await fillAndMint();
+    expect(await screen.findByText(MINTED)).toBeTruthy();
+    first.unmount();
+
+    // The server now lists the minted row (metadata only); the value is nowhere.
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken({ id: "new", name: "prod" })] });
+    renderCard();
+    expect(await screen.findByText("prod")).toBeTruthy();
+    expect(screen.queryByText(MINTED)).toBeNull();
+  });
+});
+
+describe("ProductTokens list", () => {
+  it("renders product, name, prefix, scopes, last used, IP and expiry", async () => {
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken()] });
+    renderCard();
+    const row = (await screen.findByText("support-prod")).closest("li")!;
+    expect(within(row).getByText(CLS + "4c1e…")).toBeTruthy();
+    expect(within(row).getByText("for Helpdesk assistant")).toBeTruthy();
+    // Badges use the form's words, not the wire scope.
+    expect(within(row).getByText("Run jobs")).toBeTruthy();
+    expect(within(row).getByText("Read jobs")).toBeTruthy();
+    expect(within(row).getByText(/last used/)).toBeTruthy();
+    expect(within(row).getByText(/from 10\.20\.3\.14/)).toBeTruthy();
+    expect(within(row).getByText(/expires /)).toBeTruthy();
+  });
+
+  it("marks revoked and expired tokens and offers Revoke only on the active one", async () => {
+    mockApi.listProductTokens.mockResolvedValue({
+      truncated: false,
+      tokens: [
+        aToken({ id: "live", name: "live" }),
+        aToken({ id: "gone", name: "gone", revoked: true }),
+        aToken({ id: "old", name: "old", expires_at: daysAgo(2) }),
+        aToken({ id: "forever", name: "forever", expires_at: null, revoked: true }),
+      ],
+    });
+    renderCard();
+    await screen.findByText("live");
+    expect(screen.getAllByText("revoked")).toHaveLength(2);
+    expect(screen.getAllByText("expired")).toHaveLength(1);
+    expect(screen.getByText(/never expires/)).toBeTruthy();
+    expect(screen.getAllByRole("button", { name: /^Revoke / }).map((b) => b.getAttribute("aria-label"))).toEqual([
+      "Revoke live",
+    ]);
+  });
+
+  it("flags an active token whose product is no longer mintable (disabled or deleted)", async () => {
+    mockApi.listProductTokens.mockResolvedValue({
+      truncated: false,
+      tokens: [
+        aToken({ id: "ok", name: "fine" }),
+        aToken({ id: "off", name: "stranded", product_id: "prod-gone", product_name: "Old tool" }),
+      ],
+    });
+    renderCard();
+    const stranded = (await screen.findByText("stranded")).closest("li")!;
+    const badge = within(stranded).getByText("product unavailable");
+    expect(badge.getAttribute("title")).toMatch(/disabled or deleted/);
+    expect(screen.getAllByText("product unavailable")).toHaveLength(1);
+  });
+
+  it("revoke calls DELETE for that token and reloads", async () => {
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken({ id: "pt9", name: "ci" })] });
+    mockApi.revokeProductToken.mockResolvedValue(null);
+    renderCard();
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke ci" }));
+    await waitFor(() => expect(mockApi.revokeProductToken).toHaveBeenCalledWith("pt9"));
+    await waitFor(() => expect(mockApi.listProductTokens).toHaveBeenCalledTimes(2));
+  });
+
+  it("renders an untrusted token name as text, not markup", async () => {
+    const hostile = '<img src=x onerror="alert(1)">';
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken({ name: hostile })] });
+    const { container } = renderCard();
+    expect(await screen.findByText(hostile)).toBeTruthy();
+    expect(container.querySelector("img")).toBeNull();
+  });
+});
+
+describe("Settings → Access: Revoke all covers product tokens (PRD #1907 D8)", () => {
+  it("calls revoke-all and refreshes the product-token list", async () => {
+    mockApi.listProductTokens
+      .mockResolvedValueOnce({ truncated: false, tokens: [aToken({ id: "p1", name: "helpdesk" })] })
+      .mockResolvedValue({ truncated: false, tokens: [aToken({ id: "p1", name: "helpdesk", revoked: true })] });
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    render(
+      <MemoryRouter>
+        <AccessSettings />
+      </MemoryRouter>,
+    );
+
+    // Only a product token is active, so the shared Revoke all names it.
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/Revoke all 1 product token\?/)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Revoke helpdesk" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+
+    await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(mockApi.listProductTokens).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText("revoked")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Revoke helpdesk" })).toBeNull();
+  });
+});
+
+describe("ProductTokens first-load failure (review item 2)", () => {
+  it("shows only the error: no false empty states and no mint form", async () => {
+    mockApi.listProductTokens.mockRejectedValue(new ApiError(500, "database unavailable"));
+    renderCard();
+    expect((await screen.findByRole("alert")).textContent).toBe("database unavailable");
+    // Both strings render on a successful empty load (the empty-state test above), so
+    // these negatives are live.
+    expect(screen.queryByText("No products to connect yet")).toBeNull();
+    expect(screen.queryByText("You have no product tokens.")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Create product token" })).toBeNull();
+  });
+
+  it("reports an unknown active count (null) rather than 0", async () => {
+    mockApi.listProductTokens.mockRejectedValue(new ApiError(500, "database unavailable"));
+    const onCount = vi.fn();
+    render(
+      <MemoryRouter>
+        <ProductTokens onActiveCountChange={onCount} />
+      </MemoryRouter>,
+    );
+    await screen.findByRole("alert");
+    await waitFor(() => expect(onCount).toHaveBeenLastCalledWith(null));
+    expect(onCount).not.toHaveBeenCalledWith(0);
+  });
+});
+
+describe("ProductTokens truncated list", () => {
+  it("says the list was cut, and reports an unknown count when every listed row is active", async () => {
+    mockApi.listProductTokens.mockResolvedValue({
+      truncated: true,
+      tokens: [aToken({ id: "a", name: "one" }), aToken({ id: "b", name: "two" })],
+    });
+    const onCount = vi.fn();
+    render(
+      <MemoryRouter>
+        <ProductTokens onActiveCountChange={onCount} />
+      </MemoryRouter>,
+    );
+    // The count comes from the rows returned, not a cap hard-coded in the client.
+    expect(
+      await screen.findByText(
+        "Showing your first 2 product tokens, active first; older tokens are not listed.",
+      ),
+    ).toBeTruthy();
+    await waitFor(() => expect(onCount).toHaveBeenLastCalledWith(null));
+  });
+
+  it("keeps an exact count when the cut list already reaches an inactive row", async () => {
+    mockApi.listProductTokens.mockResolvedValue({
+      truncated: true,
+      tokens: [aToken({ id: "a", name: "one" }), aToken({ id: "b", name: "two", revoked: true })],
+    });
+    const onCount = vi.fn();
+    render(
+      <MemoryRouter>
+        <ProductTokens onActiveCountChange={onCount} />
+      </MemoryRouter>,
+    );
+    await waitFor(() => expect(onCount).toHaveBeenLastCalledWith(1));
+  });
+
+  it("shows no notice when the list is complete", async () => {
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken()] });
+    renderCard();
+    await screen.findByText("support-prod");
+    expect(screen.queryByText(/older tokens are not listed/)).toBeNull();
+  });
+});
+
+describe("ProductTokens name is checked in bytes", () => {
+  it("explains a name over 200 UTF-8 bytes and blocks Create", async () => {
+    renderCard();
+    fireEvent.change(await screen.findByLabelText("Product"), { target: { value: "prod-a" } });
+    // 101 x U+00E9 is 101 characters but 202 bytes.
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "\u00e9".repeat(101) } });
+    expect(screen.getByText(/Name is 202 bytes; the limit is 200/)).toBeTruthy();
+    expect(screen.getByLabelText("Name").getAttribute("aria-invalid")).toBe("true");
+    expect(
+      (screen.getByRole("button", { name: "Create product token" }) as HTMLButtonElement).disabled,
+    ).toBe(true);
+
+    fireEvent.change(screen.getByLabelText("Name"), { target: { value: "\u00e9".repeat(100) } });
+    expect(screen.queryByText(/the limit is 200/)).toBeNull();
+    expect(
+      (screen.getByRole("button", { name: "Create product token" }) as HTMLButtonElement).disabled,
+    ).toBe(false);
+  });
+});
+
+describe("ProductTokens show-once panel is retired with its token (review item 3)", () => {
+  function mintReturning(id: string) {
+    mockApi.createProductToken.mockResolvedValue({
+      token: MINTED,
+      product_token: aToken({ id, name: "prod" }),
+    });
+    // After the mint the list includes the new row.
+    mockApi.listProductTokens.mockResolvedValue({
+      truncated: false,
+      tokens: [aToken({ id, name: "prod" }), aToken({ id: "other", name: "older" })],
+    });
+  }
+
+  it("drops the panel when that token is revoked", async () => {
+    mintReturning("new");
+    mockApi.revokeProductToken.mockResolvedValue(null);
+    renderCard();
+    await fillAndMint();
+    expect(await screen.findByText(MINTED)).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke prod" }));
+    await waitFor(() => expect(mockApi.revokeProductToken).toHaveBeenCalledWith("new"));
+    await waitFor(() => expect(screen.queryByText(MINTED)).toBeNull());
+  });
+
+  it("keeps the panel when a different token is revoked", async () => {
+    mintReturning("new");
+    mockApi.revokeProductToken.mockResolvedValue(null);
+    renderCard();
+    await fillAndMint();
+    expect(await screen.findByText(MINTED)).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke older" }));
+    await waitFor(() => expect(mockApi.revokeProductToken).toHaveBeenCalledWith("other"));
+    await waitFor(() => expect(mockApi.listProductTokens).toHaveBeenCalledTimes(3));
+    expect(screen.getByText(MINTED)).toBeTruthy();
+  });
+
+  it("drops the panel when Revoke all runs", async () => {
+    mintReturning("new");
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    render(
+      <MemoryRouter>
+        <AccessSettings />
+      </MemoryRouter>,
+    );
+    await fillAndMint();
+    expect(await screen.findByText(MINTED)).toBeTruthy();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+    await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(MINTED)).toBeNull());
+  });
+});
+
+describe("Settings → Access: Revoke all when the product count is unknown (review item 2)", () => {
+  it("stays available with no CLI token and words the confirm without a product count", async () => {
+    mockApi.listProductTokens.mockRejectedValue(new ApiError(500, "database unavailable"));
+    render(
+      <MemoryRouter>
+        <AccessSettings />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    const confirm = screen.getByRole("group", { name: "Confirm revoking all CLI and product tokens" });
+    expect(within(confirm).getByText(/^Revoke every product token\?/)).toBeTruthy();
+    expect(within(confirm).queryByText(/\d+ product token/)).toBeNull();
+  });
+});

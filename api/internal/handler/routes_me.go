@@ -13,9 +13,10 @@ import (
 )
 
 // mountMeRoutes registers the current-user route groups: /me/secrets, /me/cli-tokens,
-// /me/memory, /me/workers, /me/runs, /me/schedules, the consent PUTs, /me/rate-limits
-// and /me/settings.
-func (h *Handler) mountMeRoutes(r chi.Router) {
+// /me/product-tokens, /me/memory, /me/workers, /me/runs, /me/schedules, the consent
+// PUTs, /me/rate-limits and /me/settings. authLimiter is mounted per user on the
+// product-token mint only.
+func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// Current-user secrets (per-user, encrypted at rest). No admin read
 	// path to other users' secret values by design.
 	r.Route("/me/secrets", func(r chi.Router) {
@@ -75,13 +76,28 @@ func (h *Handler) mountMeRoutes(r chi.Router) {
 	// escalating past the ceiling (the mint check keys off the user, not the
 	// presenting credential's scope). The list returns metadata only — never a
 	// token value. revoke-all is the panic button (Decision 19); a static path
-	// matched ahead of /{id}.
+	// matched ahead of /{id}. Since PRD #1907 M5 (D8) it revokes the caller's CLI
+	// tokens AND product tokens in one transaction, so the button leaves nothing live.
 	r.Route("/me/cli-tokens", func(r chi.Router) {
 		r.Use(mw.RequireAuth(h.q, h.cfg))
 		r.Get("/", h.ListCLITokens)
 		r.Post("/", h.CreateCLIToken)
 		r.Post("/revoke-all", h.RevokeAllCLITokens)
 		r.Delete("/{id}", h.RevokeCLIToken)
+	})
+
+	// Product tokens (PRD #1907 M5), the user's uzp_ credentials for /api/v1.
+	// Cookie-only, DELIBERATELY (D14), for the same reason as /me/cli-tokens above:
+	// minting a credential is a browser action with CSRF, and a Bearer-reachable mint
+	// or list would let a stolen token of any class mint replacements. The mint rides
+	// authLimiter per user, like the other credential surfaces; the per-product cap
+	// (D15) is the handler's. /products is the mint picker (enabled, live products).
+	r.Route("/me/product-tokens", func(r chi.Router) {
+		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Get("/", h.ListMyProductTokens)
+		r.Get("/products", h.ListMintableProducts)
+		r.With(authLimiter.PerUserMiddleware).Post("/", h.MintProductToken)
+		r.Delete("/{id}", h.RevokeMyProductToken)
 	})
 
 	// Agent memory (PRD #90 M6): the owner's view + purge of their cross-run

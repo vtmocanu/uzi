@@ -10,7 +10,7 @@ import { pipeline } from "node:stream/promises";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
-import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
+import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withForgeRetry } from "./forge-retry.js";
@@ -59,6 +59,7 @@ const execFileAsync = promisify(execFile);
 function exitGatedStream(
   source: Readable,
   onAbandon?: () => void,
+  deferPrematureCloseUntilExit = false,
 ): { out: Readable; exited: (err?: Error) => void } {
   const out = new PassThrough();
   // A caller may drop the stream unread (tests do; a skipped publish could): an exit error
@@ -66,6 +67,7 @@ function exitGatedStream(
   // attach their own listener, or iterate it, still receive the error.
   out.on("error", () => undefined);
   let sourceEnded = false;
+  let sourceClosedPrematurely = false;
   let finished = false;
   let exit: { err?: Error } | undefined;
   const settle = (): void => {
@@ -76,6 +78,9 @@ function exitGatedStream(
     } else if (sourceEnded) {
       finished = true;
       out.end();
+    } else if (sourceClosedPrematurely) {
+      finished = true;
+      out.destroy(new Error("git stdout closed before end (premature close)"));
     }
   };
   out.on("close", () => {
@@ -86,14 +91,18 @@ function exitGatedStream(
     onAbandon?.();
   });
   source.on("error", (err) => out.destroy(err));
-  // A source that CLOSES without 'end' or 'error' (a premature close: destroyed with no error)
-  // would otherwise leave a clean exit waiting on `sourceEnded` forever, so `out` never ends
-  // and a consumer's pipeline never settles. Error `out` instead, as the stream.pipeline this
-  // replaced did. Skipped after a normal 'end', after an error already destroyed `out`, and on
-  // the abandon path (`out` is destroyed before its 'close' destroys the source). `finished`
-  // stays false, like the 'error' path, so `out`'s 'close' still tears down a live child.
+  // A source that closes without 'end' or 'error' must fail the output stream.
+  // Under a supervised boundary, wait for its terminal evidence first so a
+  // verified soft timeout is not hidden by the transport closing during dispose.
   source.on("close", () => {
     if (sourceEnded || finished || out.destroyed) return;
+    if (deferPrematureCloseUntilExit) {
+      // A supervised child can close stdout during a clean soft disposal before
+      // its whole-root reap resolves. Its typed timeout verdict wins over close.
+      sourceClosedPrematurely = true;
+      settle();
+      return;
+    }
     out.destroy(new Error("git stdout closed before end (premature close)"));
   });
   source.on("end", () => {
@@ -166,6 +175,30 @@ export class ScratchPublicationError extends Error {
     super(`scratch_publication_refused: ${reason}`, { cause });
     this.name = "ScratchPublicationError";
   }
+}
+
+const GIT_OUTPUT_ABORT_MESSAGE = "permit-held git output collection aborted: boundary deadline exceeded";
+const GIT_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
+
+/** A permit deadline stopped Git work. Keep this distinct from a scratch finding. */
+class GitBoundaryAbortError extends Error {
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "AbortError";
+  }
+}
+
+/** A checkpoint publication used its cooperative budget. The caller may skip
+ * only after every started child has settled under the held permit. */
+export class CheckpointSoftDeadlineError extends Error {
+  constructor() {
+    super("checkpoint publication soft deadline exceeded");
+    this.name = "AbortError";
+  }
+}
+
+function isAbortLike(error: unknown): error is Error {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 class RemoteBranchAdvancedError extends Error {
@@ -326,6 +359,10 @@ export type BoundaryProcessSpawner = (request: BoundaryProcessRequest) => Promis
 interface BoundaryProcessScope {
   spawn: BoundaryProcessSpawner;
   signal: AbortSignal;
+  /** Checkpoint-only budget. The soft signal may forfeit a queued lock or abort
+   * broker I/O; it must never abort an active child output collector. */
+  softSignal?: AbortSignal;
+  softDeadlineAt?: number;
   /** issue #1597 M2: awaited by {@link GitCache.withLock} AFTER its critical section and BEFORE the
    *  per-bare lock is released, so a scope (the mid-turn checkpoint tick) can settle a cancelled child
    *  and remove a lock file it provably owned while no other bare mutation can interleave. Never
@@ -1158,10 +1195,10 @@ export class GitCache {
     spawner: BoundaryProcessSpawner,
     signal: AbortSignal,
     action: () => Promise<T>,
-    hooks: { beforeLockRelease?: (key: string) => Promise<void> } = {},
+    hooks: { beforeLockRelease?: (key: string) => Promise<void>; softSignal?: AbortSignal; softDeadlineAt?: number } = {},
   ): Promise<T> {
     return this.boundaryProcesses.run(
-      { spawn: spawner, signal, ...(hooks.beforeLockRelease ? { beforeLockRelease: hooks.beforeLockRelease } : {}) },
+      { spawn: spawner, signal, ...hooks },
       action,
     );
   }
@@ -1315,6 +1352,8 @@ export class GitCache {
       if (touched.trim()) throw new Error(".uzi/scratch appears in candidate history");
       return candidate;
     } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError("cannot prove scratch-free candidate history", cause);
     }
@@ -1361,6 +1400,8 @@ export class GitCache {
       await this.scratchPublicationPreflight(barePath, branch, fresh);
       forwardAdvance = true;
     } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError("cannot verify fresh remote floor", cause);
     } finally {
@@ -3616,6 +3657,7 @@ export class GitCache {
     branch: string,
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<{ tipOid: string; pack: Readable } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
@@ -3624,13 +3666,16 @@ export class GitCache {
       if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs");
       }
+      onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
       let wanted = pinned.tipSha;
       if (overlay) {
-        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay) ?? wanted;
+        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay, onStep) ?? wanted;
+        onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
+      onStep?.("checkpoint_pack");
       const { stdout } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
@@ -3640,6 +3685,7 @@ export class GitCache {
     }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
+    onStep?.("scratch_preflight");
     await this.scratchPublicationPreflight(barePath, branch, realTip);
     // An unresolvable floor (e.g. no origin branch and a tip disjoint from the default, where
     // merge-base exits non-zero) is a range that cannot be established: refuse with the typed
@@ -3649,6 +3695,8 @@ export class GitCache {
       const excludeRef = await this.checkpointExcludeRef(barePath, branch, realTip);
       excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
     } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
       throw new ScratchPublicationError("checkpoint floor cannot be resolved", e);
     }
 
@@ -3656,16 +3704,17 @@ export class GitCache {
     // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
     // fast-forward wrapper commit `O_ov` whose `.github/workflows` tree equals the default's,
     // and pack THAT instead of the raw tracking tip, so a branch behind `main` on those files
-    // is no longer rejected `workflow_scope` and checkpoints durably. FAIL-SOFT: on ANY error
-    // or gate-miss `buildWorkflowOverlay` returns null and we ship `realTip` — today's exact
-    // behaviour (→ the clean workflow-scope skip; #377 owns a workflow-MODIFYING branch at
-    // finalize). This method never throws for an overlay reason. When `overlay` is undefined
+    // is no longer rejected `workflow_scope` and checkpoints durably. An ordinary overlay error
+    // or gate-miss returns null and ships `realTip` (→ the clean workflow-scope skip; #377
+    // owns a workflow-MODIFYING branch at finalize). A boundary abort propagates instead:
+    // it cannot authorize a raw-tip fallback. When `overlay` is undefined
     // the block is skipped and `realTip` ships, byte-for-byte as before.
     let wantRev = realTip;
     if (overlay) {
-      const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay);
+      const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay, onStep);
       if (ov) {
         wantRev = ov;
+        onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wantRev);
       }
     }
@@ -3674,6 +3723,7 @@ export class GitCache {
     // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
+    onStep?.("checkpoint_pack");
     const { stdout } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
@@ -4087,8 +4137,8 @@ export class GitCache {
   /**
    * PRD #1062 M2 (#1036) — build the `.github/workflows` overlay wrapper commit `O_ov` for a
    * checkpoint, or return null to ship the raw `realTip` (today's behaviour). ALL work is
-   * FAIL-SOFT: every error resolves to null so `checkpointPack` never throws for an overlay
-   * reason, and every gate-miss ships `realTip`.
+   * FAIL-SOFT for ordinary overlay errors and gate misses: they return null and ship `realTip`.
+   * A boundary abort propagates and never turns into a raw-tip publish.
    *
    * The overlay is a transport wrapper the broker pushes UNCHANGED and adoption peels
    * (`runnerCloneForBranch`, `isOverlayMarker`): its `.github/workflows` subtree is swapped to
@@ -4109,25 +4159,31 @@ export class GitCache {
     branch: string,
     realTip: string,
     overlay: CheckpointOverlayContext,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<string | null> {
-    // GATE 1 — the default tip must resolve (a fresh authenticated fetch). A failure ships
-    // realTip: overlay durability is best-effort and never blocks the checkpoint.
+    // GATE 1 — the default tip must resolve (a fresh authenticated fetch). An ordinary
+    // failure ships realTip; a boundary abort propagates instead of authorizing fallback.
     let defaultTip: string;
     try {
+      onStep?.("checkpoint_lock_wait");
       defaultTip = await this.fetchDefaultTip(
         barePath,
         overlay.defaultBranch,
         overlay.pat,
         overlay.cloneUrl,
         overlay.username,
+        () => onStep?.("default_fetch"),
       );
     } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
       this.log.warn("checkpoint overlay: could not resolve the default tip — shipping realTip", {
         branch,
         error: gitErrorMessage(e),
       });
       return null;
     }
+    onStep?.("checkpoint_overlay");
     // GATE 2 — only a branch actually behind on `.github/workflows` needs an overlay (reuse
     // #627's exact trigger). Not behind ⇒ ship realTip (the broker accepts the raw tip).
     if (!(await this.workflowTreeDiffers(barePath, realTip, defaultTip))) return null;
@@ -4213,6 +4269,8 @@ export class GitCache {
       });
       return ovSha;
     } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
       this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
         branch,
         error: gitErrorMessage(e),
@@ -5248,9 +5306,11 @@ export class GitCache {
     pat?: string,
     cloneUrl?: string,
     username?: string,
+    onLockAcquired?: () => void,
   ): Promise<string> {
     const scope = cloneUrl ? httpScopeForUrl(cloneUrl) : undefined;
     return this.withLock(barePath, async () => {
+      onLockAcquired?.();
       await this.runGit(barePath, ["fetch", "origin", defaultBranch], pat, scope, username);
       // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
       // fetch updates the remote-tracking ref; read the fresh tip off it.
@@ -6291,6 +6351,24 @@ export class GitCache {
 
   // --- git subprocess plumbing -------------------------------------------------
 
+  /** A hard permit abort is not evidence that a candidate contains scratch files. */
+  private boundaryAbortError(cause: unknown): Error | undefined {
+    const scope = this.boundaryProcesses.getStore();
+    if (scope?.signal.aborted) {
+      const message = cause instanceof Error && cause.message === GIT_OUTPUT_ABORT_MESSAGE
+        ? GIT_OUTPUT_ABORT_MESSAGE
+        : "permit-held git operation aborted";
+      return new GitBoundaryAbortError(message, cause);
+    }
+    if (cause instanceof CheckpointSoftDeadlineError) return cause;
+    if (scope?.softSignal?.aborted) return new CheckpointSoftDeadlineError();
+    if (cause instanceof GitBoundaryAbortError) return cause;
+    // Foreign AbortError messages can carry remote text. Preserve the abort type and
+    // original cause without copying that message onto the run-log surface.
+    if (isAbortLike(cause)) return new GitBoundaryAbortError("permit-held git operation aborted", cause);
+    return undefined;
+  }
+
   private async execScoped(
     command: string,
     args: string[],
@@ -6312,8 +6390,17 @@ export class GitCache {
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+      throw new CheckpointSoftDeadlineError();
+    }
+    const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+    const childTimeout = remainingSoft === undefined
+      ? options.timeout
+      : Math.min(options.timeout ?? Infinity, remainingSoft);
     const process = await boundary.spawn({ argv: [executable, ...args], cwd, env: options.env, identity,
-      ...(options.timeout === undefined ? {} : { timeoutMs: options.timeout }),
+      ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
+      ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
     });
     process.stdin?.on("error", () => undefined);
     process.stdin?.end(input);
@@ -6329,6 +6416,7 @@ export class GitCache {
           boundary.signal.removeEventListener("abort", onAbort);
           stream.removeListener("data", onData);
           stream.removeListener("end", onEnd);
+          stream.removeListener("close", onClose);
           stream.removeListener("error", onError);
         };
         const settle = (
@@ -6355,22 +6443,37 @@ export class GitCache {
           bytes += buf.length;
         };
         const onEnd = (): void => settle({ chunks, oversized });
+        const onClose = (): void => settle(undefined, new Error("subprocess output closed before end"));
         const onError = (error: unknown): void => settle(undefined, error);
         const onAbort = (): void => {
           stream.destroy();
-          settle(undefined, new Error("permit-held git output collection aborted: boundary deadline exceeded"));
+          settle(undefined, new Error(GIT_OUTPUT_ABORT_MESSAGE));
         };
         stream.on("data", onData);
         stream.once("end", onEnd);
+        stream.once("close", onClose);
         stream.once("error", onError);
+        if (stream.destroyed) onClose();
+        else if (stream.readableEnded) onEnd();
         if (boundary.signal.aborted) onAbort();
         else boundary.signal.addEventListener("abort", onAbort, { once: true });
       });
-    const [stdout, stderr, terminal] = await Promise.all([
-      collect(process.stdout),
-      collect(process.stderr),
-      process.completed,
-    ]);
+    let stdout: { chunks: Buffer[]; oversized: boolean };
+    let stderr: { chunks: Buffer[]; oversized: boolean };
+    let terminal: { readonly code: number; readonly softTimedOut?: true };
+    // A collector can close/error before a timed-out child is fully disposed.
+    // Keep the bare lock until the safety owner has verified full-root reap.
+    const settled = await Promise.allSettled([collect(process.stdout), collect(process.stderr), process.completed] as const);
+    if (settled[2].status === "rejected") {
+      throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
+    }
+    terminal = settled[2].value;
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+    if (terminal.softTimedOut) throw new CheckpointSoftDeadlineError();
+    if (settled[0].status === "rejected") throw this.boundaryAbortError(settled[0].reason) ?? settled[0].reason;
+    if (settled[1].status === "rejected") throw this.boundaryAbortError(settled[1].reason) ?? settled[1].reason;
+    stdout = settled[0].value;
+    stderr = settled[1].value;
     const out = Buffer.concat(stdout.chunks).toString();
     const err = Buffer.concat(stderr.chunks).toString();
     if (stdout.oversized || stderr.oversized || terminal.code !== 0) {
@@ -6399,6 +6502,8 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
     }
   }
@@ -6426,6 +6531,8 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
     }
   }
@@ -6455,7 +6562,8 @@ export class GitCache {
    * a caller that must know (e.g. {@link ensureRunnerCloneObjects}) awaits `exited` as well.
    *
    * `opts` (PRD #1798 M5, used by {@link readBare} only) forwards a child timeout to the boundary
-   * spawner and caps the stderr kept for the failure message; every other caller omits it.
+   * spawner and caps the stderr kept for the failure message. A checkpoint soft scope also caps
+   * a streaming pack child even when its caller omits `opts`.
    */
   private async spawnGit(
     cwd: string,
@@ -6467,12 +6575,21 @@ export class GitCache {
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
     if (boundary) {
+      if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
+      if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
+        throw new CheckpointSoftDeadlineError();
+      }
+      const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
+      const childTimeout = remainingSoft === undefined
+        ? opts.timeoutMs
+        : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
       const process = await boundary.spawn({
         argv: [GIT_BIN, ...withDir(cwd, args)],
         cwd,
         env,
         identity: "worker_pat",
-        ...(opts.timeoutMs === undefined ? {} : { timeoutMs: opts.timeoutMs }),
+        ...(childTimeout === undefined ? {} : { timeoutMs: childTimeout }),
+        ...(remainingSoft === undefined ? {} : { recoverableTimeout: true }),
       });
       if (!process.stdout) throw new Error("supervised git process has no stdout");
       const stderrCap = opts.stderrMaxBytes ?? GIT_MAX_BUFFER;
@@ -6485,8 +6602,12 @@ export class GitCache {
         stderrChunks.push(kept);
         stderrBytes += kept.length;
       });
-      const gated = exitGatedStream(process.stdout);
-      process.completed.then(({ code }) => {
+      const gated = exitGatedStream(process.stdout, undefined, true);
+      process.completed.then(({ code, softTimedOut }) => {
+        if (softTimedOut) {
+          gated.exited(new CheckpointSoftDeadlineError());
+          return;
+        }
         if (code !== 0) {
           const detail = Buffer.concat(stderrChunks).subarray(0, stderrCap).toString().trim();
           gated.exited(new Error(`git ${args.join(" ")} exited ${code}${detail ? `: ${detail}` : ""}`));
@@ -6659,6 +6780,8 @@ export class GitCache {
       await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
       return typeof code === "number" ? code : 1;
     }
@@ -6675,6 +6798,8 @@ export class GitCache {
       await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
       return typeof code === "number" ? code : null;
     }
@@ -6715,13 +6840,15 @@ export class GitCache {
     try {
       const { stdout } = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
       return stdout.trim();
-    } catch {
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       return "";
     }
   }
 
   /** Serialize all mutations on a given bare repo (chained promises per path).
-   * A permit-scoped caller waiting behind another run observes its boundary abort
+   * A permit-scoped caller waiting behind another run observes its hard or soft abort
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
    * let a later mutation overtake the holder and violate serialization. */
@@ -6741,16 +6868,24 @@ export class GitCache {
       if (started || settled) return;
       settled = true;
       removeAbortListener();
-      rejectResult(new Error("permit-held git lock wait aborted: boundary deadline exceeded"));
+      rejectResult(scope?.signal.aborted
+        ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE)
+        : new CheckpointSoftDeadlineError());
     };
     if (scope) {
-      removeAbortListener = (): void => scope.signal.removeEventListener("abort", abortBeforeAcquisition);
-      if (scope.signal.aborted) abortBeforeAcquisition();
-      else scope.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
+      removeAbortListener = (): void => {
+        scope.signal.removeEventListener("abort", abortBeforeAcquisition);
+        scope.softSignal?.removeEventListener("abort", abortBeforeAcquisition);
+      };
+      if (scope.signal.aborted || scope.softSignal?.aborted) abortBeforeAcquisition();
+      else {
+        scope.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        scope.softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
+      }
     }
     const run = async (): Promise<void> => {
       if (settled) return;
-      if (scope?.signal.aborted) {
+      if (scope?.signal.aborted || scope?.softSignal?.aborted) {
         abortBeforeAcquisition();
         return;
       }

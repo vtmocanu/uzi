@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -299,6 +300,44 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	products := &cobra.Command{
+		Use:   "products",
+		Short: "List registered external products (read-only)",
+		Long: "List every external product registered for product tokens (PRD #1907), " +
+			"soft-deleted ones included, with how many of its tokens are active (neither " +
+			"revoked nor expired).\n\n" +
+			"STATE is enabled, disabled, or deleted. A disabled or deleted product's " +
+			"tokens are refused on /api/v1; a deleted product can never be re-enabled. " +
+			"Registering, editing and deleting products are browser-only admin actions.",
+		Args: cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			ps, err := c.AdminListProducts(cmd.Context())
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(ps)
+			}
+			rows := make([][]string, 0, len(ps))
+			for _, pr := range ps {
+				rows = append(rows, []string{
+					pr.Name,
+					productStateCell(pr),
+					strconv.FormatInt(pr.ActiveTokenCount, 10),
+					pr.CreatedAt.UTC().Format(time.RFC3339),
+					// Up to 1000 bytes server-side: cellText bounds the cell.
+					cellText(pr.Description),
+				})
+			}
+			return p.Table([]string{"NAME", "STATE", "ACTIVE_TOKENS", "CREATED", "DESCRIPTION"}, rows)
+		},
+	}
+
 	guardrailImpact := &cobra.Command{
 		Use:   "guardrail-impact",
 		Short: "Pre-flight count of repos the push/merge guardrail would refuse",
@@ -379,7 +418,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminEgressProfileCmd(env, gf))
+	cmd.AddCommand(users, runs, workers, health, usage, rateLimits, cliTokens, products, guardrailImpact, blockedRepos, newAdminAgentSourceCmd(env, gf), newAdminReviewCmd(env, gf), newAdminEgressProfileCmd(env, gf))
 	return cmd
 }
 
@@ -852,6 +891,19 @@ func tokenStateCell(t apitypes.AdminCLITokenDTO) string {
 		return "expired"
 	default:
 		return "active"
+	}
+}
+
+// productStateCell renders a product's lifecycle state. deleted wins: a soft-deleted
+// product is always disabled too (PRD #1907 D9).
+func productStateCell(p apitypes.ProductDTO) string {
+	switch {
+	case p.DeletedAt != nil:
+		return "deleted"
+	case p.Enabled:
+		return "enabled"
+	default:
+		return "disabled"
 	}
 }
 

@@ -218,6 +218,31 @@ describe("CodexDelegationRunner: admission", () => {
 });
 
 describe("CodexDelegationRunner: happy path + honest attribution", () => {
+  const taskInputs: { name: string; args: Record<string, string>; expected: string }[] = [
+    { name: "task takes precedence over a dispatch description", args: { description: "label", task: "full instructions" }, expected: "full instructions" },
+    { name: "prompt takes precedence over task and description", args: { description: "label", task: "task brief", prompt: "prompt brief" }, expected: "prompt brief" },
+    { name: "input takes precedence over a dispatch description", args: { description: "label", input: "input brief" }, expected: "input brief" },
+    { name: "message takes precedence over a dispatch description", args: { description: "label", message: "message brief" }, expected: "message brief" },
+    { name: "empty prompt falls through to task", args: { description: "label", prompt: "", task: "task brief" }, expected: "task brief" },
+    { name: "empty prompt and task fall through to input", args: { description: "label", prompt: "", task: "", input: "input brief" }, expected: "input brief" },
+    { name: "empty instruction fields fall through to message", args: { description: "label", prompt: "", task: "", input: "", message: "message brief" }, expected: "message brief" },
+    { name: "all empty instruction fields fall back to description", args: { description: "label", prompt: "", task: "", input: "", message: "" }, expected: "label" },
+    { name: "description-only delegation remains supported", args: { description: "label" }, expected: "label" },
+    { name: "prompt-only delegation remains supported", args: { prompt: "prompt brief" }, expected: "prompt brief" },
+  ];
+
+  for (const { name, args, expected } of taskInputs) {
+    it(`passes the child its full task: ${name}`, async () => {
+      const controller = new FakeController({ notes: [] });
+      withNotes(controller, [turnCompletedNote(controller, "completed")]);
+      const b = makeRunner({ controller });
+      const res = await b.runner.run(delegReq({ args }));
+      assert.equal(res.ok, true);
+      assert.equal(b.startSpecs.length, 1);
+      assert.equal(b.startSpecs[0]!.taskInput, expected);
+    });
+  }
+
   it("runs a child to completion, accumulates its text, and closes it", async () => {
     const controller = new FakeController({ threadId: "ct-1", turnId: "cu-1", notes: [] });
     withNotes(controller, [

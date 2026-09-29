@@ -280,7 +280,9 @@ export class CodexDelegationRunner {
     signal: AbortSignal,
     wasTimeout: () => boolean,
   ): Promise<ChildDelegationResult> {
-    const taskInput = firstStr(request.args, ["prompt", "description", "task", "input", "message"]) ?? "";
+    // A short dispatch description labels the child; use it as instructions only
+    // when the parent supplied no dedicated instruction field.
+    const taskInput = firstStr(request.args, ["prompt", "task", "input", "message", "description"]) ?? "";
 
     // Honor a stop that already fired before any child work begins.
     if (signal.aborted) {

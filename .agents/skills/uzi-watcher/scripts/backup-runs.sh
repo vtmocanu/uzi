@@ -51,8 +51,12 @@
 #   UZI_BACKUP_RETENTION_DAYS  prune timestamped snapshots older than this many
 #                   24-hour periods (default: 14; 0 disables pruning)
 #   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
+# A failed run with a worker binding is captured like an active one while its clone or
+# owned tracking ref survives; once that source is gone it is status-only (SNAP).
+# Completed and cancelled runs are always status-only.
 # Exit: 0 when every active target produced a verified recovery artifact (terminal
-# targets may be status-only); 1 when any active target did not; 2 for bad usage.
+# targets may be status-only); 1 when any active target did not, or a failed run's
+# surviving source could not be captured intact; 2 for bad usage.
 set -u
 
 KUBECTL="${UZI_KUBECTL:-kubectl}"
@@ -288,6 +292,51 @@ fi
 tar cf - -C "$OUT" . 2>/dev/null | gzip -c
 '
 
+# Source searches run in subshells ($(...), <(...)), so an inconclusive probe (a
+# kubectl listing or exec that did not complete) is recorded in a per-run file, not a
+# variable. A failed run is reported status-only only after a conclusive search.
+probe_inconclusive(){ : > "$PROBE_ERR_FILE"; }
+
+running_pods(){   # $1=ns ; prints Running pod names; marks the search inconclusive on error
+  local out
+  if ! out="$("$KUBECTL" --context "$CTX" -n "$1" get pods \
+                --field-selector=status.phase=Running -o name 2>/dev/null)"; then
+    probe_inconclusive
+    return 1
+  fi
+  [ -z "$out" ] || printf '%s\n' "$out"
+}
+
+# kexec_probe <ns> <pod> <cmd...>: run a read-only probe in the worker container.
+# Prints its stdout and returns its exit code. A missing completion marker means the
+# exec itself failed (not the probe), so the search is marked inconclusive (rc 125).
+kexec_probe(){
+  local ns="$1" pod="$2" out rc
+  shift 2
+  # shellcheck disable=SC2016  # expanded by the pod's shell, not here.
+  out="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
+    sh -c '"$@"; printf "\n__uzi_probe_rc=%s\n" "$?"' _ "$@" 2>/dev/null)" || :
+  case "$out" in
+    *"__uzi_probe_rc="*) ;;
+    *) probe_inconclusive; return 125 ;;
+  esac
+  rc="${out##*__uzi_probe_rc=}"
+  out="${out%__uzi_probe_rc=*}"
+  printf '%s' "$out"
+  return "$rc"
+}
+
+# probe_absent <rc>: succeed for a found result (0); fail for a genuine "not found" (1,
+# as `git show-ref --verify` and `git config --get` report it); any other code is a
+# probe that ran and errored (e.g. 128 for an unreadable repo), so mark it inconclusive.
+probe_absent(){
+  case "$1" in
+    0) return 0 ;;
+    1) return 1 ;;
+    *) probe_inconclusive; return 1 ;;
+  esac
+}
+
 resolve_pod(){   # $1=worker_id ; prints "ns pod" if found
   # Only a Running pod is exec-able. A worker roll (release fleet upgrade, node
   # eviction) leaves the old ReplicaSet's dead pod behind, and it sorts BEFORE the
@@ -295,9 +344,7 @@ resolve_pod(){   # $1=worker_id ; prints "ns pod" if found
   # "cannot exec into a container in a completed pod". Filter to Running server-side.
   local wid="$1" ns pod
   for ns in $NAMESPACES; do
-    pod="$("$KUBECTL" --context "$CTX" -n "$ns" get pods \
-             --field-selector=status.phase=Running -o name 2>/dev/null \
-           | grep -m1 "uzi-hw-$wid" | sed 's#pod/##')"
+    pod="$(running_pods "$ns" | grep -m1 "uzi-hw-$wid" | sed 's#pod/##')"
     [ -n "$pod" ] && { printf '%s %s\n' "$ns" "$pod"; return 0; }
   done
   return 1
@@ -308,8 +355,7 @@ list_pods(){
   for ns in $NAMESPACES; do
     while IFS= read -r p; do
       [ -n "$p" ] && printf '%s %s\n' "$ns" "${p#pod/}"
-    done < <("$KUBECTL" --context "$CTX" -n "$ns" get pods \
-      --field-selector=status.phase=Running -o name 2>/dev/null)
+    done < <(running_pods "$ns")
   done
 }
 
@@ -324,6 +370,7 @@ list_pods(){
 LIST_CANDIDATES='
 set -u
 tab="$(printf "\t")"
+unreadable=0
 for d in "$1/$2" "$1/$2".attempt-*; do
   [ -d "$d" ] || continue
   case "${d##*/}" in .uzi-residue-*|.uzi-skills-*) continue ;; esac
@@ -333,8 +380,11 @@ for d in "$1/$2" "$1/$2".attempt-*; do
   if [ -r "$d/.git" ]; then
     br="$(git -c safe.directory="$d" -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)" || br=""
   fi
+  # A .git that exists but yields no branch is a clone we could not read, not an absent one.
+  if [ -z "$br" ] && [ -e "$d/.git" ]; then unreadable=1; fi
   printf "%s\t%s\n" "$d" "$br"
 done
+[ "$unreadable" -eq 0 ] || exit 3
 '
 ATTEMPT_RE='^[0-9]{8}T[0-9]{6}Z-(g[0-9]+|gx)-[0-9a-f]{16}$'
 
@@ -363,13 +413,23 @@ select_clone(){
   local LC_ALL=C listing journal ledger ledger_ok jr="" jc="" ja="" path br name aid
   local best="" best_aid="" have_best=0 tab=$'\t' bare="$REPOS_BASE/$REPO_SLUG.git"
   [ -n "$branch" ] || return 1
-  listing="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    sh -c "$LIST_CANDIDATES" _ "$RUNNER_BASE" "$stem" 2>/dev/null)" || return 1
+  local rc=0
+  # rc 3: listed, but some candidate's .git could not be read; keep the readable ones.
+  listing="$(kexec_probe "$ns" "$pod" sh -c "$LIST_CANDIDATES" _ "$RUNNER_BASE" "$stem")" || rc=$?
+  case "$rc" in
+    0) ;;
+    3) probe_inconclusive ;;
+    *) probe_inconclusive; return 1 ;;
+  esac
   [ -n "$listing" ] || return 1
-  journal="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$bare" config --get "uzi-recovery.$branch.clone" 2>/dev/null)" || journal=""
-  ledger="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry" 2>/dev/null)" || ledger=""
+  rc=0
+  journal="$(kexec_probe "$ns" "$pod" \
+    git --git-dir="$bare" config --get "uzi-recovery.$branch.clone")" || rc=$?
+  probe_absent "$rc" || journal=""
+  rc=0
+  ledger="$(kexec_probe "$ns" "$pod" \
+    git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
+  probe_absent "$rc" || ledger=""
   if [ -n "$journal" ]; then
     jr="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .runId // "" else "" end' 2>/dev/null)" || jr=""
     jc="$(printf '%s' "$journal" | "$JQ" -r 'if type=="object" then .clonePath // "" else "" end' 2>/dev/null)" || jc=""
@@ -396,6 +456,16 @@ select_clone(){
       case "$name" in "$stem".attempt-*) aid="${name#"$stem".attempt-}" ;; *) continue ;; esac
       [[ "$aid" =~ $ATTEMPT_RE ]] || continue
     fi
+    # An unreadable dir (no branch) that the journal or ledger names as THIS run's
+    # clone may hold its work: that is an unfinished search, not absence. An unnamed
+    # unreadable dir (e.g. an empty root-owned attempt) is still skipped silently.
+    if [ -z "$br" ]; then
+      if { [ "$jr" = "$rid" ] && [ "$jc" = "$path" ]; } \
+         || { [ -n "$aid" ] && printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path"; }; then
+        probe_inconclusive
+      fi
+      continue
+    fi
     [ "$br" = "$branch" ] || continue
     if [ "$jr" = "$rid" ] && [ "$jc" = "$path" ] && { [ -z "$ja" ] || [ "$ja" = "$aid" ]; }; then
       printf '%s\n' "$path"
@@ -414,14 +484,20 @@ select_clone(){
 pod_has_ref(){
   local ns="$1" pod="$2" ref="$3" branch="$4" rid="$5" owner
   [ -n "$branch" ] || return 1
-  "$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null 2>&1 || return 1
-  owner="$("$KUBECTL" --context "$CTX" -n "$ns" exec "$pod" -c worker -- \
-    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-trackowner.$branch.owner" 2>/dev/null)" || return 1
+  local rc=0
+  kexec_probe "$ns" "$pod" \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null || rc=$?
+  probe_absent "$rc" || return 1
+  rc=0
+  owner="$(kexec_probe "$ns" "$pod" \
+    git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-trackowner.$branch.owner")" || rc=$?
+  probe_absent "$rc" || return 1
   [ "$owner" = "$rid" ]
 }
 
+PROBE_ERR_FILE="$DEST/.probe-inconclusive"
 for RID in "${RUNS[@]}"; do
+  rm -f "$PROBE_ERR_FILE"
   J="$("$UZI" run get "$RID" --json 2>/dev/null)"
   st="$(printf '%s' "$J" | "$JQ" -r '.status // ""' 2>/dev/null)"
   if [ -z "${st:-}" ]; then
@@ -492,10 +568,20 @@ for RID in "${RUNS[@]}"; do
     echo "(full plan: $STEM.plan.md ; recent transcript: $STEM.log-tail.ndjson)"
   } > "$DEST/$STEM.progress.txt" 2>/dev/null || :
 
+  terminal_capture=0
   case "$st" in
-    completed|failed|cancelled)
+    completed|cancelled)
       log "SNAP $RID ($LBL) status=$st mr=${mr:-none} (status saved; no worker capture)"
       continue ;;
+    failed)
+      # A just-failed run's work may exist only on its worker (an ephemeral worker's
+      # PVC, held by recovery custody), so capture it while the source is still there.
+      # Best effort: a failed run whose source is already gone stays status-only.
+      if [ -z "$wid" ]; then
+        log "SNAP $RID ($LBL) status=failed (status saved; no worker binding)"
+        continue
+      fi
+      terminal_capture=1 ;;
     queued)
       # A never-claimed run has no clone. A requeued run keeps worker_id for
       # affinity, so its clone may still hold uncommitted work on that worker.
@@ -552,6 +638,15 @@ for RID in "${RUNS[@]}"; do
   fi
 
   if [ -z "$capture_kind" ]; then
+    if [ "$terminal_capture" -eq 1 ] && [ ! -e "$PROBE_ERR_FILE" ]; then
+      log "SNAP $RID ($LBL) status=$st (status saved; no live clone or tracking ref owned by this run in ctx=$CTX ns=[$NAMESPACES])"
+      continue
+    fi
+    if [ -e "$PROBE_ERR_FILE" ]; then
+      log "FAIL $RID ($LBL) status=$st: status saved, but the source search was inconclusive (a kubectl listing or exec failed); retry"
+      failures=1
+      continue
+    fi
     log "FAIL $RID ($LBL): status saved, but no live clone or durable tracking ref found in ctx=$CTX ns=[$NAMESPACES]"
     failures=1
     continue
@@ -633,6 +728,7 @@ for RID in "${RUNS[@]}"; do
   fi
 done
 
+rm -f "$PROBE_ERR_FILE"
 ln -sfn "$DEST" "$OUTROOT/latest-attempt"
 if [ "$failures" -eq 0 ] && [ "$recoverable" -eq 1 ]; then
   ln -sfn "$DEST" "$OUTROOT/latest"

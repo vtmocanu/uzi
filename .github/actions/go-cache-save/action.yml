@@ -1,0 +1,28 @@
+name: Save Go build cache
+description: >-
+  Save the entry ./.github/actions/go-cache resolved. Call it only on a push to
+  main. Never fails the job: a cache service error leaves a warning and the job's
+  result stands.
+
+inputs:
+  key:
+    description: The go-cache step's `key` output.
+    required: true
+  paths:
+    description: The go-cache step's `paths` output.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Save Go cache
+      id: save
+      continue-on-error: true
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ inputs.paths }}
+        key: ${{ inputs.key }}
+    - name: Warn on a Go cache save failure
+      if: steps.save.outcome == 'failure'
+      shell: bash
+      run: echo "::warning title=go-cache::Go cache save failed; the next run restores an older entry or builds cold."

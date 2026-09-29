@@ -403,7 +403,29 @@ var knownInstructions = []knownInstruction{
 		note: "HELP: `uzi findings resolve`'s Long help cross-links the undo verb (findings.go). " +
 			"The runtime success-line form carries its own `uzi findings undo %s` entry below.",
 	},
+	{
+		command:  "uzi findings release <operation-id> --confirm-no-issue",
+		evidence: evidenceHelpOnly,
+		// ARRIVED WITH ISSUE #1724 M3a. The span is the `uzi findings release` Use line
+		// (findings.go), a cobra help field, so the kind derives HELP; the bar is that the path
+		// RESOLVES, and `uzi findings release` is a real subcommand exercised by TestFindingsRelease.
+		note: "HELP: the `uzi findings release` usage line (findings.go).",
+	},
 	// ---- RUNTIME: emitted at a decision point. The bar is EXECUTION. --------------------
+	{
+		command:  "uzi findings release %s --confirm-no-issue",
+		evidence: evidenceGoTest,
+		where:    "TestFindingsGroupReleaseHintExecutes",
+		// ARRIVED WITH ISSUE #1724 M3a. RUNTIME, derived: the span sits inside a Printf argument
+		// in runFindingsFileGroup (findings.go), the hint printed when a group filing is not
+		// settled (HTTP 202).
+		note: "RUNTIME: `uzi findings file <id> <id>` prints this hint with the operation id when " +
+			"the server answers 202 (exit 5; TestFindingsFileGroupAcceptedExit5 asserts the print " +
+			"and the exit code). EXECUTED in TestFindingsGroupReleaseHintExecutes, which lifts the " +
+			"printed command from that real output, runs it through the real parse and asserts it " +
+			"reaches the release write with the printed operation id (TestFindingsRelease covers " +
+			"the flag gate). Against a fake client, not a booted API.",
+	},
 	{
 		command:  "uzi findings undo %s",
 		evidence: evidenceGoTest,

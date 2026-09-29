@@ -20,7 +20,7 @@ SET status = 'dismissed',
 WHERE user_id = $2
   AND id = ANY($3::uuid[])
   AND status = 'open'
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at, group_operation_id
 `
 
 type BulkDismissFindingsParams struct {
@@ -59,6 +59,7 @@ func (q *Queries) BulkDismissFindings(ctx context.Context, arg BulkDismissFindin
 			&i.ResolvedAt,
 			&i.SetVia,
 			&i.CloseSyncedAt,
+			&i.GroupOperationID,
 		); err != nil {
 			return nil, err
 		}
@@ -79,7 +80,7 @@ SET status = 'done',
 WHERE user_id = $1
   AND id = ANY($2::uuid[])
   AND status IN ('open', 'filed', 'dismissed', 'done')
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at, group_operation_id
 `
 
 type BulkMarkFindingsDoneParams struct {
@@ -118,6 +119,7 @@ func (q *Queries) BulkMarkFindingsDone(ctx context.Context, arg BulkMarkFindings
 			&i.ResolvedAt,
 			&i.SetVia,
 			&i.CloseSyncedAt,
+			&i.GroupOperationID,
 		); err != nil {
 			return nil, err
 		}
@@ -458,6 +460,7 @@ SELECT
     d.filed_issue_iid                AS filed_issue_iid,
     d.filed_issue_url                AS filed_issue_url,
     d.resolved_at                    AS resolved_at,
+    d.group_operation_id             AS group_operation_id,
     count(DISTINCT f.run_id)         AS seen_in_runs,
     latest.id                        AS latest_finding_id
 FROM finding_dispositions d
@@ -496,20 +499,21 @@ type ListFindingsBacklogParams struct {
 }
 
 type ListFindingsBacklogRow struct {
-	DispositionID   uuid.UUID          `json:"disposition_id"`
-	UserID          uuid.UUID          `json:"user_id"`
-	RepoID          uuid.UUID          `json:"repo_id"`
-	RepoPath        string             `json:"repo_path"`
-	Location        string             `json:"location"`
-	Status          string             `json:"status"`
-	LastTitle       string             `json:"last_title"`
-	DismissReason   pgtype.Text        `json:"dismiss_reason"`
-	SetVia          pgtype.Text        `json:"set_via"`
-	FiledIssueIid   pgtype.Int8        `json:"filed_issue_iid"`
-	FiledIssueUrl   string             `json:"filed_issue_url"`
-	ResolvedAt      pgtype.Timestamptz `json:"resolved_at"`
-	SeenInRuns      int64              `json:"seen_in_runs"`
-	LatestFindingID pgtype.UUID        `json:"latest_finding_id"`
+	DispositionID    uuid.UUID          `json:"disposition_id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	RepoPath         string             `json:"repo_path"`
+	Location         string             `json:"location"`
+	Status           string             `json:"status"`
+	LastTitle        string             `json:"last_title"`
+	DismissReason    pgtype.Text        `json:"dismiss_reason"`
+	SetVia           pgtype.Text        `json:"set_via"`
+	FiledIssueIid    pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl    string             `json:"filed_issue_url"`
+	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
+	GroupOperationID pgtype.UUID        `json:"group_operation_id"`
+	SeenInRuns       int64              `json:"seen_in_runs"`
+	LatestFindingID  pgtype.UUID        `json:"latest_finding_id"`
 }
 
 // The per-repo Findings backlog (D7, M4), DISPOSITION-DRIVEN so a filed/dismissed
@@ -574,6 +578,7 @@ func (q *Queries) ListFindingsBacklog(ctx context.Context, arg ListFindingsBackl
 			&i.FiledIssueIid,
 			&i.FiledIssueUrl,
 			&i.ResolvedAt,
+			&i.GroupOperationID,
 			&i.SeenInRuns,
 			&i.LatestFindingID,
 		); err != nil {
@@ -596,7 +601,7 @@ SET status = 'done',
     dismiss_reason = NULL,
     resolved_at = now()
 WHERE finding_dispositions.status <> 'filing'
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at, group_operation_id
 `
 
 type MarkFindingDoneByCoordinateParams struct {
@@ -650,6 +655,7 @@ func (q *Queries) MarkFindingDoneByCoordinate(ctx context.Context, arg MarkFindi
 		&i.ResolvedAt,
 		&i.SetVia,
 		&i.CloseSyncedAt,
+		&i.GroupOperationID,
 	)
 	return i, err
 }
@@ -712,7 +718,7 @@ UPDATE finding_dispositions
 SET status = 'open',
     filing_since = NULL
 WHERE user_id = $1 AND repo_id = $2 AND location = $3
-  AND status = 'filing'
+  AND status = 'filing' AND group_operation_id IS NULL
 `
 
 type RevertFindingFilingParams struct {
@@ -743,7 +749,7 @@ SET status = 'filed',
     close_synced_at = NULL,
     resolved_at = now()
 WHERE user_id = $3 AND repo_id = $4 AND location = $5
-  AND status = 'filing'
+  AND status = 'filing' AND group_operation_id IS NULL
 `
 
 type SettleFindingFiledParams struct {
@@ -781,7 +787,7 @@ const sweepStrandedFilingFindings = `-- name: SweepStrandedFilingFindings :execr
 UPDATE finding_dispositions
 SET status = 'open',
     filing_since = NULL
-WHERE status = 'filing' AND filing_since IS NOT NULL AND filing_since < $1
+WHERE status = 'filing' AND group_operation_id IS NULL AND filing_since IS NOT NULL AND filing_since < $1
 `
 
 // Boot/interval reaper for filing claims stranded by a crash (M5 review, mirror of
@@ -815,7 +821,7 @@ SET status = 'open',
 WHERE user_id = $1
   AND id = $2
   AND status = 'dismissed'
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at, group_operation_id
 `
 
 type UndoDismissFindingParams struct {
@@ -847,6 +853,7 @@ func (q *Queries) UndoDismissFinding(ctx context.Context, arg UndoDismissFinding
 		&i.ResolvedAt,
 		&i.SetVia,
 		&i.CloseSyncedAt,
+		&i.GroupOperationID,
 	)
 	return i, err
 }
@@ -860,7 +867,7 @@ SET status = CASE WHEN status = 'done' AND filed_issue_iid IS NOT NULL THEN 'fil
 WHERE user_id = $1
   AND id = $2
   AND status IN ('dismissed', 'done')
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at, group_operation_id
 `
 
 type UndoFindingDispositionParams struct {
@@ -901,6 +908,7 @@ func (q *Queries) UndoFindingDisposition(ctx context.Context, arg UndoFindingDis
 		&i.ResolvedAt,
 		&i.SetVia,
 		&i.CloseSyncedAt,
+		&i.GroupOperationID,
 	)
 	return i, err
 }
@@ -945,7 +953,7 @@ const upsertOpenDisposition = `-- name: UpsertOpenDisposition :one
 INSERT INTO finding_dispositions (user_id, repo_id, location, status, content_hash, last_title)
 VALUES ($1, $2, $3, 'open', $4, $5)
 ON CONFLICT (user_id, repo_id, location) DO NOTHING
-RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at
+RETURNING id, user_id, repo_id, location, status, filed_issue_iid, filed_issue_url, filing_since, dismiss_reason, content_hash, last_title, created_at, resolved_at, set_via, close_synced_at, group_operation_id
 `
 
 type UpsertOpenDispositionParams struct {
@@ -990,6 +998,7 @@ func (q *Queries) UpsertOpenDisposition(ctx context.Context, arg UpsertOpenDispo
 		&i.ResolvedAt,
 		&i.SetVia,
 		&i.CloseSyncedAt,
+		&i.GroupOperationID,
 	)
 	return i, err
 }

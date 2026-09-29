@@ -152,7 +152,7 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -709,6 +709,13 @@ A few worth knowing:
   not an oversight, but worth knowing before you mint or hand out one of
   these tokens. Read-only: there's no admin revoke here, the same write/read
   split as every other `admin` verb.
+- **`admin products` lists the external products registered for product
+  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
+  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (tokens neither
+  revoked nor expired) and `DESCRIPTION`. A disabled or deleted product's
+  tokens are refused on `/api/v1`, and a deleted product can never be
+  re-enabled. Read-only: registering, editing, deleting a product and
+  revoking one of its tokens are browser-only admin actions.
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it
@@ -1150,8 +1157,10 @@ also the TUI's own fallback when the live channel is unreachable (below).
 
 ### Startup: an available update
 
-Before the board draws, `uzi tui` checks whether a newer **stable** uzi
-release exists and, if so, shows a modal on top of it:
+At startup, `uzi tui` checks for a newer release in the running CLI's channel
+and, if one exists, shows a modal on top of the board. A stable
+`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks release
+candidates. A stable install looks like this:
 
 ```
 ▲ Update available
@@ -1164,19 +1173,24 @@ A newer release is available.
   Don't remind me for 0.85.0
 ```
 
-- **A Homebrew install** gets the "Update now" action: choosing it exits the
-  TUI and runs `brew upgrade uzi-cli` in the foreground — so the from-source
-  compile output (and any failure) stays visible — then tells you to rerun
+- **A Homebrew install** gets the "Update now" action for the formula that owns
+  the running binary: `brew upgrade uzi-cli` for stable or
+  `brew upgrade uzi-cli-rc` for an RC. Choosing it exits the TUI and runs the
+  command in the foreground, so the source-build output and any failure stay
+  visible, then tells you to rerun
   `uzi tui`. It never upgrades silently in the background while the TUI keeps
-  running. A **go-install or source build** gets an info variant instead: the
-  release-notes link, with no action button, since there's no single upgrade
-  command to hand it.
+  running. For an eligible **stamped** binary whose formula ownership cannot be
+  proven, including a manually built binary, the prompt shows release notes
+  without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
+  choose the information channel.
 - **A security release** renders as the filled amber andon band and is
   worded as a security update; a routine release stays quiet.
 - **Gating mirrors** [the CLI-vs-server skew warning](#when-your-cli-is-older-than-the-server):
   shown only for a stamped release build (a `go build`/`dev` binary never
   prompts), and it honours the same off-switches — `UZI_VERSION_CHECK=0` and
-  `--quiet`. It never offers a prerelease (`-rc.N`) tag.
+  `--quiet`. A stable install never offers a prerelease (`-rc.N`); an RC install
+  only offers a newer RC. If no newer RC exists, it shows nothing, even when a
+  stable release is newer.
 - **"Don't remind me for `<version>`"** is remembered per release version (a
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
@@ -1603,6 +1617,8 @@ uzi findings list --bucket all --json                        # filed, done and d
 uzi findings list --repo <repo-id>                           # one repo
 uzi findings list --run <run-id>                             # coordinates that also occur in that run
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
+uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
+uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
 uzi findings resolve <finding-id>                            # mark it done yourself
@@ -1631,6 +1647,28 @@ draft before filing is a web action. It prints the created issue's number and UR
 issue was created but its local record could not settle (a success with a note, still
 exit 0), not a retry signal. Filing a coordinate that is already filed or mid-filing
 is a conflict (exit 5); an unknown or foreign `<finding-id>` is not-found (exit 4).
+
+`file` also takes several ids of one repo and files **one** issue for all of them, with
+each finding linked to it. One id takes the single-file path above. With two or
+more ids (even the same id repeated), each distinct id's draft is fetched first and
+resolved to its coordinate (older evidence ids included); duplicates count once. An id
+with no triage record yet is a usage error (exit 2) and nothing is filed, even if it is
+the only coordinate left; to file an untriaged coordinate, pass its id alone. Only when
+every id resolves to one coordinate does the call fall back to the single-file filing.
+At most 50 distinct ids per call. It is all or nothing: if any chosen
+coordinate is already filed, dismissed or held, the call is a conflict (exit 5) and
+stderr lists the `pending operation <op>` ids holding them. `--json` returns
+`{operation_id, disposition_ids, phase, issue?, warning?}`, the issue plus the linked
+disposition ids. If the filing cannot be confirmed (HTTP 202) the CLI prints the
+operation id and a release hint and exits 5; the issue may still exist. uzi's repo sync
+settles the group on its own once it finds the marked issue; that happens on the
+periodic full (reconcile) sync and on a manual board Refresh. If it does not, check the
+forge and, only once the operation's deadline has passed and no such issue exists, run
+`uzi findings release <operation-id> --confirm-no-issue`. The flag is required: without
+it the command is a usage error (exit 2), and an operation that cannot be released yet
+or is unknown exits 5 or 4. Held rows show `pending group <op>` as their state in
+`uzi findings list --bucket all`. Closing the filed issue on the forge marks every member
+Done, as for a single finding; `undo` stays per finding.
 
 `dismiss` triages a coordinate to `dismissed` so it stays gone and does not re-nag
 across later runs (`not-an-issue` is a false positive, `wont-do` is valid-but-skip).
@@ -2266,6 +2304,12 @@ one line to **stderr** when it is behind:
 uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
 ```
 
+An RC-stamped CLI names the RC formula instead, for example:
+
+```
+uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc
+```
+
 - **stderr, never stdout.** `--json` output stays byte-exact and parseable.
 - **The exit code never changes.** A skew warning is not a failure.
 - **Cached**, so it costs at most one short request per hour per server —
@@ -2275,10 +2319,10 @@ uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew 
 - **It clears the moment you upgrade.** The file stores the *server's* version,
   never a verdict, so the comparison is redone against your new binary on the
   very next command — there is no cache to wait out.
-- **Silent when it cannot be sure.** A binary built from source reports `dev`
-  rather than a release, and an unparseable version on either side means no
-  warning at all. That also means the remedy is always the right one: only a
-  `brew`-installed CLI can ever see this message.
+- **Silent when it cannot be sure.** A binary built from source normally reports
+  `dev` rather than a release, and an unparseable version on either side means
+  no warning at all. A manually stamped binary can also see this warning; its
+  remedy follows its stamped release channel without probing Homebrew.
 - **Not shown** when the CLI is *newer* than the server (nothing for you to do),
   under `--quiet`, or for `uzi logout`, `uzi auth token` and `uzi auth status`,
   which otherwise make no network call at all.
@@ -2293,8 +2337,10 @@ that counts output lines, say. It is a poor substitute for upgrading.
 
 If a laptop is lost, **Settings → Access → Revoke all** is the one-click
 answer — it stops every `uzi` CLI and CI job using one of your tokens at
-once. If you'd rather keep some, the token list gives you what you need to
-decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
+once. Since PRD #1907 it revokes your **product tokens** too (see below), in
+the same step, so no CLI or product token of yours stays live (browser
+sessions are not ended: sign out for that). If you'd rather keep some, the
+token list gives you what you need to decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
 you don't recognise, and treat an unfamiliar `last_used_ip` as the signal to
 revoke, not just a curiosity.
 
@@ -2303,3 +2349,13 @@ revoke, not just a curiosity.
 There is no per-request audit log for CLI tokens — `last_used_ip` (updated at
 most once a minute) is the only detection control the design has, not a full
 trail.
+
+**Product tokens (`uzp_…`) are a separate credential.** A token you mint in
+**Settings → Access → Product tokens** for an external product works only on
+`/api/v1` and is not a CLI token: `uzi` cannot use one, so `UZI_TOKEN` must
+hold a CLI token (`uzc_` or `uza_`), and the CLI refuses a `uzp_` value with an
+error saying so. Like CLI tokens, product tokens are **not** revoked by a
+password change or logout; Revoke all, revoking one token, an admin, disabling
+or deleting the product, or deactivating the account does revoke them. Minting
+and admin product management are browser-only; the CLI has just the read-only
+`uzi admin products`. See [Product tokens](./product-tokens.md).

@@ -18,13 +18,15 @@
 #   --query          post that exact query even when the head status is stale/non-limited;
 #                    implies --ask. Use when exact quota timing matters.
 #   --wait           when limited with a known reset, poll until the reset elapses (+2 min
-#                    margin) or CR's status leaves "rate limited"; then exit 0. With an
-#                    UNKNOWN reset, --wait waits --max-wait-min as a ceiling. Hitting the
-#                    ceiling with the reset still ahead exits 1 (unknown: 2), never 0.
+#                    margin) or CR's status leaves "rate limited"; then exit 0. An exact
+#                    --query wait switches reviewer immediately when the reset is unknown
+#                    or over 15 min away. Without --query, an unknown reset waits until
+#                    --max-wait-min. Hitting that ceiling exits 2, never 0.
 #   --trigger-review atomically query, wait, post `@coderabbitai review` exactly once when
 #                    safe, then exec watch-pr.sh with `--reviewer coderabbit`; implies --query
 #                    --wait. A per-PR lock plus a current-head marker and recent-trigger check
-#                    prevent parallel/replayed invocations posting twice.
+#                    prevent parallel/replayed invocations posting twice. An unknown or
+#                    over-15-min reset exits promptly so the caller can switch reviewer.
 #   --max-wait-min   ceiling for --wait (default 180).
 #   --interval       poll seconds for --wait (default 60).
 #
@@ -34,8 +36,8 @@
 # Exit codes:
 #   0  not limited, OR the limit window has elapsed; with --trigger-review the review command
 #      was posted (or an equivalent recent command already exists)
-#   1  limited, reset known and still in the future (wait; --wait does it for you)
-#   2  limited, reset unknown (re-run with --ask, or --wait with a ceiling)
+#   1  limited, reset known and still in the future (switch reviewer when over 15 min)
+#   2  reset unknown (switch reviewer after an exact query; plain --wait has a ceiling)
 #   3  usage / gh error
 # With --trigger-review, a successful trigger hands control to watch-pr.sh and the final exit
 # code is its 0..9 readiness/finding contract; quota-phase failures retain the meanings above.
@@ -276,6 +278,21 @@ fi
 if [ "$WAIT" -eq 0 ]; then
   [ -z "$reset_ts" ] && exit 2
   exit 1
+fi
+
+# An exact query has already spent its ask window trying to obtain an authoritative
+# countdown. Without one, or when it is outside the 15-minute CR review lane, waiting
+# to the generic ceiling cannot change the reviewer decision.
+if [ "$QUERY" -eq 1 ]; then
+  if [ -z "$reset_ts" ]; then
+    echo "NEXT=switch_reviewer (CodeRabbit reset unknown after quota query)"
+    exit 2
+  fi
+  reset_min=$(( (reset_ts - $(date +%s) + 59) / 60 ))
+  if [ "$reset_min" -gt 15 ]; then
+    echo "NEXT=switch_reviewer (CodeRabbit reset $reset_min min away)"
+    exit 1
+  fi
 fi
 
 # --wait: poll until the reset (+2 min) elapses, CR's status changes, or the ceiling hits.

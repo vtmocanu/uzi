@@ -69,9 +69,12 @@ for a in "\${args[@]}"; do
 done
 case " \${args[*]} " in
   *" config current-context "*) echo test-ctx; exit 0 ;;
-  *" get pods "*)               echo "pod/uzi-hw-${WID:-w0rker}-test"; exit 0 ;;
+  *" get pods "*) [ "\${UZI_TEST_GETFAIL:-}" = 1 ] && exit 1
+                                echo "pod/uzi-hw-${WID:-w0rker}-test"; exit 0 ;;
 esac
 # exec ...: distinguish the REALMAIN git read from the capture sh -c.
+# A transport failure: the exec never ran the probe, so nothing reaches stdout.
+[ "\${UZI_TEST_EXECFAIL:-}" = 1 ] && exit 1
 if [ "\${cmd[0]:-}" = git ]; then
   # Execute the real bare-repo probes. This covers the public-main read and the
   # missing-clone fallback's show-ref lookup against the local fake worker bare.
@@ -118,6 +121,8 @@ if [ "\${1:-}" = run ] && [ "\${2:-}" = get ]; then
   case "\${3:-}" in
     *mrrflat*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"hotfix","worker_id":"${WID:-w0rker}","mr_iid":7778,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *mrr*) printf '%s' '{"status":"running","issue_iid":null,"kind":"mr_rework","branch":null,"pipeline_ref":"agent/issue-9999","worker_id":"${WID:-w0rker}","mr_iid":7777,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *failed*) printf '%s' '{"status":"failed","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
+    *completed*) printf '%s' '{"status":"completed","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *noworker*) printf '%s' '{"status":"running","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *queuedbound*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":"${WID:-w0rker}","mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
     *queued*) printf '%s' '{"status":"queued","issue_iid":4242,"kind":"issue","branch":null,"pipeline_ref":null,"worker_id":null,"mr_web_url":null,"health_reason":"ok","anthropic_secret_label":"tok","anthropic_bind_mode":"default","milestones":[],"milestones_completed":[]}' ;;
@@ -193,6 +198,96 @@ git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
   "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
 echo "PASS bound queued: live clone work captured after requeue"
 
+# A just-failed run keeps its worker binding while recovery custody holds the worker,
+# so its clone is still the only copy of its uncommitted work: capture it.
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"failed-1\",\"clonePath\":\"$RUNNER\"}"
+L1_FAILED="$(run_backup 1.failed failed-1)"
+[ -f "$L1_FAILED/issue-4242.tgz" ] || fail "failed run: no archive; got: $(cat "$L1_FAILED/backup.log")"
+tar -xOzf "$L1_FAILED/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qF '+dirty' \
+  || fail "failed run: uncommitted work was not captured"
+# Once the failed run's source is gone (the clone now belongs to another run and no
+# tracking ref is owned by it), it is status-only and the cycle still succeeds.
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
+# backup_rc <dest> <rid> [VAR=value...]: run the real script once with extra env; print its exit code.
+backup_rc() {
+  local rc=0
+  rm -rf "$1"
+  env UZI_CTX=test-ctx UZI_WORKER_NS=ns UZI_REPO_SLUG=testrepo UZI_RUNNER_BASE="$WORK/runner" \
+    UZI_REPOS_BASE="$REPOS" UZI_BACKUP_DIR="$1" UZI_KUBECTL="$KSTUB" UZI_BIN="$WORK/uzi" "${@:3}" \
+    bash "$SCRIPT" "$2" >/dev/null 2>&1 || rc=$?
+  echo "$rc"
+}
+D_FAILED_GONE="$WORK/out.1.failedgone"
+rc="$(backup_rc "$D_FAILED_GONE" failed-2)"
+[ "$rc" -eq 0 ] || fail "failed run without a source: exit $rc, want 0"
+grep -q 'SNAP failed-2 .*status=failed' "$D_FAILED_GONE/latest-attempt/backup.log" \
+  || fail "failed run without a source: expected SNAP; got: $(cat "$D_FAILED_GONE/latest-attempt/backup.log")"
+[ ! -e "$D_FAILED_GONE/latest-attempt/issue-4242.tgz" ] || fail "failed run without a source: captured another run's clone"
+# An inconclusive search (the pod listing or an exec failed) is not absence: the
+# failed run's worker may still hold the only copy, so the cycle must fail and retry.
+for mode in GETFAIL EXECFAIL; do
+  D_INC="$WORK/out.1.failed.$mode"
+  rc="$(backup_rc "$D_INC" failed-2 "UZI_TEST_$mode=1")"
+  [ "$rc" -eq 1 ] || fail "failed run, $mode: exit $rc, want 1"
+  grep -q 'FAIL failed-2 .*inconclusive' "$D_INC/latest-attempt/backup.log" \
+    || fail "failed run, $mode: expected an inconclusive FAIL; got: $(cat "$D_INC/latest-attempt/backup.log")"
+  [ ! -e "$D_INC/latest-attempt/.probe-inconclusive" ] || fail "failed run, $mode: probe marker left behind"
+done
+# A probe that runs but errors is not absence either: an unreadable bare repository
+# (git exits 128, not 1) and a candidate clone whose .git cannot be read.
+mkdir -p "$WORK/badrepos/testrepo.git"
+BADGIT="$WORK/runner/issue-4242.attempt-20260101T000000Z-g1-0123456789abcdef"
+mkdir -p "$BADGIT"; echo 'gitdir: /nonexistent' > "$BADGIT/.git"
+for mode in badbare badclone; do
+  D_INC="$WORK/out.1.failed.$mode"
+  if [ "$mode" = badbare ]; then
+    rm -rf "$BADGIT"
+    rc="$(backup_rc "$D_INC" failed-2 "UZI_REPOS_BASE=$WORK/badrepos")"
+  else
+    mkdir -p "$BADGIT"; echo 'gitdir: /nonexistent' > "$BADGIT/.git"
+    rc="$(backup_rc "$D_INC" failed-2)"
+  fi
+  [ "$rc" -eq 1 ] || fail "failed run, $mode: exit $rc, want 1"
+  grep -q 'FAIL failed-2 .*inconclusive' "$D_INC/latest-attempt/backup.log" \
+    || fail "failed run, $mode: expected an inconclusive FAIL; got: $(cat "$D_INC/latest-attempt/backup.log")"
+done
+rm -rf "$BADGIT" "$WORK/badrepos"
+# A non-searchable dir is inconclusive only when the journal names it as this run's
+# clone; an unnamed one (an empty root-owned attempt) is still absence. chmod cannot
+# lock out root, so this pair needs an unprivileged user.
+if [ "$(id -u)" -ne 0 ]; then
+  LOCKED_AID=20260102T000000Z-g1-0123456789abcdef
+  LOCKED="$WORK/runner/issue-4242.attempt-$LOCKED_AID"
+  mkdir -p "$LOCKED"; chmod 000 "$LOCKED"
+  git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+    "{\"runId\":\"failed-4\",\"clonePath\":\"$LOCKED\",\"attemptId\":\"$LOCKED_AID\"}"
+  D_INC="$WORK/out.1.failed.locked"
+  rc="$(backup_rc "$D_INC" failed-4)"
+  [ "$rc" -eq 1 ] || fail "failed run, run-owned locked clone: exit $rc, want 1"
+  grep -q 'FAIL failed-4 .*inconclusive' "$D_INC/latest-attempt/backup.log" \
+    || fail "failed run, run-owned locked clone: expected an inconclusive FAIL; got: $(cat "$D_INC/latest-attempt/backup.log")"
+  git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+    "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
+  D_INC="$WORK/out.1.failed.lockedunnamed"
+  rc="$(backup_rc "$D_INC" failed-2)"
+  [ "$rc" -eq 0 ] || fail "failed run, unnamed locked dir: exit $rc, want 0"
+  grep -q 'SNAP failed-2 .*status=failed' "$D_INC/latest-attempt/backup.log" \
+    || fail "failed run, unnamed locked dir: expected SNAP; got: $(cat "$D_INC/latest-attempt/backup.log")"
+  chmod 755 "$LOCKED"; rm -rf "$LOCKED"
+fi
+# A completed run stays status-only even when a clone for it still exists.
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"completed-1\",\"clonePath\":\"$RUNNER\"}"
+run_backup 1.completed completed-1 >/dev/null
+L1_DONE="$WORK/out.1.completed/latest-attempt"
+grep -q 'SNAP completed-1 .*status=completed' "$L1_DONE/backup.log" || fail "completed run: expected SNAP"
+[ ! -e "$L1_DONE/issue-4242.tgz" ] || fail "completed run: unexpected worker capture"
+git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
+  "{\"runId\":\"run-4242\",\"clonePath\":\"$RUNNER\"}"
+echo "PASS failed run: bound clone captured; status-only once its source is gone; completed stays status-only"
+
 # --- case 2: one committed commit -> a (small) bundle, OK -----------------------
 git_q "$RUNNER" checkout f.txt   # drop the uncommitted change
 echo more >> "$RUNNER/f.txt"
@@ -251,6 +346,16 @@ if tar tzf "$L4/issue-4242.tgz" 2>/dev/null | grep -q 'uncommitted[.]patch'; the
   fail "case4: bare fallback falsely claims an uncommitted patch"
 fi
 echo "PASS case4: missing clone -> durable runner-ref bundle, BARE"
+
+# A failed run whose clone is gone (the #1724 shape): its owned tracking ref is captured.
+git --git-dir="$BARE" config 'uzi-trackowner.agent/issue-4242.owner' failed-3
+L4_FAILED="$(run_backup 4.failed failed-3)"
+tar tzf "$L4_FAILED/issue-4242.tgz" 2>/dev/null | grep -q 'issue-4242[.]bundle' \
+  || fail "failed run bare ref: bundle missing; got: $(cat "$WORK/out.4.failed/latest-attempt/backup.log")"
+grep -q '^.*BARE .*failed-3 .*status=failed' "$L4_FAILED/backup.log" \
+  || fail "failed run bare ref: expected BARE; got: $(cat "$L4_FAILED/backup.log")"
+git --git-dir="$BARE" config 'uzi-trackowner.agent/issue-4242.owner' run-4242
+echo "PASS failed run: owned tracking ref captured when the clone is gone"
 
 # --- case 5: no clone/ref -> rc=1, latest preserved, safe retention ------------
 git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242

@@ -50,6 +50,7 @@ type FakeClient struct {
 	AdminWorkers   []apitypes.AdminWorkerDTO
 	AdminHealthDoc apitypes.HealthDocDTO
 	AdminCLITokens []apitypes.AdminCLITokenDTO
+	AdminProducts  []apitypes.ProductDTO
 	AdminUsageV    apitypes.AdminUsageDTO
 	RateLimits     []apitypes.AdminRateLimitRowDTO
 	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide
@@ -461,6 +462,21 @@ type FakeClient struct {
 	LastFileFindingID string
 	FileFindingErr    error
 
+	// Grouped filing (issue #1724). FindingDrafts maps an evidence id to its canned issue draft
+	// (an id with no entry is a 404); FileFindingGroup captures the disposition ids and returns
+	// FileFindingGroupResult with FileFindingGroupAccepted as the 201/202 flag;
+	// ReleaseFindingGroup captures the operation id. *Err fields win over Err.
+	FindingDrafts             map[string]apitypes.IncidentalFindingIssueDraftDTO
+	LastFindingDraftIDs       []string
+	FindingIssueDraftErr      error
+	FileFindingGroupResult    apitypes.FindingGroupFileResultDTO
+	FileFindingGroupAccepted  bool
+	LastFileFindingGroupIDs   []string
+	FileFindingGroupErr       error
+	ReleaseFindingGroupResult apitypes.FindingGroupReleaseResultDTO
+	LastReleaseFindingGroupOp string
+	ReleaseFindingGroupErr    error
+
 	LastDismissFindingID     string
 	LastDismissFindingReason string
 	DismissFindingErr        error
@@ -637,3 +653,44 @@ type LabelCall struct {
 }
 
 var _ Client = (*FakeClient)(nil)
+
+// FindingIssueDraft records the evidence id and returns its canned draft, or a not-found exit
+// when FindingDrafts has no entry for it.
+func (f *FakeClient) FindingIssueDraft(_ context.Context, evidenceID string) (apitypes.IncidentalFindingIssueDraftDTO, error) {
+	f.LastFindingDraftIDs = append(f.LastFindingDraftIDs, evidenceID)
+	if f.FindingIssueDraftErr != nil {
+		return apitypes.IncidentalFindingIssueDraftDTO{}, f.FindingIssueDraftErr
+	}
+	if f.Err != nil {
+		return apitypes.IncidentalFindingIssueDraftDTO{}, f.Err
+	}
+	d, ok := f.FindingDrafts[evidenceID]
+	if !ok {
+		return apitypes.IncidentalFindingIssueDraftDTO{}, Exitf(ExitNotFound, "finding not found")
+	}
+	return d, nil
+}
+
+// FileFindingGroup records the disposition ids and returns the canned result and accepted flag.
+func (f *FakeClient) FileFindingGroup(_ context.Context, dispositionIDs []string) (apitypes.FindingGroupFileResultDTO, bool, error) {
+	f.LastFileFindingGroupIDs = append([]string(nil), dispositionIDs...)
+	if f.FileFindingGroupErr != nil {
+		return apitypes.FindingGroupFileResultDTO{}, false, f.FileFindingGroupErr
+	}
+	if f.Err != nil {
+		return apitypes.FindingGroupFileResultDTO{}, false, f.Err
+	}
+	return f.FileFindingGroupResult, f.FileFindingGroupAccepted, nil
+}
+
+// ReleaseFindingGroup records the operation id and returns the canned result.
+func (f *FakeClient) ReleaseFindingGroup(_ context.Context, operationID string) (apitypes.FindingGroupReleaseResultDTO, error) {
+	f.LastReleaseFindingGroupOp = operationID
+	if f.ReleaseFindingGroupErr != nil {
+		return apitypes.FindingGroupReleaseResultDTO{}, f.ReleaseFindingGroupErr
+	}
+	if f.Err != nil {
+		return apitypes.FindingGroupReleaseResultDTO{}, f.Err
+	}
+	return f.ReleaseFindingGroupResult, nil
+}

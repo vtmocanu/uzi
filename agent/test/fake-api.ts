@@ -69,9 +69,13 @@ export class FakeApi {
   /** Issue #1604: GET /inputs failure, delay and raw-body injection, per run. */
   private readonly inputGetFailures = new Map<string, { times: number; status: number }>();
   private readonly inputGetDelays = new Map<string, { times: number; ms: number; after: number }>();
+  /** Test-only event barrier for one selected GET, after a requested read count. */
+  private readonly inputGetHolds = new Map<string, { after: number; enter: () => void; released: Promise<void> }>();
   private readonly inputGetRaw = new Map<string, { times: number; body: unknown }>();
   /** Issue #1604: GET /inputs reads per run (answered or not), so a test can prove polling continued. */
   readonly inputGets = new Map<string, number>();
+  /** GET response send attempts; a held GET has one more entry than send attempt. */
+  readonly inputGetSendAttempts = new Map<string, number>();
   /** Issue #1604: /state reports this run drops (connection destroyed, nothing recorded). */
   private readonly droppedStates = new Map<string, (body: StateRequest) => boolean>();
   /** Issue #1604: the created_at of each recorded `plan` run_message, with its plan_md, per run. */
@@ -714,6 +718,16 @@ export class FakeApi {
     this.inputGetDelays.set(runId, { times, ms, after: afterReads });
   }
 
+  /** Hold one GET until the test has observed its entry and released it. */
+  holdNextInputGet(runId: string, afterReads = 0): { entered: Promise<void>; release: () => void } {
+    let enter!: () => void;
+    let release!: () => void;
+    const entered = new Promise<void>((resolve) => { enter = resolve; });
+    const released = new Promise<void>((resolve) => { release = resolve; });
+    this.inputGetHolds.set(runId, { after: afterReads, enter, released });
+    return { entered, release };
+  }
+
   /** Issue #1604: answer the next `times` GET /inputs with this 200 body verbatim (a malformed body
    *  is a definitive protocol failure). */
   rawInputGets(runId: string, body: unknown, times = Infinity): void {
@@ -1080,6 +1094,16 @@ export class FakeApi {
         return this.handleState(res, runId, json);
       if (req.method === "GET" && kind === "inputs") {
         this.inputGets.set(runId, (this.inputGets.get(runId) ?? 0) + 1);
+        const sendInputs = (status: number, body: unknown): void => {
+          this.inputGetSendAttempts.set(runId, (this.inputGetSendAttempts.get(runId) ?? 0) + 1);
+          send(res, status, body);
+        };
+        const hold = this.inputGetHolds.get(runId);
+        if (hold && (this.inputGets.get(runId) ?? 0) > hold.after) {
+          this.inputGetHolds.delete(runId);
+          hold.enter();
+          await hold.released;
+        }
         // Issue #1604: delivery-failure injection (delay, transient status, raw body), consumed per read.
         const delay = this.inputGetDelays.get(runId);
         if (delay && delay.times > 0 && (this.inputGets.get(runId) ?? 0) > delay.after) {
@@ -1089,12 +1113,12 @@ export class FakeApi {
         const failure = this.inputGetFailures.get(runId);
         if (failure && failure.times > 0) {
           failure.times--;
-          return send(res, failure.status, { error: "fake: input GET failure" });
+          return sendInputs(failure.status, { error: "fake: input GET failure" });
         }
         const raw = this.inputGetRaw.get(runId);
         if (raw && raw.times > 0) {
           raw.times--;
-          return send(res, 200, raw.body);
+          return sendInputs(200, raw.body);
         }
         const rows = this.inputsByRun.get(runId) ?? [];
         const applied = this.appliedByRun.get(runId) ?? new Set<number>();
@@ -1107,10 +1131,10 @@ export class FakeApi {
           // An older api pod: consume on read (mark applied now) and send no receipt marker.
           for (const row of pending) applied.add(row.id);
           this.appliedByRun.set(runId, applied);
-          return send(res, 200, { inputs: pending });
+          return sendInputs(200, { inputs: pending });
         }
         const signal = switchPending ? this.switchSignalGeneration.get(runId) : this.foreignSwitchSignal.get(runId);
-        return send(res, 200, {
+        return sendInputs(200, {
           inputs: pending,
           receipts: true,
           ...(signal !== undefined ? { credential_switch: { generation: signal } } : {}),

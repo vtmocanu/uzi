@@ -19,17 +19,20 @@
 //    that field fails closed (every replayed approve/reject is stale), and a claim that does not
 //    re-present the persisted plan bumps the epoch at its first gate.
 import { describe, it } from "node:test";
+import { getEventListeners } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SteeringChannel } from "../src/steering.js";
 import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
 
@@ -192,6 +195,7 @@ interface Flight {
   runner: RunRunner;
   done: Promise<void>;
   finished: boolean;
+  error?: unknown;
   stateFrom: number;
   seqFrom: number;
   turnFrom: number;
@@ -323,7 +327,8 @@ class Scenario {
       () => {
         flight.finished = true;
       },
-      () => {
+      (error) => {
+        flight.error = error;
         flight.finished = true;
       },
     );
@@ -341,11 +346,13 @@ class Scenario {
     await Promise.race([flight.done, tick(10_000)]);
   }
 
-  /** Shut a flight down (the worker's graceful stop) and wait for it to unwind. */
+  /** Shut a flight down (the worker's graceful stop) and require a clean, bounded unwind. */
   async shutdown(flight: Flight): Promise<void> {
     flight.runner.shutdown();
-    if (!(await until(() => flight.finished, 10_000))) this.send(this.input("cancel"));
-    await Promise.race([flight.done, tick(5_000)]);
+    assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
+    await flight.done;
+    assert.equal(flight.error, undefined, "shutdown completed without an execution error");
+    assert.equal(this.rowsOf("cancel").length, 0, "shutdown needed no cancel input");
   }
 
   states(flight?: Flight): StateRequest[] {
@@ -1000,6 +1007,12 @@ function resumeWith(s: Scenario, ...rows: UserInput[]): { flight: Flight; rows: 
   return { flight, rows };
 }
 
+function assertHeldInputGet(runId: string): void {
+  const reads = api.inputGets.get(runId) ?? 0;
+  assert.ok(reads > 0, "a GET entered before its reply was checked");
+  assert.equal(api.inputGetSendAttempts.get(runId) ?? 0, reads - 1, "the entered GET has not attempted a response before release");
+}
+
 /** Wait for the flight's first gate, approve it, and let the flight end. */
 async function approveFirstGate(s: Scenario, flight: Flight, ms = 8_000): Promise<void> {
   await until(() => s.gates(flight).length >= 1 || flight.finished, ms);
@@ -1012,21 +1025,37 @@ const RECOVERY_REASON = "could not read plan-gate inputs after the resume";
 describe("#1604 — delivery on resume: no plan is offered before the inputs sent before the release are read", () => {
   it("delayed GET", () =>
     scenario(async (s) => {
-      api.delayInputGets(s.runId, 400);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
-      await approveFirstGate(s, flight);
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
-      assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      const hold = api.holdNextInputGet(s.runId);
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delayed GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        assert.equal(s.gates(flight).length, 0, "no plan is offered before the held GET returns");
+        hold.release();
+        await approveFirstGate(s, flight);
+        assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+        assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      } finally {
+        hold.release();
+      }
     }));
 
   it("delayed ACK", () =>
     scenario(async (s) => {
-      api.delayInputReceipts("ack", 400);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
-      await until(() => api.inputReceiptReplies.some((r) => r.kind === "ack"));
-      api.delayInputReceipts("ack", 0);
-      await approveFirstGate(s, flight);
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+      const release = api.holdNextInputReceipt("ack");
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
+        assert.ok(await until(() => api.inputReceiptCalls.some((r) => r.runId === s.runId && r.kind === "ack")), "the ACK entered the fake API");
+        assert.equal(api.inputReceiptReplies.filter((r) => r.runId === s.runId && r.kind === "ack").length, 0,
+          "the held ACK has not replied before release");
+        assert.equal(s.gates(flight).length, 0, "no plan is offered before the held ACK returns");
+        release();
+        await approveFirstGate(s, flight);
+        assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+      } finally {
+        release();
+      }
     }));
 
   for (const which of ["GET", "ACK"] as const) {
@@ -1111,32 +1140,48 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
 
   it("a cancel beats a pending revise (routed while the delivery waiter is parked)", () =>
     scenario(async (s) => {
-      // The first GET is slow, so the executor is already parked on the delivery wait when the
-      // cancel is routed (the abort listener runs while the waiter is armed).
-      api.delayInputGets(s.runId, 600);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK), s.input("cancel"));
-      await s.finish(flight);
-      assert.equal(s.gates(flight).length, 0, "no plan was offered");
-      assert.equal(s.model.turns.length, 0, "no revision turn");
-      // The cancel ends the run as a cancel (REASON_CANCELLED), never as the AbortError a cancel
-      // routed while the delivery waiter is parked used to reject it with.
-      const failed = s.states(flight).find((b) => b.status === "failed");
-      assert.equal(failed?.failure_reason, "run cancelled", `ended cancelled: ${s.statuses(flight).join(",")}`);
+      // The entered GET proves the delivery waiter is armed before the cancel and revise route.
+      const hold = api.holdNextInputGet(s.runId);
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK), s.input("cancel"));
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delivery GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        assert.equal(s.gates(flight).length, 0, "no plan was offered while delivery was held");
+        hold.release();
+        await s.finish(flight);
+        assert.equal(s.gates(flight).length, 0, "no plan was offered");
+        assert.equal(s.model.turns.length, 0, "no revision turn");
+        // The cancel ends the run as a cancel (REASON_CANCELLED), never as the AbortError a cancel
+        // routed while the delivery waiter is parked used to reject it with.
+        const failed = s.states(flight).find((b) => b.status === "failed");
+        assert.equal(failed?.failure_reason, "run cancelled", `ended cancelled: ${s.statuses(flight).join(",")}`);
+      } finally {
+        hold.release();
+      }
     }));
 
   it("an approve submitted during delayed delivery goes stale; the revise wins", () =>
     scenario(async (s) => {
-      api.delayInputGets(s.runId, 400);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
-      await tick(100);
-      const [approve] = s.send(s.input("approve_plan"));
-      await approveFirstGate(s, flight);
-      // This claim carries no resume_plan_at, so it fails closed: an approve read before its first
-      // gate is stale, with the unjudged notice, and never applied as approval (discarded).
-      assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
-      await assertDisposedApprove(s, approve!.id);
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
-      assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      const hold = api.holdNextInputGet(s.runId);
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delivery GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        assert.equal(s.gates(flight).length, 0, "no gate was offered while the revise was unread");
+        const [approve] = s.send(s.input("approve_plan"));
+        hold.release();
+        await approveFirstGate(s, flight);
+        // This claim carries no resume_plan_at, so it fails closed: an approve read before its first
+        // gate is stale, with the unjudged notice, and never applied as approval (discarded).
+        assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
+        await assertDisposedApprove(s, approve!.id);
+        assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+        assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      } finally {
+        hold.release();
+      }
     }));
 });
 
@@ -1265,22 +1310,32 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
     scenario(async (s) => {
       const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
       api.failInputGets(s.runId, 5, 503);
-      api.delayInputGets(s.runId, 1_000, 1, (api.inputGets.get(s.runId) ?? 0) + 5);
-      const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
-      assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
-      assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the approve was read");
-      await tick(200);
-      await assertDisposedApprove(s, row.id);
-      assertNoApproval(s);
-      assert.equal(flight.finished, false, `the stub's plan waits at the gate: ${s.statuses(flight).join(",")}`);
-      assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
-      // Round 4 (finding 1): every executor's first gate waits for the replayed backlog, so the
-      // transient read failures earn the one waiting line (the stub no longer offers its plan first).
-      assert.equal(s.texts(flight).filter((t) => t === STATUS_WAITING_DELIVERY).length, 1, s.texts(flight).join(" | "));
-      const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(row.id));
-      assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "the gate is reported only after the replayed approve was read");
-      s.send(s.input("cancel"));
-      await s.finish(flight);
+      const afterReads = (api.inputGets.get(s.runId) ?? 0) + 5;
+      const hold = api.holdNextInputGet(s.runId, afterReads);
+      try {
+        const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > afterReads, 3_000), "the post-retry GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(s.gates(flight).length, 0, "the stub cannot offer its gate before the replayed backlog is read");
+        hold.release();
+        assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
+        assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the approve was read");
+        await assertDisposedApprove(s, row.id);
+        assertNoApproval(s);
+        assert.equal(flight.finished, false, `the stub's plan waits at the gate: ${s.statuses(flight).join(",")}`);
+        assert.ok(await until(() => s.texts(flight).includes(STALE_APPROVE_NOTICE), 3_000), s.texts(flight).join(" | "));
+        // Round 4 (finding 1): every executor's first gate waits for the replayed backlog, so the
+        // transient read failures earn the one waiting line (the stub no longer offers its plan first).
+        assert.equal(s.texts(flight).filter((t) => t === STATUS_WAITING_DELIVERY).length, 1, s.texts(flight).join(" | "));
+        const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(row.id));
+        assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "the gate is reported only after the replayed approve was read");
+        s.send(s.input("cancel"));
+        await s.finish(flight);
+      } finally {
+        hold.release();
+      }
     }));
 });
 
@@ -1379,6 +1434,137 @@ describe("#1604 review — resumed-gate edges", () => {
       const lines = s.texts(flight).filter((t) => t.startsWith("the re-presented plan"));
       assert.deepEqual(lines, ["the re-presented plan timed out waiting for approval — failing the run"]);
     }));
+
+  it("clears the losing gate waiter and abort listener when approval times out", () =>
+    scenario(async (s) => {
+      const original = SteeringChannel.prototype.awaitGateEvent;
+      const channels: SteeringChannel[] = [];
+      let waitSignal: AbortSignal | undefined;
+      SteeringChannel.prototype.awaitGateEvent = function (epoch, signal) {
+        channels.push(this);
+        waitSignal = signal;
+        return original.call(this, epoch, signal);
+      };
+      try {
+        s.writeTranscript();
+        const flight = s.start(
+          s.claim({ resume_phase: "awaiting_approval", plan_md: PLAN_V1, milestones: V1_MILESTONES, plan_source: "agent", plan_approved: false, session_id: SID }),
+          { runner: { planApprovalTimeoutMs: 100 } },
+        );
+        await s.finish(flight);
+        assert.ok(s.statuses(flight).includes("failed"), "the approval timeout still fails the run");
+        assert.ok(waitSignal?.aborted, "the losing gate wait was aborted after the timeout verdict");
+        assert.equal(getEventListeners(waitSignal, "abort").length, 0, "the waiter removed its abort listener");
+        assert.equal((channels[0] as unknown as { gateWaiter?: unknown }).gateWaiter, undefined, "no gate waiter remains parked");
+      } finally {
+        SteeringChannel.prototype.awaitGateEvent = original;
+      }
+    }));
+});
+
+describe("shutdown at an observed plan gate", () => {
+  const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  const commitWork = (clone: string): string => {
+    fs.writeFileSync(path.join(clone, "SHUTDOWN-WORK.txt"), "committed before gate shutdown\n");
+    execFileSync("git", ["-C", clone, "add", "SHUTDOWN-WORK.txt"], { env: gitEnv });
+    execFileSync("git", ["-C", clone, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "keep gate work"], { env: gitEnv });
+    return execFileSync("git", ["-C", clone, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" }).trim();
+  };
+
+  it("wakes an idle gate on shutdown without a verdict or cancel input", () =>
+    scenario(async (s) => {
+      const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs: 0 } });
+      assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
+      await s.shutdown(flight);
+      assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"));
+      assert.equal(s.persistedGate()?.plan_md, PLAN_V1);
+    }));
+
+  for (const [planApprovalTimeoutMs, session, failHeldGet] of [[0, "kept", true], [60_000, "none", true], [0, "kept", false]] as const) {
+    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, () =>
+      scenario(async (s) => {
+        api.gateRevisions = true;
+        api.stampGateBindings = true;
+        client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1"];
+        let holdFirstGate = true;
+        let gateReads = 0;
+        api.onState(s.runId, (body) => {
+          if (body.status !== "awaiting_approval" || !holdFirstGate) return;
+          holdFirstGate = false;
+          gateReads = api.inputGets.get(s.runId) ?? 0;
+          api.delayInputGets(s.runId, 800, 1, gateReads);
+          if (failHeldGet) api.failInputGets(s.runId, 1, 503);
+        });
+        const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
+        assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
+        const firstGate = s.gates(flight)[0]!;
+        assert.equal(firstGate.plan_md, PLAN_V1, "the submitted plan was offered for approval");
+        assert.ok(firstGate.presentation_id, "the observed gate has a presentation id");
+        const persisted = api.gateOf(s.runId);
+        assert.deepEqual(persisted, { revision: 1, presentationId: firstGate.presentation_id });
+        const bare = git.barePathFor(fx.originPath);
+        const clone = git.runnerClonePath(bare, `issue-${s.base.issue_iid}`);
+        assert.ok(fs.existsSync(clone), "the gated runner clone exists");
+        const committedTip = commitWork(clone);
+        assert.equal(s.rowsOf("cancel").length, 0, "no cancel was sent before shutdown");
+
+        // Hold a delivery read while the owner sends a bound approval. Shutdown must leave that
+        // row pending for the next claim, rather than routing it on the first flight.
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > gateReads), "the gate's input read is held");
+        const [pending] = s.send(s.input("approve_plan"));
+        const stored = api.inputRows(s.runId).find((row) => row.id === pending!.id)!;
+        assert.equal(stored.gate_binding, "bound");
+        assert.equal(stored.gate_revision, persisted.revision);
+        flight.runner.shutdown();
+        assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
+        await flight.done;
+        assert.equal(flight.error, undefined, "shutdown completed without an execution error");
+        assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");
+        assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"), s.statuses(flight).join(","));
+        assert.equal(s.persistedGate()?.plan_md, PLAN_V1, "the submitted plan remains persisted");
+        assert.deepEqual(s.persistedGate()?.milestones, V1_MILESTONES, "the candidate work remains persisted");
+        const trackedTip = await git.trackingTip(bare, `agent/issue-${s.base.issue_iid}`);
+        assert.ok(trackedTip, "shutdown fetched the committed work into the worker bare");
+        execFileSync("git", ["-C", bare, "merge-base", "--is-ancestor", committedTip, trackedTip], { env: gitEnv });
+        assert.deepEqual(api.gateOf(s.runId), persisted, "shutdown preserves the gate identity");
+        if (failHeldGet) assert.equal(api.isAcked(s.runId, pending!.id), false, "shutdown left the verdict unread");
+        assert.equal(api.isApplied(s.runId, pending!.id), false, "shutdown did not apply the verdict");
+        assertNoApproval(s);
+        api.delayInputGets(s.runId, 0, 0);
+
+        const claim = session === "kept" ? s.resumeClaim("kept", api.gateResumeFields(s.runId)) : s.resumeClaim("none");
+        assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
+        const resumed = s.start(claim);
+        assert.ok(await until(() => s.gates(resumed).length > 0 || resumed.finished, 3_000), s.statuses(resumed).join(","));
+        assert.equal(fs.readFileSync(path.join(git.runnerClonePath(bare, `issue-${s.base.issue_iid}`), "SHUTDOWN-WORK.txt"), "utf8"),
+          "committed before gate shutdown\n", "the resumed clone retains the committed work");
+        const nextGate = s.gates(resumed)[0]!;
+        if (session === "kept") {
+          await s.finish(resumed);
+          assert.equal(nextGate.plan_md, PLAN_V1, "the submitted plan is re-presented");
+          assert.deepEqual(nextGate.milestones, V1_MILESTONES, "the candidate milestones are re-presented");
+          assert.equal(nextGate.presentation_id, persisted.presentationId, "the same gate id is retained");
+          assert.deepEqual(api.gateOf(s.runId), persisted, "the same revision is retained");
+          assert.equal(api.inputReceiptCalls.filter((c) => c.runId === s.runId && c.kind === "applied" && c.ids.includes(pending!.id)).length, 1, "the bound approval is applied exactly once");
+          assert.ok(api.humanPlanApproved(s.runId), "the pending approval was taken");
+          assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
+        } else {
+          assert.equal(nextGate.plan_md, PLAN_V1, "a fresh plan is shown");
+          assert.notEqual(nextGate.presentation_id, persisted.presentationId, "the fresh gate has a new id");
+          assert.equal(api.gateOf(s.runId).revision, persisted.revision + 1, "the fresh gate has a new revision");
+          assert.ok(await until(() => s.acks(pending!.id, resumed) > 0, 3_000), "the pending verdict was read");
+          assert.ok(await until(() => s.texts(resumed).some((line) => line.includes("ignored") && line.includes("re-send")), 3_000), "the unmatched verdict is explained");
+          await assertDisposedApprove(s, pending!.id, "the stale approval");
+          assertNoApproval(s);
+          assert.equal(resumed.finished, false, "the fresh gate requires a fresh approval");
+          const [fresh] = s.send(s.input("approve_plan"));
+          await s.finish(resumed);
+          assert.ok(api.isApplied(s.runId, fresh!.id), "the fresh approval is applied");
+          assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
+        }
+        assert.equal(s.rowsOf("cancel").length, 0, "neither claim required a cancel");
+      }));
+  }
 });
 
 describe("#1604 round 3 — a disposed approve is never applied, so no later claim reads it as approval (B1)", () => {

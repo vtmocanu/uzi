@@ -658,12 +658,12 @@ func TestIncidentalFindingDTOTags(t *testing.T) {
 	iid := int64(7)
 	now := time.Unix(0, 0)
 	full := IncidentalFindingDTO{
-		DispositionID: "d1", FindingID: &id, DismissReason: "wont_do", SetVia: "issue_close",
+		DispositionID: "d1", GroupOperationID: &id, FindingID: &id, DismissReason: "wont_do", SetVia: "issue_close",
 		FiledIssueIID: &iid, FiledIssueURL: "https://forge.example/g/a/-/issues/7", ResolvedAt: &now,
 		EvidencePreview: "x", Occurrences: []FindingOccurrenceDTO{{}},
 	}
 	assertTags(t, "IncidentalFindingDTO(full)", full,
-		"disposition_id", "finding_id", "location", "repo_id", "repo_path", "status", "last_title",
+		"disposition_id", "group_operation_id", "finding_id", "location", "repo_id", "repo_path", "status", "last_title",
 		"seen_in_runs", "dismiss_reason", "set_via", "filed_issue_iid", "filed_issue_url",
 		"resolved_at", "evidence_preview", "occurrences")
 }
@@ -692,7 +692,7 @@ func TestIncidentalFindingBacklogDTOTags(t *testing.T) {
 
 func TestIncidentalFindingIssueDraftDTOTags(t *testing.T) {
 	assertTags(t, "IncidentalFindingIssueDraftDTO", IncidentalFindingIssueDraftDTO{},
-		"title", "description", "location", "labels", "provenance")
+		"disposition_id", "title", "description", "location", "labels", "provenance")
 }
 
 // TestIncidentalFindingFileResultDTOTags pins the PRD #333 M5/M6 file-response shape. warning
@@ -876,6 +876,42 @@ func TestAdminCLITokenDTOTags(t *testing.T) {
 	assertTags(t, "AdminCLITokenDTO", AdminCLITokenDTO{},
 		"id", "user_id", "owner_email", "name", "token_prefix", "scope", "revoked",
 		"created_at", "last_used_at", "last_used_ip", "expires_at")
+}
+
+// productTokenDTOKeys is the exact per-user product-token key set (PRD #1907). Like
+// TestAdminCLITokenDTOTags these are SECURITY pins: neither the row nor the admin row
+// may ever carry "token_hash" or "token", and an exact key set makes adding one a
+// build failure rather than a review catch.
+var productTokenDTOKeys = []string{
+	"id", "product_id", "product_name", "name", "token_prefix", "scopes", "revoked",
+	"created_at", "last_used_at", "last_used_ip", "expires_at",
+}
+
+func TestProductTokenDTOTags(t *testing.T) {
+	assertTags(t, "ProductTokenDTO", ProductTokenDTO{}, productTokenDTOKeys...)
+}
+
+func TestAdminProductTokenDTOTags(t *testing.T) {
+	want := append(append([]string{}, productTokenDTOKeys...), "user_id", "owner_email")
+	assertTags(t, "AdminProductTokenDTO", AdminProductTokenDTO{}, want...)
+}
+
+// The mint response is the ONE place the token value appears, once.
+func TestMintProductTokenResponseTags(t *testing.T) {
+	assertTags(t, "MintProductTokenResponse", MintProductTokenResponse{}, "token", "product_token")
+}
+
+func TestProductDTOTags(t *testing.T) {
+	assertTags(t, "ProductDTO", ProductDTO{},
+		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count")
+}
+
+// /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries
+// no email and no admin flag.
+func TestV1WhoamiDTOTags(t *testing.T) {
+	assertTags(t, "V1WhoamiDTO", V1WhoamiDTO{}, "user", "product", "scopes")
+	assertTags(t, "V1WhoamiUserDTO", V1WhoamiUserDTO{}, "id", "display_name")
+	assertTags(t, "V1WhoamiProductDTO", V1WhoamiProductDTO{}, "id", "name")
 }
 
 func TestUsageDTOTags(t *testing.T) {

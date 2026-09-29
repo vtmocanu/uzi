@@ -236,6 +236,16 @@ services:
         condition: service_healthy
 
   agent:
+    build:
+      # Read-only layer cache from the public images release.yml publishes (the same
+      # refs ci.yml's build-agent reads). The agent image is ~2.6 GiB of pinned nix,
+      # devbox and Chromium before any uzi source, and was rebuilt cold on every run.
+      # Anonymous pull, no credential. Import is best-effort where the builder supports
+      # it: layers changed since the last release rebuild, and a builder without
+      # registry-cache import ignores these refs.
+      cache_from:
+        - type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${WORKER_TEMPLATE:-base}:buildcache
+        - type=registry,ref=ghcr.io/vtmocanu/uzi/agent-${WORKER_TEMPLATE:-base}:buildcache-release
     environment:
       # stub by default (no live session); the harness can flip this to `sdk` for
       # the OPTIONAL user-gated live capstone (UZI_E2E_EXECUTOR=sdk — see README).

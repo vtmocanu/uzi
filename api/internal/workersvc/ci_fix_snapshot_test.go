@@ -5,7 +5,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -33,6 +36,8 @@ func TestScrubKnownTokensRedactsTokenFamilies(t *testing.T) {
 		"uzc": "UZI_TOKEN=uzc_" + secret + " in the env",
 		"uza": "ran with uza_" + secret,
 		"uzw": "worker joined as uzw_" + secret,
+		// PRD #1907: a product token (uzp_) handed to an external product's CI.
+		"uzp": "PRODUCT_TOKEN=uzp_" + secret + " exported",
 	}
 	for name, in := range cases {
 		out := ScrubKnownTokens(in)
@@ -54,6 +59,31 @@ func TestScrubKnownTokensRedactsTokenFamilies(t *testing.T) {
 	benign := "=== RUN TestFoo\n--- FAIL: TestFoo (nil guard removed)\nexit status 1\n"
 	if got := ScrubKnownTokens(benign); got != benign {
 		t.Errorf("benign log must be untouched, got %q", got)
+	}
+}
+
+// TestScrubKnownTokensMintedUziPrefixes ranges over the EXPORTED minted uzi class
+// prefixes (clitoken.Prefixes, jointoken.Prefix, producttoken.Prefix), so the
+// snapshot scrubber's copy of the uz[capw]_ pattern is bound to every credential
+// class uzi mints rather than to string copies of the prefixes.
+func TestScrubKnownTokensMintedUziPrefixes(t *testing.T) {
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix)
+	body := strings.Repeat("Ab1-_", 5) // 25 chars over the whole body class, assembled at runtime
+	for _, p := range prefixes {
+		out := ScrubKnownTokens("step printed " + p + body + " and exited")
+		if strings.Contains(out, body) {
+			t.Errorf("%s: token body survived the snapshot scrub: %q", p, out)
+		}
+		if !strings.Contains(out, "[REDACTED]") {
+			t.Errorf("%s: expected a [REDACTED] placeholder, got %q", p, out)
+		}
+	}
+	tok, _, _, err := producttoken.Generate()
+	if err != nil {
+		t.Fatalf("producttoken.Generate: %v", err)
+	}
+	if out := ScrubKnownTokens("export UZI_PRODUCT_TOKEN=" + tok); strings.Contains(out, tok[len(producttoken.Prefix):]) {
+		t.Errorf("a minted uzp_ token body survived the snapshot scrub: %q", out)
 	}
 }
 

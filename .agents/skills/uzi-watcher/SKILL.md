@@ -229,7 +229,9 @@ work from the worker PVC* below.
 - **A branch merely behind main on workflow files is usually handled.** At finalize the
   worker tries to realign it to the current default (workflow-subtree overlay, else merge,
   else rebase; PRD #456, #627) before pushing; a conflict fails the run
-  `finalize_base_align_conflict`. Checkpoints get a broker-side overlay (#1036). The
+  `finalize_base_align_conflict`. For GitHub, reaped milestone/done checkpoints attempt a
+  worker-side overlay (#1036). Tick and iteration checkpoints have no overlay; if GitHub rejects
+  their push for missing workflow scope, the broker returns a best-effort `workflow_scope` skip. The
   precheck runs first, so an inherited workflow commit blocks this realign.
 - **Telling them apart on a recovered branch:** `git log --name-only origin/main..TIP --
   .github/workflows/` empty is evidence of base staleness only; a rebase onto main that
@@ -437,6 +439,10 @@ and falling back to the durable bare tracking ref when no clone survives:
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
   A `queued` run without a worker binding gets a status-only `SNAP` and stays in
   the loop. A requeued run can retain its worker and clone; capture that work.
+  A `failed` run bound to a worker is captured while its clone or owned tracking ref
+  survives (recovery custody can keep an ephemeral worker alive), else `SNAP`; a search
+  that could not complete (a kubectl listing or exec failed) is `FAIL`, never `SNAP`;
+  `completed` and `cancelled` runs are always `SNAP`.
   Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the
@@ -460,7 +466,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
   (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
-  terminal run after its first terminal snapshot, and retries active runs after a failed
+  terminal run after its first complete terminal cycle, and retries active runs, and a failed
+  run whose capture was incomplete or whose source search was inconclusive, after a failed
   capture. `backup-loop.state` records its PID, context, namespaces, interval, exact end
   time, retention and run set, so another session can audit the detached process without
   reading its full environment. This is a session-independent safety net; it is NOT a

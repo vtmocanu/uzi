@@ -433,6 +433,7 @@ func run() error {
 	})
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
+	svc.SetFindingGroupDB(pool)
 
 	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3): adopt/link
 	// an existing project + seed it. Builds forges through svc (same decryption path

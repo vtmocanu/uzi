@@ -24,8 +24,25 @@ through `[0.52.0]`.)
 
 ### Added
 
-- **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
-  It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
+- **Product tokens and a stable `/api/v1` ([#1907](https://github.com/vtmocanu/uzi/issues/1907)).**
+  Admins register external products under Admin > Products; users mint `uzp_` product tokens for them in Settings > Access (scopes, expiry, at most 10 active per product, shown once). A product token works only on `/api/v1` (today `GET /api/v1/whoami`, described in `api/openapi/v1.yaml`), never carries admin authority, and is refused everywhere else. Revoke all now also revokes product tokens; admins can revoke one, or disable or delete the product. The `uzi` CLI refuses a `uzp_` token with a clear error.
+
+- **Several findings that share a root cause can now be filed as one forge issue ([#1724](https://github.com/vtmocanu/uzi/issues/1724)).**
+  On the Findings page, select 2 to 50 open findings from one repo and click "File as one issue" to review an editable draft that lists every finding's location and title; the CLI files the default draft with `uzi findings file <finding-id> <finding-id>...` (older evidence ids resolve to their finding, duplicates count once, `--json` returns the issue plus the linked disposition IDs). Filing is all or nothing, once it settles every member shows as Filed against the same issue, and closing that issue marks every member Done, while Undo stays per finding.
+
+- **A group filing whose outcome could not be confirmed is settled by the repo sync or released by hand ([#1724](https://github.com/vtmocanu/uzi/issues/1724)).**
+  The forge issue carries a marker, and the repo sync settles the group when it finds that issue; the server logs a `finding group reconciliation pending` warning with the pending count and oldest age while any operation waits. Otherwise the CLI exits 5 with the operation id, and once the operation's deadline has passed and the forge really has no such issue, `uzi findings release <operation-id> --confirm-no-issue` frees the findings (the flag is required); held rows read `pending group <op>` in `uzi findings list --bucket all`.
+
+### Changed
+
+- **Agents wait for long gates and report only what they observed.**
+  Judge recommendations and past review findings showed runs losing long quality gates at the turn boundary and leads reporting checkpoints or gates they had not seen finish. The lead and every subagent now learn that a command still running at turn end is lost, Claude-harness agents get a bounded way to wait past the two-minute Bash timeout, and agents are told the worker has no forge CLI. The lead template now checks exhaustive and reuse claims before submitting a plan, keeps validators to focused tests while its gate runs, keeps committed, reviewed, checkpointed and signalled states apart, and names accepted risks in the PR summary. The built-in lead refreshes on the next boot unless customized.
+
+- **Built-in agents synced to skills v0.42.0.**
+  The built-in coder, reviewer, tester, auditor, documenter, fact-checker and architect gain rules drawn from judge recommendations and CodeRabbit/Greptile findings: bound every loop, retry and cleanup; never read an ambiguous 404, empty or timeout reply as success; check every surface a new state reaches and both rollout orders; wait for a backgrounded gate; prove a probe's tool exists; back every/never/only claims with the enforcing code. The built-in coder now runs on the `sonnet` tier (upstream v0.41.0). Unmodified built-in roles refresh on the next boot.
+
+- **uzi's self-improvement runs gate through the Taskfile and re-check old recommendations.**
+  On a repo opted into uzi dogfooding, the self-improvement run now passes `task gate:repo` plus the touched components' gates and, for web changes, the production build (reporting a missing `task` as a gate failure) instead of a stale hand-written test list, confirms a judge recommendation still holds on current code (and is not already fixed by an open merge request) before acting on it, prefers a fix several recommendations share, and never edits the built-in agent templates copied verbatim from upstream.
 
 - **Egress profiles: admin-managed site lists for official-sources research ([#1906](https://github.com/vtmocanu/uzi/issues/1906)).**
   Admins can now store named site lists (exact hosts or `*.base` wildcards) through the admin API, and read them with `uzi admin egress-profile list|show <name>`. Entries are normalized (lowercase, IDNA, trailing dot) and IP addresses, ports, URLs, paths, public-suffix wildcards such as `*.github.io`, wildcards with a public suffix below them such as `*.kawasaki.jp` or `*.run.app`, and known shared-hosting parents such as `*.amazonaws.com` are refused; well-known multi-publisher hosts such as `github.com`, `cdn.jsdelivr.net` or `registry.npmjs.org`, and platform apexes such as `github.io`, need an explicit per-entry override and carry a warning. A read also warns about any stored entry the current rules no longer accept, or now flag as multi-publisher without an override; such an entry matches nothing. Five new admin settings cap per-run downloads (25 MiB per file, 200 MiB and 100 files per run, 4 concurrent fetches, 500 fetch attempts per run). The research lane that uses them is not enabled yet; see the Egress profiles operator page.
@@ -66,6 +83,15 @@ through `[0.52.0]`.)
 
 - **Leads now learn their environment's limits at run start ([#1866](https://github.com/vtmocanu/uzi/issues/1866)).**
   Before the plan turn (or the first implement turn on a plan-less resume), the worker runs a fixed probe measuring whether `/proc` can be enumerated and whether `$HOME`/`$TMPDIR` are writable, and folds the limits it found, plus whether Docker is wired on this worker, into a short prompt block with a rule: a gate blocked by a verified limit is recorded as blocked or not run rather than retried unchanged. The probe fails closed, so an unconfirmed cleanup fails the run rather than reporting a fact it can't stand behind. No egress tier is reported, since the worker receives none to pass through. A new uzi-watcher plan-trap check reads the worker's `environment facts` status line to catch a plan that ignores an affected gate.
+
+- **RC channel update prompts and correct Homebrew upgrade commands ([#1890](https://github.com/vtmocanu/uzi/issues/1890)).**
+  The TUI offers newer release candidates to `uzi-cli-rc` installs while stable installs stay on stable releases. The CLI version-skew warning now names the matching formula, and an RC install is never offered a stable-formula upgrade action.
+
+- **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
+  It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
+
+- **A run whose skills plugin fails to load now stops instead of working without its skills ([#1888](https://github.com/vtmocanu/uzi/issues/1888)).**
+  When the Claude SDK reports skills-plugin load errors at session start, a run with selected skills fails with the new `fail_origin` `skills_plugin_load_failed` (never judged), and its failure reason names the plugin, error type, path and a trimmed message, redacted and bounded. An error report the worker cannot parse still counts as a failure. A run without selected skills posts a warning and continues. Claude runs only.
 
 ### Changed
 
@@ -171,6 +197,24 @@ through `[0.52.0]`.)
 
 - **Codex runs no longer fail at the next checkpoint when the lead's turn ends with a delegation still open ([#1864](https://github.com/vtmocanu/uzi/issues/1864)).**
   The open delegation is now cancelled and its work settled before the checkpoint. A boundary that still cannot settle fails closed, and the failure reason and worker log now name the stage, the checkpoint and the unsettled work instead of only `codex boundary failed at quiesce`.
+
+- **Codex finalize no longer fails finished runs on the 30-second checkpoint deadline ([#1900](https://github.com/vtmocanu/uzi/issues/1900), [#1904](https://github.com/vtmocanu/uzi/pull/1904)).**
+  Finalize (fetch, align, push, completion permit, PR description, MR creation) now runs under its own boundary deadline derived from its per-step timeouts. The worker logs each finalize step's duration, and a deadline failure names the step that was running.
+
+- **Codex checkpoint timeouts are diagnosable and recoverable ([#1914](https://github.com/vtmocanu/uzi/issues/1914), [#1917](https://github.com/vtmocanu/uzi/pull/1917), [#1919](https://github.com/vtmocanu/uzi/pull/1919)).**
+  A held-permit abort is no longer mistaken for a scratch-publication refusal, and a hard-deadline failure names the checkpoint phase that stalled. Milestone and done checkpoint publication get a 10-second cooperative budget inside the 30-second hard boundary: a clean timeout keeps the committed work in the worker and retries on the next checkpoint instead of failing the run, while hard aborts and unclean reaps still fail closed.
+
+- **A Codex finalize deadline now also stops the completion permit retry ([#1925](https://github.com/vtmocanu/uzi/pull/1925)).**
+  Previously an API outage could keep the worker slot and boundary permit occupied for up to the permit's 10-minute retry budget after the deadline fired.
+
+- **Worker shutdown no longer hangs on a run parked at the plan gate ([#1894](https://github.com/vtmocanu/uzi/issues/1894), [#1920](https://github.com/vtmocanu/uzi/pull/1920)).**
+  The gate wait now honours the shutdown signal, so the worker exits promptly and the run is released.
+
+- **The Codex command sandbox can execute the pinned Codex binary ([#1886](https://github.com/vtmocanu/uzi/issues/1886), [#1898](https://github.com/vtmocanu/uzi/pull/1898)).**
+  The Landlock allowlist now grants read and execute (never write) on `/opt/uzi-codex`, which previously failed with `EACCES` inside the sandbox. The Codex provisioning check also reports spawn errors and signals, not just the exit status.
+
+- **Faster API test suite: fake-forge 5xx tests no longer wait out the GitLab client's retry backoff ([#1893](https://github.com/vtmocanu/uzi/issues/1893), [#1905](https://github.com/vtmocanu/uzi/pull/1905)).**
+  Production retry behavior, including `Retry-After` handling, is unchanged.
 
 ## [0.84.0] - 2026-09-26
 

@@ -125,6 +125,8 @@ interface Ctl {
   fire: () => Promise<string>;
   /** Fire WITHOUT waiting for the outcome (it is still recorded). */
   fireNoWait: () => void;
+  /** Invoke the most recently armed callback even after its timer was canceled. */
+  fireRetained: () => void;
   nextOutcome: () => Promise<string>;
   outcomes: string[];
   armed: () => boolean;
@@ -138,6 +140,7 @@ interface Ctl {
 
 function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHooks"]>> = {}): Ctl {
   let tickCb: (() => void) | undefined;
+  let retainedTickCb: (() => void) | undefined;
   let tickDelay: number | undefined;
   let fakeNow = 0;
   const outcomes: string[] = [];
@@ -172,6 +175,7 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
       // faithfully (issue #1597, MR !1618 review).
       const bound = AsyncResource.bind(cb);
       tickCb = bound;
+      retainedTickCb = bound;
       tickDelay = ms;
       return () => {
         if (tickCb === bound) {
@@ -196,6 +200,10 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
       const starts = started === outcomes.length;
       cb();
       if (starts) started++;
+    },
+    fireRetained: () => {
+      assert.ok(retainedTickCb, "a tick timer was armed before teardown");
+      retainedTickCb();
     },
     nextOutcome: () => waitIdx(outcomes.length),
     outcomes,
@@ -1029,6 +1037,17 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
   const branch = `agent/issue-${iid}`;
   const hang = stubbornScript(tmp);
   let releaseLock: (() => void) | undefined;
+  const queuedFetch = deferred();
+  const originalFetchAgentBranch = g.fetchAgentBranch.bind(g);
+  if (stuck === "bare_lock") {
+    g.fetchAgentBranch = ((...args: Parameters<typeof g.fetchAgentBranch>) => {
+      const pending = originalFetchAgentBranch(...args);
+      // fetchAgentBranch synchronously joins the bare lock's queue before its
+      // first await. The held lock prevents its body from running until teardown.
+      queuedFetch.resolve();
+      return pending;
+    }) as typeof g.fetchAgentBranch;
+  }
   const ctl = control(
     stuck === "fetch_child" ? { tickSpawn: { rewrite: fetchBecomes(hang) } } : {},
   );
@@ -1064,7 +1083,7 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
     } else if (stuck === "publish") {
       await stuckIn.promise;
     } else {
-      await sleepMs(200); // the tick is now queued behind the held bare lock
+      await bounded(queuedFetch.promise, 3_000, "tick fetch entered the held bare-lock queue");
     }
   };
   const factory = teardown === "turn_end" ? turn(body) : blockingTurn(body);
@@ -1076,7 +1095,7 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
     if (teardown === "shutdown") {
       await waitFor(() => sha !== "" && (stuck !== "fetch_child" || isReady(hang)));
       if (stuck === "publish") await stuckIn.promise;
-      else await sleepMs(200);
+      else if (stuck === "bare_lock") await bounded(queuedFetch.promise, 3_000, "tick fetch entered the held bare-lock queue");
       runner.shutdown();
     }
     await p;
@@ -1088,11 +1107,16 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
     const publishesAfter = pub.count();
     const refs = gitIn(bare, ["for-each-ref"]);
     const files = listing(bare);
-    await sleepMs(400);
+    // A canceled callback must also be harmless if it was already queued by
+    // the event loop. Drain a macrotask and one fake-API round trip so a
+    // straggling promise has an opportunity to start before the negative checks.
+    ctl.fireRetained();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    await client.getInputs(claim.run_id);
     assert.equal(ctl.pids.length, spawnsAfter, "no tick spawn after teardown");
     assert.equal(pub.count(), publishesAfter, "no publish after teardown");
-    assert.equal(gitIn(bare, ["for-each-ref"]), refs, "bare refs unchanged over a following interval");
-    assert.deepEqual(listing(bare), files, "bare file listing unchanged over a following interval");
+    assert.equal(gitIn(bare, ["for-each-ref"]), refs, "bare refs unchanged after canceled callback and event-loop drain");
+    assert.deepEqual(listing(bare), files, "bare file listing unchanged after canceled callback and event-loop drain");
     assert.ok(Date.now() - started < 30_000, "teardown settled within budget");
     const feed = statusTexts(claim.run_id);
     if (teardown === "shutdown") {
@@ -1102,6 +1126,7 @@ async function quiescence(iid: number, stuck: Stuck, teardown: "turn_end" | "shu
       assert.equal(finalStatus(claim.run_id), "completed");
     }
   } finally {
+    g.fetchAgentBranch = originalFetchAgentBranch;
     releaseLock?.();
     await settleAndClean({ ctl, runners: [runner], running: [p], restore: pub.restore, paths: [tmp] });
   }

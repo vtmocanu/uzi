@@ -205,7 +205,8 @@ uzi review undo <run-id> <rec-id>
 uzi review file <run-id> <rec-id> [--repo <repo-id>]
 uzi review stats
 uzi findings list [--repo <repo-id>] [--bucket to_file|filed|done|dismissed|all] [--run <run-id>]
-uzi findings file <finding-id>
+uzi findings file <finding-id> [<finding-id>...]
+uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
 uzi findings stats [--repo <repo-id>]
@@ -242,6 +243,7 @@ uzi admin health [--all] [--strict]
 uzi admin usage
 uzi admin rate-limits [--provider claude|codex]
 uzi admin cli-tokens
+uzi admin products
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get
@@ -1320,6 +1322,23 @@ which you triage from the terminal exactly like the judge backlog.
   yours. `--json` returns `{issue:{iid,web_url,title}, warning?}`; a `warning` means
   the issue was created but its local record could not settle (a success with a note,
   still exit 0), not a retry signal.
+- `uzi findings file <finding-id> <finding-id>...` — file ONE issue for several
+  coordinates of the same repo. One id takes the single-file path. With two or more ids
+  (even a repeated one), each distinct id is resolved to its coordinate's disposition
+  (older evidence ids included) and duplicates collapse; an id with no triage record is a
+  usage error (exit 2) and nothing is filed, so to file an untriaged coordinate pass its
+  id alone. Only when every id resolves to one coordinate does it fall back to the
+  single-file filing. `--json` returns `{operation_id, disposition_ids, phase, issue?,
+  warning?}`. A 202 means the filing could not be confirmed: the operation id and phase
+  are printed and the exit is 5; a 201 whose phase is not `settled` also prints
+  `operation <id> (<phase>)` and its warning, even under `--quiet` (the issue exists).
+  Release is accepted only after the operation's deadline: check the
+  forge, and only if no such issue exists run
+  `uzi findings release <operation-id> --confirm-no-issue` (without the flag it is a
+  usage error). A 409 prints the `pending operation <op>` ids (and any non-open
+  coordinate) holding the chosen ones to stderr. Held rows show `pending group <op>` as
+  their state in `uzi findings list --bucket all` (their status is `filing`). At most 50
+  distinct ids per call; an id with no triage record yet is refused.
 - `uzi findings dismiss <finding-id> --reason wont-do|not-an-issue` — dismiss a
   coordinate (`not-an-issue` is a false positive, `wont-do` is valid-but-skip), so it
   stays gone and never re-nags across later runs. A missing or invalid `--reason` is a

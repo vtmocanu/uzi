@@ -114,7 +114,7 @@ this lander's second pair of eyes.
 | Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
 | Rebase or renumber only | the buddy's `APPROVE` of the range-diff on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
-| Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too |
+| Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too, as a skim (a brief naming the diff range and the risky seams; a verdict pinned to the SHA). The bot does the full read |
 | Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
 
 ## Entry: the snapshot
@@ -259,8 +259,12 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
      Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
-     A 409 "disabled" means rework is off for that run: `uzi run mr-rework RUN --enabled`,
-     then retry; do not downgrade a big fix to a local one because the lane was off.
+     On-demand rework ignores the per-run and per-user auto-rework settings, so a run
+     created with `--mr-rework=false` can still be reworked and needs no toggle. A 409
+     "disabled" is the admin kill-switch: report it, never downgrade a big fix to a local
+     one because of it. A `task` run (`uzi handoff`) refuses `uzi run rework`: hand
+     the fix off instead (`uzi handoff --base <PR branch> --file BRIEF`, no `--mr`), then
+     push its tip onto the PR branch with a lease once it fast-forwards from the PR head.
      **A rework already running** (uzi starts one on new bot comments; a second `uzi run
      rework` then fails "already working this branch"): steer it with `uzi run follow-up
      REWORK_RUN -m 'GUIDANCE'` instead, and wait on that run itself
@@ -285,6 +289,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
    A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
    `mergeable` before waiting on checks.
+   A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows
+   onto an older base, which can make CI call a Task target the branch lacks. On such a
+   finding, check the target on current `main`; when `main` defines it, rebase onto `main`,
+   rerun CI, then assess whatever finding remains.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```

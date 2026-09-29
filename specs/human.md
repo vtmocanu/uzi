@@ -166,6 +166,7 @@ Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/done/16-agent-skills.md`.
 - First builtin skill: `ci-cd-norms`, researched from an internal knowledge base and reference repos — an organization's CI/CD norm, with a reference app as the worked exception.
 - Repos may carry skills the worker detects. Per-repo opt-in, default off. [capability: user; opt-in/default-off shape AI-proposed, user-accepted]
 - Builtin skills ship with uzi; editable and resettable like builtin agent templates.
+- A Claude run whose skills plugin the SDK reports as failed to load (issue #1888) never works without its selected skills: a run with selected skills fails with the `skills_plugin_load_failed` fail origin (never judged, not retried automatically), even when the reported error detail is malformed; a run with no selected skills gets a warning status line (once per start or resume) and continues. The SDK's error text is redacted, stripped of control characters and bounded before it is shown. (AI-synced 2026-09-29)
 
 ## Feature #17 — Builtin lead template (opus) + worker model selection
 
@@ -741,7 +742,7 @@ Completes Feature #64/#175: `uzi version` reported both versions and never compa
   [user 2026-08-03, chosen from three placements]
 - The warning goes to stderr. stdout and the exit code are unchanged. [user 2026-08-03]
 - The server's version is probed on a cache, never once per command. [user 2026-08-03]
-- The remedy offered is `brew upgrade uzi-cli`. [user 2026-08-03]
+- The warning's remedy follows the CLI's stamped channel: `-rc.N` builds say `brew upgrade uzi-cli-rc`; stable builds say `brew upgrade uzi-cli`. (AI-synced 2026-09-29, #1890)
 
 ## Feature #325 — TUI redesign ("factory shift board")
 
@@ -806,7 +807,7 @@ Tracked as GitHub issue vtmocanu/uzi#1226 (parent epic #1225); PRD at `prds/done
 
 Tracked as GitHub issue vtmocanu/uzi#1265; PRD at `prds/1265-rc-release-train.md`.
 
-- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit; surfaces meant for stable users (the Homebrew formula, the GitHub Release marked latest, the in-app update check) never surface a candidate. [user, #1265]
+- Releases are cut as release candidates by default; a stable release is promoted from the candidate's own commit. Stable-facing update surfaces (the `uzi-cli` formula, the GitHub Release marked latest, and the TUI update prompt for stable installs) never surface a candidate; the TUI update prompt for a `uzi-cli-rc` install offers newer candidates only. (AI-synced 2026-09-29, #1890)
 
 ## Feature #1349 — Recovery custody hardening
 
@@ -828,6 +829,12 @@ Tracked as GitHub issue vtmocanu/uzi#1810; PRD at `prds/1810-retain-failed-run-c
 Tracked as GitHub issue vtmocanu/uzi#1867; PRD at `prds/1867-failed-run-salvage-ref.md`.
 
 - On a forge listed in `UZI_SALVAGE_FORGES` (default empty: off), a failed, checkpoint-eligible run's last published checkpoint is copied to a run-scoped `refs/uzi-salvage/<run-id>`, only when it is still verified live under the branch checkpoint ref or its recovery ref, and expires after `UZI_RECOVERY_READY_RETENTION`; a `push_secret_blocked` failure is never salvaged, and salvage never deletes or moves the branch checkpoint ref or a recovery ref, which stay #1810's to manage. (AI-synced 2026-09-28)
+
+## Feature #1907 — Product tokens and a stable `/api/v1`
+
+Tracked as GitHub issue vtmocanu/uzi#1907; PRD at `prds/1907-product-tokens-api-v1.md`.
+
+- An admin registers an external product; a user then mints a `uzp_` product token for it in Settings → Access, which acts as that user (once job endpoints exist, on the user's own worker and model credential) but only on the stable, versioned `/api/v1` and never with admin authority, and is refused on every other route exactly like an unknown token. A user holds at most 10 active tokens per product, chooses an expiry (30 days, 90 days by default, 1 year or never), and can revoke one token or use the existing Revoke all, which now covers product tokens too; an admin can revoke one product token or disable or delete a product, which cuts off all its tokens on their next request. A password change and logout do not revoke them. `/api/v1` changes are additive only, with a deprecation window of at least two minor releases and 90 days. Only `GET /api/v1/whoami` exists so far; job endpoints come later. (AI-synced 2026-09-29)
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
@@ -996,6 +1003,7 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 Tracked as GitHub issue vtmocanu/uzi#1864.
 
 - A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
+- A Codex run's finalize publish runs under its own finite boundary deadline sized for the full publish (push, PR description, merge request), not the 30 s checkpoint deadline; a finalize deadline failure names the finalize step that was running when it fired, and the worker logs each finalize step's duration. (AI-synced 2026-09-29)
 
 ## PRD #1906 — Official-sources web research
 

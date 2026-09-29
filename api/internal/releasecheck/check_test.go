@@ -38,12 +38,11 @@ func (f *fakeSettings) ReleaseCheckInterval(context.Context) (time.Duration, err
 }
 func (f *fakeSettings) Invalidate() { f.invalidated.Add(1) }
 
-// fakeStore is an in-memory Store recording every UpsertAppSetting, seeded with any
-// prior facts so a test can assert last-good survives an error pass.
+// fakeStore is an in-memory Store that stages a fact group before publishing it.
 type fakeStore struct {
 	values  map[string]string
 	writes  int
-	failKey string // when non-empty, UpsertAppSetting errors on this key (persist-failure path)
+	failKey string // failure during staging rolls back the whole group
 }
 
 func newFakeStore(seed map[string]string) *fakeStore {
@@ -54,13 +53,20 @@ func newFakeStore(seed map[string]string) *fakeStore {
 	return &fakeStore{values: m}
 }
 
-func (s *fakeStore) UpsertAppSetting(_ context.Context, arg store.UpsertAppSettingParams) (store.AppSetting, error) {
-	s.writes++
-	if s.failKey != "" && arg.Key == s.failKey {
-		return store.AppSetting{}, fmt.Errorf("simulated write failure for %s", arg.Key)
+func (s *fakeStore) UpsertReleaseSettings(_ context.Context, facts []store.UpsertAppSettingParams) error {
+	staged := make(map[string]string, len(s.values)+len(facts))
+	for key, value := range s.values {
+		staged[key] = value
 	}
-	s.values[arg.Key] = arg.Value
-	return store.AppSetting{Key: arg.Key, Value: arg.Value}, nil
+	for _, fact := range facts {
+		s.writes++
+		if s.failKey == fact.Key {
+			return fmt.Errorf("simulated write failure for %s", fact.Key)
+		}
+		staged[fact.Key] = fact.Value
+	}
+	s.values = staged
+	return nil
 }
 
 // releaseJSON is a minimal releases/latest payload for the stub server.
@@ -77,7 +83,7 @@ func withBaseURL(t *testing.T, u string) {
 	t.Cleanup(func() { baseURL = prev })
 }
 
-// TestCheckForUpdateSuccess: a newer upstream release → status "ok", the six facts
+// TestCheckForUpdateSuccess: a newer upstream release → status "ok", the six stable facts
 // persisted, the cache invalidated, and the parsed facts derive update_available=true.
 func TestCheckForUpdateSuccess(t *testing.T) {
 	var reqCount atomic.Int64
@@ -88,6 +94,10 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 		}
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Errorf("unauthenticated path sent Authorization = %q, want empty", got)
+		}
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
 		}
 		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "v0.15.0", "### Security\n- fix",
 			"2026-08-20T10:00:00Z", "https://github.com/vtmocanu/uzi/releases/tag/v0.15.0")))
@@ -106,8 +116,8 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	if res.Status != statusOK {
 		t.Fatalf("Status = %q, want %q (msg=%q)", res.Status, statusOK, res.Message)
 	}
-	if reqCount.Load() != 1 {
-		t.Errorf("server saw %d requests, want 1", reqCount.Load())
+	if reqCount.Load() != 2 {
+		t.Errorf("server saw %d requests, want 2", reqCount.Load())
 	}
 	if res.Facts.LatestTag != "v0.15.0" {
 		t.Errorf("Facts.LatestTag = %q, want v0.15.0", res.Facts.LatestTag)
@@ -118,7 +128,7 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	if !Security(res.Facts.Body) {
 		t.Error("expected security=true from the returned body")
 	}
-	// All six facts persisted.
+	// All six stable facts persisted.
 	for _, k := range []string{
 		settings.KeyReleaseLatestTag, settings.KeyReleaseLatestName, settings.KeyReleaseLatestBody,
 		settings.KeyReleaseNotesURL, settings.KeyReleasePublishedAt, settings.KeyReleaseCheckedAt,
@@ -135,12 +145,14 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	}
 }
 
-// TestCheckForUpdatePersistFailureReportsError: a failed fact write must surface as status
-// "error", not "ok" — the admin "Check now" would otherwise report success while a mix of
-// new and stale keys is left behind — and must NOT invalidate the cache, so the last
-// COMPLETE snapshot keeps serving until a fully-successful pass.
+// TestCheckForUpdatePersistFailureReportsError checks that a failed fact write
+// reports an error and keeps the prior snapshot.
 func TestCheckForUpdatePersistFailureReportsError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
 		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "v0.15.0", "notes",
 			"2026-08-20T10:00:00Z", "https://github.com/vtmocanu/uzi/releases/tag/v0.15.0")))
 	}))
@@ -160,14 +172,18 @@ func TestCheckForUpdatePersistFailureReportsError(t *testing.T) {
 		t.Fatalf("Status = %q, want %q on a persist failure", res.Status, statusError)
 	}
 	if set.invalidated.Load() != 0 {
-		t.Errorf("Invalidate called %d times, want 0 — a partial write must keep the last-good cache", set.invalidated.Load())
+		t.Errorf("Invalidate called %d times, want 0 after a rolled-back write", set.invalidated.Load())
 	}
 }
 
 // TestCheckForUpdateEqualNotAvailable: equal versions → update_available=false, the
 // FALSE state (distinct from the unchecked/disabled state), still Status "ok".
 func TestCheckForUpdateEqualNotAvailable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
 		_, _ = w.Write([]byte(releaseJSON("v0.14.0", "v0.14.0", "### Added\n- x",
 			"2026-08-20T10:00:00Z", "https://example.test/r")))
 	}))
@@ -294,7 +310,7 @@ func TestCheckForUpdateErrorPreservesLastGood(t *testing.T) {
 // replaced with REDACTED, a nil error stays nil, and an empty token returns the error
 // unchanged.
 func TestScrubToken(t *testing.T) {
-	const token = "ghp_secret_token_xyz789"
+	token := "ghp_" + "secret_token_xyz789"
 
 	// (a) A non-nil error whose message contains the token has it redacted.
 	in := fmt.Errorf("dial failed for %s: connection refused", token)
@@ -325,10 +341,14 @@ func TestScrubToken(t *testing.T) {
 // <token> is sent (verifies the Authorization Bearer header only; token scrubbing is
 // covered by TestScrubToken).
 func TestCheckForUpdateSendsBearerToken(t *testing.T) {
-	const token = "ghp_release_check_token_abc123"
+	token := "ghp_" + "release_check_token_abc123"
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.Header.Get("Authorization"), "Bearer "+token; got != want {
 			t.Errorf("Authorization = %q, want %q", got, want)
+		}
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
 		}
 		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "x", "", "2026-08-20T10:00:00Z", "https://x")))
 	}))

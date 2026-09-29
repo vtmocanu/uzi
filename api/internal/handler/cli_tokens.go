@@ -202,17 +202,26 @@ func (h *Handler) RevokeCLIToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// RevokeAllCLITokens revokes every un-revoked token of the caller — the panic
-// button for a lost laptop (Decision 19). Idempotent: a second call is a no-op that
-// still returns 204. Scoped to the caller, so it never touches another user's tokens.
+// RevokeAllCLITokens revokes every un-revoked CLI token AND every un-revoked product
+// token of the caller: the panic button for a lost laptop (PRD #64 Decision 19),
+// extended by PRD #1907 D8 so it leaves no uzp_ token live either. Both revokes run in
+// ONE transaction, so the call revokes both kinds or neither (a failure is a 500 with
+// nothing revoked). Idempotent: a second call is a no-op that still returns 204.
+// Scoped to the caller, so it never touches another user's tokens.
 func (h *Handler) RevokeAllCLITokens(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
 	}
-	if err := h.q.RevokeAllCLITokens(r.Context(), user.ID); err != nil {
-		slog.Error("revoke all cli tokens", "error", err)
+	err := h.inTx(r.Context(), func(q *store.Queries) error {
+		if err := q.RevokeAllCLITokens(r.Context(), user.ID); err != nil {
+			return err
+		}
+		return q.RevokeAllProductTokens(r.Context(), user.ID)
+	})
+	if err != nil {
+		slog.Error("revoke all cli and product tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}

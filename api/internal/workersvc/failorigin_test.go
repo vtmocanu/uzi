@@ -140,6 +140,41 @@ func TestWorkerResidueBlockedIsWorkerReportableAndNeverJudged(t *testing.T) {
 	}
 }
 
+// TestSkillsPluginLoadFailedIsWorkerReportableAndNeverJudged pins issue #1888's origin:
+// skills_plugin_load_failed is a stored vocabulary member, the worker may report it
+// (CoerceFailOrigin passes it through verbatim, so the typed failure is not flattened to
+// agent_failure), and it is a WORKER ENVIRONMENT failure (the Claude SDK reported load errors for
+// the run's selected-skills plugin at session start), so it is in neverJudgeFailOrigins and skips
+// the judge at EVERY iteration count (TestSkillsPluginLoadFailedNeverJudgedRegardlessOfIteration
+// drives the gate): a resumed run's session start carries iteration_count > 0. It is in no other
+// skip set (the iteration-gated preStartInfraFailOrigins would judge a resumed
+// run) and it is not human-landable: the run stops before the agent works.
+func TestSkillsPluginLoadFailedIsWorkerReportableAndNeverJudged(t *testing.T) {
+	const o = "skills_plugin_load_failed"
+	if !failOriginSet[o] {
+		t.Fatalf("%q is not in the stored fail_origin vocabulary", o)
+	}
+	v := o
+	if got := CoerceFailOrigin(&v); got == nil || *got != o {
+		t.Fatalf("CoerceFailOrigin(%q) = %v, want passthrough (worker-reportable)", o, got)
+	}
+	if !neverJudgeFailOrigins[o] {
+		t.Fatalf("%q must be in neverJudgeFailOrigins: it is a worker environment failure, not an agent defect", o)
+	}
+	for name, set := range map[string]map[string]bool{
+		"preStartInfraFailOrigins": preStartInfraFailOrigins,
+		"envPublishFailOrigins":    envPublishFailOrigins,
+		"humanLandableFailOrigins": humanLandableFailOrigins,
+	} {
+		if set[o] {
+			t.Fatalf("%q must not be in %s", o, name)
+		}
+	}
+	if IsHumanLandableFailOrigin(o) {
+		t.Fatalf("IsHumanLandableFailOrigin(%q) = true, want false", o)
+	}
+}
+
 // TestFailOriginVocabularyMatchesCheck is the instrument migration 00126's comment
 // promises, copied from TestRateLimitTypeVocabularyMatchesCheck (00091's) for the same
 // reason it exists there: a value Go writes and the CHECK rejects becomes a constraint

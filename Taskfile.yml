@@ -2273,7 +2273,35 @@ tasks:
       - ./scripts/npm-audit-gate.sh agent high
 
   test:agent:
-    desc: agent unit tests (node --test via tsx)
+    desc: agent full test gate (unit tests and Codex M4 conformance)
+    preconditions:
+      # A local gate must fail loudly if a shard variable leaked from the shell.
+      - sh: '[ -z "${UZI_AGENT_TEST_SHARD:-}" ] && [ -z "${UZI_AGENT_TEST_JUNIT:-}" ]'
+        msg: 'test:agent is always unsharded; use test:agent:shard for a CI shard'
+    cmds:
+      - task: test:agent:unit
+      # PRD 1287 C1 / D7 point 5: M4 runs once after the complete local unit suite.
+      - task: test:codex-m4
+
+  test:agent:shard:
+    desc: agent unit-test shard for CI (exactly 1/2 or 2/2; no M4)
+    preconditions:
+      - sh: 'case "${UZI_AGENT_TEST_SHARD:-}:${UZI_AGENT_TEST_JUNIT:-}" in 1/2:shard-1.xml|2/2:shard-2.xml) exit 0;; *) exit 1;; esac'
+        msg: 'set UZI_AGENT_TEST_SHARD=1/2 or 2/2 and matching UZI_AGENT_TEST_JUNIT=shard-N.xml'
+    cmds:
+      - task: test:agent:unit
+
+  check:agent-shards:
+    desc: agent - verify two JUnit shards cover every tracked test file once
+    preconditions:
+      - sh: '[ -n "${UZI_AGENT_SHARD_REPORT_DIR:-}" ]'
+        msg: 'UZI_AGENT_SHARD_REPORT_DIR must name the downloaded shard reports'
+    cmds:
+      - python3 scripts/check-agent-test-shards.py --self-test
+      - python3 scripts/check-agent-test-shards.py "$UZI_AGENT_SHARD_REPORT_DIR"
+
+  test:agent:unit:
+    internal: true
     dir: agent
     cmds:
       # `npm test` and NOT a bare `node --test`: agent/package.json's test script
@@ -2329,9 +2357,9 @@ tasks:
       # says the proc root is present. Any other outcome runs them. A skip is green, so
       # real-procfs-skip-check.sh is the gate on that gate: it collects every skip, re-probes
       # enumeration on its own, and fails when a test skipped where the proc root enumerates,
-      # or in CI at all. CI's test-agent job runs `task test:agent`, so this is the zero-skip
-      # check there (the same idea as test-api-store-it's ran/skipped check) with no workflow
-      # edit. The wrapper sits OUTSIDE the leak guard: its skip log must not live in the
+      # or in CI at all. Each CI test-agent-shard leg runs this same target, so this is
+      # the zero-skip check there (the same idea as test-api-store-it's ran/skipped check).
+      # The wrapper sits OUTSIDE the leak guard: its skip log must not live in the
       # guard's scratch TMPDIR, where it would count as a leftover. Its own hermetic test
       # runs first, so a gutted verdict table reddens here too.
       # Where the probe says denied, node cannot read its cgroup CPU quota either, so
@@ -2340,13 +2368,13 @@ tasks:
       # wrapper then exports UZI_AGENT_TEST_CONCURRENCY=1 (unless set to a positive integer),
       # which the npm test script turns into --test-concurrency=1: node rejects that flag
       # in NODE_OPTIONS, so it has to go on the command line.
-      - ../scripts/real-procfs-skip-check.test.sh
+      # This self-test validates the wrapper used by both legs. Run it once in
+      # shard 1 with M4, and once in the unsharded local composition.
+      - |
+        if [ "${UZI_AGENT_TEST_SHARD:-}" != "2/2" ]; then
+          ../scripts/real-procfs-skip-check.test.sh
+        fi
       - ../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh npm test
-      # PRD 1287 C1 / D7 point 5: the strict Codex M4 conformance contract + the REAL-binary P
-      # startup smoke, run as a MANDATORY serial second step here (never from gate:agent directly)
-      # so gate:agent and existing Linux CI exercise the P layer EXACTLY ONCE per unchanged tree.
-      # C5 tightens the completeness matrix; it does NOT add another invocation.
-      - task: test:codex-m4
 
   test:codex-m0:
     desc: Opt-in credential-free Codex 0.153.2 app-server characterization
@@ -2690,8 +2718,8 @@ tasks:
     # leg it spawns - never share one `.evidence/current.jsonl` and so cannot clobber each other's
     # evidence; the file is created empty at the start of THIS run so stale evidence cannot mask a
     # regression, and removed on success. This target is a MANDATORY serial second step of
-    # test:agent (below), so gate:agent and CI exercise P exactly once (D7 point 5) - do NOT also
-    # call it from gate:agent.
+    # local test:agent, while CI calls it in exactly one test-agent shard. Both routes exercise
+    # P once (D7 point 5); do NOT also call it from gate:agent.
     dir: agent
     vars:
       # TASK-scoped, NOT a root var: this `sh:` runs ONLY when this target runs, never on a bare

@@ -2,6 +2,13 @@
 // full forensic surface (token_prefix / last_used_at / last_used_ip), single
 // revoke, and the "Revoke all" panic button. The scope picker is offered ONLY to
 // admins (a non-admin can mint only a 'user' token). See PRD #64 M6.
+//
+// Revoke all is the ONE panic button on Settings → Access: since PRD #1907 D8 the same
+// endpoint also revokes every product token, so its confirm counts both kinds
+// (productTokenActiveCount, reported by the sibling ProductTokens) and it tells the
+// parent (onRevokedAll) so that list refetches. A count that is unknown (null: a list
+// failed to load or was cut) keeps the button available and drops that number from the
+// confirm, since hiding the panic button on a load blip is the unsafe failure.
 
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { useAuth } from "../auth/AuthContext";
@@ -17,7 +24,13 @@ import { KeyIcon } from "./icons";
 
 const scopeLabel = (scope: CliTokenScope) => (scope === "admin_ro" ? "admin (read-only)" : "user");
 
-export function CliTokens() {
+export function CliTokens({
+  productTokenActiveCount = 0,
+  onRevokedAll,
+}: {
+  productTokenActiveCount?: number | null;
+  onRevokedAll?: () => void;
+} = {}) {
   const { user } = useAuth();
   const isAdmin = user?.is_admin ?? false;
 
@@ -103,6 +116,7 @@ export function CliTokens() {
     setError("");
     try {
       await api.revokeCliToken(id);
+      setMinted((m) => (m?.row.id === id ? null : m));
       await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke token"));
@@ -114,13 +128,21 @@ export function CliTokens() {
     setConfirmingAll(false);
     try {
       await api.revokeAllCliTokens();
+      // The just-minted secret, if still on screen, is dead now: retire its panel.
+      setMinted(null);
+      // Refresh the sibling product-token list even if our own reload then fails.
+      onRevokedAll?.();
       await reload();
     } catch (err) {
       setError(errorMessage(err, "Failed to revoke tokens"));
     }
   };
 
-  const activeCount = tokens.filter((t) => !t.revoked).length;
+  // null when the CLI list could not be read (see the header on unknown counts).
+  const activeCount = loadError ? null : tokens.filter((t) => !t.revoked).length;
+  const canRevokeAll =
+    activeCount === null || productTokenActiveCount === null || activeCount + productTokenActiveCount > 0;
+  const loadFailed = data === null && loadError !== "";
 
   return (
     <Card className="space-y-5">
@@ -198,7 +220,7 @@ export function CliTokens() {
         <div className="flex items-center justify-between gap-2">
           <SectionTitle>Your tokens</SectionTitle>
           {/* The panic button. Enabled only when there is something to revoke. */}
-          {activeCount > 0 && !confirmingAll && (
+          {canRevokeAll && !confirmingAll && (
             <Button variant="danger" size="sm" onClick={() => setConfirmingAll(true)}>
               Revoke all
             </Button>
@@ -210,7 +232,7 @@ export function CliTokens() {
             ref={confirmRef}
             tabIndex={-1}
             role="group"
-            aria-label="Confirm revoking all CLI tokens"
+            aria-label="Confirm revoking all CLI and product tokens"
             aria-describedby="cli-revoke-all-warning"
             onKeyDown={(e) => {
               if (e.key === "Escape") setConfirmingAll(false);
@@ -218,9 +240,9 @@ export function CliTokens() {
             className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-hidden"
           >
             <p id="cli-revoke-all-warning" className="text-xs text-warn">
-              Revoke all {activeCount} active {activeCount === 1 ? "token" : "tokens"}? Every{" "}
-              <code className="rounded bg-raised px-1 py-0.5">uzi</code> CLI and CI job using one
-              stops working until you mint a new token. This cannot be undone.
+              Revoke {revokeAllSummary(activeCount, productTokenActiveCount)}? Every{" "}
+              <code className="rounded bg-raised px-1 py-0.5">uzi</code> CLI, CI job and connected
+              product using one stops working until you mint a new token. This cannot be undone.
             </p>
             <div className="flex items-center gap-1.5">
               <Button variant="danger" size="sm" onClick={revokeAll}>
@@ -237,7 +259,7 @@ export function CliTokens() {
           <div className="space-y-2">
             <Skeletons />
           </div>
-        ) : tokens.length === 0 ? (
+        ) : loadFailed ? null : tokens.length === 0 ? (
           <EmptyState
             icon={<KeyIcon />}
             title="No CLI tokens yet"
@@ -253,6 +275,23 @@ export function CliTokens() {
       </div>
     </Card>
   );
+}
+
+// "all 2 CLI tokens and 1 product token": both kinds counted, since the one endpoint
+// revokes both (D8). Only the kinds the user actually holds are named; a kind whose count
+// is unknown (null) is named without a number ("every product token").
+function revokeAllSummary(cli: number | null, product: number | null): string {
+  const n = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
+  if (cli !== null && product !== null) {
+    const parts = [
+      cli > 0 ? n(cli, "CLI token") : "",
+      product > 0 ? n(product, "product token") : "",
+    ].filter(Boolean);
+    return `all ${parts.join(" and ")}`;
+  }
+  const part = (count: number | null, noun: string) =>
+    count === null ? `every ${noun}` : count > 0 ? `all ${n(count, noun)}` : "";
+  return [part(cli, "CLI token"), part(product, "product token")].filter(Boolean).join(" and ");
 }
 
 function Skeletons() {

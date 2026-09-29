@@ -72,6 +72,31 @@ func TestHostileServerCannotDriveTheTerminal(t *testing.T) {
 		}
 	})
 
+	t.Run("admin-products", func(t *testing.T) {
+		// PRD #1907 D11 validates product names and descriptions on write, but the CLI
+		// does not trust the server to have done so: a hostile or pre-validation row with
+		// an escape sequence and a newline must neither drive the terminal nor forge a row.
+		fc := &uzicli.FakeClient{AdminProducts: []apitypes.ProductDTO{{
+			Name:        "Acme" + oscTitle,
+			Description: "ok" + esc2J + "\nForged  enabled  99",
+			Enabled:     true,
+			CreatedAt:   past,
+		}}}
+		out, _, code := runCLI(t, fakeEnv(fc), "admin", "products")
+		if code != 0 {
+			t.Fatalf("exit = %d, want 0", code)
+		}
+		assertNoTerminalControl(t, "admin products", out)
+		for _, want := range []string{"Acme", "enabled", "ok"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("admin products lost %q: %q", want, out)
+			}
+		}
+		if n := len(strings.Split(strings.TrimRight(out, "\n"), "\n")); n != 2 {
+			t.Errorf("admin products rendered %d lines, want 2 (header + 1 row):\n%q", n, out)
+		}
+	})
+
 	t.Run("admin-users", func(t *testing.T) {
 		// An email is the last field anyone would think to sanitize, which is exactly why
 		// the boundary rather than a call-site audit is the fix.

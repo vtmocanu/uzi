@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/re
 import { MemoryRouter } from "react-router-dom";
 import { CliTokens } from "./CliTokens";
 import { api, type CliToken, type User } from "../lib/api";
+import { ApiError } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 
 vi.mock("../lib/api", async (importActual) => {
@@ -172,6 +173,44 @@ describe("CliTokens mint is show-once", () => {
   });
 });
 
+describe("CliTokens show-once panel is retired with its token", () => {
+  const SECRET = "uzc_showoncesecret01";
+
+  async function mintLaptop() {
+    mockApi.createCliToken.mockResolvedValue({ token: SECRET, cli_token: aToken({ id: "new", name: "laptop" }) });
+    renderPage();
+    fireEvent.change(await screen.findByPlaceholderText(/laptop, ci-runner/), { target: { value: "laptop" } });
+    // The reload after the mint lists the new row.
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "new", name: "laptop" })] });
+    fireEvent.click(screen.getByRole("button", { name: "Create token" }));
+    // Positive first, so the absence asserted below is not vacuous.
+    expect(await screen.findByText(SECRET)).toBeTruthy();
+  }
+
+  it("drops the panel when that token is revoked", async () => {
+    await mintLaptop();
+    mockApi.revokeCliToken.mockResolvedValue(null);
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "new", name: "laptop", revoked: true })] });
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke" }));
+    await waitFor(() => expect(mockApi.revokeCliToken).toHaveBeenCalledWith("new"));
+    await waitFor(() => expect(screen.queryByText(SECRET)).toBeNull());
+    expect(screen.queryByText(/once and never again/i)).toBeNull();
+  });
+
+  it("drops the panel after a confirmed Revoke all", async () => {
+    await mintLaptop();
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "new", name: "laptop", revoked: true })] });
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    // Arming the confirm alone leaves the secret on screen.
+    expect(screen.getByText(SECRET)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+    await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText(SECRET)).toBeNull());
+    expect(screen.queryByText(/once and never again/i)).toBeNull();
+  });
+});
+
 describe("CliTokens revoke", () => {
   it("revokes a single token and reloads", async () => {
     mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "t9", name: "laptop" })] });
@@ -190,10 +229,62 @@ describe("CliTokens revoke", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
     // Does NOT revoke on the first click — it arms a confirmation.
     expect(mockApi.revokeAllCliTokens).not.toHaveBeenCalled();
-    expect(screen.getByRole("group", { name: /Confirm revoking all CLI tokens/ })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Confirm revoking all CLI and product tokens" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
     await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+  });
+
+  it("Revoke all names the product tokens it also revokes and tells the page to refresh them (PRD #1907 D8)", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "a" })] });
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    const onRevokedAll = vi.fn();
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={2} onRevokedAll={onRevokedAll} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/Revoke all 1 CLI token and 2 product tokens\?/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+    await waitFor(() => expect(onRevokedAll).toHaveBeenCalledTimes(1));
+    expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Revoke all when only product tokens are active", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [] });
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={1} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/Revoke all 1 product token\?/)).toBeTruthy();
+  });
+
+  it("keeps Revoke all when the product count is unknown, naming no product number", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "a" })] });
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={null} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke all 1 CLI token and every product token\?/)).toBeTruthy();
+  });
+
+  it("on a failed CLI load shows only the error and keeps Revoke all available", async () => {
+    mockApi.listCliTokens.mockRejectedValue(new ApiError(500, "database unavailable"));
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={0} />
+      </MemoryRouter>,
+    );
+    expect((await screen.findByRole("alert")).textContent).toBe("database unavailable");
+    expect(screen.queryByText("No CLI tokens yet")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke every CLI token\?/)).toBeTruthy();
   });
 
   it("hides Revoke all when there is nothing active to revoke", async () => {
