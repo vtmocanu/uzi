@@ -381,7 +381,12 @@ func (g *gitLab) CreateIssue(ctx context.Context, projectID int64, title, descri
 		l := gitlab.LabelOptions(labels)
 		opt.Labels = &l
 	}
-	i, resp, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx))
+	// Issue creation has no idempotency key. A retry after a 5xx can create a
+	// duplicate, and a later 4xx cannot prove the first POST was rejected.
+	i, resp, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx),
+		gitlab.WithRequestRetry(func(context.Context, *http.Response, error) (bool, error) {
+			return false, nil
+		}))
 	if err != nil {
 		wrapped := g.wrapErr("create issue", err)
 		if resp != nil && resp.Response != nil {

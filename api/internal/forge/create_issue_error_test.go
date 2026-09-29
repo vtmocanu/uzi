@@ -58,6 +58,36 @@ func TestCreateIssueDefinitiveRejection(t *testing.T) {
 	}
 }
 
+func TestGitLabCreateIssueDoesNotRetryAfterPossibleCreation(t *testing.T) {
+	posts := 0
+	created := 0
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("method = %s, want POST", r.Method)
+			}
+			posts++
+			if posts == 1 {
+				created++ // GitLab persisted the issue before reporting a server error.
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusUnprocessableEntity)
+		},
+	})
+	d := newTestDriver(t, m, "test-secret-value-123456")
+	_, err := d.CreateIssue(context.Background(), 7, "title", "body", nil)
+	if err == nil {
+		t.Fatal("expected create error")
+	}
+	if IsCreateIssueDefinitiveRejection(err) {
+		t.Fatalf("first POST may have created an issue: %v", err)
+	}
+	if posts != 1 || created != 1 {
+		t.Fatalf("POSTs = %d, issues created = %d; want one of each", posts, created)
+	}
+}
+
 func issueReject(status int, token string) http.HandlerFunc {
 	return func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
