@@ -124,6 +124,10 @@ async function drive(opts: {
   forge: "github" | "gitlab";
   body: (ctx: RunContext, gate: () => Promise<SecretRemediationDecision>, d: () => Drive) => Promise<void>;
   configure?: (g: GitCache) => void;
+  /** Runs on the runner instance right after construction (e.g. to stub a private method). */
+  configureRunner?: (r: RunRunner) => void;
+  /** Mutate the flight state just before each gate call (seed a floor the rig cannot reach). */
+  seedFlight?: (flight: Record<string, unknown>) => void;
 }): Promise<Drive> {
   const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: REAL }));
   let pushed = 0;
@@ -168,6 +172,16 @@ async function drive(opts: {
       checkpointIntervalMs: 60_000,
     },
   );
+  opts.configureRunner?.(runner);
+  if (opts.seedFlight) {
+    const seed = opts.seedFlight;
+    const r = runner as unknown as { runSecretRemediationGate: (f: Record<string, unknown>, ...rest: unknown[]) => unknown };
+    const origGate = r.runSecretRemediationGate.bind(runner);
+    r.runSecretRemediationGate = (f, ...rest) => {
+      seed(f);
+      return origGate(f, ...rest);
+    };
+  }
   const rec = (runner as unknown as { recovery: { pin: (a: { sourceSha: string; branch: string }) => Promise<unknown> } })
     .recovery;
   const origPin = rec.pin.bind(rec);
@@ -223,6 +237,8 @@ const publishedTipContains = (bare: string, tip: string, sha: string): boolean =
     return false;
   }
 };
+
+let floorTip = "";
 
 describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
   it("(a) a flagged final commit above the floor is remediated by a fixup rewrite, then the run completes with a push", { skip }, async () => {
@@ -363,6 +379,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         assert.equal((await gate()).action, "remediate");
         assert.equal((await gate()).action, "fail");
         assert.equal((await gate()).action, "fail", "stays failed");
+        await ctx.checkpoint!({ reap: true }); // the done checkpoint must publish nothing
       },
     });
     const failed = d.failed();
@@ -530,6 +547,138 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.equal(d.pub.count(), 1, "the milestone published through the unscanned overlay");
     assert.ok(!d.statuses().some((t) => /returning to the lead/.test(t)), "no remediation turn");
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.equal(d.pushes(), 0);
+  });
+
+  it("(k) any forge: a still-alive agent that resets back to the flagged commit after a clean rescan cannot ship it", { skip }, async () => {
+    for (const forge of ["gitlab", "github"] as const) {
+      const decisions: SecretRemediationDecision[] = [];
+      const d = await drive({
+        iid: forge === "gitlab" ? 1932_215 : 1932_216,
+        forge,
+        body: async (ctx, gate) => {
+          const w = ctx.worktreePath;
+          const flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+          decisions.push(await gate());
+          fixupAndAutosquash(w, flagged, "cfg.env", "TOKEN=\n");
+          decisions.push(await gate()); // clean: cleanTip recorded
+          gitIn(w, ["reset", "-q", "--hard", flagged]); // the agent is still alive and moves the tip back
+        },
+      });
+      assert.deepEqual(decisions.map((x) => x.action), ["remediate", "proceed"], forge);
+      assert.equal(d.failed()?.fail_origin, "push_secret_blocked", forge);
+      assert.match(d.failed()?.failure_reason ?? "", /\(rule github-pat\)/, forge);
+      assert.equal(d.failed()?.preserved_patch, undefined, forge);
+      assert.equal(d.pushes(), 0, forge);
+      assert.ok(d.pins.length >= 1, "recovery pin kept");
+    }
+  });
+
+  it("(l) any forge: a finding at a floor (not remediable) fails at finalize, including off GitHub", { skip }, async () => {
+    const d = await drive({
+      iid: 1932_217,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        const flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        const b = commitIn(w, "b.txt", "b\n");
+        await ctx.checkpoint!({ reap: false }); // fetch-back only: B lands in the bare
+        gitIn(w, ["reset", "-q", "--hard", flagged]);
+        commitIn(w, "c.txt", "c\n");
+        floorTip = b;
+        assert.equal((await gate()).action, "proceed");
+      },
+      seedFlight: (f) => {
+        f.checkpointFloor = floorTip;
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.equal(d.pushes(), 0);
+    assert.equal(d.failed()?.preserved_patch, undefined);
+  });
+
+  it("(m) a trusted finding then a rescan whose fetch-back fails fails terminally (tip-equality guards)", { skip }, async () => {
+    let failFetch = false;
+    const d = await drive({
+      iid: 1932_218,
+      forge: "gitlab",
+      configureRunner: (r) => {
+        const rr = r as unknown as { fetchBackBestEffort: (...a: unknown[]) => Promise<boolean> };
+        const orig = rr.fetchBackBestEffort.bind(r);
+        rr.fetchBackBestEffort = async (...a) => (failFetch ? false : orig(...a));
+      },
+      body: async (ctx, gate) => {
+        const flagged = commitIn(ctx.worktreePath, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(ctx.worktreePath, flagged, "cfg.env", "TOKEN=\n");
+        failFetch = true; // the bare tracking ref still lags at the flagged commit
+        assert.equal((await gate()).action, "fail");
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.equal(d.pushes(), 0);
+  });
+
+  for (const [label, key] of [
+    ["publishedTip", "publishedTip"],
+    ["lastAttemptedCheckpointRefTip", "lastAttemptedCheckpointRefTip"],
+    ["lastCheckpointRefTip", "lastCheckpointRefTip"],
+  ] as const) {
+    it(`(n) a finding reachable from ${label} is not remediated and fails at finalize`, { skip }, async () => {
+      const decisions: SecretRemediationDecision[] = [];
+      let floorSha = "";
+      const d = await drive({
+        iid: 1932_220 + ["publishedTip", "lastAttemptedCheckpointRefTip", "lastCheckpointRefTip"].indexOf(key),
+        forge: "gitlab",
+        body: async (ctx, gate) => {
+          const w = ctx.worktreePath;
+          const flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+          floorSha = commitIn(w, "b.txt", "b\n");
+          await ctx.checkpoint!({ reap: false }); // fetch-back only: the floor commit lands in the bare
+          gitIn(w, ["reset", "-q", "--hard", flagged]);
+          commitIn(w, "c.txt", "c\n");
+          decisions.push(await gate());
+        },
+        seedFlight: (f) => {
+          f[key] = floorSha;
+        },
+      });
+      assert.deepEqual(decisions.map((x) => x.action), ["proceed"]);
+      assert.ok(!d.statuses().some((t) => /returning to the lead/.test(t)), "no remediation turn");
+      assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+      assert.equal(d.pushes(), 0);
+    });
+  }
+
+  it("(o) a reap:false publish during a remediation turn is held by the known clause", { skip }, async () => {
+    const d = await drive({
+      iid: 1932_223,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        commitIn(w, "more.txt", "m\n");
+        await ctx.checkpoint!({ reap: false }); // everKnown-only would not hold a reap:false publish
+      },
+    });
+    assert.ok(d.statuses().some((t) => /checkpoint publish skipped: secret_remediation_pending/.test(t)), JSON.stringify(d.statuses()));
+    assert.equal(d.pub.count(), 0);
+  });
+
+  it("(p) the GitHub finalize scan withholds a secret-shaped filename gitleaks flags in the path list", { skip }, async () => {
+    const name = "heroku_api_key" + "=" + "aaaa1111-bbbb-2222-cccc-3333dddd4444" + ".env";
+    const d = await drive({
+      iid: 1932_224,
+      forge: "github",
+      body: async (ctx) => {
+        commitIn(ctx.worktreePath, name, `TOKEN=${runtimeSecret()}\n`);
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.match(d.failed()?.failure_reason ?? "", /\[path withheld\]/);
+    const all = d.everything();
+    assert.ok(!all.includes("aaaa1111-bbbb-2222-cccc-3333dddd4444"), "filename absent from reason, feed and log");
     assert.equal(d.pushes(), 0);
   });
 
