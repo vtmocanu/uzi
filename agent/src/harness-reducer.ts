@@ -87,7 +87,10 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         // issue #1562: thread the adapter's fresh-session verdict so the persisted
         // init frame gains `fresh_session: true` when the SDK did not continue the
         // requested session. Codex leaves it undefined (unflagged).
-        reduction.messages.push(projectInit(event.model, event.freshSession));
+        // issue #1888: only the COUNT of plugin load errors reaches the persisted frame.
+        reduction.messages.push(
+          projectInit(event.model, event.freshSession, event.pluginErrors?.length),
+        );
         break;
       case "frame":
         this.acceptFrame(event, reduction);

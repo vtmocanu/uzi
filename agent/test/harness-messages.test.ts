@@ -111,3 +111,15 @@ describe("projectInit fresh_session marker (issue #1562)", () => {
     assert.deepStrictEqual(Object.keys(em.payload), ["event", "model", "fresh_session"]);
   });
 });
+
+describe("projectInit plugin_error_count (issue #1888)", () => {
+  it("omits plugin_error_count when no count or a zero count is given", () => {
+    assert.ok(!("plugin_error_count" in projectInit("m").payload));
+    assert.ok(!("plugin_error_count" in projectInit("m", undefined, 0).payload));
+  });
+
+  it("appends plugin_error_count: N (and no error text) when N > 0", () => {
+    const em = projectInit("m", true, 2);
+    assert.deepStrictEqual(em.payload, { event: "init", model: "m", fresh_session: true, plugin_error_count: 2 });
+  });
+});

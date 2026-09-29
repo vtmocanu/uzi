@@ -13,6 +13,7 @@
 import type { Readable, Writable } from "node:stream";
 import type { EmittedMessage } from "./executor.js";
 import type { PrSummaryClaim } from "./signals.js";
+import type { PluginLoadError } from "./plugin-errors.js";
 import type {
   AskUserQuestion,
   Milestone,
@@ -213,7 +214,14 @@ export type HarnessEvent = HarnessEventMeta &
     // continue the requested session (no resume requested, or the init session_id
     // differed). Threaded to projectInit so the persisted init frame gains
     // `fresh_session: true`. Optional and absent on a Codex init (unflagged).
-    | { kind: "initialized"; model?: string; freshSession?: boolean }
+    // issue #1888: `pluginErrors` carries the init frame's decoded `plugin_errors`
+    // (parsePluginErrors, fail-closed); the key is omitted when none were reported.
+    | {
+        kind: "initialized";
+        model?: string;
+        freshSession?: boolean;
+        pluginErrors?: readonly PluginLoadError[];
+      }
     | {
         kind: "frame";
         origin: HarnessOrigin;

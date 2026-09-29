@@ -52,6 +52,7 @@ import {
 } from "./limit.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { ASYNC_DEFERRAL_TOOLS } from "./guardrails.js";
+import { parsePluginErrors } from "./plugin-errors.js";
 import type {
   HarnessContext,
   HarnessContextHook,
@@ -420,10 +421,13 @@ export class ClaudeHarness implements RunHarness {
       } else if (sessionId !== undefined && sessionId !== requested) {
         freshSession = true;
       }
+      // issue #1888: decode plugin load errors fail-closed; omit the key when none.
+      const pluginErrors = parsePluginErrors(rec["plugin_errors"]);
       return {
         kind: "initialized",
         model: asString(rec["model"]),
         freshSession,
+        ...(pluginErrors !== undefined ? { pluginErrors } : {}),
         sessionId,
         orphanInstanceFrameKind,
       };

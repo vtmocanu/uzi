@@ -148,6 +148,7 @@ import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
+import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -769,7 +770,9 @@ class DataVolumeWaitShutdown extends Error {
  *  throwers emit (provision-run appends `: <detail>` after REASON_PROVISION_FAILED;
  *  sdk-executor throws REASON_NO_TOKEN verbatim), and, by EXACT match, the static
  *  REASON_PLAN_MISSING both executors throw for a planning turn that stayed prose-only
- *  (issue #1593). Ordinary agent failures return undefined, so `fail_origin` is omitted
+ *  (issue #1593). Two more `<reason>: ` prefixes map as well: worker_residue_blocked
+ *  (issue #1783) and skills_plugin_load_failed (issue #1888, the sdk-executor trip for a
+ *  skills run whose plugin failed to load). Ordinary agent failures return undefined, so `fail_origin` is omitted
  *  and the server defaults them to 'agent_failure'. Sent unvalidated; the server
  *  allowlists it. */
 export function failOriginForReason(rawReason: string): string | undefined {
@@ -778,6 +781,8 @@ export function failOriginForReason(rawReason: string): string | undefined {
   if (rawReason === REASON_PLAN_MISSING) return "plan_missing";
   // issue #1783: RunResidueBlockedError and (M3) CloneResidueBlockedError both open with this prefix.
   if (rawReason.startsWith(`${REASON_WORKER_RESIDUE_BLOCKED}: `)) return "worker_residue_blocked";
+  // issue #1888: sdk-executor trips a skills run whose skills plugin reported load errors.
+  if (rawReason.startsWith(`${REASON_SKILLS_PLUGIN_LOAD_FAILED}: `)) return "skills_plugin_load_failed";
   return undefined;
 }
 
