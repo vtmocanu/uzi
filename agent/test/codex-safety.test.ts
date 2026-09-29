@@ -19,7 +19,7 @@ import {
   type RegisteredRoot,
   type RootKind,
 } from "../src/codex/registry.js";
-import type { BoundaryPermit, BoundaryRequest } from "../src/harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundaryStep } from "../src/harness.js";
 
 // PRD #1171 (M3 m1, first unit) — the CodexExecutionSafety facade and the trusted
 // boundary-action lane. All process work is injected; nothing real is spawned.
@@ -833,6 +833,100 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
     });
     assert.equal(await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 60_000 }, async () => 7), 7);
     assert.equal(cancels, 1);
+  });
+
+  // Issue #1900: the deadline records the caller's active step when it fires, not later.
+  const firedBoundaryError = async (
+    epoch: number,
+    activeStep: BoundaryRequest["activeStep"],
+  ): Promise<CodexBoundaryError> => {
+    let fire: (() => void) | undefined;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(epoch)), {
+      ...timerFreeSeams(epoch),
+      armDeadline: (_request, _ms, f) => {
+        fire = f;
+        return () => {};
+      },
+    });
+    let caught: unknown;
+    try {
+      await safety.withBoundary(
+        { boundary: "finalize", deadlineMs: 60_000, ...(activeStep !== undefined ? { activeStep } : {}) },
+        async (permit) => {
+          fire?.();
+          await awaitAbort(permit.signal);
+          // A second fire after the abort must not re-read the probe.
+          fire?.();
+        },
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof CodexBoundaryError, `expected CodexBoundaryError, got ${String(caught)}`);
+    return caught;
+  };
+  const NO_STEP_DIAGNOSTIC = "codex boundary failed at action (finalize): codex boundary action deadline exceeded";
+
+  it("names the step active when the deadline fired, not the step the action moved on to", async () => {
+    let current: BoundaryStep = "base_align";
+    let fire: (() => void) | undefined;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(44)), {
+      ...timerFreeSeams(44),
+      armDeadline: (_request, _ms, f) => {
+        fire = f;
+        return () => {};
+      },
+    });
+    let caught: unknown;
+    try {
+      await safety.withBoundary({ boundary: "finalize", deadlineMs: 60_000, activeStep: () => current }, async (permit) => {
+        fire?.();
+        current = "push";
+        await awaitAbort(permit.signal);
+        fire?.(); // a later fire is ignored: only the first one counts
+      });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof CodexBoundaryError);
+    assert.equal(caught.stage, "action");
+    assert.equal(caught.step, "base_align");
+    assert.equal(
+      caught.diagnostic,
+      "codex boundary failed at action (finalize) during base-align: codex boundary action deadline exceeded during base-align",
+    );
+    assert.ok(!caught.diagnostic.includes("during push"), caught.diagnostic);
+    assert.deepEqual(
+      caught.errors.map((e) => e.message),
+      ["codex boundary action deadline exceeded during base-align"],
+    );
+  });
+
+  it("with no probe the deadline diagnostic is unchanged", async () => {
+    const e = await firedBoundaryError(45, undefined);
+    assert.equal(e.step, undefined);
+    assert.equal(e.diagnostic, NO_STEP_DIAGNOSTIC);
+    assert.equal(e.message, "codex boundary failed at action");
+    assert.deepEqual(
+      e.errors.map((x) => x.message),
+      ["codex boundary action deadline exceeded"],
+    );
+  });
+
+  it("a probe that throws or returns an unknown step leaves the diagnostic unchanged", async () => {
+    const baseline = await firedBoundaryError(46, undefined);
+    const throwing = await firedBoundaryError(47, () => {
+      throw new Error("probe exploded");
+    });
+    const unknown = await firedBoundaryError(48, () => "__proto__" as unknown as "push");
+    const bogus = await firedBoundaryError(49, () => "not_a_step" as unknown as "push");
+    for (const e of [throwing, unknown, bogus]) {
+      assert.equal(e.step, undefined);
+      assert.equal(e.diagnostic, baseline.diagnostic);
+      assert.equal(e.diagnostic, NO_STEP_DIAGNOSTIC);
+      assert.equal(e.message, baseline.message);
+      assert.deepEqual(e.errors, baseline.errors);
+    }
   });
 });
 

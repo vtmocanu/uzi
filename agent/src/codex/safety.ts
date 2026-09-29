@@ -21,6 +21,7 @@ import type {
   BoundaryProcessRequest,
   BoundaryRequest,
   BoundarySink,
+  BoundaryStep,
   ChildQuiescence,
   CodexExecutionSafety,
   HarnessError,
@@ -132,6 +133,36 @@ const SINK_LABELS: Record<BoundarySink, string> = {
   milestone_checkpoint: "milestone checkpoint",
   done_checkpoint: "done checkpoint",
 };
+/** Issue #1900: the diagnostic label of each finalize step a deadline can fire during. */
+const STEP_LABELS: Record<BoundaryStep, string> = {
+  run_quiescence: "run-quiescence",
+  fetch_back: "fetch-back",
+  default_fetch: "default-fetch",
+  secret_scan: "secret-scan",
+  base_align: "base-align",
+  push: "push",
+  completion_permit: "completion-permit",
+  pr_description_prepare: "pr-description-prepare",
+  mr_create: "mr-create",
+  post_mr: "post-mr",
+};
+
+function isBoundaryStep(value: unknown): value is BoundaryStep {
+  return typeof value === "string" && Object.hasOwn(STEP_LABELS, value);
+}
+
+/** Issue #1900: read the caller's active-step probe. A missing probe, a probe that throws or
+ *  one that returns anything but a known step yields undefined, so the diagnostic stays as it
+ *  was without a step. */
+function readStep(request: BoundaryRequest): BoundaryStep | undefined {
+  let value: unknown;
+  try {
+    value = request.activeStep?.();
+  } catch {
+    return undefined;
+  }
+  return isBoundaryStep(value) ? value : undefined;
+}
 
 function capChars(text: string, max: number): string {
   return text.length <= max ? text : `${text.slice(0, max - 1)}\u2026`;
@@ -171,6 +202,7 @@ function boundaryDiagnostic(
   actionError: unknown,
   boundary: SafeBoundary | undefined,
   sink: BoundarySink | undefined,
+  step: BoundaryStep | undefined,
 ): string {
   const label =
     sink !== undefined && Object.hasOwn(SINK_LABELS, sink)
@@ -185,7 +217,11 @@ function boundaryDiagnostic(
     parts.push(`action error: ${name === "unknown" ? "Error" : name}`);
   }
   const details = parts.length > 0 ? parts.join("; ") : "no detail";
-  const head = `codex boundary failed at ${stage}${label !== undefined ? ` (${label})` : ""}`;
+  // Issue #1900: the step goes in the head, so the error cap below can never hide it.
+  const stepLabel = isBoundaryStep(step) ? STEP_LABELS[step] : undefined;
+  const head =
+    `codex boundary failed at ${stage}${label !== undefined ? ` (${label})` : ""}` +
+    `${stepLabel !== undefined ? ` during ${stepLabel}` : ""}`;
   return capChars(`${head}: ${details}`, CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS);
 }
 
@@ -206,6 +242,9 @@ export class CodexBoundaryError extends Error {
   /** Issue #1864: the boundary and the checkpoint sink that requested it, when known. */
   readonly boundary?: SafeBoundary;
   readonly sink?: BoundarySink;
+  /** Issue #1900: the finalize step that was active when the boundary deadline fired, when
+   *  the caller reported one. Set only on an `action`-stage deadline failure. */
+  readonly step?: BoundaryStep;
   /** Issue #1864: a one-line, secret-free summary of this failure, at most
    *  {@link CODEX_BOUNDARY_DIAGNOSTIC_MAX_CHARS} UTF-16 code units, containing no code point in
    *  Unicode general category Cc, Cf, Zl or Zp (see `DIAGNOSTIC_CONTROL`). `message` stays the bare
@@ -216,7 +255,7 @@ export class CodexBoundaryError extends Error {
     readonly errors: readonly HarnessError[],
     actionError?: unknown,
     deferral?: "vault_locked",
-    context?: { boundary?: SafeBoundary; sink?: BoundarySink },
+    context?: { boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep },
   ) {
     super(
       `codex boundary failed at ${stage}`,
@@ -227,7 +266,8 @@ export class CodexBoundaryError extends Error {
     if (deferral !== undefined) this.deferral = deferral;
     if (context?.boundary !== undefined) this.boundary = context.boundary;
     if (context?.sink !== undefined) this.sink = context.sink;
-    this.diagnostic = boundaryDiagnostic(stage, errors, actionError, context?.boundary, context?.sink);
+    if (context?.step !== undefined) this.step = context.step;
+    this.diagnostic = boundaryDiagnostic(stage, errors, actionError, context?.boundary, context?.sink, context?.step);
   }
 }
 
@@ -363,7 +403,13 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       this.registry.poison(errors);
       throw new CodexBoundaryError("quiesce", errors, undefined, undefined, where);
     }
-    const cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(request, atEntry, () => boundaryAbort.abort());
+    // Issue #1900: record the caller's active step at fire time, before the abort lets the
+    // action move on to another step. Only the first fire counts.
+    let firedStep: BoundaryStep | undefined;
+    const cancelDeadline = (this.seams.armDeadline ?? defaultArmDeadline)(request, atEntry, () => {
+      if (!boundaryAbort.signal.aborted) firedStep = readStep(request);
+      boundaryAbort.abort();
+    });
     const requireRemaining = (stage: "reconcile" | "quiesce" | "reap"): void => {
       if (!boundaryAbort.signal.aborted && remainingMs(deadlineAt) > 0) return;
       const errors: readonly HarnessError[] = [{ category: "timeout", message: `codex boundary deadline expired after ${stage}` }];
@@ -459,7 +505,13 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     this.heldPermit = undefined;
 
     if (boundaryAbort.signal.aborted) {
-      this.registry.poison({ category: "timeout", message: "codex boundary action deadline exceeded" });
+      this.registry.poison({
+        category: "timeout",
+        message:
+          firedStep !== undefined
+            ? `codex boundary action deadline exceeded during ${STEP_LABELS[firedStep]}`
+            : "codex boundary action deadline exceeded",
+      });
     }
 
     if (this.registry.state() === "poisoned") {
@@ -473,7 +525,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         this.registry.poisonErrors(),
         outcome.ok ? undefined : outcome.error,
         undefined,
-        where,
+        firedStep !== undefined ? { ...where, step: firedStep } : where,
       );
     }
     if (!outcome.ok) throw outcome.error;

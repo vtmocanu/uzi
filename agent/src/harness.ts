@@ -300,11 +300,29 @@ export type SafeBoundary =
  *  changes what the boundary does. */
 export type BoundarySink = "milestone_checkpoint" | "done_checkpoint";
 
+/** Issue #1900: the finalize publish's steps, as the caller reports them to a boundary.
+ *  Diagnostic only: it names the step that was active when the boundary deadline fired and
+ *  never changes what the boundary does. */
+export type BoundaryStep =
+  | "run_quiescence"
+  | "fetch_back"
+  | "default_fetch"
+  | "secret_scan"
+  | "base_align"
+  | "push"
+  | "completion_permit"
+  | "pr_description_prepare"
+  | "mr_create"
+  | "post_mr";
+
 export interface BoundaryRequest {
   boundary: SafeBoundary;
   deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
   /** Issue #1864: optional diagnostic label of the sink that requested this boundary. */
   sink?: BoundarySink;
+  /** Issue #1900: optional probe of the caller's active step. Diagnostic only: the safety
+   *  owner reads it synchronously when the boundary deadline fires, to name that step. */
+  activeStep?: () => BoundaryStep | undefined;
 }
 
 export type ChildQuiescence =
