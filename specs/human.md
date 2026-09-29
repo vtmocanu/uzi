@@ -996,6 +996,7 @@ Tracked as GitHub issue vtmocanu/uzi#1809; PRD at `prds/1809-worker-disk-safety.
 Tracked as GitHub issue vtmocanu/uzi#1864.
 
 - A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
+- A Codex run's finalize publish runs under its own finite boundary deadline sized for the full publish (push, PR description, merge request), not the 30 s checkpoint deadline; a finalize deadline failure names the finalize step that was running when it fired, and the worker logs each finalize step's duration. (AI-synced 2026-09-29)
 
 ## Startup admin seed
 

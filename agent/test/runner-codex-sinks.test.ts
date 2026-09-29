@@ -31,6 +31,7 @@ import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
 import type { BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { GitLabClient } from "../src/forge.js";
+import type { SummaryRunner } from "../src/summary-runner.js";
 import { RequestError } from "../src/client.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 import { FakeRecoveryClient, FakeRecoveryGit, makeRecoveryCoordinator } from "./codex-reap-fixture.js";
@@ -2236,5 +2237,208 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     assert.equal(rig.refreshCalls(), 1, "no refreshCodex after the deferral");
     assert.deepEqual(rig.boundaries, ["finalize"], "no terminal boundary was opened for a reap");
     assert.equal(archive.releaseCalls.length, 0, "the custody hold is never released");
+  });
+});
+
+// ================================================================================
+// Issue #1900: the Codex finalize boundary runs under its own finite deadline sized for the full
+// publish, and a finalize deadline failure names the finalize step that was running when it fired.
+describe("RunRunner #1900 — the Codex finalize boundary deadline and its named steps", () => {
+  const FINALIZE_DEFAULT_MS = 50 * 60_000;
+
+  /** A virtual clock for the finalize boundary deadline: records every `ms` the finalize arm
+   *  receives and fires only when `advance` moves the virtual clock to the armed instant. Every
+   *  other boundary keeps a real unref'd timer, as in production. */
+  function virtualFinalizeDeadline(): {
+    armDeadline: ArmBoundaryDeadline;
+    armedMs: number[];
+    fired: () => number;
+    advance: (ms: number) => void;
+  } {
+    let now = 0;
+    let fired = 0;
+    const armedMs: number[] = [];
+    let pending: { at: number; fire: () => void } | undefined;
+    const armDeadline: ArmBoundaryDeadline = (request, ms, fireDeadline) => {
+      if (request.boundary !== "finalize") {
+        const timer = setTimeout(fireDeadline, ms);
+        timer.unref?.();
+        return () => clearTimeout(timer);
+      }
+      armedMs.push(ms);
+      const entry = { at: now + ms, fire: fireDeadline };
+      pending = entry;
+      return () => {
+        if (pending === entry) pending = undefined;
+      };
+    };
+    return {
+      armDeadline,
+      armedMs,
+      fired: () => fired,
+      advance: (ms) => {
+        now += ms;
+        if (pending && now >= pending.at) {
+          const { fire } = pending;
+          pending = undefined;
+          fired += 1;
+          fire();
+        }
+      },
+    };
+  }
+
+  /** A fake editor pass: a deadline in the future (so the publisher calls it) and a
+   *  `generateDeliverySummary` that runs `during` and falls back to the lead's claims. */
+  function fakeSummaryRunner(during: () => void): { runner: SummaryRunner; calls: () => number } {
+    let calls = 0;
+    const runner = {
+      deliverySummaryDeadline: () => Date.now() + 60_000,
+      generateDeliverySummary: async () => {
+        calls += 1;
+        during();
+        return null;
+      },
+    } as unknown as SummaryRunner;
+    return { runner, calls: () => calls };
+  }
+
+  function originBranchTip(iid: number): string | null {
+    try {
+      return execFileSync(
+        "git",
+        ["-C", fx.originPath, "rev-parse", "--verify", `refs/heads/agent/issue-${iid}`],
+        { env: GIT_ENV, encoding: "utf8", stdio: ["pipe", "pipe", "pipe"] },
+      ).trim();
+    } catch {
+      return null;
+    }
+  }
+
+  function failedReasons(runId: string): string[] {
+    return api.states
+      .filter((st) => st.runId === runId && st.body.status === "failed")
+      .map((st) => String(st.body.failure_reason));
+  }
+
+  it("a 31 s PR-description editor pass completes under the default finalize deadline (regression)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const clock = virtualFinalizeDeadline();
+    const pass = fakeSummaryRunner(() => clock.advance(31_000));
+    const rig = codexRig({ armDeadline: clock.armDeadline });
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "SLOW-PASS.txt", "a slow editor pass\n");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1900);
+    // Default deadlines: neither codexBoundaryDeadlineMs nor the finalize override is passed.
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
+      summaryRunner: pass.runner,
+    }).execute(claim);
+
+    assert.equal(pass.calls(), 1, "the editor pass ran (and advanced the virtual clock 31 s)");
+    assert.deepEqual(failedReasons(claim.run_id), [], "no failure was reported");
+    assert.equal(clock.armedMs.length, 1, "the finalize deadline was armed once");
+    assert.equal(clock.fired(), 0, "the finalize deadline did not fire during a 31 s editor pass");
+    assert.equal(calls.length, 1, "the MR was created");
+    assert.ok(originBranchTip(1900), "the branch was pushed");
+    assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
+  });
+
+  it("a finalize deadline failure names the step running when it fired, not the step the action moved on to", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const deadline = manualDeadline("finalize");
+    const pass = fakeSummaryRunner(() => deadline.fire());
+    const rig = codexRig({ armDeadline: deadline.armDeadline });
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "NAMED-STEP.txt", "deadline during prepare\n");
+      return { branch: ctx.branch };
+    });
+    const { logger, lines } = recordingLogger();
+    const claim = gitlabClaim(1901);
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger, {
+      summaryRunner: pass.runner,
+    }).execute(claim);
+
+    assert.equal(pass.calls(), 1, "the editor pass ran and fired the deadline");
+    assert.equal(deadline.fired(), 1, "the finalize deadline fired once");
+    assert.equal(calls.length, 0, "the aborted createMergeRequest opened no MR");
+    const stepLines = lines.filter((l) => (l as { msg?: string }).msg === "finalize step") as Record<string, unknown>[];
+    assert.ok(stepLines.some((l) => l.step === "mr_create"), "the action moved on into mr_create after the fire");
+    const reasons = failedReasons(claim.run_id);
+    assert.equal(reasons.length, 1, `the run failed once; got ${JSON.stringify(reasons)}`);
+    assert.match(reasons[0]!, /codex boundary failed at action \(finalize\)/);
+    assert.ok(reasons[0]!.includes("during pr-description-prepare"), `names the step; got ${reasons[0]}`);
+    assert.ok(!reasons[0]!.includes("during mr-create"), `does not name the later step; got ${reasons[0]}`);
+    const detail = lines.find((l) => (l as { msg?: string }).msg === "codex boundary failed") as Record<string, unknown> | undefined;
+    assert.equal(detail?.step, "pr_description_prepare", "the structured boundary line carries the step");
+    assert.equal(detail?.boundary, "finalize");
+    assert.equal(detail?.stage, "action");
+  });
+
+  for (const override of [undefined, 123_456] as const) {
+    it(`routes ${override === undefined ? "the default finalize deadline" : "the finalize override"} to finalize and codexBoundaryDeadlineMs to checkpoint`, async () => {
+      assert.notEqual(FINALIZE_DEFAULT_MS, 30_000, "the finalize deadline differs from the 30 s default");
+      const armed: { boundary: string; ms: number }[] = [];
+      const armDeadline: ArmBoundaryDeadline = (request, ms, fireDeadline) => {
+        armed.push({ boundary: request.boundary, ms });
+        const timer = setTimeout(fireDeadline, ms);
+        timer.unref?.();
+        return () => clearTimeout(timer);
+      };
+      const { gitlab } = fakeGitlab();
+      const rig = codexRig({ armDeadline });
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        commitInTree(ctx.worktreePath, "ROUTE.txt", "milestone 1\n");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+        return { branch: ctx.branch };
+      });
+      const claim = gitlabClaim(override === undefined ? 1902 : 1903);
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined,
+        override === undefined ? {} : { codexFinalizeBoundaryDeadlineMs: override }).execute(claim);
+
+      const finalize = armed.filter((a) => a.boundary === "finalize");
+      const checkpoint = armed.filter((a) => a.boundary === "checkpoint");
+      assert.equal(finalize.length, 1, `finalize armed once; got ${JSON.stringify(armed)}`);
+      assert.ok(checkpoint.length >= 1, `checkpoint armed; got ${JSON.stringify(armed)}`);
+      const expected = override ?? FINALIZE_DEFAULT_MS;
+      // The arm receives the remaining budget at action entry: at most the deadline, and within a
+      // generous slack of it (the acquire runs on real time).
+      assert.ok(finalize[0]!.ms <= expected && finalize[0]!.ms > expected - 20_000,
+        `finalize armed with ~${expected} ms; got ${finalize[0]!.ms}`);
+      for (const c of checkpoint) {
+        assert.ok(c.ms <= 30_000 && c.ms > 10_000, `checkpoint armed with ~30000 ms; got ${c.ms}`);
+      }
+      assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
+    });
+  }
+
+  it("a successful Codex finalize logs each finalize step with its duration", async () => {
+    const { gitlab } = fakeGitlab();
+    const rig = codexRig();
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "STEPS.txt", "step logging\n");
+      return { branch: ctx.branch };
+    });
+    const { logger, lines } = recordingLogger();
+    const claim = gitlabClaim(1904);
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
+    const stepLines = lines.filter((l) => (l as { msg?: string }).msg === "finalize step") as Record<string, unknown>[];
+    const steps = stepLines.map((l) => l.step);
+    for (const step of ["run_quiescence", "fetch_back", "push", "pr_description_prepare", "mr_create", "post_mr"]) {
+      assert.ok(steps.includes(step), `logged ${step}; got ${JSON.stringify(steps)}`);
+    }
+    assert.equal(new Set(steps).size, steps.length, "each step is logged once");
+    for (const l of stepLines) {
+      assert.equal(l.level, "info");
+      assert.equal(typeof l.durationMs, "number");
+      assert.ok((l.durationMs as number) >= 0);
+    }
+    const last = stepLines.at(-1)!;
+    assert.equal(last.step, "post_mr", "the last step is closed at the end of finalize");
+    assert.equal(last.outcome, "ok", "the last step carries the finalize outcome");
+    assert.ok(stepLines.slice(0, -1).every((l) => l.outcome === undefined), "only the last step carries an outcome");
   });
 });

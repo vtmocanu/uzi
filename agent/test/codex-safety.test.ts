@@ -880,6 +880,10 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
     let caught: unknown;
     try {
       await safety.withBoundary({ boundary: "finalize", deadlineMs: 60_000, activeStep: () => current }, async (permit) => {
+        // Pins read-before-abort: a probe read after the abort would already see "push".
+        permit.signal.addEventListener("abort", () => {
+          current = "push";
+        });
         fire?.();
         current = "push";
         await awaitAbort(permit.signal);
@@ -900,6 +904,34 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
       caught.errors.map((e) => e.message),
       ["codex boundary action deadline exceeded during base-align"],
     );
+  });
+
+  it("names the fired step and the action error's name, never its message, when the action throws", async () => {
+    let current: BoundaryStep = "base_align";
+    let fire: (() => void) | undefined;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(50)), {
+      ...timerFreeSeams(50),
+      armDeadline: (_request, _ms, f) => {
+        fire = f;
+        return () => {};
+      },
+    });
+    let caught: unknown;
+    try {
+      await safety.withBoundary({ boundary: "finalize", deadlineMs: 60_000, activeStep: () => current }, async () => {
+        fire?.();
+        current = "push";
+        throw new Error("secret-ish detail");
+      });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof CodexBoundaryError);
+    assert.equal(caught.step, "base_align");
+    assert.ok(caught.diagnostic.includes("during base-align"), caught.diagnostic);
+    assert.ok(caught.diagnostic.includes("action error: Error"), caught.diagnostic);
+    assert.ok(!caught.diagnostic.includes("secret-ish"), caught.diagnostic);
+    assert.ok(!caught.diagnostic.includes("during push"), caught.diagnostic);
   });
 
   it("with no probe the deadline diagnostic is unchanged", async () => {

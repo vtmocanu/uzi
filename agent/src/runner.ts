@@ -15,7 +15,7 @@ import {
 import type { SecretFinding } from "./secret-scan-guard.js";
 import type { CredentialFreeSettleOutcome, Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
-import type { BoundaryPermit, BoundaryRequest, BoundarySink, SafeBoundary } from "./harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
 import {
@@ -246,6 +246,33 @@ const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
   "checkpoint", "park", "shutdown", "terminal", "finalize", "credentialed_git",
 ]);
 const CODEX_BOUNDARY_SINKS: ReadonlySet<BoundarySink> = new Set<BoundarySink>(["milestone_checkpoint", "done_checkpoint"]);
+/** Issue #1900: the closed set of finalize steps a CodexBoundaryError `step` may name. */
+const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
+  "run_quiescence", "fetch_back", "default_fetch", "secret_scan", "base_align", "push",
+  "completion_permit", "pr_description_prepare", "mr_create", "post_mr",
+]);
+
+/** Issue #1900: the finite deadline (ms) of the Codex FINALIZE boundary. The finalize publish
+ *  runs the whole push / PR-description / merge-request sequence under one held permit, so the
+ *  30 s checkpoint deadline (`codexBoundaryDeadlineMs`) is far too small for it. Derivation, one
+ *  modelled slow-but-healthy finalize:
+ *  - queue wait behind at most one earlier boundary (deadlineAt fixed before `await prior`): 30 s
+ *  - boundary acquire: reconcile (one HTTP, 30 s) + registry quiesce and reap: 60 s
+ *  - finalize run-quiescence Docker teardown (teardownDocker 15 s + 5 s request): 20 s
+ *  - git path: fetch/align stage + push stage, each allowed one op stalling to GIT_TIMEOUT_MS
+ *    (10 min): 1200 s. A MODELLED bound, not a strict worst case: repeated push timeouts or
+ *    more stalled ops could exceed it; exceeding it is the typed, step-named failure.
+ *  - completion permit (DEFAULT_PERMIT_RETRY_BUDGET_MS): 600 s
+ *  - PR-description prepare (FORGE_BUDGET_MS 60 s + editor pass 60 s default
+ *    SUMMARY_MODEL_TIMEOUT_MS): 120 s
+ *  - createMergeRequest: 6 attempts x (30 s HTTP + 30 s findOpenMr on a GitHub duplicate 422)
+ *    + 31 s FORGE_RETRY_SCHEDULE backoff: 391 s
+ *  - PR-description publish (60 s + 60 s): 120 s
+ *  - post-MR interlock reads and reconcile: ~120 s
+ *  Sum ~2661 s, rounded up to 50 min. Bounded, never unbounded (PRD #1171). Park, checkpoint,
+ *  shutdown and terminal boundaries stay on `codexBoundaryDeadlineMs` (park publishes only a
+ *  checkpoint). */
+const CODEX_FINALIZE_BOUNDARY_DEADLINE_MS = 50 * 60_000;
 
 /** Issue #1864: a code point a CodexBoundaryError `diagnostic` must not contain: Unicode general
  *  category Cc (C0, DEL, C1), Cf (every format character: zero-width, bidi, soft hyphen, word
@@ -276,15 +303,53 @@ function codexBoundaryDiagnosticField(err: unknown, redact: (text: string) => st
 
 /** Issue #1864: the structured fields of a CodexBoundaryError, each kept only when it is one of
  *  the closed set of values the harness can produce. */
-function codexBoundaryFieldsOf(err: unknown): { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink } {
-  const e = err as { stage?: unknown; boundary?: unknown; sink?: unknown };
-  const out: { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink } = {};
+function codexBoundaryFieldsOf(
+  err: unknown,
+): { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep } {
+  const e = err as { stage?: unknown; boundary?: unknown; sink?: unknown; step?: unknown };
+  const out: { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep } = {};
   if (typeof e.stage === "string" && CODEX_BOUNDARY_STAGES.has(e.stage)) out.stage = e.stage;
   if (typeof e.boundary === "string" && CODEX_BOUNDARY_NAMES.has(e.boundary as SafeBoundary)) {
     out.boundary = e.boundary as SafeBoundary;
   }
   if (typeof e.sink === "string" && CODEX_BOUNDARY_SINKS.has(e.sink as BoundarySink)) out.sink = e.sink as BoundarySink;
+  if (typeof e.step === "string" && CODEX_BOUNDARY_STEPS.has(e.step as BoundaryStep)) out.step = e.step as BoundaryStep;
   return out;
+}
+
+/** Issue #1900: tracks which finalize step is running, so a Codex finalize deadline failure can
+ *  name it (read through `BoundaryRequest.activeStep`) and every run logs each step's duration.
+ *  `enter` closes the previous step with an info line; `end` closes the last one with the
+ *  finalize outcome, after which `current()` is undefined. */
+class FinalizeStepTracker {
+  private active: { step: BoundaryStep; startedAt: number } | undefined;
+
+  constructor(
+    private readonly log: Logger,
+    private readonly now: () => number,
+  ) {}
+
+  enter(step: BoundaryStep): void {
+    this.close();
+    this.active = { step, startedAt: this.now() };
+  }
+
+  current(): BoundaryStep | undefined {
+    return this.active?.step;
+  }
+
+  end(outcome: "ok" | "failed"): void {
+    this.close(outcome);
+  }
+
+  private close(outcome?: "ok" | "failed"): void {
+    const active = this.active;
+    if (!active) return;
+    this.active = undefined;
+    const fields: Record<string, unknown> = { step: active.step, durationMs: this.now() - active.startedAt };
+    if (outcome) fields.outcome = outcome;
+    this.log.info("finalize step", fields);
+  }
 }
 
 /** Issue #1766: the harness-agnostic probe for a Codex credential DEFERRAL. A locked owner vault
@@ -1447,8 +1512,12 @@ export interface RunnerOptions {
   recoveryRetryMs?: number;
   /** PRD #1171 m4: the bounded absolute deadline (ms) for a Codex durability-sink
    *  `withBoundary` (quiesce → reap → action). NEVER unbounded. Default 30s. Only used when the
-   *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. */
+   *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
+   *  boundary uses its own deadline (`codexFinalizeBoundaryDeadlineMs`, issue #1900). */
   codexBoundaryDeadlineMs?: number;
+  /** Issue #1900 (test-only): overrides CODEX_FINALIZE_BOUNDARY_DEADLINE_MS, the finite deadline
+   *  of the Codex finalize boundary. A 0/negative value falls back to the default. */
+  codexFinalizeBoundaryDeadlineMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
@@ -1622,6 +1691,7 @@ export class RunRunner {
   private readonly recoveryRetryMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
+  private readonly codexFinalizeBoundaryDeadlineMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
@@ -1803,6 +1873,10 @@ export class RunRunner {
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
+    this.codexFinalizeBoundaryDeadlineMs =
+      opts.codexFinalizeBoundaryDeadlineMs && opts.codexFinalizeBoundaryDeadlineMs > 0
+        ? opts.codexFinalizeBoundaryDeadlineMs
+        : CODEX_FINALIZE_BOUNDARY_DEADLINE_MS;
     this.now = opts.now ?? (() => Date.now());
     const realTimer = (cb: () => void, ms: number): (() => void) => {
       const t = setTimeout(cb, ms);
@@ -2186,19 +2260,33 @@ export class RunRunner {
         // is a plain call, so this path is unchanged for them.
         await this.phasePublish(claim, flight, undefined, undefined);
       } else {
+        // Issue #1900: the finalize step tracker names the step a deadline fired in and logs
+        // each step's duration (Claude/stub runs get the logging only).
+        const finalizeSteps = new FinalizeStepTracker(runLog, this.now);
         try {
-          await this.withCodexBoundaryOnly(
-            executor,
-            { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
-            (permit) => this.phasePublish(
-              claim,
-              flight,
-              permit?.signal,
-              executor.safety
-                ? (report) => { postFinalizeTerminal = report; }
-                : undefined,
-            ),
-          );
+          let finalizeOutcome: "ok" | "failed" = "failed";
+          try {
+            await this.withCodexBoundaryOnly(
+              executor,
+              {
+                boundary: "finalize",
+                deadlineMs: this.codexFinalizeBoundaryDeadlineMs,
+                activeStep: () => finalizeSteps.current(),
+              },
+              (permit) => this.phasePublish(
+                claim,
+                flight,
+                permit?.signal,
+                executor.safety
+                  ? (report) => { postFinalizeTerminal = report; }
+                  : undefined,
+                finalizeSteps,
+              ),
+            );
+            finalizeOutcome = "ok";
+          } finally {
+            finalizeSteps.end(finalizeOutcome);
+          }
         } catch (err) {
           if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
           runLog.warn(
@@ -4076,6 +4164,7 @@ export class RunRunner {
     flight: RunFlight,
     boundarySignal?: AbortSignal,
     deferCommittedTerminal?: (report: () => Promise<void>) => void,
+    steps?: FinalizeStepTracker,
   ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
     // PRD #1296 M3 — the source pinned at the finalization boundary (set below, after the
@@ -4282,6 +4371,7 @@ export class RunRunner {
     // `survivors` or `unverified` fails the run with the typed fail_origin `worker_residue_blocked`
     // and keeps the clone. The branch-local killAgentTree calls below stay as they were; they are
     // now idempotent re-reaps of an already-reaped tree.
+    steps?.enter("run_quiescence");
     const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
     if (finalizeQuiescence.blocked) {
       flight.preserveRecoveryClone = true;
@@ -4395,6 +4485,7 @@ export class RunRunner {
     // and it brings the agent's objects into the worker bare so the push does not
     // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
     // changedFiles read; the runner clone is never a git source for either.
+    steps?.enter("fetch_back");
     const trackingRef = await this.git.fetchAgentBranch(
       barePath,
       runnerClone.path,
@@ -4761,6 +4852,7 @@ export class RunRunner {
       const wfBarePath = barePath;
       // Fetch before the precheck so commit classification sees the current default tip.
       try {
+        steps?.enter("default_fetch");
         const defaultBranch = claim.repo.default_branch?.trim() ||
           (await this.git.defaultBranchName(wfBarePath)) || "main";
         freshDefaultTip = await this.git.fetchDefaultTip(
@@ -4857,6 +4949,7 @@ export class RunRunner {
     // real secret. GitHub-only: GitLab/Forgejo have no equivalent push-side secret rejection.
     if (claim.repo.forge_type === "github") {
       const scanBarePath = barePath;
+      steps?.enter("secret_scan");
       const scan = await this.git.secretScanRange(scanBarePath, trackingRef, result.branch, {
         pat: claim.secrets.forge_pat,
         cloneUrl: claim.repo.clone_url,
@@ -5147,6 +5240,7 @@ export class RunRunner {
     // OUTSIDE this try so the plain-push block below still sees `alignPushed`.
     try {
       if (claim.repo.forge_type === "github") {
+        steps?.enter("base_align");
         const alignBarePath = barePath;
         const alignDefaultBranch =
           claim.repo.default_branch?.trim() ||
@@ -5580,6 +5674,7 @@ export class RunRunner {
     // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
     // successful align-push and the normal push converge here without ever double-pushing.
     if (!alignPushed) {
+      steps?.enter("push");
       // PRD #1416 M3 (C3): non-destructively bridge a divergent tracking tip so the plain push
       // fast-forwards. On "bridged" the tracking ref now points at B (P is an ancestor of B), so
       // pushToOrigin pushes B. "clean"/"unknown" proceed unchanged. PRD #1416 M4: on "failed" the
@@ -5788,6 +5883,7 @@ export class RunRunner {
       //    finalize) is retried inside the client until the api answers, bounded by its retry budget
       //    and cancelled with the flight; only a permanent error, a cancel, or an exhausted budget
       //    throws to the generic catch, which fails the run without falsely completing.
+      steps?.enter("completion_permit");
       const permit = await this.client.requestCompletionPermit(
         runId,
         {
@@ -5910,6 +6006,7 @@ export class RunRunner {
     // Step 1: context + editor pass + stage, before createMergeRequest (D2). Never throws; every
     // failure falls down the D8 ladder. The size line is computed per snapshot, so a regeneration for
     // the PR's actual target (read back after create) recomputes it against that target.
+    steps?.enter("pr_description_prepare");
     const description = await publisher.prepare(
       {
         runId,
@@ -5981,6 +6078,7 @@ export class RunRunner {
     // transient findOpenMr failure after a duplicate POST would otherwise fail a run
     // whose MR actually exists; retrying the whole call re-runs it instead. Create
     // failures stay fatal. Step 2: a new PR is created with the final body.
+    steps?.enter("mr_create");
     const mr = await withForgeRetry(
       () =>
         forge.createMergeRequest({
@@ -6001,6 +6099,7 @@ export class RunRunner {
     // Steps 3-9: read, bind, revalidate, write, confirm, ack. Advisory: never throws, never fails or
     // holds the run. For an interlocked run it writes the NON-closing creation completion block; the
     // interlock below then owns that block.
+    steps?.enter("post_mr");
     const published = await description.publish(mr.iid);
     // uzi's own region: what a whole-body rewrite below writes (never text read back from the forge).
     const ownRegion = published.region;
