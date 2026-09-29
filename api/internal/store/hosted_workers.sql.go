@@ -654,12 +654,19 @@ WHERE w.ephemeral
 //	    run is profile-bound, so ClaimRun's isolated-lane clause bars it from the run forever
 //	    (and it holds the run's one uq_workers_ephemeral_run slot, which would starve the right
 //	    trigger). No deadline: it can never make progress, so it goes on the next tick.
-//	(e) lane worker without the lane protocol (PRD #1906 M5): an isolated_lane worker that has
-//	    registered (online_since set; register writes protocol_capabilities in the same UPDATE)
-//	    but does not advertise 'isolated_fetch_v1' (an old image, or a fetcher env it could not
-//	    load). ClaimRun's lane clause requires that capability, so it can never claim its bound
-//	    run, yet it holds the run's uq_workers_ephemeral_run slot and one per-user slot. No
-//	    deadline, like (d); the busy and custody guards above still apply.
+//	(e) lane worker without the lane protocol (PRD #1906 M5): an isolated_lane worker that is
+//	    online (online_since set) but does not advertise 'isolated_fetch_v1' (an old image, or a
+//	    fetcher env it could not load). ClaimRun's lane clause requires that capability, so it
+//	    can never claim its bound run, yet it holds the run's uq_workers_ephemeral_run slot and
+//	    one per-user slot. No deadline, like (d); the busy and custody guards above still apply.
+//	    online_since stands in for "has registered" ONLY because the agent registers before it
+//	    heartbeats: RegisterWorker writes protocol_capabilities in the same UPDATE that stamps
+//	    online_since, but HeartbeatWorker also stamps online_since and never writes the
+//	    capabilities, so a worker that heartbeated first would be reaped here with the column
+//	    still at its '{}' default. agent/src/worker.ts awaits registerWithRetry before it starts
+//	    heartbeatLoop; keep that order, or key this arm on a column only register writes. (The
+//	    register nonce, snapshot_register_nonce, is not one: an older image sends none, and
+//	    that is the image this arm exists to reap.)
 func (q *Queries) ReapEphemeralWorkers(ctx context.Context, deadlineCutoff pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, reapEphemeralWorkers, deadlineCutoff)
 	if err != nil {

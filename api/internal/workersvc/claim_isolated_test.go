@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
@@ -116,6 +117,62 @@ func TestRunOwnedByWorkerPurposeCheck(t *testing.T) {
 			t.Errorf("%s: RunOwnership = %q, %d, %v; want the owned run", name, status, gen, err)
 		case !tc.owned && !errors.Is(err, ErrRunNotOwned):
 			t.Errorf("%s: RunOwnership = %q, %v; want ErrRunNotOwned", name, status, err)
+		}
+	}
+}
+
+// lanePrDescQueries answers lockPrDescRun's row lock with a fixed run; every other
+// PrDescQueries method is the nil embedded interface, so a call past the fence panics.
+type lanePrDescQueries struct {
+	PrDescQueries
+	run store.Run
+}
+
+func (q lanePrDescQueries) GetRunOwnedByWorkerForUpdate(context.Context, store.GetRunOwnedByWorkerForUpdateParams) (store.Run, error) {
+	return q.run, nil
+}
+
+// PRD #1906 M5 (Decision D-D): the PR-description fence (stage, bind, ack) is not preceded by
+// runOwnedByWorker, so lockPrDescRun applies the lane purpose check itself: a mismatched
+// run/worker pair is not owned, an agreeing pair passes the fence.
+func TestLockPrDescRunLanePurposeCheck(t *testing.T) {
+	bound := pgtype.UUID{Bytes: uuid.New(), Valid: true}
+	for name, tc := range map[string]struct {
+		bound, lane, owned bool
+	}{
+		"bound run, lane worker":       {bound: true, lane: true, owned: true},
+		"unbound run, ordinary worker": {bound: false, lane: false, owned: true},
+		"bound run, ordinary worker":   {bound: true, lane: false, owned: false},
+		"unbound run, lane worker":     {bound: false, lane: true, owned: false},
+	} {
+		wkr := store.Worker{ID: uuid.New(), UserID: uuid.New(), IsolatedLane: tc.lane}
+		run := store.Run{ID: uuid.New(), UserID: wkr.UserID, Kind: runkind.Issue, Status: "running", ClaimGeneration: 3,
+			RepoID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}
+		if tc.bound {
+			run.EgressProfileID = bound
+		}
+		_, err := lockPrDescRun(context.Background(), lanePrDescQueries{run: run}, wkr, run.ID, 3)
+		switch {
+		case tc.owned && err != nil:
+			t.Errorf("%s: lockPrDescRun = %v, want the fence passed", name, err)
+		case !tc.owned && !errors.Is(err, ErrRunNotOwned):
+			t.Errorf("%s: lockPrDescRun = %v, want ErrRunNotOwned", name, err)
+		}
+	}
+}
+
+// PRD #1906 M5 (Decision D-D): a chat run is never profile-bound, so a lane worker's chat
+// claim is idle before ClaimChatRun runs; an ordinary worker still reaches the claim query.
+func TestClaimChatLaneWorkerIdle(t *testing.T) {
+	for name, lane := range map[string]bool{"lane worker": true, "ordinary worker": false} {
+		fs := &fakeStore{chatClaimErr: pgx.ErrNoRows}
+		s := New(fs, nil, testParams())
+		p, err := s.ClaimChat(context.Background(), store.Worker{ID: uuid.New(), UserID: uuid.New(), IsolatedLane: lane})
+		if p != nil || err != nil {
+			t.Fatalf("%s: ClaimChat = %+v, %v; want idle", name, p, err)
+		}
+		if reached := fs.chatClaimParams != nil; reached == lane {
+			t.Errorf("%s: ClaimChatRun reached = %v, want %v", name, reached, !lane)
 		}
 	}
 }

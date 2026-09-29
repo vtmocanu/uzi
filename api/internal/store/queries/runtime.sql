@@ -4873,6 +4873,9 @@ WITH authorized AS (
       AND r.worker_id = @worker_id
       AND r.claim_released_at IS NULL
       AND r.claim_generation = @claim_generation
+      -- PRD #1906 M5 (Decision D-D): the isolated-lane purpose check runOwnedByWorker applies,
+      -- in this same statement: a run and worker on different sides of the lane are not owned.
+      AND ((r.egress_profile_id IS NOT NULL) = @worker_isolated_lane::boolean)
 ),
 present AS (
     SELECT m.seq FROM run_messages m
@@ -6170,8 +6173,10 @@ ORDER BY id ASC
 LIMIT 1000;
 
 -- name: LockRunForInputReceipt :one
+-- egress_profile_id rides this lock (PRD #1906 M5, Decision D-D) so inputReceipt applies the
+-- same isolated-lane purpose check as runOwnedByWorker before it returns any input body.
 SELECT id, status, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
-       credential_switch_generation
+       credential_switch_generation, egress_profile_id
 FROM runs WHERE id = @run_id FOR UPDATE;
 
 -- name: ListInputReceiptRows :many

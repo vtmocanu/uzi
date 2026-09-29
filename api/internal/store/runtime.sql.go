@@ -9352,7 +9352,7 @@ func (q *Queries) LockOwnedRunsByIDs(ctx context.Context, arg LockOwnedRunsByIDs
 
 const lockRunForInputReceipt = `-- name: LockRunForInputReceipt :one
 SELECT id, status, worker_id, claim_generation, claim_released_at, credential_switch_requested_at,
-       credential_switch_generation
+       credential_switch_generation, egress_profile_id
 FROM runs WHERE id = $1 FOR UPDATE
 `
 
@@ -9364,8 +9364,11 @@ type LockRunForInputReceiptRow struct {
 	ClaimReleasedAt             pgtype.Timestamptz `json:"claim_released_at"`
 	CredentialSwitchRequestedAt pgtype.Timestamptz `json:"credential_switch_requested_at"`
 	CredentialSwitchGeneration  pgtype.Int8        `json:"credential_switch_generation"`
+	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
 }
 
+// egress_profile_id rides this lock (PRD #1906 M5, Decision D-D) so inputReceipt applies the
+// same isolated-lane purpose check as runOwnedByWorker before it returns any input body.
 func (q *Queries) LockRunForInputReceipt(ctx context.Context, runID uuid.UUID) (LockRunForInputReceiptRow, error) {
 	row := q.db.QueryRow(ctx, lockRunForInputReceipt, runID)
 	var i LockRunForInputReceiptRow
@@ -9377,6 +9380,7 @@ func (q *Queries) LockRunForInputReceipt(ctx context.Context, runID uuid.UUID) (
 		&i.ClaimReleasedAt,
 		&i.CredentialSwitchRequestedAt,
 		&i.CredentialSwitchGeneration,
+		&i.EgressProfileID,
 	)
 	return i, err
 }
@@ -12339,25 +12343,28 @@ WITH authorized AS (
       AND r.worker_id = $2
       AND r.claim_released_at IS NULL
       AND r.claim_generation = $3
+      -- PRD #1906 M5 (Decision D-D): the isolated-lane purpose check runOwnedByWorker applies,
+      -- in this same statement: a run and worker on different sides of the lane are not owned.
+      AND ((r.egress_profile_id IS NOT NULL) = $4::boolean)
 ),
 present AS (
     SELECT m.seq FROM run_messages m
     CROSS JOIN authorized
-    WHERE m.run_id = $1 AND m.seq BETWEEN 1 AND $4::int AND m.seq >= $5::int
+    WHERE m.run_id = $1 AND m.seq BETWEEN 1 AND $5::int AND m.seq >= $6::int
     UNION ALL
-    SELECT ($4::int) + 1 FROM authorized
+    SELECT ($5::int) + 1 FROM authorized
 ),
 edges AS (
     SELECT seq AS closer,
-           COALESCE(LAG(seq) OVER (ORDER BY seq), $5::int) AS prev
+           COALESCE(LAG(seq) OVER (ORDER BY seq), $6::int) AS prev
     FROM present
 ),
 gaps AS (
     SELECT (prev + 1)::int AS gap_first, (closer - 1)::int AS gap_last, closer::int AS next_cursor
     FROM edges
-    WHERE closer - prev > 1 AND closer > $5::int
+    WHERE closer - prev > 1 AND closer > $6::int
     ORDER BY closer ASC
-    LIMIT $6::int
+    LIMIT $7::int
 )
 SELECT gaps.gap_first, gaps.gap_last, gaps.next_cursor
 FROM authorized
@@ -12366,12 +12373,13 @@ ORDER BY gaps.next_cursor ASC NULLS LAST
 `
 
 type RunMessageGapsParams struct {
-	RunID           uuid.UUID   `json:"run_id"`
-	WorkerID        pgtype.UUID `json:"worker_id"`
-	ClaimGeneration int64       `json:"claim_generation"`
-	Through         int32       `json:"through"`
-	Cursor          int32       `json:"cursor"`
-	Lim             int32       `json:"lim"`
+	RunID              uuid.UUID   `json:"run_id"`
+	WorkerID           pgtype.UUID `json:"worker_id"`
+	ClaimGeneration    int64       `json:"claim_generation"`
+	WorkerIsolatedLane bool        `json:"worker_isolated_lane"`
+	Through            int32       `json:"through"`
+	Cursor             int32       `json:"cursor"`
+	Lim                int32       `json:"lim"`
 }
 
 type RunMessageGapsRow struct {
@@ -12408,6 +12416,7 @@ func (q *Queries) RunMessageGaps(ctx context.Context, arg RunMessageGapsParams) 
 		arg.RunID,
 		arg.WorkerID,
 		arg.ClaimGeneration,
+		arg.WorkerIsolatedLane,
 		arg.Through,
 		arg.Cursor,
 		arg.Lim,

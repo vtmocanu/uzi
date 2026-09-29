@@ -957,13 +957,6 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	return reasonWaitingWorker
 }
 
-// capabilityAwareOn reads the capability-aware scheduling kill-switch, nil-safe and
-// DEFAULTING ON (a nil reader — tests, or a deployment without a settings cache — or a
-// read error both leave it true), IDENTICALLY to the claim path in service.go. A run
-// the claim gate is fencing for want of an eligible worker must surface its
-// capability-specific reason in exactly the flag state that fencing happens in; a
-// different fail direction here would report "no eligible worker" for a run the fleet
-// is in fact claiming best-effort (flag off), or hide it for a run being fenced.
 // isolatedLaneReason is queuedReason's rung for a profile-bound run, which only an
 // api-provisioned lane worker can claim. It names the two blocks no lane worker will ever
 // clear before the generic wait: a docker requirement (the lane has no DinD sidecar) and the
@@ -985,6 +978,13 @@ func (s *Service) isolatedLaneReason(ctx context.Context, r store.ListActiveRuns
 	return reasonWaitingIsolatedLane
 }
 
+// capabilityAwareOn reads the capability-aware scheduling kill-switch, nil-safe and
+// DEFAULTING ON (a nil reader — tests, or a deployment without a settings cache — or a
+// read error both leave it true), IDENTICALLY to the claim path in service.go. A run
+// the claim gate is fencing for want of an eligible worker must surface its
+// capability-specific reason in exactly the flag state that fencing happens in; a
+// different fail direction here would report "no eligible worker" for a run the fleet
+// is in fact claiming best-effort (flag off), or hide it for a run being fenced.
 func (s *Service) capabilityAwareOn(ctx context.Context) bool {
 	if s.capabilitySettings == nil {
 		return true
