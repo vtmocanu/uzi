@@ -73,7 +73,7 @@ func TestReleaseFindingGroupOrReportReturnsRecoveryID(t *testing.T) {
 	op := uuid.New()
 	w := httptest.NewRecorder()
 	called := false
-	if releaseFindingGroupOrReport(w, op, []string{"member"}, "pre_call", func() bool {
+	if releaseFindingGroupOrReport(w, op, []string{"member"}, func() bool {
 		called = true
 		return false
 	}) {

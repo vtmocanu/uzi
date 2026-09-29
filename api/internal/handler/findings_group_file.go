@@ -73,9 +73,7 @@ func composeFiledFindingGroup(parts []groupDraftPart, edited *string, operation 
 	if edited != nil {
 		userText := *edited
 		previewRoster := issuedraft.SanitizeFiledBody(roster.String())
-		if strings.HasPrefix(userText, previewRoster) {
-			userText = strings.TrimPrefix(userText, previewRoster)
-		}
+		userText = strings.TrimPrefix(userText, previewRoster)
 		body += "\n## Description\n\n" + termsafe.SanitizeTTY(userText)
 	} else {
 		_, defaultBody := composeFindingGroupDraft(parts)
@@ -139,7 +137,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	for _, member := range members {
 		finding, e := h.q.GetIncidentalFinding(ctx, store.GetIncidentalFindingParams{ID: member.FindingID, UserID: user.ID})
 		if e != nil {
-			if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+			if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 				return
 			}
 			slog.Error("file finding group: evidence", "error", e)
@@ -154,7 +152,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 		title = issuedraft.SanitizeTitle(termsafe.SanitizeTTY(*req.Title))
 	}
 	if title == "" {
-		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
 		httpx.Error(w, http.StatusBadRequest, "title must be non-empty")
@@ -162,7 +160,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	description, fits := composeFiledFindingGroup(parts, req.Description, op.ID)
 	if !fits {
-		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
 		httpx.Error(w, http.StatusBadRequest, "description is too large")
@@ -170,7 +168,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	marker, err := h.settings.FindingLabel(ctx)
 	if err != nil {
-		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
 		slog.Error("file finding group: marker", "error", err)
@@ -179,7 +177,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	repo, err := h.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: op.RepoID, UserID: user.ID})
 	if err != nil {
-		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
 		slog.Error("file finding group: repo", "error", err)
@@ -188,7 +186,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 	}
 	f, err := h.svc.ForgeForConnection(repo.ForgeType, repo.BaseUrl, repo.TokenCiphertext)
 	if err != nil {
-		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
 		slog.Error("file finding group: forge connection", "error", err)
@@ -206,7 +204,7 @@ func (h *Handler) FileFindingGroup(w http.ResponseWriter, r *http.Request) {
 			writeStoppedFindingGroup(w, op.ID, dispositionIDs, "pre_call")
 			return
 		}
-		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, "pre_call", release) {
+		if !releaseFindingGroupOrReport(w, op.ID, dispositionIDs, release) {
 			return
 		}
 		httpx.Error(w, http.StatusBadGateway, "could not ensure the finding label on the forge: "+err.Error())
@@ -273,11 +271,11 @@ func writeStoppedFindingGroup(w http.ResponseWriter, operation uuid.UUID, ids []
 	})
 }
 
-func releaseFindingGroupOrReport(w http.ResponseWriter, operation uuid.UUID, ids []string, phase string, release func() bool) bool {
+func releaseFindingGroupOrReport(w http.ResponseWriter, operation uuid.UUID, ids []string, release func() bool) bool {
 	if release() {
 		return true
 	}
-	writeStoppedFindingGroup(w, operation, ids, phase)
+	writeStoppedFindingGroup(w, operation, ids, "pre_call")
 	return false
 }
 

@@ -65,6 +65,9 @@ func (db *pendingPageDB) Query(_ context.Context, _ string, args ...interface{})
 	}
 	var page []store.FindingGroupClaimOperation
 	for _, op := range db.ops {
+		if op.Phase == "settled" {
+			continue
+		}
 		if after != nil && !op.CreatedAt.After(*after) {
 			continue
 		}
@@ -218,6 +221,13 @@ func (db *markerPageDB) Exec(_ context.Context, _ string, args ...interface{}) (
 	db.iid = args[0].(int64)
 	db.url = args[1].(string)
 	db.recorded = args[2].(uuid.UUID)
+	for i := range db.ops {
+		if db.ops[i].ID == db.recorded {
+			db.ops[i].Phase = "issue_recorded"
+			db.ops[i].IssueIID = &db.iid
+			db.ops[i].IssueURL = db.url
+		}
+	}
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
@@ -248,6 +258,11 @@ func (tx *markerTx) Exec(_ context.Context, _ string, _ ...interface{}) (pgconn.
 }
 func (tx *markerTx) Commit(context.Context) error {
 	tx.db.settled = tx.db.recorded
+	for i := range tx.db.ops {
+		if tx.db.ops[i].ID == tx.db.recorded {
+			tx.db.ops[i].Phase = "settled"
+		}
+	}
 	return nil
 }
 func (tx *markerTx) Rollback(context.Context) error { return nil }
@@ -362,6 +377,9 @@ func TestIncrementalSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 		if err == nil || got != start || len(cache.upserts) != 0 {
 			t.Fatalf("pass %d: mark=%v error=%v writes=%d", pass, got, err, len(cache.upserts))
 		}
+	}
+	if db.ops[0].Phase != "issue_recorded" || db.candidateQueries != 1 {
+		t.Fatalf("second pass did not retry the durable record: phase=%s candidate queries=%d", db.ops[0].Phase, db.candidateQueries)
 	}
 	if _, advanced := svc.groupCursors[repo]; advanced {
 		t.Fatal("marker settlement failure advanced past the recorded operation")
