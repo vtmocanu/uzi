@@ -133,7 +133,7 @@ const SINK_LABELS: Record<BoundarySink, string> = {
   milestone_checkpoint: "milestone checkpoint",
   done_checkpoint: "done checkpoint",
 };
-/** Issue #1900: the diagnostic label of each finalize step a deadline can fire during. */
+/** Issues #1900 and #1914: fixed, secret-free deadline step labels. */
 const STEP_LABELS: Record<BoundaryStep, string> = {
   run_quiescence: "run-quiescence",
   fetch_back: "fetch-back",
@@ -145,6 +145,12 @@ const STEP_LABELS: Record<BoundaryStep, string> = {
   pr_description_prepare: "pr-description-prepare",
   mr_create: "mr-create",
   post_mr: "post-mr",
+  checkpoint_lock_wait: "checkpoint-lock-wait",
+  checkpoint_overlay: "checkpoint-overlay",
+  scratch_preflight: "scratch-preflight",
+  checkpoint_pack: "checkpoint-pack",
+  checkpoint_upload: "checkpoint-upload",
+  checkpoint_report: "checkpoint-report",
 };
 
 function isBoundaryStep(value: unknown): value is BoundaryStep {

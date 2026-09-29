@@ -10,7 +10,7 @@ import { pipeline } from "node:stream/promises";
 import { PassThrough, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
-import type { BoundaryProcessHandle, BoundaryProcessRequest } from "./harness.js";
+import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
 import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, uidSplitActive } from "./runner-uid.js";
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { withForgeRetry } from "./forge-retry.js";
@@ -166,6 +166,18 @@ export class ScratchPublicationError extends Error {
     super(`scratch_publication_refused: ${reason}`, { cause });
     this.name = "ScratchPublicationError";
   }
+}
+
+/** A permit deadline stopped Git work. Keep this distinct from a scratch finding. */
+class GitBoundaryAbortError extends Error {
+  constructor(cause?: unknown) {
+    super("permit-held git operation aborted", { cause });
+    this.name = "AbortError";
+  }
+}
+
+function isAbortLike(error: unknown): error is Error {
+  return error instanceof Error && error.name === "AbortError";
 }
 
 class RemoteBranchAdvancedError extends Error {
@@ -1315,6 +1327,8 @@ export class GitCache {
       if (touched.trim()) throw new Error(".uzi/scratch appears in candidate history");
       return candidate;
     } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError("cannot prove scratch-free candidate history", cause);
     }
@@ -1361,6 +1375,8 @@ export class GitCache {
       await this.scratchPublicationPreflight(barePath, branch, fresh);
       forwardAdvance = true;
     } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError("cannot verify fresh remote floor", cause);
     } finally {
@@ -3616,6 +3632,7 @@ export class GitCache {
     branch: string,
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<{ tipOid: string; pack: Readable } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
@@ -3624,13 +3641,16 @@ export class GitCache {
       if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs");
       }
+      onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
       let wanted = pinned.tipSha;
       if (overlay) {
-        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay) ?? wanted;
+        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay, onStep) ?? wanted;
+        onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
+      onStep?.("checkpoint_pack");
       const { stdout } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
@@ -3640,6 +3660,7 @@ export class GitCache {
     }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
+    onStep?.("scratch_preflight");
     await this.scratchPublicationPreflight(barePath, branch, realTip);
     // An unresolvable floor (e.g. no origin branch and a tip disjoint from the default, where
     // merge-base exits non-zero) is a range that cannot be established: refuse with the typed
@@ -3649,6 +3670,8 @@ export class GitCache {
       const excludeRef = await this.checkpointExcludeRef(barePath, branch, realTip);
       excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
     } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
       throw new ScratchPublicationError("checkpoint floor cannot be resolved", e);
     }
 
@@ -3656,16 +3679,17 @@ export class GitCache {
     // supplied (GitHub, agent already reaped — see runner.ts), attempt to build a genuine
     // fast-forward wrapper commit `O_ov` whose `.github/workflows` tree equals the default's,
     // and pack THAT instead of the raw tracking tip, so a branch behind `main` on those files
-    // is no longer rejected `workflow_scope` and checkpoints durably. FAIL-SOFT: on ANY error
-    // or gate-miss `buildWorkflowOverlay` returns null and we ship `realTip` — today's exact
-    // behaviour (→ the clean workflow-scope skip; #377 owns a workflow-MODIFYING branch at
-    // finalize). This method never throws for an overlay reason. When `overlay` is undefined
+    // is no longer rejected `workflow_scope` and checkpoints durably. An ordinary overlay error
+    // or gate-miss returns null and ships `realTip` (→ the clean workflow-scope skip; #377
+    // owns a workflow-MODIFYING branch at finalize). A boundary abort propagates instead:
+    // it cannot authorize a raw-tip fallback. When `overlay` is undefined
     // the block is skipped and `realTip` ships, byte-for-byte as before.
     let wantRev = realTip;
     if (overlay) {
-      const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay);
+      const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay, onStep);
       if (ov) {
         wantRev = ov;
+        onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wantRev);
       }
     }
@@ -3674,6 +3698,7 @@ export class GitCache {
     // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
+    onStep?.("checkpoint_pack");
     const { stdout } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
@@ -4087,8 +4112,8 @@ export class GitCache {
   /**
    * PRD #1062 M2 (#1036) — build the `.github/workflows` overlay wrapper commit `O_ov` for a
    * checkpoint, or return null to ship the raw `realTip` (today's behaviour). ALL work is
-   * FAIL-SOFT: every error resolves to null so `checkpointPack` never throws for an overlay
-   * reason, and every gate-miss ships `realTip`.
+   * FAIL-SOFT for ordinary overlay errors and gate misses: they return null and ship `realTip`.
+   * A boundary abort propagates and never turns into a raw-tip publish.
    *
    * The overlay is a transport wrapper the broker pushes UNCHANGED and adoption peels
    * (`runnerCloneForBranch`, `isOverlayMarker`): its `.github/workflows` subtree is swapped to
@@ -4109,25 +4134,31 @@ export class GitCache {
     branch: string,
     realTip: string,
     overlay: CheckpointOverlayContext,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<string | null> {
-    // GATE 1 — the default tip must resolve (a fresh authenticated fetch). A failure ships
-    // realTip: overlay durability is best-effort and never blocks the checkpoint.
+    // GATE 1 — the default tip must resolve (a fresh authenticated fetch). An ordinary
+    // failure ships realTip; a boundary abort propagates instead of authorizing fallback.
     let defaultTip: string;
     try {
+      onStep?.("checkpoint_lock_wait");
       defaultTip = await this.fetchDefaultTip(
         barePath,
         overlay.defaultBranch,
         overlay.pat,
         overlay.cloneUrl,
         overlay.username,
+        () => onStep?.("default_fetch"),
       );
     } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
       this.log.warn("checkpoint overlay: could not resolve the default tip — shipping realTip", {
         branch,
         error: gitErrorMessage(e),
       });
       return null;
     }
+    onStep?.("checkpoint_overlay");
     // GATE 2 — only a branch actually behind on `.github/workflows` needs an overlay (reuse
     // #627's exact trigger). Not behind ⇒ ship realTip (the broker accepts the raw tip).
     if (!(await this.workflowTreeDiffers(barePath, realTip, defaultTip))) return null;
@@ -4213,6 +4244,8 @@ export class GitCache {
       });
       return ovSha;
     } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
       this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
         branch,
         error: gitErrorMessage(e),
@@ -5248,9 +5281,11 @@ export class GitCache {
     pat?: string,
     cloneUrl?: string,
     username?: string,
+    onLockAcquired?: () => void,
   ): Promise<string> {
     const scope = cloneUrl ? httpScopeForUrl(cloneUrl) : undefined;
     return this.withLock(barePath, async () => {
+      onLockAcquired?.();
       await this.runGit(barePath, ["fetch", "origin", defaultBranch], pat, scope, username);
       // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
       // fetch updates the remote-tracking ref; read the fresh tip off it.
@@ -6291,6 +6326,13 @@ export class GitCache {
 
   // --- git subprocess plumbing -------------------------------------------------
 
+  /** A hard permit abort is not evidence that a candidate contains scratch files. */
+  private boundaryAbortError(cause: unknown): Error | undefined {
+    if (isAbortLike(cause)) return cause;
+    if (this.boundaryProcesses.getStore()?.signal.aborted) return new GitBoundaryAbortError(cause);
+    return undefined;
+  }
+
   private async execScoped(
     command: string,
     args: string[],
@@ -6366,11 +6408,19 @@ export class GitCache {
         if (boundary.signal.aborted) onAbort();
         else boundary.signal.addEventListener("abort", onAbort, { once: true });
       });
-    const [stdout, stderr, terminal] = await Promise.all([
-      collect(process.stdout),
-      collect(process.stderr),
-      process.completed,
-    ]);
+    let stdout: { chunks: Buffer[]; oversized: boolean };
+    let stderr: { chunks: Buffer[]; oversized: boolean };
+    let terminal: { readonly code: number };
+    try {
+      [stdout, stderr, terminal] = await Promise.all([
+        collect(process.stdout),
+        collect(process.stderr),
+        process.completed,
+      ]);
+    } catch (error) {
+      throw this.boundaryAbortError(error) ?? error;
+    }
+    if (boundary.signal.aborted) throw new GitBoundaryAbortError();
     const out = Buffer.concat(stdout.chunks).toString();
     const err = Buffer.concat(stderr.chunks).toString();
     if (stdout.oversized || stderr.oversized || terminal.code !== 0) {
@@ -6399,6 +6449,8 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
     }
   }
@@ -6426,6 +6478,8 @@ export class GitCache {
       });
       return stdout;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       throw new Error(`git ${args.join(" ")} failed: ${gitErrorMessage(err)}`);
     }
   }
@@ -6659,6 +6713,8 @@ export class GitCache {
       await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
       return typeof code === "number" ? code : 1;
     }
@@ -6675,6 +6731,8 @@ export class GitCache {
       await this.execScoped("git", withDir(cwd, args), { env: gitEnv(pat), timeout: GIT_TIMEOUT_MS });
       return 0;
     } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       const code = (err as { code?: unknown }).code;
       return typeof code === "number" ? code : null;
     }
@@ -6715,7 +6773,9 @@ export class GitCache {
     try {
       const { stdout } = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
       return stdout.trim();
-    } catch {
+    } catch (err) {
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
       return "";
     }
   }
@@ -6741,7 +6801,7 @@ export class GitCache {
       if (started || settled) return;
       settled = true;
       removeAbortListener();
-      rejectResult(new Error("permit-held git lock wait aborted: boundary deadline exceeded"));
+      rejectResult(new GitBoundaryAbortError());
     };
     if (scope) {
       removeAbortListener = (): void => scope.signal.removeEventListener("abort", abortBeforeAcquisition);

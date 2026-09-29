@@ -246,10 +246,12 @@ const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
   "checkpoint", "park", "shutdown", "terminal", "finalize", "credentialed_git",
 ]);
 const CODEX_BOUNDARY_SINKS: ReadonlySet<BoundarySink> = new Set<BoundarySink>(["milestone_checkpoint", "done_checkpoint"]);
-/** Issue #1900: the closed set of finalize steps a CodexBoundaryError `step` may name. */
+/** Issues #1900 and #1914: closed set of safe boundary step names. */
 const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
   "run_quiescence", "fetch_back", "default_fetch", "secret_scan", "base_align", "push",
   "completion_permit", "pr_description_prepare", "mr_create", "post_mr",
+  "checkpoint_lock_wait", "checkpoint_overlay", "scratch_preflight", "checkpoint_pack",
+  "checkpoint_upload", "checkpoint_report",
 ]);
 
 /** Issue #1900: the finite deadline (ms) of the Codex FINALIZE boundary. The finalize publish
@@ -317,16 +319,17 @@ function codexBoundaryFieldsOf(
   return out;
 }
 
-/** Issue #1900: tracks which finalize step is running, so a Codex finalize deadline failure can
- *  name it (read through `BoundaryRequest.activeStep`) and every run logs each step's duration.
+/** Issues #1900 and #1914: tracks a fixed boundary step so a deadline failure can name
+ *  it (read through `BoundaryRequest.activeStep`) and logs each step's duration.
  *  `enter` closes the previous step with an info line; `end` closes the last one with the
  *  finalize outcome, after which `current()` is undefined. */
-class FinalizeStepTracker {
+class BoundaryStepTracker {
   private active: { step: BoundaryStep; startedAt: number } | undefined;
 
   constructor(
     private readonly log: Logger,
     private readonly now: () => number,
+    private readonly event: "finalize step" | "checkpoint step",
   ) {}
 
   enter(step: BoundaryStep): void {
@@ -348,7 +351,7 @@ class FinalizeStepTracker {
     this.active = undefined;
     const fields: Record<string, unknown> = { step: active.step, durationMs: this.now() - active.startedAt };
     if (outcome) fields.outcome = outcome;
-    this.log.info("finalize step", fields);
+    this.log.info(this.event, fields);
   }
 }
 
@@ -2262,7 +2265,7 @@ export class RunRunner {
       } else {
         // Issue #1900: the finalize step tracker names the step a deadline fired in and logs
         // each step's duration (Claude/stub runs get the logging only).
-        const finalizeSteps = new FinalizeStepTracker(runLog, this.now);
+        const finalizeSteps = new BoundaryStepTracker(runLog, this.now, "finalize step");
         let finalizeFailed = false;
         let finalizeError: unknown;
         try {
@@ -4169,7 +4172,7 @@ export class RunRunner {
     flight: RunFlight,
     boundarySignal?: AbortSignal,
     deferCommittedTerminal?: (report: () => Promise<void>) => void,
-    steps?: FinalizeStepTracker,
+    steps?: BoundaryStepTracker,
   ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
     // PRD #1296 M3 — the source pinned at the finalization boundary (set below, after the
@@ -7462,6 +7465,7 @@ export class RunRunner {
       // `barePath` is the outer `let` (string | undefined); it is set before the run
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
+      const checkpointSteps = opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step") : undefined;
       // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
       // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
       // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
@@ -7493,11 +7497,13 @@ export class RunRunner {
         inPermit = false,
         noReport = false,
       ): Promise<void> => {
+        const trace = noReport ? undefined : checkpointSteps;
         // issue #1597 M2: a cancelled tick (quiescence, shutdown, a preempting sink) starts nothing.
         if (opts.signal?.aborted) {
           bodyOutcome = "aborted";
           return;
         }
+        trace?.enter("fetch_back");
         // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
         // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
         // iteration can become publish-eligible on a later tip-unmoved iteration).
@@ -7612,6 +7618,7 @@ export class RunRunner {
                 overlay,
                 opts.signal,
                 scanned.kind === "pinned" ? scanned.range : undefined,
+                trace ? (step) => trace.enter(step) : undefined,
               );
               published = outcome.published;
               bodyOutcome = outcome.published
@@ -7702,6 +7709,7 @@ export class RunRunner {
         // #267 Fix 2: emit ONLY on real activity (a fetch or a publish); stay silent on a
         // pure-idle checkpoint. issue #1597 M2: the mid-turn tick runs QUIET (no report).
         if (!opts.quiet && !noReport && (!tipUnmovedSinceFetch || published)) {
+          trace?.enter("checkpoint_report");
           // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
           // ordered behind any pending immediate `reportProgress` push.
           await enqueueRunningReport(() =>
@@ -7750,11 +7758,16 @@ export class RunRunner {
         // RunResidueBlockedError; every other error, the #1766 vault-locked deferral included,
         // still propagates.
         let residueBlocked = false;
+        let checkpointFailed = false;
         try {
           await this.reapForSink(
             executor,
-            { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: opts.sink },
+            {
+              boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: opts.sink,
+              activeStep: () => checkpointSteps?.current(),
+            },
             async (permit) => {
+              checkpointSteps?.enter("checkpoint_overlay");
               const midRunOverlay = hasNewWork
                 ? await this.buildCheckpointOverlay(claim, flight, barePath)
                 : undefined;
@@ -7764,6 +7777,7 @@ export class RunRunner {
             { keepClone: false },
           );
         } catch (err) {
+          checkpointFailed = !(err instanceof RunResidueBlockedError);
           if (!(err instanceof RunResidueBlockedError)) throw err;
           residueBlocked = true;
           bodyOutcome = "residue_blocked";
@@ -7771,6 +7785,8 @@ export class RunRunner {
             run_id: runId,
             error: errMessage(err),
           });
+        } finally {
+          checkpointSteps?.end(checkpointFailed ? "failed" : "ok");
         }
         // issue #1597 M2 (round 4): with NO mid-turn ticker running (CHECKPOINT_TICK_INTERVAL=0) a
         // publish deferred out of the Codex permit is made RIGHT HERE, after the permit has ended
@@ -9621,6 +9637,7 @@ export class RunRunner {
     signal?: AbortSignal,
     /** issue #1597 M2: the scanned range — pack exactly these SHAs (see GitCache.checkpointPack). */
     pinned?: CheckpointRange,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<PublishOutcome> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
@@ -9633,12 +9650,13 @@ export class RunRunner {
       // issue #1597 M2: `pinned` is passed only by the scanned (overlay-less) publish; every other
       // caller keeps the unpinned 3-argument call shape.
       const packed = pinned
-        ? await this.git.checkpointPack(barePath, branch, overlay, pinned)
-        : await this.git.checkpointPack(barePath, branch, overlay);
+        ? await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep)
+        : await this.git.checkpointPack(barePath, branch, overlay, undefined, onStep);
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
       packedTip = packed.tipOid;
+      onStep?.("checkpoint_upload");
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the

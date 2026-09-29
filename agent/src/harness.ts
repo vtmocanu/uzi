@@ -300,7 +300,7 @@ export type SafeBoundary =
  *  changes what the boundary does. */
 export type BoundarySink = "milestone_checkpoint" | "done_checkpoint";
 
-/** Issue #1900: the finalize publish's steps, as the caller reports them to a boundary.
+/** Issues #1900 and #1914: fixed finalize/checkpoint steps reported to a boundary.
  *  Diagnostic only: it names the step that was active when the boundary deadline fired and
  *  never changes what the boundary does. */
 export type BoundaryStep =
@@ -313,7 +313,13 @@ export type BoundaryStep =
   | "completion_permit"
   | "pr_description_prepare"
   | "mr_create"
-  | "post_mr";
+  | "post_mr"
+  | "checkpoint_lock_wait"
+  | "checkpoint_overlay"
+  | "scratch_preflight"
+  | "checkpoint_pack"
+  | "checkpoint_upload"
+  | "checkpoint_report";
 
 export interface BoundaryRequest {
   boundary: SafeBoundary;
