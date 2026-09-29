@@ -3808,6 +3808,7 @@ export interface IncidentalFinding {
   // rollout skew) — the same reason finding_id and the M3 additions below are optional.
   disposition_id?: string;
   finding_id?: string;
+  group_operation_id?: string;
   location: string;
   repo_id: string;
   repo_path: string;

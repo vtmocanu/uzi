@@ -87,7 +87,7 @@ func (h *Handler) GetFindingGroupIssueDraft(w http.ResponseWriter, r *http.Reque
 }
 
 func parseFindingGroupIDs(raw string) ([]uuid.UUID, bool) {
-	if raw == "" {
+	if raw == "" || len(raw) > 50*37 {
 		return nil, false
 	}
 	seen := map[uuid.UUID]bool{}
@@ -121,7 +121,7 @@ func composeFindingGroupDraft(parts []groupDraftPart) (string, string) {
 	for i, p := range parts {
 		b.WriteString(strconv.Itoa(i + 1))
 		b.WriteString(". ")
-		b.WriteString(p.title)
+		b.WriteString(issuedraft.SafeInlineCode(p.title))
 		b.WriteString(" — ")
 		b.WriteString(p.location)
 		b.WriteString("\n")

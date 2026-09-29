@@ -29,6 +29,9 @@ func TestParseFindingGroupIDs(t *testing.T) {
 	if _, ok := parseFindingGroupIDs(strings.Join(many, ",")); ok {
 		t.Error("accepted 51 ids")
 	}
+	if _, ok := parseFindingGroupIDs(strings.Repeat(first.String()+",", 20000) + first.String()); ok {
+		t.Error("accepted oversized duplicate input")
+	}
 }
 
 func TestComposeFindingGroupDraftKeepsEveryMember(t *testing.T) {
@@ -44,11 +47,24 @@ func TestComposeFindingGroupDraftKeepsEveryMember(t *testing.T) {
 		t.Fatalf("invalid bounded body: %d bytes", len(body))
 	}
 	for i, p := range parts {
-		if !strings.Contains(body, p.title+" — "+p.location) {
+		if !strings.Contains(body, issuedraft.SafeInlineCode(p.title)+" — "+p.location) {
 			t.Errorf("missing member %d", i)
 		}
 	}
 	if issuedraft.SanitizeFiledBody(body) != body {
 		t.Error("final body is not sanitized")
+	}
+}
+
+func TestComposeFindingGroupDraftInertMemberTitle(t *testing.T) {
+	payload := "![x](https://example.com/pixel)"
+	_, body := composeFindingGroupDraft([]groupDraftPart{{
+		title: payload, location: issuedraft.SafeInlineCode("src/a.go"), evidence: "plain evidence",
+	}})
+	if strings.Contains(body, "1. "+payload+" — ") {
+		t.Fatalf("active Markdown in member roster: %q", body)
+	}
+	if !strings.Contains(body, issuedraft.SafeInlineCode(payload)) {
+		t.Fatalf("missing inert title: %q", body)
 	}
 }
