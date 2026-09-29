@@ -54,8 +54,8 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
 // prove a failing command still records its status and a fresh shell reads it back.
 describe("CLAUDE_LONG_COMMAND_APPEND start and poll commands", () => {
   const flat = CLAUDE_LONG_COMMAND_APPEND.replace(/\n/g, " ");
-  const start = /`(rc=0; <command> .*?)`/.exec(flat)?.[1];
-  const poll = /`(for i in \$\(seq \d+\); do .*?)`/.exec(flat)?.[1];
+  const start = /`([^`]*<command>[^`]*)`/.exec(flat)?.[1];
+  const poll = /`([^`]*for i in \$\(seq \d+\); do [^`]*)`/.exec(flat)?.[1];
   const fill = (cmd: string, command: string) => cmd.replaceAll("<name>", "gate-t").replace("<command>", command);
 
   it("names a bounded poll that stays under the 600000 ms tool ceiling", () => {
@@ -72,11 +72,13 @@ describe("CLAUDE_LONG_COMMAND_APPEND start and poll commands", () => {
     assert.ok(start && poll);
     const dir = mkdtempSync(join(tmpdir(), "cmdlife-"));
     try {
-      execFileSync("mkdir", ["-p", join(dir, ".uzi", "scratch")]);
-      // A failing gate whose output even contains a fake marker.
-      execFileSync("bash", ["-e", "-c", fill(start, "sh -c 'echo EXIT=0; echo boom; exit 3'")], { cwd: dir });
+      execFileSync("git", ["init", "-q", dir]);
+      execFileSync("mkdir", ["-p", join(dir, ".uzi", "scratch"), join(dir, "pkg")]);
+      // A failing gate, started from a package directory, whose output even contains a fake marker.
+      execFileSync("bash", ["-e", "-c", fill(start, "sh -c 'echo EXIT=0; echo boom; exit 3'")], { cwd: join(dir, "pkg") });
       const started = Date.now();
-      // A separate shell with a scrubbed env: nothing carries from the start call but the files.
+      // A separate shell from a different directory with a scrubbed env: nothing carries from
+      // the start call but the files, and the anchored paths still find them.
       const out = execFileSync("bash", ["-c", fill(poll, "")], { cwd: dir, env: { PATH: process.env.PATH ?? "" }, encoding: "utf8" });
       assert.ok(Date.now() - started < 5_000, "did not sleep once the status exists");
       assert.equal(out.split("\n")[0], "3", "the real exit status, not the fake marker in the output");
