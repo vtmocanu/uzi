@@ -3764,7 +3764,7 @@ export class GitCache {
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[] } = {},
   ): Promise<CheckpointRange | null> {
     try {
       const tipSha = await this.trackingTip(barePath, branch);
@@ -3786,6 +3786,21 @@ export class GitCache {
         (await this.isAncestor(barePath, confirmed, tipSha))
       ) {
         scanFloorShas.push(confirmed);
+      }
+      // issue #1932: extra scan floors (every tip that may already be durable: the checkpoint floor,
+      // an attempted/confirmed checkpoint tip, the published tip). Same admission rule as
+      // `confirmedTip`: 40-hex, resolves to itself, an ancestor of the tip; a non-ancestor is
+      // dropped and duplicates of the exclude floor or another floor are skipped.
+      for (const floor of opts.extraFloors ?? []) {
+        if (
+          SHA40_RE.test(floor) &&
+          floor !== excludeSha &&
+          !scanFloorShas.includes(floor) &&
+          (await this.revParse(barePath, `${floor}^{commit}`)) === floor &&
+          (await this.isAncestor(barePath, floor, tipSha))
+        ) {
+          scanFloorShas.push(floor);
+        }
       }
       return { tipSha, excludeSha, scanFloorShas };
     } catch (err) {

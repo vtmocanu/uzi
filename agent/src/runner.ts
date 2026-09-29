@@ -14,8 +14,21 @@ import {
   isWorkflowScopeRejection,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
-import { renderSecretFinding, renderSecretFindings } from "./secret-finding-render.js";
-import type { CredentialFreeSettleOutcome, Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
+import {
+  buildSecretRemediationFollowUp,
+  renderRuleIds,
+  renderSecretFinding,
+  renderSecretFindings,
+} from "./secret-finding-render.js";
+import type {
+  CredentialFreeSettleOutcome,
+  Executor,
+  ExecutorResult,
+  RunContext,
+  SecretRemediationDecision,
+  WallParkOutcome,
+  WallParkRefresh,
+} from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
@@ -155,6 +168,10 @@ import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
 const MAX_FAILURE_REASON_LEN = 512;
+
+/** issue #1932: how many times the pre-exit secret remediation gate returns a done to the lead for a
+ *  history rewrite before the run fails `push_secret_blocked`. */
+const SECRET_REMEDIATION_MAX_ATTEMPTS = 2;
 
 /** The three authoritative TERMINAL run statuses. A run in any of these can never
  *  write again, so its retained recovery clone is safe to reclaim. Used by the
@@ -521,6 +538,9 @@ type CheckpointBodyOutcome =
   | "no_new_work"
   | "secret_found"
   | "secret_scan_untrusted"
+  // issue #1932: the pre-exit secret remediation gate holds a known finding (or a reap publish is not
+  // at the last clean-scanned tip), so this checkpoint published nothing.
+  | "secret_remediation_pending"
   | `publish_failed:${Exclude<PublishFailClass, "aborted">}`
   | "aborted"
   // issue #1783: the milestone checkpoint could not prove the clone quiescent, so it skipped its
@@ -1419,6 +1439,20 @@ interface RunFlight {
    *  checkpoint ticks within a flight (a fresh flight after a restart re-detects, which is fine —
    *  the finalize bridge in M3 is the correctness backstop). */
   steeredTips?: Set<string>;
+  /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
+   *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted scan that still
+   *  suppress every checkpoint publish; `blocked` = findings that make finalize fail terminally
+   *  (`push_secret_blocked`, no push); `cleanTip` = the tracking tip of the last CLEAN trusted scan;
+   *  `everKnown` = a finding has been known at some point in this run; `withholdPaths` = the
+   *  gitleaks text scan of the finding paths was untrusted or flagged them (render no path). */
+  secretRemediation?: {
+    attempts: number;
+    known?: SecretFinding[];
+    blocked?: SecretFinding[];
+    cleanTip?: string;
+    everKnown?: boolean;
+    withholdPaths?: boolean;
+  };
 }
 
 /** PRD #1390 M2a: the four run states a worker's ActiveSnapshot may report as a `phase`
@@ -4531,6 +4565,57 @@ export class RunRunner {
       }
     }
 
+    // PRD #974 M2 / #1077: the single terminal reporter for a push_secret_blocked failure.
+    // PRD #1391 Run B M3b: journal it WRITE-AHEAD (D3) then resolve it. On the journaled path a send
+    // that fails now leaves the durable journal (with the push_secret_blocked origin) for a later
+    // resolve, so it never throws — the outcome is captured. Only the reserve_exhausted (or no-outbox)
+    // degraded path sends directly and can throw on exhaustion; rethrow a typed sentinel THERE so
+    // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting to
+    // agent_failure. NEVER attach preserved_patch (the diff carries the detected secret).
+    const reportPushSecretBlocked = async (reason: string): Promise<void> => {
+      const capped = reason.slice(0, MAX_FAILURE_REASON_LEN);
+      try {
+        await journalTerminalReport({
+          status: "failed",
+          failure_reason: capped,
+          fail_origin: "push_secret_blocked",
+          preserved_patch: undefined,
+        });
+      } catch (e) {
+        throw new TerminalReportError(capped, "push_secret_blocked", e);
+      }
+    };
+
+    // issue #1932 D5: the pre-exit secret remediation gate already decided this run cannot ship its
+    // branch (the remediation cap was exhausted, or a rescan after a known finding was untrusted).
+    // Fail terminally HERE, directly
+    // after the fetch-back and the durable-recovery pin (so `uzi run export` still has its capture)
+    // and before the zero-diff, workflow-scope (patch-preserving) and GitHub scan guards, on EVERY
+    // forge. Nothing has been pushed or published between executor.run returning and this point,
+    // and no preserved_patch is attached (the diff may carry the detected secret).
+    const remediationBlocked = flight.secretRemediation?.blocked;
+    if (remediationBlocked && remediationBlocked.length > 0) {
+      const withholdPaths = flight.secretRemediation?.withholdPaths === true;
+      const reason = composeLocalScanBlockedReason(remediationBlocked, { redact: redactText, withholdPaths });
+      batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `the pre-push secret scan flagged ${renderSecretFindings(remediationBlocked, { redact: redactText, withholdPaths })}; failing early without pushing — the diff is withheld because it may carry the secret`,
+        },
+      });
+      runLog.info(
+        "run failed: the pre-exit secret remediation gate blocked the branch; withholding diff (it may carry the secret)",
+        {
+          run_id: runId,
+          findings: remediationBlocked.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
+        },
+      );
+      await closeBatcher();
+      await reportPushSecretBlocked(reason);
+      return;
+    }
+
     // issue #279: an UNDECLARED zero-diff guard, ISSUE runs only. A declared report_only
     // already returned above, so reaching here on an issue run with a confirmed-empty diff
     // is the ambiguous "forgot to commit / should have set report_only" case — a
@@ -4911,27 +4996,6 @@ export class RunRunner {
         return;
       }
     }
-
-    // PRD #974 M2 / #1077: the single terminal reporter for a push_secret_blocked failure.
-    // PRD #1391 Run B M3b: journal it WRITE-AHEAD (D3) then resolve it. On the journaled path a send
-    // that fails now leaves the durable journal (with the push_secret_blocked origin) for a later
-    // resolve, so it never throws — the outcome is captured. Only the reserve_exhausted (or no-outbox)
-    // degraded path sends directly and can throw on exhaustion; rethrow a typed sentinel THERE so
-    // execute()'s generic catch preserves the push_secret_blocked origin instead of defaulting to
-    // agent_failure. NEVER attach preserved_patch (the diff carries the detected secret).
-    const reportPushSecretBlocked = async (reason: string): Promise<void> => {
-      const capped = reason.slice(0, MAX_FAILURE_REASON_LEN);
-      try {
-        await journalTerminalReport({
-          status: "failed",
-          failure_reason: capped,
-          fail_origin: "push_secret_blocked",
-          preserved_patch: undefined,
-        });
-      } catch (e) {
-        throw new TerminalReportError(capped, "push_secret_blocked", e);
-      }
-    };
 
     // PRD #1416 M4 (fact 15): whether the top-of-finalize secret scan below walked a TRUSTWORTHY
     // range. A divergent H (the branch that reaches history_rewritten) fails the scan floor OPEN
@@ -7560,12 +7624,29 @@ export class RunRunner {
         // remote publication runs out of budget. The soft stop begins to govern
         // only the overlay/pack/upload path below.
         if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
+        // issue #1932 D3: while the pre-exit secret remediation gate holds a known/blocked finding,
+        // NO publish happens on any path (overlay and pinned, reap true/false, the mid-turn tick,
+        // the deferred pendingPublish): the fetch-back / steer / bridge above stay (local only),
+        // but the flagged commit must never reach the checkpoint ref. After a finding has been known
+        // in this run, a reap:true (milestone/done) publish also requires the tracking tip to be the
+        // tip of the last CLEAN trusted gate scan, so a commit landing after that scan cannot slip
+        // out unscanned through the GitHub overlay (which is otherwise unscanned). lastPublish,
+        // lastPublishedTip, checkpointFloor and pendingPublish are left as they are.
+        const remediation = flight.secretRemediation;
+        const remediationHold =
+          hasNewWork &&
+          remediation !== undefined &&
+          ((remediation.known?.length ?? 0) > 0 ||
+            (remediation.blocked?.length ?? 0) > 0 ||
+            (opts.reap && remediation.everKnown === true && fetchedTip !== remediation.cleanTip));
         // Resolve the GitHub overlay context after the candidate is in the
         // worker bare. Even a slow local default-branch lookup now runs under
         // the same checkpoint-only child budget as the remote default fetch.
-        const resolvedOverlay = typeof overlay === "function"
-          ? await withCheckpointSoftGit(overlay)
-          : overlay;
+        const resolvedOverlay = remediationHold
+          ? undefined
+          : typeof overlay === "function"
+            ? await withCheckpointSoftGit(overlay)
+            : overlay;
         if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
 
         // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
@@ -7581,7 +7662,14 @@ export class RunRunner {
         let published = false;
         // issue #1597 M2 (round 3): a publish DEFERRED out of a Codex permit (below) is owed: the
         // next overlay-less checkpoint outside a permit publishes regardless of the time gate.
-        if (hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish)) {
+        if (remediationHold) {
+          bodyOutcome = "secret_remediation_pending";
+          this.reportPublishOutcome(
+            flight,
+            "secret:remediation",
+            "checkpoint publish skipped: secret_remediation_pending",
+          );
+        } else if (hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish)) {
           // issue #1597 M2: an overlay-less publish (the mid-turn tick, the iteration boundary, and a
           // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
           // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
@@ -8358,6 +8446,9 @@ export class RunRunner {
         this.runGatedSink(flight, async () => {
           await checkpointBody({ reap: opts.reap, progress: opts.progress, sink: opts.sink });
         }),
+      // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
+      secretRemediationGate: () =>
+        this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone)),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
       // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
@@ -9355,6 +9446,136 @@ export class RunRunner {
         error: errMessage(e),
       });
       return untrusted("scan_threw");
+    }
+  }
+
+  /**
+   * issue #1932 D2 — the pre-exit secret remediation gate (`RunContext.secretRemediationGate`).
+   * Called by the executor at the done point, BEFORE any done checkpoint. Credential-free only
+   * (a file:// fetch-back and local gitleaks; no PAT, no overlay), so it is legal with the agent
+   * alive; it runs under the flight's sink gate so it serializes with the mid-turn tick.
+   *
+   * Decision table (state on `flight.secretRemediation`):
+   *  - no bare / any thrown error with no known finding => proceed (finalize's scan stays the guard)
+   *  - untrusted scan (failed fetch-back, tracking tip != clone tip, unresolved range, untrusted
+   *    gitleaks) => proceed when nothing is known, else blocked = known and fail
+   *  - trusted and clean => clear `known`, remember the scanned tip as `cleanTip`, proceed
+   *  - trusted, ANY finding reachable from a floor (checkpoint floor, confirmed/attempted checkpoint
+   *    tip, published tip; including floors no longer ancestors of the tip) => proceed with no
+   *    remediation, `known` set so every checkpoint publish is suppressed; finalize fails as today
+   *  - trusted, all findings above every floor, attempts < cap => remediate (attempts++)
+   *  - trusted, findings above the floors, attempts == cap => blocked, fail
+   */
+  private async runSecretRemediationGate(
+    flight: RunFlight,
+    barePath: string | undefined,
+    runnerClone: RunnerClone,
+  ): Promise<SecretRemediationDecision> {
+    const { runLog, runId } = flight;
+    const state = (flight.secretRemediation ??= { attempts: 0 });
+    if (state.blocked && state.blocked.length > 0) return { action: "fail" };
+    if (!barePath) return { action: "proceed" };
+    const branch = runnerClone.branch;
+    const failOrProceed = (why: string): SecretRemediationDecision => {
+      if (state.known && state.known.length > 0) {
+        state.blocked = state.known;
+        runLog.warn("pre-exit secret scan could not be trusted after a known finding; failing", { run_id: runId, why });
+        return { action: "fail" };
+      }
+      runLog.warn("pre-exit secret scan could not run or is untrusted; proceeding (finalize scan stays the guard)", {
+        run_id: runId,
+        why,
+      });
+      return { action: "proceed" };
+    };
+    try {
+      const fetched = await this.fetchBackBestEffort(barePath, runnerClone.path, branch, runId, runLog);
+      const cloneTip = await this.git.branchTip(runnerClone.path, branch);
+      const trackTip = await this.git.trackingTip(barePath, branch);
+      if (!fetched || cloneTip === null || trackTip === null || cloneTip !== trackTip) {
+        return failOrProceed("tracking_tip_stale");
+      }
+      const floorCandidates = [
+        flight.checkpointFloor,
+        flight.lastAttemptedCheckpointRefTip,
+        flight.publishedTip,
+        flight.lastCheckpointRefTip,
+      ].filter((f): f is string => typeof f === "string" && /^[0-9a-f]{40}$/.test(f));
+      const range = await this.git.resolveCheckpointRange(barePath, branch, {
+        confirmedTip: flight.lastCheckpointRefTip,
+        extraFloors: floorCandidates,
+      });
+      if (!range || range.tipSha !== cloneTip) return failOrProceed("range_unresolved");
+      const scan = await this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() });
+      if (!scan.trusted) return failOrProceed(scan.reason ?? "scan_untrusted");
+      if (scan.findings.length === 0) {
+        state.known = undefined;
+        state.cleanTip = range.tipSha;
+        return { action: "proceed" };
+      }
+      const findings = scan.findings;
+      // issue #1932 D6(c): a committed filename can itself be a secret. Scan the raw path list with
+      // gitleaks before rendering anything; an untrusted or flagging scan withholds EVERY path on
+      // every surface (prompt, feed, failure_reason, log).
+      const pathScan = await this.git.scanPatchForSecrets(
+        findings.map((f) => (typeof f.file === "string" ? f.file : "")).join("\n"),
+      );
+      const withholdPaths = !pathScan.trusted || pathScan.findings.length > 0;
+      state.withholdPaths = withholdPaths;
+      state.everKnown = true;
+      let atFloor = false;
+      for (const f of findings) {
+        let reachable = typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit);
+        for (const floor of floorCandidates) {
+          if (reachable) break;
+          reachable = await this.git.isAncestorRef(barePath, f.commit, floor);
+        }
+        if (reachable) {
+          atFloor = true;
+          break;
+        }
+      }
+      state.known = findings;
+      if (atFloor) {
+        // Not remediable (already reachable from a durable floor): no rewrite turn. Publication is
+        // suppressed while known; finalize fails push_secret_blocked as it does today.
+        runLog.warn("pre-exit secret scan: finding at or below a checkpoint floor; not remediable", {
+          run_id: runId,
+          findings: findings.map((f) => renderSecretFinding(f, { redact: flight.redactText, withholdPaths })),
+        });
+        return { action: "proceed" };
+      }
+      if (state.attempts >= SECRET_REMEDIATION_MAX_ATTEMPTS) {
+        state.blocked = findings;
+        runLog.warn("pre-exit secret scan: remediation attempts exhausted; failing", { run_id: runId });
+        return { action: "fail" };
+      }
+      state.attempts++;
+      const floorSha = flight.checkpointFloor ?? flight.publishedTip ?? range.excludeSha;
+      const renderOpts = { redact: flight.redactText, withholdPaths };
+      flight.batcher.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text: `pre-exit secret scan flagged ${findings.length} finding(s) (rule ${renderRuleIds(findings)}); returning to the lead to rewrite the commit (attempt ${state.attempts} of ${SECRET_REMEDIATION_MAX_ATTEMPTS})`,
+        },
+      });
+      runLog.info("pre-exit secret scan flagged commits above the checkpoint floor; returning to the lead", {
+        run_id: runId,
+        attempt: state.attempts,
+        findings: findings.slice(0, 20).map((f) => renderSecretFinding(f, renderOpts)),
+      });
+      return {
+        action: "remediate",
+        followUp: buildSecretRemediationFollowUp(findings, {
+          ...renderOpts,
+          floorSha,
+          attempt: state.attempts,
+          maxAttempts: SECRET_REMEDIATION_MAX_ATTEMPTS,
+        }),
+      };
+    } catch (e) {
+      return failOrProceed(`gate_threw: ${errMessage(e)}`);
     }
   }
 

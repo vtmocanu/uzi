@@ -25,8 +25,6 @@ import type { SecretFinding } from "./secret-scan-guard.js";
 export interface RenderSecretFindingOpts {
   /** The run's text redactor (`makeTextRedactor`): a path it changes carries a run secret. */
   redact?: (s: string) => string;
-  /** JSON-quote each visible path (the escaped string), so it reads as a data value in a prompt. */
-  quotePaths?: boolean;
   /** Withhold every path (a text scan of the path list was untrusted: fail closed). */
   withholdPaths?: boolean;
 }
@@ -151,8 +149,10 @@ function renderPath(path: unknown, opts: RenderSecretFindingOpts): string {
   if (typeof path !== "string" || opts.withholdPaths) return "[path withheld]";
   if (opts.redact && opts.redact(path) !== path) return "[path withheld]";
   if (pathLooksSecretShaped(path)) return "[path withheld]";
-  const escaped = escapePath(path);
-  return opts.quotePaths ? JSON.stringify(escaped) : escaped;
+  // issue #1932: always JSON-quote a visible path (on EVERY surface: prompt, status line, log,
+  // failure_reason) so a filename such as `a.ts:1 (rule x); bbbbbbbbbbbb evil.ts` reads as ONE data
+  // value and cannot forge an extra finding label.
+  return JSON.stringify(escapePath(path));
 }
 
 /** One safe label: `<commit12> <path>:<line> (rule <ruleId>)`. */
@@ -173,6 +173,16 @@ export function renderSecretFinding(
       ? String(f.startLine)
       : "?";
   return `${commit} ${renderPath(f.file, opts)}:${line} (rule ${rule})`;
+}
+
+/** The distinct, validated rule ids of the findings (first `max`), comma-joined; an invalid id renders `[rule withheld]`. */
+export function renderRuleIds(findings: SecretFinding[], max = 5): string {
+  const ids: string[] = [];
+  for (const f of findings) {
+    const id = typeof f.ruleId === "string" && RULE_ID_RE.test(f.ruleId) ? f.ruleId : "[rule withheld]";
+    if (!ids.includes(id)) ids.push(id);
+  }
+  return ids.slice(0, max).join(", ") + (ids.length > max ? `, and ${ids.length - max} more` : "");
 }
 
 /** The first `max` labels joined with `; `, plus a `; and N more` tail. */
@@ -198,7 +208,7 @@ export function buildSecretRemediationFollowUp(
     maxAttempts: number;
   },
 ): string {
-  const labels = renderSecretFindings(findings, { ...opts, quotePaths: true });
+  const labels = renderSecretFindings(findings, opts);
   const floor =
     opts.floorSha && /^[0-9a-fA-F]{7,40}$/.test(opts.floorSha)
       ? opts.floorSha

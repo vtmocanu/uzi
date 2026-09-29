@@ -362,7 +362,7 @@ describe("composeLocalScanBlockedReason", () => {
     // Short commit (first 12 chars), path:line, and rule all present.
     assert.match(reason, /0123456789ab /, "short commit (12 chars) must appear");
     assert.ok(!reason.includes("0123456789abc"), "the full commit must be shortened to 12 chars");
-    assert.match(reason, /config\/app\.env:12/, "path:line must appear");
+    assert.match(reason, /"config\/app\.env":12/, "path:line must appear");
     assert.match(reason, /\(rule generic-api-key\)/, "rule id must appear");
     assert.doesNotMatch(reason, /GH013|GitHub Push Protection/, "local-scan wording: no GH013 claim");
     assert.ok(reason.endsWith(SUFFIX_TAIL), "the preserved-diff pointer must end the reason");
@@ -450,7 +450,8 @@ describe("composeLocalScanBlockedReason", () => {
     assert.ok(!/[\u0000-\u001f\u007f]/.test(reason), "no C0 control byte or DEL may survive");
     assert.ok(!reason.includes("\u001b"), "ESC must be stripped");
     assert.ok(!reason.includes("\n"), "newline must be stripped");
-    // The visible path characters survive, just not the control bytes.
-    assert.match(reason, /evil\\u\{1b\}\[2K\\u\{a\}row\.env/, "control bytes are escaped as visible \\u{..}, not stripped");
+    // The visible path characters survive, just not the control bytes. The path is JSON-quoted after
+    // escaping (issue #1932), so each escape's backslash is doubled once more.
+    assert.match(reason, /evil\\\\u\{1b\}\[2K\\\\u\{a\}row\.env/, "control bytes are escaped as visible \\u{..}, not stripped");
   });
 });
