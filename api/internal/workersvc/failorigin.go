@@ -117,6 +117,15 @@ var failOrigins = []string{
 	// (neverJudgeFailOrigins, judge_enqueue.go) REGARDLESS of iteration_count: a full worker
 	// volume is the environment's failure, not an agent defect, and it lands mid-run.
 	"data_volume_full",
+	// issue #1888: a run with selected skills whose Claude SDK skills plugin failed to load at
+	// session start (the SDK reported plugin load errors, or an error report the worker could not
+	// parse), so the worker fails the run typed with a bounded, redacted failure_reason instead of
+	// letting it proceed without the skills its owner selected. WORKER-REPORTABLE (see
+	// workerReportableFailOrigins). It is a WORKER ENVIRONMENT failure, not an agent defect, so it
+	// is NEVER JUDGED: a member of neverJudgeFailOrigins (judge_enqueue.go), which skips
+	// regardless of iteration_count, since a resumed run's session start carries
+	// iteration_count > 0. It is not human-landable: the run stops before the agent works.
+	"skills_plugin_load_failed",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so
@@ -161,7 +170,9 @@ func AllFailOrigins() []string {
 // submit_plan and no ask_user, after one corrective nudge, so the worker fails the run typed
 // with a fixed failure_reason), and worker_residue_blocked (issue #1783: the worker could not
 // prove the run's execution stopped or could not clear or quarantine residue at the run's clone
-// path, so it refused to push, capture or reseed); agent_failure is included because it is the judgeable
+// path, so it refused to push, capture or reseed), and skills_plugin_load_failed (issue #1888:
+// the Claude SDK reported load errors for the run's selected-skills plugin at session start, so
+// the worker failed the run rather than run it without its skills); agent_failure is included because it is the judgeable
 // default the `failed` arm applies anyway, so an explicit worker agent_failure is
 // harmless and semantically correct. The partition (worker-reportable + server-only ==
 // vocabulary) is pinned by TestCoerceFailOrigin.
@@ -183,6 +194,9 @@ var workerReportableFailOrigins = map[string]bool{
 	// execution stopped or cannot clear the run's clone-path residue (never judged; see
 	// failOrigins and neverJudgeFailOrigins).
 	"worker_residue_blocked": true,
+	// issue #1888: the worker fails a run with selected skills whose Claude SDK skills plugin
+	// failed to load at session start (never judged; see failOrigins and neverJudgeFailOrigins).
+	"skills_plugin_load_failed": true,
 }
 
 // CoerceFailOrigin maps a worker-reported fail_origin onto the WORKER-REPORTABLE subset.

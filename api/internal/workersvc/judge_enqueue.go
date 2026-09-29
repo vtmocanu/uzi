@@ -41,13 +41,13 @@ var preStartInfraFailOrigins = map[string]bool{
 
 // neverJudgeFailOrigins is the fail_origin set that skips the judge REGARDLESS of
 // iteration_count (PRD #1392 M1, SC3). Its members are origins that are never a real agent
-// defect, so there is nothing to retrospect however far the run got. All but one are
+// defect, so there is nothing to retrospect however far the run got. All but two are
 // SERVER-DERIVED. Its first member is forge_unreachable: it is stamped ONLY inside SetState's
 // forge-park transaction (a forge that stayed unreachable at clone past the park cap), never by
 // a worker report (workerReportableFailOrigins excludes it, and CoerceFailOrigin drops a worker
 // forging it), so an untrusted report can never steer its skip. worker_residue_blocked (issue
-// #1783) is the one WORKER-REPORTABLE member, and the agent can induce it (see its entry
-// below). Unlike preStartInfraFailOrigins it is NOT
+// #1783) and skills_plugin_load_failed (issue #1888) are the WORKER-REPORTABLE members, and the
+// agent can induce the former (see its entry below). Unlike preStartInfraFailOrigins it is NOT
 // gated on iteration_count == 0, because a resumed run's forge cap-fail carries
 // iteration_count > 0 (see preStartInfraFailOrigins). A strict subset of failorigin.go's
 // vocabulary. TestNeverJudgeFailOriginsExact pins the exact set.
@@ -77,6 +77,14 @@ var neverJudgeFailOrigins = map[string]bool{
 	// environment failure, not an agent defect, so it skips the judge regardless of
 	// iteration_count: it lands mid-run, where iteration_count is usually > 0.
 	"data_volume_full": true,
+	// issue #1888: a run with selected skills whose Claude SDK skills plugin failed to load at
+	// session start. A worker-environment failure, not an agent defect, so there is nothing to
+	// retrospect. It lives here and NOT in preStartInfraFailOrigins because it can fire on a
+	// RESUMED run's session start, which carries iteration_count > 0, so an == 0 gate would
+	// wrongly judge it. WORKER-REPORTABLE like worker_residue_blocked: a worker reporting it can at
+	// worst skip its own retrospective, the same spend/accuracy trade-off accepted there, and the
+	// failure still surfaces through the failed-run broadcast.
+	"skills_plugin_load_failed": true,
 }
 
 // envPublishFailOrigins is the fail_origin set for ENVIRONMENT-CAUSED publish failures (issue
@@ -91,7 +99,7 @@ var neverJudgeFailOrigins = map[string]bool{
 // judge it). TestEnvPublishFailOriginsExact pins the exact set.
 //
 // DELIBERATELY WORKER-REPORTABLE (all three members, whereas neverJudgeFailOrigins has only
-// worker_residue_blocked); what distinguishes this set is that its members are PUBLISH failures
+// worker_residue_blocked and skills_plugin_load_failed); what distinguishes this set is that its members are PUBLISH failures
 // at finalize. A worker forging one of these could at worst decline to spend judge tokens
 // retrospecting its OWN publish failure — a spend/accuracy footgun, NOT a security boundary (contrast guardrail_blocked,
 // which gates a security classification, and forge_unreachable, which is server-derived). These
