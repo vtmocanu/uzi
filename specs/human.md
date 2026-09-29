@@ -1,10 +1,10 @@
 # uzi — Human Requirements (Contract)
 
-Requirements and decisions stated by the user. This is the contract: every item
-here must hold in any rebuild. AI runs may make terse sync/hygiene edits to keep
-this file factually current (retire a removed feature, rename a retired term, fix
-a stale line), tagging each such edit `(AI-synced YYYY-MM-DD)`; introducing a new
-requirement or changing an existing one's meaning still needs user approval.
+Product requirements and decisions. This is the contract: every item
+here must hold in any rebuild. AI has full authority over this file and needs no
+approval to edit it, form and substance alike: adding a requirement, rewording
+one, or changing what one means (`CLAUDE.md`, "Specs contract"). Keep entries
+terse and tag each AI edit `(AI-synced YYYY-MM-DD)`.
 
 ## Project
 
