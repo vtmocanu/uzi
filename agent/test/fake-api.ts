@@ -340,11 +340,12 @@ export class FakeApi {
     // hang, not a slow test). afterEach still close()s each server; this is the
     // belt-and-braces that makes draining deterministic across platforms.
     //
-    // (runner.test.ts was split into runner-*.test.ts on 2026-08-03; the hazard is
-    // unchanged and now applies to each of those files, which all share this fake
-    // through test/runner-harness.ts. Smaller files make a leaked handle CHEAPER to
-    // hit the cap with, not rarer: the per-file budget is spent by whichever file
-    // holds the handle.)
+    // (runner.test.ts was split into runner-*.test.ts on 2026-08-03; the hazard
+    // applies to each of those files, which all share this fake through
+    // test/runner-harness.ts. On current node (24 in CI, v26.8 locally) the cap binds
+    // each test, not the file, so a leaked handle is worse than it was: the file never
+    // exits and --test-timeout does not end it (measured 2026-09-29: a passing test
+    // that leaves a listening server open hangs its file until killed from outside).)
     this.server.unref();
     const { port } = this.server.address() as AddressInfo;
     return `http://127.0.0.1:${port}`;
