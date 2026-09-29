@@ -2,6 +2,7 @@ import type { CliAuthRequestMeta, CliToken, CliTokenScope } from "../../lib/api"
 import { ApiError } from "../../lib/apiError";
 import { MOCK_CLI_AUTH_REQUEST_ID, mockCliAuthRequest, mockCliTokens } from "../data";
 import { delay, requireSession } from "./shared";
+import { revokeAllProductTokensOf } from "./productTokens";
 
 // ── CLI tokens + browser-login requests (PRD #64 M6) ─────────────────────────
 // Tokens are owner-attributed (user_id) so every read/write is scoped to the
@@ -82,6 +83,8 @@ export const cliTokensApi = {
     const me = requireSession();
     // Only the caller's tokens, mirroring `WHERE user_id=$1`.
     cliTokens = cliTokens.map((t) => (t.user_id === me.id ? { ...t, revoked: true } : t));
+    // D8 (PRD #1907): the same call revokes every product token of the caller.
+    revokeAllProductTokensOf(me.id);
     return delay(null);
   },
 

@@ -7,6 +7,7 @@ import { patchRun } from "../store";
 import { agentSourceApi } from "./agentSource";
 import { agentsApi } from "./agents";
 import { cliTokensApi } from "./cliTokens";
+import { productTokensApi } from "./productTokens";
 import { forgeApi } from "./forge";
 import { judgeApi } from "./judge";
 import { memoryApi } from "./memory";
@@ -60,6 +61,8 @@ export const mockApi = {
   ...chatApi,
 
   ...cliTokensApi,
+
+  ...productTokensApi,
 
   ...memoryApi,
 

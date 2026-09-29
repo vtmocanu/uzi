@@ -190,10 +190,38 @@ describe("CliTokens revoke", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
     // Does NOT revoke on the first click — it arms a confirmation.
     expect(mockApi.revokeAllCliTokens).not.toHaveBeenCalled();
-    expect(screen.getByRole("group", { name: /Confirm revoking all CLI tokens/ })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Confirm revoking all CLI and product tokens" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
     await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+  });
+
+  it("Revoke all names the product tokens it also revokes and tells the page to refresh them (PRD #1907 D8)", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "a" })] });
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    const onRevokedAll = vi.fn();
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={2} onRevokedAll={onRevokedAll} />
+      </MemoryRouter>,
+    );
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/Revoke all 1 CLI token and 2 product tokens\?/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+    await waitFor(() => expect(onRevokedAll).toHaveBeenCalledTimes(1));
+    expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1);
+  });
+
+  it("offers Revoke all when only product tokens are active", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [] });
+    render(
+      <MemoryRouter>
+        <CliTokens productTokenActiveCount={1} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/Revoke all 1 product token\?/)).toBeTruthy();
   });
 
   it("hides Revoke all when there is nothing active to revoke", async () => {

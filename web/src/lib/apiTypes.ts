@@ -1468,6 +1468,10 @@ export interface CliTokenMint {
 // non-empty subset of these scopes. Mirrors api/internal/apitypes/product_token.go.
 export type ProductTokenScope = "jobs:run" | "jobs:read";
 
+// The mint form's expiry choice (PRD #1907 D10). The server maps it to a stored
+// timestamp ("never" is a null expires_at); the client never sends a timestamp.
+export type ProductTokenExpiry = "30d" | "90d" | "1y" | "never";
+
 // Product is one registered external product (apitypes.ProductDTO). deleted_at is
 // null for a live product; a soft-deleted product is always disabled and stays listed
 // for the audit trail. active_token_count counts tokens neither revoked nor expired.
@@ -1479,6 +1483,24 @@ export interface Product {
   deleted_at: string | null;
   created_at: string;
   active_token_count: number;
+}
+
+// AdminDeleteProductResponse is DELETE /api/admin/products/{id}
+// (apitypes.AdminDeleteProductResponse): the soft-deleted product plus how many of its
+// tokens the delete stopped (0 when the product was already disabled, since those
+// tokens were already refused).
+export interface AdminDeleteProductResponse {
+  product: Product;
+  stopped_token_count: number;
+}
+
+// MintableProduct is one entry of the user mint picker, GET
+// /api/me/product-tokens/products (apitypes.MintableProductDTO): an enabled, live
+// product. Only the fields the picker shows; no counts, no creator.
+export interface MintableProduct {
+  id: string;
+  name: string;
+  description: string;
 }
 
 // ProductToken is the metadata-only view of one product token (the per-user list row,

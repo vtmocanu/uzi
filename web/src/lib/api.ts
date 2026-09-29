@@ -46,6 +46,14 @@ import type {
   CliToken,
   CliTokenMint,
   CliTokenScope,
+  AdminDeleteProductResponse,
+  AdminProductToken,
+  MintableProduct,
+  Product,
+  ProductToken,
+  ProductTokenMint,
+  ProductTokenExpiry,
+  ProductTokenScope,
   CreatedIssue,
   ForgeConfig,
   ForgeConnection,
@@ -1757,6 +1765,38 @@ const realApi = {
   // The panic button for a lost laptop: one query revokes every un-revoked token
   // of the caller. Idempotent (a second call is a no-op 204).
   revokeAllCliTokens: () => request<null>("POST", "/me/cli-tokens/revoke-all"),
+
+  // ── Product tokens (PRD #1907) — cookie-only, owner-scoped ─────────────────
+  // uzp_ tokens a user mints for an admin-registered product; they reach /api/v1
+  // only. The list carries no value (revoked and expired rows included, newest
+  // first); the mint returns the plaintext once. revokeAllCliTokens above also
+  // revokes every product token of the caller (D8), in one transaction.
+  listProductTokens: () => request<{ tokens: ProductToken[] }>("GET", "/me/product-tokens"),
+  listMintableProducts: () =>
+    request<{ products: MintableProduct[] }>("GET", "/me/product-tokens/products"),
+  createProductToken: (input: {
+    product_id: string;
+    name: string;
+    scopes: ProductTokenScope[];
+    expiry: ProductTokenExpiry;
+  }) => request<ProductTokenMint>("POST", "/me/product-tokens", input),
+  revokeProductToken: (id: string) => request<null>("DELETE", `/me/product-tokens/${id}`),
+
+  // ── Product registry (PRD #1907 M4) — admin, cookie-only writes ────────────
+  // Delete is soft (D9): the row stays listed with deleted_at set, disabled, and
+  // its tokens' rows stay for the audit trail. Create and update answer
+  // {product}, delete the bare {product, stopped_token_count}.
+  adminListProducts: () => request<{ products: Product[] }>("GET", "/admin/products"),
+  adminCreateProduct: (name: string, description: string) =>
+    request<{ product: Product }>("POST", "/admin/products", { name, description }),
+  adminUpdateProduct: (id: string, patch: { description?: string; enabled?: boolean }) =>
+    request<{ product: Product }>("PATCH", `/admin/products/${id}`, patch),
+  adminDeleteProduct: (id: string) =>
+    request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
+  adminListProductTokens: () =>
+    request<{ tokens: AdminProductToken[] }>("GET", "/admin/product-tokens"),
+  adminRevokeProductToken: (id: string) =>
+    request<null>("POST", `/admin/product-tokens/${id}/revoke`),
 
   // ── CLI browser-login consent flow (PRD #64) ───────────────────────────────
   // The `/cli-auth` page's three calls. getCliAuthRequest is a cookie-only read

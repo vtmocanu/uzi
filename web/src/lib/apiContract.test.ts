@@ -50,6 +50,8 @@ import type {
   AdminProductToken,
   ProductTokenMint,
   V1Whoami,
+  AdminDeleteProductResponse,
+  MintableProduct,
 } from "./apiTypes";
 
 import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
@@ -148,6 +150,10 @@ import adminProductTokenZero from "../../../fixtures/api-contract/admin_product_
 import adminProductTokenFull from "../../../fixtures/api-contract/admin_product_token.full.json";
 import mintProductTokenZero from "../../../fixtures/api-contract/mint_product_token.zero.json";
 import mintProductTokenFull from "../../../fixtures/api-contract/mint_product_token.full.json";
+import adminDeleteProductZero from "../../../fixtures/api-contract/admin_delete_product.zero.json";
+import adminDeleteProductFull from "../../../fixtures/api-contract/admin_delete_product.full.json";
+import mintableProductZero from "../../../fixtures/api-contract/mintable_product.zero.json";
+import mintableProductFull from "../../../fixtures/api-contract/mintable_product.full.json";
 import v1WhoamiZero from "../../../fixtures/api-contract/v1_whoami.zero.json";
 import v1WhoamiFull from "../../../fixtures/api-contract/v1_whoami.full.json";
 
@@ -1016,6 +1022,28 @@ void _buildInfoFull;
   void _v1WhoamiZero;
   void _v1WhoamiFull;
 }
+// PRD #1907 M4/M5: the typed admin delete response (its nested product's deleted_at is
+// `string | null`, no exemption) and the user mint-picker entry (all strings).
+{
+  const _adminDeleteProductMissing: never = null as unknown as Exclude<keyof AdminDeleteProductResponse, keyof typeof adminDeleteProductFull>;
+  const _adminDeleteProductExtra: never = null as unknown as Exclude<keyof typeof adminDeleteProductFull, keyof AdminDeleteProductResponse>;
+  const _adminDeleteProductZero: ZeroOf<AdminDeleteProductResponse> = adminDeleteProductZero;
+  const _adminDeleteProductFull: Widen<AdminDeleteProductResponse> = adminDeleteProductFull;
+  void _adminDeleteProductMissing;
+  void _adminDeleteProductExtra;
+  void _adminDeleteProductZero;
+  void _adminDeleteProductFull;
+}
+{
+  const _mintableProductMissing: never = null as unknown as Exclude<keyof MintableProduct, keyof typeof mintableProductFull>;
+  const _mintableProductExtra: never = null as unknown as Exclude<keyof typeof mintableProductFull, keyof MintableProduct>;
+  const _mintableProductZero: ZeroOf<MintableProduct> = mintableProductZero;
+  const _mintableProductFull: Widen<MintableProduct> = mintableProductFull;
+  void _mintableProductMissing;
+  void _mintableProductExtra;
+  void _mintableProductZero;
+  void _mintableProductFull;
+}
 
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
@@ -1133,6 +1161,10 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "admin_product_token", nullable: true },
   { stem: "mint_product_token", nullable: true },
   { stem: "v1_whoami", nullable: true },
+  // PRD #1907 M4/M5: admin_delete_product nests a product whose deleted_at is null in
+  // zero.json; mintable_product is all strings, so its zero.json carries no null.
+  { stem: "admin_delete_product", nullable: true },
+  { stem: "mintable_product", nullable: false },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {
