@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **The `sonnet` model alias now runs Claude Sonnet 5.5.**
+  The worker's Claude Agent SDK moves from 0.3.280 to 0.3.284, whose bundled Claude Code resolves `sonnet` to `claude-sonnet-5-5` instead of `claude-sonnet-5`, so every run, role or setting that selects `sonnet` switches model once the worker fleet runs the new image. `opus`, `haiku` and `fable` resolve as before. A full model ID (a custom ID in the model picker, or one pinned in a repo's agent definitions) does not move; set `claude-sonnet-5-5` there explicitly to adopt it, or keep `claude-sonnet-5`.
+
 - **Landlock for Codex commands is now off by default.**
   The Codex command sandbox gains a third mode, `off`, which never applies Landlock and runs model-authorized commands without filesystem confinement, relying on the uid split (unchanged in every mode). It is the new default for the worker (`UZI_CODEX_COMMAND_SANDBOX`), the controller and the chart (`workers.codex.commandSandbox: "off"`), after Landlock confinement caused repeated Codex run failures (#1769, #1863, #1598). `required` and `best-effort` remain available as opt-ins; the controller now renders `UZI_CODEX_COMMAND_SANDBOX` onto workers for those two modes and omits it for `off`, so a default install's worker pods keep their spec hash and a worker image older than this change keeps its previous `required` default until the fleet rolls. An install that explicitly sets `required` now gets the env rendered, which rolls its fleet once. Quote `"off"` in values files: a bare `off` is YAML `false`, which the chart rejects.
 
