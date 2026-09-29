@@ -398,21 +398,22 @@ func TestFullSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
 	}
 }
 
-// requireFullSyncHeld asserts a FullSync failed closed: an error, the zero Marks, no
-// cache write or eviction, the claim untouched and the group cursor not advanced.
-func requireFullSyncHeld(t *testing.T, svc *Service, cache *fakeStore, db *markerPageDB, repo uuid.UUID, marks Marks, err error) {
+// requireScanSkipped asserts a FullSync whose marker scan could not see the complete
+// issue set: the issue sync still succeeds (marks reported, cache written and
+// evicted), the claim stays untouched, and the group cursor rotates.
+func requireScanSkipped(t *testing.T, svc *Service, cache *fakeStore, db *markerPageDB, repo uuid.UUID, marks Marks, err error) {
 	t.Helper()
-	if err == nil {
-		t.Fatal("FullSync succeeded, want the pass to fail closed")
+	if err != nil {
+		t.Fatalf("FullSync failed on an incomplete marker scan: %v", err)
 	}
-	if marks != (Marks{}) || len(cache.upserts) != 0 || len(cache.deleteCalls) != 0 {
-		t.Fatalf("marks=%v writes=%d evictions=%d", marks, len(cache.upserts), len(cache.deleteCalls))
+	if marks.PRD.IsZero() || len(cache.upserts) == 0 || len(cache.deleteCalls) == 0 {
+		t.Fatalf("issue sync did not run: marks=%v writes=%d evictions=%d", marks, len(cache.upserts), len(cache.deleteCalls))
 	}
 	if db.candidateQueries != 0 || db.recorded != uuid.Nil || db.ops[0].Phase != "in_flight" || db.ops[0].IssueIID != nil {
 		t.Fatalf("claim changed: queries=%d recorded=%s phase=%s", db.candidateQueries, db.recorded, db.ops[0].Phase)
 	}
-	if _, advanced := svc.groupCursors[repo]; advanced {
-		t.Fatal("failed pass advanced the group cursor")
+	if _, advanced := svc.groupCursors[repo]; !advanced {
+		t.Fatal("incomplete scan did not rotate the group cursor")
 	}
 }
 
@@ -426,29 +427,46 @@ func newHeldFixture() (*Service, *fakeStore, *markerPageDB, store.FindingGroupCl
 	return svc, cache, db, op, repo
 }
 
-func TestFindingGroupMarkerLimitFailsFullSyncBeforeCacheWrites(t *testing.T) {
+func TestFindingGroupDescriptionLimitSkipsScanNotSync(t *testing.T) {
 	svc, cache, db, _, repo := newHeldFixture()
 	issue := forge.Issue{Description: strings.Repeat("a", findingGroupDescriptionLimit+1), UpdatedAt: time.Now()}
-	// The uzi/open/finding fetches also return rows: none of them may reach the cache.
 	f := &fakeForge{allIssues: []forge.Issue{issue}, issues: []forge.Issue{issueAt(1, time.Now())}}
 	marks, err := svc.FullSync(context.Background(), repo, 7, f)
-	requireFullSyncHeld(t, svc, cache, db, repo, marks, err)
+	requireScanSkipped(t, svc, cache, db, repo, marks, err)
 }
 
-func TestFindingGroupCandidateLimitFailsFullSyncAndHoldsClaim(t *testing.T) {
+func TestFindingGroupCandidateLimitSkipsScanAndHoldsClaim(t *testing.T) {
 	svc, cache, db, op, repo := newHeldFixture()
 	marker := "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->"
 	issue := forge.Issue{IID: 77, Description: strings.Repeat(marker, findingGroupCandidateLimit+1), UpdatedAt: time.Now()}
 	f := &fakeForge{allIssues: []forge.Issue{issue}, issues: []forge.Issue{issueAt(1, time.Now())}}
 	marks, err := svc.FullSync(context.Background(), repo, 7, f)
-	requireFullSyncHeld(t, svc, cache, db, repo, marks, err)
+	requireScanSkipped(t, svc, cache, db, repo, marks, err)
 }
 
-func TestFullSyncUnfilteredFetchErrorFailsClosed(t *testing.T) {
+// Anyone who can open an issue can plant marker-shaped text naming operations that do
+// not exist. Past the candidate cap that must not stop the issue sync, or the planted
+// issue would freeze the cache, manual Refresh and the poller's follow-up syncs.
+func TestFindingGroupPlantedUnrelatedMarkersDoNotFailFullSync(t *testing.T) {
+	svc, cache, db, op, repo := newHeldFixture()
+	var planted strings.Builder
+	for i := 0; i <= findingGroupCandidateLimit; i++ {
+		planted.WriteString("<!-- uzi-finding-group-operation: " + uuid.NewString() + " -->")
+	}
+	genuine := forge.Issue{IID: 78, WebURL: "https://example.com/78", Description: "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->", UpdatedAt: time.Now()}
+	f := &fakeForge{
+		allIssues: []forge.Issue{{IID: 77, Description: planted.String(), UpdatedAt: time.Now()}, genuine},
+		issues:    []forge.Issue{issueAt(1, time.Now())},
+	}
+	marks, err := svc.FullSync(context.Background(), repo, 7, f)
+	requireScanSkipped(t, svc, cache, db, repo, marks, err)
+}
+
+func TestFullSyncUnfilteredFetchErrorSkipsScanNotSync(t *testing.T) {
 	svc, cache, db, _, repo := newHeldFixture()
 	f := &fakeForge{allErr: fmt.Errorf("forge pagination cap"), issues: []forge.Issue{issueAt(1, time.Now())}}
 	marks, err := svc.FullSync(context.Background(), repo, 7, f)
-	requireFullSyncHeld(t, svc, cache, db, repo, marks, err)
+	requireScanSkipped(t, svc, cache, db, repo, marks, err)
 	if len(f.unfilteredListCalls()) != 1 {
 		t.Fatalf("unfiltered calls = %d, want 1", len(f.unfilteredListCalls()))
 	}

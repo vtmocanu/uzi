@@ -310,18 +310,26 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	return ops, finish, advance, nil
 }
 
-// Bound marker parsing before any cache write or watermark advance. The caps
-// apply to the COMPLETE unfiltered issue list that FullSync reconciles markers
-// over (see reconcileFindingGroupMarkers): a description or candidate count over
-// a cap fails the whole FullSync with marks held rather than skipping the
-// offending issue, because a skipped issue could be the second carrier of an
-// op's marker and hiding it would make an ambiguous marker look unique.
+// Bound marker parsing. The caps apply to the COMPLETE unfiltered issue list that
+// FullSync reconciles markers over (see reconcileFindingGroupMarkers): a
+// description or candidate count over a cap abandons the whole scan rather than
+// skipping the offending issue, because a skipped issue could be the second
+// carrier of an op's marker and hiding it would make an ambiguous marker look
+// unique. An abandoned scan settles nothing, but it does not fail the issue sync:
+// anyone who can open an issue can plant marker-shaped text, and that must not
+// stop the cache refresh or the poller's follow-up work.
 const (
 	findingGroupMarkerPrefix     = "<!-- uzi-finding-group-operation: "
 	findingGroupMarkerSuffix     = " -->"
 	findingGroupDescriptionLimit = 1 << 20
 	findingGroupCandidateLimit   = 1000
 )
+
+// errFindingGroupScanIncomplete marks a marker scan that could not see the
+// complete issue set (the fetch failed or a cap was hit). FullSync keeps every
+// unconfirmed claim and carries on with the issue sync; any other
+// reconciliation error, a database write in particular, still fails the pass.
+var errFindingGroupScanIncomplete = errors.New("finding group marker scan incomplete")
 
 type findingGroupMatch struct {
 	issue     forge.Issue
@@ -370,8 +378,11 @@ func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUI
 		return nil
 	}
 	index, err := indexFindingGroupIssues(issues)
-	if err != nil || len(index) == 0 {
-		return err
+	if err != nil {
+		return errors.Join(errFindingGroupScanIncomplete, err)
+	}
+	if len(index) == 0 {
+		return nil
 	}
 	ids := make([]uuid.UUID, 0, len(index))
 	for id := range index {
@@ -414,9 +425,9 @@ func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUI
 // It makes NO forge request unless some op in pending can actually be matched:
 // ListPendingFindingGroupsByIDs only matches phase in_flight or
 // returned_uncertain with no recorded iid, so a recorded op (settled by
-// pendingFindingGroups) or a pre_call op never triggers the fetch. Any error,
-// including the driver's own pagination cap, is returned so the caller keeps its
-// marks and claims.
+// pendingFindingGroups) or a pre_call op never triggers the fetch. A failed
+// fetch (including the driver's own pagination cap) or a marker cap returns
+// errFindingGroupScanIncomplete with nothing recorded, so every claim stays.
 func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, pending []store.FindingGroupClaimOperation) error {
 	if s.groupDB == nil {
 		return nil
@@ -433,7 +444,7 @@ func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.
 	}
 	all, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{})
 	if err != nil {
-		return err
+		return errors.Join(errFindingGroupScanIncomplete, err)
 	}
 	return s.recordFindingGroupMatches(ctx, repoID, all)
 }
@@ -749,9 +760,12 @@ func (m Marks) Advance(next Marks) Marks {
 //
 // FullSync is also the only path that settles unconfirmed finding-group
 // operations by marker (reconcileFindingGroupMarkers): it makes one extra
-// unfiltered all-states fetch, only while a matchable operation is pending, and
-// a failure of that fetch (or a cap in it) fails the whole pass with the zero
-// Marks, no cache writes and the claims retained.
+// unfiltered all-states fetch, only while a matchable operation is pending. A
+// failure of that fetch (or a cap in it) settles nothing and keeps every claim,
+// but the issue sync below still runs and reports its marks: the marks bound
+// only the label-filtered fetches, which match no markers, so advancing them
+// hides nothing from a later scan. A database error while recording a match
+// still fails the pass with the zero Marks and no cache writes.
 //
 // The third fetch closes a gap the first two structurally left open: a filed finding
 // issue carries only the finding marker label, never the uzi label, so once it CLOSES
@@ -815,10 +829,17 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		findingMark = maxUpdatedAt(findingIssues)
 	}
 	// Marker reconciliation runs over the complete issue list, after every
-	// fetch above succeeded and before any cache write. An error returns the
-	// zero Marks, leaves the cache untouched and does not advance the cursor.
+	// fetch above succeeded and before any cache write. An incomplete scan
+	// leaves the page's claims unsettled and the sync continues; the cursor
+	// still rotates, so recorded operations on other pages keep settling while
+	// the scan cannot complete. Any other error returns the zero Marks, leaves
+	// the cache untouched and does not advance the cursor.
 	if err := s.reconcileFindingGroupMarkers(ctx, repoID, forgeProjectID, f, pendingGroups); err != nil {
-		return Marks{}, err
+		if !errors.Is(err, errFindingGroupScanIncomplete) {
+			return Marks{}, err
+		}
+		slog.Warn("finding group marker scan incomplete; unconfirmed operations stay claimed",
+			"repo_id", repoID, "error", err)
 	}
 	advanceGroups()
 

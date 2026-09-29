@@ -555,15 +555,6 @@ func (e *rcEnv) requireInFlightUntouched(op uuid.UUID) {
 	}
 }
 
-func (e *rcEnv) requireNoCursor() {
-	e.t.Helper()
-	e.svc.groupCursorMu.Lock()
-	defer e.svc.groupCursorMu.Unlock()
-	if _, ok := e.svc.groupCursors[e.repoID]; ok {
-		e.t.Error("failed FullSync advanced the group cursor")
-	}
-}
-
 // The marker is on two issues. The older one is closed and has lost its label, so the
 // finding-labelled, UpdatedAfter-bounded fetch and the open fetch both miss it: only the
 // complete (unlabelled, all-state) set shows both carriers.
@@ -669,11 +660,22 @@ func TestFindingGroupReconcileUnfilteredFetchOnlyWhenMatchableLiveDB(t *testing.
 	})
 }
 
-// A failed complete-set fetch, or one over a cap, fails the whole FullSync: claims stay, the
-// cache is not written and the cursor does not advance.
-func TestFindingGroupReconcileCompleteSetFailureFailsFullSyncLiveDB(t *testing.T) {
+// A failed complete-set fetch, or one over a cap, settles nothing: claims stay and the op
+// is untouched. The issue sync itself still succeeds, so the cache is written and the
+// group cursor rotates. Planted markers naming unrelated operations are the reason: they
+// are issue text anyone can write, and must not stop the sync.
+func TestFindingGroupReconcileIncompleteScanKeepsClaimsLiveDB(t *testing.T) {
 	longMarkerIssue := func(op uuid.UUID) forge.Issue {
 		is := rcIssue(1901, strings.Repeat(rcMarker(op), findingGroupCandidateLimit+1))
+		is.Labels = nil
+		return is
+	}
+	plantedIssue := func() forge.Issue {
+		var b strings.Builder
+		for i := 0; i <= findingGroupCandidateLimit; i++ {
+			b.WriteString(rcMarker(uuid.New()))
+		}
+		is := rcIssue(1903, b.String())
 		is.Labels = nil
 		return is
 	}
@@ -683,6 +685,9 @@ func TestFindingGroupReconcileCompleteSetFailureFailsFullSyncLiveDB(t *testing.T
 	}{
 		{"fetch error", func(e *rcEnv, _ uuid.UUID) { e.fake.unfilteredErr = fmt.Errorf("forge pagination cap") }},
 		{"candidate cap", func(e *rcEnv, op uuid.UUID) { e.fake.set(rcIssue(1900, "unrelated"), longMarkerIssue(op)) }},
+		{"planted unrelated markers", func(e *rcEnv, op uuid.UUID) {
+			e.fake.set(rcIssue(1900, "unrelated"), plantedIssue(), rcIssue(1904, rcMarker(op)))
+		}},
 		{"description cap", func(e *rcEnv, _ uuid.UUID) {
 			big := rcIssue(1902, strings.Repeat("a", findingGroupDescriptionLimit+1))
 			big.Labels = nil
@@ -696,18 +701,23 @@ func TestFindingGroupReconcileCompleteSetFailureFailsFullSyncLiveDB(t *testing.T
 			e.fake.set(rcIssue(1900, "unrelated"))
 			tc.setup(e, op.ID)
 			marks, err := e.svc.FullSync(e.ctx, e.repoID, 7001, e.fake)
-			if err == nil {
-				t.Fatal("FullSync succeeded, want the pass to fail closed")
+			if err != nil {
+				t.Fatalf("FullSync failed on an incomplete marker scan: %v", err)
 			}
-			if marks != (Marks{}) {
-				t.Errorf("marks = %v, want zero", marks)
+			if marks == (Marks{}) {
+				t.Error("marks are zero, want the issue sync's marks")
 			}
 			e.requireClaimed(ids)
 			e.requireInFlightUntouched(op.ID)
-			if n := e.cachedIssueRows(); n != 0 {
-				t.Errorf("cache rows written = %d, want 0", n)
+			if n := e.cachedIssueRows(); n == 0 {
+				t.Error("no cache rows written, want the issue sync to run")
 			}
-			e.requireNoCursor()
+			e.svc.groupCursorMu.Lock()
+			_, rotated := e.svc.groupCursors[e.repoID]
+			e.svc.groupCursorMu.Unlock()
+			if !rotated {
+				t.Error("incomplete scan did not rotate the group cursor")
+			}
 		})
 	}
 }
