@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"reflect"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -84,23 +85,36 @@ func TestFindingsFileGroupJSON(t *testing.T) {
 	}
 }
 
-func TestFindingsFileGroupWarningQuiet(t *testing.T) {
+func TestFindingsFileGroupSettledWarningHiddenByQuiet(t *testing.T) {
 	fc := groupFake()
-	fc.FileFindingGroupResult.Warning = "settle failed"
+	fc.FileFindingGroupResult.Warning = "note"
 	out, _, _ := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-2")
-	if !strings.Contains(out, "warning: settle failed") {
+	if !strings.Contains(out, "warning: note") {
 		t.Errorf("warning missing:\n%s", out)
 	}
-	out, _, code := runCLI(t, fakeEnv(groupWithWarning()), "--quiet", "findings", "file", "e-1", "e-2")
+	out, _, code := runCLI(t, fakeEnv(fc), "--quiet", "findings", "file", "e-1", "e-2")
 	if code != uzicli.ExitOK || strings.Contains(out, "warning") {
-		t.Errorf("--quiet should hide the warning (exit %d):\n%s", code, out)
+		t.Errorf("--quiet should hide a settled warning (exit %d):\n%s", code, out)
 	}
 }
 
-func groupWithWarning() *uzicli.FakeClient {
+// A 201 whose phase is not settled means an issue exists but the operation is unsettled: the
+// operation and warning stay visible even under --quiet.
+func TestFindingsFileGroupUnsettled201KeptUnderQuiet(t *testing.T) {
 	fc := groupFake()
-	fc.FileFindingGroupResult.Warning = "settle failed"
-	return fc
+	fc.FileFindingGroupResult.Phase = "in_flight"
+	fc.FileFindingGroupResult.Warning = "record not settled"
+	for _, args := range [][]string{{"findings", "file", "e-1", "e-2"}, {"--quiet", "findings", "file", "e-1", "e-2"}} {
+		out, _, code := runCLI(t, fakeEnv(fc), args...)
+		if code != uzicli.ExitOK {
+			t.Fatalf("%v: exit = %d, want 0 (an issue exists)", args, code)
+		}
+		for _, want := range []string{"operation op-1 (in_flight)", "warning: record not settled"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%v: output missing %q:\n%s", args, want, out)
+			}
+		}
+	}
 }
 
 func TestFindingsFileGroupAcceptedExit5(t *testing.T) {
@@ -113,7 +127,7 @@ func TestFindingsFileGroupAcceptedExit5(t *testing.T) {
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want 5", code)
 	}
-	for _, want := range []string{"op-7", "returned_uncertain", "unsure", "uzi findings release op-7 --confirm-no-issue"} {
+	for _, want := range []string{"op-7", "returned_uncertain", "unsure", "uzi findings release op-7 --confirm-no-issue", "deadline", "checked the forge"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
@@ -125,21 +139,56 @@ func TestFindingsFileGroupAcceptedExit5(t *testing.T) {
 	}
 }
 
-func TestFindingsFileGroup409ReportsPendingOperation(t *testing.T) {
+func TestFindingsFileGroup409ReportsPendingOperations(t *testing.T) {
 	fc := groupFake()
+	fc.FindingDrafts["e-3"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-3"}
+	fc.FindingDrafts["e-4"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-4"}
 	fc.FileFindingGroupErr = uzicli.Exitf(uzicli.ExitConflict, "finding not fileable")
-	op := "op-99"
+	op1 := "11111111-1111-4111-8111-111111111111"
+	op2 := "22222222-2222-4222-8222-222222222222"
 	fc.FindingsResult.Findings = []apitypes.IncidentalFindingDTO{
-		{DispositionID: "d-1"},
-		{DispositionID: "d-2", GroupOperationID: &op},
-		{DispositionID: "d-other", GroupOperationID: ptr("op-zzz")},
+		{DispositionID: "d-1", Status: "open"},
+		{DispositionID: "d-2", Status: "filing", GroupOperationID: &op1},
+		{DispositionID: "d-3", Status: "filing", GroupOperationID: &op1},
+		{DispositionID: "d-4", Status: "filing", GroupOperationID: &op2},
+		{DispositionID: "d-other", Status: "filing", GroupOperationID: ptr("op-zzz")},
 	}
-	_, errb, code := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-2")
+	_, errb, code := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-2", "e-3", "e-4")
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want 5", code)
 	}
-	if !strings.Contains(errb, "finding not fileable") || !strings.Contains(errb, "d-2: pending operation op-99") || strings.Contains(errb, "op-zzz") {
+	if !strings.Contains(errb, "finding not fileable") || strings.Contains(errb, "op-zzz") {
 		t.Errorf("stderr:\n%s", errb)
+	}
+	for _, op := range []string{op1, op2} {
+		if got := strings.Count(errb, "pending operation "+op); got != 1 {
+			t.Errorf("operation %s listed %d times (want once, full id):\n%s", op, got, errb)
+		}
+	}
+}
+
+func TestFindingsFileGroup409NamesNonOpenCoordinate(t *testing.T) {
+	fc := groupFake()
+	fc.FileFindingGroupErr = uzicli.Exitf(uzicli.ExitConflict, "finding not fileable")
+	fc.FindingsResult.Findings = []apitypes.IncidentalFindingDTO{
+		{DispositionID: "d-1", Status: "open"},
+		{DispositionID: "d-2", Status: "filed"},
+	}
+	_, errb, code := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-2")
+	if code != uzicli.ExitConflict || !strings.Contains(errb, "finding d-2 is filed") {
+		t.Errorf("exit=%d stderr:\n%s", code, errb)
+	}
+}
+
+func TestFindingsFileGroupTooManyIDs(t *testing.T) {
+	fc := groupFake()
+	args := []string{"findings", "file"}
+	for i := 0; i < 51; i++ {
+		args = append(args, "e-"+strconv.Itoa(i))
+	}
+	_, _, code := runCLI(t, fakeEnv(fc), args...)
+	if code != uzicli.ExitUsage || len(fc.LastFindingDraftIDs) != 0 || fc.LastFileFindingGroupIDs != nil {
+		t.Errorf("exit=%d drafts=%d group=%v", code, len(fc.LastFindingDraftIDs), fc.LastFileFindingGroupIDs)
 	}
 }
 

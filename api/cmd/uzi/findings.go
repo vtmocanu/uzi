@@ -58,7 +58,8 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			"Give several finding ids (same repo) to file ONE issue covering all of them; the\n" +
 			"findings are linked to that issue. Ids that resolve to the same coordinate count once.\n" +
 			"If the filing cannot be confirmed (HTTP 202) the operation id is printed and the exit is 5;\n" +
-			"once you have checked the forge and no issue exists, run\n" +
+			"once the operation's deadline (a few minutes) has passed and you have checked the forge and\n" +
+			"no such issue exists, run\n" +
 			"`uzi findings release <operation-id> --confirm-no-issue`.",
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -77,8 +78,9 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		Use:   "release <operation-id> --confirm-no-issue",
 		Short: "Release a stuck group filing after confirming no forge issue was created",
 		Long: "Release the findings held by a group filing whose outcome could not be confirmed, so\n" +
-			"they can be filed again. Only do this after checking the forge and finding that the\n" +
-			"issue was NOT created; --confirm-no-issue records that confirmation. Exit 5 if the\n" +
+			"they can be filed again. The server accepts a release only after the operation's\n" +
+			"deadline (a few minutes), and you must first check the forge and find that the issue\n" +
+			"was NOT created; --confirm-no-issue records that confirmation. Exit 5 if the\n" +
 			"operation cannot be released (yet), 4 if unknown.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -419,11 +421,21 @@ func runFindingsDismiss(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Co
 	return nil
 }
 
+// maxGroupFindings is the server's cap on one group filing; the CLI refuses more input ids
+// before any request so the draft lookups stay bounded.
+const maxGroupFindings = 50
+
+// releaseHint is the operator guidance shared by every unsettled group filing report.
+const releaseHint = "release is accepted only after the operation's deadline (a few minutes) and only once you checked the forge and no such issue exists"
+
 // runFindingsFileGroup files ONE issue from several evidence ids (issue #1724). Each id is
 // resolved to its coordinate's disposition id through the issue-draft read (so older evidence
 // ids that map to the same coordinate collapse), deduped in first-seen order. A single distinct
 // coordinate falls back to the plain single-file path.
 func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, ids []string) error {
+	if len(ids) > maxGroupFindings {
+		return uzicli.Exitf(uzicli.ExitUsage, "at most %d findings can be filed as one issue (got %d)", maxGroupFindings, len(ids))
+	}
 	var dispIDs []string
 	seen := map[string]bool{}
 	for _, id := range ids {
@@ -443,29 +455,42 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
 	if err != nil {
 		var ee *uzicli.ExitError
 		if errors.As(err, &ee) && ee.Code == uzicli.ExitConflict {
-			return explainGroupConflict(cmd, c, ee, dispIDs)
+			return explainGroupConflict(env, cmd, c, ee, dispIDs)
 		}
 		return err
 	}
+	unsettled := accepted || res.Issue == nil
 	p := env.printer(gf)
 	if p.Format == uzicli.FormatJSON {
 		if err := p.JSON(res); err != nil {
 			return err
 		}
-	} else if accepted || res.Issue == nil {
-		p.Printf("group filing not settled: operation %s (%s)\n", sanitizeTTY(res.OperationID), sanitizeTTY(res.Phase))
-		if res.Warning != "" {
+	} else {
+		if !unsettled && !gf.quiet {
+			p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+			if res.Issue.WebURL != "" {
+				p.Printf("  %s\n", res.Issue.WebURL)
+			}
+			p.Printf("linked findings: %s\n", strings.Join(res.DispositionIDs, ", "))
+		}
+		if unsettled && res.Issue != nil && !gf.quiet {
+			// An issue exists but the record has not settled: still show it.
+			p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+			if res.Issue.WebURL != "" {
+				p.Printf("  %s\n", res.Issue.WebURL)
+			}
+		}
+		// An unsettled operation (202, or a 201 not yet settled) and any warning are always
+		// printed, --quiet included: the operation id is what the user later inspects, and must
+		// not be released blindly.
+		if res.Phase != "settled" || accepted {
+			p.Printf("operation %s (%s)\n", sanitizeTTY(res.OperationID), sanitizeTTY(res.Phase))
+		}
+		if res.Warning != "" && (res.Phase != "settled" || accepted || !gf.quiet) {
 			p.Printf("warning: %s\n", sanitizeTTY(res.Warning))
 		}
-		p.Printf("check the forge; if no issue was created, run `uzi findings release %s --confirm-no-issue`\n", sanitizeTTY(res.OperationID))
-	} else if !gf.quiet {
-		p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
-		if res.Issue.WebURL != "" {
-			p.Printf("  %s\n", res.Issue.WebURL)
-		}
-		p.Printf("linked findings: %s\n", strings.Join(res.DispositionIDs, ", "))
-		if res.Warning != "" {
-			p.Printf("warning: %s\n", sanitizeTTY(res.Warning))
+		if accepted || res.Issue == nil {
+			p.Printf("check the forge; if no issue exists, run `uzi findings release %s --confirm-no-issue` (%s)\n", sanitizeTTY(res.OperationID), releaseHint)
 		}
 	}
 	if accepted || res.Issue == nil {
@@ -475,9 +500,11 @@ func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.
 }
 
 // explainGroupConflict enriches the group POST's plain 409 ("finding not fileable", no operation
-// id) with the pending operations found on the selected coordinates in the backlog. A failed
+// id) from the backlog. The detail goes straight to stderr, one line per pending operation
+// (deduped) or non-open coordinate, because root prints the returned error through cellText,
+// which folds newlines and cuts at 200 runes and would truncate UUID operation ids. A failed
 // backlog read leaves the original error untouched.
-func explainGroupConflict(cmd *cobra.Command, c uzicli.Client, orig *uzicli.ExitError, dispIDs []string) error {
+func explainGroupConflict(env Env, cmd *cobra.Command, c uzicli.Client, orig *uzicli.ExitError, dispIDs []string) error {
 	b, err := c.ListFindings(cmd.Context(), "all", "", "")
 	if err != nil {
 		return orig
@@ -486,16 +513,29 @@ func explainGroupConflict(cmd *cobra.Command, c uzicli.Client, orig *uzicli.Exit
 	for _, d := range dispIDs {
 		selected[d] = true
 	}
+	seenOps := map[string]bool{}
 	var lines []string
 	for _, f := range b.Findings {
-		if selected[f.DispositionID] && f.GroupOperationID != nil && *f.GroupOperationID != "" {
-			lines = append(lines, fmt.Sprintf("finding %s: pending operation %s", f.DispositionID, sanitizeTTY(*f.GroupOperationID)))
+		if !selected[f.DispositionID] {
+			continue
+		}
+		switch {
+		case f.GroupOperationID != nil && *f.GroupOperationID != "":
+			if op := sanitizeTTY(*f.GroupOperationID); !seenOps[op] {
+				seenOps[op] = true
+				lines = append(lines, "pending operation "+op)
+			}
+		case f.Status != "open":
+			lines = append(lines, fmt.Sprintf("finding %s is %s", f.DispositionID, sanitizeTTY(f.Status)))
 		}
 	}
 	if len(lines) == 0 {
 		return orig
 	}
-	return &uzicli.ExitError{Code: uzicli.ExitConflict, Err: fmt.Errorf("%s\n%s", orig.Error(), strings.Join(lines, "\n"))}
+	for _, l := range lines {
+		_, _ = fmt.Fprintln(env.Stderr, l)
+	}
+	return uzicli.Exitf(uzicli.ExitConflict, "%s (details above)", orig.Error())
 }
 
 // runFindingsRelease releases a stuck group filing operation the owner confirmed produced no
