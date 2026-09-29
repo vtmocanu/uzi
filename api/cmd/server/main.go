@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
@@ -806,6 +807,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "run_salvage",
 			Run:  wsvc.SweepSalvage,
+		},
+		// Stale fetch reservations (PRD #1906 M3): a reservation older than
+		// fetchctl.StaleReservationAge belongs to a fetch whose fetcher crashed or lost its
+		// Complete; its bytes and concurrency slot go back to the run. Always registered:
+		// with no profile-bound runs it is one UPDATE matching nothing.
+		sweeper.Pass{
+			Name: "fetch_reservations_stale",
+			Run:  fetchctl.New(pool, settingsCache).SweepStale,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484

@@ -980,6 +980,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// recovery service's own owner-scoped queries. Download streams decrypted bytes
 				// with private/no-store/nosniff + a server-generated filename and no redirect.
 				r.Get("/{id}/archives", h.ListRecoveryArchives)
+				// Source log of a profile-bound research run (PRD #1906 M3). Same RequireUser
+				// group and the same strict GetRun owner-or-404 gate as the archives above, so
+				// `uzi run fetches` reaches it from a uzc_ Bearer and an admin is refused.
+				r.Get("/{id}/fetches", h.ListRunFetches)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
 				// Exact owner custody-hold DISCARD (PRD #1349 M5, D7). Same RequireUser /runs
@@ -1035,6 +1039,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 		h.mountWorkerRoutes(r, proposalLimiter)
 		h.mountControllerRoutes(r)
+		h.mountFetcherRoutes(r)
 	})
 
 	return r
@@ -1069,6 +1074,7 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 	r.Route("/api", func(r chi.Router) {
 		h.mountWorkerRoutes(r, proposalLimiter)
 		h.mountControllerRoutes(r)
+		h.mountFetcherRoutes(r)
 	})
 
 	return r

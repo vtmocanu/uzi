@@ -180,6 +180,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
+	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
+	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
+	// the shapes that cannot be isolated: the judge lane below has no isolation, and a Codex
+	// run's own web search is server-side (Decision 10; the schema CHECK forbids the pair,
+	// this is the backstop).
+	isolated := run.EgressProfileID.Valid
+	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
+		return nil, errIsolatedClaimRefused
+	}
 	if run.Kind == runkind.Judge {
 		// PRD #1429 M3: the judge lane now threads the CLAIMING worker through too —
 		// assembleJudgeClaim's Codex branch needs it (codexClaimSecrets is worker-scoped),
@@ -227,10 +236,15 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
-	botPAT, err := s.box.Open(rc.TokenCiphertext)
-	if err != nil {
-		// box.Open errors carry no plaintext.
-		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
+	// Decision 12: a profile-bound run's claim carries no forge credential, so its PAT is
+	// never even decrypted.
+	var botPAT []byte
+	if !isolated {
+		botPAT, err = s.box.Open(rc.TokenCiphertext)
+		if err != nil {
+			// box.Open errors carry no plaintext.
+			return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
+		}
 	}
 
 	// PRD #1429 M2 (D4): claim assembly is HARNESS-AUTHORITATIVE — the Codex/Claude split is
@@ -793,6 +807,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// (repos.fold_improve_uzi_backlog, read from the same GetRunClaimContextRow as
 		// RepoDevboxOptIn above); false ⇒ the worker runs the generic directive (m4).
 		payload.SelfImproveDogfood = rc.FoldImproveUziBacklog
+	}
+
+	// PRD #1906 M3: last, so nothing attached above survives the strip. An unbound run
+	// skips this and its claim is byte-identical to before.
+	if isolated {
+		if err := s.isolateClaim(ctx, run, payload); err != nil {
+			return nil, err
+		}
 	}
 
 	return payload, nil

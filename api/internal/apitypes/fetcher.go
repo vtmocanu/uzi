@@ -78,3 +78,28 @@ type FetcherControlErrorDTO struct {
 	Error  string `json:"error"`
 	Reason string `json:"reason"`
 }
+
+// RunFetchDTO is one row of a run's source log (PRD #1906 M3, Decision 8), as the run's
+// owner reads it from GET /api/runs/{id}/fetches and `uzi run fetches`. URL, FinalURL,
+// ContentType and Reason are site- or agent-controlled: the api stored them escaped
+// (control and format runes as \u{XXXX}, invalid bytes as \xNN, a backslash as \\) and
+// length-capped, and a renderer must still treat them as untrusted text.
+type RunFetchDTO struct {
+	ID          string    `json:"id"`
+	URL         string    `json:"url"`
+	FinalURL    string    `json:"final_url"`
+	Verdict     string    `json:"verdict"`
+	Reason      string    `json:"reason"`
+	HTTPStatus  int       `json:"http_status"`
+	ContentType string    `json:"content_type"`
+	Bytes       int64     `json:"bytes"`
+	SHA256      string    `json:"sha256"`
+	StartedAt   time.Time `json:"started_at"`
+	FinishedAt  time.Time `json:"finished_at"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// RunFetchesDTO is the owner read's envelope: every attempt, oldest first.
+type RunFetchesDTO struct {
+	Fetches []RunFetchDTO `json:"fetches"`
+}

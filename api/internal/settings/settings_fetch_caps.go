@@ -22,6 +22,7 @@ var fetchCapBounds = map[string][2]int64{
 	KeyFetchMaxRunBytes:      {1, 10 << 30}, // 10 GiB
 	KeyFetchMaxRunFiles:      {1, 10000},
 	KeyFetchMaxConcurrentRun: {1, 32},
+	KeyFetchMaxRunAttempts:   {1, 100000},
 }
 
 // FetchCaps is the effective set of fetch caps.
@@ -34,6 +35,8 @@ type FetchCaps struct {
 	MaxRunFiles int64
 	// MaxConcurrentPerRun is how many fetches one run may have in flight.
 	MaxConcurrentPerRun int64
+	// MaxRunAttempts is how many admission requests a run may make, admitted or refused.
+	MaxRunAttempts int64
 }
 
 // FetchCaps returns the effective fetch caps. A stored value that does not parse or is
@@ -57,6 +60,7 @@ func (c *Cache) FetchCaps(ctx context.Context) (FetchCaps, error) {
 		MaxRunBytes:         get(KeyFetchMaxRunBytes),
 		MaxRunFiles:         get(KeyFetchMaxRunFiles),
 		MaxConcurrentPerRun: get(KeyFetchMaxConcurrentRun),
+		MaxRunAttempts:      get(KeyFetchMaxRunAttempts),
 	}
 	return caps, firstErr
 }

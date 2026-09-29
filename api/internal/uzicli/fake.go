@@ -592,6 +592,11 @@ type FakeClient struct {
 	// capture id IN ORDER, so a test proves NO download was attempted when selection should
 	// have failed first (the >1-available-without-selection case). The *Err fields win over
 	// the blanket Err so a test can model a summary that reads fine and a download that fails.
+	// RunFetchesResult backs RunFetches, keyed by run id (an absent key is an empty log);
+	// RunFetchesErr wins over the blanket Err.
+	RunFetchesResult map[string]apitypes.RunFetchesDTO
+	RunFetchesErr    error
+
 	RecoverySummaries     map[string]apitypes.RecoveryArchiveSummaryDTO
 	RecoveryArchivesErr   error
 	RecoveryBytes         map[string][]byte

@@ -17,6 +17,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/egressprofile"
@@ -53,6 +54,10 @@ type egressProfileInvalidBody struct {
 }
 
 const egressProfileInvalidReason = "invalid_egress_profile"
+
+// egressProfileRunsFK is the Postgres default name of runs.egress_profile_id's foreign key
+// (migration 00270).
+const egressProfileRunsFK = "runs_egress_profile_id_fkey"
 
 func egressProfileToDTO(p store.EgressProfile, warnings []egressprofile.Warning) apitypes.EgressProfileDTO {
 	dto := apitypes.EgressProfileDTO{
@@ -237,6 +242,13 @@ func (h *Handler) AdminDeleteEgressProfile(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	n, err := h.q.DeleteEgressProfileByName(r.Context(), name)
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == egressProfileRunsFK {
+		// PRD #1906 M3: runs.egress_profile_id is ON DELETE RESTRICT, because unbinding a
+		// run would let it claim with the full tool set and a forge credential.
+		httpx.Error(w, http.StatusConflict, "egress profile is still referenced by runs")
+		return
+	}
 	if err != nil {
 		slog.Error("delete egress profile", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

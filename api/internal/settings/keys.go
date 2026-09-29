@@ -276,6 +276,10 @@ const (
 	KeyFetchMaxRunBytes      = "fetch_max_run_bytes"
 	KeyFetchMaxRunFiles      = "fetch_max_run_files"
 	KeyFetchMaxConcurrentRun = "fetch_max_concurrent_per_run"
+	// KeyFetchMaxRunAttempts bounds how many admission requests one run may make, admitted
+	// or refused (PRD #1906 M3), so a run whose byte or file total is used up cannot loop
+	// on refused requests without end.
+	KeyFetchMaxRunAttempts = "fetch_max_run_attempts"
 )
 
 // Compiled-in defaults, used when a row is absent so a fresh or partially
@@ -411,6 +415,8 @@ const (
 	DefaultFetchMaxRunBytes      = "209715200" // 200 MiB
 	DefaultFetchMaxRunFiles      = "100"
 	DefaultFetchMaxConcurrentRun = "4"
+	// PRD #1906 M3: five admission requests per file slot.
+	DefaultFetchMaxRunAttempts = "500"
 )
 
 // Defaults maps every known key to its compiled-in default. This is the single
@@ -548,6 +554,7 @@ var Defaults = map[string]string{
 	KeyFetchMaxRunBytes:      DefaultFetchMaxRunBytes,
 	KeyFetchMaxRunFiles:      DefaultFetchMaxRunFiles,
 	KeyFetchMaxConcurrentRun: DefaultFetchMaxConcurrentRun,
+	KeyFetchMaxRunAttempts:   DefaultFetchMaxRunAttempts,
 }
 
 // SecretKeys is the set of settings whose values are secrets (PRD #25): sealed

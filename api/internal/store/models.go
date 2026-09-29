@@ -743,6 +743,8 @@ type Run struct {
 	GateRefusalGeneration       pgtype.Int8        `json:"gate_refusal_generation"`
 	DiskParkCount               int32              `json:"disk_park_count"`
 	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
+	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
+	EgressSnapshot              []byte             `json:"egress_snapshot"`
 }
 
 type RunCompletionAttempt struct {
@@ -775,6 +777,47 @@ type RunCredentialEpoch struct {
 	Label           pgtype.Text        `json:"label"`
 	SelectReason    pgtype.Text        `json:"select_reason"`
 	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+}
+
+type RunFetch struct {
+	ID            uuid.UUID          `json:"id"`
+	RunID         uuid.UUID          `json:"run_id"`
+	ReservationID uuid.UUID          `json:"reservation_id"`
+	Url           string             `json:"url"`
+	FinalUrl      string             `json:"final_url"`
+	Verdict       string             `json:"verdict"`
+	Reason        string             `json:"reason"`
+	HttpStatus    int32              `json:"http_status"`
+	ContentType   string             `json:"content_type"`
+	Bytes         int64              `json:"bytes"`
+	Sha256        string             `json:"sha256"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	FinishedAt    pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunFetchCredential struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	TokenHash       []byte             `json:"token_hash"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+	ReservedBytes   int64              `json:"reserved_bytes"`
+	UsedBytes       int64              `json:"used_bytes"`
+	Files           int64              `json:"files"`
+	Inflight        int64              `json:"inflight"`
+	Attempts        int64              `json:"attempts"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunFetchReservation struct {
+	ID              uuid.UUID          `json:"id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	Bytes           int64              `json:"bytes"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	Settled         bool               `json:"settled"`
+	SettledAt       pgtype.Timestamptz `json:"settled_at"`
 }
 
 type RunGatePresentation struct {

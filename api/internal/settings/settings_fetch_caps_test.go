@@ -8,7 +8,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// TestFetchCapsKnownAndDefaults pins the four PRD #1906 keys as Known (so the admin PUT does
+// TestFetchCapsKnownAndDefaults pins the five PRD #1906 keys as Known (so the admin PUT does
 // not 400 them) with the Open question 1 defaults in Defaults (which is what surfaces them in
 // GET /api/admin/settings with no per-key handler).
 func TestFetchCapsKnownAndDefaults(t *testing.T) {
@@ -17,6 +17,7 @@ func TestFetchCapsKnownAndDefaults(t *testing.T) {
 		"fetch_max_run_bytes":          "209715200", // 200 MiB
 		"fetch_max_run_files":          "100",
 		"fetch_max_concurrent_per_run": "4",
+		"fetch_max_run_attempts":       "500",
 	}
 	for key, def := range want {
 		if !Known(key) {
@@ -47,6 +48,8 @@ func TestValidateFetchCaps(t *testing.T) {
 			[]string{"0", "10001", "-5"}},
 		{KeyFetchMaxConcurrentRun, []string{"1", "4", "32"},
 			[]string{"0", "33", "four"}},
+		{KeyFetchMaxRunAttempts, []string{"1", "500", "100000"},
+			[]string{"0", "100001", "many"}},
 	}
 	for _, c := range cases {
 		for _, v := range c.accept {
@@ -78,7 +81,7 @@ func TestFetchCapsAccessor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("FetchCaps default: %v", err)
 	}
-	if want := (FetchCaps{MaxFileBytes: 25 << 20, MaxRunBytes: 200 << 20, MaxRunFiles: 100, MaxConcurrentPerRun: 4}); def != want {
+	if want := (FetchCaps{MaxFileBytes: 25 << 20, MaxRunBytes: 200 << 20, MaxRunFiles: 100, MaxConcurrentPerRun: 4, MaxRunAttempts: 500}); def != want {
 		t.Fatalf("FetchCaps default = %+v, want %+v", def, want)
 	}
 
@@ -87,11 +90,12 @@ func TestFetchCapsAccessor(t *testing.T) {
 		row(KeyFetchMaxRunBytes, "5368709120"), // 5 GiB: above int32, must not truncate
 		row(KeyFetchMaxRunFiles, "7"),
 		row(KeyFetchMaxConcurrentRun, "2"),
+		row(KeyFetchMaxRunAttempts, "9"),
 	}}, time.Minute).FetchCaps(ctx)
 	if err != nil {
 		t.Fatalf("FetchCaps stored: %v", err)
 	}
-	if want := (FetchCaps{MaxFileBytes: 1 << 20, MaxRunBytes: 5 << 30, MaxRunFiles: 7, MaxConcurrentPerRun: 2}); set != want {
+	if want := (FetchCaps{MaxFileBytes: 1 << 20, MaxRunBytes: 5 << 30, MaxRunFiles: 7, MaxConcurrentPerRun: 2, MaxRunAttempts: 9}); set != want {
 		t.Fatalf("FetchCaps stored = %+v, want %+v", set, want)
 	}
 
@@ -100,6 +104,7 @@ func TestFetchCapsAccessor(t *testing.T) {
 		row(KeyFetchMaxRunBytes, "-1"),
 		row(KeyFetchMaxRunFiles, "junk"),
 		row(KeyFetchMaxConcurrentRun, "1000"),
+		row(KeyFetchMaxRunAttempts, "0"),
 	}}, time.Minute).FetchCaps(ctx)
 	if err != nil {
 		t.Fatalf("FetchCaps bad rows: %v", err)

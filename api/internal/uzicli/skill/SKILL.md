@@ -179,6 +179,7 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
+uzi run fetches <run-id> [--json]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -674,6 +675,11 @@ uzi version
   (without a TTY and without `--yes` it refuses and changes nothing). A cancelled prompt mutates
   nothing. An available archive is never deleted here (export it first). A foreign/absent/already
   settled hold is a 404 (exit 4).
+- `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
+  (official-sources research): every web fetch it attempted, allowed or refused, with the
+  reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only
+  (a foreign run is a 404, exit 4). The URLs, content type and reason are site- or
+  agent-controlled text; `--json` adds each file's sha256 and prints long URLs whole.
 
 ### Schedules — time-driven runs
 
