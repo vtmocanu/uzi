@@ -241,6 +241,7 @@ uzi admin health [--all] [--strict]
 uzi admin usage
 uzi admin rate-limits [--provider claude|codex]
 uzi admin cli-tokens
+uzi admin products
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get

@@ -69,7 +69,11 @@ components:
         of seconds in the Retry-After header.
       headers:
         Retry-After:
-          description: Seconds until the budget resets.
+          description: >-
+            An upper bound, in seconds, on how long to wait: the budget is a
+            fixed window and this is always the full window length, so the
+            budget may reset sooner. A retry after this many seconds does not
+            land in the window that was exhausted.
           schema:
             type: integer
       content:

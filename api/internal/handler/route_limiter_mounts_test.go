@@ -67,7 +67,11 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 205 as of this commit. PRD #1907 M3 added GET /api/v1/whoami, the first route of the
+// 211 as of this commit. PRD #1907 M4 added the admin product registry: GET
+// /api/admin/products and GET /api/admin/product-tokens (both authLimiter per-user), and
+// the cookie-only writes POST /api/admin/products, PATCH and DELETE
+// /api/admin/products/{id} and POST /api/admin/product-tokens/{id}/revoke (noLimiter).
+// It was 205 until then. PRD #1907 M3 added GET /api/v1/whoami, the first route of the
 // stable external API, behind RequireV1Caller and authLimiter.PerUserMiddleware mounted on
 // the whole /api/v1 subtree (one per-user budget across /api/v1, keyed "/api/v1/*").
 // It was 204 until then. Issue #1751 M2 added POST
@@ -232,13 +236,14 @@ type routeMount struct {
 // endpoint: POST /api/vault/unlock and POST /api/vault/passphrase.
 //
 // NOTE on authLimiter: it is mounted BOTH ways. Its per-IP Middleware sits on
-// /register, /login, /config, the OIDC pair and /cli/start; FIVE routes take its
+// /register, /login, /config, the OIDC pair and /cli/start; SEVEN routes take its
 // PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase,
-// /admin/cli-tokens and /v1/whoami (the last through the /api/v1 subtree's r.Use, so
-// every future /api/v1 route inherits it). This table covers the per-user mounts ONLY —
+// /admin/cli-tokens, /admin/products, /admin/product-tokens and /v1/whoami (the last
+// through the /api/v1 subtree's r.Use, so every future /api/v1 route inherits it).
+// This table covers the per-user mounts ONLY —
 // the per-IP ones read as noLimiter here and are not guarded by this file.
 // e2e/run-e2e.sh asserts a 429 on /api/auth/login, which is the per-IP mount and closes
-// none of the 26.
+// none of the 28.
 //
 // 🔴 WHICH LINES A MOUNT-ADDER OWNS, because two numerals in this paragraph and one at
 // the `lim*` constants above were rotted by a single commit — `c309e8a0`, which added
@@ -266,6 +271,9 @@ var wantRouteMounts = []routeMount{
 	// PRD #66 M8 (D8): admin per-repo guardrail override revoke — an admin-only,
 	// unscoped-by-id DB write, no forge call → noLimiter.
 	{"DELETE", "/api/admin/repos/{id}/guardrail-override", noLimiter},
+	// PRD #1907 M4: admin soft delete of a product (D9) — a cookie-only admin DB write,
+	// no forge call → noLimiter, like every sibling admin write.
+	{"DELETE", "/api/admin/products/{id}", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
@@ -297,6 +305,11 @@ var wantRouteMounts = []routeMount{
 	// credentials, so it rides the credential-surface limiter. Its bucket is keyed by
 	// (pattern, user) and is therefore disjoint from the other authLimiter mounts.
 	{"GET", "/api/admin/cli-tokens", limAuth},
+	// PRD #1907 M4: the product registry and the product-credential inventory (the
+	// /cli-tokens sibling) ride the same credential-surface limiter, each in its own
+	// (pattern, user) bucket.
+	{"GET", "/api/admin/products", limAuth},
+	{"GET", "/api/admin/product-tokens", limAuth},
 	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
 	// privilege_report (no forge call) → noLimiter.
 	{"GET", "/api/admin/blocked-repos", noLimiter},
@@ -474,6 +487,9 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/workers/hosted/config", noLimiter},
 	{"GET", "/api/ws", noLimiter},
 	{"PATCH", "/api/admin/users/{id}", noLimiter},
+	// PRD #1907 M4: admin edit of a product's description / enabled flag — cookie-only
+	// admin DB write → noLimiter.
+	{"PATCH", "/api/admin/products/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/anthropic_token/{id}", noLimiter},
 	{"PATCH", "/api/me/secrets/{kind}/{id}/enabled", noLimiter},
 	// PRD #1147 M1 codex credential patches (rename / set-default / replace): owner-scoped
@@ -525,6 +541,10 @@ var wantRouteMounts = []routeMount{
 	// admin — cookie-only admin, a single local per-(episode, caller) upsert (no egress, no
 	// forge/model spend) → noLimiter, like the release-check snooze above.
 	{"POST", "/api/admin/health/snooze", noLimiter},
+	// PRD #1907 M4: register a product and admin-revoke one product token (D8) —
+	// cookie-only admin DB writes, no forge call → noLimiter.
+	{"POST", "/api/admin/products", noLimiter},
+	{"POST", "/api/admin/product-tokens/{id}/revoke", noLimiter},
 	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
 	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
 	// forge WRITE, so it carries forgeLimiter.PerUserMiddleware like the owner

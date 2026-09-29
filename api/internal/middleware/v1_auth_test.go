@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -406,7 +407,8 @@ func TestRequireScopePanicsOnUnknownScope(t *testing.T) {
 }
 
 // A lookup error that is not "no such row" is still a 401 but is logged at Warn, with
-// no token material; a plain unknown token (ErrNoRows) logs nothing.
+// no token material; a plain unknown token (ErrNoRows) or a cancelled/timed-out request
+// context logs nothing.
 func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
@@ -432,6 +434,17 @@ func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
 			func(fx v1Fixture) { fx.st.userErr = dbDown }, "cli token user lookup failed"},
 		{"product user missing (ErrNoRows)", func(fx v1Fixture) string { return fx.uzp },
 			func(fx v1Fixture) { delete(fx.st.users, fx.user.ID) }, ""},
+		// A request whose context was cancelled or timed out mid-lookup is still a 401,
+		// but a client going away is not an infrastructure fault: no Warn. Wrapped, as
+		// pgx returns them, so the check must be errors.Is rather than ==.
+		{"product lookup cancelled", func(fx v1Fixture) string { return fx.uzp },
+			func(fx v1Fixture) { fx.st.productErr = fmt.Errorf("query: %w", context.Canceled) }, ""},
+		{"cli lookup deadline", func(fx v1Fixture) string { return fx.uzc },
+			func(fx v1Fixture) { fx.st.cliErr = fmt.Errorf("query: %w", context.DeadlineExceeded) }, ""},
+		{"product user lookup cancelled", func(fx v1Fixture) string { return fx.uzp },
+			func(fx v1Fixture) { fx.st.userErr = fmt.Errorf("query: %w", context.Canceled) }, ""},
+		{"cli user lookup deadline", func(fx v1Fixture) string { return fx.uzc },
+			func(fx v1Fixture) { fx.st.userErr = fmt.Errorf("query: %w", context.DeadlineExceeded) }, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

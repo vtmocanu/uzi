@@ -50,6 +50,7 @@ type FakeClient struct {
 	AdminWorkers   []apitypes.AdminWorkerDTO
 	AdminHealthDoc apitypes.HealthDocDTO
 	AdminCLITokens []apitypes.AdminCLITokenDTO
+	AdminProducts  []apitypes.ProductDTO
 	AdminUsageV    apitypes.AdminUsageDTO
 	RateLimits     []apitypes.AdminRateLimitRowDTO
 	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide

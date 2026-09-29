@@ -717,6 +717,10 @@ var adminReadPaths = []string{
 	// "a user-scope uzc_ cannot reach it" is the assertion that keeps a token holder
 	// from enumerating every credential in the factory.
 	"/api/admin/cli-tokens",
+	// PRD #1907 M4: the product registry and the product-credential inventory (the
+	// /cli-tokens sibling), readable by a uza_ like every admin read.
+	"/api/admin/products",
+	"/api/admin/product-tokens",
 }
 
 func TestCLIAdminSurfaceLiveDB(t *testing.T) {

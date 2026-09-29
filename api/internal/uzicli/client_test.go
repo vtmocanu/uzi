@@ -827,6 +827,7 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"admin-runs", func(c *HTTPClient) error { _, e := c.AdminListRuns(context.Background()); return e }},
 		{"admin-workers", func(c *HTTPClient) error { _, e := c.AdminListWorkers(context.Background()); return e }},
 		{"admin-cli-tokens", func(c *HTTPClient) error { _, e := c.AdminListCLITokens(context.Background()); return e }},
+		{"admin-products", func(c *HTTPClient) error { _, e := c.AdminListProducts(context.Background()); return e }},
 		{"admin-usage", func(c *HTTPClient) error { _, e := c.AdminUsage(context.Background()); return e }},
 		{"admin-rate-limits", func(c *HTTPClient) error { _, e := c.AdminRateLimits(context.Background()); return e }},
 		{"self-codex-rate-limits", func(c *HTTPClient) error { _, e := c.SelfCodexRateLimits(context.Background()); return e }},

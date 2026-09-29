@@ -112,6 +112,15 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// with it the position-to-name mapping the mount tests pin, for no behavioural
 			// gain.
 			r.With(authLimiter.PerUserMiddleware).Get("/cli-tokens", h.AdminListCLITokens)
+			// Product registry and product-credential inventory (PRD #1907 M4). Both are
+			// reads a uza_ token may make, and both ride authLimiter's per-user budget for
+			// the reason /cli-tokens does: /product-tokens enumerates standing credentials,
+			// and /products carries each product's live-token count. Buckets are keyed by
+			// (pattern, user), so neither contends with /cli-tokens. Soft-deleted products
+			// and their token rows are listed (D9: the audit trail). The writes are
+			// cookie-only, in the group below.
+			r.With(authLimiter.PerUserMiddleware).Get("/products", h.AdminListProducts)
+			r.With(authLimiter.PerUserMiddleware).Get("/product-tokens", h.AdminListProductTokens)
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 		r.Group(func(r chi.Router) {
@@ -192,6 +201,16 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// verbs" — a uza_/uzc_ Bearer 401s/403s before the handler). 409 when no episode
 			// is open. No forge limiter — a local per-(episode, caller) upsert, no egress.
 			r.Post("/health/snooze", h.PostAdminHealthSnooze)
+			// Product registry writes (PRD #1907 M4, D14): register, edit description /
+			// enabled, soft delete (D9), and admin-revoke ONE product token (D8; product
+			// credentials, so PRD #64's no-admin-revoke rule for CLI tokens is unchanged).
+			// Cookie-only here, so a uza_ Bearer 401s before the handler. No per-user
+			// limiter, like every sibling admin write: local DB writes, no forge call, no
+			// token spend, and the actor is an authenticated admin session.
+			r.Post("/products", h.AdminCreateProduct)
+			r.Patch("/products/{id}", h.AdminPatchProduct)
+			r.Delete("/products/{id}", h.AdminDeleteProduct)
+			r.Post("/product-tokens/{id}/revoke", h.AdminRevokeProductToken)
 		})
 	})
 }

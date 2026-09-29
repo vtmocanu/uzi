@@ -180,6 +180,32 @@ func (q *Queries) GetProduct(ctx context.Context, id uuid.UUID) (Product, error)
 	return i, err
 }
 
+const getProductForUpdate = `-- name: GetProductForUpdate :one
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at FROM products WHERE id = $1 FOR UPDATE
+`
+
+// One product by id, soft-deleted included, ROW-LOCKED for the rest of the transaction.
+// The admin PATCH (PRD #1907 M4) accepts description and/or enabled and writes both
+// through UpdateProduct, so it reads the row, merges the fields the request left out,
+// then writes: without the lock two concurrent PATCHes of different fields would each
+// write back the other's stale value (a lost update). Must run on a transaction-bound
+// Queries; on a bare pool the lock is released as soon as the statement ends.
+func (q *Queries) GetProductForUpdate(ctx context.Context, id uuid.UUID) (Product, error) {
+	row := q.db.QueryRow(ctx, getProductForUpdate, id)
+	var i Product
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Enabled,
+		&i.DeletedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getProductTokenForAuth = `-- name: GetProductTokenForAuth :one
 SELECT t.id,
        t.user_id,

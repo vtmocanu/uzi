@@ -212,6 +212,10 @@ type Client interface {
 	// when that verdict is danger (or warn/unknown under --strict), a success-path exit.
 	AdminHealth(ctx context.Context) (apitypes.HealthDocDTO, error)
 	AdminListCLITokens(ctx context.Context) ([]apitypes.AdminCLITokenDTO, error)
+	// AdminListProducts reads the product registry (PRD #1907 M4): GET
+	// /api/admin/products, in the admin READ group, so a uza_ token reads it. Every
+	// product, soft-deleted ones included, with its active-token count.
+	AdminListProducts(ctx context.Context) ([]apitypes.ProductDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows

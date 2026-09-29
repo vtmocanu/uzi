@@ -198,6 +198,15 @@ SELECT *
 -- One product by id, soft-deleted included (callers check enabled / deleted_at).
 SELECT * FROM products WHERE id = $1;
 
+-- name: GetProductForUpdate :one
+-- One product by id, soft-deleted included, ROW-LOCKED for the rest of the transaction.
+-- The admin PATCH (PRD #1907 M4) accepts description and/or enabled and writes both
+-- through UpdateProduct, so it reads the row, merges the fields the request left out,
+-- then writes: without the lock two concurrent PATCHes of different fields would each
+-- write back the other's stale value (a lost update). Must run on a transaction-bound
+-- Queries; on a bare pool the lock is released as soon as the statement ends.
+SELECT * FROM products WHERE id = $1 FOR UPDATE;
+
 -- name: CountActiveProductTokensForProduct :one
 -- Active (not revoked, not expired) tokens of one product, across all users.
 SELECT count(*)

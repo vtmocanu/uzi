@@ -356,8 +356,11 @@ func (c *oaChecker) match(where string, s *oaSchema, typ reflect.Type) {
 
 	// Nullability: exactly the pointer, slice and map fields encode as null in Go. A
 	// slice is the exception the handlers take on themselves: the spec may declare it
-	// non-null only because the handler never leaves it nil (V1Whoami normalises
-	// scopes), which the live whoami test measures on the wire.
+	// non-null only because the handler never leaves it nil. For whoami's scopes that
+	// normalisation is measured by TestV1WhoamiNilScopesEncodeAsEmptyArray (a nil-scopes
+	// principal served through V1Whoami must put "scopes":[] on the wire); the live
+	// whoami tests only ever see a non-empty scopes column, so they cannot reach it. This
+	// checker itself proves nothing about a slice's nullability.
 	isPtr := typ.Kind() == reflect.Pointer
 	if isPtr != nullable && typ.Kind() != reflect.Slice {
 		c.t.Errorf("%s: spec nullable=%t but Go type %s nullable=%t", where, nullable, typ, isPtr)

@@ -151,7 +151,7 @@ uzi repo list | remove <id> [--force]
 uzi project-sync status <repo> | resync <repo>
 uzi pr list [--repo <id>] | checks <iid> [--repo <id>] [--watch]
 uzi ci list [--repo <id>] [--limit <n>] | jobs <run-id> [--repo <id>] | fix <ref> [--repo <id>]
-uzi admin users | runs | workers | usage | rate-limits | cli-tokens | guardrail-impact | blocked-repos
+uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products | guardrail-impact | blocked-repos
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
@@ -696,6 +696,13 @@ A few worth knowing:
   not an oversight, but worth knowing before you mint or hand out one of
   these tokens. Read-only: there's no admin revoke here, the same write/read
   split as every other `admin` verb.
+- **`admin products` lists the external products registered for product
+  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
+  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (tokens neither
+  revoked nor expired) and `DESCRIPTION`. A disabled or deleted product's
+  tokens are refused on `/api/v1`, and a deleted product can never be
+  re-enabled. Read-only: registering, editing, deleting a product and
+  revoking one of its tokens are browser-only admin actions.
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it

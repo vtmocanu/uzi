@@ -217,8 +217,15 @@ func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok 
 // warnV1LookupError logs an auth lookup failure that is not "no such row". The caller
 // still answers 401 (fail closed); this only makes an infrastructure fault visible. The
 // log carries the step and the error, never the token or its hash.
+//
+// A cancelled or timed-out request context is not an infrastructure fault either: the
+// client went away (or the server's own deadline fired) mid-lookup, which is routine
+// and would otherwise make every dropped connection read as a database problem. It is
+// still a 401; only the Warn is skipped.
 func warnV1LookupError(step string, err error) {
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, pgx.ErrNoRows) ||
+		errors.Is(err, context.Canceled) ||
+		errors.Is(err, context.DeadlineExceeded) {
 		return
 	}
 	slog.Warn("v1 auth: "+step+" failed; answering 401", "error", err)
