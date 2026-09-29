@@ -15,6 +15,7 @@ import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
+import { IsolatedExecutor } from "./isolated-executor.js";
 import { IsolatedRunner } from "./isolated-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { SummaryRunner } from "./summary-runner.js";
@@ -173,6 +174,20 @@ export function buildChatExecutor(deps: {
     : new ChatExecutor(deps.log, deps.sdkHomeRoot, {
         secretPaths: workerSecretDenyPaths(deps.workerTokenFile),
       });
+}
+
+/**
+ * Build the isolated research lane's executor (PRD #1906 M4). Exported so the stub seam is
+ * testable. Under UZI_EXECUTOR=stub it gets the stub judge queryFn, exactly as the judge and
+ * review lanes do, so a stub/e2e worker never starts a real SDK session (the stub stream
+ * carries no init frame, so the isolated session fails closed). Its path guard gets the same
+ * worker-credential deny set as a run.
+ */
+export function buildIsolatedExecutor(deps: { log: Logger; executorKind: ExecutorKind; workerTokenFile?: string }): IsolatedExecutor {
+  return new IsolatedExecutor(deps.log, {
+    secretPaths: workerSecretDenyPaths(deps.workerTokenFile),
+    ...(deps.executorKind === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
+  });
 }
 
 export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undefined, deps: BuildRunExecutorDeps): RunExecution {
@@ -642,15 +657,15 @@ async function main(): Promise<void> {
 
   // PRD #1906 M4: the isolated research lane's slim runner. Always built: on a worker without
   // UZI_FETCHER_URL / UZI_FETCHER_CA_FILE it fails every isolated claim closed (and the worker
-  // does not advertise isolated_fetch_v1, so the api should never send one). Its path guard
-  // gets the same worker-credential deny set as a run.
+  // does not advertise isolated_fetch_v1, so the api should never send one). Its executor
+  // comes from buildIsolatedExecutor (the stub queryFn under UZI_EXECUTOR=stub).
   const isolatedRunner = new IsolatedRunner(client, log, {
+    executor: buildIsolatedExecutor({ log, executorKind: config.executor, workerTokenFile: config.workerTokenFile }),
     dataDir: config.dataDir,
     fetcherUrl: config.fetcherUrl,
     fetcherCaFile: config.fetcherCaFile,
     batchMs: config.messageBatchMs,
     joinToken: config.workerToken,
-    secretPaths: workerSecretDenyPaths(config.workerTokenFile),
     pollMs: config.pollIntervalMs,
     activeRuns,
     outbox,
@@ -775,6 +790,9 @@ async function main(): Promise<void> {
       // below — waits for within the container's termination grace. controller.abort()
       // then unblocks the loops as today.
       runner.shutdown();
+      // PRD #1906 M4: abort any in-flight isolated research session too; each reports its
+      // run failed as it unwinds, so the drain does not wait out the run's timeout.
+      isolatedRunner.shutdown();
       controller.abort();
     });
   }

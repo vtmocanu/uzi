@@ -159,12 +159,142 @@ describe("IsolatedRunner: lifecycle", () => {
     assert.match(states[1]!.failure_reason ?? "", /extra tool/);
   });
 
+  it("the prompt always opens with the literal \"Research task: \", so a leading / is never a slash command", async () => {
+    for (const over of [
+      { issue_title: "/compact", issue_description: "/clear everything" },
+      { issue_title: "", issue_description: "/model opus" },
+      { issue_title: null, issue_description: null },
+      { issue_title: " /resume", issue_description: "" },
+    ] as Array<Partial<ClaimResponse>>) {
+      const { client } = recordingClient();
+      const ran: IsolatedContext[] = [];
+      await runner(client, { ran }).execute(isolatedClaim(over));
+      assert.equal(ran.length, 1);
+      const prompt = ran[0]!.prompt;
+      assert.ok(prompt.startsWith("Research task: "), JSON.stringify(over));
+      assert.ok(!prompt.startsWith("/"), JSON.stringify(over));
+    }
+  });
+
+  it("the run's signal is aborted once the session ends, so an in-flight fetch never outlives the run", async () => {
+    const { client } = recordingClient();
+    const ran: IsolatedContext[] = [];
+    await runner(client, { ran }).execute(isolatedClaim());
+    assert.equal(ran[0]!.signal.aborted, true);
+  });
+
   it("the isolated runner has no git collaborator: its module imports neither git nor the RunRunner", () => {
     const src = fs.readFileSync(path.join(import.meta.dirname, "..", "src", "isolated-runner.ts"), "utf8");
     const imports = [...src.matchAll(/from "(\.\/[^"]+)"/g)].map((m) => m[1]);
     for (const banned of ["./git.js", "./runner.js", "./provision-run.js"]) {
       assert.ok(!imports.includes(banned), `isolated-runner.ts must not import ${banned}`);
     }
+  });
+});
+
+describe("IsolatedRunner: steering, claim loss and shutdown", () => {
+  /** A client whose GET /inputs answers `inputs` once (consume-on-read, no receipts). */
+  function steeringClient(inputs: Array<{ kind: string; body?: string }>, stateAck: (b: StateRequest) => object = () => ({ applied: true })) {
+    const states: StateRequest[] = [];
+    const posted: unknown[] = [];
+    let served = false;
+    const client = {
+      reportState: async (_runId: string, body: StateRequest) => {
+        states.push(body);
+        return stateAck(body);
+      },
+      postMessages: async (_runId: string, messages: unknown[]) => void posted.push(...messages),
+      getInputs: async () => {
+        if (served) return { inputs: [] };
+        served = true;
+        return { inputs: inputs.map((i, n) => ({ id: n + 1, kind: i.kind, body: i.body ?? null })) };
+      },
+    } as unknown as WorkerClient;
+    return { client, states, posted };
+  }
+
+  /** An executor that runs until its signal aborts, then fails the way the real one does. */
+  const untilAborted = { run: (ctx: IsolatedContext) => new Promise<void>((_, reject) => {
+    const fail = (): void => reject(new Error("isolated run cancelled"));
+    if (ctx.signal.aborted) fail();
+    else ctx.signal.addEventListener("abort", fail, { once: true });
+  }) };
+
+  it("a cancel input aborts the session and the run is reported failed", async () => {
+    const { client, states } = steeringClient([{ kind: "cancel" }]);
+    await runner(client, { makeSource: undefined, pollMs: 1, executor: untilAborted }).execute(isolatedClaim());
+    assert.deepEqual(states.map((s) => s.status), ["running", "failed"]);
+    assert.match(states[1]!.failure_reason ?? "", /cancelled/);
+  });
+
+  it("a follow_up is refused visibly (a research run takes no steering), and the run carries on", async () => {
+    const { client, states, posted } = steeringClient([{ kind: "follow_up", body: "also compare prices" }]);
+    const r = runner(client, {
+      makeSource: undefined,
+      pollMs: 1,
+      executor: { run: async () => { for (let i = 0; i < 100 && !JSON.stringify(posted).includes("follow-up"); i++) await tick(5); } },
+    });
+    await r.execute(isolatedClaim());
+    assert.deepEqual(states.map((s) => s.status), ["running", "completed"]);
+    const text = JSON.stringify(posted);
+    assert.match(text, /follow-up was not applied/);
+    assert.ok(!text.includes("also compare prices"), "the ignored text is not echoed back as if it were acted on");
+  });
+
+  it("a stale-claim ack at the running report abandons the claim: no session, no further report, no workspace", async () => {
+    const { client, states } = steeringClient([], (b) => (b.status === "running" ? { applied: false, staleClaim: true } : { applied: true }));
+    const ran: IsolatedContext[] = [];
+    const activeRuns = new ActiveRunRegistry();
+    await runner(client, { ran, activeRuns }).execute(isolatedClaim());
+    assert.equal(ran.length, 0);
+    assert.deepEqual(states.map((s) => s.status), ["running"]);
+    assert.equal(activeRuns.size, 0);
+    assert.ok(!fs.existsSync(path.join(dataDir, "isolated", "iso-1")));
+  });
+
+  for (const outcome of ["completes", "fails"] as const) {
+    it(`a lost claim reports no terminal state when the session ${outcome}`, async () => {
+      const { client, states } = steeringClient([]);
+      const r = runner(client, {
+        makeSource: () => ({ start() {}, stop: async () => {}, claimLost: () => true }),
+        executor: { run: async () => { if (outcome === "fails") throw new Error("isolated run cancelled"); } },
+      });
+      await r.execute(isolatedClaim());
+      assert.deepEqual(states.map((s) => s.status), ["running"]);
+      assert.ok(!fs.existsSync(path.join(dataDir, "isolated", "iso-1")), "the per-run dir is still removed");
+    });
+  }
+
+  it("shutdown() aborts an in-flight session and reports it failed", async () => {
+    const { client, states } = steeringClient([]);
+    const r = runner(client, { executor: untilAborted });
+    const done = r.execute(isolatedClaim());
+    for (let i = 0; i < 200 && states.length === 0; i++) await tick();
+    r.shutdown();
+    await done;
+    assert.deepEqual(states.map((s) => s.status), ["running", "failed"]);
+    assert.match(states[1]!.failure_reason ?? "", /worker shut down/);
+  });
+
+  it("a claim that arrives after shutdown() starts no session", async () => {
+    const { client, states } = steeringClient([]);
+    const ran: IsolatedContext[] = [];
+    const r = runner(client, { ran });
+    r.shutdown();
+    await r.execute(isolatedClaim());
+    assert.equal(ran.length, 0);
+    assert.equal(states.at(-1)?.status, "failed");
+    assert.match(states.at(-1)?.failure_reason ?? "", /worker shut down/);
+  });
+
+  it("fails closed under the uid split (the 0700 per-run dirs would be the worker's alone)", async () => {
+    const { client, states } = recordingClient();
+    const ran: IsolatedContext[] = [];
+    await runner(client, { ran, splitActive: true }).execute(isolatedClaim());
+    assert.equal(ran.length, 0);
+    assert.deepEqual(states.map((s) => s.status), ["failed"]);
+    assert.match(states[0]!.failure_reason ?? "", /UZI_UID_SPLIT/);
+    assert.ok(!fs.existsSync(path.join(dataDir, "isolated")));
   });
 });
 

@@ -1406,7 +1406,7 @@ export function buildSendMessageAliasHook(
 }
 
 /** Path-bearing fields across the file tools (file_path / path / notebook_path). */
-function extractToolPaths(toolInput: unknown): string[] {
+export function extractToolPaths(toolInput: unknown): string[] {
   if (!toolInput || typeof toolInput !== "object") return [];
   const rec = toolInput as Record<string, unknown>;
   const out: string[] = [];
@@ -1499,7 +1499,7 @@ function classifyResolvedPath(
  * unresolved. Bounded hops guard against a symlink cycle; any fs error falls back
  * to what is resolved so far (the lexical check already ran).
  */
-function realpathExisting(p: string): string {
+export function realpathExisting(p: string): string {
   let current = path.resolve(p);
   for (let hops = 0; hops < 64; hops++) {
     const found = deepestExisting(current);

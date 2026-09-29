@@ -19,9 +19,14 @@
 //     never put in any environment, so the SDK child cannot read it.
 //   - The fetcher's X-Uzi-Sha256 / X-Uzi-Bytes are claims, not facts: the body is streamed
 //     through a byte cap, hashed here, and refused on any mismatch. The file is named by
-//     the hash computed HERE.
+//     the hash computed HERE, and the isolated executor's write guard denies every write
+//     tool under `sources/`, so the model cannot later change the bytes behind that name.
 //   - final_url and content_type are site-controlled text: control and bidi characters are
 //     escaped before they reach the model.
+//   - A fetch never outlives its run: the run's AbortSignal abandons it (socket destroyed,
+//     partial file removed), `timeoutMs` is a TOTAL deadline on top of the socket's idle
+//     timer, and `sources/` is created non-recursively under the EXISTING workspace, so a
+//     fetch still in flight when the run directory is removed cannot recreate it.
 
 import { createHash, randomBytes } from "node:crypto";
 import fs from "node:fs";
@@ -46,7 +51,7 @@ const FETCH_TOOL_NAME = "fetch_url";
 export const FETCH_TOOL_QUALIFIED = `mcp__${FETCH_SERVER_NAME}__${FETCH_TOOL_NAME}`;
 
 /** Workspace subdirectory the downloads land in. */
-const SOURCES_DIR = "sources";
+export const SOURCES_DIR = "sources";
 /** Worker-side per-file ceiling. The fetcher enforces the admin cap (default 25 MiB);
  *  this only bounds what the worker will accept from it. */
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
@@ -70,7 +75,10 @@ export interface FetchToolDeps {
   workspace: string;
   log: Logger;
   maxBytes?: number;
+  /** The TOTAL deadline of one fetch (connect, request and body), and the socket idle limit. */
   timeoutMs?: number;
+  /** The run's signal: aborted when the run is cancelled or ends, it abandons every fetch. */
+  signal?: AbortSignal;
 }
 
 /** What one fetch produced: the saved file's metadata, or the refusal. */
@@ -93,6 +101,12 @@ class Refusal extends Error {
   ) {
     super(message);
   }
+}
+
+/** The refusal an aborted fetch reports: the deadline's own Refusal, else `cancelled`. */
+function abortRefusal(signal: AbortSignal): Refusal {
+  const reason: unknown = signal.reason;
+  return reason instanceof Refusal ? reason : new Refusal("cancelled", "the run ended; the fetch was abandoned");
 }
 
 /** Escape control and bidi characters in site-controlled text, and cap its length. */
@@ -131,10 +145,14 @@ function endpointOf(fetcherUrl: string): URL {
  * AND the peer certificate verified against `ca` alone. Nothing is written to the socket
  * before this resolves.
  */
-function connectVerified(endpoint: URL, ca: string | Buffer, timeoutMs: number): Promise<tls.TLSSocket> {
+function connectVerified(endpoint: URL, ca: string | Buffer, timeoutMs: number, signal: AbortSignal): Promise<tls.TLSSocket> {
   const host = endpoint.hostname.replace(/^\[|\]$/g, "");
   const port = endpoint.port ? Number(endpoint.port) : 443;
   return new Promise((resolve, reject) => {
+    if (signal.aborted) {
+      reject(abortRefusal(signal));
+      return;
+    }
     const socket = tls.connect({
       host,
       port,
@@ -148,8 +166,15 @@ function connectVerified(endpoint: URL, ca: string | Buffer, timeoutMs: number):
       reject(new Refusal("fetcher_unreachable", "timed out connecting to the fetcher"));
     }, timeoutMs);
     timer.unref?.();
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      socket.destroy();
+      reject(abortRefusal(signal));
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
     socket.once("secureConnect", () => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       // Belt and braces: rejectUnauthorized already turns a failed verification into an
       // `error` event, but never proceed on anything but an authorized peer.
       if (!socket.authorized) {
@@ -164,6 +189,7 @@ function connectVerified(endpoint: URL, ca: string | Buffer, timeoutMs: number):
     });
     socket.on("error", (err) => {
       clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
       socket.destroy();
       const code = (err as NodeJS.ErrnoException).code ?? "";
       const tlsFailure = /CERT|SELF_SIGNED|UNABLE_TO|ERR_TLS|HOSTNAME|ALTNAME|SSL/i.test(code + " " + err.message);
@@ -244,10 +270,18 @@ async function refusalFrom(res: IncomingMessage): Promise<Refusal> {
   return new Refusal(reason, message, extra);
 }
 
-/** Create `<workspace>/sources` as a real directory (never through a symlink). */
+/** Create `<workspace>/sources` as a real directory (never through a symlink). Not
+ *  recursive: a workspace that no longer exists (the run ended and its directory was
+ *  removed) is a refusal, never recreated. */
 async function sourcesDir(workspace: string): Promise<string> {
   const dir = path.join(workspace, SOURCES_DIR);
-  await fsp.mkdir(dir, { recursive: true });
+  try {
+    await fsp.mkdir(dir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") throw new Refusal("workspace_error", "the run workspace no longer exists");
+    if (code !== "EEXIST") throw err;
+  }
   const st = await fsp.lstat(dir);
   if (!st.isDirectory() || st.isSymbolicLink()) {
     throw new Refusal("workspace_error", "the workspace sources path is not a plain directory");
@@ -256,7 +290,7 @@ async function sourcesDir(workspace: string): Promise<string> {
 }
 
 /** Stream the 200 body into `sources/`, hashing and counting it, then check the claims. */
-async function saveBody(res: IncomingMessage, deps: FetchToolDeps, maxBytes: number): Promise<FetchOutcome> {
+async function saveBody(res: IncomingMessage, deps: FetchToolDeps, maxBytes: number, signal: AbortSignal): Promise<FetchOutcome> {
   const claimedSha = (headerOf(res, "x-uzi-sha256") ?? "").trim().toLowerCase();
   const claimedBytesRaw = (headerOf(res, "x-uzi-bytes") ?? "").trim();
   const finalUrl = headerOf(res, "x-uzi-final-url") ?? "";
@@ -269,6 +303,7 @@ async function saveBody(res: IncomingMessage, deps: FetchToolDeps, maxBytes: num
     throw new Refusal("too_large", `the file is larger than the worker's ${maxBytes}-byte limit`);
   }
 
+  if (signal.aborted) throw abortRefusal(signal);
   const dir = await sourcesDir(deps.workspace);
   const tmp = path.join(dir, `.partial-${randomBytes(8).toString("hex")}`);
   // O_EXCL | O_NOFOLLOW: a fresh file, never an existing one or a link.
@@ -294,6 +329,8 @@ async function saveBody(res: IncomingMessage, deps: FetchToolDeps, maxBytes: num
     if (sha !== claimedSha) {
       throw new Refusal("sha_mismatch", "the body's sha256 does not match the fetcher's X-Uzi-Sha256");
     }
+    // The run may have ended while the body streamed: never publish into it then.
+    if (signal.aborted) throw abortRefusal(signal);
     const dest = path.join(dir, sha);
     await fsp.rename(tmp, dest);
     keep = true;
@@ -318,25 +355,41 @@ async function saveBody(res: IncomingMessage, deps: FetchToolDeps, maxBytes: num
 export async function fetchIntoWorkspace(deps: FetchToolDeps, url: string): Promise<FetchOutcome> {
   const maxBytes = deps.maxBytes ?? DEFAULT_MAX_BYTES;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  // One signal for the whole fetch: the run's own, or the total deadline, whichever first.
+  const deadline = new AbortController();
+  const timer = setTimeout(
+    () => deadline.abort(new Refusal("fetcher_timeout", "the fetch exceeded its total time limit")),
+    timeoutMs,
+  );
+  timer.unref?.();
+  const signal = deps.signal ? AbortSignal.any([deps.signal, deadline.signal]) : deadline.signal;
   let socket: tls.TLSSocket | undefined;
+  // Once connected, an abort destroys the socket: a pending response errors, a streaming
+  // body ends early, and saveBody removes its partial file.
+  const onAbort = (): void => void socket?.destroy();
+  signal.addEventListener("abort", onAbort, { once: true });
   try {
     if (typeof url !== "string" || url.length === 0 || url.length > MAX_URL_LEN) {
       throw new Refusal("url_too_long", `the URL must be 1 to ${MAX_URL_LEN} characters`);
     }
     const endpoint = endpointOf(deps.fetcherUrl);
-    socket = await connectVerified(endpoint, deps.ca, timeoutMs);
+    socket = await connectVerified(endpoint, deps.ca, timeoutMs, signal);
+    if (signal.aborted) throw abortRefusal(signal);
     const { res, abort } = await postOver(socket, endpoint, deps.credential, JSON.stringify({ url }), timeoutMs);
     try {
       if (res.statusCode !== 200) throw await refusalFrom(res);
-      return await saveBody(res, deps, maxBytes);
+      return await saveBody(res, deps, maxBytes, signal);
     } finally {
       abort();
     }
   } catch (err) {
-    const r = err instanceof Refusal ? err : new Refusal("fetch_failed", errMessage(err));
+    // Whatever surfaced (a socket hang-up, a premature close), an aborted fetch reports why.
+    const r = signal.aborted ? abortRefusal(signal) : err instanceof Refusal ? err : new Refusal("fetch_failed", errMessage(err));
     deps.log.warn("fetch tool refused", { reason: r.reason, status: r.extra.status });
     return { ok: false, reason: r.reason, message: r.message, ...r.extra };
   } finally {
+    clearTimeout(timer);
+    signal.removeEventListener("abort", onAbort);
     socket?.destroy();
   }
 }

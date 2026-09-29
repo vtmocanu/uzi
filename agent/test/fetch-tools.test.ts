@@ -62,7 +62,11 @@ async function fakeFetcher(key: string, cert: string, handler: Handler): Promise
   return {
     url: `https://localhost:${port}`,
     requests,
-    close: () => new Promise((resolve) => server.close(() => resolve())),
+    close: () =>
+      new Promise((resolve) => {
+        server.closeAllConnections();
+        server.close(() => resolve());
+      }),
   };
 }
 
@@ -220,6 +224,79 @@ describe("fetch tool (uzi_fetch / fetch_url)", () => {
   it("refuses a non-https fetcher URL without connecting", async () => {
     const out = await fetchIntoWorkspace(deps("http://127.0.0.1:1"), "https://a.example/");
     assert.equal(!out.ok && out.reason, "fetcher_misconfigured");
+  });
+
+  it("the run's abort signal abandons an in-flight fetch and keeps no file", async () => {
+    const body = Buffer.from("x".repeat(1000));
+    const run = new AbortController();
+    const f = await fakeFetcher(pki.goodKey, pki.goodCert, (_r, res) => {
+      res.writeHead(200, { "X-Uzi-Final-Url": "https://a.example/x", "X-Uzi-Sha256": sha(body), "X-Uzi-Bytes": String(body.length) });
+      res.write(body.subarray(0, 10)); // ...and never the rest: the fetch hangs until aborted
+      setTimeout(() => run.abort(), 50);
+    });
+    try {
+      const started = Date.now();
+      const out = await fetchIntoWorkspace(deps(f.url, { signal: run.signal }), "https://a.example/x");
+      assert.equal(!out.ok && out.reason, "cancelled", JSON.stringify(out));
+      assert.ok(Date.now() - started < 5_000, "returned on the abort, not on a timeout");
+      assert.deepEqual(sources(), [], "no file, not even a partial, is left");
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("an already-aborted signal sends nothing", async () => {
+    const f = await fakeFetcher(pki.goodKey, pki.goodCert, (_r, res) => res.end());
+    try {
+      const out = await fetchIntoWorkspace(deps(f.url, { signal: AbortSignal.abort() }), "https://a.example/x");
+      assert.equal(!out.ok && out.reason, "cancelled");
+      assert.equal(f.requests.length, 0);
+    } finally {
+      await f.close();
+    }
+  });
+
+  it("a trickling body cannot outlive the total deadline (the socket idle timer alone never fires)", async () => {
+    const body = Buffer.from("y".repeat(60));
+    let timer: NodeJS.Timeout | undefined;
+    const f = await fakeFetcher(pki.goodKey, pki.goodCert, (_r, res) => {
+      res.writeHead(200, { "X-Uzi-Final-Url": "https://a.example/x", "X-Uzi-Sha256": sha(body), "X-Uzi-Bytes": String(body.length) });
+      let i = 0;
+      timer = setInterval(() => {
+        if (res.destroyed || i >= body.length) {
+          clearInterval(timer);
+          if (!res.destroyed) res.end();
+          return;
+        }
+        res.write(body.subarray(i, i + 1));
+        i++;
+      }, 25);
+    });
+    try {
+      const out = await fetchIntoWorkspace(deps(f.url, { timeoutMs: 400 }), "https://a.example/x");
+      assert.equal(!out.ok && out.reason, "fetcher_timeout", JSON.stringify(out));
+      assert.deepEqual(sources(), []);
+    } finally {
+      clearInterval(timer);
+      await f.close();
+    }
+  });
+
+  it("never recreates sources/ (or the workspace) once the run directory is gone", async () => {
+    const body = Buffer.from("late bytes");
+    const f = await fakeFetcher(pki.goodKey, pki.goodCert, (_r, res) => {
+      res.writeHead(200, { "X-Uzi-Final-Url": "https://a.example/x", "X-Uzi-Sha256": sha(body), "X-Uzi-Bytes": String(body.length) });
+      res.end(body);
+    });
+    try {
+      fs.rmSync(workspace, { recursive: true, force: true });
+      const out = await fetchIntoWorkspace(deps(f.url), "https://a.example/x");
+      assert.equal(out.ok, false);
+      assert.equal(!out.ok && out.reason, "workspace_error");
+      assert.ok(!fs.existsSync(workspace), "the removed workspace was not recreated");
+    } finally {
+      await f.close();
+    }
   });
 
   it("escapes control characters in site-controlled metadata", async () => {

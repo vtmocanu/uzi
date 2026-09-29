@@ -2423,6 +2423,11 @@ export interface ChatSteeringOptions {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** Injectable clock so the idle window is provable without real time. */
   now?: () => number;
+  /** PRD #1906 M4: a lane with no conversation (the isolated research run) takes no
+   *  follow_up. When set, each routed follow_up body is handed here INSTEAD of being
+   *  buffered for awaitFollowUp, so the lane can say visibly that it was not applied.
+   *  Unset (every chat), follow_ups are buffered exactly as before. */
+  onFollowUp?: (text: string) => void;
 }
 
 /**
@@ -2470,6 +2475,7 @@ export class ChatSteering implements ChatInputSource {
     | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly now: () => number;
+  private readonly onFollowUp: ((text: string) => void) | undefined;
 
   constructor(
     private readonly client: WorkerClient,
@@ -2484,6 +2490,7 @@ export class ChatSteering implements ChatInputSource {
   ) {
     this.sleepFn = opts.sleep ?? sleep;
     this.now = opts.now ?? Date.now;
+    this.onFollowUp = opts.onFollowUp;
   }
 
   claimLost(): boolean {
@@ -2530,7 +2537,9 @@ export class ChatSteering implements ChatInputSource {
   private route(kind: string, body: string | null | undefined): void {
     switch (kind) {
       case "follow_up":
-        if (body && body.trim()) this.followUps.push(body.trim());
+        if (!body || !body.trim()) break;
+        if (this.onFollowUp) this.onFollowUp(body.trim());
+        else this.followUps.push(body.trim());
         break;
       case "cancel":
         if (!this.cancel.signal.aborted) this.cancel.abort();

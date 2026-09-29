@@ -241,6 +241,87 @@ describe("isolated executor: SDK options and the path guard", () => {
   });
 });
 
+describe("isolated executor: fetched sources are read-only to the model", () => {
+  const SHA = "a".repeat(64);
+
+  function withSource(): SdkOptions {
+    const o = options({ passed: true });
+    fs.mkdirSync(path.join(workspace, "sources"));
+    fs.writeFileSync(path.join(workspace, "sources", SHA), "fetched bytes");
+    return o;
+  }
+
+  it("denies Write/Edit on sources/<sha256> in every path form", async () => {
+    const o = withSource();
+    fs.mkdirSync(path.join(workspace, "notes"));
+    fs.symlinkSync(path.join(workspace, "sources"), path.join(workspace, "srclink"));
+    const forms = [
+      `sources/${SHA}`,
+      `./sources/${SHA}`,
+      `notes/../sources/${SHA}`,
+      path.join(workspace, "sources", SHA),
+      `${workspace}/./notes/../sources/${SHA}`,
+      `srclink/${SHA}`,
+      "sources/new-file.md",
+      "sources",
+    ];
+    for (const tool of ["Write", "Edit"]) {
+      for (const p of forms) {
+        const input = tool === "Write" ? { file_path: p, content: "x" } : { file_path: p, old_string: "fetched", new_string: "forged" };
+        assert.equal(await simulateToolUse(o, tool, input), "deny", `${tool} ${p}`);
+      }
+    }
+  });
+
+  it("the sources hook also covers MultiEdit and NotebookEdit (not in the tool set, so denied twice over)", async () => {
+    const o = withSource();
+    const writeOnly = o.hooks?.PreToolUse?.find(
+      (m) => m.matcher !== undefined && new RegExp(`^(?:${m.matcher})$`).test("MultiEdit") && !new RegExp(`^(?:${m.matcher})$`).test("Read"),
+    );
+    assert.ok(writeOnly, "a write-only PreToolUse matcher exists");
+    const cases: Array<[string, Record<string, unknown>]> = [
+      ["MultiEdit", { file_path: `sources/${SHA}`, edits: [] }],
+      ["NotebookEdit", { notebook_path: `sources/${SHA}`, new_source: "x" }],
+    ];
+    for (const [tool, input] of cases) {
+      const hookInput = { hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, session_id: "s", transcript_path: "", cwd: workspace } as unknown as HookInput;
+      const out = (await writeOnly.hooks[0]!(hookInput, undefined, { signal: new AbortController().signal })) as {
+        hookSpecificOutput?: { permissionDecision?: string };
+      };
+      assert.equal(out.hookSpecificOutput?.permissionDecision, "deny", tool);
+    }
+  });
+
+  it("still allows Read/Grep/Glob of sources/ and writes elsewhere in the workspace", async () => {
+    const o = withSource();
+    assert.equal(await simulateToolUse(o, "Read", { file_path: `sources/${SHA}` }), "allow");
+    assert.equal(await simulateToolUse(o, "Grep", { pattern: "x", path: "sources" }), "allow");
+    assert.equal(await simulateToolUse(o, "Glob", { pattern: "*", path: path.join(workspace, "sources") }), "allow");
+    assert.equal(await simulateToolUse(o, "Write", { file_path: "findings.md", content: "x" }), "allow");
+    assert.equal(await simulateToolUse(o, "Write", { file_path: "sources-notes.md", content: "x" }), "allow");
+  });
+});
+
+describe("isolated executor: the run secrets dir entry is load-bearing", () => {
+  it("denies it even when the workspace root contains it, while the rest of the root stays readable", async () => {
+    const fetch = buildFetchToolsServer({ fetcherUrl: "https://127.0.0.1:1", ca: "", credential: "cred", workspace: "/run", log: nullLogger() });
+    const o = buildIsolatedSdkOptions({
+      env: isolateSdkEnv(buildSdkEnv(OAUTH, path.join(dir, "home"))),
+      cwd: "/run",
+      log: nullLogger(),
+      secretPaths: [],
+      fetchServer: fetch.server,
+      gate: { passed: true },
+      maxTurns: 5,
+    });
+    // Containment alone would allow both: only the secret-dir entry tells them apart.
+    const secretDir = ["", "run", "uzi-secrets"].join("/");
+    assert.equal(await simulateToolUse(o, "Read", { file_path: "/run/some-other-file" }), "allow");
+    assert.equal(await simulateToolUse(o, "Read", { file_path: `${secretDir}/fetch-token` }), "deny");
+    assert.equal(await simulateToolUse(o, "Grep", { pattern: "x", path: "uzi-secrets" }), "deny");
+  });
+});
+
 describe("isolated executor: env scope", () => {
   it("a normal run's env (buildSdkEnv, what SdkExecutor and ChatExecutor use) has no nonessential-traffic key", () => {
     const env = buildSdkEnv(OAUTH, "/h");

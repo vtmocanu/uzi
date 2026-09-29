@@ -9,10 +9,23 @@
 // It works in a fresh per-run directory under the data dir, removed when the run ends
 // (lane workers are run-bound, so nothing survives into another run either way).
 //
+// Steering: a research run is one prompt, so it takes NO follow_up. A follow_up input is
+// still received and settled (the input protocol has no "rejected" receipt for a follow_up:
+// its only settling receipt is `applied`, and the `discarded` one is approve_plan-only), but
+// it is never delivered to the session, and the run's transcript says so in a status line,
+// so nobody reads the settled input as acted on. `cancel` is the only steering it honours.
+//
+// Shutdown: shutdown() (main.ts calls it on SIGTERM/SIGINT) aborts every in-flight session
+// and reports each run failed with a shutdown reason, so the worker's drain does not wait
+// out the run timeout. The run's signal is also aborted when the run ends for any reason,
+// which abandons every fetch still in flight before the run directory is removed.
+//
 // Fail closed, before anything starts (the FailClosedExecutor idiom, codex-executor.ts):
 // a claim with a Codex block (Decision 10: Codex's own web search is server-side), a
-// forge credential (Decision 12), a malformed grant, or a worker without UZI_FETCHER_URL
-// and UZI_FETCHER_CA_FILE is reported failed without a session, a workspace or a fetch.
+// forge credential (Decision 12), a malformed grant, a worker without UZI_FETCHER_URL
+// and UZI_FETCHER_CA_FILE, or a worker running the UZI_UID_SPLIT uid split (the lane runs
+// single-uid; its 0700 worker-owned per-run dirs would be unusable to the runner uid) is
+// reported failed without a session, a workspace or a fetch.
 
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -27,6 +40,7 @@ import type { Logger } from "./log.js";
 import type { Outbox } from "./outbox.js";
 import type { ClaimResponse, IsolatedFetchClaim, StateRequest } from "./protocol.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, type TerminalOutboxDeps } from "./terminal-resolve.js";
 import { errMessage } from "./util.js";
@@ -35,6 +49,11 @@ const MAX_FAILURE_REASON_LEN = 512;
 const DEFAULT_MAX_TURNS = 200;
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
 const DEFAULT_POLL_MS = 3000;
+/** The failure reason of a run the worker's shutdown ended. */
+const SHUTDOWN_REASON = "the worker shut down during the research run";
+/** The status line a follow_up input gets: it is never delivered to the session. */
+const IGNORED_FOLLOW_UP =
+  "a follow-up was not applied: a research run takes no steering once it has started (cancel it and start a new run to change the task)";
 
 /** What the runner drives: the real IsolatedExecutor, or a test fake. */
 export interface IsolatedExecutorLike {
@@ -60,7 +79,14 @@ export interface IsolatedRunnerOptions {
   /** Worker credential paths the path guard denies. */
   secretPaths?: readonly string[];
   executor?: IsolatedExecutorLike;
-  makeSource?: (runId: string, cancel: AbortController, log: Logger, claimGeneration: number) => IsolatedCancelSource;
+  /** `onFollowUp` receives each follow_up input, which is never delivered to the session. */
+  makeSource?: (
+    runId: string,
+    cancel: AbortController,
+    log: Logger,
+    claimGeneration: number,
+    onFollowUp: (text: string) => void,
+  ) => IsolatedCancelSource;
   pollMs?: number;
   maxTurns?: number;
   activeRuns?: ActiveRunRegistry;
@@ -68,6 +94,8 @@ export interface IsolatedRunnerOptions {
   rearm?: Map<string, () => void>;
   outboxTerminalMaxBytes?: number;
   gapFillMax?: number;
+  /** Whether the UZI_UID_SPLIT uid split is active (default: {@link uidSplitActive}). */
+  splitActive?: boolean;
 }
 
 /** A shape-valid isolated grant, or undefined. */
@@ -91,6 +119,9 @@ function preflightReason(claim: ClaimResponse, opts: IsolatedRunnerOptions): str
     return "a profile-bound run cannot run on the Codex harness (its web search is server-side)";
   }
   if (secrets?.forge_pat) return "a profile-bound claim must not carry a forge credential";
+  if (opts.splitActive ?? uidSplitActive()) {
+    return "the isolated lane runs single-uid, but this worker has the UZI_UID_SPLIT uid split active (its 0700 per-run dirs would be unusable to the runner uid)";
+  }
   if (!opts.fetcherUrl || !opts.fetcherCaFile) {
     return "this worker is not configured for the isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE are required)";
   }
@@ -114,6 +145,9 @@ export class IsolatedRunner {
   private readonly executor: IsolatedExecutorLike;
   private readonly terminalDeps: TerminalOutboxDeps | undefined;
   private readonly makeSource: NonNullable<IsolatedRunnerOptions["makeSource"]>;
+  private shuttingDown = false;
+  /** Each in-flight run's cancel controller, aborted by shutdown(). */
+  private readonly inflight = new Set<AbortController>();
 
   constructor(
     private readonly client: WorkerClient,
@@ -129,7 +163,20 @@ export class IsolatedRunner {
     const pollMs = opts.pollMs ?? DEFAULT_POLL_MS;
     this.makeSource =
       opts.makeSource ??
-      ((runId, cancel, runLog, generation) => new ChatSteering(client, runId, pollMs, runLog, cancel, {}, generation));
+      ((runId, cancel, runLog, generation, onFollowUp) =>
+        new ChatSteering(client, runId, pollMs, runLog, cancel, { onFollowUp }, generation));
+  }
+
+  /**
+   * Worker shutdown: abort every in-flight isolated session (each then reports its run
+   * failed with {@link SHUTDOWN_REASON}), and refuse any claim that arrives afterwards.
+   * Synchronous and idempotent, like RunRunner.shutdown().
+   */
+  shutdown(): void {
+    this.shuttingDown = true;
+    for (const cancel of this.inflight) {
+      if (!cancel.signal.aborted) cancel.abort(new Error(SHUTDOWN_REASON));
+    }
   }
 
   /** Report this run failed (journaled when an outbox is wired). Never throws. */
@@ -163,7 +210,7 @@ export class IsolatedRunner {
     for (const s of runSecrets) this.log.addSecret(s);
     this.opts.activeRuns?.add(runId, generation);
 
-    const refused = preflightReason(claim, this.opts);
+    const refused = this.shuttingDown ? SHUTDOWN_REASON : preflightReason(claim, this.opts);
     if (refused || !grant) {
       runLog.error("isolated claim refused before start", { reason: refused });
       await this.reportFailed(runId, generation, refused ?? "malformed isolated claim", undefined, 0);
@@ -176,6 +223,10 @@ export class IsolatedRunner {
     const runDir = path.join(this.opts.dataDir, "isolated", runId);
     let batcher: MessageBatcher | undefined;
     let source: IsolatedCancelSource | undefined;
+    // The run's signal: a `cancel` input, shutdown(), a lost claim, or the run's end aborts
+    // it. It is the session's ctx.signal AND every fetch's signal.
+    const cancel = new AbortController();
+    this.inflight.add(cancel);
     try {
       let ca: Buffer;
       try {
@@ -203,8 +254,11 @@ export class IsolatedRunner {
       batcher = b;
       this.opts.rearm?.set(runId, () => b.rearm());
 
-      const cancel = new AbortController();
-      source = this.makeSource(runId, cancel, runLog, generation);
+      source = this.makeSource(runId, cancel, runLog, generation, () => {
+        // Never the text itself: echoing it back would read as if it had been acted on.
+        runLog.warn("isolated run ignored a follow_up input (a research run takes no steering)");
+        b.emit({ kind: "status", agent: "worker", payload: { text: IGNORED_FOLLOW_UP } });
+      });
       source.start();
 
       const fetch = buildFetchToolsServer({
@@ -213,7 +267,10 @@ export class IsolatedRunner {
         credential: grant.credential,
         workspace,
         log: runLog,
+        signal: cancel.signal,
       });
+      // shutdown() may have landed while the run was being set up.
+      if (cancel.signal.aborted) throw new Error("isolated run cancelled before the session started");
       const timeoutSeconds = claim.config?.run_timeout_seconds;
       await this.executor.run({
         runId,
@@ -250,12 +307,15 @@ export class IsolatedRunner {
         await batcher?.close().catch(() => undefined);
         return;
       }
-      const reason = redactText(errMessage(err));
+      const reason = this.shuttingDown && cancel.signal.aborted ? SHUTDOWN_REASON : redactText(errMessage(err));
       runLog.error("isolated run failed", { error: reason });
       batcher?.emit({ kind: "error", agent: "worker", payload: { text: reason } });
       await batcher?.close().catch(() => undefined);
       await this.reportFailed(runId, generation, reason, err, batcher?.currentSeq() ?? 0);
     } finally {
+      // Ends every fetch still in flight BEFORE the run directory goes.
+      if (!cancel.signal.aborted) cancel.abort();
+      this.inflight.delete(cancel);
       await fsp.rm(runDir, { recursive: true, force: true }).catch((err) =>
         runLog.warn("could not remove the isolated run directory", { error: errMessage(err) }),
       );

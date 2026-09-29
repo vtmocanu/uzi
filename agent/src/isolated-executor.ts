@@ -14,18 +14,29 @@
 //      the run (fail closed). This is what catches a future SDK tool that `tools` does not
 //      govern (PRD Risks, "An Anthropic-side tool that reads the web").
 //   4. The path guard, rooted at the run workspace with `/run/uzi-secrets` and the worker
-//      credential paths denied.
+//      credential paths denied, plus a write guard that keeps `<workspace>/sources/` (the
+//      fetch tool's hash-named downloads) out of reach of Write/Edit/MultiEdit/NotebookEdit,
+//      so a saved source always holds the bytes whose sha256 names it.
 //
 // The SDK child env is buildSdkEnv() with no provisioned tool env (so nothing a devbox
 // could add), then the lane knobs, with CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 as the
 // last assignment so no earlier key can override it. The fetch credential is never in it:
 // the fetch tool runs in this process (fetch-tools.ts).
 
+import path from "node:path";
+
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
 
 import type { EmittedMessage } from "./executor.js";
-import { FETCH_SERVER_NAME, FETCH_TOOL_QUALIFIED } from "./fetch-tools.js";
-import { ASYNC_DEFERRAL_TOOLS, buildPathGuardHook, NESTED_AGENT_TOOL } from "./guardrails.js";
+import { FETCH_SERVER_NAME, FETCH_TOOL_QUALIFIED, SOURCES_DIR } from "./fetch-tools.js";
+import {
+  ASYNC_DEFERRAL_TOOLS,
+  buildPathGuardHook,
+  extractToolPaths,
+  NESTED_AGENT_TOOL,
+  realpathExisting,
+  WRITE_PATH_TOOLS,
+} from "./guardrails.js";
 import { classifyLimitFailure, LimitReachedError, RateLimitObserver } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { SdkQueryFn } from "./sdk-executor.js";
@@ -76,6 +87,43 @@ const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false };
 
 const REASON_INIT_PENDING = "denied: the isolated session's tool set has not been verified yet";
 const REASON_TOOL_NOT_ALLOWED = "denied: this tool is not in the isolated run's fixed tool set";
+const REASON_SOURCES_READ_ONLY =
+  "denied: fetched sources under sources/ are read-only evidence; write your findings elsewhere in the workspace";
+
+/** Whether `p` is `dir` or lies under it. */
+function within(p: string, dir: string): boolean {
+  return p === dir || p.startsWith(dir + path.sep);
+}
+
+/**
+ * The isolated lane's write guard: deny any write tool whose target resolves into
+ * `<workspace>/sources/` (the directory itself included, so it cannot be pre-empted by a
+ * file of that name). The target is checked lexically (relative, absolute, `./` and `..`
+ * forms all normalize) AND after resolving symlinks on its existing prefix, against both the
+ * lexical and the resolved sources path. Read, Grep and Glob are not write tools and stay
+ * allowed. This is the lane's own hook: the shared path guard of normal runs is unchanged.
+ */
+function buildSourcesWriteGuard(workspace: string, log: Logger): (input: HookInput) => Promise<HookJSONOutput> {
+  const writeTools = new Set<string>(WRITE_PATH_TOOLS);
+  const root = path.resolve(workspace);
+  const sources = path.join(root, SOURCES_DIR);
+  return async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse" || !writeTools.has(input.tool_name)) return {};
+    const cwd = typeof input.cwd === "string" && input.cwd ? input.cwd : root;
+    const realSources = realpathExisting(sources);
+    for (const candidate of extractToolPaths(input.tool_input)) {
+      const lexical = path.resolve(cwd, candidate);
+      const real = realpathExisting(lexical);
+      if (within(lexical, sources) || within(real, sources) || within(real, realSources)) {
+        log.warn("isolated write guard denied a write into sources/", { tool: input.tool_name });
+        return {
+          hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: REASON_SOURCES_READ_ONLY },
+        };
+      }
+    }
+    return {};
+  };
+}
 
 /**
  * The SDK child env for an isolated run: `base` (normally buildSdkEnv's output with NO
@@ -249,6 +297,10 @@ export function buildIsolatedSdkOptions(input: {
         {
           matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
           hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR])],
+        },
+        {
+          matcher: WRITE_PATH_TOOLS.join("|"),
+          hooks: [buildSourcesWriteGuard(input.cwd, input.log)],
         },
       ],
     },
