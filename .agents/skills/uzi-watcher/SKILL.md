@@ -229,9 +229,9 @@ work from the worker PVC* below.
 - **A branch merely behind main on workflow files is usually handled.** At finalize the
   worker tries to realign it to the current default (workflow-subtree overlay, else merge,
   else rebase; PRD #456, #627) before pushing; a conflict fails the run
-  `finalize_base_align_conflict`. Reaped (milestone/done) checkpoints build a worker-side
-  overlay (#1036); overlay-less tick and iteration checkpoints of such a branch are skipped by the
-  broker as workflow-scope rejections. The
+  `finalize_base_align_conflict`. For GitHub, reaped milestone/done checkpoints attempt a
+  worker-side overlay (#1036). Tick and iteration checkpoints have no overlay; if GitHub rejects
+  their push for missing workflow scope, the broker returns a best-effort `workflow_scope` skip. The
   precheck runs first, so an inherited workflow commit blocks this realign.
 - **Telling them apart on a recovered branch:** `git log --name-only origin/main..TIP --
   .github/workflows/` empty is evidence of base staleness only; a rebase onto main that
