@@ -450,7 +450,8 @@ func resolveSettings(env Env, gf *globalFlags) (uzicli.Settings, error) {
 // names the prefix constant only and never interpolates the credential, so the
 // token value cannot reach stderr.
 const msgProductTokenCLI = "product tokens (" + producttoken.Prefix + ") only work on /api/v1; " +
-	"the uzi CLI needs a CLI token (uzc_ or uza_): run \"uzi login\" or mint one in Settings > Access"
+	"the uzi CLI needs a CLI token (uzc_ or uza_): unset UZI_TOKEN if it holds this token, " +
+	"then run \"uzi login\" or mint a CLI token in Settings > Access"
 
 // rejectProductToken fails fast when the resolved credential ($UZI_TOKEN or the
 // active context's stored token) is a product token (PRD #1907 M6). A product

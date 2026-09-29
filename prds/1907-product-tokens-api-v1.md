@@ -2,7 +2,7 @@
 
 **Issue**: #1907
 **Priority**: High
-**Status**: Draft (reviewed 2026-09-29: peer review plus a security review; findings folded in, see the Decision Log)
+**Status**: In progress: M1-M6 implemented (2026-09-29), M7 (hosted k8s acceptance) open. Reviewed 2026-09-29: peer review plus a security review; findings folded in, see the Decision Log.
 **Part of**: external-product integration, phase 1 (in parallel with PRD #1906's pre-integration milestones). PRD #1908 (phase 2) builds on it; PRD #1909 and PRD #1910 follow in phase 3.
 **Builds on**: PRD #64 (CLI tokens, `RequireUser`, the `uzc_`/`uza_` scope ceiling), PRD #982 (api/SPA wire-contract fixtures), PRD #45 (OIDC login, account JIT provisioning).
 **Related**: PRD #1908 (adds the first `/api/v1/jobs` endpoints, the per-product `allowed_job_types` allowance and the OpenAPI breaking-change gate), PRD #1910 (replaces copy-paste minting with an OAuth consent flow), PRD #1906 (egress site lists and the per-product site-list allowance).
@@ -146,7 +146,7 @@ Every milestone's gate: `task gate:api` (with `-race`, `-count=1`), plus `task g
 
 ### M6: Docs, spec and ADR
 
-**Status (2026-09-29): done.** Evidence: `docs/product-tokens.md`, `docs/cli.md` "Managing tokens", the mirror refreshed by `task docs:sync`, `adr/1907-product-api-v1-contract.md`, `specs/human.md` entry. The optional items shipped: `uzi admin products` and the `uzp_` CLI error. `task check-docs:web` and `TestEmbeddedDocsMatchSource` are run by the docs author and the gate.
+**Status (2026-09-29): done.** Evidence: `docs/product-tokens.md`, `docs/cli.md` "Managing tokens", the mirror refreshed by `task docs:sync`, `adr/1907-product-api-v1-contract.md`, `specs/human.md` entry. The optional items shipped: `uzi admin products` and the `uzp_` CLI error. `task check-docs:web` and `task gate:api` (incl. `TestEmbeddedDocsMatchSource`) passed on 2026-09-29.
 
 - New `docs/product-tokens.md` (audience `user`, with an operator section for product registration): what a product token is, what it can and cannot reach, revocation (including that password change and logout do not revoke it), expiry, the Revoke all change. `docs/cli.md` "Managing tokens" updated. `task docs:sync` run and the mirror committed.
 - The D12 ADR written.
@@ -220,7 +220,7 @@ This PRD does not depend on PRD #1906. PRD #1910 replaces M5's copy-paste with c
   - The in-repo OpenAPI diff checker is dropped as over-engineering for one endpoint; PRD #1908 adds a pinned tool with its first real endpoints (D12). CLI parity becomes optional. `check:token-literals` is not extended for `uzp_` (D16).
   - Hosted k8s acceptance is part of completion (M7).
 - 2026-09-29, implementation decisions:
-  - `/api/v1` reuses the existing general per-user limiter (`authLimiter`, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW`, default 10 per minute) rather than a new one. Mounted with `r.Use` on the subtree, it keys one budget per user across all of `/api/v1`. Enough for `whoami`; PRD #1908, whose job polling needs more, is where a dedicated limiter belongs (`TestV1RateLimitPerUserLiveDB`).
+  - `/api/v1` reuses the existing credential-surface per-user limiter (`authLimiter`, `RATE_LIMIT_MAX` per `RATE_LIMIT_WINDOW`, default 10 per minute) rather than a new one. Mounted with `r.Use` on the subtree, it keys one budget per user across all of `/api/v1`. Enough for `whoami`; PRD #1908, whose job polling needs more, is where a dedicated limiter belongs (`TestV1RateLimitPerUserLiveDB`).
   - No web credential inventory existed to extend, so the admin Products page lists product tokens per product, each with an admin revoke action.
   - The mint picker is `GET /api/me/product-tokens/products` (enabled, live products) rather than a separate `/api/products`, keeping every user-facing product-token route under one cookie-only mount.
   - The cap race is closed by a transaction-scoped `pg_advisory_xact_lock` keyed on (user_id, product_id), taken before the count, with count and insert in one transaction. `FOR UPDATE` cannot lock rows that do not exist yet, so two concurrent mints at 9 active tokens both passed the count. The lock class is `store.ProductTokenMintLockClass`, taken by the `LockProductTokenMint` query. Proven by `TestMintProductTokenCapRaceLiveDB` and its mutation (lock removed, test red).

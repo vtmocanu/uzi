@@ -6,7 +6,7 @@ audience: user
 
 # Product tokens
 
-A **product token** (`uzp_…`) lets an external product call uzi **as you**. You mint it in Settings for a product an admin has registered, and paste it into that product. Work the product starts runs on your own worker and model credential.
+A **product token** (`uzp_…`) lets an external product call uzi **as you**. You mint it in Settings for a product an admin has registered, and paste it into that product. Once job endpoints ship, work the product starts will run on your own worker and model credential; today a product token can only call `whoami`.
 
 ## What it can and cannot reach
 
@@ -20,7 +20,7 @@ The `uzi` CLI cannot use a product token: it needs a CLI token (`uzc_` or `uza_`
 ## Mint a token
 
 1. Open **Settings → Access → Product tokens**.
-2. Pick a product, name the token, choose scopes and an expiry, then **Create**.
+2. Pick a product, name the token, choose scopes and an expiry, then **Create product token**.
 3. Copy the token now. It is shown once and only its hash is stored.
 
 Minting is a browser action only (no CLI or Bearer mint), so a stolen token cannot mint replacements.
@@ -62,4 +62,4 @@ Product registration is an admin-only browser action under **Admin → Products*
 
 `/api/v1` is described by the checked-in OpenAPI 3.1 document `api/openapi/v1.yaml`, and a test keeps it identical to the router. Changes are **additive only**: new paths, new optional request fields, new response fields. Removing or renaming a path, field or enum value, or making an optional request field required, is breaking. A breaking change keeps the old shape working for **at least two minor releases and at least 90 days, whichever is later**, announced in the [changelog](./changelog.md), or ships under a new `/api/v2`. The internal `/api/*` routes are not covered: products must not call them.
 
-`/api/v1` shares one per-user request budget (the general authenticated limit, 10 per minute by default); over it you get a 429 with `Retry-After`.
+`/api/v1` shares one per-user request budget (`RATE_LIMIT_MAX` requests per `RATE_LIMIT_WINDOW`, 10 per minute by default, the same knob as the sign-in and credential routes); over it you get a 429 with `Retry-After`.

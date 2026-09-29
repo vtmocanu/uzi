@@ -2286,8 +2286,9 @@ that counts output lines, say. It is a poor substitute for upgrading.
 If a laptop is lost, **Settings → Access → Revoke all** is the one-click
 answer — it stops every `uzi` CLI and CI job using one of your tokens at
 once. Since PRD #1907 it revokes your **product tokens** too (see below), in
-the same step, so nothing of yours stays live. If you'd rather keep some, the token list gives you what you need to
-decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
+the same step, so no CLI or product token of yours stays live (browser
+sessions are not ended: sign out for that). If you'd rather keep some, the
+token list gives you what you need to decide: `token_prefix`, `last_used_at`, and `last_used_ip`. Revoke anything
 you don't recognise, and treat an unfamiliar `last_used_ip` as the signal to
 revoke, not just a curiosity.
 
