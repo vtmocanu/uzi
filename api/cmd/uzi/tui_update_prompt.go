@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"image/color"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -17,8 +16,8 @@ import (
 )
 
 // The codex-style startup update prompt (PRD #1251 M1): a modal shown over the board at
-// startup when a newer STABLE uzi release exists, offering `brew upgrade uzi-cli` for a
-// Homebrew install or the release-notes link otherwise. It is built entirely from the
+// startup when a newer release exists on the running binary's channel, offering the
+// owning formula upgrade or the release-notes link otherwise. It is built entirely from the
 // existing andon palette/primitives (D8) and does NO CLI egress of its own — the data
 // rides the same GET /api/version the footer skew banner already fetches (D6).
 
@@ -28,7 +27,7 @@ type updatePromptState struct {
 	// latches after the first eligible reply so the prompt fires at most once per `uzi tui`.
 	showing          bool
 	shownThisSession bool
-	// sel is the highlighted choice index into updateChoices() (which varies by isBrew).
+	// sel is the highlighted choice index into updateChoices() (which varies by owner).
 	sel int
 	// latestVersion / latestName / latestNotesURL are the server-authored release facts copied
 	// off buildInfoMsg.latest. They are UNTRUSTED (D7) and drawn only through cellText /
@@ -38,11 +37,12 @@ type updatePromptState struct {
 	latestNotesURL string
 	// security is Latest.Security: a security release renders as the amber andon band (D2).
 	security bool
-	// isBrew is whether this uzi-cli is a Homebrew install (detectBrewCmd → brewInfoMsg). It
-	// gates the "Update now" action vs the info-only variant. brewKnown records whether the
-	// detection probe has completed, so it runs at most once.
-	isBrew    bool
-	brewKnown bool
+	// The owner is proven by the running executable path; an unknown owner offers notes only.
+	owner       string
+	brewKnown   bool
+	brewPending bool
+	latest      *apitypes.LatestReleaseDTO
+	latestRC    *apitypes.LatestReleaseDTO
 	// pendingUpgrade / upgradeArgv are the foreground-exit hand-off (D1): "Update now" sets
 	// these and quits, and newTUICmd's RunE runs env.Brew(true, upgradeArgv...) after p.Run().
 	pendingUpgrade bool
@@ -50,12 +50,11 @@ type updatePromptState struct {
 }
 
 // maybeShowUpdatePrompt evaluates the show gate ONCE per session on the first eligible
-// buildInfoMsg and, when it opens the modal, returns the brew-detection command so the
-// brew/non-brew variant resolves without blocking the board. It returns nil (no command,
+// buildInfoMsg only after the asynchronous brew ownership probe resolves. It returns nil (no command,
 // no state change) whenever the prompt should not show.
 //
 // The gate mirrors the skew warning's discipline plus the PRD #1251 axis rule: the wire
-// Latest is a PRESENCE signal only (nil ⇒ no check ran / feature disabled ⇒ nothing), and
+// Latest and LatestRC are channel-specific presence signals (nil ⇒ no release fact), and
 // the CLI axis is recomputed LOCALLY — this binary vs latest — NEVER the wire
 // update_available bool, which is the server's own version-vs-latest axis.
 //
@@ -66,7 +65,7 @@ type updatePromptState struct {
 // readout already uses — so "cmp < 0" (CLI strictly behind) is exactly UpdateAvailable's
 // "latest strictly newer than running", IsValid-guarded so a `dev`/malformed version reads
 // as "not behind" rather than a false prompt.
-func (m *tuiModel) maybeShowUpdatePrompt(latest *apitypes.LatestReleaseDTO) tea.Cmd {
+func (m *tuiModel) maybeShowUpdatePrompt(latest, latestRC *apitypes.LatestReleaseDTO) tea.Cmd {
 	if m.updatePrompt.shownThisSession {
 		return nil
 	}
@@ -76,13 +75,26 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest *apitypes.LatestReleaseDTO) tea.
 	if !m.skewCheck || !m.showVersion {
 		return nil
 	}
-	if latest == nil {
-		return nil // no check has run, or the release-check feature is disabled → show nothing
+	if !m.updatePrompt.brewKnown {
+		m.updatePrompt.latest, m.updatePrompt.latestRC = latest, latestRC
+		if !m.updatePrompt.brewPending {
+			m.updatePrompt.brewPending = true
+			return m.detectBrewCmd()
+		}
+		return nil
 	}
-	// Never offer an -rc.N. Latest excludes prereleases upstream (releasecheck/client.go), so
-	// this is defense in depth: even if a prerelease ever reached the wire, the prompt must not
-	// point a user at one. This is also what makes the RC-guard regression test meaningful.
-	if isPrereleaseTag(latest.Version) {
+	if m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && isRCTag(version)) {
+		latest = latestRC
+	}
+	if latest == nil {
+		return nil
+	}
+	wantRC := m.updatePrompt.owner == "uzi-cli-rc" || (m.updatePrompt.owner == "" && isRCTag(version))
+	if wantRC {
+		if !isRCTag(latest.Version) {
+			return nil
+		}
+	} else if isPrereleaseTag(latest.Version) {
 		return nil
 	}
 	// Recompute the CLI axis locally: is THIS binary behind the latest? IsValid-guarded, so a
@@ -100,9 +112,6 @@ func (m *tuiModel) maybeShowUpdatePrompt(latest *apitypes.LatestReleaseDTO) tea.
 	m.updatePrompt.latestName = latest.Name
 	m.updatePrompt.latestNotesURL = latest.NotesURL
 	m.updatePrompt.security = latest.Security
-	if !m.updatePrompt.brewKnown {
-		return m.detectBrewCmd()
-	}
 	return nil
 }
 
@@ -119,47 +128,79 @@ func (m tuiModel) dismissedForVersion(v string) bool {
 
 // detectBrewCmd runs the deterministic brew-detection probe off the injected seam (R1) and
 // reports the result as a brewInfoMsg. It never blocks the board and, on any doubt, reports
-// non-brew (the info variant, which is always safe — it just shows the manual command).
+// unknown ownership (the info variant).
 func (m tuiModel) detectBrewCmd() tea.Cmd {
-	brew := m.brew
+	brew, executable := m.brew, m.executable
 	return func() tea.Msg {
-		return brewInfoMsg{isBrew: detectBrew(brew)}
+		return brewInfoMsg{owner: detectBrewOwner(brew, executable)}
 	}
 }
 
-// detectBrew is the two-detector brew probe (R1), pure over the injected seam so it is
-// deterministic offline. Detector 1: `brew list uzi-cli` exits 0 iff the formula is
-// installed. Detector 2 (fallback): the running executable resolves under `brew --prefix`.
-// A nil seam or any error at either step reads as NON-brew.
-func detectBrew(brew func(foreground bool, args ...string) (string, error)) bool {
-	if brew == nil {
-		return false
+// detectBrewOwner checks each formula's installed prefix against the resolved executable.
+// Path errors fail closed to unknown ownership.
+func detectBrewOwner(brew func(bool, ...string) (string, error), executable func() (string, error)) string {
+	if brew == nil || executable == nil {
+		return ""
 	}
-	if _, err := brew(false, "list", "uzi-cli"); err == nil {
-		return true
-	}
-	exe, err := os.Executable()
+	exe, err := executable()
 	if err != nil {
-		return false
+		return ""
 	}
-	out, err := brew(false, "--prefix")
+	exe, err = filepath.EvalSymlinks(exe)
 	if err != nil {
+		return ""
+	}
+	owner := ""
+	for _, formula := range []string{"uzi-cli", "uzi-cli-rc"} {
+		out, err := brew(false, "--prefix", "--installed", formula)
+		if err != nil {
+			continue
+		}
+		prefix := strings.TrimSpace(out)
+		if prefix == "" {
+			continue
+		}
+		prefix, err = filepath.EvalSymlinks(prefix)
+		if err != nil {
+			continue
+		}
+		cellar := filepath.Dir(filepath.Dir(prefix))
+		if !(filepath.Base(cellar) == "Cellar" && filepath.Base(filepath.Dir(prefix)) == formula) &&
+			!(filepath.Base(prefix) == formula && filepath.Base(filepath.Dir(prefix)) == "opt") {
+			continue
+		}
+		if strings.HasPrefix(exe, prefix+string(filepath.Separator)) {
+			if owner != "" {
+				return ""
+			}
+			owner = formula
+		}
+	}
+	return owner
+}
+
+func isRCTag(tag string) bool {
+	base, n, ok := strings.Cut(tag, "-rc.")
+	if !ok || n == "" {
 		return false
 	}
-	prefix := strings.TrimSpace(out)
-	if prefix == "" {
-		return false
+	for _, c := range n {
+		if c < '0' || c > '9' {
+			return false
+		}
 	}
-	// Resolve symlinks on both sides: a brew-managed binary is typically symlinked out of the
-	// Cellar, so a raw prefix-check would miss it. EvalSymlinks failures (e.g. a fake prefix in
-	// a test, or a path that no longer exists) fall back to the raw value rather than crashing.
-	if resolved, rerr := filepath.EvalSymlinks(exe); rerr == nil {
-		exe = resolved
-	}
-	if resolved, rerr := filepath.EvalSymlinks(prefix); rerr == nil {
-		prefix = resolved
-	}
-	return exe == prefix || strings.HasPrefix(exe, prefix+string(filepath.Separator))
+	return semver.IsValid(tag) && semver.Prerelease(tag) == "-rc."+n &&
+		semver.Build(tag) == "" && semver.Canonical(base) == base
+}
+
+func isStableVersion(tag string) bool {
+	v := "v" + strings.TrimPrefix(tag, "v")
+	return semver.IsValid(v) && semver.Prerelease(v) == ""
+}
+
+func isPrereleaseTag(tag string) bool {
+	v := "v" + strings.TrimPrefix(tag, "v")
+	return semver.Prerelease(v) != ""
 }
 
 // updateChoice is one selectable action in the modal.
@@ -174,7 +215,7 @@ const (
 // updateChoices is the ordered choice list for the current variant: a brew user gets the
 // "Update now" action first; a non-brew user gets only "Not now" / "Don't remind me".
 func (m tuiModel) updateChoices() []updateChoice {
-	if m.updatePrompt.isBrew {
+	if m.updatePrompt.owner != "" {
 		return []updateChoice{updateChoiceUpdateNow, updateChoiceNotNow, updateChoiceDismiss}
 	}
 	return []updateChoice{updateChoiceNotNow, updateChoiceDismiss}
@@ -185,7 +226,7 @@ func (m tuiModel) updateChoices() []updateChoice {
 func (m tuiModel) updateChoiceLabel(c updateChoice) string {
 	switch c {
 	case updateChoiceUpdateNow:
-		return "Update now  (brew upgrade uzi-cli)"
+		return "Update now  (brew upgrade " + m.updatePrompt.owner + ")"
 	case updateChoiceDismiss:
 		return "Don't remind me for " + cellText(m.updatePrompt.latestVersion)
 	default:
@@ -230,7 +271,7 @@ func (m tuiModel) selectUpdateChoice(choices []updateChoice) (tea.Model, tea.Cmd
 	switch choices[m.updatePrompt.sel] {
 	case updateChoiceUpdateNow:
 		m.updatePrompt.pendingUpgrade = true
-		m.updatePrompt.upgradeArgv = []string{"upgrade", "uzi-cli"}
+		m.updatePrompt.upgradeArgv = []string{"upgrade", m.updatePrompt.owner}
 		m.updatePrompt.showing = false
 		return m, tea.Quit
 	case updateChoiceDismiss:
@@ -306,7 +347,7 @@ func (m tuiModel) renderUpdatePrompt() string {
 
 	// Non-brew info variant: the release-notes URL instead of an Update-now action (UNTRUSTED,
 	// renderer.Plain). A brew user gets the action row instead, so the URL is omitted there.
-	if !m.updatePrompt.isBrew {
+	if m.updatePrompt.owner == "" {
 		if url := m.renderer.Plain(m.updatePrompt.latestNotesURL, updatePromptTextCap); url != "" {
 			notes := "Release notes: " + url
 			if !ascii {
@@ -380,15 +421,7 @@ func (m tuiModel) updateChoiceRow(c updateChoice, selected, ascii bool, width in
 	return padSeg(row, width, bg)
 }
 
-// isPrereleaseTag reports whether tag is a semver prerelease (e.g. v0.85.0-rc.1). It
-// re-prefixes and IsValid-guards like semverNewer, so a malformed tag reads as NOT a
-// prerelease (the show gate's UpdateAvailable check then rejects it on the compare instead).
-func isPrereleaseTag(tag string) bool {
-	v := "v" + strings.TrimPrefix(tag, "v")
-	return semver.Prerelease(v) != ""
-}
-
-// runPendingUpgrade runs `brew upgrade uzi-cli` in the FOREGROUND after the TUI has exited
+// runPendingUpgrade runs the selected formula upgrade in the FOREGROUND after the TUI has exited
 // (PRD #1251 M1 D1), so the from-source compile progress and any failure are visible and the
 // stale running process is replaced by a rerun. It is extracted from RunE so a test can
 // assert it calls the seam with foreground=true and argv ["upgrade","uzi-cli"] WITHOUT
@@ -401,10 +434,17 @@ func runPendingUpgrade(env Env, argv []string) error {
 	// built from a source escape at runtime (never a raw control byte in source). Write errors
 	// are dropped explicitly: this is a best-effort UX line, and env.Brew is the real work.
 	_, _ = fmt.Fprint(env.Stdout, "\x1b[H\x1b[2J")
-	_, _ = fmt.Fprintln(env.Stdout, "Updating uzi-cli via Homebrew (this compiles from source)...")
+	formula := ""
+	if len(argv) == 2 && argv[0] == "upgrade" && (argv[1] == "uzi-cli" || argv[1] == "uzi-cli-rc") {
+		formula = argv[1]
+	}
+	if formula == "" {
+		return uzicli.Exitf(uzicli.ExitGeneric, "update: invalid brew upgrade target")
+	}
+	_, _ = fmt.Fprintf(env.Stdout, "Updating %s via Homebrew (this compiles from source)...\n", formula)
 	if _, err := env.Brew(true, argv...); err != nil {
 		_, _ = fmt.Fprintf(env.Stderr, "update failed: %v\n", err)
-		return uzicli.Exitf(uzicli.ExitGeneric, "brew upgrade uzi-cli: %v", err)
+		return uzicli.Exitf(uzicli.ExitGeneric, "brew upgrade %s: %v", formula, err)
 	}
 	_, _ = fmt.Fprintln(env.Stdout, "Update complete. Start the TUI again to use the new version.")
 	return nil

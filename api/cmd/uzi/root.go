@@ -40,11 +40,11 @@ func realGit(dir string, args ...string) (string, error) {
 // realBrew is the production Env.Brew: it runs `brew <args>` (PRD #1251 M1's startup
 // update prompt). It has two modes, matching how the TUI uses the seam:
 //
-//   - foreground == false: a QUIET detection probe (`brew list uzi-cli`, `brew --prefix`).
+//   - foreground == false: a QUIET detection probe (`brew --prefix --installed <formula>` for both formulas).
 //     stdout+stderr are captured and returned combined so the caller can inspect them,
 //     and no output reaches the terminal — a `brew: command not found` here just means
-//     "not a brew user", not an error the user should see.
-//   - foreground == true: the actual `brew upgrade uzi-cli`, run AFTER the TUI has exited
+//     "unknown ownership", not an error the user should see.
+//   - foreground == true: the selected formula upgrade, run AFTER the TUI has exited
 //     (D1). The subprocess stdout/stderr are wired to the real os.Stdout/os.Stderr so the
 //     from-source compile progress and any failure are visible; nothing is captured.
 //
@@ -96,14 +96,15 @@ type Env struct {
 	Git func(dir string, args ...string) (string, error)
 
 	// Brew runs `brew <args>` for the TUI startup update prompt (PRD #1251 M1): brew
-	// detection (`brew list uzi-cli`, `brew --prefix`) and the `brew upgrade uzi-cli`
-	// hand-off on foreground exit. foreground==false captures output quietly for a
+	// detection (`brew --prefix --installed <formula>` for both formulas) and the
+	// selected formula upgrade hand-off on foreground exit. foreground==false captures output quietly for a
 	// detection probe; foreground==true wires the subprocess to os.Stdout/os.Stderr so
 	// the from-source compile is visible (D1). DefaultEnv wires realBrew; tests inject a
 	// fake that records the (foreground, args) call and returns canned output, so no test
 	// forks brew. Same injection-seam contract as Git above; may be nil (a test that never
-	// exercises the prompt), read through the brew() accessor which then reports non-brew.
-	Brew func(foreground bool, args ...string) (string, error)
+	// exercises the prompt), read through the brew() accessor which then reports unknown ownership.
+	Brew       func(foreground bool, args ...string) (string, error)
+	Executable func() (string, error)
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -154,6 +155,7 @@ func DefaultEnv() Env {
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Git:                realGit,
 		Brew:               realBrew,
+		Executable:         os.Executable,
 		Store:              store,
 		Getenv:             os.Getenv,
 		AutoUpgradeSkill:   true,

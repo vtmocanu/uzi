@@ -172,22 +172,22 @@ type vaultStatusMsg struct {
 // the board footer's CLI-vs-server skew banner. Fetched at Init and on the skewTickMsg
 // ticker when the session is allowed to probe (see tuiModel.skewCheck).
 //
-// latest carries the newest upstream release the server knows about (PRD #1251 M1), copied
+// latest and latestRC carry the newest server-known releases for each channel, copied
 // verbatim off the same GET /api/version response — the CLI does NO egress of its own for
 // the update prompt (D6). It is nil until a release check has run AND the feature is
-// enabled (nil = "never checked / disabled" ⇒ show no prompt). Its fields (Version, Name,
+// enabled (nil = "never checked / disabled" ⇒ show no prompt on that channel). Its fields (Version, Name,
 // NotesURL) are server-authored and drawn ONLY through the D7 sanitizers.
 type buildInfoMsg struct {
-	version string
-	latest  *apitypes.LatestReleaseDTO
-	err     error
+	version  string
+	latest   *apitypes.LatestReleaseDTO
+	latestRC *apitypes.LatestReleaseDTO
+	err      error
 }
 
 // brewInfoMsg carries the result of the deterministic brew-detection probe (PRD #1251 M1,
-// R1): isBrew is true when this uzi-cli is a Homebrew install, so the startup update prompt
-// offers the "Update now" action rather than the info-only variant. Produced by
-// detectBrewCmd from the Env.Brew seam; on any doubt or error it is false (info variant).
-type brewInfoMsg struct{ isBrew bool }
+// R1): owner names the formula whose installed path contains the running executable.
+// Unknown ownership yields the info-only variant.
+type brewInfoMsg struct{ owner string }
 
 // detailRunMsg carries the first GetRun for the drilled-in run (PRD #1137). The header,
 // crew-rail milestones/accounts and now-line render from it, before the transcript.
@@ -442,17 +442,18 @@ type tuiModel struct {
 	noBlink bool
 
 	// updatePrompt is the codex-style startup update-prompt modal (PRD #1251 M1): shown once
-	// per session, over the board, when the widened buildInfoMsg reports a newer STABLE
-	// release and the session is allowed to probe. Its full state and the show gate live in
+	// per session, over the board, when buildInfoMsg reports a newer release on the running
+	// channel and the session is allowed to probe. Its full state and the show gate live in
 	// tui_update_prompt.go.
 	updatePrompt updatePromptState
 
 	// brew is the injected `brew` shell-out seam for the update prompt (Env.Brew), used for
-	// deterministic detection (detectBrewCmd) and the foreground `brew upgrade uzi-cli`
+	// deterministic ownership detection (detectBrewCmd) and the foreground formula upgrade
 	// hand-off on exit. Assigned from Env in newTUICmd's RunE on the real path; left nil on
 	// the --demo / direct-construction test paths, where the update prompt never runs. Read
-	// nil-safely — a nil brew reports non-brew and never upgrades.
-	brew func(foreground bool, args ...string) (string, error)
+	// nil-safely — a nil brew reports unknown ownership and never upgrades.
+	brew       func(foreground bool, args ...string) (string, error)
+	executable func() (string, error)
 
 	// store and serverURL back the update prompt's per-version "don't remind me" dismissal
 	// (PRD #1251 M1), threaded from newTUICmd's RunE like client/showVersion. store is the
@@ -762,10 +763,8 @@ func (m tuiModel) fetchBuildInfoCmd() tea.Cmd {
 	c, ctx := m.client, m.ctx
 	return func() tea.Msg {
 		info, err := c.BuildInfo(ctx)
-		// Carry info.Latest through verbatim (PRD #1251 M1): it is already on the decoded
-		// response, so the update prompt needs no extra call. nil (no check ran / disabled)
-		// stays nil, which the buildInfoMsg handler reads as "show nothing".
-		return buildInfoMsg{version: info.Version, latest: info.Latest, err: err}
+		// Carry both release facts verbatim from the decoded response; nil stays nil.
+		return buildInfoMsg{version: info.Version, latest: info.Latest, latestRC: info.LatestRC, err: err}
 	}
 }
 
@@ -1249,16 +1248,15 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		// The startup update prompt (PRD #1251 M1), evaluated ONCE per session on the first
 		// eligible reply (shownThisSession latches it). All the gating lives in maybeShowUpdatePrompt;
-		// when it opens the modal it kicks the brew-detection probe so the brew/non-brew variant
-		// resolves without blocking the board.
-		return m, (&m).maybeShowUpdatePrompt(msg.latest)
+		// the asynchronous owner probe resolves before channel selection and latching.
+		return m, (&m).maybeShowUpdatePrompt(msg.latest, msg.latestRC)
 
 	case brewInfoMsg:
-		// The deterministic brew-detection reply (PRD #1251 M1, R1): flips the modal to the
-		// "Update now" variant when this is a Homebrew install, leaving the info variant otherwise.
-		m.updatePrompt.isBrew = msg.isBrew
+		// Resolve the owner first, then compare only the matching release channel.
+		m.updatePrompt.owner = msg.owner
 		m.updatePrompt.brewKnown = true
-		return m, nil
+		m.updatePrompt.brewPending = false
+		return m, (&m).maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC)
 
 	case detailRunMsg:
 		// Drop a load that resolved for a run the user has since navigated away from:
@@ -1663,6 +1661,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// env.client just above, so its error is swallowed here — a missing URL only means the
 			// dismissal degrades to session-only.
 			m.brew = env.Brew
+			m.executable = env.Executable
 			m.store = env.Store
 			if s, serr := resolveSettings(env, gf); serr == nil {
 				m.serverURL = s.URL
