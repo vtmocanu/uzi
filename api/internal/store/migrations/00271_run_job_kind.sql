@@ -127,8 +127,9 @@ CREATE TABLE job_findings (
 );
 
 -- 8. products.allowed_job_types: the job types a product's uzp_ tokens may create. Empty (the
--- default) refuses every job. The known-values CHECK mirrors runkind.JobTypes(); the
--- array_position(..., NULL) term rejects a NULL element, which <@ alone would let through.
+-- default) refuses every job. The known-values CHECK mirrors runkind.JobTypes().
+-- `<@` treats a NULL element as unmatched, and array_position(..., NULL) spells that out
+-- rather than relying on it (the 00270 phrasing).
 ALTER TABLE products ADD COLUMN allowed_job_types text[] NOT NULL DEFAULT '{}';
 ALTER TABLE products ADD CONSTRAINT products_allowed_job_types_check
     CHECK (allowed_job_types <@ ARRAY['research']::text[] AND array_position(allowed_job_types, NULL) IS NULL);

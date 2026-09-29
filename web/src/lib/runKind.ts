@@ -15,8 +15,6 @@ export function runKindLabel(kind: string): string {
       return "ci fix";
     case "mr_rework":
       return "MR rework";
-    case "job":
-      return "Job";
     default:
       // Equivalent to kind.replaceAll("_", " ") — a regex global replace because
       // the web tsconfig's lib target predates String.prototype.replaceAll (ES2021).

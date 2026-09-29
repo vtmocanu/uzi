@@ -191,7 +191,7 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
   },
 
   // job (PRD #1908): repo-less. No clone, no git, no MR, no plan gate: it defines no cloneBranch,
-  // mrTitle or completionLine, and the worker dispatches it to its own job runner, so this row
+  // mrTitle or completionLine, and the worker dispatches it to its own job runner (PRD #1908 M4), so this row
   // is never consulted for a job claim. Empty on purpose, like chat and judge.
   job: {},
 
