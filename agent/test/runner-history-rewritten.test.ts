@@ -344,9 +344,9 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
 
   it("(GitLab, OMITTED forge_type) a trusted post-bridge finding still gets forge-neutral wording (finding 8, R8)", async () => {
     // R8: an OMITTED forge_type means GitLab, which has no GH013 backstop. The default taskClaim repo
-    // sets NO forge_type. Without the call-site normalization, composePushSecretBlockedReason would
-    // default undefined → github and wrongly cite GH013/"GitHub Push Protection"; the fix normalizes
-    // the omitted value to gitlab at this call site.
+    // sets NO forge_type. The blocked reason comes from composeLocalScanBlockedReason, which is
+    // forge-neutral for every forge (no GH013 / GitHub Push Protection claim), so the omitted
+    // forge_type needs no call-site normalization.
     const { gitlab } = fakeGitlab();
     const branch = "feature/pb-gitlab-untyped";
     const P = publishBranch(branch);

@@ -419,6 +419,22 @@ describe("composeLocalScanBlockedReason", () => {
     assert.match(reason, /…/, "a hard-truncated single label must show the ellipsis");
   });
 
+  it("hard-truncates an over-budget first label by code point (no lone surrogate), suffix intact", () => {
+    const LONE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+    const reason = composeLocalScanBlockedReason([
+      {
+        file: "\u{1f600}".repeat(200),
+        startLine: 1,
+        commit: "0123456789abcdef0123456789abcdef01234567",
+        ruleId: "generic-api-key",
+      },
+    ]);
+    assert.ok(reason.length <= MAX, `must be ≤${MAX} (got ${reason.length})`);
+    assert.ok(reason.endsWith(SUFFIX_TAIL), "suffix intact");
+    assert.match(reason, /…\. The change is otherwise valid/, "the hard-truncation branch ran");
+    assert.ok(!LONE.test(reason), "no lone surrogate");
+  });
+
   it("escapes control bytes in the attacker-controlled file path (no terminal-forge)", () => {
     // A committed filename can carry ESC/newline; those must not survive into the stored
     // failure_reason (they would forge rows / inject ANSI when rendered in a CLI/TUI terminal).

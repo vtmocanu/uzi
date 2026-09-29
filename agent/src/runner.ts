@@ -951,7 +951,13 @@ export function composeLocalScanBlockedReason(
     if (shown === 0) {
       // Pathological: even one label overflows the budget. Keep a hard-truncated first label so
       // the fixed suffix (and its withheld-diff / recovery pointer) still fits.
-      list = (labels[0] ?? "").slice(0, Math.max(0, budget - 1)) + "…";
+      // Cut by code point (never a lone surrogate) and by UTF-16 length (the cap is in units).
+      let cut = "";
+      for (const ch of labels[0] ?? "") {
+        if (cut.length + ch.length > Math.max(0, budget - 1)) break;
+        cut += ch;
+      }
+      list = cut + "…";
     }
   }
   return prefix + list + suffix;
@@ -9333,11 +9339,9 @@ export class RunRunner {
           "checkpoint publish skipped: secret_found",
           {
             trusted: scan.trusted,
-            findings: scan.findings.slice(0, 20).map((f) => ({
-              rule_id: f.ruleId,
-              commit: f.commit,
-              path: f.file,
-            })),
+            findings: scan.findings
+              .slice(0, 20)
+              .map((f) => renderSecretFinding(f, { redact: flight.redactText })),
           },
         );
         return { kind: "blocked", outcome: "secret_found" };
