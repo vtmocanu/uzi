@@ -1399,6 +1399,7 @@ describe("shutdown at an observed plan gate", () => {
           holdFirstGate = false;
           gateReads = api.inputGets.get(s.runId) ?? 0;
           api.delayInputGets(s.runId, 800, 1, gateReads);
+          api.failInputGets(s.runId, 1, 503);
         });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
         assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
