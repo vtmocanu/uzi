@@ -286,19 +286,24 @@ export const WORKER_RUNTIME_APPEND = [
  * argument and already waits for background descendants, so it never gets this). Verified
  * against the CLI bundled with the Agent SDK: a Bash call past its timeout is
  * auto-backgrounded (`timedOutAfterMs`), only a standalone `sleep N` is blocked, and each
- * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded.
+ * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. The
+ * exit status goes to a sidecar `.rc` file written even when the command fails, so gate output
+ * cannot fake completion, and the paths are literal because shell variables do not persist
+ * between Bash calls.
  * Appended to the Claude lead (buildLeadSystemPrompt, harness "claude") and every Claude
  * subagent (agents.ts toDefinition).
  */
 export const CLAUDE_LONG_COMMAND_APPEND = [
   "On this harness the Bash tool times out after two minutes by default and then moves the",
   "command to the background. Give a command that may run longer an explicit `timeout` (at",
-  "most 600000 ms). If it may run longer than that, start it with `run_in_background`, writing",
-  "its output and then `EXIT=<status>` to a fresh log (`... > \"$log\" 2>&1; echo \"EXIT=$?\" >>",
-  "\"$log\"`), and wait with foreground calls that each poll a bounded number of times:",
-  "`for i in $(seq 40); do grep -q '^EXIT=' \"$log\" && break; sleep 10; done; tail -n 5 \"$log\"`.",
-  "Repeat that call in the same turn until the `EXIT=` line appears. If the command is gone",
-  "and no `EXIT=` line was written, report the result as unverified.",
+  "most 600000 ms). If it may run longer than that, pick a fresh name and start it with",
+  "`run_in_background` as `rc=0; <command> > .uzi/scratch/<name>.log 2>&1 || rc=$?; echo \"$rc\" >",
+  ".uzi/scratch/<name>.rc`. Shell variables do not carry between Bash calls, so wait with",
+  "foreground calls that repeat the literal paths and poll a bounded number of times:",
+  "`for i in $(seq 40); do test -s .uzi/scratch/<name>.rc && break; sleep 10; done; cat",
+  ".uzi/scratch/<name>.rc; tail -n 5 .uzi/scratch/<name>.log`. Repeat that call in the same turn",
+  "until the `.rc` file exists; its content is the exit status. If the command is gone and no",
+  "`.rc` file was written, report the result as unverified.",
 ].join("\n");
 
 /**

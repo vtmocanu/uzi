@@ -50,28 +50,35 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
   });
 });
 
-// The recipe's poll command is what an agent will paste; prove it is valid shell and
-// that it returns promptly once the gate wrote its EXIT= line.
-describe("CLAUDE_LONG_COMMAND_APPEND poll command", () => {
-  const poll = /`(for i in \$\(seq \d+\); do .*?)`/s.exec(CLAUDE_LONG_COMMAND_APPEND)?.[1];
+// The recipe's two commands are what an agent will paste into two separate Bash calls;
+// prove a failing command still records its status and a fresh shell reads it back.
+describe("CLAUDE_LONG_COMMAND_APPEND start and poll commands", () => {
+  const flat = CLAUDE_LONG_COMMAND_APPEND.replace(/\n/g, " ");
+  const start = /`(rc=0; <command> .*?)`/.exec(flat)?.[1];
+  const poll = /`(for i in \$\(seq \d+\); do .*?)`/.exec(flat)?.[1];
+  const fill = (cmd: string, command: string) => cmd.replaceAll("<name>", "gate-t").replace("<command>", command);
 
   it("names a bounded poll that stays under the 600000 ms tool ceiling", () => {
+    assert.ok(start, "start command present");
     assert.ok(poll, "poll command present");
     const m = /seq (\d+)\); .* sleep (\d+);/.exec(poll);
     assert.ok(m, "bounded seq + sleep");
     assert.ok(Number(m[1]) * Number(m[2]) < 600, "total sleep stays under 600 s");
   });
 
-  it("returns at once and prints the log tail when the EXIT= line is present", () => {
-    assert.ok(poll);
+  it("a failing command under set -e still writes its status, and a fresh shell polls it back", () => {
+    assert.ok(start && poll);
     const dir = mkdtempSync(join(tmpdir(), "cmdlife-"));
     try {
-      const log = join(dir, "gate.log");
-      writeFileSync(log, "ok 1 - a\nEXIT=0\n");
+      execFileSync("mkdir", ["-p", join(dir, ".uzi", "scratch")]);
+      // A failing gate whose output even contains a fake marker.
+      execFileSync("bash", ["-e", "-c", fill(start, "sh -c 'echo EXIT=0; echo boom; exit 3'")], { cwd: dir });
       const started = Date.now();
-      const out = execFileSync("bash", ["-c", poll], { env: { ...process.env, log }, encoding: "utf8" });
-      assert.ok(Date.now() - started < 5_000, "did not sleep");
-      assert.match(out, /EXIT=0/);
+      // A separate shell with a scrubbed env: nothing carries from the start call but the files.
+      const out = execFileSync("bash", ["-c", fill(poll, "")], { cwd: dir, env: { PATH: process.env.PATH ?? "" }, encoding: "utf8" });
+      assert.ok(Date.now() - started < 5_000, "did not sleep once the status exists");
+      assert.equal(out.split("\n")[0], "3", "the real exit status, not the fake marker in the output");
+      assert.match(out, /boom/);
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

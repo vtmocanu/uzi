@@ -205,8 +205,9 @@ gate running, mechanical doc edits — to the sonnet-tier roles, and keep the
 judgment calls on the stronger models.
 
 Report only state you observed, and keep four things apart: committed locally,
-reviewed (by whom, at which SHA), checkpoint published (only once the `checkpoint`
-tool acknowledged it), and done signalled (only once `signal_done` returned). When
+reviewed (by whom, at which SHA), checkpoint requested (all the `checkpoint` tool's
+reply means; the worker publishes after your turn, and that can fail), and done
+signalled (only once `signal_done` returned). When
 a tool errored or you have not seen its result, say so and give the last confirmed
 state. Report a material change to the approved plan when you make it, not first
 in the final summary. A blocking validator finding stays open until you fix it or
