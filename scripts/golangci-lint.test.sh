@@ -234,10 +234,20 @@ printf '%s\n' "$*" >> "$FAKE_EXEC_LOG"
 if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
   # The PID file is the test's readiness handshake. Install handlers before publishing it,
   # otherwise the caller can signal after seeing the PID but before the traps exist.
-  trap 'printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
-  trap 'printf "INT\n" >> "$FAKE_SIGNAL_LOG"; exit 130' INT
+  ready_delay_pid=
+  stop_ready_delay() {
+    if [ -n "$ready_delay_pid" ]; then
+      kill "$ready_delay_pid" 2>/dev/null || true
+      wait "$ready_delay_pid" 2>/dev/null || true
+    fi
+  }
+  trap 'stop_ready_delay; printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
+  trap 'stop_ready_delay; printf "INT\n" >> "$FAKE_SIGNAL_LOG"; exit 130' INT
   if [ "${FAKE_CHILD_READY_DELAY:-0}" != "0" ]; then
-    sleep "$FAKE_CHILD_READY_DELAY"
+    sleep "$FAKE_CHILD_READY_DELAY" &
+    ready_delay_pid=$!
+    wait "$ready_delay_pid"
+    ready_delay_pid=
   fi
   printf '%s\n' "$$" > "$FAKE_CHILD_PID_FILE"
   while :; do sleep 1; done
