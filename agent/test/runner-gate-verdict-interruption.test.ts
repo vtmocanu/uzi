@@ -19,17 +19,20 @@
 //    that field fails closed (every replayed approve/reject is stale), and a claim that does not
 //    re-present the persisted plan bumps the epoch at its first gate.
 import { describe, it } from "node:test";
+import { getEventListeners } from "node:events";
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import { execFileSync } from "node:child_process";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SteeringChannel } from "../src/steering.js";
 import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
-import { api, client, fakeGitlab, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
 
@@ -1383,9 +1386,52 @@ describe("#1604 review — resumed-gate edges", () => {
       const lines = s.texts(flight).filter((t) => t.startsWith("the re-presented plan"));
       assert.deepEqual(lines, ["the re-presented plan timed out waiting for approval — failing the run"]);
     }));
+
+  it("clears the losing gate waiter and abort listener when approval times out", () =>
+    scenario(async (s) => {
+      const original = SteeringChannel.prototype.awaitGateEvent;
+      const channels: SteeringChannel[] = [];
+      let waitSignal: AbortSignal | undefined;
+      SteeringChannel.prototype.awaitGateEvent = function (epoch, signal) {
+        channels.push(this);
+        waitSignal = signal;
+        return original.call(this, epoch, signal);
+      };
+      try {
+        s.writeTranscript();
+        const flight = s.start(
+          s.claim({ resume_phase: "awaiting_approval", plan_md: PLAN_V1, milestones: V1_MILESTONES, plan_source: "agent", plan_approved: false, session_id: SID }),
+          { runner: { planApprovalTimeoutMs: 100 } },
+        );
+        await s.finish(flight);
+        assert.ok(s.statuses(flight).includes("failed"), "the approval timeout still fails the run");
+        assert.ok(waitSignal?.aborted, "the losing gate wait was aborted after the timeout verdict");
+        assert.equal(getEventListeners(waitSignal, "abort").length, 0, "the waiter removed its abort listener");
+        assert.equal((channels[0] as unknown as { gateWaiter?: unknown }).gateWaiter, undefined, "no gate waiter remains parked");
+      } finally {
+        SteeringChannel.prototype.awaitGateEvent = original;
+      }
+    }));
 });
 
 describe("shutdown at an observed plan gate", () => {
+  const gitEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+  const commitWork = (clone: string): string => {
+    fs.writeFileSync(path.join(clone, "SHUTDOWN-WORK.txt"), "committed before gate shutdown\n");
+    execFileSync("git", ["-C", clone, "add", "SHUTDOWN-WORK.txt"], { env: gitEnv });
+    execFileSync("git", ["-C", clone, "-c", "user.name=Test", "-c", "user.email=test@example.invalid", "-c", "commit.gpgsign=false", "commit", "-m", "keep gate work"], { env: gitEnv });
+    return execFileSync("git", ["-C", clone, "rev-parse", "HEAD"], { env: gitEnv, encoding: "utf8" }).trim();
+  };
+
+  it("wakes an idle gate on shutdown without a verdict or cancel input", () =>
+    scenario(async (s) => {
+      const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs: 0 } });
+      assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
+      await s.shutdown(flight);
+      assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"));
+      assert.equal(s.persistedGate()?.plan_md, PLAN_V1);
+    }));
+
   for (const [planApprovalTimeoutMs, session, failHeldGet] of [[0, "kept", true], [60_000, "none", true], [0, "kept", false]] as const) {
     it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, () =>
       scenario(async (s) => {
@@ -1408,6 +1454,10 @@ describe("shutdown at an observed plan gate", () => {
         assert.ok(firstGate.presentation_id, "the observed gate has a presentation id");
         const persisted = api.gateOf(s.runId);
         assert.deepEqual(persisted, { revision: 1, presentationId: firstGate.presentation_id });
+        const bare = git.barePathFor(fx.originPath);
+        const clone = git.runnerClonePath(bare, `issue-${s.base.issue_iid}`);
+        assert.ok(fs.existsSync(clone), "the gated runner clone exists");
+        const committedTip = commitWork(clone);
         assert.equal(s.rowsOf("cancel").length, 0, "no cancel was sent before shutdown");
 
         // Hold a delivery read while the owner sends a bound approval. Shutdown must leave that
@@ -1425,6 +1475,9 @@ describe("shutdown at an observed plan gate", () => {
         assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"), s.statuses(flight).join(","));
         assert.equal(s.persistedGate()?.plan_md, PLAN_V1, "the submitted plan remains persisted");
         assert.deepEqual(s.persistedGate()?.milestones, V1_MILESTONES, "the candidate work remains persisted");
+        const trackedTip = await git.trackingTip(bare, `agent/issue-${s.base.issue_iid}`);
+        assert.ok(trackedTip, "shutdown fetched the committed work into the worker bare");
+        execFileSync("git", ["-C", bare, "merge-base", "--is-ancestor", committedTip, trackedTip], { env: gitEnv });
         assert.deepEqual(api.gateOf(s.runId), persisted, "shutdown preserves the gate identity");
         if (failHeldGet) assert.equal(api.isAcked(s.runId, pending!.id), false, "shutdown left the verdict unread");
         assert.equal(api.isApplied(s.runId, pending!.id), false, "shutdown did not apply the verdict");
@@ -1435,6 +1488,8 @@ describe("shutdown at an observed plan gate", () => {
         assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
         const resumed = s.start(claim);
         assert.ok(await until(() => s.gates(resumed).length > 0 || resumed.finished, 3_000), s.statuses(resumed).join(","));
+        assert.equal(fs.readFileSync(path.join(git.runnerClonePath(bare, `issue-${s.base.issue_iid}`), "SHUTDOWN-WORK.txt"), "utf8"),
+          "committed before gate shutdown\n", "the resumed clone retains the committed work");
         const nextGate = s.gates(resumed)[0]!;
         if (session === "kept") {
           await s.finish(resumed);
