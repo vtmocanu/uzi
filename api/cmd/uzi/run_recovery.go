@@ -13,6 +13,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -22,36 +24,43 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// newRunRecoveryCmd builds `uzi run recovery <run-id> [--json]`.
+// newRunRecoveryCmd builds `uzi run recovery [run-id] [--json]`.
 func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 	recovery := &cobra.Command{
-		Use:   "recovery <run-id>",
-		Short: "List a run's retained custody holds and their dispositions",
-		Long: "Show the durable-recovery custody holds retained for a run: each hold's exact id, " +
+		Use:   "recovery [run-id]",
+		Short: "List open custody holds across your runs or all holds for one run",
+		Long: "Without a run id, show your open custody holds across all runs, oldest first, " +
+			"with exact run and hold ids, disposition, archive availability, worker, age, and the " +
+			"owner-wide custody summary. With a run id, show that run's retained holds: each hold's exact id, " +
 			"claim generation, server-derived disposition, and the latest capture's state.\n\n" +
 			"Owner-only: you see only your own runs' holds. A disposition of `source_only` or " +
 			"`needs_action` awaits your decision — recover the archive with `run export` when one " +
 			"is available, or discard the held source with `run discard <run-id> --hold <hold-id> " +
 			"--yes`. An `archive_ready` hold releases itself once its archive is durable; `active` is " +
 			"healthy protection of a still-running run and needs nothing.\n\n" +
-			"--json emits each of the run's hold DTOs plus a `captures` array listing that hold's " +
+			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
+			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
+			"plus a `captures` array listing that hold's " +
 			"recovery captures (id, state, source_sha, byte_size, created_at); a capture id is what " +
 			"`run export --capture` takes. A hold that outlived its deleted run lists `captures: []`.\n\n" +
 			"While the server retains the run's last published checkpoint on origin, the hold also " +
 			"names where it lives: `refs/uzi-checkpoints/<branch>`, or `refs/uzi-recovery/<run-id>` " +
 			"once a newer run on the same branch superseded it, with its tip and retention state " +
 			"(--json: checkpoint_ref, checkpoint_tip, checkpoint_state).",
-		Args: cobra.ExactArgs(1),
+		Args: cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
-			runID := args[0]
 			holds, err := c.RecoveryHolds(cmd.Context())
 			if err != nil {
 				return err
 			}
+			if len(args) == 0 {
+				return renderOwnerRecovery(env, gf, holds)
+			}
+			runID := args[0]
 			// The endpoint is owner-wide; narrow to this run client-side.
 			var forRun []apitypes.RecoveryCustodyHoldDTO
 			for _, h := range holds.Holds {
@@ -81,6 +90,64 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	return recovery
+}
+
+// renderOwnerRecovery shows only open holds in the human view. The JSON form preserves
+// the server's entire owner response, including settled holds and server order.
+func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyHoldsDTO) error {
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		if dto.Holds == nil {
+			dto.Holds = []apitypes.RecoveryCustodyHoldDTO{}
+		}
+		return p.JSON(dto)
+	}
+	open := make([]apitypes.RecoveryCustodyHoldDTO, 0, len(dto.Holds))
+	for _, h := range dto.Holds {
+		if h.State == "open" {
+			open = append(open, h)
+		}
+	}
+	sort.SliceStable(open, func(i, j int) bool {
+		a, b := open[i], open[j]
+		if !a.CreatedAt.Equal(b.CreatedAt) {
+			return a.CreatedAt.Before(b.CreatedAt)
+		}
+		if a.RunID != b.RunID {
+			return a.RunID < b.RunID
+		}
+		if a.ID != b.ID {
+			return a.ID < b.ID
+		}
+		return a.Generation < b.Generation
+	})
+	rows := make([][]string, 0, len(open))
+	decisionNeeded := 0
+	for _, h := range open {
+		if h.Attention == "source_only" || h.Attention == "needs_action" {
+			decisionNeeded++
+		}
+		rows = append(rows, []string{
+			cellText(h.RunID), cellText(h.ID), strconv.FormatInt(h.Generation, 10),
+			cellText(h.Attention), strconv.FormatBool(h.HasAvailableCapture),
+			cellText(recoveryWorkerLabel(h)), relAge(h.CreatedAt),
+		})
+	}
+	if len(rows) > 0 {
+		if err := p.Table([]string{"RUN ID", "HOLD ID", "GEN", "DISPOSITION", "ARCHIVE", "WORKER", "AGE"}, rows); err != nil {
+			return err
+		}
+	} else if !gf.quiet {
+		p.Printf("no open custody holds\n")
+	}
+	a := dto.Aggregate
+	p.Printf("open_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
+		a.OpenHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
+	if decisionNeeded > 0 && !gf.quiet {
+		p.Printf("\n%d hold(s) await a decision: recover with `uzi run export` or discard with "+
+			"`uzi run discard <run-id> --hold <hold-id> --yes`\n", decisionNeeded)
+	}
+	return nil
 }
 
 // recoveryHoldCapture is one capture listed under its hold in `run recovery --json` (#1417):

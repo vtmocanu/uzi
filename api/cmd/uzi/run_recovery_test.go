@@ -6,7 +6,9 @@ package main
 // without --yes, and --yes mapping straight to the discard call.
 
 import (
+	"context"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -14,6 +16,162 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
+
+// countingRecoveryClient keeps the call-count seam local to these command tests.
+type countingRecoveryClient struct {
+	uzicli.Client
+	holdsCalls    int
+	archivesCalls int
+}
+
+func (c *countingRecoveryClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
+	c.holdsCalls++
+	return c.Client.RecoveryHolds(ctx)
+}
+
+func (c *countingRecoveryClient) RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error) {
+	c.archivesCalls++
+	return c.Client.RecoveryArchives(ctx, runID)
+}
+
+func ownerRecoveryFixture() apitypes.RecoveryCustodyHoldsDTO {
+	old := time.Date(2026, 9, 27, 10, 0, 0, 0, time.UTC)
+	newer := old.Add(time.Hour)
+	return apitypes.RecoveryCustodyHoldsDTO{
+		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 3, CustodyHoldLimit: 8, DecisionNeeded: 2, BlockedRuns: 1},
+		Holds: []apitypes.RecoveryCustodyHoldDTO{
+			{ID: "hold-z", RunID: "run-z", Generation: 3, State: "open", Attention: "active",
+				WorkerID: "worker-z", CreatedAt: newer},
+			{ID: "hold-released", RunID: "run-r", Generation: 1, State: "released", Attention: "settled",
+				WorkerID: "worker-r", CreatedAt: old.Add(-time.Hour)},
+			{ID: "hold-discarded", RunID: "run-d", Generation: 1, State: "discarded", Attention: "settled",
+				WorkerID: "worker-d", CreatedAt: old.Add(-2 * time.Hour)},
+			{ID: "hold-b", RunID: "run-b", Generation: 2, State: "open", Attention: "needs_action",
+				WorkerID: "worker-b", WorkerName: "beta", HasAvailableCapture: true, CreatedAt: old},
+			{ID: "hold-a", RunID: "run-a", Generation: 1, State: "open", Attention: "source_only",
+				WorkerID: "worker-a", CreatedAt: old},
+		},
+	}
+}
+
+func TestOwnerRecoveryHuman(t *testing.T) {
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: ownerRecoveryFixture(),
+		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives must not be read")}
+	client := &countingRecoveryClient{Client: fc}
+	out, errb, code := runCLI(t, fakeEnv(client), "run", "recovery")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, stderr=%q", code, errb)
+	}
+	if client.holdsCalls != 1 || client.archivesCalls != 0 {
+		t.Fatalf("calls: holds=%d archives=%d; want 1, 0", client.holdsCalls, client.archivesCalls)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if got := strings.Fields(lines[0]); !reflect.DeepEqual(got, []string{"RUN", "ID", "HOLD", "ID", "GEN", "DISPOSITION", "ARCHIVE", "WORKER", "AGE"}) {
+		t.Fatalf("headers = %q", lines[0])
+	}
+	for i, want := range [][]string{
+		{"run-a", "hold-a", "1", "source_only", "false", "worker-a"},
+		{"run-b", "hold-b", "2", "needs_action", "true", "beta"},
+		{"run-z", "hold-z", "3", "active", "false", "worker-z"},
+	} {
+		got := strings.Fields(lines[i+1])
+		if len(got) != 7 || !reflect.DeepEqual(got[:6], want) || got[6] == "-" {
+			t.Errorf("row %d = %q, want %v plus age", i, lines[i+1], want)
+		}
+	}
+	if strings.Contains(out, "hold-released") || strings.Contains(out, "hold-discarded") ||
+		strings.Contains(out, "run-r") || strings.Contains(out, "run-d") {
+		t.Errorf("settled hold in human view: %q", out)
+	}
+	if !strings.Contains(out, "open_holds: 3  custody_hold_limit: 8  decision_needed: 2  blocked_runs: 1") {
+		t.Errorf("aggregate absent: %q", out)
+	}
+	if !strings.Contains(out, "2 hold(s) await a decision") || !strings.Contains(out, "run discard <run-id> --hold <hold-id> --yes") {
+		t.Errorf("decision hint absent: %q", out)
+	}
+}
+
+func TestOwnerRecoveryJSON(t *testing.T) {
+	dto := ownerRecoveryFixture()
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto,
+		RecoveryArchivesErr: uzicli.Exitf(uzicli.ExitGeneric, "archives must not be read")}
+	client := &countingRecoveryClient{Client: fc}
+	out, errb, code := runCLI(t, fakeEnv(client), "run", "recovery", "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, stderr=%q", code, errb)
+	}
+	if client.holdsCalls != 1 || client.archivesCalls != 0 {
+		t.Fatalf("calls: holds=%d archives=%d; want 1, 0", client.holdsCalls, client.archivesCalls)
+	}
+	var got apitypes.RecoveryCustodyHoldsDTO
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, dto) {
+		t.Errorf("JSON changed owner DTO: got %+v, want %+v", got, dto)
+	}
+	if strings.Contains(out, "captures") {
+		t.Errorf("owner JSON gained per-run capture join: %s", out)
+	}
+}
+
+func TestOwnerRecoveryEmptyAndNoHint(t *testing.T) {
+	for _, holds := range [][]apitypes.RecoveryCustodyHoldDTO{nil, {{ID: "settled", RunID: "run-x", State: "released", Attention: "needs_action"}}} {
+		fc := &uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{
+			Aggregate: apitypes.RecoveryCustodyAggregateDTO{CustodyHoldLimit: 8}, Holds: holds,
+		}}
+		out, _, code := runCLI(t, fakeEnv(fc), "run", "recovery")
+		if code != uzicli.ExitOK || !strings.Contains(out, "no open custody holds") ||
+			!strings.Contains(out, "open_holds: 0  custody_hold_limit: 8  decision_needed: 0  blocked_runs: 0") ||
+			strings.Contains(out, "await a decision") || strings.Contains(out, "settled") {
+			t.Errorf("empty human view: code=%d output=%q", code, out)
+		}
+		out, _, code = runCLI(t, fakeEnv(fc), "run", "recovery", "--json")
+		if code != uzicli.ExitOK || strings.Contains(out, `"holds": null`) {
+			t.Errorf("empty JSON view: code=%d output=%q", code, out)
+		}
+		if holds == nil && !strings.Contains(out, `"holds": []`) {
+			t.Errorf("nil holds did not render as []: %q", out)
+		}
+	}
+}
+
+func TestOwnerRecoveryActiveHasNoDecisionHint(t *testing.T) {
+	dto := ownerRecoveryFixture()
+	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{dto.Holds[0]}
+	dto.Aggregate.OpenHolds, dto.Aggregate.DecisionNeeded = 1, 0
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery")
+	if code != uzicli.ExitOK || !strings.Contains(out, "hold-z") || strings.Contains(out, "await a decision") {
+		t.Errorf("active-only view: code=%d output=%q", code, out)
+	}
+}
+
+func TestOwnerRecoveryHelp(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "run", "recovery", "--help")
+	if code != uzicli.ExitOK {
+		t.Fatalf("help exit = %d", code)
+	}
+	for _, want := range []string{"recovery [run-id]", "open custody holds", "including settled holds", "With a run id"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("help missing %q: %s", want, out)
+		}
+	}
+}
+
+func TestOwnerRecoverySanitizesCells(t *testing.T) {
+	dto := ownerRecoveryFixture()
+	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{{
+		ID: "hold\nforged", RunID: "run\x1b[31m", Generation: 1, State: "open",
+		Attention: "active\tbad", WorkerName: "worker\nforged", CreatedAt: time.Now().Add(-time.Hour),
+	}}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.ContainsAny(out, "\x1b") || strings.Count(out, "\n") != 3 {
+		t.Errorf("server fields escaped table cells: %q", out)
+	}
+}
 
 func recoveryHoldsFixture() apitypes.RecoveryCustodyHoldsDTO {
 	return apitypes.RecoveryCustodyHoldsDTO{
