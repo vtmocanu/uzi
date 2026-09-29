@@ -99,9 +99,10 @@ this lander's second pair of eyes.
 - **Longer loops.** With a Claude lander and a Codex buddy, a user-authorized
   multi-round loop runs `peers.py budget allow buddy --replies N` once, not a reset
   per round. A correlated `ask`/`dispatch` reply needs no allowance.
-- **Issues you file** (follow-ups, inherited or incidental findings) **and skill or
-  script PRs you open**: the buddy reviews the final draft, then add the `reviewed`
-  label, so the user sees both agents agreed. Solo: a local reviewer.
+- **Issues you file** (follow-ups, inherited or incidental findings): label `reviewed`
+  per the root `CLAUDE.md` rule.
+- **Skill or script PRs you open**: the buddy reviews the final draft, then add the
+  `reviewed` label, so the user sees both agents agreed. Solo: a local reviewer.
 - The buddy's `APPROVE` is required where this skill says so below. It never
   replaces a user approval.
 
