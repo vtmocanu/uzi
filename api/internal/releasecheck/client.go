@@ -75,7 +75,7 @@ func fetchLatest(ctx context.Context, client *http.Client, token string) (github
 }
 
 // fetchLatestRC scans one bounded page, choosing the highest exact RC tag among
-// published, non-draft releases. GitHub's ordering is not a version ordering.
+// non-draft releases. GitHub's ordering is not a version ordering.
 func fetchLatestRC(ctx context.Context, client *http.Client, token string) (githubRelease, error) {
 	var releases []githubRelease
 	if err := fetchJSON(ctx, client, token, releasesPath, &releases); err != nil {
@@ -135,6 +135,9 @@ func fetchJSON(ctx context.Context, client *http.Client, token, path string, des
 	}
 	if len(body) > maxReleaseBodyBytes {
 		return errors.New("release check: response exceeds 1 MiB")
+	}
+	if strings.TrimSpace(string(body)) == "null" {
+		return errors.New("release check: null response")
 	}
 	if err := json.Unmarshal(body, dest); err != nil {
 		return fmt.Errorf("release check: decode response: %w", err)

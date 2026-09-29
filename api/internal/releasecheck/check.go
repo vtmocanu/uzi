@@ -18,10 +18,9 @@ const (
 )
 
 // Store is the DB surface the release check writes. *store.Queries satisfies it. The
-// check persists engine-managed remote-fact keys via the existing
-// generic UpsertAppSetting — it adds NO new query and never touches any other table.
+// check persists engine-managed remote-fact keys as one atomic group.
 type Store interface {
-	UpsertAppSetting(ctx context.Context, arg store.UpsertAppSettingParams) (store.AppSetting, error)
+	UpsertReleaseSettings(ctx context.Context, facts []store.UpsertAppSettingParams) error
 }
 
 // SettingsReader is the typed release-check settings surface the check reads, plus
@@ -146,11 +145,8 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		RCPublishedAt: rc.PublishedAt,
 	}
 
-	// Persist remote facts through the existing generic query. Never fatal, but a
-	// write failure must NOT surface as success: the six keys are read back independently
-	// (KeyReleaseCheckedAt, written last, is what handler.attachReleaseInfo treats as
-	// "facts exist"), so a partial write would let the panel derive signals from a mix of
-	// new and stale keys, and the admin "Check now" would report ok while nothing landed.
+	// Publish the stable facts and, on RC success, the RC facts in one transaction.
+	// A failed RC fetch leaves the previous RC group untouched.
 	writes := []store.UpsertAppSettingParams{
 		{Key: settings.KeyReleaseLatestTag, Value: facts.LatestTag},
 		{Key: settings.KeyReleaseLatestName, Value: facts.LatestName},
@@ -168,18 +164,9 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 			store.UpsertAppSettingParams{Key: settings.KeyReleaseRCPublishedAt, Value: facts.RCPublishedAt},
 		)
 	}
-	var persistErr error
-	for _, w := range writes {
-		if _, err := r.store.UpsertAppSetting(ctx, w); err != nil {
-			r.logger.Error("releasecheck: persist remote facts", "key", w.Key, "error", err)
-			persistErr = err
-		}
-	}
-	if persistErr != nil {
-		// Report the failure truthfully and leave the cache un-invalidated so it keeps
-		// serving the last COMPLETE snapshot rather than the partial one just written; the
-		// condition self-corrects on the next fully-successful pass.
-		return Result{Status: statusError, Facts: facts, Message: "persist remote facts failed: " + persistErr.Error()}, nil
+	if err := r.store.UpsertReleaseSettings(ctx, writes); err != nil {
+		r.logger.Error("releasecheck: persist remote facts", "error", err)
+		return Result{Status: statusError, Facts: facts, Message: "persist remote facts failed: " + err.Error()}, nil
 	}
 	r.settings.Invalidate()
 	if rcErr != nil {
