@@ -46,15 +46,15 @@ func run() error {
 	f := fetcher.New(cfg.FetcherOptions("uzi-fetcher/" + version))
 	handler := fetcher.NewServer(f, control, slog.Default(), cfg.MaxInflight)
 
+	writeTimeout, shutdownTimeout := serverTimeouts(cfg)
 	srv := &http.Server{
 		Addr:              cfg.Addr,
 		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       15 * time.Second,
-		// A response is written only after the whole fetch and the source-log write.
-		WriteTimeout:   cfg.Timeout + 30*time.Second,
-		IdleTimeout:    60 * time.Second,
-		MaxHeaderBytes: 16 << 10,
+		ReadTimeout:       readTimeout,
+		WriteTimeout:      writeTimeout,
+		IdleTimeout:       60 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	// The worker-facing listener is TLS only, with the mounted pair re-read on rotation
 	// (the same reloader as the api's TLS listener).
@@ -85,11 +85,24 @@ func run() error {
 	case <-ctx.Done():
 		slog.Info("shutting down")
 	}
-	// Long enough for an in-flight fetch plus its source-log write to finish.
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), cfg.Timeout+20*time.Second)
+	// Long enough for an in-flight handler to finish (serverTimeouts).
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	if err := srv.Shutdown(shutdownCtx); err != nil && runErr == nil {
 		runErr = err
 	}
 	return runErr
+}
+
+// readTimeout bounds reading one worker request, headers and body.
+const readTimeout = 15 * time.Second
+
+// serverTimeouts returns the listener's WriteTimeout and the shutdown budget. net/http
+// arms the write deadline when it has read a request's headers, so it must cover reading
+// the body (readTimeout) plus the handler's worst case (fetcher.HandlerBudget: Begin, the
+// whole fetch, the source-log write and streaming the largest body). Shutdown waits for
+// in-flight handlers, so its budget is that write deadline plus a margin.
+func serverTimeouts(cfg fetcher.Config) (write, shutdown time.Duration) {
+	write = readTimeout + fetcher.HandlerBudget(fetcher.DefaultControlTimeout, cfg.Timeout, cfg.MaxFileBytes)
+	return write, write + 5*time.Second
 }

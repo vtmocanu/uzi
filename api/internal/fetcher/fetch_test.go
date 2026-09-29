@@ -640,3 +640,161 @@ func TestEscapeQuery(t *testing.T) {
 		}
 	}
 }
+
+// Every Content-Encoding value counts, across header lines and comma-separated codings:
+// a first line of "identity" does not admit a second line of "gzip".
+func TestFetchContentEncodingEveryValue(t *testing.T) {
+	ca := newTestCA(t)
+	cases := map[string][]string{
+		"/second-line-gzip": {"identity", "gzip"},
+		"/list-gzip":        {"identity, gzip"},
+		"/empty-then-br":    {"", "br"},
+		"/identity-ok":      {"identity"},
+		"/identity-list-ok": {" Identity , identity", ""},
+		"/none-ok":          nil,
+	}
+	_, port := upstream(t, ca.validLeaf(t, "docs.example.com"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		for _, v := range cases[r.URL.Path] {
+			w.Header().Add("Content-Encoding", v)
+		}
+		pdfHandler(w, r)
+	}))
+	f := fetcherFor(publicResolver(), ca, port)
+	for path, vals := range cases {
+		r, ref := f.Fetch(context.Background(), "https://docs.example.com"+path, []string{"docs.example.com"}, 1<<20)
+		if strings.HasSuffix(path, "-ok") {
+			if ref != nil {
+				t.Errorf("%s (%q): refused %+v", path, vals, ref)
+			}
+			continue
+		}
+		if r != nil || ref == nil || ref.Reason != ReasonContentEncoding {
+			t.Errorf("%s (%q): result %v refusal %+v, want %s", path, vals, r != nil, ref, ReasonContentEncoding)
+		}
+	}
+}
+
+// MaxURLLen applies to every hop: a redirect Location over the cap is refused, not
+// followed, and so is a URL whose escaped form outgrows the cap.
+func TestFetchURLLengthCapEveryHop(t *testing.T) {
+	ca := newTestCA(t)
+	var longHits atomic.Int32
+	_, port := upstream(t, ca.validLeaf(t, "docs.example.com"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/to-long":
+			w.Header().Set("Location", "/long/"+strings.Repeat("a", MaxURLLen))
+			w.WriteHeader(http.StatusFound)
+		case strings.HasPrefix(r.URL.Path, "/long/"):
+			longHits.Add(1)
+			pdfHandler(w, r)
+		default:
+			pdfHandler(w, r)
+		}
+	}))
+	f := fetcherFor(publicResolver(), ca, port)
+	entries := []string{"docs.example.com"}
+	r, ref := f.Fetch(context.Background(), "https://docs.example.com/to-long", entries, 1<<20)
+	ref = mustRefuse(t, r, ref, ReasonURLTooLong)
+	if longHits.Load() != 0 {
+		t.Error("an over-long redirect target was requested")
+	}
+	if len(ref.FinalURL) > MaxURLLen || ref.HTTPStatus != http.StatusFound {
+		t.Errorf("refused hop recorded as %d bytes, status %d", len(ref.FinalURL), ref.HTTPStatus)
+	}
+	// Under the cap as sent, over it once escaped (each byte of U+00E9 becomes %XX).
+	raw := "https://docs.example.com/?q=" + strings.Repeat("\u00e9", MaxURLLen/3)
+	if len(raw) > MaxURLLen {
+		t.Fatalf("test URL is %d bytes", len(raw))
+	}
+	r, ref = f.Fetch(context.Background(), raw, entries, 1<<20)
+	ref = mustRefuse(t, r, ref, ReasonURLTooLong)
+	if len(ref.FinalURL) > MaxURLLen {
+		t.Errorf("refused URL recorded as %d bytes", len(ref.FinalURL))
+	}
+}
+
+// A refused hop's FinalURL is recorded in the same form as an allowed hop's: lower-case
+// scheme and host, path escaped, query through escapeQuery, fragment and userinfo
+// dropped, so the Complete record is printable ASCII.
+func TestFetchRefusedFinalURLIsPrintableASCII(t *testing.T) {
+	ca := newTestCA(t)
+	var n atomic.Int32
+	_, port := upstream(t, ca.validLeaf(t, "docs.example.com"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/to-evil":
+			w.Header().Set("Location", "HTTPS://EVIL.Example.NET/St\u202eeal?q=\u009b\u202e#frag\u202e")
+			w.WriteHeader(http.StatusFound)
+		default:
+			w.Header().Set("Location", fmt.Sprintf("/loop/%d?x=\u202e#f", n.Add(1)))
+			w.WriteHeader(http.StatusFound)
+		}
+	}))
+	f := fetcherFor(publicResolver(), ca, port)
+	entries := []string{"docs.example.com"}
+
+	r, ref := f.Fetch(context.Background(), "https://docs.example.com/to-evil", entries, 1<<20)
+	ref = mustRefuse(t, r, ref, ReasonRedirectOffList)
+	if want := "https://evil.example.net/St%E2%80%AEeal?q=%C2%9B%E2%80%AE"; ref.FinalURL != want {
+		t.Errorf("off-list hop recorded as %q, want %q", ref.FinalURL, want)
+	}
+
+	r, ref = f.Fetch(context.Background(), "https://docs.example.com/loop", entries, 1<<20)
+	ref = mustRefuse(t, r, ref, ReasonTooManyRedirects)
+	if want := fmt.Sprintf("https://docs.example.com/loop/%d?x=%%E2%%80%%AE", MaxRedirects+1); ref.FinalURL != want {
+		t.Errorf("too-many-redirects hop recorded as %q, want %q", ref.FinalURL, want)
+	}
+
+	// The worker's own URL, refused on its first check, is recorded the same way.
+	r, ref = f.Fetch(context.Background(), "https://u:p@Docs.Example.COM/\u202e?q=\u009b#frag", entries, 1<<20)
+	ref = mustRefuse(t, r, ref, ReasonUserinfo)
+	if want := "https://docs.example.com/%E2%80%AE?q=%C2%9B"; ref.FinalURL != want {
+		t.Errorf("refused first URL recorded as %q, want %q", ref.FinalURL, want)
+	}
+	r, ref = f.Fetch(context.Background(), "https://a\u202eb.example.com/\x7f", entries, 1<<20)
+	if r != nil || ref == nil || !isPrintableASCII(ref.FinalURL) {
+		t.Errorf("unparseable URL recorded as %+v", ref)
+	}
+}
+
+func isPrintableASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] < 0x20 || s[i] > 0x7e {
+			return false
+		}
+	}
+	return true
+}
+
+// A caller that goes away is "cancelled", not "timeout": only the fetch's own deadline
+// is a timeout.
+func TestFetchCallerCancelIsNotTimeout(t *testing.T) {
+	ca := newTestCA(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	started := make(chan struct{}, 1)
+	_, port := upstream(t, ca.validLeaf(t, "docs.example.com"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		started <- struct{}{}
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	f := fetcherFor(publicResolver(), ca, port)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-started
+		cancel()
+	}()
+	r, ref := f.Fetch(ctx, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonCancelled)
+
+	f, _ = testFetcher(publicResolver(), ca, port, func(o *Options) { o.Timeout = 200 * time.Millisecond })
+	r, ref = f.Fetch(context.Background(), "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonTimeout)
+
+	// A lookup cut short by the caller is cancelled too.
+	done, stop := context.WithCancel(context.Background())
+	stop()
+	r, ref = fetcherFor(publicResolver(), ca, port).Fetch(done, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonCancelled)
+}

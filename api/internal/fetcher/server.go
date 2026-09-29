@@ -24,8 +24,11 @@ const (
 	// completeTimeout bounds the source-log write, which runs even when the worker has
 	// gone away.
 	completeTimeout = 15 * time.Second
-	// DefaultMaxInflight bounds concurrent fetches in one fetcher process, so its memory
-	// is bounded by MaxInflight x the per-file cap.
+	// DefaultMaxInflight bounds concurrent fetches (Begin to response) in one fetcher
+	// process. Each holds at most one body of up to the per-file cap plus one byte, in an
+	// io.ReadAll buffer whose capacity can grow to about twice that, so fetch bodies take
+	// roughly MaxInflight x 2 x the per-file cap at most. It bounds nothing else: requests
+	// refused as busy, header and TLS buffers, and idle connections are outside it.
 	DefaultMaxInflight = 16
 )
 
@@ -174,6 +177,8 @@ func statusFor(reason string) int {
 	case ReasonDNSFailed, ReasonConnectFailed, ReasonTLS, ReasonTimeout, ReasonHeadersTooLarge,
 		ReasonUpstreamStatus, ReasonUpstreamError, ReasonTooLarge:
 		return http.StatusBadGateway
+	case ReasonCancelled:
+		return http.StatusServiceUnavailable
 	default:
 		return http.StatusForbidden
 	}
@@ -216,12 +221,34 @@ func decodeStrict(r io.Reader, dst any) error {
 	return nil
 }
 
+// maxLoggedHost caps the host hostOf returns.
+const maxLoggedHost = 255
+
 // hostOf returns only the host of a URL, for logs: never the path or query, which can
-// carry tokens.
+// carry tokens. The host is worker- or site-controlled, so every byte outside printable
+// ASCII (a bidi override, a C1 control) is percent-encoded, and it is cut to
+// maxLoggedHost bytes.
 func hostOf(raw string) string {
 	u, err := url.Parse(raw)
 	if err != nil {
 		return ""
 	}
-	return u.Hostname()
+	h := escapeQuery(u.Hostname())
+	if len(h) > maxLoggedHost {
+		h = h[:maxLoggedHost]
+	}
+	return h
+}
+
+// minStreamBytesPerSec is the slowest worker read rate HandlerBudget allows for when it
+// budgets the time to write the largest body.
+const minStreamBytesPerSec = 1 << 20
+
+// HandlerBudget is the longest one POST /v1/fetch handler runs once its request is read:
+// Begin (bounded by controlTimeout), the fetch (bounded by fetchTimeout), Complete
+// (bounded by completeTimeout) and writing a body of maxFileBytes to a worker reading at
+// minStreamBytesPerSec. A worker that reads slower than that can be cut off.
+func HandlerBudget(controlTimeout, fetchTimeout time.Duration, maxFileBytes int64) time.Duration {
+	stream := time.Duration((maxFileBytes+minStreamBytesPerSec-1)/minStreamBytesPerSec) * time.Second
+	return controlTimeout + fetchTimeout + completeTimeout + stream
 }

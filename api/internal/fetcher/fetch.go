@@ -47,6 +47,7 @@ const (
 	ReasonConnectFailed    = "connect_failed"
 	ReasonTLS              = "tls"
 	ReasonTimeout          = "timeout"
+	ReasonCancelled        = "cancelled"
 	ReasonHeadersTooLarge  = "headers_too_large"
 	ReasonUpstreamStatus   = "upstream_status"
 	ReasonUpstreamError    = "upstream_error"
@@ -154,8 +155,8 @@ type Result struct {
 }
 
 // Refusal is a fetch that returned no content. FinalURL is the last URL attempted (the
-// requested URL, or the redirect target that was refused); HTTPStatus is the upstream
-// status when one was received.
+// requested URL, or the redirect target that was refused), in recordURL's printable form;
+// HTTPStatus is the upstream status when one was received.
 type Refusal struct {
 	Reason     string
 	Message    string
@@ -189,7 +190,7 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string, entries []string, ma
 	for hop := 0; ; hop++ {
 		u, host, ref := checkURL(cur, hop > 0, entries)
 		if ref != nil {
-			ref.FinalURL = cur
+			ref.FinalURL = recordURL(cur)
 			ref.HTTPStatus = lastStatus
 			return nil, ref
 		}
@@ -229,14 +230,14 @@ func (f *Fetcher) hop(ctx context.Context, u *url.URL, host string, hop int, max
 			return nil, "", 0, &Refusal{Reason: ReasonRedirectInvalid, Message: "redirect Location is not a URL", HTTPStatus: resp.StatusCode}
 		}
 		if hop >= MaxRedirects {
-			return nil, "", 0, &Refusal{Reason: ReasonTooManyRedirects, Message: "too many redirects", FinalURL: next.String(), HTTPStatus: resp.StatusCode}
+			return nil, "", 0, &Refusal{Reason: ReasonTooManyRedirects, Message: "too many redirects", FinalURL: recordURL(next.String()), HTTPStatus: resp.StatusCode}
 		}
 		return nil, next.String(), resp.StatusCode, nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, "", 0, &Refusal{Reason: ReasonUpstreamStatus, Message: "the site answered " + resp.Status, HTTPStatus: resp.StatusCode}
 	}
-	if ce := strings.TrimSpace(resp.Header.Get("Content-Encoding")); ce != "" && !strings.EqualFold(ce, "identity") {
+	if !identityOnly(resp.Header.Values("Content-Encoding")) {
 		return nil, "", 0, &Refusal{Reason: ReasonContentEncoding, Message: "the site sent an encoded body although identity was requested", HTTPStatus: resp.StatusCode}
 	}
 	if resp.ContentLength > maxBytes {
@@ -260,6 +261,19 @@ func (f *Fetcher) hop(ctx context.Context, u *url.URL, host string, hop int, max
 	}, "", 0, nil
 }
 
+// identityOnly reports whether every Content-Encoding value, across all header lines and
+// comma-separated codings, is identity or empty.
+func identityOnly(vals []string) bool {
+	for _, line := range vals {
+		for _, c := range strings.Split(line, ",") {
+			if c = strings.TrimSpace(c); c != "" && !strings.EqualFold(c, "identity") {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 func isRedirect(code int) bool {
 	switch code {
 	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther,
@@ -270,8 +284,13 @@ func isRedirect(code int) bool {
 }
 
 // checkURL applies the URL checks to one hop and returns the URL to request (host
-// replaced by its normalized form, fragment and userinfo dropped) and that host.
+// replaced by its normalized form, fragment and userinfo dropped) and that host. Every
+// hop, a redirect Location included, is held to MaxURLLen both as received and as the
+// escaped URL that would be requested.
 func checkURL(raw string, redirect bool, entries []string) (*url.URL, string, *Refusal) {
+	if len(raw) > MaxURLLen {
+		return nil, "", refuse(ReasonURLTooLong, "the URL is longer than the fetcher's URL cap")
+	}
 	u, err := url.Parse(raw)
 	if err != nil {
 		return nil, "", refuse(ReasonInvalidURL, "not a valid URL")
@@ -313,13 +332,58 @@ func checkURL(raw string, redirect bool, entries []string) (*url.URL, string, *R
 		RawPath:  u.RawPath,
 		RawQuery: escapeQuery(u.RawQuery),
 	}
+	if len(out.String()) > MaxURLLen {
+		return nil, "", refuse(ReasonURLTooLong, "the escaped URL is longer than the fetcher's URL cap")
+	}
 	return out, host, nil
 }
 
-// escapeQuery percent-encodes every byte of a raw query that is not printable ASCII.
-// url.Parse refuses ASCII control bytes but keeps UTF-8 (a bidi override, say) verbatim
-// in RawQuery, and url.URL.String() does not re-escape it; this keeps the URL the fetcher
-// requests, logs and returns in X-Uzi-Final-Url printable ASCII.
+// recordURL is the form a refused hop's URL is recorded in (Refusal.FinalURL, so the
+// Complete record and the log): the shape checkURL gives an allowed hop (scheme and host
+// in ASCII lower case, the path escaped, the query through escapeQuery, userinfo and
+// fragment dropped), backstopped by escaping any remaining byte outside printable ASCII
+// and cut to MaxURLLen. A URL that does not parse is recorded with its fragment dropped
+// and every byte outside printable ASCII escaped.
+func recordURL(raw string) string {
+	var out string
+	if u, err := url.Parse(raw); err == nil && u.Opaque == "" {
+		out = (&url.URL{
+			Scheme:   asciiLower(u.Scheme),
+			Host:     asciiLower(u.Host),
+			Path:     u.Path,
+			RawPath:  u.RawPath,
+			RawQuery: escapeQuery(u.RawQuery),
+		}).String()
+	} else {
+		out, _, _ = strings.Cut(raw, "#")
+	}
+	out = escapeQuery(out)
+	if len(out) > MaxURLLen {
+		out = out[:MaxURLLen]
+		// Do not leave half of a %XX escape at the end.
+		if i := strings.LastIndexByte(out, '%'); i >= len(out)-2 {
+			out = out[:i]
+		}
+	}
+	return out
+}
+
+// asciiLower lower-cases the ASCII letters of s and leaves every other byte as it is.
+func asciiLower(s string) string {
+	b := []byte(s)
+	for i, c := range b {
+		if 'A' <= c && c <= 'Z' {
+			b[i] = c + ('a' - 'A')
+		}
+	}
+	return string(b)
+}
+
+// escapeQuery percent-encodes every byte of s that is not printable ASCII (space
+// included). url.Parse refuses ASCII control bytes but keeps UTF-8 (a bidi override, say)
+// verbatim in RawQuery, and url.URL.String() does not re-escape it; checkURL runs the
+// query through this so the URL the fetcher requests and returns in X-Uzi-Final-Url is
+// printable ASCII, and recordURL and hostOf use it for what is recorded and logged.
 func escapeQuery(q string) string {
 	const hexDigits = "0123456789ABCDEF"
 	var b strings.Builder
@@ -343,7 +407,7 @@ func (f *Fetcher) resolve(ctx context.Context, host string) ([]netip.Addr, *Refu
 	addrs, err := f.opts.Resolver.LookupNetIP(ctx, "ip", host+".")
 	if err != nil {
 		if ctx.Err() != nil {
-			return nil, refuse(ReasonTimeout, "the fetch timed out")
+			return nil, ctxRefusal(ctx)
 		}
 		return nil, refuse(ReasonDNSFailed, "the host name did not resolve")
 	}
@@ -462,7 +526,7 @@ func classify(ctx context.Context, err error) *Refusal {
 	case errors.Is(err, errAddressRefused):
 		return refuse(ReasonPrivateAddress, "the connection address is not public")
 	case ctx.Err() != nil:
-		return refuse(ReasonTimeout, "the fetch timed out")
+		return ctxRefusal(ctx)
 	case errors.As(err, &certErr), errors.As(err, &unknownCA), errors.As(err, &hostErr),
 		errors.As(err, &invalidErr), errors.As(err, &alertErr), errors.As(err, &recordErr):
 		return refuse(ReasonTLS, "the site's TLS certificate or handshake failed verification")
@@ -475,6 +539,15 @@ func classify(ctx context.Context, err error) *Refusal {
 	default:
 		return refuse(ReasonUpstreamError, "the site's response could not be read")
 	}
+}
+
+// ctxRefusal names why ctx ended: its deadline (the fetch's Timeout) is "timeout"; a
+// cancellation (the worker disconnected) is "cancelled".
+func ctxRefusal(ctx context.Context) *Refusal {
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return refuse(ReasonTimeout, "the fetch timed out")
+	}
+	return refuse(ReasonCancelled, "the fetch was cancelled: the caller went away")
 }
 
 // charsetName is the shape a relayed charset parameter must have (IANA charset names).

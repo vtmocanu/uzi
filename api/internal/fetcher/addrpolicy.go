@@ -6,11 +6,18 @@ import (
 	"strings"
 )
 
-// blockedPrefixes are the ranges no fetch may reach, whatever the site list says: every
-// non-public IPv4 and IPv6 range, plus the IPv6 ranges that embed or tunnel to an IPv4
-// address (NAT64, 6to4, Teredo, IPv4-compatible), which could otherwise carry a private
-// IPv4 address past an IPv4-only check. Addresses are unmapped (::ffff:a.b.c.d ->
-// a.b.c.d) before they are checked against this list.
+// ipv6GlobalUnicast is 2000::/3, the only IPv6 space Allowed admits (an allowlist):
+// everything outside it, including ::ffff:0:0:0/96 (SIIT, which embeds an IPv4 address
+// Unmap does not extract), 4000::/2 and the rest of ::/8, is refused without being listed.
+var ipv6GlobalUnicast = netip.MustParsePrefix("2000::/3")
+
+// blockedPrefixes are the ranges no fetch may reach, whatever the site list says: the
+// non-public IPv4 ranges, and the non-public IPv6 ranges inside 2000::/3, among them the
+// ones that tunnel to an IPv4 address (Teredo, 6to4), which could otherwise carry a
+// private IPv4 address past an IPv4-only check. The IPv6 entries outside 2000::/3 (NAT64,
+// IPv4-compatible, loopback, ULA, link-local, multicast...) are refused by the
+// ipv6GlobalUnicast check anyway and stay listed as a second layer.
+// Addresses are unmapped (::ffff:a.b.c.d -> a.b.c.d) before they are checked.
 var blockedPrefixes = mustPrefixes(
 	// IPv4
 	"0.0.0.0/8",       // "this network", includes the unspecified address
@@ -91,12 +98,16 @@ func NewAddressPolicy(extraCIDRs []string) (AddressPolicy, error) {
 }
 
 // Allowed reports whether a may be dialed. An IPv4-mapped IPv6 address is judged as the
-// IPv4 address it carries; an address with a zone is refused.
+// IPv4 address it carries; any other IPv6 address must lie in 2000::/3; an address with
+// a zone is refused.
 func (p AddressPolicy) Allowed(a netip.Addr) bool {
 	if !a.IsValid() || a.Zone() != "" {
 		return false
 	}
 	a = a.Unmap()
+	if a.Is6() && !ipv6GlobalUnicast.Contains(a) {
+		return false
+	}
 	if !a.IsGlobalUnicast() || a.IsPrivate() {
 		return false
 	}

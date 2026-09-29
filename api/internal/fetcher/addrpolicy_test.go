@@ -129,3 +129,25 @@ func TestAddressPolicyStdlibLayerAlone(t *testing.T) {
 		}
 	}
 }
+
+// IPv6 is admitted only inside 2000::/3, the global unicast allocation: every other IPv6
+// range is refused whatever it embeds. ::ffff:0:a.b.c.d (SIIT, ::ffff:0:0:0/96) carries
+// an IPv4 address that Unmap does not extract, so a blocklist alone let
+// ::ffff:0:a9fe:a9fe (169.254.169.254) through.
+func TestAddressPolicyIPv6OnlyInGlobalUnicastAllocation(t *testing.T) {
+	var p AddressPolicy
+	for _, s := range []string{
+		"::ffff:0:a9fe:a9fe", "::ffff:0:a00:1", "::ffff:0:7f00:1", "4000::1", "::1:0:0:1",
+		"1000::1", "8000::1", "e000::1", "1fff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+		"4000::", "c000::1",
+	} {
+		if p.Allowed(netip.MustParseAddr(s)) {
+			t.Errorf("%s allowed", s)
+		}
+	}
+	for _, s := range []string{publicV6, "2a00:1450:4001::1", "2606:4700::1111", "2c0f:fb50::1", "3ffe:ffff::1"} {
+		if !p.Allowed(netip.MustParseAddr(s)) {
+			t.Errorf("public %s refused", s)
+		}
+	}
+}

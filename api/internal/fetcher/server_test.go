@@ -179,7 +179,7 @@ func TestServerCompleteSurvivesCallerCancel(t *testing.T) {
 	if sawCancelled.Load() {
 		t.Fatal("Complete ran with the cancelled request context")
 	}
-	if ctl.completes[0].Verdict != VerdictRefused || ctl.completes[0].Reason != ReasonTimeout {
+	if ctl.completes[0].Verdict != VerdictRefused || ctl.completes[0].Reason != ReasonCancelled {
 		t.Fatalf("record %+v", ctl.completes[0])
 	}
 }
@@ -392,5 +392,53 @@ func TestServerNormalizesSiteControlledHeaders(t *testing.T) {
 		if rec.Header().Get("X-Content-Type-Options") != "nosniff" {
 			t.Errorf("%s: no nosniff", path)
 		}
+	}
+}
+
+// Worker- and site-controlled text reaches the fetcher's log only as printable ASCII: a
+// host carrying U+202E (a bidi override) or U+009B (a C1 control) is escaped at every
+// sink, the Begin-failure, Complete-failure and per-fetch lines alike.
+func TestServerLogsArePrintableASCII(t *testing.T) {
+	hostile := "https://docs\u202e.exa\u009bmple.com/p?q=\u202e"
+	for _, c := range []struct {
+		name        string
+		beginErr    error
+		completeErr error
+	}{
+		{"begin-failed", errors.New("connection refused"), nil},
+		{"complete-failed", nil, errors.New("api answered 500")},
+		{"fetch-line", nil, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			var buf bytes.Buffer
+			log := slog.New(slog.NewJSONHandler(&buf, nil))
+			ctl := newControl("docs.example.com")
+			ctl.beginErr, ctl.completeErr = c.beginErr, c.completeErr
+			s := NewServer(fetcherFor(publicResolver(), nil, 0), ctl, log, 0)
+			_ = doFetch(t, s, testCredential, urlBody(t, hostile))
+			if buf.Len() == 0 {
+				t.Fatal("nothing logged")
+			}
+			for i, b := range buf.Bytes() {
+				if b != '\n' && (b < 0x20 || b > 0x7e) {
+					t.Fatalf("log byte %d is 0x%02x: %q", i, b, buf.String())
+				}
+			}
+		})
+	}
+	if got := hostOf("https://a\u202eb\u009b.example.com/x"); !isPrintableASCII(got) || got == "" {
+		t.Errorf("hostOf = %q", got)
+	}
+}
+
+// HandlerBudget adds every bounded phase of the handler, and the stream time grows with
+// the per-file cap.
+func TestHandlerBudget(t *testing.T) {
+	got := HandlerBudget(10*time.Second, 60*time.Second, 25<<20)
+	if want := 10*time.Second + 60*time.Second + completeTimeout + 25*time.Second; got != want {
+		t.Fatalf("HandlerBudget = %s, want %s", got, want)
+	}
+	if HandlerBudget(0, 0, 1) < completeTimeout+time.Second {
+		t.Fatal("a one-byte body is budgeted no stream time")
 	}
 }
