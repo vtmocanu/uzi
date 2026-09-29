@@ -39,7 +39,8 @@ func newMockGitLab(t *testing.T, routes map[string]http.HandlerFunc) *mockGitLab
 
 func newTestDriver(t *testing.T, m *mockGitLab, token string) Forge {
 	t.Helper()
-	d, err := New(TypeGitLab, m.srv.URL, token, 5*time.Second)
+	d, err := NewWithGitLabBackoff(TypeGitLab, m.srv.URL, token, 5*time.Second,
+		func(_, _ time.Duration, _ int, _ *http.Response) time.Duration { return 0 })
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
