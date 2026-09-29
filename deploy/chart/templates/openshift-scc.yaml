@@ -149,8 +149,9 @@ subjects:
   posture; under workers.uidSplit.enabled it is the wider uid-split envelope (RunAsAny,
   the uid-split capabilities). What holds a lane pod to the restricted shape in BOTH
   postures is the lane namespace's Pod Security `restricted` label, ENFORCED
-  unconditionally (worker-isolated-namespace.yaml): admission rejects a root start or an
-  added capability there whatever this SCC would admit.
+  unconditionally (worker-isolated-namespace.yaml): admission rejects a root start there,
+  and any added capability except NET_BIND_SERVICE (the one `restricted` admits),
+  whatever this SCC would admit.
 */}}
 ---
 apiVersion: rbac.authorization.k8s.io/v1

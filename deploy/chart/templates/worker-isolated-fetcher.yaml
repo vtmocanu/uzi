@@ -171,6 +171,14 @@ spec:
             - name: UZI_FETCHER_MAX_INFLIGHT
               value: {{ . | int64 | toString | quote }}
             {{- end }}
+            # The Go runtime's soft heap limit, at 90% of the container's memory limit, so the
+            # GC works harder near the limit instead of letting GOGC=100 double a large live
+            # heap past it (an OOM kill). A plain byte count, which GOMEMLIMIT accepts. Not
+            # set when the container has no memory limit (then there is nothing to stay under).
+            {{- with (.Values.workers.isolatedLane.fetcher.resources.limits | default dict).memory }}
+            - name: GOMEMLIMIT
+              value: {{ mulf (float64 (include "uzi.quantityBytes" .)) 0.9 | int64 | toString | quote }}
+            {{- end }}
           # GET /healthz answers 200 without touching the api, on the TLS listener.
           readinessProbe:
             httpGet:

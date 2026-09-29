@@ -12,11 +12,14 @@
        rendered from the SAME helper as the floor (uzi.isolatedLaneFloorEgress). They are
        here only so that step 2 can drop the cluster's own ranges without cutting the
        lane off from them; they admit nothing the floor does not.
-    2. the drop belt: fqdnEgress.denyCIDRs, the lane's clusterCIDRs (pod, service, node)
-       and the IPv6 metadata address fd00:ec2::254. It precedes the FQDN Allow for the
-       same reason as in worker-fqdn-egress.yaml: an FQDN Allow admits whatever addresses
-       the DNS answer carried, so a hostile answer mapping the model host to the metadata
-       address, a node, or an in-cluster pod would otherwise open it through step 3.
+    2. the drop belt: fqdnEgress.denyCIDRs, then uzi.isolatedLaneAntreaDropCIDRs (the
+       lane's clusterCIDRs, every IPv4 range the OVN branch excepts, i.e.
+       uzi.isolatedLaneExceptV4, and the non-global IPv6 ranges uzi-fetcher refuses,
+       fc00::/7 and fe80::/10 among them), then the IPv6 metadata address fd00:ec2::254.
+       It precedes the FQDN Allow for the same reason as in worker-fqdn-egress.yaml: an
+       FQDN Allow admits whatever addresses the DNS answer carried, so a hostile answer
+       mapping the model host to the metadata address, a node, an in-cluster pod or any
+       other non-public address would otherwise open it through step 3.
     3. the model host, by exact name, on TCP 443.
 
   An Antrea Allow jumps past the k8s NetworkPolicy tables, so the lane floor
@@ -46,8 +49,8 @@ spec:
         - ipBlock:
             cidr: {{ .cidr }}
     {{- end }}
-    {{- range $i, $c := fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) }}
-    - name: drop-lane-cluster-{{ $i }}
+    {{- range $i, $c := fromJsonArray (include "uzi.isolatedLaneAntreaDropCIDRs" .) }}
+    - name: drop-lane-nonpublic-{{ $i }}
       action: Drop
       to:
         - ipBlock:

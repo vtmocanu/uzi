@@ -1131,8 +1131,13 @@ workers:
       # body in a buffer that can grow to twice the per-file cap). At the defaults that is
       # 16 x 2 x 25 MiB = 800 MiB, so the limit is 1Gi: the worst case plus ~224 MiB for
       # the runtime, TLS and header buffers and idle connections, which that bound does
-      # not cover. Raising maxInflight or maxFileBytes raises the bound; raise this limit
-      # with them, or the kernel OOM-kills the fetcher under load.
+      # not cover. The chart also sets the fetcher's GOMEMLIMIT to 90% of limits.memory
+      # (at 1Gi, 966367641 bytes, ~922 MiB), so the Go GC holds the heap under the limit
+      # instead of letting GOGC=100 grow it toward twice the live set. Sizing rule:
+      # 0.9 x limits.memory >= maxInflight x 2 x maxFileBytes + ~100 MiB (at the
+      # defaults, 922 MiB >= 900 MiB). Raising maxInflight or maxFileBytes raises the
+      # bound; raise this limit with them, or the GC thrashes near GOMEMLIMIT and the
+      # kernel OOM-kills the fetcher under load. With no limits.memory, no GOMEMLIMIT.
       resources:
         requests:
           cpu: 50m

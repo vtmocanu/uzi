@@ -592,6 +592,32 @@ true
 {{- end -}}
 
 {{- /*
+  uzi.isolatedLaneAntreaDropCIDRs: the lane Antrea policy's drop belt (beyond its named
+  fqdnEgress.denyCIDRs rules and its fd00:ec2::254/128 rule), as a JSON list, deduplicated
+  and with those named entries left out. It is the union of: the lane's cluster CIDRs (both
+  families), uzi.isolatedLaneExceptV4 (the IPv4 half of addrpolicy.go, the same set the OVN
+  branch excepts), uzi.isolatedLaneExceptV6 (addrpolicy.go's ranges inside 2000::/3), and
+  addrpolicy.go's IPv6 ranges outside 2000::/3 (unique-local fc00::/7, link-local, NAT64,
+  and the rest). So an FQDN answer for the model host naming any address uzi-fetcher would
+  refuse is dropped here too. The one addrpolicy.go range left out is ::ffff:0:0/96
+  (IPv4-mapped): a socket dialling one sends an IPv4 packet, which the IPv4 entries drop.
+*/ -}}
+{{- define "uzi.isolatedLaneAntreaDropCIDRs" -}}
+{{- $v6 := list "::/96" "::1/128" "64:ff9b::/96" "64:ff9b:1::/48" "100::/64" "5f00::/16" "fc00::/7" "fe80::/10" "fec0::/10" "ff00::/8" -}}
+{{- $named := list "fd00:ec2::254/128" -}}
+{{- range .Values.workers.fqdnEgress.denyCIDRs -}}
+{{- $named = append $named .cidr -}}
+{{- end -}}
+{{- $out := list -}}
+{{- range concat (fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .)) (fromJsonArray (include "uzi.isolatedLaneExceptV4" .)) (fromJsonArray (include "uzi.isolatedLaneExceptV6" .)) $v6 -}}
+{{- if not (has . $named) -}}
+{{- $out = append $out . -}}
+{{- end -}}
+{{- end -}}
+{{- toJson (uniq $out) -}}
+{{- end -}}
+
+{{- /*
   uzi.validateIsolatedLane: every precondition of the lane, checked once, at render time.
   Each one, left unchecked, renders a lane that is either unreachable or wider than
   promised, and nothing else reports it.
@@ -630,12 +656,15 @@ true
   The fetcher parses these with strconv (a positive decimal integer) and refuses to start
   otherwise. A YAML integer reaches the template as a float64, which `toString` would
   print as 5.24288e+07, so worker-isolated-fetcher.yaml renders int64 | toString; this
-  refuses what that conversion cannot carry (a unit suffix, zero, a negative number).
+  refuses what that conversion cannot carry: a unit suffix, a negative number, zero (the
+  template's `with` would otherwise drop it and render no env at all, silently) and a
+  fraction (int64 would truncate 12345678.9 to 12345678, silently). Only an unset value
+  (null or "") means "the fetcher's own default".
 */ -}}
 {{- range $k := list "maxFileBytes" "maxInflight" -}}
 {{- $v := index $l.fetcher $k -}}
-{{- if $v -}}
-{{- if or (le (int64 $v) 0) (not (regexMatch "^[0-9]+(\\.0+)?$|^[0-9](\\.[0-9]+)?e\\+[0-9]+$" (toString $v))) -}}
+{{- if not (or (kindIs "invalid" $v) (and (kindIs "string" $v) (eq $v ""))) -}}
+{{- if or (le (int64 $v) 0) (ne (float64 (int64 $v)) (float64 $v)) (not (regexMatch "^[0-9]+(\\.0+)?$|^[0-9](\\.[0-9]+)?e\\+[0-9]+$" (toString $v))) -}}
 {{- fail (printf "workers.isolatedLane.fetcher.%s must be a positive whole number (a byte count for maxFileBytes, a count for maxInflight), got %q" $k (toString $v)) -}}
 {{- end -}}
 {{- end -}}

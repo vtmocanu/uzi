@@ -393,6 +393,17 @@ got=$(q "$WORK/lane-nums.out" 'select(.kind == "Deployment" and .metadata.name =
 [ "$got" = "UZI_FETCHER_MAX_FILE_BYTES=52428800,UZI_FETCHER_MAX_INFLIGHT=8" ] && ok "the fetcher's numeric env renders as plain integers (52428800, 8)" || bad "the fetcher's numeric env renders '$got', want UZI_FETCHER_MAX_FILE_BYTES=52428800,UZI_FETCHER_MAX_INFLIGHT=8"
 refuse "workers.isolatedLane.fetcher.maxFileBytes must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" --set-string workers.isolatedLane.fetcher.maxFileBytes=25MiB
 refuse "workers.isolatedLane.fetcher.maxInflight must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" --set workers.isolatedLane.fetcher.maxInflight=-1
+# Zero and a fraction are refused, not dropped or truncated: `with` would skip a 0 (no env,
+# so the fetcher's default applies silently) and int64 would render 12345678.9 as 12345678.
+# YAML-typed, from a values file, as a real deployment writes them (--set types a fraction
+# as a string).
+printf 'workers:\n  isolatedLane:\n    fetcher:\n      maxFileBytes: 12345678.9\n' > "$WORK/lane-frac.yaml"
+printf 'workers:\n  isolatedLane:\n    fetcher:\n      maxInflight: 0\n' > "$WORK/lane-zero.yaml"
+printf 'workers:\n  isolatedLane:\n    fetcher:\n      maxFileBytes: 0\n' > "$WORK/lane-zero-bytes.yaml"
+refuse "workers.isolatedLane.fetcher.maxFileBytes must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" -f "$WORK/lane-frac.yaml"
+refuse "workers.isolatedLane.fetcher.maxInflight must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" -f "$WORK/lane-zero.yaml"
+refuse "workers.isolatedLane.fetcher.maxFileBytes must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" -f "$WORK/lane-zero-bytes.yaml"
+refuse "workers.isolatedLane.fetcher.maxInflight must be a positive whole number" -f "$WORK/workers.yaml" -f "$WORK/lane.yaml" --set-string workers.isolatedLane.fetcher.maxInflight=2.5
 
 # Provider ovn: the lane's pair renders only where the cluster serves EgressFirewall, and then
 # allows the model host alone.
@@ -417,6 +428,10 @@ last=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "EgressFirewall" and .metadata.n
 # IPv6 entry (an except outside 0.0.0.0/0 makes the apiserver reject the policy).
 got=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-external-egress") | (.spec.egress | length | tostring) + " " + (.spec.egress[0].to | length | tostring) + " " + .spec.egress[0].to[0].ipBlock.cidr + " ports " + ([.spec.egress[0].ports[] | .protocol + "/" + (.port | tostring)] | join(","))')
 [ "$got" = "1 1 0.0.0.0/0 ports TCP/443" ] && ok "lane external-egress policy: one rule, 0.0.0.0/0 only, TCP/443 only" || bad "lane external-egress policy renders '$got'"
+# Egress-only: an ingress rule here would be OR'd with the lane floor's `ingress: []` and
+# admit whatever it names into every lane pod.
+got=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-external-egress") | (.spec.policyTypes | join(",")) + " ingress=" + (.spec | has("ingress") | tostring)')
+[ "$got" = "Egress ingress=false" ] && ok "lane external-egress policy: policyTypes [Egress] only, no ingress key" || bad "lane external-egress policy's policyTypes/ingress render '$got', want 'Egress ingress=false'"
 exc=$(q "$WORK/lane-ovn.yaml" 'select(.kind == "NetworkPolicy" and .metadata.name == "uzi-worker-isolated-external-egress") | .spec.egress[0].to[0].ipBlock.except | join(" ")')
 [ -n "$exc" ] || { echo "BROKEN: the lane external-egress policy has no except list" >&2; exit 2; }
 missing=""

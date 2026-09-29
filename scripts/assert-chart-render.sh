@@ -424,8 +424,9 @@ check_codex_egress "$RENDER" || exit $?
 #       nothing appended (so neither allowWebService, on in ci-render, nor extraEgress);
 #   (c) the lane's Antrea policy: every rule names a peer; its Allow rules are the floor's
 #       three in-cluster rules (signature-equal) plus exactly one fqdn, api.anthropic.com,
-#       on TCP/443; its ipBlock-only Drop belt holds 169.254.169.254/32, fd00:ec2::254/128
-#       and every configured cluster range, and precedes the fqdn Allow;
+#       on TCP/443; its ipBlock-only Drop belt holds 169.254.169.254/32, fd00:ec2::254/128,
+#       every configured cluster range and every addrpolicy.go range (bar IPv4-mapped),
+#       and precedes the fqdn Allow; it has no spec.ingress;
 #   (d) uzi-fetcher's policy admits ingress from the lane's worker pods (and the api's
 #       probe CIDRs) on the fetcher port only, every rule with a `from` peer; its egress
 #       rules all name a peer and are DNS, the api, and TCP/443 to 0.0.0.0/0 and 2000::/3
@@ -440,8 +441,9 @@ check_codex_egress "$RENDER" || exit $?
 #       kind and name) and the render has no cluster-scoped network policy: policies are
 #       additive, so any other one could open what (b)-(c) close;
 #   (h) wiring: the controller's fetcher URL host is on the fetcher certificate; the
-#       fetcher's env names are ones api/internal/fetcher/config.go reads, the required
-#       ones present; the token-hash and token-file Secret keys exist; and every file-path
+#       fetcher's env names are ones api/internal/fetcher/config.go reads (or GOMEMLIMIT),
+#       the required ones present, GOMEMLIMIT a byte count within 80-100% of the
+#       container's memory limit; the token-hash and token-file Secret keys exist; and every file-path
 #       env resolves through a volumeMount to the right key of the right Secret.
 #
 # PARSED, NOT GREPPED. `flatten` turns the block-style YAML helm emits into one
@@ -666,12 +668,23 @@ $_got"
   # three in-cluster peers (signature-equal to the floor's, so they admit nothing it does
   # not), a Drop belt, then the one FQDN Allow. Every rule names a peer (a rule without
   # `to` matches every destination), every Drop is ipBlock-only with no port narrowing,
-  # the belt holds the metadata addresses and every configured cluster range, and no Drop
-  # follows the FQDN Allow (a DNS answer for the model host must not reach a dropped
-  # address through it).
+  # the belt holds the metadata addresses, every configured cluster range and every range
+  # api/internal/fetcher/addrpolicy.go refuses (so every uzi.isolatedLaneExceptV4 entry, the
+  # set the OVN branch excepts, and the non-global IPv6 ranges), and no Drop follows the
+  # FQDN Allow (a DNS answer for the model host must not reach a dropped address through
+  # it). The policy carries no ingress: an Antrea Allow ingress rule would jump past the
+  # floor's `ingress: []` and admit whatever it names into every lane pod.
+  _policy_go="$SCRIPT_DIR/../api/internal/fetcher/addrpolicy.go"
+  _fixed=$(awk '/^var blockedPrefixes = mustPrefixes\(/ { f = 1; next } f && /^\)/ { f = 0 } f && match($0, /"[^"]+"/) { print substr($0, RSTART + 1, RLENGTH - 2) }' "$_policy_go" 2>/dev/null | tr '\n' ' ') || true
+  if [ "$(printf '%s' "$_fixed" | wc -w)" -lt 20 ]; then
+    echo "BROKEN: isolated lane: could not read blockedPrefixes from $_policy_go (got: $_fixed)" >&2; rm -f "$_flat"; return 2
+  fi
   _blocked=$(awk -F '\t' -v d="$_fdep" '$1 == d && $3 == "UZI_FETCHER_BLOCKED_CIDRS" { p = $2; sub(/name$/, "value", p); want = p } $1 == d && $2 == want { print $3; exit }' "$_flat" | tr ',' ' ')
   [ -n "$_blocked" ] || _fail "the fetcher Deployment carries no UZI_FETCHER_BLOCKED_CIDRS"
   [ "$(field "$_flat" "$_model" metadata.namespace)" = "$_lane_ns" ] || _fail "the model-egress policy is not in $_lane_ns"
+  if awk -F '\t' -v d="$_model" '$1 == d && index($2, "spec.ingress") == 1 { f = 1 } END { exit !f }' "$_flat"; then
+    _fail "the lane's Antrea policy has a spec.ingress: it is egress-only, and an Antrea ingress Allow skips the floor's ingress: []"
+  fi
   _mn=$(count_items "$_flat" "$_model" spec.egress)
   _in_allow=""; _fqdn_at=""; _fqdn_n=0; _last_drop=-1; _drops=" "
   i=0
@@ -710,6 +723,12 @@ $_got
 $_in_sorted"
   for _c in 169.254.169.254/32 fd00:ec2::254/128 $_blocked; do
     in_list "$_c" "$_drops" || _fail "the lane's Antrea drop belt does not drop $_c"
+  done
+  # Every addrpolicy.go range but ::ffff:0:0/96 (IPv4-mapped: a socket dialling one sends an
+  # IPv4 packet, which the IPv4 entries drop; see uzi.isolatedLaneAntreaDropCIDRs).
+  for _c in $_fixed; do
+    [ "$_c" = "::ffff:0:0/96" ] && continue
+    in_list "$_c" "$_drops" || _fail "the lane's Antrea drop belt does not drop $_c, which uzi-fetcher refuses (addrpolicy.go; the OVN branch excepts every IPv4 one via uzi.isolatedLaneExceptV4)"
   done
 
   # (d) the fetcher's own policy.
@@ -786,11 +805,6 @@ $_in_sorted"
   # from the code: every IPv4 range, and every IPv6 range inside 2000::/3, must be an
   # except by name; every range (IPv6 outside 2000::/3 included) must fall outside the
   # allow by arithmetic. The configured cluster ranges get the same treatment.
-  _policy_go="$SCRIPT_DIR/../api/internal/fetcher/addrpolicy.go"
-  _fixed=$(awk '/^var blockedPrefixes = mustPrefixes\(/ { f = 1; next } f && /^\)/ { f = 0 } f && match($0, /"[^"]+"/) { print substr($0, RSTART + 1, RLENGTH - 2) }' "$_policy_go" 2>/dev/null | tr '\n' ' ') || true
-  if [ "$(printf '%s' "$_fixed" | wc -w)" -lt 20 ]; then
-    echo "BROKEN: isolated lane: could not read blockedPrefixes from $_policy_go (got: $_fixed)" >&2; rm -f "$_flat" "$_flat.in"; return 2
-  fi
   for _c in $_fixed $_blocked; do
     _a=${_c%/*}
     case "$_c" in
@@ -883,7 +897,8 @@ $_inv"
   fi
   _fenv=$(awk -F '\t' -v d="$_fdep" '$1 == d && $2 ~ /^spec\.template\.spec\.containers\[0\]\.env\[[0-9]+\]\.name$/ { print $3 }' "$_flat")
   for _n in $_fenv; do
-    in_list "$_n" "$_known" || _fail "the fetcher's env $_n is not read by api/internal/fetcher/config.go (it reads: $_known)"
+    # GOMEMLIMIT is the Go runtime's, not config.go's.
+    in_list "$_n" "$_known GOMEMLIMIT" || _fail "the fetcher's env $_n is not read by api/internal/fetcher/config.go (it reads: $_known)"
   done
   for _n in UZI_FETCHER_TLS_CERT UZI_FETCHER_TLS_KEY UZI_API_URL UZI_FETCHER_TOKEN_FILE UZI_API_CA_FILE UZI_FETCHER_BLOCKED_CIDRS; do
     in_list "$_n" "$_fenv" || _fail "the fetcher's env lacks $_n"
@@ -894,6 +909,24 @@ $_inv"
     _fail "the fetcher's container has envFrom, which injects env names this check cannot see"
   fi
   case "$(_env "$_fdep" UZI_API_URL)" in https://*) ;; *) _fail "the fetcher's UZI_API_URL is not https (the fetcher refuses to start)" ;; esac
+  # GOMEMLIMIT: a plain byte count below the container's memory limit, so the Go GC holds the
+  # heap under it rather than GOGC=100 growing it past the limit into an OOM kill.
+  _gml=$(_env "$_fdep" GOMEMLIMIT)
+  _mlim=$(field "$_flat" "$_fdep" 'spec.template.spec.containers[0].resources.limits.memory')
+  _mlim_b=$(printf '%s\n' "$_mlim" | awk '
+    match($0, /^[0-9]+/) { n = substr($0, 1, RLENGTH); u = substr($0, RLENGTH + 1)
+      f["" ] = 1; f["k"] = 1e3; f["M"] = 1e6; f["G"] = 1e9; f["T"] = 1e12
+      f["Ki"] = 1024; f["Mi"] = 1048576; f["Gi"] = 1073741824; f["Ti"] = 1099511627776
+      if (u in f) printf "%.0f\n", n * f[u] }')
+  if [ -z "$_mlim_b" ]; then
+    _fail "the fetcher container has no parseable memory limit ('$_mlim'), so nothing bounds GOMEMLIMIT"
+  else
+    case "$_gml" in
+      ''|*[!0-9]*) _fail "the fetcher's GOMEMLIMIT is '$_gml', want a plain byte count below its memory limit ($_mlim)" ;;
+      *) awk -v g="$_gml" -v l="$_mlim_b" 'BEGIN { exit !(g > 0 && g < l && g >= l * 0.8) }' \
+           || _fail "the fetcher's GOMEMLIMIT $_gml is not within 80-100% of its memory limit $_mlim ($_mlim_b bytes)" ;;
+    esac
+  fi
 
   # _skey <secret> <key>: 0 = a rendered Secret carries the key, or a rendered cert-manager
   # Certificate writes that Secret and the key is one it writes (tls.crt, tls.key, ca.crt);
@@ -967,7 +1000,7 @@ $_inv"
 
   rm -f "$_flat" "$_flat.in"
   if [ "$_bad" -ne 0 ]; then return 1; fi
-  echo "OK: isolated lane -- $_lane_ns is restricted and default-deny with egress exactly {DNS, api, fetcher} and holds no other policy object; its Antrea policy re-allows only those three, drops the metadata addresses and every cluster range, then allows api.anthropic.com TCP/443; the fetcher's internet rule excludes every addrpolicy.go and configured range and every rule names a peer; the api admits the lane and the fetcher; the fetcher URL, env names, Secret keys and mounted files line up"
+  echo "OK: isolated lane -- $_lane_ns is restricted and default-deny with egress exactly {DNS, api, fetcher} and holds no other policy object; its Antrea policy re-allows only those three, carries no ingress, drops the metadata addresses, every cluster range and every range the fetcher refuses, then allows api.anthropic.com TCP/443; the fetcher's internet rule excludes every addrpolicy.go and configured range and every rule names a peer; the api admits the lane and the fetcher; the fetcher URL, env names, Secret keys and mounted files line up"
   return 0
 }
 
