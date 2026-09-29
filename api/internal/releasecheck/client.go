@@ -23,7 +23,11 @@ const defaultBaseURL = "https://api.github.com"
 // releasePath is the constant "latest release" path for vtmocanu/uzi. The endpoint
 // excludes drafts and prereleases itself, so a prerelease-ahead reads as up to date.
 const releasePath = "/repos/vtmocanu/uzi/releases/latest"
-const releasesPath = "/repos/vtmocanu/uzi/releases?per_page=100"
+
+// The active RC is created after the previous stable release; promotion prunes
+// superseded RC Release entries. A recent page is enough to find that train and
+// keeps the full GitHub JSON response comfortably below the 1 MiB read cap.
+const releasesPath = "/repos/vtmocanu/uzi/releases?per_page=20"
 
 // baseURL is the fetch base; overridable by tests only (see defaultBaseURL).
 var baseURL = defaultBaseURL
@@ -74,8 +78,8 @@ func fetchLatest(ctx context.Context, client *http.Client, token string) (github
 	return rel, err
 }
 
-// fetchLatestRC scans one bounded page, choosing the highest exact RC tag among
-// non-draft releases. GitHub's ordering is not a version ordering.
+// fetchLatestRC scans one recent, bounded page, choosing the highest exact RC
+// tag among non-draft releases. GitHub's ordering is not a version ordering.
 func fetchLatestRC(ctx context.Context, client *http.Client, token string) (githubRelease, error) {
 	var releases []githubRelease
 	if err := fetchJSON(ctx, client, token, releasesPath, &releases); err != nil {

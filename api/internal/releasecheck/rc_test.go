@@ -40,7 +40,7 @@ func TestRCSelectionAndClear(t *testing.T) {
 		releaseJSON("v1.2.0-rc.01", "invalid", "", "", "") + `] `
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
-			if r.URL.Query().Get("per_page") != "100" {
+			if r.URL.RawQuery != "per_page=20" {
 				t.Errorf("query = %q", r.URL.RawQuery)
 			}
 			_, _ = w.Write([]byte(list))
@@ -61,6 +61,25 @@ func TestRCSelectionAndClear(t *testing.T) {
 	got, _ = rec.CheckForUpdate(context.Background())
 	if got.Status != statusOK || st.values[settings.KeyReleaseRCTag] != "" || st.values[settings.KeyReleaseRCBody] != "" {
 		t.Fatalf("clear = %+v values=%v", got, st.values)
+	}
+}
+
+func TestRCFetchRejectsOversizeResponse(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte(strings.Repeat("x", maxReleaseBodyBytes+1)))
+			return
+		}
+		_, _ = w.Write([]byte(releaseJSON("v1.1.0", "stable", "", "", "")))
+	}))
+	defer srv.Close()
+	withBaseURL(t, srv.URL)
+	st := newFakeStore(map[string]string{settings.KeyReleaseRCTag: "v1.0.0-rc.1"})
+	set := &fakeSettings{enabled: true}
+	got, _ := NewReconciler(st, set, nil, nil).CheckForUpdate(context.Background())
+	if got.Status != statusError || !strings.Contains(got.Message, "response exceeds 1 MiB") ||
+		st.values[settings.KeyReleaseLatestTag] != "v1.1.0" || st.values[settings.KeyReleaseRCTag] != "v1.0.0-rc.1" {
+		t.Fatalf("oversize RC response = %+v values=%v", got, st.values)
 	}
 }
 
