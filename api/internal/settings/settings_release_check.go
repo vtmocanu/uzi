@@ -60,12 +60,17 @@ func (c *Cache) ReleaseCheckToken(ctx context.Context) (string, error) {
 // available"/"far behind"/"security" are DERIVED from these plus the running version,
 // never stored — see releasecheck.UpdateAvailable / FarBehind / Security.
 type ReleaseStatus struct {
-	LatestTag   string
-	LatestName  string
-	Body        string
-	NotesURL    string
-	PublishedAt string
-	CheckedAt   string
+	RCTag         string
+	RCName        string
+	RCBody        string
+	RCNotesURL    string
+	RCPublishedAt string
+	LatestTag     string
+	LatestName    string
+	Body          string
+	NotesURL      string
+	PublishedAt   string
+	CheckedAt     string
 	// BannerSnoozeTag is the release tag the escalation banner was snoozed for (PRD
 	// #836 M6), or "" when never snoozed. "banner_snoozed" is derived: it is true iff
 	// this equals LatestTag, so a newer release auto-clears the snooze.
@@ -81,6 +86,11 @@ func (c *Cache) ReleaseStatus(ctx context.Context) (ReleaseStatus, error) {
 		return ReleaseStatus{}, err
 	}
 	return ReleaseStatus{
+		RCTag:           c.effective(KeyReleaseRCTag, m),
+		RCName:          c.effective(KeyReleaseRCName, m),
+		RCBody:          c.effective(KeyReleaseRCBody, m),
+		RCNotesURL:      c.effective(KeyReleaseRCNotesURL, m),
+		RCPublishedAt:   c.effective(KeyReleaseRCPublishedAt, m),
 		LatestTag:       c.effective(KeyReleaseLatestTag, m),
 		LatestName:      c.effective(KeyReleaseLatestName, m),
 		Body:            c.effective(KeyReleaseLatestBody, m),

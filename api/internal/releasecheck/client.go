@@ -9,6 +9,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"golang.org/x/mod/semver"
 )
 
 // defaultBaseURL is the GitHub REST API base. The fetch endpoint is a compile-time
@@ -21,6 +23,7 @@ const defaultBaseURL = "https://api.github.com"
 // releasePath is the constant "latest release" path for vtmocanu/uzi. The endpoint
 // excludes drafts and prereleases itself, so a prerelease-ahead reads as up to date.
 const releasePath = "/repos/vtmocanu/uzi/releases/latest"
+const releasesPath = "/repos/vtmocanu/uzi/releases?per_page=100"
 
 // baseURL is the fetch base; overridable by tests only (see defaultBaseURL).
 var baseURL = defaultBaseURL
@@ -36,6 +39,7 @@ const (
 // githubRelease is the subset of the releases/latest payload the check reads.
 type githubRelease struct {
 	TagName     string `json:"tag_name"`
+	Draft       bool   `json:"draft"`
 	Name        string `json:"name"`
 	Body        string `json:"body"`
 	PublishedAt string `json:"published_at"`
@@ -65,9 +69,50 @@ func newHTTPClient() *http.Client {
 // capped with io.LimitReader. A non-200 status or a decode failure is a plain error
 // with no token material.
 func fetchLatest(ctx context.Context, client *http.Client, token string) (githubRelease, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+releasePath, nil)
-	if err != nil {
+	var rel githubRelease
+	err := fetchJSON(ctx, client, token, releasePath, &rel)
+	return rel, err
+}
+
+// fetchLatestRC scans one bounded page, choosing the highest exact RC tag among
+// published, non-draft releases. GitHub's ordering is not a version ordering.
+func fetchLatestRC(ctx context.Context, client *http.Client, token string) (githubRelease, error) {
+	var releases []githubRelease
+	if err := fetchJSON(ctx, client, token, releasesPath, &releases); err != nil {
 		return githubRelease{}, err
+	}
+	var best githubRelease
+	for _, rel := range releases {
+		if rel.Draft || !exactRCTag(rel.TagName) {
+			continue
+		}
+		if best.TagName == "" || semver.Compare(rel.TagName, best.TagName) > 0 {
+			best = rel
+		}
+	}
+	return best, nil
+}
+
+func exactRCTag(tag string) bool {
+	if !semver.IsValid(tag) || semver.Canonical(tag) != tag {
+		return false
+	}
+	base, n, ok := strings.Cut(tag, "-rc.")
+	if !ok || strings.Contains(base, "-") || strings.Contains(n, ".") || n == "" || (len(n) > 1 && n[0] == '0') {
+		return false
+	}
+	for _, ch := range n {
+		if ch < '0' || ch > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+func fetchJSON(ctx context.Context, client *http.Client, token, path string, dest any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
+	if err != nil {
+		return err
 	}
 	req.Header.Set("Accept", "application/vnd.github+json")
 	if token != "" {
@@ -76,19 +121,25 @@ func fetchLatest(ctx context.Context, client *http.Client, token string) (github
 
 	resp, err := client.Do(req)
 	if err != nil {
-		return githubRelease{}, scrubToken(err, token)
+		return scrubToken(err, token)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		return githubRelease{}, fmt.Errorf("release check: unexpected status %d", resp.StatusCode)
+		return fmt.Errorf("release check: unexpected status %d", resp.StatusCode)
 	}
 
-	var rel githubRelease
-	if err := json.NewDecoder(io.LimitReader(resp.Body, maxReleaseBodyBytes)).Decode(&rel); err != nil {
-		return githubRelease{}, fmt.Errorf("release check: decode response: %w", err)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseBodyBytes+1))
+	if err != nil {
+		return fmt.Errorf("release check: read response: %w", scrubToken(err, token))
 	}
-	return rel, nil
+	if len(body) > maxReleaseBodyBytes {
+		return errors.New("release check: response exceeds 1 MiB")
+	}
+	if err := json.Unmarshal(body, dest); err != nil {
+		return fmt.Errorf("release check: decode response: %w", err)
+	}
+	return nil
 }
 
 // scrubToken removes the token from an error message defensively. A transport error

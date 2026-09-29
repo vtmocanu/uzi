@@ -89,6 +89,10 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 		if got := r.Header.Get("Authorization"); got != "" {
 			t.Errorf("unauthenticated path sent Authorization = %q, want empty", got)
 		}
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
 		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "v0.15.0", "### Security\n- fix",
 			"2026-08-20T10:00:00Z", "https://github.com/vtmocanu/uzi/releases/tag/v0.15.0")))
 	}))
@@ -106,8 +110,8 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	if res.Status != statusOK {
 		t.Fatalf("Status = %q, want %q (msg=%q)", res.Status, statusOK, res.Message)
 	}
-	if reqCount.Load() != 1 {
-		t.Errorf("server saw %d requests, want 1", reqCount.Load())
+	if reqCount.Load() != 2 {
+		t.Errorf("server saw %d requests, want 2", reqCount.Load())
 	}
 	if res.Facts.LatestTag != "v0.15.0" {
 		t.Errorf("Facts.LatestTag = %q, want v0.15.0", res.Facts.LatestTag)
@@ -140,7 +144,11 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 // new and stale keys is left behind — and must NOT invalidate the cache, so the last
 // COMPLETE snapshot keeps serving until a fully-successful pass.
 func TestCheckForUpdatePersistFailureReportsError(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
 		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "v0.15.0", "notes",
 			"2026-08-20T10:00:00Z", "https://github.com/vtmocanu/uzi/releases/tag/v0.15.0")))
 	}))
@@ -167,7 +175,11 @@ func TestCheckForUpdatePersistFailureReportsError(t *testing.T) {
 // TestCheckForUpdateEqualNotAvailable: equal versions → update_available=false, the
 // FALSE state (distinct from the unchecked/disabled state), still Status "ok".
 func TestCheckForUpdateEqualNotAvailable(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
+		}
 		_, _ = w.Write([]byte(releaseJSON("v0.14.0", "v0.14.0", "### Added\n- x",
 			"2026-08-20T10:00:00Z", "https://example.test/r")))
 	}))
@@ -329,6 +341,10 @@ func TestCheckForUpdateSendsBearerToken(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if got, want := r.Header.Get("Authorization"), "Bearer "+token; got != want {
 			t.Errorf("Authorization = %q, want %q", got, want)
+		}
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			_, _ = w.Write([]byte("[]"))
+			return
 		}
 		_, _ = w.Write([]byte(releaseJSON("v0.15.0", "x", "", "2026-08-20T10:00:00Z", "https://x")))
 	}))

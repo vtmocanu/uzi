@@ -224,12 +224,17 @@ const (
 	// "Update available"/"far behind"/"security" are DERIVED from these plus the
 	// running version, never stored — see releasecheck.UpdateAvailable / FarBehind /
 	// Security.
-	KeyReleaseLatestTag   = "release_latest_tag"   // v-prefixed tag_name of the latest upstream release
-	KeyReleaseLatestName  = "release_latest_name"  // release name
-	KeyReleaseLatestBody  = "release_latest_body"  // markdown release notes (the ### Security scan + notes excerpt)
-	KeyReleaseNotesURL    = "release_notes_url"    // html_url of the latest release
-	KeyReleasePublishedAt = "release_published_at" // RFC3339 publish timestamp of the latest release
-	KeyReleaseCheckedAt   = "release_checked_at"   // RFC3339 timestamp of the last check
+	KeyReleaseLatestTag     = "release_latest_tag"   // v-prefixed tag_name of the latest upstream release
+	KeyReleaseLatestName    = "release_latest_name"  // release name
+	KeyReleaseLatestBody    = "release_latest_body"  // markdown release notes (the ### Security scan + notes excerpt)
+	KeyReleaseNotesURL      = "release_notes_url"    // html_url of the latest release
+	KeyReleasePublishedAt   = "release_published_at" // RFC3339 publish timestamp of the latest release
+	KeyReleaseCheckedAt     = "release_checked_at"   // RFC3339 timestamp of the last check
+	KeyReleaseRCTag         = "release_rc_tag"
+	KeyReleaseRCName        = "release_rc_name"
+	KeyReleaseRCBody        = "release_rc_body"
+	KeyReleaseRCNotesURL    = "release_rc_notes_url"
+	KeyReleaseRCPublishedAt = "release_rc_published_at"
 	// KeyReleaseBannerSnoozeTag records the release tag an admin snoozed the escalation
 	// banner for (PRD #836 M6). Engine/admin-written via the snooze endpoint's
 	// UpsertAppSetting — kept OUT of Defaults (like the six remote-fact keys) and never

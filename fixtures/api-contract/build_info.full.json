@@ -1,0 +1,26 @@
+{
+  "version": "x",
+  "founded": "x",
+  "built_at": "x",
+  "commit": "x",
+  "commits": 1,
+  "prds_done": 1,
+  "prds_open": 1,
+  "uptime_seconds": 1,
+  "latest": {
+    "version": "x",
+    "name": "x",
+    "published_at": "x",
+    "notes_url": "x",
+    "security": true
+  },
+  "latest_rc": {
+    "version": "x",
+    "name": "x",
+    "published_at": "x",
+    "notes_url": "x",
+    "security": true
+  },
+  "update_available": true,
+  "far_behind": true
+}

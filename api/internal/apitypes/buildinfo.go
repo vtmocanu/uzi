@@ -83,6 +83,8 @@ type BuildInfoDTO struct {
 	// admin-only and served by the admin release-check endpoint, never this
 	// world-readable one.
 	Latest *LatestReleaseDTO `json:"latest,omitempty"`
+	// LatestRC is the newest published release candidate from the last successful RC scan.
+	LatestRC *LatestReleaseDTO `json:"latest_rc,omitempty"`
 	// UpdateAvailable / FarBehind are the read-time derivations over Latest + the
 	// running Version (PRD #836 M3). *bool, NOT a bare bool: a bare bool with omitempty
 	// collapses false ("checked, up to date") into "never checked", exactly the
