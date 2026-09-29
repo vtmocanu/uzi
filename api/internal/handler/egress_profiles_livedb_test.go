@@ -356,6 +356,35 @@ func TestAdminEgressProfileValidationLiveDB(t *testing.T) {
 	if rec := cookieReq(t, router, http.MethodPut, base+"/"+over, adminJWT, `{"hosts":["docs.vendor.com","github.com"]}`); rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("update dropping the override = %d, want 422\nbody: %s", rec.Code, rec.Body.String())
 	}
+
+	// A stored entry the current rules refuse (written under an older Public Suffix List,
+	// seeded here past the api) is flagged on every read, list and show: Match skips it.
+	stale := egressName(t, pool)
+	cliMustExec(t, pool, `INSERT INTO egress_profiles (name, hosts) VALUES ($1, '{docs.example.com,*.kawasaki.jp}')`, stale)
+	rec = bearerReq(router, http.MethodGet, base+"/"+stale, adminUza)
+	if shown := decodeEgressProfile(t, rec.Body.Bytes()); len(shown.Warnings) != 1 ||
+		shown.Warnings[0].Entry != "*.kawasaki.jp" || shown.Warnings[0].Code != egressprofile.WarningCodeStaleEntry {
+		t.Fatalf("show stale warnings = %+v, want one stale_entry for *.kawasaki.jp\nbody: %s", shown.Warnings, rec.Body.String())
+	}
+	rec = bearerReq(router, http.MethodGet, base, adminUza)
+	var listed struct {
+		EgressProfiles []apitypes.EgressProfileDTO `json:"egress_profiles"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &listed); err != nil {
+		t.Fatalf("decode list: %v", err)
+	}
+	found := false
+	for _, p := range listed.EgressProfiles {
+		if p.Name == stale {
+			found = true
+			if len(p.Warnings) != 1 || p.Warnings[0].Code != egressprofile.WarningCodeStaleEntry {
+				t.Fatalf("list stale warnings = %+v, want one stale_entry", p.Warnings)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("list lacks %s", stale)
+	}
 }
 
 // TestEgressProfileTableChecksLiveDB pins the schema floor under the Go validation: a writer

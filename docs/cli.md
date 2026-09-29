@@ -764,10 +764,13 @@ A few worth knowing:
   `OVERRIDES` (multi-publisher entries admitted by an explicit override),
   `UPDATED` and `DESCRIPTION`. `show` prints the profile's fields, then one
   `HOST`/`OVERRIDE` row per entry, then a `warning:` line for each overridden
-  multi-publisher host. An entry is an exact host or `*.base`, which matches
-  proper subdomains of base but not base itself. An unknown name exits 4. Names,
-  descriptions and hosts go through the same sanitizing cell path as every other
-  untrusted field. Read-only, `uza_`-token, same ceiling as every other `admin`
+  multi-publisher host and for each stored entry the current rules no longer
+  accept (it matches nothing). An entry is an exact host or `*.base`, which
+  matches proper subdomains of base but not base itself. An unknown name exits
+  4; a name that is not a profile name (lowercase letters, digits and hyphens)
+  exits 2 without a request. Names, descriptions and hosts go through the same
+  sanitizing cell path as every other untrusted field; `show` prints a host or
+  description whole, up to its 253- or 500-character maximum. Read-only, `uza_`-token, same ceiling as every other `admin`
   verb: creating, editing and deleting a profile are cookie-only admin writes.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a

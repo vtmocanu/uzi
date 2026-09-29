@@ -15,17 +15,24 @@
 // who wants both lists both. This keeps a wildcard from silently widening to the apex,
 // which is often a different site (a marketing host, a redirector) from the docs subtree.
 //
-// A wildcard over a public suffix is refused: the base must not be a suffix on the Public
-// Suffix List (golang.org/x/net/publicsuffix, which embeds both the ICANN and the private
-// sections), so "*.com", "*.co.uk", "*.github.io" and "*.cloudfront.net" are refused. A
-// short built-in list (sharedParents) adds parents that are not suffixes themselves but
-// whose subdomains belong to many customers ("*.amazonaws.com").
+// A wildcard that could cover a public suffix is refused: the base must not be a suffix
+// on the Public Suffix List (golang.org/x/net/publicsuffix, which embeds both the ICANN
+// and the private sections), so "*.com", "*.co.uk", "*.github.io" and "*.cloudfront.net"
+// are refused, and no PSL rule may lie below the base, so "*.kawasaki.jp" (the ICANN rule
+// "*.kawasaki.jp") and "*.run.app" (the private rule "a.run.app") are refused too. The
+// second set is psl_ancestors_gen.go, generated from the same pinned x/net table. A short
+// built-in list (sharedParents) adds parents with no PSL rule below them whose subdomains
+// still belong to many customers ("*.googleusercontent.com").
 //
 // Hosts where many unrelated publishers serve content under one host name (code hosting,
 // path-style object storage, docs and package hosting, forums) are on a built-in list
 // (see multipublisher.go). Such an entry is accepted only with an explicit per-entry
 // override, and the admin API returns a warning for every overridden entry.
 package egressprofile
+
+// psl_ancestors_gen.go is derived from the pinned golang.org/x/net Public Suffix List
+// table; internal/genpsl's test fails when it is stale.
+//go:generate go run ./internal/genpsl
 
 import (
 	"fmt"
@@ -45,8 +52,9 @@ import (
 const (
 	// MaxEntries caps the host entries in one profile.
 	MaxEntries = 200
-	// MaxEntryLen caps one entry (the DNS name limit, 253 octets), checked on the raw
-	// input and again on the normalized form.
+	// MaxEntryLen caps one entry at the DNS name limit, 253 octets, measured on the
+	// normalized A-label form (a wildcard's "*." included). The raw input gets only a loose
+	// 4x byte bound, because a Unicode name is longer in UTF-8 than its A-label form.
 	MaxEntryLen = 253
 	// MaxNameLen caps a profile name.
 	MaxNameLen = 64
@@ -157,6 +165,13 @@ func NormalizeEntry(raw string) (string, error) {
 		return "", entryErr(CodeSharedParentWildcard,
 			"\"*.%s\" is refused: the subdomains of %s belong to many different customers; list the exact hosts instead", host, parent)
 	}
+	// A public suffix BELOW base: "*.kawasaki.jp" covers the ICANN wildcard rule
+	// "*.kawasaki.jp", "*.run.app" the private rule "a.run.app". PublicSuffix(base) is
+	// not base in either case, so the check above cannot see it.
+	if _, ok := pslRuleAncestors[host]; ok {
+		return "", entryErr(CodePublicSuffixWildcard,
+			"\"*.%s\" is refused: public suffixes lie under %s, so the wildcard would cover sites run by unrelated owners; list the exact hosts instead", host, host)
+	}
 	if len(host)+2 > MaxEntryLen {
 		return "", entryErr(CodeTooLong, "an entry must be at most %d characters", MaxEntryLen)
 	}
@@ -181,6 +196,13 @@ func NormalizeHost(raw string) (string, error) {
 // An exact entry matches only that host; "*.base" matches every proper subdomain of base
 // and not base itself. An entry that no longer normalizes is skipped (fail closed), and a
 // host that does not normalize matches nothing.
+//
+// Invariant for callers: Match answers for NormalizeHost(host), not for the raw string.
+// Normalization folds case and Unicode forms and drops ignorable code points (a soft
+// hyphen in "docs\u00ad.example.com" disappears), so the raw string and the name Match
+// approved can differ. A fetcher must therefore take NormalizeHost's output and use that
+// exact name for the DNS lookup, the connection, TLS SNI and certificate verification,
+// never the raw host it was given.
 func Match(host string, entries []string) bool {
 	h, err := NormalizeHost(host)
 	if err != nil {

@@ -64,6 +64,8 @@ A refused write stores nothing and answers `422` with every problem at once:
 }
 ```
 
+`multi_publisher_override` may name at most 200 entries, like `hosts`.
+
 ## Host entries
 
 An entry is an exact host (`docs.vendor-x.com`) or a wildcard over a base
@@ -97,21 +99,32 @@ surrounding spaces trimmed. Duplicates after normalization are folded into one.
 
 ## Public suffix wildcards
 
-A wildcard whose base is a public suffix is refused (`public_suffix_wildcard`):
-it would cover sites run by unrelated owners. The check uses the Public Suffix
-List built into uzi (both its ICANN and private sections, pinned with the
-`golang.org/x/net` module), so `*.com`, `*.co.uk`, `*.github.io`,
-`*.cloudfront.net` and `*.s3.amazonaws.com` are all refused.
+A wildcard that could cover a public suffix is refused
+(`public_suffix_wildcard`): it would cover sites run by unrelated owners. The
+check uses the Public Suffix List built into uzi (both its ICANN and private
+sections, pinned with the `golang.org/x/net` module) two ways:
 
-A few parents are not public suffixes themselves but their subdomains belong to
-many different customers. A wildcard at or under one of these is refused too
-(`shared_parent_wildcard`), with no override: `amazonaws.com`, `azure.com`,
-`windows.net`, `googleusercontent.com`, `fastly.net`, `sharepoint.com`. List
-the exact hosts instead.
+- The base is a public suffix: `*.com`, `*.co.uk`, `*.github.io`,
+  `*.cloudfront.net` and `*.s3.amazonaws.com` are refused.
+- A public suffix lies below the base: `*.kawasaki.jp` (every child of
+  `kawasaki.jp` is a suffix), `*.run.app` (`a.run.app` is one) and
+  `*.digitaloceanspaces.com` (`nyc3.digitaloceanspaces.com` is one) are
+  refused, although the base itself is not a suffix.
+
+A few parents have no public suffix below them in the list, but their
+subdomains belong to many different customers. A wildcard at or under one of
+these is refused too (`shared_parent_wildcard`), with no override:
+`amazonaws.com`, `azure.com`, `windows.net`, `googleusercontent.com`,
+`fastly.net`, `sharepoint.com`. List the exact hosts instead.
+
+**Entries can go stale.** A newer uzi can carry a newer Public Suffix List, so a
+wildcard accepted when the profile was written can be refused later. Such an
+entry matches nothing, and every read of the profile carries a warning for it
+(`code: stale_entry`). Edit the profile to fix or remove it.
 
 ## Multi-publisher hosts
 
-The fetch service checks each request's host, not its path. On a host where
+The fetch service will check each request's host, not its path. On a host where
 many publishers serve content under the same name (code hosting, path-style
 object storage, documentation and package hosting, forums), allowing the host
 allows every publisher on it: allowing `github.com` allows every repository,
@@ -127,21 +140,29 @@ naming an entry that is not multi-publisher is dropped.
 
 The built-in list:
 
-- **Exact hosts** (their other subdomains are the operator's own sites, so
-  `docs.github.com` is not flagged): `github.com`, `gist.github.com`,
-  `codeload.github.com`, `raw.githubusercontent.com`,
-  `gist.githubusercontent.com`, `objects.githubusercontent.com`, `gitlab.com`,
-  `bitbucket.org`, `codeberg.org`, `s3.amazonaws.com` and the regional
-  path-style S3 endpoints (`s3.<region>.amazonaws.com`,
-  `s3-<region>.amazonaws.com`), `storage.googleapis.com`,
-  `storage.cloud.google.com`, `dl.dropboxusercontent.com`, `docs.google.com`,
-  `drive.google.com`, `sites.google.com`, `readthedocs.io`, `readthedocs.org`,
-  `gitbook.io`, `docs.rs`, `pkg.go.dev`, `pypi.org`, `www.npmjs.com`,
-  `huggingface.co`, `hub.docker.com`.
-- **Whole domains** (the subdomains are shared too): `stackoverflow.com`,
+- **Exact hosts** (only the host itself is flagged; a sibling that is not
+  listed is not, whatever it serves, so review siblings yourself):
+  `github.com`, `api.github.com`, `gist.github.com`, `codeload.github.com`,
+  `gitlab.com`, `bitbucket.org`, `codeberg.org`, `s3.amazonaws.com` and the
+  regional path-style S3 endpoints (`s3.<region>.amazonaws.com`,
+  `s3-<region>.amazonaws.com`, and `s3.<region>.amazonaws.com.cn` in the China
+  regions), `storage.googleapis.com`, `storage.cloud.google.com`,
+  `dl.dropboxusercontent.com`, `docs.google.com`, `drive.google.com`,
+  `sites.google.com`, `readthedocs.io`, `readthedocs.org`, `gitbook.io`,
+  `docs.rs`, `pkg.go.dev`, `pypi.org`, `www.npmjs.com`, `hub.docker.com`,
+  `unpkg.com`, `registry.npmjs.org`, `files.pythonhosted.org`,
+  `proxy.golang.org`, `static.crates.io`.
+- **Whole domains** (the subdomains are shared too): `githubusercontent.com`
+  (`raw.`, `objects.`, `media.` and the rest), `jsdelivr.net`,
+  `huggingface.co` (including `cdn-lfs.huggingface.co`), `stackoverflow.com`,
   `stackexchange.com`, `reddit.com`, `quora.com`, `medium.com`,
   `substack.com`, `wordpress.com`, `blogspot.com`, `sourceforge.net`,
   `dropbox.com`, `npmjs.com`.
+- **Platform apexes:** an exact host that is itself a public suffix from the
+  list's private section, such as `github.io`, `gitlab.io` or
+  `cloudfront.net`. The platform hands the names under it to its customers, and
+  its own host may serve them by path, so it needs the override too. (An ICANN
+  suffix such as `co.uk` is refused outright as a host.)
 
 A wildcard is flagged when it could reach a listed host: `*.github.com` covers
 `gist.github.com`. A platform that gives each publisher its own subdomain is

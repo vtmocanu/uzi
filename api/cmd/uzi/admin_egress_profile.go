@@ -8,6 +8,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/egressprofile"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -17,8 +18,11 @@ import (
 // there is deliberately no create/edit/delete verb here: the web Admin page is the editor.
 //
 // Every server string (name, description, host entries, warning text) is admin-authored
-// and validated by the api, and is still rendered through the bounded cellText here: the
-// render site is the trust boundary and does not depend on the validator holding.
+// and validated by the api, and is still sanitized here: the render site is the trust
+// boundary and does not depend on the validator holding. `list` uses the 200-rune
+// cellText cap (a summary row); `show` bounds each field at its own validated maximum
+// instead (fullCell), so a legal 253-character host or 500-character description prints
+// whole.
 func newAdminEgressProfileCmd(env Env, gf *globalFlags) *cobra.Command {
 	group := &cobra.Command{
 		Use:   "egress-profile",
@@ -97,7 +101,7 @@ func newAdminEgressProfileCmd(env Env, gf *globalFlags) *cobra.Command {
 func renderEgressProfile(p *uzicli.Printer, e apitypes.EgressProfileDTO) error {
 	if err := p.Table([]string{"FIELD", "VALUE"}, [][]string{
 		{"name", cellText(e.Name)},
-		{"description", dashOr(cellText(e.Description))},
+		{"description", dashOr(fullCell(e.Description, egressprofile.MaxDescriptionLen))},
 		{"created_at", updatedCell(e.CreatedAt)},
 		{"updated_at", updatedCell(e.UpdatedAt)},
 	}); err != nil {
@@ -110,15 +114,26 @@ func renderEgressProfile(p *uzicli.Printer, e apitypes.EgressProfileDTO) error {
 		if slices.Contains(e.MultiPublisherOverride, h) {
 			override = "yes"
 		}
-		rows = append(rows, []string{cellText(h), override})
+		rows = append(rows, []string{fullCell(h, egressprofile.MaxEntryLen), override})
 	}
 	if err := p.Table([]string{"HOST", "OVERRIDE"}, rows); err != nil {
 		return err
 	}
 	for _, w := range e.Warnings {
-		p.Printf("warning: %s\n", cellText(w.Message))
+		p.Printf("warning: %s\n", fullCell(w.Message, maxWarningLen))
 	}
 	return nil
+}
+
+// maxWarningLen bounds one printed warning: a warning quotes its entry (at most
+// MaxEntryLen) inside a sentence or two of reason, so this is generous for any legal one.
+const maxWarningLen = 4 * egressprofile.MaxEntryLen
+
+// fullCell sanitizes a server string for one table cell (controls and invisible formatting
+// stripped, tab and newline folded to a space) and bounds it at max runes, the field's own
+// validated maximum, rather than cellText's 200-rune summary cap.
+func fullCell(s string, max int) string {
+	return capCell(uzicli.CellText(s), max)
 }
 
 // updatedCell renders a profile timestamp; the zero time (a server that omitted it) reads "-".

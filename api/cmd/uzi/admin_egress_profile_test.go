@@ -147,3 +147,36 @@ func TestAdminEgressProfileRendersUntrustedFieldsSafely(t *testing.T) {
 		}
 	}
 }
+
+// `show` prints a host and a description up to their validated maxima (253 and 500
+// characters) whole: the 200-rune summary cap of cellText would cut a legal entry, and an
+// admin reviewing a site list must see the exact host. Past the maximum (only a hostile or
+// broken server sends that) the cell is still bounded.
+func TestAdminEgressProfileShowPrintsLongFieldsWhole(t *testing.T) {
+	longHost := strings.Repeat("a", 61) + "." + strings.Repeat("b", 61) + "." + strings.Repeat("c", 61) + "." + strings.Repeat("d", 63) + ".com"
+	if len(longHost) != 253 {
+		t.Fatalf("fixture host is %d characters, want 253", len(longHost))
+	}
+	longDesc := strings.Repeat("é", 499) + "Z"
+	fc := &uzicli.FakeClient{EgressProfiles: []apitypes.EgressProfileDTO{{
+		Name: "long", Description: longDesc, Hosts: []string{longHost},
+	}}}
+	out, _, code := runCLI(t, fakeEnv(fc), "admin", "egress-profile", "show", "long")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(out, longHost) {
+		t.Errorf("show cut the 253-character host:\n%s", out)
+	}
+	if !strings.Contains(out, longDesc) {
+		t.Errorf("show cut the 500-character description:\n%s", out)
+	}
+	if strings.Contains(out, "…") {
+		t.Errorf("show truncated a field within its maximum:\n%s", out)
+	}
+
+	tooLong := strings.Repeat("x", 600)
+	if got := fullCell(tooLong, 500); len([]rune(got)) != 500 || !strings.HasSuffix(got, "…") {
+		t.Errorf("fullCell(600 runes, 500) = %d runes, want 500 ending in an ellipsis", len([]rune(got)))
+	}
+}

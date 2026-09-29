@@ -5,6 +5,7 @@ import (
 	"net/url"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/egressprofile"
 )
 
 // client_admin.go holds the admin verbs (uzi admin) of the
@@ -115,9 +116,16 @@ func (c *HTTPClient) AdminListEgressProfiles(ctx context.Context) ([]apitypes.Eg
 }
 
 // AdminGetEgressProfile reads one egress profile by name (PRD #1906 M1): GET
-// /api/admin/egress-profiles/{name}. The name is path-escaped, so an argument can never
-// address a different route; an unknown name is the server's 404 (exit 4).
+// /api/admin/egress-profiles/{name}. The name is checked against the server's own name
+// rule (egressprofile.ValidateName, a lowercase slug) before any request, and a name that
+// fails is a usage error (exit 2) with nothing sent. Path escaping alone would not keep an
+// argument inside the route: url.PathEscape leaves "." and ".." unchanged, and a ".."
+// segment is resolved by the client or a proxy into the parent path. A slug can be
+// neither. An unknown valid name is the server's 404 (exit 4).
 func (c *HTTPClient) AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error) {
+	if err := egressprofile.ValidateName(name); err != nil {
+		return apitypes.EgressProfileDTO{}, Exitf(ExitUsage, "invalid egress profile name: %v", err)
+	}
 	var env struct {
 		EgressProfile apitypes.EgressProfileDTO `json:"egress_profile"`
 	}

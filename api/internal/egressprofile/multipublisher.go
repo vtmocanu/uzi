@@ -7,6 +7,8 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"golang.org/x/net/publicsuffix"
+
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
 
@@ -24,11 +26,20 @@ import (
 // platform hosts that serve many publishers by path ("readthedocs.io", "s3.amazonaws.com")
 // are flagged.
 //
-// Two shapes:
-//   - multiPublisherHosts: flagged as that exact host only. Their other subdomains are the
-//     operator's own sites ("docs.github.com" is GitHub's documentation).
+// Three shapes:
+//   - multiPublisherHosts: flagged as that exact host only. A sibling subdomain that is
+//     not listed is not flagged, whatever it serves: "docs.github.com" (GitHub's own
+//     documentation) is clean, but so would be a new GitHub host that serves every
+//     account's content until it is added here. Listing a host is a claim about that
+//     host, not about the rest of its domain.
 //   - multiPublisherDomains: flagged as the domain AND every subdomain, because the
-//     subdomains are shared too ("old.reddit.com", "user.medium.com").
+//     subdomains are shared too ("old.reddit.com", "raw.githubusercontent.com").
+//   - an exact host that is itself a Public Suffix List entry in the PRIVATE section
+//     ("github.io", "s3.amazonaws.com"): the platform hands the names under it to its
+//     customers, and its apex is the platform's own endpoint, which may serve those
+//     customers by path. Which apexes do cannot be read off the list, so every one is
+//     flagged and needs the override. (An ICANN-section suffix is not a site at all and is
+//     refused outright, and a wildcard over any suffix is refused.)
 //
 // A wildcard is flagged when it could reach a flagged host: "*.github.com" covers
 // "gist.github.com", and "*.medium.com" is under a flagged domain.
@@ -38,15 +49,13 @@ import (
 // where it matters most. docs/egress-profiles.md carries the same list for operators.
 var multiPublisherHosts = map[string]string{
 	// Code hosting: every account's repositories, gists and raw files share these hosts.
-	"github.com":                    "code hosting",
-	"gist.github.com":               "code hosting",
-	"codeload.github.com":           "code hosting",
-	"raw.githubusercontent.com":     "code hosting",
-	"gist.githubusercontent.com":    "code hosting",
-	"objects.githubusercontent.com": "code hosting",
-	"gitlab.com":                    "code hosting",
-	"bitbucket.org":                 "code hosting",
-	"codeberg.org":                  "code hosting",
+	"github.com":          "code hosting",
+	"api.github.com":      "code hosting",
+	"gist.github.com":     "code hosting",
+	"codeload.github.com": "code hosting",
+	"gitlab.com":          "code hosting",
+	"bitbucket.org":       "code hosting",
+	"codeberg.org":        "code hosting",
 	// Object storage addressed by path: every bucket shares the endpoint.
 	"s3.amazonaws.com":          "object storage",
 	"storage.googleapis.com":    "object storage",
@@ -64,11 +73,22 @@ var multiPublisherHosts = map[string]string{
 	"pkg.go.dev":      "documentation hosting",
 	"pypi.org":        "package hosting",
 	"www.npmjs.com":   "package hosting",
-	"huggingface.co":  "model and dataset hosting",
 	"hub.docker.com":  "image hosting",
+	// Package registries and CDNs that serve every package's files by path.
+	"unpkg.com":              "package CDN",
+	"registry.npmjs.org":     "package hosting",
+	"files.pythonhosted.org": "package hosting",
+	"proxy.golang.org":       "package hosting",
+	"static.crates.io":       "package hosting",
 }
 
 var multiPublisherDomains = map[string]string{
+	// Every subdomain serves content from every account or repository
+	// (raw., gist., objects., objects-origin., media.githubusercontent.com; cdn., fastly.
+	// jsdelivr.net; cdn-lfs.huggingface.co).
+	"githubusercontent.com": "code hosting",
+	"jsdelivr.net":          "package CDN",
+	"huggingface.co":        "model and dataset hosting",
 	// Forums and user-generated publishing: the subdomains are shared too.
 	"stackoverflow.com": "forum",
 	"stackexchange.com": "forum",
@@ -83,10 +103,12 @@ var multiPublisherDomains = map[string]string{
 	"npmjs.com":         "package hosting",
 }
 
-// sharedParents are parents whose subdomains belong to many customers but which are not
-// themselves on the Public Suffix List (only some of their children are), so the public
-// suffix check alone would accept "*.amazonaws.com". A wildcard at or under one is
-// refused outright, with no override: list the exact hosts instead.
+// sharedParents are parents whose subdomains belong to many customers. A wildcard at or
+// under one is refused outright, with no override: list the exact hosts instead. Most of
+// them also have Public Suffix List rules below them (amazonaws.com, windows.net,
+// fastly.net), which the generated pslRuleAncestors set refuses on its own; azure.com,
+// googleusercontent.com and sharepoint.com have none in the pinned list, so this list is
+// what refuses them. It is checked first so these keep their more specific code.
 var sharedParents = []string{
 	"amazonaws.com",
 	"azure.com",
@@ -107,10 +129,14 @@ func underSharedParent(host string) (string, bool) {
 }
 
 // isS3PathStyleRegional reports a regional path-style S3 endpoint such as
-// "s3.us-east-1.amazonaws.com" or "s3-us-west-2.amazonaws.com" (and the dualstack form),
-// which serve every bucket in the region by path like s3.amazonaws.com does.
+// "s3.us-east-1.amazonaws.com" or "s3-us-west-2.amazonaws.com" (and the dualstack form,
+// and the China regions under amazonaws.com.cn), which serve every bucket in the region
+// by path like s3.amazonaws.com does.
 func isS3PathStyleRegional(host string) bool {
 	rest, ok := strings.CutSuffix(host, ".amazonaws.com")
+	if !ok {
+		rest, ok = strings.CutSuffix(host, ".amazonaws.com.cn")
+	}
 	if !ok || strings.Contains(rest, "..") {
 		return false
 	}
@@ -158,6 +184,9 @@ func MultiPublisher(entry string) (string, bool) {
 	if isS3PathStyleRegional(entry) {
 		return fmt.Sprintf("%s is object storage: every bucket in the region shares this host", entry), true
 	}
+	if suffix, icann := publicsuffix.PublicSuffix(entry); suffix == entry && !icann {
+		return fmt.Sprintf("%s is a public suffix: the platform gives the names under it to its customers, and its own host may serve them by path", entry), true
+	}
 	return "", false
 }
 
@@ -189,16 +218,21 @@ type Problem struct {
 	Message string `json:"message"`
 }
 
-// Warning is an accepted entry the admin should know about: today, a multi-publisher
-// host admitted by an explicit override.
+// Warning is a stored entry the admin should know about: a multi-publisher host admitted
+// by an explicit override, or (on read) an entry the current rules no longer accept.
 type Warning struct {
 	Entry   string `json:"entry"`
 	Code    string `json:"code"`
 	Message string `json:"message"`
 }
 
-// WarningCodeMultiPublisherOverride is the code of the override warning.
-const WarningCodeMultiPublisherOverride = "multi_publisher_override"
+// Warning codes.
+const (
+	// WarningCodeMultiPublisherOverride marks a multi-publisher entry admitted by an override.
+	WarningCodeMultiPublisherOverride = "multi_publisher_override"
+	// WarningCodeStaleEntry marks a stored entry the current rules refuse; Match skips it.
+	WarningCodeStaleEntry = "stale_entry"
+)
 
 // Input is a profile write as the caller sent it.
 type Input struct {
@@ -239,6 +273,13 @@ func Validate(in Input, checkName bool) (Validated, []Problem) {
 	case len(in.Hosts) > MaxEntries:
 		probs = append(probs, Problem{Field: "hosts", Code: CodeTooManyEntries,
 			Message: fmt.Sprintf("a profile may list at most %d host entries (got %d)", MaxEntries, len(in.Hosts))})
+		return out, probs
+	}
+	// The overrides name host entries, so there can never legitimately be more of them than
+	// entries; bound them before normalizing any, like hosts.
+	if len(in.MultiPublisherOverride) > MaxEntries {
+		probs = append(probs, Problem{Field: "multi_publisher_override", Code: CodeTooManyEntries,
+			Message: fmt.Sprintf("a profile may list at most %d overrides (got %d)", MaxEntries, len(in.MultiPublisherOverride))})
 		return out, probs
 	}
 
@@ -287,11 +328,19 @@ func Validate(in Input, checkName bool) (Validated, []Problem) {
 	return out, probs
 }
 
-// WarningsFor recomputes the override warnings for a stored profile, so a read shows the
-// same warnings the write did.
+// WarningsFor recomputes the warnings for a stored profile, so a read shows the same
+// override warnings the write did, plus a stale-entry warning for every stored entry that
+// the current rules no longer accept (a newer Public Suffix List can turn an accepted
+// wildcard into a refused one). Match skips such an entry, so without the warning an admin
+// would see it listed while it silently allows nothing.
 func WarningsFor(hosts, overrides []string) []Warning {
 	out := []Warning{}
 	for _, h := range hosts {
+		if _, err := NormalizeEntry(h); err != nil {
+			out = append(out, Warning{Entry: h, Code: WarningCodeStaleEntry,
+				Message: fmt.Sprintf("%s is no longer accepted (%v), so it matches nothing; edit the profile to fix or remove it", echo(h), err)})
+			continue
+		}
 		if !slices.Contains(overrides, h) {
 			continue
 		}

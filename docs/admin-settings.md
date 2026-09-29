@@ -215,7 +215,8 @@ enabled yet, so today they are stored and validated but nothing reads them.
 | `fetch_max_concurrent_per_run` | 4 | How many fetches one run may have in flight at once. 1 to 32. |
 
 There is no "unlimited" value: `0` is refused. The Admin settings page has no
-card for these yet; they keep their defaults until one lands.
+card for these yet (a later milestone adds one). Until it lands, change them
+with `PUT /api/admin/settings` from a signed-in admin browser session.
 
 ## Run health
 

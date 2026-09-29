@@ -120,9 +120,9 @@ func TestNormalizeEntryRefuses(t *testing.T) {
 	}
 }
 
-// TestNormalizeEntryPublicSuffixWildcards pins the PSL rule across both sections, plus the
-// shared-parent list for parents the PSL does not carry (amazonaws.com is not a suffix, only
-// its children are, so the PSL check alone would accept "*.amazonaws.com").
+// TestNormalizeEntryPublicSuffixWildcards pins the PSL rule across both sections: a
+// wildcard is refused when its base is a public suffix, when any PSL rule lies BELOW its
+// base (psl_ancestors_gen.go), and when the base is at or under a shared parent.
 func TestNormalizeEntryPublicSuffixWildcards(t *testing.T) {
 	cases := []struct {
 		in   string
@@ -140,6 +140,22 @@ func TestNormalizeEntryPublicSuffixWildcards(t *testing.T) {
 		{"*.core.windows.net", CodeSharedParentWildcard},
 		{"*.googleusercontent.com", CodeSharedParentWildcard},
 		{"*.sharepoint.com", CodeSharedParentWildcard},
+		{"*.azure.com", CodeSharedParentWildcard},
+		// A rule BELOW the base: PublicSuffix(base) is not base, so only the generated
+		// ancestor set refuses these. ICANN wildcard rules first ("*.kawasaki.jp",
+		// "*.sch.uk", "*.nom.br" are rules, so every child is a public suffix) ...
+		{"*.kawasaki.jp", CodePublicSuffixWildcard},
+		{"*.sch.uk", CodePublicSuffixWildcard},
+		{"*.nom.br", CodePublicSuffixWildcard},
+		// ... then private-section rules below the base.
+		{"*.stg.dev", CodePublicSuffixWildcard},
+		{"*.lcl.dev", CodePublicSuffixWildcard},
+		{"*.platformsh.site", CodePublicSuffixWildcard},
+		{"*.run.app", CodePublicSuffixWildcard},                // rule a.run.app
+		{"*.railway.app", CodePublicSuffixWildcard},            // rule up.railway.app
+		{"*.digitaloceanspaces.com", CodePublicSuffixWildcard}, // rule nyc3.digitaloceanspaces.com, ...
+		{"*.salesforce.com", CodePublicSuffixWildcard},         // rules several labels below
+		{"*.jp", CodePublicSuffixWildcard},
 	}
 	for _, c := range cases {
 		got, err := NormalizeEntry(c.in)
@@ -152,7 +168,11 @@ func TestNormalizeEntryPublicSuffixWildcards(t *testing.T) {
 		}
 	}
 	// A wildcard over a registrable domain is fine, including one under a private suffix.
-	for _, ok := range []string{"*.example.com", "*.vendor.github.io", "*.docs.example.co.uk"} {
+	for _, ok := range []string{
+		"*.example.com", "*.vendor.github.io", "*.docs.example.co.uk", "*.vendor.co.uk",
+		"*.docs.vendor.com", "*.vendor.kawasaki.jp.example.com",
+		"*.city.kawasaki.jp", // "!city.kawasaki.jp" is an exception: a registrable domain with no rule below it
+	} {
 		if _, err := NormalizeEntry(ok); err != nil {
 			t.Errorf("NormalizeEntry(%q) = %v, want accepted", ok, err)
 		}
@@ -203,6 +223,14 @@ func TestMatch(t *testing.T) {
 	if Match("anything.com", []string{"*.com", "*"}) {
 		t.Error("an invalid stored entry matched")
 	}
+	// A wildcard whose base has a public suffix below it is not an entry, so a stored one
+	// (written under an older list) matches nothing: every child of kawasaki.jp is a
+	// public suffix, and foo.kawasaki.jp belongs to someone unrelated to evil.foo's owner.
+	for _, h := range []string{"evil.foo.kawasaki.jp", "x.a.run.app", "b.nyc3.digitaloceanspaces.com"} {
+		if Match(h, []string{"*.kawasaki.jp", "*.run.app", "*.digitaloceanspaces.com"}) {
+			t.Errorf("Match(%q) = true through a wildcard that covers a public suffix", h)
+		}
+	}
 }
 
 // TestMultiPublisher pins the built-in list's two shapes and the wildcard coverage rule.
@@ -220,6 +248,18 @@ func TestMultiPublisher(t *testing.T) {
 		"*.reddit.com",            // under a flagged domain
 		"*.blog.medium.com",       // under a flagged domain
 		"*.githubusercontent.com", // (a PSL suffix, refused earlier; MultiPublisher alone still flags it)
+		// Hosts that serve arbitrary publishers' content by path (review of PRD #1906 M1).
+		"api.github.com", "media.githubusercontent.com", "objects-origin.githubusercontent.com",
+		"objects.githubusercontent.com", "gist.githubusercontent.com",
+		"cdn.jsdelivr.net", "fastly.jsdelivr.net", "unpkg.com", "registry.npmjs.org",
+		"files.pythonhosted.org", "proxy.golang.org", "static.crates.io",
+		"huggingface.co", "cdn-lfs.huggingface.co",
+		"*.huggingface.co", "*.jsdelivr.net", "*.npmjs.org", "*.pythonhosted.org", "*.golang.org", "*.crates.io",
+		// China-region path-style S3.
+		"s3.cn-north-1.amazonaws.com.cn", "s3.dualstack.cn-northwest-1.amazonaws.com.cn",
+		// An exact host that is a private-section public suffix: the platform's own apex.
+		"github.io", "gitlab.io", "githubusercontent.com", "cloudfront.net", "blogspot.com",
+		"vendor.platformsh.site", // "*.platformsh.site" is a rule, so this is a suffix itself
 	}
 	for _, e := range flagged {
 		if reason, ok := MultiPublisher(e); !ok || reason == "" {
@@ -233,6 +273,9 @@ func TestMultiPublisher(t *testing.T) {
 		"docs.example.com", "*.example.com",
 		"s3.amazonaws.com.evil.com", "xs3.amazonaws.com", "notreddit.com",
 		"*.docs.github.com",
+		"vendor.github.io", "vendor.gitlab.io", // one site under a private suffix
+		"xs3.cn-north-1.amazonaws.com.cn",
+		"example.org", "docs.golang.org.example.com",
 	}
 	for _, e := range clean {
 		if reason, ok := MultiPublisher(e); ok {
@@ -379,6 +422,20 @@ func TestValidateProfile(t *testing.T) {
 		}
 	})
 
+	t.Run("override count is capped before any is normalized", func(t *testing.T) {
+		over := make([]string, MaxEntries+1)
+		for i := range over {
+			over[i] = "github.com"
+		}
+		_, probs := Validate(Input{Name: "x", Hosts: []string{"github.com"}, MultiPublisherOverride: over}, true)
+		if len(probs) != 1 || probs[0].Code != CodeTooManyEntries || probs[0].Field != "multi_publisher_override" {
+			t.Fatalf("%d overrides: problems = %+v, want one too_many_entries on multi_publisher_override", len(over), probs)
+		}
+		if _, probs := Validate(Input{Name: "x", Hosts: []string{"github.com"}, MultiPublisherOverride: over[:MaxEntries]}, true); len(probs) != 0 {
+			t.Fatalf("%d overrides: problems = %+v, want none", MaxEntries, probs)
+		}
+	})
+
 	t.Run("a refused entry is echoed terminal-safe", func(t *testing.T) {
 		_, probs := Validate(Input{Name: "x", Hosts: []string{"bad\u202e\x1b[2Jhost/x"}}, true)
 		if len(probs) != 1 {
@@ -388,4 +445,34 @@ func TestValidateProfile(t *testing.T) {
 			t.Fatalf("echoed entry %q still carries a control or bidi character", probs[0].Entry)
 		}
 	})
+}
+
+// TestWarningsForStaleEntry: a stored entry the current rules refuse (a list written
+// before a Public Suffix List update, or before a rule tightened) is skipped by Match, so
+// a read must say so instead of listing it as if it allowed something.
+func TestWarningsForStaleEntry(t *testing.T) {
+	hosts := []string{"docs.vendor.com", "*.kawasaki.jp", "github.com"}
+	got := WarningsFor(hosts, []string{"github.com"})
+	byEntry := map[string]string{}
+	for _, w := range got {
+		byEntry[w.Entry] = w.Code
+		if w.Message == "" {
+			t.Errorf("warning for %q has no message", w.Entry)
+		}
+	}
+	want := map[string]string{"*.kawasaki.jp": WarningCodeStaleEntry, "github.com": WarningCodeMultiPublisherOverride}
+	if len(got) != len(want) {
+		t.Fatalf("warnings = %+v, want %v", got, want)
+	}
+	for e, c := range want {
+		if byEntry[e] != c {
+			t.Errorf("warning for %q = %q, want %q (all: %+v)", e, byEntry[e], c, got)
+		}
+	}
+	if Match("evil.foo.kawasaki.jp", hosts) {
+		t.Error("the stale entry matched")
+	}
+	if w := WarningsFor([]string{"docs.vendor.com"}, nil); len(w) != 0 {
+		t.Errorf("clean profile warnings = %+v, want none", w)
+	}
 }

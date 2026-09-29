@@ -8,8 +8,8 @@ import (
 )
 
 // TestHTTPClientEgressProfiles pins the PRD #1906 M1 read client: the list envelope, the
-// show envelope, a name path-escaped into one segment (so an argument cannot address a
-// different route), and the server's 404 surfacing as exit 4.
+// show envelope, the server's 404 surfacing as exit 4, and a name that is not a profile
+// slug refused client-side (exit 2) so it cannot address a different route.
 func TestHTTPClientEgressProfiles(t *testing.T) {
 	var gotPaths []string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -35,11 +35,20 @@ func TestHTTPClientEgressProfiles(t *testing.T) {
 	if err != nil || p.Name != "vendor-docs" || len(p.Hosts) != 1 {
 		t.Fatalf("show = %+v, %v", p, err)
 	}
-	_, err = c.AdminGetEgressProfile(context.Background(), "../users")
+	_, err = c.AdminGetEgressProfile(context.Background(), "no-such-profile")
 	if ExitCodeFor(err) != ExitNotFound {
-		t.Fatalf("show ../users exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
+		t.Fatalf("show no-such-profile exit = %d, want %d", ExitCodeFor(err), ExitNotFound)
 	}
-	if last := gotPaths[len(gotPaths)-1]; last != "/api/admin/egress-profiles/..%2Fusers" {
-		t.Fatalf("escaped path = %q, want the name as one escaped segment", last)
+	// A name that is not a profile slug never reaches the server: url.PathEscape leaves
+	// "." and ".." as they are, and a ".." segment would address the parent route.
+	sent := len(gotPaths)
+	for _, bad := range []string{"..", ".", "../users", "a/b", "Upper", "", "x\x1b[2J"} {
+		_, err := c.AdminGetEgressProfile(context.Background(), bad)
+		if ExitCodeFor(err) != ExitUsage {
+			t.Errorf("show %q exit = %d (%v), want %d", bad, ExitCodeFor(err), err, ExitUsage)
+		}
+	}
+	if len(gotPaths) != sent {
+		t.Fatalf("an invalid name reached the server: %v", gotPaths[sent:])
 	}
 }

@@ -1454,9 +1454,10 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   instance's egress profiles: named site lists for official-sources research. `list`
   prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's
   fields, then one `HOST`/`OVERRIDE` row per entry and a `warning:` line for each
-  multi-publisher host admitted by an explicit override. An entry is an exact host or
+  multi-publisher host admitted by an explicit override or stored entry the current rules
+  no longer accept (`stale_entry`: it matches nothing). An entry is an exact host or
   `*.base`, which matches proper subdomains of base but not base itself. Unknown name:
-  exit 4. Creating and editing a list is web-only (cookie-only admin writes). Same
+  exit 4; a name that is not a lowercase slug: exit 2, nothing sent. Creating and editing a list is web-only (cookie-only admin writes). Same
   `uza_`-token ceiling as every other `uzi admin` verb.
 
 ### PR and CI views
