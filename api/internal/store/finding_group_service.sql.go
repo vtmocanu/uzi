@@ -211,12 +211,6 @@ func SettleFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.UU
 	return true, nil
 }
 
-// ReleaseFindingGroupDefinitive is for a confirmed no-create outcome. The caller
-// must only invoke it after the forge has definitively rejected the write.
-func ReleaseFindingGroupDefinitive(ctx context.Context, db FindingGroupDB, user, id uuid.UUID) (bool, error) {
-	return releaseFindingGroup(ctx, db, user, id, false)
-}
-
 // ReleaseFindingGroupAfterDeadline requires an owner-confirmed request. The DB
 // enforces the deadline and absence of any recorded issue.
 func ReleaseFindingGroupAfterDeadline(ctx context.Context, db FindingGroupDB, user, id uuid.UUID) (bool, error) {
