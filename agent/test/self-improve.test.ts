@@ -580,6 +580,8 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     // Learned from judge-rec triage: gate through the Taskfile, re-check a recommendation
     // against the current tree, and never edit the verbatim upstream builtins.
     assert.ok(p.includes("`task gate:repo` plus `task gate:<component>`"));
+    // gate:web omits the production vite build that CI's build-web job runs.
+    assert.ok(p.includes("`npm run build` in web/ (the gate does not run the production build)"));
     assert.ok(p.includes("still holds on the current code"));
     assert.ok(p.includes("verbatim upstream copies: never edit them"));
     // The generic-only wording must NOT appear in the dogfood variant.

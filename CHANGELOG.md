@@ -30,7 +30,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **uzi's self-improvement runs gate through the Taskfile and re-check old recommendations.**
-  On a repo opted into uzi dogfooding, the self-improvement run now passes `task gate:repo` plus the touched components' gates (reporting a missing `task` as a gate failure) instead of a stale hand-written test list, confirms a judge recommendation still holds on current code (and is not already fixed by an open merge request) before acting on it, prefers a fix several recommendations share, and never edits the built-in agent templates copied verbatim from upstream.
+  On a repo opted into uzi dogfooding, the self-improvement run now passes `task gate:repo` plus the touched components' gates and, for web changes, the production build (reporting a missing `task` as a gate failure) instead of a stale hand-written test list, confirms a judge recommendation still holds on current code (and is not already fixed by an open merge request) before acting on it, prefers a fix several recommendations share, and never edits the built-in agent templates copied verbatim from upstream.
 
 ## [0.85.0] - 2026-09-26
 
