@@ -38,6 +38,7 @@ import { FakeRecoveryClient, FakeRecoveryGit, makeRecoveryCoordinator } from "./
 import {
   api,
   client,
+  fakeGitHub,
   fakeGitlab,
   fx,
   git,
@@ -2444,5 +2445,161 @@ describe("RunRunner #1900 — the Codex finalize boundary deadline and its named
     assert.equal(last.step, "post_mr", "the last step is closed at the end of finalize");
     assert.equal(last.outcome, "ok", "the last step carries the finalize outcome");
     assert.ok(stepLines.slice(0, -1).every((l) => l.outcome === undefined), "only the last step carries an outcome");
+  });
+});
+
+describe("RunRunner #1914 — Codex milestone checkpoint diagnostics", () => {
+  it("reports the checkpoint step active when the hard deadline fires", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const deadline = manualDeadline("checkpoint");
+    const rig = codexRig({ armDeadline: deadline.armDeadline });
+    let inCheckpoint = false;
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = async (request, action) => {
+      if (request.boundary === "checkpoint") inCheckpoint = true;
+      try {
+        return await originalWithBoundary(request, action);
+      } finally {
+        if (request.boundary === "checkpoint") inCheckpoint = false;
+      }
+    };
+    const originalFetch = git.fetchDefaultTip.bind(git);
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      if (inCheckpoint) {
+        deadline.fire();
+        throw new Error("the test fired the checkpoint boundary deadline");
+      }
+      return originalFetch(...args);
+    }) as typeof git.fetchDefaultTip;
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "deadline step\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1916, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, { github }).execute(claim);
+    } finally {
+      git.fetchDefaultTip = originalFetch;
+    }
+
+    assert.equal(deadline.fired(), 1, "the checkpoint deadline fired once");
+    const reasons = api.states
+      .filter((state) => state.runId === claim.run_id && state.body.status === "failed")
+      .map((state) => String(state.body.failure_reason));
+    assert.equal(reasons.length, 1, "the hard boundary still fails closed");
+    assert.match(reasons[0]!, /deadline exceeded during checkpoint-lock-wait/,
+      "the failure names the step at fire time, not the later settled state");
+  });
+
+  it("exposes the default-fetch phase to the checkpoint boundary while it runs", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const rig = codexRig();
+    let activeStep: BoundaryRequest["activeStep"];
+    let inCheckpoint = false;
+    const originalWithBoundary = rig.safety.withBoundary.bind(rig.safety);
+    rig.safety.withBoundary = async (request, action) => {
+      if (request.boundary === "checkpoint") {
+        activeStep = request.activeStep;
+        inCheckpoint = true;
+      }
+      try {
+        return await originalWithBoundary(request, action);
+      } finally {
+        if (request.boundary === "checkpoint") {
+          activeStep = undefined;
+          inCheckpoint = false;
+        }
+      }
+    };
+    const originalFetch = git.fetchDefaultTip.bind(git);
+    const phasesDuringFetch: Array<string | undefined> = [];
+    const phasesWhileQueued: Array<string | undefined> = [];
+    const scoped = git as unknown as { execScoped: (...args: unknown[]) => Promise<{ stdout: string; stderr: string }> };
+    const originalExec = scoped.execScoped.bind(git);
+    const phasesDuringGitFetch: Array<string | undefined> = [];
+    const overlay = git as unknown as { workflowTreeDiffers: (...args: unknown[]) => Promise<boolean> };
+    const originalTreeDiffers = overlay.workflowTreeDiffers.bind(git);
+    const phasesDuringOverlayGate: Array<string | undefined> = [];
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      if (!inCheckpoint) return originalFetch(...args);
+      phasesDuringFetch.push(activeStep?.());
+      let releaseHeld!: () => void;
+      const held = git.withBareLock(args[0], () => new Promise<void>((resolve) => { releaseHeld = resolve; }));
+      await new Promise<void>((resolve) => setTimeout(resolve, 0));
+      const pending = originalFetch(...args);
+      try {
+        await new Promise<void>((resolve) => setTimeout(resolve, 5));
+        phasesWhileQueued.push(activeStep?.());
+      } finally {
+        releaseHeld();
+        await held;
+      }
+      return pending;
+    }) as typeof git.fetchDefaultTip;
+    scoped.execScoped = async (...args) => {
+      const argv = args[1];
+      if (inCheckpoint && Array.isArray(argv) && argv.includes("fetch") && argv.includes("origin")) {
+        phasesDuringGitFetch.push(activeStep?.());
+      }
+      return originalExec(...args);
+    };
+    overlay.workflowTreeDiffers = async (...args) => {
+      if (inCheckpoint) phasesDuringOverlayGate.push(activeStep?.());
+      return originalTreeDiffers(...args);
+    };
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "checkpoint diagnostics\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1914, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, { github }).execute(claim);
+    } finally {
+      git.fetchDefaultTip = originalFetch;
+      scoped.execScoped = originalExec;
+      overlay.workflowTreeDiffers = originalTreeDiffers;
+    }
+
+    assert.deepEqual(phasesDuringFetch, ["checkpoint_lock_wait"],
+      "the boundary names the lock wait before the authenticated fetch starts");
+    assert.deepEqual(phasesWhileQueued, ["checkpoint_lock_wait"],
+      "the boundary keeps the lock-wait label while a real bare lock blocks the fetch");
+    assert.deepEqual(phasesDuringGitFetch, ["default_fetch"],
+      "the boundary's fire-time probe names the authenticated child after acquiring the lock");
+    assert.deepEqual(phasesDuringOverlayGate, ["checkpoint_overlay"],
+      "the workflow comparison has its own label after the fetch finishes");
+    assert.ok(statuses(claim.run_id).includes("completed"), "the run completed after a normal fetch");
+  });
+
+  it("logs bounded, secret-free phase durations for a successful milestone checkpoint", async () => {
+    const { gitlab } = fakeGitlab();
+    const rig = codexRig();
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "checkpoint step timings\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      return { branch: ctx.branch };
+    });
+    const { logger, lines } = recordingLogger();
+    const claim = gitlabClaim(1915);
+    await runnerWith(() => ({ executor: exec }), gitlab, undefined, logger).execute(claim);
+
+    assert.ok(statuses(claim.run_id).includes("completed"), "the run completed");
+    const phases = lines.filter((line) => (line as { msg?: string }).msg === "checkpoint step") as Record<string, unknown>[];
+    assert.ok(phases.length > 0, "the checkpoint emitted phase timing records");
+    for (const phase of phases) {
+      assert.equal(phase.level, "info");
+      assert.ok(typeof phase.step === "string" && /^[a-z_]+$/.test(phase.step), "phase is a fixed label");
+      assert.equal(typeof phase.durationMs, "number");
+      assert.ok(Number.isFinite(phase.durationMs) && (phase.durationMs as number) >= 0, "duration is finite and nonnegative");
+      assert.ok(!JSON.stringify(phase).includes(claim.secrets.forge_pat), "phase log contains no forge PAT");
+    }
   });
 });
