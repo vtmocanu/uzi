@@ -16,11 +16,17 @@ export function MultiSelectBar({
   onClear,
   onMarkDone,
   onDismiss,
+  onFileGroup,
+  fileGroupDisabledReason,
 }: {
   count: number;
   onClear: () => void;
   onMarkDone: () => void;
   onDismiss: (reason: "wont_do" | "not_an_issue") => void;
+  // "File as one issue" (issue #1724). A non-empty fileGroupDisabledReason disables the button and
+  // is shown as its title and in the hint line, so the user can see why the selection is ineligible.
+  onFileGroup?: () => void;
+  fileGroupDisabledReason?: string;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const wrapRef = useRef<HTMLDivElement>(null);
@@ -57,8 +63,21 @@ export function MultiSelectBar({
         <span className="text-sm font-medium text-fg">
           {count} {count === 1 ? "finding" : "findings"} selected
         </span>
-        <span className="text-xs text-faint">Dismiss applies to open findings only.</span>
+        <span className="text-xs text-faint">
+          {onFileGroup && fileGroupDisabledReason ? fileGroupDisabledReason : "Dismiss applies to open findings only."}
+        </span>
         <div className="ml-auto flex items-center gap-2">
+          {onFileGroup && (
+            <Button
+              size="sm"
+              variant="secondary"
+              onClick={onFileGroup}
+              disabled={!!fileGroupDisabledReason}
+              title={fileGroupDisabledReason || undefined}
+            >
+              File as one issue
+            </Button>
+          )}
           <Button size="sm" variant="secondary" onClick={onMarkDone}>
             Mark done
           </Button>

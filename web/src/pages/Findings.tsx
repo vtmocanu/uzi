@@ -119,6 +119,20 @@ const UNDO_CONCURRENCY = 6;
 // shared UndoToast's Toast.undo is JudgeSettledMember[], adapted at the render site below).
 type FindingsToast = { message: string; undo: string[] };
 
+// GROUP_MAX mirrors the server's 1-50 cap on one grouped filing (issue #1724).
+const GROUP_MAX = 50;
+
+// groupFileIneligibility returns why the selected rows cannot be filed as one issue, or "" when
+// they can (issue #1724): 2..50 rows, every one open with evidence (finding_id), all one repo.
+function groupFileIneligibility(rows: IncidentalFinding[]): string {
+  if (rows.length < 2) return "Select at least 2 findings to file as one issue.";
+  if (rows.length > GROUP_MAX) return `Select at most ${GROUP_MAX} findings to file as one issue.`;
+  if (rows.some((r) => r.status !== "open")) return "Only open findings can be filed as one issue.";
+  if (rows.some((r) => !r.finding_id)) return "Some selected findings have no evidence to file.";
+  if (rows.some((r) => r.repo_id !== rows[0].repo_id)) return "Select findings from one repo to file them together.";
+  return "";
+}
+
 export function Findings() {
   const demo = useDemoMode();
   const [searchParams, setSearchParams] = useSearchParams();
@@ -141,6 +155,10 @@ export function Findings() {
   // act on).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<FindingsToast | null>(null);
+  // The grouped-filing draft card (issue #1724): the selection is frozen when the card opens, so
+  // ticking boxes afterwards cannot change what Create files.
+  const [groupTarget, setGroupTarget] = useState<{ ids: string[]; repoLabel: string } | null>(null);
+  const [notice, setNotice] = useState("");
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // Publishes the canonical open count to the nav badge (PRD #1183 M4, the BLK-BADGE pattern). A
@@ -189,6 +207,8 @@ export function Findings() {
     setFiledWarnings({});
     setResolvedIds(new Set());
     setSelected(new Set());
+    setGroupTarget(null);
+    setNotice("");
   }, [bucket, repoFilter, runAnchor]);
 
   // The repo scope selector's options. Best-effort (a failure leaves All-repos as the only option,
@@ -294,6 +314,42 @@ export function Findings() {
 
   // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
   // skipped ones) and returns their disposition ids — the Undo set.
+  // fileGroup posts the frozen selection and the human's edits as ONE issue (issue #1724). 201 and
+  // 202 both close the card, clear the selection and reload; a 409 (a member was filed or is being
+  // filed meanwhile) does the same with a friendly note; anything else rethrows so the card keeps
+  // the user's edits and shows the error.
+  const fileGroup = useCallback(
+    async (ids: string[], body: { title: string; description: string; labels: string[] }) => {
+      setActionErr("");
+      setNotice("");
+      try {
+        const res = await api.fileFindingGroup({ ids, ...body });
+        setGroupTarget(null);
+        setSelected(new Set());
+        if (res.issue) {
+          const filed = `Filed ${ids.length} findings as issue #${res.issue.iid}.`;
+          setNotice(res.warning ? `${filed} ${res.warning}` : filed);
+        } else {
+          const detail = res.warning ? `${res.warning} ` : "";
+          setNotice(`${detail}Operation ${res.operation_id}.`);
+        }
+        load();
+        reloadStats();
+      } catch (e) {
+        if (e instanceof ApiError && e.status === 409) {
+          setGroupTarget(null);
+          setSelected(new Set());
+          setNotice("One or more of those findings were already filed or are being filed. The list has been refreshed.");
+          load();
+          reloadStats();
+          return;
+        }
+        throw e;
+      }
+    },
+    [load, reloadStats],
+  );
+
   const settle = useCallback(
     (rows: IncidentalFinding[]): string[] => {
       const settled: string[] = [];
@@ -437,6 +493,18 @@ export function Findings() {
     () => selectableIds.filter((id) => selected.has(id)),
     [selectableIds, selected],
   );
+  const selectedRows = useMemo(() => {
+    const byDisposition = new Map((backlog?.findings ?? []).map((f) => [f.disposition_id, f]));
+    return activeSelected.map((id) => byDisposition.get(id)).filter((f): f is IncidentalFinding => !!f);
+  }, [backlog, activeSelected]);
+  const groupDisabledReason = groupFileIneligibility(selectedRows);
+  const openGroup = () => {
+    if (groupDisabledReason || selectedRows.length === 0) return;
+    setGroupTarget({
+      ids: [...activeSelected],
+      repoLabel: stripUnsafeChars(maskRepoPath(selectedRows[0].repo_path, demo)),
+    });
+  };
   const allSelected = selectableIds.length > 0 && activeSelected.length === selectableIds.length;
   const someSelected = activeSelected.length > 0;
   const toggleSelectAll = (checked: boolean) => setSelected(checked ? new Set(selectableIds) : new Set());
@@ -485,6 +553,11 @@ export function Findings() {
 
       {error && <Alert message={error} />}
       {actionErr && <Alert message={actionErr} />}
+      {notice && (
+        <div role="status" className="rounded-lg border border-info/30 bg-info/[0.06] px-3 py-2 text-sm text-muted">
+          {notice}
+        </div>
+      )}
 
       {runAnchor && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-info/30 bg-info/[0.06] px-3 py-2 text-sm">
@@ -572,6 +645,33 @@ export function Findings() {
                 />
               </div>
             )}
+            {groupTarget && (
+              <div className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
+                <p className="mb-2 text-sm font-medium text-fg">
+                  File {groupTarget.ids.length} findings as one issue
+                </p>
+                <IssueDraftCard
+                  fixedRepoLabel={groupTarget.repoLabel}
+                  loadDraft={async () => {
+                    const draft = await api.findingGroupIssueDraft(groupTarget.ids);
+                    return {
+                      title: draft.title,
+                      description: draft.description,
+                      labels: draft.labels,
+                      provenance: "",
+                    };
+                  }}
+                  onCreate={(values) =>
+                    fileGroup(groupTarget.ids, {
+                      title: values.title,
+                      description: values.description,
+                      labels: values.labels,
+                    })
+                  }
+                  onCancel={() => setGroupTarget(null)}
+                />
+              </div>
+            )}
             {singleRepo ? (
               <ul className="space-y-2">
                 {backlog.findings.map((f) => (
@@ -604,6 +704,8 @@ export function Findings() {
           onClear={() => setSelected(new Set())}
           onMarkDone={() => markDone(activeSelected)}
           onDismiss={(reason) => dismiss(activeSelected, reason)}
+          onFileGroup={openGroup}
+          fileGroupDisabledReason={groupDisabledReason}
         />
       )}
 

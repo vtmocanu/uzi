@@ -33,6 +33,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       fileFinding: vi.fn(),
       dismissFinding: vi.fn(),
       findingIssueDraft: vi.fn(),
+      findingGroupIssueDraft: vi.fn(),
+      fileFindingGroup: vi.fn(),
       listRepos: vi.fn().mockResolvedValue({ repos: [] }),
       // AppShell chrome, for the together-mount BLK-BADGE test. Zero/empty so the nav renders with
       // no other badge in the way of the Findings badge assertions.
@@ -790,5 +792,154 @@ describe("Findings nav badge moves after a dismiss without navigation (PRD #1183
     // The badge follows the fresh stats.todo, published through the context (no navigation).
     await waitFor(() => expect(navBadgeText()).toContain("2"));
     expect(navBadgeText()).not.toContain("3");
+  });
+});
+
+describe("Findings page - File as one issue (issue #1724)", () => {
+  const rows = [
+    finding({ disposition_id: "d1", finding_id: "f1", last_title: "Alpha bug" }),
+    finding({ disposition_id: "d2", finding_id: "f2", last_title: "Beta bug" }),
+    finding({ disposition_id: "d3", finding_id: "f3", last_title: "Gamma bug", repo_id: "repo-atlas", repo_path: "vtmocanu/atlas" }),
+    finding({ disposition_id: "d4", finding_id: undefined, last_title: "Orphan bug" }),
+    finding({ disposition_id: "d5", finding_id: "f5", last_title: "Filed bug", status: "filed" }),
+  ];
+
+  async function renderAll() {
+    mockApi.listFindings.mockResolvedValue(backlog({ bucket: "all", findings: rows }));
+    renderFindings(["/findings?bucket=all"]);
+    await screen.findByText("Alpha bug");
+  }
+  const tick = (title: string) => fireEvent.click(screen.getByRole("checkbox", { name: `Select ${title}` }));
+  const groupButton = () => screen.getByRole("button", { name: "File as one issue" }) as HTMLButtonElement;
+
+  it("is disabled with a visible reason for 1 row, mixed repos, a non-open row and an evidence-less row", async () => {
+    await renderAll();
+    tick("Alpha bug");
+    expect(groupButton().disabled).toBe(true);
+    expect(groupButton().title).toBe("Select at least 2 findings to file as one issue.");
+    expect(screen.getByText("Select at least 2 findings to file as one issue.")).toBeTruthy();
+
+    tick("Gamma bug");
+    expect(groupButton().disabled).toBe(true);
+    expect(groupButton().title).toMatch(/one repo/);
+    tick("Gamma bug");
+
+    tick("Orphan bug");
+    expect(groupButton().disabled).toBe(true);
+    expect(groupButton().title).toMatch(/no evidence/);
+    tick("Orphan bug");
+
+    tick("Filed bug");
+    expect(groupButton().disabled).toBe(true);
+    expect(groupButton().title).toMatch(/Only open/);
+    tick("Filed bug");
+
+    // Two open, evidence-bearing rows of one repo is the one enabled shape.
+    tick("Beta bug");
+    expect(groupButton().disabled).toBe(false);
+    expect(groupButton().title).toBe("");
+  });
+
+  it("is disabled beyond 50 selected rows", async () => {
+    const many = Array.from({ length: 51 }, (_, i) =>
+      finding({ disposition_id: `m${i}`, finding_id: `mf${i}`, last_title: `Many ${i}` }),
+    );
+    mockApi.listFindings.mockResolvedValue(backlog({ findings: many }));
+    renderFindings();
+    await screen.findByText("Many 0");
+    fireEvent.click(screen.getByRole("checkbox", { name: "Select all 51 shown" }));
+    expect(groupButton().disabled).toBe(true);
+    expect(groupButton().title).toBe("Select at most 50 findings to file as one issue.");
+  });
+
+  function openDraft() {
+    mockApi.findingGroupIssueDraft.mockResolvedValue({
+      repo_id: "repo-uzi",
+      disposition_ids: ["d1", "d2"],
+      title: "Findings (2): Alpha bug",
+      description: "1. Alpha\n2. Beta",
+      labels: ["uzi"],
+    });
+  }
+
+  it("happy path: loads the draft, posts ids and edits, reloads, and shows the warning", async () => {
+    openDraft();
+    mockApi.fileFindingGroup.mockResolvedValue({
+      operation_id: "op-1",
+      disposition_ids: ["d1", "d2"],
+      phase: "settled",
+      issue: { iid: 77, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/77", title: "edited" },
+      warning: "Issue created but two rows failed to settle.",
+    });
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    await screen.findByRole("button", { name: "Create issue" });
+    expect(mockApi.findingGroupIssueDraft).toHaveBeenCalledWith(["d1", "d2"]);
+    expect(screen.getByText("vtmocanu/uzi", { selector: "span, p, div, code" })).toBeTruthy();
+
+    fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "edited" } });
+    const listCalls = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+
+    await waitFor(() =>
+      expect(mockApi.fileFindingGroup).toHaveBeenCalledWith({
+        ids: ["d1", "d2"],
+        title: "edited",
+        description: "1. Alpha\n2. Beta",
+        labels: ["uzi"],
+      }),
+    );
+    await screen.findByText(/Filed 2 findings as issue #77\. Issue created but two rows failed to settle\./);
+    await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
+    expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
+    // Selection cleared, so the bar is gone.
+    expect(screen.queryByRole("button", { name: "File as one issue" })).toBeNull();
+  });
+
+  it("202 closes the card and shows the warning with the operation id", async () => {
+    openDraft();
+    mockApi.fileFindingGroup.mockResolvedValue({
+      operation_id: "op-202",
+      disposition_ids: ["d1", "d2"],
+      phase: "uncertain",
+      warning: "Outcome unknown, inspect the forge before retrying.",
+    });
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202\./);
+    expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
+  });
+
+  it("409 closes the card, reloads and explains the rows were already filed", async () => {
+    openDraft();
+    mockApi.fileFindingGroup.mockRejectedValue(new ApiError(409, "finding not fileable"));
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    const listCalls = mockApi.listFindings.mock.calls.length;
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await screen.findByText(/already filed or are being filed/);
+    await waitFor(() => expect(mockApi.listFindings.mock.calls.length).toBeGreaterThan(listCalls));
+    expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
+  });
+
+  it("keeps the card and the user's edits when the forge rejects (502)", async () => {
+    openDraft();
+    mockApi.fileFindingGroup.mockRejectedValue(new ApiError(502, "forge rejected the request"));
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    await screen.findByRole("button", { name: "Create issue" });
+    fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "kept edit" } });
+    fireEvent.click(screen.getByRole("button", { name: "Create issue" }));
+    await screen.findByText(/forge rejected the request/);
+    expect(screen.getByDisplayValue("kept edit")).toBeTruthy();
   });
 });

@@ -3867,6 +3867,28 @@ export interface IncidentalFindingFileResult {
   warning?: string;
 }
 
+// FindingGroupDraft is GET /api/findings/issue-draft?ids=... (issue #1724): the deterministic,
+// human-editable draft for filing several findings of ONE repo as one issue. `disposition_ids`
+// echoes the deduped selection in the order the server composed the draft.
+export interface FindingGroupDraft {
+  repo_id: string;
+  disposition_ids: string[];
+  title: string;
+  description: string;
+  labels: string[];
+}
+
+// FindingGroupFileResult is the POST /api/findings/issue response (issue #1724). 201 carries
+// `issue` (phase settled or a settled-with-warning); 202 omits it when the forge outcome is
+// uncertain or stopped, and `warning` then says to inspect the forge before retrying.
+export interface FindingGroupFileResult {
+  operation_id: string;
+  disposition_ids: string[];
+  phase: string;
+  issue?: IncidentalFindingFiledIssue;
+  warning?: string;
+}
+
 // RunMessage is one persisted, seq-numbered event in a run's stream.
 export interface RunMessage {
   seq: number;
