@@ -1005,6 +1005,10 @@ Tracked as GitHub issue vtmocanu/uzi#1864.
 - A Codex delegation still open when the lead's turn ends is cancelled and its work settled before the next checkpoint; a boundary that still cannot settle fails closed, and the failure reason and worker log name the stage, the checkpoint and the unsettled work. (AI-synced 2026-09-28)
 - A Codex run's finalize publish runs under its own finite boundary deadline sized for the full publish (push, PR description, merge request), not the 30 s checkpoint deadline; a finalize deadline failure names the finalize step that was running when it fired, and the worker logs each finalize step's duration. (AI-synced 2026-09-29)
 
+## Issue #1932 — Pre-exit secret-scan remediation before publishing
+
+- Before a non-interactive run's done checkpoint, the worker scans the branch's unpublished commits locally. A trusted finding entirely above the checkpoint floor returns to the lead for a history rewrite, at most 2 times; a finding at or below the floor, an exhausted cap, or an untrusted rescan after a finding fails the run `push_secret_blocked` with no push and no preserved patch (a durable-recovery archive stays exportable). A commit the mid-turn checkpoint scan flagged fails the run the same way while it is still in the pushed history. While a finding is live, no checkpoint publish goes out from the checkpoint body; the park, shutdown, pause, capture and completion-hold sinks stay unscanned (#1597). The local-scan failure reason never claims GH013 or GitHub Push Protection. Limits: a secret already published by an earlier GitHub milestone checkpoint is at or below the floor and is not remediated; a token-shaped fixture on a merged public non-default branch counts as a finding. (AI-synced 2026-09-29)
+
 ## PRD #1906 — Official-sources web research
 
 Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources-web-research.md`.

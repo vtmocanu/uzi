@@ -2440,6 +2440,17 @@ export class CodexExecutor implements Executor {
           continue;
         }
         if (result.done) {
+          // Issue #1932: consult the secret-remediation gate BEFORE the persist/done checkpoint
+          // publishes the branch. `remediate` re-prompts the SAME live epoch (no persist, no
+          // recreate); `fail` stops (the runner already recorded the blocked state).
+          if (!ctx.interactive) {
+            const secretDecision = await ctx.secretRemediationGate?.();
+            if (secretDecision?.action === "remediate") {
+              completionFollowUp = secretDecision.followUp;
+              continue;
+            }
+            if (secretDecision?.action === "fail") break;
+          }
           if (!interlockedIssue) break;
           // Preserve the live thread before reaping the provider and reading Git state.
           await epoch.persistSession();
