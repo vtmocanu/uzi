@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/auth"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
@@ -70,5 +71,47 @@ func TestFetcherRoutesServiceAuthAndStrictDecode(t *testing.T) {
 	// A well-formed body on a handler with no database reaches the handler and fails closed.
 	if code := fetcherPost(plain, fetchctl.BeginPath, "Bearer "+tok, `{"credential":"c","url":"https://x.example/"}`); code != http.StatusServiceUnavailable {
 		t.Errorf("begin with no database = %d, want 503", code)
+	}
+}
+
+// The DB-free half of the credential separation (TestFetcherCredentialIsolationLiveDB adds
+// the worker surface and positive controls with real credentials): with hosting and the
+// fetcher both configured, the fetcher token is refused on /api/controller/*, and the
+// controller token, a uzw_-shaped Bearer and a session cookie are refused on
+// /api/fetcher/v1/*, on both listeners.
+func TestFetcherAndControllerTokensAreNotInterchangeable(t *testing.T) {
+	fetchTok := "fetcher-svc-" + uuid.NewString()
+	ctrlTok := "controller-svc-" + uuid.NewString()
+	fs, cs := sha256.Sum256([]byte(fetchTok)), sha256.Sum256([]byte(ctrlTok))
+	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true, ControllerTokenSHA256: cs[:], FetcherTokenSHA256: fs[:]}}
+	lim := mw.NewLimiter(1000, time.Minute, nil)
+	for name, r := range map[string]http.Handler{"plain": h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim), "tls": h.WorkerRoutes(lim)} {
+		for _, p := range []string{"/api/controller/status", "/api/controller/workers/" + uuid.NewString() + "/drain"} {
+			if code := fetcherPost(r, p, "Bearer "+fetchTok, `{}`); code != http.StatusUnauthorized {
+				t.Errorf("%s: fetcher token on %s = %d, want 401", name, p, code)
+			}
+		}
+		req := httptest.NewRequest(http.MethodGet, "/api/controller/poll", nil)
+		req.Header.Set("Authorization", "Bearer "+fetchTok)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		if rec.Code != http.StatusUnauthorized {
+			t.Errorf("%s: fetcher token on controller poll = %d, want 401", name, rec.Code)
+		}
+		for _, p := range []string{fetchctl.BeginPath, fetchctl.CompletePath} {
+			for who, bearer := range map[string]string{"controller": "Bearer " + ctrlTok, "uzw_": "Bearer uzw_" + uuid.NewString()} {
+				if code := fetcherPost(r, p, bearer, `{"credential":"c","url":"https://x.example/"}`); code != http.StatusUnauthorized {
+					t.Errorf("%s: %s token on %s = %d, want 401", name, who, p, code)
+				}
+			}
+			req := httptest.NewRequest(http.MethodPost, p, strings.NewReader(`{"credential":"c","url":"https://x.example/"}`))
+			req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: "a.b.c"}) //nolint:gosec // G124: test-only client cookie on an httptest request.
+			req.Header.Set(auth.CSRFHeaderName, "x")
+			rec := httptest.NewRecorder()
+			r.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s: session cookie on %s = %d, want 401", name, p, rec.Code)
+			}
+		}
 	}
 }

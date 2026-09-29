@@ -679,7 +679,9 @@ uzi version
   (official-sources research): every web fetch it attempted, allowed or refused, with the
   reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only
   (a foreign run is a 404, exit 4). The URLs, content type and reason are site- or
-  agent-controlled text; `--json` adds each file's sha256 and prints long URLs whole.
+  agent-controlled text; `--json` adds each file's sha256 and prints long URLs whole. The api
+  pages the log (500 rows a page, `?after=<next_cursor>`); the command follows every page and
+  prints the whole log.
 
 ### Schedules — time-driven runs
 

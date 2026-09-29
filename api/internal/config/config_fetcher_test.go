@@ -55,3 +55,44 @@ func TestFetcherTokenMalformedRefusesBoot(t *testing.T) {
 		})
 	}
 }
+
+// The fetcher credential must never be the controller credential: RequireController and
+// RequireFetcher each compare only against their own hash, so a shared hash would let a
+// compromised fetcher (the lane's internet-facing process) pass RequireController and
+// drive the hosted-worker protocol. Boot refuses the pair, and names both variables.
+func TestFetcherTokenEqualToControllerTokenRefusesBoot(t *testing.T) {
+	hostingBaseEnv(t)
+	shared := controllerTokenHashHex("one-credential-for-two-services")
+	t.Setenv("WORKER_HOSTING_ENABLED", "true")
+	t.Setenv("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256", shared)
+	// Case and whitespace differ from the controller's value: the compare is on the
+	// decoded bytes, not the strings.
+	t.Setenv("UZI_FETCHER_TOKEN_SHA256", " "+strings.ToUpper(shared)+" ")
+	_, err := Load()
+	if err == nil {
+		t.Fatal("Load() accepted a fetcher token hash equal to the controller token hash")
+	}
+	for _, name := range []string{"UZI_FETCHER_TOKEN_SHA256", "WORKER_HOSTING_CONTROLLER_TOKEN_SHA256"} {
+		if !strings.Contains(err.Error(), name) {
+			t.Fatalf("error does not name %s: %v", name, err)
+		}
+	}
+	if strings.Contains(strings.ToLower(err.Error()), shared) {
+		t.Fatalf("error echoes the hash: %v", err)
+	}
+}
+
+// Distinct credentials both load: the guard compares, it does not forbid coexistence.
+func TestFetcherTokenDistinctFromControllerTokenLoads(t *testing.T) {
+	hostingBaseEnv(t)
+	t.Setenv("WORKER_HOSTING_ENABLED", "true")
+	t.Setenv("WORKER_HOSTING_CONTROLLER_TOKEN_SHA256", controllerTokenHashHex("the-controller-service-credential"))
+	t.Setenv("UZI_FETCHER_TOKEN_SHA256", controllerTokenHashHex("the-fetcher-service-credential"))
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if cfg.FetcherTokenSHA256 == nil || cfg.ControllerTokenSHA256 == nil {
+		t.Fatal("both hashes should load")
+	}
+}

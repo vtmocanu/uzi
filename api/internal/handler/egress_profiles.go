@@ -230,9 +230,9 @@ func (h *Handler) AdminUpdateEgressProfile(w http.ResponseWriter, r *http.Reques
 	httpx.JSON(w, http.StatusOK, map[string]any{"egress_profile": egressProfileToDTO(p, v.Warnings)})
 }
 
-// AdminDeleteEgressProfile deletes a profile by name. 204, or 404 for an unknown name.
-// Nothing references a profile yet (runs gain a reference in a later milestone, which
-// snapshots the list at claim), so a delete has no dependents to guard.
+// AdminDeleteEgressProfile deletes a profile by name. 204, 404 for an unknown name, or 409
+// when any run, in any status, is bound to it: runs.egress_profile_id is ON DELETE
+// RESTRICT (PRD #1906 M3), and the delete maps exactly that foreign key's violation.
 func (h *Handler) AdminDeleteEgressProfile(w http.ResponseWriter, r *http.Request) {
 	if _, ok := egressProfileAdmin(w, r); !ok {
 		return

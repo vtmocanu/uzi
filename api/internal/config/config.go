@@ -6,6 +6,7 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -1584,7 +1585,8 @@ func loadWorkerHosting(cfg *Config) error {
 // loadFetcherToken reads UZI_FETCHER_TOKEN_SHA256 (PRD #1906 M3), the hex sha256 of
 // uzi-fetcher's service token. Unset leaves the fetcher control routes unmounted (the
 // compose default: there is no fetcher, so the endpoints do not exist). A set value must be
-// exactly 32 bytes of hex and not the hash of a well-known placeholder, or boot fails: it
+// exactly 32 bytes of hex, not the hash of a well-known placeholder, and not the controller's
+// hash (WORKER_HOSTING_CONTROLLER_TOKEN_SHA256), or boot fails: it
 // authenticates a route that writes every profile-bound run's source log, so a typo must
 // not quietly leave the lane without a working log (every fetch would then be refused) or
 // worse, accept a guessable token. The value is never echoed in an error.
@@ -1602,6 +1604,14 @@ func loadFetcherToken(cfg *Config) error {
 	}
 	if name, bad := placeholderControllerToken(sum); bad {
 		return fmt.Errorf("UZI_FETCHER_TOKEN_SHA256 is the hash of the well-known placeholder %q; generate a real fetcher token with: openssl rand -base64 32", name)
+	}
+	// One credential for two services would let a compromised fetcher (the isolated lane's
+	// internet-facing process) pass RequireController, which compares only against the
+	// controller hash. Refuse the pair outright. loadWorkerHosting runs first, so
+	// ControllerTokenSHA256 is already set when hosting is on; constant-time like the
+	// middlewares' own compares, though both values are hashes the operator configured.
+	if len(cfg.ControllerTokenSHA256) != 0 && subtle.ConstantTimeCompare(sum, cfg.ControllerTokenSHA256) == 1 {
+		return fmt.Errorf("UZI_FETCHER_TOKEN_SHA256 equals WORKER_HOSTING_CONTROLLER_TOKEN_SHA256; the fetcher and the controller must hold distinct tokens (generate another with: openssl rand -base64 32)")
 	}
 	cfg.FetcherTokenSHA256 = sum
 	return nil

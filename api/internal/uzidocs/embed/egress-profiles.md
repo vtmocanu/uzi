@@ -27,7 +27,12 @@ every profile with its hosts and warnings, and creates, edits and deletes them.
 | Show one profile | `uzi admin egress-profile show <name>`, or `GET /api/admin/egress-profiles/<name>` |
 | Create | Admin → Site lists → New site list, or `POST /api/admin/egress-profiles` |
 | Replace | Edit on the profile's row, or `PUT /api/admin/egress-profiles/<name>` |
-| Delete | Delete on the profile's row (asks to confirm), or `DELETE /api/admin/egress-profiles/<name>` |
+| Delete | Delete on the profile's row (asks to confirm), or `DELETE /api/admin/egress-profiles/<name>`. A profile that any run is bound to, finished runs included, can't be deleted: the api answers `409` and keeps it. |
+
+A run's binding to its profile is permanent, so a list that has been used stays
+until every run bound to it is deleted. There is no disable switch: to retire a
+list, stop choosing it for new runs. Editing it changes only runs that haven't
+started yet, because a run keeps the copy of the list it started with.
 
 Reads work from an admin browser session or an admin-scoped (`uza_`) CLI token.
 Create, replace and delete are cookie-only admin writes, like every other admin

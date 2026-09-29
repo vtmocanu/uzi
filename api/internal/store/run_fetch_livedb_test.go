@@ -234,8 +234,10 @@ func TestRunFetchRevokeTriggerLiveDB(t *testing.T) {
 		}
 	}
 	// Every other status a run can leave running for.
-	for _, status := range []string{"completed", "failed", "cancelled", "queued", "awaiting_approval", "awaiting_input",
-		"limit_wait", "awaiting_followup", "pool_wait", "paused", "recovery_wait"} {
+	// (awaiting_approval, awaiting_input and awaiting_followup are refused outright for a
+	// bound run: TestRunEgressNoInPlaceParkLiveDB.)
+	for _, status := range []string{"completed", "failed", "cancelled", "queued",
+		"limit_wait", "pool_wait", "paused", "recovery_wait"} {
 		run := f.boundRun(t, "running")
 		f.exec(t, `UPDATE runs SET status = $2 WHERE id = $1`, run, status)
 		if !f.revoked(t, run) {
@@ -248,6 +250,46 @@ func TestRunFetchRevokeTriggerLiveDB(t *testing.T) {
 	f.exec(t, `UPDATE runs SET status = 'running' WHERE id = $1`, run)
 	if f.revoked(t, run) {
 		t.Error("claimed -> running revoked the credential")
+	}
+}
+
+// TestRunEgressNoInPlaceParkLiveDB pins the invariant the revoke trigger's "revoking
+// early loses nothing" rests on: a bound run cannot enter the three statuses that
+// SetRunRunning resumes IN PLACE (no re-claim, so no re-mint). Each is refused by
+// runs_egress_profile_no_in_place_park, from running and from claimed, leaving the status
+// and the credential untouched; an unbound run still parks there, and a bound run still
+// takes a park that resumes through a re-claim (limit_wait, whose re-claim re-mints).
+func TestRunEgressNoInPlaceParkLiveDB(t *testing.T) {
+	f := newRFFix(t)
+	for _, from := range []string{"running", "claimed"} {
+		for _, status := range []string{"awaiting_approval", "awaiting_input", "awaiting_followup"} {
+			run := f.boundRun(t, from)
+			_, err := f.pool.Exec(f.ctx, `UPDATE runs SET status = $2 WHERE id = $1`, run, status)
+			if code, c := rfPGErr(err); code != "23514" || c != "runs_egress_profile_no_in_place_park" {
+				t.Errorf("bound %s -> %s: err = %v, want the no-in-place-park CHECK", from, status, err)
+			}
+			var got string
+			if err := f.pool.QueryRow(f.ctx, `SELECT status FROM runs WHERE id = $1`, run).Scan(&got); err != nil || got != from {
+				t.Errorf("bound %s -> %s: status now %q (%v), want unchanged", from, status, got, err)
+			}
+			if f.revoked(t, run) {
+				t.Errorf("bound %s -> %s: a refused park revoked the credential", from, status)
+			}
+		}
+	}
+	// A bound run's re-claim park is still allowed (and revokes).
+	run := f.boundRun(t, "running")
+	f.exec(t, `UPDATE runs SET status = 'limit_wait' WHERE id = $1`, run)
+	if !f.revoked(t, run) {
+		t.Error("bound running -> limit_wait did not revoke")
+	}
+	// An unbound run is unaffected.
+	unbound := uuid.New()
+	f.iid++
+	f.exec(t, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status)
+	           VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'running')`, unbound, f.userID, f.repoID, f.iid)
+	for _, status := range []string{"awaiting_approval", "awaiting_input", "awaiting_followup", "running"} {
+		f.exec(t, `UPDATE runs SET status = $2 WHERE id = $1`, unbound, status)
 	}
 }
 

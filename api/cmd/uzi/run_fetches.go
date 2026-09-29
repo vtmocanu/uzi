@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/spf13/cobra"
@@ -14,6 +15,10 @@ import (
 // Every text cell (URL, final URL, content type, reason) is site- or agent-controlled, so
 // it goes through cellText (control and format runes stripped, 200-rune cap) even though
 // the api already escaped it at write time: the render site is the trust boundary.
+//
+// The api pages the log (fetchctl.FetchesPageSize rows a page); the command follows every
+// page and prints the whole log, which fetch_max_run_attempts bounds (default 500, so one
+// page). There is no --after/--limit: a partial log is not what an owner audits.
 func newRunFetchesCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "fetches <run-id>",
@@ -31,12 +36,45 @@ func newRunFetchesCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			dto, err := c.RunFetches(cmd.Context(), args[0])
+			dto, err := allRunFetches(cmd.Context(), c, args[0])
 			if err != nil {
 				return err
 			}
 			return renderRunFetches(env.printer(gf), dto)
 		},
+	}
+}
+
+// maxFollowedFetches is the most rows allRunFetches collects: the fetch_max_run_attempts
+// ceiling (api/internal/settings), which no honest log exceeds. With the checks below it
+// bounds how long a misbehaving server can keep the command paging.
+const maxFollowedFetches = 100000
+
+// allRunFetches follows the log's next_cursor chain from the first page and returns every
+// row, with NextCursor cleared. A page that carries a cursor but no rows, a cursor that
+// repeats, or more rows than maxFollowedFetches is a server fault, reported as an error
+// rather than looped on.
+func allRunFetches(ctx context.Context, c uzicli.Client, runID string) (apitypes.RunFetchesDTO, error) {
+	out := apitypes.RunFetchesDTO{Fetches: []apitypes.RunFetchDTO{}}
+	seen := map[string]bool{}
+	after := ""
+	for {
+		page, err := c.RunFetches(ctx, runID, after)
+		if err != nil {
+			return apitypes.RunFetchesDTO{}, err
+		}
+		out.Fetches = append(out.Fetches, page.Fetches...)
+		if len(out.Fetches) > maxFollowedFetches {
+			return apitypes.RunFetchesDTO{}, uzicli.Exitf(uzicli.ExitGeneric, "the server returned more than %d fetches for one run", maxFollowedFetches)
+		}
+		if page.NextCursor == "" {
+			return out, nil
+		}
+		if len(page.Fetches) == 0 || seen[page.NextCursor] {
+			return apitypes.RunFetchesDTO{}, uzicli.Exitf(uzicli.ExitGeneric, "the server's fetch log pagination did not advance")
+		}
+		seen[page.NextCursor] = true
+		after = page.NextCursor
 	}
 }
 

@@ -25,10 +25,11 @@ var errIsolatedClaimRefused = fmt.Errorf("%w: profile-bound run cannot be claime
 // M3, Decisions 5, 7, 10 and 12). In one transaction it snapshots the run's site list at
 // its FIRST claim (a later claim keeps that snapshot, so an admin edit never changes a
 // claimed run), mints or rotates the run's fetch credential under this claim's generation,
-// and releases any reservation an earlier claim left open. Then it strips everything a
-// research run must not have: the forge credential and identity, the repo, the agents,
-// skills and tool packages, and every forge- or memory-derived extra. The Codex block is
-// never attached (assembleClaim refuses a Codex profile-bound run before building it).
+// and releases any reservation an earlier claim left open. Then stripForIsolation clears
+// the forge credential and identity, the repo, the agents, skills and tool packages, and
+// the forge- or repo-derived context (its comment lists exactly what, and what it keeps).
+// The Codex block is never attached (assembleClaim refuses a Codex profile-bound run
+// before building it).
 //
 // A mint that matches no row means the run left this claim (cancelled or reclaimed)
 // between ClaimRun and here: errRunVanished, and nothing is delivered.
@@ -105,9 +106,24 @@ func snapshotEgressProfile(ctx context.Context, q *store.Queries, run store.Run)
 	return q.SetRunEgressSnapshotOnce(ctx, store.SetRunEgressSnapshotOnceParams{ID: run.ID, Snapshot: b})
 }
 
-// stripForIsolation removes from a claim everything a profile-bound run must not carry.
+// stripForIsolation clears the parts of an assembled claim that give a profile-bound run a
+// forge, a repository, an agent roster or a tool beyond the research runner's fixed set:
+// the repo and every forge credential and identity (and the Codex block), the agents,
+// skills and tool packages, the devbox opt-in, and the forge- or repo-derived context (the
+// issue's comment thread, review comments, CI pipeline, the branch and base branch, the PR
+// description, self-improve targets and open MRs).
+//
+// It is not a whitelist. What it leaves is what the research runner reads
+// (agent/src/isolated-runner.ts: run_id, claim_generation, last_seq, issue_title,
+// issue_description, the Anthropic token, config's timeout, model and effort, and
+// isolated_fetch) plus run bookkeeping the runner ignores (kind, status, the plan, session
+// and resume fields, the milestones and flags): none of it is a credential, a forge
+// handle or a tool. A new claim field that is one must be cleared here.
 func stripForIsolation(p *ClaimPayload) {
 	p.Repo = ClaimRepo{}
+	p.IssueComments = nil
+	p.Branch = nil
+	p.BaseBranch = nil
 	p.Secrets.ForgePAT = ""
 	p.Secrets.ForgeUsername = ""
 	p.Secrets.Codex = nil

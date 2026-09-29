@@ -273,7 +273,7 @@ func TestFetcherBeginCredentialRulesLiveDB(t *testing.T) {
 	staleRun, stale := e.boundRun("running", 2, 1)
 	claimedRun, claimed := e.boundRun("claimed", 1, 1)
 	parkedRun, parked := e.boundRun("running", 1, 1)
-	e.exec(`UPDATE runs SET status = 'awaiting_input' WHERE id = $1`, parkedRun) // the trigger revokes it too
+	e.exec(`UPDATE runs SET status = 'limit_wait' WHERE id = $1`, parkedRun) // the trigger revokes it too
 	doneRun, done := e.boundRun("running", 1, 1)
 	e.exec(`UPDATE runs SET status = 'completed' WHERE id = $1`, doneRun)
 	foreign, _, _ := fetchctl.GenerateCredential()

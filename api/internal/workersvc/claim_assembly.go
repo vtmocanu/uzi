@@ -237,7 +237,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 
 	// Decision 12: a profile-bound run's claim carries no forge credential, so its PAT is
-	// never even decrypted.
+	// not decrypted here, and the two claim extras that would read forge-derived state for
+	// it (the PR description, and a self_improve run's open-MR set, which builds a forge
+	// client from the connection) are skipped below. GetRunClaimContext above still reads
+	// the repo and connection ROWS (the per-repo settings the claim is assembled from);
+	// nothing reaches the forge.
 	var botPAT []byte
 	if !isolated {
 		botPAT, err = s.box.Open(rc.TokenCiphertext)
@@ -792,12 +796,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
 	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
-	payload.PrDescription = s.claimPrDescription(ctx, run)
+	// Skipped for a profile-bound run (it has no PR, and stripForIsolation clears it anyway).
+	if !isolated {
+		payload.PrDescription = s.claimPrDescription(ctx, run)
+	}
 
 	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
 	// a recommendation whose fix another active run is already doing. Best-effort and
 	// self_improve-only; every other kind's claim stays byte-identical to today's.
-	if run.Kind == runkind.SelfImprove {
+	// Not for a profile-bound run: selfImproveOpenMRs builds a forge client from the
+	// connection's PAT, and stripForIsolation would clear all three anyway.
+	if run.Kind == runkind.SelfImprove && !isolated {
 		payload.InflightTargets = s.inflightTargets(ctx, run)
 		// PRD #686 M10 (D11/D12): the repo's currently-OPEN self-improve MRs' "what was
 		// proposed" text, so the picker chooses a non-overlapping improvement. Best-effort

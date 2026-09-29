@@ -4,6 +4,12 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
+	"strings"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/fetchctl"
@@ -18,6 +24,11 @@ import (
 // uzc_/uza_ Bearer) so `uzi run fetches` reaches it; STRICT owner-or-404 through
 // h.wsvc.GetRun, like the recovery archives (an admin viewing a foreign run is refused
 // too). A run that never fetched has an empty list.
+//
+// Keyset-paginated, because a log can hold up to fetch_max_run_attempts rows: ?limit= is
+// 1..fetchctl.FetchesPageSize (default that, larger values clamped to it), ?after= is the
+// next_cursor of the previous page (a row id of THIS run; anything else is 400). The page
+// asks for one row more than it returns to know whether next_cursor is due.
 func (h *Handler) ListRunFetches(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -37,13 +48,51 @@ func (h *Handler) ListRunFetches(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	rows, err := h.q.ListRunFetches(r.Context(), store.ListRunFetchesParams{RunID: runID, MaxRows: fetchctl.MaxListedFetches})
+	limit := int32(fetchctl.FetchesPageSize)
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 32)
+		if err != nil || n < 1 {
+			httpx.Error(w, http.StatusBadRequest, "limit must be a positive integer")
+			return
+		}
+		limit = int32(min(n, fetchctl.FetchesPageSize))
+	}
+	params := store.ListRunFetchesParams{
+		RunID:          runID,
+		AfterCreatedAt: pgtype.Timestamptz{InfinityModifier: pgtype.NegativeInfinity, Valid: true},
+		AfterID:        uuid.Nil,
+		MaxRows:        limit + 1,
+	}
+	if raw := strings.TrimSpace(r.URL.Query().Get("after")); raw != "" {
+		after, err := uuid.Parse(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, "after must be the next_cursor of a previous page")
+			return
+		}
+		cur, err := h.q.GetRunFetchCursor(r.Context(), store.GetRunFetchCursorParams{RunID: runID, ID: after})
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusBadRequest, "after is not a fetch of this run")
+			return
+		}
+		if err != nil {
+			slog.Error("run fetches: cursor", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		params.AfterCreatedAt, params.AfterID = cur.CreatedAt, cur.ID
+	}
+	rows, err := h.q.ListRunFetches(r.Context(), params)
 	if err != nil {
 		slog.Error("run fetches: list", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	out := apitypes.RunFetchesDTO{Fetches: make([]apitypes.RunFetchDTO, 0, len(rows))}
+	out := apitypes.RunFetchesDTO{}
+	if len(rows) > int(limit) {
+		rows = rows[:limit]
+		out.NextCursor = rows[len(rows)-1].ID.String()
+	}
+	out.Fetches = make([]apitypes.RunFetchDTO, 0, len(rows))
 	for _, f := range rows {
 		out.Fetches = append(out.Fetches, apitypes.RunFetchDTO{
 			ID:          f.ID.String(),

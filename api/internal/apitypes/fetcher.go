@@ -99,7 +99,10 @@ type RunFetchDTO struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
-// RunFetchesDTO is the owner read's envelope: every attempt, oldest first.
+// RunFetchesDTO is one page of the owner read, oldest first. NextCursor is set when more
+// rows follow: pass it back as ?after= to read the next page. It is the id of this page's
+// last row, and omitted on the last page.
 type RunFetchesDTO struct {
-	Fetches []RunFetchDTO `json:"fetches"`
+	Fetches    []RunFetchDTO `json:"fetches"`
+	NextCursor string        `json:"next_cursor,omitempty"`
 }

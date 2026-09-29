@@ -84,24 +84,6 @@ func (q *Queries) GetFetchCounters(ctx context.Context, runID uuid.UUID) (GetFet
 	return i, err
 }
 
-const getFetchCredentialRunByHash = `-- name: GetFetchCredentialRunByHash :one
-SELECT run_id, claim_generation FROM run_fetch_credentials WHERE token_hash = $1
-`
-
-type GetFetchCredentialRunByHashRow struct {
-	RunID           uuid.UUID `json:"run_id"`
-	ClaimGeneration int64     `json:"claim_generation"`
-}
-
-// Complete's credential lookup: the run and the generation the token belongs to. A revoked
-// credential still resolves, so an attempt admitted before the run ended is still logged.
-func (q *Queries) GetFetchCredentialRunByHash(ctx context.Context, tokenHash []byte) (GetFetchCredentialRunByHashRow, error) {
-	row := q.db.QueryRow(ctx, getFetchCredentialRunByHash, tokenHash)
-	var i GetFetchCredentialRunByHashRow
-	err := row.Scan(&i.RunID, &i.ClaimGeneration)
-	return i, err
-}
-
 const getRunEgressSnapshot = `-- name: GetRunEgressSnapshot :one
 SELECT egress_snapshot FROM runs WHERE id = $1
 `
@@ -111,6 +93,30 @@ func (q *Queries) GetRunEgressSnapshot(ctx context.Context, id uuid.UUID) ([]byt
 	var egress_snapshot []byte
 	err := row.Scan(&egress_snapshot)
 	return egress_snapshot, err
+}
+
+const getRunFetchCursor = `-- name: GetRunFetchCursor :one
+SELECT created_at, id FROM run_fetches
+WHERE run_id = $1 AND id = $2
+`
+
+type GetRunFetchCursorParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	ID    uuid.UUID `json:"id"`
+}
+
+type GetRunFetchCursorRow struct {
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID        uuid.UUID          `json:"id"`
+}
+
+// Resolves a page cursor (a row id the previous page returned) to its sort key, scoped
+// to the run so another run's row id is not a valid cursor here.
+func (q *Queries) GetRunFetchCursor(ctx context.Context, arg GetRunFetchCursorParams) (GetRunFetchCursorRow, error) {
+	row := q.db.QueryRow(ctx, getRunFetchCursor, arg.RunID, arg.ID)
+	var i GetRunFetchCursorRow
+	err := row.Scan(&i.CreatedAt, &i.ID)
+	return i, err
 }
 
 const insertFetchReservation = `-- name: InsertFetchReservation :one
@@ -178,18 +184,29 @@ func (q *Queries) InsertRunFetch(ctx context.Context, arg InsertRunFetchParams) 
 const listRunFetches = `-- name: ListRunFetches :many
 SELECT id, run_id, reservation_id, url, final_url, verdict, reason, http_status, content_type, bytes, sha256, started_at, finished_at, created_at FROM run_fetches
 WHERE run_id = $1
+  AND (created_at, id) > ($2::timestamptz, $3::uuid)
 ORDER BY created_at, id
-LIMIT $2
+LIMIT $4
 `
 
 type ListRunFetchesParams struct {
-	RunID   uuid.UUID `json:"run_id"`
-	MaxRows int32     `json:"max_rows"`
+	RunID          uuid.UUID          `json:"run_id"`
+	AfterCreatedAt pgtype.Timestamptz `json:"after_created_at"`
+	AfterID        uuid.UUID          `json:"after_id"`
+	MaxRows        int32              `json:"max_rows"`
 }
 
-// The owner read. The caller has already checked ownership.
+// One page of the owner read, keyset-paginated on (created_at, id), the order and the
+// columns of idx_run_fetches_run, so a deep page is an index range scan rather than an
+// OFFSET walk. The first page passes after_created_at = -infinity and after_id = the nil
+// uuid, which every row sorts after. The caller has already checked ownership.
 func (q *Queries) ListRunFetches(ctx context.Context, arg ListRunFetchesParams) ([]RunFetch, error) {
-	rows, err := q.db.Query(ctx, listRunFetches, arg.RunID, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listRunFetches,
+		arg.RunID,
+		arg.AfterCreatedAt,
+		arg.AfterID,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -216,6 +233,41 @@ func (q *Queries) ListRunFetches(ctx context.Context, arg ListRunFetchesParams) 
 			return nil, err
 		}
 		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockCredentialsWithStaleFetchReservations = `-- name: LockCredentialsWithStaleFetchReservations :many
+SELECT c.run_id FROM run_fetch_credentials c
+WHERE c.run_id IN (
+    SELECT fr.run_id FROM run_fetch_reservations fr
+    WHERE NOT fr.settled AND fr.created_at < $1
+)
+ORDER BY c.run_id
+FOR UPDATE OF c
+`
+
+// The stale sweep's first step: lock the credential of every run that has a reservation
+// older than @cutoff, in run_id order, before touching any reservation (the lock order
+// LockFetchCredentialRunByHash documents; the ORDER BY keeps two sweeps from interleaving
+// their multi-row acquisitions). ReleaseStaleFetchReservations then releases only these
+// runs' reservations.
+func (q *Queries) LockCredentialsWithStaleFetchReservations(ctx context.Context, cutoff pgtype.Timestamptz) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockCredentialsWithStaleFetchReservations, cutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var run_id uuid.UUID
+		if err := rows.Scan(&run_id); err != nil {
+			return nil, err
+		}
+		items = append(items, run_id)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -259,6 +311,33 @@ func (q *Queries) LockFetchCredentialByHash(ctx context.Context, tokenHash []byt
 		&i.RunClaimGeneration,
 		&i.EgressSnapshot,
 	)
+	return i, err
+}
+
+const lockFetchCredentialRunByHash = `-- name: LockFetchCredentialRunByHash :one
+SELECT run_id, claim_generation FROM run_fetch_credentials
+WHERE token_hash = $1
+FOR UPDATE
+`
+
+type LockFetchCredentialRunByHashRow struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Complete's credential lookup: the run and the generation the token belongs to. A revoked
+// credential still resolves, so an attempt admitted before the run ended is still logged.
+// FOR UPDATE, and BEFORE the reservation: every writer of these tables takes its locks in
+// one order, runs -> run_fetch_credentials -> run_fetch_reservations (the revoke trigger
+// and the claim-time mint from the run, Begin and this from the credential, the stale
+// sweep from the credentials of the runs it releases), so two of them can never each hold
+// the lock the other waits on. Taking the reservation first and the credential at
+// ReconcileFetchCounters, as a re-claim's mint holds the credential and then releases the
+// prior claim's reservations, is the deadlock this ordering rules out.
+func (q *Queries) LockFetchCredentialRunByHash(ctx context.Context, tokenHash []byte) (LockFetchCredentialRunByHashRow, error) {
+	row := q.db.QueryRow(ctx, lockFetchCredentialRunByHash, tokenHash)
+	var i LockFetchCredentialRunByHashRow
+	err := row.Scan(&i.RunID, &i.ClaimGeneration)
 	return i, err
 }
 
@@ -382,7 +461,9 @@ type ReleasePriorGenerationFetchReservationsParams struct {
 
 // At a re-claim's mint: the open reservations of an earlier claim belong to fetches whose
 // credential no longer exists, so they are released now rather than holding concurrency
-// slots until the stale sweep. Returns how many were released.
+// slots until the stale sweep. Returns how many were released. Runs after
+// MintRunFetchCredential in the same transaction, so the credential row is already locked
+// when the reservations are (the lock order LockFetchCredentialRunByHash documents).
 func (q *Queries) ReleasePriorGenerationFetchReservations(ctx context.Context, arg ReleasePriorGenerationFetchReservationsParams) (int64, error) {
 	row := q.db.QueryRow(ctx, releasePriorGenerationFetchReservations, arg.RunID, arg.ClaimGeneration)
 	var column_1 int64
@@ -395,6 +476,7 @@ WITH rel AS (
     UPDATE run_fetch_reservations fr
     SET settled = true, settled_at = now()
     WHERE NOT fr.settled AND fr.created_at < $1
+      AND fr.run_id = ANY($2::uuid[])
     RETURNING fr.run_id, fr.bytes
 ), agg AS (
     SELECT run_id, sum(bytes)::bigint AS b, count(*)::bigint AS n FROM rel GROUP BY run_id
@@ -410,11 +492,18 @@ WITH rel AS (
 SELECT count(*)::bigint FROM rel
 `
 
+type ReleaseStaleFetchReservationsParams struct {
+	Cutoff pgtype.Timestamptz `json:"cutoff"`
+	RunIds []uuid.UUID        `json:"run_ids"`
+}
+
 // The fetch_reservations_stale sweep: a reservation older than @cutoff belongs to a fetch
 // that crashed or lost its Complete, so its bytes and concurrency slot go back. The file
 // slot stays counted (the outcome is unknown). A late Complete still logs the attempt.
-func (q *Queries) ReleaseStaleFetchReservations(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
-	row := q.db.QueryRow(ctx, releaseStaleFetchReservations, cutoff)
+// Only the runs in @run_ids, whose credentials LockCredentialsWithStaleFetchReservations
+// locked in this transaction.
+func (q *Queries) ReleaseStaleFetchReservations(ctx context.Context, arg ReleaseStaleFetchReservationsParams) (int64, error) {
+	row := q.db.QueryRow(ctx, releaseStaleFetchReservations, arg.Cutoff, arg.RunIds)
 	var column_1 int64
 	err := row.Scan(&column_1)
 	return column_1, err

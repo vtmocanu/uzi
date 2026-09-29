@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -35,6 +36,7 @@ func TestAssembleClaimRefusesUnisolatableBoundRuns(t *testing.T) {
 
 func TestStripForIsolation(t *testing.T) {
 	iid := int64(1)
+	branch, base := "agent/issue-1-feature", "release-base"
 	p := &ClaimPayload{
 		IssueIID: &iid,
 		Repo:     ClaimRepo{ID: "r", URL: "u", CloneURL: "c", ForgeType: "github", SkillsEnabled: true},
@@ -47,13 +49,18 @@ func TestStripForIsolation(t *testing.T) {
 		SelfImproveDogfood:     true,
 		Pipeline:               &ClaimPipeline{},
 		ReviewComments:         &ReviewCommentsSnapshot{},
+		IssueComments:          &IssueCommentsSnapshot{Truncated: true},
+		Branch:                 &branch,
+		BaseBranch:             &base,
+		PrDescription:          &apitypes.PrDescriptionState{MrIid: 42},
 	}
 	stripForIsolation(p)
 	raw, err := json.Marshal(p)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, leak := range []string{"secret-pat", `"bot"`, `"jq"`, `"clone_url":"c"`, "inflight_targets", "self_improve_open_mrs", "known_improve_uzi_targets", `"pipeline"`, `"review_comments"`, `"codex"`} {
+	for _, leak := range []string{"secret-pat", `"bot"`, `"jq"`, `"clone_url":"c"`, "inflight_targets", "self_improve_open_mrs", "known_improve_uzi_targets", `"pipeline"`, `"review_comments"`, `"codex"`,
+		`"issue_comments"`, "agent/issue-1-feature", "release-base", `"pr_description"`} {
 		if strings.Contains(string(raw), leak) {
 			t.Errorf("stripped claim still carries %s: %s", leak, raw)
 		}

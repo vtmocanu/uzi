@@ -14,6 +14,13 @@
 // whose WHERE clause is the cap check, all in one transaction. Under READ COMMITTED the
 // lock orders concurrent Begins for a run, and each sees the counters the previous one
 // committed, so parallel fetches cannot jointly pass the check and overshoot a total.
+//
+// Lock order. Every transaction that writes these tables takes row locks in one order:
+// runs, then run_fetch_credentials, then run_fetch_reservations. The revoke trigger and the
+// claim-time mint start from the run; Begin, Complete and the stale sweep start from the
+// credential. Complete in particular locks the credential before the reservation it
+// settles, because a re-claim's mint holds the credential while it releases the prior
+// claim's reservations: the reverse order would let each wait on the other.
 package fetchctl
 
 import (
@@ -79,9 +86,11 @@ const (
 // reservation this old belongs to a fetch that crashed or lost its Complete.
 const StaleReservationAge = 10 * time.Minute
 
-// MaxListedFetches bounds the owner read: the attempts cap's ceiling
-// (settings fetch_max_run_attempts), so a run's whole log fits.
-const MaxListedFetches = 100000
+// FetchesPageSize is the owner read's default and largest page (GET
+// /api/runs/{id}/fetches?limit=). A run's log can hold up to the attempts cap's ceiling
+// (settings fetch_max_run_attempts, 100000 rows of up to ~8 KB of URL text each), so the
+// read is keyset-paginated and never loads a whole log into one response.
+const FetchesPageSize = 500
 
 // Verdicts of an attempt.
 const (
@@ -329,7 +338,11 @@ func (s *Service) Complete(ctx context.Context, r apitypes.FetcherCompleteReques
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
 
-	cred, err := q.GetFetchCredentialRunByHash(ctx, HashCredential(r.Credential))
+	// The credential row is locked FIRST, then the reservation: the same order as Begin and
+	// the claim-time mint (credential, then reservations). Locking the reservation first and
+	// the credential only at ReconcileFetchCounters would deadlock against a re-claim's mint,
+	// which holds the credential while it releases the prior claim's reservations.
+	cred, err := q.LockFetchCredentialRunByHash(ctx, HashCredential(r.Credential))
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCredentialInvalid
 	}
@@ -398,7 +411,17 @@ func (s *Service) SweepStale(ctx context.Context) (int64, error) {
 		return 0, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	n, err := store.New(tx).ReleaseStaleFetchReservations(ctx, pgtype.Timestamptz{Time: s.now().Add(-StaleReservationAge), Valid: true})
+	q := store.New(tx)
+	cutoff := pgtype.Timestamptz{Time: s.now().Add(-StaleReservationAge), Valid: true}
+	// Credentials first, then reservations: the lock order Complete and the mint take.
+	runs, err := q.LockCredentialsWithStaleFetchReservations(ctx, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	if len(runs) == 0 {
+		return 0, nil
+	}
+	n, err := q.ReleaseStaleFetchReservations(ctx, store.ReleaseStaleFetchReservationsParams{Cutoff: cutoff, RunIds: runs})
 	if err != nil {
 		return 0, err
 	}

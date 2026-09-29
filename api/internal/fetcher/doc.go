@@ -70,10 +70,15 @@
 //	      non-empty and max_bytes > 0, or the fetcher treats the answer as a control
 //	      failure (and the api's sweep releases the reservation).
 //	  403 apitypes.FetcherControlErrorDTO {reason: "credential_invalid"}
-//	      Unknown, revoked or terminal-run credential. The worker gets 401.
+//	      Unknown or revoked credential, one minted for an earlier claim of the run,
+//	      or a run that is not running. The worker gets 401.
 //	  429 apitypes.FetcherControlErrorDTO {reason: <admission code>}
-//	      A run total (bytes, files) or the concurrency limit is used up. The worker
-//	      gets 429 "admission_refused" with admission_reason = the api's code.
+//	      A cap refused the fetch. The codes (fetchctl.Admission*): "run_bytes" (the
+//	      run's byte total cannot fit another max_bytes), "run_files" (its file count
+//	      is used up), "concurrency" (its in-flight limit is reached; frees itself) and
+//	      "attempts" (its admission-request count, fetch_max_run_attempts, is used up;
+//	      requests refused at admission count too). The worker gets 429
+//	      "admission_refused" with admission_reason = the api's code.
 //	  anything else: control failure, the worker gets 503 "control_unavailable".
 //
 //	POST /api/fetcher/v1/complete   apitypes.FetcherCompleteRequest

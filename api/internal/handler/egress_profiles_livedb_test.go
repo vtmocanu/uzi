@@ -413,3 +413,42 @@ func TestEgressProfileTableChecksLiveDB(t *testing.T) {
 		t.Fatalf("a valid row was refused: %v", err)
 	}
 }
+
+// TestAdminEgressProfileDeleteReferencedByRunLiveDB: runs.egress_profile_id is ON DELETE
+// RESTRICT (PRD #1906 M3), so deleting a profile any run is bound to, a finished run
+// included, is a 409 that deletes nothing; once no run references it the same delete is
+// a 204. The 409 is the handler's mapping of that exact foreign key's violation, so a
+// renamed constraint would surface here as a 500.
+func TestAdminEgressProfileDeleteReferencedByRunLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	admin := cliSeedUser(t, pool, true)
+	adminJWT := cliMintJWT(t, pool, admin)
+	owner := cliSeedUser(t, pool, false)
+	repo := cliSeedOwnedRepo(t, pool, owner)
+
+	name := egressName(t, pool)
+	profile := uuid.New()
+	cliMustExec(t, pool, `INSERT INTO egress_profiles (id, name, hosts) VALUES ($1, $2, '{docs.example.com}')`, profile, name)
+	run := uuid.New()
+	cliMustExec(t, pool, `INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, egress_profile_id)
+	        VALUES ($1, $2, $3, 'issue', 1, 't', 'd', 'completed', $4)`, run, owner, repo, profile)
+	// Registered after egressName's cleanup, so it runs first and the profile can go.
+	t.Cleanup(func() { _, _ = pool.Exec(context.Background(), `DELETE FROM runs WHERE id = $1`, run) })
+
+	path := "/api/admin/egress-profiles/" + name
+	rec := cookieReq(t, router, http.MethodDelete, path, adminJWT, "")
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("delete of a profile a run references = %d, want 409\nbody: %s", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "referenced by runs") {
+		t.Fatalf("409 body = %s, want it to say runs reference the profile", rec.Body.String())
+	}
+	if n := egressProfileCount(t, pool, name); n != 1 {
+		t.Fatalf("profile count after the refused delete = %d, want 1", n)
+	}
+
+	cliMustExec(t, pool, `DELETE FROM runs WHERE id = $1`, run)
+	if rec := cookieReq(t, router, http.MethodDelete, path, adminJWT, ""); rec.Code != http.StatusNoContent {
+		t.Fatalf("delete once no run references it = %d, want 204\nbody: %s", rec.Code, rec.Body.String())
+	}
+}

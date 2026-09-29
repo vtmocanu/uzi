@@ -203,7 +203,7 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
 ## Research fetch caps
 
-Four limits bound what one official-sources research run may download (see
+Five limits bound what one official-sources research run may download (see
 [Egress profiles](./egress-profiles.md)). The run lane that uses them is not
 enabled yet, so today they are stored and validated but nothing reads them.
 
@@ -213,6 +213,7 @@ enabled yet, so today they are stored and validated but nothing reads them.
 | `fetch_max_run_bytes` | 209715200 (200 MiB) | The total one run may download. 1 to 10737418240 (10 GiB). |
 | `fetch_max_run_files` | 100 | How many downloads one run may make. 1 to 10000. |
 | `fetch_max_concurrent_per_run` | 4 | How many fetches one run may have in flight at once. 1 to 32. |
+| `fetch_max_run_attempts` | 500 | How many fetch requests one run may make, allowed or refused, so a run that has used up its bytes or files can't keep asking. 1 to 100000. |
 
 There is no "unlimited" value: `0` is refused. Edit them on **Admin → Instance
 → Research fetch caps**, which shows the two byte caps in MiB (a fraction such

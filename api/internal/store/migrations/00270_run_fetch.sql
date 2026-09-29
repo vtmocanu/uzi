@@ -119,10 +119,20 @@ CREATE INDEX idx_run_fetches_run ON run_fetches (run_id, created_at, id);
 -- or running state": a terminal status (completed, failed, cancelled), a requeue (queued,
 -- including a claim-assembly failure that requeues and SweepClaimedNeverStarted), any park
 -- (limit_wait, pool_wait, recovery_wait, paused, awaiting_*). Once revoked, only the next
--- claim's mint un-revokes, and that mint also rotates the token. A research run never needs
--- its credential outside running (Begin requires 'running' anyway), so there is no state in
--- which revoking early loses anything, and this one rule covers every current and future
--- park, requeue and terminal writer without naming them.
+-- claim's mint un-revokes, and that mint also rotates the token. Begin requires 'running'
+-- anyway, and this one rule covers every current and future park, requeue and terminal
+-- writer without naming them.
+--
+-- Revoking early loses nothing ONLY because a bound run never comes back to running
+-- without a new claim. Most parks resume through 'queued' and a re-claim, whose mint
+-- issues a fresh credential. Three statuses resume IN PLACE instead (SetRunRunning takes
+-- awaiting_approval, awaiting_input and awaiting_followup straight back to running, with
+-- no claim and so no mint), which would leave the resumed run holding a revoked
+-- credential and every fetch refused. The research runner never reports them today (it
+-- reports running, completed and failed only), and runs_egress_profile_no_in_place_park
+-- below makes that a schema rule rather than a property of one runner: a bound run
+-- cannot enter those statuses at all, whoever writes them. A future in-place resume for a
+-- bound run has to re-mint (or not revoke) first, and then relax that CHECK.
 -- +goose StatementBegin
 CREATE FUNCTION run_fetch_credential_revoke() RETURNS trigger AS $$
 BEGIN
@@ -142,7 +152,12 @@ CREATE TRIGGER run_fetch_credential_revoke_trg
           AND NEW.status NOT IN ('claimed', 'running'))
     EXECUTE FUNCTION run_fetch_credential_revoke();
 
+ALTER TABLE runs ADD CONSTRAINT runs_egress_profile_no_in_place_park
+    CHECK (egress_profile_id IS NULL
+           OR status NOT IN ('awaiting_approval', 'awaiting_input', 'awaiting_followup'));
+
 -- +goose Down
+ALTER TABLE runs DROP CONSTRAINT runs_egress_profile_no_in_place_park;
 DROP TRIGGER run_fetch_credential_revoke_trg ON runs;
 DROP FUNCTION run_fetch_credential_revoke();
 DROP TABLE run_fetches;
