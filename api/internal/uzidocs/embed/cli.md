@@ -1624,7 +1624,7 @@ is a conflict (exit 5); an unknown or foreign `<finding-id>` is not-found (exit 
 each finding linked to it. Every id (older evidence ids included) resolves to its
 coordinate and duplicates count once; if a single coordinate remains it is filed as
 above. At most 50 distinct ids per call, and an id with no triage record yet is a usage
-error (exit 2) raised before any request. It is all or nothing: if any chosen
+error (exit 2) raised before anything is filed. It is all or nothing: if any chosen
 coordinate is already filed, dismissed or held, the call is a conflict (exit 5) and
 stderr lists the `pending operation <op>` ids holding them. `--json` returns
 `{operation_id, disposition_ids, phase, issue?, warning?}`, the issue plus the linked

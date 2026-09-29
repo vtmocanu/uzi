@@ -59,7 +59,7 @@ one issue** in the selection bar. It is enabled for 2 to 50 selected open
 findings that have evidence and belong to the same repo. uzi opens the
 editable issue draft with the repo fixed, listing every selected finding's
 location and title; change the title, description, or labels as you would for a
-single finding, then file. Afterwards every selected finding shows as **Filed**
+single finding, then file. Once the filing settles, every selected finding shows as **Filed**
 against the same issue, and any warning uzi returns is shown with the result.
 
 Filing is all or nothing: uzi claims every selected finding before it talks to
