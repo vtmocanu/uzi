@@ -20,6 +20,7 @@ import {
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
+  CLAUDE_LONG_COMMAND_APPEND,
   WORKER_RUNTIME_APPEND,
 } from "../src/prompt.js";
 import type { AgentTemplate } from "../src/protocol.js";
@@ -31,9 +32,10 @@ const FINDINGS_TOOL = reportIncidentalIssueToolName();
 // PRD #702 M5: toDefinition also appends the worker-runtime deps note (WORKER_RUNTIME_APPEND)
 // after the findings nudge, in that order — mirror the composition here.
 // PRD #1120: then the secret-fixture hygiene rule (SECRET_FIXTURE_HYGIENE_APPEND).
+// Then the Claude-only long-command recipe (CLAUDE_LONG_COMMAND_APPEND).
 // Issue #1660: and the worker-owned safety block (SUBAGENT_SAFETY_APPEND) last.
 const withNudge = (body: string) =>
-  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
+  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CLAUDE_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
 
 const coder: AgentTemplate = {
   name: "coder",

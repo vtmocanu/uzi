@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Agents wait for long gates and report only what they observed.**
+  Judge recommendations and past review findings showed runs losing long quality gates at the turn boundary and leads reporting checkpoints or gates they had not seen finish. The lead and every subagent now learn that a command still running at turn end is lost, Claude-harness agents get a bounded way to wait past the two-minute Bash timeout, and agents are told the worker has no forge CLI. The lead template now checks exhaustive and reuse claims before submitting a plan, keeps validators to focused tests while its gate runs, keeps committed, reviewed, checkpointed and signalled states apart, and names accepted risks in the PR summary. The built-in lead refreshes on the next boot unless customized.
+
 - **uzi's self-improvement runs gate through the Taskfile and re-check old recommendations.**
   On a repo opted into uzi dogfooding, the self-improvement run now passes `task gate:repo` plus the touched components' gates and, for web changes, the production build (reporting a missing `task` as a gate failure) instead of a stale hand-written test list, confirms a judge recommendation still holds on current code (and is not already fixed by an open merge request) before acting on it, prefers a fix several recommendations share, and never edits the built-in agent templates copied verbatim from upstream.
 

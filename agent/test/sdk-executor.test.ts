@@ -18,6 +18,7 @@ import {
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
+  CLAUDE_LONG_COMMAND_APPEND,
   WORKER_RUNTIME_APPEND,
 } from "../src/prompt.js";
 import type { WorkerClient } from "../src/client.js";
@@ -62,7 +63,7 @@ const FAKE_JOIN_TOKEN = "dummy-join-token-do-not-scan-2222";
 // the discovery nudge to every subagent prompt. Reference the helper, not a literal.
 const FINDINGS_TOOL = reportIncidentalIssueToolName();
 const withNudge = (body: string) =>
-  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
+  `${body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CLAUDE_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
 
 const coder: AgentTemplate = { name: "coder", description: "writes code", prompt_body: "You implement.", tools: ["Read", "Edit", "Write", "Bash"] };
 const reviewer: AgentTemplate = { name: "reviewer", description: "reviews", prompt_body: "You review.", tools: ["Read", "Grep"] };
@@ -637,6 +638,12 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     const append = appendOf(impl.systemPrompt);
     assert.ok(append.includes("LEAD SYSTEM PROMPT"), "the own builtin lead prompt runs the main thread");
     assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
+  });
+
+  it("the Claude lead's plan and implement system prompts carry the Claude long-command recipe", async () => {
+    const { turns } = await runWith({}, approveWith("own"));
+    assert.ok(appendOf(turns[0]!.options.systemPrompt).includes(CLAUDE_LONG_COMMAND_APPEND), "plan turn");
+    assert.ok(appendOf(turns[1]!.options.systemPrompt).includes(CLAUDE_LONG_COMMAND_APPEND), "implement turn");
   });
 
   it("repo source adds the untrusted-review passage to the lead prompt; own does not", async () => {

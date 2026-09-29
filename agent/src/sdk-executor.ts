@@ -1416,6 +1416,7 @@ export class SdkExecutor implements Executor {
       systemPrompt: buildLeadSystemPrompt(assembled.leadSystemPrompt, {
         kind: ctx.kind,
         repoInstructions: repoInstructionsBlock,
+        harness: "claude",
       }),
       agents: planTurn.subagents,
       mcpServers,
@@ -2236,6 +2237,7 @@ export class SdkExecutor implements Executor {
           repoSourced: selection.source === "repo",
           kind: ctx.kind,
           repoInstructions: repoInstructionsBlock,
+          harness: "claude",
         }),
         preToolUse: preToolUse(selectedNames),
       };
