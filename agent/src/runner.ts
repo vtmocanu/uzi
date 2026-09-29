@@ -5213,8 +5213,9 @@ export class RunRunner {
     // checkpoint scan counts non-merge commits with hunks and scans each merge's own (remerge-diff)
     // contribution, and it excludes ONLY published content (published-only floors, never a bare local
     // checkpointFloor), so a local-only bridge's content IS scanned. On a TRUSTED finding: remember
-    // the commits as flagged, report push_secret_blocked (no preserved_patch), no push. On
-    // untrusted/clean: fail open (unchanged; GH013 still backstops GitHub at the push catch).
+    // the commits as flagged, report push_secret_blocked (no preserved_patch), no push. On an
+    // UNTRUSTED scan after a known finding (everKnown): fail closed, like D5. Otherwise
+    // untrusted/clean fails open (GH013 still backstops GitHub at the push catch).
     const scanBridgedRangeAndBlock = async (scanBare: string): Promise<"blocked" | "ok"> => {
       const scanTip = await this.git.trackingTip(scanBare, result.branch);
       let untrustedWhy = "tracking_tip_unreadable";

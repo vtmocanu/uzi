@@ -3787,8 +3787,9 @@ export class GitCache {
       ) {
         scanFloorShas.push(confirmed);
       }
-      // issue #1932: extra scan floors (every tip that may already be durable: the checkpoint floor,
-      // an attempted/confirmed checkpoint tip, the published tip). Same admission rule as
+      // issue #1932: extra scan floors — ONLY tips proven published (confirmed published real tips,
+      // an attempted/confirmed checkpoint tip, the published tip); a caller must never pass a local-only
+      // checkpoint floor (bridge), or content under it would go unscanned. Same admission rule as
       // `confirmedTip`: 40-hex, resolves to itself, an ancestor of the tip; a non-ancestor is
       // dropped and duplicates of the exclude floor or another floor are skipped.
       for (const floor of opts.extraFloors ?? []) {
