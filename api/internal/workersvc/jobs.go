@@ -329,6 +329,9 @@ func knownJobType(t string) bool {
 	return false
 }
 
+// errJobNoTransaction: a live store without a transaction beginner cannot create a job atomically.
+var errJobNoTransaction = errors.New("workersvc: job create needs a transaction beginner")
+
 // CreateJobRun creates a queued job run for the caller. Validation runs before any transaction;
 // the harness resolution (an EXPLICIT Claude pin: a job is Claude-only, never falling back to
 // Codex), the per-user advisory lock, the active-job cap, the product allow-list, the run INSERT,
@@ -351,7 +354,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 	if _, live := s.q.(*store.Queries); live && s.txBeginner == nil {
 		// Without a transaction createRunAtomic's no-tx branch would split the advisory lock, the
 		// cap check and the inserts apart. Fail closed rather than lose the cap's atomicity.
-		return JobView{}, errHarnessStoreUnavailable
+		return JobView{}, errJobNoTransaction
 	}
 	maxActive, err := s.jobMaxActive(ctx)
 	if err != nil {

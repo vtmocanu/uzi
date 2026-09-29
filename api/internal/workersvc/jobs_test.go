@@ -187,3 +187,13 @@ func TestDefaultJobMaxActiveMatchesSettings(t *testing.T) {
 		t.Errorf("defaultJobMaxActive = %d, settings default = %d", defaultJobMaxActive, n)
 	}
 }
+
+// TestCreateJobRunRefusesWithoutTransaction pins the fail-closed guard: a live store without a
+// transaction beginner must refuse rather than split the cap lock from the inserts.
+func TestCreateJobRunRefusesWithoutTransaction(t *testing.T) {
+	svc := &Service{q: store.New(nil)}
+	p := CreateJobParams{Caller: JobCaller{UserID: uuid.New()}, JobType: runkind.JobTypeResearch, Title: "t", Prompt: "p"}
+	if _, err := svc.CreateJobRun(context.Background(), p); !errors.Is(err, errJobNoTransaction) {
+		t.Fatalf("err = %v, want errJobNoTransaction", err)
+	}
+}
