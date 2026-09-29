@@ -192,6 +192,7 @@ interface Flight {
   runner: RunRunner;
   done: Promise<void>;
   finished: boolean;
+  error?: unknown;
   stateFrom: number;
   seqFrom: number;
   turnFrom: number;
@@ -323,7 +324,8 @@ class Scenario {
       () => {
         flight.finished = true;
       },
-      () => {
+      (error) => {
+        flight.error = error;
         flight.finished = true;
       },
     );
@@ -1415,6 +1417,7 @@ describe("shutdown at an observed plan gate", () => {
         flight.runner.shutdown();
         assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
         await flight.done;
+        assert.equal(flight.error, undefined, "shutdown completed without an execution error");
         assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");
         assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"), s.statuses(flight).join(","));
         assert.equal(s.persistedGate()?.plan_md, PLAN_V1, "the submitted plan remains persisted");
@@ -1433,6 +1436,7 @@ describe("shutdown at an observed plan gate", () => {
         if (session === "kept") {
           await s.finish(resumed);
           assert.equal(nextGate.plan_md, PLAN_V1, "the submitted plan is re-presented");
+          assert.deepEqual(nextGate.milestones, V1_MILESTONES, "the candidate milestones are re-presented");
           assert.equal(nextGate.presentation_id, persisted.presentationId, "the same gate id is retained");
           assert.deepEqual(api.gateOf(s.runId), persisted, "the same revision is retained");
           assert.equal(api.inputReceiptCalls.filter((c) => c.runId === s.runId && c.kind === "applied" && c.ids.includes(pending!.id)).length, 1, "the bound approval is applied exactly once");
