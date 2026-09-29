@@ -174,6 +174,8 @@ const MAX_FAILURE_REASON_LEN = 512;
 const SECRET_REMEDIATION_MAX_ATTEMPTS = 2;
 /** issue #1932: cap on the trusted-flagged commit SHAs kept per run for the ancestry checks. */
 const FLAGGED_COMMITS_CAP = 500;
+/** issue #1932: cap on the confirmed-published real-branch tips kept per run (oldest dropped). */
+const PUBLISHED_REAL_TIPS_CAP = 64;
 
 /** The three authoritative TERMINAL run statuses. A run in any of these can never
  *  write again, so its retained recovery clone is safe to reclaim. Used by the
@@ -1434,6 +1436,13 @@ interface RunFlight {
   /** PRD #1416 M1: floor C, initialised to P (`publishedTip`). Advanced to each confirmed
    *  checkpoint tip by later milestones (M2/M3); M1 only seeds it. */
   checkpointFloor?: string;
+  /** issue #1932: real-branch tips that were CONFIRMED published (40-hex, deduped, capped): the
+   *  pinned and unpinned confirmed-publish sites of doCheckpointPublish record here. The secret
+   *  remediation scans use ONLY these (plus `publishedTip`, the confirmed/attempted checkpoint ref
+   *  tips) as `^` exclusion floors and at-floor classifiers; a bare `checkpointFloor` that is not in
+   *  this list can be a local-only bridge (set by bridgeBareTrackingRefIfDivergent even when the
+   *  publish is later held) and must never hide content from a scan. */
+  publishedRealTips?: string[];
   /** PRD #1416 M2: the set of fetched tips already steered on for a divergence, so the mid-run
    *  detection emits AT MOST ONE status + steer per distinct tip. A repeated checkpoint tick that
    *  re-fetches the SAME diverged tip emits nothing; a FURTHER rewrite (a new tip) is a new key
@@ -1455,8 +1464,13 @@ interface RunFlight {
    *  `flaggedCommits` / `flaggedFindings` = every trusted-flagged commit SHA (40-hex, deduped, capped)
    *  ever seen in the run, with its finding. `checkpointFloor` can be a LOCAL-ONLY bridge commit that
    *  contains a flagged commit and is never published, so a floor exclusion can hide a finding from
-   *  a range scan: ancestry of these commits against the tip is authoritative (the gate's clean
-   *  branch and D5 fail while any is still an ancestor), and floors are only an optimisation. */
+   *  a range scan. Two rules follow. (1) Floors for the remediation scans are PUBLISHED-ONLY
+   *  (`publishedRealTips`, `publishedTip`, the confirmed/attempted checkpoint ref tips), never a bare
+   *  `checkpointFloor`, so content under a local-only bridge is scanned and stays remediable.
+   *  (2) Ancestry of the retained flagged commits against a tip is authoritative: the gate's clean
+   *  branch, D5, and a re-check after EVERY finalize bridge (which can wrap the pushed tip over a
+   *  local-only floor and re-add hidden content) fail while any is still an ancestor. `overflow` =
+   *  the flagged-commit list hit its cap, after which the gate and D5 fail closed. */
   secretRemediation?: {
     attempts: number;
     known?: SecretFinding[];
@@ -1466,6 +1480,7 @@ interface RunFlight {
     cleanTip?: string;
     everKnown?: boolean;
     withholdPaths?: boolean;
+    overflow?: boolean;
   };
 }
 
@@ -1502,6 +1517,8 @@ export interface CheckpointTestHooks {
   tickKillGraceMs?: number;
   /** The checkpoint secret-scan deadline (default CHECKPOINT_SCAN_TIMEOUT_MS, 60s). */
   scanDeadlineMs?: number;
+  /** Override FLAGGED_COMMITS_CAP (the per-run flagged-commit list cap) so a test can reach overflow. */
+  flaggedCommitsCap?: number;
   /** Observe the flight bookkeeping right after a confirmed PINNED publish. */
   afterPinnedPublish?: (state: { publishedTip: string; lastPublishedTip?: string; checkpointFloor?: string }) => void;
   /** Observe the flight bookkeeping right after a confirmed UNPINNED (overlay/plain) publish. */
@@ -4600,6 +4617,42 @@ export class RunRunner {
       }
     };
 
+    // issue #1932: the ONE terminal reporter for a secret-remediation block, shared by D5 below and by
+    // the post-bridge re-check at both finalize bridge sites. `findings` undefined = an untrusted
+    // re-scan after a known finding (fixed reason, no finding data). Nothing is pushed, no
+    // preserved_patch is attached (the diff may carry the secret).
+    const reportRemediationBlocked = async (
+      findings: SecretFinding[] | undefined,
+      withholdFromState: boolean,
+    ): Promise<void> => {
+      let reason: string;
+      let statusText: string;
+      if (findings) {
+        const withholdPaths = withholdFromState || (await this.withholdPathsFor(findings));
+        reason = composeLocalScanBlockedReason(findings, { redact: redactText, withholdPaths });
+        statusText = `the pre-push secret scan flagged ${renderSecretFindings(findings, { redact: redactText, withholdPaths })}; failing early without pushing — the diff is withheld because it may carry the secret`;
+        runLog.info(
+          "run failed: the pre-exit secret remediation gate blocked the branch; withholding diff (it may carry the secret)",
+          {
+            run_id: runId,
+            findings: findings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
+          },
+        );
+      } else {
+        reason =
+          "This run's branch was not pushed: a secret finding was flagged earlier in the run and the branch changed after the last clean scan, but the re-scan of the final branch could not be trusted. " +
+          "The diff is withheld because it may carry the detected secret; if a durable-recovery archive of this run is available, export it with `uzi run export`.";
+        statusText =
+          "a secret finding was flagged earlier and the branch changed after the last clean scan, but the re-scan of the final branch could not be trusted; failing early without pushing — the diff is withheld because it may carry the secret";
+        runLog.info("run failed: the final-branch secret re-scan was untrusted after a known finding; withholding diff", {
+          run_id: runId,
+        });
+      }
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: statusText } });
+      await closeBatcher();
+      await reportPushSecretBlocked(reason);
+    };
+
     // issue #1932 D5: the pre-exit secret remediation gate's verdict is enforced HERE, on EVERY
     // forge (GitLab/Forgejo have no finalize scan, so this is their only guard). Fail terminally
     // (push_secret_blocked, no push, no preserved_patch, recovery pin kept for `uzi run export`) when
@@ -4622,6 +4675,11 @@ export class RunRunner {
       let withholdFromState = remediationState.withholdPaths === true;
       if (remediationState.blocked && remediationState.blocked.length > 0) {
         remediationFindings = remediationState.blocked;
+      } else if (remediationState.overflow === true) {
+        // The flagged-commit list overflowed its cap: an unrecorded flagged commit could be hidden, so
+        // fail closed on what is recorded (never on a partial "clean").
+        remediationFindings = remediationState.flaggedFindings ?? remediationState.known;
+        if (!remediationFindings || remediationFindings.length === 0) rescanUntrusted = true;
       } else if (remediationState.known && remediationState.known.length > 0) {
         remediationFindings = remediationState.known;
       } else if (remediationState.everKnown === true) {
@@ -4660,33 +4718,7 @@ export class RunRunner {
         }
       }
       if (remediationFindings || rescanUntrusted) {
-        let reason: string;
-        let statusText: string;
-        if (remediationFindings) {
-          const withholdPaths = withholdFromState || (await this.withholdPathsFor(remediationFindings));
-          reason = composeLocalScanBlockedReason(remediationFindings, { redact: redactText, withholdPaths });
-          statusText = `the pre-push secret scan flagged ${renderSecretFindings(remediationFindings, { redact: redactText, withholdPaths })}; failing early without pushing — the diff is withheld because it may carry the secret`;
-          runLog.info(
-            "run failed: the pre-exit secret remediation gate blocked the branch; withholding diff (it may carry the secret)",
-            {
-              run_id: runId,
-              findings: remediationFindings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
-            },
-          );
-        } else {
-          reason = (
-            "This run's branch was not pushed: a secret finding was flagged earlier in the run and the branch changed after the last clean scan, but the re-scan of the final branch could not be trusted. " +
-            "The diff is withheld because it may carry the detected secret; if a durable-recovery archive of this run is available, export it with `uzi run export`."
-          );
-          statusText =
-            "a secret finding was flagged earlier and the branch changed after the last clean scan, but the re-scan of the final branch could not be trusted; failing early without pushing — the diff is withheld because it may carry the secret";
-          runLog.info("run failed: the final-branch secret re-scan was untrusted after a known finding; withholding diff", {
-            run_id: runId,
-          });
-        }
-        batcher.emit({ kind: "status", agent: "worker", payload: { text: statusText } });
-        await closeBatcher();
-        await reportPushSecretBlocked(reason);
+        await reportRemediationBlocked(remediationFindings, withholdFromState);
         return;
       }
     }
@@ -5202,12 +5234,42 @@ export class RunRunner {
         return "blocked";
       }
       if (!scan.trusted) {
+        if (flight.secretRemediation?.everKnown === true) {
+          // A finding was known earlier in this run and this post-bridge scan cannot be trusted:
+          // failing open here is how a bridge over a local-only floor pushed a flagged commit.
+          runLog.warn("post-bridge secret scan untrusted after a known finding; failing closed", { run_id: runId });
+          await reportRemediationBlocked(undefined, false);
+          return "blocked";
+        }
         runLog.warn(
           "post-bridge secret scan: not trustworthy (broken/empty); pushing and relying on the GH013 remote backstop where it exists",
           { run_id: runId },
         );
       }
       return "ok";
+    };
+
+    // issue #1932: after a finalize bridge (or an align re-fetch) moved the tracking tip, re-check the
+    // retained flagged commits against the tip that is ABOUT to be pushed. A bridge wraps the tip over
+    // the published AND checkpoint floors, and a checkpoint floor can be a local-only bridge that
+    // contains a flagged commit, so the bridged tip can re-add content the earlier gates cleared.
+    // Reports push_secret_blocked (no push, no preserved_patch) and returns "blocked" on a reachable
+    // flagged commit; an unreadable tracking tip after a known finding fails closed the same way.
+    const recheckFlaggedBeforePush = async (scanBare: string): Promise<"blocked" | "ok"> => {
+      const st = flight.secretRemediation;
+      if (!st || (st.everKnown !== true && (st.flaggedCommits?.length ?? 0) === 0)) return "ok";
+      const tip = await this.git.trackingTip(scanBare, result.branch);
+      if (tip === null) {
+        runLog.warn("pre-push flagged-commit re-check: tracking tip unreadable after a known finding; failing closed", {
+          run_id: runId,
+        });
+        await reportRemediationBlocked(undefined, false);
+        return "blocked";
+      }
+      const still = await this.reachableFlaggedFindings(st, scanBare, tip);
+      if (still.length === 0) return "ok";
+      await reportRemediationBlocked(still, st.withholdPaths === true);
+      return "blocked";
     };
 
     // Whether the push must take the post-bridge scan: finalize bridged just now, OR the pushed
@@ -5534,8 +5596,9 @@ export class RunRunner {
               // enclosing align try/catch and the outer finalize catch propagate it without pushing or
               // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
               if (
-                (await needsBridgeScan(o.kind, alignBarePath)) &&
-                (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked"
+                (await recheckFlaggedBeforePush(alignBarePath)) === "blocked" ||
+                ((await needsBridgeScan(o.kind, alignBarePath)) &&
+                  (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked")
               ) {
                 throw new PushSecretBlockedSignal();
               }
@@ -5833,8 +5896,9 @@ export class RunRunner {
       // push_secret_blocked and STOPS (a direct return unwinds the whole finalize, like the
       // failHistoryRewritten site above).
       if (
-        (await needsBridgeScan(o.kind, finalizeBarePath)) &&
-        (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked"
+        (await recheckFlaggedBeforePush(finalizeBarePath)) === "blocked" ||
+        ((await needsBridgeScan(o.kind, finalizeBarePath)) &&
+          (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked")
       ) {
         return;
       }
@@ -7828,6 +7892,7 @@ export class RunRunner {
                 flight.lastPublishedTip = bridgedTip && fetchedTip ? fetchedTip : tipSha;
                 flight.landedCheckpoint = true;
                 flight.checkpointFloor = tipSha;
+                this.recordPublishedRealTip(flight, tipSha);
                 this.checkpointTestHooks?.afterPinnedPublish?.({
                   publishedTip: tipSha,
                   lastPublishedTip: flight.lastPublishedTip,
@@ -7862,6 +7927,7 @@ export class RunRunner {
                     : packedClone
                       ? cloneTip
                       : (fetchedTip ?? flight.checkpointFloor);
+                this.recordPublishedRealTip(flight, flight.checkpointFloor);
                 this.checkpointTestHooks?.afterUnpinnedPublish?.({
                   cloneTip,
                   fetchedTip,
@@ -9559,8 +9625,11 @@ export class RunRunner {
     | { trusted: true; range: CheckpointRange; findings: SecretFinding[]; floorCandidates: string[] }
     | { trusted: false; why: string }
   > {
+    // PUBLISHED-ONLY floors: never a bare flight.checkpointFloor (it can be a local-only bridge that
+    // contains a flagged commit). lastAttemptedCheckpointRefTip is an ambiguous publish and counts as
+    // published; lastCheckpointRefTip stays an ancestor-checked floor (resolveCheckpointRange).
     const floorCandidates = [
-      flight.checkpointFloor,
+      ...(flight.publishedRealTips ?? []),
       flight.lastAttemptedCheckpointRefTip,
       flight.publishedTip,
       flight.lastCheckpointRefTip,
@@ -9575,6 +9644,15 @@ export class RunRunner {
     return { trusted: true, range, findings: scan.findings, floorCandidates };
   }
 
+  /** issue #1932: remember a CONFIRMED-published real-branch tip (validated 40-hex, deduped, capped). */
+  private recordPublishedRealTip(flight: RunFlight, sha: string | null | undefined): void {
+    if (typeof sha !== "string" || !/^[0-9a-f]{40}$/.test(sha)) return;
+    const tips = (flight.publishedRealTips ??= []);
+    if (tips.includes(sha)) return;
+    tips.push(sha);
+    if (tips.length > PUBLISHED_REAL_TIPS_CAP) tips.shift();
+  }
+
   /**
    * issue #1932: remember every trusted-flagged commit of the run (validated 40-hex, deduped, capped)
    * with its finding, so a later scan whose range hides the commit behind a floor cannot un-know it.
@@ -9582,13 +9660,21 @@ export class RunRunner {
   private recordFlaggedCommits(
     state: NonNullable<RunFlight["secretRemediation"]>,
     findings: SecretFinding[],
+    runLog: Logger,
   ): void {
+    const cap = this.checkpointTestHooks?.flaggedCommitsCap ?? FLAGGED_COMMITS_CAP;
     const commits = (state.flaggedCommits ??= []);
     const kept = (state.flaggedFindings ??= []);
     for (const f of findings) {
       if (typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit)) continue;
       const sha = f.commit.toLowerCase();
-      if (commits.includes(sha) || commits.length >= FLAGGED_COMMITS_CAP) continue;
+      if (commits.includes(sha)) continue;
+      if (commits.length >= cap) {
+        // Fail closed: an unrecorded flagged commit could later hide behind a floor or a bridge.
+        if (!state.overflow) runLog.warn("flagged-commit list overflowed its cap; the gate and finalize now fail closed", { cap });
+        state.overflow = true;
+        continue;
+      }
       commits.push(sha);
       kept.push(f);
     }
@@ -9640,6 +9726,7 @@ export class RunRunner {
     const { runLog, runId } = flight;
     const state = (flight.secretRemediation ??= { attempts: 0 });
     if (state.blocked && state.blocked.length > 0) return { action: "fail" };
+    if (state.overflow) return { action: "fail" };
     if (!barePath) return { action: "proceed" };
     const branch = runnerClone.branch;
     const failOrProceed = (why: string): SecretRemediationDecision => {
@@ -9676,7 +9763,13 @@ export class RunRunner {
         }
         findings = still;
       }
-      this.recordFlaggedCommits(state, findings);
+      this.recordFlaggedCommits(state, findings, runLog);
+      if (state.overflow) {
+        state.known = findings;
+        state.blocked = findings;
+        state.everKnown = true;
+        return { action: "fail" };
+      }
       // issue #1932 D6(c): a committed filename can itself be a secret. Scan the raw path list with
       // gitleaks before rendering anything; an untrusted or flagging scan withholds EVERY path on
       // every surface (prompt, feed, failure_reason, log).
@@ -9718,7 +9811,9 @@ export class RunRunner {
       // An ancestor-verified floor: the checkpoint floor when it is one of the range's scan floors,
       // else the range's exclude SHA.
       const floorSha =
-        flight.checkpointFloor && range.scanFloorShas?.includes(flight.checkpointFloor)
+        flight.checkpointFloor &&
+        (flight.publishedRealTips ?? []).includes(flight.checkpointFloor) &&
+        range.scanFloorShas?.includes(flight.checkpointFloor)
           ? flight.checkpointFloor
           : range.excludeSha;
       const renderOpts = { redact: flight.redactText, withholdPaths };

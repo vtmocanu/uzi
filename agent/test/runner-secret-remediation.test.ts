@@ -109,6 +109,8 @@ const forgeClaim = (iid: number, forge: "github" | "gitlab") =>
 interface Drive {
   claim: ReturnType<typeof gitlabClaim>;
   pushes: () => number;
+  /** The tracking tip at each pushBranch call (the tip that would have been pushed). */
+  pushedTips: string[];
   pub: Landed;
   pins: Array<{ sourceSha: string; branch: string }>;
   logs: unknown[];
@@ -128,11 +130,15 @@ async function drive(opts: {
   configureRunner?: (r: RunRunner) => void;
   /** Mutate the flight state just before each gate call (seed a floor the rig cannot reach). */
   seedFlight?: (flight: Record<string, unknown>) => void;
+  /** Extra checkpointTestHooks (e.g. a low flagged-commit cap). */
+  hooks?: { flaggedCommitsCap?: number };
 }): Promise<Drive> {
   const g = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: REAL }));
   let pushed = 0;
-  (g as unknown as { pushBranch: unknown }).pushBranch = async () => {
+  const pushedTips: string[] = [];
+  (g as unknown as { pushBranch: unknown }).pushBranch = async (bare: string, branch: string) => {
     pushed++;
+    pushedTips.push(trackingOf(bare, branch));
   };
   opts.configure?.(g);
   const pub = stubPublish();
@@ -170,6 +176,7 @@ async function drive(opts: {
       gitlab,
       github,
       checkpointIntervalMs: 60_000,
+      ...(opts.hooks ? { checkpointTestHooks: opts.hooks } : {}),
     },
   );
   opts.configureRunner?.(runner);
@@ -192,6 +199,7 @@ async function drive(opts: {
   self = {
     claim,
     pushes: () => pushed,
+    pushedTips,
     pub,
     pins,
     logs: lines,
@@ -252,7 +260,6 @@ function publishOriginBranch(name: string): string {
 
 const trackingOf = (bare: string, branch: string): string =>
   execFileSync("git", ["--git-dir", bare, "rev-parse", `refs/uzi-runner/${branch}`], { encoding: "utf8" }).trim();
-
 
 describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
   it("(a) a flagged final commit above the floor is remediated by a fixup rewrite, then the run completes with a push", { skip }, async () => {
@@ -604,6 +611,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
       },
       seedFlight: (f) => {
         f.checkpointFloor = floorTip;
+        f.publishedRealTips = [floorTip];
       },
     });
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
@@ -715,7 +723,10 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         gitIn(w, ["reset", "-q", "--hard", x]); // the finalize tip equals cleanTip again
       },
       seedFlight: (f) => {
-        if (floor) f.checkpointFloor = floor;
+        if (floor) {
+          f.checkpointFloor = floor;
+          f.publishedRealTips = [floor];
+        }
       },
     });
     assert.deepEqual(decisions.map((x) => x.action), ["proceed", "proceed"]);
@@ -742,6 +753,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
       },
       seedFlight: (f) => {
         f.checkpointFloor = base;
+        f.publishedRealTips = [base];
       },
     });
     assert.deepEqual(decisions.map((x) => x.action), ["proceed"]);
@@ -765,7 +777,10 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         followUp = (first as { followUp: string }).followUp;
       },
       seedFlight: (f) => {
-        if (floor) f.checkpointFloor = floor;
+        if (floor) {
+          f.checkpointFloor = floor;
+          f.publishedRealTips = [floor];
+        }
       },
     });
     assert.ok(floor.length === 40);
@@ -792,7 +807,10 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         followUp = (first as { followUp: string }).followUp;
       },
       seedFlight: (f) => {
-        if (stray) f.checkpointFloor = stray;
+        if (stray) {
+          f.checkpointFloor = stray;
+          f.publishedRealTips = [stray];
+        }
       },
     });
     assert.ok(stray.length === 40 && base.length === 40);
@@ -875,10 +893,11 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.ok(!d.completed());
   });
 
-  it("(x) an at-floor finding hidden by a bridge floor is not cleared by a later clean gate: finalize fails", { skip }, async () => {
+  it("(x) a finding hidden under a PUBLISHED floor is not cleared by a later clean gate: finalize fails", { skip }, async () => {
     const iid = 1932_241;
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
+    let B = "";
     const d = await drive({
       iid,
       forge: "gitlab",
@@ -886,12 +905,15 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         const w = ctx.worktreePath;
         gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
         commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
-        await ctx.checkpoint!({ reap: false }); // bridge B over S: checkpointFloor = B (local only)
-        const B = trackingOf(dd().bare, ctx.branch);
-        acts.push((await gate()).action); // S at-floor: known
+        await ctx.checkpoint!({ reap: false }); // bridge B over S
+        B = trackingOf(dd().bare, ctx.branch);
+        acts.push((await gate()).action); // S under B, and B is treated as published (ambiguous attempt): at-floor
         gitIn(w, ["reset", "-q", "--hard", B]);
         commitIn(w, "d.txt", "d\n");
         acts.push((await gate()).action); // range D ^B is clean, but S is still an ancestor: stays known
+      },
+      seedFlight: (f) => {
+        if (B) f.lastAttemptedCheckpointRefTip = B;
       },
     });
     assert.deepEqual(acts, ["proceed", "proceed"]);
@@ -899,6 +921,209 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.match(d.failed()?.failure_reason ?? "", /\(rule github-pat\)/);
     assert.equal(d.pushes(), 0);
     assert.ok(!d.completed());
+  });
+
+  it("(z) GitHub: a finding hidden under a published floor is not cleared by a clean gate, and the done checkpoint publishes nothing containing it", { skip }, async () => {
+    const iid = 1932_242;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let S = "";
+    let B = "";
+    let before = 0;
+    const d = await drive({
+      iid,
+      forge: "github",
+      body: async (ctx, gate, dd) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: false }); // bridge B over S
+        B = trackingOf(dd().bare, ctx.branch);
+        acts.push((await gate()).action);
+        gitIn(w, ["reset", "-q", "--hard", B]);
+        commitIn(w, "d.txt", "d\n");
+        acts.push((await gate()).action);
+        before = dd().pub.count();
+        await ctx.checkpoint!({ reap: true }); // the done checkpoint: the GitHub overlay is unscanned
+      },
+      seedFlight: (f) => {
+        if (B) f.lastAttemptedCheckpointRefTip = B;
+      },
+    });
+    assert.deepEqual(acts, ["proceed", "proceed"]);
+    assert.equal(d.pub.count(), before, "the done checkpoint published nothing");
+    for (const tip of d.pub.tips) assert.equal(publishedTipContains(d.bare, tip, S), false, "no published tip has S");
+    assert.ok(d.statuses().some((t) => /checkpoint publish skipped: secret_remediation_pending/.test(t)));
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    assert.equal(d.pushes(), 0);
+  });
+
+  it("(y) R3 GitLab: a flagged commit under a local-only bridge is remediable, and a finalize bridge over it never pushes it", { skip }, async () => {
+    const iid = 1932_243;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let S = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      // The post-bridge range scan misses the wrapped-in commit (a bridge's merge makes the real scan
+      // fail open); only the retained-flagged-commit ancestry re-check can stop the push.
+      configure: (g) => {
+        (g as unknown as { secretScanRange: unknown }).secretScanRange = async () => ({
+          trusted: true,
+          findings: [],
+        });
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: false }); // the tick bridges B=(S,P); checkpointFloor = local-only B
+        acts.push((await gate()).action); // S is above every PUBLISHED floor: remediable
+        gitIn(w, ["reset", "-q", "--hard", P]);
+        commitIn(w, "d.txt", "d\n");
+        acts.push((await gate()).action); // clean, S not an ancestor: known cleared
+      },
+    });
+    assert.deepEqual(acts, ["remediate", "proceed"]);
+    // The finalize bridge wraps the clean tip over the local-only B, re-adding S: it must not push.
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S), false);
+    for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(y4) a bridge at finalize after a known finding fails closed when the post-bridge scan is untrusted", { skip }, async () => {
+    const iid = 1932_248;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      configure: (g) => {
+        (g as unknown as { secretScanRange: unknown }).secretScanRange = async () => ({
+          trusted: false,
+          findings: [],
+          reason: "merge counting",
+        });
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        const S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        acts.push((await gate()).action);
+        fixupAndAutosquash(w, S, "cfg.env", "TOKEN=\n");
+        acts.push((await gate()).action); // clean: known cleared, everKnown stays
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]); // rewrite below the published tip: finalize bridges
+        commitIn(w, "e.txt", "e\n");
+      },
+    });
+    assert.deepEqual(acts, ["remediate", "proceed"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.match(d.failed()?.failure_reason ?? "", /could not be trusted/);
+    assert.equal(d.pushes(), 0);
+  });
+
+  it("(y2) R1 GitLab: a never-flagged secret under a local-only bridge is scanned (not hidden by the bridge) and cannot be pushed", { skip }, async () => {
+    const iid = 1932_244;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let S = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      body: async (ctx, gate, dd) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: false });
+        const B = trackingOf(dd().bare, ctx.branch);
+        gitIn(w, ["reset", "-q", "--hard", B]);
+        acts.push((await gate()).action);
+      },
+    });
+    assert.deepEqual(acts, ["remediate"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.pushes(), 0);
+    for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S), false);
+    for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(y3) R2 GitLab: a remediated secret cherry-picked back below the published tip under a bridge cannot be pushed", { skip }, async () => {
+    const iid = 1932_245;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let S = "";
+    let S2 = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      body: async (ctx, gate, dd) => {
+        const w = ctx.worktreePath;
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        acts.push((await gate()).action);
+        fixupAndAutosquash(w, S, "cfg.env", "TOKEN=\n");
+        acts.push((await gate()).action);
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        gitIn(w, ["cherry-pick", "--allow-empty", S]);
+        S2 = gitIn(w, ["rev-parse", "HEAD"]);
+        await ctx.checkpoint!({ reap: false }); // bridge over S2: local-only checkpointFloor
+        const B = trackingOf(dd().bare, ctx.branch);
+        gitIn(w, ["reset", "-q", "--hard", B]);
+        acts.push((await gate()).action);
+      },
+    });
+    assert.deepEqual(acts, ["remediate", "proceed", "remediate"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.pushes(), 0);
+    for (const t of [...d.pushedTips, ...d.pub.tips]) {
+      assert.equal(publishedTipContains(d.bare, t, S), false);
+      assert.equal(publishedTipContains(d.bare, t, S2), false);
+    }
+  });
+
+  it("(r2) an unknown ancestry for a recorded flagged commit counts as reachable: the clean branch does not clear it", { skip }, async () => {
+    let S = "";
+    let stubOn = false;
+    const d = await drive({
+      iid: 1932_246,
+      forge: "gitlab",
+      configure: (g) => {
+        const orig = g.ancestry.bind(g);
+        (g as unknown as { ancestry: unknown }).ancestry = async (bare: string, a: string, b: string) =>
+          stubOn && a === S ? "unknown" : orig(bare, a, b);
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(w, S, "cfg.env", "TOKEN=\n"); // S is rewritten out: a real ancestry says divergent
+        stubOn = true;
+        // Still reachable (unknown counts as reachable), so not cleared: a second remediation turn.
+        assert.equal((await gate()).action, "remediate");
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.pushes(), 0);
+  });
+
+  it("(cap) overflowing the flagged-commit cap fails closed at the gate and at finalize", { skip }, async () => {
+    const d = await drive({
+      iid: 1932_247,
+      forge: "gitlab",
+      hooks: { flaggedCommitsCap: 1 },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        commitIn(w, "one.env", `TOKEN=${runtimeSecret()}\n`);
+        commitIn(w, "two.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "fail");
+        assert.equal((await gate()).action, "fail", "stays failed");
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    assert.ok(d.logs.some((l) => /flagged-commit list overflowed/.test(JSON.stringify(l))));
   });
 
   it("(u2) clause (c): a secret-shaped filename on the late post-gate commit is withheld everywhere", { skip }, async () => {
