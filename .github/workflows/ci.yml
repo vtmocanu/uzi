@@ -522,8 +522,8 @@ jobs:
           UZI_AGENT_TEST_SHARD: ${{ format('{0}/2', matrix.shard) }}
           UZI_AGENT_TEST_JUNIT: shard-${{ matrix.shard }}.xml
         run: task test:agent:shard
-      - name: test:codex-m4 (shard 1 only)
-        if: matrix.shard == 1
+      - name: test:codex-m4 (shard 2 only)
+        if: matrix.shard == 2
         env:
           SHARD_INDEX: ${{ matrix.shard }}
         run: |

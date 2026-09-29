@@ -2369,9 +2369,9 @@ tasks:
       # which the npm test script turns into --test-concurrency=1: node rejects that flag
       # in NODE_OPTIONS, so it has to go on the command line.
       # This self-test validates the wrapper used by both legs. Run it once in
-      # shard 1 with M4, and once in the unsharded local composition.
+      # shard 2 with M4, and once in the unsharded local composition.
       - |
-        if [ "${UZI_AGENT_TEST_SHARD:-}" != "2/2" ]; then
+        if [ "${UZI_AGENT_TEST_SHARD:-}" != "1/2" ]; then
           ../scripts/real-procfs-skip-check.test.sh
         fi
       - ../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh npm test
