@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Egress profiles: admin-managed site lists for official-sources research ([#1906](https://github.com/vtmocanu/uzi/issues/1906)).**
   Admins can now store named site lists (exact hosts or `*.base` wildcards) through the admin API, and read them with `uzi admin egress-profile list|show <name>`. Entries are normalized (lowercase, IDNA, trailing dot) and IP addresses, ports, URLs, paths, public-suffix wildcards such as `*.github.io`, wildcards with a public suffix below them such as `*.kawasaki.jp` or `*.run.app`, and known shared-hosting parents such as `*.amazonaws.com` are refused; well-known multi-publisher hosts such as `github.com`, `cdn.jsdelivr.net` or `registry.npmjs.org`, and platform apexes such as `github.io`, need an explicit per-entry override and carry a warning. A read also warns about any stored entry the current rules no longer accept, or now flag as multi-publisher without an override; such an entry matches nothing. Four new admin settings cap per-run downloads (25 MiB per file, 200 MiB and 100 files per run, 4 concurrent fetches). The research lane that uses them is not enabled yet; see the Egress profiles operator page.
 
+- **Admin → Site lists page and a fetch-caps card ([#1906](https://github.com/vtmocanu/uzi/issues/1906)).**
+  Admins can now create, edit and delete site lists (egress profiles) in the web app, which is the only place to write them since the CLI is read-only. Hosts are typed one per line; each refused entry shows its reason beside it, and a multi-publisher host such as `github.com` is saved only after the admin ticks "Allow every publisher on" that host. Admin → Instance gains a Research fetch caps card that edits the four caps, the two byte caps in MiB.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

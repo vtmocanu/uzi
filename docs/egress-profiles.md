@@ -18,19 +18,28 @@ changes nothing about how any run reaches the network.
 
 ## Managing profiles
 
+The web page is **Admin → Site lists** (`/admin/egress-profiles`): it lists
+every profile with its hosts and warnings, and creates, edits and deletes them.
+
 | What | How |
 |---|---|
-| List profiles | `uzi admin egress-profile list`, or `GET /api/admin/egress-profiles` |
+| List profiles | Admin → Site lists, `uzi admin egress-profile list`, or `GET /api/admin/egress-profiles` |
 | Show one profile | `uzi admin egress-profile show <name>`, or `GET /api/admin/egress-profiles/<name>` |
-| Create | `POST /api/admin/egress-profiles` |
-| Replace | `PUT /api/admin/egress-profiles/<name>` |
-| Delete | `DELETE /api/admin/egress-profiles/<name>` |
+| Create | Admin → Site lists → New site list, or `POST /api/admin/egress-profiles` |
+| Replace | Edit on the profile's row, or `PUT /api/admin/egress-profiles/<name>` |
+| Delete | Delete on the profile's row (asks to confirm), or `DELETE /api/admin/egress-profiles/<name>` |
 
 Reads work from an admin browser session or an admin-scoped (`uza_`) CLI token.
 Create, replace and delete are cookie-only admin writes, like every other admin
-write: a CLI token gets `401`, so the CLI is read-only. The web Admin page for
-editing profiles is a later milestone; until it lands, the writes are reachable
-only from a signed-in admin browser session.
+write: a CLI token gets `401`, so the CLI is read-only and the Site lists page
+is where profiles are written.
+
+On the page, hosts are typed one per line. A refused save stores nothing and
+shows each problem beside the entry it names, with its line number. A
+multi-publisher entry (see below) shows a checkbox, such as "Allow every
+publisher on github.com", with the reason; the page sends the override only for
+entries whose box is ticked, and editing a profile shows its stored overrides
+already ticked.
 
 A create body:
 
@@ -190,5 +199,6 @@ on it. Review each profile for hosts where other people can publish.
 
 Four [admin settings](./admin-settings.md#research-fetch-caps) bound what one
 research run may download: 25 MiB per file, 200 MiB and 100 files per run, and
-4 concurrent fetches per run by default. Like the profiles, nothing reads them
-until the research lane is enabled.
+4 concurrent fetches per run by default. Edit them on **Admin → Instance →
+Research fetch caps**. Like the profiles, nothing reads them until the research
+lane is enabled.

@@ -47,6 +47,9 @@ import type {
   CliTokenMint,
   CliTokenScope,
   CreatedIssue,
+  EgressProfile,
+  EgressProfileProblem,
+  EgressProfileWriteInput,
   ForgeConfig,
   ForgeConnection,
   Harness,
@@ -285,6 +288,23 @@ export function gateRevisionMismatchCurrent(err: unknown): number | null {
   const body = err.body as { reason?: string; current_gate_revision?: unknown } | null;
   if (body?.reason !== "gate_revision_mismatch") return null;
   return typeof body.current_gate_revision === "number" ? body.current_gate_revision : 0;
+}
+
+// egressProfileProblems returns the per-field problems of a 422 `invalid_egress_profile`
+// (PRD #1906 M1), or null when the error is anything else, so the site-list editor can pin
+// each problem to its field or host entry and surface every other failure as a banner.
+export function egressProfileProblems(err: unknown): EgressProfileProblem[] | null {
+  if (!(err instanceof ApiError) || err.status !== 422) return null;
+  const body = err.body as { reason?: string; problems?: unknown } | null;
+  if (body?.reason !== "invalid_egress_profile" || !Array.isArray(body.problems)) return null;
+  return body.problems.filter(
+    (p): p is EgressProfileProblem =>
+      typeof p === "object" &&
+      p !== null &&
+      typeof (p as EgressProfileProblem).field === "string" &&
+      typeof (p as EgressProfileProblem).code === "string" &&
+      typeof (p as EgressProfileProblem).message === "string",
+  );
 }
 
 async function request<T>(
@@ -1738,6 +1758,22 @@ const realApi = {
   // checks_unknown so the page can say "unknown" rather than "none blocked" (R1).
   adminListBlockedRepos: () =>
     request<AdminBlockedRepos>("GET", "/admin/blocked-repos"),
+  // Egress profiles, "site lists" (PRD #1906 M1/M1w). Reads sit in the admin read group;
+  // create/replace/delete are cookie-only admin writes (request() echoes the CSRF cookie).
+  // A refused write is a 422 whose body carries `problems` (see egressProfileProblems).
+  // The name is immutable: PUT/DELETE address it in the path and PUT's body omits it.
+  adminListEgressProfiles: () =>
+    request<{ egress_profiles: EgressProfile[] }>("GET", "/admin/egress-profiles"),
+  adminCreateEgressProfile: (input: EgressProfileWriteInput & { name: string }) =>
+    request<{ egress_profile: EgressProfile }>("POST", "/admin/egress-profiles", input),
+  adminUpdateEgressProfile: (name: string, input: EgressProfileWriteInput) =>
+    request<{ egress_profile: EgressProfile }>(
+      "PUT",
+      `/admin/egress-profiles/${encodeURIComponent(name)}`,
+      input,
+    ),
+  adminDeleteEgressProfile: (name: string) =>
+    request<null>("DELETE", `/admin/egress-profiles/${encodeURIComponent(name)}`),
 
   // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
   // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')

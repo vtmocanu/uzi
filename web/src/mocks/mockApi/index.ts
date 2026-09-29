@@ -7,6 +7,7 @@ import { patchRun } from "../store";
 import { agentSourceApi } from "./agentSource";
 import { agentsApi } from "./agents";
 import { cliTokensApi } from "./cliTokens";
+import { egressProfilesApi } from "./egressProfiles";
 import { forgeApi } from "./forge";
 import { judgeApi } from "./judge";
 import { memoryApi } from "./memory";
@@ -45,6 +46,9 @@ export const mockApi = {
   ...agentsApi,
 
   ...forgeApi,
+
+  // ── Egress profiles / site lists (PRD #1906 M1w) ─────────────────────────────
+  ...egressProfilesApi,
 
   ...boardsApi,
 

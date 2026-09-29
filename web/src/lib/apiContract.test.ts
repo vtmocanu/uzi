@@ -44,6 +44,7 @@ import type {
   CodexAccountRateLimit,
   CodexAdminRateLimitRow,
   HealthDoc,
+  EgressProfile,
 } from "./apiTypes";
 
 import runZero from "../../../fixtures/api-contract/run.zero.json";
@@ -132,6 +133,8 @@ import codexAdminRateLimitRowZero from "../../../fixtures/api-contract/codex_adm
 import codexAdminRateLimitRowFull from "../../../fixtures/api-contract/codex_admin_rate_limit_row.full.json";
 import healthDocZero from "../../../fixtures/api-contract/health_doc.zero.json";
 import healthDocFull from "../../../fixtures/api-contract/health_doc.full.json";
+import egressProfileZero from "../../../fixtures/api-contract/egress_profile.zero.json";
+import egressProfileFull from "../../../fixtures/api-contract/egress_profile.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -302,6 +305,24 @@ type ZeroOf<T, NeverNull extends keyof T = never> = {
   void _healthDocExtra;
   void _healthDocZero;
   void _healthDocFull;
+}
+
+// ── EgressProfile (PRD #1906 M1w) ────────────────────────────────────────────
+// The admin egress profile ("site list"). ZeroOf exemptions: hosts,
+// multi_publisher_override and warnings — egressProfileToDTO sends nonNilStrings(...) and
+// make([]EgressProfileWarningDTO, 0, n) (handler/egress_profiles.go), so the wire always
+// carries [], though json.Marshal(EgressProfileDTO{}) is a null nil-slice. created_by /
+// updated_by are string|null (present as null on the zero value, no exemption needed). The
+// nested EgressProfileWarning rides inside warnings[0] of the full fixture.
+{
+  const _egressProfileMissing: never = null as unknown as Exclude<keyof EgressProfile, keyof typeof egressProfileFull>;
+  const _egressProfileExtra: never = null as unknown as Exclude<keyof typeof egressProfileFull, keyof EgressProfile>;
+  const _egressProfileZero: ZeroOf<EgressProfile, "hosts" | "multi_publisher_override" | "warnings"> = egressProfileZero;
+  const _egressProfileFull: Widen<EgressProfile> = egressProfileFull;
+  void _egressProfileMissing;
+  void _egressProfileExtra;
+  void _egressProfileZero;
+  void _egressProfileFull;
 }
 
 // ── RunMessage (M2) ─────────────────────────────────────────────────────────
@@ -1040,6 +1061,9 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // pointers and checks is a non-omitempty slice (a null nil-slice marshal the registry
   // normalizes to []), so its zero.json carries nulls.
   { stem: "health_doc", nullable: true },
+  // PRD #1906 M1w: the admin egress profile. created_by/updated_by are present-as-null
+  // pointers and the three slices are nil-slice nulls the handler normalizes to [].
+  { stem: "egress_profile", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

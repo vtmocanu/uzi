@@ -1,5 +1,5 @@
 // AdminShell: one header + tab bar shared by the admin surfaces (Users,
-// Rate limits, Tool allowlist, Blocked repos, Instance, Branding, Health). The same
+// Rate limits, Tool allowlist, Blocked repos, Site lists, Instance, Branding, Health). The same
 // treatment SettingsShell gives the user-scoped settings: the pages used to be separate
 // top-level sidebar entries wired together only by proximity, which crowded the
 // sidebar for admins and hid that they are one area — this instance's controls.
@@ -20,6 +20,7 @@ const TABS = [
   { to: "/admin/rate-limits", label: "Rate limits" },
   { to: "/admin/tool-allowlist", label: "Tool allowlist" },
   { to: "/admin/blocked-repos", label: "Blocked repos" },
+  { to: "/admin/egress-profiles", label: "Site lists" },
   { to: "/admin/settings", label: "Instance" },
   { to: "/admin/branding", label: "Branding" },
   { to: "/admin/health", label: "Health", pip: true },

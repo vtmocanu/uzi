@@ -64,6 +64,10 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   capability_aware_scheduling: "true",
   completion_interlock_rollout: "true",
   github_project_sync_enabled: "false",
+  fetch_max_file_bytes: "26214400",
+  fetch_max_run_bytes: "209715200",
+  fetch_max_run_files: "100",
+  fetch_max_concurrent_per_run: "4",
   // PRD #685 branding config keys (owned by the Branding tab; unbranded defaults).
   app_logo_mode: "default",
   app_logo_preset: "",

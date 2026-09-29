@@ -143,6 +143,12 @@ func contractCases() []contractCase {
 		// nested all-int struct (no null). The nested HealthCheckDTO / HealthEvidenceDTO
 		// ride inside the full fixture's checks[0], no standalone row (never returned alone).
 		newContractCase[HealthDocDTO]("health_doc"),
+		// PRD #1906 M1w: the admin egress profile ("site list"). created_by/updated_by are
+		// present-as-null pointers on the zero value; hosts, multi_publisher_override and
+		// warnings are non-omitempty slices (nil-slice nulls the handler normalizes to [],
+		// nonNilStrings and make(..., 0, n) in egressProfileToDTO). The nested
+		// EgressProfileWarningDTO rides inside the full fixture's warnings[0].
+		newContractCase[EgressProfileDTO]("egress_profile"),
 	}
 }
 
