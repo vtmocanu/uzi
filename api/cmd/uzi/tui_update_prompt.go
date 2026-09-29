@@ -165,8 +165,9 @@ func detectBrewOwner(brew func(bool, ...string) (string, error), executable func
 			continue
 		}
 		cellar := filepath.Dir(filepath.Dir(prefix))
-		if !(filepath.Base(cellar) == "Cellar" && filepath.Base(filepath.Dir(prefix)) == formula) &&
-			!(filepath.Base(prefix) == formula && filepath.Base(filepath.Dir(prefix)) == "opt") {
+		validPrefix := (filepath.Base(cellar) == "Cellar" && filepath.Base(filepath.Dir(prefix)) == formula) ||
+			(filepath.Base(prefix) == formula && filepath.Base(filepath.Dir(prefix)) == "opt")
+		if !validPrefix {
 			continue
 		}
 		if strings.HasPrefix(exe, prefix+string(filepath.Separator)) {
@@ -191,11 +192,6 @@ func isRCTag(tag string) bool {
 	}
 	return semver.IsValid(tag) && semver.Prerelease(tag) == "-rc."+n &&
 		semver.Build(tag) == "" && semver.Canonical(base) == base
-}
-
-func isStableVersion(tag string) bool {
-	v := "v" + strings.TrimPrefix(tag, "v")
-	return semver.IsValid(v) && semver.Prerelease(v) == ""
 }
 
 func isPrereleaseTag(tag string) bool {

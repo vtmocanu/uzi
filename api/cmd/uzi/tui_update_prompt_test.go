@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -345,10 +346,10 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 			dir := t.TempDir()
 			stableDir := filepath.Join(dir, "Cellar", "uzi-cli", "1")
 			rcDir := filepath.Join(dir, "Cellar", "uzi-cli-rc", "1")
-			if err := os.MkdirAll(filepath.Join(stableDir, "bin"), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Join(stableDir, "bin"), 0700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.MkdirAll(filepath.Join(rcDir, "bin"), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Join(rcDir, "bin"), 0700); err != nil {
 				t.Fatal(err)
 			}
 			exe := filepath.Join(dir, "handbuilt", "uzi")
@@ -358,10 +359,10 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 			if tc.owner == "uzi-cli-rc" {
 				exe = filepath.Join(rcDir, "bin", "uzi")
 			}
-			if err := os.MkdirAll(filepath.Dir(exe), 0755); err != nil {
+			if err := os.MkdirAll(filepath.Dir(exe), 0700); err != nil {
 				t.Fatal(err)
 			}
-			if err := os.WriteFile(exe, nil, 0755); err != nil {
+			if err := os.WriteFile(exe, nil, 0600); err != nil {
 				t.Fatal(err)
 			}
 			b := &brewRec{stablePrefix: stableDir, rcPrefix: rcDir}
@@ -412,14 +413,50 @@ func TestBrewOwnerAndPromptChannels(t *testing.T) {
 	}
 }
 
+func TestUpdatePromptKeepsRCFactAcrossFailedBuildProbe(t *testing.T) {
+	withVersion(t, "v0.84.0-rc.1")
+	m := updatePromptModel(t)
+	m.updatePrompt.brewKnown = false
+	m.brew = func(bool, ...string) (string, error) { return "", nil }
+	m.executable = func() (string, error) { return "", errors.New("unknown executable") }
+	next, cmd := m.Update(buildInfoMsg{latestRC: &apitypes.LatestReleaseDTO{Version: "v0.84.0-rc.2"}})
+	m = next.(tuiModel)
+	if cmd == nil || !m.updatePrompt.brewPending {
+		t.Fatal("expected pending ownership probe")
+	}
+	next, _ = m.Update(buildInfoMsg{err: errors.New("transient failure")})
+	m = next.(tuiModel)
+	if m.updatePrompt.latestRC == nil {
+		t.Fatal("failed build probe cleared the saved RC release")
+	}
+	next, _ = m.Update(cmd())
+	m = next.(tuiModel)
+	if !m.updatePrompt.showing || m.updatePrompt.latestVersion != "v0.84.0-rc.2" {
+		t.Fatalf("RC prompt lost after failed probe: %+v", m.updatePrompt)
+	}
+}
+
+func TestCappedBrewOutput(t *testing.T) {
+	var out cappedBrewOutput
+	chunk := strings.Repeat("x", 40*1024)
+	for i := 0; i < 3; i++ {
+		if n, err := out.Write([]byte(chunk)); n != len(chunk) || err != nil {
+			t.Fatalf("write = %d, %v", n, err)
+		}
+	}
+	if out.Len() != 64*1024 || !out.overflow {
+		t.Fatalf("captured %d bytes, overflow = %v", out.Len(), out.overflow)
+	}
+}
+
 func TestBrewOwnerSymlinkAndBoundary(t *testing.T) {
 	dir := t.TempDir()
 	prefix := filepath.Join(dir, "Cellar", "uzi-cli", "1")
-	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Join(prefix, "bin"), 0700); err != nil {
 		t.Fatal(err)
 	}
 	target := filepath.Join(prefix, "bin", "uzi")
-	if err := os.WriteFile(target, nil, 0755); err != nil {
+	if err := os.WriteFile(target, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	link := filepath.Join(dir, "uzi")
@@ -431,10 +468,10 @@ func TestBrewOwnerSymlinkAndBoundary(t *testing.T) {
 		t.Fatalf("symlink owner = %q", got)
 	}
 	sibling := filepath.Join(dir, "Cellar", "uzi-cli", "10", "bin", "uzi")
-	if err := os.MkdirAll(filepath.Dir(sibling), 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(sibling), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(sibling, nil, 0755); err != nil {
+	if err := os.WriteFile(sibling, nil, 0600); err != nil {
 		t.Fatal(err)
 	}
 	if got := detectBrewOwner(b.fn, func() (string, error) { return sibling, nil }); got != "" {

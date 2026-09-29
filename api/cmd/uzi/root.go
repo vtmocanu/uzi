@@ -2,11 +2,14 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -41,7 +44,7 @@ func realGit(dir string, args ...string) (string, error) {
 // update prompt). It has two modes, matching how the TUI uses the seam:
 //
 //   - foreground == false: a QUIET detection probe (`brew --prefix --installed <formula>` for both formulas).
-//     stdout+stderr are captured and returned combined so the caller can inspect them,
+//     up to 64 KiB of combined stdout+stderr is captured for at most 10 seconds,
 //     and no output reaches the terminal — a `brew: command not found` here just means
 //     "unknown ownership", not an error the user should see.
 //   - foreground == true: the selected formula upgrade, run AFTER the TUI has exited
@@ -52,14 +55,44 @@ func realGit(dir string, args ...string) (string, error) {
 // inject a fake that records (foreground, args) and returns canned output without forking
 // brew.
 func realBrew(foreground bool, args ...string) (string, error) {
-	cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew shell-out seam — `brew <args>` where args are internal command literals (`list uzi-cli`, `--prefix`, `upgrade uzi-cli`), never remote/untrusted input.
 	if foreground {
+		cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew seam; args are internal `upgrade uzi-cli` or `upgrade uzi-cli-rc` literals.
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return "", cmd.Run()
 	}
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "brew", args...) //nolint:gosec // G204: internal `--prefix --installed <formula>` probe; formula is one of two literals.
+	cmd.WaitDelay = time.Second
+	var out cappedBrewOutput
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	if out.overflow {
+		return "", errors.New("brew probe output exceeds 64 KiB")
+	}
+	return out.String(), err
+}
+
+// cappedBrewOutput drains a noisy probe while retaining at most 64 KiB.
+type cappedBrewOutput struct {
+	bytes.Buffer
+	overflow bool
+}
+
+func (b *cappedBrewOutput) Write(p []byte) (int, error) {
+	const limit = 64 * 1024
+	n := len(p)
+	if remaining := limit - b.Len(); remaining < n {
+		b.overflow = true
+		p = p[:remaining]
+	}
+	_, _ = b.Buffer.Write(p)
+	return n, nil
 }
 
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"

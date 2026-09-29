@@ -1246,9 +1246,12 @@ func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if msg.err == nil && msg.version != "" {
 			m.serverVersion = msg.version
 		}
-		// The startup update prompt (PRD #1251 M1), evaluated ONCE per session on the first
-		// eligible reply (shownThisSession latches it). All the gating lives in maybeShowUpdatePrompt;
-		// the asynchronous owner probe resolves before channel selection and latching.
+		// A failed probe carries no release facts. Keep the last successful facts while
+		// the asynchronous ownership probe is pending.
+		if msg.err != nil {
+			return m, nil
+		}
+		// The asynchronous owner probe resolves before channel selection and latching.
 		return m, (&m).maybeShowUpdatePrompt(msg.latest, msg.latestRC)
 
 	case brewInfoMsg:
