@@ -23,9 +23,9 @@ cd agent && node --import tsx --test --test-timeout=120000 test/worker.test.ts  
 
 ## `--test-timeout`
 
-- What the flag caps differs by node major: local node v26 shares a process across files and caps each top-level suite, while CI's `node:22-alpine` runs a child process per file and caps the whole file. Read any `--test-timeout` as the tightest thing it might bind, and check which node the SLOWEST environment runs — one Taskfile target cannot make local and CI agree here.
-- Split a test file that approaches the cap rather than raising 120000: node's per-file cap makes a large file a serialization point no timeout value fixes.
-- A cap kill is reported `cancelled`, not `fail`, so the summary reads `fail 0` on a red job and the TAP plan shrinks with the FILE named in place of its remaining suites.
+- CI's `test-agent` runs Node 24 on `ubuntu-latest`. There, as on local node v26.8, each file runs in its own child process and the flag caps each test, not the whole file. What the flag caps has changed across node majors (the old `node:22-alpine` CI capped the whole file), so check which node the SLOWEST environment runs before reading a timeout.
+- Keep a single test well under the cap rather than raising 120000.
+- A cap kill is reported `cancelled`, not `fail`, so the summary reads `fail 0` on a red job; the cancelled test is named in the `✖` list.
 - Settle an unexplained failure by re-running one unchanged commit, rather than inventing a mechanism from the diff.
 - Read the durations before assuming which cause you have: `test/judge-runner.test.ts` unrefs a 60s timer, load-bearing for wall time but not for the cap (an idle timer holding the event loop open is not body duration), while `agent/test/fake-api.ts` records the other one, a leaked listening handle on musl with every subtest passing.
 
