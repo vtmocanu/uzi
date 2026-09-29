@@ -64,6 +64,8 @@ describe("CLAUDE_LONG_COMMAND_APPEND start and poll commands", () => {
     const m = /seq (\d+)\); .* sleep (\d+);/.exec(poll);
     assert.ok(m, "bounded seq + sleep");
     assert.ok(Number(m[1]) * Number(m[2]) < 600, "total sleep stays under 600 s");
+    // Without an explicit timeout the poll call itself is backgrounded at the 2-minute default.
+    assert.match(flat, /foreground calls, each with `timeout` 600000/);
   });
 
   it("a failing command under set -e still writes its status, and a fresh shell polls it back", () => {
