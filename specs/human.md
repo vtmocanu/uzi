@@ -166,7 +166,7 @@ Tracked as GitLab issue vtmocanu/uzi#16; PRD at `prds/done/16-agent-skills.md`.
 - First builtin skill: `ci-cd-norms`, researched from an internal knowledge base and reference repos — an organization's CI/CD norm, with a reference app as the worked exception.
 - Repos may carry skills the worker detects. Per-repo opt-in, default off. [capability: user; opt-in/default-off shape AI-proposed, user-accepted]
 - Builtin skills ship with uzi; editable and resettable like builtin agent templates.
-- A Claude run whose skills plugin the SDK reports as failed to load (issue #1888) never works without its selected skills: a run with selected skills fails with the `skills_plugin_load_failed` fail origin (never judged, not retried automatically), even when the reported error detail is malformed; a run with no selected skills gets one warning status line and continues. The SDK's error text is redacted, stripped of control characters and bounded before it is shown. (AI-synced 2026-09-29)
+- A Claude run whose skills plugin the SDK reports as failed to load (issue #1888) never works without its selected skills: a run with selected skills fails with the `skills_plugin_load_failed` fail origin (never judged, not retried automatically), even when the reported error detail is malformed; a run with no selected skills gets a warning status line (once per start or resume) and continues. The SDK's error text is redacted, stripped of control characters and bounded before it is shown. (AI-synced 2026-09-29)
 
 ## Feature #17 — Builtin lead template (opus) + worker model selection
 

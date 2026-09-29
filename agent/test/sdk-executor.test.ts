@@ -5622,7 +5622,7 @@ describe("SdkExecutor run-start environment probe (issue #1866 M2)", () => {
 
 // issue #1888: the init frame's `plugin_errors` (SDK 0.3.284+). The only plugin the worker
 // passes is the run's skills plugin, so a run that SELECTED skills fails closed before working
-// without them, and a run with no skills warns once per run and continues.
+// without them, and a run with no skills warns once per worker attempt and continues.
 describe("SdkExecutor skills plugin load errors (issue #1888)", () => {
   const union: ClaimSkill[] = [{ name: "team-runbook", description: "cicd norms.", body: "# CICD\n" }];
   const PREFIX = "skills_plugin_load_failed: ";
@@ -5673,7 +5673,12 @@ describe("SdkExecutor skills plugin load errors (issue #1888)", () => {
   it("(a) a skills run whose plugin reports load errors fails closed naming the plugin", async () => {
     const { probe, turns, run } = drive(
       [
-        [init([{ plugin: "uzi-skills", type: "manifest-validation-error", message: "bad manifest" }]), submitPlan("plan"), resultSuccess()],
+        [
+          init([{ plugin: "uzi-skills", type: "manifest-validation-error", message: "bad manifest" }]),
+          assistantText("worked without the skills"),
+          submitPlan("plan"),
+          resultSuccess(),
+        ],
         [signalDone(), resultSuccess()],
       ],
       true,
@@ -5686,6 +5691,15 @@ describe("SdkExecutor skills plugin load errors (issue #1888)", () => {
     });
     assert.strictEqual(probe.gated.length, 0, "stopped before the plan reached the gate");
     assert.strictEqual(turns.length, 1, "no further turn ran");
+    // The early stop: no frame after the init frame was processed. The fake SDK ignores the
+    // abort and keeps yielding, so the assistant text that follows the init would be emitted if
+    // the turn read on. (The submit_plan signal alone cannot show this: the reducer drops signal
+    // tool uses from the stream, and the gate is only reached after the turn, where the post-loop
+    // trip check throws anyway.)
+    assert.ok(
+      !JSON.stringify(probe.emits).includes("worked without the skills"),
+      "a frame after the init frame was processed",
+    );
     // Only the count reaches the persisted init frame.
     const initFrame = probe.emits.find((m) => m.payload["event"] === "init");
     assert.strictEqual(initFrame?.payload["plugin_error_count"], 1);

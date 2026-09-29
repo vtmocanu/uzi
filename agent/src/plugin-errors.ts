@@ -72,8 +72,9 @@ function field(text: string, max: number, redact: (s: string) => string): string
 /**
  * A bounded, log-safe description of plugin load errors for a status line or failure reason:
  * `plugin (type): message [path: ...]` for the first three entries, then `; and N more`. Every
- * field is redacted, then sanitized and capped (plugin 80, type 40, message 200, path 160);
- * the whole string is capped at 360 characters.
+ * field is redacted, then sanitized and capped (plugin 80, type 40, message 200, path 160; a
+ * truncated field may exceed its figure by the 3-character `...` marker). The whole string is
+ * at most 360 characters, marker and `and N more` tail included.
  */
 export function describePluginErrors(
   errors: readonly PluginLoadError[],

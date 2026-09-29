@@ -488,16 +488,19 @@ healthy again.
 ## When the skills plugin fails to load
 
 The worker loads the skills selected for a run into the agent's session as
-a local plugin. If the Claude SDK reports that the plugin failed to load
-when the session starts, and the run has selected skills, the run
-**fails** with `fail_origin = skills_plugin_load_failed` (shown as
-**skills plugin load failed**) rather than carrying on without the skills
-you chose.
+a local plugin. The selected skills are the ones that fit within the
+per-run skill size and count limits. If the Claude SDK reports that the
+plugin failed to load when the session starts, and the run has selected
+skills, the run **fails** with `fail_origin = skills_plugin_load_failed`
+(shown as **skills plugin load failed**) rather than carrying on without
+the skills you chose.
 
-The failure reason names the plugin, the error type, a trimmed error
-message and the path it tried to load. Secrets are redacted, control
-characters are removed, and the reason's length is bounded. An error
-report the worker cannot parse still counts as a load failure.
+The failure reason names the plugin, the error type and a trimmed error
+message for each of the first three errors, plus the path it tried to load
+when the SDK reports one. If there are more than three errors, the reason
+ends with a count of the rest. Secrets are redacted, control characters
+are removed, and the reason's length is bounded. An error report the
+worker cannot parse still counts as a load failure.
 
 The run is not parked or retried automatically, and because this is a
 worker environment problem rather than something the agent did wrong, it is
@@ -505,8 +508,10 @@ never sent to the judge. Fix the skill or plugin the reason names, then
 start a new run.
 
 If the run has no selected skills, a plugin load error does not fail it:
-one status line in the activity feed warns about the error and the run
-continues. Codex runs are unaffected.
+a status line in the activity feed warns about the error and the run
+continues. The worker rebuilds the plugin each time the run starts or
+resumes, so the warning is posted once per start or resume, not once per
+turn. Codex runs are unaffected.
 
 ## From the CLI
 

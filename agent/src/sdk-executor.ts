@@ -630,7 +630,8 @@ interface RunDrive {
   /** issue #1888: the run selected at least one skill, so a skills plugin that reports load
    *  errors at init fails the run closed (REASON_SKILLS_PLUGIN_LOAD_FAILED). */
   skillsSelected: boolean;
-  /** issue #1888: a no-skills run warns about plugin load errors once per run, not per turn. */
+  /** issue #1888: a no-skills run warns about plugin load errors once per worker attempt, not
+   *  per turn (each claim or resume rebuilds the plugin and may warn again). */
   pluginWarned: boolean;
 }
 
@@ -4249,7 +4250,7 @@ export class SdkExecutor implements Executor {
    * issue #1888: the init frame reported plugin load errors. The only plugin the worker passes is
    * the run's skills plugin, so a run that SELECTED skills trips fail-closed with
    * REASON_SKILLS_PLUGIN_LOAD_FAILED before it works without them; a run with no skills posts one
-   * status line per run and continues. The detail is redacted before it is bounded
+   * status line per worker attempt and continues. The detail is redacted before it is bounded
    * (describePluginErrors) and is the only untrusted text that reaches the reason or status line.
    */
   private onPluginLoadErrors(
