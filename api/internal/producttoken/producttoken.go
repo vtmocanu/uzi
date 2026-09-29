@@ -1,19 +1,27 @@
 // Package producttoken issues and verifies product tokens (PRD #1907): the uzp_
 // Bearer credential a user mints for a registered external product, which acts as
-// that user on /api/v1 only. It mirrors clitoken exactly in its crypto posture: a
-// uniformly random 256-bit body shown once at mint, of which the server stores only
-// the sha256 (product_tokens.token_hash) and re-derives that hash from the Bearer
-// value on every request. The plaintext is never persisted; losing it means minting
-// a new token. A plain unsalted sha256 is safe for the same reason as clitoken and
-// jointoken: there is no low-entropy keyspace to precompute against.
+// that user on /api/v1 only. Like clitoken and jointoken, the body is a uniformly
+// random 256 bits shown once at mint, of which the server stores only the sha256
+// (product_tokens.token_hash) and re-derives that hash from the Bearer value on every
+// request. The plaintext is never persisted; losing it means minting a new token. A
+// plain unsalted sha256 is safe for the same reason as clitoken and jointoken: there
+// is no low-entropy keyspace to precompute against.
 //
-// The uzp_ class prefix is what keeps product tokens out of every internal route:
-// middleware.RequireUser resolves Bearer values against cli_tokens only, so a uzp_
-// token is unknown there and fails closed. Only RequireV1Caller (PRD #1907 M2)
-// resolves it, dispatching on this prefix to pick the product_tokens table. The
-// prefix is also what the secret scrubbers key on (secretscrub, issuedraft,
-// workersvc's CI-fix snapshot), bound by secretscrub's minted-prefix test, which
-// ranges over Prefix.
+// One difference from clitoken's verification: the auth lookup
+// (GetProductTokenForAuth) never projects token_hash (a rule for every query in
+// queries/product_tokens.sql), so middleware.RequireV1Caller has no stored hash to
+// pass to Equal and does not call it. The row is found by an indexed equality on the
+// sha256 of a 256-bit random token, the same property RequireUser relies on; its extra
+// Equal on the uzc_ path is belt-and-suspenders, not a separate control.
+//
+// What keeps product tokens out of every internal route is the separate
+// product_tokens TABLE, not this prefix: middleware.RequireUser resolves Bearer values
+// against cli_tokens only and never reads product_tokens, so a uzp_ token is unknown
+// there and fails closed like any unknown Bearer (TestV1IsolationLiveDB measures this
+// on both production routers). The prefix is the dispatch label: RequireV1Caller
+// keys on it to pick the product_tokens table. It is also what the secret scrubbers
+// key on (secretscrub, issuedraft, workersvc's CI-fix snapshot), bound by
+// secretscrub's minted-prefix test, which ranges over Prefix.
 package producttoken
 
 import (
@@ -72,7 +80,9 @@ func Hash(token string) []byte {
 	return sum[:]
 }
 
-// Equal compares two hashes in constant time.
+// Equal compares two hashes in constant time. RequireV1Caller does not call it (see
+// the package comment: the auth row carries no hash); it is here for any future
+// fetch-then-compare lookup.
 func Equal(a, b []byte) bool {
 	return subtle.ConstantTimeCompare(a, b) == 1
 }

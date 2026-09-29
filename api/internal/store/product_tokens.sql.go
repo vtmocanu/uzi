@@ -510,9 +510,11 @@ type LockProductTokenMintParams struct {
 // CountActiveProductTokensForUserProduct, then CreateProductToken. The same reasoning as
 // store.HostedProvisionLockClass (migrate.go).
 //
-// Two-int advisory lock: class 1970958452 = 0x757A7074 ("uzpt"), distinct from every
-// class constant in migrate.go, and the two-int space is disjoint from the one-bigint
-// space RegistrationLockKey / SettingsMutationLockKey use. The objid is hashtext of the
+// Two-int advisory lock: class 1970958452 = 0x757A7074 ("uzpt"), the value of
+// store.ProductTokenMintLockClass in migrate.go, distinct from every other class
+// constant there; TestProductTokenMintLockClassMatchesSQL pins this literal to it. The
+// two-int space is disjoint from the one-bigint space RegistrationLockKey /
+// SettingsMutationLockKey use. The objid is hashtext of the
 // (user, product) pair, so two unrelated pairs can collide: a moment of contention,
 // never a correctness problem. XACT-scoped: released on commit or rollback, so it must
 // run on a transaction-bound Queries (on a bare pool it would release immediately).
@@ -526,7 +528,8 @@ UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked
 `
 
 // The panic button's product half (D8): revoke every un-revoked product token of one
-// user. The existing revoke-all handler calls it in the SAME transaction as
+// user. Nothing calls it yet: PRD #1907 M5 wires it into the existing revoke-all
+// handler (POST /api/me/cli-tokens/revoke-all), in the SAME transaction as
 // RevokeAllCLITokens. Idempotent, and scoped to $1.
 func (q *Queries) RevokeAllProductTokens(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, revokeAllProductTokens, userID)
