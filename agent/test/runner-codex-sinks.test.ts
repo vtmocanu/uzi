@@ -629,6 +629,10 @@ describe("RunRunner m4 — Codex durability sinks route through withBoundary", (
         "Codex finalize boundary failed after committed publish; reporting committed terminal outcome"),
       "the swallowed post-publish boundary error is logged",
     );
+    const stepLines = lines.filter((l) => (l as { msg?: string }).msg === "finalize step") as Record<string, unknown>[];
+    const last = stepLines.at(-1);
+    assert.equal(last?.outcome, "committed", `the last finalize step reports the committed outcome; got ${JSON.stringify(last)}`);
+    assert.ok(!stepLines.some((l) => l.outcome === "failed"), "no finalize step is logged failed for a committed publish");
   });
 
   it("(1) checkpoint reap:true routes through withBoundary (boundary=checkpoint)", async () => {

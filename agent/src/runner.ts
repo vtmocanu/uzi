@@ -338,11 +338,11 @@ class FinalizeStepTracker {
     return this.active?.step;
   }
 
-  end(outcome: "ok" | "failed"): void {
+  end(outcome: "ok" | "failed" | "committed"): void {
     this.close(outcome);
   }
 
-  private close(outcome?: "ok" | "failed"): void {
+  private close(outcome?: "ok" | "failed" | "committed"): void {
     const active = this.active;
     if (!active) return;
     this.active = undefined;
@@ -2263,35 +2263,40 @@ export class RunRunner {
         // Issue #1900: the finalize step tracker names the step a deadline fired in and logs
         // each step's duration (Claude/stub runs get the logging only).
         const finalizeSteps = new FinalizeStepTracker(runLog, this.now);
+        let finalizeFailed = false;
+        let finalizeError: unknown;
         try {
-          let finalizeOutcome: "ok" | "failed" = "failed";
-          try {
-            await this.withCodexBoundaryOnly(
-              executor,
-              {
-                boundary: "finalize",
-                deadlineMs: this.codexFinalizeBoundaryDeadlineMs,
-                activeStep: () => finalizeSteps.current(),
-              },
-              (permit) => this.phasePublish(
-                claim,
-                flight,
-                permit?.signal,
-                executor.safety
-                  ? (report) => { postFinalizeTerminal = report; }
-                  : undefined,
-                finalizeSteps,
-              ),
-            );
-            finalizeOutcome = "ok";
-          } finally {
-            finalizeSteps.end(finalizeOutcome);
-          }
+          await this.withCodexBoundaryOnly(
+            executor,
+            {
+              boundary: "finalize",
+              deadlineMs: this.codexFinalizeBoundaryDeadlineMs,
+              activeStep: () => finalizeSteps.current(),
+            },
+            (permit) => this.phasePublish(
+              claim,
+              flight,
+              permit?.signal,
+              executor.safety
+                ? (report) => { postFinalizeTerminal = report; }
+                : undefined,
+              finalizeSteps,
+            ),
+          );
         } catch (err) {
-          if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
+          finalizeFailed = true;
+          finalizeError = err;
+        }
+        // A boundary error after phasePublish registered the committed terminal callback is not a
+        // failed finalize: the pushed branch/open MR is the outcome reported below, so the last
+        // step log says "committed" rather than "failed".
+        const committed = finalizeFailed && postFinalizeTerminal !== undefined && isCodexBoundaryError(finalizeError);
+        finalizeSteps.end(!finalizeFailed ? "ok" : committed ? "committed" : "failed");
+        if (finalizeFailed) {
+          if (!committed) throw finalizeError;
           runLog.warn(
             "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
-            { error: errMessage(err) },
+            { error: errMessage(finalizeError) },
           );
         }
       }
