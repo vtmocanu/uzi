@@ -481,7 +481,7 @@ describe("buildSelfImprovePlanPrompt", () => {
   it("carries the trusted directive: pick ONE, guardrails, tests, guard-path flag", () => {
     assert.ok(prompt.includes("exactly ONE"));
     assert.ok(prompt.includes("Never weaken uzi's guardrails"));
-    assert.ok(prompt.includes("go test ./..."));
+    assert.ok(prompt.includes("`task gate:repo`"));
     assert.ok(prompt.includes("never merge to `main`"));
     assert.ok(prompt.includes(SELF_IMPROVE_BRANCH));
   });
@@ -575,7 +575,8 @@ describe("buildSelfImprovePlanPrompt — generic vs dogfood directive (PRD #686 
     const p = buildSelfImprovePlanPrompt({ ...base, selfImproveDogfood: true });
     assert.ok(p.includes("uzi's own repository"));
     assert.ok(p.includes("Never weaken uzi's guardrails"));
-    assert.ok(p.includes("go test ./..."));
+    // The gate is the Taskfile's, never a hand-picked subset of it.
+    assert.ok(!p.includes("go test ./..."), "no hand-written test list that omits lint/deadcode/race slots");
     // Learned from judge-rec triage: gate through the Taskfile, re-check a recommendation
     // against the current tree, and never edit the verbatim upstream builtins.
     assert.ok(p.includes("`task gate:repo` plus `task gate:<component>`"));
