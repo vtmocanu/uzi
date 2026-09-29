@@ -3849,6 +3849,52 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
     // AND iteration >= max → throw BEFORE a second fallback. Exactly one reap:false checkpoint.
     assert.deepEqual(checkpoints, [{ reap: false }], "one iteration-boundary fallback checkpoint before the budget tripped");
   });
+
+  function servedBudgetRun(servedMax: readonly (number | undefined)[], doneAt?: number) {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const id = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === doneAt) c.transport.push(signalDone("th-1", id));
+        c.transport.push(turnCompleted("completed", "th-1", id));
+        return { turn: { id } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    rig.transport.push(threadStarted());
+    const iterations: number[] = [];
+    const { ctx } = makeCtx({
+      config: { max_iterations: 2 },
+      reportIteration: async (iteration) => {
+        iterations.push(iteration);
+        const maxIterations = servedMax[iteration - 1];
+        return maxIterations === undefined ? undefined : { maxIterations };
+      },
+    });
+    return { rig, iterations, run: withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "served iteration budget") };
+  }
+
+  it("a larger served iteration budget lets the third implement turn complete, even after a smaller ACK", async () => {
+    const { rig, iterations, run } = servedBudgetRun([4, 1, undefined], 3);
+    const result = await run;
+    assert.equal(result.branch, "agent/issue-42");
+    assert.deepEqual(iterations, [1, 2, 3]);
+    assert.equal(rig.transport.turnStartCount, 3, "the served cap lifted the configured two-turn limit");
+  });
+
+  for (const { name, served } of [
+    { name: "equal", served: [2, 2] },
+    { name: "smaller", served: [1, 1] },
+    { name: "absent", served: [] },
+  ]) {
+    it(`${name} served iteration budgets retain the configured cap`, async () => {
+      const { rig, iterations, run } = servedBudgetRun(served);
+      await assert.rejects(run, /iteration budget without completing/);
+      assert.deepEqual(iterations, [1, 2]);
+      assert.equal(rig.transport.turnStartCount, 2, "the configured cap still bounds the loop");
+    });
+  }
 });
 
 // ================================================================================
@@ -6634,7 +6680,7 @@ describe("Codex completion interlock", () => {
         checkpoint: async () => {},
         recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: ++attempts }),
         reportIteration: async (iteration) => budget === "server" && iteration === 2
-          ? { budgetExhausted: true } : undefined,
+          ? { maxIterations: 8, budgetExhausted: true } : undefined,
         enterCompletionHold: async (reason) => { holds.push(reason); return true; },
       });
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `${budget} hold`);

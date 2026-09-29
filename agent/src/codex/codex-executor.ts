@@ -262,9 +262,9 @@ const DEFAULT_CACHE_RELEASE_TIMEOUT_MS = 30 * 1000;
 /** Issue #1598: the least a terminal dispose's remaining budget caps a cache wait to. */
 const MIN_CACHE_SETTLE_WAIT_MS = 1000;
 const DEFAULT_CHILD_TURN_DEADLINE_MS = 10 * 60 * 1000;
-// The single-milestone implement/review iteration budget when the claim omits one, matching
-// sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5). Codex carries no
-// milestone-scaling served budget yet, so the claim value or this default is the whole cap.
+// The implement/review iteration budget when the claim omits one, matching
+// sdk-executor's DEFAULT_MAX_ITERATIONS (PRD: RUN_MAX_ITERATIONS default 5).
+// A larger server-served milestone budget can raise this cap during execution.
 const DEFAULT_MAX_ITERATIONS = 5;
 const DEFAULT_MAX_REVISIONS = 3;
 
@@ -2234,7 +2234,7 @@ export class CodexExecutor implements Executor {
       //   - reaching the bounded iteration budget holds a post-attempt run and otherwise fails;
       //   - otherwise an iteration-boundary fallback checkpoint (reap:false — credential-free, does
       //     NOT reap the provider → NO recreation; the SAME epoch drives the next turn), then continue.
-      const maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
+      let maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
       let completionAttempted = false;
@@ -2290,10 +2290,16 @@ export class CodexExecutor implements Executor {
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         // Report the iteration boundary before any implementation work. Besides carrying the
         // latest progress, this is the post-approval `awaiting_approval` → `running` transition.
-        // Issue #1600: lift the run-wide wall to the served total (an owner extension included),
-        // as sdk-executor does. The served iteration budget is still not consumed.
+        // Match sdk-executor's upward-only served iteration cap. A smaller or absent
+        // budget never shortens the configured/default limit or an earlier lift.
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
-        if (served) liftWall(wall, served.totalWallSeconds ?? served.wallSeconds);
+        if (served) {
+          if (typeof served.maxIterations === "number" && served.maxIterations > maxIterations) {
+            maxIterations = served.maxIterations;
+          }
+          // Issue #1600: lift the run-wide wall to the served total (including owner extensions).
+          liftWall(wall, served.totalWallSeconds ?? served.wallSeconds);
+        }
         if (served?.budgetExhausted && interlockedIssue && completionAttempted &&
             await routeHold(REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted)) {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
