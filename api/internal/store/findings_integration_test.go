@@ -98,6 +98,11 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 		if f, d := tablesExist(); !f || !d {
 			t.Fatalf("precondition: both tables should exist after Migrate (findings=%v dispositions=%v)", f, d)
 		}
+		// 00270 (finding group operations) hangs a foreign key and a column off finding_dispositions,
+		// so its Down must run before 00129's can drop that table; its Up is replayed below.
+		for _, stmt := range migrationDownStatements(t, "00270_finding_group_operations.sql") {
+			mustExec(ctx, t, pool, stmt)
+		}
 		for _, stmt := range migrationDownStatements(t, "00129_incidental_findings.sql") {
 			mustExec(ctx, t, pool, stmt)
 		}
@@ -123,6 +128,9 @@ func TestIncidentalFindingsLiveDB(t *testing.T) {
 		// the constraints un-validated. (store.Migrate can't do it: after 00129's Down the recorded
 		// goose version is still HEAD, so a Migrate call is a no-op and the dropped tables stay gone.)
 		for _, stmt := range migrationUpStatements(t, "00210_validate_finding_status_check.sql") {
+			mustExec(ctx, t, pool, stmt)
+		}
+		for _, stmt := range migrationUpStatements(t, "00270_finding_group_operations.sql") {
 			mustExec(ctx, t, pool, stmt)
 		}
 	})

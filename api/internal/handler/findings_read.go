@@ -104,14 +104,14 @@ func (h *Handler) GetFindingIssueDraft(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	dispositionID, err := store.FindingDispositionForEvidence(ctx, h.pool, user.ID, findingID)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			httpx.Error(w, http.StatusNotFound, "finding not found")
-		} else {
-			slog.Error("finding issue draft: get disposition", "error", err)
-			httpx.Error(w, http.StatusInternalServerError, "internal error")
-		}
+	// Evidence without a disposition row still yields a draft (as before group filing): the id is
+	// then empty, and there is nothing for the client to select or file.
+	dispositionID := ""
+	if id, derr := store.FindingDispositionForEvidence(ctx, h.pool, user.ID, findingID); derr == nil {
+		dispositionID = id.String()
+	} else if !errors.Is(derr, pgx.ErrNoRows) {
+		slog.Error("finding issue draft: get disposition", "error", derr)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 
@@ -123,7 +123,7 @@ func (h *Handler) GetFindingIssueDraft(w http.ResponseWriter, r *http.Request) {
 	draft := h.buildFindingDraft(ctx, finding)
 
 	httpx.JSON(w, http.StatusOK, apitypes.IncidentalFindingIssueDraftDTO{
-		DispositionID: dispositionID.String(),
+		DispositionID: dispositionID,
 		Title:         draft.Title,
 		Description:   draft.Description,
 		Location:      draft.Location,
