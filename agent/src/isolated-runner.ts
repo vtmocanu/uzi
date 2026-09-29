@@ -34,7 +34,7 @@ import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { MessageBatcher } from "./batcher.js";
 import type { WorkerClient } from "./client.js";
 import { buildFetchToolsServer } from "./fetch-tools.js";
-import { IsolatedExecutor, type IsolatedContext } from "./isolated-executor.js";
+import type { IsolatedContext } from "./isolated-executor.js";
 import { LimitReachedError } from "./limit.js";
 import type { Logger } from "./log.js";
 import type { Outbox } from "./outbox.js";
@@ -76,9 +76,12 @@ export interface IsolatedRunnerOptions {
   batchMs: number;
   /** The worker's join token, redacted from every message payload. */
   joinToken?: string;
-  /** Worker credential paths the path guard denies. */
-  secretPaths?: readonly string[];
-  executor?: IsolatedExecutorLike;
+  /**
+   * The session executor. Required, with no default: main.ts builds it with
+   * buildIsolatedExecutor, whose path guard carries the worker-credential deny set
+   * (workerSecretDenyPaths). A default here would build a guard without that set.
+   */
+  executor: IsolatedExecutorLike;
   /** `onFollowUp` receives each follow_up input, which is never delivered to the session. */
   makeSource?: (
     runId: string,
@@ -154,7 +157,10 @@ export class IsolatedRunner {
     private readonly log: Logger,
     private readonly opts: IsolatedRunnerOptions,
   ) {
-    this.executor = opts.executor ?? new IsolatedExecutor(log, { secretPaths: opts.secretPaths ?? [] });
+    // Checked at runtime too, for a caller the type system does not reach: no executor
+    // means no run, never a fallback guard without the worker-credential deny set.
+    if (!opts.executor) throw new Error("IsolatedRunner requires an executor (build it with buildIsolatedExecutor)");
+    this.executor = opts.executor;
     this.terminalDeps = makeTerminalOutboxDeps(opts.outbox, client, {
       gapFillMax: opts.gapFillMax ?? 10_000,
       terminalMaxBytes: opts.outboxTerminalMaxBytes ?? Math.round(1.25 * 1024 * 1024),

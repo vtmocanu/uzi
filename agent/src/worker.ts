@@ -16,6 +16,7 @@ import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState 
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
 import type { DiskPressureController } from "./disk-reclaim.js";
 import type { RunDiskSampler } from "./run-disk.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
@@ -393,8 +394,11 @@ export class Worker {
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
         // only on lane pods). An ordinary worker runs the same code but has no fetcher to reach,
         // so it must not look eligible for a lane run; the api's placement clause additionally
-        // keys on a server-set lane marker, so this is the worker's half of that pair.
-        if (this.config.fetcherUrl && this.config.fetcherCaFile) {
+        // keys on a server-set lane marker, so this is the worker's half of that pair. Never
+        // under the UZI_UID_SPLIT uid split: the isolated runner's preflight refuses every
+        // claim there (the same uidSplitActive detector), so advertising would only attract
+        // runs this worker fails.
+        if (this.config.fetcherUrl && this.config.fetcherCaFile && !uidSplitActive()) {
           protocolCapabilities.push(ISOLATED_FETCH_CAPABILITY);
         }
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness

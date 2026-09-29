@@ -71,6 +71,9 @@ function runner(client: WorkerClient, over: Partial<IsolatedRunnerOptions> & { r
     fetcherCaFile: caFile,
     batchMs: 5,
     makeSource: noCancel(),
+    // Pinned: the default reads process.env.UZI_UID_SPLIT, which would make this file
+    // depend on the environment it runs in. The split case is its own test below.
+    splitActive: false,
     executor: {
       run: async (ctx) => {
         ran.push(ctx);
@@ -80,6 +83,15 @@ function runner(client: WorkerClient, over: Partial<IsolatedRunnerOptions> & { r
     ...over,
   });
 }
+
+describe("IsolatedRunner: requires its executor", () => {
+  it("refuses construction without an executor (no fallback path guard without the worker-credential deny set)", () => {
+    const { client } = recordingClient();
+    const opts = { dataDir, fetcherUrl: "https://uzi-fetcher.test:8443", fetcherCaFile: caFile, batchMs: 5 };
+    // @ts-expect-error executor is required
+    assert.throws(() => new IsolatedRunner(client, nullLogger(), opts), /executor/);
+  });
+});
 
 describe("IsolatedRunner: fail closed before anything starts", () => {
   const cases: Array<[string, Partial<ClaimResponse>, Partial<IsolatedRunnerOptions>, RegExp]> = [
@@ -403,6 +415,22 @@ describe("Worker: isolated_fetch_v1 advertisement", () => {
     await done;
     return captured;
   }
+
+  let savedSplit: string | undefined;
+  beforeEach(() => {
+    savedSplit = process.env.UZI_UID_SPLIT;
+    delete process.env.UZI_UID_SPLIT;
+  });
+  afterEach(() => {
+    if (savedSplit === undefined) delete process.env.UZI_UID_SPLIT;
+    else process.env.UZI_UID_SPLIT = savedSplit;
+  });
+
+  it("is not advertised under the UZI_UID_SPLIT uid split, whose preflight refuses every isolated claim", async () => {
+    process.env.UZI_UID_SPLIT = "1";
+    const caps = await advertised(fakeConfig({ fetcherUrl: "https://f:8443", fetcherCaFile: "/run/ca.pem" }));
+    assert.ok(caps && !caps.includes("isolated_fetch_v1"), JSON.stringify(caps));
+  });
 
   it("is advertised only when both UZI_FETCHER_URL and UZI_FETCHER_CA_FILE are configured", async () => {
     assert.equal(ISOLATED_FETCH_CAPABILITY, "isolated_fetch_v1");

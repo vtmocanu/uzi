@@ -56,6 +56,7 @@ export const SOURCES_DIR = "sources";
  *  this only bounds what the worker will accept from it. */
 const DEFAULT_MAX_BYTES = 64 * 1024 * 1024;
 const DEFAULT_TIMEOUT_MS = 180_000;
+const DEFAULT_CONNECT_TIMEOUT_MS = 15_000;
 /** A refusal body is small JSON; never read more than this of it. */
 const MAX_ERROR_BODY = 16 * 1024;
 /** Matches the fetcher's own URL cap (MaxURLLen); a longer URL is refused before sending. */
@@ -77,6 +78,12 @@ export interface FetchToolDeps {
   maxBytes?: number;
   /** The TOTAL deadline of one fetch (connect, request and body), and the socket idle limit. */
   timeoutMs?: number;
+  /**
+   * The bound on reaching a verified TLS session with the fetcher, reported as
+   * `fetcher_unreachable`. Clamped to `timeoutMs`; at or above it the total deadline
+   * fires first and the fetch reports `fetcher_timeout` instead.
+   */
+  connectTimeoutMs?: number;
   /** The run's signal: aborted when the run is cancelled or ends, it abandons every fetch. */
   signal?: AbortSignal;
 }
@@ -355,6 +362,7 @@ async function saveBody(res: IncomingMessage, deps: FetchToolDeps, maxBytes: num
 export async function fetchIntoWorkspace(deps: FetchToolDeps, url: string): Promise<FetchOutcome> {
   const maxBytes = deps.maxBytes ?? DEFAULT_MAX_BYTES;
   const timeoutMs = deps.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const connectTimeoutMs = Math.min(deps.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS, timeoutMs);
   // One signal for the whole fetch: the run's own, or the total deadline, whichever first.
   const deadline = new AbortController();
   const timer = setTimeout(
@@ -373,7 +381,7 @@ export async function fetchIntoWorkspace(deps: FetchToolDeps, url: string): Prom
       throw new Refusal("url_too_long", `the URL must be 1 to ${MAX_URL_LEN} characters`);
     }
     const endpoint = endpointOf(deps.fetcherUrl);
-    socket = await connectVerified(endpoint, deps.ca, timeoutMs, signal);
+    socket = await connectVerified(endpoint, deps.ca, connectTimeoutMs, signal);
     if (signal.aborted) throw abortRefusal(signal);
     const { res, abort } = await postOver(socket, endpoint, deps.credential, JSON.stringify({ url }), timeoutMs);
     try {

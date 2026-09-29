@@ -8,7 +8,7 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import https from "node:https";
-import type { AddressInfo } from "node:net";
+import net, { type AddressInfo } from "node:net";
 import os from "node:os";
 import path from "node:path";
 
@@ -279,6 +279,26 @@ describe("fetch tool (uzi_fetch / fetch_url)", () => {
     } finally {
       clearInterval(timer);
       await f.close();
+    }
+  });
+
+  it("a fetcher that accepts TCP but never completes TLS is reported fetcher_unreachable at the connect bound", async () => {
+    const sockets = new Set<net.Socket>();
+    const server = net.createServer((s) => {
+      sockets.add(s);
+      s.on("error", () => undefined);
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    try {
+      const started = Date.now();
+      const out = await fetchIntoWorkspace(deps(`https://localhost:${port}`, { timeoutMs: 10_000, connectTimeoutMs: 200 }), "https://a.example/x");
+      assert.equal(!out.ok && out.reason, "fetcher_unreachable", JSON.stringify(out));
+      assert.ok(Date.now() - started < 5_000, "returned at the connect bound, not the total deadline");
+      assert.deepEqual(sources(), []);
+    } finally {
+      for (const s of sockets) s.destroy();
+      await new Promise<void>((resolve) => server.close(() => resolve()));
     }
   });
 
