@@ -65,8 +65,8 @@ function bytesToMib(stored: string): string {
 }
 
 function toDisplay(f: (typeof FIELDS)[number], stored: string | undefined): string {
-  // `?? ""` guards an api pod that predates the keys: empty reads honestly and the field's
-  // validator flags it rather than the input going uncontrolled.
+  // `?? ""` guards an api pod that predates the keys: the field reads empty rather than the
+  // input going uncontrolled, and an untouched field is neither validated nor sent.
   const v = stored ?? "";
   return f.unit === "mib" ? bytesToMib(v) : v;
 }

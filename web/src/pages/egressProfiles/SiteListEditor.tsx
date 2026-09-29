@@ -73,7 +73,7 @@ export function SiteListEditor({
   // entry while the admin edits other lines, and vanish from an entry whose text changes.
   const [entryProblems, setEntryProblems] = useState<Map<string, EgressProfileProblem[]>>(new Map());
   // Why the api called an entry multi-publisher, remembered ACROSS refused saves (merged,
-  // never replaced) while the entry is still listed. A later refusal about something else
+  // never replaced or pruned; an unlisted entry renders nothing). A later refusal about something else
   // no longer mentions the entry, but its consent is still sent, so its checkbox and reason
   // must stay on screen: an override is never sent from a control the admin cannot see.
   const [mpReasons, setMpReasons] = useState<Map<string, string>>(new Map());
@@ -167,9 +167,10 @@ export function SiteListEditor({
         byEntry.set(k, [...(byEntry.get(k) ?? []), p]);
       }
       setEntryProblems(byEntry);
+      // Never pruned for an entry the admin deleted: its tick stays in `overrides`, so a
+      // re-added entry must come back with its checkbox and reason, not as a silent consent.
       setMpReasons((prev) => {
-        const listed = new Set(hosts.map(entryKey));
-        const next = new Map([...prev].filter(([k]) => listed.has(k)));
+        const next = new Map(prev);
         for (const [k, ps] of byEntry) {
           const mp = ps.find((p) => MULTI_PUBLISHER_CODES.has(p.code));
           if (mp) next.set(k, mp.message);

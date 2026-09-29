@@ -194,6 +194,39 @@ describe("AdminEgressProfiles", () => {
     expect(mockApi.adminListEgressProfiles).toHaveBeenCalledTimes(2);
   });
 
+  it("a ticked consent for a deleted-then-re-added entry comes back visible, never sent unseen", async () => {
+    const MP_MSG = "github.com is code hosting: many publishers share this host";
+    mockApi.adminCreateEgressProfile
+      .mockRejectedValueOnce(
+        invalid([
+          { field: "hosts[0]", entry: "github.com", code: "multi_publisher_needs_override", message: MP_MSG },
+          { field: "hosts[1]", entry: "bad://x", code: "scheme", message: "no scheme" },
+        ]),
+      )
+      // github.com is no longer listed, so this refusal names only the bad entry.
+      .mockRejectedValueOnce(invalid([{ field: "hosts[0]", entry: "bad://x", code: "scheme", message: "no scheme" }]))
+      .mockResolvedValueOnce({ egress_profile: profile({ id: "ep-new", name: "kernel", hosts: ["github.com"] }) });
+    const form = await openCreate();
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "kernel" } });
+    const hostsField = within(form).getByLabelText("Hosts, one per line");
+    fireEvent.change(hostsField, { target: { value: "github.com\nbad://x" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
+    fireEvent.click(await within(form).findByRole("checkbox", { name: "Allow every publisher on github.com" }));
+
+    fireEvent.change(hostsField, { target: { value: "bad://x" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
+    await waitFor(() => expect(mockApi.adminCreateEgressProfile).toHaveBeenCalledTimes(2));
+    await within(form).findByText("no scheme");
+
+    fireEvent.change(hostsField, { target: { value: "github.com" } });
+    const back = within(form).getByRole("checkbox", { name: "Allow every publisher on github.com" });
+    expect((back as HTMLInputElement).checked).toBe(true);
+    expect(document.getElementById(back.getAttribute("aria-describedby")!)?.textContent).toBe(MP_MSG);
+    fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
+    await waitFor(() => expect(mockApi.adminCreateEgressProfile).toHaveBeenCalledTimes(3));
+    expect(mockApi.adminCreateEgressProfile.mock.calls[2][0].multi_publisher_override).toEqual(["github.com"]);
+  });
+
   it("edits a stored list: the stored override is pre-ticked, and unticking drops it from the PUT", async () => {
     mockApi.adminUpdateEgressProfile.mockResolvedValue({ egress_profile: KERNEL });
     renderPage();
