@@ -114,15 +114,15 @@ advice alike. Four things can hold a worker back:
 
 - The fleet does not have the opt-in uid-split profile Codex needs turned on.
   Ask your admin to enable it (`UZI_WORKER_UID_SPLIT`).
-- A node's kernel lacks Landlock while the fleet requires it. Either move the
-  fleet onto Landlock-capable nodes, or, if running commands unconfined is
-  acceptable, set the command sandbox to best-effort
+- The fleet opted into Landlock (command sandbox `required`) and a node's
+  kernel lacks it. Either move the fleet onto Landlock-capable nodes, or set
+  the command sandbox back to its default `off`, or to `best-effort`
   (`UZI_CODEX_COMMAND_SANDBOX`).
-- The Landlock probe fails outright: it could not run, or the kernel returned
-  an unexpected result. This is distinct from a clean "unavailable" and is
-  fatal even in best-effort, so no knob re-enables Codex: check the node's
-  kernel/Landlock support and that the command-sandbox binary is present on the
-  worker image.
+- The fleet opted into Landlock (`required` or `best-effort`) and the Landlock
+  probe fails outright: it could not run, or the kernel returned an unexpected
+  result. This is distinct from a clean "unavailable" and is fatal in both
+  modes: check the node's kernel/Landlock support and that the command-sandbox
+  binary is present on the worker image, or set the mode back to `off`.
 - The worker's Codex installer receipt is not intact (the Codex runtime is
   missing or corrupt on the image). Re-provision or rebuild the hosted worker
   so the runtime is reinstalled; an operator knob does not fix this.

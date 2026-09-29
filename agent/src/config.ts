@@ -18,15 +18,15 @@ import { errMessage } from "./util.js";
 export type ExecutorKind = "sdk" | "stub";
 
 /**
- * PRD #1493 M3: the Codex command-sandbox enforcement mode. `required` (the
- * default) keeps today's fail-closed behaviour — the command sandbox refuses to
- * run without Landlock. `best-effort` applies Landlock wherever the kernel offers
- * it (still failing closed if applying it fails) and otherwise runs the command
- * without filesystem confinement, relying on the uid split. It never relaxes the
- * uid split. The value comes ONLY from the worker's own env, never from run, repo
- * or model input.
+ * PRD #1493 M3: the Codex command-sandbox enforcement mode. `off` (the default)
+ * never applies Landlock: commands run without filesystem confinement, relying on
+ * the uid split. `required` makes Landlock mandatory — the command sandbox refuses
+ * to run without it. `best-effort` applies Landlock wherever the kernel offers it
+ * (still failing closed if applying it fails) and otherwise runs the command
+ * unconfined. No mode relaxes the uid split. The value comes ONLY from the worker's
+ * own env, never from run, repo or model input.
  */
-export type CommandSandboxMode = "required" | "best-effort";
+export type CommandSandboxMode = "off" | "required" | "best-effort";
 
 export interface Config {
   apiUrl: string;
@@ -226,7 +226,7 @@ export interface Config {
    * PRD #1493 M3: the Codex command-sandbox enforcement mode
    * (UZI_CODEX_COMMAND_SANDBOX). Parsed strictly at `loadConfig` (unknown value
    * throws and refuses to start, mirroring {@link parseExecutor}); defaults to
-   * `required`. It is threaded into `commandSandboxArgv` as the `--mode` token the
+   * `off`. It is threaded into `commandSandboxArgv` as the `--mode` token the
    * trusted worker passes to `uzi-codex-command-sandbox`, and into the startup
    * capability wrapper that gates `codex_harness_v1`. The command env is fully
    * replaced (`buildCommandEnv`), so this worker-owned value can never be
@@ -431,15 +431,16 @@ function parseExecutor(v: string | undefined): ExecutorKind {
 
 /**
  * Strict allow-list parse of UZI_CODEX_COMMAND_SANDBOX, mirroring
- * {@link parseExecutor}'s shape exactly: `best-effort` and `required` are the only
- * accepted values; absent/empty defaults to `required`; anything else THROWS so a
- * fat-fingered mode refuses to start rather than silently degrading enforcement.
+ * {@link parseExecutor}'s shape exactly: `off`, `required` and `best-effort` are the
+ * only accepted values; absent/empty defaults to `off`; anything else THROWS so a
+ * fat-fingered mode refuses to start rather than silently changing enforcement.
  */
 function parseCommandSandbox(v: string | undefined): CommandSandboxMode {
   const mode = v?.trim().toLowerCase();
+  if (mode === "required") return "required";
   if (mode === "best-effort") return "best-effort";
-  if (mode === "required" || mode === undefined || mode === "") return "required";
-  throw new Error(`invalid UZI_CODEX_COMMAND_SANDBOX ${JSON.stringify(v)} (expected "required" or "best-effort")`);
+  if (mode === "off" || mode === undefined || mode === "") return "off";
+  throw new Error(`invalid UZI_CODEX_COMMAND_SANDBOX ${JSON.stringify(v)} (expected "off", "required" or "best-effort")`);
 }
 
 function parseBool(v: string | undefined): boolean {
@@ -576,7 +577,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     // never advertises codex_harness_v1 until the probe positively confirms the layout.
     codexProbe: { capable: false },
     // PRD #1493 M3: the command-sandbox mode, strict-parsed (unknown value throws
-    // and refuses to start). Default `required` keeps today's fail-closed sandbox.
+    // and refuses to start). Default `off`: Landlock is never applied.
     codexCommandSandbox: parseCommandSandbox(env.UZI_CODEX_COMMAND_SANDBOX),
     // Populated by main.ts after the async receipt + Landlock probes; the sync parse
     // cannot probe, so the default is "do not advertise" until startup resolves it.

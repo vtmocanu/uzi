@@ -23,11 +23,13 @@ import (
 // nonsense cap straight into the pod.
 const workerMaxConcurrentRunsCeiling = 256
 
-// The Codex command sandbox modes (PRD #1493). "required" is today's behaviour (Landlock
-// mandatory); "best-effort" runs a command unconfined behind the uid split when the kernel
-// lacks Landlock. The set is a strict allow-list — any other UZI_CODEX_COMMAND_SANDBOX
-// value is a boot error rather than a silent default.
+// The Codex command sandbox modes (PRD #1493). "off" (the default) never applies Landlock
+// and runs a command unconfined behind the uid split; "required" makes Landlock mandatory;
+// "best-effort" applies it where the kernel offers it and runs unconfined otherwise. The
+// set is a strict allow-list — any other UZI_CODEX_COMMAND_SANDBOX value is a boot error
+// rather than a silent default.
 const (
+	commandSandboxOff        = "off"
 	commandSandboxRequired   = "required"
 	commandSandboxBestEffort = "best-effort"
 )
@@ -169,12 +171,13 @@ type Config struct {
 	// a typo. Off, the rendered pod is byte-identical to before this field existed.
 	WorkerUIDSplit bool
 	// WorkerCommandSandbox is the Codex command sandbox mode (UZI_CODEX_COMMAND_SANDBOX):
-	// "required" (the default and today's behaviour — Landlock is mandatory) or
-	// "best-effort" (Landlock applied where the kernel offers it, otherwise the command
-	// runs unconfined behind the uid split). Strict allow-list: an unknown value is a BOOT
-	// error, never a silent default, and empty/unset takes the "required" default. Rendered
-	// onto the worker container as UZI_CODEX_COMMAND_SANDBOX only when it is NOT "required",
-	// so a default install's pod stays byte-identical.
+	// "off" (the default — Landlock never applied, the command runs unconfined behind the
+	// uid split), "required" (Landlock is mandatory) or "best-effort" (Landlock applied where
+	// the kernel offers it, otherwise unconfined). Strict allow-list: an unknown value is a
+	// BOOT error, never a silent default, and empty/unset takes the "off" default. Rendered
+	// onto the worker container as UZI_CODEX_COMMAND_SANDBOX only when it is NOT "off", so a
+	// default install's pod stays byte-identical and a worker image older than the "off"
+	// mode never receives a value it would refuse to boot on.
 	WorkerCommandSandbox string
 
 	// --- drain policy (PRD #422 M5) -------------------------------------------
@@ -464,19 +467,19 @@ func loadWorkerSettings(cfg *Config) error {
 		cfg.WorkerUIDSplit = uidSplit
 	}
 
-	// The Codex command sandbox mode (PRD #1493). Default "required" (today's behaviour);
-	// "best-effort" runs a command unconfined behind the uid split on a kernel without
-	// Landlock. Strict allow-list: an unknown value is a BOOT error rather than a silent
-	// default — the same "fail at boot, not at the far end" rule the other knobs follow. An
-	// empty/unset value takes the default.
-	cfg.WorkerCommandSandbox = commandSandboxRequired
+	// The Codex command sandbox mode (PRD #1493). Default "off" (Landlock never applied);
+	// "required" makes Landlock mandatory; "best-effort" runs a command unconfined behind
+	// the uid split on a kernel without Landlock. Strict allow-list: an unknown value is a
+	// BOOT error rather than a silent default — the same "fail at boot, not at the far end"
+	// rule the other knobs follow. An empty/unset value takes the default.
+	cfg.WorkerCommandSandbox = commandSandboxOff
 	if raw := strings.TrimSpace(os.Getenv("UZI_CODEX_COMMAND_SANDBOX")); raw != "" {
 		switch raw {
-		case commandSandboxRequired, commandSandboxBestEffort:
+		case commandSandboxOff, commandSandboxRequired, commandSandboxBestEffort:
 			cfg.WorkerCommandSandbox = raw
 		default:
-			return fmt.Errorf("UZI_CODEX_COMMAND_SANDBOX=%q is not a recognized mode (want %q or %q)",
-				raw, commandSandboxRequired, commandSandboxBestEffort)
+			return fmt.Errorf("UZI_CODEX_COMMAND_SANDBOX=%q is not a recognized mode (want %q, %q or %q)",
+				raw, commandSandboxOff, commandSandboxRequired, commandSandboxBestEffort)
 		}
 	}
 

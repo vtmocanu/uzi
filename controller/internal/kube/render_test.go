@@ -2010,23 +2010,23 @@ func TestUIDSplitRollsThePodButOffIsInert(t *testing.T) {
 
 	// Knob OFF: the OFF render is byte-identical to today's baseline. A config that leaves
 	// the new fields at their zero value (UIDSplit false, CommandSandbox "") must hash the
-	// same as one that explicitly sets the config default CommandSandbox "required" — the
-	// render normalizes "" to "required" and emits no env for either, so neither can re-hash
-	// an existing worker on upgrade.
+	// same as one that explicitly sets the config default CommandSandbox "off" — the render
+	// normalizes "" to "off" and emits no env for either, so neither can re-hash an existing
+	// worker on upgrade.
 	baseline := testConfig()
 	offDefaulted := testConfig()
-	offDefaulted.CommandSandbox = "required"
+	offDefaulted.CommandSandbox = "off"
 	if a, b := SpecHashOf(baseline, desired("abc"), testSpec(t, "base", "m")),
 		SpecHashOf(offDefaulted, desired("abc"), testSpec(t, "base", "m")); a != b {
-		t.Error("a plain worker's spec hash changed between a zero-value config and one with the knob off + CommandSandbox=required; the off render must be byte-identical to today's baseline")
+		t.Error("a plain worker's spec hash changed between a zero-value config and one with the knob off + CommandSandbox=off; the off render must be byte-identical to today's baseline")
 	}
 }
 
 // UZI_CODEX_COMMAND_SANDBOX is rendered on the WORKER container ONLY, and ONLY when the mode
-// is the non-default "best-effort". "required" and an unset/zero value emit NO env key — not
-// an empty one — so a default install's pod stays byte-identical. It never lands on any other
-// container.
-func TestCommandSandboxEnvOnlyForBestEffort(t *testing.T) {
+// is a non-default "required" or "best-effort". "off" and an unset/zero value emit NO env key
+// — not an empty one — so a default install's pod stays byte-identical and an older worker
+// image never sees "off". It never lands on any other container.
+func TestCommandSandboxEnvOnlyWhenNotOff(t *testing.T) {
 	workerEnv := func(cfg RenderConfig, name string) (string, bool) {
 		dep := RenderDeployment(cfg, desired("abc"), testSpec(t, "base", "m"))
 		worker := containerByName(t, dep.Spec.Template.Spec.Containers, workerContainerName)
@@ -2057,18 +2057,26 @@ func TestCommandSandboxEnvOnlyForBestEffort(t *testing.T) {
 		}
 	}
 
-	// required: no env at all (today's behaviour).
+	// required: no longer the default, so the env is present — a worker whose own default
+	// is "off" would otherwise run without Landlock.
 	req := testConfig()
 	req.CommandSandbox = "required"
-	if v, ok := workerEnv(req, "UZI_CODEX_COMMAND_SANDBOX"); ok {
-		t.Errorf("required must emit NO UZI_CODEX_COMMAND_SANDBOX env, got %q", v)
+	if v, ok := workerEnv(req, "UZI_CODEX_COMMAND_SANDBOX"); !ok || v != "required" {
+		t.Errorf("required must render UZI_CODEX_COMMAND_SANDBOX=required on the worker, got %q/%v", v, ok)
 	}
 
-	// The zero value ("") normalizes to required, so still NO env — and crucially never an
+	// off: the default, so no env at all.
+	off := testConfig()
+	off.CommandSandbox = "off"
+	if v, ok := workerEnv(off, "UZI_CODEX_COMMAND_SANDBOX"); ok {
+		t.Errorf("off must emit NO UZI_CODEX_COMMAND_SANDBOX env, got %q", v)
+	}
+
+	// The zero value ("") normalizes to off, so still NO env — and crucially never an
 	// empty-valued key.
 	zero := testConfig() // CommandSandbox left at its zero value ""
 	if v, ok := workerEnv(zero, "UZI_CODEX_COMMAND_SANDBOX"); ok {
-		t.Errorf("a zero-value CommandSandbox must emit NO UZI_CODEX_COMMAND_SANDBOX env (it normalizes to required), got %q", v)
+		t.Errorf("a zero-value CommandSandbox must emit NO UZI_CODEX_COMMAND_SANDBOX env (it normalizes to off), got %q", v)
 	}
 }
 

@@ -243,14 +243,15 @@ spec:
             # The Codex uid-split profile (PRD #1493 M4). Each renders ONLY when set away
             # from its default, so a default install's controller pod stays byte-identical:
             # the split bool renders only as "true" (the controller defaults false on an
-            # absent var), and the command-sandbox mode renders only for "best-effort"
-            # ("required" and unset are the same default and emit no key). An unrecognized
+            # absent var), and the command-sandbox mode renders only for "required" or
+            # "best-effort" ("off" is the default and emits no key, so a worker image that
+            # predates "off" keeps its own default instead of refusing an unknown value). An unrecognized
             # commandSandbox is rejected at template time by uzi.validateCommandSandbox.
             {{- if .Values.workers.uidSplit.enabled }}
             - name: UZI_WORKER_UID_SPLIT
               value: {{ .Values.workers.uidSplit.enabled | quote }}
             {{- end }}
-            {{- if ne .Values.workers.codex.commandSandbox "required" }}
+            {{- if ne .Values.workers.codex.commandSandbox "off" }}
             - name: UZI_CODEX_COMMAND_SANDBOX
               value: {{ .Values.workers.codex.commandSandbox | quote }}
             {{- end }}

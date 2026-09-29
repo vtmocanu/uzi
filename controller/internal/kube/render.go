@@ -465,10 +465,11 @@ type RenderConfig struct {
 	// existed. Any pod-template change moves the spec hash, so flipping the knob rolls the
 	// fleet once (the intended behaviour).
 	UIDSplit bool
-	// CommandSandbox is the Codex command sandbox mode ("required" or "best-effort"). It is
-	// rendered onto the worker container as UZI_CODEX_COMMAND_SANDBOX ONLY when it is not the
-	// default "required" (an empty value normalizes to "required" in podTemplate), so a
-	// default install's pod carries no such env and stays byte-identical. Worker container
+	// CommandSandbox is the Codex command sandbox mode ("off", "required" or "best-effort").
+	// It is rendered onto the worker container as UZI_CODEX_COMMAND_SANDBOX ONLY when it is
+	// not the default "off" (an empty value normalizes to "off" in podTemplate), so a default
+	// install's pod carries no such env and stays byte-identical, and a worker image that
+	// predates "off" never receives it (that image keeps its own "required" default). Worker container
 	// only — the mode never comes off the wire and never touches the seed/dind containers.
 	CommandSandbox string
 	// SecretMountPath is where the worker's join-token Secret (worker_token + ca.crt)
@@ -881,15 +882,15 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 
 	// The Codex command sandbox mode (PRD #1493 M1), worker container only. Normalize an
-	// empty (Go zero) value to "required" locally so a zero value never leaks out, then emit
-	// UZI_CODEX_COMMAND_SANDBOX ONLY when it is NOT the default "required" — "required" and an
-	// unset value render NO env key at all, keeping a default install's pod byte-identical.
-	// Only "best-effort" is ever emitted, and only on the worker container.
+	// empty (Go zero) value to "off" locally so a zero value never leaks out, then emit
+	// UZI_CODEX_COMMAND_SANDBOX ONLY when it is NOT the default "off" — "off" and an unset
+	// value render NO env key at all, keeping a default install's pod byte-identical. Only
+	// "required" and "best-effort" are ever emitted, and only on the worker container.
 	mode := cfg.CommandSandbox
 	if mode == "" {
-		mode = "required"
+		mode = "off"
 	}
-	if mode != "" && mode != "required" {
+	if mode != "off" {
 		env = append(env, corev1.EnvVar{Name: "UZI_CODEX_COMMAND_SANDBOX", Value: mode})
 	}
 

@@ -89,7 +89,7 @@ it can reach runner-group trees; `runner` is **not** in group `worker`.
   `fetch`es the agent branch **back** over `file://`+pack (never the local-copy path,
   so it never traverses the clone's alternates or a planted hook), and pushes from
   its own bare with the PAT. For a Codex run, whose command sandbox's Landlock
-  allowlist grants only the clone (not the bare it was seeded from), the seed
+  allowlist (when the operator enables Landlock) grants only the clone (not the bare it was seeded from), the seed
   additionally dissociates the clone: it repacks the borrowed objects into the
   clone under the bare lock, verifies the clone is self-contained with
   alternates disabled, and only then drops `objects/info/alternates` — a

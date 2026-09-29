@@ -393,20 +393,22 @@ describe("loadConfig terminal-journal knobs (PRD #1391 M3)", () => {
 });
 
 describe("loadConfig UZI_CODEX_COMMAND_SANDBOX (PRD #1493 M3)", () => {
-  it("defaults to required when unset or blank", () => {
-    assert.strictEqual(loadConfig(baseEnv()).codexCommandSandbox, "required");
-    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "" })).codexCommandSandbox, "required");
-    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "   " })).codexCommandSandbox, "required");
+  it("defaults to off when unset or blank", () => {
+    assert.strictEqual(loadConfig(baseEnv()).codexCommandSandbox, "off");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "" })).codexCommandSandbox, "off");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "   " })).codexCommandSandbox, "off");
   });
 
-  it("accepts required and best-effort (case/space-insensitive, mirroring parseExecutor)", () => {
+  it("accepts off, required and best-effort (case/space-insensitive, mirroring parseExecutor)", () => {
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "off" })).codexCommandSandbox, "off");
+    assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: " OFF " })).codexCommandSandbox, "off");
     assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "required" })).codexCommandSandbox, "required");
     assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "best-effort" })).codexCommandSandbox, "best-effort");
     assert.strictEqual(loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: "  BEST-EFFORT " })).codexCommandSandbox, "best-effort");
   });
 
   it("THROWS on an unknown value so a fat-fingered mode refuses to start", () => {
-    for (const v of ["off", "none", "loose", "besteffort", "true"]) {
+    for (const v of ["disabled", "none", "loose", "besteffort", "true"]) {
       assert.throws(
         () => loadConfig(baseEnv({ UZI_CODEX_COMMAND_SANDBOX: v })),
         /invalid UZI_CODEX_COMMAND_SANDBOX/,

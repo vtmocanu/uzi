@@ -392,6 +392,20 @@ describe("resolveCodexHarnessAvailability — honest advertisement conjunction",
     assert.equal(r.degraded, true);
   });
 
+  it("advertises DEGRADED in mode off whatever the Landlock probe says", () => {
+    for (const landlock of ["available", "unavailable", "error", "probe-failed"] as const) {
+      const r = resolveCodexHarnessAvailability({ ...base, mode: "off", landlock });
+      assert.equal(r.advertise, true, `off must advertise on landlock ${landlock}`);
+      assert.equal(r.degraded, true, `off must report degraded on landlock ${landlock}`);
+    }
+  });
+
+  it("mode off still requires the uid split", () => {
+    const r = resolveCodexHarnessAvailability({ ...base, mode: "off", uidSplit: false });
+    assert.equal(r.advertise, false);
+    assert.match(r.reason ?? "", /uid split not active/);
+  });
+
   it("does NOT advertise in required mode on a Landlock-unavailable kernel (distinct reason)", () => {
     const r = resolveCodexHarnessAvailability({ ...base, mode: "required", landlock: "unavailable" });
     assert.equal(r.advertise, false);

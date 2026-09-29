@@ -93,16 +93,16 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- /*
   uzi.validateCommandSandbox: fail fast on an unrecognized workers.codex.commandSandbox
   (PRD #1493 M4). The controller and the worker both parse it as a strict allow-list
-  (required|best-effort) and refuse to boot on anything else, so this catches a typo at
+  (off|required|best-effort) and refuse to boot on anything else, so this catches a typo at
   `helm template` time — where the message can name the fix — rather than as a controller
   CrashLoop after deploy. Called unconditionally from api-deployment.yaml alongside
   uzi.validateDatabaseMode, so it fires even with workers disabled; renders nothing on a
   valid value, so a good install is byte-unchanged.
 */ -}}
 {{- define "uzi.validateCommandSandbox" -}}
-{{- $s := .Values.workers.codex.commandSandbox -}}
-{{- if not (has $s (list "required" "best-effort")) -}}
-{{- fail (printf "workers.codex.commandSandbox must be one of required|best-effort, got %q" $s) -}}
+{{- $s := .Values.workers.codex.commandSandbox | toString -}}
+{{- if not (has $s (list "off" "required" "best-effort")) -}}
+{{- fail (printf "workers.codex.commandSandbox must be one of off|required|best-effort (quote \"off\": bare off is YAML false), got %q" $s) -}}
 {{- end -}}
 {{- end -}}
 

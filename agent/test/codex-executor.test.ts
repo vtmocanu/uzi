@@ -4672,6 +4672,28 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
       !emittedOff.some((m) => /without filesystem confinement/i.test(String((m.payload as { text?: string }).text ?? ""))),
       "no degraded-mode line when the sandbox is not degraded",
     );
+
+    // Mode off: the one degraded line names the off mode, not best-effort.
+    const rigModeOff = makeRig();
+    rigModeOff.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    const { ctx: ctxModeOff, emitted: emittedModeOff } = makeCtx();
+    await withTimeout(
+      new CodexExecutor(
+        noopLog,
+        "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rigModeOff.client as never, provider, commandSandbox: "off", commandSandboxDegraded: true },
+        rigModeOff.deps,
+      ).run(ctxModeOff),
+      3000,
+      "mode-off feed run",
+    );
+    const offLines = emittedModeOff
+      .filter((m) => m.kind === "status" && m.agent === "worker")
+      .map((m) => String((m.payload as { text?: string }).text ?? ""))
+      .filter((t) => /without filesystem confinement/i.test(t));
+    assert.equal(offLines.length, 1, "exactly one degraded-mode feed line per run in mode off");
+    assert.match(offLines[0]!, /mode is off/);
+    assert.equal(modeFlagOf(rigModeOff.fileopSpawns[0]!.args), "off", "the worker's off mode reaches the sandbox argv");
   });
 });
 

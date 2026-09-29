@@ -377,7 +377,7 @@ export class Worker {
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
         // receipt probe alone; it is now the combined decision main.ts resolved ONCE (like
         // dockerWiring) and stored on config.codexHarness — receipt intact AND the uid
-        // split active AND (Landlock available OR best-effort on a Landlock-less kernel).
+        // split active AND (mode off OR Landlock available OR best-effort on a Landlock-less kernel).
         // A positive result APPENDS codex_harness_v1; a failed precondition leaves the
         // array unchanged so a stripped/corrupt/mismatched/old image, a split-less worker,
         // or a Landlock-less worker in `required` mode keeps serving Claude — its Codex

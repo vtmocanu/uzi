@@ -1657,11 +1657,12 @@ uid-split mechanism the image already ships for compose, starting the
 existing entrypoint establishes the split before dropping to `worker`; the
 kube-native worker namespace's PodSecurity `enforce` tier moves from
 `restricted` to `baseline` only while it is on. A second knob
-(`workers.codex.commandSandbox`) makes the command sandbox's Landlock
-requirement `required` (fail closed on a kernel without it, the default) or
-`best-effort` (run unconfined on such a kernel, relying on the uid split
-alone). A worker advertises the Codex capability only when the split is
-active and Landlock is usable under the configured mode; otherwise it never
+(`workers.codex.commandSandbox`) sets the command sandbox's Landlock mode:
+`off` (never applied, relying on the uid split alone, the default),
+`required` (fail closed on a kernel without it) or `best-effort` (applied
+where available, unconfined otherwise). A worker advertises the Codex
+capability only when the split is active and the configured mode can run a
+command on this kernel; otherwise it never
 claims a Codex-indicating run, which stays queued instead. See
 [PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)

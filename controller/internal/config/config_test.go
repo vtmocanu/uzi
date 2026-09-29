@@ -980,11 +980,11 @@ func TestLoadParsesTheUIDSplit(t *testing.T) {
 	})
 }
 
-// UZI_CODEX_COMMAND_SANDBOX defaults to "required", accepts "best-effort", and rejects any
+// UZI_CODEX_COMMAND_SANDBOX defaults to "off", accepts "required" and "best-effort", and rejects any
 // other value at boot (strict allow-list). An empty/unset value takes the default rather than
 // erroring — the same "fail at boot, not at the far end" rule its neighbours follow.
 func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
-	t.Run("defaults to required when unset", func(t *testing.T) {
+	t.Run("defaults to off when unset", func(t *testing.T) {
 		setWorkerEnv(t)
 		t.Setenv("UZI_API_URL", "https://uzi.example.com")
 		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
@@ -992,8 +992,22 @@ func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Load: %v", err)
 		}
-		if cfg.WorkerCommandSandbox != "required" {
-			t.Errorf("WorkerCommandSandbox = %q, want the default \"required\" when unset", cfg.WorkerCommandSandbox)
+		if cfg.WorkerCommandSandbox != "off" {
+			t.Errorf("WorkerCommandSandbox = %q, want the default \"off\" when unset", cfg.WorkerCommandSandbox)
+		}
+	})
+
+	t.Run("off parses", func(t *testing.T) {
+		setWorkerEnv(t)
+		t.Setenv("UZI_API_URL", "https://uzi.example.com")
+		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
+		t.Setenv("UZI_CODEX_COMMAND_SANDBOX", "off")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if cfg.WorkerCommandSandbox != "off" {
+			t.Errorf("WorkerCommandSandbox = %q, want off", cfg.WorkerCommandSandbox)
 		}
 	})
 
@@ -1029,7 +1043,7 @@ func TestLoadParsesTheCommandSandboxMode(t *testing.T) {
 		setWorkerEnv(t)
 		t.Setenv("UZI_API_URL", "https://uzi.example.com")
 		t.Setenv("UZI_CONTROLLER_TOKEN_FILE", writeToken(t, "tok"))
-		t.Setenv("UZI_CODEX_COMMAND_SANDBOX", "off")
+		t.Setenv("UZI_CODEX_COMMAND_SANDBOX", "disabled")
 		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_CODEX_COMMAND_SANDBOX") {
 			t.Fatalf("err = %v, want a boot refusal naming UZI_CODEX_COMMAND_SANDBOX", err)
 		}

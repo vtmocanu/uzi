@@ -13,6 +13,11 @@
 //     relying on the uid split. It never relaxes no_new_privs, the private 0700
 //     tmp and cache adoption checks, the cwd-inside-root check or exit-status
 //     passthrough.
+//   - off: Landlock is never applied and never probed; the command runs without
+//     filesystem confinement behind the uid split, with the same no_new_privs,
+//     adoption, cwd and exit-status guarantees as the best-effort degrade. The
+//     worker's default mode; `required` stays the default only for an argv
+//     without --mode, which the worker never builds.
 //
 // The private tmp (--tmp) is created, locked and removed by the supervisor
 // above this process: it holds the creation pin and outlives any backgrounded
@@ -35,7 +40,7 @@
 // "Unavailable" is defined by errno (D8): a version probe returning ENOSYS or
 // EOPNOTSUPP is unavailable; any other errno, an ABI below 1, and every later
 // create/add-rule/restrict/deny-probe failure is an ERROR and stays fatal in
-// BOTH modes.
+// required and best-effort. Mode off never probes, so it never sees one.
 package main
 
 import (
@@ -79,6 +84,7 @@ type sandboxMode string
 const (
 	modeRequired   sandboxMode = "required"
 	modeBestEffort sandboxMode = "best-effort"
+	modeOff        sandboxMode = "off"
 )
 
 // landlockAvailability is the typed probe result shared by `--probe` and the
@@ -96,7 +102,7 @@ type policyAction int
 
 const (
 	actionApply      policyAction = iota // apply Landlock (both modes, when available)
-	actionUnconfined                     // best-effort degrade: run without Landlock
+	actionUnconfined                     // best-effort degrade or mode off: run without Landlock
 	actionFatal                          // fail closed (required-unavailable, or any error)
 )
 
@@ -278,7 +284,7 @@ func requireEmptyDir(fd int) error {
 
 // parseArgs reads the trusted worker-built argv. Grammar:
 //
-//	--root R --tmp T --cwd C [--cache K] [--mode required|best-effort] -- CMD...
+//	--root R --tmp T --cwd C [--cache K] [--mode required|best-effort|off] -- CMD...
 //
 // The three path flags stay positional (as before). The cache and mode flags
 // are OPTIONAL and, when present, come in that order after --cwd and before
@@ -373,8 +379,10 @@ func parseMode(value string) (sandboxMode, error) {
 		return modeRequired, nil
 	case modeBestEffort:
 		return modeBestEffort, nil
+	case modeOff:
+		return modeOff, nil
 	default:
-		return "", fmt.Errorf("invalid sandbox mode %q (expected %q or %q)", value, modeRequired, modeBestEffort)
+		return "", fmt.Errorf("invalid sandbox mode %q (expected %q, %q or %q)", value, modeRequired, modeBestEffort, modeOff)
 	}
 }
 
@@ -412,8 +420,12 @@ func probeExitCode(probe versionProbe) int {
 
 // decidePolicy resolves the action for a mode + probe result WITHOUT applying
 // any policy, so it is fully unit-testable through the injected seam. The abi it
-// returns is meaningful only for actionApply.
+// returns is meaningful only for actionApply. Mode off returns actionUnconfined
+// without calling the probe.
 func decidePolicy(probe versionProbe, mode sandboxMode) (action policyAction, abi int, err error) {
+	if mode == modeOff {
+		return actionUnconfined, 0, nil
+	}
 	avail, abiValue, classifyErr := classifyLandlock(probe)
 	switch avail {
 	case landlockAvailable:
@@ -449,7 +461,7 @@ type noNewPrivsFunc func() error
 
 // applyPolicy decides from mode + probe what to do, then does it. actionApply
 // applies Landlock and fails closed on any apply error (both modes);
-// actionUnconfined (best-effort, kernel without Landlock) runs the child without
+// actionUnconfined (mode off, or best-effort on a kernel without Landlock) runs the child without
 // filesystem confinement but STILL sets no_new_privs; actionFatal returns the
 // error so realMain fails closed. The two enforcement primitives are injected
 // (confineFn/noNewPrivsFn) so the dispatch itself is unit-testable; realMain
@@ -460,7 +472,7 @@ func applyPolicy(root string, fds grantFds, mode sandboxMode, probe versionProbe
 	case actionApply:
 		return confineFn(root, fds, abi)
 	case actionUnconfined:
-		// Degraded best-effort: no worktree confinement, but the uid split and
+		// Mode off or degraded best-effort: no worktree confinement, but the uid split and
 		// no_new_privs still hold (the private 0700 tmp and cache adoption and
 		// the cwd-inside-root check are enforced by realMain/parseArgs
 		// regardless of this branch).

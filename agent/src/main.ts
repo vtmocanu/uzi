@@ -137,8 +137,8 @@ export interface BuildRunExecutorDeps {
   /** PRD #1493 M3: the worker-configured command-sandbox mode, threaded into the
    *  CodexExecutor so its command/fileop argv carries the `--mode` token. */
   codexCommandSandbox: CommandSandboxMode;
-  /** PRD #1493 M3: true when the sandbox is running degraded (best-effort on a
-   *  Landlock-less kernel); the CodexExecutor writes one feed line per run. */
+  /** PRD #1493 M3: true when the sandbox is running degraded (mode off, or
+   *  best-effort on a Landlock-less kernel); the CodexExecutor writes one feed line per run. */
   codexSandboxDegraded: boolean;
 }
 
@@ -340,7 +340,9 @@ async function main(): Promise<void> {
   if (config.codexHarness.advertise && config.codexHarness.degraded) {
     // Log the DEGRADED mode ONCE here at startup (no per-command model-visible warning;
     // the executor writes one line into each Codex run's feed).
-    log.warn("codex_harness_v1 advertised DEGRADED: best-effort mode on a kernel without Landlock — commands run WITHOUT filesystem confinement (uid split still enforced)", {
+    log.warn(config.codexCommandSandbox === "off"
+      ? "codex_harness_v1 advertised DEGRADED: command sandbox mode off (Landlock disabled) — commands run WITHOUT filesystem confinement (uid split still enforced)"
+      : "codex_harness_v1 advertised DEGRADED: best-effort mode on a kernel without Landlock — commands run WITHOUT filesystem confinement (uid split still enforced)", {
       sandbox_mode: config.codexCommandSandbox,
       landlock,
     });

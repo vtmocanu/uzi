@@ -24,7 +24,7 @@ func TestParseArgs(t *testing.T) {
 
 func TestParseArgsMode(t *testing.T) {
 	// (present) an explicit --mode before -- is honored.
-	for _, want := range []sandboxMode{modeRequired, modeBestEffort} {
+	for _, want := range []sandboxMode{modeRequired, modeBestEffort, modeOff} {
 		root, tmp, cwd, _, mode, child, err := parseArgs([]string{
 			"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", string(want), "--", "/bin/true",
 		})
@@ -92,7 +92,7 @@ func TestParseArgsRejectsEscape(t *testing.T) {
 		{name: "relative child", args: []string{"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "bin/true"}},
 		{name: "malformed flag order", args: []string{"--tmp", "/tmp/run", "--root", "/data/run", "--cwd", "/data/run", "--", "/bin/true"}},
 		{name: "missing separator", args: []string{"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "/bin/true"}},
-		{name: "invalid mode", args: []string{"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", "off", "--", "/bin/true"}},
+		{name: "invalid mode", args: []string{"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", "disabled", "--", "/bin/true"}},
 		{name: "too short", args: []string{"--root", "/data/run", "--tmp", "/tmp/run"}},
 	}
 	for _, test := range tests {
@@ -162,6 +162,10 @@ func TestDecidePolicyByModeAndErrno(t *testing.T) {
 		// Available: apply in both modes.
 		{name: "available required applies", probe: fakeProbe(1, 0), mode: modeRequired, want: actionApply},
 		{name: "available best-effort applies", probe: fakeProbe(3, 0), mode: modeBestEffort, want: actionApply},
+		// Off: unconfined whatever the kernel reports, including a probe error.
+		{name: "available off is unconfined", probe: fakeProbe(6, 0), mode: modeOff, want: actionUnconfined},
+		{name: "ENOSYS off is unconfined", probe: fakeProbe(0, syscall.ENOSYS), mode: modeOff, want: actionUnconfined},
+		{name: "EPERM off is unconfined", probe: fakeProbe(0, syscall.EPERM), mode: modeOff, want: actionUnconfined},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -176,6 +180,22 @@ func TestDecidePolicyByModeAndErrno(t *testing.T) {
 				t.Fatalf("an apply decision must carry the ABI, got %d", abi)
 			}
 		})
+	}
+}
+
+// TestDecidePolicyOffNeverProbes pins that mode off skips the Landlock syscall
+// entirely rather than probing and discarding the result.
+func TestDecidePolicyOffNeverProbes(t *testing.T) {
+	probed := false
+	probe := func() (uintptr, syscall.Errno) {
+		probed = true
+		return 6, 0
+	}
+	if got, _, err := decidePolicy(probe, modeOff); got != actionUnconfined || err != nil {
+		t.Fatalf("decidePolicy(off) = %v, %v; want actionUnconfined, nil", got, err)
+	}
+	if probed {
+		t.Fatal("mode off must not call the Landlock version probe")
 	}
 }
 
@@ -232,6 +252,14 @@ func TestApplyPolicyDispatch(t *testing.T) {
 			name:           "actionUnconfined skips confine but still sets no_new_privs",
 			probe:          fakeProbe(0, syscall.ENOSYS),
 			mode:           modeBestEffort,
+			wantNoNewPrivs: true,
+		},
+		{
+			// Mode off on a Landlock-capable kernel → confine() does NOT run, and
+			// no_new_privs is STILL set.
+			name:           "mode off skips confine on a capable kernel but still sets no_new_privs",
+			probe:          fakeProbe(wantABI, 0),
+			mode:           modeOff,
 			wantNoNewPrivs: true,
 		},
 		{

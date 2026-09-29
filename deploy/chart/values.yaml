@@ -525,10 +525,11 @@ workers:
     # restricted posture; a flip rolls the whole fleet.
     enabled: false
   codex:
-    # `required` fails a Codex command closed if the kernel lacks Landlock. `best-effort`
-    # runs the command without Landlock filesystem confinement on such kernels (relying on
-    # the uid split), never relaxing the uid split.
-    commandSandbox: required
+    # `off` (the default) never applies Landlock: a Codex command runs without filesystem
+    # confinement, relying on the uid split. `required` fails a Codex command closed if the
+    # kernel lacks Landlock. `best-effort` applies Landlock where the kernel offers it and
+    # runs the command unconfined otherwise. No mode relaxes the uid split.
+    commandSandbox: "off"
 
   # PRD #837 M4 disk-pressure recycle (self-healing worker disk). When a hosted worker
   # reports disk pressure (a volume at used/total >= the api's diskPressureThreshold

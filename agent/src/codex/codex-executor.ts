@@ -1473,13 +1473,14 @@ export interface CodexExecutorOptions {
    * PRD #1493 M3: the command-sandbox enforcement mode this worker was configured
    * with (`config.codexCommandSandbox`). Threaded into `commandSandboxArgv` as the
    * `--mode` token the Go sandbox reads. It comes ONLY from the worker Config, never
-   * from run/repo/model input; omitted defaults to `required` (today's fail-closed
-   * behaviour), so a caller/test that does not set it is unchanged.
+   * from run/repo/model input; omitted defaults to `required` (fail-closed), so a
+   * caller/test that does not set it keeps Landlock. The worker always sets it from
+   * Config, whose default is `off`.
    */
   readonly commandSandbox?: CommandSandboxMode;
   /**
-   * PRD #1493 M3: true when this worker is advertising Codex DEGRADED (best-effort on
-   * a Landlock-less kernel, so commands run without filesystem confinement). When set,
+   * PRD #1493 M3: true when this worker is advertising Codex DEGRADED (mode off, or
+   * best-effort on a Landlock-less kernel, so commands run without filesystem confinement). When set,
    * `run()` writes ONE line into the run's feed at startup (never a per-command
    * model-visible warning). Absent/false is the normal (confined or required) case.
    */
@@ -1758,8 +1759,8 @@ export class CodexExecutor implements Executor {
     // repo/model input); absent defaults to `required` (today's fail-closed sandbox).
     const commandSandbox = this.opts.commandSandbox ?? "required";
 
-    // PRD #1493 M3: when the worker is advertising Codex DEGRADED (best-effort on a
-    // Landlock-less kernel), write ONE line into this run's feed — a worker status line,
+    // PRD #1493 M3: when the worker is advertising Codex DEGRADED (mode off, or
+    // best-effort on a Landlock-less kernel), write ONE line into this run's feed — a worker status line,
     // never a per-command model-visible warning. main.ts already logged it once at
     // startup; this makes the posture visible per run.
     if (this.opts.commandSandboxDegraded === true) {
@@ -1767,7 +1768,9 @@ export class CodexExecutor implements Executor {
         kind: "status",
         agent: "worker",
         payload: {
-          text: "codex command sandbox is running best-effort on a kernel without Landlock: model-authorized commands run WITHOUT filesystem confinement (the uid split is still enforced)",
+          text: commandSandbox === "off"
+            ? "codex command sandbox mode is off (Landlock disabled): model-authorized commands run WITHOUT filesystem confinement (the uid split is still enforced)"
+            : "codex command sandbox is running best-effort on a kernel without Landlock: model-authorized commands run WITHOUT filesystem confinement (the uid split is still enforced)",
         },
       });
     }
@@ -3904,7 +3907,7 @@ export function withCommandGitTrust(env: NodeJS.ProcessEnv, canonicalCheckout: s
  *  worktree, resolved ONCE at run start (git also resolves the configured value when it
  *  compares). Only the command's Landlock root, which excludes the checkout's parent, stands
  *  between a command and swapping that path: file modes do not (the clone parent is group
- *  `runner` writable, see git.ts), and best-effort mode may run without Landlock. Only a
+ *  `runner` writable, see git.ts), and modes off and best-effort may run without Landlock. Only a
  *  MISSING worktree (ENOENT, e.g. a unit-test rig's placeholder path) falls back to the
  *  lexically resolved path; any other error propagates. */
 export async function canonicalCheckoutPath(worktreePath: string): Promise<string> {

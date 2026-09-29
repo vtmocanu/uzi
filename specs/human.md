@@ -477,6 +477,7 @@ Tracked as GitLab issue vtmocanu/uzi#58 (closed); PRD at `prds/done/58-hosted-k8
 - Three sizes stay, and the picker displays what each size buys. [user 2026-07-17]
 - Deleting a hosted worker requires a confirmation (it destroys the worker's volumes); deleting an external worker stays one click. [user 2026-07-16]
 - Hosted k8s gains an opt-in uid-split worker profile for Codex (default off; while on, the kube-native worker namespace's PodSecurity admission drops from `restricted` to `baseline`, while the separate Docker-capable tier keeps its own `privileged` namespace); Landlock is optional via a mode knob (`required` fails closed, `best-effort` runs unconfined on a kernel without it, relying on the uid split alone). A worker without the split, or without usable Landlock under `required`, stops advertising Codex — those runs (including tool-less Codex advice) simply queue instead of being claimed and then failing. (AI-synced 2026-09-20)
+- Landlock for Codex commands is off by default (a third mode, `off`, is the default everywhere: worker, controller, chart); `required` and `best-effort` remain opt-ins. User decision after repeated Landlock-caused run failures (#1769, #1863, #1598). (AI-synced 2026-09-28)
 - Restricted-tier hosted workers may reach `api.openai.com`, `chatgpt.com` and `auth.openai.com` on 443, fleet-wide for the tier (Claude-only workers included), per PRD #1106 D12. (AI-synced 2026-09-24)
 
 ## Feature #64 — uzi CLI: terminal control for humans and agents

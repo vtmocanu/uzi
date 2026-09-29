@@ -281,8 +281,9 @@ fails provisioning instead of replacing repository content.
 Direct file-tool paths are limited to the run worktree on Claude and Codex.
 This is a tool policy, not a promise that every shell command is filesystem
 confined: Claude's Bash guardrail screens commands but does not jail paths;
-Codex also screens the shell working directory and uses Landlock where
-available. OS permissions and the worker/runner uid split still apply. The
+Codex also screens the shell working directory, and uses Landlock only when
+the operator turns its command sandbox on (`UZI_CODEX_COMMAND_SANDBOX`, off by
+default). OS permissions and the worker/runner uid split still apply. The
 existing credential and `.git` restrictions also apply inside scratch.
 
 ### Environment facts in the lead's prompt

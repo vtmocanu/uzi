@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Landlock for Codex commands is now off by default.**
+  The Codex command sandbox gains a third mode, `off`, which never applies Landlock and runs model-authorized commands without filesystem confinement, relying on the uid split (unchanged in every mode). It is the new default for the worker (`UZI_CODEX_COMMAND_SANDBOX`), the controller and the chart (`workers.codex.commandSandbox: "off"`), after Landlock confinement caused repeated Codex run failures (#1769, #1863, #1598). `required` and `best-effort` remain available as opt-ins; the controller now renders `UZI_CODEX_COMMAND_SANDBOX` onto workers for those two modes and omits it for `off`, so a default install's worker pods keep their spec hash and a worker image older than this change keeps its previous `required` default until the fleet rolls. An install that explicitly sets `required` now gets the env rendered, which rolls its fleet once. Quote `"off"` in values files: a bare `off` is YAML `false`, which the chart rejects.
+
 - **A lone unreadable runner process no longer blocks every run on a split-uid worker ([#1854](https://github.com/vtmocanu/uzi/issues/1854)).**
   When no other claim is active, the worker kills an unattributed runner process and confirms it exited before proceeding. It checks the process start time before signalling and excludes the scanner's own children. Concurrent claims and single-uid workers still fail closed when ownership cannot be proven.
 
