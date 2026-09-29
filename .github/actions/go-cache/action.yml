@@ -59,17 +59,21 @@ runs:
       run: |
         set -euo pipefail
         test -n "${GO_SUM_HASH}" || { echo "go-cache: no go.sum for this module" >&2; exit 2; }
-        fallback="go-${CLASS}-${RUNNER_OS}-$(go env GOVERSION)-"
+        # Resolve everything before writing any output, and write `key` last: a
+        # failure part-way must leave `key` empty, which is what the save gate checks.
+        gover=$(go env GOVERSION)
+        gocache=$(go env GOCACHE)
+        gomodcache=$(go env GOMODCACHE)
+        fallback="go-${CLASS}-${RUNNER_OS}-${gover}-"
         prefix="${fallback}${GO_SUM_HASH}-"
         {
           echo "fallback=${fallback}"
           echo "prefix=${prefix}"
-          echo "key=${prefix}${GITHUB_SHA}"
           echo "paths<<GO_CACHE_PATHS_EOF"
-          go env GOCACHE
-          go env GOMODCACHE
+          printf '%s\n%s\n' "${gocache}" "${gomodcache}"
           if [ -n "${EXTRA_PATHS}" ]; then printf '%s\n' "${EXTRA_PATHS}"; fi
           echo "GO_CACHE_PATHS_EOF"
+          echo "key=${prefix}${GITHUB_SHA}"
         } >> "${GITHUB_OUTPUT}"
     - name: Restore Go cache
       id: restore
