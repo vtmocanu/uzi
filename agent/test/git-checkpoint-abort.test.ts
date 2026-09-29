@@ -8,6 +8,12 @@ import { nullLogger } from "./helpers.js";
 const SHA = "a".repeat(40);
 const FLOOR = "b".repeat(40);
 
+function safeAbort(error: unknown, cause: Error): boolean {
+  return error instanceof Error && error.name === "AbortError" &&
+    !(error instanceof ScratchPublicationError) && !error.message.includes(cause.message) &&
+    error.cause === cause;
+}
+
 /** Stub only the Git reads before the bounded history walk; no repository is needed. */
 function preflightCache(): GitCache {
   const cache = new GitCache("/unused-checkpoint-abort-test", nullLogger());
@@ -29,24 +35,24 @@ it("an aborted scratch history walk stays an abort, not a scratch refusal", asyn
   seam.execScoped = async () => { throw abort; };
 
   await assert.rejects(cache.scratchPublicationPreflight("/unused", "agent/issue-1914", SHA),
-    (error: unknown) => error === abort && !(error instanceof ScratchPublicationError));
+    (error: unknown) => safeAbort(error, abort));
 });
 
 it("a plain subprocess error after the held permit aborts is classified as an abort", async () => {
   const cache = preflightCache();
   const controller = new AbortController();
   const seam = cache as unknown as { execScoped: () => Promise<never> };
+  const remote = new Error("attacker-controlled git response");
   seam.execScoped = async () => {
     controller.abort();
-    throw new Error("permit-held git output collection aborted: boundary deadline exceeded");
+    throw remote;
   };
 
   await assert.rejects(cache.withBoundaryProcessSpawner(
     async () => { throw new Error("unexpected child spawn"); },
     controller.signal,
     () => cache.scratchPublicationPreflight("/unused", "agent/issue-1914", SHA),
-  ), (error: unknown) => error instanceof Error && error.name === "AbortError" &&
-    !(error instanceof ScratchPublicationError));
+  ), (error: unknown) => safeAbort(error, remote));
 });
 
 it("a default-tip abort cannot turn an overlay checkpoint into a raw-tip pack", async () => {
@@ -74,7 +80,7 @@ it("a default-tip abort cannot turn an overlay checkpoint into a raw-tip pack", 
   };
 
   await assert.rejects(cache.checkpointPack("/unused", "agent/issue-1914", { defaultBranch: "main" }),
-    (error: unknown) => error === abort && !(error instanceof ScratchPublicationError));
+    (error: unknown) => safeAbort(error, abort));
   assert.equal(packs, 0, "an aborted overlay must not create a raw-tip pack");
 });
 
@@ -109,7 +115,7 @@ it("an abort during overlay synthesis cannot turn into a raw-tip pack", async ()
   };
 
   await assert.rejects(cache.checkpointPack("/unused", "agent/issue-1914", { defaultBranch: "main" }),
-    (error: unknown) => error === abort && !(error instanceof ScratchPublicationError));
+    (error: unknown) => safeAbort(error, abort));
   assert.equal(packs, 0);
 });
 

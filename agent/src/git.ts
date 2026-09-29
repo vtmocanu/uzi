@@ -168,6 +168,9 @@ export class ScratchPublicationError extends Error {
   }
 }
 
+const GIT_OUTPUT_ABORT_MESSAGE = "permit-held git output collection aborted: boundary deadline exceeded";
+const GIT_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
+
 /** A permit deadline stopped Git work. Keep this distinct from a scratch finding. */
 class GitBoundaryAbortError extends Error {
   constructor(message: string, cause?: unknown) {
@@ -6328,9 +6331,16 @@ export class GitCache {
 
   /** A hard permit abort is not evidence that a candidate contains scratch files. */
   private boundaryAbortError(cause: unknown): Error | undefined {
-    if (isAbortLike(cause)) return cause;
+    if (cause instanceof GitBoundaryAbortError) return cause;
+    // Foreign AbortError messages can carry remote text. Preserve the abort type and
+    // original cause without copying that message onto the run-log surface.
+    if (isAbortLike(cause)) return new GitBoundaryAbortError("permit-held git operation aborted", cause);
     if (this.boundaryProcesses.getStore()?.signal.aborted) {
-      const message = cause instanceof Error ? cause.message : "permit-held git operation aborted";
+      // A generic Git/remote error can carry untrusted stderr. Only fixed abort
+      // messages may reach the run log; the original detail stays in cause.
+      const message = cause instanceof Error && cause.message === GIT_OUTPUT_ABORT_MESSAGE
+        ? GIT_OUTPUT_ABORT_MESSAGE
+        : "permit-held git operation aborted";
       return new GitBoundaryAbortError(message, cause);
     }
     return undefined;
@@ -6403,7 +6413,7 @@ export class GitCache {
         const onError = (error: unknown): void => settle(undefined, error);
         const onAbort = (): void => {
           stream.destroy();
-          settle(undefined, new Error("permit-held git output collection aborted: boundary deadline exceeded"));
+          settle(undefined, new Error(GIT_OUTPUT_ABORT_MESSAGE));
         };
         stream.on("data", onData);
         stream.once("end", onEnd);
@@ -6424,7 +6434,7 @@ export class GitCache {
       throw this.boundaryAbortError(error) ?? error;
     }
     if (boundary.signal.aborted) {
-      throw new GitBoundaryAbortError("permit-held git output collection aborted: boundary deadline exceeded");
+      throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
     }
     const out = Buffer.concat(stdout.chunks).toString();
     const err = Buffer.concat(stderr.chunks).toString();
@@ -6806,7 +6816,7 @@ export class GitCache {
       if (started || settled) return;
       settled = true;
       removeAbortListener();
-      rejectResult(new GitBoundaryAbortError("permit-held git lock wait aborted: boundary deadline exceeded"));
+      rejectResult(new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE));
     };
     if (scope) {
       removeAbortListener = (): void => scope.signal.removeEventListener("abort", abortBeforeAcquisition);
