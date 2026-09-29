@@ -187,6 +187,13 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		return s.assembleJudgeClaim(ctx, wkr, run)
 	}
 
+	// Job lane (PRD #1908): a job is repo-less like a judge, so it forks here too, before
+	// GetRunClaimContext and any PAT decrypt. Its claim carries the model credential and the job
+	// block, and no repo, PAT, memory or skills.
+	if run.Kind == runkind.Job {
+		return s.assembleJobClaim(ctx, wkr, run)
+	}
+
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {

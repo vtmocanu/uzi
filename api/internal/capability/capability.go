@@ -137,6 +137,15 @@ const GateRevisionV1 = "gate_revision_v1"
 // vocabulary below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
 const AdviceClaimFenceV1 = "advice_claim_fence_v1"
 
+// JobRunnerV1 is the PROTOCOL capability a worker self-reports (PRD #1908 D-A) to declare it
+// implements the repo-less `job` run lane: it dispatches a `job` claim to the job runner instead
+// of the issue executor. ClaimRun gates every `kind='job'` run on it (plus a non-docker worker),
+// OUTSIDE required_capabilities and the capability_aware kill-switch, so an old-image worker can
+// never be handed a job it would run as an issue. It is a worker/server protocol fact, so it lives
+// in the protocol vocabulary below, NEVER in `vocabulary`, `required_capabilities` or the web
+// capability picker.
+const JobRunnerV1 = "job_runner_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -152,11 +161,12 @@ var protocolVocabulary = map[string]struct{}{
 	InputReceiptsV1:            {},
 	GateRevisionV1:             {},
 	AdviceClaimFenceV1:         {},
+	JobRunnerV1:                {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

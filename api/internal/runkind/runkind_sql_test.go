@@ -20,12 +20,11 @@ import (
 // All blocks are checked, not a representative one, so a divergence in any sibling is red.
 // This file lives inside the api/ module, so Go's test cache rechecks it.
 
-// jobWallExclusionDeferred is true while the wall-park blocks do not yet exclude 'job'. PRD
-// #1908 M1 adds the kind and the WallTimed property but deliberately does not touch the park
-// queries (D-E, the job-never-parks change, lands with M3). While true, the wall blocks may omit
-// exactly the job kind from WallTimed's excluded set; M3 flips this to false, after which the
-// blocks must match WallTimed exactly.
-const jobWallExclusionDeferred = true
+// jobWallExclusionDeferred was true while the wall-park blocks did not yet exclude 'job' (PRD
+// #1908 M1 added the kind and the WallTimed property without touching the park queries). D-E
+// (a job never parks) landed with M3, so it is false and the blocks must match WallTimed exactly.
+// While true the blocks could omit exactly the job kind from WallTimed's excluded set.
+const jobWallExclusionDeferred = false
 
 func TestRuntimeSQLKindFilterMatchesListed(t *testing.T) {
 	assertKindFilters(t, []string{"CountInProgressRunsForUser", "ListRunsForUser", "ListActiveRunsAll"},

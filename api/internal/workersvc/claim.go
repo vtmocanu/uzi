@@ -344,10 +344,17 @@ type ClaimPayload struct {
 	// PR has no record, so every other claim stays byte-identical to today's wire.
 	PrDescription *apitypes.PrDescriptionState `json:"pr_description,omitempty"`
 
-	Repo    ClaimRepo    `json:"repo"`
-	Secrets ClaimSecrets `json:"secrets"`
-	Agents  []ClaimAgent `json:"agents"`
-	Config  ClaimConfig  `json:"config"`
+	// Job is the job block of a kind='job' claim (PRD #1908): the caller's job type, title,
+	// prompt and named inputs. nil (key omitted) for every other kind. A job claim carries no
+	// repo, PAT, memory, skills or forge fields.
+	Job *ClaimJob `json:"job,omitempty"`
+	// BudgetWallSeconds is the job's wall-clock budget in seconds (PRD #1908): the job runner
+	// aborts and reports failed at this bound. Set only on a job claim, omitted otherwise.
+	BudgetWallSeconds *int32       `json:"budget_wall_seconds,omitempty"`
+	Repo              ClaimRepo    `json:"repo"`
+	Secrets           ClaimSecrets `json:"secrets"`
+	Agents            []ClaimAgent `json:"agents"`
+	Config            ClaimConfig  `json:"config"`
 
 	// Skills is the deduplicated per-run union of every skill allocated to any
 	// template for this run's owner (shared allocations ∪ the owner's overlay),

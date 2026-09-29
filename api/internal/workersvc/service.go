@@ -1052,6 +1052,16 @@ type Store interface {
 	// run's non-bypassable custom-model claim clause can never be satisfied. A per-run lookup like
 	// CountOnlineWorkersSatisfyingCodexHarness above, and off the hot path for the same reason.
 	CountOnlineWorkersSatisfyingCustomCodex(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingJobRunner backs PRD #1908's (D-A) queued-reason rung: a queued
+	// kind='job' run whose owner has NO online non-docker worker advertising 'job_runner_v1' gets
+	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
+	// satisfied. A per-run lookup like CountOnlineWorkersSatisfyingCodexHarness above, and off the
+	// hot path for the same reason.
+	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, userID uuid.UUID) (int64, error)
+	// ListJobInputsForClaim reads a claimed job's named inputs for claim assembly (PRD #1908).
+	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
+	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
+	FailJobsPastWallDeadline(ctx context.Context, arg store.FailJobsPastWallDeadlineParams) ([]store.FailJobsPastWallDeadlineRow, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-

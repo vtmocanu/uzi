@@ -119,3 +119,98 @@ SELECT m.seq, m.created_at, m.kind, COALESCE(m.payload->>'text', '')::text AS te
    AND (sqlc.narg('product_id')::uuid IS NULL OR o.product_id = sqlc.narg('product_id')::uuid)
  ORDER BY m.seq ASC
  LIMIT @lim;
+
+-- name: ListJobInputsForClaim :many
+-- The named text inputs of a job, in ordinal order, for claim assembly. NOT caller-scoped: the
+-- claim path runs as the worker that just claimed the run (the run id comes from the claimed
+-- row, never from a request).
+SELECT name, content_md
+  FROM job_inputs
+ WHERE run_id = @run_id
+ ORDER BY ordinal ASC;
+
+-- name: LockUnservableEphemeralJobWorkers :many
+-- PRD #1908 D-A2. The ephemeral workers bound to a kind='job' run that can never serve it,
+-- locked FOR UPDATE (worker rows, id order) so the fail-and-delete that follows in the same
+-- transaction serialises with the worker's own register/heartbeat. Two shapes:
+--   (a) the worker registered and is online, but its protocol_capabilities lack 'job_runner_v1'
+--       (an old worker image): ClaimRun's job clause will never let it claim, and the gap
+--       trigger would provision another one forever. cause = 'no_job_capable_worker'.
+--   (b) the worker never registered by the provision deadline (online_since IS NULL and
+--       created_at older than @deadline_cutoff): the same shape ReapEphemeralWorkers would
+--       delete silently, leaving the still-queued job to be re-provisioned every deadline.
+--       cause = 'ephemeral_worker_never_registered'.
+-- A worker holding ANY non-terminal run is left alone (the ReapEphemeralWorkers busy guard), and
+-- so is one under an OPEN custody hold (the DeleteEphemeralWorkerForRun custody skip): the
+-- worker row is the last local source and its delete would hit the hold's RESTRICT FK.
+SELECT w.id AS worker_id, r.id AS run_id, r.user_id AS user_id,
+       CASE WHEN w.online_since IS NULL THEN 'ephemeral_worker_never_registered'
+            ELSE 'no_job_capable_worker' END::text AS cause
+  FROM workers w
+  JOIN runs r ON r.id = w.ephemeral_run_id AND r.kind = 'job'
+ WHERE w.ephemeral
+   AND (
+        (w.online_since IS NOT NULL
+         AND w.status = 'online'
+         AND NOT ('job_runner_v1' = ANY(w.protocol_capabilities)))
+        OR (w.online_since IS NULL AND w.created_at < @deadline_cutoff)
+   )
+   AND NOT EXISTS (
+       SELECT 1 FROM runs br
+        WHERE br.worker_id = w.id
+          AND br.status NOT IN ('completed', 'failed', 'cancelled')
+   )
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+        WHERE h.live_worker_id = w.id AND h.state = 'open'
+   )
+ ORDER BY w.id
+   FOR UPDATE OF w;
+
+-- name: FailUnservedJobRun :many
+-- PRD #1908 D-A2: fail a job whose run-bound ephemeral worker can never serve it. The race
+-- guard is load-bearing: `status = 'queued' AND worker_id IS NULL` means a capable worker that
+-- claimed the job in the meantime keeps it (this then matches nothing and the caller deletes
+-- only the stale ephemeral row). Server-derived failure: fail_origin is one of the two
+-- server-only values (@fail_origin is checked by runs_fail_origin_check), stamped in the same
+-- statement, and the transition is returned so the caller can fan it out.
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = @fail_origin::text,
+    finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE id = @run_id
+  AND kind = 'job'
+  AND status = 'queued'
+  AND worker_id IS NULL
+RETURNING id, user_id, status;
+
+-- name: FailJobsPastWallDeadline :many
+-- PRD #1908 D-E: the server backstop for a job's wall clock. A job never parks (the wall-park
+-- passes exclude it), so the runner aborts itself at budget_wall_seconds and reports failed;
+-- this fails a claimed or running job whose deadline plus @grace_seconds has passed, for a
+-- runner that died or wedged. The deadline is the same shape the wall passes use
+-- (budget_wall_seconds, else the global timeout, plus banked pause and any extension/finalize
+-- term, all zero for a job in practice) measured from started_at, else claimed_at.
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = 'run_timeout',
+    finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE kind = 'job'
+  AND status IN ('claimed', 'running')
+  AND COALESCE(started_at, claimed_at) < (sqlc.arg('now')::timestamptz
+        - make_interval(secs => COALESCE(budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                              + budget_paused_seconds
+                              + budget_extension_seconds
+                              + budget_finalize_seconds
+                              + sqlc.arg('grace_seconds')::int))
+RETURNING id, user_id, status;

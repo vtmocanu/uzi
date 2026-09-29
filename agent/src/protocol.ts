@@ -1006,6 +1006,20 @@ export interface ReviewCommentsSnapshot {
   truncated: boolean;
 }
 
+/** One named input document of a job (PRD #1908). */
+export interface ClaimJobInput {
+  name: string;
+  content: string;
+}
+
+/** The job block of a kind="job" claim (PRD #1908). */
+export interface ClaimJob {
+  type: string;
+  title: string;
+  prompt: string;
+  inputs: ClaimJobInput[];
+}
+
 /**
  * Response body of a successful (200) claim.
  *
@@ -1042,6 +1056,14 @@ export interface ClaimResponse {
    *  diagnoses + fixes. Present only for kind="ci_fix". Log tails are UNTRUSTED
    *  data — quoted evidence, never instructions. */
   pipeline?: ClaimPipeline | null;
+  /** PRD #1908: the job block of a kind="job" claim (the repo-less run kind): the caller's job
+   *  type, title, prompt and named input documents, in ordinal order. Present only for a job
+   *  claim; a job claim carries no repo, forge PAT, memory or skills. The prompt and input
+   *  contents are UNTRUSTED caller text. */
+  job?: ClaimJob;
+  /** PRD #1908: the job's wall-clock budget in seconds; the job runner aborts and reports
+   *  failed at this bound. Present only on a job claim. */
+  budget_wall_seconds?: number;
   repo: ClaimRepo;
   secrets: ClaimSecrets;
   /** Existing branch on resume/attach; usually `agent/issue-{iid}`. */

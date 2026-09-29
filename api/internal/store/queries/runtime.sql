@@ -935,6 +935,15 @@ WITH target AS (
           )
           OR 'codex_custom_model_v1' = ANY(@worker_protocol_caps::text[])
       )
+      -- PRD #1908 (D-A): the NON-BYPASSABLE job-runner claim clause, a standalone sibling of the
+      -- Codex clauses above. A repo-less 'job' run may be claimed ONLY by a NON-docker worker whose
+      -- SELF-REPORTED protocol_capabilities contain 'job_runner_v1'. Every other kind is unaffected.
+      -- OUTSIDE fn_worker_can_claim, required_capabilities, ClearRunRequiredCapabilities and the
+      -- @capability_aware kill-switch: an old-image worker would route a job to the issue executor,
+      -- and a docker worker never serves a repo-less non-judge run. @is_docker_worker is the
+      -- claimant's docker flag, @worker_protocol_caps its stored protocol_capabilities.
+      AND (r.kind <> 'job'
+           OR (NOT @is_docker_worker::boolean AND 'job_runner_v1' = ANY(@worker_protocol_caps::text[])))
       -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
       -- its SAME alias's account authority is on hold (D1's hold class):
       --   (1) quarantine: the linked account is quarantined and is still the run's
@@ -1078,6 +1087,11 @@ WITH target AS (
                     )
                     OR 'codex_custom_model_v1' = ANY(p.protocol_capabilities)
                 )
+                -- PRD #1908 (D-A): MIRROR the job-runner claim clause for the peer, or fleet-spread could
+                -- DEFER a job to a docker or old-image peer that could never claim it. Reads the peer's
+                -- OWN docker flag and workers.protocol_capabilities.
+                AND (r.kind <> 'job'
+                     OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)))
                 -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
                 -- busy worker never defers this run to a peer that cannot claim it.
                 AND NOT (
@@ -2245,7 +2259,7 @@ UPDATE runs SET
     updated_at           = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge'
+  AND kind NOT IN ('judge', 'job')
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, the SAME nil-guarded
   -- shape as InsertRunMessage. A CAPABILITY worker stamps claim_generation on the park report;
   -- a stale report from an OLD flight — reclaimed to a NEW generation under same-worker affinity
@@ -2476,7 +2490,7 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge'
+  AND kind NOT IN ('judge', 'job')
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
   -- SetRunLimitWait's and the SAME nil-guarded shape as InsertRunMessage. A stale report from an
   -- OLD flight — reclaimed to a NEW generation under same-worker affinity, or against a released
@@ -2523,7 +2537,7 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge'
+  AND kind NOT IN ('judge', 'job')
 RETURNING *;
 
 -- name: ParkRunDataVolumeFull :one
@@ -2561,7 +2575,7 @@ UPDATE runs SET
     updated_at                = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status = 'running'
-  AND kind <> 'judge'
+  AND kind NOT IN ('judge', 'job')
   AND claim_released_at IS NULL
   AND (sqlc.narg('claim_generation')::bigint IS NULL
        OR claim_generation = sqlc.narg('claim_generation')::bigint)
@@ -4020,7 +4034,7 @@ WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generati
 --   - is NOT a usage park (Decision 9): limit_wait_count, limit_resets_at, retry_not_before
 --     and rate_limit_type are untouched, and limit_dead_secret_id is kept because M3's
 --     exclude-relax reads it on resume;
---   - never holds a judge (`kind <> 'judge'`, Decision 14).
+--   - never holds a judge (`kind <> 'judge'`, Decision 14) or a job (PRD #1908 D-E: a job never parks).
 -- Both arms keep the POSITIVE source guard (status = 'claimed'), revoke the claim's Codex
 -- capability (PRD #1147 F7), reset health (the status itself is the signal; never write a
 -- sentence into health_reason) and keep worker_id for resume affinity.
@@ -4034,7 +4048,7 @@ UPDATE runs SET
     updated_at = now()
 WHERE id = @id AND worker_id = @worker_id AND claim_generation = @claim_generation
   AND status = 'claimed'
-  AND (NOT @pool_wait::boolean OR kind <> 'judge');
+  AND (NOT @pool_wait::boolean OR kind NOT IN ('judge', 'job'));
 
 -- name: ListPoolWaitRuns :many
 -- The reactive-resume worklist (PRD #754 M5): every run currently held in pool_wait,
@@ -4171,7 +4185,7 @@ WITH requested AS (
                                   + budget_paused_seconds
                                   + budget_extension_seconds
                                   + budget_finalize_seconds))
-      AND kind NOT IN ('chat', 'judge')
+      AND kind NOT IN ('chat', 'judge', 'job')
       AND interactive = false
       -- idempotent across ticks: a row already carrying a 'wall' request is not re-requested.
       AND pause_mode IS DISTINCT FROM 'wall'
@@ -4237,7 +4251,7 @@ WITH locked AS (
         SELECT 1 FROM runs r
         WHERE r.worker_id = w.id
           AND r.status = 'running'
-          AND r.kind NOT IN ('chat', 'judge')
+          AND r.kind NOT IN ('chat', 'judge', 'job')
           AND r.interactive = false
           AND r.started_at < (sqlc.arg('now')::timestamptz
                 - make_interval(secs => COALESCE(r.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
@@ -4267,7 +4281,7 @@ parked AS (
     FROM locked l
     WHERE runs.worker_id = l.id
       AND runs.status = 'running'
-      AND runs.kind NOT IN ('chat', 'judge')
+      AND runs.kind NOT IN ('chat', 'judge', 'job')
       AND runs.interactive = false
       AND runs.started_at < (sqlc.arg('now')::timestamptz
             - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
@@ -4352,7 +4366,7 @@ WHERE status = 'running'
                               + budget_extension_seconds
                               + budget_finalize_seconds
                               + budget_paused_seconds))
-  AND kind NOT IN ('chat', 'judge')
+  AND kind NOT IN ('chat', 'judge', 'job')
   AND interactive = false
   AND completion_attempts > 0
   AND completion_contract_version IS NOT NULL
@@ -5951,7 +5965,7 @@ WITH extended AS (
                     updated_at = now()
     WHERE id = sqlc.arg('id')
       AND status NOT IN ('completed', 'failed', 'cancelled')
-      AND kind NOT IN ('chat', 'judge')
+      AND kind NOT IN ('chat', 'judge', 'job')
       AND interactive = false
       AND budget_extension_seconds + sqlc.arg('secs')::int <= sqlc.arg('cap')::int
     RETURNING id, budget_extension_seconds
@@ -6609,6 +6623,9 @@ WHERE run.id = @run_id
       )
       OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
   )
+  -- PRD #1908 (D-A): MIRROR ClaimRun's job-runner clause (non-docker AND job_runner_v1).
+  AND (run.kind <> 'job'
+       OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
   AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
@@ -6795,6 +6812,21 @@ WHERE w.user_id = @user_id
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities);
 
+-- name: CountOnlineWorkersSatisfyingJobRunner :one
+-- PRD #1908 (D-A): how many of a user's ONLINE, non-draining, non-ephemeral, NON-docker workers
+-- self-report the 'job_runner_v1' PROTOCOL capability. The job analogue of
+-- CountOnlineWorkersSatisfyingCodexHarness: it drives the queued-reason resolver's
+-- reasonNoJobCapableWorker rung (a 0 here for a queued job means ClaimRun's non-bypassable
+-- job-runner clause can never be satisfied). Reads workers.protocol_capabilities DIRECTLY and
+-- excludes docker workers, exactly the set ClaimRun's clause admits.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL
+  AND NOT w.ephemeral
+  AND NOT COALESCE(w.docker_enabled, false)
+  AND 'job_runner_v1' = ANY(w.protocol_capabilities);
+
 -- name: ListUnplaceableQueuedRunsForEphemeral :many
 -- The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the
 -- queued, non-chat runs for which the api should spin a run-bound ephemeral worker:
@@ -6843,15 +6875,29 @@ FROM runs r
 JOIN users u ON u.id = r.user_id AND u.ephemeral_workers_enabled
 WHERE r.status = 'queued'
   AND r.kind <> 'chat'
-  AND cardinality(r.required_capabilities) > 0
+  AND (cardinality(r.required_capabilities) > 0 OR r.kind = 'job')
   AND NOT EXISTS (
       SELECT 1 FROM workers w
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
         AND NOT w.ephemeral
+        AND r.kind <> 'job'
         AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
+  -- PRD #1908 (D-A): a repo-less 'job' is placeable ONLY on an online, non-draining,
+  -- non-ephemeral, NON-docker worker advertising 'job_runner_v1' (ClaimRun's non-bypassable
+  -- job-runner clause), so the capability-subset test above is skipped for it (r.kind <> 'job')
+  -- and THIS block decides instead. Non-job runs are unaffected (the OR is true).
+  AND (r.kind <> 'job' OR NOT EXISTS (
+      SELECT 1 FROM workers wj
+      WHERE wj.user_id = r.user_id
+        AND wj.status = 'online'
+        AND wj.draining_since IS NULL
+        AND NOT wj.ephemeral
+        AND NOT COALESCE(wj.docker_enabled, false)
+        AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
+  ))
   AND NOT EXISTS (
       SELECT 1 FROM workers w2
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
@@ -6935,6 +6981,9 @@ WHERE r.status = 'queued'
         AND w.draining_since IS NULL
         AND NOT w.ephemeral
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
+        -- PRD #1908 (D-A): for a 'job' the capable set is the job-runner set (non-docker AND
+        -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
+        AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
   )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -6943,6 +6992,7 @@ WHERE r.status = 'queued'
         AND w.draining_since IS NULL
         AND NOT w.ephemeral
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
+        AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
         AND (w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
                   WHERE r2.worker_id = w.id

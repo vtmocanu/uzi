@@ -1,0 +1,119 @@
+package workersvc
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/toolprofile"
+)
+
+// ClaimJob is the job block of a claim (PRD #1908): what a job runner needs to do the work and
+// nothing about a repo. type is the job type the caller asked for, title/prompt are the caller's
+// own words, and inputs are the named text documents attached to the job, in ordinal order.
+type ClaimJob struct {
+	Type   string          `json:"type"`
+	Title  string          `json:"title"`
+	Prompt string          `json:"prompt"`
+	Inputs []ClaimJobInput `json:"inputs"`
+}
+
+// ClaimJobInput is one named input document of a job.
+type ClaimJobInput struct {
+	Name    string `json:"name"`
+	Content string `json:"content"`
+}
+
+// assembleJobClaim builds the claim payload for an already-claimed kind='job' run (PRD #1908).
+// A job has no repo, no forge connection, no memory and no skills, so it forks in assembleClaim
+// BEFORE GetRunClaimContext (which INNER-JOINs repos) and before any PAT decrypt: the payload
+// carries the model credential, the job block and the wall budget, and nothing else. The
+// credential resolves through the SAME ladder the ordinary Claude run lane uses (a per-run
+// override, else the claiming worker's binding, else the owner's default), so a job spends the
+// account the worker or the request selected and not the judge's binding.
+//
+// The wire keeps the (empty) repo and forge_pat keys because a job rides the ordinary
+// ClaimPayload; the no-PAT guarantee is that assembly never decrypts one.
+func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run store.Run) (*ClaimPayload, error) {
+	if run.Harness == harnessCodex {
+		// Jobs are created with an explicit Claude pin; a Codex job is a data error and must
+		// fail closed rather than run without a credential.
+		return nil, fmt.Errorf("%w: a job run cannot use the Codex harness", errCredentialUnavailable)
+	}
+	choice, err := s.claimSecretID(ctx, wkr, run)
+	if err != nil {
+		return nil, err
+	}
+	cred, choice, err := s.openWithAutoRetry(ctx, run, choice)
+	if err != nil {
+		return nil, err
+	}
+	// emitSwitchMessage=false: a job is not credential-switchable (D-E), so it never emits a
+	// 'credential_switch' message and last_seq cannot diverge from run.LastSeq.
+	if _, err := s.recordRunCredential(ctx, run, cred, choice, false); err != nil {
+		return nil, err
+	}
+
+	inputs, err := s.q.ListJobInputsForClaim(ctx, run.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list job inputs: %w", err)
+	}
+	job := &ClaimJob{
+		Type:   run.JobType.String,
+		Title:  run.IssueTitle,
+		Prompt: run.IssueDescription,
+		Inputs: make([]ClaimJobInput, 0, len(inputs)),
+	}
+	for _, in := range inputs {
+		job.Inputs = append(job.Inputs, ClaimJobInput{Name: in.Name, Content: in.ContentMd})
+	}
+
+	// The owner's Claude model lane, then a frozen per-run model when it is compatible. Best
+	// effort: a lookup error logs and the runner uses its own default, it never fails the claim.
+	var defaultModel *string
+	if lanes, lerr := s.q.GetUserHarnessModelDefaults(ctx, run.UserID); lerr != nil {
+		slog.Warn("job claim: read user model defaults", "user", run.UserID.String(), "error", lerr)
+	} else {
+		defaultModel = textPtr(lanes.DefaultClaudeModel)
+	}
+	if run.Model.Valid && harnessModelCompatible(Harness(run.Harness), run.Model.String) {
+		defaultModel = textPtr(run.Model)
+	}
+	defaultEffort, eerr := s.q.GetUserDefaultEffort(ctx, run.UserID)
+	if eerr != nil {
+		slog.Warn("job claim: read user default effort", "user", run.UserID.String(), "error", eerr)
+	}
+
+	wall := coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds()))
+	wall32 := int32(wall) //nolint:gosec // G115: a clamped wall budget, at most budgetWallCeilingSeconds
+	return &ClaimPayload{
+		RunID:             run.ID.String(),
+		Kind:              run.Kind,
+		ClaimGeneration:   run.ClaimGeneration,
+		IssueTitle:        run.IssueTitle,
+		IssueDescription:  run.IssueDescription,
+		Status:            run.Status,
+		Job:               job,
+		BudgetWallSeconds: &wall32,
+		LastSeq:           run.LastSeq,
+		IterationCount:    run.IterationCount,
+		RequeueCount:      run.RequeueCount,
+		Secrets:           ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
+		Agents:            []ClaimAgent{},
+		Skills:            []ClaimSkill{},
+		SkillsDropped:     []ClaimSkillDrop{},
+		Config: ClaimConfig{
+			RunTimeoutSeconds:      wall,
+			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+			MaxIterations:          s.p.RunMaxIterations,
+			PlanMaxRevisions:       s.p.PlanMaxRevisions,
+			QuestionMax:            s.p.QuestionMax,
+			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
+			DefaultModel:           defaultModel,
+			DefaultEffort:          resolveEffortPtr(defaultEffort),
+			ToolPackages:           []string{},
+			DeniedToolPackages:     toolprofile.DenylistNames(),
+		},
+	}, nil
+}

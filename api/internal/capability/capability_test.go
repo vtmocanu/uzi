@@ -218,6 +218,21 @@ func TestFilterProtocol_KeepsAdviceClaimFenceV1(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_KeepsJobRunnerV1 pins PRD #1908 D-A: job_runner_v1 survives registration (the
+// job claim clause reads it off workers.protocol_capabilities), is not a scheduler capability,
+// and orders last in protocolOrder.
+func TestFilterProtocol_KeepsJobRunnerV1(t *testing.T) {
+	if got := FilterProtocol([]string{JobRunnerV1, AdviceClaimFenceV1}); !reflect.DeepEqual(got, []string{AdviceClaimFenceV1, JobRunnerV1}) {
+		t.Errorf("FilterProtocol([job runner, advice fence]) = %v, want [%q %q]", got, AdviceClaimFenceV1, JobRunnerV1)
+	}
+	if got := Filter([]string{JobRunnerV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", JobRunnerV1, got)
+	}
+	if got := SelfReportable([]string{JobRunnerV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", JobRunnerV1, got)
+	}
+}
+
 // TestUnmet_SubsetPresent pins the empty result when every required capability is present
 // in the effective set — the run is approvable/claimable by that worker (PRD #84 M4 4c).
 func TestUnmet_SubsetPresent(t *testing.T) {

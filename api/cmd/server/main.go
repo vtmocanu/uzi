@@ -783,6 +783,28 @@ func run() error {
 			Name: "ephemeral_workers_provision",
 			Run:  ephemeralProv.ProvisionPass,
 		},
+		// Unservable-ephemeral job failure (PRD #1908 D-A2). A run-bound ephemeral worker that
+		// registered without job_runner_v1, or never registered by the provision deadline, can
+		// never serve its kind='job' run; this fails the still-queued, unclaimed job (typed
+		// fail_origin) and deletes the worker in one transaction so the gap trigger cannot
+		// re-provision for it forever. It MUST run BEFORE the reap pass below, which would
+		// otherwise delete a never-booted worker silently and leave the job queued.
+		// UNCONDITIONAL (not gated on the ephemeral kill-switch), like the reap.
+		sweeper.Pass{
+			Name: "ephemeral_job_unservable_fail",
+			Run: func(ctx context.Context) (int64, error) {
+				return wsvc.FailJobsWithUnservableEphemeral(ctx, cfg.EphemeralProvisionDeadline)
+			},
+		},
+		// Job wall-clock backstop (PRD #1908 D-E). A job never parks at its wall (the wall-park
+		// passes exclude it), so a claimed or running job past its budget plus a grace, whose
+		// runner died or wedged, is failed with fail_origin='run_timeout'.
+		sweeper.Pass{
+			Name: "job_wall_backstop",
+			Run: func(ctx context.Context) (int64, error) {
+				return wsvc.FailJobsPastWallDeadline(ctx, cfg.RunTimeout)
+			},
+		},
 		// Ephemeral worker orphan/failure GC backstop (PRD #529 M5, Decision 6). Deletes
 		// ephemeral workers that can no longer make progress — owning run terminal/absent,
 		// never booted past the provision deadline, or idle-stolen by a sibling — all
