@@ -246,6 +246,9 @@ if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
   if [ "${FAKE_CHILD_READY_DELAY:-0}" != "0" ]; then
     sleep "$FAKE_CHILD_READY_DELAY" &
     ready_delay_pid=$!
+    ready_delay_marker="$FAKE_READY_DELAY_PID_FILE.tmp.$$"
+    printf '%s\n' "$ready_delay_pid" > "$ready_delay_marker"
+    mv "$ready_delay_marker" "$FAKE_READY_DELAY_PID_FILE"
     wait "$ready_delay_pid"
     ready_delay_pid=
   fi
@@ -317,6 +320,7 @@ EXEC_LOG="$TMP/executions.log"
 WRAPPER_TMP_ROOT="$TMP/wrapper-tmp"
 MKTEMP_LOG="$TMP/mktemp.log"
 CHILD_PID_FILE="$TMP/child.pid"
+READY_DELAY_PID_FILE="$TMP/ready-delay.pid"
 WRAPPER_PID_FILE="$TMP/wrapper.pid"
 SIGNAL_LOG="$TMP/signals.log"
 CURL_ARGV_LOG="$TMP/curl-argv.log"
@@ -456,6 +460,7 @@ start_blocking_wrapper() {
       FAKE_CHILD_STATUS=0 \
       FAKE_CHILD_BLOCK=1 \
       FAKE_CHILD_READY_DELAY="${FAKE_CHILD_READY_DELAY:-0}" \
+      FAKE_READY_DELAY_PID_FILE="$READY_DELAY_PID_FILE" \
       FAKE_CHILD_PID_FILE="$CHILD_PID_FILE" \
       FAKE_SIGNAL_LOG="$SIGNAL_LOG" \
       FAKE_EXEC_LOG="$EXEC_LOG" \
@@ -669,15 +674,16 @@ seed_archive "$CANCEL_CACHE" darwin-arm64
 : > "$CHILD_PID_FILE"
 : > "$WRAPPER_PID_FILE"
 : > "$SIGNAL_LOG"
+rm -f "$READY_DELAY_PID_FILE"
 FAKE_CHILD_READY_DELAY=4
 start_blocking_wrapper "$TMP/forced-start-timeout.out" "$CANCEL_CACHE"
 CANCEL_LAUNCHER_PID="$START_PID"
 tries=0
-while [ ! -s "$WRAPPER_PID_FILE" ]; do
+while [ ! -s "$WRAPPER_PID_FILE" ] || [ ! -s "$READY_DELAY_PID_FILE" ]; do
   tries=$((tries + 1))
   if [ "$tries" -gt "$READINESS_MAX_TRIES" ]; then
     stop_cancel_processes
-    fail "forced-timeout wrapper did not spawn"
+    fail "forced-timeout wrapper or readiness delay did not spawn"
   fi
   sleep 0.02
 done
@@ -686,10 +692,12 @@ if wait_for_blocking_start "$TMP/forced-start-timeout.out" "forced timeout" 0 5 
   fail "forced readiness timeout unexpectedly reached the child marker"
 fi
 forced_wrapper_pid="$(marker_value "$WRAPPER_PID_FILE")"
+forced_delay_pid="$(cat "$READY_DELAY_PID_FILE")"
 forced_launcher_pid="$CANCEL_LAUNCHER_PID"
 assert_contains "$TMP/forced-start-timeout.err" "child_pid=missing"
 assert_contains "$TMP/forced-start-timeout.err" "launcher=alive"
 stop_cancel_processes
+if kill -0 "$forced_delay_pid" 2>/dev/null; then fail "forced timeout left readiness sleep $forced_delay_pid alive"; fi
 if kill -0 "$forced_wrapper_pid" 2>/dev/null; then fail "forced timeout left wrapper $forced_wrapper_pid alive"; fi
 if kill -0 "$forced_launcher_pid" 2>/dev/null; then fail "forced timeout left launcher $forced_launcher_pid alive"; fi
 
