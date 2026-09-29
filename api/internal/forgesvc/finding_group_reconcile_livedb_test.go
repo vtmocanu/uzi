@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -295,6 +296,19 @@ func TestFindingGroupReconcileConcurrentPassesSettleOnceLiveDB(t *testing.T) {
 	e := newRCEnv(t)
 	op, ids := e.inFlight(e.user, 4)
 	e.fake.set(rcIssue(1501, "body "+rcMarker(op.ID)))
+	// Count the phase transitions the operation goes through: however many passes race, the
+	// recording and the settlement must each happen exactly once.
+	tbl := "rc_transitions_" + uuid.NewString()[:8]
+	tbl = strings.ReplaceAll(tbl, "-", "")
+	e.exec(`CREATE TABLE ` + tbl + ` (phase text NOT NULL)`)
+	e.exec(`CREATE FUNCTION ` + tbl + `_fn() RETURNS trigger LANGUAGE plpgsql AS $f$ BEGIN INSERT INTO ` + tbl + ` VALUES (NEW.phase); RETURN NEW; END $f$`)
+	e.exec(`CREATE TRIGGER ` + tbl + `_trg AFTER UPDATE ON finding_group_operations FOR EACH ROW
+		WHEN (OLD.phase IS DISTINCT FROM NEW.phase AND NEW.id = '` + op.ID.String() + `') EXECUTE FUNCTION ` + tbl + `_fn()`)
+	t.Cleanup(func() {
+		_, _ = e.pool.Exec(context.Background(), `DROP TRIGGER IF EXISTS `+tbl+`_trg ON finding_group_operations`)
+		_, _ = e.pool.Exec(context.Background(), `DROP FUNCTION IF EXISTS `+tbl+`_fn()`)
+		_, _ = e.pool.Exec(context.Background(), `DROP TABLE IF EXISTS `+tbl)
+	})
 	var wg sync.WaitGroup
 	errs := make([]error, 6)
 	start := make(chan struct{})
@@ -314,6 +328,22 @@ func TestFindingGroupReconcileConcurrentPassesSettleOnceLiveDB(t *testing.T) {
 		}
 	}
 	e.requireSettled(1501, ids)
+	rows, err := e.pool.Query(e.ctx, `SELECT phase FROM `+tbl+` ORDER BY phase`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var phases []string
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			t.Fatal(err)
+		}
+		phases = append(phases, p)
+	}
+	if fmt.Sprint(phases) != "[issue_recorded settled]" {
+		t.Errorf("phase transitions = %v, want exactly one issue_recorded and one settled", phases)
+	}
 }
 
 // More recorded operations than one page: every one settles within two passes (cursor then wrap).

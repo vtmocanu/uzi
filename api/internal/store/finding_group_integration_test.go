@@ -335,9 +335,12 @@ func TestFindingGroupDefinitiveReleaseGuardsLiveDB(t *testing.T) {
 	if ok, err := store.ReleaseFindingGroupDefinitive(e.ctx, e.pool, e.user, op4.ID); err != nil || ok {
 		t.Fatalf("expired definitive: %v %v", ok, err)
 	}
-	// Another user's release changes nothing, before or after the deadline.
-	if ok, err := store.ReleaseFindingGroupAfterDeadline(e.ctx, e.pool, e.other, op4.ID); err != nil || ok {
-		t.Fatalf("foreign release: %v %v", ok, err)
+	// Another user's release changes nothing, before or after the deadline (op3 is unexpired,
+	// op4 expired).
+	for _, op := range []store.FindingGroupClaimOperation{op3, op4} {
+		if ok, err := store.ReleaseFindingGroupAfterDeadline(e.ctx, e.pool, e.other, op.ID); err != nil || ok {
+			t.Fatalf("foreign release of %s: %v %v", op.ID, ok, err)
+		}
 	}
 	if got := e.statuses(append(ids3, ids4...)); got["filing"] != 2 {
 		t.Fatalf("members after refused releases: %v", got)
@@ -558,6 +561,9 @@ func TestFindingGroupPendingReadsLiveDB(t *testing.T) {
 // Deleting a repo or a user while a group operation is pending must not trip the operation <->
 // disposition foreign keys (the disposition -> operation link has no ON DELETE action of its own).
 func TestFindingGroupPendingOperationDoesNotBlockCascadeDeletesLiveDB(t *testing.T) {
+	if os.Getenv("UZI_TEST_DATABASE_URL") == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set")
+	}
 	for _, target := range []string{"repo", "user"} {
 		t.Run(target, func(t *testing.T) {
 			e := newFGSEnv(t)
@@ -578,5 +584,26 @@ func TestFindingGroupPendingOperationDoesNotBlockCascadeDeletesLiveDB(t *testing
 				t.Fatalf("leftover rows after deleting the %s: %d (%v)", target, n, err)
 			}
 		})
+	}
+}
+
+// The issue_iid IS NULL guard on release, on its own: the phase is releasable and the deadline has
+// passed, so only the recorded issue identity may refuse it.
+func TestFindingGroupReleaseRefusesRecordedIdentityInReleasablePhaseLiveDB(t *testing.T) {
+	e := newFGSEnv(t)
+	for _, phase := range []string{"pre_call", "in_flight", "returned_uncertain"} {
+		op, ids := e.claim(2)
+		mustExec(e.ctx, t, e.pool, `UPDATE finding_group_operations SET phase=$2, issue_iid=91, issue_url='https://forge.e2e/i/91',
+			deadline_at = now() - interval '1 second' WHERE id=$1`, op.ID, phase)
+		if ok, err := store.ReleaseFindingGroupAfterDeadline(e.ctx, e.pool, e.user, op.ID); err != nil || ok {
+			t.Fatalf("%s with a recorded iid: released=%v err=%v", phase, ok, err)
+		}
+		if got := e.statuses(ids); got["filing"] != 2 {
+			t.Fatalf("%s: members after refused release: %v", phase, got)
+		}
+		var got string
+		if err := e.pool.QueryRow(e.ctx, `SELECT phase FROM finding_group_operations WHERE id=$1`, op.ID).Scan(&got); err != nil || got != phase {
+			t.Fatalf("%s: phase = %q (%v), want untouched", phase, got, err)
+		}
 	}
 }

@@ -93,6 +93,10 @@ func TestGetFindingIssueDraftLiveDB(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &dto); err != nil {
 		t.Fatalf("decode draft: %v", err)
 	}
+	// Evidence with no disposition row still drafts, with an empty disposition id.
+	if dto.DispositionID != "" {
+		t.Errorf("disposition_id = %q, want empty for evidence without a disposition", dto.DispositionID)
+	}
 	// Title: single line, leading "/" defanged.
 	if strings.HasPrefix(dto.Title, "/") || strings.ContainsAny(dto.Title, "\n\r") {
 		t.Errorf("title not sanitised: %q", dto.Title)
@@ -112,6 +116,19 @@ func TestGetFindingIssueDraftLiveDB(t *testing.T) {
 	// Labels seed from the stored suggestions.
 	if len(dto.Labels) != 2 {
 		t.Errorf("labels = %v, want the two stored suggestions", dto.Labels)
+	}
+
+	// Once the coordinate has a disposition the draft names it.
+	disp, err := q.UpsertOpenDisposition(ctx, store.UpsertOpenDispositionParams{
+		UserID: owner, RepoID: repoID, Location: f.Location, ContentHash: "h", LastTitle: f.Title,
+	})
+	if err != nil {
+		t.Fatalf("UpsertOpenDisposition: %v", err)
+	}
+	rec2 := draftReq(owner, f.ID.String())
+	var dto2 apitypes.IncidentalFindingIssueDraftDTO
+	if rec2.Code != http.StatusOK || json.Unmarshal(rec2.Body.Bytes(), &dto2) != nil || dto2.DispositionID != disp.ID.String() {
+		t.Errorf("draft with a disposition = %d %+v, want disposition_id %s", rec2.Code, dto2, disp.ID)
 	}
 
 	// ── non-owner: 404 (no existence oracle) ──

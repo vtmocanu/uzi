@@ -1058,6 +1058,11 @@ func TestFileFindingGroupUncertainOutcomeStaysClaimedLiveDB(t *testing.T) {
 	if rr.Code != http.StatusConflict {
 		t.Errorf("single file of a claimed member: %d, want 409", rr.Code)
 	}
+	rr = httptest.NewRecorder()
+	e.h.DismissFinding(rr, dismissFindingReq(e.owner, ms[0].Finding, map[string]any{"reason": "wont_do"}))
+	if rr.Code != http.StatusConflict {
+		t.Errorf("dismiss of a claimed member: %d, want 409", rr.Code)
+	}
 	if rr := e.release(e.owner, op.String(), true); rr.Code != http.StatusConflict {
 		t.Errorf("release before the deadline: %d, want 409", rr.Code)
 	}
@@ -1212,6 +1217,19 @@ func TestReleaseFindingGroupRefusalsLiveDB(t *testing.T) {
 		}
 		e.requireClaimed(op.ID, ms...)
 	})
+	t.Run("uncertain operation with a recorded forge iid", func(t *testing.T) {
+		// Pins the issue_iid guard on its own: the phase is one release accepts, the deadline
+		// has passed, and only the recorded identity stands in the way.
+		op, ms := e.claimDirect(2)
+		mustExecT(e.ctx, t, e.pool, `UPDATE finding_group_operations SET phase='returned_uncertain', issue_iid=78, issue_url='https://forge.e2e/i/78', deadline_at=now()-interval '1 minute' WHERE id=$1`, op.ID)
+		if rr := e.release(e.owner, op.ID.String(), true); rr.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409; body=%s", rr.Code, rr.Body.String())
+		}
+		e.requireClaimed(op.ID, ms...)
+		if phase, iid := e.opPhase(op.ID); phase != "returned_uncertain" || iid == nil || *iid != 78 {
+			t.Errorf("operation = %s iid=%v, want untouched", phase, iid)
+		}
+	})
 	t.Run("another user's operation", func(t *testing.T) {
 		op, ms := e.claimDirect(2)
 		e.expireOp(op.ID)
@@ -1241,6 +1259,9 @@ func TestReleaseFindingGroupRefusalsLiveDB(t *testing.T) {
 }
 
 func TestReleaseFindingGroupHonorsDurableDeadlineLiveDB(t *testing.T) {
+	if os.Getenv("UZI_TEST_DATABASE_URL") == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
+	}
 	for _, phase := range []string{"pre_call", "in_flight", "returned_uncertain"} {
 		t.Run(phase, func(t *testing.T) {
 			e := newFGEnv(t, nil)
@@ -1319,7 +1340,11 @@ func TestFileFindingGroupPausedPastDeadlineNeverCreatesLiveDB(t *testing.T) {
 
 	done := make(chan *httptest.ResponseRecorder, 1)
 	go func() { done <- e.fileGroup(e.owner, map[string]any{"ids": fgIDs(ms...)}) }()
-	<-e.fake.ensureEntered
+	select {
+	case <-e.fake.ensureEntered:
+	case <-time.After(20 * time.Second):
+		t.Fatal("handler never reached EnsureLabels")
+	}
 	var op uuid.UUID
 	if err := e.pool.QueryRow(e.ctx, `SELECT id FROM finding_group_operations WHERE user_id=$1`, e.owner.ID).Scan(&op); err != nil {
 		t.Fatal(err)
@@ -1327,8 +1352,13 @@ func TestFileFindingGroupPausedPastDeadlineNeverCreatesLiveDB(t *testing.T) {
 	e.expireOp(op)
 	close(e.fake.ensureGate)
 
-	if rr := <-done; rr.Code != http.StatusAccepted {
-		t.Fatalf("resumed handler: %d, want 202; body=%s", rr.Code, rr.Body.String())
+	select {
+	case rr := <-done:
+		if rr.Code != http.StatusAccepted {
+			t.Fatalf("resumed handler: %d, want 202; body=%s", rr.Code, rr.Body.String())
+		}
+	case <-time.After(20 * time.Second):
+		t.Fatal("resumed handler never returned")
 	}
 	if e.fake.createCount() != 0 {
 		t.Fatalf("CreateIssue reached after the durable deadline: %d", e.fake.createCount())
