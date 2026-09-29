@@ -240,6 +240,20 @@ const publishedTipContains = (bare: string, tip: string, sha: string): boolean =
 
 let floorTip = "";
 
+function publishOriginBranch(name: string): string {
+  gitIn(fx.originPath, ["checkout", "-q", "-b", name]);
+  fs.writeFileSync(path.join(fx.originPath, "PUBLISHED.md"), `published ${name}\n`);
+  gitIn(fx.originPath, ["add", "PUBLISHED.md"]);
+  gitIn(fx.originPath, ["commit", "-q", "-m", "published"]);
+  const sha = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+  gitIn(fx.originPath, ["checkout", "-q", "main"]);
+  return sha;
+}
+
+const trackingOf = (bare: string, branch: string): string =>
+  execFileSync("git", ["--git-dir", bare, "rev-parse", `refs/uzi-runner/${branch}`], { encoding: "utf8" }).trim();
+
+
 describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
   it("(a) a flagged final commit above the floor is remediated by a fixup rewrite, then the run completes with a push", { skip }, async () => {
     const decisions: SecretRemediationDecision[] = [];
@@ -828,6 +842,87 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.equal(d.failed()?.preserved_patch, undefined);
     assert.equal(d.pushes(), 0);
     assert.ok(d.pins.length >= 1, "recovery pin kept");
+  });
+
+  it("(w) GitLab: a local-only bridge floor cannot hide a cleared-then-resurrected flagged commit at finalize", { skip }, async () => {
+    const iid = 1932_240;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let S = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      body: async (ctx, gate, dd) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        acts.push((await gate()).action); // remediate
+        gitIn(w, ["reset", "-q", "--hard", P]);
+        commitIn(w, "ok.txt", "ok\n");
+        acts.push((await gate()).action); // clean: known cleared, cleanTip set
+        gitIn(w, ["reset", "-q", "--hard", S]);
+        await ctx.checkpoint!({ reap: false }); // the tick bridges: checkpointFloor = local-only B over S
+        const B = trackingOf(dd().bare, ctx.branch);
+        assert.notEqual(B, S);
+        gitIn(w, ["reset", "-q", "--hard", B]); // B is reachable via the shared alternate
+      },
+    });
+    assert.deepEqual(acts, ["remediate", "proceed"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.match(d.failed()?.failure_reason ?? "", /\(rule github-pat\)/);
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    assert.ok(!d.completed());
+  });
+
+  it("(x) an at-floor finding hidden by a bridge floor is not cleared by a later clean gate: finalize fails", { skip }, async () => {
+    const iid = 1932_241;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      body: async (ctx, gate, dd) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: false }); // bridge B over S: checkpointFloor = B (local only)
+        const B = trackingOf(dd().bare, ctx.branch);
+        acts.push((await gate()).action); // S at-floor: known
+        gitIn(w, ["reset", "-q", "--hard", B]);
+        commitIn(w, "d.txt", "d\n");
+        acts.push((await gate()).action); // range D ^B is clean, but S is still an ancestor: stays known
+      },
+    });
+    assert.deepEqual(acts, ["proceed", "proceed"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.match(d.failed()?.failure_reason ?? "", /\(rule github-pat\)/);
+    assert.equal(d.pushes(), 0);
+    assert.ok(!d.completed());
+  });
+
+  it("(u2) clause (c): a secret-shaped filename on the late post-gate commit is withheld everywhere", { skip }, async () => {
+    const secretName = "aaaa1111-bbbb-2222-cccc-3333dddd4444";
+    const name = "heroku_api_key" + "=" + secretName + ".env";
+    let flagged = "";
+    const d = await drive({
+      iid: 1932_242,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        flagged = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(w, flagged, "cfg.env", "TOKEN=\n");
+        assert.equal((await gate()).action, "proceed");
+        commitIn(w, name, `TOKEN=${runtimeSecret()}\n`); // late, no re-gate
+      },
+    });
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
+    const reason = d.failed()?.failure_reason ?? "";
+    assert.match(reason, /\[path withheld\]/);
+    assert.ok(!reason.includes(secretName), "filename absent from failure_reason");
+    assert.ok(!d.everything().includes(secretName), "filename absent from feed and log");
+    assert.equal(d.pushes(), 0);
   });
 
   it("(v) clause (c), untrusted re-scan: fails with the fixed reason and names no stale commit", { skip }, async () => {

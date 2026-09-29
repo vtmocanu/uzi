@@ -172,6 +172,8 @@ const MAX_FAILURE_REASON_LEN = 512;
 /** issue #1932: how many times the pre-exit secret remediation gate returns a done to the lead for a
  *  history rewrite before the run fails `push_secret_blocked`. */
 const SECRET_REMEDIATION_MAX_ATTEMPTS = 2;
+/** issue #1932: cap on the trusted-flagged commit SHAs kept per run for the ancestry checks. */
+const FLAGGED_COMMITS_CAP = 500;
 
 /** The three authoritative TERMINAL run statuses. A run in any of these can never
  *  write again, so its retained recovery clone is safe to reclaim. Used by the
@@ -1441,16 +1443,25 @@ interface RunFlight {
   steeredTips?: Set<string>;
   /** issue #1932: per-flight state of the pre-exit secret remediation gate (see
    *  RunRunner.runSecretRemediationGate). `known` = findings of the last trusted gate scan that
-   *  still suppress every checkpoint publish, and that make finalize fail (`push_secret_blocked`,
-   *  no push) while non-empty; `blocked` = findings that make finalize fail terminally (cap
-   *  exhausted, or an untrusted rescan after a known finding); `cleanTip` = the tracking tip of the
-   *  last CLEAN trusted gate scan, used by the reap-publish hold and to decide at finalize whether
-   *  the branch moved since (a moved branch is RE-SCANNED there, never failed on this field alone);
-   *  `everKnown` = a finding has been known at some point in this run; `withholdPaths` = the
-   *  gitleaks text scan of the finding paths was untrusted or flagged them (render no path). */
+   *  still suppress the checkpointBody publish paths (tick, milestone, done, reap), and that make
+   *  finalize fail (`push_secret_blocked`, no push) while non-empty. The park / shutdown / pause /
+   *  capture sinks are unscanned by design (#1597) and may publish a known finding; finalize (D5) is
+   *  the guard that still fails the run. `blocked` = findings that make finalize fail terminally
+   *  (cap exhausted, or an untrusted gate scan after a known finding); `cleanTip` = the tracking tip
+   *  of the last CLEAN trusted gate scan, used by the reap-publish hold and to decide at finalize
+   *  whether the branch moved since (a moved branch is RE-SCANNED there, never failed on this field
+   *  alone); `everKnown` = a finding has been known at some point in this run; `withholdPaths` = the
+   *  gitleaks text scan of the finding paths was untrusted or flagged them (render no path).
+   *  `flaggedCommits` / `flaggedFindings` = every trusted-flagged commit SHA (40-hex, deduped, capped)
+   *  ever seen in the run, with its finding. `checkpointFloor` can be a LOCAL-ONLY bridge commit that
+   *  contains a flagged commit and is never published, so a floor exclusion can hide a finding from
+   *  a range scan: ancestry of these commits against the tip is authoritative (the gate's clean
+   *  branch and D5 fail while any is still an ancestor), and floors are only an optimisation. */
   secretRemediation?: {
     attempts: number;
     known?: SecretFinding[];
+    flaggedCommits?: string[];
+    flaggedFindings?: SecretFinding[];
     blocked?: SecretFinding[];
     cleanTip?: string;
     everKnown?: boolean;
@@ -4596,6 +4607,8 @@ export class RunRunner {
     //  (b) `known` is non-empty: a trusted finding the gate still knows (including at-floor ones,
     //      which are not remediable and so never reach `blocked`; the agent may since have reset the
     //      clone to a clean-scanned commit, and `known` is what still fails that run), OR
+    //  (b2) any retained flagged commit (flaggedCommits) is still an ancestor of the finalize tracking
+    //      tip, whatever the floors say (checkpointFloor can be a local-only bridge), OR
     //  (c) a finding was known at some point and the finalize tracking tip is not the tip of the
     //      last CLEAN trusted gate scan (the branch moved after it). The agent is reaped by now, so
     //      the final branch is RE-SCANNED here with the gate's scan core (no re-fetch: the finalize
@@ -4613,7 +4626,13 @@ export class RunRunner {
         remediationFindings = remediationState.known;
       } else if (remediationState.everKnown === true) {
         const finalizeTip = await this.git.trackingTip(barePath, result.branch);
-        if (finalizeTip === null || finalizeTip !== remediationState.cleanTip) {
+        if (finalizeTip !== null) {
+          // Authoritative on every forge: a flagged commit still in the tip's ancestry fails, whatever
+          // floor exclusion a re-scan range would apply (a floor can be a local-only bridge).
+          const still = await this.reachableFlaggedFindings(remediationState, barePath, finalizeTip);
+          if (still.length > 0) remediationFindings = still;
+        }
+        if (!remediationFindings && (finalizeTip === null || finalizeTip !== remediationState.cleanTip)) {
           let rescanWhy = "tracking_tip_missing";
           if (finalizeTip !== null) {
             try {
@@ -9557,6 +9576,44 @@ export class RunRunner {
   }
 
   /**
+   * issue #1932: remember every trusted-flagged commit of the run (validated 40-hex, deduped, capped)
+   * with its finding, so a later scan whose range hides the commit behind a floor cannot un-know it.
+   */
+  private recordFlaggedCommits(
+    state: NonNullable<RunFlight["secretRemediation"]>,
+    findings: SecretFinding[],
+  ): void {
+    const commits = (state.flaggedCommits ??= []);
+    const kept = (state.flaggedFindings ??= []);
+    for (const f of findings) {
+      if (typeof f.commit !== "string" || !/^[0-9a-f]{40}$/i.test(f.commit)) continue;
+      const sha = f.commit.toLowerCase();
+      if (commits.includes(sha) || commits.length >= FLAGGED_COMMITS_CAP) continue;
+      commits.push(sha);
+      kept.push(f);
+    }
+  }
+
+  /**
+   * issue #1932: the retained findings whose flagged commit is still an ancestor of `tip`. An
+   * "unknown" ancestry (a git error) counts as reachable. Authoritative over every floor exclusion:
+   * `checkpointFloor` can be a local-only bridge that contains a flagged commit.
+   */
+  private async reachableFlaggedFindings(
+    state: NonNullable<RunFlight["secretRemediation"]>,
+    barePath: string,
+    tip: string,
+  ): Promise<SecretFinding[]> {
+    const out: SecretFinding[] = [];
+    const commits = state.flaggedCommits ?? [];
+    const kept = state.flaggedFindings ?? [];
+    for (let i = 0; i < commits.length; i++) {
+      if ((await this.git.ancestry(barePath, commits[i]!, tip)) !== "divergent" && kept[i]) out.push(kept[i]!);
+    }
+    return out;
+  }
+
+  /**
    * issue #1932 D2 — the pre-exit secret remediation gate (`RunContext.secretRemediationGate`).
    * Called by the executor at the done point, BEFORE any done checkpoint. Credential-free only
    * (a file:// fetch-back and local gitleaks; no PAT, no overlay), so it is legal with the agent
@@ -9607,12 +9664,19 @@ export class RunRunner {
       const scanned = await this.scanRemediationRange(flight, barePath, branch, cloneTip);
       if (!scanned.trusted) return failOrProceed(scanned.why);
       const { range, floorCandidates } = scanned;
-      if (scanned.findings.length === 0) {
-        state.known = undefined;
-        state.cleanTip = range.tipSha;
-        return { action: "proceed" };
+      let findings = scanned.findings;
+      if (findings.length === 0) {
+        // A flagged commit still in the tip's ancestry is NOT cleared, even when a floor exclusion
+        // (possibly a local-only bridge) hid it from this range: keep it known.
+        const still = await this.reachableFlaggedFindings(state, barePath, cloneTip);
+        if (still.length === 0) {
+          state.known = undefined;
+          state.cleanTip = range.tipSha;
+          return { action: "proceed" };
+        }
+        findings = still;
       }
-      const findings = scanned.findings;
+      this.recordFlaggedCommits(state, findings);
       // issue #1932 D6(c): a committed filename can itself be a secret. Scan the raw path list with
       // gitleaks before rendering anything; an untrusted or flagging scan withholds EVERY path on
       // every surface (prompt, feed, failure_reason, log).
