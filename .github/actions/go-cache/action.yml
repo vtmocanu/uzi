@@ -1,0 +1,78 @@
+name: Go build cache (per job class)
+description: >-
+  Restore GOCACHE + GOMODCACHE (plus optional extra paths) under a key private to
+  one job class, so each job warms from a cache built with its own flags. Pair it
+  with the "Save Go cache" step at the end of the job; only a push to main saves.
+
+# Why not setup-go's built-in cache: it keys on go.sum alone, so every Go job of a
+# module restores ONE entry, and after a primary-key hit no job saves. The entry is
+# whatever the first job to save happened to build (race or not, coverage or not),
+# so the other jobs compile cold. A key per job class keeps -race, coverage and
+# plain builds apart.
+#
+# Keys end in the commit SHA, so each main push saves a fresh entry and a PR (which
+# can read its base branch's caches, never write them) restores the newest one by
+# prefix. Older entries are never read again, so the repo cache's LRU eviction
+# drops them first. The Go version is in every restore prefix, so a toolchain bump
+# starts cold; a go.sum change falls back to the newest entry of the same class.
+
+inputs:
+  class:
+    description: Job-class name, unique per job (e.g. api-test).
+    required: true
+  module:
+    description: Go module directory whose go.sum keys the cache (api or controller).
+    required: true
+  extra-paths:
+    description: Extra newline-separated paths to cache (e.g. the golangci-lint cache).
+    required: false
+    default: ""
+
+outputs:
+  key:
+    description: The exact key to save under.
+    value: ${{ steps.vars.outputs.key }}
+  paths:
+    description: The newline-separated paths to save.
+    value: ${{ steps.vars.outputs.paths }}
+  cache-hit:
+    description: '"true" when the exact key was restored (nothing new to save).'
+    value: ${{ steps.restore.outputs.cache-hit }}
+
+runs:
+  using: composite
+  steps:
+    - name: Resolve Go cache key and paths
+      id: vars
+      shell: bash
+      env:
+        CLASS: ${{ inputs.class }}
+        GO_SUM_HASH: ${{ hashFiles(format('{0}/go.sum', inputs.module)) }}
+        EXTRA_PATHS: ${{ inputs.extra-paths }}
+      run: |
+        set -euo pipefail
+        test -n "${GO_SUM_HASH}" || { echo "go-cache: no go.sum for this module" >&2; exit 2; }
+        fallback="go-${CLASS}-${RUNNER_OS}-$(go env GOVERSION)-"
+        prefix="${fallback}${GO_SUM_HASH}-"
+        {
+          echo "fallback=${fallback}"
+          echo "prefix=${prefix}"
+          echo "key=${prefix}${GITHUB_SHA}"
+          echo "paths<<GO_CACHE_PATHS_EOF"
+          go env GOCACHE
+          go env GOMODCACHE
+          if [ -n "${EXTRA_PATHS}" ]; then printf '%s\n' "${EXTRA_PATHS}"; fi
+          echo "GO_CACHE_PATHS_EOF"
+        } >> "${GITHUB_OUTPUT}"
+    - name: Restore Go cache
+      id: restore
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+      with:
+        path: ${{ steps.vars.outputs.paths }}
+        key: ${{ steps.vars.outputs.key }}
+        # Fall back across a go.sum change too: the Go cache is content-addressed,
+        # so entries for unchanged packages stay valid, and Go's own trim drops
+        # entries unused for five days.
+        restore-keys: |
+          ${{ steps.vars.outputs.prefix }}
+          ${{ steps.vars.outputs.fallback }}

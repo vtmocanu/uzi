@@ -59,7 +59,13 @@ jobs:
           # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: api/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: api-validate
+          module: api
       - uses: ./.github/actions/setup-task
       - name: go mod download
         working-directory: api
@@ -70,9 +76,9 @@ jobs:
           task vet:api
           task build:api
       # sqlc as a PINNED RELEASE BINARY, not `go run .../sqlc@v1.31.1 generate`. The
-      # go-run form COMPILES sqlc from source every run (~57-61s measured): all api
-      # jobs share one setup-go cache key (api/go.sum), so only one job's GOCACHE
-      # persists and it is never the one that compiled sqlc -> perpetual recompile.
+      # go-run form COMPILES sqlc from source on any cold cache (~57-61s measured,
+      # back when all api jobs shared one setup-go cache key); even with the per-job
+      # cache it would recompile after every toolchain bump and bloat the entry.
       # A downloaded release binary skips the compile. Same VERSION (1.31.1) => byte-
       # identical codegen, so the drift check is unchanged; the version pin is the
       # arg; the sha256 is the whole control on this fetch, and Renovate keeps it in
@@ -106,6 +112,12 @@ jobs:
         run: |
           sqlc generate
           git diff --exit-code -- internal/store
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   lint-api:
     runs-on: ubuntu-latest
@@ -132,7 +144,14 @@ jobs:
           # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: api/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: api-lint
+          module: api
+          extra-paths: ~/.cache/golangci-lint
       - uses: ./.github/actions/setup-task
       - name: go mod download
         working-directory: api
@@ -144,6 +163,12 @@ jobs:
           task lint:api
           task deadcode:api
           task vulncheck:api
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   test-api:
     runs-on: ubuntu-latest
@@ -164,7 +189,13 @@ jobs:
           # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: api/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: api-test
+          module: api
       - uses: ./.github/actions/setup-task
       - name: go mod download
         working-directory: api
@@ -173,6 +204,12 @@ jobs:
         run: task test:api
       - name: coverage-xml:api
         run: task coverage-xml:api
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   # The live-DB gate. The *LiveDB tests self-skip unless UZI_TEST_DATABASE_URL is
   # set, so `go test` above prints a green `ok` while every one of them is skipped.
@@ -217,7 +254,13 @@ jobs:
           # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: api/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: api-livedb
+          module: api
       - name: go mod download
         working-directory: api
         run: go mod download
@@ -261,6 +304,12 @@ jobs:
               exit 1
             fi
           done
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   # --------------------------------------------------------- Go controller ----
   validate-controller:
@@ -271,7 +320,13 @@ jobs:
         with:
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: controller/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: controller-validate
+          module: controller
       - uses: ./.github/actions/setup-task
       - name: go mod download
         working-directory: controller
@@ -281,6 +336,12 @@ jobs:
           task fmt-check:controller
           task vet:controller
           task build:controller
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   lint-controller:
     runs-on: ubuntu-latest
@@ -292,7 +353,14 @@ jobs:
         with:
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: controller/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: controller-lint
+          module: controller
+          extra-paths: ~/.cache/golangci-lint
       - uses: ./.github/actions/setup-task
       - name: go mod download
         working-directory: controller
@@ -304,6 +372,12 @@ jobs:
           task lint:controller
           task deadcode:controller
           task vulncheck:controller
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   test-controller:
     runs-on: ubuntu-latest
@@ -313,7 +387,13 @@ jobs:
         with:
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: controller/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: controller-test
+          module: controller
       - uses: ./.github/actions/setup-task
       - name: go mod download
         working-directory: controller
@@ -322,6 +402,12 @@ jobs:
         run: task test:controller
       - name: coverage-xml:controller
         run: task coverage-xml:controller
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   # ---------------------------------------------------------- Vite/React web ----
   validate-web:
@@ -455,7 +541,13 @@ jobs:
           # raised by hand (Renovate leaves that directive alone by default).
           go-version: "1.27"
           check-latest: true
-          cache-dependency-path: api/go.sum
+          # Per-job-class cache below instead (.github/actions/go-cache).
+          cache: false
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: repo-lint
+          module: api
       - uses: ./.github/actions/setup-task
       - name: Install shellcheck (pinned, sha256-verified)
         run: |
@@ -501,7 +593,7 @@ jobs:
           set -euo pipefail
           # actionlint as a PINNED RELEASE BINARY (curl + sha256), not `go install
           # @v1.7.7`. The go-install form COMPILES actionlint from source each run
-          # (~10-20s) using the shared api/go.sum GOCACHE; a downloaded release binary
+          # (~10-20s) on a cold GOCACHE; a downloaded release binary
           # skips the compile, the same win the pinned-shellcheck block above and
           # scripts/golangci-lint.sh already take. Its embedded shellcheck is the
           # same 0.11.0 installed above, so shell findings match lint:shell's tool.
@@ -562,6 +654,12 @@ jobs:
       # present on the runner and set up by the checkout above.
       - name: test:release-scripts (release-train fixture)
         run: task test:release-scripts
+      - name: Save Go cache (main only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && steps.gocache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9  # v6.1.0
+        with:
+          path: ${{ steps.gocache.outputs.paths }}
+          key: ${{ steps.gocache.outputs.key }}
 
   # ------------------------------------------------------------- Helm chart ----
   helm-chart:
