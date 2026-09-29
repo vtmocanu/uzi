@@ -194,6 +194,10 @@ const _buildInfoMissing: never = null as unknown as Exclude<keyof BuildInfo, key
 const _buildInfoExtra: never = null as unknown as Exclude<keyof typeof buildInfoFull, keyof BuildInfo>;
 const _buildInfoZero: ZeroOf<BuildInfo> = buildInfoZero;
 const _buildInfoFull: Widen<BuildInfo> = buildInfoFull;
+void _buildInfoMissing;
+void _buildInfoExtra;
+void _buildInfoZero;
+void _buildInfoFull;
 
 // ── Run ─────────────────────────────────────────────────────────────────────
 // ZeroOf exemptions for Run (all normalized to [] by a mapper in runToDTO):
