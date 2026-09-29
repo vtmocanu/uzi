@@ -47,7 +47,7 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
 - **Conditional approve**: deltas the implementation needs → `revise`, since
   `approve` starts implementing at once. Only for non-blocking advice: approve, then
   send it with `uzi run follow-up`; it may arrive after work starts.
-- **Issues you file**: buddy-review the final draft, then label it `reviewed`.
+- **Issues you file**: buddy-review the final draft; label `reviewed` per the root `CLAUDE.md` rule.
 
 ## The loop, per run
 

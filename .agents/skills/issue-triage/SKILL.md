@@ -132,6 +132,7 @@ EOF
 )"
 ```
 
+- Add `--add-label "reviewed"` when the buddy agreed with the verdict and Step 4 ran (root `CLAUDE.md` rule); otherwise leave it off.
 - Bot-assignment path: replace `--add-label "uzi"` with `--add-assignee BOT_LOGIN` (from `CLAUDE.local.md`; never invent it).
 - Comment carries Step 4 findings; mirror #525/#509.
 - A body note like "Needs re-review before dispatch" is stale once Step 4 is that re-review: remove it from the body (`gh issue edit NNN --body-file`) when queuing.
