@@ -1320,7 +1320,12 @@ func TestFileFindingGroupPausedThenReleasedNeverCreatesLiveDB(t *testing.T) {
 	e.requireOpen(ms...)
 	close(e.fake.ensureGate)
 
-	rr := <-done
+	var rr *httptest.ResponseRecorder
+	select {
+	case rr = <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("resumed handler never returned")
+	}
 	if rr.Code != http.StatusAccepted {
 		t.Fatalf("resumed handler: %d, want 202; body=%s", rr.Code, rr.Body.String())
 	}

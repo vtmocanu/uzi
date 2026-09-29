@@ -430,8 +430,9 @@ const releaseHint = "release is accepted only after the operation's deadline and
 
 // runFindingsFileGroup files ONE issue from several evidence ids (issue #1724). Each id is
 // resolved to its coordinate's disposition id through the issue-draft read (so older evidence
-// ids that map to the same coordinate collapse), deduped in first-seen order. A single distinct
-// coordinate falls back to the plain single-file path.
+// ids that map to the same coordinate collapse), deduped in first-seen order. An id with no
+// disposition is a usage error. The plain single-file fallback applies only when every id
+// resolved to a disposition and they all share one.
 func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, ids []string) error {
 	// Cap DISTINCT input ids (the server caps distinct ids) before any request.
 	var distinct []string

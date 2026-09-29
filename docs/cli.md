@@ -1621,16 +1621,20 @@ exit 0), not a retry signal. Filing a coordinate that is already filed or mid-fi
 is a conflict (exit 5); an unknown or foreign `<finding-id>` is not-found (exit 4).
 
 `file` also takes several ids of one repo and files **one** issue for all of them, with
-each finding linked to it. Every id (older evidence ids included) resolves to its
-coordinate and duplicates count once; if a single coordinate remains it is filed as
-above. At most 50 distinct ids per call, and an id with no triage record yet is a usage
-error (exit 2) raised before anything is filed. It is all or nothing: if any chosen
+each finding linked to it. One id takes the single-file path above. With two or
+more ids (even the same id repeated), each distinct id's draft is fetched first and
+resolved to its coordinate (older evidence ids included); duplicates count once. An id
+with no triage record yet is a usage error (exit 2) and nothing is filed, even if it is
+the only coordinate left; to file an untriaged coordinate, pass its id alone. Only when
+every id resolves to one coordinate does the call fall back to the single-file filing.
+At most 50 distinct ids per call. It is all or nothing: if any chosen
 coordinate is already filed, dismissed or held, the call is a conflict (exit 5) and
 stderr lists the `pending operation <op>` ids holding them. `--json` returns
 `{operation_id, disposition_ids, phase, issue?, warning?}`, the issue plus the linked
 disposition ids. If the filing cannot be confirmed (HTTP 202) the CLI prints the
 operation id and a release hint and exits 5; the issue may still exist. uzi's repo sync
-settles the group on its own once it finds the marked issue. If it does not, check the
+settles the group on its own once it finds the marked issue; that happens on the
+periodic full (reconcile) sync and on a manual board Refresh. If it does not, check the
 forge and, only once the operation's deadline has passed and no such issue exists, run
 `uzi findings release <operation-id> --confirm-no-issue`. The flag is required: without
 it the command is a usage error (exit 2), and an operation that cannot be released yet

@@ -1313,9 +1313,12 @@ which you triage from the terminal exactly like the judge backlog.
   the issue was created but its local record could not settle (a success with a note,
   still exit 0), not a retry signal.
 - `uzi findings file <finding-id> <finding-id>...` — file ONE issue for several
-  coordinates of the same repo. Each id (older evidence ids included) is resolved to its
-  coordinate's disposition and duplicates collapse; if only one coordinate remains it is
-  filed as above. `--json` returns `{operation_id, disposition_ids, phase, issue?,
+  coordinates of the same repo. One id takes the single-file path. With two or more ids
+  (even a repeated one), each distinct id is resolved to its coordinate's disposition
+  (older evidence ids included) and duplicates collapse; an id with no triage record is a
+  usage error (exit 2) and nothing is filed, so to file an untriaged coordinate pass its
+  id alone. Only when every id resolves to one coordinate does it fall back to the
+  single-file filing. `--json` returns `{operation_id, disposition_ids, phase, issue?,
   warning?}`. A 202 means the filing could not be confirmed: the operation id and phase
   are printed and the exit is 5; a 201 whose phase is not `settled` also prints
   `operation <id> (<phase>)` and its warning, even under `--quiet` (the issue exists).
