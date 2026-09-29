@@ -911,8 +911,10 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Beta bug");
     fireEvent.click(groupButton());
     fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
-    await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202\./);
+    await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202 \(uncertain\)\./);
     expect(screen.getByText(/uzi findings release op-202 --confirm-no-issue/)).toBeTruthy();
+    expect(screen.getByText(/deadline has passed/)).toBeTruthy();
+    expect(screen.getByText(/Check the forge/)).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
   });
 
@@ -932,12 +934,12 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull();
   });
 
-  it("201 with a warning names the operation id and the CLI release command", async () => {
+  it("201 with a warning keeps the operation id and phase and shows NO release hint (issue_recorded)", async () => {
     openDraft();
     mockApi.fileFindingGroup.mockResolvedValue({
       operation_id: "op-w",
       disposition_ids: ["d1", "d2"],
-      phase: "claimed",
+      phase: "issue_recorded",
       issue: { iid: 78, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/78", title: "t" },
       warning: "Issue created but rows did not settle.",
     });
@@ -946,14 +948,36 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Beta bug");
     fireEvent.click(groupButton());
     fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
-    await screen.findByText(/Filed 2 findings as issue #78\. Issue created but rows did not settle\. Operation op-w\./);
-    expect(screen.getByText(/uzi findings release op-w --confirm-no-issue/)).toBeTruthy();
+    await screen.findByText(
+      /Filed 2 findings as issue #78\. Issue created but rows did not settle\. Operation op-w \(issue_recorded\)\./,
+    );
+    expect(screen.queryByText(/uzi findings release/)).toBeNull();
   });
 
-  it("is ineligible when a selected row is already claimed by a group filing", async () => {
+  it("201 in_flight with an issue shows the op id and no release hint", async () => {
+    openDraft();
+    mockApi.fileFindingGroup.mockResolvedValue({
+      operation_id: "op-f",
+      disposition_ids: ["d1", "d2"],
+      phase: "in_flight",
+      issue: { iid: 80, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/80", title: "t" },
+      warning: "Issue created; settling continues.",
+    });
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await screen.findByText(/Operation op-f \(in_flight\)/);
+    expect(screen.queryByText(/uzi findings release/)).toBeNull();
+    expect(screen.queryByText(/confirm-no-issue/)).toBeNull();
+  });
+
+  it("a finding claimed by a group filing has no checkbox; a stray group_operation_id is still ineligible", async () => {
     mockApi.listFindings.mockResolvedValue(
       backlog({
         findings: [
+          finding({ disposition_id: "g0", finding_id: "gf0", last_title: "Filing bug", status: "filing", group_operation_id: "op-y" }),
           finding({ disposition_id: "g1", finding_id: "gf1", last_title: "Claimed bug", group_operation_id: "op-x" }),
           finding({ disposition_id: "g2", finding_id: "gf2", last_title: "Free bug" }),
         ],
@@ -961,11 +985,46 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     );
     renderFindings();
     await screen.findByText("Claimed bug");
+    // A claimed ("filing") row is not selectable at all, so the group_operation_id check is defence
+    // in depth for a row that somehow carries it while still open.
+    expect(screen.queryByRole("checkbox", { name: "Select Filing bug" })).toBeNull();
     tick("Claimed bug");
     tick("Free bug");
     expect(groupButton().disabled).toBe(true);
     expect(groupButton().title).toMatch(/already being filed as a group/);
     expect(screen.getByText(/already being filed as a group\. Dismiss applies to open findings only\./)).toBeTruthy();
+  });
+
+  it("keeps the draft edits across a list reload (a row File that 409s reloads the list)", async () => {
+    openDraft();
+    mockApi.findingIssueDraft.mockResolvedValue({
+      title: "row t",
+      description: "row d",
+      location: "x",
+      labels: [],
+      provenance: "",
+    });
+    mockApi.fileFinding.mockRejectedValue(new ApiError(409, "already resolved"));
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    await screen.findByRole("button", { name: "Create issue" });
+    fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "my edit" } });
+
+    fireEvent.click(within(screen.getByText("Gamma bug").closest("li") as HTMLElement).getByRole("button", { name: "File issue" }));
+    await screen.findByDisplayValue("row t");
+    // The 409 handler reloads; hold that reload open so the list skeleton is showing.
+    let resolveReload: (v: ReturnType<typeof backlog>) => void = () => {};
+    mockApi.listFindings.mockImplementation(() => new Promise((r) => (resolveReload = r)));
+    const buttons = screen.getAllByRole("button", { name: "Create issue" });
+    fireEvent.click(buttons[buttons.length - 1]);
+    await waitFor(() => expect(mockApi.fileFinding).toHaveBeenCalledTimes(1));
+    await waitFor(() => expect(screen.queryByText("Alpha bug")).toBeNull());
+    expect(screen.getByDisplayValue("my edit")).toBeTruthy();
+    resolveReload(backlog({ bucket: "all", findings: rows }));
+    await screen.findByText("Alpha bug");
+    expect(screen.getByDisplayValue("my edit")).toBeTruthy();
   });
 
   it("ticking another row while the card is open cannot post ids under the old draft", async () => {

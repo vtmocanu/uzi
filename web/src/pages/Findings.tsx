@@ -127,9 +127,11 @@ const GROUP_MAX = 50;
 function groupFileIneligibility(rows: IncidentalFinding[]): string {
   if (rows.length < 2) return "Select at least 2 findings to file as one issue.";
   if (rows.length > GROUP_MAX) return `Select at most ${GROUP_MAX} findings to file as one issue.`;
+  // A row claimed by an unfinished group filing has status "filing" and group_operation_id set, so
+  // this check is defence in depth; it runs first so its reason wins over "only open".
+  if (rows.some((r) => r.group_operation_id)) return "A selected finding is already being filed as a group.";
   if (rows.some((r) => r.status !== "open")) return "Only open findings can be filed as one issue.";
   if (rows.some((r) => !r.finding_id)) return "Some selected findings have no evidence to file.";
-  if (rows.some((r) => r.group_operation_id)) return "A selected finding is already being filed as a group.";
   if (rows.some((r) => r.repo_id !== rows[0].repo_id)) return "Select findings from one repo to file them together.";
   return "";
 }
@@ -319,7 +321,7 @@ export function Findings() {
   // (issue #1724). 201 and 202 both close the card, clear the selection and reload; a 409 (a member
   // was filed or is being filed meanwhile) does the same with a friendly note; anything else
   // rethrows so the card keeps the user's edits and shows the error. The web has no release action,
-  // so an unsettled operation points at the CLI after the user inspects the forge.
+  // so a 202 (no issue) points at the CLI release after the user inspects the forge.
   const fileGroup = useCallback(
     async (ids: string[], body: { title: string; description: string; labels: string[] }) => {
       setActionErr("");
@@ -328,17 +330,20 @@ export function Findings() {
         const res = await api.fileFindingGroup({ ids, ...body });
         setGroupTarget(null);
         setSelected(new Set());
-        const release = `After inspecting the forge, the operation can be released with: uzi findings release ${res.operation_id} --confirm-no-issue`;
         if (res.issue) {
+          // The forge issue exists, so no release hint: release is refused once the issue is recorded
+          // and would reopen the members (a duplicate issue) while the operation is in flight.
           const filed = `Filed ${ids.length} findings as issue #${res.issue.iid}.`;
           setNotice(
             res.warning || res.phase !== "settled"
-              ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id}. ${release}`.replace(/ {2,}/g, " ")
+              ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id} (${res.phase}).`.replace(/ {2,}/g, " ")
               : filed,
           );
         } else {
           const detail = res.warning ? `${res.warning} ` : "";
-          setNotice(`${detail}Operation ${res.operation_id}. ${release}`);
+          setNotice(
+            `${detail}Operation ${res.operation_id} (${res.phase}). The web has no release action. Check the forge for an issue for these findings first. If there is none, once the operation's deadline has passed (a few minutes), run: uzi findings release ${res.operation_id} --confirm-no-issue`,
+          );
         }
         load();
         reloadStats();
@@ -635,6 +640,37 @@ export function Findings() {
         })}
       </div>
 
+      {/* Rendered outside the list block below: every load() flips `loading` and unmounts that block,
+          which would discard the user's draft edits mid-review. */}
+      {groupTarget && (
+        <div className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
+          <p className="mb-2 text-sm font-medium text-fg">
+            File {groupTarget.ids.length} findings as one issue
+          </p>
+          <IssueDraftCard
+            key={groupTarget.ids.join(",")}
+            fixedRepoLabel={groupTarget.repoLabel}
+            loadDraft={async () => {
+              const draft = await api.findingGroupIssueDraft(groupTarget.ids);
+              return {
+                title: draft.title,
+                description: draft.description,
+                labels: draft.labels,
+                provenance: "",
+              };
+            }}
+            onCreate={(values) =>
+              fileGroup(groupTarget.ids, {
+                title: values.title,
+                description: values.description,
+                labels: values.labels,
+              })
+            }
+            onCancel={() => setGroupTarget(null)}
+          />
+        </div>
+      )}
+
       {loading && <ListSkeleton rows={4} />}
 
       {!loading && backlog && (
@@ -653,34 +689,6 @@ export function Findings() {
                   indeterminate={someSelected && !allSelected}
                   onChange={toggleSelectAll}
                   label={`Select all ${selectableIds.length} shown`}
-                />
-              </div>
-            )}
-            {groupTarget && (
-              <div className="rounded-lg border border-edge bg-raised/40 px-3 py-2.5">
-                <p className="mb-2 text-sm font-medium text-fg">
-                  File {groupTarget.ids.length} findings as one issue
-                </p>
-                <IssueDraftCard
-                  key={groupTarget.ids.join(",")}
-                  fixedRepoLabel={groupTarget.repoLabel}
-                  loadDraft={async () => {
-                    const draft = await api.findingGroupIssueDraft(groupTarget.ids);
-                    return {
-                      title: draft.title,
-                      description: draft.description,
-                      labels: draft.labels,
-                      provenance: "",
-                    };
-                  }}
-                  onCreate={(values) =>
-                    fileGroup(groupTarget.ids, {
-                      title: values.title,
-                      description: values.description,
-                      labels: values.labels,
-                    })
-                  }
-                  onCancel={() => setGroupTarget(null)}
                 />
               </div>
             )}
