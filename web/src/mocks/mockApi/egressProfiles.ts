@@ -95,11 +95,21 @@ function multiPublisher(entry: string): string | null {
   return null;
 }
 
-// warningsFor mirrors egressprofile.WarningsFor for stored (already normalized) entries.
+// warningsFor mirrors egressprofile.WarningsFor for stored entries: a stale-entry warning
+// for one the current rules refuse, then the multi-publisher warnings.
 function warningsFor(hosts: string[], overrides: string[]): EgressProfileWarning[] {
   const out: EgressProfileWarning[] = [];
   for (const h of hosts) {
-    const reason = multiPublisher(h);
+    const n = normalizeEntry(h);
+    if (typeof n !== "string") {
+      out.push({
+        entry: h,
+        code: "stale_entry",
+        message: `${h} is no longer accepted (${n.message}), so it matches nothing; edit the profile to fix or remove it`,
+      });
+      continue;
+    }
+    const reason = multiPublisher(n);
     if (!reason) continue;
     out.push(
       overrides.includes(h)
@@ -141,9 +151,10 @@ function seed(
   };
 }
 
-// Three seeds: a clean list, one with an accepted multi-publisher override, and one whose
-// stored entry the (grown) built-in list now flags without an override, so the demo shows
-// every read-time warning the page renders.
+// Four seeds: a clean list, one with an accepted multi-publisher override, one whose stored
+// entry the (grown) built-in list now flags without an override, and one holding a wildcard
+// written before its base became a public suffix (a stale entry), so the demo shows every
+// read-time warning the page renders.
 let profiles: StoredProfile[] = [
   seed(
     "ep-kernel",
@@ -168,6 +179,14 @@ let profiles: StoredProfile[] = [
     ["docs.vendor-x.com", "*.cdn.vendor-x.com", "vendor-x.com"],
     [],
     5,
+  ),
+  seed(
+    "ep-pages",
+    "project-pages",
+    "Project sites published on GitHub Pages",
+    ["docs.example-project.org", "*.github.io"],
+    [],
+    60,
   ),
 ];
 
@@ -204,10 +223,20 @@ function validate(
   } else if (input.description !== input.description.trim()) {
     problems.push({ field: "description", code: "unsafe_text", message: "description must not start or end with spaces" });
   }
+  // Like Validate, an over-long list stops validation before any entry is normalized.
   if (input.hosts.length === 0) {
     problems.push({ field: "hosts", code: "no_entries", message: "a profile needs at least one host entry" });
   } else if (input.hosts.length > 200) {
     problems.push({ field: "hosts", code: "too_many_entries", message: `a profile may list at most 200 host entries (got ${input.hosts.length})` });
+    throw invalid(problems);
+  }
+  if (input.multi_publisher_override.length > 200) {
+    problems.push({
+      field: "multi_publisher_override",
+      code: "too_many_entries",
+      message: `a profile may list at most 200 overrides (got ${input.multi_publisher_override.length})`,
+    });
+    throw invalid(problems);
   }
   const override = new Set<string>();
   input.multi_publisher_override.forEach((raw, i) => {

@@ -74,7 +74,7 @@ beforeEach(() => {
 });
 afterEach(() => {
   cleanup();
-  vi.clearAllMocks();
+  vi.resetAllMocks();
 });
 
 async function openCreate() {
@@ -143,6 +143,10 @@ describe("AdminEgressProfiles", () => {
       .mockRejectedValueOnce(
         invalid([{ field: "hosts[1]", entry: "github.com", code: "multi_publisher_needs_override", message: MP_MSG }]),
       )
+      // The second refusal is about something else entirely: it no longer names github.com.
+      .mockRejectedValueOnce(
+        invalid([{ field: "name", code: "invalid_name", message: "name must be 1-64 characters of lowercase letters" }]),
+      )
       .mockResolvedValueOnce({
         egress_profile: profile({ id: "ep-new", name: "kernel", hosts: ["docs.kernel.org", "github.com"] }),
       });
@@ -163,10 +167,24 @@ describe("AdminEgressProfiles", () => {
     expect(within(form).getAllByRole("checkbox")).toHaveLength(1);
 
     fireEvent.click(box);
+    // A ticked consent is a decision made, not a problem left: the summary stops counting it.
+    expect(within(form).queryByText(/problems? to fix/)).toBeNull();
     fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
     await waitFor(() => expect(mockApi.adminCreateEgressProfile).toHaveBeenCalledTimes(2));
+    expect(await within(form).findByText("name must be 1-64 characters of lowercase letters")).toBeTruthy();
+    expect(within(form).getByText("1 problem to fix before this site list can be saved. Nothing was stored.")).toBeTruthy();
+    // The consent the admin gave stays visible, still ticked, with its reason, even though
+    // the latest refusal does not mention the entry: an override is never sent unseen.
+    const kept = within(form).getByRole("checkbox", { name: "Allow every publisher on github.com" });
+    expect((kept as HTMLInputElement).checked).toBe(true);
+    expect(document.getElementById(kept.getAttribute("aria-describedby")!)?.textContent).toBe(MP_MSG);
+    expect(within(form).getByText("Every publisher allowed")).toBeTruthy();
+
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "kernel" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
+    await waitFor(() => expect(mockApi.adminCreateEgressProfile).toHaveBeenCalledTimes(3));
     expect(mockApi.adminCreateEgressProfile.mock.calls[0][0].multi_publisher_override).toEqual([]);
-    expect(mockApi.adminCreateEgressProfile.mock.calls[1][0]).toEqual({
+    expect(mockApi.adminCreateEgressProfile.mock.calls[2][0]).toEqual({
       name: "kernel",
       description: "",
       hosts: ["docs.kernel.org", "github.com"],
@@ -234,6 +252,57 @@ describe("AdminEgressProfiles", () => {
     fireEvent.change(within(form).getByLabelText("Hosts, one per line"), { target: { value: "a.example.com" } });
     fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
     expect(await within(form).findByText("an egress profile with that name already exists")).toBeTruthy();
+  });
+
+  it("shows a 422 with no usable problems as a banner, so a refused save is never silent", async () => {
+    mockApi.adminCreateEgressProfile.mockRejectedValue(invalid([]));
+    const form = await openCreate();
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "vendor" } });
+    fireEvent.change(within(form).getByLabelText("Hosts, one per line"), { target: { value: "a.example.com" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Create site list" }));
+    expect(await within(form).findByText("the egress profile is invalid: see problems")).toBeTruthy();
+  });
+
+  it("renders server strings in the editor as text, never as markup", async () => {
+    const payload = '<img src=x onerror="alert(1)">';
+    mockApi.adminListEgressProfiles.mockResolvedValue({
+      egress_profiles: [
+        profile({
+          id: "ep-x",
+          name: "odd",
+          hosts: ["github.com", payload],
+          warnings: [
+            { entry: "github.com", code: "multi_publisher_needs_override", message: `mp ${payload}` },
+            { entry: payload, code: "stale_entry", message: `stale ${payload}` },
+          ],
+        }),
+      ],
+    });
+    mockApi.adminUpdateEgressProfile.mockRejectedValue(
+      invalid([
+        { field: "description", code: "unsafe_text", message: `desc ${payload}` },
+        { field: "hosts[1]", entry: payload, code: "invalid_host", message: `host ${payload}` },
+        { field: "something_new", code: "other", message: `other ${payload}` },
+      ]),
+    );
+    const { container } = renderPage();
+    await screen.findByText("odd");
+    fireEvent.click(screen.getByRole("button", { name: "Edit odd" }));
+    const form = screen.getByRole("form", { name: "Edit odd" });
+    // Stored-entry warnings: the multi-publisher reason and the stale warning, plus the
+    // echoed entry itself in the ledger.
+    const box = within(form).getByRole("checkbox", { name: "Allow every publisher on github.com" });
+    expect(document.getElementById(box.getAttribute("aria-describedby")!)?.textContent).toBe(`mp ${payload}`);
+    expect(within(form).getByText(`stale ${payload}`)).toBeTruthy();
+    const staleRow = within(form).getByText(`stale ${payload}`).closest("li")!;
+    expect(within(staleRow).getByText(payload)).toBeTruthy();
+
+    fireEvent.click(within(form).getByRole("button", { name: "Save changes" }));
+    // Problem messages: a field problem, an entry problem in the ledger, an unplaced one.
+    expect(await within(form).findByText(`desc ${payload}`)).toBeTruthy();
+    expect(within(form).getByText(`host ${payload}`).closest("li")).toBe(staleRow);
+    expect(within(form).getByText(`other ${payload}`)).toBeTruthy();
+    expect(container.querySelector("img")).toBeNull();
   });
 
   it("renders server strings as text, never as markup", async () => {

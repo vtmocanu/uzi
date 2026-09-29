@@ -293,11 +293,13 @@ export function gateRevisionMismatchCurrent(err: unknown): number | null {
 // egressProfileProblems returns the per-field problems of a 422 `invalid_egress_profile`
 // (PRD #1906 M1), or null when the error is anything else, so the site-list editor can pin
 // each problem to its field or host entry and surface every other failure as a banner.
+// A 422 whose problems list is empty, or holds nothing well-formed, is also null: the
+// caller then shows the generic error, so a refused save is never silent.
 export function egressProfileProblems(err: unknown): EgressProfileProblem[] | null {
   if (!(err instanceof ApiError) || err.status !== 422) return null;
   const body = err.body as { reason?: string; problems?: unknown } | null;
   if (body?.reason !== "invalid_egress_profile" || !Array.isArray(body.problems)) return null;
-  return body.problems.filter(
+  const problems = body.problems.filter(
     (p): p is EgressProfileProblem =>
       typeof p === "object" &&
       p !== null &&
@@ -305,6 +307,7 @@ export function egressProfileProblems(err: unknown): EgressProfileProblem[] | nu
       typeof (p as EgressProfileProblem).code === "string" &&
       typeof (p as EgressProfileProblem).message === "string",
   );
+  return problems.length > 0 ? problems : null;
 }
 
 async function request<T>(

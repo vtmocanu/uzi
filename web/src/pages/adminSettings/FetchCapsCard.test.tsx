@@ -3,7 +3,7 @@ import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { FetchCapsCard } from "./FetchCapsCard";
-import { api, type AppSettings, type SettingSource, type SettingsResponse } from "../../lib/api";
+import { api, type AppSettings, type SettingsResponse } from "../../lib/api";
 
 vi.mock("../../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../../lib/api")>();
@@ -27,10 +27,10 @@ function response(s: AppSettings): SettingsResponse {
   return { settings: s, secrets: {}, sources: {} } as unknown as SettingsResponse;
 }
 
-function renderCard(s = settings(), sources: Record<string, SettingSource> = {}, onSaved = vi.fn()) {
+function renderCard(s = settings(), onSaved = vi.fn()) {
   render(
     <MemoryRouter>
-      <FetchCapsCard settings={s} sources={sources} onSaved={onSaved} />
+      <FetchCapsCard settings={s} onSaved={onSaved} />
     </MemoryRouter>,
   );
   return onSaved;
@@ -128,10 +128,32 @@ describe("FetchCapsCard", () => {
     expect(screen.getByRole("link", { name: "site list" }).getAttribute("href")).toBe("/admin/egress-profiles");
   });
 
-  it("shows an env-sourced cap read-only and never sends it", () => {
-    renderCard(settings(), { fetch_max_run_files: "env" });
-    expect(filesInput().disabled).toBe(true);
-    expect(screen.getByText("Set by an environment variable, so it can't be changed here.")).toBeTruthy();
-    expect(fileInput().disabled).toBe(false);
+  it.each([
+    ["1", "0.000001"],
+    ["524", "0.0005"],
+    ["525", "0.001"],
+  ])("shows a tiny stored byte cap (%s bytes) as a non-zero MiB value, not 0", (stored, shown) => {
+    renderCard(settings({ fetch_max_file_bytes: stored }));
+    expect(fileInput().value).toBe(shown);
+    expect(fileInput().getAttribute("aria-invalid")).toBe("false");
+  });
+
+  it("never lets an untouched stored value block saving another cap", async () => {
+    mockApi.updateSettings.mockResolvedValue(response(settings()));
+    // 1 byte, and a value the form cannot represent at all: neither is validated or sent
+    // while left alone.
+    renderCard(settings({ fetch_max_file_bytes: "1", fetch_max_run_bytes: "0" }));
+    expect(screen.queryByText(/Must be more than 0/)).toBeNull();
+    fireEvent.change(concInput(), { target: { value: "8" } });
+    expect(saveBtn().disabled).toBe(false);
+    fireEvent.click(saveBtn());
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ fetch_max_concurrent_per_run: "8" }));
+  });
+
+  it("validates a stored value again once it is edited", () => {
+    renderCard(settings({ fetch_max_run_bytes: "0" }));
+    fireEvent.change(runInput(), { target: { value: "0.0" } });
+    expect(screen.getByText("Must be more than 0 and at most 10240 MiB")).toBeTruthy();
+    expect(saveBtn().disabled).toBe(true);
   });
 });

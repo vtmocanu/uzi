@@ -72,6 +72,11 @@ export function SiteListEditor({
   // Verdicts from the last refused save, keyed by entryKey so they stay pinned to their
   // entry while the admin edits other lines, and vanish from an entry whose text changes.
   const [entryProblems, setEntryProblems] = useState<Map<string, EgressProfileProblem[]>>(new Map());
+  // Why the api called an entry multi-publisher, remembered ACROSS refused saves (merged,
+  // never replaced) while the entry is still listed. A later refusal about something else
+  // no longer mentions the entry, but its consent is still sent, so its checkbox and reason
+  // must stay on screen: an override is never sent from a control the admin cannot see.
+  const [mpReasons, setMpReasons] = useState<Map<string, string>>(new Map());
   const [fieldProblems, setFieldProblems] = useState<EgressProfileProblem[]>([]);
   const [error, setError] = useState("");
   const [busy, setBusy] = useState(false);
@@ -97,7 +102,19 @@ export function SiteListEditor({
   }, [editing]);
 
   const lines = parseLines(hostsText);
-  const problemCount = [...entryProblems.values()].reduce((n, ps) => n + ps.length, 0) + fieldProblems.length;
+  // A multi-publisher refusal whose box is now ticked is a decision made, not a problem left.
+  const problemCount =
+    [...entryProblems].reduce(
+      (n, [k, ps]) => n + ps.filter((p) => !(MULTI_PUBLISHER_CODES.has(p.code) && overrides.has(k))).length,
+      0,
+    ) + fieldProblems.length;
+
+  // The multi-publisher reason for an entry, in order of freshness: the last refusal, a
+  // remembered earlier refusal, then a stored-entry warning (edit mode).
+  const multiPublisherReason = (k: string): string | undefined =>
+    entryProblems.get(k)?.find((p) => MULTI_PUBLISHER_CODES.has(p.code))?.message ??
+    mpReasons.get(k) ??
+    storedWarnings.get(k)?.find((w) => MULTI_PUBLISHER_CODES.has(w.code))?.message;
 
   const fieldProblem = (field: string) => fieldProblems.filter((p) => p.field === field);
 
@@ -127,6 +144,7 @@ export function SiteListEditor({
         ? await api.adminUpdateEgressProfile(editing.name, body)
         : await api.adminCreateEgressProfile({ name: name.trim(), ...body });
       setEntryProblems(new Map());
+      setMpReasons(new Map());
       setFieldProblems([]);
       onSaved(resp.egress_profile, !editing);
     } catch (err) {
@@ -149,6 +167,15 @@ export function SiteListEditor({
         byEntry.set(k, [...(byEntry.get(k) ?? []), p]);
       }
       setEntryProblems(byEntry);
+      setMpReasons((prev) => {
+        const listed = new Set(hosts.map(entryKey));
+        const next = new Map([...prev].filter(([k]) => listed.has(k)));
+        for (const [k, ps] of byEntry) {
+          const mp = ps.find((p) => MULTI_PUBLISHER_CODES.has(p.code));
+          if (mp) next.set(k, mp.message);
+        }
+        return next;
+      });
       setFieldProblems(rest);
       requestAnimationFrame(() => summaryRef.current?.focus());
     } finally {
@@ -257,6 +284,7 @@ export function SiteListEditor({
                     line={l}
                     problems={entryProblems.get(entryKey(l.text)) ?? []}
                     warnings={storedWarnings.get(entryKey(l.text)) ?? []}
+                    multiPublisherReason={multiPublisherReason(entryKey(l.text))}
                     overridden={overrides.has(entryKey(l.text))}
                     onOverride={(on) => toggleOverride(entryKey(l.text), on)}
                   />
@@ -292,28 +320,29 @@ function ProblemList({ problems }: { problems: EgressProfileProblem[] }) {
   );
 }
 
-// LedgerRow is one entry of the ledger. A multi-publisher entry (flagged by a refused
-// save, or by a stored warning) carries the consent checkbox: ticking it is the explicit,
-// per-entry override the api requires.
+// LedgerRow is one entry of the ledger. A multi-publisher entry (flagged by this or an
+// earlier refused save, or by a stored warning) carries the consent checkbox: ticking it
+// is the explicit, per-entry override the api requires.
 function LedgerRow({
   line,
   problems,
   warnings,
+  multiPublisherReason,
   overridden,
   onOverride,
 }: {
   line: Line;
   problems: EgressProfileProblem[];
   warnings: EgressProfileWarning[];
+  multiPublisherReason: string | undefined;
   overridden: boolean;
   onOverride: (on: boolean) => void;
 }) {
   const id = useId();
-  const multiPublisher =
-    problems.find((p) => MULTI_PUBLISHER_CODES.has(p.code)) ?? warnings.find((w) => MULTI_PUBLISHER_CODES.has(w.code));
+  const multiPublisher = multiPublisherReason !== undefined;
   const refusals = problems.filter((p) => !MULTI_PUBLISHER_CODES.has(p.code));
   const stale = warnings.filter((w) => w.code === "stale_entry");
-  const needsDecision = multiPublisher !== undefined && !overridden;
+  const needsDecision = multiPublisher && !overridden;
   const refused = refusals.length > 0 || (needsDecision && problems.some((p) => MULTI_PUBLISHER_CODES.has(p.code)));
 
   return (
@@ -367,7 +396,7 @@ function LedgerRow({
               </span>
             </label>
             <p id={`${id}-mp-why`} className="pl-6 text-xs text-muted">
-              {multiPublisher.message}
+              {multiPublisherReason}
             </p>
             <p className="pl-6 text-xs text-muted">
               Many unrelated people publish on this host, and the fetch check sees only the host, not the path.

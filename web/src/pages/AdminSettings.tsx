@@ -528,7 +528,7 @@ export function AdminSettings() {
 
       {!loading && saved && (
         <section id="fetch-caps" className="scroll-mt-6">
-          <FetchCapsCard settings={saved} sources={sources} onSaved={applyResponse} />
+          <FetchCapsCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
     </AdminShell>

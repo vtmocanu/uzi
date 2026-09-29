@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   api,
   ApiError,
+  egressProfileProblems,
   gateRevisionMismatchCurrent,
   isOutcomePendingConfirmation,
   MOCK_MODE,
@@ -296,5 +297,27 @@ describe("gateRevisionMismatchCurrent (PRD #1795 M4)", () => {
       gateRevisionMismatchCurrent(new ApiError(400, "x", { reason: "gate_revision_mismatch", current_gate_revision: 2 })),
     ).toBeNull();
     expect(gateRevisionMismatchCurrent(new Error("boom"))).toBeNull();
+  });
+});
+
+describe("egressProfileProblems (PRD #1906 M1w)", () => {
+  const refused = (problems: unknown) =>
+    new ApiError(422, "the egress profile is invalid: see problems", { reason: "invalid_egress_profile", problems });
+
+  it("returns the well-formed problems of an invalid_egress_profile 422", () => {
+    const p = { field: "hosts[0]", code: "scheme", message: "list a host name, not a URL" };
+    expect(egressProfileProblems(refused([p, { field: 3 }, null]))).toEqual([p]);
+  });
+
+  it("is null when nothing usable is left, so the editor falls back to the generic error", () => {
+    expect(egressProfileProblems(refused([]))).toBeNull();
+    expect(egressProfileProblems(refused([{ field: "name" }, "x", null]))).toBeNull();
+    expect(egressProfileProblems(refused("not a list"))).toBeNull();
+  });
+
+  it("is null for any other error", () => {
+    expect(egressProfileProblems(new ApiError(422, "x", { reason: "other", problems: [] }))).toBeNull();
+    expect(egressProfileProblems(new ApiError(409, "taken"))).toBeNull();
+    expect(egressProfileProblems(new Error("boom"))).toBeNull();
   });
 });

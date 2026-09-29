@@ -20,6 +20,9 @@ describe("mockApi egress profiles", () => {
     const codes = egress_profiles.flatMap((p) => p.warnings.map((w) => w.code));
     expect(codes).toContain("multi_publisher_override");
     expect(codes).toContain("multi_publisher_needs_override");
+    expect(codes).toContain("stale_entry");
+    const pages = egress_profiles.find((p) => p.name === "project-pages")!;
+    expect(pages.warnings).toEqual([expect.objectContaining({ entry: "*.github.io", code: "stale_entry" })]);
     expect(egress_profiles.some((p) => p.warnings.length === 0)).toBe(true);
   });
 
@@ -79,6 +82,28 @@ describe("mockApi egress profiles", () => {
           { field: "multi_publisher_override[0]", code: "override_not_in_hosts" },
         ],
       },
+    });
+  });
+
+  it("stops at an over-long host or override list without judging any entry, like Validate", async () => {
+    const api = await freshApi();
+    const many = Array.from({ length: 201 }, () => "https://not-a-host");
+    await expect(
+      api.adminCreateEgressProfile({ name: "Bad Name", description: "", hosts: many, multi_publisher_override: [] }),
+    ).rejects.toMatchObject({
+      status: 422,
+      body: {
+        problems: [
+          { field: "name", code: "invalid_name" },
+          { field: "hosts", code: "too_many_entries" },
+        ],
+      },
+    });
+    await expect(
+      api.adminCreateEgressProfile({ name: "ok", description: "", hosts: ["a.example.com"], multi_publisher_override: many }),
+    ).rejects.toMatchObject({
+      status: 422,
+      body: { problems: [{ field: "multi_publisher_override", code: "too_many_entries" }] },
     });
   });
 

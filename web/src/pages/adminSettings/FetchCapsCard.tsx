@@ -1,12 +1,6 @@
 import { useState, type FormEvent } from "react";
 import { Link } from "react-router-dom";
-import {
-  api,
-  type AppSettings,
-  type SettingSource,
-  type SettingsResponse,
-  type UpdateSettingsPayload,
-} from "../../lib/api";
+import { api, type AppSettings, type SettingsResponse, type UpdateSettingsPayload } from "../../lib/api";
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
@@ -55,14 +49,19 @@ const FIELDS: {
   },
 ];
 
-// bytesToMib renders a stored byte count as MiB, exact when it is a whole MiB and to at
-// most three decimals otherwise (a value written through the API need not be a MiB
-// multiple). An unparsable stored value renders as-is so the validator flags it.
+// bytesToMib renders a stored byte count as MiB, exact when it is a whole MiB and to three
+// decimals otherwise (a value written through the API need not be a MiB multiple). A
+// count too small for three decimals (1 to 524 bytes) gets as many decimals as it needs
+// to stay non-zero, so a tiny stored cap never reads as "0". Fixed notation, never
+// exponent notation, so the MiB validator accepts what it shows. An unparsable stored
+// value renders as-is.
 function bytesToMib(stored: string): string {
   if (!/^\d+$/.test(stored.trim())) return stored;
   const n = Number(stored.trim());
   if (n % MIB === 0) return String(n / MIB);
-  return String(Math.round((n / MIB) * 1000) / 1000);
+  let digits = 3;
+  while (digits < 6 && Number((n / MIB).toFixed(digits)) === 0) digits++;
+  return (n / MIB).toFixed(digits).replace(/\.?0+$/, "");
 }
 
 function toDisplay(f: (typeof FIELDS)[number], stored: string | undefined): string {
@@ -91,14 +90,12 @@ function toStored(f: (typeof FIELDS)[number], raw: string): { value: string } | 
 
 // FetchCapsCard is the admin surface for the research fetch caps (PRD #1906 M1w). It
 // saves independently of the other cards and sends only the caps that changed, like
-// HealthSettingsCard; an env-sourced key is shown read-only (the server refuses the write).
+// HealthSettingsCard. No environment variable sets a fetch cap, so every field is editable.
 export function FetchCapsCard({
   settings,
-  sources,
   onSaved,
 }: {
   settings: AppSettings;
-  sources: Record<string, SettingSource>;
   onSaved: (resp: SettingsResponse) => void;
 }) {
   const [values, setValues] = useState<Record<CapKey, string>>(
@@ -108,18 +105,16 @@ export function FetchCapsCard({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  const isEnv = (key: string) => sources[key] === "env";
-  const results = FIELDS.map((f) => ({ f, r: toStored(f, values[f.key]) }));
-  const invalid = results.some(({ r }) => "error" in r);
-  // Changed is judged in the DISPLAY unit: a stored byte count that is not a whole MiB
+  // Touched is judged in the DISPLAY unit: a stored byte count that is not a whole MiB
   // shows rounded, and re-saving that rounded value untouched would silently rewrite it.
-  const changed = results.filter(
-    ({ f, r }) =>
-      !isEnv(f.key) &&
-      "value" in r &&
-      values[f.key].trim() !== toDisplay(f, settings[f.key]) &&
-      r.value !== (settings[f.key] ?? ""),
-  );
+  // An untouched field is never validated and never sent, so a stored value the form
+  // cannot represent exactly does not block saving the other caps.
+  const results = FIELDS.map((f) => {
+    const touched = values[f.key].trim() !== toDisplay(f, settings[f.key]);
+    return { f, r: touched ? toStored(f, values[f.key]) : null };
+  });
+  const invalid = results.some(({ r }) => r !== null && "error" in r);
+  const changed = results.filter(({ f, r }) => r !== null && "value" in r && r.value !== (settings[f.key] ?? ""));
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
@@ -127,7 +122,7 @@ export function FetchCapsCard({
     setNotice("");
     if (invalid || changed.length === 0) return;
     const payload: UpdateSettingsPayload = {};
-    for (const { f, r } of changed) if ("value" in r) payload[f.key] = r.value;
+    for (const { f, r } of changed) if (r !== null && "value" in r) payload[f.key] = r.value;
     setBusy(true);
     try {
       const resp = await api.updateSettings(payload);
@@ -162,7 +157,7 @@ export function FetchCapsCard({
       <form onSubmit={save} className="space-y-4" noValidate>
         <div className="grid gap-4 sm:grid-cols-2">
           {results.map(({ f, r }) => {
-            const err = "error" in r ? r.error : null;
+            const err = r !== null && "error" in r ? r.error : null;
             const id = `fetchcap-${f.key}`;
             return (
               <div key={f.key} className="space-y-1">
@@ -171,14 +166,13 @@ export function FetchCapsCard({
                     id={id}
                     inputMode={f.unit === "mib" ? "decimal" : "numeric"}
                     value={values[f.key]}
-                    disabled={isEnv(f.key)}
                     aria-invalid={err != null}
                     aria-describedby={`${id}-hint${err ? ` ${id}-error` : ""}`}
                     onChange={(e) => setValues((v) => ({ ...v, [f.key]: e.target.value }))}
                   />
                 </Field>
                 <p id={`${id}-hint`} className="text-xs text-faint">
-                  {isEnv(f.key) ? "Set by an environment variable, so it can't be changed here." : f.hint}
+                  {f.hint}
                 </p>
                 {err && (
                   <p id={`${id}-error`} className="text-xs text-danger">
