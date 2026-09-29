@@ -12,8 +12,29 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 # /bin/stat on some Linux images (the uzi worker), where a hard-coded path made the stub
 # fail and the script fall through to the fake BSD output ("File: unbound variable").
 REAL_STAT=$(command -v stat) || { echo "BROKEN: no stat on PATH" >&2; exit 2; }
-export REAL_STAT
+REAL_DATE=$(command -v date) || { echo "BROKEN: no date on PATH" >&2; exit 2; }
+export REAL_STAT REAL_DATE
 mkdir -p "$WORK/bin" "$WORK/state"
+export TEST_CLOCK="$WORK/clock"
+"$REAL_DATE" +%s > "$TEST_CLOCK"
+cat > "$WORK/bin/date" <<'STUB'
+#!/usr/bin/env bash
+set -eu
+# Only the clock reads used by cr-rate-limit.sh are virtual; preserve other date forms.
+if [ "$#" -eq 1 ] && [ "$1" = '+%s' ]; then
+  cat "$TEST_CLOCK"
+  exit 0
+fi
+if [ "$#" -eq 2 ] && [ "$1" = -u ] && [ "$2" = '+%Y-%m-%dT%H:%M:%SZ' ]; then
+  jq -nr --argjson e "$(cat "$TEST_CLOCK")" '$e|todate'
+  exit 0
+fi
+if [ "$#" -eq 1 ] && [ "$1" = '+%H:%M:%S' ]; then
+  jq -nr --argjson e "$(cat "$TEST_CLOCK")" '$e|strftime("%H:%M:%S")'
+  exit 0
+fi
+exec "$REAL_DATE" "$@"
+STUB
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -39,6 +60,11 @@ cat > "$WORK/bin/gh" <<'STUB'
 #!/usr/bin/env bash
 set -eu
 
+advance_clock() {
+  now=$(cat "$TEST_CLOCK")
+  printf '%s\n' "$((now + $1))" > "$TEST_CLOCK"
+}
+
 if [ "${1:-}" = pr ] && [ "${2:-}" = view ]; then
   echo "${HEAD_OID:-deadbeef}"
   exit 0
@@ -51,25 +77,26 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
   done
   printf '%s\n' "$body" >> "$POSTED"
   if [ "$body" = '@coderabbitai review' ]; then
-    review_at=$(jq -nr 'now|todate')
+    review_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     jq --arg t "$review_at" '. + [{user:{login:"tester"},body:"@coderabbitai review",created_at:$t,updated_at:$t}]' \
       "$COMMENTS" > "$COMMENTS.next"
     mv "$COMMENTS.next" "$COMMENTS"
     exit 0
   fi
-  asked=$(jq -nr 'now|todate')
+  asked=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   if [ "${SINGULAR_MINUTE:-0}" = 1 ]; then
-    /bin/sleep 1
-    replied=$(jq -nr 'now|todate')
+    advance_clock 1
+    replied=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     reply='<!-- This is an auto-generated reply by CodeRabbit -->
 Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy) includes PR reviews subject to [rate limits](https://docs.coderabbit.ai/management/plans#rate-limits). More reviews will be available in 1 minute.'
   elif [ "${AVAILABLE_NOW:-0}" = 1 ]; then
-    /bin/sleep 1
-    replied=$(jq -nr 'now|todate')
+    advance_clock 1
+    replied=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     reply='<!-- This is an auto-generated reply by CodeRabbit -->
 Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy) includes PR reviews subject to [rate limits](https://docs.coderabbit.ai/management/plans#rate-limits). Reviews are available now.'
   else
-    replied=$(jq -nr 'now+2|todate')
+    advance_clock 1
+    replied=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     reply="More reviews will be available in ${RESET_MIN:-12} minutes"
   fi
   # A large body AFTER the match phrase forces the `printf … | grep -qF` SIGPIPE the fix
@@ -91,7 +118,7 @@ Your [plan](https://docs.coderabbit.ai/management/plans#fair-usage-limits-policy
     ]' > "$COMMENTS"
   fi
   if [ "${LATER_WALKTHROUGH:-0}" = 1 ]; then
-    later=$(jq -nr 'now+4|todate')
+    later=$(jq -nr --argjson e "$(cat "$TEST_CLOCK")" '$e+4|todate')
     jq --arg t "$later" '. + [{
       user:{login:"coderabbitai[bot]"},
       body:"<!-- auto-generated comment: rate limited by coderabbit.ai -->\nNext included review available in 60 minutes\n<!-- end of auto-generated comment: rate limited -->",
@@ -113,6 +140,8 @@ if [ "${1:-}" = api ]; then
       else
         n=0; [ -f "$STATUS_COUNT" ] && n=$(cat "$STATUS_COUNT")
         n=$((n + 1)); echo "$n" > "$STATUS_COUNT"
+        # --interval 0 uses a no-op sleep, so move the bounded wait clock on polls.
+        if [ "$MODE" = wait ]; then advance_clock 15; fi
         if [ "$n" -le 2 ]; then echo 'Review rate limited'; else echo 'Review completed'; fi
       fi
       exit 0 ;;
@@ -121,7 +150,7 @@ fi
 echo "unexpected gh call: $*" >&2
 exit 1
 STUB
-chmod +x "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat"
+chmod +x "$WORK/bin/date" "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat"
 cat > "$WORK/bin/watch-pr-stub" <<'STUB'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >> "$WATCHED"
@@ -153,7 +182,7 @@ grep -q '^CR_RESET_SOURCE=reply$' "$WORK/query.out" || fail "fresh reply was not
 # A wait progress line must print one RFC3339 value, never RFC3339+epoch concatenation.
 MODE="wait"; export MODE
 rm -f "$STATUS_COUNT"
-now=$(jq -nr 'now|todate')
+now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 jq -n --arg t "$now" '[{
   user:{login:"coderabbitai[bot]"},
   body:"<!-- auto-generated comment: rate limited by coderabbit.ai -->\nNext included review available in 1 minutes\n<!-- end of auto-generated comment: rate limited -->",
