@@ -204,8 +204,9 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 ## Research fetch caps
 
 Five limits bound what one official-sources research run may download (see
-[Egress profiles](./egress-profiles.md)). The run lane that uses them is not
-enabled yet, so today they are stored and validated but nothing reads them.
+[Egress profiles](./egress-profiles.md)). The fetch service reads them for
+every fetch of a run in the [isolated research lane](./isolated-research-lane.md);
+no run is bound to a site list yet, so nothing exercises them today.
 
 | Setting | Default | Controls |
 |---|---|---|

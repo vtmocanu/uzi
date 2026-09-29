@@ -107,6 +107,7 @@ uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
+uzi run fetches <id> [--json]
 uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
@@ -593,6 +594,17 @@ A few worth knowing:
   run lists the whole conversation, not just steering messages; an issue or
   CI-fix run's queue starts empty and only ever holds what you actually sent
   mid-run.
+- **`run fetches <id>`** prints a research run's source log
+  ([PRD #1906](../prds/1906-official-sources-web-research.md)): one row per web
+  fetch the run attempted, oldest first, with `STARTED`, `VERDICT` (`allowed` or
+  `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
+  `FINAL URL` (after redirects). The command follows every page of the log.
+  Owner-only: another user's run reads as not found (exit 4), and a run that
+  never fetched, which is every run until runs can be bound to a site list, shows
+  no rows. URLs are cut in the table; `--json` prints them whole with each file's
+  sha256. The text cells are site- or agent-controlled and are printed with
+  control characters stripped. See [Isolated research
+  lane](isolated-research-lane.md#reading-the-source-log).
 - **`run expedite <id>`** bumps a **queued** run to the front of the claim
   queue, so a worker picks it up ahead of the rest. It only matters before a
   run is claimed — ordering is fixed once a worker takes it — so a non-queued

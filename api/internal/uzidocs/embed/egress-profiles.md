@@ -11,10 +11,12 @@ run may read from ([PRD #1906](../prds/1906-official-sources-web-research.md)).
 Admins create and edit profiles; a run will name one profile, never a list of
 domains.
 
-**Not enabled yet.** This release stores and validates profiles and the fetch
-caps. The pieces that use them (the fetch service, the no-internet worker lane,
-and binding a run to a profile) land in later milestones. Until then a profile
-changes nothing about how any run reaches the network.
+**Not in use yet.** The fetch service and the no-internet worker lane that read
+these profiles exist and are described in [Isolated research
+lane](isolated-research-lane.md), but binding a run to a profile lands with job
+creation ([PRD #1908](../prds/1908-repo-less-jobs-api.md)). Until then no run
+is bound to a profile, and a profile changes nothing about how any run reaches
+the network.
 
 ## Managing profiles
 
@@ -141,7 +143,7 @@ entry matches nothing, and every read of the profile carries a warning for it
 
 ## Multi-publisher hosts
 
-The fetch service will check each request's host, not its path. On a host where
+The fetch service checks each request's host, not its path. On a host where
 many publishers serve content under the same name (code hosting, path-style
 object storage, documentation and package hosting, forums), allowing the host
 allows every publisher on it: allowing `github.com` allows every repository,

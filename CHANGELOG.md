@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 - **Admin → Site lists page and a fetch-caps card ([#1906](https://github.com/vtmocanu/uzi/issues/1906)).**
   Admins can now create, edit and delete site lists (egress profiles) in the web app, which is the only place to write them since the CLI is read-only. Hosts are typed one per line; each refused entry shows its reason beside it, and a multi-publisher host such as `github.com` is saved only after the admin ticks "Allow every publisher on" that host. Admin → Instance gains a Research fetch caps card that edits the four caps, the two byte caps in MiB.
 
+- **An isolated, no-internet worker lane and a fetch service for official-sources research, off by default ([#1906](https://github.com/vtmocanu/uzi/issues/1906)).**
+  The Helm chart gains `workers.isolatedLane.*`: a third worker namespace (`uzi-workers-isolated`) whose default-deny policy admits only DNS, the api, the new `uzi-fetcher` Deployment and `api.anthropic.com` by exact name, plus the fetcher itself, which checks every URL against a run's site list (https on 443, no userinfo, public addresses only, per-run caps) and logs every attempt. A run in the lane gets a per-run fetch credential, a fixed tool set (`Read`, `Write`, `Edit`, `Grep`, `Glob` and one fetch tool, no shell), and can be claimed only by a worker the api provisioned into the lane. Owners read a run's source log with `uzi run fetches <run>`. Turning it on needs workers, an FQDN egress provider (Antrea or OVN), api TLS and the cluster's pod, service and node CIDRs; use `fetcher.token.source: existing` under Argo CD, since a generated token changes on every sync. Nothing binds a run to a site list until job creation (PRD #1908), so the lane is idle, and it has not been measured on a live cluster. DNS, the model API and a multi-publisher host admitted by an override remain open channels; see the Isolated research lane operator page and ADR-1906.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
