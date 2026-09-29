@@ -69,6 +69,7 @@ func newContractCase[T any](name string) contractCase {
 
 func contractCases() []contractCase {
 	return []contractCase{
+		newContractCase[BuildInfoDTO]("build_info"),
 		newContractCase[RunDTO]("run"),
 		newContractCase[RunListItemDTO]("run_list_item"),
 		// M2 — the rest of the apitypes hot set.

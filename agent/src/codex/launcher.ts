@@ -556,9 +556,18 @@ function buildReplacedEnv(trees: OwnedTrees, spec: CodexLaunchSpec): NodeJS.Proc
   return env;
 }
 
-function withDeadline<T>(p: Promise<T>, ms: number, label: string): Promise<T> {
+/** A supervisor-owned child exit deadline, distinct from a boundary abort or a
+ * supervisor failure. Only checkpoint publication may recover after a clean reap. */
+export class SupervisedChildExitTimeoutError extends Error {
+  constructor(ms = 0) {
+    super(`supervised child exit deadline exceeded (${ms}ms)`);
+    this.name = "SupervisedChildExitTimeoutError";
+  }
+}
+
+function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`${label} deadline exceeded (${ms}ms)`)), ms);
+    const timer = setTimeout(() => reject(timeoutError?.() ?? new Error(`${label} deadline exceeded (${ms}ms)`)), ms);
     if (typeof timer.unref === "function") timer.unref();
     p.then(
       (value) => { clearTimeout(timer); resolve(value); },
@@ -924,7 +933,7 @@ async function createHandle(
   async function waitChild(timeoutMs = deadlines.exit): Promise<ChildExitEvidence> {
     if (childExitEvent) return childExitEvent;
     if (failure) throw failure;
-    return withDeadline(childExitPromise, timeoutMs, "supervised child exit");
+    return withDeadline(childExitPromise, timeoutMs, "supervised child exit", () => new SupervisedChildExitTimeoutError(timeoutMs));
   }
 
   /** Every unclean outcome carries the tmpCleanup an abnormal event reported, however

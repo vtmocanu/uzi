@@ -810,6 +810,15 @@ func (h *Handler) attachReleaseInfo(ctx context.Context, info *apitypes.BuildInf
 		NotesURL:    st.NotesURL,
 		Security:    releasecheck.Security(st.Body),
 	}
+	if st.RCTag != "" {
+		info.LatestRC = &apitypes.LatestReleaseDTO{
+			Version:     st.RCTag,
+			Name:        st.RCName,
+			PublishedAt: st.RCPublishedAt,
+			NotesURL:    st.RCNotesURL,
+			Security:    releasecheck.Security(st.RCBody),
+		}
+	}
 	ua := releasecheck.UpdateAvailable(h.version, st.LatestTag)
 	info.UpdateAvailable = &ua
 	fb := releasecheck.FarBehind(h.version, st.LatestTag, st.PublishedAt, h.clock())

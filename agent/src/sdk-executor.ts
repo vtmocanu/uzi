@@ -100,6 +100,7 @@ import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetac
 import { defaultQueryFn, providerErrorMessage } from "./sdk-messages.js";
 import { ClaudeHarness, type ClaudeTurnConfig } from "./claude-harness.js";
 import { RunTurnReducerImpl } from "./harness-reducer.js";
+import { describePluginErrors, REASON_SKILLS_PLUGIN_LOAD_FAILED, type PluginLoadError } from "./plugin-errors.js";
 import type {
   HarnessRateLimit,
   HarnessTerminal,
@@ -626,6 +627,12 @@ interface RunDrive {
   wallRemainingMs: number;
   wallArmedAt?: number;
   wallTimer?: NodeJS.Timeout;
+  /** issue #1888: the run selected at least one skill, so a skills plugin that reports load
+   *  errors at init fails the run closed (REASON_SKILLS_PLUGIN_LOAD_FAILED). */
+  skillsSelected: boolean;
+  /** issue #1888: a no-skills run warns about plugin load errors once per worker attempt, not
+   *  per turn (each claim or resume rebuilds the plugin and may warn again). */
+  pluginWarned: boolean;
 }
 
 /**
@@ -1437,6 +1444,8 @@ export class SdkExecutor implements Executor {
     const state: RunDrive = {
       currentChild: {},
       wallRemainingMs: initialWallMs,
+      skillsSelected: runSkills.length > 0,
+      pluginWarned: false,
     };
     const idleMs = seconds(
       ctx.config?.idle_timeout_seconds,
@@ -3780,6 +3789,11 @@ export class SdkExecutor implements Executor {
           );
         }
         for (const em of reduction.messages) ctx.emit(em);
+        if (event.kind === "initialized" && event.pluginErrors && event.pluginErrors.length > 0) {
+          this.onPluginLoadErrors(ctx, state, event.pluginErrors);
+          // A skills run tripped above: stop now rather than let the turn work without them.
+          if (state.tripReason) throw this.tripError(state);
+        }
         // PRD #1064 M1: push + emit transition frames the MOMENT progress is
         // observed, not at the next turn boundary. Fire-and-forget in the runner.
         if (reduction.progress) onProgress?.(reduction.progress);
@@ -4230,6 +4244,35 @@ export class SdkExecutor implements Executor {
     // `failed` report's text.
     if (state.tripReason === REASON_CREDENTIAL_SWITCH) return new CredentialSwitchSignal();
     return new Error(state.tripReason ?? REASON_CANCELLED);
+  }
+
+  /**
+   * issue #1888: the init frame reported plugin load errors. The only plugin the worker passes is
+   * the run's skills plugin, so a run that SELECTED skills trips fail-closed with
+   * REASON_SKILLS_PLUGIN_LOAD_FAILED before it works without them; a run with no skills posts one
+   * status line per worker attempt and continues. The detail is redacted before it is bounded
+   * (describePluginErrors) and is the only untrusted text that reaches the reason or status line.
+   */
+  private onPluginLoadErrors(
+    ctx: RunContext,
+    state: RunDrive,
+    errors: readonly PluginLoadError[],
+  ): void {
+    const desc = describePluginErrors(errors, ctx.redactText ?? ((s) => s));
+    if (state.skillsSelected) {
+      this.trip(
+        state,
+        `${REASON_SKILLS_PLUGIN_LOAD_FAILED}: the run's skills plugin failed to load (${desc}); stopped before working without its selected skills`,
+      );
+      return;
+    }
+    if (state.pluginWarned) return;
+    state.pluginWarned = true;
+    ctx.emit({
+      kind: "status",
+      agent: "worker",
+      payload: { text: `skills plugin failed to load (${desc}); continuing without it` },
+    });
   }
 
   /** Record a first-wins watchdog/cancel trip and stop the current turn. */

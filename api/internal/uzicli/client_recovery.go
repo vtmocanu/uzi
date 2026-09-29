@@ -78,7 +78,7 @@ func (c *HTTPClient) DownloadRecoveryArchive(ctx context.Context, runID, capture
 }
 
 // RecoveryHolds fetches the caller's owner-wide custody holds + aggregate (PRD #1349 M5, D7).
-// Owner-scoped server-side; Holds is always a JSON array (never null). `uzi run recovery`
+// Owner-scoped server-side; Holds is always a JSON array (never null). `uzi run recovery <run-id>`
 // narrows to one run client-side.
 func (c *HTTPClient) RecoveryHolds(ctx context.Context) (apitypes.RecoveryCustodyHoldsDTO, error) {
 	var out apitypes.RecoveryCustodyHoldsDTO

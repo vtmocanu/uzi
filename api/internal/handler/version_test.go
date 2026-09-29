@@ -585,6 +585,7 @@ func TestVersionEndpointCarriesNothingPrivate(t *testing.T) {
 		// these three top-level keys are added; the body/notes are admin-only and never
 		// ride this endpoint.
 		"latest":           "already public: the newest upstream release, published on github.com/vtmocanu/uzi",
+		"latest_rc":        "already public: the newest upstream release candidate, published on github.com/vtmocanu/uzi",
 		"update_available": "already public: a boolean derived from the public latest tag vs the public running version",
 		"far_behind":       "already public: a boolean derived from the same public version delta (D4 heuristic)",
 	}

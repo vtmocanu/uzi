@@ -13,6 +13,7 @@
 import type { Readable, Writable } from "node:stream";
 import type { EmittedMessage } from "./executor.js";
 import type { PrSummaryClaim } from "./signals.js";
+import type { PluginLoadError } from "./plugin-errors.js";
 import type {
   AskUserQuestion,
   Milestone,
@@ -213,7 +214,14 @@ export type HarnessEvent = HarnessEventMeta &
     // continue the requested session (no resume requested, or the init session_id
     // differed). Threaded to projectInit so the persisted init frame gains
     // `fresh_session: true`. Optional and absent on a Codex init (unflagged).
-    | { kind: "initialized"; model?: string; freshSession?: boolean }
+    // issue #1888: `pluginErrors` carries the init frame's decoded `plugin_errors`
+    // (parsePluginErrors, fail-closed); the key is omitted when none were reported.
+    | {
+        kind: "initialized";
+        model?: string;
+        freshSession?: boolean;
+        pluginErrors?: readonly PluginLoadError[];
+      }
     | {
         kind: "frame";
         origin: HarnessOrigin;
@@ -300,11 +308,35 @@ export type SafeBoundary =
  *  changes what the boundary does. */
 export type BoundarySink = "milestone_checkpoint" | "done_checkpoint";
 
+/** Issues #1900 and #1914: fixed finalize/checkpoint steps reported to a boundary.
+ *  Diagnostic only: it names the step that was active when the boundary deadline fired and
+ *  never changes what the boundary does. */
+export type BoundaryStep =
+  | "run_quiescence"
+  | "fetch_back"
+  | "default_fetch"
+  | "secret_scan"
+  | "base_align"
+  | "push"
+  | "completion_permit"
+  | "pr_description_prepare"
+  | "mr_create"
+  | "post_mr"
+  | "checkpoint_lock_wait"
+  | "checkpoint_overlay"
+  | "scratch_preflight"
+  | "checkpoint_pack"
+  | "checkpoint_upload"
+  | "checkpoint_report";
+
 export interface BoundaryRequest {
   boundary: SafeBoundary;
   deadlineMs: number; // total wall-clock budget, converted once to an absolute deadline
   /** Issue #1864: optional diagnostic label of the sink that requested this boundary. */
   sink?: BoundarySink;
+  /** Issue #1900: optional probe of the caller's active step. Diagnostic only: the safety
+   *  owner reads it synchronously when the boundary deadline fires, to name that step. */
+  activeStep?: () => BoundaryStep | undefined;
 }
 
 export type ChildQuiescence =
@@ -375,13 +407,16 @@ export interface BoundaryProcessRequest {
   readonly identity: "command" | "worker_pat";
   /** Per-child wall clock deadline; the spawner terminates the whole owned process group. */
   readonly timeoutMs?: number;
+  /** Only a checkpoint permit may treat a child deadline as a recoverable skip,
+   * and only after its supervisor root has been disposed and reaped cleanly. */
+  readonly recoverableTimeout?: true;
 }
 
 export interface BoundaryProcessHandle {
   readonly stdin: Writable | null;
   readonly stdout: Readable | null;
   readonly stderr: Readable | null;
-  readonly completed: Promise<{ readonly code: number }>;
+  readonly completed: Promise<{ readonly code: number; readonly softTimedOut?: true }>;
 }
 
 export interface CodexExecutionSafety {

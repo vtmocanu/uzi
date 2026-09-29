@@ -1303,6 +1303,13 @@ export interface BuildInfo {
     notes_url?: string;
     security?: boolean;
   };
+  latest_rc?: {
+    version: string;
+    name?: string;
+    published_at?: string;
+    notes_url?: string;
+    security?: boolean;
+  };
   update_available?: boolean;
   far_behind?: boolean;
 }

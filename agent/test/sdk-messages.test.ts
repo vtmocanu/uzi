@@ -225,6 +225,21 @@ describe("mapSdkMessage", () => {
     assert.deepStrictEqual(out, [{ kind: "status", agent: "lead", payload: { event: "init", model: "claude-fable-5" } }]);
   });
 
+  it("init plugin_error_count is present only when plugin errors are reported (issue #1888)", () => {
+    const valid = mapSdkMessage({
+      type: "system",
+      subtype: "init",
+      model: "m",
+      plugin_errors: [{ plugin: "p", type: "generic-error", message: "secret-ish text" }],
+    });
+    assert.deepStrictEqual(valid, [{ kind: "status", agent: "lead", payload: { event: "init", model: "m", plugin_error_count: 1 } }]);
+    // Malformed-only entries still count (fail-closed decode); no entry text is persisted.
+    const malformed = mapSdkMessage({ type: "system", subtype: "init", model: "m", plugin_errors: [null, 7, {}] });
+    assert.deepStrictEqual(malformed, [{ kind: "status", agent: "lead", payload: { event: "init", model: "m", plugin_error_count: 3 } }]);
+    const none = mapSdkMessage({ type: "system", subtype: "init", model: "m", plugin_errors: [] });
+    assert.deepStrictEqual(none, [{ kind: "status", agent: "lead", payload: { event: "init", model: "m" } }]);
+  });
+
   it("skips partial stream events and unknown frames", () => {
     assert.deepStrictEqual(mapSdkMessage({ type: "stream_event", event: {} }), []);
     assert.deepStrictEqual(mapSdkMessage({ type: "system", subtype: "task_started" }), []);

@@ -2,6 +2,8 @@ package handler
 
 import (
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
@@ -127,6 +129,51 @@ func TestVersionReleaseThreeState(t *testing.T) {
 		wantBool(t, body, "update_available", true)
 		wantBool(t, body, "far_behind", true)
 	})
+}
+
+// TestVersionLatestRCRoute exercises the mounted unauthenticated route.
+func TestVersionLatestRCRoute(t *testing.T) {
+	h := releaseVersionHandler("0.11.0",
+		store.AppSetting{Key: settings.KeyReleaseCheckEnabled, Value: "true"},
+		store.AppSetting{Key: settings.KeyReleaseLatestTag, Value: "v0.12.0"},
+		store.AppSetting{Key: settings.KeyReleaseRCTag, Value: "v0.13.0-rc.2"},
+		store.AppSetting{Key: settings.KeyReleaseRCName, Value: "candidate"},
+		store.AppSetting{Key: settings.KeyReleaseRCBody, Value: "### Security\nprivate notes"},
+		store.AppSetting{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T10:00:00Z"},
+	)
+	route := h.Routes(nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	fetch := func() map[string]json.RawMessage {
+		rec := httptest.NewRecorder()
+		route.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/version", nil))
+		if rec.Code != http.StatusOK {
+			t.Fatalf("route status = %d", rec.Code)
+		}
+		var body map[string]json.RawMessage
+		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+			t.Fatal(err)
+		}
+		return body
+	}
+	body := fetch()
+	var rc map[string]json.RawMessage
+	if err := json.Unmarshal(body["latest_rc"], &rc); err != nil {
+		t.Fatal(err)
+	}
+	if string(rc["version"]) != `"v0.13.0-rc.2"` || string(rc["security"]) != "true" {
+		t.Fatalf("latest_rc = %s", body["latest_rc"])
+	}
+	if _, leak := rc["body"]; leak {
+		t.Fatal("RC body leaked")
+	}
+	h.settings = settings.New(&settingsStore{rows: []store.AppSetting{
+		{Key: settings.KeyReleaseCheckEnabled, Value: "true"},
+		{Key: settings.KeyReleaseLatestTag, Value: "v0.12.0"},
+		{Key: settings.KeyReleaseRCTag, Value: ""},
+		{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T10:00:00Z"},
+	}}, time.Minute)
+	if _, present := fetch()["latest_rc"]; present {
+		t.Fatal("latest_rc remained after clear")
+	}
 }
 
 // TestVersionReleaseSecurityInLatest proves a "### Security" release body sets

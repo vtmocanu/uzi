@@ -18,10 +18,9 @@ const (
 )
 
 // Store is the DB surface the release check writes. *store.Queries satisfies it. The
-// check persists only the six engine-managed remote-fact keys via the existing
-// generic UpsertAppSetting — it adds NO new query and never touches any other table.
+// check persists engine-managed remote-fact keys as one atomic group.
 type Store interface {
-	UpsertAppSetting(ctx context.Context, arg store.UpsertAppSettingParams) (store.AppSetting, error)
+	UpsertReleaseSettings(ctx context.Context, facts []store.UpsertAppSettingParams) error
 }
 
 // SettingsReader is the typed release-check settings surface the check reads, plus
@@ -37,17 +36,21 @@ type SettingsReader interface {
 // Facts are the persisted remote-release facts one check produces (PRD #836 M1) — the
 // inputs the read-time derivation (UpdateAvailable / FarBehind / Security) consumes.
 type Facts struct {
-	LatestTag   string
-	LatestName  string
-	Body        string
-	NotesURL    string
-	PublishedAt string // RFC3339
-	CheckedAt   string // RFC3339, from the reconciler's clock
+	LatestTag     string
+	RCTag         string
+	RCName        string
+	RCBody        string
+	RCNotesURL    string
+	RCPublishedAt string
+	LatestName    string
+	Body          string
+	NotesURL      string
+	PublishedAt   string // RFC3339
+	CheckedAt     string // RFC3339, from the reconciler's clock
 }
 
-// Result summarizes one check pass (PRD #836 M1). Status is "disabled", "ok", or
-// "error". Facts is populated only on "ok"; on "disabled"/"error" nothing is
-// persisted and Message carries the (token-scrubbed) reason.
+// Result summarizes one check pass. A stable success with an RC fetch failure
+// returns error status with the newly persisted stable Facts and a scrubbed message.
 type Result struct {
 	Status  string
 	Message string
@@ -88,10 +91,11 @@ func NewReconciler(st Store, set SettingsReader, now func() time.Time, logger *s
 // CheckForUpdate runs one check pass (PRD #836 M1):
 //
 //   - master toggle OFF → Status "disabled", NO http call, persist NOTHING.
-//   - fetch/parse error → Status "error", token-scrubbed message, persist NOTHING
+//   - stable fetch/parse error → Status "error", token-scrubbed message, persist NOTHING
 //     (the last-good facts survive so the SPA keeps showing the previous release).
-//   - success → persist the six facts via UpsertAppSetting, Invalidate the cache, and
-//     return Status "ok" with the parsed Facts.
+//   - stable success → fetch one RC page, persist stable facts and RC facts on RC
+//     success (clearing RC keys when absent), then invalidate the cache. An RC
+//     failure preserves prior RC keys and returns an error after stable persistence.
 //
 // The returned error is always nil today (every failure is recorded in the Result,
 // not propagated); the signature matches the engine convention.
@@ -126,20 +130,23 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		return Result{Status: statusError, Message: ferr.Error()}, nil
 	}
 
+	rc, rcErr := fetchLatestRC(ctx, r.client, token)
 	facts := Facts{
-		LatestTag:   rel.TagName,
-		LatestName:  rel.Name,
-		Body:        rel.Body,
-		NotesURL:    rel.HTMLURL,
-		PublishedAt: rel.PublishedAt,
-		CheckedAt:   r.now().UTC().Format(time.RFC3339),
+		LatestTag:     rel.TagName,
+		LatestName:    rel.Name,
+		Body:          rel.Body,
+		NotesURL:      rel.HTMLURL,
+		PublishedAt:   rel.PublishedAt,
+		CheckedAt:     r.now().UTC().Format(time.RFC3339),
+		RCTag:         rc.TagName,
+		RCName:        rc.Name,
+		RCBody:        rc.Body,
+		RCNotesURL:    rc.HTMLURL,
+		RCPublishedAt: rc.PublishedAt,
 	}
 
-	// Persist the six remote facts through the existing generic query. Never fatal, but a
-	// write failure must NOT surface as success: the six keys are read back independently
-	// (KeyReleaseCheckedAt, written last, is what handler.attachReleaseInfo treats as
-	// "facts exist"), so a partial write would let the panel derive signals from a mix of
-	// new and stale keys, and the admin "Check now" would report ok while nothing landed.
+	// Publish the stable facts and, on RC success, the RC facts in one transaction.
+	// A failed RC fetch leaves the previous RC group untouched.
 	writes := []store.UpsertAppSettingParams{
 		{Key: settings.KeyReleaseLatestTag, Value: facts.LatestTag},
 		{Key: settings.KeyReleaseLatestName, Value: facts.LatestName},
@@ -148,20 +155,22 @@ func (r *Reconciler) CheckForUpdate(ctx context.Context) (Result, error) {
 		{Key: settings.KeyReleasePublishedAt, Value: facts.PublishedAt},
 		{Key: settings.KeyReleaseCheckedAt, Value: facts.CheckedAt},
 	}
-	var persistErr error
-	for _, w := range writes {
-		if _, err := r.store.UpsertAppSetting(ctx, w); err != nil {
-			r.logger.Error("releasecheck: persist remote facts", "key", w.Key, "error", err)
-			persistErr = err
-		}
+	if rcErr == nil {
+		writes = append(writes,
+			store.UpsertAppSettingParams{Key: settings.KeyReleaseRCTag, Value: facts.RCTag},
+			store.UpsertAppSettingParams{Key: settings.KeyReleaseRCName, Value: facts.RCName},
+			store.UpsertAppSettingParams{Key: settings.KeyReleaseRCBody, Value: facts.RCBody},
+			store.UpsertAppSettingParams{Key: settings.KeyReleaseRCNotesURL, Value: facts.RCNotesURL},
+			store.UpsertAppSettingParams{Key: settings.KeyReleaseRCPublishedAt, Value: facts.RCPublishedAt},
+		)
 	}
-	if persistErr != nil {
-		// Report the failure truthfully and leave the cache un-invalidated so it keeps
-		// serving the last COMPLETE snapshot rather than the partial one just written; the
-		// condition self-corrects on the next fully-successful pass.
-		return Result{Status: statusError, Facts: facts, Message: "persist remote facts failed: " + persistErr.Error()}, nil
+	if err := r.store.UpsertReleaseSettings(ctx, writes); err != nil {
+		r.logger.Error("releasecheck: persist remote facts", "error", err)
+		return Result{Status: statusError, Facts: facts, Message: "persist remote facts failed: " + err.Error()}, nil
 	}
 	r.settings.Invalidate()
-
+	if rcErr != nil {
+		return Result{Status: statusError, Facts: facts, Message: "stable release updated; RC fetch failed: " + rcErr.Error()}, nil
+	}
 	return Result{Status: statusOK, Facts: facts}, nil
 }

@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
+import * as codexLauncher from "../src/codex/launcher.js";
 
 import {
   CodexBoundaryError,
@@ -19,7 +20,7 @@ import {
   type RegisteredRoot,
   type RootKind,
 } from "../src/codex/registry.js";
-import type { BoundaryPermit, BoundaryRequest } from "../src/harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundaryStep } from "../src/harness.js";
 
 // PRD #1171 (M3 m1, first unit) — the CodexExecutionSafety facade and the trusted
 // boundary-action lane. All process work is injected; nothing real is spawned.
@@ -455,6 +456,144 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
 });
 
 describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses", () => {
+  /** Access the new typed launcher error at test time so the pre-fix module still loads and
+   *  the regression reports a named assertion instead of a module-import failure. */
+  function childExitTimeout(): Error {
+    const ctor = (codexLauncher as unknown as {
+      SupervisedChildExitTimeoutError?: new () => Error;
+    }).SupervisedChildExitTimeoutError;
+    assert.ok(ctor, "the launcher exports a typed child-exit timeout");
+    return new ctor();
+  }
+
+  it("a checkpoint opt-in returns a soft timeout only after disposal and full root reap", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1914));
+    const events: string[] = [];
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: {
+        kind: "boundary_action",
+        dispose: async () => { events.push("dispose"); },
+        reap: async () => {
+          events.push("reap");
+          return events.includes("dispose")
+            ? { ok: true as const }
+            : { ok: false as const, error: { category: "timeout" as const, message: "root was not disposed" } };
+        },
+      },
+      stdin: new PassThrough(), stdout, stderr,
+      waitChild: async () => { throw childExitTimeout(); },
+    }));
+
+    const result = await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 5_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        timeoutMs: 1_000, recoverableTimeout: true,
+      } as Parameters<typeof safety.spawnBoundaryProcess>[1]);
+      const completed = await child.completed;
+      assert.equal(permit.signal.aborted, false, "the outer boundary deadline did not fire");
+      return completed;
+    });
+    assert.deepEqual(result, { code: -1, softTimedOut: true });
+    assert.deepEqual(events, ["dispose", "reap"], "a clean full-root reap precedes the recoverable result");
+    assert.equal(reg.isPoisoned(), false, "a settled best-effort child leaves the boundary usable");
+    assert.equal(stdout.destroyed, true, "the abandoned output collector is closed");
+    assert.equal(stderr.destroyed, true, "the abandoned error collector is closed");
+  });
+
+  it("a child returned after its soft launch budget is disposed and reaped before recovery", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1918));
+    const events: string[] = [];
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      return {
+        root: {
+          kind: "boundary_action",
+          dispose: async () => { events.push("dispose"); },
+          reap: async () => {
+            events.push("reap");
+            return events.includes("dispose")
+              ? { ok: true as const }
+              : { ok: false as const, error: { category: "timeout" as const, message: "root not disposed" } };
+          },
+        },
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => { events.push("wait_child"); return { code: 0 }; },
+      };
+    });
+
+    const completed = await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        timeoutMs: 5, recoverableTimeout: true,
+      });
+      return child.completed;
+    });
+    assert.deepEqual(completed, { code: -1, softTimedOut: true });
+    assert.deepEqual(events, ["dispose", "reap"], "late launch never enters an unbudgeted child wait");
+    assert.equal(reg.isPoisoned(), false);
+  });
+
+  it("a checkpoint soft timeout remains fatal when the owned root cannot be reaped", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1915));
+    const events: string[] = [];
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: {
+        kind: "boundary_action",
+        dispose: async () => { events.push("dispose"); },
+        reap: async () => {
+          events.push("reap_failed");
+          return { ok: false, error: { category: "timeout", message: "owned child still live" } };
+        },
+      },
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      waitChild: async () => { throw childExitTimeout(); },
+    }));
+
+    await assert.rejects(safety.withBoundary({ boundary: "checkpoint", deadlineMs: 5_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        timeoutMs: 1_000, recoverableTimeout: true,
+      } as Parameters<typeof safety.spawnBoundaryProcess>[1]);
+      await child.completed;
+    }), CodexBoundaryError);
+    assert.deepEqual(events, ["dispose", "reap_failed"]);
+    assert.equal(reg.isPoisoned(), true, "an unverified child never becomes a soft skip");
+  });
+
+  it("the same typed child timeout is fatal for finalize without an opt-in", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1916));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: new FakeRoot("boundary_action"),
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      waitChild: async () => { throw childExitTimeout(); },
+    }));
+    await assert.rejects(safety.withBoundary({ boundary: "finalize", deadlineMs: 1_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat", timeoutMs: 20,
+      });
+      await child.completed;
+    }), CodexBoundaryError);
+    assert.equal(reg.isPoisoned(), true, "ordinary boundary child timeouts still poison");
+  });
+
+  it("rejects a recoverable timeout request outside a checkpoint permit before spawning", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1917));
+    let spawns = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+      spawns += 1;
+      throw new Error("must not spawn");
+    });
+    await assert.rejects(safety.withBoundary({ boundary: "finalize", deadlineMs: 1_000 }, async (permit) => {
+      await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        recoverableTimeout: true,
+      } as Parameters<typeof safety.spawnBoundaryProcess>[1]);
+    }));
+    assert.equal(spawns, 0, "the invalid opt-in is refused before launch");
+  });
+
   it("caps a boundary child to its requested deadline", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(19));
     let launchBudget = -1;
@@ -833,6 +972,132 @@ describe("CodexExecutionSafety.withBoundary: boundary deadline trigger (issue #1
     });
     assert.equal(await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 60_000 }, async () => 7), 7);
     assert.equal(cancels, 1);
+  });
+
+  // Issue #1900: the deadline records the caller's active step when it fires, not later.
+  const firedBoundaryError = async (
+    epoch: number,
+    activeStep: BoundaryRequest["activeStep"],
+  ): Promise<CodexBoundaryError> => {
+    let fire: (() => void) | undefined;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(epoch)), {
+      ...timerFreeSeams(epoch),
+      armDeadline: (_request, _ms, f) => {
+        fire = f;
+        return () => {};
+      },
+    });
+    let caught: unknown;
+    try {
+      await safety.withBoundary(
+        { boundary: "finalize", deadlineMs: 60_000, ...(activeStep !== undefined ? { activeStep } : {}) },
+        async (permit) => {
+          fire?.();
+          await awaitAbort(permit.signal);
+          // A second fire after the abort must not re-read the probe.
+          fire?.();
+        },
+      );
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof CodexBoundaryError, `expected CodexBoundaryError, got ${String(caught)}`);
+    return caught;
+  };
+  const NO_STEP_DIAGNOSTIC = "codex boundary failed at action (finalize): codex boundary action deadline exceeded";
+
+  it("names the step active when the deadline fired, not the step the action moved on to", async () => {
+    let current: BoundaryStep = "base_align";
+    let fire: (() => void) | undefined;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(44)), {
+      ...timerFreeSeams(44),
+      armDeadline: (_request, _ms, f) => {
+        fire = f;
+        return () => {};
+      },
+    });
+    let caught: unknown;
+    try {
+      await safety.withBoundary({ boundary: "finalize", deadlineMs: 60_000, activeStep: () => current }, async (permit) => {
+        // Pins read-before-abort: a probe read after the abort would already see "push".
+        permit.signal.addEventListener("abort", () => {
+          current = "push";
+        });
+        fire?.();
+        current = "push";
+        await awaitAbort(permit.signal);
+        fire?.(); // a later fire is ignored: only the first one counts
+      });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof CodexBoundaryError);
+    assert.equal(caught.stage, "action");
+    assert.equal(caught.step, "base_align");
+    assert.equal(
+      caught.diagnostic,
+      "codex boundary failed at action (finalize) during base-align: codex boundary action deadline exceeded during base-align",
+    );
+    assert.ok(!caught.diagnostic.includes("during push"), caught.diagnostic);
+    assert.deepEqual(
+      caught.errors.map((e) => e.message),
+      ["codex boundary action deadline exceeded during base-align"],
+    );
+  });
+
+  it("names the fired step and the action error's name, never its message, when the action throws", async () => {
+    let current: BoundaryStep = "base_align";
+    let fire: (() => void) | undefined;
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(50)), {
+      ...timerFreeSeams(50),
+      armDeadline: (_request, _ms, f) => {
+        fire = f;
+        return () => {};
+      },
+    });
+    let caught: unknown;
+    try {
+      await safety.withBoundary({ boundary: "finalize", deadlineMs: 60_000, activeStep: () => current }, async () => {
+        fire?.();
+        current = "push";
+        throw new Error("secret-ish detail");
+      });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught instanceof CodexBoundaryError);
+    assert.equal(caught.step, "base_align");
+    assert.ok(caught.diagnostic.includes("during base-align"), caught.diagnostic);
+    assert.ok(caught.diagnostic.includes("action error: Error"), caught.diagnostic);
+    assert.ok(!caught.diagnostic.includes("secret-ish"), caught.diagnostic);
+    assert.ok(!caught.diagnostic.includes("during push"), caught.diagnostic);
+  });
+
+  it("with no probe the deadline diagnostic is unchanged", async () => {
+    const e = await firedBoundaryError(45, undefined);
+    assert.equal(e.step, undefined);
+    assert.equal(e.diagnostic, NO_STEP_DIAGNOSTIC);
+    assert.equal(e.message, "codex boundary failed at action");
+    assert.deepEqual(
+      e.errors.map((x) => x.message),
+      ["codex boundary action deadline exceeded"],
+    );
+  });
+
+  it("a probe that throws or returns an unknown step leaves the diagnostic unchanged", async () => {
+    const baseline = await firedBoundaryError(46, undefined);
+    const throwing = await firedBoundaryError(47, () => {
+      throw new Error("probe exploded");
+    });
+    const unknown = await firedBoundaryError(48, () => "__proto__" as unknown as "push");
+    const bogus = await firedBoundaryError(49, () => "not_a_step" as unknown as "push");
+    for (const e of [throwing, unknown, bogus]) {
+      assert.equal(e.step, undefined);
+      assert.equal(e.diagnostic, baseline.diagnostic);
+      assert.equal(e.diagnostic, NO_STEP_DIAGNOSTIC);
+      assert.equal(e.message, baseline.message);
+      assert.deepEqual(e.errors, baseline.errors);
+    }
   });
 });
 

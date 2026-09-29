@@ -24,13 +24,15 @@ set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/run.sh"
-MIN_CASES=43
+MIN_CASES=51
 
 [ -f "$SCRIPT" ] || { echo "run.sh not found at $SCRIPT" >&2; exit 2; }
 [ -r /proc/self/stat ] || { echo "ERROR: needs /proc (Linux only)" >&2; exit 2; }
 timeout --foreground 5s true 2>/dev/null || { echo "ERROR: needs GNU timeout --foreground" >&2; exit 2; }
 env --default-signal=INT,TERM true 2>/dev/null \
   || { echo "ERROR: needs GNU env --default-signal (coreutils >= 8.31) to reset inherited INT/TERM ignores" >&2; exit 2; }
+REAL_TIMEOUT="$(command -v timeout)"
+export REAL_TIMEOUT
 
 # Hermetic: no inherited knob may steer run.sh.
 for v in ${!CODEX_GIT_TRUST_@} ${!STUB_@}; do unset "$v"; done
@@ -87,6 +89,29 @@ case "${1:-}" in
 esac
 EOF
 chmod +x "$FAKEBIN/docker"
+
+# Keep the production 10s kill grace visible to the test. Only the blocking docker
+# run/build calls use a short grace here; the image-inspect timeout passes through.
+cat > "$FAKEBIN/timeout" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+if [ "${1:-}" = --foreground ] && [ "${2:-}" = --kill-after=10s ] &&
+   [ "${4:-}" = docker ]; then
+  case "${5:-}" in
+    run|build)
+      printf 'requested=%s forwarded=%s docker=%s\n' "$2" --kill-after=0.2s "$5" >> "${STUB_STATE:?}/timeout.log"
+      shift 2
+      exec "$REAL_TIMEOUT" --foreground --kill-after=0.2s "$@"
+      ;;
+  esac
+fi
+if [ "${1:-}" = 10s ] && [ "${2:-}" = docker ] &&
+   [ "${3:-}" = image ] && [ "${4:-}" = inspect ]; then
+  printf 'passthrough=10s docker image inspect\n' >> "${STUB_STATE:?}/timeout.log"
+fi
+exec "$REAL_TIMEOUT" "$@"
+EOF
+chmod +x "$FAKEBIN/timeout"
 PATH="$FAKEBIN:$PATH"
 export PATH
 
@@ -160,7 +185,13 @@ signal_case() {
   check "$label: exit status is $want" "$(t [ "$rc" = "$want" ])" "got $rc after $((SECONDS - start))s"
   check "$label: docker $stub itself received SIG$sig" "$(t grep -sqx "$sig" "$ST/$stub.signals")" \
     "signals recorded: $(cat "$ST/$stub.signals" 2>/dev/null | tr '\n' ' ')"
+  check "$label: production requested 10s kill grace" \
+    "$(t grep -qxF "requested=--kill-after=10s forwarded=--kill-after=0.2s docker=$stub" "$ST/timeout.log")"
+  check "$label: only docker $stub grace was shortened" \
+    "$(t [ "$(grep -c '^requested=' "$ST/timeout.log")" = 1 ])"
   if [ "$action" = fixture ]; then
+    check "$label: image-inspect timeout kept its 10s duration" \
+      "$(t grep -qxF 'passthrough=10s docker image inspect' "$ST/timeout.log")"
     check "$label: container removed by exact name on the signal path" \
       "$(t grep -qx "rm -f codex-git-trust-$pid" "$ST/calls.log")"
   fi

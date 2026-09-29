@@ -107,7 +107,7 @@ uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
-uzi run recovery <id> [--json]
+uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
@@ -836,16 +836,31 @@ available when it is not.
 
 A run's custody hold reserves owner capacity while its committed-but-unpublished work is
 recovered. Holds are per claim generation and capped per owner, so unresolved holds can
-eventually block new code runs. `uzi run recovery` lists a run's holds and captures so you
-can see exactly what is retained:
+eventually block new code runs. To find what held work you have, start here before choosing
+a run to export or an exact hold to discard:
+
+```
+uzi run recovery [--json]
+```
+
+- The human view shows only open holds across your runs, oldest first by `created_at`.
+  Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ARCHIVE` (whether an
+  available capture exists), `WORKER`, and `AGE`. Run and hold ids are shown in full.
+  Below the table it prints the owner-wide `open_holds`, `custody_hold_limit`,
+  `decision_needed`, and `blocked_runs` aggregate, plus a recover-or-discard hint when
+  an open hold needs a decision. With no open holds it says so and still prints the
+  aggregate.
+- Without a run id, `--json` returns the endpoint's `aggregate` and `holds` object,
+  including settled holds. These hold rows have no `captures` array. Use the run id
+  from this list for the detailed view and capture ids:
 
 ```
 uzi run recovery <run-id> [--json]
 ```
 
-- Shows each hold's exact id, claim generation, and its attention state — active
+- The per-run view shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, an archive ready (which releases automatically), or a
-  capture-less source that needs a decision — plus any retained captures. `--json` prints
+  capture-less source that needs a decision — plus the latest capture state. `--json` prints
   the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
@@ -1107,8 +1122,10 @@ also the TUI's own fallback when the live channel is unreachable (below).
 
 ### Startup: an available update
 
-Before the board draws, `uzi tui` checks whether a newer **stable** uzi
-release exists and, if so, shows a modal on top of it:
+At startup, `uzi tui` checks for a newer release in the running CLI's channel
+and, if one exists, shows a modal on top of the board. A stable
+`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks release
+candidates. A stable install looks like this:
 
 ```
 ▲ Update available
@@ -1121,19 +1138,24 @@ A newer release is available.
   Don't remind me for 0.85.0
 ```
 
-- **A Homebrew install** gets the "Update now" action: choosing it exits the
-  TUI and runs `brew upgrade uzi-cli` in the foreground — so the from-source
-  compile output (and any failure) stays visible — then tells you to rerun
+- **A Homebrew install** gets the "Update now" action for the formula that owns
+  the running binary: `brew upgrade uzi-cli` for stable or
+  `brew upgrade uzi-cli-rc` for an RC. Choosing it exits the TUI and runs the
+  command in the foreground, so the source-build output and any failure stay
+  visible, then tells you to rerun
   `uzi tui`. It never upgrades silently in the background while the TUI keeps
-  running. A **go-install or source build** gets an info variant instead: the
-  release-notes link, with no action button, since there's no single upgrade
-  command to hand it.
+  running. For an eligible **stamped** binary whose formula ownership cannot be
+  proven, including a manually built binary, the prompt shows release notes
+  without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
+  choose the information channel.
 - **A security release** renders as the filled amber andon band and is
   worded as a security update; a routine release stays quiet.
 - **Gating mirrors** [the CLI-vs-server skew warning](#when-your-cli-is-older-than-the-server):
   shown only for a stamped release build (a `go build`/`dev` binary never
   prompts), and it honours the same off-switches — `UZI_VERSION_CHECK=0` and
-  `--quiet`. It never offers a prerelease (`-rc.N`) tag.
+  `--quiet`. A stable install never offers a prerelease (`-rc.N`); an RC install
+  only offers a newer RC. If no newer RC exists, it shows nothing, even when a
+  stable release is newer.
 - **"Don't remind me for `<version>`"** is remembered per release version (a
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
@@ -2223,6 +2245,12 @@ one line to **stderr** when it is behind:
 uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
 ```
 
+An RC-stamped CLI names the RC formula instead, for example:
+
+```
+uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc
+```
+
 - **stderr, never stdout.** `--json` output stays byte-exact and parseable.
 - **The exit code never changes.** A skew warning is not a failure.
 - **Cached**, so it costs at most one short request per hour per server —
@@ -2232,10 +2260,10 @@ uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew 
 - **It clears the moment you upgrade.** The file stores the *server's* version,
   never a verdict, so the comparison is redone against your new binary on the
   very next command — there is no cache to wait out.
-- **Silent when it cannot be sure.** A binary built from source reports `dev`
-  rather than a release, and an unparseable version on either side means no
-  warning at all. That also means the remedy is always the right one: only a
-  `brew`-installed CLI can ever see this message.
+- **Silent when it cannot be sure.** A binary built from source normally reports
+  `dev` rather than a release, and an unparseable version on either side means
+  no warning at all. A manually stamped binary can also see this warning; its
+  remedy follows its stamped release channel without probing Homebrew.
 - **Not shown** when the CLI is *newer* than the server (nothing for you to do),
   under `--quiet`, or for `uzi logout`, `uzi auth token` and `uzi auth status`,
   which otherwise make no network call at all.

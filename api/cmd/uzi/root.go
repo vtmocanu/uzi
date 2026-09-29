@@ -2,11 +2,15 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/spf13/cobra"
 
@@ -40,11 +44,11 @@ func realGit(dir string, args ...string) (string, error) {
 // realBrew is the production Env.Brew: it runs `brew <args>` (PRD #1251 M1's startup
 // update prompt). It has two modes, matching how the TUI uses the seam:
 //
-//   - foreground == false: a QUIET detection probe (`brew list uzi-cli`, `brew --prefix`).
-//     stdout+stderr are captured and returned combined so the caller can inspect them,
+//   - foreground == false: a QUIET detection probe (`brew --prefix --installed <formula>` for both formulas).
+//     up to 64 KiB of combined stdout+stderr is captured for at most 10 seconds,
 //     and no output reaches the terminal — a `brew: command not found` here just means
-//     "not a brew user", not an error the user should see.
-//   - foreground == true: the actual `brew upgrade uzi-cli`, run AFTER the TUI has exited
+//     "unknown ownership", not an error the user should see.
+//   - foreground == true: the selected formula upgrade, run AFTER the TUI has exited
 //     (D1). The subprocess stdout/stderr are wired to the real os.Stdout/os.Stderr so the
 //     from-source compile progress and any failure are visible; nothing is captured.
 //
@@ -52,14 +56,74 @@ func realGit(dir string, args ...string) (string, error) {
 // inject a fake that records (foreground, args) and returns canned output without forking
 // brew.
 func realBrew(foreground bool, args ...string) (string, error) {
-	cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew shell-out seam — `brew <args>` where args are internal command literals (`list uzi-cli`, `--prefix`, `upgrade uzi-cli`), never remote/untrusted input.
 	if foreground {
+		cmd := exec.Command("brew", args...) //nolint:gosec // G204: the CLI's own brew seam; args are internal `upgrade uzi-cli` or `upgrade uzi-cli-rc` literals.
 		cmd.Stdout = os.Stdout
 		cmd.Stderr = os.Stderr
 		return "", cmd.Run()
 	}
-	out, err := cmd.CombinedOutput()
-	return string(out), err
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "brew", args...) //nolint:gosec // G204: internal `--prefix --installed <formula>` probe; formula is one of two literals.
+	cmd.WaitDelay = time.Second
+	out := cappedBrewOutput{cancel: cancel}
+	cmd.Stdout = &out
+	cmd.Stderr = &out
+	err := cmd.Run()
+	if out.didOverflow() {
+		return "", errBrewProbeOverflow
+	}
+	if ctx.Err() != nil {
+		return "", ctx.Err()
+	}
+	return out.String(), err
+}
+
+var errBrewProbeOverflow = errors.New("brew probe output exceeds 64 KiB")
+
+// cappedBrewOutput accepts at most 64 KiB across both process output streams.
+type cappedBrewOutput struct {
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	cancel   context.CancelFunc
+	overflow bool
+}
+
+func (b *cappedBrewOutput) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.overflow {
+		return 0, errBrewProbeOverflow
+	}
+	const limit = 64 * 1024
+	remaining := limit - b.buf.Len()
+	if len(p) > remaining {
+		_, _ = b.buf.Write(p[:remaining])
+		b.overflow = true
+		if b.cancel != nil {
+			b.cancel()
+		}
+		return remaining, errBrewProbeOverflow
+	}
+	return b.buf.Write(p)
+}
+
+func (b *cappedBrewOutput) didOverflow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.overflow
+}
+
+func (b *cappedBrewOutput) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *cappedBrewOutput) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
 }
 
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"
@@ -96,14 +160,15 @@ type Env struct {
 	Git func(dir string, args ...string) (string, error)
 
 	// Brew runs `brew <args>` for the TUI startup update prompt (PRD #1251 M1): brew
-	// detection (`brew list uzi-cli`, `brew --prefix`) and the `brew upgrade uzi-cli`
-	// hand-off on foreground exit. foreground==false captures output quietly for a
+	// detection (`brew --prefix --installed <formula>` for both formulas) and the
+	// selected formula upgrade hand-off on foreground exit. foreground==false captures output quietly for a
 	// detection probe; foreground==true wires the subprocess to os.Stdout/os.Stderr so
 	// the from-source compile is visible (D1). DefaultEnv wires realBrew; tests inject a
 	// fake that records the (foreground, args) call and returns canned output, so no test
 	// forks brew. Same injection-seam contract as Git above; may be nil (a test that never
-	// exercises the prompt), read through the brew() accessor which then reports non-brew.
-	Brew func(foreground bool, args ...string) (string, error)
+	// exercises the prompt), read through the brew() accessor which then reports unknown ownership.
+	Brew       func(foreground bool, args ...string) (string, error)
+	Executable func() (string, error)
 
 	// Store reads config/credentials. May be nil (e.g. no home dir), in which
 	// case only env/flags supply settings.
@@ -154,6 +219,7 @@ func DefaultEnv() Env {
 		NewClient:          func(s uzicli.Settings) uzicli.Client { return uzicli.NewHTTPClient(s) },
 		Git:                realGit,
 		Brew:               realBrew,
+		Executable:         os.Executable,
 		Store:              store,
 		Getenv:             os.Getenv,
 		AutoUpgradeSkill:   true,

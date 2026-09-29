@@ -7,6 +7,7 @@ import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
 import {
+  CheckpointSoftDeadlineError,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -15,7 +16,7 @@ import {
 import type { SecretFinding } from "./secret-scan-guard.js";
 import type { CredentialFreeSettleOutcome, Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
-import type { BoundaryPermit, BoundaryRequest, BoundarySink, SafeBoundary } from "./harness.js";
+import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
 import { SinkGate } from "./sink-gate.js";
 import { cloneKeyOf } from "./attempt-path.js";
 import {
@@ -148,6 +149,7 @@ import type { SummaryRunner } from "./summary-runner.js";
 import { REASON_PROVISION_FAILED } from "./provision-run.js";
 import { REASON_NO_TOKEN, TransientRecoveryError } from "./sdk-executor.js";
 import { PLAN_MISSING_QUESTION, PLAN_MISSING_QUESTION_HEADER, REASON_PLAN_MISSING } from "./plan-missing.js";
+import { REASON_SKILLS_PLUGIN_LOAD_FAILED } from "./plugin-errors.js";
 
 /** Cap on a reported failure_reason, matching the forge error-body cap
  *  (forge.ts) so a runaway SDK error can't bloat the run row or the stream. */
@@ -246,6 +248,35 @@ const CODEX_BOUNDARY_NAMES: ReadonlySet<SafeBoundary> = new Set<SafeBoundary>([
   "checkpoint", "park", "shutdown", "terminal", "finalize", "credentialed_git",
 ]);
 const CODEX_BOUNDARY_SINKS: ReadonlySet<BoundarySink> = new Set<BoundarySink>(["milestone_checkpoint", "done_checkpoint"]);
+/** Issues #1900 and #1914: closed set of safe boundary step names. */
+const CODEX_BOUNDARY_STEPS: ReadonlySet<BoundaryStep> = new Set<BoundaryStep>([
+  "run_quiescence", "fetch_back", "default_fetch", "secret_scan", "base_align", "push",
+  "completion_permit", "pr_description_prepare", "mr_create", "post_mr",
+  "checkpoint_lock_wait", "checkpoint_overlay", "scratch_preflight", "checkpoint_pack",
+  "checkpoint_upload", "checkpoint_report",
+]);
+
+/** Issue #1900: the finite deadline (ms) of the Codex FINALIZE boundary. The finalize publish
+ *  runs the whole push / PR-description / merge-request sequence under one held permit, so the
+ *  30 s checkpoint deadline (`codexBoundaryDeadlineMs`) is far too small for it. Derivation, one
+ *  modelled slow-but-healthy finalize:
+ *  - queue wait behind at most one earlier boundary (deadlineAt fixed before `await prior`): 30 s
+ *  - boundary acquire: reconcile (one HTTP, 30 s) + registry quiesce and reap: 60 s
+ *  - finalize run-quiescence Docker teardown (teardownDocker 15 s + 5 s request): 20 s
+ *  - git path: fetch/align stage + push stage, each allowed one op stalling to GIT_TIMEOUT_MS
+ *    (10 min): 1200 s. A MODELLED bound, not a strict worst case: repeated push timeouts or
+ *    more stalled ops could exceed it; exceeding it is the typed, step-named failure.
+ *  - completion permit (DEFAULT_PERMIT_RETRY_BUDGET_MS): 600 s
+ *  - PR-description prepare (FORGE_BUDGET_MS 60 s + editor pass 60 s default
+ *    SUMMARY_MODEL_TIMEOUT_MS): 120 s
+ *  - createMergeRequest: 6 attempts x (30 s HTTP + 30 s findOpenMr on a GitHub duplicate 422)
+ *    + 31 s FORGE_RETRY_SCHEDULE backoff: 391 s
+ *  - PR-description publish (60 s + 60 s): 120 s
+ *  - post-MR interlock reads and reconcile: ~120 s
+ *  Sum ~2661 s, rounded up to 50 min. Bounded, never unbounded (PRD #1171). Park, checkpoint,
+ *  shutdown and terminal boundaries stay on `codexBoundaryDeadlineMs` (park publishes only a
+ *  checkpoint). */
+const CODEX_FINALIZE_BOUNDARY_DEADLINE_MS = 50 * 60_000;
 
 /** Issue #1864: a code point a CodexBoundaryError `diagnostic` must not contain: Unicode general
  *  category Cc (C0, DEL, C1), Cf (every format character: zero-width, bidi, soft hyphen, word
@@ -276,15 +307,54 @@ function codexBoundaryDiagnosticField(err: unknown, redact: (text: string) => st
 
 /** Issue #1864: the structured fields of a CodexBoundaryError, each kept only when it is one of
  *  the closed set of values the harness can produce. */
-function codexBoundaryFieldsOf(err: unknown): { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink } {
-  const e = err as { stage?: unknown; boundary?: unknown; sink?: unknown };
-  const out: { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink } = {};
+function codexBoundaryFieldsOf(
+  err: unknown,
+): { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep } {
+  const e = err as { stage?: unknown; boundary?: unknown; sink?: unknown; step?: unknown };
+  const out: { stage?: string; boundary?: SafeBoundary; sink?: BoundarySink; step?: BoundaryStep } = {};
   if (typeof e.stage === "string" && CODEX_BOUNDARY_STAGES.has(e.stage)) out.stage = e.stage;
   if (typeof e.boundary === "string" && CODEX_BOUNDARY_NAMES.has(e.boundary as SafeBoundary)) {
     out.boundary = e.boundary as SafeBoundary;
   }
   if (typeof e.sink === "string" && CODEX_BOUNDARY_SINKS.has(e.sink as BoundarySink)) out.sink = e.sink as BoundarySink;
+  if (typeof e.step === "string" && CODEX_BOUNDARY_STEPS.has(e.step as BoundaryStep)) out.step = e.step as BoundaryStep;
   return out;
+}
+
+/** Issues #1900 and #1914: tracks a fixed boundary step so a deadline failure can name
+ *  it (read through `BoundaryRequest.activeStep`) and logs each step's duration.
+ *  `enter` closes the previous step with an info line; `end` closes the last one with the
+ *  finalize outcome, after which `current()` is undefined. */
+class BoundaryStepTracker {
+  private active: { step: BoundaryStep; startedAt: number } | undefined;
+
+  constructor(
+    private readonly log: Logger,
+    private readonly now: () => number,
+    private readonly event: "finalize step" | "checkpoint step",
+  ) {}
+
+  enter(step: BoundaryStep): void {
+    this.close();
+    this.active = { step, startedAt: this.now() };
+  }
+
+  current(): BoundaryStep | undefined {
+    return this.active?.step;
+  }
+
+  end(outcome: "ok" | "failed" | "committed"): void {
+    this.close(outcome);
+  }
+
+  private close(outcome?: "ok" | "failed" | "committed"): void {
+    const active = this.active;
+    if (!active) return;
+    this.active = undefined;
+    const fields: Record<string, unknown> = { step: active.step, durationMs: this.now() - active.startedAt };
+    if (outcome) fields.outcome = outcome;
+    this.log.info(this.event, fields);
+  }
 }
 
 /** Issue #1766: the harness-agnostic probe for a Codex credential DEFERRAL. A locked owner vault
@@ -443,6 +513,7 @@ function shutdownOutcomeOf(
 /** issue #1597 M2: the class one run of the checkpoint body ended in (the mid-turn tick logs it).
  *  `publish_failed:<reason>` carries the {@link PublishFailClass} of a publish that did not land. */
 type CheckpointBodyOutcome =
+  | "soft_deadline"
   | "scan_deferred"
   | "published"
   | "time_gate_closed"
@@ -769,7 +840,9 @@ class DataVolumeWaitShutdown extends Error {
  *  throwers emit (provision-run appends `: <detail>` after REASON_PROVISION_FAILED;
  *  sdk-executor throws REASON_NO_TOKEN verbatim), and, by EXACT match, the static
  *  REASON_PLAN_MISSING both executors throw for a planning turn that stayed prose-only
- *  (issue #1593). Ordinary agent failures return undefined, so `fail_origin` is omitted
+ *  (issue #1593). Two more `<reason>: ` prefixes map as well: worker_residue_blocked
+ *  (issue #1783) and skills_plugin_load_failed (issue #1888, the sdk-executor trip for a
+ *  skills run whose plugin failed to load). Ordinary agent failures return undefined, so `fail_origin` is omitted
  *  and the server defaults them to 'agent_failure'. Sent unvalidated; the server
  *  allowlists it. */
 export function failOriginForReason(rawReason: string): string | undefined {
@@ -778,6 +851,8 @@ export function failOriginForReason(rawReason: string): string | undefined {
   if (rawReason === REASON_PLAN_MISSING) return "plan_missing";
   // issue #1783: RunResidueBlockedError and (M3) CloneResidueBlockedError both open with this prefix.
   if (rawReason.startsWith(`${REASON_WORKER_RESIDUE_BLOCKED}: `)) return "worker_residue_blocked";
+  // issue #1888: sdk-executor trips a skills run whose skills plugin reported load errors.
+  if (rawReason.startsWith(`${REASON_SKILLS_PLUGIN_LOAD_FAILED}: `)) return "skills_plugin_load_failed";
   return undefined;
 }
 
@@ -1376,6 +1451,8 @@ function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | 
 
 /** issue #1597 M2: test-only seams for the mid-turn checkpoint tick and the scanned publish. */
 export interface CheckpointTestHooks {
+  /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
+  softDeadlineMs?: number;
   /** Awaited just before a tick's git-busy probe (a test can hold a tick in its pre-scope phase). */
   beforeBusyProbe?: () => Promise<void>;
   /** Fires between the pinned secret scan and the pack of an overlay-less checkpoint publish. */
@@ -1447,8 +1524,12 @@ export interface RunnerOptions {
   recoveryRetryMs?: number;
   /** PRD #1171 m4: the bounded absolute deadline (ms) for a Codex durability-sink
    *  `withBoundary` (quiesce → reap → action). NEVER unbounded. Default 30s. Only used when the
-   *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. */
+   *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
+   *  boundary uses its own deadline (`codexFinalizeBoundaryDeadlineMs`, issue #1900). */
   codexBoundaryDeadlineMs?: number;
+  /** Issue #1900 (test-only): overrides CODEX_FINALIZE_BOUNDARY_DEADLINE_MS, the finite deadline
+   *  of the Codex finalize boundary. A 0/negative value falls back to the default. */
+  codexFinalizeBoundaryDeadlineMs?: number;
   /** Injectable clock for tests; defaults to Date.now. */
   now?: () => number;
   /** Injectable answer-deadline timer for tests; defaults to setTimeout (unref'd)
@@ -1622,6 +1703,7 @@ export class RunRunner {
   private readonly recoveryRetryMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
+  private readonly codexFinalizeBoundaryDeadlineMs: number;
   /** PRD #267: injectable clock (defaults to Date.now), so the time-gate is testable.
    *  Also feeds the PRD #88 answer-deadline math (askUser), so that budget is testable
    *  on the same clock. */
@@ -1803,6 +1885,10 @@ export class RunRunner {
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
         ? opts.codexBoundaryDeadlineMs
         : 30_000;
+    this.codexFinalizeBoundaryDeadlineMs =
+      opts.codexFinalizeBoundaryDeadlineMs && opts.codexFinalizeBoundaryDeadlineMs > 0
+        ? opts.codexFinalizeBoundaryDeadlineMs
+        : CODEX_FINALIZE_BOUNDARY_DEADLINE_MS;
     this.now = opts.now ?? (() => Date.now());
     const realTimer = (cb: () => void, ms: number): (() => void) => {
       const t = setTimeout(cb, ms);
@@ -2186,10 +2272,19 @@ export class RunRunner {
         // is a plain call, so this path is unchanged for them.
         await this.phasePublish(claim, flight, undefined, undefined);
       } else {
+        // Issue #1900: the finalize step tracker names the step a deadline fired in and logs
+        // each step's duration (Claude/stub runs get the logging only).
+        const finalizeSteps = new BoundaryStepTracker(runLog, this.now, "finalize step");
+        let finalizeFailed = false;
+        let finalizeError: unknown;
         try {
           await this.withCodexBoundaryOnly(
             executor,
-            { boundary: "finalize", deadlineMs: this.codexBoundaryDeadlineMs },
+            {
+              boundary: "finalize",
+              deadlineMs: this.codexFinalizeBoundaryDeadlineMs,
+              activeStep: () => finalizeSteps.current(),
+            },
             (permit) => this.phasePublish(
               claim,
               flight,
@@ -2197,13 +2292,23 @@ export class RunRunner {
               executor.safety
                 ? (report) => { postFinalizeTerminal = report; }
                 : undefined,
+              finalizeSteps,
             ),
           );
         } catch (err) {
-          if (!postFinalizeTerminal || !isCodexBoundaryError(err)) throw err;
+          finalizeFailed = true;
+          finalizeError = err;
+        }
+        // A boundary error after phasePublish registered the committed terminal callback is not a
+        // failed finalize: the pushed branch/open MR is the outcome reported below, so the last
+        // step log says "committed" rather than "failed".
+        const committed = finalizeFailed && postFinalizeTerminal !== undefined && isCodexBoundaryError(finalizeError);
+        finalizeSteps.end(!finalizeFailed ? "ok" : committed ? "committed" : "failed");
+        if (finalizeFailed) {
+          if (!committed) throw finalizeError;
           runLog.warn(
             "Codex finalize boundary failed after committed publish; reporting committed terminal outcome",
-            { error: errMessage(err) },
+            { error: errMessage(finalizeError) },
           );
         }
       }
@@ -4076,6 +4181,7 @@ export class RunRunner {
     flight: RunFlight,
     boundarySignal?: AbortSignal,
     deferCommittedTerminal?: (report: () => Promise<void>) => void,
+    steps?: BoundaryStepTracker,
   ): Promise<void> {
     const { runLog, batcher, redactText, executor, runHome } = flight;
     // PRD #1296 M3 — the source pinned at the finalization boundary (set below, after the
@@ -4282,6 +4388,7 @@ export class RunRunner {
     // `survivors` or `unverified` fails the run with the typed fail_origin `worker_residue_blocked`
     // and keeps the clone. The branch-local killAgentTree calls below stay as they were; they are
     // now idempotent re-reaps of an already-reaped tree.
+    steps?.enter("run_quiescence");
     const finalizeQuiescence = await this.quiesceRun(flight, executor, { mode: "own", site: "finalize" });
     if (finalizeQuiescence.blocked) {
       flight.preserveRecoveryClone = true;
@@ -4395,6 +4502,7 @@ export class RunRunner {
     // and it brings the agent's objects into the worker bare so the push does not
     // depend on the (soon torn-down) runner clone. `trackingRef` is what push +
     // changedFiles read; the runner clone is never a git source for either.
+    steps?.enter("fetch_back");
     const trackingRef = await this.git.fetchAgentBranch(
       barePath,
       runnerClone.path,
@@ -4761,6 +4869,7 @@ export class RunRunner {
       const wfBarePath = barePath;
       // Fetch before the precheck so commit classification sees the current default tip.
       try {
+        steps?.enter("default_fetch");
         const defaultBranch = claim.repo.default_branch?.trim() ||
           (await this.git.defaultBranchName(wfBarePath)) || "main";
         freshDefaultTip = await this.git.fetchDefaultTip(
@@ -4857,6 +4966,7 @@ export class RunRunner {
     // real secret. GitHub-only: GitLab/Forgejo have no equivalent push-side secret rejection.
     if (claim.repo.forge_type === "github") {
       const scanBarePath = barePath;
+      steps?.enter("secret_scan");
       const scan = await this.git.secretScanRange(scanBarePath, trackingRef, result.branch, {
         pat: claim.secrets.forge_pat,
         cloneUrl: claim.repo.clone_url,
@@ -5147,6 +5257,7 @@ export class RunRunner {
     // OUTSIDE this try so the plain-push block below still sees `alignPushed`.
     try {
       if (claim.repo.forge_type === "github") {
+        steps?.enter("base_align");
         const alignBarePath = barePath;
         const alignDefaultBranch =
           claim.repo.default_branch?.trim() ||
@@ -5580,6 +5691,7 @@ export class RunRunner {
     // aligned branch — the run pushes through EXACTLY ONE code path (`pushToOrigin`), so a
     // successful align-push and the normal push converge here without ever double-pushing.
     if (!alignPushed) {
+      steps?.enter("push");
       // PRD #1416 M3 (C3): non-destructively bridge a divergent tracking tip so the plain push
       // fast-forwards. On "bridged" the tracking ref now points at B (P is an ancestor of B), so
       // pushToOrigin pushes B. "clean"/"unknown" proceed unchanged. PRD #1416 M4: on "failed" the
@@ -5788,6 +5900,7 @@ export class RunRunner {
       //    finalize) is retried inside the client until the api answers, bounded by its retry budget
       //    and cancelled with the flight; only a permanent error, a cancel, or an exhausted budget
       //    throws to the generic catch, which fails the run without falsely completing.
+      steps?.enter("completion_permit");
       const permit = await this.client.requestCompletionPermit(
         runId,
         {
@@ -5910,6 +6023,7 @@ export class RunRunner {
     // Step 1: context + editor pass + stage, before createMergeRequest (D2). Never throws; every
     // failure falls down the D8 ladder. The size line is computed per snapshot, so a regeneration for
     // the PR's actual target (read back after create) recomputes it against that target.
+    steps?.enter("pr_description_prepare");
     const description = await publisher.prepare(
       {
         runId,
@@ -5981,6 +6095,7 @@ export class RunRunner {
     // transient findOpenMr failure after a duplicate POST would otherwise fail a run
     // whose MR actually exists; retrying the whole call re-runs it instead. Create
     // failures stay fatal. Step 2: a new PR is created with the final body.
+    steps?.enter("mr_create");
     const mr = await withForgeRetry(
       () =>
         forge.createMergeRequest({
@@ -6001,6 +6116,7 @@ export class RunRunner {
     // Steps 3-9: read, bind, revalidate, write, confirm, ack. Advisory: never throws, never fails or
     // holds the run. For an interlocked run it writes the NON-closing creation completion block; the
     // interlock below then owns that block.
+    steps?.enter("post_mr");
     const published = await description.publish(mr.iid);
     // uzi's own region: what a whole-body rewrite below writes (never text read back from the forge).
     const ownRegion = published.region;
@@ -7358,6 +7474,7 @@ export class RunRunner {
       // `barePath` is the outer `let` (string | undefined); it is set before the run
       // reaches the executor, but narrow it so the closure is honest rather than `!`.
       if (!barePath) return "no_new_work";
+      const checkpointSteps = opts.reap ? new BoundaryStepTracker(runLog, this.now, "checkpoint step") : undefined;
       // Decision 6 tip-movement check: has the runner clone's branch tip moved since the
       // last checkpoint wrote the tracking ref? A null trackTip (never checkpointed) or a
       // null cloneTip (unresolvable) is NOT a match, so it falls through to a real fetch.
@@ -7380,20 +7497,34 @@ export class RunRunner {
       // issue #1597 M2: the class this body ended in — read by the mid-turn tick (the gated
       // ctx.checkpoint discards it). Default: nothing new to publish.
       let bodyOutcome: CheckpointBodyOutcome = "no_new_work";
+      let checkpointSoft: { signal: AbortSignal; deadlineAt: number; permit: BoundaryPermit } | undefined;
+      const withCheckpointSoftGit = <T>(action: () => Promise<T>): Promise<T> => {
+        const soft = checkpointSoft;
+        return soft
+          ? this.git.withBoundaryProcessSpawner(
+              (request) => executor.safety!.spawnBoundaryProcess(soft.permit, request),
+              soft.permit.signal,
+              action,
+              { softSignal: soft.signal, softDeadlineAt: soft.deadlineAt },
+            )
+          : action();
+      };
       // `inPermit`: this publish runs inside a Codex permit (the reap:true milestone on a Codex run),
       // whose deadline the scan must not push it past (issue #1597 M2 review item 7).
       // `noReport`: skip the running report (the post-permit deferred publish; the milestone's own
       // pass already reported it).
       const doCheckpointPublish = async (
-        overlay?: CheckpointOverlayContext,
+        overlay?: CheckpointOverlayContext | (() => Promise<CheckpointOverlayContext | undefined>),
         inPermit = false,
         noReport = false,
       ): Promise<void> => {
+        const trace = noReport ? undefined : checkpointSteps;
         // issue #1597 M2: a cancelled tick (quiescence, shutdown, a preempting sink) starts nothing.
         if (opts.signal?.aborted) {
           bodyOutcome = "aborted";
           return;
         }
+        trace?.enter("fetch_back");
         // Skip ONLY the fetch when there is nothing new to fetch — do NOT return, so the
         // origin-publish gate below still runs (Decision 9: a commit fetched at an earlier
         // iteration can become publish-eligible on a later tip-unmoved iteration).
@@ -7444,6 +7575,17 @@ export class RunRunner {
             outcome: bridgeOutcome.kind,
           });
         }
+        // The local fetch-back and ancestry bridge above must finish even when
+        // remote publication runs out of budget. The soft stop begins to govern
+        // only the overlay/pack/upload path below.
+        if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
+        // Resolve the GitHub overlay context after the candidate is in the
+        // worker bare. Even a slow local default-branch lookup now runs under
+        // the same checkpoint-only child budget as the remote default fetch.
+        const resolvedOverlay = typeof overlay === "function"
+          ? await withCheckpointSoftGit(overlay)
+          : overlay;
+        if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
 
         // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
         // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
@@ -7463,7 +7605,7 @@ export class RunRunner {
           // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
           // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
           // which do not come through here) is byte-unchanged and not scanned.
-          if (!overlay && inPermit) {
+          if (!resolvedOverlay && inPermit) {
             // issue #1597 M2 (round 3): NEVER run gitleaks inside a Codex permit. A permit-held child
             // cannot be killed on its own and execScoped's scoped branch ignores `timeout`, while
             // gitleaks' own git-mode `--timeout` yields a silent clean partial scan — so a slow scan
@@ -7480,7 +7622,7 @@ export class RunRunner {
             flight.kickMidTurnTick?.();
             // Falls through to the running report below (the milestone's progress is reported).
           } else {
-            const scanned = overlay
+            const scanned = resolvedOverlay
               ? { kind: "unscanned" as const }
               : await this.scanCheckpointForPublish(flight, barePath, runnerClone.branch, opts.scanScope);
             if (opts.signal?.aborted) {
@@ -7501,14 +7643,16 @@ export class RunRunner {
               flight.pendingPublish = false;
               bodyOutcome = scanned.outcome;
             } else {
-              const outcome = await this.publishCheckpointOutcome(
-                flight,
-                barePath,
-                runnerClone.branch,
-                overlay,
-                opts.signal,
+              const publish = () => this.publishCheckpointOutcome(
+                flight, barePath, runnerClone.branch, resolvedOverlay,
+                checkpointSoft
+                  ? AbortSignal.any([checkpointSoft.permit.signal, checkpointSoft.signal])
+                  : opts.signal,
                 scanned.kind === "pinned" ? scanned.range : undefined,
+                trace ? (step) => trace.enter(step) : undefined,
               );
+              const outcome = await withCheckpointSoftGit(publish);
+              if (!outcome.published && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
               published = outcome.published;
               bodyOutcome = outcome.published
                 ? "published"
@@ -7598,6 +7742,7 @@ export class RunRunner {
         // #267 Fix 2: emit ONLY on real activity (a fetch or a publish); stay silent on a
         // pure-idle checkpoint. issue #1597 M2: the mid-turn tick runs QUIET (no report).
         if (!opts.quiet && !noReport && (!tipUnmovedSinceFetch || published)) {
+          trace?.enter("checkpoint_report");
           // PRD #1064 M1: enqueue onto the per-run chain so this checkpoint report stays
           // ordered behind any pending immediate `reportProgress` push.
           await enqueueRunningReport(() =>
@@ -7646,27 +7791,68 @@ export class RunRunner {
         // RunResidueBlockedError; every other error, the #1766 vault-locked deferral included,
         // still propagates.
         let residueBlocked = false;
+        let checkpointFailed = false;
+        // This budget starts with the Codex checkpoint boundary. It aims to
+        // leave 20 seconds before the 30-second hard deadline for verified
+        // child reap and boundary drain; local fetch-back still runs first.
+        const softController = executor.safety ? new AbortController() : undefined;
+        const softBudgetMs = this.checkpointTestHooks?.softDeadlineMs ?? 10_000;
+        const softDeadlineAt = Date.now() + softBudgetMs;
+        const softTimer = softController ? setTimeout(() => softController.abort(), softBudgetMs) : undefined;
+        softTimer?.unref();
         try {
           await this.reapForSink(
             executor,
-            { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: opts.sink },
+            {
+              boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: opts.sink,
+              activeStep: () => checkpointSteps?.current(),
+            },
             async (permit) => {
-              const midRunOverlay = hasNewWork
-                ? await this.buildCheckpointOverlay(claim, flight, barePath)
-                : undefined;
-              await doCheckpointPublish(midRunOverlay, permit !== undefined);
+              if (permit && softController) {
+                checkpointSoft = { signal: softController.signal, deadlineAt: softDeadlineAt, permit };
+              }
+              checkpointSteps?.enter("checkpoint_overlay");
+              await doCheckpointPublish(
+                hasNewWork ? () => this.buildCheckpointOverlay(claim, flight, barePath) : undefined,
+                permit !== undefined,
+              );
             },
             flight,
             { keepClone: false },
           );
         } catch (err) {
-          if (!(err instanceof RunResidueBlockedError)) throw err;
-          residueBlocked = true;
-          bodyOutcome = "residue_blocked";
-          runLog.warn("milestone checkpoint skipped: the clone is not provably quiescent; nothing published", {
-            run_id: runId,
-            error: errMessage(err),
-          });
+          checkpointFailed = !(err instanceof RunResidueBlockedError || err instanceof CheckpointSoftDeadlineError);
+          if (err instanceof CheckpointSoftDeadlineError) {
+            bodyOutcome = "soft_deadline";
+            this.reportPublishOutcome(flight, "soft_deadline", "checkpoint publish skipped: soft deadline", {
+              step: checkpointSteps?.current(),
+            });
+            if (opts.progress) {
+              // The local milestone completed even though its remote checkpoint did
+              // not. Preserve the progress report without claiming publication.
+              await enqueueRunningReport(() => reportState({
+                status: "running",
+                milestones_completed: opts.progress!.completed,
+                milestones_in_progress: opts.progress!.in_progress,
+                ...(opts.progress!.milestones_agents
+                  ? { milestones_agents: opts.progress!.milestones_agents }
+                  : {}),
+              })).catch((e) => runLog.warn("could not report checkpoint progress", { error: errMessage(e) }));
+            }
+          } else if (!(err instanceof RunResidueBlockedError)) {
+            throw err;
+          } else {
+            residueBlocked = true;
+            bodyOutcome = "residue_blocked";
+            runLog.warn("milestone checkpoint skipped: the clone is not provably quiescent; nothing published", {
+              run_id: runId,
+              error: errMessage(err),
+            });
+          }
+        } finally {
+          if (softTimer) clearTimeout(softTimer);
+          checkpointSoft = undefined;
+          checkpointSteps?.end(checkpointFailed ? "failed" : "ok");
         }
         // issue #1597 M2 (round 4): with NO mid-turn ticker running (CHECKPOINT_TICK_INTERVAL=0) a
         // publish deferred out of the Codex permit is made RIGHT HERE, after the permit has ended
@@ -9517,6 +9703,7 @@ export class RunRunner {
     signal?: AbortSignal,
     /** issue #1597 M2: the scanned range — pack exactly these SHAs (see GitCache.checkpointPack). */
     pinned?: CheckpointRange,
+    onStep?: (step: BoundaryStep) => void,
   ): Promise<PublishOutcome> {
     // issue #1086 (F2): two-tip reconciliation. The CONFIRMED tip advances only on a real ACK; an
     // ambiguous result (non-2xx, or a throw after the pack tip is known) records the ATTEMPTED tip
@@ -9529,12 +9716,13 @@ export class RunRunner {
       // issue #1597 M2: `pinned` is passed only by the scanned (overlay-less) publish; every other
       // caller keeps the unpinned 3-argument call shape.
       const packed = pinned
-        ? await this.git.checkpointPack(barePath, branch, overlay, pinned)
-        : await this.git.checkpointPack(barePath, branch, overlay);
+        ? await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep)
+        : await this.git.checkpointPack(barePath, branch, overlay, undefined, onStep);
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
       packedTip = packed.tipOid;
+      onStep?.("checkpoint_upload");
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
@@ -9586,6 +9774,7 @@ export class RunRunner {
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
       // throw DURING checkpointPack leaves packedTip undefined and records nothing.
       if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;
+      if (e instanceof CheckpointSoftDeadlineError) throw e;
       // issue #1597 M1: a deadline/permit abort is an expected bounded stop, not a publish fault —
       // runLog only, never the feed (the shutdown sink names it as `timeout` itself).
       if (signal?.aborted || isAbortLikeError(e)) {

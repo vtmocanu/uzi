@@ -151,6 +151,26 @@ func TestForgeUnreachableNeverJudgedRegardlessOfIteration(t *testing.T) {
 	}
 }
 
+// TestSkillsPluginLoadFailedNeverJudgedRegardlessOfIteration (issue #1888): a run failed because
+// its selected-skills plugin did not load must NEVER enqueue a judge, whatever the iteration
+// count. The iteration_count>0 case is the one an iteration-gated skip set would get wrong: the
+// failure fires at session start, and a RESUMED run's session start carries iteration_count>0.
+func TestSkillsPluginLoadFailedNeverJudgedRegardlessOfIteration(t *testing.T) {
+	for _, iter := range []int32{0, 7} {
+		t.Run("iteration_count="+strconv.Itoa(int(iter)), func(t *testing.T) {
+			fs, svc, run := eligibleFixture(t)
+			run.Status = "failed"
+			run.IterationCount = iter
+			run.FailOrigin = pgconv.TextOrNull("skills_plugin_load_failed")
+			svc.maybeEnqueueJudge(context.Background(), run)
+			if fs.createdJudgeRun != nil {
+				t.Fatalf("a skills_plugin_load_failed run at iteration_count=%d must NOT be judged, got %+v",
+					iter, fs.createdJudgeRun)
+			}
+		})
+	}
+}
+
 // TestPreStartInfraFailOriginsExact pins preStartInfraFailOrigins to its EXACT membership so
 // an accidental add or drop (which would silently widen or narrow the iteration_count==0-gated
 // judge skip) reddens here rather than in production. forge_unreachable must NOT be a member —
@@ -164,14 +184,15 @@ func TestPreStartInfraFailOriginsExact(t *testing.T) {
 // origins with no agent attempt to retrospect — forge_unreachable (PRD #1392),
 // task_undispatched (issue #1367, a handoff reaped before it was ever claimed),
 // gate_presentation_refused (PRD #1795 M1, the plan-gate refusal cap), data_volume_full (PRD
-// #1809 M5, a worker data volume that stayed full) and worker_residue_blocked (issue #1783, the
-// worker could not prove the run's execution stopped or clear its clone-path residue). An
+// #1809 M5, a worker data volume that stayed full), worker_residue_blocked (issue #1783, the
+// worker could not prove the run's execution stopped or clear its clone-path residue) and
+// skills_plugin_load_failed (issue #1888, the run's selected-skills plugin failed to load). An
 // accidental add (a genuinely judgeable origin slipping into the regardless-of-iteration skip)
 // or drop (any falling out, re-exposing SC3) reddens here.
 func TestNeverJudgeFailOriginsExact(t *testing.T) {
 	assertFailOriginSetExact(t, "neverJudgeFailOrigins", neverJudgeFailOrigins,
 		"forge_unreachable", "task_undispatched", "gate_presentation_refused", "data_volume_full",
-		"worker_residue_blocked")
+		"worker_residue_blocked", "skills_plugin_load_failed")
 }
 
 // TestEnvPublishFailOriginsExact pins envPublishFailOrigins (issue #1418) to its EXACT membership:

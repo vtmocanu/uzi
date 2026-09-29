@@ -25,6 +25,7 @@ const labels: Record<string, string> = {
   task_undispatched: "task undispatched",
   plan_missing: "plan missing",
   worker_residue_blocked: "worker residue blocked",
+  skills_plugin_load_failed: "skills plugin load failed",
   data_volume_full: "data volume full",
   unknown: "unknown",
 };

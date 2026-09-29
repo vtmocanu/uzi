@@ -87,27 +87,35 @@ apiget() {
   sed -n "${n}p" "$SEQ_DIR/seq"
   [ "$n" -ge "$(wc -l < "$SEQ_DIR/seq")" ] || echo $((n + 1)) > "$SEQ_DIR/n"
 }
-# regate NAME WANT(pass|fail) STATUS:CLAIMED_AT... — runs wait_regated with before=T0, 2s timeout.
+# Bash's SECONDS loses its wall-clock behavior when unset. Reset it inside each test's
+# subshell, then advance it on every poll without waiting in real time.
+sleep() { SECONDS=$((SECONDS + 1)); }
+# regate NAME WANT(pass|fail) DIAGNOSTIC_PREFIX STATUS:CLAIMED_AT...
 regate() {
   cases=$((cases + 1))
-  local name="$1" want="$2" got; shift 2
+  local name="$1" want="$2" diagnostic="$3" got output timeout=2; shift 3
+  [ "$want" = pass ] && timeout=5
   : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"
   for step in "$@"; do
     jq -nc --arg s "${step%%:*}" --arg c "${step#*:}" '{run: {status: $s, claimed_at: (if $c == "" then null else $c end)}}' >> "$SEQ_DIR/seq"
   done
-  if (wait_regated R T0 2) 2>/dev/null; then got=pass; else got=fail; fi
-  if [ "$got" = "$want" ]; then passed=$((passed + 1)); echo "PASS: $name"; else echo "FAIL: $name — got $got want $want"; fi
+  if output="$(unset SECONDS; SECONDS=0; wait_regated R T0 "$timeout" 2>&1)"; then got=pass; else got=fail; fi
+  if [ "$got" = "$want" ] && [[ "$output" == "$diagnostic"* ]]; then
+    passed=$((passed + 1)); echo "PASS: $name"
+  else
+    echo "FAIL: $name — got $got want $want; output [$output] (want prefix [$diagnostic])"
+  fi
 }
-regate "stale pre-restart gate row never passes"  fail awaiting_approval:T0
-regate "requeued then re-gated by a new claim"      pass awaiting_approval:T0 queued: running:T1 awaiting_approval:T1
-regate "new claim not yet at the gate"              fail awaiting_approval:T0 running:T1
-regate "gate row with no claimed_at"                fail awaiting_approval:
-regate "terminal failure while waiting"             fail awaiting_approval:T0 failed:T1
-regate "cancelled while waiting"                    fail awaiting_approval:T0 cancelled:
+regate "stale pre-restart gate row never passes"  fail "timeout: run R was never re-gated" awaiting_approval:T0
+regate "requeued then re-gated by a new claim"      pass "" awaiting_approval:T0 queued: running:T1 awaiting_approval:T1
+regate "new claim not yet at the gate"              fail "timeout: run R was never re-gated" awaiting_approval:T0 running:T1
+regate "gate row with no claimed_at"                fail "timeout: run R was never re-gated" awaiting_approval:
+regate "terminal failure while waiting"             fail "run R entered 'failed'" awaiting_approval:T0 failed:T1
+regate "cancelled while waiting"                    fail "run R entered 'cancelled'" awaiting_approval:T0 cancelled:
 
 # settle_runs_terminal: best-effort, so it must return 0 both when a run settles and when it
-# never does, and it must stop polling a run once that run is terminal. Asserted on the number of
-# status reads, not on wall-clock time, so host load cannot redden it.
+# never does, and it must stop polling a run once that run is terminal. The virtual clock
+# makes the never-terminal timeout require exactly five status reads.
 eval "$(awk '/^settle_runs_terminal\(\) \{/,/^\}/' "$LIB")"
 # run_status_quick stub: serves the scripted statuses in order (sticking on the last) and counts calls.
 run_status_quick() {
@@ -117,21 +125,20 @@ run_status_quick() {
   sed -n "${n}p" "$SEQ_DIR/seq"
   [ "$n" -ge "$(wc -l < "$SEQ_DIR/seq")" ] || echo $((n + 1)) > "$SEQ_DIR/n"
 }
-# settle NAME WANT_CALLS STATUS... — one run (plus an empty id, which must be skipped); WANT_CALLS
-# is the exact number of reads expected, or "many" for a run that never settles (more than one).
+# settle NAME WANT_CALLS STATUS... — one run (plus an empty id, which must be skipped).
 settle() {
   cases=$((cases + 1))
   local name="$1" want="$2" rc calls; shift 2
   : > "$SEQ_DIR/seq"; echo 1 > "$SEQ_DIR/n"; echo 0 > "$SEQ_DIR/calls"
   printf '%s\n' "$@" > "$SEQ_DIR/seq"
-  ( settle_runs_terminal 5 R "" ); rc=$?
+  ( unset SECONDS; SECONDS=0; settle_runs_terminal 5 R "" ); rc=$?
   calls="$(cat "$SEQ_DIR/calls")"
-  if [ "$rc" = 0 ] && { [ "$calls" = "$want" ] || { [ "$want" = many ] && [ "$calls" -gt 1 ]; }; }; then
+  if [ "$rc" = 0 ] && [ "$calls" = "$want" ]; then
     passed=$((passed + 1)); echo "PASS: $name"
   else echo "FAIL: $name — rc=$rc (want 0), status reads=$calls (want $want)"; fi
 }
 settle "stops polling as soon as the run turns terminal" 2 running cancelled
-settle "never-terminal run: returns 0 once the timeout passes" many running
+settle "never-terminal run: returns 0 once the timeout passes" 5 running
 
 echo "cases=$cases passed=$passed"
 # Tally guard (the driver.test.sh idiom): a real run has all 20 cases green; a zero-case or

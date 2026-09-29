@@ -377,3 +377,63 @@ test("issue #1562 ClaudeHarness: resume requested + absent init session_id ⇒ f
   assert.equal(await driveInitFreshSession("sess-requested", undefined), undefined);
   recordConformanceEvidence(t.name, "pass");
 });
+
+// issue #1888: the ClaudeHarness decodes the init frame's `plugin_errors` fail-closed onto the
+// `initialized` event. Same single-init-frame drive as the #1562 helper above.
+async function driveInitPluginErrors(
+  extra: Record<string, unknown>,
+): Promise<Extract<HarnessEvent, { kind: "initialized" }> | undefined> {
+  const initFrame: Record<string, unknown> = { type: "system", subtype: "init", model: "m", session_id: "s", ...extra };
+  const queryFn = (() => {
+    return (async function* () {
+      yield initFrame;
+    })();
+  }) as unknown as SdkQueryFn;
+  const harness = new ClaudeHarness({
+    queryFn,
+    spawn: () => ({ pid: undefined }),
+    kill: () => true,
+    log: nullLogger(),
+    contextUsageTimeoutMs: 2000,
+    spawnedPids: new Set<number>(),
+    homeDir: path.join(os.tmpdir(), "uzi-1888-run-home-does-not-exist"),
+  });
+  harness.prepareTurn(runLaneConfig, { pid: undefined });
+  const turn = harness.startTurn({
+    prompt: "p",
+    systemPrompt: "sys",
+    signal: new AbortController().signal,
+    phase: "implement",
+    agents: {},
+    leadSkills: [],
+  });
+  let init: Extract<HarnessEvent, { kind: "initialized" }> | undefined;
+  for await (const ev of turn.events as AsyncIterable<HarnessEvent>) {
+    if (ev.kind === "initialized") init = ev;
+  }
+  return init;
+}
+
+test("issue #1888 ClaudeHarness: init plugin_errors decode onto the initialized event", async () => {
+  const init = await driveInitPluginErrors({
+    plugin_errors: [{ plugin: "uzi-skills", type: "path-not-found", message: "no such dir", path: "/p" }],
+  });
+  assert.deepEqual(init?.pluginErrors, [
+    { plugin: "uzi-skills", type: "path-not-found", message: "no such dir", path: "/p" },
+  ]);
+});
+
+test("issue #1888 ClaudeHarness: an init with no plugin_errors leaves the key absent", async () => {
+  const init = await driveInitPluginErrors({});
+  assert.ok(init !== undefined);
+  assert.ok(!("pluginErrors" in init));
+  const empty = await driveInitPluginErrors({ plugin_errors: [] });
+  assert.ok(empty !== undefined && !("pluginErrors" in empty));
+});
+
+test("issue #1888 ClaudeHarness: malformed-only plugin_errors still decode non-empty (fail-closed)", async () => {
+  const init = await driveInitPluginErrors({ plugin_errors: [null, 42] });
+  assert.equal(init?.pluginErrors?.length, 2);
+  const scalar = await driveInitPluginErrors({ plugin_errors: "boom" });
+  assert.equal(scalar?.pluginErrors?.length, 1);
+});
