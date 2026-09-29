@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -65,34 +66,64 @@ func realBrew(foreground bool, args ...string) (string, error) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, "brew", args...) //nolint:gosec // G204: internal `--prefix --installed <formula>` probe; formula is one of two literals.
 	cmd.WaitDelay = time.Second
-	var out cappedBrewOutput
+	out := cappedBrewOutput{cancel: cancel}
 	cmd.Stdout = &out
 	cmd.Stderr = &out
 	err := cmd.Run()
+	if out.didOverflow() {
+		return "", errBrewProbeOverflow
+	}
 	if ctx.Err() != nil {
 		return "", ctx.Err()
-	}
-	if out.overflow {
-		return "", errors.New("brew probe output exceeds 64 KiB")
 	}
 	return out.String(), err
 }
 
-// cappedBrewOutput drains a noisy probe while retaining at most 64 KiB.
+var errBrewProbeOverflow = errors.New("brew probe output exceeds 64 KiB")
+
+// cappedBrewOutput accepts at most 64 KiB across both process output streams.
 type cappedBrewOutput struct {
-	bytes.Buffer
+	mu       sync.Mutex
+	buf      bytes.Buffer
+	cancel   context.CancelFunc
 	overflow bool
 }
 
 func (b *cappedBrewOutput) Write(p []byte) (int, error) {
-	const limit = 64 * 1024
-	n := len(p)
-	if remaining := limit - b.Len(); remaining < n {
-		b.overflow = true
-		p = p[:remaining]
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.overflow {
+		return 0, errBrewProbeOverflow
 	}
-	_, _ = b.Buffer.Write(p)
-	return n, nil
+	const limit = 64 * 1024
+	remaining := limit - b.buf.Len()
+	if len(p) > remaining {
+		_, _ = b.buf.Write(p[:remaining])
+		b.overflow = true
+		if b.cancel != nil {
+			b.cancel()
+		}
+		return remaining, errBrewProbeOverflow
+	}
+	return b.buf.Write(p)
+}
+
+func (b *cappedBrewOutput) didOverflow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.overflow
+}
+
+func (b *cappedBrewOutput) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func (b *cappedBrewOutput) Len() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Len()
 }
 
 // version is stamped at build time via -ldflags "-X main.version=vX.Y.Z"

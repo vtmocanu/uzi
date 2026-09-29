@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	tea "charm.land/bubbletea/v2"
 	"github.com/charmbracelet/colorprofile"
@@ -16,8 +18,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// PRD #1251 M1 — the codex-style startup update prompt. Deterministic, offline: no brew is
-// run and no network call is made; the brew shell-out is exercised through the injected seam.
+// PRD #1251 M1 — the codex-style startup update prompt. Model tests are deterministic
+// and offline; the brew shell-out is exercised through the injected seam.
 
 // updatePromptModel builds a model allowed to probe (skewCheck + showVersion), the state
 // newTUICmd's RunE sets on the real path, so the update-prompt gate can fire in a test.
@@ -438,15 +440,61 @@ func TestUpdatePromptKeepsRCFactAcrossFailedBuildProbe(t *testing.T) {
 
 func TestCappedBrewOutput(t *testing.T) {
 	var out cappedBrewOutput
-	chunk := strings.Repeat("x", 40*1024)
-	for i := 0; i < 3; i++ {
-		if n, err := out.Write([]byte(chunk)); n != len(chunk) || err != nil {
-			t.Fatalf("write = %d, %v", n, err)
+	chunk := []byte(strings.Repeat("x", 40*1024))
+	if n, err := out.Write(chunk); n != len(chunk) || err != nil {
+		t.Fatalf("first write = %d, %v", n, err)
+	}
+	if n, err := out.Write(chunk); n != 24*1024 || !errors.Is(err, errBrewProbeOverflow) {
+		t.Fatalf("overflow write = %d, %v", n, err)
+	}
+	if n, err := out.Write(chunk); n != 0 || !errors.Is(err, errBrewProbeOverflow) {
+		t.Fatalf("later write = %d, %v", n, err)
+	}
+	if out.Len() != 64*1024 || !out.didOverflow() {
+		t.Fatalf("accepted %d bytes, overflow = %v", out.Len(), out.didOverflow())
+	}
+}
+
+func TestRealBrewQuietProbe(t *testing.T) {
+	dir := t.TempDir()
+	brew := filepath.Join(dir, "brew")
+	// The fake prints past the cap on both pipes, then hangs if the probe keeps draining.
+	script := "#!/bin/sh\ncase \"$1\" in\n" +
+		"noisy) printf '%40000s' x; printf '%40000s' y >&2; exec sleep 30 ;;\n" +
+		"hang) exec sleep 30 ;;\n" +
+		"small) printf 'prefix\\n'; printf 'note\\n' >&2 ;;\n" +
+		"esac\n"
+	if err := os.WriteFile(brew, []byte(script), 0700); err != nil { //nolint:gosec // G306: this temporary fake must be executable by the probe.
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	t.Run("overflow cancels promptly", func(t *testing.T) {
+		start := time.Now()
+		output, err := realBrew(false, "noisy")
+		if output != "" || !errors.Is(err, errBrewProbeOverflow) {
+			t.Fatalf("realBrew noisy = %q, %v", output, err)
 		}
-	}
-	if out.Len() != 64*1024 || !out.overflow {
-		t.Fatalf("captured %d bytes, overflow = %v", out.Len(), out.overflow)
-	}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Fatalf("overflow took %s", elapsed)
+		}
+	})
+	t.Run("timeout cancels", func(t *testing.T) {
+		start := time.Now()
+		output, err := realBrew(false, "hang")
+		if output != "" || !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("realBrew hang = %q, %v", output, err)
+		}
+		if elapsed := time.Since(start); elapsed > 15*time.Second {
+			t.Fatalf("timeout took %s", elapsed)
+		}
+	})
+	t.Run("small output", func(t *testing.T) {
+		output, err := realBrew(false, "small")
+		if err != nil || (output != "prefix\nnote\n" && output != "note\nprefix\n") {
+			t.Fatalf("realBrew small = %q, %v", output, err)
+		}
+	})
 }
 
 func TestBrewOwnerSymlinkAndBoundary(t *testing.T) {
