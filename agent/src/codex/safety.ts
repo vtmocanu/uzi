@@ -31,6 +31,7 @@ import type {
 } from "../harness.js";
 import type { CaptureSettlement, ExecutionRegistry, ReapOutcome, RegisteredRoot } from "./registry.js";
 import { safeErrorName } from "./registry.js";
+import { SupervisedChildExitTimeoutError } from "./launcher.js";
 
 /** Which OS identity a boundary action runs as. `worker_pat` is a PAT-bearing
  *  (credentialed) action (e.g. `git push`); `command` is the credential-free
@@ -550,6 +551,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     if (request.timeoutMs !== undefined && (!Number.isFinite(request.timeoutMs) || request.timeoutMs <= 0)) {
       throw new Error("codex boundary process timeout must be positive and finite");
     }
+    if (request.recoverableTimeout && permit.boundary !== "checkpoint") {
+      throw new Error("recoverable child timeout is checkpoint-only");
+    }
     if (!request.argv[0]?.startsWith("/")) {
       const error: HarnessError = { category: "protocol", message: "boundary process executable must be absolute" };
       this.registry.poison(error);
@@ -581,11 +585,16 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       await launched.root.dispose(remainingMs(this.currentDeadlineAt)).catch(() => undefined);
       throw new Error("boundary process failed registry admission");
     }
-    const completed = (async (): Promise<{ readonly code: number }> => {
+    const completed = (async (): Promise<{ readonly code: number; readonly softTimedOut?: true }> => {
       let terminal: { readonly code: number } | undefined;
       let terminalError: unknown;
       try {
-        if (Date.now() >= childDeadlineAt) throw new Error("boundary process child deadline exceeded during launch");
+        if (Date.now() >= childDeadlineAt) {
+          if (request.recoverableTimeout && !permit.signal.aborted && remainingMs(this.currentDeadlineAt) > 0) {
+            throw new SupervisedChildExitTimeoutError(request.timeoutMs);
+          }
+          throw new Error("boundary process child deadline exceeded during launch");
+        }
         terminal = await this.waitChildOrAbort(
           launched,
           permit.signal,
@@ -593,6 +602,25 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         );
       } catch (error) {
         terminalError = error;
+      }
+      if (request.recoverableTimeout && terminalError instanceof SupervisedChildExitTimeoutError &&
+          !permit.signal.aborted && remainingMs(this.currentDeadlineAt) > 0) {
+        // The timeout only authorizes a skip after the supervisor has stopped its
+        // owned process group and the registry has verified a full-root reap.
+        // Keep this work inside the held permit and, for git, its bare lock.
+        try {
+          await launched.root.dispose(remainingMs(this.currentDeadlineAt));
+        } catch {
+          this.registry.poison({ category: "tool", message: "checkpoint child disposal failed" });
+          throw new Error("checkpoint child disposal failed");
+        }
+        const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
+        if (!reaped.ok || permit.signal.aborted || remainingMs(this.currentDeadlineAt) <= 0) {
+          throw new Error("checkpoint child root did not reap cleanly before boundary deadline");
+        }
+        launched.stdout?.destroy();
+        launched.stderr?.destroy();
+        return { code: -1, softTimedOut: true };
       }
       const reaped = await this.registry.reapRoot(launched.root, remainingMs(this.currentDeadlineAt));
       if (!reaped.ok) throw new Error("boundary process root did not reap cleanly");

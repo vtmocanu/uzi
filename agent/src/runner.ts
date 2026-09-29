@@ -7,6 +7,7 @@ import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
 import {
+  CheckpointSoftDeadlineError,
   gitBasicCredential,
   isNonFastForwardRejection,
   isPushProtectionRejection,
@@ -512,6 +513,7 @@ function shutdownOutcomeOf(
 /** issue #1597 M2: the class one run of the checkpoint body ended in (the mid-turn tick logs it).
  *  `publish_failed:<reason>` carries the {@link PublishFailClass} of a publish that did not land. */
 type CheckpointBodyOutcome =
+  | "soft_deadline"
   | "scan_deferred"
   | "published"
   | "time_gate_closed"
@@ -1449,6 +1451,8 @@ function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | 
 
 /** issue #1597 M2: test-only seams for the mid-turn checkpoint tick and the scanned publish. */
 export interface CheckpointTestHooks {
+  /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
+  softDeadlineMs?: number;
   /** Awaited just before a tick's git-busy probe (a test can hold a tick in its pre-scope phase). */
   beforeBusyProbe?: () => Promise<void>;
   /** Fires between the pinned secret scan and the pack of an overlay-less checkpoint publish. */
@@ -7493,12 +7497,24 @@ export class RunRunner {
       // issue #1597 M2: the class this body ended in — read by the mid-turn tick (the gated
       // ctx.checkpoint discards it). Default: nothing new to publish.
       let bodyOutcome: CheckpointBodyOutcome = "no_new_work";
+      let checkpointSoft: { signal: AbortSignal; deadlineAt: number; permit: BoundaryPermit } | undefined;
+      const withCheckpointSoftGit = <T>(action: () => Promise<T>): Promise<T> => {
+        const soft = checkpointSoft;
+        return soft
+          ? this.git.withBoundaryProcessSpawner(
+              (request) => executor.safety!.spawnBoundaryProcess(soft.permit, request),
+              soft.permit.signal,
+              action,
+              { softSignal: soft.signal, softDeadlineAt: soft.deadlineAt },
+            )
+          : action();
+      };
       // `inPermit`: this publish runs inside a Codex permit (the reap:true milestone on a Codex run),
       // whose deadline the scan must not push it past (issue #1597 M2 review item 7).
       // `noReport`: skip the running report (the post-permit deferred publish; the milestone's own
       // pass already reported it).
       const doCheckpointPublish = async (
-        overlay?: CheckpointOverlayContext,
+        overlay?: CheckpointOverlayContext | (() => Promise<CheckpointOverlayContext | undefined>),
         inPermit = false,
         noReport = false,
       ): Promise<void> => {
@@ -7559,6 +7575,17 @@ export class RunRunner {
             outcome: bridgeOutcome.kind,
           });
         }
+        // The local fetch-back and ancestry bridge above must finish even when
+        // remote publication runs out of budget. The soft stop begins to govern
+        // only the overlay/pack/upload path below.
+        if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
+        // Resolve the GitHub overlay context after the candidate is in the
+        // worker bare. Even a slow local default-branch lookup now runs under
+        // the same checkpoint-only child budget as the remote default fetch.
+        const resolvedOverlay = typeof overlay === "function"
+          ? await withCheckpointSoftGit(overlay)
+          : overlay;
+        if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
 
         // PRD #267: origin-publish gate. The publish is CREDENTIAL-FREE (a pack brokered to the
         // api via publishCheckpoint, no PAT — checkpointPack local objects → client join token)
@@ -7578,7 +7605,7 @@ export class RunRunner {
           // milestone whose overlay is undefined) is SCANNED first, over a range PINNED to SHAs, and
           // packs exactly that range. An overlay publish (and every park/shutdown/pause/capture sink,
           // which do not come through here) is byte-unchanged and not scanned.
-          if (!overlay && inPermit) {
+          if (!resolvedOverlay && inPermit) {
             // issue #1597 M2 (round 3): NEVER run gitleaks inside a Codex permit. A permit-held child
             // cannot be killed on its own and execScoped's scoped branch ignores `timeout`, while
             // gitleaks' own git-mode `--timeout` yields a silent clean partial scan — so a slow scan
@@ -7595,7 +7622,7 @@ export class RunRunner {
             flight.kickMidTurnTick?.();
             // Falls through to the running report below (the milestone's progress is reported).
           } else {
-            const scanned = overlay
+            const scanned = resolvedOverlay
               ? { kind: "unscanned" as const }
               : await this.scanCheckpointForPublish(flight, barePath, runnerClone.branch, opts.scanScope);
             if (opts.signal?.aborted) {
@@ -7616,15 +7643,16 @@ export class RunRunner {
               flight.pendingPublish = false;
               bodyOutcome = scanned.outcome;
             } else {
-              const outcome = await this.publishCheckpointOutcome(
-                flight,
-                barePath,
-                runnerClone.branch,
-                overlay,
-                opts.signal,
+              const publish = () => this.publishCheckpointOutcome(
+                flight, barePath, runnerClone.branch, resolvedOverlay,
+                checkpointSoft
+                  ? AbortSignal.any([checkpointSoft.permit.signal, checkpointSoft.signal])
+                  : opts.signal,
                 scanned.kind === "pinned" ? scanned.range : undefined,
                 trace ? (step) => trace.enter(step) : undefined,
               );
+              const outcome = await withCheckpointSoftGit(publish);
+              if (!outcome.published && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
               published = outcome.published;
               bodyOutcome = outcome.published
                 ? "published"
@@ -7764,6 +7792,14 @@ export class RunRunner {
         // still propagates.
         let residueBlocked = false;
         let checkpointFailed = false;
+        // This budget starts with the Codex checkpoint boundary. It aims to
+        // leave 20 seconds before the 30-second hard deadline for verified
+        // child reap and boundary drain; local fetch-back still runs first.
+        const softController = executor.safety ? new AbortController() : undefined;
+        const softBudgetMs = this.checkpointTestHooks?.softDeadlineMs ?? 10_000;
+        const softDeadlineAt = Date.now() + softBudgetMs;
+        const softTimer = softController ? setTimeout(() => softController.abort(), softBudgetMs) : undefined;
+        softTimer?.unref();
         try {
           await this.reapForSink(
             executor,
@@ -7772,25 +7808,50 @@ export class RunRunner {
               activeStep: () => checkpointSteps?.current(),
             },
             async (permit) => {
+              if (permit && softController) {
+                checkpointSoft = { signal: softController.signal, deadlineAt: softDeadlineAt, permit };
+              }
               checkpointSteps?.enter("checkpoint_overlay");
-              const midRunOverlay = hasNewWork
-                ? await this.buildCheckpointOverlay(claim, flight, barePath)
-                : undefined;
-              await doCheckpointPublish(midRunOverlay, permit !== undefined);
+              await doCheckpointPublish(
+                hasNewWork ? () => this.buildCheckpointOverlay(claim, flight, barePath) : undefined,
+                permit !== undefined,
+              );
             },
             flight,
             { keepClone: false },
           );
         } catch (err) {
-          checkpointFailed = !(err instanceof RunResidueBlockedError);
-          if (!(err instanceof RunResidueBlockedError)) throw err;
-          residueBlocked = true;
-          bodyOutcome = "residue_blocked";
-          runLog.warn("milestone checkpoint skipped: the clone is not provably quiescent; nothing published", {
-            run_id: runId,
-            error: errMessage(err),
-          });
+          checkpointFailed = !(err instanceof RunResidueBlockedError || err instanceof CheckpointSoftDeadlineError);
+          if (err instanceof CheckpointSoftDeadlineError) {
+            bodyOutcome = "soft_deadline";
+            this.reportPublishOutcome(flight, "soft_deadline", "checkpoint publish skipped: soft deadline", {
+              step: checkpointSteps?.current(),
+            });
+            if (opts.progress) {
+              // The local milestone completed even though its remote checkpoint did
+              // not. Preserve the progress report without claiming publication.
+              await enqueueRunningReport(() => reportState({
+                status: "running",
+                milestones_completed: opts.progress!.completed,
+                milestones_in_progress: opts.progress!.in_progress,
+                ...(opts.progress!.milestones_agents
+                  ? { milestones_agents: opts.progress!.milestones_agents }
+                  : {}),
+              })).catch((e) => runLog.warn("could not report checkpoint progress", { error: errMessage(e) }));
+            }
+          } else if (!(err instanceof RunResidueBlockedError)) {
+            throw err;
+          } else {
+            residueBlocked = true;
+            bodyOutcome = "residue_blocked";
+            runLog.warn("milestone checkpoint skipped: the clone is not provably quiescent; nothing published", {
+              run_id: runId,
+              error: errMessage(err),
+            });
+          }
         } finally {
+          if (softTimer) clearTimeout(softTimer);
+          checkpointSoft = undefined;
           checkpointSteps?.end(checkpointFailed ? "failed" : "ok");
         }
         // issue #1597 M2 (round 4): with NO mid-turn ticker running (CHECKPOINT_TICK_INTERVAL=0) a
@@ -9713,6 +9774,7 @@ export class RunRunner {
       // issue #1086 (F2): a throw is AMBIGUOUS too, but only after the pack tip was obtained — a
       // throw DURING checkpointPack leaves packedTip undefined and records nothing.
       if (packedTip !== undefined) flight.lastAttemptedCheckpointRefTip = packedTip;
+      if (e instanceof CheckpointSoftDeadlineError) throw e;
       // issue #1597 M1: a deadline/permit abort is an expected bounded stop, not a publish fault —
       // runLog only, never the feed (the shutdown sink names it as `timeout` itself).
       if (signal?.aborted || isAbortLikeError(e)) {

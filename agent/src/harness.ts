@@ -407,13 +407,16 @@ export interface BoundaryProcessRequest {
   readonly identity: "command" | "worker_pat";
   /** Per-child wall clock deadline; the spawner terminates the whole owned process group. */
   readonly timeoutMs?: number;
+  /** Only a checkpoint permit may treat a child deadline as a recoverable skip,
+   * and only after its supervisor root has been disposed and reaped cleanly. */
+  readonly recoverableTimeout?: true;
 }
 
 export interface BoundaryProcessHandle {
   readonly stdin: Writable | null;
   readonly stdout: Readable | null;
   readonly stderr: Readable | null;
-  readonly completed: Promise<{ readonly code: number }>;
+  readonly completed: Promise<{ readonly code: number; readonly softTimedOut?: true }>;
 }
 
 export interface CodexExecutionSafety {

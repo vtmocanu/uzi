@@ -1,6 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
+import * as codexLauncher from "../src/codex/launcher.js";
 
 import {
   CodexBoundaryError,
@@ -455,6 +456,144 @@ describe("CodexExecutionSafety.spawnBoundaryAction: boundary-action lane", () =>
 });
 
 describe("CodexExecutionSafety.spawnBoundaryProcess: permit-owned subprocesses", () => {
+  /** Access the new typed launcher error at test time so the pre-fix module still loads and
+   *  the regression reports a named assertion instead of a module-import failure. */
+  function childExitTimeout(): Error {
+    const ctor = (codexLauncher as unknown as {
+      SupervisedChildExitTimeoutError?: new () => Error;
+    }).SupervisedChildExitTimeoutError;
+    assert.ok(ctor, "the launcher exports a typed child-exit timeout");
+    return new ctor();
+  }
+
+  it("a checkpoint opt-in returns a soft timeout only after disposal and full root reap", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1914));
+    const events: string[] = [];
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: {
+        kind: "boundary_action",
+        dispose: async () => { events.push("dispose"); },
+        reap: async () => {
+          events.push("reap");
+          return events.includes("dispose")
+            ? { ok: true as const }
+            : { ok: false as const, error: { category: "timeout" as const, message: "root was not disposed" } };
+        },
+      },
+      stdin: new PassThrough(), stdout, stderr,
+      waitChild: async () => { throw childExitTimeout(); },
+    }));
+
+    const result = await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 5_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        timeoutMs: 1_000, recoverableTimeout: true,
+      } as Parameters<typeof safety.spawnBoundaryProcess>[1]);
+      const completed = await child.completed;
+      assert.equal(permit.signal.aborted, false, "the outer boundary deadline did not fire");
+      return completed;
+    });
+    assert.deepEqual(result, { code: -1, softTimedOut: true });
+    assert.deepEqual(events, ["dispose", "reap"], "a clean full-root reap precedes the recoverable result");
+    assert.equal(reg.isPoisoned(), false, "a settled best-effort child leaves the boundary usable");
+    assert.equal(stdout.destroyed, true, "the abandoned output collector is closed");
+    assert.equal(stderr.destroyed, true, "the abandoned error collector is closed");
+  });
+
+  it("a child returned after its soft launch budget is disposed and reaped before recovery", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1918));
+    const events: string[] = [];
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+      await new Promise<void>((resolve) => setTimeout(resolve, 25));
+      return {
+        root: {
+          kind: "boundary_action",
+          dispose: async () => { events.push("dispose"); },
+          reap: async () => {
+            events.push("reap");
+            return events.includes("dispose")
+              ? { ok: true as const }
+              : { ok: false as const, error: { category: "timeout" as const, message: "root not disposed" } };
+          },
+        },
+        stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+        waitChild: async () => { events.push("wait_child"); return { code: 0 }; },
+      };
+    });
+
+    const completed = await safety.withBoundary({ boundary: "checkpoint", deadlineMs: 1_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        timeoutMs: 5, recoverableTimeout: true,
+      });
+      return child.completed;
+    });
+    assert.deepEqual(completed, { code: -1, softTimedOut: true });
+    assert.deepEqual(events, ["dispose", "reap"], "late launch never enters an unbudgeted child wait");
+    assert.equal(reg.isPoisoned(), false);
+  });
+
+  it("a checkpoint soft timeout remains fatal when the owned root cannot be reaped", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1915));
+    const events: string[] = [];
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: {
+        kind: "boundary_action",
+        dispose: async () => { events.push("dispose"); },
+        reap: async () => {
+          events.push("reap_failed");
+          return { ok: false, error: { category: "timeout", message: "owned child still live" } };
+        },
+      },
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      waitChild: async () => { throw childExitTimeout(); },
+    }));
+
+    await assert.rejects(safety.withBoundary({ boundary: "checkpoint", deadlineMs: 5_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        timeoutMs: 1_000, recoverableTimeout: true,
+      } as Parameters<typeof safety.spawnBoundaryProcess>[1]);
+      await child.completed;
+    }), CodexBoundaryError);
+    assert.deepEqual(events, ["dispose", "reap_failed"]);
+    assert.equal(reg.isPoisoned(), true, "an unverified child never becomes a soft skip");
+  });
+
+  it("the same typed child timeout is fatal for finalize without an opt-in", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1916));
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => ({
+      root: new FakeRoot("boundary_action"),
+      stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough(),
+      waitChild: async () => { throw childExitTimeout(); },
+    }));
+    await assert.rejects(safety.withBoundary({ boundary: "finalize", deadlineMs: 1_000 }, async (permit) => {
+      const child = await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat", timeoutMs: 20,
+      });
+      await child.completed;
+    }), CodexBoundaryError);
+    assert.equal(reg.isPoisoned(), true, "ordinary boundary child timeouts still poison");
+  });
+
+  it("rejects a recoverable timeout request outside a checkpoint permit before spawning", async () => {
+    const reg = new ExecutionRegistry(newLocalExecutionEpoch(1917));
+    let spawns = 0;
+    const safety = createCodexExecutionSafety(reg, spawnCounter().seam, undefined, undefined, async () => {
+      spawns += 1;
+      throw new Error("must not spawn");
+    });
+    await assert.rejects(safety.withBoundary({ boundary: "finalize", deadlineMs: 1_000 }, async (permit) => {
+      await safety.spawnBoundaryProcess(permit, {
+        argv: ["/usr/bin/git", "fetch"], cwd: "/tmp", env: {}, identity: "worker_pat",
+        recoverableTimeout: true,
+      } as Parameters<typeof safety.spawnBoundaryProcess>[1]);
+    }));
+    assert.equal(spawns, 0, "the invalid opt-in is refused before launch");
+  });
+
   it("caps a boundary child to its requested deadline", async () => {
     const reg = new ExecutionRegistry(newLocalExecutionEpoch(19));
     let launchBudget = -1;

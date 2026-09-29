@@ -1,10 +1,11 @@
 import { after, describe, it } from "node:test";
+import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { Readable } from "node:stream";
+import { PassThrough, type Readable } from "node:stream";
 
 import {
   type CredentialFreeSettleOutcome,
@@ -20,6 +21,7 @@ import {
   createCodexExecutionSafety,
   type ArmBoundaryDeadline,
   type ReconcileBeforeBoundary,
+  type SpawnedBoundaryProcess,
 } from "../src/codex/safety.js";
 import { buildRunLaneReconcile, CodexCredentialDeferredError } from "../src/codex/codex-executor.js";
 import {
@@ -28,7 +30,8 @@ import {
   type RegisteredRoot,
 } from "../src/codex/registry.js";
 import { selectCodexBinding, type CodexBinding } from "../src/codex/select.js";
-import type { BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
+import type { BoundaryProcessRequest, BoundaryRequest, CodexExecutionSafety } from "../src/harness.js";
+import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { resolveBoundaryExecutable } from "../src/git.js";
 import { GitLabClient } from "../src/forge.js";
 import type { SummaryRunner } from "../src/summary-runner.js";
@@ -231,6 +234,8 @@ function codexRig(
     armDeadline?: ArmBoundaryDeadline;
     /** Delay before each permit-held process spawn: reproduces suite load deterministically. */
     processSpawnDelayMs?: number;
+    /** Replace one test-owned boundary process, leaving every other Git child real. */
+    boundaryProcess?: (request: BoundaryProcessRequest) => SpawnedBoundaryProcess | undefined;
     /** Issue #1766: while this answers true, refreshCodex/releaseCodex throw the api's real typed
      *  409 `vault_locked` RequestError (a locked owner vault after authorization). */
     vaultLocked?: () => boolean;
@@ -281,6 +286,8 @@ function codexRig(
     async (request) => {
       processSpawns += 1;
       processArgv.push(request.argv);
+      const injected = opts.boundaryProcess?.(request);
+      if (injected) return injected;
       const [command, ...args] = request.argv;
       if (!command) throw new Error("empty test process argv");
       if (opts.processSpawnDelayMs) await delay(opts.processSpawnDelayMs);
@@ -2601,5 +2608,537 @@ describe("RunRunner #1914 — Codex milestone checkpoint diagnostics", () => {
       assert.ok(Number.isFinite(phase.durationMs) && (phase.durationMs as number) >= 0, "duration is finite and nonnegative");
       assert.ok(!JSON.stringify(phase).includes(claim.secrets.forge_pat), "phase log contains no forge PAT");
     }
+  });
+});
+
+describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
+  it("skips a queued default-tip lock without publishing, then retries the same committed tip under a fresh checkpoint", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const rig = codexRig();
+    const bare = git.barePathFor(fx.originPath);
+    const originalFetch = git.fetchDefaultTip.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    let markAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => { markAcquired = resolve; });
+    let fetches = 0;
+    const uploadedTips: string[] = [];
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      fetches += 1;
+      if (fetches !== 1) return originalFetch(...args);
+      // Occupy only the default-tip fetch's lock, after the checkpoint's fetch-back and
+      // bridge work. Its queued PAT operation must settle inside the permit when the soft
+      // deadline expires; releasing the holder afterward cannot cause a late fetch.
+      const holder = git.withBareLock(bare, async () => {
+        markAcquired();
+        await held;
+      });
+      await acquired;
+      try {
+        return await originalFetch(...args);
+      } finally {
+        releaseHolder();
+        await holder;
+      }
+    }) as typeof git.fetchDefaultTip;
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, tip: string, pack: Readable,
+    ) => {
+      uploadedTips.push(tip);
+      await drain(pack);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1918" } };
+    };
+
+    let firstReturned = false;
+    let secondReturned = false;
+    let committedTip = "";
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "the committed milestone\n");
+      committedTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"],
+        { env: GIT_ENV, encoding: "utf8" }).trim();
+      // Fetch back before entering the Codex permit so the test spends its short
+      // checkpoint deadline specifically at the overlay's queued default-tip lock.
+      await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+      fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+      commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      firstReturned = true;
+      assert.equal(await git.trackingTip(bare, ctx.branch), committedTip,
+        "the committed milestone remains in the worker bare after the skipped upload");
+      assert.deepEqual(uploadedTips, [], "the timed-out overlay neither uploaded nor claimed remote durability");
+      assert.ok(api.states.some((state) => state.runId === ctx.runId && state.body.status === "running" &&
+        state.body.milestones_completed?.includes("m1")), "the locally completed milestone progress was reported");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      secondReturned = true;
+      assert.equal(uploadedTips.length, 1, "the owed milestone was retried once without a new commit");
+      assert.notEqual(uploadedTips[0], committedTip, "retry rebuilt the workflow overlay, rather than sending the raw tip");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1918, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
+        github,
+        codexBoundaryDeadlineMs: 8_000,
+        checkpointIntervalMs: 0,
+        checkpointTickIntervalMs: 0,
+        checkpointTestHooks: { softDeadlineMs: 2_500 },
+      }).execute(claim);
+    } finally {
+      releaseHolder();
+      git.fetchDefaultTip = originalFetch;
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+
+    assert.ok(fetches >= 2, `the retry performed a fresh default-tip fetch; saw ${fetches}`);
+    assert.equal(firstReturned, true, "the soft-skipped milestone returned to the executor");
+    assert.equal(secondReturned, true, "the next milestone settled the owed publication");
+    assert.ok(statuses(claim.run_id).includes("completed"), "the run completed after the guarded retry");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "a best-effort checkpoint timeout did not fail the run");
+  });
+
+  it("lets the ordinary time-gated tick publish a locally fetched milestone after a soft skip", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const rig = codexRig();
+    const bare = git.barePathFor(fx.originPath);
+    const originalFetch = git.fetchDefaultTip.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    let markAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => { markAcquired = resolve; });
+    let blockedFetches = 0;
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      if (++blockedFetches !== 1) return originalFetch(...args);
+      const holder = git.withBareLock(bare, async () => { markAcquired(); await held; });
+      await acquired;
+      try { return await originalFetch(...args); }
+      finally { releaseHolder(); await holder; }
+    }) as typeof git.fetchDefaultTip;
+    const tips: string[] = [];
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, tip: string, pack: Readable,
+    ) => {
+      tips.push(tip);
+      await drain(pack);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1922" } };
+    };
+    let tick: (() => void) | undefined;
+    let resolveOutcome!: (outcome: string) => void;
+    const tickOutcome = new Promise<string>((resolve) => { resolveOutcome = resolve; });
+    let now = 0;
+    let milestoneTip = "";
+    let tickResult = "";
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "tick retry after soft skip\n");
+      milestoneTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"],
+        { env: GIT_ENV, encoding: "utf8" }).trim();
+      await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+      fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+      commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      assert.deepEqual(tips, [], "the soft-skipped milestone sent no raw or overlay pack");
+      assert.equal(await git.trackingTip(bare, ctx.branch), milestoneTip, "the tick can read the local committed candidate");
+      now = 1_001; // open the ordinary time gate, which was closed for the initial fetch-back
+      assert.ok(tick, "the mid-turn timer was armed");
+      tick();
+      tickResult = await tickOutcome;
+      assert.equal(tickResult, "published", "the ordinary tick settled the owed candidate");
+      assert.deepEqual(tips, [milestoneTip], "the overlay-less, scratch-scanned tick packed the committed tip");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1922, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
+        github, codexBoundaryDeadlineMs: 8_000, checkpointIntervalMs: 1_000, checkpointTickIntervalMs: 424_242,
+        now: () => now,
+        setTickTimer: (callback) => {
+          const bound = AsyncResource.bind(callback);
+          tick = bound;
+          return () => { if (tick === bound) tick = undefined; };
+        },
+        checkpointTestHooks: { softDeadlineMs: 2_500, onTickOutcome: resolveOutcome },
+      }).execute(claim);
+    } finally {
+      releaseHolder();
+      git.fetchDefaultTip = originalFetch;
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+    assert.equal(tickResult, "published", "the tick completed before the executor returned");
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+  });
+
+  it("reclaims the locally fetched candidate on the same worker after a soft skip", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    client.protocolFeatures = [VAULT_FEATURE];
+    let vaultLocked = false;
+    const rig1 = codexRig({ vaultLocked: () => vaultLocked });
+    const bare = git.barePathFor(fx.originPath);
+    const originalFetch = git.fetchDefaultTip.bind(git);
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let releaseHolder!: () => void;
+    const held = new Promise<void>((resolve) => { releaseHolder = resolve; });
+    let markAcquired!: () => void;
+    const acquired = new Promise<void>((resolve) => { markAcquired = resolve; });
+    let defaultFetches = 0;
+    git.fetchDefaultTip = (async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+      if (++defaultFetches !== 1) return originalFetch(...args);
+      const holder = git.withBareLock(bare, async () => { markAcquired(); await held; });
+      await acquired;
+      try { return await originalFetch(...args); }
+      finally { releaseHolder(); await holder; }
+    }) as typeof git.fetchDefaultTip;
+    let firstFlight = true;
+    const confirmedTips: string[] = [];
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, tip: string, pack: Readable,
+    ) => {
+      await drain(pack);
+      if (firstFlight) {
+        return { ok: true, body: { published: false, skipped: "workflow_scope" } };
+      }
+      confirmedTips.push(tip);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1923" } };
+    };
+    let committedTip = "";
+    let softSkipped = false;
+    const claim = gitlabClaim(1923, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "saved in the worker bare\n");
+      committedTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"],
+        { env: GIT_ENV, encoding: "utf8" }).trim();
+      await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+      fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+      commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      softSkipped = true;
+      assert.equal(await git.trackingTip(bare, ctx.branch), committedTip, "the candidate survived locally");
+      assert.deepEqual(confirmedTips, [], "the first flight reported no remote success");
+      vaultLocked = true; // finalize parks for recovery without a credentialed push
+      return { branch: ctx.branch };
+    }, rig1.settle);
+    let reclaimedTip = "";
+    let secondCheckpointReturned = false;
+    try {
+      await runnerWith(() => ({ executor: exec1 }), gitlab, undefined, undefined, {
+        github, codexBoundaryDeadlineMs: 8_000, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
+        checkpointTestHooks: { softDeadlineMs: 2_500 }, recoveryRetryMs: 5,
+      }).execute(claim);
+      assert.equal(softSkipped, true, "the first flight returned from its soft-skipped checkpoint");
+      assert.equal(parkReports(claim.run_id).length, 1, "the first flight parked for same-worker reclaim");
+      assert.deepEqual(confirmedTips, [], "neither the skip nor recovery park claimed remote durability");
+      assert.equal(await git.trackingTip(bare, "agent/issue-1923"), committedTip,
+        "the same worker bare retains the candidate across the claim boundary");
+
+      firstFlight = false;
+      vaultLocked = false;
+      const rig2 = codexRig({ vaultLocked: () => vaultLocked });
+      const exec2 = new FakeCodexExecutor(rig2.safety, async (ctx) => {
+        reclaimedTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"],
+          { env: GIT_ENV, encoding: "utf8" }).trim();
+        assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "M1.txt"), "utf8"), "saved in the worker bare\n");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+        secondCheckpointReturned = true;
+        assert.equal(confirmedTips.length, 1, "the reclaim's guarded checkpoint received the first published ACK");
+        assert.notEqual(confirmedTips[0], committedTip, "the reclaimed candidate was wrapped for the advanced workflow");
+        return { branch: ctx.branch };
+      }, rig2.settle);
+      await runnerWith(() => ({ executor: exec2 }), gitlab, undefined, undefined, {
+        github, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
+      }).execute({ ...claim, claim_generation: 2 });
+    } finally {
+      releaseHolder();
+      git.fetchDefaultTip = originalFetch;
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+    assert.equal(reclaimedTip, committedTip, "the second claim recovered the exact committed milestone");
+    assert.equal(secondCheckpointReturned, true, "the reclaimed flight retried publication");
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+  });
+
+  it("settles an aborted broker upload without a success report, then retries the unacknowledged tip", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const rig = codexRig();
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let uploads = 0;
+    let abortSettled = false;
+    let confirmed = 0;
+    const publishedStates: Array<{ lastPublishedTip?: string; checkpointFloor?: string }> = [];
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, _tip: string, pack: Readable, signal?: AbortSignal,
+    ) => {
+      uploads += 1;
+      await drain(pack);
+      if (uploads === 1) {
+        assert.ok(signal, "the milestone passes its soft and hard abort signals to the broker request");
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        abortSettled = true;
+        throw new DOMException("checkpoint upload aborted", "AbortError");
+      }
+      confirmed += 1;
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1919" } };
+    };
+
+    let firstReturned = false;
+    let secondReturned = false;
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "upload must settle before permit release\n");
+      await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+      fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+      commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      firstReturned = true;
+      assert.equal(abortSettled, true, "the in-flight upload settled before the checkpoint returned");
+      assert.equal(uploads, 1, "the first checkpoint attempted one upload");
+      assert.equal(confirmed, 0, "no upload received a published ACK");
+      assert.deepEqual(publishedStates, [], "the aborted attempt did not advance published-tip or floor state");
+      assert.ok(api.states.some((state) => state.runId === ctx.runId && state.body.status === "running" &&
+        state.body.milestones_completed?.includes("m1")), "the locally completed milestone progress was reported");
+      assert.ok(!api.messages(ctx.runId).some((m) => m.kind === "status" &&
+        /checkpoint publishing recovered|published to origin/.test(String(m.payload.text))),
+      "the feed contains no false published-success line");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      secondReturned = true;
+      assert.equal(uploads, 2, "the same committed work was retried without another commit");
+      assert.equal(confirmed, 1, "the retry received the only published ACK");
+      assert.equal(publishedStates.length, 1, "only the confirmed retry advanced published state");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1919, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
+        github,
+        codexBoundaryDeadlineMs: 8_000,
+        checkpointIntervalMs: 0,
+        checkpointTickIntervalMs: 0,
+        checkpointTestHooks: {
+          softDeadlineMs: 2_500,
+          afterUnpinnedPublish: (state) => publishedStates.push(state),
+        },
+      }).execute(claim);
+    } finally {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+    assert.equal(firstReturned, true, "the soft-skipped upload returned to the executor");
+    assert.equal(secondReturned, true, "the next guarded checkpoint retried publication");
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+  });
+
+  it("holds the bare lock through clean reap of a timed-out authenticated Git child", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const events: string[] = [];
+    let childLive = true;
+    let timedOutFetches = 0;
+    let published = 0;
+    const rig = codexRig({
+      boundaryProcess: (request) => {
+        if (timedOutFetches > 0 || request.identity !== "worker_pat" ||
+            !request.argv.includes("fetch") || !request.argv.includes("origin")) return undefined;
+        timedOutFetches += 1;
+        assert.equal(request.recoverableTimeout, true, "only this checkpoint child opted into a recoverable timeout");
+        const stdout = new PassThrough();
+        const stderr = new PassThrough();
+        return {
+          root: {
+            kind: "boundary_action",
+            dispose: async () => {
+              events.push("dispose");
+              childLive = false;
+            },
+            reap: async () => {
+              events.push("reap");
+              return childLive
+                ? { ok: false as const, error: { category: "timeout" as const, message: "PAT child still live" } }
+                : { ok: true as const };
+            },
+          },
+          stdin: new PassThrough(), stdout, stderr,
+          waitChild: async () => {
+            events.push("child_timeout");
+            throw new SupervisedChildExitTimeoutError(1);
+          },
+        };
+      },
+    });
+    const originalScope = git.withBoundaryProcessSpawner.bind(git);
+    git.withBoundaryProcessSpawner = ((spawner, signal, action, hooks) => originalScope(spawner, signal, action, {
+      ...hooks,
+      beforeLockRelease: async (key) => {
+        await hooks?.beforeLockRelease?.(key);
+        if (timedOutFetches > 0 && !events.includes("lock_release")) {
+          events.push("lock_release");
+          assert.equal(childLive, false, "the PAT child was disposed before the bare lock was released");
+          assert.ok(events.includes("reap"), "the registered root fully reaped before bare-lock release");
+        }
+      },
+    })) as typeof git.withBoundaryProcessSpawner;
+    const originalPublish = client.publishCheckpoint.bind(client);
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, _tip: string, pack: Readable,
+    ) => {
+      published += 1;
+      await drain(pack);
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1920" } };
+    };
+    let firstReturned = false;
+    let secondReturned = false;
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "supervised fetch timeout\n");
+      await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+      fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+      commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      firstReturned = true;
+      assert.equal(published, 0, "a timed-out authenticated child cannot authorize a raw-tip upload");
+      assert.ok(api.states.some((state) => state.runId === ctx.runId && state.body.status === "running" &&
+        state.body.milestones_completed?.includes("m1")), "the locally completed milestone progress was reported");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      secondReturned = true;
+      assert.equal(published, 1, "a later guarded checkpoint retries and lands the committed tip once");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1920, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
+        github, codexBoundaryDeadlineMs: 8_000, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
+        checkpointTestHooks: { softDeadlineMs: 3_000 },
+      }).execute(claim);
+    } finally {
+      git.withBoundaryProcessSpawner = originalScope;
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+    assert.equal(firstReturned, true, "the soft timeout returned to the executor");
+    assert.equal(secondReturned, true, "the guarded retry settled");
+    assert.equal(timedOutFetches, 1);
+    assert.deepEqual(events.slice(0, 4), ["child_timeout", "dispose", "reap", "lock_release"]);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+  });
+
+  it("settles a timed-out supervised pack child before returning, then retries the pack", async () => {
+    const { gitlab } = fakeGitlab();
+    const { github } = fakeGitHub();
+    const events: string[] = [];
+    let timedOutPacks = 0;
+    const rig = codexRig({
+      boundaryProcess: (request) => {
+        if (timedOutPacks > 0 || !request.argv.includes("pack-objects")) return undefined;
+        timedOutPacks += 1;
+        assert.equal(request.recoverableTimeout, true, "a checkpoint pack child uses the soft deadline");
+        let childLive = true;
+        const stdout = new PassThrough();
+        return {
+          root: {
+            kind: "boundary_action",
+            dispose: async () => { events.push("dispose"); childLive = false; },
+            reap: async () => {
+              events.push("reap");
+              return childLive
+                ? { ok: false as const, error: { category: "timeout" as const, message: "pack child still live" } }
+                : { ok: true as const };
+            },
+          },
+          stdin: new PassThrough(), stdout, stderr: new PassThrough(),
+          waitChild: async () => {
+            stdout.destroy();
+            await new Promise<void>((resolve) => setImmediate(resolve));
+            events.push("pack_timeout");
+            throw new SupervisedChildExitTimeoutError(1);
+          },
+        };
+      },
+    });
+    const originalPublish = client.publishCheckpoint.bind(client);
+    let attempts = 0;
+    let streamFailures = 0;
+    let confirmed = 0;
+    const publishedStates: Array<{ lastPublishedTip?: string }> = [];
+    (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async (
+      _runId: string, _tip: string, pack: Readable,
+    ) => {
+      attempts += 1;
+      try {
+        await drain(pack);
+      } catch (error) {
+        streamFailures += 1;
+        throw error;
+      }
+      confirmed += 1;
+      return { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-1921" } };
+    };
+    let firstReturned = false;
+    let secondReturned = false;
+    let turnFailure: unknown;
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "M1.txt", "pack must fully settle\n");
+      await ctx.checkpoint!({ reap: false, progress: { completed: [], in_progress: ["m1"] } });
+      fs.mkdirSync(path.join(fx.originPath, ".github", "workflows"), { recursive: true });
+      commitInTree(fx.originPath, ".github/workflows/ci.yml", "name: test\non: push\n# default advanced\n");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      firstReturned = true;
+      assert.equal(timedOutPacks, 1, "the first checkpoint reached the supervised pack child");
+      assert.deepEqual(events.slice(0, 3), ["pack_timeout", "dispose", "reap"],
+        "the pack child was disposed and reaped before the checkpoint returned");
+      assert.equal(confirmed, 0, "a failed pack never received a broker ACK");
+      assert.deepEqual(publishedStates, [], "the failed pack did not advance published-tip state");
+      assert.ok(api.states.some((state) => state.runId === ctx.runId && state.body.status === "running" &&
+        state.body.milestones_completed?.includes("m1")), "the locally completed milestone progress was reported");
+      await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+      secondReturned = true;
+      assert.equal(confirmed, 1, "the retried pack was the only confirmed publication");
+      assert.equal(publishedStates.length, 1, "only the ACK advanced published state");
+      return { branch: ctx.branch };
+    });
+    const originalRun = exec.run.bind(exec);
+    exec.run = async (ctx) => {
+      try { return await originalRun(ctx); }
+      catch (error) { turnFailure = error; throw error; }
+    };
+    const claim = gitlabClaim(1921, {
+      repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
+    });
+    try {
+      await runnerWith(() => ({ executor: exec }), gitlab, undefined, undefined, {
+        github, codexBoundaryDeadlineMs: 8_000, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
+        checkpointTestHooks: {
+          softDeadlineMs: 3_000,
+          afterUnpinnedPublish: (state) => publishedStates.push(state),
+        },
+      }).execute(claim);
+    } finally {
+      (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = originalPublish;
+    }
+    assert.equal(firstReturned, true, "the soft-skipped pack returned to the executor");
+    assert.equal(secondReturned, true, `the next checkpoint retried the committed tip; turn error: ${String(turnFailure)}`);
+    assert.equal(attempts, 2, "the broker saw the timed-out stream and the guarded retry");
+    assert.equal(streamFailures, 1, "only the timed-out pack stream failed");
+    const statusTexts = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
+    assert.ok(statusTexts.some((line) => line.includes("checkpoint publish skipped: soft deadline")),
+      `a source close before typed completion remains a soft skip: ${JSON.stringify(statusTexts)}`);
+    assert.ok(!statusTexts.some((line) => line.includes("checkpoint publish failed:")),
+      "a premature source-close hint is not misreported as a generic publish failure");
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
   });
 });
