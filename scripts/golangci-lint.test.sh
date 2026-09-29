@@ -236,10 +236,13 @@ if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
   # otherwise the caller can signal after seeing the PID but before the traps exist.
   ready_delay_pid=
   stop_ready_delay() {
+    trap '' TERM INT
     if [ -n "$ready_delay_pid" ]; then
-      kill "$ready_delay_pid" 2>/dev/null || true
+      ready_delay_to_stop=$ready_delay_pid
+      ready_delay_pid=
+      kill "$ready_delay_to_stop" 2>/dev/null || true
       ready_delay_status=0
-      wait "$ready_delay_pid" 2>/dev/null || ready_delay_status=$?
+      wait "$ready_delay_to_stop" 2>/dev/null || ready_delay_status=$?
       ready_delay_status_marker="$FAKE_READY_DELAY_STATUS_FILE.tmp.$$"
       printf '%s\n' "$ready_delay_status" > "$ready_delay_status_marker"
       mv "$ready_delay_status_marker" "$FAKE_READY_DELAY_STATUS_FILE"
