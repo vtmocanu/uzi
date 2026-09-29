@@ -261,7 +261,7 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 		}
 		slog.Warn("finding group reconciliation pending", attrs...)
 	}
-	// Serialize cursor selection so concurrent syncs advance the page.
+	// Select a bounded page. The cursor advances only after recorded settlements succeed.
 	s.groupCursorMu.Lock()
 	if s.groupCursors == nil {
 		s.groupCursors = make(map[uuid.UUID]store.FindingGroupCursor)
@@ -273,10 +273,6 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	ops, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID, after)
 	if err == nil && len(ops) == 0 && after != nil {
 		ops, err = store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID, nil)
-	}
-	if err == nil && len(ops) > 0 {
-		last := ops[len(ops)-1]
-		s.groupCursors[repoID] = store.FindingGroupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
 	}
 	s.groupCursorMu.Unlock()
 	if err != nil {
@@ -296,6 +292,16 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	}
 	if reconcileErr != nil {
 		return ops, finish, reconcileErr
+	}
+	if len(ops) > 0 {
+		last := ops[len(ops)-1]
+		s.groupCursorMu.Lock()
+		// A concurrent pass may already have advanced farther. Do not rewind it.
+		current, exists := s.groupCursors[repoID]
+		if (after == nil && !exists) || (after != nil && exists && current == *after) {
+			s.groupCursors[repoID] = store.FindingGroupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+		}
+		s.groupCursorMu.Unlock()
 	}
 	return ops, finish, nil
 }

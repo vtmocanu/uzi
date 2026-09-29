@@ -314,15 +314,26 @@ func TestIncrementalSyncSettlementFailureHoldsMarks(t *testing.T) {
 		ID: uuid.New(), UserID: user, RepoID: repo, Phase: "issue_recorded", IssueIID: &iid,
 		IssueURL: "https://example.com/issues/31", CreatedAt: time.Now().Add(-time.Minute),
 	}}}, beginErr: fmt.Errorf("settlement database unavailable")}
+	for i := 0; i < 100; i++ {
+		db.ops = append(db.ops, store.FindingGroupClaimOperation{
+			ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight",
+			CreatedAt: db.ops[0].CreatedAt.Add(time.Duration(i+1) * time.Second),
+		})
+	}
 	cache := &fakeStore{}
 	svc := newTestService(cache)
 	svc.SetFindingGroupDB(db)
 	start := Marks{Finding: time.Now().Add(-time.Hour)}
-	got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{{
-		IID: 32, UpdatedAt: time.Now(),
-	}}}, start)
-	if err == nil || got != start || len(cache.upserts) != 0 {
-		t.Fatalf("mark=%v error=%v cache writes=%d", got, err, len(cache.upserts))
+	for pass := 0; pass < 2; pass++ {
+		got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{{
+			IID: 32, UpdatedAt: time.Now(),
+		}}}, start)
+		if err == nil || got != start || len(cache.upserts) != 0 {
+			t.Fatalf("pass %d: mark=%v error=%v cache writes=%d", pass, got, err, len(cache.upserts))
+		}
+	}
+	if _, advanced := svc.groupCursors[repo]; advanced {
+		t.Fatal("failed settlement advanced the group cursor past the recorded issue")
 	}
 }
 
