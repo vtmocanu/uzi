@@ -27,6 +27,12 @@ through `[0.52.0]`.)
 - **Product tokens and a stable `/api/v1` ([#1907](https://github.com/vtmocanu/uzi/issues/1907)).**
   Admins register external products under Admin > Products; users mint `uzp_` product tokens for them in Settings > Access (scopes, expiry, at most 10 active per product, shown once). A product token works only on `/api/v1` (today `GET /api/v1/whoami`, described in `api/openapi/v1.yaml`), never carries admin authority, and is refused everywhere else. Revoke all now also revokes product tokens; admins can revoke one, or disable or delete the product. The `uzi` CLI refuses a `uzp_` token with a clear error.
 
+- **Several findings that share a root cause can now be filed as one forge issue ([#1724](https://github.com/vtmocanu/uzi/issues/1724)).**
+  On the Findings page, select 2 to 50 open findings from one repo and click "File as one issue" to review an editable draft that lists every finding's location and title; the CLI does the same with `uzi findings file <finding-id> <finding-id>...` (older evidence ids resolve to their finding, duplicates count once, `--json` returns the issue plus the linked disposition IDs). Filing is all or nothing, every member shows as Filed against the same issue, and closing that issue marks every member Done, while Undo stays per finding.
+
+- **A group filing whose outcome could not be confirmed is settled by the repo sync or released by hand ([#1724](https://github.com/vtmocanu/uzi/issues/1724)).**
+  The forge issue carries a marker, and the repo sync settles the group when it finds that issue; the server logs a `finding group reconciliation pending` warning with the pending count and oldest age while any operation waits. Otherwise the CLI exits 5 with the operation id, and once the operation's deadline has passed and the forge really has no such issue, `uzi findings release <operation-id> --confirm-no-issue` frees the findings (the flag is required); held rows read `pending group <op>` in `uzi findings list --bucket all`.
+
 ### Changed
 
 - **Agents wait for long gates and report only what they observed.**
