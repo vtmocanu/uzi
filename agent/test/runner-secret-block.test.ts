@@ -89,7 +89,7 @@ describe("RunRunner — push_secret_blocked typed terminal (PRD #974 M2 / #1077)
         {
           file: "src/leak.ts",
           startLine: 1,
-          commit: "deadbeefcafe",
+          commit: "deadbeefcafe0123456789abcdef0123456789ab",
           ruleId: "generic-api-key",
         },
       ],
@@ -107,13 +107,16 @@ describe("RunRunner — push_secret_blocked typed terminal (PRD #974 M2 / #1077)
     assert.ok(!reason.includes("preserved below"));
     assert.ok(!reason.includes("diff is preserved"));
     assert.match(reason, /withheld/);
+    // issue #1932: a LOCAL scan finding: the reason names the rule and never claims GH013.
+    assert.match(reason, /\(rule generic-api-key\)/);
+    assert.doesNotMatch(reason, /GH013|GitHub Push Protection/);
     // The emitted worker STATUS makes no preservation claim either.
     const statusTexts = api
       .messages(claim.run_id)
       .filter((m) => m.kind === "status")
       .map((m) => JSON.stringify(m.payload));
     assert.ok(
-      statusTexts.some((t) => /Push Protection would reject/.test(t)),
+      statusTexts.some((t) => /pre-push secret scan flagged .*rule generic-api-key/.test(t) && !/GH013|Push Protection/.test(t)),
       "the trusted-scan block must emit its own secret-block worker status",
     );
     for (const t of statusTexts) {

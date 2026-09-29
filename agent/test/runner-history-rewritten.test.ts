@@ -297,8 +297,8 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     trusted: true as const,
     findings: [{ commit: "deadbeef", file: "leaked.env", startLine: 1, ruleId: "generic-api-key" }],
   });
-  /** A gitlab task claim with forge_type set (so composePushSecretBlockedReason picks the
-   *  forge-neutral wording, not the GitHub GH013 wording). */
+  /** A gitlab task claim with forge_type set (composeLocalScanBlockedReason is forge-neutral, so the
+   *  reason must never carry the GitHub GH013 wording). */
   const gitlabClaimTyped = (branch: string) =>
     taskClaim(branch, {
       open_mr: false,
@@ -339,7 +339,7 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     const reason = failed.failure_reason ?? "";
     assert.doesNotMatch(reason, /GH013/, "the gitlab reason is forge-neutral: no GH013");
     assert.doesNotMatch(reason, /GitHub Push Protection/i, "the gitlab reason is forge-neutral: no GitHub Push Protection");
-    assert.match(reason, /pre-push secret scan detected a secret/i, "the reason cites the pre-push scan");
+    assert.match(reason, /pre-push secret scan \(gitleaks default ruleset\) flagged/i, "the reason cites the pre-push scan");
   });
 
   it("(GitLab, OMITTED forge_type) a trusted post-bridge finding still gets forge-neutral wording (finding 8, R8)", async () => {
@@ -366,7 +366,7 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
       /GitHub Push Protection/i,
       "an omitted forge_type reason is forge-neutral: no GitHub Push Protection",
     );
-    assert.match(reason, /pre-push secret scan detected a secret/i, "the reason cites the pre-push scan");
+    assert.match(reason, /pre-push secret scan \(gitleaks default ruleset\) flagged/i, "the reason cites the pre-push scan");
   });
 
   it("(GitHub, plain path) the post-bridge re-scan blocks a secret the top scan failed open on", async () => {

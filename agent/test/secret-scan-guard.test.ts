@@ -8,7 +8,7 @@ import {
   type SecretFinding,
 } from "../src/secret-scan-guard.js";
 import { isPushProtectionRejection } from "../src/git.js";
-import { composePushSecretBlockedReason } from "../src/runner.js";
+import { composeLocalScanBlockedReason } from "../src/runner.js";
 
 // PRD #974 M2 (load-bearing security): the pure, I/O-free helpers behind the finalize
 // pre-push secret scan, plus the two remote-backstop helpers that classify a GH013
@@ -350,20 +350,21 @@ describe("isPushProtectionRejection", () => {
   });
 });
 
-describe("composePushSecretBlockedReason", () => {
+describe("composeLocalScanBlockedReason", () => {
   const SUFFIX_TAIL = "export it with `uzi run export`.";
   const MAX = 512;
 
   it("names the short commit + path + rule for a single finding, ≤512, suffix intact", () => {
-    const reason = composePushSecretBlockedReason([
-      { file: "config/app.env", startLine: 12, commit: "abcdef1234567890", ruleId: "generic-api-key" },
+    const reason = composeLocalScanBlockedReason([
+      { file: "config/app.env", startLine: 12, commit: "0123456789abcdef0123456789abcdef01234567", ruleId: "generic-api-key" },
     ]);
     assert.ok(reason.length <= MAX, `must be ≤${MAX} (got ${reason.length})`);
-    // Short commit (first 8 chars), path:line, and rule all present.
-    assert.match(reason, /abcdef12/, "short commit (8 chars) must appear");
-    assert.ok(!reason.includes("abcdef1234567890"), "the full commit must be shortened to 8 chars");
+    // Short commit (first 12 chars), path:line, and rule all present.
+    assert.match(reason, /0123456789ab /, "short commit (12 chars) must appear");
+    assert.ok(!reason.includes("0123456789abc"), "the full commit must be shortened to 12 chars");
     assert.match(reason, /config\/app\.env:12/, "path:line must appear");
-    assert.match(reason, /\(generic-api-key\)/, "rule id must appear");
+    assert.match(reason, /\(rule generic-api-key\)/, "rule id must appear");
+    assert.doesNotMatch(reason, /GH013|GitHub Push Protection/, "local-scan wording: no GH013 claim");
     assert.ok(reason.endsWith(SUFFIX_TAIL), "the preserved-diff pointer must end the reason");
     assert.ok(!reason.includes("preserved below"), "must not claim the diff is preserved");
     assert.ok(!reason.includes("diff is preserved"), "must not claim the diff is preserved");
@@ -377,20 +378,22 @@ describe("composePushSecretBlockedReason", () => {
     const findings: SecretFinding[] = Array.from({ length: 200 }, (_, i) => ({
       file: `services/backend/module-${i}/very/deeply/nested/config/secrets-${i}.yaml`,
       startLine: i + 1,
-      commit: `deadbeefcafebabe${i}`,
+      commit: `deadbeefcafebabe${String(i).padStart(24, "0")}`,
       ruleId: "generic-api-key",
     }));
-    const reason = composePushSecretBlockedReason(findings);
+    const reason = composeLocalScanBlockedReason(findings);
     assert.ok(reason.length <= MAX, `must be ≤${MAX} (got ${reason.length})`);
     assert.match(reason, /and \d+ more/, "a truncated list must show the omitted count");
     assert.ok(reason.endsWith(SUFFIX_TAIL), "the preserved-diff pointer must survive truncation");
     assert.ok(!reason.includes("preserved below"), "must not claim the diff is preserved");
     assert.ok(!reason.includes("diff is preserved"), "must not claim the diff is preserved");
     assert.match(reason, /withheld/, "must state the diff is withheld, not preserved");
-    assert.match(reason, /GH013/, "the fixed prefix must survive truncation");
+    assert.match(reason, /^This run's branch was not pushed: the worker's pre-push secret scan/, "the fixed prefix must survive truncation");
+    assert.match(reason, /\(rule generic-api-key\)/, "the rule id must be named");
+    assert.doesNotMatch(reason, /GH013|GitHub Push Protection/, "local-scan wording: no GH013 claim");
     // Non-vacuity: the UNtruncated join would blow past the cap, so truncation actually fired.
     const untruncated = findings
-      .map((f) => `${f.commit.slice(0, 8)} ${f.file}:${f.startLine} (${f.ruleId})`)
+      .map((f) => `${f.commit.slice(0, 12)} ${f.file}:${f.startLine} (rule ${f.ruleId})`)
       .join("; ");
     assert.ok(untruncated.length > MAX, "control: the raw finding list must exceed the cap");
     // The first finding is always shown (list is truncated from the tail).
@@ -398,11 +401,11 @@ describe("composePushSecretBlockedReason", () => {
   });
 
   it("caps a single pathological very-long path at ≤512 with the suffix intact", () => {
-    const reason = composePushSecretBlockedReason([
+    const reason = composeLocalScanBlockedReason([
       {
         file: "a/" + "x".repeat(2000) + "/secret.env",
         startLine: 99999,
-        commit: "0123456789abcdef",
+        commit: "0123456789abcdef0123456789abcdef01234567",
         ruleId: "generic-api-key",
       },
     ]);
@@ -411,18 +414,19 @@ describe("composePushSecretBlockedReason", () => {
     assert.ok(!reason.includes("preserved below"), "must not claim the diff is preserved");
     assert.ok(!reason.includes("diff is preserved"), "must not claim the diff is preserved");
     assert.match(reason, /withheld/, "must state the diff is withheld, not preserved");
-    assert.match(reason, /GH013/, "the fixed prefix must survive hard truncation");
+    assert.match(reason, /^This run's branch was not pushed: the worker's pre-push secret scan/, "the fixed prefix must survive hard truncation");
+    assert.doesNotMatch(reason, /GH013|GitHub Push Protection/, "local-scan wording: no GH013 claim");
     assert.match(reason, /…/, "a hard-truncated single label must show the ellipsis");
   });
 
-  it("strips control bytes from the attacker-controlled file path (no terminal-forge)", () => {
+  it("escapes control bytes in the attacker-controlled file path (no terminal-forge)", () => {
     // A committed filename can carry ESC/newline; those must not survive into the stored
     // failure_reason (they would forge rows / inject ANSI when rendered in a CLI/TUI terminal).
-    const reason = composePushSecretBlockedReason([
+    const reason = composeLocalScanBlockedReason([
       {
         file: "evil\u001b[2K\nrow.env",
         startLine: 1,
-        commit: "abcdef1234567890",
+        commit: "0123456789abcdef0123456789abcdef01234567",
         ruleId: "generic-api-key",
       },
     ]);
@@ -431,6 +435,6 @@ describe("composePushSecretBlockedReason", () => {
     assert.ok(!reason.includes("\u001b"), "ESC must be stripped");
     assert.ok(!reason.includes("\n"), "newline must be stripped");
     // The visible path characters survive, just not the control bytes.
-    assert.match(reason, /evil\[2Krow\.env/, "the printable path remains, control bytes removed");
+    assert.match(reason, /evil\\u\{1b\}\[2K\\u\{a\}row\.env/, "control bytes are escaped as visible \\u{..}, not stripped");
   });
 });

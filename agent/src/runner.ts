@@ -14,6 +14,7 @@ import {
   isWorkflowScopeRejection,
 } from "./git.js";
 import type { SecretFinding } from "./secret-scan-guard.js";
+import { renderSecretFinding, renderSecretFindings } from "./secret-finding-render.js";
 import type { CredentialFreeSettleOutcome, Executor, ExecutorResult, RunContext, WallParkOutcome, WallParkRefresh } from "./executor.js";
 import { PlanRejectedError } from "./executor.js";
 import type { BoundaryPermit, BoundaryRequest, BoundarySink, BoundaryStep, SafeBoundary } from "./harness.js";
@@ -907,12 +908,14 @@ export function composeWorkflowScopeReason(paths: string[], patchPreserved = tru
 }
 
 /**
- * PRD #974 M2 — compose the actionable, capped `failure_reason` for a GitHub run whose branch
- * carries a secret GitHub Push Protection (GH013) would reject at push. It NAMES the offending
- * commit + path(s) (the first finding, plus an "and N more" tail like composeWorkflowScopeReason)
- * so a human knows exactly what to scrub, says the branch could not be pushed, and — because the
- * diff may carry the detected secret — states that the diff is withheld, pointing the owner at a
- * durable-recovery archive (`uzi run export`) when one exists.
+ * PRD #974 M2 / issue #1932 — compose the actionable, capped `failure_reason` for a run whose
+ * branch the worker's OWN pre-push secret scan (gitleaks default ruleset) flagged, so it was not
+ * pushed. It is local-scan wording: it never claims GitHub Push Protection / GH013 (the real remote
+ * rejection has its own fixed reason in `failPushSecretBlocked`). It NAMES the offending
+ * commit + path(s) + rule id(s) (an "and N more" tail like composeWorkflowScopeReason) so a human
+ * knows what to scrub, and — because the diff may carry the detected secret — states that the diff
+ * is withheld, pointing the owner at a durable-recovery archive (`uzi run export`) when one exists.
+ * Labels come from renderSecretFinding, so a hostile filename is escaped, capped or withheld.
  *
  * The variable part (the finding list) is truncated to fit MAX_FAILURE_REASON_LEN against the
  * budget left after the fixed prefix + suffix — the withheld-diff / recovery pointer in the suffix is
@@ -920,38 +923,18 @@ export function composeWorkflowScopeReason(paths: string[], patchPreserved = tru
  * not by slicing the whole string at the end. Exported for a direct cap unit test; the caller
  * still applies `.slice(0, MAX_FAILURE_REASON_LEN)` as a belt-and-braces net.
  */
-export function composePushSecretBlockedReason(
+export function composeLocalScanBlockedReason(
   findings: SecretFinding[],
-  forgeType?: string,
+  opts: { redact?: (s: string) => string; withholdPaths?: boolean } = {},
 ): string {
-  // PRD #1416 (MR-rework, finding 1): the post-bridge scan runs on EVERY forge, so a non-GitHub
-  // block must NOT cite "GitHub Push Protection"/"GH013" (there is no such backstop on
-  // GitLab/Forgejo). GitHub (or an omitted forge — the top-of-finalize GH013 caller) keeps the
-  // original wording so its existing callers + unit tests stay stable.
-  const isGitHub = forgeType === undefined || forgeType === "github";
-  const prefix = isGitHub
-    ? "This run's branch could not be pushed: it carries a secret GitHub Push Protection blocks " +
-      "(GH013). Offending: "
-    : "This run's branch could not be pushed: the pre-push secret scan detected a secret (a " +
-      "rewritten branch was bridged so it could publish). Offending: ";
+  const prefix =
+    "This run's branch was not pushed: the worker's pre-push secret scan (gitleaks default ruleset) flagged ";
   const suffix =
     ". The change is otherwise valid; a human can scrub the secret from the commit(s) and " +
     "land it. The diff is withheld because it may carry the detected secret; if a " +
     "durable-recovery archive of this run is available, export it with `uzi run export`.";
   const budget = MAX_FAILURE_REASON_LEN - prefix.length - suffix.length;
-  // One human-readable label per finding: `<short-commit> <path> (<rule>)`. The file path (and
-  // rule id) come from gitleaks' report of ATTACKER-authored repo content, so a committed
-  // filename can carry control bytes (ESC, newline) that would forge rows / inject ANSI when this
-  // failure_reason is later rendered in a CLI/TUI terminal. Strip the C0 control range + DEL at
-  // this WRITE site so the stored reason cannot carry them (the render boundary is defense in
-  // depth, not the only guard).
-  // eslint-disable-next-line no-control-regex
-  const stripControl = (s: string): string => s.replace(/[\u0000-\u001f\u007f]/g, "");
-  const labels = findings.map((f) => {
-    const shortCommit = f.commit ? stripControl(f.commit.slice(0, 8)) : "?";
-    const rule = f.ruleId ? ` (${stripControl(f.ruleId)})` : "";
-    return `${shortCommit} ${stripControl(f.file)}:${f.startLine}${rule}`;
-  });
+  const labels = findings.map((f) => renderSecretFinding(f, opts));
   let list = labels.join("; ");
   if (list.length > budget) {
     // Drop trailing labels (replaced by an "and N more" tail) until the list fits the budget.
@@ -4975,7 +4958,7 @@ export class RunRunner {
       scanRangeTrusted = scan.trusted;
       if (scan.trusted) scannedTip = await this.git.trackingTip(scanBarePath, result.branch);
       if (scan.trusted && scan.findings.length > 0) {
-        const reason = composePushSecretBlockedReason(scan.findings);
+        const reason = composeLocalScanBlockedReason(scan.findings, { redact: redactText });
         // Do NOT preserve the diff on a secret block. redactText only scrubs the run's OWN
         // secrets (forge PAT / Anthropic / join token / gitBasic); a gitleaks finding is by
         // definition a DIFFERENT secret whose value we do not even have here (the report is
@@ -4987,18 +4970,14 @@ export class RunRunner {
           kind: "status",
           agent: "worker",
           payload: {
-            text: "branch carries a secret GitHub Push Protection would reject; failing early — the diff is withheld because it may carry the secret",
+            text: `the pre-push secret scan flagged ${renderSecretFindings(scan.findings, { redact: redactText })}; failing early without pushing — the diff is withheld because it may carry the secret`,
           },
         });
         runLog.info(
-          "run failed: branch carries a secret GitHub Push Protection would reject (GH013); withholding diff (it may carry the secret)",
+          "run failed: the pre-push secret scan flagged the branch; withholding diff (it may carry the secret)",
           {
             run_id: runId,
-            findings: scan.findings.map((f) => ({
-              commit: f.commit,
-              file: f.file,
-              rule: f.ruleId,
-            })),
+            findings: scan.findings.map((f) => renderSecretFinding(f, { redact: redactText })),
           },
         );
         await closeBatcher();
@@ -5055,17 +5034,8 @@ export class RunRunner {
         username: claim.secrets.forge_username,
       });
       if (scan.trusted && scan.findings.length > 0) {
-        // #1416 (MR-rework, finding 8) — forge_type is optional (an omitted value means GitLab, R8),
-        // but composePushSecretBlockedReason defaults undefined → github (relied on by the
-        // GitHub-gated top-of-finalize caller). Normalize HERE so an omitted-forge_type GitLab run
-        // gets forge-neutral wording, not GH013/"GitHub Push Protection".
-        const forgeType =
-          claim.repo.forge_type === "forgejo"
-            ? "forgejo"
-            : claim.repo.forge_type === "github"
-              ? "github"
-              : "gitlab"; // R8: an omitted forge_type is GitLab, which has no GH013 backstop
-        const reason = composePushSecretBlockedReason(scan.findings, forgeType);
+        // issue #1932: local-scan wording on every forge (no GH013 / GitHub Push Protection claim).
+        const reason = composeLocalScanBlockedReason(scan.findings, { redact: redactText });
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -5077,7 +5047,7 @@ export class RunRunner {
           "run failed: post-bridge secret scan found a secret in the P..B push delta; withholding diff",
           {
             run_id: runId,
-            findings: scan.findings.map((f) => ({ commit: f.commit, file: f.file, rule: f.ruleId })),
+            findings: scan.findings.map((f) => renderSecretFinding(f, { redact: redactText })),
           },
         );
         await closeBatcher();
@@ -5115,7 +5085,7 @@ export class RunRunner {
     // finding spans at all, so a preserved patch would persist the secret into
     // runs.preserved_patch / RunView — the exact leak this feature prevents. The committed work
     // stays recoverable from the run's branch/PVC; the fixed capped reason points a human there
-    // (the backstop has no gitleaks findings to name, so it cannot use composePushSecretBlockedReason).
+    // (the backstop has no gitleaks findings to name, so it cannot use composeLocalScanBlockedReason).
     const failPushSecretBlocked = async () => {
       const reason =
         "the push was rejected by GitHub Push Protection (GH013): it carries a secret. " +
