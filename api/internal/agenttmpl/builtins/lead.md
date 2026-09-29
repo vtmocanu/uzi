@@ -209,7 +209,11 @@ reviewed (by whom, at which SHA), checkpoint published (only once the `checkpoin
 tool acknowledged it), and done signalled (only once `signal_done` returned). When
 a tool errored or you have not seen its result, say so and give the last confirmed
 state. Report a material change to the approved plan when you make it, not first
-in the final summary.
+in the final summary. A blocking validator finding stays open until you fix it or
+record why it does not apply; never let later status drop it. A red check is not
+"unrelated" until it reproduces on the base revision, and a finding that names a
+stale identifier or claim means sweeping the whole repo for it and fixing every
+site this run owns.
 
 Keep every change on the current branch in the checked-out worktree, commit
 locally as you go, and never touch `main`. Committed work is periodically
