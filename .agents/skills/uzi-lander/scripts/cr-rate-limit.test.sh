@@ -90,6 +90,10 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
     exit 0
   fi
   asked=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  if [ "${NO_CR_REPLY:-0}" = 1 ]; then
+    jq -n --arg a "$asked" '[{user:{login:"tester"},body:"@coderabbitai rate limit",created_at:$a,updated_at:$a}]' > "$COMMENTS"
+    exit 0
+  fi
   if [ "${SINGULAR_MINUTE:-0}" = 1 ]; then
     advance_clock 1
     replied=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -185,6 +189,32 @@ set -e
 grep -q '^CR_LIMITED=1$' "$WORK/query.out" || fail "fresh quota reply did not override stale success status"
 grep -q '^CR_RESET_SOURCE=reply$' "$WORK/query.out" || fail "fresh reply was not authoritative"
 
+# Exact-query waits cannot infer a reset when CR never answers. The fake clock advances
+# through the ask window and a would-be wait interval, so the old ceiling loop terminates
+# quickly and fails this assertion instead of hanging the test.
+MODE="query"; NO_CR_REPLY=1; EXACT_WAIT_CLOCK_STEP=70; export MODE NO_CR_REPLY EXACT_WAIT_CLOCK_STEP
+for mode in trigger query-wait; do
+  printf '[]\n' > "$COMMENTS"
+  rm -f "$POSTED" "$WATCHED"
+  set +e
+  if [ "$mode" = trigger ]; then
+    bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/$mode.out" 2>&1
+  else
+    bash "$SCRIPT" test/repo 42 --query --wait --interval 0 --max-wait-min 1 > "$WORK/$mode.out" 2>&1
+  fi
+  rc=$?
+  set -e
+  [ "$rc" -eq 2 ] || fail "$mode no-reply rc=$rc, want 2: $(cat "$WORK/$mode.out")"
+  grep -q '^CR_RESET_MIN=unknown$' "$WORK/$mode.out" || fail "$mode lost unknown-reset header: $(cat "$WORK/$mode.out")"
+  grep -q '^NEXT=switch_reviewer' "$WORK/$mode.out" || fail "$mode did not switch reviewer: $(cat "$WORK/$mode.out")"
+  if grep -q 'waiting on exact quota reset\|^CR_WAIT_CEILING=' "$WORK/$mode.out"; then
+    fail "$mode entered the ceiling wait with no exact reset: $(cat "$WORK/$mode.out")"
+  fi
+  [ "$(cat "$POSTED")" = '@coderabbitai rate limit' ] || fail "$mode posted an unexpected comment: $(cat "$POSTED")"
+  [ ! -e "$WATCHED" ] || fail "$mode entered watch-pr without an authoritative reset"
+done
+unset NO_CR_REPLY EXACT_WAIT_CLOCK_STEP
+
 # A wait progress line must print one RFC3339 value, never RFC3339+epoch concatenation.
 MODE="wait"; export MODE
 rm -f "$STATUS_COUNT"
@@ -219,6 +249,23 @@ grep -q '^CR_RESET_MIN=1$' "$WORK/exact-future-wait.out" || fail "future exact r
 grep -q 'waiting on exact quota reset at ' "$WORK/exact-future-wait.out" || fail "future exact reset did not enter query wait: $(cat "$WORK/exact-future-wait.out")"
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/exact-future-wait.out" || fail "future exact reset did not release the wait: $(cat "$WORK/exact-future-wait.out")"
 if grep -q '^CR_RESUMED=1$' "$WORK/exact-future-wait.out"; then fail "stale status ended future exact wait early"; fi
+
+# A known reset outside the 15-minute review lane also switches reviewers immediately.
+RESET_MIN=18; EXACT_WAIT_CLOCK_STEP=70; export RESET_MIN EXACT_WAIT_CLOCK_STEP
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+set +e
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/long-reset.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "long reset rc=$rc, want 1: $(cat "$WORK/long-reset.out")"
+grep -q '^CR_RESET_MIN=17$' "$WORK/long-reset.out" || fail "long reset header wrong: $(cat "$WORK/long-reset.out")"
+grep -q '^NEXT=switch_reviewer' "$WORK/long-reset.out" || fail "long reset did not switch reviewer: $(cat "$WORK/long-reset.out")"
+if grep -q 'waiting on exact quota reset\|^CR_WAIT_CEILING=' "$WORK/long-reset.out"; then
+  fail "long reset waited despite the reviewer-switch rule: $(cat "$WORK/long-reset.out")"
+fi
+unset EXACT_WAIT_CLOCK_STEP RESET_MIN
+"$REAL_DATE" +%s > "$TEST_CLOCK" # restore wall-clock alignment for the lock-mtime cases below
 
 # "Reviews are available now" is an authoritative zero-minute reply, even with stale limited status.
 MODE="available"; AVAILABLE_NOW=1; export MODE AVAILABLE_NOW
@@ -333,4 +380,4 @@ bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$W
 grep -q '^WATCH_RESULT=ready$' "$WORK/trigger-lock-stale.out" || fail "stale-lock recovery did not enter the watcher: $(cat "$WORK/trigger-lock-stale.out")"
 unset HEAD_OID
 
-echo "PASS cr-rate-limit: exact query, singular minute, available-now, atomic review trigger, stale status, reset formatting"
+echo "PASS cr-rate-limit: exact query, unknown/long reset switch, singular minute, available-now, atomic review trigger, stale status, reset formatting"
