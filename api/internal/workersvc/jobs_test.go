@@ -3,12 +3,14 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -66,6 +68,12 @@ func TestCreateJobRunRefusalsBeforeTheStore(t *testing.T) {
 	if _, err := svc.CreateJobRun(ctx, unknown); !errors.Is(err, ErrJobTypeUnknown) {
 		t.Errorf("unknown type err = %v, want ErrJobTypeUnknown", err)
 	}
+	prod := base
+	pid := uuid.New()
+	prod.Caller.ProductID = &pid
+	if _, err := svc.CreateJobRun(ctx, prod); !errors.Is(err, ErrJobInvalid) {
+		t.Errorf("product caller without token id err = %v, want ErrJobInvalid", err)
+	}
 	bad := base
 	bad.Title = ""
 	_, err := svc.CreateJobRun(ctx, bad)
@@ -104,7 +112,7 @@ func TestValidateCreateJob(t *testing.T) {
 		{"blank title", CreateJobParams{Title: "  ", Prompt: "p"}, "title"},
 		{"long title", CreateJobParams{Title: strings.Repeat("a", maxJobTitleBytes+1), Prompt: "p"}, "title"},
 		{"control char title", CreateJobParams{Title: "a\nb", Prompt: "p"}, "title"},
-		{"bidi title", CreateJobParams{Title: "a‮b", Prompt: "p"}, "title"},
+		{"bidi title", CreateJobParams{Title: "a\u202eb", Prompt: "p"}, "title"},
 		{"blank prompt", CreateJobParams{Title: "t", Prompt: " \x00 "}, "prompt"},
 		{"oversize prompt", CreateJobParams{Title: "t", Prompt: strings.Repeat("a", MaxIssueDescriptionBytes+1)}, "prompt"},
 		{"bad utf8 prompt", CreateJobParams{Title: "t", Prompt: "a\xffb"}, "prompt"},
@@ -166,5 +174,16 @@ func TestJobRunRefusesPauseExtendAndCredentialPin(t *testing.T) {
 		if _, err := validateCredentialOverrideOn(context.Background(), nil, uuid.New(), runkind.Job, harnessClaude, mode, &id); !errors.Is(err, ErrCredentialOverrideLaneNotSwitchable) {
 			t.Errorf("job override mode=%s err = %v, want ErrCredentialOverrideLaneNotSwitchable", mode, err)
 		}
+	}
+}
+
+// TestDefaultJobMaxActiveMatchesSettings ties the service's fallback to the settings default.
+func TestDefaultJobMaxActiveMatchesSettings(t *testing.T) {
+	n, err := strconv.Atoi(settings.DefaultJobMaxActivePerUser)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if n != defaultJobMaxActive {
+		t.Errorf("defaultJobMaxActive = %d, settings default = %d", defaultJobMaxActive, n)
 	}
 }

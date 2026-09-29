@@ -105,7 +105,7 @@ describe("runKindLabel", () => {
     expect(runKindLabel("mr_rework")).toBe("MR rework");
   });
 
-  it("maps job to the 'Job' label (PRD #1908)", () => {
+  it("maps job to the 'job' label (PRD #1908)", () => {
     expect(runKindLabel("job")).toBe("job");
   });
 });

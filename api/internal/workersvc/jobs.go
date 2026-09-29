@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -15,6 +17,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -207,6 +210,12 @@ type jobCapSettings interface {
 	JobMaxActivePerUser(ctx context.Context) (int, error)
 }
 
+// Compile-time proof that the production settings reader exposes the cap accessor, so the
+// jobMaxActive type assertion below can never silently stop matching.
+var _ jobCapSettings = (*settings.Cache)(nil)
+
+var jobCapFallbackWarn sync.Once
+
 func (s *Service) jobMaxActive(ctx context.Context) (int, error) {
 	if r, ok := s.healthSettings.(jobCapSettings); ok && r != nil {
 		n, err := r.JobMaxActivePerUser(ctx)
@@ -218,6 +227,10 @@ func (s *Service) jobMaxActive(ctx context.Context) (int, error) {
 		}
 		return n, nil
 	}
+	jobCapFallbackWarn.Do(func() {
+		slog.Warn("job active cap: settings reader does not expose JobMaxActivePerUser; using the built-in default",
+			"default", defaultJobMaxActive)
+	})
 	return defaultJobMaxActive, nil
 }
 
@@ -302,7 +315,7 @@ func validateCreateJob(p CreateJobParams) (validatedJob, error) {
 		if w > budgetWallCeilingSeconds {
 			w = budgetWallCeilingSeconds
 		}
-		v.wall = pgtype.Int4{Int32: int32(w), Valid: true} //nolint:gosec // G115: clamped to budgetWallCeilingSeconds (28800) above
+		v.wall = pgtype.Int4{Int32: int32(w), Valid: true}
 	}
 	return v, nil
 }
@@ -330,6 +343,15 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 	v, err := validateCreateJob(p)
 	if err != nil {
 		return JobView{}, err
+	}
+	if p.Caller.ProductID != nil && p.Caller.ProductTokenID == nil {
+		// The revoke sweep keys on the token id; a product job without one could never be revoked.
+		return JobView{}, jobInvalid("caller", "a product caller requires its token id")
+	}
+	if _, live := s.q.(*store.Queries); live && s.txBeginner == nil {
+		// Without a transaction createRunAtomic's no-tx branch would split the advisory lock, the
+		// cap check and the inserts apart. Fail closed rather than lose the cap's atomicity.
+		return JobView{}, errHarnessStoreUnavailable
 	}
 	maxActive, err := s.jobMaxActive(ctx)
 	if err != nil {
@@ -386,7 +408,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		}
 		for i, in := range v.inputs {
 			if err := qq.CreateJobInput(ctx, store.CreateJobInputParams{
-				RunID: run.ID, Ordinal: int32(i), Name: in.Name, ContentMd: in.Content, //nolint:gosec // G115: i < maxJobInputs (20)
+				RunID: run.ID, Ordinal: int32(i), Name: in.Name, ContentMd: in.Content,
 			}); err != nil {
 				return store.Run{}, err
 			}
@@ -410,7 +432,7 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		JobType:           p.JobType,
 		Status:            JobStatus(run.Status),
 		Title:             run.IssueTitle,
-		BudgetWallSeconds: intPtr32(run.BudgetWallSeconds),
+		BudgetWallSeconds: intPtr(run.BudgetWallSeconds),
 		RequestedByLabel:  v.label,
 		CreatedAt:         run.CreatedAt.Time,
 		UpdatedAt:         run.UpdatedAt.Time,
@@ -423,14 +445,6 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		view.CreatedAt = originCreatedAt.Time
 	}
 	return view, nil
-}
-
-func intPtr32(v pgtype.Int4) *int {
-	if !v.Valid {
-		return nil
-	}
-	n := int(v.Int32)
-	return &n
 }
 
 func timePtrTz(t pgtype.Timestamptz) *time.Time {
@@ -449,23 +463,15 @@ func uuidPtrPg(u pgtype.UUID) *uuid.UUID {
 	return &v
 }
 
-func textPtrPg(t pgtype.Text) *string {
-	if !t.Valid {
-		return nil
-	}
-	v := t.String
-	return &v
-}
-
 func jobViewFromRow(f store.ListJobsForCallerRow) JobView {
 	v := JobView{
 		ID:                f.ID,
 		JobType:           f.JobType.String,
 		Status:            JobStatus(f.Status),
 		Title:             f.Title,
-		FailOrigin:        textPtrPg(f.FailOrigin),
-		BudgetWallSeconds: intPtr32(f.BudgetWallSeconds),
-		RequestedByLabel:  textPtrPg(f.RequestedByLabel),
+		FailOrigin:        textPtr(f.FailOrigin),
+		BudgetWallSeconds: intPtr(f.BudgetWallSeconds),
+		RequestedByLabel:  textPtr(f.RequestedByLabel),
 		ProductID:         uuidPtrPg(f.ProductID),
 		ProductTokenID:    uuidPtrPg(f.ProductTokenID),
 		CreatedAt:         f.CreatedAt.Time,
@@ -527,7 +533,7 @@ func (s *Service) ListJobsForCaller(ctx context.Context, caller JobCaller, curso
 	if limit > maxJobListLimit {
 		limit = maxJobListLimit
 	}
-	params := store.ListJobsForCallerParams{UserID: caller.UserID, ProductID: caller.product(), Lim: int32(limit) + 1} //nolint:gosec // G115: limit <= maxJobListLimit
+	params := store.ListJobsForCallerParams{UserID: caller.UserID, ProductID: caller.product(), Lim: int32(limit) + 1}
 	if cursor != nil {
 		params.CursorCreatedAt = pgtype.Timestamptz{Time: cursor.CreatedAt, Valid: true}
 		params.CursorID = pgconv.UUID(cursor.ID)
@@ -573,7 +579,7 @@ func (s *Service) GetJobResult(ctx context.Context, caller JobCaller, runID uuid
 	}
 	findings := make([]JobFindingView, 0, len(rows))
 	for _, f := range rows {
-		fv := JobFindingView{Ordinal: int(f.Ordinal), Severity: f.Severity, MessageMD: f.MessageMd, URL: textPtrPg(f.Url), File: textPtrPg(f.File)}
+		fv := JobFindingView{Ordinal: int(f.Ordinal), Severity: f.Severity, MessageMD: f.MessageMd, URL: textPtr(f.Url), File: textPtr(f.File)}
 		if f.Line.Valid {
 			n := int(f.Line.Int32)
 			fv.Line = &n
@@ -609,7 +615,7 @@ func (s *Service) ListJobMessages(ctx context.Context, caller JobCaller, runID u
 		limit = maxJobMessageLimit
 	}
 	rows, err := q.ListJobMessagesForCaller(ctx, store.ListJobMessagesForCallerParams{
-		RunID: runID, AfterSeq: afterSeq, UserID: caller.UserID, ProductID: caller.product(), Lim: int32(limit), //nolint:gosec // G115: limit <= maxJobMessageLimit
+		RunID: runID, AfterSeq: afterSeq, UserID: caller.UserID, ProductID: caller.product(), Lim: int32(limit),
 	})
 	if err != nil {
 		return nil, err

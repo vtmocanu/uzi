@@ -207,6 +207,12 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
 	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
 	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	// PRD #1908 D-E: a job is never extended, on ANY extend path. Refuse it here, above the
+	// budget_exhausted wall-park branch (which routes to ExtendAndResumeWallPark with no kind
+	// filter) and the generic CTE (whose kind list admits a job).
+	if kind == "extend" && run.Kind == runkind.Job {
+		return SubmitInputResult{}, extendRefusalReason(run, 0, 0)
+	}
 	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 		switch kind {
 		case "extend":
@@ -311,10 +317,6 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		secs, err := strconv.Atoi(strings.TrimSpace(body))
 		if err != nil || secs < 60 || secs > math.MaxInt32 {
 			return SubmitInputResult{}, ErrInvalidExtension
-		}
-		// PRD #1908 D-E: refuse a job before touching the cap or the CTE (whose kind list admits it).
-		if run.Kind == runkind.Job {
-			return SubmitInputResult{}, extendRefusalReason(run, secs, 0)
 		}
 		capSeconds, err := s.runExtensionCap(ctx)
 		if err != nil {

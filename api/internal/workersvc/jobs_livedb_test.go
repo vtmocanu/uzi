@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -525,6 +526,12 @@ func TestCancelJobLiveDB(t *testing.T) {
 	if _, err := e.svc.SubmitInput(e.ctx, u, v.ID, "extend", "7200", nil); !errors.Is(err, ErrExtendNotTimed) {
 		t.Errorf("extend of a job err = %v, want ErrExtendNotTimed", err)
 	}
+	// ... including on the budget_exhausted wall-park path, which has its own extend branch.
+	e.exec(`UPDATE runs SET status = 'paused', hold_reason = 'budget_exhausted' WHERE id = $1`, v.ID)
+	if _, err := e.svc.SubmitInput(e.ctx, u, v.ID, "extend", "7200", nil); !errors.Is(err, ErrExtendNotTimed) {
+		t.Errorf("wall-park extend of a job err = %v, want ErrExtendNotTimed", err)
+	}
+	e.exec(`UPDATE runs SET status = 'queued', hold_reason = NULL WHERE id = $1`, v.ID)
 	if _, err := e.svc.SubmitInput(e.ctx, u, v.ID, "pause", "now", nil); !errors.Is(err, ErrPauseNotRunning) && !errors.Is(err, ErrPauseNotSupported) {
 		t.Errorf("pause of a queued job err = %v, want a pause refusal", err)
 	}
@@ -605,6 +612,16 @@ func TestListJobMessagesProjectionLiveDB(t *testing.T) {
 	var seqs []int
 	for _, m := range out {
 		seqs = append(seqs, m.Seq)
+		switch m.Seq {
+		case 1:
+			if m.Text != "working on it" {
+				t.Errorf("seq 1 text = %q, want %q (a wrong JSON key in the projection yields an empty text)", m.Text, "working on it")
+			}
+		case 5:
+			if !strings.Contains(m.Text, "[redacted]") || !strings.Contains(m.Text, "leaked") {
+				t.Errorf("seq 5 text = %q, want the secret replaced by the redaction marker", m.Text)
+			}
+		}
 		if got := m.Text; got != "" && containsSecret(got, secret) {
 			t.Errorf("message %d leaked the secret: %q", m.Seq, got)
 		}
@@ -673,4 +690,19 @@ var explicitJobStatus = map[string]bool{
 	"queued": true, "claimed": true, "running": true, "awaiting_approval": true, "awaiting_input": true,
 	"awaiting_followup": true, "pool_wait": true, "paused": true, "limit_wait": true, "recovery_wait": true,
 	"completed": true, "failed": true, "cancelled": true,
+}
+
+// TestCreateJobRunProductWithoutTokenLiveDB: a product caller with no token id is refused (the
+// revoke sweep keys on the token id) and leaves no run behind.
+func TestCreateJobRunProductWithoutTokenLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	u := e.seedJobUser(t)
+	prod := uuid.New()
+	_, err := e.svc.CreateJobRun(e.ctx, jobReq(JobCaller{UserID: u, ProductID: &prod}))
+	if !errors.Is(err, ErrJobInvalid) {
+		t.Fatalf("product caller without token err = %v, want ErrJobInvalid", err)
+	}
+	if n := e.jobCount(t, u); n != 0 {
+		t.Errorf("job rows = %d, want 0", n)
+	}
 }
