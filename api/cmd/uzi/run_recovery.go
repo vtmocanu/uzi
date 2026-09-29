@@ -2,12 +2,14 @@ package main
 
 // run_recovery.go is `uzi run recovery` and `uzi run discard` (PRD #1349 M5, D7/D9): the
 // owner-side custody-hold LIST and exact hold DISCARD. `run recovery` fetches the owner-wide
-// custody holds (GET /api/recovery/holds), narrows them to one run client-side, and renders
-// each hold's exact id, generation, server-derived disposition (attention) and latest capture
-// state. `run discard` targets ONE exact hold (DELETE .../recovery-holds/<hold>?confirm=discard,
-// which the client always sends); it requires an interactive confirmation when --yes is absent
-// and HARD-REFUSES when --yes is absent and stdin is not a TTY, so a possible only copy is never
-// destroyed without a human decision. A cancelled/declined prompt performs NO mutation.
+// custody holds (GET /api/recovery/holds) once. With a run id it narrows them to that run
+// client-side and renders each hold's exact id, generation, server-derived disposition
+// (attention) and latest capture state; with none it lists every open hold across runs (all
+// states under --json). `run discard` targets ONE exact hold
+// (DELETE .../recovery-holds/<hold>?confirm=discard, which the client always sends); it
+// requires an interactive confirmation when --yes is absent and HARD-REFUSES when --yes is
+// absent and stdin is not a TTY, so a possible only copy is never destroyed without a human
+// decision. A cancelled/declined prompt performs NO mutation.
 
 import (
 	"bufio"
