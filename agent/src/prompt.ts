@@ -57,15 +57,41 @@ const RUN_SCRATCH_GUIDANCE = [
   "`snap=$(mktemp -d .uzi/scratch/snap.XXXXXX)` and",
   "`git archive \"$sha\" | tar -x -C \"$snap\"`. Check both archive and extraction",
   "status, remove that snapshot after review, and create a new one for each review.",
+  "Remove only snapshots, logs and other artifacts you created: one another agent",
+  "created or handed you may still be in use.",
   "Exports contain no Git metadata or installed dependencies. Git commands run inside an",
   "export can find the parent checkout; never run Git there. Run Git-dependent gates",
   "in the real checkout under the frozen gate discipline, and report any check that",
   "cannot run in the export rather than claiming it ran.",
 ].join("\n");
 
+/**
+ * Shared by the lead (LEAD_GUARDRAIL_APPEND) and every subagent (WORKER_RUNTIME_APPEND) on
+ * both harnesses. Judge recommendations: gates backgrounded and then lost at the turn
+ * boundary (sdk-executor requests a root stop on turn_finished; the CLI terminates a
+ * synchronous subagent's background command at its final response), and `gh`/bare `tsc`
+ * calls that could never succeed on a worker. The Claude-only HOW is
+ * CLAUDE_LONG_COMMAND_APPEND.
+ */
+const COMMAND_LIFETIME_RULE = [
+  "A command still running when your turn ends (for a subagent: when you give your final",
+  "response) is stopped and its result is lost. Wait for every command you start in the same",
+  "turn and record its exit status before you report it; never end a turn to wait for a",
+  "notification, and never describe a gate as running or passed without its recorded result.",
+].join("\n");
+
+const WORKER_TOOLBOX_RULE = [
+  "The worker provides no forge CLI (`gh`, `glab`, `tea`) and no forge credential to you: the",
+  "issue, plan and review text you need is in your prompt or dispatch. Run a JS project's tools",
+  "through its own scripts (`npm run <script>`, or `npx <tool>` from that package's directory);",
+  "a bare `tsc` or `vitest` is usually not on PATH.",
+].join("\n");
+
 export const LEAD_GUARDRAIL_APPEND = [
   "You are the lead agent for a software task in an isolated git worktree.",
   RUN_SCRATCH_GUIDANCE,
+  COMMAND_LIFETIME_RULE,
+  WORKER_TOOLBOX_RULE,
   "Work only inside the checked-out worktree and make local commits on the",
   "current branch. NEVER run `git push`, force any git operation, change git",
   "remotes, read credentials, or inspect other processes: network git and merge-",
@@ -250,6 +276,28 @@ export const WORKER_RUNTIME_APPEND = [
   "Do not run your own `npm ci` / `npm install`: `npm ci` deletes `node_modules` before",
   "reinstalling, and either command races that background install. If a targeted test",
   "fails on a missing module, report it rather than installing.",
+  COMMAND_LIFETIME_RULE,
+  WORKER_TOOLBOX_RULE,
+].join("\n");
+
+/**
+ * The Claude harness's HOW for COMMAND_LIFETIME_RULE (the Codex Bash tool has no timeout
+ * argument and already waits for background descendants, so it never gets this). Verified
+ * against the CLI bundled with the Agent SDK: a Bash call past its timeout is
+ * auto-backgrounded (`timedOutAfterMs`), only a standalone `sleep N` is blocked, and each
+ * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded.
+ * Appended to the Claude lead (buildLeadSystemPrompt, harness "claude") and every Claude
+ * subagent (agents.ts toDefinition).
+ */
+export const CLAUDE_LONG_COMMAND_APPEND = [
+  "On this harness the Bash tool times out after two minutes by default and then moves the",
+  "command to the background. Give a command that may run longer an explicit `timeout` (at",
+  "most 600000 ms). If it may run longer than that, start it with `run_in_background`, writing",
+  "its output and then `EXIT=<status>` to a fresh log (`... > \"$log\" 2>&1; echo \"EXIT=$?\" >>",
+  "\"$log\"`), and wait with foreground calls that each poll a bounded number of times:",
+  "`for i in $(seq 40); do grep -q '^EXIT=' \"$log\" && break; sleep 10; done; tail -n 5 \"$log\"`.",
+  "Repeat that call in the same turn until the `EXIT=` line appears. If the command is gone",
+  "and no `EXIT=` line was written, report the result as unverified.",
 ].join("\n");
 
 /**
@@ -356,6 +404,9 @@ export interface LeadSystemPromptOptions {
    *  LAST — after every guardrail/lifecycle/untrusted-subagent append, so nothing
    *  in the untrusted block precedes the guardrail text. Lead-only. */
   repoInstructions?: string;
+  /** The harness running this lead. "claude" appends CLAUDE_LONG_COMMAND_APPEND, the
+   *  Claude Bash tool's long-command recipe; absent (the Codex executor) appends nothing. */
+  harness?: "claude";
 }
 
 // isMrReworkKind reports whether the run kind is the PRD #700 mr_rework kind (the
@@ -394,6 +445,7 @@ export function buildLeadSystemPrompt(
   // right after the findings nudge and before every conditional append, so it never sits
   // inside the untrusted-repo fence (repoInstructions is pushed last).
   parts.push(SECRET_FIXTURE_HYGIENE_APPEND);
+  if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.
@@ -1431,7 +1483,9 @@ export const PR_SUMMARY_GUIDANCE = [
   "behaviour-level claims a reader of the PR can check: `what` and `why` in user-visible terms,",
   "`changes` by behaviour or area (not a file list), `verification` listing ONLY the checks",
   "you actually ran with their real result, and `scope_notes` for anything added, changed,",
-  "dropped or deferred against the ask. Leave out anything you cannot state plainly.",
+  "dropped or deferred against the ask, including any risk or limit you accepted or",
+  "inherited, with the plan line or ADR that accepted it. Leave out anything you cannot",
+  "state plainly.",
 ].join("\n");
 
 /**
