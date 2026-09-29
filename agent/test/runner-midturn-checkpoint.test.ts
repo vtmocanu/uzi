@@ -789,10 +789,12 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       assert.ok(feed.includes("checkpoint publish skipped: secret_found"), JSON.stringify(feed));
       assert.ok(!JSON.stringify(api.messages(claim.run_id)).includes(secret), "the secret never reaches the feed");
       const warn = lines.find((l) => l.msg === "checkpoint publish skipped: secret_found") as
-        | { findings?: Array<{ rule_id: string; path: string }> }
+        | { findings?: string[] }
         | undefined;
-      assert.equal(warn?.findings?.[0]?.rule_id, "github-pat");
-      assert.equal(warn?.findings?.[0]?.path, "config.env");
+      // issue #1932: findings are logged as rendered (validated, escaped) labels, never raw fields.
+      const label = warn?.findings?.[0] ?? "";
+      assert.ok(label.includes("config.env"), label);
+      assert.ok(label.includes("(rule github-pat)"), label);
       assert.ok(!JSON.stringify(lines).includes(secret), "the secret never reaches the run log");
       assert.ok(shimCalls(shim).length >= 1, "the shim scanned");
     } finally {
