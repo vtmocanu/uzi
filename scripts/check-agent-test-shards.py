@@ -49,11 +49,11 @@ def check_reports(report_dir, expected):
     present = {p.name for p in report_dir.glob("*.xml")}
     if present != set(REPORTS):
         errors.append(f"expected exactly {', '.join(REPORTS)}; found {', '.join(sorted(present)) or '(none)'}")
-    marker = report_dir / "shard-2.codex-m4"
+    marker = report_dir / "shard-1.codex-m4"
     if not marker.is_file() or marker.read_text().strip() != "passed":
-        errors.append("Codex M4 did not complete in shard 2")
-    if (report_dir / "shard-1.codex-m4").exists():
-        errors.append("Codex M4 also ran in shard 1")
+        errors.append("Codex M4 did not complete in shard 1")
+    if (report_dir / "shard-2.codex-m4").exists():
+        errors.append("Codex M4 also ran in shard 2")
     for name in REPORTS:
         path = report_dir / name
         if not path.is_file():
@@ -102,18 +102,18 @@ def self_test():
         directory = Path(tmp)
         write(directory / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
         write(directory / REPORTS[1], ["agent/test/b.test.ts"])
-        (directory / "shard-2.codex-m4").write_text("passed\n")
+        (directory / "shard-1.codex-m4").write_text("passed\n")
         errors, _ = check_reports(directory, expected)
         if errors:
             raise RuntimeError(f"self-test failed: valid disjoint union was refused; errors={errors}")
-        (directory / "shard-2.codex-m4").unlink()
+        (directory / "shard-1.codex-m4").unlink()
         errors, _ = check_reports(directory, expected)
         require(errors, "did not complete", "missing M4 run went unnoticed")
-        (directory / "shard-2.codex-m4").write_text("passed\n")
         (directory / "shard-1.codex-m4").write_text("passed\n")
+        (directory / "shard-2.codex-m4").write_text("passed\n")
         errors, _ = check_reports(directory, expected)
         require(errors, "also ran", "duplicate M4 run went unnoticed")
-        (directory / "shard-1.codex-m4").unlink()
+        (directory / "shard-2.codex-m4").unlink()
         write(directory / REPORTS[1], ["agent/test/a.test.ts", "agent/test/b.test.ts"])
         errors, _ = check_reports(directory, expected)
         require(errors, "both shards", "duplicate shard index went unnoticed")
