@@ -127,8 +127,8 @@ const GROUP_MAX = 50;
 function groupFileIneligibility(rows: IncidentalFinding[]): string {
   if (rows.length < 2) return "Select at least 2 findings to file as one issue.";
   if (rows.length > GROUP_MAX) return `Select at most ${GROUP_MAX} findings to file as one issue.`;
-  // A row claimed by an unfinished group filing has status "filing" and group_operation_id set, so
-  // this check is defence in depth; it runs first so its reason wins over "only open".
+  // A row claimed by an unfinished group filing has status "filing" (not selectable at all) and
+  // group_operation_id set, so this check is defence in depth.
   if (rows.some((r) => r.group_operation_id)) return "A selected finding is already being filed as a group.";
   if (rows.some((r) => r.status !== "open")) return "Only open findings can be filed as one issue.";
   if (rows.some((r) => !r.finding_id)) return "Some selected findings have no evidence to file.";

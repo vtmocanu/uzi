@@ -3880,7 +3880,7 @@ export interface FindingGroupDraft {
 
 // FindingGroupFileResult is the POST /api/findings/issue response (issue #1724). 201 carries
 // `issue` (phase settled or a settled-with-warning); 202 omits it when the forge outcome is
-// uncertain or stopped, and `warning` then says to inspect the forge before retrying.
+// uncertain or stopped, and `warning` then says to inspect the forge before releasing this operation.
 export interface FindingGroupFileResult {
   operation_id: string;
   disposition_ids: string[];

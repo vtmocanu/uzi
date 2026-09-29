@@ -9,6 +9,7 @@ import {
   api,
   ApiError,
   type IncidentalFinding,
+  type Repo,
   type IncidentalFindingBacklog,
   type TriageCounts,
 } from "../lib/api";
@@ -903,7 +904,7 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     mockApi.fileFindingGroup.mockResolvedValue({
       operation_id: "op-202",
       disposition_ids: ["d1", "d2"],
-      phase: "uncertain",
+      phase: "returned_uncertain",
       warning: "Outcome unknown, inspect the forge before retrying.",
     });
     await renderAll();
@@ -911,7 +912,7 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Beta bug");
     fireEvent.click(groupButton());
     fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
-    await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202 \(uncertain\)\./);
+    await screen.findByText(/Outcome unknown, inspect the forge before retrying\. Operation op-202 \(returned_uncertain\)\./);
     expect(screen.getByText(/uzi findings release op-202 --confirm-no-issue/)).toBeTruthy();
     expect(screen.getByText(/deadline has passed/)).toBeTruthy();
     expect(screen.getByText(/Check the forge/)).toBeTruthy();
@@ -1025,6 +1026,32 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     resolveReload(backlog({ bucket: "all", findings: rows }));
     await screen.findByText("Alpha bug");
     expect(screen.getByDisplayValue("my edit")).toBeTruthy();
+  });
+
+  it("closes the open group card when the bucket tab changes", async () => {
+    openDraft();
+    await renderAll();
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    await screen.findByRole("button", { name: "Create issue" });
+    fireEvent.click(screen.getByRole("tab", { name: /^To triage/ }));
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull());
+  });
+
+  it("closes the open group card when the repo filter changes", async () => {
+    openDraft();
+    mockApi.listRepos.mockResolvedValue({
+      repos: [{ id: "repo-uzi", path_with_namespace: "vtmocanu/uzi" } as Repo],
+    });
+    await renderAll();
+    await screen.findByRole("option", { name: "vtmocanu/uzi" });
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    await screen.findByRole("button", { name: "Create issue" });
+    fireEvent.change(screen.getByLabelText(/repo/i), { target: { value: "repo-uzi" } });
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Create issue" })).toBeNull());
   });
 
   it("ticking another row while the card is open cannot post ids under the old draft", async () => {
