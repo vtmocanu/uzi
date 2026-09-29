@@ -190,19 +190,29 @@ func TestFindingsFileGroup409NamesNonOpenCoordinate(t *testing.T) {
 }
 
 func TestFindingsFileGroupTooManyDistinctIDs(t *testing.T) {
+	// The cap counts DISTINCT input ids: 50 distinct ids plus repeats (52 args) is allowed and
+	// reaches the group POST with exactly 50 disposition ids.
 	fc := groupFake()
+	okArgs := []string{"findings", "file"}
+	for i := 0; i < 50; i++ {
+		ev := "ev-" + strconv.Itoa(i)
+		fc.FindingDrafts[ev] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "dd-" + strconv.Itoa(i)}
+		okArgs = append(okArgs, ev)
+	}
+	okArgs = append(okArgs, "ev-0", "ev-1")
+	if _, _, code := runCLI(t, fakeEnv(fc), okArgs...); code != uzicli.ExitOK || len(fc.LastFileFindingGroupIDs) != 50 {
+		t.Errorf("50 distinct + repeats: exit=%d group ids=%d, want 0 and 50", code, len(fc.LastFileFindingGroupIDs))
+	}
+
+	// 51 distinct ids are refused before any draft lookup or POST.
+	fc2 := groupFake()
 	args := []string{"findings", "file"}
 	for i := 0; i < 51; i++ {
 		args = append(args, "e-"+strconv.Itoa(i))
 	}
-	// Repeated ids do not count toward the cap: 51 args with duplicates is still allowed.
-	dupArgs := append([]string{"findings", "file"}, "e-1", "e-2", "e-1", "e-2")
-	if _, _, code := runCLI(t, fakeEnv(groupFake()), dupArgs...); code != uzicli.ExitOK {
-		t.Errorf("duplicates within the cap: exit = %d", code)
-	}
-	_, _, code := runCLI(t, fakeEnv(fc), args...)
-	if code != uzicli.ExitUsage || len(fc.LastFindingDraftIDs) != 0 || fc.LastFileFindingGroupIDs != nil {
-		t.Errorf("exit=%d drafts=%d group=%v", code, len(fc.LastFindingDraftIDs), fc.LastFileFindingGroupIDs)
+	_, _, code := runCLI(t, fakeEnv(fc2), args...)
+	if code != uzicli.ExitUsage || len(fc2.LastFindingDraftIDs) != 0 || fc2.LastFileFindingGroupIDs != nil {
+		t.Errorf("exit=%d drafts=%d group=%v", code, len(fc2.LastFindingDraftIDs), fc2.LastFileFindingGroupIDs)
 	}
 }
 

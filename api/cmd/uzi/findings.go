@@ -421,8 +421,8 @@ func runFindingsDismiss(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Co
 	return nil
 }
 
-// maxGroupFindings is the server's cap on one group filing; the CLI refuses more input ids
-// before any request so the draft lookups stay bounded.
+// maxGroupFindings is the server's cap on one group filing. The CLI refuses more than this many
+// DISTINCT input ids (repeats do not count) before any request so the draft lookups stay bounded.
 const maxGroupFindings = 50
 
 // releaseHint is the operator guidance shared by every unsettled group filing report.
