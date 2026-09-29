@@ -264,6 +264,10 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 /etc/uzi/ca
 {{- end -}}
 
+{{- define "uzi.controllerFetcherCADir" -}}
+/etc/uzi/fetcher-ca
+{{- end -}}
+
 {{- /*
   uzi.apiHostingEnabled: whether the API turns its hosted-worker surface on
   (WORKER_HOSTING_ENABLED — the provision endpoints, the quota setting, the UI's
@@ -406,3 +410,121 @@ true
 {{- fail (printf "workers.fqdnEgress.provider %q is not supported; use \"antrea\" (crd.antrea.io NetworkPolicy) or \"ovn\" (k8s.ovn.org EgressFirewall + a NetworkPolicy external allow)." $p) }}
 {{- end }}
 {{- end }}
+
+{{- /*
+  The isolated lane (PRD #1906 M6): a third worker namespace with no internet, and the
+  uzi-fetcher Deployment that is its only content path. Everything the lane adds renders
+  only when uzi.isolatedLaneEnabled is non-empty, so a default install renders no new object.
+*/ -}}
+{{- define "uzi.isolatedLaneEnabled" -}}
+{{- if and .Values.workers.enabled .Values.workers.isolatedLane.enabled -}}
+true
+{{- end -}}
+{{- end -}}
+
+{{- define "uzi.fetcherName" -}}
+{{- printf "%s-fetcher" (include "uzi.fullname" .) -}}
+{{- end -}}
+
+{{- /*
+  uzi.fetcherURL: the base URL a lane worker dials. The FQDN in the RELEASE namespace, for
+  the same two reasons as uzi.apiInClusterURL: the lane is another namespace (a short name
+  does not resolve there), and the name must be one the fetcher's certificate carries.
+*/ -}}
+{{- define "uzi.fetcherURL" -}}
+{{- printf "https://%s.%s.svc.%s:%v" (include "uzi.fetcherName" .) .Release.Namespace .Values.api.tls.clusterDomain .Values.workers.isolatedLane.fetcher.port -}}
+{{- end -}}
+
+{{- /*
+  uzi.fetcherTLSSecretName: the fetcher's serving pair (tls.crt, tls.key) and ca.crt, the
+  CA that signed it. Written by the fetcher Certificate when cert-manager issues the api's
+  certificate; otherwise a pre-created Secret named by isolatedLane.fetcher.tls.secretName.
+*/ -}}
+{{- define "uzi.fetcherTLSSecretName" -}}
+{{- if .Values.workers.isolatedLane.fetcher.tls.secretName -}}
+{{- .Values.workers.isolatedLane.fetcher.tls.secretName -}}
+{{- else if .Values.api.tls.certManager.enabled -}}
+{{- printf "%s-tls" (include "uzi.fetcherName" .) -}}
+{{- else -}}
+{{- required "workers.isolatedLane.fetcher.tls.secretName is required when api.tls.certManager.enabled is false: the chart then issues no fetcher certificate, so point this at a PRE-CREATED Secret holding tls.crt + tls.key + ca.crt for the fetcher Service's names." .Values.workers.isolatedLane.fetcher.tls.secretName -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.fetcherToken: the fetcher's service token when the chart generates it
+  (isolatedLane.fetcher.token.source: generated). Reuses the value already stored in the
+  applied Secret, so a `helm upgrade` does not rotate it; otherwise a fresh 48-char token.
+  `lookup` returns nothing under `helm template` and under Argo CD, which renders with
+  `helm template`: there every render is a NEW token (see values.yaml, and use
+  source: existing for a GitOps install).
+*/ -}}
+{{- define "uzi.fetcherToken" -}}
+{{- $existing := lookup "v1" "Secret" .Release.Namespace (printf "%s-token" (include "uzi.fetcherName" .)) -}}
+{{- if and $existing (hasKey ($existing.data | default dict) "token") -}}
+{{- index $existing.data "token" | b64dec -}}
+{{- else -}}
+{{- randAlphaNum 48 -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.fetcherTokenSecret: the Secret and keys the fetcher token (a file in the fetcher)
+  and its hex sha256 (an env var in the api) come from, as JSON
+  {"name": ..., "tokenKey": ..., "hashKey": ...}.
+*/ -}}
+{{- define "uzi.fetcherTokenSecret" -}}
+{{- $t := .Values.workers.isolatedLane.fetcher.token -}}
+{{- if eq $t.source "existing" -}}
+{{- toJson (dict "name" .Values.infisical.app.managedSecretName "tokenKey" $t.tokenSecretKey "hashKey" $t.tokenHashSecretKey) -}}
+{{- else -}}
+{{- toJson (dict "name" (printf "%s-token" (include "uzi.fetcherName" .)) "tokenKey" "token" "hashKey" "token-sha256") -}}
+{{- end -}}
+{{- end -}}
+
+{{- /*
+  uzi.isolatedLaneBlockedCIDRs: the cluster's pod, service and node CIDRs, in that order, as
+  a JSON list. The fetcher refuses them itself (UZI_FETCHER_BLOCKED_CIDRS) and its
+  NetworkPolicy excludes them from the internet allow, so one list feeds both.
+*/ -}}
+{{- define "uzi.isolatedLaneBlockedCIDRs" -}}
+{{- $c := .Values.workers.isolatedLane.clusterCIDRs -}}
+{{- toJson (concat ($c.pod | default list) ($c.service | default list) ($c.node | default list)) -}}
+{{- end -}}
+
+{{- /*
+  uzi.validateIsolatedLane: every precondition of the lane, checked once, at render time.
+  Each one, left unchecked, renders a lane that is either unreachable or wider than
+  promised, and nothing else reports it.
+*/ -}}
+{{- define "uzi.validateIsolatedLane" -}}
+{{- $l := .Values.workers.isolatedLane -}}
+{{- if and $l.enabled (not .Values.workers.enabled) -}}
+{{- fail "workers.isolatedLane.enabled is true but workers.enabled is false. The lane is a hosted-worker namespace; turn on workers.enabled (and its controller) with it." -}}
+{{- end -}}
+{{- if include "uzi.isolatedLaneEnabled" . -}}
+{{- if not .Values.workers.fqdnEgress.enabled -}}
+{{- fail "workers.isolatedLane.enabled needs workers.fqdnEgress.enabled: the lane reaches its model host (workers.isolatedLane.modelHost) only through the FQDN egress provider (Antrea or OVN). Without it the lane's default-deny floor admits DNS, the api and the fetcher only, so every run there fails at its first model call." -}}
+{{- end -}}
+{{- if not .Values.api.tls.enabled -}}
+{{- fail "workers.isolatedLane.enabled needs api.tls.enabled: uzi-fetcher dials the api over https only (its service token and every run credential cross that hop), and workers.allowPlaintextAPI does not apply to it." -}}
+{{- end -}}
+{{- $c := $l.clusterCIDRs -}}
+{{- if or (not $c.pod) (not $c.service) (not $c.node) -}}
+{{- fail "workers.isolatedLane.enabled needs workers.isolatedLane.clusterCIDRs.pod, .service and .node (each a non-empty list): the fetcher's NetworkPolicy subtracts them from its internet allow and the fetcher refuses them itself, so an unset list leaves the fetcher able to reach in-cluster addresses at the network layer." -}}
+{{- end -}}
+{{- range fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) -}}
+{{- if not (regexMatch "^([0-9]{1,3}(\\.[0-9]{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:]*)/[0-9]{1,3}$" .) -}}
+{{- fail (printf "workers.isolatedLane.clusterCIDRs entry %q is not a CIDR (an address, a slash and a prefix length, e.g. 10.244.0.0/16 or fd00:10:244::/56)." .) -}}
+{{- end -}}
+{{- end -}}
+{{- if or (not $l.modelHost) (contains "*" $l.modelHost) -}}
+{{- fail (printf "workers.isolatedLane.modelHost must be one exact hostname (e.g. api.anthropic.com), got %q: the lane admits its model host by exact name only, never a wildcard." ($l.modelHost | toString)) -}}
+{{- end -}}
+{{- if or (eq $l.namespace .Values.workers.namespace) (eq $l.namespace .Values.workers.docker.namespace) (eq $l.namespace .Release.Namespace) -}}
+{{- fail (printf "workers.isolatedLane.namespace %q must be its own namespace, distinct from workers.namespace, workers.docker.namespace and the release namespace: the lane's default-deny policy selects every pod in it." $l.namespace) -}}
+{{- end -}}
+{{- if not (has $l.fetcher.token.source (list "generated" "existing")) -}}
+{{- fail (printf "workers.isolatedLane.fetcher.token.source must be generated or existing, got %q" ($l.fetcher.token.source | toString)) -}}
+{{- end -}}
+{{- end -}}
+{{- end -}}

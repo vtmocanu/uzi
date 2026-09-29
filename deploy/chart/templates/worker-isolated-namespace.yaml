@@ -1,0 +1,114 @@
+{{- include "uzi.validateIsolatedLane" . }}
+{{- if include "uzi.isolatedLaneEnabled" . }}
+{{- /*
+  The ISOLATED lane's namespace and admission envelope (PRD #1906 M6).
+
+  A third hosted-worker namespace, for runs bound to a site list. It mirrors
+  worker-docker-namespace.yaml's shape (namespace, quota, limits, the worker
+  ServiceAccount) with the opposite purpose: where the docker tier gets broad egress,
+  this one gets none. Its NetworkPolicy (worker-isolated-networkpolicy.yaml) admits DNS,
+  the api, uzi-fetcher and one model host, and nothing else.
+
+  WHY A SEPARATE NAMESPACE: the lane's default-deny policy selects EVERY pod in it, and
+  the controller's Role here is the same create-pods grant as elsewhere, so the blast
+  radius argument of worker-namespace.yaml applies verbatim. Park nothing else here.
+
+  WHAT LIVES HERE, stated exactly: run-bound lane workers, their per-worker token Secrets,
+  their PVCs, the lane's zero-permission worker ServiceAccount, and the pull secret
+  (worker-pull-secret.yaml). No forge credential: a lane run's claim carries none.
+*/ -}}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.workers.isolatedLane.namespace }}
+  annotations:
+    # Same wave as the other worker namespaces: the pull secret materialized into it
+    # must find it.
+    argocd.argoproj.io/sync-wave: "-20"
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+    # `restricted`, ENFORCED, and unconditionally: unlike worker-namespace.yaml this does
+    # not follow workers.uidSplit (PRD #1906 fixes the lane at the standard tier's
+    # restricted level), so a lane pod gets no root entry and no added capability.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/enforce-version: latest
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/audit-version: latest
+    pod-security.kubernetes.io/warn: restricted
+    pod-security.kubernetes.io/warn-version: latest
+    {{- if .Values.openshift.enabled }}
+    # OpenShift rewrites a namespace's pod-security labels to match the SCCs its
+    # ServiceAccounts can use unless this opts out; the labels above are the contract.
+    security.openshift.io/scc.podSecurityLabelSync: "false"
+    {{- end }}
+{{- if .Values.workers.isolatedLane.quota.enabled }}
+{{- /*
+  The lane's own ResourceQuota, the restricted tier's shape. Same side effect: a quota on
+  requests.cpu or requests.memory makes admission reject a pod with a container that
+  declares none, so the controller renders explicit requests on every container.
+*/}}
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "uzi.fullname" . }}-hosted-workers-isolated
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+spec:
+  hard:
+    requests.cpu: {{ .Values.workers.isolatedLane.quota.requestsCPU | quote }}
+    requests.memory: {{ .Values.workers.isolatedLane.quota.requestsMemory | quote }}
+    requests.storage: {{ .Values.workers.isolatedLane.quota.requestsStorage | quote }}
+    persistentvolumeclaims: {{ .Values.workers.isolatedLane.quota.persistentVolumeClaims | quote }}
+    count/deployments.apps: {{ .Values.workers.isolatedLane.quota.deployments | quote }}
+{{- end }}
+{{- if .Values.workers.isolatedLane.limitRange.enabled }}
+{{- /*
+  The backstop, never the source: every lane worker pod arrives from the controller with
+  explicit requests and limits. `max` must stay >= the largest worker preset's limits.
+*/}}
+---
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "uzi.fullname" . }}-hosted-workers-isolated
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+spec:
+  limits:
+    - type: Container
+      default:
+        {{- toYaml .Values.workers.isolatedLane.limitRange.default | nindent 8 }}
+      defaultRequest:
+        {{- toYaml .Values.workers.isolatedLane.limitRange.defaultRequest | nindent 8 }}
+      max:
+        {{- toYaml .Values.workers.isolatedLane.limitRange.max | nindent 8 }}
+    - type: PersistentVolumeClaim
+      max:
+        storage: {{ .Values.workers.isolatedLane.limitRange.maxPVCStorage | quote }}
+{{- end }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  # The lane's own zero-permission worker ServiceAccount: same name and same zero
+  # permissions as the other tiers' copies, in this namespace because a pod's
+  # serviceAccountName must name a SA in its own namespace. Bound to no Role anywhere.
+  name: {{ .Values.workers.serviceAccountName }}
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+# A lane worker that mounts no kube token cannot reach the apiserver even if this
+# namespace's RBAC were widened by mistake.
+automountServiceAccountToken: false
+{{- if .Values.workers.imagePullSecretName }}
+imagePullSecrets:
+  - name: {{ .Values.workers.imagePullSecretName }}
+{{- end }}
+{{- end }}

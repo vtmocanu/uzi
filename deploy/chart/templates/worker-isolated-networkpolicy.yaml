@@ -1,0 +1,80 @@
+{{- if include "uzi.isolatedLaneEnabled" . }}
+{{- /*
+  The isolated lane's floor (PRD #1906 M6): default-deny in both directions, and egress
+  to exactly three in-cluster destinations: cluster DNS, the api's worker port and
+  uzi-fetcher. The model host is the only external destination, and it is added by the
+  FQDN provider (worker-isolated-model-egress.yaml), never here.
+
+  WHAT IS DELIBERATELY ABSENT, compared with worker-networkpolicy.yaml:
+    * workers.networkPolicy.allowWebService: uzi's own web UI is content that does not
+      pass through the fetcher's site-list check;
+    * workers.networkPolicy.extraEgress: an appended rule is by construction a path the
+      lane's guarantee does not cover;
+    * the workers.networkPolicy.enabled gate: this floor IS the lane. A lane without it
+      is a namespace with default-allow egress, so it renders whenever the lane does.
+  scripts/assert-chart-render.sh fails the CI render if this policy grows a fourth rule,
+  an ipBlock, or a web peer.
+
+  ENFORCEMENT is CNI-dependent, as for every policy here: kindnet enforces none.
+*/ -}}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-isolated-default-deny
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+spec:
+  # Empty podSelector: every pod in the lane namespace, including anything that arrives
+  # later. The floor must not depend on a label the controller remembers to set.
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+  # Nothing dials a lane worker.
+  ingress: []
+  egress:
+    # DNS, the same peer as the restricted tier's. Also what lets the FQDN provider learn
+    # the model host's addresses (Antrea snoops the responses).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.workers.networkPolicy.dns.podSelector | nindent 14 }}
+      ports:
+        {{- range .Values.workers.networkPolicy.dns.ports }}
+        - protocol: UDP
+          port: {{ . }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    # The api's worker port (register, claim, heartbeat, the run's own routes).
+    # Selector-based: an FQDN rule cannot match an in-cluster Service.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    # uzi-fetcher, on its container port (the policy sees the post-DNAT pod address and
+    # port). The lane's only path to web content.
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Release.Namespace }}
+          podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: fetcher
+      ports:
+        - protocol: TCP
+          port: {{ .Values.workers.isolatedLane.fetcher.port }}
+{{- end }}

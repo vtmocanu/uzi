@@ -102,5 +102,32 @@ spec:
         - protocol: TCP
           port: {{ include "uzi.workerAPIPort" . }}
     {{- end }}
+
+    {{- if include "uzi.isolatedLaneEnabled" . }}
+    # 4. Isolated-lane worker pods (the THIRD worker namespace, PRD #1906 M6) -> api.
+    #    Same AND-scoping as rules 2 and 3, and for the same reason rule 3 exists: a
+    #    namespace this policy does not name is dropped by the default-deny.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.isolatedLane.namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uzi-hosted-worker
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+
+    # 5. uzi-fetcher (this namespace) -> api: the site-list check, the source log and
+    #    the per-run caps, all on the worker port behind the fetcher's service token.
+    - from:
+        - podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: fetcher
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    {{- end }}
     {{- end }}
 {{- end }}

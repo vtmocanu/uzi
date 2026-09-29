@@ -1048,6 +1048,113 @@ workers:
     # on a node whose root disk is itself too small. Re-derive what is left on
     # ephemeral storage before raising it again; see adr/1598-codex-command-storage.md.
     ephemeralRequest: 5Gi
+  # --- the isolated lane (PRD #1906 M6) ---------------------------------------------
+  #
+  # A THIRD worker namespace for runs bound to a site list: no internet. Its pods may
+  # reach exactly DNS, the api's worker port, uzi-fetcher (below) and ONE model host by
+  # exact name, and nothing else (worker-isolated-networkpolicy.yaml). Web content
+  # reaches a lane run only through uzi-fetcher, which checks every URL against the
+  # run's site list and logs every attempt.
+  #
+  # OFF by default, and off renders NO object at all: no namespace, no fetcher, no
+  # policy, no controller env, no api rule.
+  #
+  # TURNING IT ON REQUIRES (each is a render-time `fail`, uzi.validateIsolatedLane):
+  #   * workers.enabled and api.tls.enabled (the fetcher dials the api over https only);
+  #   * workers.fqdnEgress.enabled: the model host is admitted through the same Antrea
+  #     or OVN provider (workers.fqdnEgress.provider) the restricted tier uses. Under
+  #     provider ovn the lane's pair (external-egress NetworkPolicy + EgressFirewall)
+  #     renders only where the cluster serves k8s.ovn.org/v1 EgressFirewall; elsewhere
+  #     it is omitted and the lane cannot reach its model (fail-closed, not open);
+  #   * clusterCIDRs.pod, .service and .node, each non-empty (below).
+  #
+  # WHAT IS NOT A KNOB HERE, ON PURPOSE: the lane policy honours neither
+  # workers.networkPolicy.allowWebService nor workers.networkPolicy.extraEgress, and it
+  # is not gated on workers.networkPolicy.enabled. Each would be a path to content that
+  # does not go through the fetcher.
+  isolatedLane:
+    enabled: false
+    # The lane namespace. Pod Security `restricted` is ENFORCED there unconditionally
+    # (not relaxed by workers.uidSplit), so the controller must render lane pods with no
+    # root entry. Must differ from workers.namespace and workers.docker.namespace.
+    namespace: uzi-workers-isolated
+    # The ONE model host the lane may reach, by exact name (a `*` fails the render).
+    # Admitted on TCP 443 only. Enforced per resolved address, like every FQDN rule
+    # here: another host sharing the address is reachable too (ADR-0285). Change it
+    # only from a real failure.
+    modelHost: api.anthropic.com
+    # The cluster's own address ranges, IPv4 and IPv6 alike. REQUIRED with the lane on.
+    # uzi-fetcher's NetworkPolicy allows TCP 443 to 0.0.0.0/0 and ::/0 MINUS these
+    # (plus the fixed private, link-local, unique-local, NAT64, 6to4, Teredo and
+    # multicast ranges in worker-isolated-fetcher.yaml), and the fetcher refuses them
+    # itself (UZI_FETCHER_BLOCKED_CIDRS), so an internal destination is blocked twice.
+    # Example: pod: [10.244.0.0/16], service: [10.96.0.0/12], node: [192.0.2.0/24]
+    clusterCIDRs:
+      pod: []
+      service: []
+      node: []
+    # The lane's own ResourceQuota and LimitRange, the restricted tier's shape. Lane
+    # workers are run-bound (one run, then removed), so the fleet is sized small.
+    quota:
+      enabled: true
+      requestsCPU: "8"
+      requestsMemory: 48Gi
+      requestsStorage: 400Gi
+      persistentVolumeClaims: "20"
+      deployments: "10"
+    # `max` must stay >= the largest worker preset's limits and maxPVCStorage >= its
+    # /data and nix claims, exactly as for workers.limitRange above.
+    limitRange:
+      enabled: true
+      default:
+        cpu: "2"
+        memory: 4Gi
+      defaultRequest:
+        cpu: 500m
+        memory: 2Gi
+      max:
+        cpu: "4"
+        memory: 12Gi
+      maxPVCStorage: 25Gi
+    # uzi-fetcher: a Deployment in the RELEASE namespace running /fetcher from the api
+    # image (no new image). Lane workers dial it at
+    # https://<fullname>-fetcher.<release-ns>.svc.<clusterDomain>:<port>; it dials the
+    # api's worker port and, for content, TCP 443 on the internet minus clusterCIDRs.
+    fetcher:
+      replicaCount: 1
+      # The TLS listener (UZI_FETCHER_ADDR), the container port and the Service port.
+      port: 8443
+      resources:
+        requests:
+          cpu: 50m
+          memory: 64Mi
+        limits:
+          memory: 256Mi
+      # Empty => the fetcher's own defaults (25 MiB per file, 60s per fetch, 16
+      # concurrent fetches). maxFileBytes is a byte count; timeout a Go duration.
+      maxFileBytes: ""
+      timeout: ""
+      maxInflight: ""
+      tls:
+        # Empty => <fullname>-fetcher-tls, issued by the same issuer as the api's
+        # certificate (the chart CA unless api.tls.certManager.issuerRef names another).
+        # With api.tls.certManager.enabled false, name a PRE-CREATED Secret holding
+        # tls.crt, tls.key and ca.crt for the fetcher Service's names. Its ca.crt is the
+        # one trust anchor lane workers get for the fetcher (the controller relays it).
+        secretName: ""
+      # The fetcher's service token. The api holds only its sha256
+      # (UZI_FETCHER_TOKEN_SHA256), which must differ from the controller's.
+      #   generated (default): the chart creates <fullname>-fetcher-token with a random
+      #     token and its hash, reusing the stored value on `helm upgrade` (lookup).
+      #     Argo CD renders with `helm template`, where lookup returns nothing, so EVERY
+      #     sync would generate a new token: use `existing` for a GitOps install.
+      #   existing: the plaintext token and its hex sha256 are the two keys below in
+      #     infisical.app.managedSecretName (uzi-secrets), set like the controller's:
+      #       TOKEN=$(openssl rand -base64 32); printf '%s' "$TOKEN" | shasum -a 256
+      token:
+        source: generated
+        tokenSecretKey: UZI_FETCHER_TOKEN
+        tokenHashSecretKey: UZI_FETCHER_TOKEN_SHA256
   # The CNI-INDEPENDENT floor: default-deny both directions, plus the two in-cluster
   # destinations an FQDN rule structurally cannot express (AntreaProxy rewrites a
   # ClusterIP before policy enforcement, so FQDN cannot match a Service).

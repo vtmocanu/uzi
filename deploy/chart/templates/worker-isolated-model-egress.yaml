@@ -1,0 +1,113 @@
+{{- if include "uzi.isolatedLaneEnabled" . }}
+{{- $provider := .Values.workers.fqdnEgress.provider | default "antrea" }}
+{{- if eq $provider "antrea" }}
+{{- /*
+  The isolated lane's ONE external destination, Antrea-native (PRD #1906 M6): its model
+  host, by exact name, on TCP 443. Modelled on worker-fqdn-egress.yaml, with the
+  allow list cut down to that single name: no forge host (a lane claim carries no forge
+  credential), no package hosts, no wildcard (uzi.validateIsolatedLane refuses one).
+
+  The drop belt goes first for the same reason as there: an FQDN Allow admits whatever
+  addresses the DNS answer carried, so a hostile answer mapping the model host to the
+  metadata address would otherwise open it through this rule.
+
+  An Antrea Allow jumps past the k8s NetworkPolicy tables, so the lane floor
+  (worker-isolated-networkpolicy.yaml) needs no external rule of its own.
+*/ -}}
+apiVersion: crd.antrea.io/v1beta1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-isolated-model-egress
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+spec:
+  priority: {{ .Values.workers.fqdnEgress.priority }}
+  tier: {{ .Values.workers.fqdnEgress.tier }}
+  appliedTo:
+    - podSelector:
+        matchLabels:
+          app.kubernetes.io/name: uzi-hosted-worker
+  egress:
+    {{- range .Values.workers.fqdnEgress.denyCIDRs }}
+    - name: {{ .name }}
+      action: Drop
+      to:
+        - ipBlock:
+            cidr: {{ .cidr }}
+    {{- end }}
+    - name: allow-model-host
+      action: Allow
+      to:
+        - fqdn: {{ .Values.workers.isolatedLane.modelHost | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+{{- else if and (eq $provider "ovn") (.Capabilities.APIVersions.Has "k8s.ovn.org/v1/EgressFirewall") }}
+{{- /*
+  The same destination on OVN-Kubernetes, as the COMPOSED pair worker-ovn-egress.yaml
+  explains: (a) a NetworkPolicy opening the floor to external addresses on TCP 443 only
+  (0.0.0.0/0 minus fqdnEgress.ovn.exceptCIDRs), and (b) the lane namespace's
+  EgressFirewall `default` narrowing that to the model host. Either half alone is wrong,
+  so both sit behind ONE guard: where the cluster does not serve EgressFirewall, neither
+  renders and the lane reaches no external address at all (it fails closed: the first
+  model call times out), rather than (a) opening the internet unfiltered.
+*/}}
+{{- if not .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
+{{- fail "workers.fqdnEgress.provider is ovn but workers.fqdnEgress.ovn.exceptCIDRs is empty. The isolated lane's external-egress NetworkPolicy would then admit in-cluster pod, service and node addresses too. List the pod, service, node and link-local CIDRs." }}
+{{- end }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-isolated-external-egress
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: uzi-hosted-worker
+  policyTypes:
+    - Egress
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range .Values.workers.fqdnEgress.ovn.exceptCIDRs }}
+              - {{ . }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+---
+apiVersion: k8s.ovn.org/v1
+kind: EgressFirewall
+metadata:
+  # One per namespace, named `default`; this is the lane namespace's.
+  name: default
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+spec:
+  # First match wins: the deny belt, the model host, then deny everything else.
+  egress:
+    {{- range .Values.workers.fqdnEgress.denyCIDRs }}
+    - type: Deny
+      to:
+        cidrSelector: {{ .cidr }}
+    {{- end }}
+    - type: Allow
+      to:
+        dnsName: {{ .Values.workers.isolatedLane.modelHost | quote }}
+      ports:
+        - protocol: TCP
+          port: 443
+    - type: Deny
+      to:
+        cidrSelector: 0.0.0.0/0
+{{- end }}
+{{- end }}

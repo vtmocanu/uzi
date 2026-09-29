@@ -107,6 +107,15 @@ workers:
         ports: [443]
   networkPolicy:
     allowWebService: true
+  # The isolated lane (PRD #1906 M6), ON so the chart-render assertions see its namespace,
+  # its default-deny policy, its model-host rule, uzi-fetcher and the api's ingress rule for
+  # both. Dummy dual-stack CIDRs: the v6 entries exercise the per-family except split.
+  isolatedLane:
+    enabled: true
+    clusterCIDRs:
+      pod: [10.244.0.0/16, "fd00:10:244::/56"]
+      service: [10.96.0.0/12, "fd00:10:96::/112"]
+      node: [10.0.0.0/24]
 
 web:
   ingress:

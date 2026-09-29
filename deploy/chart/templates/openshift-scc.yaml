@@ -142,4 +142,41 @@ subjects:
     name: {{ .Values.workers.serviceAccountName }}
     namespace: {{ .Values.workers.docker.namespace }}
 {{- end }}
+{{- if include "uzi.isolatedLaneEnabled" . }}
+{{- /*
+  The isolated lane (PRD #1906 M6): its pods are rendered like the kube-native tier's
+  (uid 10001, restricted), so its worker SA gets the same minimal SCC.
+*/}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-isolated-scc
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+rules:
+  - apiGroups: ["security.openshift.io"]
+    resources: ["securitycontextconstraints"]
+    resourceNames: [{{ printf "%s-worker" (include "uzi.fullname" .) | quote }}]
+    verbs: ["use"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-worker-isolated-scc
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: worker-isolated
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uzi.fullname" . }}-worker-isolated-scc
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.workers.serviceAccountName }}
+    namespace: {{ .Values.workers.isolatedLane.namespace }}
+{{- end }}
 {{- end }}
