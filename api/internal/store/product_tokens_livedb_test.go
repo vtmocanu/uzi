@@ -19,7 +19,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Live-DB coverage for PRD #1907 M1 (migration 00269, queries/product_tokens.sql).
+// Live-DB coverage for PRD #1907 M1 (migration 00270, queries/product_tokens.sql).
 // Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via
 // e2e/run-store-it.sh. Every unique value (emails, product names, token hashes) is
 // derived from a fresh uuid, because the database is shared across packages.
@@ -252,7 +252,7 @@ func TestProductTokenAuthDeletedAtTermLiveDB(t *testing.T) {
 }
 
 // TestProductTokenSchemaConstraintsLiveDB pins the CHECKs and FK actions of migration
-// 00269: the scopes vocabulary and non-empty CHECKs, ON DELETE RESTRICT on product_id,
+// 00270: the scopes vocabulary and non-empty CHECKs, ON DELETE RESTRICT on product_id,
 // ON DELETE SET NULL on products.created_by, the deleted-is-disabled CHECK, and the
 // live-name partial unique index.
 func TestProductTokenSchemaConstraintsLiveDB(t *testing.T) {

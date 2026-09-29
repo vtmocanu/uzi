@@ -968,7 +968,7 @@ void _buildInfoFull;
 
 // ── Product tokens (PRD #1907 M1) ────────────────────────────────────────────
 // ZeroOf exemption: scopes — product_tokens.scopes is NOT NULL with a non-empty CHECK
-// (migration 00269), so every row the mappers build carries a non-empty array; the null
+// (migration 00270), so every row the mappers build carries a non-empty array; the null
 // is only the nil-slice zero marshal. The nested product_token in the mint response
 // carries the same exemption, spelled as a nested ZeroOf. deleted_at, last_used_at,
 // last_used_ip, expires_at and the whoami product are typed `X | null`, no exemption.

@@ -37,7 +37,7 @@ import (
 // covered by the hash.
 const Prefix = "uzp_"
 
-// Scope values, mirrored from the product_tokens scopes CHECK (migration 00269,
+// Scope values, mirrored from the product_tokens scopes CHECK (migration 00270,
 // PRD #1907 D5). jobs:run starts and cancels jobs; jobs:read reads their status and
 // results.
 const (

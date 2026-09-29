@@ -249,7 +249,7 @@ type GetProductTokenForAuthRow struct {
 }
 
 // Product tokens and the product registry (PRD #1907). Schema and rationale:
-// migrations/00269_product_tokens.sql.
+// migrations/00270_product_tokens.sql.
 //
 // TOKEN_HASH IS NEVER PROJECTED BY ANY QUERY IN THIS FILE. Every product_tokens read
 // and RETURNING spells its columns out, so the sha256 of a credential is absent from
