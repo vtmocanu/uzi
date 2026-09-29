@@ -343,11 +343,13 @@ class Scenario {
     await Promise.race([flight.done, tick(10_000)]);
   }
 
-  /** Shut a flight down (the worker's graceful stop) and wait for it to unwind. */
+  /** Shut a flight down (the worker's graceful stop) and require a clean, bounded unwind. */
   async shutdown(flight: Flight): Promise<void> {
     flight.runner.shutdown();
-    if (!(await until(() => flight.finished, 10_000))) this.send(this.input("cancel"));
-    await Promise.race([flight.done, tick(5_000)]);
+    assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
+    await flight.done;
+    assert.equal(flight.error, undefined, "shutdown completed without an execution error");
+    assert.equal(this.rowsOf("cancel").length, 0, "shutdown needed no cancel input");
   }
 
   states(flight?: Flight): StateRequest[] {
@@ -1396,7 +1398,7 @@ describe("shutdown at an observed plan gate", () => {
           if (body.status !== "awaiting_approval" || !holdFirstGate) return;
           holdFirstGate = false;
           gateReads = api.inputGets.get(s.runId) ?? 0;
-          api.delayInputGets(s.runId, 5_000, Infinity, gateReads);
+          api.delayInputGets(s.runId, 800, 1, gateReads);
         });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
         assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
@@ -1447,8 +1449,8 @@ describe("shutdown at an observed plan gate", () => {
           assert.notEqual(nextGate.presentation_id, persisted.presentationId, "the fresh gate has a new id");
           assert.equal(api.gateOf(s.runId).revision, persisted.revision + 1, "the fresh gate has a new revision");
           assert.ok(await until(() => s.acks(pending!.id, resumed) > 0, 3_000), "the pending verdict was read");
-          assert.ok(s.texts(resumed).some((line) => line.includes("ignored") && line.includes("re-send")), "the unmatched verdict is explained");
-          assert.equal(api.isApplied(s.runId, pending!.id), false, "the old approval is never applied");
+          assert.ok(await until(() => s.texts(resumed).some((line) => line.includes("ignored") && line.includes("re-send")), 3_000), "the unmatched verdict is explained");
+          await assertDisposedApprove(s, pending!.id, "the stale approval");
           assertNoApproval(s);
           assert.equal(resumed.finished, false, "the fresh gate requires a fresh approval");
           const [fresh] = s.send(s.input("approve_plan"));

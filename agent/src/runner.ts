@@ -12613,7 +12613,7 @@ export class RunRunner {
     };
 
     if (this.planApprovalTimeoutMs <= 0)
-      return settle(await steering.awaitGateEvent(epoch));
+      return settle(await steering.awaitGateEvent(epoch, this.shutdownSignal.signal));
 
     // One absolute deadline across all revision rounds: set it on the first entry and
     // reuse it, so the per-round timer counts down the REMAINING budget (not a fresh 24h).
@@ -12633,7 +12633,7 @@ export class RunRunner {
     });
     try {
       return settle(
-        await Promise.race([steering.awaitGateEvent(epoch), timeout]),
+        await Promise.race([steering.awaitGateEvent(epoch, this.shutdownSignal.signal), timeout]),
       );
     } finally {
       if (timer) clearTimeout(timer);
