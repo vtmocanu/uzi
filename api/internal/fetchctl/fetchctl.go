@@ -20,7 +20,13 @@
 // claim-time mint start from the run; Begin, Complete and the stale sweep start from the
 // credential. Complete in particular locks the credential before the reservation it
 // settles, because a re-claim's mint holds the credential while it releases the prior
-// claim's reservations: the reverse order would let each wait on the other.
+// claim's reservations: the reverse order would let each wait on the other. The one
+// exception is implicit: the foreign-key checks of Begin's reservation insert and
+// Complete's source-log insert take FOR KEY SHARE on the run row after the credential lock.
+// Only a DELETE of the run (or a change of its key) conflicts with it, not a status update,
+// the revoke trigger or the mint, so a run DELETE (run row, then the cascade into the
+// credential) concurrent with a Begin or Complete for that run can deadlock, and Postgres
+// aborts one of the two (SQLSTATE 40P01).
 package fetchctl
 
 import (

@@ -18,7 +18,10 @@ import (
 //
 // The api pages the log (fetchctl.FetchesPageSize rows a page); the command follows every
 // page and prints the whole log, which fetch_max_run_attempts bounds (default 500, so one
-// page). There is no --after/--limit: a partial log is not what an owner audits.
+// page). There is no --after/--limit: a partial log is not what an owner audits. A walk of
+// several pages while the run is still fetching can skip an attempt that commits late (the
+// api's keyset is the row's transaction-start time; handler.ListRunFetches), so a log above
+// one page is complete only when read after the run has ended and its fetches reported.
 func newRunFetchesCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "fetches <run-id>",

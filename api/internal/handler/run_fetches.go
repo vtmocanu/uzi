@@ -29,6 +29,14 @@ import (
 // 1..fetchctl.FetchesPageSize (default that, larger values clamped to it), ?after= is the
 // next_cursor of the previous page (a row id of THIS run; anything else is 400). The page
 // asks for one row more than it returns to know whether next_cursor is due.
+//
+// The keyset is (created_at, id), and created_at is the writing transaction's start
+// (now()), not its commit. A walk of several pages while the run is still fetching can
+// therefore skip a row: one Complete that started earlier but commits after a later page's
+// cursor was taken sorts before that cursor and is never returned by the walk. Nothing is
+// skipped once the run has ended and its in-flight fetches have reported, and the default
+// attempts cap (500) fits one page, so only a live walk of a log whose cap was raised above
+// FetchesPageSize can miss a row; re-reading it after the run ends returns every row.
 func (h *Handler) ListRunFetches(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {

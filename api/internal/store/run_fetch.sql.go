@@ -327,13 +327,19 @@ type LockFetchCredentialRunByHashRow struct {
 
 // Complete's credential lookup: the run and the generation the token belongs to. A revoked
 // credential still resolves, so an attempt admitted before the run ended is still logged.
-// FOR UPDATE, and BEFORE the reservation: every writer of these tables takes its locks in
-// one order, runs -> run_fetch_credentials -> run_fetch_reservations (the revoke trigger
+// FOR UPDATE, and BEFORE the reservation: every writer of these tables takes its row locks
+// in one order, runs -> run_fetch_credentials -> run_fetch_reservations (the revoke trigger
 // and the claim-time mint from the run, Begin and this from the credential, the stale
 // sweep from the credentials of the runs it releases), so two of them can never each hold
 // the lock the other waits on. Taking the reservation first and the credential at
 // ReconcileFetchCounters, as a re-claim's mint holds the credential and then releases the
 // prior claim's reservations, is the deadlock this ordering rules out.
+// The one exception: the foreign-key checks of InsertFetchReservation (Begin) and
+// InsertRunFetch (this Complete) take FOR KEY SHARE on the run row AFTER the credential
+// lock. Only a DELETE of the run (or a change of its key) conflicts with that lock; a
+// status update, the revoke trigger and the mint's FOR SHARE do not. So a run DELETE,
+// which locks the run and then cascades into the credential, can deadlock against a
+// concurrent Begin or Complete for that run, and Postgres aborts one side (40P01).
 func (q *Queries) LockFetchCredentialRunByHash(ctx context.Context, tokenHash []byte) (LockFetchCredentialRunByHashRow, error) {
 	row := q.db.QueryRow(ctx, lockFetchCredentialRunByHash, tokenHash)
 	var i LockFetchCredentialRunByHashRow

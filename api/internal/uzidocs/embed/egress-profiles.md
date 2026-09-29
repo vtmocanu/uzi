@@ -202,8 +202,9 @@ on it. Review each profile for hosts where other people can publish.
 
 ## Fetch caps
 
-Four [admin settings](./admin-settings.md#research-fetch-caps) bound what one
-research run may download: 25 MiB per file, 200 MiB and 100 files per run, and
-4 concurrent fetches per run by default. Edit them on **Admin → Instance →
+Five [admin settings](./admin-settings.md#research-fetch-caps) bound what one
+research run may download: 25 MiB per file, 200 MiB and 100 files per run,
+4 concurrent fetches per run, and 500 fetch attempts per run (allowed or
+refused) by default. Edit them on **Admin → Instance →
 Research fetch caps**. Like the profiles, nothing reads them until the research
 lane is enabled.
