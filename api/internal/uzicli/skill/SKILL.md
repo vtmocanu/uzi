@@ -1319,13 +1319,13 @@ which you triage from the terminal exactly like the judge backlog.
   warning?}`. A 202 means the filing could not be confirmed: the operation id and phase
   are printed and the exit is 5; a 201 whose phase is not `settled` also prints
   `operation <id> (<phase>)` and its warning, even under `--quiet` (the issue exists).
-  Release is accepted only after the operation's deadline (a few minutes): check the
+  Release is accepted only after the operation's deadline: check the
   forge, and only if no such issue exists run
   `uzi findings release <operation-id> --confirm-no-issue` (without the flag it is a
   usage error). A 409 prints the `pending operation <op>` ids (and any non-open
   coordinate) holding the chosen ones to stderr. Held rows show `pending group <op>` as
   their state in `uzi findings list --bucket all` (their status is `filing`). At most 50
-  ids per call.
+  distinct ids per call; an id with no triage record yet is refused.
 - `uzi findings dismiss <finding-id> --reason wont-do|not-an-issue` — dismiss a
   coordinate (`not-an-issue` is a false positive, `wont-do` is valid-but-skip), so it
   stays gone and never re-nags across later runs. A missing or invalid `--reason` is a

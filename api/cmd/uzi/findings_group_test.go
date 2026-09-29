@@ -106,6 +106,9 @@ func TestFindingsFileGroupUnsettled201KeptUnderQuiet(t *testing.T) {
 	fc.FileFindingGroupResult.Warning = "record not settled"
 	for _, args := range [][]string{{"findings", "file", "e-1", "e-2"}, {"--quiet", "findings", "file", "e-1", "e-2"}} {
 		out, _, code := runCLI(t, fakeEnv(fc), args...)
+		if strings.Contains(out, "findings release") || strings.Contains(out, "--confirm-no-issue") {
+			t.Errorf("%v: an issue exists, so no release hint may be printed:\n%s", args, out)
+		}
 		if code != uzicli.ExitOK {
 			t.Fatalf("%v: exit = %d, want 0 (an issue exists)", args, code)
 		}
@@ -141,26 +144,32 @@ func TestFindingsFileGroupAcceptedExit5(t *testing.T) {
 
 func TestFindingsFileGroup409ReportsPendingOperations(t *testing.T) {
 	fc := groupFake()
-	fc.FindingDrafts["e-3"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-3"}
-	fc.FindingDrafts["e-4"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-4"}
-	fc.FileFindingGroupErr = uzicli.Exitf(uzicli.ExitConflict, "finding not fileable")
-	op1 := "11111111-1111-4111-8111-111111111111"
-	op2 := "22222222-2222-4222-8222-222222222222"
-	fc.FindingsResult.Findings = []apitypes.IncidentalFindingDTO{
-		{DispositionID: "d-1", Status: "open"},
-		{DispositionID: "d-2", Status: "filing", GroupOperationID: &op1},
-		{DispositionID: "d-3", Status: "filing", GroupOperationID: &op1},
-		{DispositionID: "d-4", Status: "filing", GroupOperationID: &op2},
-		{DispositionID: "d-other", Status: "filing", GroupOperationID: ptr("op-zzz")},
+	var evIDs, ops []string
+	var rows []apitypes.IncidentalFindingDTO
+	for i := 0; i < 6; i++ {
+		ev, disp := "ev-"+strconv.Itoa(i), "d-"+strconv.Itoa(i)
+		op := "0000000" + strconv.Itoa(i) + "-1111-4111-8111-111111111111"
+		fc.FindingDrafts[ev] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: disp}
+		evIDs, ops = append(evIDs, ev), append(ops, op)
+		rows = append(rows, apitypes.IncidentalFindingDTO{DispositionID: disp, Status: "filing", GroupOperationID: &ops[i]})
 	}
-	_, errb, code := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-2", "e-3", "e-4")
+	// A second coordinate held by an already-listed operation must not repeat it.
+	fc.FindingDrafts["ev-dup"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d-dup"}
+	evIDs = append(evIDs, "ev-dup")
+	rows = append(rows, apitypes.IncidentalFindingDTO{DispositionID: "d-dup", Status: "filing", GroupOperationID: &ops[0]},
+		apitypes.IncidentalFindingDTO{DispositionID: "d-other", Status: "filing", GroupOperationID: ptr("op-zzz")})
+	fc.FileFindingGroupErr = uzicli.Exitf(uzicli.ExitConflict, "finding not fileable")
+	fc.FindingsResult.Findings = rows
+	_, errb, code := runCLI(t, fakeEnv(fc), append([]string{"findings", "file"}, evIDs...)...)
 	if code != uzicli.ExitConflict {
 		t.Fatalf("exit = %d, want 5", code)
 	}
 	if !strings.Contains(errb, "finding not fileable") || strings.Contains(errb, "op-zzz") {
 		t.Errorf("stderr:\n%s", errb)
 	}
-	for _, op := range []string{op1, op2} {
+	// Six full UUIDs folded into one line exceed cellText's 200-rune cap, so a regression that
+	// returns the details inside the error would truncate the later ids.
+	for _, op := range ops {
 		if got := strings.Count(errb, "pending operation "+op); got != 1 {
 			t.Errorf("operation %s listed %d times (want once, full id):\n%s", op, got, errb)
 		}
@@ -180,11 +189,16 @@ func TestFindingsFileGroup409NamesNonOpenCoordinate(t *testing.T) {
 	}
 }
 
-func TestFindingsFileGroupTooManyIDs(t *testing.T) {
+func TestFindingsFileGroupTooManyDistinctIDs(t *testing.T) {
 	fc := groupFake()
 	args := []string{"findings", "file"}
 	for i := 0; i < 51; i++ {
 		args = append(args, "e-"+strconv.Itoa(i))
+	}
+	// Repeated ids do not count toward the cap: 51 args with duplicates is still allowed.
+	dupArgs := append([]string{"findings", "file"}, "e-1", "e-2", "e-1", "e-2")
+	if _, _, code := runCLI(t, fakeEnv(groupFake()), dupArgs...); code != uzicli.ExitOK {
+		t.Errorf("duplicates within the cap: exit = %d", code)
 	}
 	_, _, code := runCLI(t, fakeEnv(fc), args...)
 	if code != uzicli.ExitUsage || len(fc.LastFindingDraftIDs) != 0 || fc.LastFileFindingGroupIDs != nil {
@@ -252,5 +266,14 @@ func TestFindingsGroupReleaseHintExecutes(t *testing.T) {
 	out2, _, code := runCLI(t, fakeEnv(fc), fields[1:]...)
 	if code != uzicli.ExitOK || fc.LastReleaseFindingGroupOp != "op-8" || !strings.Contains(out2, "released operation op-8") {
 		t.Errorf("hint %q: exit=%d op=%q out=%s", hint, code, fc.LastReleaseFindingGroupOp, out2)
+	}
+}
+
+func TestFindingsFileGroupRefusesEvidenceWithoutDisposition(t *testing.T) {
+	fc := groupFake()
+	fc.FindingDrafts["e-nodisp"] = apitypes.IncidentalFindingIssueDraftDTO{}
+	_, errb, code := runCLI(t, fakeEnv(fc), "findings", "file", "e-1", "e-nodisp")
+	if code != uzicli.ExitUsage || fc.LastFileFindingGroupIDs != nil || !strings.Contains(errb, "e-nodisp") {
+		t.Errorf("exit=%d group=%v stderr=%s", code, fc.LastFileFindingGroupIDs, errb)
 	}
 }
