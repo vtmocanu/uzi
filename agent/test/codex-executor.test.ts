@@ -53,7 +53,7 @@ import { MAX_PROJECTED_BYTES } from "../src/codex/projection.js";
 import type { WorkerClient } from "../src/client.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 import { CodexTransportError, type CodexNotification, type CodexTransport } from "../src/codex/transport.js";
-import type { RunContext, EmittedMessage, Executor, WallParkOutcome } from "../src/executor.js";
+import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
 import { PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
@@ -8907,4 +8907,84 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
     const [impl] = turnTexts(rig.transport);
     assert.ok(impl!.includes("- A command's own private $TMPDIR is not writable."));
   });
+});
+
+// Issue #1932 m3: the Codex executor consults ctx.secretRemediationGate at the done point, BEFORE
+// the persist / done checkpoint. `remediate` re-prompts the SAME live epoch; `fail` stops.
+describe("CodexExecutor secret remediation gate (issue #1932)", () => {
+  type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
+  const script = (th: string, turns: TurnScript[]): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${th}-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const done = (id: number, th: string, tn: string): CodexNotification =>
+    toolCall(id, "signal_done", {}, th, tn, `c-done-${id}`);
+  const turnTexts = (t: FakeTransport): string[] =>
+    t.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
+
+  for (const interlocked of [false, true]) {
+    const label = interlocked ? "interlocked" : "non-interlocked";
+
+    it(`${label}: remediate re-prompts the same live epoch, then proceed completes`, async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(11, th, tn)], (th, tn) => [done(21, th, tn)]]),
+      ]);
+      const events: string[] = [];
+      const persistAtGate: number[] = [];
+      const decisions: SecretRemediationDecision[] = [{ action: "remediate", followUp: REMEDIATE }, { action: "proceed" }];
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue",
+        ...(interlocked ? { completionInterlock: true } : {}),
+        config: { max_iterations: 5 },
+        recordCompletionAttempt: async () => { attempts++; events.push("attempt"); return { unmet: [], attemptCount: attempts }; },
+        checkpoint: async (o) => { events.push(o.reap ? "checkpoint:reap" : "checkpoint"); },
+        secretRemediationGate: async () => {
+          events.push("gate");
+          persistAtGate.push(rig.sessionOps.persist);
+          return decisions.shift()!;
+        },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1932 remediate run");
+      assert.equal(result.branch, "agent/issue-42");
+      const texts = turnTexts(rig.epochs[0]!.transport);
+      assert.equal(texts.length, 2, "the remediation turn ran on the same epoch's transport");
+      assert.ok(texts[1]!.includes(REMEDIATE), "the follow-up is the next turn's prompt");
+      assert.equal(rig.providerLaunches(), 1, "no epoch was recreated for the remediation turn");
+      assert.deepEqual(persistAtGate, [persistAtGate[0], persistAtGate[0]], "no session persist between the two gate calls");
+      assert.deepEqual(events.slice(0, 2), ["gate", "gate"], "no checkpoint before the gate proceeds");
+      if (interlocked) {
+        assert.equal(attempts, 1);
+        assert.ok(events.indexOf("checkpoint:reap") > 1, "the done checkpoint follows the proceed decision");
+      }
+    });
+
+    it(`${label}: fail stops with no done checkpoint and no completion attempt`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+      const checkpoints: unknown[] = [];
+      let attempts = 0;
+      const { ctx } = makeCtx({
+        kind: "issue",
+        ...(interlocked ? { completionInterlock: true } : {}),
+        recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
+        checkpoint: async (o) => { checkpoints.push(o); },
+        secretRemediationGate: async () => ({ action: "fail" }),
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1932 fail run");
+      assert.equal(result.branch, "agent/issue-42", "the run returns a result, no throw");
+      assert.equal(turnTexts(rig.epochs[0]!.transport).length, 1, "no further turn");
+      assert.equal(checkpoints.length, 0, "no done checkpoint");
+      assert.equal(attempts, 0, "no completion attempt");
+    });
+  }
 });

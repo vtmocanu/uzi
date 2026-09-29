@@ -2952,6 +2952,20 @@ export class SdkExecutor implements Executor {
             // signal (unlike `cancelled` above) — a graceful stop is a clean completion, not an
             // abort. Named explicitly so the three ended-reasons are exhaustively handled.
           }
+          // Issue #1932: consult the pre-exit secret-remediation gate BEFORE the done checkpoint
+          // publishes the branch. `remediate` returns to the lead on the SAME session (like a completion
+          // rework); `fail` stops here with no done checkpoint and no completion attempt (the runner
+          // already recorded the blocked state). Never reached by an interactive run.
+          if (!ctx.interactive) {
+            const secretDecision = await ctx.secretRemediationGate?.();
+            if (secretDecision?.action === "remediate") {
+              followUp = secretDecision.followUp;
+              resetStallState();
+              turn.done = false;
+              continue;
+            }
+            if (secretDecision?.action === "fail") break;
+          }
           // PRD #1226 M3 (D3): the structural completion interlock. On an INTERLOCKED,
           // non-interactive issue run, a clean signal_done is NOT a finalize — it is a
           // completion ATTEMPT. The interactive park above already returned/continued for an
