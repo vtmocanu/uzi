@@ -1446,7 +1446,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     });
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked");
     const reason = d.failed()?.failure_reason ?? "";
-    assert.match(reason, /the re-scan of the final branch could not be trusted/);
+    assert.match(reason, /the final branch could not be verified clean/);
     assert.match(reason, /uzi run export/);
     assert.ok(reason.length <= 512, String(reason.length));
     assert.ok(!reason.includes(flagged.slice(0, 12)), "no stale commit named");
@@ -1503,6 +1503,59 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         gitIn(w, ["reset", "-q", "--hard", base]); // S is no longer an ancestor
         commitIn(w, "ok.txt", "fine\n");
         acts.push((await gate()).action);
+      },
+    });
+    assert.deepEqual(acts, ["proceed"]);
+    assert.equal(d.failed(), undefined, JSON.stringify(d.failed()));
+    assert.ok(d.completed());
+    assert.equal(d.pushes(), 1);
+  });
+
+  it("(hold) GitHub: a tick-flagged commit is never published by a later reap:true overlay checkpoint", { skip }, async () => {
+    let S = "";
+    let skew = 0;
+    const d = await drive({
+      iid: 1932_273,
+      forge: "github",
+      configureRunner: (r) => {
+        // Open the checkpoint time gate so the reap:false checkpoint scans (as the mid-turn tick does).
+        (r as unknown as { now: () => number }).now = () => Date.now() + skew;
+      },
+      body: async (ctx, _gate, dd) => {
+        const w = ctx.worktreePath;
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        skew = 3_600_000;
+        await ctx.checkpoint!({ reap: false }); // the scan flags S: flaggedCommits only, no gate call
+        assert.equal(dd().pub.count(), 0, "the flagged tip was not published");
+        commitIn(w, "later.txt", "benign\n");
+        await ctx.checkpoint!({ reap: true }); // unscanned overlay publish: must be held
+      },
+    });
+    for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
+    assert.equal(d.pub.count(), 0);
+  });
+
+  it("(stale) GitLab: a failed fetch-back at the gate does not falsely block a tick-flagged commit the lead removed", { skip }, async () => {
+    const acts: string[] = [];
+    let failFetch = false;
+    const d = await drive({
+      iid: 1932_274,
+      forge: "gitlab",
+      configureRunner: (r) => {
+        const rr = r as unknown as { fetchBackBestEffort: (...a: unknown[]) => Promise<boolean> };
+        const orig = rr.fetchBackBestEffort.bind(r);
+        rr.fetchBackBestEffort = async (...a) => (failFetch ? false : orig(...a));
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        const base = gitIn(w, ["rev-parse", "HEAD"]);
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: true }); // flags S; the tracking ref now holds S
+        gitIn(w, ["reset", "-q", "--hard", base]);
+        commitIn(w, "ok.txt", "fine\n");
+        failFetch = true; // the gate's fetch-back fails: the tracking tip is stale and still holds S
+        acts.push((await gate()).action);
+        failFetch = false;
       },
     });
     assert.deepEqual(acts, ["proceed"]);
