@@ -231,9 +231,13 @@ func (s *Service) Begin(ctx context.Context, credential string) (Admission, erro
 	if n == 0 {
 		return Admission{}, &AdmissionRefusedError{Reason: AdmissionAttempts}
 	}
+	// One fetch reserves the per-file cap, but never more than the whole run may use: the
+	// two caps are validated independently, and a per-file cap above the run cap would
+	// otherwise refuse every fetch, however small the file.
+	fileBytes := min(caps.MaxFileBytes, caps.MaxRunBytes)
 	n, err = q.ReserveFetch(ctx, store.ReserveFetchParams{
 		RunID:        cred.RunID,
-		MaxFileBytes: caps.MaxFileBytes,
+		MaxFileBytes: fileBytes,
 		MaxRunBytes:  caps.MaxRunBytes,
 		MaxRunFiles:  caps.MaxRunFiles,
 		MaxInflight:  caps.MaxConcurrentPerRun,
@@ -253,7 +257,7 @@ func (s *Service) Begin(ctx context.Context, credential string) (Admission, erro
 		return Admission{}, &AdmissionRefusedError{Reason: refusalReason(c, caps)}
 	}
 	id, err := q.InsertFetchReservation(ctx, store.InsertFetchReservationParams{
-		RunID: cred.RunID, ClaimGeneration: cred.ClaimGeneration, Bytes: caps.MaxFileBytes,
+		RunID: cred.RunID, ClaimGeneration: cred.ClaimGeneration, Bytes: fileBytes,
 	})
 	if err != nil {
 		return Admission{}, err
@@ -261,7 +265,7 @@ func (s *Service) Begin(ctx context.Context, credential string) (Admission, erro
 	if err := tx.Commit(ctx); err != nil {
 		return Admission{}, err
 	}
-	return Admission{ReservationID: id, Entries: snap.Entries, MaxBytes: caps.MaxFileBytes}, nil
+	return Admission{ReservationID: id, Entries: snap.Entries, MaxBytes: fileBytes}, nil
 }
 
 // credentialLive is Begin's credential rule: not revoked, minted under the run's CURRENT

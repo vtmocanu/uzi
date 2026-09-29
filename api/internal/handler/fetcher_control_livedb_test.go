@@ -313,6 +313,24 @@ func TestFetcherBeginCredentialRulesLiveDB(t *testing.T) {
 	}
 }
 
+// TestFetcherBeginFileCapAboveRunCapLiveDB: the per-file and per-run byte caps are validated
+// independently, so an admin can set the per-file cap above the run cap. Admission then
+// reserves (and hands the fetcher as max_bytes) the run cap, instead of refusing every fetch.
+func TestFetcherBeginFileCapAboveRunCapLiveDB(t *testing.T) {
+	e := newFCEnv(t, fcCaps{settings.KeyFetchMaxFileBytes: "1000", settings.KeyFetchMaxRunBytes: "600"}, true)
+	run, cred := e.boundRun("running", 1, 1)
+	adm := e.mustBegin(cred)
+	if adm.ReservationID == "" || adm.MaxBytes != 600 {
+		t.Fatalf("begin = %+v, want a reservation and max_bytes 600 (the run cap)", adm)
+	}
+	if c := e.counters(run); c.reserved != 600 || c.files != 1 || c.inflight != 1 {
+		t.Fatalf("counters after one admit = %+v, want 600 reserved", c)
+	}
+	if n := e.count(`SELECT count(*) FROM run_fetch_reservations WHERE run_id = $1 AND bytes = 600`, run); n != 1 {
+		t.Fatalf("reservation rows with 600 bytes = %d, want 1", n)
+	}
+}
+
 // TestFetcherCompleteLiveDB: Complete writes exactly one escaped source-log row, keyed from
 // the credential; a second Complete for the same reservation is a 2xx no-op; another run's
 // credential cannot complete the reservation; a refused attempt refunds its file slot; an
