@@ -194,13 +194,60 @@ func v1Send(router http.Handler, method, path, bearer string, hdr http.Header) v
 	return v1Resp{status: rec.Code, body: rec.Body.String()}
 }
 
-var v1PathParam = regexp.MustCompile(`\{[^}]*\}`)
+// v1PathParam matches one chi path parameter, capturing the optional regexp after
+// the first ':' ({id} or {slot:[a-z]+}).
+var v1PathParam = regexp.MustCompile(`\{[^}:]*(?::([^}]*))?\}`)
 
-// v1ConcretePath turns a chi pattern into a request path: every {param} (with or
-// without a regexp) becomes placeholder, and a catch-all "*" becomes "x".
-func v1ConcretePath(pattern, placeholder string) string {
-	p := v1PathParam.ReplaceAllString(pattern, placeholder)
-	return strings.ReplaceAll(p, "*", "x")
+// v1RegexpCandidates are tried, in order, for a {param:regexp} segment the uuid
+// placeholder does not satisfy. Extend it when a route adds a constraint none meets.
+// No production route carries a regexp param today (TestV1WalkHelpers exercises the
+// generation on synthetic patterns); the walk's chi Find check is the backstop that
+// reddens if a future one is filled with a value chi cannot route.
+var v1RegexpCandidates = []string{"a", "x", "abc", "1", "0", "123"}
+
+// v1ConcretePath turns a chi pattern into a request path: a plain {param} becomes
+// placeholder, a {param:regexp} becomes the first of placeholder and
+// v1RegexpCandidates that the WHOLE regexp matches (chi anchors it to the segment), and
+// a catch-all "*" becomes "x". A regexp no candidate satisfies is an error, never a
+// silently unroutable path: a request chi cannot route 404s before any auth runs and
+// would make every comparison over it vacuous.
+func v1ConcretePath(pattern, placeholder string) (string, error) {
+	var firstErr error
+	p := v1PathParam.ReplaceAllStringFunc(pattern, func(seg string) string {
+		m := v1PathParam.FindStringSubmatch(seg)
+		if m[1] == "" {
+			return placeholder
+		}
+		re, err := regexp.Compile("^(?:" + m[1] + ")$")
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("pattern %q: param regexp %q: %w", pattern, m[1], err)
+			}
+			return seg
+		}
+		for _, c := range append([]string{placeholder}, v1RegexpCandidates...) {
+			if re.MatchString(c) {
+				return c
+			}
+		}
+		if firstErr == nil {
+			firstErr = fmt.Errorf("pattern %q: no placeholder satisfies param regexp %q; extend v1RegexpCandidates", pattern, m[1])
+		}
+		return seg
+	})
+	if firstErr != nil {
+		return "", firstErr
+	}
+	return strings.ReplaceAll(p, "*", "x"), nil
+}
+
+// v1RoutingMiss reports whether a response is chi's own "no route" answer rather than
+// anything a route produced: the default NotFound (http.NotFound's plain-text body)
+// or the default MethodNotAllowed (405, empty body). Every uzi handler and middleware
+// answers with a JSON body, so neither can be mistaken for a handler's own 404.
+func v1RoutingMiss(r v1Resp) bool {
+	return (r.status == http.StatusNotFound && r.body == "404 page not found\n") ||
+		(r.status == http.StatusMethodNotAllowed && r.body == "")
 }
 
 // v1IsV1 reports whether a pattern is inside the /api/v1 subtree, the only exclusion.
@@ -280,6 +327,9 @@ func TestV1IsolationLiveDB(t *testing.T) {
 	type walked struct{ router, method, pattern string }
 	var seen []walked
 	statuses := map[int]int{}
+	// Routes whose answer to the unknown uzp_ is RequireUser's own 401: the positive
+	// proof that walked requests reach an auth layer (see the floor below).
+	requireUserRefusals := 0
 	for _, rt := range []struct {
 		name   string
 		router http.Handler
@@ -293,12 +343,31 @@ func TestV1IsolationLiveDB(t *testing.T) {
 				return nil
 			}
 			seen = append(seen, walked{rt.name, method, pattern})
-			path := v1ConcretePath(pattern, placeholder)
+			path, err := v1ConcretePath(pattern, placeholder)
+			if err != nil {
+				t.Errorf("%s %s %s: %v", rt.name, method, pattern, err)
+				return nil
+			}
+			// The request must route to the walked route itself. Without this a path chi
+			// cannot route (a regexp param the placeholder fails, a mangled prefix) gets
+			// chi's 404 for BOTH tokens, and the equality below passes having tested no
+			// auth layer at all.
+			if found := cr.Find(chi.NewRouteContext(), method, path); found != pattern {
+				t.Errorf("%s %s %s: concrete path %q routes to %q, not the walked pattern", rt.name, method, pattern, path, found)
+				return nil
+			}
 			// The unknown token first, then the real one: if anything differed, the real
 			// token's response is the one that carries the leak.
 			got0 := v1Send(rt.router, method, path, unknown, nil)
 			got1 := v1Send(rt.router, method, path, pt.token, nil)
 			statuses[got1.status]++
+			if v1RoutingMiss(got0) || v1RoutingMiss(got1) {
+				t.Errorf("%s %s %s (%s): a chi routing miss (%d %q), not a response from the route",
+					rt.name, method, pattern, path, got1.status, got1.body)
+			}
+			if got0.status == http.StatusUnauthorized && got0.body == "{\"error\":\"invalid CLI token\"}\n" {
+				requireUserRefusals++
+			}
 			if got0 != got1 {
 				t.Errorf("%s %s %s (%s): real uzp_ got %d %q, unknown uzp_ got %d %q",
 					rt.name, method, pattern, path, got1.status, got1.body, got0.status, got0.body)
@@ -338,8 +407,15 @@ func TestV1IsolationLiveDB(t *testing.T) {
 		count[w.router]++
 		has[w.router+" "+w.method+" "+w.pattern] = true
 	}
-	t.Logf("walked %d routes outside /api/v1: Routes=%d WorkerRoutes=%d; statuses %v",
-		len(seen), count["Routes"], count["WorkerRoutes"], statuses)
+	t.Logf("walked %d routes outside /api/v1: Routes=%d WorkerRoutes=%d; statuses %v; RequireUser refusals %d",
+		len(seen), count["Routes"], count["WorkerRoutes"], statuses, requireUserRefusals)
+	// Positive reach: a large share of the internal API is behind RequireUser, and
+	// every such route must answer the unknown uzp_ with RequireUser's own 401. A floor
+	// well below today's figure (logged above) catches a walk whose requests stopped
+	// reaching the auth layer without pinning an inventory count.
+	if requireUserRefusals < 50 {
+		t.Fatalf("only %d walked routes answered with RequireUser's 401: the requests are not reaching the auth layer", requireUserRefusals)
+	}
 	if count["Routes"] < 100 || count["WorkerRoutes"] < 10 {
 		t.Fatalf("walked Routes=%d WorkerRoutes=%d: too few for the production routers, the walk is not covering them",
 			count["Routes"], count["WorkerRoutes"])
@@ -542,16 +618,34 @@ func TestV1CallerLiveDB(t *testing.T) {
 
 // Guard for v1ConcretePath / v1IsV1 (pure, runs without a database).
 func TestV1WalkHelpers(t *testing.T) {
-	ph := "PH"
+	ph := "0b0e2a52-5f0c-4c55-9d3a-6f4e0b1c2d3e"
 	for in, want := range map[string]string{
-		"/api/runs/{id}": "/api/runs/PH",
-		"/api/runs/{id}/review/recommendations/{recID}": "/api/runs/PH/review/recommendations/PH",
-		"/api/branding/logo/{slot:[a-z]+}":              "/api/branding/logo/PH",
-		"/api/x/*":                                      "/api/x/x",
-		"/api/health":                                   "/api/health",
+		"/api/runs/{id}": "/api/runs/" + ph,
+		"/api/runs/{id}/review/recommendations/{recID}": "/api/runs/" + ph + "/review/recommendations/" + ph,
+		// A regexp param gets a value its regexp accepts, not the uuid.
+		"/api/branding/logo/{slot:[a-z]+}": "/api/branding/logo/a",
+		"/api/n/{n:[0-9]+}":                "/api/n/1",
+		// A regexp the uuid itself satisfies keeps the uuid.
+		"/api/u/{id:[0-9a-f-]+}": "/api/u/" + ph,
+		"/api/x/*":               "/api/x/x",
+		"/api/health":            "/api/health",
 	} {
-		if got := v1ConcretePath(in, ph); got != want {
-			t.Errorf("v1ConcretePath(%q) = %q, want %q", in, got, want)
+		if got, err := v1ConcretePath(in, ph); err != nil || got != want {
+			t.Errorf("v1ConcretePath(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	// No candidate satisfies it: a loud error, never an unroutable path.
+	if got, err := v1ConcretePath("/api/z/{z:[A-Z]+}", ph); err == nil {
+		t.Errorf("v1ConcretePath with an unsatisfiable regexp = %q, want an error", got)
+	}
+	for in, want := range map[v1Resp]bool{
+		{http.StatusNotFound, "404 page not found\n"}:                    true,
+		{http.StatusMethodNotAllowed, ""}:                                true,
+		{http.StatusNotFound, "{\"error\":\"run not found\"}\n"}:         false,
+		{http.StatusUnauthorized, "{\"error\":\"invalid CLI token\"}\n"}: false,
+	} {
+		if got := v1RoutingMiss(in); got != want {
+			t.Errorf("v1RoutingMiss(%+v) = %t, want %t", in, got, want)
 		}
 	}
 	for in, want := range map[string]bool{

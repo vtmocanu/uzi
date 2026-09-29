@@ -67,7 +67,10 @@ var limiterNames = [...]string{
 // error rather than a failing row. Spelled `lim*` rather than matching the parameter
 // names exactly, so nothing here shadows a parameter inside Routes.
 //
-// 204 as of this commit. Issue #1751 M2 added POST
+// 205 as of this commit. PRD #1907 M3 added GET /api/v1/whoami, the first route of the
+// stable external API, behind RequireV1Caller and authLimiter.PerUserMiddleware mounted on
+// the whole /api/v1 subtree (one per-user budget across /api/v1, keyed "/api/v1/*").
+// It was 204 until then. Issue #1751 M2 added POST
 // /api/worker/runs/{id}/recovery-holds/{holdID}/settle-live — the live twin of /settle below,
 // mounted on the same proposalLimiter.PerWorkerMiddleware (noLimiter to this per-USER probe).
 // It was 203 until then. PRD #1650 M2 retired the notifications inbox read path (GET
@@ -229,11 +232,13 @@ type routeMount struct {
 // endpoint: POST /api/vault/unlock and POST /api/vault/passphrase.
 //
 // NOTE on authLimiter: it is mounted BOTH ways. Its per-IP Middleware sits on
-// /register, /login, /config, the OIDC pair and /cli/start; FOUR routes take its
-// PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase and
-// /admin/cli-tokens. This table covers the per-user mounts ONLY — the per-IP ones read
-// as noLimiter here and are not guarded by this file. e2e/run-e2e.sh asserts a 429 on
-// /api/auth/login, which is the per-IP mount and closes none of the 25.
+// /register, /login, /config, the OIDC pair and /cli/start; FIVE routes take its
+// PerUserMiddleware — /cli/approve, /vault/unlock, /vault/passphrase,
+// /admin/cli-tokens and /v1/whoami (the last through the /api/v1 subtree's r.Use, so
+// every future /api/v1 route inherits it). This table covers the per-user mounts ONLY —
+// the per-IP ones read as noLimiter here and are not guarded by this file.
+// e2e/run-e2e.sh asserts a 429 on /api/auth/login, which is the per-IP mount and closes
+// none of the 26.
 //
 // 🔴 WHICH LINES A MOUNT-ADDER OWNS, because two numerals in this paragraph and one at
 // the `lim*` constants above were rotted by a single commit — `c309e8a0`, which added
@@ -442,6 +447,10 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/skills/{id}", noLimiter},
 	{"GET", "/api/tool-allowlist/", noLimiter},
 	{"GET", "/api/usage", noLimiter},
+	// PRD #1907 M3 (D15): the stable external API's whoami. The per-user limiter is
+	// mounted on the whole /api/v1 subtree after RequireV1Caller (routes_v1.go), so it
+	// keys on the caller's user, not the token: minting more tokens buys no budget.
+	{"GET", "/api/v1/whoami", limAuth},
 	{"GET", "/api/vault/status", noLimiter},
 	{"GET", "/api/version", noLimiter},
 	{"GET", "/api/worker/chat/runs", noLimiter},

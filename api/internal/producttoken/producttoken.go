@@ -10,9 +10,10 @@
 // One difference from clitoken's verification: the auth lookup
 // (GetProductTokenForAuth) never projects token_hash (a rule for every query in
 // queries/product_tokens.sql), so middleware.RequireV1Caller has no stored hash to
-// pass to Equal and does not call it. The row is found by an indexed equality on the
-// sha256 of a 256-bit random token, the same property RequireUser relies on; its extra
-// Equal on the uzc_ path is belt-and-suspenders, not a separate control.
+// compare, and this package has no constant-time Equal. The row is found by an indexed
+// equality on the sha256 of a 256-bit random token, the same property RequireUser
+// relies on; clitoken.Equal on the uzc_ path is belt-and-suspenders, not a separate
+// control.
 //
 // What keeps product tokens out of every internal route is the separate
 // product_tokens TABLE, not this prefix: middleware.RequireUser resolves Bearer values
@@ -27,12 +28,9 @@ package producttoken
 import (
 	"crypto/rand"
 	"crypto/sha256"
-	"crypto/subtle"
 	"encoding/base64"
 	"fmt"
 	"strings"
-
-	"github.com/vtmocanu/uzi/api/internal/clitoken"
 )
 
 // Prefix is the product-token class prefix. It is part of the token bytes and
@@ -80,32 +78,11 @@ func Hash(token string) []byte {
 	return sum[:]
 }
 
-// Equal compares two hashes in constant time. RequireV1Caller does not call it (see
-// the package comment: the auth row carries no hash); it is here for any future
-// fetch-then-compare lookup.
-func Equal(a, b []byte) bool {
-	return subtle.ConstantTimeCompare(a, b) == 1
-}
-
 // HasPrefix reports whether a bearer credential is of the product-token class. It
 // is a dispatch label only, never authority: authority comes from the
 // product_tokens row the hash resolves to.
 func HasPrefix(token string) bool {
 	return strings.HasPrefix(token, Prefix)
-}
-
-// FromAuthorizationHeader extracts a product-token credential from an Authorization
-// header value. ok is true exactly for `Bearer <value>` whose value carries Prefix;
-// the Bearer parsing itself is clitoken.FromAuthorizationHeader's, so the two token
-// classes can never disagree about what a Bearer header is. A non-uzp_ Bearer is
-// !ok here, which lets the caller dispatch on class deterministically rather than
-// trying one table and falling back to another (PRD #1907 D2).
-func FromAuthorizationHeader(h string) (token string, ok bool) {
-	token, ok = clitoken.FromAuthorizationHeader(h)
-	if !ok || !HasPrefix(token) {
-		return "", false
-	}
-	return token, true
 }
 
 // ValidScope reports whether s is a known scope.

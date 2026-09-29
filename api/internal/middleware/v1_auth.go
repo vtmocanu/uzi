@@ -2,12 +2,15 @@ package middleware
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"slices"
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/config"
@@ -87,6 +90,9 @@ const v1Unauthorized = "invalid token"
 //	other → 401 (uza_, no or non-Bearer header, a cookie alone).
 //
 // Every failure is the same 401, including a lookup error: fail closed, never a pass.
+// A lookup error other than "no such row" (the database is unreachable, a query
+// fails) is also logged at Warn with the token class and the error only, never any
+// token material, so an outage that turns every caller away is visible to operators.
 //
 // D3: the context user is a COPY with IsAdmin cleared, for both kinds, before anything
 // downstream sees it, so a handler reused from the internal API (which takes admin-ness
@@ -139,12 +145,17 @@ func RequireV1Caller(q V1CallerStore, cfg config.Config) func(http.Handler) http
 func resolveV1ProductToken(r *http.Request, q V1CallerStore, cfg config.Config, tok string) (V1Principal, bool) {
 	row, err := q.GetProductTokenForAuth(r.Context(), producttoken.Hash(tok))
 	if err != nil {
+		warnV1LookupError("product token lookup", err)
 		return V1Principal{}, false
 	}
 	// Defense in depth: the auth query already filters on users.is_active, but the user
 	// row we hand downstream is loaded here and re-checked on its own.
 	user, err := q.GetUserByID(r.Context(), row.UserID)
-	if err != nil || !user.IsActive {
+	if err != nil {
+		warnV1LookupError("product token user lookup", err)
+		return V1Principal{}, false
+	}
+	if !user.IsActive {
 		return V1Principal{}, false
 	}
 	if err := q.TouchProductToken(r.Context(), store.TouchProductTokenParams{
@@ -170,6 +181,7 @@ func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok 
 	hash := clitoken.Hash(tok)
 	row, err := q.GetCLITokenByHash(r.Context(), hash)
 	if err != nil {
+		warnV1LookupError("cli token lookup", err)
 		return V1Principal{}, false
 	}
 	// The same explicit constant-time compare RequireUser makes.
@@ -180,7 +192,11 @@ func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok 
 		return V1Principal{}, false
 	}
 	user, err := q.GetUserByID(r.Context(), row.UserID)
-	if err != nil || !user.IsActive {
+	if err != nil {
+		warnV1LookupError("cli token user lookup", err)
+		return V1Principal{}, false
+	}
+	if !user.IsActive {
 		return V1Principal{}, false
 	}
 	if err := q.TouchCLIToken(r.Context(), store.TouchCLITokenParams{
@@ -198,9 +214,26 @@ func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok 
 	}, true
 }
 
+// warnV1LookupError logs an auth lookup failure that is not "no such row". The caller
+// still answers 401 (fail closed); this only makes an infrastructure fault visible. The
+// log carries the step and the error, never the token or its hash.
+func warnV1LookupError(step string, err error) {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return
+	}
+	slog.Warn("v1 auth: "+step+" failed; answering 401", "error", err)
+}
+
 // RequireScope gates an /api/v1 route on one scope (PRD #1907 D5). It must run after
 // RequireV1Caller: no principal is a 401, a principal without the scope a 403.
+//
+// It panics at construction (router build, i.e. server start) on a scope that is not
+// in producttoken.Scopes: a typo would otherwise build a route no token can ever reach,
+// silently 403ing every caller.
 func RequireScope(scope string) func(http.Handler) http.Handler {
+	if !producttoken.ValidScope(scope) {
+		panic(fmt.Sprintf("middleware.RequireScope: unknown scope %q (known: %v)", scope, producttoken.Scopes))
+	}
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			p, ok := V1PrincipalFromContext(r.Context())

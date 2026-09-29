@@ -88,7 +88,10 @@ const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 // The lock is taken in SQL by LockProductTokenMint (queries/product_tokens.sql), which
 // carries this value as the literal 1970958452 with the objid derived there from the
 // pair; TestProductTokenMintLockClassMatchesSQL fails if the two disagree. Distinct
-// from every class above; XACT-scoped.
+// from every other two-int *LockClass in this package, including the ones declared
+// below it (JudgeDispositionCoordLockClass, RunBranchLockClass,
+// CheckpointRetentionLockClass): the same test enumerates every such constant from
+// source and fails on any collision. XACT-scoped.
 const ProductTokenMintLockClass int32 = 0x757A7074 // "uzpt"
 
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from

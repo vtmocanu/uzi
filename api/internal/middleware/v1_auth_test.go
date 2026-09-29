@@ -3,7 +3,9 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -29,6 +31,7 @@ type fakeV1Store struct {
 
 	cliHash []byte
 	cliRow  store.CliToken
+	cliErr  error // returned for a matching hash instead of the row, when set
 
 	users   map[uuid.UUID]store.User
 	userErr error
@@ -53,6 +56,9 @@ func (f *fakeV1Store) GetProductTokenForAuth(_ context.Context, h []byte) (store
 func (f *fakeV1Store) GetCLITokenByHash(_ context.Context, h []byte) (store.CliToken, error) {
 	f.cliLookups++
 	if f.cliHash != nil && bytes.Equal(h, f.cliHash) {
+		if f.cliErr != nil {
+			return store.CliToken{}, f.cliErr
+		}
 		return f.cliRow, nil
 	}
 	return store.CliToken{}, pgx.ErrNoRows
@@ -373,5 +379,88 @@ func TestRequireV1CallerThenRequireScope(t *testing.T) {
 		if rec.Code != c.want {
 			t.Errorf("%s… on %s: status = %d, want %d", c.tok[:4], c.scope, rec.Code, c.want)
 		}
+	}
+}
+
+// RequireScope refuses, at construction, a scope outside producttoken.Scopes: a typo
+// would otherwise build a route that 403s every caller.
+func TestRequireScopePanicsOnUnknownScope(t *testing.T) {
+	for _, bad := range []string{"", "jobs:write", "JOBS:READ", "jobs:read "} {
+		func() {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Errorf("RequireScope(%q) did not panic", bad)
+					return
+				}
+				if msg, _ := r.(string); !strings.Contains(msg, "unknown scope") {
+					t.Errorf("RequireScope(%q) panicked with %v, want an unknown-scope message", bad, r)
+				}
+			}()
+			_ = RequireScope(bad)
+		}()
+	}
+	for _, good := range producttoken.Scopes {
+		_ = RequireScope(good) // must not panic
+	}
+}
+
+// A lookup error that is not "no such row" is still a 401 but is logged at Warn, with
+// no token material; a plain unknown token (ErrNoRows) logs nothing.
+func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dbDown := errors.New("db down: connection refused")
+	cases := []struct {
+		name    string
+		tok     func(fx v1Fixture) string
+		mutate  func(fx v1Fixture)
+		wantLog string // "" = nothing logged
+	}{
+		{"unknown uzp_", func(v1Fixture) string { return "uz" + "p_" + strings.Repeat("a", 43) }, nil, ""},
+		{"unknown uzc_", func(v1Fixture) string { return "uz" + "c_" + strings.Repeat("a", 43) }, nil, ""},
+		{"product lookup error", func(fx v1Fixture) string { return fx.uzp },
+			func(fx v1Fixture) { fx.st.productErr = dbDown }, "product token lookup failed"},
+		{"product user lookup error", func(fx v1Fixture) string { return fx.uzp },
+			func(fx v1Fixture) { fx.st.userErr = dbDown }, "product token user lookup failed"},
+		{"cli lookup error", func(fx v1Fixture) string { return fx.uzc },
+			func(fx v1Fixture) { fx.st.cliErr = dbDown }, "cli token lookup failed"},
+		{"cli user lookup error", func(fx v1Fixture) string { return fx.uzc },
+			func(fx v1Fixture) { fx.st.userErr = dbDown }, "cli token user lookup failed"},
+		{"product user missing (ErrNoRows)", func(fx v1Fixture) string { return fx.uzp },
+			func(fx v1Fixture) { delete(fx.st.users, fx.user.ID) }, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			buf.Reset()
+			fx := newV1Fixture(t, clitoken.ScopeUser)
+			if tc.mutate != nil {
+				tc.mutate(fx)
+			}
+			tok := tc.tok(fx)
+			var probe v1Probe
+			rec := v1Do(t, fx.st, "Bearer "+tok, false, &probe)
+			assertV1Unauthorized(t, rec, &probe)
+			logged := buf.String()
+			if tc.wantLog == "" {
+				if logged != "" {
+					t.Fatalf("logged %q, want nothing", logged)
+				}
+				return
+			}
+			if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, tc.wantLog) || !strings.Contains(logged, "db down") {
+				t.Fatalf("log %q lacks a WARN %q with the error", logged, tc.wantLog)
+			}
+			// No token material: neither the token, its body, nor its sha256 (hex).
+			body := tok[4:]
+			for _, secret := range []string{tok, body[:12], hex.EncodeToString(clitoken.Hash(tok))[:16]} {
+				if strings.Contains(logged, secret) {
+					t.Fatalf("log %q contains token material %q", logged, secret)
+				}
+			}
+		})
 	}
 }

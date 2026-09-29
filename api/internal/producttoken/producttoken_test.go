@@ -1,6 +1,7 @@
 package producttoken
 
 import (
+	"bytes"
 	"regexp"
 	"strings"
 	"testing"
@@ -34,11 +35,11 @@ func TestGenerateShapeAndDisplay(t *testing.T) {
 	if len(hash) != 32 {
 		t.Errorf("hash len = %d, want 32 (sha256)", len(hash))
 	}
-	if !Equal(hash, Hash(token)) {
+	if !bytes.Equal(hash, Hash(token)) {
 		t.Error("hash != Hash(token)")
 	}
-	if Equal(hash, Hash(token+"x")) {
-		t.Error("Equal matched the hash of a different token")
+	if bytes.Equal(hash, Hash(token+"x")) {
+		t.Error("Hash of a different token matched")
 	}
 }
 
@@ -63,36 +64,6 @@ func TestGenerateUnique(t *testing.T) {
 			t.Fatalf("duplicate token generated: %q", token)
 		}
 		seen[token] = true
-	}
-}
-
-func TestFromAuthorizationHeader(t *testing.T) {
-	// Assembled at runtime: never one token-shaped literal in source.
-	body := strings.Repeat("a", 32)
-	product := "uz" + "p_" + body
-	cli := "uz" + "c_" + body
-	cases := []struct {
-		name   string
-		header string
-		want   string
-		ok     bool
-	}{
-		{"product bearer", "Bearer " + product, product, true},
-		{"case-insensitive scheme", "bearer " + product, product, true},
-		{"trims space", "Bearer   " + product + "  ", product, true},
-		{"cli bearer is not a product token", "Bearer " + cli, "", false},
-		{"unknown bearer", "Bearer " + body, "", false},
-		{"prefix is case-sensitive", "Bearer UZP_" + body, "", false},
-		{"empty", "", "", false},
-		{"bearer empty credential", "Bearer ", "", false},
-		{"basic", "Basic " + product, "", false},
-		{"no scheme", product, "", false},
-	}
-	for _, tc := range cases {
-		got, ok := FromAuthorizationHeader(tc.header)
-		if ok != tc.ok || got != tc.want {
-			t.Errorf("%s: FromAuthorizationHeader(%q) = (%q, %v), want (%q, %v)", tc.name, tc.header, got, ok, tc.want, tc.ok)
-		}
 	}
 }
 

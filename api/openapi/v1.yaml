@@ -1,0 +1,132 @@
+# uzi external API, version 1 (PRD #1907 D12).
+#
+# This document is the stable, versioned contract external products build against.
+# Changes are ADDITIVE ONLY: new paths, new optional request fields, new response
+# fields. Removing or renaming a path, field or enum value, or making an optional
+# request field required, is a breaking change and needs a deprecation window (at
+# least two minor releases and at least 90 days, whichever is later) or a new
+# /api/v2 prefix. The internal /api/* routes are NOT part of this contract.
+#
+# Paths below are relative to the single server url, /api/v1: "/whoami" is served
+# at GET /api/v1/whoami. TestV1OpenAPIRouteParity (api/internal/handler) asserts
+# that this document's operations and the production router's /api/v1 routes are
+# the same set, in both directions, and that every response schema's properties
+# match the Go DTO's JSON fields.
+openapi: 3.1.0
+info:
+  title: uzi API
+  version: 1.0.0
+  description: >-
+    The stable external API of a uzi instance. Callers authenticate with a
+    Bearer product token (uzp_), minted by a user in Settings for a product an
+    admin registered, or with the user's own uzi CLI token (uzc_). The token
+    acts as the user who minted it and never with admin authority.
+servers:
+  - url: /api/v1
+security:
+  - bearerAuth: []
+paths:
+  /whoami:
+    get:
+      operationId: whoami
+      summary: Identify the caller
+      description: >-
+        Returns the user the token acts as, the product the token is bound to
+        (null for a CLI token), and the scopes the token holds. Any valid token
+        may call it; no particular scope is required.
+      responses:
+        "200":
+          description: The caller's identity.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Whoami"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      description: >-
+        A product token (uzp_) or a uzi CLI token (uzc_) with user scope. Admin
+        read-only tokens (uza_) and browser session cookies are refused.
+  responses:
+    Unauthorized:
+      description: >-
+        Missing, malformed, unknown, revoked or expired token, a disabled or
+        deleted product, or an inactive user. The body is the same whatever the
+        reason.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    TooManyRequests:
+      description: >-
+        The per-user request budget for /api/v1 is spent. Retry after the number
+        of seconds in the Retry-After header.
+      headers:
+        Retry-After:
+          description: Seconds until the budget resets.
+          schema:
+            type: integer
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+  schemas:
+    Error:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: A human-readable message.
+    Whoami:
+      type: object
+      required:
+        - user
+        - product
+        - scopes
+      properties:
+        user:
+          $ref: "#/components/schemas/WhoamiUser"
+        product:
+          description: The product the token is bound to; null for a CLI token.
+          oneOf:
+            - $ref: "#/components/schemas/WhoamiProduct"
+            - type: "null"
+        scopes:
+          type: array
+          description: The scopes the token holds. A CLI token holds every scope.
+          items:
+            type: string
+            enum:
+              - jobs:run
+              - jobs:read
+    WhoamiUser:
+      type: object
+      required:
+        - id
+        - display_name
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+          description: Empty when the user has not set a display name.
+    WhoamiProduct:
+      type: object
+      required:
+        - id
+        - name
+      properties:
+        id:
+          type: string
+          format: uuid
+        name:
+          type: string

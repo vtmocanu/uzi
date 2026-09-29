@@ -877,6 +877,9 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountForgeRoutes(r, forgeLimiter)
 		h.mountRepoRoutes(r, forgeLimiter, boardOrderLimiter)
 		h.mountWorkersRoutes(r, hostedLimiter)
+		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
+		// only) and a per-user limit; read mountV1Routes before adding anything here.
+		h.mountV1Routes(r, authLimiter)
 
 		// Runs (PRD #64): the core CLI loop is RequireUser — list/get/messages/inputs,
 		// /{id}/review (Decision 21), and the forge FileIssue write (PRD #365 M1). The
