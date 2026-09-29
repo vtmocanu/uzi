@@ -218,5 +218,18 @@ case_name="latest stable tag ignores prereleases"; new_case tags
 got="$("$script" --latest-stable-tag "$up")"
 if [ "$got" = v0.10.0 ]; then ok "$case_name"; else bad "$case_name" "got $got"; fi
 
+# 13. a relative upstream path still reaches parity as an absolute path (the real parity
+#     step runs from api/, where a relative path resolves elsewhere).
+case_name="relative upstream path reaches parity absolute"; new_case relative
+cat > "$stub/parity.sh" <<'SH'
+#!/usr/bin/env bash
+case "$1" in /*) echo "builtins match upstream (stub)" ;; *) echo "relative upstream: $1"; exit 3 ;; esac
+SH
+ghout="$case_dir/ghout"; : > "$ghout"
+if out="$(cd "$repo" && STUB_DIR="$stub" ROLE_SYNC_PY="$stub/sync.py" ROLE_PARITY_CMD="$stub/parity.sh" \
+    ROLE_SYNC_ALLOWLIST="$case_dir/allow.tsv" GITHUB_OUTPUT="$ghout" "$script" ../up old 2>&1)"; then
+  if [ "$(outv parity_ok)" = true ]; then ok "$case_name"; else bad "$case_name" "$out"; fi
+else bad "$case_name" "script exited non-zero: $out"; fi
+
 echo "$pass passed, $fail failed"
 [ "$fail" -eq 0 ]
