@@ -527,6 +527,58 @@ async function shutdownDeadlineScenario(
 
 // ================================================================================
 describe("RunRunner m4 — Codex durability sinks route through withBoundary", () => {
+  it("stops a transient completion-permit retry when the finalize deadline fires (finding 4daa8d10)", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const deadline = manualDeadline("finalize");
+    const rig = codexRig({ armDeadline: deadline.armDeadline });
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "PERMIT-DEADLINE.txt", "permit retry must stop\n");
+      return { branch: ctx.branch };
+    });
+    const claim = gitlabClaim(1916, {
+      config: { completion_contract_version: 1, contract_revision: 1 },
+    });
+    api.setCompletionPermitResponse(true, { httpStatus: 503 });
+
+    let retryStarted!: () => void;
+    const retrying = new Promise<void>((resolve) => { retryStarted = resolve; });
+    const permitClient = client as unknown as { sleep: (ms: number) => Promise<void> };
+    const originalSleep = permitClient.sleep;
+    permitClient.sleep = async () => {
+      retryStarted();
+      await delay(1_000);
+    };
+    const originalPermit = client.requestCompletionPermit.bind(client);
+    let permitSignal: AbortSignal | undefined;
+    client.requestCompletionPermit = async (runId, args, signal) => {
+      permitSignal = signal;
+      return originalPermit(runId, args, signal);
+    };
+    try {
+      const run = runnerWith(() => ({ executor: exec }), gitlab).execute(claim);
+      await retrying;
+      assert.equal(api.completionPermitRequests.length, 1, "the first transient permit response entered retry backoff");
+      assert.equal(permitSignal?.aborted, false, "the permit signal is live before the finalize deadline");
+
+      deadline.fire();
+      // An unfixed permit can resume after backoff. Let the fake API recover so the red
+      // regression settles promptly instead of waiting for the real 10-minute retry budget.
+      api.setCompletionPermitResponse(true);
+      await run;
+
+      assert.equal(permitSignal?.aborted, true, "the finalize deadline aborts the permit retry signal");
+      assert.equal(api.completionPermitRequests.length, 1, "no permit retry starts after the deadline");
+      assert.equal(calls.length, 0, "no MR is opened after the finalize deadline");
+      const failures = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "failed");
+      assert.equal(failures.length, 1, "the run fails once");
+      assert.match(String(failures[0]!.body.failure_reason), /codex boundary failed at action \(finalize\) during completion-permit: codex boundary action deadline exceeded/);
+      assert.ok(!statuses(claim.run_id).includes("completed"), "a poisoned boundary never reports completion");
+    } finally {
+      permitClient.sleep = originalSleep;
+      client.requestCompletionPermit = originalPermit;
+    }
+  });
+
   it("aborts and settles a stuck finalize forge request before withBoundary/dispose returns", async () => {
     await finalizeDeadlineScenario(1219);
   });

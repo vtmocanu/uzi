@@ -5898,9 +5898,14 @@ export class RunRunner {
       // 2. Request the permit bound to (run, contract_revision, branch, H). A denial is a normal 200
       //    body (granted:false), never a throw. A transient transport failure (an api outage at
       //    finalize) is retried inside the client until the api answers, bounded by its retry budget
-      //    and cancelled with the flight; only a permanent error, a cancel, or an exhausted budget
-      //    throws to the generic catch, which fails the run without falsely completing.
+      //    and cancelled with the flight or the Codex finalize boundary. For Claude/stub runs
+      //    there is no boundary signal, so the flight signal is passed unchanged. Only a
+      //    permanent error, a cancel, or an exhausted budget throws to the generic catch,
+      //    which fails the run without falsely completing.
       steps?.enter("completion_permit");
+      const permitSignal = boundarySignal
+        ? AbortSignal.any([flight.cancel.signal, boundarySignal])
+        : flight.cancel.signal;
       const permit = await this.client.requestCompletionPermit(
         runId,
         {
@@ -5911,7 +5916,7 @@ export class RunRunner {
           // stamps) so the server refuses to issue a permit for a released/superseded stale flight.
           claimGeneration: flight.claimGeneration,
         },
-        flight.cancel.signal,
+        permitSignal,
       );
       // 3. NOT granted: do NOT create the MR, do NOT render Closes, do NOT report completed — hold.
       if (!permit.granted) {
