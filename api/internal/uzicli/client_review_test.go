@@ -3,6 +3,7 @@ package uzicli
 import (
 	"context"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -187,5 +188,85 @@ func TestUndoFindingFallbackHardError(t *testing.T) {
 	var ee *ExitError
 	if !errors.As(err, &ee) {
 		t.Fatalf("fallback 500 err = %v, want an *ExitError", err)
+	}
+}
+
+func TestFindingIssueDraftWire(t *testing.T) {
+	var gotMethod, gotPath string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.EscapedPath()
+		_, _ = w.Write([]byte(`{"disposition_id":"d-3","title":"t"}`))
+	}))
+	defer srv.Close()
+	d, err := newTestClient(srv).FindingIssueDraft(context.Background(), "e/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodGet || gotPath != "/api/findings/e%2F1/issue-draft" || d.DispositionID != "d-3" {
+		t.Errorf("method=%q path=%q draft=%+v", gotMethod, gotPath, d)
+	}
+}
+
+func TestFileFindingGroupWire(t *testing.T) {
+	for _, tc := range []struct {
+		status   int
+		body     string
+		accepted bool
+	}{
+		{http.StatusCreated, `{"operation_id":"op-1","disposition_ids":["a","b"],"phase":"settled","issue":{"iid":5,"web_url":"u","title":"t"}}`, false},
+		{http.StatusAccepted, `{"operation_id":"op-2","disposition_ids":["a","b"],"phase":"in_flight","warning":"w"}`, true},
+	} {
+		var gotMethod, gotPath, gotBody string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			gotMethod, gotPath = r.Method, r.URL.Path
+			b, _ := io.ReadAll(r.Body)
+			gotBody = string(b)
+			w.WriteHeader(tc.status)
+			_, _ = w.Write([]byte(tc.body))
+		}))
+		res, accepted, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a", "b"})
+		srv.Close()
+		if err != nil {
+			t.Fatalf("%d: %v", tc.status, err)
+		}
+		if gotMethod != http.MethodPost || gotPath != "/api/findings/issue" || gotBody != `{"ids":["a","b"]}` {
+			t.Errorf("%d: method=%q path=%q body=%q", tc.status, gotMethod, gotPath, gotBody)
+		}
+		if accepted != tc.accepted || res.OperationID == "" || (tc.accepted == (res.Issue != nil)) {
+			t.Errorf("%d: accepted=%v res=%+v", tc.status, accepted, res)
+		}
+	}
+}
+
+func TestFileFindingGroupStatusMapping(t *testing.T) {
+	for status, want := range map[int]int{http.StatusConflict: ExitConflict, http.StatusBadRequest: ExitUsage, http.StatusNotFound: ExitNotFound} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"x"}`))
+		}))
+		_, _, err := newTestClient(srv).FileFindingGroup(context.Background(), []string{"a"})
+		srv.Close()
+		var ee *ExitError
+		if !errors.As(err, &ee) || ee.Code != want {
+			t.Errorf("status %d: err=%v want exit %d", status, err, want)
+		}
+	}
+}
+
+func TestReleaseFindingGroupWire(t *testing.T) {
+	var gotMethod, gotPath, gotBody string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod, gotPath = r.Method, r.URL.EscapedPath()
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		_, _ = w.Write([]byte(`{"operation_id":"op/1","phase":"released"}`))
+	}))
+	defer srv.Close()
+	res, err := newTestClient(srv).ReleaseFindingGroup(context.Background(), "op/1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotMethod != http.MethodPost || gotPath != "/api/findings/filing-operations/op%2F1/release" || gotBody != `{"confirmed_absent":true}` || res.Phase != "released" {
+		t.Errorf("method=%q path=%q body=%q res=%+v", gotMethod, gotPath, gotBody, res)
 	}
 }

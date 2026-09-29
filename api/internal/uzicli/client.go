@@ -529,6 +529,21 @@ type Client interface {
 	// created-with-warning note. An unknown/foreign id is a 404 (exit 4); an already-filed or
 	// mid-filing coordinate is a 409 (exit 5) — both come straight from statusError.
 	FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error)
+	// FindingIssueDraft reads the issue draft for one finding (GET /api/findings/{id}/issue-draft,
+	// keyed on the EVIDENCE id). The CLI uses it only for DispositionID, which resolves any
+	// (possibly older) evidence id to its coordinate's disposition so a group file can dedupe.
+	// An unknown/foreign id is a 404 (exit 4).
+	FindingIssueDraft(ctx context.Context, evidenceID string) (apitypes.IncidentalFindingIssueDraftDTO, error)
+	// FileFindingGroup files ONE forge issue from several coordinates (issue #1724): POST
+	// /api/findings/issue {ids} keyed on DISPOSITION ids, with the server's default text. The bool
+	// is true on a 202 (the filing has not settled: pre_call/in_flight/returned_uncertain, no
+	// Issue), false on a 201. A 409 (a coordinate is not fileable) is exit 5, 400 exit 2, 404
+	// exit 4, all straight from statusError.
+	FileFindingGroup(ctx context.Context, dispositionIDs []string) (res apitypes.FindingGroupFileResultDTO, accepted bool, err error)
+	// ReleaseFindingGroup releases a stuck group filing operation after the owner confirmed no
+	// issue exists (POST /api/findings/filing-operations/{op}/release {confirmed_absent:true}).
+	// A 409 (cannot be released) is exit 5, an unknown operation exit 4.
+	ReleaseFindingGroup(ctx context.Context, operationID string) (apitypes.FindingGroupReleaseResultDTO, error)
 	// DismissFinding triages one finding coordinate to `dismissed` with a reason (PRD #333 M6):
 	// POST /api/findings/{id}/dismiss {reason}. reason is the wire enum (wont_do|not_an_issue),
 	// mapped from the hyphenated flag and validated by the COMMAND before this is reached. An

@@ -128,6 +128,38 @@ func (c *HTTPClient) FileFinding(ctx context.Context, id string) (apitypes.Incid
 	return out, nil
 }
 
+func (c *HTTPClient) FindingIssueDraft(ctx context.Context, evidenceID string) (apitypes.IncidentalFindingIssueDraftDTO, error) {
+	var out apitypes.IncidentalFindingIssueDraftDTO
+	if err := c.get(ctx, "/api/findings/"+url.PathEscape(evidenceID)+"/issue-draft", &out); err != nil {
+		return apitypes.IncidentalFindingIssueDraftDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) FileFindingGroup(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupFileResultDTO, bool, error) {
+	// Only ids are sent: the server renders the default group text. doJSONRead (not postJSON) so
+	// the 201/202 split stays visible; decode2xx already accepts any 2xx and maps the rest.
+	const path = "/api/findings/issue"
+	resp, body, err := c.doJSONRead(ctx, http.MethodPost, path, apitypes.FindingGroupFileRequest{IDs: dispositionIDs})
+	if err != nil {
+		return apitypes.FindingGroupFileResultDTO{}, false, err
+	}
+	var out apitypes.FindingGroupFileResultDTO
+	if err := decode2xx(resp, body, path, &out); err != nil {
+		return apitypes.FindingGroupFileResultDTO{}, false, err
+	}
+	return out, resp.StatusCode == http.StatusAccepted, nil
+}
+
+func (c *HTTPClient) ReleaseFindingGroup(ctx context.Context, operationID string) (apitypes.FindingGroupReleaseResultDTO, error) {
+	var out apitypes.FindingGroupReleaseResultDTO
+	path := "/api/findings/filing-operations/" + url.PathEscape(operationID) + "/release"
+	if err := c.postJSON(ctx, path, apitypes.FindingGroupReleaseRequest{ConfirmedAbsent: true}, &out); err != nil {
+		return apitypes.FindingGroupReleaseResultDTO{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) DismissFinding(ctx context.Context, id, reason string) error {
 	// reason is the wire enum, already mapped and validated by the command. postJSON discards
 	// the (200) body via a nil out and maps a non-2xx through statusError (404→4, 409→5).

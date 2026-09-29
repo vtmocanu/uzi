@@ -204,7 +204,8 @@ uzi review undo <run-id> <rec-id>
 uzi review file <run-id> <rec-id> [--repo <repo-id>]
 uzi review stats
 uzi findings list [--repo <repo-id>] [--bucket to_file|filed|done|dismissed|all] [--run <run-id>]
-uzi findings file <finding-id>
+uzi findings file <finding-id> [<finding-id>...]
+uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
 uzi findings stats [--repo <repo-id>]
@@ -1311,6 +1312,15 @@ which you triage from the terminal exactly like the judge backlog.
   yours. `--json` returns `{issue:{iid,web_url,title}, warning?}`; a `warning` means
   the issue was created but its local record could not settle (a success with a note,
   still exit 0), not a retry signal.
+- `uzi findings file <finding-id> <finding-id>...` — file ONE issue for several
+  coordinates of the same repo. Each id (older evidence ids included) is resolved to its
+  coordinate's disposition and duplicates collapse; if only one coordinate remains it is
+  filed as above. `--json` returns `{operation_id, disposition_ids, phase, issue?,
+  warning?}`. A 202 means the filing could not be confirmed: the operation id and phase
+  are printed and the exit is 5. Check the forge, and only if no issue exists run
+  `uzi findings release <operation-id> --confirm-no-issue` (without the flag it is a
+  usage error). A 409 lists any `pending operation <op>` holding the chosen coordinates.
+  A backlog row claimed by a group filing shows `pending group <op>` as its state.
 - `uzi findings dismiss <finding-id> --reason wont-do|not-an-issue` — dismiss a
   coordinate (`not-an-issue` is a false positive, `wont-do` is valid-but-skip), so it
   stays gone and never re-nags across later runs. A missing or invalid `--reason` is a
