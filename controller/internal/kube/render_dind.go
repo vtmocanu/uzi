@@ -318,7 +318,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 // CNPG instance pod (the cnpg.io/cluster label). Rendered for docker workers only; a
 // plain worker gets nil, so its spec/hash is untouched.
 func dockerNodeAntiAffinity(w protocol.DesiredWorker) *corev1.Affinity {
-	if !w.Docker {
+	if !withDinD(w) {
 		return nil
 	}
 	const hostnameTopology = "kubernetes.io/hostname"

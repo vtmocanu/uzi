@@ -52,6 +52,16 @@ type DesiredWorker struct {
 	// is why it rides its own bool rather than a template name. Mirrors the api's
 	// hostedsvc.DesiredWorker.Docker; the shared golden pins the two in lockstep.
 	Docker bool `json:"docker"`
+	// Isolated is the isolated research lane dimension (PRD #1906 M5): true for a hosted,
+	// run-bound worker the api itself provisioned into the no-internet lane (it is set from
+	// the server-owned workers.isolated_lane column, never a worker self-report). This side
+	// renders such a worker into the dedicated lane namespace
+	// (UZI_WORKER_ISOLATED_NAMESPACE) with the fetcher env, and SKIPS it (fail closed,
+	// logged) when the lane is not configured: it is never rendered into the ordinary
+	// worker namespace, whose egress policy is wider. Isolated together with Docker is
+	// refused and never rendered (the lane never carries a DinD sidecar). Mirrors the api's
+	// hostedsvc.DesiredWorker.Isolated; the shared golden pins the two in lockstep.
+	Isolated bool `json:"isolated"`
 	// Busy is true when the worker holds at least one non-terminal run (PRD #422 M3).
 	// The controller defers a deliberate roll of a busy worker (cordon-then-roll-when-idle,
 	// M4). Mirrors the api's hostedsvc.DesiredWorker.Busy; the shared golden pins the two
