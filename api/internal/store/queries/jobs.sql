@@ -102,6 +102,52 @@ SELECT f.ordinal, f.severity, f.message_md, f.url, f.file, f.line
    AND (sqlc.narg('product_id')::uuid IS NULL OR o.product_id = sqlc.narg('product_id')::uuid)
  ORDER BY f.ordinal ASC;
 
+-- name: UpsertJobResult :exec
+-- The worker's job-result ingest (PRD #1908): the run's one structured result, idempotent on
+-- run_id so a retried POST replaces the earlier body. Runs in the ingest transaction, after the
+-- run row was locked FOR UPDATE and the kind and claim generation were checked in Go.
+INSERT INTO job_results (run_id, status, report_md)
+VALUES (@run_id, @status, @report_md)
+ON CONFLICT (run_id) DO UPDATE
+   SET status     = EXCLUDED.status,
+       report_md  = EXCLUDED.report_md,
+       updated_at = now();
+
+-- name: DeleteJobFindingsForRun :exec
+-- Replace semantics: the ingest transaction drops the run's earlier findings, then re-inserts the
+-- new set (InsertJobFinding), so a second POST never leaves the first body's findings behind.
+DELETE FROM job_findings WHERE run_id = @run_id;
+
+-- name: InsertJobFinding :exec
+INSERT INTO job_findings (run_id, ordinal, severity, message_md, url, file, line)
+VALUES (@run_id, @ordinal, @severity, @message_md, sqlc.narg('url'), sqlc.narg('file'), sqlc.narg('line'));
+
+-- name: FailJobRunWithoutResult :execrows
+-- The no-result invariant (PRD #1908): a job run the worker reports `completed` while no
+-- job_results row exists is failed instead, fail_origin 'job_no_result'. ONE statement, so the
+-- result probe and the transition cannot interleave with a result ingest. workersvc runs it just
+-- before SetRunCompleted for a kind='job' run: 1 row means the run failed here; 0 rows means a
+-- result exists (or the run is not this worker's live, non-terminal job) and SetRunCompleted
+-- proceeds exactly as for any other kind. The SET list mirrors SetRunFailed's terminal columns.
+UPDATE runs SET
+    status             = 'failed',
+    status_since       = now(),
+    failure_reason     = @failure_reason,
+    fail_origin        = 'job_no_result',
+    session_id         = COALESCE(sqlc.narg('session_id'), session_id),
+    finished_at        = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = @id AND worker_id = @worker_id
+  AND kind = 'job'
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND claim_released_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM job_results jr WHERE jr.run_id = runs.id);
+
 -- name: ListJobMessagesForCaller :many
 -- The narrowed, caller-safe projection of a job's run_messages: ONLY the human-readable kinds
 -- (text, status, error) and ONLY their payload text. tool_use / tool_result / thinking /

@@ -814,6 +814,9 @@ type Store interface {
 	SetRunAwaitingFollowup(ctx context.Context, arg store.SetRunAwaitingFollowupParams) (int64, error)
 	SetRunCompleted(ctx context.Context, arg store.SetRunCompletedParams) (int64, error)
 	SetRunFailed(ctx context.Context, arg store.SetRunFailedParams) (int64, error)
+	// FailJobRunWithoutResult fails a kind='job' run reported completed with no job_results row
+	// (PRD #1908 no-result invariant); 0 rows leaves the completion to SetRunCompleted.
+	FailJobRunWithoutResult(ctx context.Context, arg store.FailJobRunWithoutResultParams) (int64, error)
 	// SetRunFailedPlanRejected is SetRunFailed for a plan_rejected report that also settles the
 	// run's unapplied reject_plan inputs in the same statement (issue #1604).
 	SetRunFailedPlanRejected(ctx context.Context, arg store.SetRunFailedPlanRejectedParams) (int64, error)
@@ -4220,7 +4223,24 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 				return run, true, rerr
 			}
 		} else {
-			rows, err = q.SetRunCompleted(ctx, completedParams)
+			// PRD #1908 no-result invariant: a job run reported completed with no job_results row
+			// is failed (fail_origin job_no_result) by one guarded statement instead. It updates
+			// nothing when a result exists, and only a kind='job' row can match, so every other
+			// kind (and a job with a result) falls through to SetRunCompleted unchanged.
+			var failedNoResult int64
+			if owned.Kind == runkind.Job {
+				failedNoResult, err = q.FailJobRunWithoutResult(ctx, store.FailJobRunWithoutResultParams{
+					FailureReason: pgconv.TextOrNull(jobNoResultFailureReasonText),
+					SessionID:     sessionID, ID: runID, WorkerID: pgconv.UUID(wkr.ID),
+				})
+			}
+			switch {
+			case err != nil:
+			case failedNoResult > 0:
+				rows = failedNoResult
+			default:
+				rows, err = q.SetRunCompleted(ctx, completedParams)
+			}
 		}
 	case "limit_wait":
 		rows, err = s.setLimitWait(ctx, owned, wkr, req, sessionID)

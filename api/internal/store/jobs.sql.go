@@ -263,6 +263,64 @@ func (q *Queries) CreateJobRun(ctx context.Context, arg CreateJobRunParams) (Run
 	return i, err
 }
 
+const deleteJobFindingsForRun = `-- name: DeleteJobFindingsForRun :exec
+DELETE FROM job_findings WHERE run_id = $1
+`
+
+// Replace semantics: the ingest transaction drops the run's earlier findings, then re-inserts the
+// new set (InsertJobFinding), so a second POST never leaves the first body's findings behind.
+func (q *Queries) DeleteJobFindingsForRun(ctx context.Context, runID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, deleteJobFindingsForRun, runID)
+	return err
+}
+
+const failJobRunWithoutResult = `-- name: FailJobRunWithoutResult :execrows
+UPDATE runs SET
+    status             = 'failed',
+    status_since       = now(),
+    failure_reason     = $1,
+    fail_origin        = 'job_no_result',
+    session_id         = COALESCE($2, session_id),
+    finished_at        = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at         = now()
+WHERE id = $3 AND worker_id = $4
+  AND kind = 'job'
+  AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND claim_released_at IS NULL
+  AND NOT EXISTS (SELECT 1 FROM job_results jr WHERE jr.run_id = runs.id)
+`
+
+type FailJobRunWithoutResultParams struct {
+	FailureReason pgtype.Text `json:"failure_reason"`
+	SessionID     pgtype.Text `json:"session_id"`
+	ID            uuid.UUID   `json:"id"`
+	WorkerID      pgtype.UUID `json:"worker_id"`
+}
+
+// The no-result invariant (PRD #1908): a job run the worker reports `completed` while no
+// job_results row exists is failed instead, fail_origin 'job_no_result'. ONE statement, so the
+// result probe and the transition cannot interleave with a result ingest. workersvc runs it just
+// before SetRunCompleted for a kind='job' run: 1 row means the run failed here; 0 rows means a
+// result exists (or the run is not this worker's live, non-terminal job) and SetRunCompleted
+// proceeds exactly as for any other kind. The SET list mirrors SetRunFailed's terminal columns.
+func (q *Queries) FailJobRunWithoutResult(ctx context.Context, arg FailJobRunWithoutResultParams) (int64, error) {
+	result, err := q.db.Exec(ctx, failJobRunWithoutResult,
+		arg.FailureReason,
+		arg.SessionID,
+		arg.ID,
+		arg.WorkerID,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const failJobsPastWallDeadline = `-- name: FailJobsPastWallDeadline :many
 UPDATE runs SET status = 'failed', status_since = now(), failure_reason = $1,
     fail_origin = 'run_timeout',
@@ -491,6 +549,34 @@ func (q *Queries) GetProductJobPolicy(ctx context.Context, id uuid.UUID) ([]stri
 	var allowed_job_types []string
 	err := row.Scan(&allowed_job_types)
 	return allowed_job_types, err
+}
+
+const insertJobFinding = `-- name: InsertJobFinding :exec
+INSERT INTO job_findings (run_id, ordinal, severity, message_md, url, file, line)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+`
+
+type InsertJobFindingParams struct {
+	RunID     uuid.UUID   `json:"run_id"`
+	Ordinal   int32       `json:"ordinal"`
+	Severity  string      `json:"severity"`
+	MessageMd string      `json:"message_md"`
+	Url       pgtype.Text `json:"url"`
+	File      pgtype.Text `json:"file"`
+	Line      pgtype.Int4 `json:"line"`
+}
+
+func (q *Queries) InsertJobFinding(ctx context.Context, arg InsertJobFindingParams) error {
+	_, err := q.db.Exec(ctx, insertJobFinding,
+		arg.RunID,
+		arg.Ordinal,
+		arg.Severity,
+		arg.MessageMd,
+		arg.Url,
+		arg.File,
+		arg.Line,
+	)
+	return err
 }
 
 const listJobFindingsForCaller = `-- name: ListJobFindingsForCaller :many
@@ -826,4 +912,27 @@ func (q *Queries) LockUnservableEphemeralJobWorkers(ctx context.Context, deadlin
 		return nil, err
 	}
 	return items, nil
+}
+
+const upsertJobResult = `-- name: UpsertJobResult :exec
+INSERT INTO job_results (run_id, status, report_md)
+VALUES ($1, $2, $3)
+ON CONFLICT (run_id) DO UPDATE
+   SET status     = EXCLUDED.status,
+       report_md  = EXCLUDED.report_md,
+       updated_at = now()
+`
+
+type UpsertJobResultParams struct {
+	RunID    uuid.UUID `json:"run_id"`
+	Status   string    `json:"status"`
+	ReportMd string    `json:"report_md"`
+}
+
+// The worker's job-result ingest (PRD #1908): the run's one structured result, idempotent on
+// run_id so a retried POST replaces the earlier body. Runs in the ingest transaction, after the
+// run row was locked FOR UPDATE and the kind and claim generation were checked in Go.
+func (q *Queries) UpsertJobResult(ctx context.Context, arg UpsertJobResultParams) error {
+	_, err := q.db.Exec(ctx, upsertJobResult, arg.RunID, arg.Status, arg.ReportMd)
+	return err
 }

@@ -1170,26 +1170,26 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// mountWorkerRoutes, new config knobs, and updating the pinned route-table +
 		// limiter-argument-order tests — so it is left as a follow-up rather than folded
 		// into this hardening pass.
-		r.Post("/runs/{id}/publish", h.WorkerRunPublish)
+		r.With(h.refuseJobRuns).Post("/runs/{id}/publish", h.WorkerRunPublish)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences
 		// into the lead's prompt at claim time. Both derive (user_id, repo_id) from
 		// the run claim inside the service — never from the request body.
-		r.Post("/runs/{id}/memory", h.WorkerSaveMemory)
-		r.Get("/runs/{id}/memory", h.WorkerListMemory)
+		r.With(h.refuseJobRuns).Post("/runs/{id}/memory", h.WorkerSaveMemory)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/memory", h.WorkerListMemory)
 
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ
 		// ONLY. Every route derives the (repo, connection, project id) from the OWNED
 		// run — never from the request — builds a driver, and returns a coordinate-free
 		// DTO (no WebURL, no forge project id/base url/token; driver errors are mapped
 		// to fixed generic messages so the SDK's embedded URL never reaches the agent).
-		r.Get("/runs/{id}/forge/issues/{iid}", h.WorkerForgeGetIssue)
-		r.Get("/runs/{id}/forge/issues", h.WorkerForgeListIssues)
-		r.Get("/runs/{id}/forge/issues/{iid}/label-events", h.WorkerForgeListIssueLabelEvents)
-		r.Get("/runs/{id}/forge/merge-requests/{iid}", h.WorkerForgeGetMergeRequest)
-		r.Get("/runs/{id}/forge/pipelines/{pipeline_id}/jobs", h.WorkerForgePipelineJobs)
-		r.Get("/runs/{id}/forge/latest-pipeline", h.WorkerForgeLatestPipeline)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/forge/issues/{iid}", h.WorkerForgeGetIssue)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/forge/issues", h.WorkerForgeListIssues)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/forge/issues/{iid}/label-events", h.WorkerForgeListIssueLabelEvents)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/forge/merge-requests/{iid}", h.WorkerForgeGetMergeRequest)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/forge/pipelines/{pipeline_id}/jobs", h.WorkerForgePipelineJobs)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/forge/latest-pipeline", h.WorkerForgeLatestPipeline)
 
 		// Forge WRITE surface (PRD #700 M4): the mr_rework run's write-back — reply in
 		// and resolve the MR review threads it addressed. The only worker-mediated forge
@@ -1197,8 +1197,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// OWNED run and enforces the Decision-11 scope check server-side (the reply/
 		// resolve id must belong to a thread in THIS run's review snapshot), so an
 		// injected "resolve all open threads" is a no-op. Neither touches `main`.
-		r.Post("/runs/{id}/forge/mr-threads/reply", h.WorkerForgeReplyMRThread)
-		r.Post("/runs/{id}/forge/mr-threads/resolve", h.WorkerForgeResolveMRThread)
+		r.With(h.refuseJobRuns).Post("/runs/{id}/forge/mr-threads/reply", h.WorkerForgeReplyMRThread)
+		r.With(h.refuseJobRuns).Post("/runs/{id}/forge/mr-threads/resolve", h.WorkerForgeResolveMRThread)
 
 		// Codex credential bridge (PRD #1171 M1), ships DARK. Bearer-only, run-scoped
 		// worker→API routes over the M1 coordinated-refresh service half. release re-fetches
@@ -1213,14 +1213,25 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Run judge (PRD #46 M3): a judge run reads the run it reviews and posts a
 		// verdict. Both are judge-run-scoped (the worker must own the active judge
 		// run reviewing {id}); {id} is the TARGET run, not the judge run.
-		r.Get("/runs/{id}/trace", h.WorkerRunTrace)
-		r.Post("/runs/{id}/review", h.WorkerRunReview)
+		//
+		// PRD #1908: trace, review and task-review are refused (403 not_for_job) when the
+		// REVIEWED run {id} is a job (refuseJobReviewTargets), not when the run the worker holds
+		// is. The publish, memory and forge routes above are refused when the run the worker
+		// holds is a job (refuseJobRuns).
+		r.With(h.refuseJobReviewTargets).Get("/runs/{id}/trace", h.WorkerRunTrace)
+		r.With(h.refuseJobReviewTargets).Post("/runs/{id}/review", h.WorkerRunReview)
 
 		// Task diff-review (PRD #400 M4a): a review run (a task carrying
 		// review_target_run_id) posts its structured findings for the reviewed task.
 		// Review-run-scoped (the worker must own the active review run reviewing {id});
 		// {id} is the TARGET run, not the review run.
-		r.Post("/runs/{id}/task-review", h.WorkerTaskReview)
+		r.With(h.refuseJobReviewTargets).Post("/runs/{id}/task-review", h.WorkerTaskReview)
+
+		// Job result ingest (PRD #1908): a kind='job' run posts its structured result (report +
+		// findings) before it reports `completed`. Fenced on the worker holding the run and the
+		// body's claim_generation; job runs only (any other kind is 403 not_for_job). Idempotent:
+		// one transaction upserts the result and replaces the run's findings.
+		r.Post("/runs/{id}/job-result", h.WorkerJobResult)
 
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's

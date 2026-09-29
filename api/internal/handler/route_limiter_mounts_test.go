@@ -777,6 +777,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.
 	{"POST", "/api/worker/runs/{id}/task-review", noLimiter},
+	// PRD #1908: the job runner's structured result POST, worker-authenticated and unlimited like task-review.
+	{"POST", "/api/worker/runs/{id}/job-result", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the
