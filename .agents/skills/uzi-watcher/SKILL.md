@@ -439,6 +439,10 @@ and falling back to the durable bare tracking ref when no clone survives:
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
   A `queued` run without a worker binding gets a status-only `SNAP` and stays in
   the loop. A requeued run can retain its worker and clone; capture that work.
+  A `failed` run bound to a worker is captured while its clone or owned tracking ref
+  survives (recovery custody can keep an ephemeral worker alive), else `SNAP`; a search
+  that could not complete (a kubectl listing or exec failed) is `FAIL`, never `SNAP`;
+  `completed` and `cancelled` runs are always `SNAP`.
   Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the
@@ -462,7 +466,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
   (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
-  terminal run after its first terminal snapshot, and retries active runs after a failed
+  terminal run after its first complete terminal cycle, and retries active runs, and a failed
+  run whose capture was incomplete or whose source search was inconclusive, after a failed
   capture. `backup-loop.state` records its PID, context, namespaces, interval, exact end
   time, retention and run set, so another session can audit the detached process without
   reading its full environment. This is a session-independent safety net; it is NOT a
