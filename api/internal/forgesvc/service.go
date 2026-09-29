@@ -868,12 +868,20 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // were written; advancing a successful path's mark would skip a window whose
 // rows never reached the cache.
 //
+// IncrementalSync makes no finding-group marker match: its fetches are filtered
+// by label and by updated_after, so they are not the complete issue set marker
+// uniqueness requires. It only settles durably recorded group operations (those
+// with a stored issue iid and url) on the current pending page, and it never
+// advances the group cursor: only FullSync rotates pages, so every page is
+// examined within as many FullSync passes as there are pages, however many
+// incremental passes run between them.
+//
 // The finding fetch is SKIPPED when the finding label equals the uzi label (a
 // misconfig ValidateMerged forbids): those issues are already covered by the uzi
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
-	_, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
+	_, finishGroups, _, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
 	if pendingErr != nil {
 		return m, pendingErr
@@ -907,10 +915,13 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 			return m, err
 		}
 	}
-	// No marker matching here: an UpdatedAfter-filtered, label-filtered page is
-	// not the complete set marker uniqueness needs. pendingFindingGroups above
-	// already settled recorded iids; unrecorded ops wait for FullSync.
-	advanceGroups()
+	// No marker matching and NO cursor advance here: an UpdatedAfter-filtered,
+	// label-filtered page is not the complete set marker uniqueness needs.
+	// pendingFindingGroups above settled the recorded iids of the current page;
+	// the page rotates only in FullSync (the returned advance closure is
+	// deliberately ignored), so incremental passes cannot shift which page the
+	// next FullSync examines. Recorded-op settlement on later pages therefore
+	// happens as FullSync rotates to them.
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}

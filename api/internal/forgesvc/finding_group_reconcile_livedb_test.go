@@ -418,6 +418,31 @@ func TestFindingGroupReconcilePagesPastOnePageLiveDB(t *testing.T) {
 	}
 }
 
+// One FullSync then nine IncrementalSyncs per reconcile cycle: incremental passes must not
+// rotate the page, or every FullSync re-reads page 1 (all pre_call) and never reaches the
+// in_flight op on page 2.
+func TestFindingGroupReconcileIncrementalDoesNotStarvePageTwoLiveDB(t *testing.T) {
+	e := newRCEnv(t)
+	for i := 0; i < 100; i++ {
+		e.claim(e.user, 1)
+	}
+	op, ids := e.inFlight(e.user, 1)
+	e.fake.set(rcIssue(2500, "body "+rcMarker(op.ID)))
+	if err := e.fullSync(); err != nil {
+		t.Fatal(err)
+	}
+	e.requireClaimed(ids)
+	for i := 0; i < 9; i++ {
+		if _, err := e.svc.IncrementalSync(e.ctx, e.repoID, 7001, e.fake, Marks{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := e.fullSync(); err != nil {
+		t.Fatal(err)
+	}
+	e.requireSettled(2500, ids)
+}
+
 // ── diagnostics ──────────────────────────────────────────────────────────────────────────────
 
 type captureHandler struct {
@@ -539,14 +564,15 @@ func (e *rcEnv) requireNoCursor() {
 	}
 }
 
-// The marker is on two issues. The finding-labelled, UpdatedAfter-bounded fetch sees only the
-// newer one, and the older one has lost its label, so no filtered fetch shows the duplicate.
+// The marker is on two issues. The older one is closed and has lost its label, so the
+// finding-labelled, UpdatedAfter-bounded fetch and the open fetch both miss it: only the
+// complete (unlabelled, all-state) set shows both carriers.
 func TestFindingGroupReconcileDuplicateHiddenFromFilteredFetchesStaysClaimedLiveDB(t *testing.T) {
 	e := newRCEnv(t)
 	op, ids := e.inFlight(e.user, 2)
 	now := time.Now().UTC().Truncate(time.Second)
 	older := rcIssue(1601, "first "+rcMarker(op.ID))
-	older.Labels, older.UpdatedAt = nil, now.Add(-time.Hour)
+	older.Labels, older.State, older.UpdatedAt = nil, "closed", now.Add(-time.Hour)
 	newer := rcIssue(1602, "second "+rcMarker(op.ID))
 	newer.UpdatedAt = now
 	e.fake.set(older, newer)

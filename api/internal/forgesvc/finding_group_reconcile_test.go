@@ -215,7 +215,7 @@ func (db *markerPageDB) Query(ctx context.Context, query string, args ...interfa
 	var matches []store.FindingGroupClaimOperation
 	for _, op := range db.ops {
 		for _, id := range ids {
-			if op.ID == id && op.Phase == "in_flight" && db.settled != id {
+			if op.ID == id && (op.Phase == "in_flight" || op.Phase == "returned_uncertain") && db.settled != id {
 				matches = append(matches, op)
 			}
 		}
@@ -556,4 +556,69 @@ func TestFullSyncUnfilteredFetchOnlyWhenMatchableOpPending(t *testing.T) {
 			t.Fatalf("unfiltered calls = %d, want 0", got)
 		}
 	})
+}
+
+// IncrementalSync must not rotate the group page: with 1 FullSync + 9
+// IncrementalSync per reconcile cycle, incremental rotation left every FullSync on
+// the same page, so an in_flight op on page 2 behind a page of pre_call ops was
+// never examined.
+func TestIncrementalSyncDoesNotRotateGroupPage(t *testing.T) {
+	repo, user := uuid.New(), uuid.New()
+	start := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
+	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
+	for i := 0; i < 101; i++ {
+		phase := "pre_call"
+		if i == 100 {
+			phase = "in_flight"
+		}
+		db.ops = append(db.ops, store.FindingGroupClaimOperation{
+			ID: uuid.New(), UserID: user, RepoID: repo, Phase: phase,
+			CreatedAt: start.Add(time.Duration(i) * time.Second),
+		})
+	}
+	target := db.ops[100].ID
+	svc := newTestService(&fakeStore{})
+	svc.SetFindingGroupDB(db)
+	marker := "<!-- uzi-finding-group-operation: " + target.String() + " -->"
+	f := &fakeForge{allIssues: []forge.Issue{{
+		IID: 301, WebURL: "https://example.com/301", Description: marker,
+		UpdatedAt: start.Add(200 * time.Second),
+	}}}
+	ctx := context.Background()
+	if _, err := svc.FullSync(ctx, repo, 7, f); err != nil {
+		t.Fatal(err)
+	}
+	if db.settled != uuid.Nil {
+		t.Fatal("page 1 holds only pre_call ops; nothing may settle on the first FullSync")
+	}
+	for i := 0; i < 9; i++ {
+		if _, err := svc.IncrementalSync(ctx, repo, 7, f, Marks{}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := svc.FullSync(ctx, repo, 7, f); err != nil {
+		t.Fatal(err)
+	}
+	if db.recorded != target || db.settled != target {
+		t.Fatalf("in_flight op on page 2 not settled by the second FullSync: recorded=%s settled=%s", db.recorded, db.settled)
+	}
+}
+
+// A returned_uncertain unrecorded op is matchable exactly like in_flight.
+func TestFullSyncMatchesReturnedUncertainOp(t *testing.T) {
+	repo := uuid.New()
+	op := store.FindingGroupClaimOperation{ID: uuid.New(), UserID: uuid.New(), RepoID: repo, Phase: "returned_uncertain", CreatedAt: time.Now().Add(-time.Minute)}
+	db := &markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{op}}}
+	svc := newTestService(&fakeStore{})
+	svc.SetFindingGroupDB(db)
+	f := &fakeForge{allIssues: []forge.Issue{{
+		IID: 41, WebURL: "https://example.com/41", UpdatedAt: time.Now(),
+		Description: "<!-- uzi-finding-group-operation: " + op.ID.String() + " -->",
+	}}}
+	if _, err := svc.FullSync(context.Background(), repo, 7, f); err != nil {
+		t.Fatal(err)
+	}
+	if db.recorded != op.ID || db.settled != op.ID || db.candidateQueries != 1 {
+		t.Fatalf("returned_uncertain op: recorded=%s settled=%s candidate queries=%d", db.recorded, db.settled, db.candidateQueries)
+	}
 }
