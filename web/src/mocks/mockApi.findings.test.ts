@@ -284,7 +284,18 @@ describe("mockApi grouped filing (issue #1724)", () => {
     await expect(api.fileFindingGroup({ ids })).rejects.toMatchObject({ status: 409 });
   });
 
-  it("mirrors the server errors: mixed repos 400, unknown 404, non-fileable 409, bad count 400", async () => {
+  it("rejects an empty title with 400 and files nothing", async () => {
+    const api = await freshApi();
+    const ids = openUzi.slice(0, 2).map((f) => f.disposition_id);
+    await expect(api.fileFindingGroup({ ids, title: "  " })).rejects.toMatchObject({
+      status: 400,
+      message: "title must be non-empty",
+    });
+    const res = await api.fileFindingGroup({ ids, title: "ok" });
+    expect(res.issue?.title).toBe("ok");
+  });
+
+  it("approximates the server errors: mixed repos 400, unknown 404, non-fileable 409, bad count 400", async () => {
     const api = await freshApi();
     const [a] = openUzi;
     await expect(

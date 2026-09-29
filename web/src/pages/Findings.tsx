@@ -129,6 +129,7 @@ function groupFileIneligibility(rows: IncidentalFinding[]): string {
   if (rows.length > GROUP_MAX) return `Select at most ${GROUP_MAX} findings to file as one issue.`;
   if (rows.some((r) => r.status !== "open")) return "Only open findings can be filed as one issue.";
   if (rows.some((r) => !r.finding_id)) return "Some selected findings have no evidence to file.";
+  if (rows.some((r) => r.group_operation_id)) return "A selected finding is already being filed as a group.";
   if (rows.some((r) => r.repo_id !== rows[0].repo_id)) return "Select findings from one repo to file them together.";
   return "";
 }
@@ -155,8 +156,10 @@ export function Findings() {
   // act on).
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [toast, setToast] = useState<FindingsToast | null>(null);
-  // The grouped-filing draft card (issue #1724): the selection is frozen when the card opens, so
-  // ticking boxes afterwards cannot change what Create files.
+  // The grouped-filing draft card (issue #1724): ids are captured when the card opens and the card
+  // is keyed on them, so the posted ids always equal the ids its draft was loaded for. The bar's
+  // File as one issue is disabled while the card is open, so a changed selection cannot be posted
+  // under an old draft (and the user's edits are never silently discarded by a reload).
   const [groupTarget, setGroupTarget] = useState<{ ids: string[]; repoLabel: string } | null>(null);
   const [notice, setNotice] = useState("");
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -312,12 +315,11 @@ export function Findings() {
     [patchByFinding, load, reloadStats],
   );
 
-  // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
-  // skipped ones) and returns their disposition ids — the Undo set.
-  // fileGroup posts the frozen selection and the human's edits as ONE issue (issue #1724). 201 and
-  // 202 both close the card, clear the selection and reload; a 409 (a member was filed or is being
-  // filed meanwhile) does the same with a friendly note; anything else rethrows so the card keeps
-  // the user's edits and shows the error.
+  // fileGroup posts the ids the open draft was loaded for and the human's edits as ONE issue
+  // (issue #1724). 201 and 202 both close the card, clear the selection and reload; a 409 (a member
+  // was filed or is being filed meanwhile) does the same with a friendly note; anything else
+  // rethrows so the card keeps the user's edits and shows the error. The web has no release action,
+  // so an unsettled operation points at the CLI after the user inspects the forge.
   const fileGroup = useCallback(
     async (ids: string[], body: { title: string; description: string; labels: string[] }) => {
       setActionErr("");
@@ -326,12 +328,17 @@ export function Findings() {
         const res = await api.fileFindingGroup({ ids, ...body });
         setGroupTarget(null);
         setSelected(new Set());
+        const release = `After inspecting the forge, the operation can be released with: uzi findings release ${res.operation_id} --confirm-no-issue`;
         if (res.issue) {
           const filed = `Filed ${ids.length} findings as issue #${res.issue.iid}.`;
-          setNotice(res.warning ? `${filed} ${res.warning}` : filed);
+          setNotice(
+            res.warning || res.phase !== "settled"
+              ? `${filed} ${res.warning ?? ""} Operation ${res.operation_id}. ${release}`.replace(/ {2,}/g, " ")
+              : filed,
+          );
         } else {
           const detail = res.warning ? `${res.warning} ` : "";
-          setNotice(`${detail}Operation ${res.operation_id}.`);
+          setNotice(`${detail}Operation ${res.operation_id}. ${release}`);
         }
         load();
         reloadStats();
@@ -350,6 +357,8 @@ export function Findings() {
     [load, reloadStats],
   );
 
+  // settle patches every row a bulk verdict response re-read (exactly the rows that moved, never the
+  // skipped ones) and returns their disposition ids — the Undo set.
   const settle = useCallback(
     (rows: IncidentalFinding[]): string[] => {
       const settled: string[] = [];
@@ -497,7 +506,9 @@ export function Findings() {
     const byDisposition = new Map((backlog?.findings ?? []).map((f) => [f.disposition_id, f]));
     return activeSelected.map((id) => byDisposition.get(id)).filter((f): f is IncidentalFinding => !!f);
   }, [backlog, activeSelected]);
-  const groupDisabledReason = groupFileIneligibility(selectedRows);
+  const groupDisabledReason = groupTarget
+    ? "Close the open draft before filing a different selection."
+    : groupFileIneligibility(selectedRows);
   const openGroup = () => {
     if (groupDisabledReason || selectedRows.length === 0) return;
     setGroupTarget({
@@ -651,6 +662,7 @@ export function Findings() {
                   File {groupTarget.ids.length} findings as one issue
                 </p>
                 <IssueDraftCard
+                  key={groupTarget.ids.join(",")}
                   fixedRepoLabel={groupTarget.repoLabel}
                   loadDraft={async () => {
                     const draft = await api.findingGroupIssueDraft(groupTarget.ids);

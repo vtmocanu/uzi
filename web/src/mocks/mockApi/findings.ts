@@ -145,7 +145,7 @@ function mockIssueDraft(
   };
 }
 
-// resolveGroup validates a grouped-filing selection the way the server does (issue #1724): 1..50
+// resolveGroup validates a grouped-filing selection roughly as the server does, for the demo (issue #1724): 1..50
 // unique ids (400), all owned (404), one repo (400 "mixed repositories"), all open with evidence
 // (409 "finding not fileable"). Returns the members in request order.
 function resolveGroup(rawIds: string[]): MockFinding[] {
@@ -218,7 +218,7 @@ export const findingsApi = {
     };
     return delay(res, 120);
   },
-  // findingGroupIssueDraft mirrors the server's group draft (issue #1724): 1..50 unique disposition
+  // findingGroupIssueDraft approximates the server's group draft for the demo (issue #1724): 1..50 unique disposition
   // ids, every one owned (404), one repo (400), every one open with evidence (409). The description
   // lists every member's location and title so the preview shows the whole selection.
   findingGroupIssueDraft: async (ids: string[]) => {
@@ -236,6 +236,9 @@ export const findingsApi = {
   // sharing one new iid and web_url. Same validation as the draft; returns the 201 shape.
   fileFindingGroup: async (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) => {
     const members = resolveGroup(body.ids);
+    // Like the server, an explicitly empty title is rejected; an omitted one falls back to the first
+    // member's title (demo convenience).
+    if (body.title !== undefined && body.title.trim() === "") throw new ApiError(400, "title must be non-empty");
     const iid = nextFiledIssueIid++;
     const webURL = `https://gitlab.example.com/${members[0].repo_path}/-/issues/${iid}`;
     const now = new Date().toISOString();

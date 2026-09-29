@@ -64,7 +64,9 @@ export function MultiSelectBar({
           {count} {count === 1 ? "finding" : "findings"} selected
         </span>
         <span className="text-xs text-faint">
-          {onFileGroup && fileGroupDisabledReason ? fileGroupDisabledReason : "Dismiss applies to open findings only."}
+          {onFileGroup && fileGroupDisabledReason
+            ? `${fileGroupDisabledReason} Dismiss applies to open findings only.`
+            : "Dismiss applies to open findings only."}
         </span>
         <div className="ml-auto flex items-center gap-2">
           {onFileGroup && (
