@@ -15,6 +15,7 @@ import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
 import { JudgeRunner } from "./judge-runner.js";
+import { IsolatedRunner } from "./isolated-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
@@ -639,6 +640,25 @@ async function main(): Promise<void> {
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
+  // PRD #1906 M4: the isolated research lane's slim runner. Always built: on a worker without
+  // UZI_FETCHER_URL / UZI_FETCHER_CA_FILE it fails every isolated claim closed (and the worker
+  // does not advertise isolated_fetch_v1, so the api should never send one). Its path guard
+  // gets the same worker-credential deny set as a run.
+  const isolatedRunner = new IsolatedRunner(client, log, {
+    dataDir: config.dataDir,
+    fetcherUrl: config.fetcherUrl,
+    fetcherCaFile: config.fetcherCaFile,
+    batchMs: config.messageBatchMs,
+    joinToken: config.workerToken,
+    secretPaths: workerSecretDenyPaths(config.workerTokenFile),
+    pollMs: config.pollIntervalMs,
+    activeRuns,
+    outbox,
+    rearm,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
+  });
+
   // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
   // report, so it takes the same outbox + re-arm registry the runners spill into. The
   // `undefined` preserves the default boot toolchain preflight (only tests inject one).
@@ -733,6 +753,8 @@ async function main(): Promise<void> {
     dindPrune,
     diskPressure,
     runDisk,
+    undefined,
+    isolatedRunner,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these

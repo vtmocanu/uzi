@@ -6,9 +6,10 @@ import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
+import type { IsolatedRunner } from "./isolated-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
-import type { ActiveSnapshot, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
+import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { DindPruneController } from "./dind-prune.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
@@ -18,6 +19,11 @@ import type { RunDiskSampler } from "./run-disk.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
+
+/** PRD #1906 M4: the protocol capability proving this image runs the isolated research lane
+ *  (the IsolatedRunner, the fetch tool and the fixed tool set). The api's dedicated claim
+ *  clause (M5) hands a profile-bound run only to a worker advertising it. */
+export const ISOLATED_FETCH_CAPABILITY = "isolated_fetch_v1";
 
 /** issue #1582 M2: default re-sweep interval of the ancestry-settlement journal. */
 const SETTLEMENT_SWEEP_MS = 5 * 60_000;
@@ -85,6 +91,10 @@ export class Worker {
     // sandbox denies. Production uses the default.
     private readonly newStatsCollector: (dataDir: string) => StatsCollector = (dataDir) =>
       new StatsCollector({ dataDir }),
+    // PRD #1906 M4: the slim runner for a profile-bound research claim (`isolated_fetch`).
+    // Undefined only in tests that never see one; an isolated claim then fails closed here
+    // (see executeIsolated), never falling through to the RunRunner.
+    private readonly isolatedRunner?: IsolatedRunner,
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -379,6 +389,14 @@ export class Worker {
           // shipped before advice posts were stamped, so older images keep posting mid-upgrade.
           "advice_claim_fence_v1",
         ];
+        // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
+        // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
+        // only on lane pods). An ordinary worker runs the same code but has no fetcher to reach,
+        // so it must not look eligible for a lane run; the api's placement clause additionally
+        // keys on a server-set lane marker, so this is the worker's half of that pair.
+        if (this.config.fetcherUrl && this.config.fetcherCaFile) {
+          protocolCapabilities.push(ISOLATED_FETCH_CAPABILITY);
+        }
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
         // receipt probe alone; it is now the combined decision main.ts resolved ONCE (like
@@ -717,7 +735,12 @@ export class Worker {
           // run lane (it counts toward worker capacity, Decision 8) but is executed by the
           // slim JudgeRunner — no clone/worktree/git, just fetch the trace, call the model,
           // post the review.
-          const exec = claim.review_target_run_id
+          // PRD #1906 M4: a profile-bound research claim (`isolated_fetch`) is routed FIRST,
+          // before every other dispatch, so no kind or review target can send it to a runner
+          // that clones, holds tools beyond the fixed set, or reaches the RunRunner at all.
+          const exec = claim.isolated_fetch
+            ? this.executeIsolated(claim)
+            : claim.review_target_run_id
             ? this.reviewRunner.execute(claim)
             : claim.kind === "judge"
               ? this.judgeRunner.execute(claim)
@@ -758,6 +781,25 @@ export class Worker {
     // the Promise.race calls above STAY — those build a longer array and the spread
     // is load-bearing there.
     await Promise.allSettled(active);
+  }
+
+  /**
+   * PRD #1906 M4: run an isolated claim on the IsolatedRunner, or fail it closed when none is
+   * wired. Never delegates to the RunRunner.
+   */
+  private async executeIsolated(claim: ClaimResponse): Promise<void> {
+    if (this.isolatedRunner) {
+      await this.isolatedRunner.execute(claim);
+      return;
+    }
+    this.log.error("isolated claim on a worker without an isolated runner; failing it", { run_id: claim.run_id });
+    await this.client
+      .reportState(claim.run_id, {
+        status: "failed",
+        failure_reason: "this worker cannot run a profile-bound research run",
+        claim_generation: claim.claim_generation,
+      })
+      .catch((err) => this.log.warn("could not report the refused isolated claim", { error: errMessage(err) }));
   }
 
   /**

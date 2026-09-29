@@ -36,8 +36,14 @@
   // test/repo-instructions.test.ts to build a real FIFO and prove the CLAUDE.md reader
   // never blocks on `open()` (#1219). It is not a project dependency and has no
   // package.json bin, so knip's `binaries` rule flags it as unlisted; the test itself
-  // skips cleanly when `mkfifo` is absent. This is the ONLY ignored binary.
-  "ignoreBinaries": ["mkfifo"],
+  // skips cleanly when `mkfifo` is absent.
+  //
+  // `openssl` is invoked ONLY by test/fetch-tools.test.ts (PRD #1906 M4) to mint a
+  // throwaway CA and server certificates for the fake uzi-fetcher, so no private key is
+  // ever committed. It is a system utility, not a project dependency. Unlike the mkfifo
+  // test, that suite does NOT skip without it: it proves the fetch tool's certificate
+  // check, so a missing openssl fails it loudly. These two are the only ignored binaries.
+  "ignoreBinaries": ["mkfifo", "openssl"],
 
   // An exported type/interface referenced only within its OWN declaring file is
   // legitimate in-file contract surface, not dead-export debt: the src/protocol.ts
