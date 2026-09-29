@@ -248,6 +248,7 @@ const publishedTipContains = (bare: string, tip: string, sha: string): boolean =
 
 let floorTip = "";
 
+
 function publishOriginBranch(name: string): string {
   gitIn(fx.originPath, ["checkout", "-q", "-b", name]);
   fs.writeFileSync(path.join(fx.originPath, "PUBLISHED.md"), `published ${name}\n`);
@@ -788,6 +789,26 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.ok(followUp.includes(`--autosquash ${floor}`), followUp);
   });
 
+  it("(s3) a REAL confirmed publish records its tip as a published floor, which the follow-up then names", { skip }, async () => {
+    let floor = "";
+    let followUp = "";
+    const d = await drive({
+      iid: 1932_251,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        floor = commitIn(w, "m.txt", "m\n");
+        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // a real confirmed publish of floor
+        commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        const first = await gate();
+        assert.equal(first.action, "remediate");
+        followUp = (first as { followUp: string }).followUp;
+      },
+    });
+    assert.equal(d.pub.tips.length, 1, "the milestone really published");
+    assert.ok(followUp.includes(`Never rewrite commits at or below ${floor}`), followUp);
+  });
+
   it("(s2) the follow-up names the range exclude SHA when the checkpoint floor is not an ancestor of the tip", { skip }, async () => {
     let base = "";
     let stray = "";
@@ -958,7 +979,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     assert.equal(d.pushes(), 0);
   });
 
-  it("(y) R3 GitLab: a flagged commit under a local-only bridge is remediable, and a finalize bridge over it never pushes it", { skip }, async () => {
+  it("(y) R3 GitLab: a flagged commit under a local-only bridge is not remediable (finalize re-bridges over it), and the finalize bridge never pushes it", { skip }, async () => {
     const iid = 1932_243;
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
@@ -966,8 +987,8 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     const d = await drive({
       iid,
       forge: "gitlab",
-      // The post-bridge range scan misses the wrapped-in commit (a bridge's merge makes the real scan
-      // fail open); only the retained-flagged-commit ancestry re-check can stop the push.
+      // The stub makes the post-bridge range scan report clean, isolating the retained-flagged-commit
+      // ancestry re-check as the only thing that can stop the push.
       configure: (g) => {
         (g as unknown as { secretScanRange: unknown }).secretScanRange = async () => ({
           trusted: true,
@@ -979,13 +1000,13 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
         S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
         await ctx.checkpoint!({ reap: false }); // the tick bridges B=(S,P); checkpointFloor = local-only B
-        acts.push((await gate()).action); // S is above every PUBLISHED floor: remediable
+        acts.push((await gate()).action); // S is under the local-only bridge floor: not remediable
         gitIn(w, ["reset", "-q", "--hard", P]);
         commitIn(w, "d.txt", "d\n");
         acts.push((await gate()).action); // clean, S not an ancestor: known cleared
       },
     });
-    assert.deepEqual(acts, ["remediate", "proceed"]);
+    assert.deepEqual(acts, ["proceed", "proceed"]);
     // The finalize bridge wraps the clean tip over the local-only B, re-adding S: it must not push.
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
     assert.equal(d.failed()?.preserved_patch, undefined);
@@ -994,37 +1015,144 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
   });
 
-  it("(y4) a bridge at finalize after a known finding fails closed when the post-bridge scan is untrusted", { skip }, async () => {
+  it("(y4) after a remediated finding, a clean bridged branch with an untrusted post-bridge scan pushes: the re-check proved no flagged commit is reachable", { skip }, async () => {
     const iid = 1932_248;
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
+    let S4 = "";
     const d = await drive({
       iid,
       forge: "gitlab",
+      // The stub makes the post-bridge range scan untrusted, isolating the flagged-commit re-check.
       configure: (g) => {
         (g as unknown as { secretScanRange: unknown }).secretScanRange = async () => ({
           trusted: false,
           findings: [],
-          reason: "merge counting",
+          reason: "stubbed untrusted",
         });
       },
       body: async (ctx, gate) => {
         const w = ctx.worktreePath;
-        const S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        S4 = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
         acts.push((await gate()).action);
-        fixupAndAutosquash(w, S, "cfg.env", "TOKEN=\n");
+        fixupAndAutosquash(w, S4, "cfg.env", "TOKEN=\n");
         acts.push((await gate()).action); // clean: known cleared, everKnown stays
         gitIn(w, ["reset", "-q", "--hard", `${P}^`]); // rewrite below the published tip: finalize bridges
         commitIn(w, "e.txt", "e\n");
       },
     });
     assert.deepEqual(acts, ["remediate", "proceed"]);
-    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
-    assert.match(d.failed()?.failure_reason ?? "", /could not be trusted/);
-    assert.equal(d.pushes(), 0);
+    assert.equal(d.failed(), undefined, JSON.stringify(d.failed()));
+    assert.ok(d.completed());
+    assert.equal(d.pushes(), 1);
+    for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S4), false);
   });
 
-  it("(y2) R1 GitLab: a never-flagged secret under a local-only bridge is scanned (not hidden by the bridge) and cannot be pushed", { skip }, async () => {
+  it("(y5) R7 GitLab, REAL scan: an early benign bridge, then a remediated finding, then the final push succeeds", { skip }, async () => {
+    const iid = 1932_249;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let S = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      body: async (ctx, gate, dd) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        commitIn(w, "x.txt", "x\n");
+        await ctx.checkpoint!({ reap: false }); // benign local bridge B
+        const B = trackingOf(dd().bare, ctx.branch);
+        gitIn(w, ["reset", "-q", "--hard", B]); // the agent adopts the bridge
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        acts.push((await gate()).action);
+        fixupAndAutosquash(w, S, "cfg.env", "TOKEN=\n");
+        acts.push((await gate()).action);
+      },
+    });
+    assert.deepEqual(acts, ["remediate", "proceed"]);
+    assert.equal(d.failed(), undefined, JSON.stringify(d.failed()));
+    assert.ok(d.completed());
+    assert.equal(d.pushes(), 1);
+    for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(y6) the finalize re-check fails closed when the tracking tip is unreadable after a known finding", { skip }, async () => {
+    const iid = 1932_252;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    let nullRecheck = false;
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      configure: (g) => {
+        const orig = g.trackingTip.bind(g);
+        (g as unknown as { trackingTip: unknown }).trackingTip = async (bare: string, branch: string) =>
+          nullRecheck && /recheckFlaggedBeforePush/.test(new Error().stack ?? "") ? null : orig(bare, branch);
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        const S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        assert.equal((await gate()).action, "remediate");
+        fixupAndAutosquash(w, S, "cfg.env", "TOKEN=\n");
+        assert.equal((await gate()).action, "proceed");
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]); // finalize bridges, so the re-check runs
+        commitIn(w, "e.txt", "e\n");
+        nullRecheck = true;
+      },
+    });
+    assert.ok(d.logs.some((l) => /tracking tip unreadable after a known finding/.test(JSON.stringify(l))), "the null-tip arm ran");
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    assert.ok(!d.completed());
+  });
+
+  it("(y7) GitHub align path: a bridge that re-adds a flagged commit is blocked before the aligned push", { skip }, async () => {
+    const iid = 1932_253;
+    const CI_V1 = "name: ci\non: [push]\njobs: {}\n";
+    const CI_V2 = "name: ci\non: [pull_request]\njobs: {}\n";
+    commitIn(fx.originPath, ".github/workflows/ci.yml", CI_V1);
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    const aligns: string[] = [];
+    let S = "";
+    const d = await drive({
+      iid,
+      forge: "github",
+      configure: (g) => {
+        const orig = g.alignBranchWithDefault.bind(g);
+        (g as unknown as { alignBranchWithDefault: unknown }).alignBranchWithDefault = async (
+          ...a: Parameters<GitCache["alignBranchWithDefault"]>
+        ) => {
+          aligns.push(String(a[4]));
+          return orig(...a);
+        };
+      },
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        await ctx.checkpoint!({ reap: false }); // the tick bridges B=(S,P): a local-only checkpoint floor
+        acts.push((await gate()).action); // S is under the local-only floor: not remediable
+        gitIn(w, ["reset", "-q", "--hard", P]);
+        commitIn(w, "d.txt", "d\n");
+        acts.push((await gate()).action); // clean: known cleared
+        commitIn(fx.originPath, ".github/workflows/ci.yml", CI_V2); // main moves on workflows: finalize aligns
+      },
+    });
+    assert.deepEqual(acts, ["proceed", "proceed"]);
+    assert.ok(aligns.length >= 1, "the finalize took the base-align path");
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.failed()?.preserved_patch, undefined);
+    assert.equal(d.pushes(), 0);
+    assert.equal(
+      api.states.filter((s) => s.runId === d.claim.run_id && (s.body.status === "failed" || s.body.status === "completed")).length,
+      1,
+      "exactly one terminal report",
+    );
+    for (const t of [...d.pushedTips, ...d.pub.tips]) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(y2) R1 GitLab: a never-flagged secret under a local-only bridge is scanned (not hidden by the bridge), not remediable, and cannot be pushed", { skip }, async () => {
     const iid = 1932_244;
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
@@ -1042,14 +1170,14 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         acts.push((await gate()).action);
       },
     });
-    assert.deepEqual(acts, ["remediate"]);
+    assert.deepEqual(acts, ["proceed"], "under a local-only bridge floor: not remediable");
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
     assert.equal(d.pushes(), 0);
     for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S), false);
     for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
   });
 
-  it("(y3) R2 GitLab: a remediated secret cherry-picked back below the published tip under a bridge cannot be pushed", { skip }, async () => {
+  it("(y3) R2 GitLab: a remediated secret cherry-picked back below the published tip under a bridge is not remediable and cannot be pushed", { skip }, async () => {
     const iid = 1932_245;
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
@@ -1073,7 +1201,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
         acts.push((await gate()).action);
       },
     });
-    assert.deepEqual(acts, ["remediate", "proceed", "remediate"]);
+    assert.deepEqual(acts, ["remediate", "proceed", "proceed"]);
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
     assert.equal(d.pushes(), 0);
     for (const t of [...d.pushedTips, ...d.pub.tips]) {

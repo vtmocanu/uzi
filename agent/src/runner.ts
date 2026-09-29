@@ -1466,7 +1466,8 @@ interface RunFlight {
    *  contains a flagged commit and is never published, so a floor exclusion can hide a finding from
    *  a range scan. Two rules follow. (1) Floors for the remediation scans are PUBLISHED-ONLY
    *  (`publishedRealTips`, `publishedTip`, the confirmed/attempted checkpoint ref tips), never a bare
-   *  `checkpointFloor`, so content under a local-only bridge is scanned and stays remediable.
+   *  `checkpointFloor`, so content under a local-only bridge is still scanned; the gate then classifies a
+   *  finding under that local-only floor as not remediable (finalize re-bridges over it).
    *  (2) Ancestry of the retained flagged commits against a tip is authoritative: the gate's clean
    *  branch, D5, and a re-check after EVERY finalize bridge (which can wrap the pushed tip over a
    *  local-only floor and re-add hidden content) fail while any is still an ancestor. `overflow` =
@@ -4675,11 +4676,6 @@ export class RunRunner {
       let withholdFromState = remediationState.withholdPaths === true;
       if (remediationState.blocked && remediationState.blocked.length > 0) {
         remediationFindings = remediationState.blocked;
-      } else if (remediationState.overflow === true) {
-        // The flagged-commit list overflowed its cap: an unrecorded flagged commit could be hidden, so
-        // fail closed on what is recorded (never on a partial "clean").
-        remediationFindings = remediationState.flaggedFindings ?? remediationState.known;
-        if (!remediationFindings || remediationFindings.length === 0) rescanUntrusted = true;
       } else if (remediationState.known && remediationState.known.length > 0) {
         remediationFindings = remediationState.known;
       } else if (remediationState.everKnown === true) {
@@ -5234,13 +5230,6 @@ export class RunRunner {
         return "blocked";
       }
       if (!scan.trusted) {
-        if (flight.secretRemediation?.everKnown === true) {
-          // A finding was known earlier in this run and this post-bridge scan cannot be trusted:
-          // failing open here is how a bridge over a local-only floor pushed a flagged commit.
-          runLog.warn("post-bridge secret scan untrusted after a known finding; failing closed", { run_id: runId });
-          await reportRemediationBlocked(undefined, false);
-          return "blocked";
-        }
         runLog.warn(
           "post-bridge secret scan: not trustworthy (broken/empty); pushing and relying on the GH013 remote backstop where it exists",
           { run_id: runId },
@@ -7927,7 +7916,11 @@ export class RunRunner {
                     : packedClone
                       ? cloneTip
                       : (fetchedTip ?? flight.checkpointFloor);
-                this.recordPublishedRealTip(flight, flight.checkpointFloor);
+                // Record only a tip this publish actually confirmed: not the unchanged prior floor a
+                // failed fetch-back falls back to.
+                if (bridgeOutcome.kind === "bridged" || packedClone || fetchedTip !== null) {
+                  this.recordPublishedRealTip(flight, flight.checkpointFloor);
+                }
                 this.checkpointTestHooks?.afterUnpinnedPublish?.({
                   cloneTip,
                   fetchedTip,
@@ -9610,9 +9603,9 @@ export class RunRunner {
 
   /**
    * issue #1932: the scan core shared by the pre-exit remediation gate and the D5 finalize re-scan.
-   * Resolves the checkpoint range with the run's floors (checkpoint floor, attempted / confirmed /
-   * published checkpoint tips), requires its tip to equal `expectedTip` (the tracking tip the caller
-   * holds), and runs the local gitleaks range scan. Credential-free; it fetches nothing, so a caller
+   * Resolves the checkpoint range with the run's PUBLISHED floors only (confirmed-published real
+   * tips, attempted / confirmed checkpoint ref tips, the published tip; never a bare checkpoint floor), requires its tip to equal
+   * `expectedTip` (the tracking tip the caller holds), and runs the local gitleaks range scan. Credential-free; it fetches nothing, so a caller
    * that needs a fresh tracking ref fetches first. Trusted only when the range resolved AND the scan
    * is trustworthy.
    */
@@ -9711,10 +9704,12 @@ export class RunRunner {
    *    gitleaks) => proceed when nothing is known, else blocked = known and fail
    *  - trusted and clean => clear `known`, remember the scanned tip as `cleanTip`, proceed (finalize
    *    RE-SCANS the final branch when a finding was ever known and its tip != `cleanTip`)
-   *  - trusted, ANY finding reachable from a floor (checkpoint floor, confirmed/attempted checkpoint
-   *    tip, published tip; including floors no longer ancestors of the tip; an unknown ancestry
-   *    counts as reachable) => proceed with no remediation, `known` set so every checkpoint publish
-   *    is suppressed and finalize (D5, every forge) fails push_secret_blocked
+   *  - trusted, ANY finding reachable from a published floor (confirmed-published real tip,
+   *    confirmed/attempted checkpoint ref tip, published tip; including floors no longer ancestors
+   *    of the tip; an unknown ancestry counts as reachable), or from a LOCAL-ONLY bridge checkpoint
+   *    floor (the finalize bridge would re-add it) => proceed with no remediation, `known` set so
+   *    every checkpoint publish is suppressed and finalize (D5, every forge) fails
+   *    push_secret_blocked
    *  - trusted, all findings above every floor, attempts < cap => remediate (attempts++)
    *  - trusted, findings above the floors, attempts == cap => blocked, fail
    */
@@ -9726,7 +9721,6 @@ export class RunRunner {
     const { runLog, runId } = flight;
     const state = (flight.secretRemediation ??= { attempts: 0 });
     if (state.blocked && state.blocked.length > 0) return { action: "fail" };
-    if (state.overflow) return { action: "fail" };
     if (!barePath) return { action: "proceed" };
     const branch = runnerClone.branch;
     const failOrProceed = (why: string): SecretRemediationDecision => {
@@ -9785,6 +9779,17 @@ export class RunRunner {
           // Tri-state: an "unknown" ancestry (a git error) counts as at-floor, the conservative
           // answer: never ask for a rewrite of possibly published history.
           reachable = (await this.git.ancestry(barePath, findingCommit, floor)) !== "divergent";
+        }
+        // A local-only bridge checkpoint floor (not a published tip) that already contains the finding:
+        // the finalize bridge re-adds it over any rewrite, so a remediation turn would be futile.
+        const localFloor = flight.checkpointFloor;
+        if (
+          !reachable &&
+          typeof localFloor === "string" &&
+          !(flight.publishedRealTips ?? []).includes(localFloor) &&
+          localFloor !== flight.publishedTip
+        ) {
+          reachable = (await this.git.ancestry(barePath, findingCommit, localFloor)) !== "divergent";
         }
         if (reachable) {
           atFloor = true;
