@@ -129,7 +129,7 @@ export function setprivArgsForUid(uid: number): string[] {
     // plain reuid leaks CAP_SETUID and the runner can climb to uid 0), `no-new-privileges`
     // (blocks any fcap/suid raise on execve), and the image shipping NO file-capability /
     // setuid binary (getcap-confirmed). It is kept for intent/defense-in-depth. If a
-    // future node:22-alpine base bump changes util-linux `setpriv` to ABORT on an
+    // future base-image bump changes util-linux `setpriv` to ABORT on an
     // un-droppable bounding cap (rather than best-effort), this flag would break the spawn
     // functionally — make a base bump a conscious setpriv re-check.
     "--bounding-set", "-all",

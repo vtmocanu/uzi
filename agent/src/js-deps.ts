@@ -68,7 +68,8 @@
 // repo-authored script runs. Say so out loud; do not cross it silently.
 //
 // ─── What the shipped worker image can actually run ───────────────────────────
-// Probed on the pinned base (`agent/templates/base/Dockerfile` → `node:22-alpine`):
+// Probed on the pinned base (`agent/templates/base/Dockerfile` → `node:24-alpine`,
+// re-checked 2026-09-29):
 // npm ✓ and yarn 1.22.22 ✓ are present; **pnpm and bun are NOT**, and neither the
 // Dockerfile's `apk add` nor `devbox-global/devbox.json` supplies them. So on a stock
 // worker a pnpm or bun repo ENOENTs into an honest skip, and this module's headline
