@@ -104,6 +104,10 @@ describe("runKindLabel", () => {
   it("maps mr_rework to the legible 'MR rework' label (PRD #700)", () => {
     expect(runKindLabel("mr_rework")).toBe("MR rework");
   });
+
+  it("maps job to the 'Job' label (PRD #1908)", () => {
+    expect(runKindLabel("job")).toBe("Job");
+  });
 });
 
 describe("RunIssueRef — raised scopes z-10 to the interactive anchor only (#485 NB1)", () => {

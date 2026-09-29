@@ -127,6 +127,15 @@ var failOrigins = []string{
 	// iteration_count > 0. It is not human-landable (not a publish failure), but it can fire
 	// on a resumed run that already has commits, so earlier work may still need recovery.
 	"skills_plugin_load_failed",
+	// PRD #1908: the three fail_origins of the repo-less `job` run kind. All SERVER-DERIVED, NOT
+	// worker-reportable (absent from workerReportableFailOrigins, so CoerceFailOrigin drops a
+	// worker forging one): no_job_capable_worker and ephemeral_worker_never_registered are
+	// stamped by the sweeper's unservable-ephemeral-worker pass, job_no_result by the job-result
+	// ingest invariant (a job reported completed with no result row). A job is never judged
+	// (runkind.JudgeEligible is false for it), so none of them joins a judge skip set.
+	"no_job_capable_worker",
+	"ephemeral_worker_never_registered",
+	"job_no_result",
 }
 
 // failOriginSet is the lookup form. Built once; failOrigins stays the declaration so

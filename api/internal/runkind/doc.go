@@ -19,7 +19,9 @@
 //     fn_run_priority*/fn_worker_can_claim kind sets that enumerate kinds.
 //  2. runkind (this package, runkind.go): add the const, extend All() in DB
 //     CHECK order, and update any property helper the kind participates in
-//     (JudgeEligible, Listed).
+//     (JudgeEligible, Listed, PlanningCapable, WallTimed), and the job-type set
+//     (JobTypes) if the kind is job-like. runkind_sql_test.go pins Listed and WallTimed
+//     to the `kind NOT IN (...)` blocks of runtime.sql.
 //  3. fixtures/run-kinds/registry.json: add the kind (and to its judge_eligible
 //     list if the kind is judge-eligible).
 //  4. agent: add the RUN_KINDS entry in agent/src/protocol.ts and its

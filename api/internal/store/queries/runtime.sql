@@ -5439,7 +5439,9 @@ DELETE FROM run_usage WHERE run_id = @run_id;
 -- chat agent's investigation surface (PRD #39 Decision 7). judge runs are hidden
 -- (PRD #46, M1-review carry-forward): a judge is a repo-less internal retrospective
 -- with no investigable task, same rationale as excluding it from the general run
--- lists (f55b37e). self_improve stays visible — it is real work with a repo + MR.
+-- lists (f55b37e). job runs (PRD #1908) are excluded too: an API-created, repo-less job is
+-- the product's, not something the chat agent may browse or steer. self_improve stays visible —
+-- it is real work with a repo + MR.
 -- The judge WORKER reads its own run through the M3 judge-scoped trace path, not
 -- this chat surface, so hiding judge here does not affect judging.
 SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
@@ -5447,22 +5449,21 @@ SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.user_id = @user_id AND r.kind <> 'judge'
+WHERE r.user_id = @user_id AND r.kind NOT IN ('judge', 'job')
 ORDER BY r.created_at DESC
 LIMIT @lim;
 
 -- name: GetRunForWorkerUser :one
 -- One run's detail, scoped to the worker's user (foreign/unknown id -> no row -> 404).
--- judge runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
--- for a judge run's detail gets a 404, exactly like an unknown id. self_improve is
--- visible.
+-- judge and job runs are excluded here too (see ListRunsForWorkerUser): a chat agent asking
+-- for either's detail gets a 404, exactly like an unknown id. self_improve is visible.
 SELECT r.id, r.kind, r.status, r.issue_iid, r.issue_title, r.branch, r.mr_iid, r.mr_state,
        r.failure_reason, r.stop_kind, r.fix_verdict, r.iteration_count, r.plan_md,
        r.created_at, r.updated_at,
        rp.path_with_namespace AS repo_path, rp.web_url AS repo_web_url
 FROM runs r
 LEFT JOIN repos rp ON rp.id = r.repo_id
-WHERE r.id = @id AND r.user_id = @user_id AND r.kind <> 'judge';
+WHERE r.id = @id AND r.user_id = @user_id AND r.kind NOT IN ('judge', 'job');
 
 -- name: ListRunMessagesForWorkerPage :many
 -- A bounded page of a run's messages after a seq (the worker read tool's paging).

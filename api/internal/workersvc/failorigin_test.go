@@ -40,7 +40,7 @@ func TestCoerceFailOrigin(t *testing.T) {
 	// conditional UPDATE, never a worker report. gate_presentation_refused (PRD #1795 M1) is stamped
 	// by SetState's awaiting_approval transaction past the refusal cap, and data_volume_full (PRD
 	// #1809 M5) by SetState's disk-park transaction past the disk park cap, never the worker.
-	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched", "gate_presentation_refused", "data_volume_full"}
+	serverOnly := []string{"worker_lost", "run_timeout", "plan_rejected", "auto_stopped", "guardrail_blocked", "forge_unreachable", "task_undispatched", "gate_presentation_refused", "data_volume_full", "no_job_capable_worker", "ephemeral_worker_never_registered", "job_no_result"}
 	for _, s := range serverOnly {
 		if !failOriginSet[s] {
 			t.Fatalf("%q is in the server-only list but not in the stored vocabulary", s)

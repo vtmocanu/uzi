@@ -23,11 +23,11 @@ import (
 // display-only predicate meaningful only while status=="running" (issue #321). A run
 // is planning iff it is a planning-capable kind (chat/judge never plan), is running,
 // has not yet entered the implement loop (iteration_count 0), and has no persisted
-// plan yet (plan_md empty). Planning-capability delegates to runkind.Listed, which is
-// pinned to ListRunsForUser's NOT IN ('chat','judge') filter by runkind_sql_test.go,
-// so issue/ci_fix/self_improve are planning-capable.
+// plan yet (plan_md empty). Planning-capability delegates to runkind.PlanningCapable
+// (chat/judge never plan, and neither does a job, PRD #1908), so issue/ci_fix/self_improve
+// are planning-capable.
 func isPlanningPhase(kind, status string, iterationCount int32, planMdPresent bool) bool {
-	if !runkind.Listed(kind) {
+	if !runkind.PlanningCapable(kind) {
 		return false
 	}
 	return status == "running" && iterationCount == 0 && !planMdPresent

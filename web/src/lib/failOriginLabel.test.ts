@@ -14,6 +14,12 @@ describe("failOriginLabel", () => {
     expect(failOriginLabel("skills_plugin_load_failed")).toBe("skills plugin load failed");
   });
 
+  it("labels the repo-less job origins (PRD #1908)", () => {
+    expect(failOriginLabel("no_job_capable_worker")).toBe("no job-capable worker");
+    expect(failOriginLabel("ephemeral_worker_never_registered")).toBe("ephemeral worker never registered");
+    expect(failOriginLabel("job_no_result")).toBe("job reported no result");
+  });
+
   it("labels the data_volume_full origin (PRD #1809)", () => {
     expect(failOriginLabel("data_volume_full")).toBe("data volume full");
   });

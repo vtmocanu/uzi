@@ -72,7 +72,7 @@ func (q *Queries) CountActiveProductTokensForUserProduct(ctx context.Context, ar
 const createProduct = `-- name: CreateProduct :one
 INSERT INTO products (name, description, created_by)
 VALUES ($1, $2, $3)
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
 `
 
 type CreateProductParams struct {
@@ -95,6 +95,7 @@ func (q *Queries) CreateProduct(ctx context.Context, arg CreateProductParams) (P
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AllowedJobTypes,
 	)
 	return i, err
 }
@@ -177,7 +178,7 @@ func (q *Queries) CreateProductToken(ctx context.Context, arg CreateProductToken
 }
 
 const getProduct = `-- name: GetProduct :one
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at FROM products WHERE id = $1
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types FROM products WHERE id = $1
 `
 
 // One product by id, soft-deleted included (callers check enabled / deleted_at).
@@ -193,12 +194,13 @@ func (q *Queries) GetProduct(ctx context.Context, id uuid.UUID) (Product, error)
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AllowedJobTypes,
 	)
 	return i, err
 }
 
 const getProductForUpdate = `-- name: GetProductForUpdate :one
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at FROM products WHERE id = $1 FOR UPDATE
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types FROM products WHERE id = $1 FOR UPDATE
 `
 
 // One product by id, soft-deleted included, ROW-LOCKED for the rest of the transaction.
@@ -219,6 +221,7 @@ func (q *Queries) GetProductForUpdate(ctx context.Context, id uuid.UUID) (Produc
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AllowedJobTypes,
 	)
 	return i, err
 }
@@ -380,7 +383,7 @@ func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int3
 }
 
 const listEnabledProducts = `-- name: ListEnabledProducts :many
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
   FROM products
  WHERE enabled
    AND deleted_at IS NULL
@@ -406,6 +409,7 @@ func (q *Queries) ListEnabledProducts(ctx context.Context) ([]Product, error) {
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.AllowedJobTypes,
 		); err != nil {
 			return nil, err
 		}
@@ -680,7 +684,7 @@ UPDATE products
        updated_at = now()
  WHERE id = $3
    AND deleted_at IS NULL
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
 `
 
 type UpdateProductParams struct {
@@ -710,6 +714,7 @@ func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (P
 		&i.CreatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.AllowedJobTypes,
 	)
 	return i, err
 }

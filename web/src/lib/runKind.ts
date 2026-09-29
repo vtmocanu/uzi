@@ -1,7 +1,7 @@
 // RUN_KINDS is the web mirror of runs.kind, in DB runs_kind_check order. The
 // authoritative set is the DB CHECK / api/internal/runkind; this list is pinned to
 // the shared fixtures/run-kinds/registry.json by runKindContract.test.ts.
-export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework"] as const;
+export const RUN_KINDS = ["issue", "ci_fix", "chat", "judge", "self_improve", "prompt", "task", "mr_rework", "job"] as const;
 export type RunKind = (typeof RUN_KINDS)[number];
 
 // runKindLabel maps an issue-less run's kind to a short human label for the chip
@@ -15,6 +15,8 @@ export function runKindLabel(kind: string): string {
       return "ci fix";
     case "mr_rework":
       return "MR rework";
+    case "job":
+      return "Job";
     default:
       // Equivalent to kind.replaceAll("_", " ") — a regex global replace because
       // the web tsconfig's lib target predates String.prototype.replaceAll (ES2021).

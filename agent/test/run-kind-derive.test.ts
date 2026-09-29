@@ -93,4 +93,9 @@ describe("deriveCloneKey", () => {
     assert.equal(deriveCloneKey({ kind: "mr_rework", runId: "r", branch: null }), undefined);
     assert.equal(deriveCloneKey({ kind: "mr_rework", runId: "r", branch: "" }), undefined);
   });
+
+  it("job is repo-less: it has no clone key at all (PRD #1908)", () => {
+    assert.equal(deriveCloneKey({ kind: "job", runId: "r" }), undefined);
+    assert.equal(deriveCloneKey({ kind: "job", runId: "r", issueIid: 7, branch: "x" }), undefined);
+  });
 });

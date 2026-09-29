@@ -27,6 +27,9 @@ const labels: Record<string, string> = {
   worker_residue_blocked: "worker residue blocked",
   skills_plugin_load_failed: "skills plugin load failed",
   data_volume_full: "data volume full",
+  no_job_capable_worker: "no job-capable worker",
+  ephemeral_worker_never_registered: "ephemeral worker never registered",
+  job_no_result: "job reported no result",
   unknown: "unknown",
 };
 

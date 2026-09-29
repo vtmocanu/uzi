@@ -111,6 +111,9 @@ export function deriveCloneKey(id: CloneIdentity): { branch: string; slug: strin
       if (!branch) return undefined;
       return { branch, slug: slugify(branch) };
     }
+    case "job":
+      // A job is repo-less: there is no clone, so there is no key to derive (PRD #1908).
+      return undefined;
     default: {
       const _exhaustive: never = kind;
       return _exhaustive;
@@ -186,6 +189,11 @@ export const RUN_KIND_PROFILES: Record<RunKind, RunKindProfile> = {
     completionLine: (_claim, ctx) =>
       `Handoff task (PRD #400) on ${codeSpan(ctx.branch)}${ctx.baseBranch ? ` (branched from ${codeSpan(ctx.baseBranch)})` : ""}, opened because it was created with \`--mr\`. There is no tracking issue, so this PR closes nothing.`,
   },
+
+  // job (PRD #1908): repo-less. No clone, no git, no MR, no plan gate: it defines no cloneBranch,
+  // mrTitle or completionLine, and the worker dispatches it to its own job runner, so this row
+  // is never consulted for a job claim. Empty on purpose, like chat and judge.
+  job: {},
 
   mr_rework: {
     cloneBranch: (claim) => {

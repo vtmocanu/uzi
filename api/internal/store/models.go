@@ -399,6 +399,40 @@ type IssueProposal struct {
 	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
+type JobFinding struct {
+	ID        uuid.UUID   `json:"id"`
+	RunID     uuid.UUID   `json:"run_id"`
+	Ordinal   int32       `json:"ordinal"`
+	Severity  string      `json:"severity"`
+	MessageMd string      `json:"message_md"`
+	Url       pgtype.Text `json:"url"`
+	File      pgtype.Text `json:"file"`
+	Line      pgtype.Int4 `json:"line"`
+}
+
+type JobInput struct {
+	RunID     uuid.UUID `json:"run_id"`
+	Ordinal   int32     `json:"ordinal"`
+	Name      string    `json:"name"`
+	ContentMd string    `json:"content_md"`
+}
+
+type JobOrigin struct {
+	RunID            uuid.UUID          `json:"run_id"`
+	ProductID        pgtype.UUID        `json:"product_id"`
+	ProductTokenID   pgtype.UUID        `json:"product_token_id"`
+	RequestedByLabel pgtype.Text        `json:"requested_by_label"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type JobResult struct {
+	RunID     uuid.UUID          `json:"run_id"`
+	Status    string             `json:"status"`
+	ReportMd  string             `json:"report_md"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt pgtype.Timestamptz `json:"updated_at"`
+}
+
 type MrReworkLedger struct {
 	RepoID       uuid.UUID          `json:"repo_id"`
 	Ref          string             `json:"ref"`
@@ -459,14 +493,15 @@ type PrDescriptionVersion struct {
 }
 
 type Product struct {
-	ID          uuid.UUID          `json:"id"`
-	Name        string             `json:"name"`
-	Description string             `json:"description"`
-	Enabled     bool               `json:"enabled"`
-	DeletedAt   pgtype.Timestamptz `json:"deleted_at"`
-	CreatedBy   pgtype.UUID        `json:"created_by"`
-	CreatedAt   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	ID              uuid.UUID          `json:"id"`
+	Name            string             `json:"name"`
+	Description     string             `json:"description"`
+	Enabled         bool               `json:"enabled"`
+	DeletedAt       pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy       pgtype.UUID        `json:"created_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes []string           `json:"allowed_job_types"`
 }
 
 type ProductToken struct {
@@ -757,6 +792,7 @@ type Run struct {
 	GateRefusalGeneration       pgtype.Int8        `json:"gate_refusal_generation"`
 	DiskParkCount               int32              `json:"disk_park_count"`
 	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
+	JobType                     pgtype.Text        `json:"job_type"`
 }
 
 type RunCompletionAttempt struct {
