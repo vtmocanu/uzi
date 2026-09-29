@@ -1386,8 +1386,8 @@ describe("#1604 review — resumed-gate edges", () => {
 });
 
 describe("shutdown at an observed plan gate", () => {
-  for (const [planApprovalTimeoutMs, session] of [[0, "kept"], [60_000, "none"]] as const) {
-    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs}`, () =>
+  for (const [planApprovalTimeoutMs, session, failHeldGet] of [[0, "kept", true], [60_000, "none", true], [0, "kept", false]] as const) {
+    it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs} and the held GET ${failHeldGet ? "fails" : "succeeds"}`, () =>
       scenario(async (s) => {
         api.gateRevisions = true;
         api.stampGateBindings = true;
@@ -1399,7 +1399,7 @@ describe("shutdown at an observed plan gate", () => {
           holdFirstGate = false;
           gateReads = api.inputGets.get(s.runId) ?? 0;
           api.delayInputGets(s.runId, 800, 1, gateReads);
-          api.failInputGets(s.runId, 1, 503);
+          if (failHeldGet) api.failInputGets(s.runId, 1, 503);
         });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
         assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
@@ -1426,7 +1426,7 @@ describe("shutdown at an observed plan gate", () => {
         assert.equal(s.persistedGate()?.plan_md, PLAN_V1, "the submitted plan remains persisted");
         assert.deepEqual(s.persistedGate()?.milestones, V1_MILESTONES, "the candidate work remains persisted");
         assert.deepEqual(api.gateOf(s.runId), persisted, "shutdown preserves the gate identity");
-        assert.equal(api.isAcked(s.runId, pending!.id), false, "shutdown left the verdict unread");
+        if (failHeldGet) assert.equal(api.isAcked(s.runId, pending!.id), false, "shutdown left the verdict unread");
         assert.equal(api.isApplied(s.runId, pending!.id), false, "shutdown did not apply the verdict");
         assertNoApproval(s);
         api.delayInputGets(s.runId, 0, 0);
