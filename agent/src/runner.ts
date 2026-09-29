@@ -1470,7 +1470,10 @@ interface RunFlight {
    *  finding under that local-only floor as not remediable (finalize re-bridges over it).
    *  (2) Ancestry of the retained flagged commits against a tip is authoritative: the gate's clean
    *  branch, D5, and a re-check after EVERY finalize bridge (which can wrap the pushed tip over a
-   *  local-only floor and re-add hidden content) fail while any is still an ancestor. `overflow` =
+   *  local-only floor and re-add hidden content) fail while any is still an ancestor. The mid-turn
+   *  checkpoint scan and the post-bridge scan record their trusted findings here too (without setting
+   *  `known`/`everKnown`); a commit only those recorded is re-checked when a bridge is in play.
+   *  `overflow` =
    *  the flagged-commit list hit its cap, after which the gate and D5 fail closed. */
   secretRemediation?: {
     attempts: number;
@@ -5196,21 +5199,37 @@ export class RunRunner {
 
     // PRD #1416 (MR-rework, finding 1): a bridge NEWLY makes a rewritten branch pushable (a plain
     // rewritten push is non-fast-forward-rejected on every forge). The top-of-finalize scan ran on
-    // the divergent H with an unresolvable floor and failed OPEN; now that the tracking ref is B and
-    // P is an ancestor of B, P..B is the real, trustworthy push delta. Re-scan it on EVERY forge
-    // before pushing B — GitLab/Forgejo have no GH013 backstop, so this worker-side scan is their
-    // only gate. On a TRUSTED finding: report push_secret_blocked (no preserved_patch), no push.
-    // On untrusted/clean: fail open (unchanged; GH013 still backstops GitHub at the push catch).
+    // the divergent H with an unresolvable floor and failed OPEN; now the tracking ref is B, so scan
+    // the push delta before pushing B. GitLab/Forgejo have no GH013 backstop, so this worker-side
+    // scan is their only gate.
+    // issue #1932 (rework 6): it uses the merge-aware checkpoint scanner, not `secretScanRange`. A
+    // bridge is always a merge, and the range scan counts merge commits that gitleaks git mode does
+    // not, so it was never trustworthy over a bridged range and this gate always failed open. The
+    // checkpoint scan counts non-merge commits with hunks and scans each merge's own (remerge-diff)
+    // contribution, and it excludes ONLY published content (published-only floors, never a bare local
+    // checkpointFloor), so a local-only bridge's content IS scanned. On a TRUSTED finding: remember
+    // the commits as flagged, report push_secret_blocked (no preserved_patch), no push. On
+    // untrusted/clean: fail open (unchanged; GH013 still backstops GitHub at the push catch).
     const scanBridgedRangeAndBlock = async (scanBare: string): Promise<"blocked" | "ok"> => {
-      const scan = await this.git.secretScanRange(scanBare, trackingRef, result.branch, {
-        pat: claim.secrets.forge_pat,
-        cloneUrl: claim.repo.clone_url,
-        username: claim.secrets.forge_username,
-      });
-      if (scan.trusted && scan.findings.length > 0) {
+      const scanTip = await this.git.trackingTip(scanBare, result.branch);
+      let untrustedWhy = "tracking_tip_unreadable";
+      let findings: SecretFinding[] = [];
+      let trusted = false;
+      if (scanTip !== null) {
+        try {
+          const scanned = await this.scanRemediationRange(flight, scanBare, result.branch, scanTip);
+          trusted = scanned.trusted;
+          if (scanned.trusted) findings = scanned.findings;
+          else untrustedWhy = scanned.why;
+        } catch {
+          untrustedWhy = "scan_threw";
+        }
+      }
+      if (trusted && findings.length > 0) {
+        this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), findings, runLog);
         // issue #1932: local-scan wording on every forge (no GH013 / GitHub Push Protection claim).
-        const withholdPaths = await this.withholdPathsFor(scan.findings);
-        const reason = composeLocalScanBlockedReason(scan.findings, { redact: redactText, withholdPaths });
+        const withholdPaths = await this.withholdPathsFor(findings);
+        const reason = composeLocalScanBlockedReason(findings, { redact: redactText, withholdPaths });
         batcher.emit({
           kind: "status",
           agent: "worker",
@@ -5222,17 +5241,17 @@ export class RunRunner {
           "run failed: post-bridge secret scan found a secret in the P..B push delta; withholding diff",
           {
             run_id: runId,
-            findings: scan.findings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
+            findings: findings.map((f) => renderSecretFinding(f, { redact: redactText, withholdPaths })),
           },
         );
         await closeBatcher();
         await reportPushSecretBlocked(reason);
         return "blocked";
       }
-      if (!scan.trusted) {
+      if (!trusted) {
         runLog.warn(
-          "post-bridge secret scan: not trustworthy (broken/empty); pushing and relying on the GH013 remote backstop where it exists",
-          { run_id: runId },
+          "post-bridge secret scan: not trustworthy; pushing and relying on the GH013 remote backstop where it exists",
+          { run_id: runId, why: untrustedWhy },
         );
       }
       return "ok";
@@ -5244,9 +5263,12 @@ export class RunRunner {
     // contains a flagged commit, so the bridged tip can re-add content the earlier gates cleared.
     // Reports push_secret_blocked (no push, no preserved_patch) and returns "blocked" on a reachable
     // flagged commit; an unreadable tracking tip after a known finding fails closed the same way.
-    const recheckFlaggedBeforePush = async (scanBare: string): Promise<"blocked" | "ok"> => {
+    // A flagged commit the mid-turn checkpoint scan recorded (`everKnown` unset: the remediation gate
+    // never saw it) is re-checked only when a bridge is in play (`bridgeInPlay`): a plain push of an
+    // unbridged tip is the pre-existing contract, and the done-point gate is what fails such a run.
+    const recheckFlaggedBeforePush = async (scanBare: string, bridgeInPlay: boolean): Promise<"blocked" | "ok"> => {
       const st = flight.secretRemediation;
-      if (!st || (st.everKnown !== true && (st.flaggedCommits?.length ?? 0) === 0)) return "ok";
+      if (!st || (st.everKnown !== true && (!bridgeInPlay || (st.flaggedCommits?.length ?? 0) === 0))) return "ok";
       const tip = await this.git.trackingTip(scanBare, result.branch);
       if (tip === null) {
         runLog.warn("pre-push flagged-commit re-check: tracking tip unreadable after a known finding; failing closed", {
@@ -5579,15 +5601,16 @@ export class RunRunner {
                 runLog,
               );
               if (o.kind === "failed") throw new HistoryRewrittenError(flight.publishedTip!);
-              // PRD #1416 (MR-rework, finding 1): re-scan the now-trusted P..B delta before pushing
-              // the bridged, aligned tip. On a trusted finding scanBridgedRangeAndBlock has already
+              // PRD #1416 (MR-rework, finding 1): re-check the retained flagged commits and run the
+              // merge-aware scan of everything above the published floors before pushing the bridged,
+              // aligned tip. On a trusted finding scanBridgedRangeAndBlock has already
               // terminally reported push_secret_blocked, so throw the data-free unwind sentinel — the
               // enclosing align try/catch and the outer finalize catch propagate it without pushing or
               // re-reporting (mirroring how HistoryRewrittenError unwinds this same nested closure).
+              const alignBridgeScan = await needsBridgeScan(o.kind, alignBarePath);
               if (
-                (await recheckFlaggedBeforePush(alignBarePath)) === "blocked" ||
-                ((await needsBridgeScan(o.kind, alignBarePath)) &&
-                  (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked")
+                (await recheckFlaggedBeforePush(alignBarePath, alignBridgeScan)) === "blocked" ||
+                (alignBridgeScan && (await scanBridgedRangeAndBlock(alignBarePath)) === "blocked")
               ) {
                 throw new PushSecretBlockedSignal();
               }
@@ -5881,13 +5904,14 @@ export class RunRunner {
         return;
       }
       // PRD #1416 (MR-rework, finding 1): a bridge just made this rewritten branch pushable, so
-      // re-scan the now-trusted P..B delta on EVERY forge before pushing. A trusted finding reports
+      // re-check the retained flagged commits and run the merge-aware scan of everything above the
+      // published floors, on EVERY forge, before pushing. A trusted finding reports
       // push_secret_blocked and STOPS (a direct return unwinds the whole finalize, like the
       // failHistoryRewritten site above).
+      const finalizeBridgeScan = await needsBridgeScan(o.kind, finalizeBarePath);
       if (
-        (await recheckFlaggedBeforePush(finalizeBarePath)) === "blocked" ||
-        ((await needsBridgeScan(o.kind, finalizeBarePath)) &&
-          (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked")
+        (await recheckFlaggedBeforePush(finalizeBarePath, finalizeBridgeScan)) === "blocked" ||
+        (finalizeBridgeScan && (await scanBridgedRangeAndBlock(finalizeBarePath)) === "blocked")
       ) {
         return;
       }
@@ -9560,6 +9584,12 @@ export class RunRunner {
         this.git.secretScanCheckpointRange(barePath, range, { deadlineMs: this.scanDeadlineMs() }),
       );
       if (scan.findings.length > 0) {
+        // A TRUSTED finding is remembered (flaggedCommits only, not `known`, so the tick does not
+        // itself suppress later publishes or trip the gate on its own) so the remediation gate, the
+        // pre-push re-check and the post-bridge scan know a commit a later local bridge might hide.
+        if (scan.trusted) {
+          this.recordFlaggedCommits((flight.secretRemediation ??= { attempts: 0 }), scan.findings, flight.runLog);
+        }
         this.reportPublishOutcome(
           flight,
           "secret:found",
@@ -9602,12 +9632,13 @@ export class RunRunner {
   }
 
   /**
-   * issue #1932: the scan core shared by the pre-exit remediation gate and the D5 finalize re-scan.
-   * Resolves the checkpoint range with the run's PUBLISHED floors only (confirmed-published real
-   * tips, attempted / confirmed checkpoint ref tips, the published tip; never a bare checkpoint floor), requires its tip to equal
-   * `expectedTip` (the tracking tip the caller holds), and runs the local gitleaks range scan. Credential-free; it fetches nothing, so a caller
-   * that needs a fresh tracking ref fetches first. Trusted only when the range resolved AND the scan
-   * is trustworthy.
+   * issue #1932: the scan core shared by the pre-exit remediation gate, the D5 finalize re-scan and
+   * the post-bridge scan. Resolves the checkpoint range with the run's PUBLISHED floors only
+   * (confirmed-published real tips, attempted / confirmed checkpoint ref tips, the published tip;
+   * never a bare checkpoint floor), requires its tip to equal `expectedTip` (the tracking tip the
+   * caller holds), and runs the merge-aware local checkpoint scan. Credential-free; it fetches
+   * nothing, so a caller that needs a fresh tracking ref fetches first. Trusted only when the range
+   * resolved AND the scan is trustworthy.
    */
   private async scanRemediationRange(
     flight: RunFlight,

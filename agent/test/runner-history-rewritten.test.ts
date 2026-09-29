@@ -314,10 +314,16 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
    *  finding on every later call (the post-bridge scan). Returns a counter to assert both ran. */
   const countingLeakStub = (): { calls: () => number } => {
     let n = 0;
+    // The top-of-finalize scan (GitHub only) is `secretScanRange`; the post-bridge scan is the
+    // merge-aware `secretScanCheckpointRange` (issue #1932).
     git.secretScanRange = (async () => {
       n++;
-      return n === 1 ? { trusted: false, findings: [] } : leakFinding();
+      return { trusted: false, findings: [] };
     }) as typeof git.secretScanRange;
+    git.secretScanCheckpointRange = (async () => {
+      n++;
+      return leakFinding();
+    }) as typeof git.secretScanCheckpointRange;
     return { calls: () => n };
   };
 
@@ -327,7 +333,7 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     const P = publishBranch(branch);
     // A gitlab claim never runs the github top scan, so this CONSTANT stub is hit ONLY by the
     // post-bridge scan.
-    git.secretScanRange = (async () => leakFinding()) as typeof git.secretScanRange;
+    git.secretScanCheckpointRange = (async () => leakFinding()) as typeof git.secretScanCheckpointRange;
     const claim = gitlabClaimTyped(branch);
     await runner(rewritingExecutor({}), gitlab).execute(claim);
 
@@ -349,10 +355,10 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     const P = publishBranch(branch);
     const body = "aaaa1111-bbbb-2222-cccc-3333dddd4444";
     const name = "heroku_api_key" + "=" + body + ".env";
-    git.secretScanRange = (async () => ({
+    git.secretScanCheckpointRange = (async () => ({
       trusted: true as const,
       findings: [{ commit: "deadbeef", file: name, startLine: 1, ruleId: "generic-api-key" }],
-    })) as typeof git.secretScanRange;
+    })) as typeof git.secretScanCheckpointRange;
     // The path-list scan flags a text that carries the secret-shaped name (deterministic, no shim).
     git.scanPatchForSecrets = (async (text: string) => ({
       trusted: true as const,
@@ -383,7 +389,7 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     const { gitlab } = fakeGitlab();
     const branch = "feature/pb-gitlab-untyped";
     const P = publishBranch(branch);
-    git.secretScanRange = (async () => leakFinding()) as typeof git.secretScanRange;
+    git.secretScanCheckpointRange = (async () => leakFinding()) as typeof git.secretScanCheckpointRange;
     const claim = taskClaim(branch, { open_mr: false }); // repo carries no forge_type
     assert.strictEqual(claim.repo.forge_type, undefined, "the claim genuinely omits forge_type");
     await runner(rewritingExecutor({}), gitlab).execute(claim);
@@ -443,7 +449,7 @@ describe("RunRunner — post-bridge secret scan (PRD #1416 MR-rework)", () => {
     const { gitlab } = fakeGitlab();
     const branch = "feature/pb-clean";
     const P = publishBranch(branch);
-    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    git.secretScanCheckpointRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanCheckpointRange;
     const claim = gitlabClaimTyped(branch);
     await runner(rewritingExecutor({}), gitlab).execute(claim);
 
@@ -494,8 +500,12 @@ describe("RunRunner — a bridge adopted before finalize is still secret-scanned
     let scans = 0;
     git.secretScanRange = (async () => {
       scans++;
-      return scans === 1 ? { trusted: true as const, findings: [] } : leak();
+      return { trusted: true as const, findings: [] };
     }) as typeof git.secretScanRange;
+    git.secretScanCheckpointRange = (async () => {
+      scans++;
+      return leak();
+    }) as typeof git.secretScanCheckpointRange;
     const claim = githubTaskClaim(branch, { open_mr: false });
     await githubRunner(github, bridgedEarlyExecutor(P, { ".github/workflows/ci.yml": CI_V2 })).execute(claim);
 
@@ -509,10 +519,10 @@ describe("RunRunner — a bridge adopted before finalize is still secret-scanned
     const branch = "feature/early-bridge-gitlab";
     const P = publishBranch(branch);
     let scans = 0;
-    git.secretScanRange = (async () => {
+    git.secretScanCheckpointRange = (async () => {
       scans++;
       return leak();
-    }) as typeof git.secretScanRange;
+    }) as typeof git.secretScanCheckpointRange;
     const claim = taskClaim(branch, {
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, forge_type: "gitlab" },
     });
@@ -530,7 +540,7 @@ describe("RunRunner — a bridge adopted before finalize is still secret-scanned
     const { gitlab } = fakeGitlab();
     const branch = "feature/early-bridge-clean";
     const P = publishBranch(branch);
-    git.secretScanRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanRange;
+    git.secretScanCheckpointRange = (async () => ({ trusted: true, findings: [] })) as typeof git.secretScanCheckpointRange;
     const claim = taskClaim(branch, {
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, forge_type: "gitlab" },
     });
@@ -582,10 +592,10 @@ describe("RunRunner — a bridge adopted before finalize is still secret-scanned
     const branch = "feature/no-bridge";
     publishBranch(branch);
     let scans = 0;
-    git.secretScanRange = (async () => {
+    git.secretScanCheckpointRange = (async () => {
       scans++;
       return leak();
-    }) as typeof git.secretScanRange;
+    }) as typeof git.secretScanCheckpointRange;
     const claim = taskClaim(branch, {
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath, forge_type: "gitlab" },
     });

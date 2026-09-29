@@ -248,6 +248,13 @@ const publishedTipContains = (bare: string, tip: string, sha: string): boolean =
 
 let floorTip = "";
 
+/** Make `secretScanCheckpointRange` report an untrusted scan when its call stack matches `where`. */
+const untrustedWhen = (where: RegExp) => (g: GitCache): void => {
+  const orig = g.secretScanCheckpointRange.bind(g);
+  (g as unknown as { secretScanCheckpointRange: unknown }).secretScanCheckpointRange = async (
+    ...a: Parameters<GitCache["secretScanCheckpointRange"]>
+  ) => (where.test(new Error().stack ?? "") ? { trusted: false, findings: [], reason: "stubbed" } : orig(...a));
+};
 
 function publishOriginBranch(name: string): string {
   gitIn(fx.originPath, ["checkout", "-q", "-b", name]);
@@ -987,14 +994,6 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     const d = await drive({
       iid,
       forge: "gitlab",
-      // The stub makes the post-bridge range scan report clean, isolating the retained-flagged-commit
-      // ancestry re-check as the only thing that can stop the push.
-      configure: (g) => {
-        (g as unknown as { secretScanRange: unknown }).secretScanRange = async () => ({
-          trusted: true,
-          findings: [],
-        });
-      },
       body: async (ctx, gate) => {
         const w = ctx.worktreePath;
         gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
@@ -1015,7 +1014,7 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     for (const t of d.pub.tips) assert.equal(publishedTipContains(d.bare, t, S), false);
   });
 
-  it("(y4) after a remediated finding, a clean bridged branch with an untrusted post-bridge scan pushes: the re-check proved no flagged commit is reachable", { skip }, async () => {
+  it("(y4) after a remediated finding, a clean rewrite below the published tip is bridged and pushed without the flagged commit", { skip }, async () => {
     const iid = 1932_248;
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
@@ -1023,14 +1022,6 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     const d = await drive({
       iid,
       forge: "gitlab",
-      // The stub makes the post-bridge range scan untrusted, isolating the flagged-commit re-check.
-      configure: (g) => {
-        (g as unknown as { secretScanRange: unknown }).secretScanRange = async () => ({
-          trusted: false,
-          findings: [],
-          reason: "stubbed untrusted",
-        });
-      },
       body: async (ctx, gate) => {
         const w = ctx.worktreePath;
         S4 = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
@@ -1110,46 +1101,131 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     const iid = 1932_253;
     const CI_V1 = "name: ci\non: [push]\njobs: {}\n";
     const CI_V2 = "name: ci\non: [pull_request]\njobs: {}\n";
-    commitIn(fx.originPath, ".github/workflows/ci.yml", CI_V1);
+    // This test commits workflow files to the shared fixture origin's main; restore it afterwards so
+    // no later test sees them.
+    const mainBefore = gitIn(fx.originPath, ["rev-parse", "main"]);
+    try {
+      commitIn(fx.originPath, ".github/workflows/ci.yml", CI_V1);
+      const P = publishOriginBranch(`agent/issue-${iid}`);
+      const acts: string[] = [];
+      const aligns: string[] = [];
+      let S = "";
+      const d = await drive({
+        iid,
+        forge: "github",
+        configure: (g) => {
+          const orig = g.alignBranchWithDefault.bind(g);
+          (g as unknown as { alignBranchWithDefault: unknown }).alignBranchWithDefault = async (
+            ...a: Parameters<GitCache["alignBranchWithDefault"]>
+          ) => {
+            aligns.push(String(a[4]));
+            return orig(...a);
+          };
+        },
+        body: async (ctx, gate) => {
+          const w = ctx.worktreePath;
+          gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+          S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+          await ctx.checkpoint!({ reap: false }); // the tick bridges B=(S,P): a local-only checkpoint floor
+          acts.push((await gate()).action); // S is under the local-only floor: not remediable
+          gitIn(w, ["reset", "-q", "--hard", P]);
+          commitIn(w, "d.txt", "d\n");
+          acts.push((await gate()).action); // clean: known cleared
+          commitIn(fx.originPath, ".github/workflows/ci.yml", CI_V2); // main moves on workflows: finalize aligns
+        },
+      });
+      assert.deepEqual(acts, ["proceed", "proceed"]);
+      assert.ok(aligns.length >= 1, "the finalize took the base-align path");
+      assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+      assert.equal(d.failed()?.preserved_patch, undefined);
+      assert.equal(d.pushes(), 0);
+      assert.equal(
+        api.states.filter((s) => s.runId === d.claim.run_id && (s.body.status === "failed" || s.body.status === "completed")).length,
+        1,
+        "exactly one terminal report",
+      );
+      for (const t of [...d.pushedTips, ...d.pub.tips]) assert.equal(publishedTipContains(d.bare, t, S), false);
+    } finally {
+      gitIn(fx.originPath, ["checkout", "-q", "main"]);
+      gitIn(fx.originPath, ["reset", "-q", "--hard", mainBefore]);
+    }
+  });
+
+  /** R5 body: S is held off a checkpoint by the publish scan under a local-only tick bridge, the agent
+   *  restores P and moves on without S, and the finalize bridge wraps the clean tip over that bridge. */
+  const r5Run = (iid: number, configure?: (g: GitCache) => void) => {
     const P = publishOriginBranch(`agent/issue-${iid}`);
     const acts: string[] = [];
-    const aligns: string[] = [];
     let S = "";
-    const d = await drive({
+    return drive({
       iid,
-      forge: "github",
-      configure: (g) => {
-        const orig = g.alignBranchWithDefault.bind(g);
-        (g as unknown as { alignBranchWithDefault: unknown }).alignBranchWithDefault = async (
-          ...a: Parameters<GitCache["alignBranchWithDefault"]>
-        ) => {
-          aligns.push(String(a[4]));
-          return orig(...a);
-        };
-      },
+      forge: "gitlab",
+      configure,
       body: async (ctx, gate) => {
         const w = ctx.worktreePath;
         gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
         S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
-        await ctx.checkpoint!({ reap: false }); // the tick bridges B=(S,P): a local-only checkpoint floor
-        acts.push((await gate()).action); // S is under the local-only floor: not remediable
+        await ctx.checkpoint!({ reap: true }); // local bridge B=(S,P); the pinned scan blocks the publish (no bridge push)
         gitIn(w, ["reset", "-q", "--hard", P]);
         commitIn(w, "d.txt", "d\n");
-        acts.push((await gate()).action); // clean: known cleared
-        commitIn(fx.originPath, ".github/workflows/ci.yml", CI_V2); // main moves on workflows: finalize aligns
+        acts.push((await gate()).action); // range P..D is clean: S is not an ancestor
       },
-    });
-    assert.deepEqual(acts, ["proceed", "proceed"]);
-    assert.ok(aligns.length >= 1, "the finalize took the base-align path");
+    }).then((d) => ({ d, acts, S }));
+  };
+
+  it("(r5) R5 GitLab: a secret only ever under a local-only tick bridge is not re-added by the finalize bridge and pushed", { skip }, async () => {
+    const { d, acts, S } = await r5Run(1932_261);
+    assert.deepEqual(acts, ["proceed"]);
     assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
     assert.equal(d.failed()?.preserved_patch, undefined);
     assert.equal(d.pushes(), 0);
-    assert.equal(
-      api.states.filter((s) => s.runId === d.claim.run_id && (s.body.status === "failed" || s.body.status === "completed")).length,
-      1,
-      "exactly one terminal report",
-    );
     for (const t of [...d.pushedTips, ...d.pub.tips]) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(r5-scan) R5 GitLab: the merge-aware post-bridge scan alone blocks the push when the tick scan was untrusted", { skip }, async () => {
+    const { d, S } = await r5Run(1932_262, untrustedWhen(/scanCheckpointForPublish/));
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.ok(d.logs.some((l) => /post-bridge secret scan found a secret/.test(JSON.stringify(l))), "the post-bridge scan blocked");
+    assert.equal(d.pushes(), 0);
+    for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(r5-flag) R5 GitLab: the tick's flagged commit alone blocks the push when the post-bridge scan is untrusted", { skip }, async () => {
+    const { d, S } = await r5Run(1932_263, untrustedWhen(/scanBridgedRangeAndBlock/));
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.pushes(), 0);
+    for (const t of d.pushedTips) assert.equal(publishedTipContains(d.bare, t, S), false);
+  });
+
+  it("(na) N-A GitLab: the known secret re-committed under a new SHA X2 below P and bridged locally is not pushed by the finalize bridge", { skip }, async () => {
+    const iid = 1932_264;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    const acts: string[] = [];
+    let X = "";
+    let X2 = "";
+    const d = await drive({
+      iid,
+      forge: "gitlab",
+      body: async (ctx, gate) => {
+        const w = ctx.worktreePath;
+        X = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        acts.push((await gate()).action); // remediate
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        gitIn(w, ["cherry-pick", "--allow-empty", X]); // the remediation turn re-commits it as X2
+        X2 = gitIn(w, ["rev-parse", "HEAD"]);
+        await ctx.checkpoint!({ reap: true }); // a scanned checkpoint bridges over X2 (local-only) and is held
+        gitIn(w, ["reset", "-q", "--hard", P]); // the lead fixes X up / restores P and moves on clean
+        commitIn(w, "d.txt", "d\n");
+        acts.push((await gate()).action);
+      },
+    });
+    assert.deepEqual(acts, ["remediate", "proceed"]);
+    assert.equal(d.failed()?.fail_origin, "push_secret_blocked", JSON.stringify(d.failed()));
+    assert.equal(d.pushes(), 0);
+    for (const t of [...d.pushedTips, ...d.pub.tips]) {
+      assert.equal(publishedTipContains(d.bare, t, X), false);
+      assert.equal(publishedTipContains(d.bare, t, X2), false);
+    }
   });
 
   it("(y2) R1 GitLab: a never-flagged secret under a local-only bridge is scanned (not hidden by the bridge), not remediable, and cannot be pushed", { skip }, async () => {
