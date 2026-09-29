@@ -131,13 +131,14 @@ func TestPendingFindingGroupsCursorWrapsPastUnmatched(t *testing.T) {
 		first int
 		last  int
 	}{{100, 0, 99}, {1, 100, 100}, {100, 0, 99}} {
-		ops, finish, err := svc.pendingFindingGroups(context.Background(), repo)
+		ops, finish, advance, err := svc.pendingFindingGroups(context.Background(), repo)
 		if err != nil {
 			t.Fatal(err)
 		}
 		if len(ops) != want.count || ops[0].ID != db.ops[want.first].ID || ops[len(ops)-1].ID != db.ops[want.last].ID {
 			t.Fatalf("pass %d: selected %d ops, wanted indices %d..%d", pass, len(ops), want.first, want.last)
 		}
+		advance()
 		finish()
 	}
 }
@@ -155,7 +156,7 @@ func TestPendingFindingGroupsLogsStatsAfterSyncCancellation(t *testing.T) {
 
 	svc := &Service{groupDB: db}
 	ctx, cancel := context.WithCancel(context.Background())
-	_, finish, err := svc.pendingFindingGroups(ctx, repo)
+	_, finish, _, err := svc.pendingFindingGroups(ctx, repo)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -334,6 +335,36 @@ func TestIncrementalSyncSettlementFailureHoldsMarks(t *testing.T) {
 	}
 	if _, advanced := svc.groupCursors[repo]; advanced {
 		t.Fatal("failed settlement advanced the group cursor past the recorded issue")
+	}
+}
+
+func TestIncrementalSyncMarkerSettlementFailureRetainsPage(t *testing.T) {
+	repo, user := uuid.New(), uuid.New()
+	db := &markerPageDB{pendingPageDB: &pendingPageDB{}}
+	startTime := time.Now().Add(-time.Hour)
+	for i := 0; i < 101; i++ {
+		db.ops = append(db.ops, store.FindingGroupClaimOperation{
+			ID: uuid.New(), UserID: user, RepoID: repo, Phase: "in_flight",
+			CreatedAt: startTime.Add(time.Duration(i) * time.Second),
+		})
+	}
+	db.beginErr = fmt.Errorf("settlement unavailable after marker record")
+	cache := &fakeStore{}
+	svc := newTestService(cache)
+	svc.SetFindingGroupDB(db)
+	marker := "<!-- uzi-finding-group-operation: " + db.ops[0].ID.String() + " -->"
+	start := Marks{Finding: startTime}
+	for pass := 0; pass < 2; pass++ {
+		got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{{
+			IID: 44, WebURL: "https://example.com/issues/44", Description: marker,
+			UpdatedAt: startTime.Add(200 * time.Second),
+		}}}, start)
+		if err == nil || got != start || len(cache.upserts) != 0 {
+			t.Fatalf("pass %d: mark=%v error=%v writes=%d", pass, got, err, len(cache.upserts))
+		}
+	}
+	if _, advanced := svc.groupCursors[repo]; advanced {
+		t.Fatal("marker settlement failure advanced past the recorded operation")
 	}
 }
 

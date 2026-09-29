@@ -231,9 +231,10 @@ func (s *Service) SetFindingGroupDB(db findingGroupDB) { s.groupDB = db }
 
 // pendingFindingGroups settles durable records before any forge observation. The
 // returned closure emits one warning after the pass if claims remain.
-func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([]store.FindingGroupClaimOperation, func(), error) {
+func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([]store.FindingGroupClaimOperation, func(), func(), error) {
+	noop := func() {}
 	if s.groupDB == nil {
-		return nil, func() {}, nil
+		return nil, noop, noop, nil
 	}
 	var reconcileErr error
 	finish := func() {
@@ -277,7 +278,7 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 	s.groupCursorMu.Unlock()
 	if err != nil {
 		reconcileErr = err
-		return nil, finish, err
+		return nil, finish, noop, err
 	}
 	// Settle durable issue identities before spending work on uncertain claims.
 	for _, op := range ops {
@@ -291,19 +292,22 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 		// A failed or raced settlement stays claimed for a later pass.
 	}
 	if reconcileErr != nil {
-		return ops, finish, reconcileErr
+		return ops, finish, noop, reconcileErr
 	}
-	if len(ops) > 0 {
+	advance := func() {
+		if len(ops) == 0 {
+			return
+		}
 		last := ops[len(ops)-1]
 		s.groupCursorMu.Lock()
+		defer s.groupCursorMu.Unlock()
 		// A concurrent pass may already have advanced farther. Do not rewind it.
 		current, exists := s.groupCursors[repoID]
 		if (after == nil && !exists) || (after != nil && exists && current == *after) {
 			s.groupCursors[repoID] = store.FindingGroupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
 		}
-		s.groupCursorMu.Unlock()
 	}
-	return ops, finish, nil
+	return ops, finish, advance, nil
 }
 
 // Bound marker parsing before any cache write or watermark advance.
@@ -720,7 +724,7 @@ func (m Marks) Advance(next Marks) Marks {
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
-	pendingGroups, finishGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
+	pendingGroups, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
 	if pendingErr != nil {
 		return Marks{}, pendingErr
@@ -769,6 +773,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 			return Marks{}, err
 		}
 	}
+	advanceGroups()
 
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return Marks{}, err
@@ -821,7 +826,7 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
-	pendingGroups, finishGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
+	pendingGroups, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
 	defer finishGroups()
 	if pendingErr != nil {
 		return m, pendingErr
@@ -864,6 +869,7 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 			return m, err
 		}
 	}
+	advanceGroups()
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}
