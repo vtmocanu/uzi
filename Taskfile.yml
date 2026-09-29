@@ -2301,9 +2301,9 @@ tasks:
       # that settled it was re-running one unchanged commit.
       #
       # 120000 keeps the flag's stated purpose (catching a HANG, which is
-      # unbounded) while giving the worst real file ~4x headroom. Do not tune it
-      # back down to "just above the current worst" -- that is how it became a
-      # knife-edge.
+      # unbounded). Under node 22's per-file cap it gave the worst real file ~4x
+      # headroom. Do not tune it back down to "just above the current worst" --
+      # that is how it became a knife-edge.
       #
       # runner.test.ts was split the same day into seven runner-*.test.ts files
       # sharing test/runner-harness.ts. Under node 22's per-file cap, the split
