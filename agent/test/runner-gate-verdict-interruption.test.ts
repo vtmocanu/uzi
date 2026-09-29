@@ -29,7 +29,7 @@ import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
-import { api, fakeGitlab, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { api, client, fakeGitlab, gitlabClaim, installHarness, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 installHarness();
 
@@ -1382,18 +1382,77 @@ describe("#1604 review — resumed-gate edges", () => {
 });
 
 describe("shutdown at an observed plan gate", () => {
-  for (const planApprovalTimeoutMs of [0, 60_000]) {
+  for (const [planApprovalTimeoutMs, session] of [[0, "kept"], [60_000, "none"]] as const) {
     it(`finishes promptly without a cancel input when planApprovalTimeoutMs is ${planApprovalTimeoutMs}`, () =>
       scenario(async (s) => {
+        api.gateRevisions = true;
+        api.stampGateBindings = true;
+        client.protocolFeatures = ["claim_generation_fence", "gate_revision_v1"];
+        let holdFirstGate = true;
+        let gateReads = 0;
+        api.onState(s.runId, (body) => {
+          if (body.status !== "awaiting_approval" || !holdFirstGate) return;
+          holdFirstGate = false;
+          gateReads = api.inputGets.get(s.runId) ?? 0;
+          api.delayInputGets(s.runId, 5_000, Infinity, gateReads);
+        });
         const flight = s.start(s.claim(), { runner: { planApprovalTimeoutMs } });
         assert.ok(await until(() => s.gates(flight).length > 0 || flight.finished), "the plan gate was observed");
-        assert.equal(s.gates(flight)[0]?.plan_md, PLAN_V1, "the submitted plan was offered for approval");
+        const firstGate = s.gates(flight)[0]!;
+        assert.equal(firstGate.plan_md, PLAN_V1, "the submitted plan was offered for approval");
+        assert.ok(firstGate.presentation_id, "the observed gate has a presentation id");
+        const persisted = api.gateOf(s.runId);
+        assert.deepEqual(persisted, { revision: 1, presentationId: firstGate.presentation_id });
         assert.equal(s.rowsOf("cancel").length, 0, "no cancel was sent before shutdown");
 
+        // Hold a delivery read while the owner sends a bound approval. Shutdown must leave that
+        // row pending for the next claim, rather than routing it on the first flight.
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > gateReads), "the gate's input read is held");
+        const [pending] = s.send(s.input("approve_plan"));
+        const stored = api.inputRows(s.runId).find((row) => row.id === pending!.id)!;
+        assert.equal(stored.gate_binding, "bound");
+        assert.equal(stored.gate_revision, persisted.revision);
         flight.runner.shutdown();
         assert.ok(await until(() => flight.finished, 2_000), "shutdown ended the gate flight within two seconds");
         await flight.done;
         assert.equal(s.rowsOf("cancel").length, 0, "shutdown needed no cancel fallback");
+        assert.ok(!s.statuses(flight).some((status) => status === "failed" || status === "cancelled"), s.statuses(flight).join(","));
+        assert.equal(s.persistedGate()?.plan_md, PLAN_V1, "the submitted plan remains persisted");
+        assert.deepEqual(s.persistedGate()?.milestones, V1_MILESTONES, "the candidate work remains persisted");
+        assert.deepEqual(api.gateOf(s.runId), persisted, "shutdown preserves the gate identity");
+        assert.equal(api.isAcked(s.runId, pending!.id), false, "shutdown left the verdict unread");
+        assert.equal(api.isApplied(s.runId, pending!.id), false, "shutdown did not apply the verdict");
+        assertNoApproval(s);
+        api.delayInputGets(s.runId, 0, 0);
+
+        const claim = session === "kept" ? s.resumeClaim("kept", api.gateResumeFields(s.runId)) : s.resumeClaim("none");
+        assert.equal(claim.plan_approved, false, "the resumed claim still needs approval");
+        const resumed = s.start(claim);
+        assert.ok(await until(() => s.gates(resumed).length > 0 || resumed.finished, 3_000), s.statuses(resumed).join(","));
+        const nextGate = s.gates(resumed)[0]!;
+        if (session === "kept") {
+          await s.finish(resumed);
+          assert.equal(nextGate.plan_md, PLAN_V1, "the submitted plan is re-presented");
+          assert.equal(nextGate.presentation_id, persisted.presentationId, "the same gate id is retained");
+          assert.deepEqual(api.gateOf(s.runId), persisted, "the same revision is retained");
+          assert.equal(api.inputReceiptCalls.filter((c) => c.runId === s.runId && c.kind === "applied" && c.ids.includes(pending!.id)).length, 1, "the bound approval is applied exactly once");
+          assert.ok(api.humanPlanApproved(s.runId), "the pending approval was taken");
+          assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
+        } else {
+          assert.equal(nextGate.plan_md, PLAN_V1, "a fresh plan is shown");
+          assert.notEqual(nextGate.presentation_id, persisted.presentationId, "the fresh gate has a new id");
+          assert.equal(api.gateOf(s.runId).revision, persisted.revision + 1, "the fresh gate has a new revision");
+          assert.ok(await until(() => s.acks(pending!.id, resumed) > 0, 3_000), "the pending verdict was read");
+          assert.ok(s.texts(resumed).some((line) => line.includes("ignored") && line.includes("re-send")), "the unmatched verdict is explained");
+          assert.equal(api.isApplied(s.runId, pending!.id), false, "the old approval is never applied");
+          assertNoApproval(s);
+          assert.equal(resumed.finished, false, "the fresh gate requires a fresh approval");
+          const [fresh] = s.send(s.input("approve_plan"));
+          await s.finish(resumed);
+          assert.ok(api.isApplied(s.runId, fresh!.id), "the fresh approval is applied");
+          assert.ok(s.statuses(resumed).includes("completed"), s.statuses(resumed).join(","));
+        }
+        assert.equal(s.rowsOf("cancel").length, 0, "neither claim required a cancel");
       }));
   }
 });
