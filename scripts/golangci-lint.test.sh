@@ -238,7 +238,11 @@ if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
   stop_ready_delay() {
     if [ -n "$ready_delay_pid" ]; then
       kill "$ready_delay_pid" 2>/dev/null || true
-      wait "$ready_delay_pid" 2>/dev/null || true
+      ready_delay_status=0
+      wait "$ready_delay_pid" 2>/dev/null || ready_delay_status=$?
+      ready_delay_status_marker="$FAKE_READY_DELAY_STATUS_FILE.tmp.$$"
+      printf '%s\n' "$ready_delay_status" > "$ready_delay_status_marker"
+      mv "$ready_delay_status_marker" "$FAKE_READY_DELAY_STATUS_FILE"
     fi
   }
   trap 'stop_ready_delay; printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
@@ -321,6 +325,7 @@ WRAPPER_TMP_ROOT="$TMP/wrapper-tmp"
 MKTEMP_LOG="$TMP/mktemp.log"
 CHILD_PID_FILE="$TMP/child.pid"
 READY_DELAY_PID_FILE="$TMP/ready-delay.pid"
+READY_DELAY_STATUS_FILE="$TMP/ready-delay.status"
 WRAPPER_PID_FILE="$TMP/wrapper.pid"
 SIGNAL_LOG="$TMP/signals.log"
 CURL_ARGV_LOG="$TMP/curl-argv.log"
@@ -461,6 +466,7 @@ start_blocking_wrapper() {
       FAKE_CHILD_BLOCK=1 \
       FAKE_CHILD_READY_DELAY="${FAKE_CHILD_READY_DELAY:-0}" \
       FAKE_READY_DELAY_PID_FILE="$READY_DELAY_PID_FILE" \
+      FAKE_READY_DELAY_STATUS_FILE="$READY_DELAY_STATUS_FILE" \
       FAKE_CHILD_PID_FILE="$CHILD_PID_FILE" \
       FAKE_SIGNAL_LOG="$SIGNAL_LOG" \
       FAKE_EXEC_LOG="$EXEC_LOG" \
@@ -674,7 +680,7 @@ seed_archive "$CANCEL_CACHE" darwin-arm64
 : > "$CHILD_PID_FILE"
 : > "$WRAPPER_PID_FILE"
 : > "$SIGNAL_LOG"
-rm -f "$READY_DELAY_PID_FILE"
+rm -f "$READY_DELAY_PID_FILE" "$READY_DELAY_STATUS_FILE"
 FAKE_CHILD_READY_DELAY=4
 start_blocking_wrapper "$TMP/forced-start-timeout.out" "$CANCEL_CACHE"
 CANCEL_LAUNCHER_PID="$START_PID"
@@ -697,6 +703,7 @@ forced_launcher_pid="$CANCEL_LAUNCHER_PID"
 assert_contains "$TMP/forced-start-timeout.err" "child_pid=missing"
 assert_contains "$TMP/forced-start-timeout.err" "launcher=alive"
 stop_cancel_processes
+assert_eq 143 "$(marker_value "$READY_DELAY_STATUS_FILE")" "forced timeout readiness sleep signal status"
 if kill -0 "$forced_delay_pid" 2>/dev/null; then fail "forced timeout left readiness sleep $forced_delay_pid alive"; fi
 if kill -0 "$forced_wrapper_pid" 2>/dev/null; then fail "forced timeout left wrapper $forced_wrapper_pid alive"; fi
 if kill -0 "$forced_launcher_pid" 2>/dev/null; then fail "forced timeout left launcher $forced_launcher_pid alive"; fi
