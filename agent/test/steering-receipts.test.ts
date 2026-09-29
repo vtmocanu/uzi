@@ -213,6 +213,20 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     assert.strictEqual(cancel.signal.aborted, true);
     assert.deepStrictEqual(api.inputReceiptCalls, [], "no ACK or APPLIED for a reply without the receipts marker");
   });
+
+  it("routes an older api's consume-on-read reply even when stop began during GET", async () => {
+    api.setInputClaimGeneration(RUN, 1);
+    api.legacyConsumeOnRead = true;
+    api.setInputs(RUN, [{ id: 8, kind: "cancel", body: null }]);
+    api.delayInputGets(RUN, 100, 1);
+    const cancel = new AbortController();
+    const ch = channel(clientLosingGets(0), 1, cancel);
+    await until(() => (api.inputGets.get(RUN) ?? 0) > 0);
+    await ch.stop();
+    assert.equal(api.isApplied(RUN, 8), true, "the older api consumed the input before replying");
+    assert.equal(cancel.signal.aborted, true, "the already-consumed input is still routed");
+    assert.deepStrictEqual(api.inputReceiptCalls, [], "legacy input has no receipt lane");
+  });
 });
 
 // Issue #1604 round 4: the plan-gate replay edges, driven through a real WorkerClient and FakeApi.

@@ -2314,8 +2314,9 @@ export class SteeringChannel {
         if (!this.held && !this.stopped) {
           this.requestStage = "get";
           const { inputs: read, credentialSwitch, receipts } = await this.client.getInputs(this.runId);
-          // A read that completes after stop belongs to the next claim. Leave its rows un-ACKed.
-          if (this.stopped) break;
+          // A receipted read that completes after stop belongs to the next claim. An older
+          // consume-on-read API has already applied its rows, so route those below as before.
+          if (this.stopped && receipts) break;
           if (!validBatch(read)) throw new InvalidInputResponse("invalid input GET response");
           // Issue #1604: a plan-gate input awaiting its result stays unapplied, so every GET
           // returns it again; it is neither re-ACKed nor re-routed.
