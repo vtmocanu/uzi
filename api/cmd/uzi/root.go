@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -439,7 +440,29 @@ func resolveSettings(env Env, gf *globalFlags) (uzicli.Settings, error) {
 	if v := os.Getenv("UZI_TOKEN"); v != "" {
 		s.Token = v
 	}
+	if err := rejectProductToken(s.Token); err != nil {
+		return uzicli.Settings{}, err
+	}
 	return s, nil
+}
+
+// msgProductTokenCLI is the fixed message for a product token handed to the CLI. It
+// names the prefix constant only and never interpolates the credential, so the
+// token value cannot reach stderr.
+const msgProductTokenCLI = "product tokens (" + producttoken.Prefix + ") only work on /api/v1; " +
+	"the uzi CLI needs a CLI token (uzc_ or uza_): run \"uzi login\" or mint one in Settings > Access"
+
+// rejectProductToken fails fast when the resolved credential ($UZI_TOKEN or the
+// active context's stored token) is a product token (PRD #1907 M6). A product
+// token authenticates only /api/v1, which the CLI does not call, so refusing here
+// names the fix before any request is built. resolveSettings is the one place
+// both token sources merge, and env.client builds every authenticated client from
+// it.
+func rejectProductToken(token string) error {
+	if producttoken.HasPrefix(token) {
+		return uzicli.Exitf(uzicli.ExitAuth, "%s", msgProductTokenCLI)
+	}
+	return nil
 }
 
 // resolveURL resolves the API base URL for the named context with the same
