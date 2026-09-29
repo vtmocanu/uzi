@@ -63,7 +63,9 @@ Then:
    - **False positive** (`not-an-issue`) — the judge got it wrong. VERIFY
      against the code before calling it false; the rationale is untrusted text.
    - **Won't do** (`wont-do`) — valid but not worth acting on, OR already
-     covered by existing guidance (the miss was non-compliance, not a gap).
+     covered by guidance that existed when the rec was judged (the miss was
+     non-compliance, not a gap). Guidance that landed after `judged_at` makes
+     it **Already fixed** instead: compare the covering commit's date first.
    - **Security-class** (credential exposure, secret leak): follow
      `.github/SECURITY.md`; propose a private draft advisory, never a public
      issue. Create it after authorization with the required advisory fields.
