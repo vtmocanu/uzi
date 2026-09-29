@@ -25,8 +25,8 @@ const defaultBaseURL = "https://api.github.com"
 const releasePath = "/repos/vtmocanu/uzi/releases/latest"
 
 // The active RC is created after the previous stable release; promotion prunes
-// superseded RC Release entries. A recent page is enough to find that train and
-// keeps the full GitHub JSON response comfortably below the 1 MiB read cap.
+// superseded RC Release entries. A recent page is enough to find that train;
+// its separate 4 MiB cap leaves room for full release-note bodies.
 const releasesPath = "/repos/vtmocanu/uzi/releases?per_page=20"
 
 // baseURL is the fetch base; overridable by tests only (see defaultBaseURL).
@@ -35,9 +35,10 @@ var baseURL = defaultBaseURL
 const (
 	// releaseCheckTimeout is the hard per-call ceiling so a poll can never hang.
 	releaseCheckTimeout = 15 * time.Second
-	// maxReleaseBodyBytes bounds each GitHub JSON response, including the RC list.
-	// This caps hostile/oversized responses, mirroring the agent-source wire cap.
-	maxReleaseBodyBytes = 1 << 20 // 1 MiB
+	// Keep the stable latest response at its original 1 MiB bound. A list of 20
+	// releases carries every release body, so give it a separate bounded 4 MiB.
+	maxReleaseBodyBytes     = 1 << 20 // 1 MiB
+	maxReleaseListBodyBytes = 4 << 20 // 4 MiB
 )
 
 // githubRelease is the subset of each GitHub release payload the check reads.
@@ -74,7 +75,7 @@ func newHTTPClient() *http.Client {
 // with no token material.
 func fetchLatest(ctx context.Context, client *http.Client, token string) (githubRelease, error) {
 	var rel githubRelease
-	err := fetchJSON(ctx, client, token, releasePath, &rel)
+	err := fetchJSON(ctx, client, token, releasePath, &rel, maxReleaseBodyBytes)
 	return rel, err
 }
 
@@ -82,7 +83,7 @@ func fetchLatest(ctx context.Context, client *http.Client, token string) (github
 // tag among non-draft releases. GitHub's ordering is not a version ordering.
 func fetchLatestRC(ctx context.Context, client *http.Client, token string) (githubRelease, error) {
 	var releases []githubRelease
-	if err := fetchJSON(ctx, client, token, releasesPath, &releases); err != nil {
+	if err := fetchJSON(ctx, client, token, releasesPath, &releases, maxReleaseListBodyBytes); err != nil {
 		return githubRelease{}, err
 	}
 	var best githubRelease
@@ -113,7 +114,7 @@ func exactRCTag(tag string) bool {
 	return true
 }
 
-func fetchJSON(ctx context.Context, client *http.Client, token, path string, dest any) error {
+func fetchJSON(ctx context.Context, client *http.Client, token, path string, dest any, maxBytes int64) error {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, baseURL+path, nil)
 	if err != nil {
 		return err
@@ -133,12 +134,12 @@ func fetchJSON(ctx context.Context, client *http.Client, token, path string, des
 		return fmt.Errorf("release check: unexpected status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxReleaseBodyBytes+1))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBytes+1))
 	if err != nil {
 		return fmt.Errorf("release check: read response: %w", scrubToken(err, token))
 	}
-	if len(body) > maxReleaseBodyBytes {
-		return errors.New("release check: response exceeds 1 MiB")
+	if int64(len(body)) > maxBytes {
+		return fmt.Errorf("release check: response exceeds %d MiB", maxBytes/(1<<20))
 	}
 	if strings.TrimSpace(string(body)) == "null" {
 		return errors.New("release check: null response")

@@ -438,6 +438,22 @@ func TestUpdatePromptKeepsRCFactAcrossFailedBuildProbe(t *testing.T) {
 	}
 }
 
+func TestUpdatePromptUsesNewRCFactOnLaterPoll(t *testing.T) {
+	withVersion(t, "v0.84.0-rc.1")
+	m := updatePromptModel(t)
+	m.updatePrompt.owner = "uzi-cli-rc"
+	next, _ := m.Update(buildInfoMsg{latest: &apitypes.LatestReleaseDTO{Version: "v0.84.0"}})
+	m = next.(tuiModel)
+	if m.updatePrompt.showing || m.updatePrompt.shownThisSession {
+		t.Fatal("a missing RC fact must not latch the prompt")
+	}
+	next, _ = m.Update(buildInfoMsg{latestRC: &apitypes.LatestReleaseDTO{Version: "v0.84.0-rc.2"}})
+	m = next.(tuiModel)
+	if !m.updatePrompt.showing || m.updatePrompt.latestVersion != "v0.84.0-rc.2" {
+		t.Fatalf("later RC fact did not open the prompt: %+v", m.updatePrompt)
+	}
+}
+
 func TestCappedBrewOutput(t *testing.T) {
 	var out cappedBrewOutput
 	chunk := []byte(strings.Repeat("x", 40*1024))

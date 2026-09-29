@@ -64,10 +64,40 @@ func TestRCSelectionAndClear(t *testing.T) {
 	}
 }
 
+func TestRCListAcceptsResponseAboveLatestLimit(t *testing.T) {
+	notes := strings.Repeat("n", maxReleaseBodyBytes+1)
+	list := "[" + releaseJSON("v1.2.0-rc.2", "candidate", notes, "", "") + "]"
+	if len(list) <= maxReleaseBodyBytes || len(list) >= 4<<20 {
+		t.Fatalf("list fixture has %d bytes, want between 1 and 4 MiB", len(list))
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(list))
+	}))
+	defer srv.Close()
+	withBaseURL(t, srv.URL)
+	rel, err := fetchLatestRC(context.Background(), newHTTPClient(), "")
+	if err != nil || rel.TagName != "v1.2.0-rc.2" || rel.Body != notes {
+		t.Fatalf("large valid RC page = tag %q, body bytes %d, err %v", rel.TagName, len(rel.Body), err)
+	}
+}
+
+func TestStableLatestKeepsOneMiBLimit(t *testing.T) {
+	stable := releaseJSON("v1.2.0", "stable", strings.Repeat("n", maxReleaseBodyBytes+1), "", "")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(stable))
+	}))
+	defer srv.Close()
+	withBaseURL(t, srv.URL)
+	_, err := fetchLatest(context.Background(), newHTTPClient(), "")
+	if err == nil || !strings.Contains(err.Error(), "response exceeds 1 MiB") {
+		t.Fatalf("large stable response error = %v, want 1 MiB bound", err)
+	}
+}
+
 func TestRCFetchRejectsOversizeResponse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
-			_, _ = w.Write([]byte(strings.Repeat("x", maxReleaseBodyBytes+1)))
+			_, _ = w.Write([]byte(strings.Repeat("x", maxReleaseListBodyBytes+1)))
 			return
 		}
 		_, _ = w.Write([]byte(releaseJSON("v1.1.0", "stable", "", "", "")))
@@ -77,7 +107,7 @@ func TestRCFetchRejectsOversizeResponse(t *testing.T) {
 	st := newFakeStore(map[string]string{settings.KeyReleaseRCTag: "v1.0.0-rc.1"})
 	set := &fakeSettings{enabled: true}
 	got, _ := NewReconciler(st, set, nil, nil).CheckForUpdate(context.Background())
-	if got.Status != statusError || !strings.Contains(got.Message, "response exceeds 1 MiB") ||
+	if got.Status != statusError || !strings.Contains(got.Message, "response exceeds 4 MiB") ||
 		st.values[settings.KeyReleaseLatestTag] != "v1.1.0" || st.values[settings.KeyReleaseRCTag] != "v1.0.0-rc.1" {
 		t.Fatalf("oversize RC response = %+v values=%v", got, st.values)
 	}
