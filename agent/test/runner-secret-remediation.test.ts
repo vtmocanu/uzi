@@ -1151,6 +1151,32 @@ describe("pre-exit secret remediation gate (issue #1932 m2)", () => {
     }
   });
 
+  it("(rw10) GitHub: the hold judges the post-bridge tip, so a reap:true publish never packs a bridge over a tick-flagged local-only floor", { skip }, async () => {
+    const iid = 1932_271;
+    const P = publishOriginBranch(`agent/issue-${iid}`);
+    let S = "";
+    let skew = 0;
+    const d = await drive({
+      iid,
+      forge: "github",
+      configureRunner: (r) => {
+        // Open the checkpoint time gate so the reap:false checkpoint scans (as the mid-turn tick does).
+        (r as unknown as { now: () => number }).now = () => Date.now() + skew;
+      },
+      body: async (ctx) => {
+        const w = ctx.worktreePath;
+        gitIn(w, ["reset", "-q", "--hard", `${P}^`]);
+        S = commitIn(w, "cfg.env", `TOKEN=${runtimeSecret()}\n`);
+        skew = 3_600_000;
+        await ctx.checkpoint!({ reap: false }); // the tick bridges B=(S,P) (local-only floor) and flags S
+        gitIn(w, ["reset", "-q", "--hard", P]);
+        commitIn(w, "d.txt", "d\n");
+        await ctx.checkpoint!({ reap: true }); // the bridge wraps D over the floor: the unscanned overlay must not publish it
+      },
+    });
+    for (const t of [...d.pushedTips, ...d.pub.tips]) assert.equal(publishedTipContains(d.bare, t, S), false, "no published tip has S");
+  });
+
   /** R5 body: S is held off a checkpoint by the publish scan under a local-only tick bridge, the agent
    *  restores P and moves on without S, and the finalize bridge wraps the clean tip over that bridge. */
   const r5Run = (iid: number, configure?: (g: GitCache) => void) => {

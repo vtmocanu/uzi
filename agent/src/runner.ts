@@ -7809,31 +7809,41 @@ export class RunRunner {
         // only the overlay/pack/upload path below.
         if (hasNewWork && checkpointSoft?.signal.aborted) throw new CheckpointSoftDeadlineError();
         // issue #1932 D3: while the pre-exit secret remediation gate holds a known/blocked finding,
-        // NO publish happens on any path (overlay and pinned, reap true/false, the mid-turn tick,
-        // the deferred pendingPublish): the fetch-back / steer / bridge above stay (local only),
-        // but the flagged commit must never reach the checkpoint ref. After a finding has been known
-        // in this run, a reap:true (milestone/done) publish also requires the tracking tip to be the
-        // tip of the last CLEAN trusted gate scan, so a commit landing after that scan cannot slip
-        // out unscanned through the GitHub overlay (which is otherwise unscanned). lastPublish,
+        // checkpointBody publishes nothing on any path (overlay and pinned, reap true/false, the
+        // mid-turn tick, the deferred pendingPublish): the fetch-back / steer / bridge above stay
+        // (local only), but the flagged commit must never reach the checkpoint ref from here. The
+        // park / shutdown / pause / capture / completion-hold sinks publish unscanned by design
+        // (#1597): an accepted residual outside this hold. After a finding has been known in this
+        // run, a reap:true (milestone/done) publish also requires the tracking tip to be the tip of
+        // the last CLEAN trusted gate scan, so a commit landing after that scan cannot slip out
+        // unscanned through the GitHub overlay (which is otherwise unscanned). lastPublish,
         // lastPublishedTip, checkpointFloor and pendingPublish are left as they are.
         const remediation = flight.secretRemediation;
         // A commit only the mid-turn scan flagged (flaggedCommits, no `known`) holds too while it is
         // still an ancestor of the tip about to be published (unknown ancestry counts as reachable, an
         // unreadable tip fails closed), or once the list overflowed: the GitHub reap:true overlay
-        // publish is unscanned, so ancestry is the only guard there. Computed only when a flagged
-        // commit was recorded, so a clean run pays nothing.
+        // publish is unscanned, so ancestry is the only guard there. The tip judged is the POST-bridge
+        // tracking tip (re-read below, not fetchedTip): the bridge can move the ref to a commit that
+        // wraps a local-only floor containing the flagged commit. Read only when remediation state
+        // exists, so a clean run pays nothing extra.
         const timeGateOpen =
           this.checkpointIntervalMs > 0 &&
           this.now() - flight.lastPublish >= this.checkpointIntervalMs;
         let flaggedHold = false;
+        let holdTip: string | null = fetchedTip;
         // Only a publish that would otherwise happen is held here (a closed time gate keeps its own outcome).
         if (hasNewWork && (opts.reap || timeGateOpen || flight.pendingPublish) && remediation !== undefined) {
+          holdTip = await this.git.trackingTip(barePath, runnerClone.branch);
           if (remediation.overflow === true) {
             flaggedHold = true;
           } else if ((remediation.flaggedCommits?.length ?? 0) > 0) {
-            flaggedHold =
-              fetchedTip === null ||
-              (await this.reachableFlaggedFindings(remediation, barePath, fetchedTip)).length > 0;
+            try {
+              flaggedHold =
+                holdTip === null ||
+                (await this.reachableFlaggedFindings(remediation, barePath, holdTip)).length > 0;
+            } catch {
+              flaggedHold = true; // fail closed
+            }
           }
         }
         const remediationHold =
@@ -7842,7 +7852,7 @@ export class RunRunner {
           (flaggedHold ||
             (remediation.known?.length ?? 0) > 0 ||
             (remediation.blocked?.length ?? 0) > 0 ||
-            (opts.reap && remediation.everKnown === true && fetchedTip !== remediation.cleanTip));
+            (opts.reap && remediation.everKnown === true && holdTip !== remediation.cleanTip));
         // Resolve the GitHub overlay context after the candidate is in the
         // worker bare. Even a slow local default-branch lookup now runs under
         // the same checkpoint-only child budget as the remote default fetch.
@@ -9814,7 +9824,7 @@ export class RunRunner {
       }
       // A commit only the mid-turn scan flagged: ancestry against an authoritative tip decides, no
       // trusted scan needed. With no authoritative tip (stale tracking ref, thrown error) proceed: the
-      // done-checkpoint hold and D5 at finalize judge a freshly fetched tip. Accepted limit: a
+      // done-checkpoint hold (the post-bridge tracking tip packed for publish) and D5 at finalize judge a fresh tip. Accepted limit: a
       // token-shaped fixture on a merged public non-default branch is treated as a finding.
       if (authoritativeTip !== undefined && (state.flaggedCommits?.length ?? 0) > 0) {
         let reachable: SecretFinding[] | undefined;
