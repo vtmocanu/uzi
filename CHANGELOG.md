@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **`uzi run recovery` with no run id lists all your held work ([#1889](https://github.com/vtmocanu/uzi/issues/1889)).**
   It shows every open custody hold across your runs, with the full run and hold ids ready to paste into `uzi run discard`, plus the open, limit and decision-needed counts. `--json` returns every hold, settled ones included. `uzi run recovery <run-id>` is unchanged.
 
+- **A run whose skills plugin fails to load now stops instead of working without its skills ([#1888](https://github.com/vtmocanu/uzi/issues/1888)).**
+  When the Claude SDK reports skills-plugin load errors at session start, a run with selected skills fails with the new `fail_origin` `skills_plugin_load_failed` (never judged), and its failure reason names the plugin, error type, path and a trimmed message, redacted and bounded. An error report the worker cannot parse still counts as a failure. A run without selected skills posts a warning and continues. Claude runs only.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

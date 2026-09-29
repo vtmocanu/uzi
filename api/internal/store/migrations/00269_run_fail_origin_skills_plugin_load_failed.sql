@@ -15,8 +15,9 @@
 -- an agent defect, so it is NEVER JUDGED: it is a member of neverJudgeFailOrigins
 -- (workersvc/judge_enqueue.go), which skips the judge regardless of iteration_count (it fires at
 -- session start, which on a resumed run carries iteration_count > 0). It is not human-landable
--- (humanLandableFailOrigins excludes it): the run stops before the agent works, so there is no
--- committed work to land. TestFailOriginVocabularyMatchesCheck parses THIS CHECK (the latest
+-- (humanLandableFailOrigins excludes it): it is not a publish failure. It can still fire on a
+-- resumed run that already has commits, so earlier work may need recovery.
+-- TestFailOriginVocabularyMatchesCheck parses THIS CHECK (the latest
 -- migration declaring one) and asserts it equals AllFailOrigins(), so adding a member on one side
 -- without the other reddens at `go test` rather than raising 23514 on a user's failed run.
 --

@@ -495,12 +495,13 @@ skills, the run **fails** with `fail_origin = skills_plugin_load_failed`
 (shown as **skills plugin load failed**) rather than carrying on without
 the skills you chose.
 
-The failure reason names the plugin, the error type and a trimmed error
-message for each of the first three errors, plus the path it tried to load
-when the SDK reports one. If there are more than three errors, the reason
-ends with a count of the rest. Secrets are redacted, control characters
-are removed, and the reason's length is bounded. An error report the
-worker cannot parse still counts as a load failure.
+The failure reason names the plugin, the error type, the path it tried to
+load when the SDK reports one, and a trimmed error message, for up to the
+first three errors: the length bound can cut the second and third. If there
+are more than three errors, the reason ends with a count of the rest.
+Secrets are redacted, control characters are removed, and the reason's
+length is bounded. An error report the worker cannot parse still counts as
+a load failure.
 
 The run is not parked or retried automatically, and because this is a
 worker environment problem rather than something the agent did wrong, it is

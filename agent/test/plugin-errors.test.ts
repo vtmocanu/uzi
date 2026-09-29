@@ -58,11 +58,24 @@ describe("parsePluginErrors", () => {
 });
 
 describe("describePluginErrors", () => {
-  it("renders plugin (type): message [path: ...] and passes an unknown type through", () => {
+  it("renders plugin (type) [path: ...]: message and passes an unknown type through", () => {
     assert.equal(
       describePluginErrors([{ plugin: "uzi-skills", type: "brand-new-kind", message: "bad", path: "/p" }]),
-      "uzi-skills (brand-new-kind): bad [path: /p]",
+      "uzi-skills (brand-new-kind) [path: /p]: bad",
     );
+  });
+
+  it("keeps the first entry's whole path when its message and fields are at their caps", () => {
+    const path = "/data/runner/" + "x".repeat(147);
+    const out = describePluginErrors([
+      { plugin: "p".repeat(500), type: "t".repeat(500), message: "m".repeat(10_000), path },
+      { plugin: "q", type: "t", message: "m" },
+      { plugin: "r", type: "t", message: "m" },
+      { plugin: "s", type: "t", message: "m" },
+    ]);
+    assert.ok(out.length <= 360, `${out.length}`);
+    assert.ok(out.includes(`[path: ${path}]`), out);
+    assert.ok(out.endsWith("; and 1 more"), out);
   });
 
   it("strips control and bidi characters", () => {

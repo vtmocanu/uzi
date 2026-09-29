@@ -124,7 +124,8 @@ var failOrigins = []string{
 	// workerReportableFailOrigins). It is a WORKER ENVIRONMENT failure, not an agent defect, so it
 	// is NEVER JUDGED: a member of neverJudgeFailOrigins (judge_enqueue.go), which skips
 	// regardless of iteration_count, since a resumed run's session start carries
-	// iteration_count > 0. It is not human-landable: the run stops before the agent works.
+	// iteration_count > 0. It is not human-landable (not a publish failure), but it can fire
+	// on a resumed run that already has commits, so earlier work may still need recovery.
 	"skills_plugin_load_failed",
 }
 

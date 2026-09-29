@@ -71,19 +71,22 @@ function field(text: string, max: number, redact: (s: string) => string): string
 
 /**
  * A bounded, log-safe description of plugin load errors for a status line or failure reason:
- * `plugin (type): message [path: ...]` for the first three entries, then `; and N more`. Every
- * field is redacted, then sanitized and capped (plugin 80, type 40, message 200, path 160; a
- * truncated field may exceed its figure by the 3-character `...` marker). The whole string is
- * at most 360 characters, marker and `and N more` tail included.
+ * `plugin (type) [path: ...]: message` for up to the first three entries (the bound can cut the
+ * second and third), then `; and N more`. Every field is redacted, then sanitized and capped
+ * (plugin 80, type 40, message 200, path 160; a truncated field may exceed its figure by the
+ * 3-character `...` marker). The whole string is at most 360 characters, marker and
+ * `and N more` tail included.
  */
 export function describePluginErrors(
   errors: readonly PluginLoadError[],
   redact: (s: string) => string = (s) => s,
 ): string {
   const parts = errors.slice(0, SHOWN_ENTRIES).map((e) => {
-    let s = `${field(e.plugin, 80, redact)} (${field(e.type, 40, redact)}): ${field(e.message, 200, redact)}`;
-    if (e.path !== undefined) s += ` [path: ${field(e.path, 160, redact)}]`;
-    return s;
+    // The path goes before the message: a long message is the part the 360-character bound
+    // cuts, so this order keeps the first entry's path whole: everything before its message is at
+    // most 303 characters, under the cap even with the `and N more` tail.
+    const path = e.path !== undefined ? ` [path: ${field(e.path, 160, redact)}]` : "";
+    return `${field(e.plugin, 80, redact)} (${field(e.type, 40, redact)})${path}: ${field(e.message, 200, redact)}`;
   });
   const more = errors.length > SHOWN_ENTRIES ? `; and ${errors.length - SHOWN_ENTRIES} more` : "";
   // Every piece is already sanitized, so this re-pass only bounds (code-point safe), keeping the
