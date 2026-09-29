@@ -381,9 +381,13 @@ func (g *gitLab) CreateIssue(ctx context.Context, projectID int64, title, descri
 		l := gitlab.LabelOptions(labels)
 		opt.Labels = &l
 	}
-	i, _, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx))
+	i, resp, err := g.client.Issues.CreateIssue(projectID, opt, gitlab.WithContext(ctx))
 	if err != nil {
-		return Issue{}, g.wrapErr("create issue", err)
+		wrapped := g.wrapErr("create issue", err)
+		if resp != nil && resp.Response != nil {
+			return Issue{}, createIssueError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toIssue(i), nil
 }
