@@ -170,8 +170,8 @@ export class ScratchPublicationError extends Error {
 
 /** A permit deadline stopped Git work. Keep this distinct from a scratch finding. */
 class GitBoundaryAbortError extends Error {
-  constructor(cause?: unknown) {
-    super("permit-held git operation aborted", { cause });
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
     this.name = "AbortError";
   }
 }
@@ -6329,7 +6329,10 @@ export class GitCache {
   /** A hard permit abort is not evidence that a candidate contains scratch files. */
   private boundaryAbortError(cause: unknown): Error | undefined {
     if (isAbortLike(cause)) return cause;
-    if (this.boundaryProcesses.getStore()?.signal.aborted) return new GitBoundaryAbortError(cause);
+    if (this.boundaryProcesses.getStore()?.signal.aborted) {
+      const message = cause instanceof Error ? cause.message : "permit-held git operation aborted";
+      return new GitBoundaryAbortError(message, cause);
+    }
     return undefined;
   }
 
@@ -6420,7 +6423,9 @@ export class GitCache {
     } catch (error) {
       throw this.boundaryAbortError(error) ?? error;
     }
-    if (boundary.signal.aborted) throw new GitBoundaryAbortError();
+    if (boundary.signal.aborted) {
+      throw new GitBoundaryAbortError("permit-held git output collection aborted: boundary deadline exceeded");
+    }
     const out = Buffer.concat(stdout.chunks).toString();
     const err = Buffer.concat(stderr.chunks).toString();
     if (stdout.oversized || stderr.oversized || terminal.code !== 0) {
@@ -6801,7 +6806,7 @@ export class GitCache {
       if (started || settled) return;
       settled = true;
       removeAbortListener();
-      rejectResult(new GitBoundaryAbortError());
+      rejectResult(new GitBoundaryAbortError("permit-held git lock wait aborted: boundary deadline exceeded"));
     };
     if (scope) {
       removeAbortListener = (): void => scope.signal.removeEventListener("abort", abortBeforeAcquisition);
