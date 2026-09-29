@@ -180,9 +180,10 @@ type credentialSecretMetaReader interface {
 // tx-bound Store so the pinned lookup does not take a second pool connection while the
 // closure holds the run-branch advisory lock.
 func validateCredentialOverrideOn(ctx context.Context, q credentialSecretMetaReader, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
-	// D10: chat, judge and self_improve follow their own ladders and are not switchable.
+	// D10: chat, judge and self_improve follow their own ladders and are not switchable; a job
+	// (PRD #1908 D-E) resolves its credential as its owner via the worker-binding ladder, never a pin.
 	switch kind {
-	case runkind.Chat, runkind.Judge, runkind.SelfImprove:
+	case runkind.Chat, runkind.Judge, runkind.SelfImprove, runkind.Job:
 		return nil, fmt.Errorf("%w: %s", ErrCredentialOverrideLaneNotSwitchable, kind)
 	}
 	// D9: a Codex run/schedule cannot carry an Anthropic-only override; the switch keeps

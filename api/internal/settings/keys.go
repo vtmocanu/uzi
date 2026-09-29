@@ -128,6 +128,10 @@ const (
 	// where 0 disables self-service entirely (the API then 403s a provision).
 	// Runtime-tunable from the Admin Settings page; no env var.
 	KeyHostedWorkerQuota = "hosted_worker_quota"
+	// KeyJobMaxActivePerUser (PRD #1908) caps how many NON-TERMINAL job runs one user may have
+	// at once; a create past it is refused (429 over_cap). An integer in [1, maxJobMaxActivePerUser],
+	// validated by validateJobMaxActivePerUser. Runtime-tunable from the Admin Settings API; no env var.
+	KeyJobMaxActivePerUser = "job_max_active_per_user"
 	// Docker-worker repo allowlist (PRD #89 M-allow): the set of repos a
 	// docker-enabled worker is permitted to CLAIM runs for. Stored as a
 	// comma-separated list of repo UUIDs. This is the accepted-risk likelihood
@@ -349,6 +353,8 @@ const (
 	// which is why a permissive-ish default is safe here and the flag, not this
 	// number, is the real "is this feature on" switch.
 	DefaultHostedWorkerQuota = "2"
+	// PRD #1908: ten concurrent non-terminal job runs per user by default.
+	DefaultJobMaxActivePerUser = "10"
 	// PRD #89 M-allow: the docker repo allowlist is EMPTY by default, which the claim
 	// gate reads as fail-closed — a docker worker claims no repo-bearing run until an
 	// admin lists the trusted repos. Empty is the safe default precisely because this
@@ -480,6 +486,8 @@ var Defaults = map[string]string{
 	// an inert knob is cheaper than a settings surface that changes shape with the
 	// deployment.
 	KeyHostedWorkerQuota: DefaultHostedWorkerQuota,
+	// PRD #1908 per-user active job cap. Same no-seeded-row pattern as the quota above.
+	KeyJobMaxActivePerUser: DefaultJobMaxActivePerUser,
 	// PRD #89 M-allow docker repo allowlist. Same no-seeded-row pattern: an absent
 	// row synthesizes to the empty (fail-closed) default, so All/AdminView surface it
 	// to the settings page on every instance and no migration seeds it.

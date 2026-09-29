@@ -312,6 +312,10 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if err != nil || secs < 60 || secs > math.MaxInt32 {
 			return SubmitInputResult{}, ErrInvalidExtension
 		}
+		// PRD #1908 D-E: refuse a job before touching the cap or the CTE (whose kind list admits it).
+		if run.Kind == runkind.Job {
+			return SubmitInputResult{}, extendRefusalReason(run, secs, 0)
+		}
 		capSeconds, err := s.runExtensionCap(ctx)
 		if err != nil {
 			return SubmitInputResult{}, err
@@ -1182,6 +1186,8 @@ func pauseRefusalReason(run store.Run) error {
 		why = "interactive tasks park after each turn"
 	case run.Kind == runkind.Judge || run.Kind == runkind.MRRework || run.Kind == runkind.CIFix:
 		why = "judge, mr_rework and ci_fix runs are short and finish on their own"
+	case run.Kind == runkind.Job:
+		why = "job runs never park; cancel the job instead"
 	default:
 		why = "pause is not supported for this run"
 	}
@@ -1213,6 +1219,11 @@ func extendRefusalReason(run store.Run, secs, capSeconds int) error {
 	}
 	if run.Kind == runkind.Chat || run.Kind == runkind.Judge || run.Interactive {
 		return fmt.Errorf("%w (a %s run has no wall-clock timeout)", ErrExtendNotTimed, run.Kind)
+	}
+	// PRD #1908 D-E: a job's wall-clock limit is fixed at creation and the run fails at it, so it
+	// is never extended (CreateExtendInput's SQL kind list would otherwise admit it).
+	if run.Kind == runkind.Job {
+		return fmt.Errorf("%w (a job run's wall-clock limit is fixed at creation)", ErrExtendNotTimed)
 	}
 	remaining := capSeconds - int(run.BudgetExtensionSeconds)
 	if remaining < 0 {

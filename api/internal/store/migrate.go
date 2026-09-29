@@ -94,6 +94,16 @@ const SecretMutationLockClass int32 = 0x757A736B // "uzsk"
 // source and fails on any collision. XACT-scoped.
 const ProductTokenMintLockClass int32 = 0x757A7074 // "uzpt"
 
+// JobCreateLockClass is the class half of the two-int advisory lock that serializes one
+// user's job-run creates, so the per-user cap on non-terminal job runs (PRD #1908,
+// job_max_active_per_user) cannot be passed twice by two concurrent creates under READ
+// COMMITTED: the same reasoning ProductTokenMintLockClass records. The lock is taken in SQL by
+// LockJobCreate (queries/jobs.sql), which carries this value as the literal 1970956898 with
+// the objid derived there from the user; TestJobCreateLockClassMatchesSQL fails if the two
+// disagree, and lockClassesFromSource-based collision checking covers it like every other
+// *LockClass. XACT-scoped.
+const JobCreateLockClass int32 = 0x757A6A62 // "uzjb"
+
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from
 // a user's uuid, exactly as the hosted-provision lock does: a uuid's leading bytes are
 // random, so two users can collide and serialize for a moment, a contention non-event,
