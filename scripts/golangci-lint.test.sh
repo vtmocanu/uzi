@@ -248,7 +248,7 @@ if [ "${FAKE_CHILD_BLOCK:-0}" = "1" ]; then
       mv "$ready_delay_status_marker" "$FAKE_READY_DELAY_STATUS_FILE"
     fi
   }
-  trap 'stop_ready_delay; printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
+  trap 'stop_ready_delay; if [ "${FAKE_REPEAT_READY_DELAY_CLEANUP:-0}" = "1" ]; then stop_ready_delay; fi; printf "TERM\n" >> "$FAKE_SIGNAL_LOG"; exit 143' TERM
   trap 'stop_ready_delay; printf "INT\n" >> "$FAKE_SIGNAL_LOG"; exit 130' INT
   if [ "${FAKE_CHILD_READY_DELAY:-0}" != "0" ]; then
     sleep "$FAKE_CHILD_READY_DELAY" &
@@ -468,6 +468,7 @@ start_blocking_wrapper() {
       FAKE_CHILD_STATUS=0 \
       FAKE_CHILD_BLOCK=1 \
       FAKE_CHILD_READY_DELAY="${FAKE_CHILD_READY_DELAY:-0}" \
+      FAKE_REPEAT_READY_DELAY_CLEANUP="${FAKE_REPEAT_READY_DELAY_CLEANUP:-0}" \
       FAKE_READY_DELAY_PID_FILE="$READY_DELAY_PID_FILE" \
       FAKE_READY_DELAY_STATUS_FILE="$READY_DELAY_STATUS_FILE" \
       FAKE_CHILD_PID_FILE="$CHILD_PID_FILE" \
@@ -685,7 +686,9 @@ seed_archive "$CANCEL_CACHE" darwin-arm64
 : > "$SIGNAL_LOG"
 rm -f "$READY_DELAY_PID_FILE" "$READY_DELAY_STATUS_FILE"
 FAKE_CHILD_READY_DELAY=4
+FAKE_REPEAT_READY_DELAY_CLEANUP=1
 start_blocking_wrapper "$TMP/forced-start-timeout.out" "$CANCEL_CACHE"
+unset FAKE_REPEAT_READY_DELAY_CLEANUP
 CANCEL_LAUNCHER_PID="$START_PID"
 tries=0
 while [ ! -s "$WRAPPER_PID_FILE" ] || [ ! -s "$READY_DELAY_PID_FILE" ]; do
