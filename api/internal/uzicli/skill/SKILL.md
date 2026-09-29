@@ -177,7 +177,7 @@ uzi run mr-rework <run-id> [--enabled[=false]] [--clear]
 uzi run rework <run-id> [-m|--message <text>]
 uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
-uzi run recovery <run-id> [--json]
+uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
@@ -635,9 +635,16 @@ uzi version
   **not** completion-blocked is a 409 (exit 5); a foreign/unknown run is a 404 (exit 4). Prints
   the run's new status (plus the deferred/accepted ids for partial/accept); `--json` emits the
   resumed run object.
-- `uzi run recovery <run-id> [--json]` — list the durable-recovery **custody holds** retained
-  for a run (owner-only): each hold's exact id, claim generation, server-derived **disposition**
-  and latest capture state. A `source_only` or `needs_action` disposition awaits your decision;
+- `uzi run recovery [<run-id>] [--json]` — start without a run id to find what held work
+  you have before export or discard. The human view lists only open custody holds across
+  your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
+  `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
+  `open_holds`, `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate, plus
+  a recover-or-discard hint when an open hold needs a decision. With no run id, `--json`
+  returns the endpoint's `aggregate` and `holds`, including settled holds, without captures.
+  Supply a run id to list that run's retained holds (owner-only): each hold's exact id,
+  claim generation, server-derived **disposition** and latest capture state.
+  A `source_only` or `needs_action` disposition awaits your decision;
   `archive_ready` self-releases and `active` is healthy protection of a still-running run.
   Recover an available archive with `uzi run export`, or discard a held source with
   `uzi run discard`. `--json` emits the run's raw hold DTOs, each with a `captures` array

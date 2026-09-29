@@ -107,7 +107,7 @@ uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
-uzi run recovery <id> [--json]
+uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
@@ -836,16 +836,31 @@ available when it is not.
 
 A run's custody hold reserves owner capacity while its committed-but-unpublished work is
 recovered. Holds are per claim generation and capped per owner, so unresolved holds can
-eventually block new code runs. `uzi run recovery` lists a run's holds and captures so you
-can see exactly what is retained:
+eventually block new code runs. To find what held work you have, start here before choosing
+a run to export or an exact hold to discard:
+
+```
+uzi run recovery [--json]
+```
+
+- The human view shows only open holds across your runs, oldest first by `created_at`.
+  Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ARCHIVE` (whether an
+  available capture exists), `WORKER`, and `AGE`. Run and hold ids are shown in full.
+  Below the table it prints the owner-wide `open_holds`, `custody_hold_limit`,
+  `decision_needed`, and `blocked_runs` aggregate, plus a recover-or-discard hint when
+  an open hold needs a decision. With no open holds it says so and still prints the
+  aggregate.
+- Without a run id, `--json` returns the endpoint's `aggregate` and `holds` object,
+  including settled holds. These hold rows have no `captures` array. Use the run id
+  from this list for the detailed view and capture ids:
 
 ```
 uzi run recovery <run-id> [--json]
 ```
 
-- Shows each hold's exact id, claim generation, and its attention state — active
+- The per-run view shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, an archive ready (which releases automatically), or a
-  capture-less source that needs a decision — plus any retained captures. `--json` prints
+  capture-less source that needs a decision — plus the latest capture state. `--json` prints
   the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives
