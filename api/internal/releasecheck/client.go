@@ -35,12 +35,12 @@ var baseURL = defaultBaseURL
 const (
 	// releaseCheckTimeout is the hard per-call ceiling so a poll can never hang.
 	releaseCheckTimeout = 15 * time.Second
-	// maxReleaseBodyBytes bounds the JSON read (a latest-release payload is a few KB;
-	// this caps a hostile/oversized response, mirroring the agent-source wire cap).
+	// maxReleaseBodyBytes bounds each GitHub JSON response, including the RC list.
+	// This caps hostile/oversized responses, mirroring the agent-source wire cap.
 	maxReleaseBodyBytes = 1 << 20 // 1 MiB
 )
 
-// githubRelease is the subset of the releases/latest payload the check reads.
+// githubRelease is the subset of each GitHub release payload the check reads.
 type githubRelease struct {
 	TagName     string `json:"tag_name"`
 	Draft       bool   `json:"draft"`
@@ -56,7 +56,7 @@ type githubRelease struct {
 // back UNFOLLOWED, which fetchLatest then rejects as a non-200 status). It is NOT the
 // per-user forge driver (newGitHub), which carries a user PAT — the wrong trust
 // context for an instance-global check. The response body is separately bounded with
-// io.LimitReader in fetchLatest.
+// io.LimitReader in fetchJSON.
 func newHTTPClient() *http.Client {
 	return &http.Client{
 		Timeout: releaseCheckTimeout,

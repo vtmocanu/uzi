@@ -77,7 +77,7 @@ type ReleaseStatus struct {
 	BannerSnoozeTag string
 }
 
-// ReleaseStatus reads the six engine-managed release-fact keys in one snapshot pass
+// ReleaseStatus reads the engine-managed stable and RC release-fact keys in one snapshot pass
 // (PRD #836 M1). Best-effort: a snapshot error returns the zero status alongside the
 // error so a best-effort caller can still render an empty panel.
 func (c *Cache) ReleaseStatus(ctx context.Context) (ReleaseStatus, error) {

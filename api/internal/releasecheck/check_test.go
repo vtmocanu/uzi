@@ -83,7 +83,7 @@ func withBaseURL(t *testing.T, u string) {
 	t.Cleanup(func() { baseURL = prev })
 }
 
-// TestCheckForUpdateSuccess: a newer upstream release → status "ok", the six facts
+// TestCheckForUpdateSuccess: a newer upstream release → status "ok", the six stable facts
 // persisted, the cache invalidated, and the parsed facts derive update_available=true.
 func TestCheckForUpdateSuccess(t *testing.T) {
 	var reqCount atomic.Int64
@@ -128,7 +128,7 @@ func TestCheckForUpdateSuccess(t *testing.T) {
 	if !Security(res.Facts.Body) {
 		t.Error("expected security=true from the returned body")
 	}
-	// All six facts persisted.
+	// All six stable facts persisted.
 	for _, k := range []string{
 		settings.KeyReleaseLatestTag, settings.KeyReleaseLatestName, settings.KeyReleaseLatestBody,
 		settings.KeyReleaseNotesURL, settings.KeyReleasePublishedAt, settings.KeyReleaseCheckedAt,

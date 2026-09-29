@@ -91,7 +91,7 @@ func NewReconciler(st Store, set SettingsReader, now func() time.Time, logger *s
 // CheckForUpdate runs one check pass (PRD #836 M1):
 //
 //   - master toggle OFF → Status "disabled", NO http call, persist NOTHING.
-//   - fetch/parse error → Status "error", token-scrubbed message, persist NOTHING
+//   - stable fetch/parse error → Status "error", token-scrubbed message, persist NOTHING
 //     (the last-good facts survive so the SPA keeps showing the previous release).
 //   - stable success → fetch one RC page, persist stable facts and RC facts on RC
 //     success (clearing RC keys when absent), then invalidate the cache. An RC

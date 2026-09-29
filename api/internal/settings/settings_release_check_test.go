@@ -170,7 +170,7 @@ func TestReleaseCheckTokenIsSecret(t *testing.T) {
 
 // TestReleaseCheckAccessors pins the typed Cache accessors (PRD #836 M1): the two
 // bools default ON and are junk-tolerant, the interval defaults to 6h and floors a
-// sub-minute stored value, and ReleaseStatus reads the six engine-written facts (an
+// sub-minute stored value, and ReleaseStatus reads the engine-written facts (an
 // absent key → "").
 func TestReleaseCheckAccessors(t *testing.T) {
 	// Empty table → defaults.
