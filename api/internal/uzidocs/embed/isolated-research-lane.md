@@ -165,9 +165,10 @@ On every request, and on every redirect hop:
   [research fetch caps](admin-settings.md#research-fetch-caps): 25 MiB per file,
   200 MiB and 100 files per run, 4 concurrent fetches, and 500 requests
   (`fetch_max_run_attempts`), which count cap refusals too. The per-file limit is
-  the smaller of `fetch_max_file_bytes` and the fetcher's own ceiling (25 MiB
-  unless `workers.isolatedLane.fetcher.maxFileBytes` sets another value), so
-  raising the setting alone has no effect above that ceiling. A refused admission
+  the smallest of `fetch_max_file_bytes`, `fetch_max_run_bytes` and the fetcher's
+  own ceiling (25 MiB unless `workers.isolatedLane.fetcher.maxFileBytes` sets
+  another value), so raising the setting alone has no effect above either of the
+  other two. A refused admission
   returns `admission_refused` with the reason (`run_bytes`, `run_files`,
   `concurrency` or `attempts`).
 - **Every admitted attempt is logged, or it did not happen.** The fetcher reports
