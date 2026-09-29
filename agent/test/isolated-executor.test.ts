@@ -16,6 +16,7 @@ import {
   IsolatedExecutor,
   ISOLATED_TOOLS,
   type IsolatedContext,
+  type IsolatedExecutorOptions,
 } from "../src/isolated-executor.js";
 import { buildFetchToolsServer } from "../src/fetch-tools.js";
 import { buildSdkEnv } from "../src/sdk-env.js";
@@ -25,6 +26,8 @@ import { nullLogger } from "./helpers.js";
 
 const OAUTH = "dummy-oauth-token-isolated-0000";
 const NONESSENTIAL = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
+/** A worker-credential deny set (the path is assembled so no literal names the credential). */
+const SECRET_PATHS = [["", "run", "secrets", "worker_token"].join("/")];
 
 /** The REAL init frame the pinned SDK emitted for these options (see its _provenance). */
 function realInit(): Record<string, unknown> {
@@ -105,7 +108,7 @@ function options(gate = { passed: false }): SdkOptions {
     env: isolateSdkEnv(buildSdkEnv(OAUTH, path.join(dir, "home"))),
     cwd: workspace,
     log: nullLogger(),
-    secretPaths: ["/run/secrets/worker_token"],
+    secretPaths: SECRET_PATHS,
     fetchServer: fetch.server,
     gate,
     maxTurns: 5,
@@ -151,7 +154,7 @@ describe("isolated executor: the init check (fail closed on the EFFECTIVE tool s
     (init.tools as string[]).push("Bash");
     const emitted: EmittedMessage[] = [];
     const { queryFn } = fakeQuery([init as unknown as SDKMessage, assistantText("should never be emitted"), resultSuccess()]);
-    const ex = new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true });
+    const ex = new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS });
     await assert.rejects(ex.run(ctx(emitted)), /isolated run refused: effective tool set differs.*extra: Bash/);
     assert.ok(!JSON.stringify(emitted).includes("should never be emitted"), "no frame after the failed init was emitted");
   });
@@ -159,18 +162,32 @@ describe("isolated executor: the init check (fail closed on the EFFECTIVE tool s
   it("the happy path: a matching init, then output, then success", async () => {
     const emitted: EmittedMessage[] = [];
     const { queryFn } = fakeQuery([realInit() as unknown as SDKMessage, assistantText("done"), resultSuccess()]);
-    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true }).run(ctx(emitted));
+    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(ctx(emitted));
     assert.ok(JSON.stringify(emitted).includes("done"));
   });
 
   it("no init frame at all fails the run", async () => {
     const { queryFn } = fakeQuery([resultSuccess()]);
-    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true }).run(ctx()), /no init frame/);
+    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(ctx()), /no init frame/);
   });
 
   it("model output before the init frame fails the run", async () => {
     const { queryFn } = fakeQuery([assistantText("early"), realInit() as unknown as SDKMessage, resultSuccess()]);
-    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true }).run(ctx()), /before its tool set was verified/);
+    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(ctx()), /before its tool set was verified/);
+  });
+});
+
+describe("isolated executor: construction requires the worker-credential deny set", () => {
+  it("throws when secretPaths is absent", () => {
+    assert.throws(() => new IsolatedExecutor(nullLogger(), {} as unknown as IsolatedExecutorOptions), /secretPaths/);
+  });
+
+  it("throws when secretPaths is empty", () => {
+    assert.throws(() => new IsolatedExecutor(nullLogger(), { secretPaths: [] }), /secretPaths/);
+  });
+
+  it("accepts a non-empty set", () => {
+    assert.doesNotThrow(() => new IsolatedExecutor(nullLogger(), { secretPaths: SECRET_PATHS }));
   });
 });
 
@@ -187,7 +204,7 @@ describe("isolated executor: the tool gate (matcher-less PreToolUse hook + init 
       async (o) => void decisions.push(`fetch-post:${await simulateToolUse(o, "mcp__uzi_fetch__fetch_url", { url: "https://a" })}`),
       resultSuccess(),
     ]);
-    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true }).run(ctx());
+    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(ctx());
     assert.deepEqual(decisions, [
       "bash-pre:deny",
       "read-pre:deny",
@@ -205,7 +222,7 @@ describe("isolated executor: the tool gate (matcher-less PreToolUse hook + init 
       async (o) => void decisions.push(await simulateToolUse(o, "Read", { file_path: path.join(workspace, "a") })),
       resultSuccess(),
     ]);
-    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true }).run(ctx()), /no init frame/);
+    await assert.rejects(new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(ctx()), /no init frame/);
     assert.deepEqual(decisions, ["deny", "deny"]);
   });
 
@@ -336,7 +353,7 @@ describe("isolated executor: env scope", () => {
 
   it("the executor hands the SDK child that env, and never the fetch credential", async () => {
     const { queryFn, seen } = fakeQuery([realInit() as unknown as SDKMessage, resultSuccess()]);
-    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true }).run(ctx());
+    await new IsolatedExecutor(nullLogger(), { queryFn, kill: () => true, secretPaths: SECRET_PATHS }).run(ctx());
     const env = seen.options?.env as Record<string, string | undefined>;
     assert.equal(env[NONESSENTIAL], "1");
     assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);

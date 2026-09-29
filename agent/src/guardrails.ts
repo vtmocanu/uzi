@@ -227,7 +227,7 @@ const MAX_DEPTH = 6;
 // there (and remains the primary bar-raise on a #58 single-uid start, where there is no
 // split; see docs/proc-hardening.md). The specific UZI_WORKER_TOKEN_FILE path (if
 // outside this prefix) is added at the hook via `extraSecretPaths`.
-const SECRET_PATH_PREFIXES = ["/run/secrets/"];
+export const SECRET_PATH_PREFIXES: readonly string[] = ["/run/secrets/"];
 
 /**
  * The worker-credential paths the guards deny for a configured UZI_WORKER_TOKEN_FILE,

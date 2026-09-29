@@ -35,7 +35,7 @@ import { resolveDockerWiring, dockerSidecarExpected, type DockerWiring } from ".
 import { probeCodexRuntime } from "./codex/codex-runtime-probe.js";
 import { landlockProbeForMode, resolveCodexHarnessAvailability } from "./codex/codex-capability.js";
 import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launcher.js";
-import { workerSecretDenyPaths } from "./guardrails.js";
+import { SECRET_PATH_PREFIXES, workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
 
@@ -181,11 +181,13 @@ export function buildChatExecutor(deps: {
  * testable. Under UZI_EXECUTOR=stub it gets the stub judge queryFn, exactly as the judge and
  * review lanes do, so a stub/e2e worker never starts a real SDK session (the stub stream
  * carries no init frame, so the isolated session fails closed). Its path guard gets the same
- * worker-credential deny set as a run.
+ * worker-credential deny set as a run's Bash screen: the built-in secrets prefix plus the
+ * configured UZI_WORKER_TOKEN_FILE and its dir. The prefix keeps the set non-empty when no
+ * token file is configured, which IsolatedExecutor requires.
  */
 export function buildIsolatedExecutor(deps: { log: Logger; executorKind: ExecutorKind; workerTokenFile?: string }): IsolatedExecutor {
   return new IsolatedExecutor(deps.log, {
-    secretPaths: workerSecretDenyPaths(deps.workerTokenFile),
+    secretPaths: [...SECRET_PATH_PREFIXES, ...workerSecretDenyPaths(deps.workerTokenFile)],
     ...(deps.executorKind === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 }

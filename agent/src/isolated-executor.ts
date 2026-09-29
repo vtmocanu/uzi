@@ -315,8 +315,12 @@ export interface IsolatedExecutorOptions {
   queryFn?: SdkQueryFn;
   spawn?: (opts: SpawnOptions) => { pid?: number };
   kill?: (pid: number | undefined) => boolean;
-  /** Worker credential paths the path guard denies (UZI_WORKER_TOKEN_FILE and its dir). */
-  secretPaths?: readonly string[];
+  /**
+   * Worker credential paths the path guard denies (the built-in secrets prefix plus
+   * UZI_WORKER_TOKEN_FILE and its dir). Required and non-empty: the constructor throws
+   * otherwise, so no caller can build a guard without the worker-credential deny set.
+   */
+  secretPaths: readonly string[];
 }
 
 /** Drives one isolated SDK session to its result frame. Throws on any failure. */
@@ -328,12 +332,15 @@ export class IsolatedExecutor {
 
   constructor(
     private readonly log: Logger,
-    opts: IsolatedExecutorOptions = {},
+    opts: IsolatedExecutorOptions,
   ) {
+    if (!opts?.secretPaths || opts.secretPaths.length === 0) {
+      throw new Error("IsolatedExecutor requires a non-empty secretPaths (the worker-credential deny set)");
+    }
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
-    this.secretPaths = opts.secretPaths ?? [];
+    this.secretPaths = [...opts.secretPaths];
   }
 
   async run(ctx: IsolatedContext): Promise<void> {
