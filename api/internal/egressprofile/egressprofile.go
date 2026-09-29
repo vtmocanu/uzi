@@ -203,6 +203,10 @@ func NormalizeHost(raw string) (string, error) {
 // approved can differ. A fetcher must therefore take NormalizeHost's output and use that
 // exact name for the DNS lookup, the connection, TLS SNI and certificate verification,
 // never the raw host it was given.
+//
+// Match knows nothing about overrides: for a stored profile, pass
+// EffectiveEntries(hosts, overrides), never the stored hosts, so a multi-publisher entry
+// without an override matches nothing.
 func Match(host string, entries []string) bool {
 	h, err := NormalizeHost(host)
 	if err != nil {

@@ -120,19 +120,36 @@ func TestAdminEgressProfileShowMissingExit4(t *testing.T) {
 	}
 }
 
+// A name that is not a profile name exits 2 without reaching the (fake) server, as the
+// HTTP client does.
+func TestAdminEgressProfileShowInvalidNameExit2(t *testing.T) {
+	for _, bad := range []string{"Vendor-Docs", "../admin", "a b"} {
+		_, _, code := runCLI(t, fakeEnv(egressFake()), "admin", "egress-profile", "show", bad)
+		if code != uzicli.ExitUsage {
+			t.Errorf("show %q exit = %d, want %d (usage)", bad, code, uzicli.ExitUsage)
+		}
+	}
+}
+
 // The render site is the trust boundary: a hostile server's name, description, host and
 // warning text must not put a terminal escape, a bidi override or a forged line on screen.
 func TestAdminEgressProfileRendersUntrustedFieldsSafely(t *testing.T) {
 	hostile := "evil\x1b]0;pwned\x07\x1b[2J\u202egnp.exe\nFORGED-ROW"
-	fc := &uzicli.FakeClient{EgressProfiles: []apitypes.EgressProfileDTO{{
-		Name: hostile, Description: hostile, Hosts: []string{hostile}, MultiPublisherOverride: []string{hostile},
-		Warnings: []apitypes.EgressProfileWarningDTO{{Entry: hostile, Message: hostile}},
-	}}}
+	hostileProfile := func(name string) apitypes.EgressProfileDTO {
+		return apitypes.EgressProfileDTO{
+			Name: name, Description: hostile, Hosts: []string{hostile}, MultiPublisherOverride: []string{hostile},
+			Warnings: []apitypes.EgressProfileWarningDTO{{Entry: hostile, Message: hostile}},
+		}
+	}
+	fc := &uzicli.FakeClient{EgressProfiles: []apitypes.EgressProfileDTO{hostileProfile(hostile)}}
 	listOut, _, code := runCLI(t, fakeEnv(fc), "admin", "egress-profile", "list")
 	if code != uzicli.ExitOK {
 		t.Fatalf("list exit = %d", code)
 	}
-	showOut, _, code := runCLI(t, fakeEnv(fc), "admin", "egress-profile", "show", hostile)
+	// show refuses a hostile name locally (exit 2), so it is queried by a valid name; every
+	// other field it renders is hostile.
+	fc = &uzicli.FakeClient{EgressProfiles: []apitypes.EgressProfileDTO{hostileProfile("hostile")}}
+	showOut, _, code := runCLI(t, fakeEnv(fc), "admin", "egress-profile", "show", "hostile")
 	if code != uzicli.ExitOK {
 		t.Fatalf("show exit = %d", code)
 	}

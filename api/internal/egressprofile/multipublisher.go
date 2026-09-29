@@ -53,9 +53,10 @@ var multiPublisherHosts = map[string]string{
 	"api.github.com":      "code hosting",
 	"gist.github.com":     "code hosting",
 	"codeload.github.com": "code hosting",
+	"raw.github.com":      "code hosting",
 	"gitlab.com":          "code hosting",
-	"bitbucket.org":       "code hosting",
 	"codeberg.org":        "code hosting",
+	"gitee.com":           "code hosting",
 	// Object storage addressed by path: every bucket shares the endpoint.
 	"s3.amazonaws.com":          "object storage",
 	"storage.googleapis.com":    "object storage",
@@ -72,14 +73,17 @@ var multiPublisherHosts = map[string]string{
 	"docs.rs":         "documentation hosting",
 	"pkg.go.dev":      "documentation hosting",
 	"pypi.org":        "package hosting",
+	"test.pypi.org":   "package hosting",
 	"www.npmjs.com":   "package hosting",
 	"hub.docker.com":  "image hosting",
+	"ghcr.io":         "image hosting",
 	// Package registries and CDNs that serve every package's files by path.
 	"unpkg.com":              "package CDN",
+	"cdnjs.cloudflare.com":   "package CDN",
 	"registry.npmjs.org":     "package hosting",
 	"files.pythonhosted.org": "package hosting",
 	"proxy.golang.org":       "package hosting",
-	"static.crates.io":       "package hosting",
+	"repo.maven.apache.org":  "package hosting",
 }
 
 var multiPublisherDomains = map[string]string{
@@ -101,6 +105,17 @@ var multiPublisherDomains = map[string]string{
 	"sourceforge.net":   "project hosting",
 	"dropbox.com":       "file sharing",
 	"npmjs.com":         "package hosting",
+	// Package registries whose every subdomain serves every package (crates.io and
+	// static.crates.io; rubygems.org and index.rubygems.org; repo1.maven.org and
+	// central.maven.org), and code hosting whose API host is shared too
+	// (api.bitbucket.org).
+	"crates.io":     "package hosting",
+	"rubygems.org":  "package hosting",
+	"maven.org":     "package hosting",
+	"bitbucket.org": "code hosting",
+	// Web archives: every archived site shares web.archive.org, and archive.org serves
+	// every uploader's items by path.
+	"archive.org": "web archive",
 }
 
 // sharedParents are parents whose subdomains belong to many customers. A wildcard at or
@@ -219,7 +234,8 @@ type Problem struct {
 }
 
 // Warning is a stored entry the admin should know about: a multi-publisher host admitted
-// by an explicit override, or (on read) an entry the current rules no longer accept.
+// by an explicit override, or (on read) an entry EffectiveEntries drops because the
+// current rules no longer accept it or now flag it as multi-publisher without an override.
 type Warning struct {
 	Entry   string `json:"entry"`
 	Code    string `json:"code"`
@@ -230,7 +246,12 @@ type Warning struct {
 const (
 	// WarningCodeMultiPublisherOverride marks a multi-publisher entry admitted by an override.
 	WarningCodeMultiPublisherOverride = "multi_publisher_override"
-	// WarningCodeStaleEntry marks a stored entry the current rules refuse; Match skips it.
+	// WarningCodeMultiPublisherNeedsOverride marks a stored entry the CURRENT rules flag as
+	// multi-publisher that carries no override (the list grew after the profile was
+	// written); EffectiveEntries drops it. The same code refuses such an entry on a write.
+	WarningCodeMultiPublisherNeedsOverride = CodeMultiPublisher
+	// WarningCodeStaleEntry marks a stored entry the current rules refuse; EffectiveEntries
+	// and Match skip it.
 	WarningCodeStaleEntry = "stale_entry"
 )
 
@@ -329,27 +350,73 @@ func Validate(in Input, checkName bool) (Validated, []Problem) {
 }
 
 // WarningsFor recomputes the warnings for a stored profile, so a read shows the same
-// override warnings the write did, plus a stale-entry warning for every stored entry that
-// the current rules no longer accept (a newer Public Suffix List can turn an accepted
-// wildcard into a refused one). Match skips such an entry, so without the warning an admin
-// would see it listed while it silently allows nothing.
+// override warnings the write did, plus a warning for every stored entry that
+// EffectiveEntries drops: a stale-entry warning for an entry the current rules no longer
+// accept (a newer Public Suffix List can turn an accepted wildcard into a refused one), and
+// a needs-override warning for an entry the current multi-publisher list flags that has no
+// override (the list grew after the profile was written). Without them an admin would see
+// the entry listed while it silently allows nothing.
 func WarningsFor(hosts, overrides []string) []Warning {
 	out := []Warning{}
+	override := normalizedSet(overrides)
 	for _, h := range hosts {
-		if _, err := NormalizeEntry(h); err != nil {
+		n, err := NormalizeEntry(h)
+		if err != nil {
 			out = append(out, Warning{Entry: h, Code: WarningCodeStaleEntry,
 				Message: fmt.Sprintf("%s is no longer accepted (%v), so it matches nothing; edit the profile to fix or remove it", echo(h), err)})
 			continue
 		}
-		if !slices.Contains(overrides, h) {
-			continue
-		}
-		if reason, ok := MultiPublisher(h); ok {
+		reason, flagged := MultiPublisher(n)
+		switch {
+		case !flagged:
+		case override[n]:
 			out = append(out, Warning{Entry: h, Code: WarningCodeMultiPublisherOverride,
 				Message: reason + "; admitted by an explicit override, so every publisher on it is reachable"})
+		default:
+			out = append(out, Warning{Entry: h, Code: WarningCodeMultiPublisherNeedsOverride,
+				Message: reason + "; it has no multi_publisher_override, so it matches nothing. Add the override to accept every publisher on it, or remove it"})
 		}
 	}
 	return out
+}
+
+// EffectiveEntries is the set of a stored profile's entries that may allow anything, in
+// stored order and normalized: an entry is dropped when it no longer normalizes, or when
+// the CURRENT multi-publisher rules flag it and overrides does not name it (fail closed:
+// a host added to the built-in list after a profile was written stops matching until an
+// admin adds the override). WarningsFor reports every dropped entry.
+//
+// This is the only way from a stored profile to a match set. The fetcher and the
+// claim-time profile snapshot must take EffectiveEntries(hosts, overrides) and pass that
+// to Match; Match on the raw stored hosts would still admit an unoverridden
+// multi-publisher entry.
+func EffectiveEntries(hosts, overrides []string) []string {
+	override := normalizedSet(overrides)
+	out := []string{}
+	seen := map[string]bool{}
+	for _, h := range hosts {
+		n, err := NormalizeEntry(h)
+		if err != nil || seen[n] {
+			continue
+		}
+		if _, flagged := MultiPublisher(n); flagged && !override[n] {
+			continue
+		}
+		seen[n] = true
+		out = append(out, n)
+	}
+	return out
+}
+
+// normalizedSet is the normalized form of each entry that still normalizes.
+func normalizedSet(entries []string) map[string]bool {
+	set := make(map[string]bool, len(entries))
+	for _, e := range entries {
+		if n, err := NormalizeEntry(e); err == nil {
+			set[n] = true
+		}
+	}
+	return set
 }
 
 func entryProblem(field, raw string, err error) Problem {

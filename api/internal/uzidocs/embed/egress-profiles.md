@@ -111,11 +111,14 @@ sections, pinned with the `golang.org/x/net` module) two ways:
   `*.digitaloceanspaces.com` (`nyc3.digitaloceanspaces.com` is one) are
   refused, although the base itself is not a suffix.
 
-A few parents have no public suffix below them in the list, but their
-subdomains belong to many different customers. A wildcard at or under one of
-these is refused too (`shared_parent_wildcard`), with no override:
-`amazonaws.com`, `azure.com`, `windows.net`, `googleusercontent.com`,
-`fastly.net`, `sharepoint.com`. List the exact hosts instead.
+A few parents hand their subdomains to many different customers. A wildcard at
+or under one of these is refused with its own code (`shared_parent_wildcard`),
+with no override: `amazonaws.com`, `azure.com`, `windows.net`,
+`googleusercontent.com`, `fastly.net`, `sharepoint.com`. Most of them also have
+public suffixes below them in the list (`amazonaws.com`, `windows.net`,
+`fastly.net`), which would refuse the wildcard anyway; a few, such as
+`azure.com`, `googleusercontent.com` and `sharepoint.com`, do not, so this list
+is what refuses them. List the exact hosts instead.
 
 **Entries can go stale.** A newer uzi can carry a newer Public Suffix List, so a
 wildcard accepted when the profile was written can be refused later. Such an
@@ -138,26 +141,37 @@ admin egress-profile show` prints it as a `warning:` line. An override naming
 an entry that is not in `hosts` is refused (`override_not_in_hosts`); one
 naming an entry that is not multi-publisher is dropped.
 
+**The list can grow under a stored profile.** A newer uzi can flag an entry
+that was clean when the profile was written. Such an entry, stored without an
+override, matches nothing, and every read of the profile carries a warning for
+it (`code: multi_publisher_needs_override`). Add the override to accept every
+publisher on it, or remove it.
+
 The built-in list:
 
 - **Exact hosts** (only the host itself is flagged; a sibling that is not
   listed is not, whatever it serves, so review siblings yourself):
   `github.com`, `api.github.com`, `gist.github.com`, `codeload.github.com`,
-  `gitlab.com`, `bitbucket.org`, `codeberg.org`, `s3.amazonaws.com` and the
+  `raw.github.com`, `gitlab.com`, `codeberg.org`, `gitee.com`,
+  `s3.amazonaws.com` and the
   regional path-style S3 endpoints (`s3.<region>.amazonaws.com`,
   `s3-<region>.amazonaws.com`, and `s3.<region>.amazonaws.com.cn` in the China
   regions), `storage.googleapis.com`, `storage.cloud.google.com`,
   `dl.dropboxusercontent.com`, `docs.google.com`, `drive.google.com`,
   `sites.google.com`, `readthedocs.io`, `readthedocs.org`, `gitbook.io`,
-  `docs.rs`, `pkg.go.dev`, `pypi.org`, `www.npmjs.com`, `hub.docker.com`,
-  `unpkg.com`, `registry.npmjs.org`, `files.pythonhosted.org`,
-  `proxy.golang.org`, `static.crates.io`.
+  `docs.rs`, `pkg.go.dev`, `pypi.org`, `test.pypi.org`, `www.npmjs.com`,
+  `hub.docker.com`, `ghcr.io`, `unpkg.com`, `cdnjs.cloudflare.com`,
+  `registry.npmjs.org`, `files.pythonhosted.org`, `proxy.golang.org`,
+  `repo.maven.apache.org`.
 - **Whole domains** (the subdomains are shared too): `githubusercontent.com`
   (`raw.`, `objects.`, `media.` and the rest), `jsdelivr.net`,
   `huggingface.co` (including `cdn-lfs.huggingface.co`), `stackoverflow.com`,
   `stackexchange.com`, `reddit.com`, `quora.com`, `medium.com`,
   `substack.com`, `wordpress.com`, `blogspot.com`, `sourceforge.net`,
-  `dropbox.com`, `npmjs.com`.
+  `dropbox.com`, `npmjs.com`, `crates.io` (including `static.crates.io`),
+  `rubygems.org`, `maven.org` (including `repo1.maven.org`), `bitbucket.org`
+  (including `api.bitbucket.org`), `archive.org` (including
+  `web.archive.org`).
 - **Platform apexes:** an exact host that is itself a public suffix from the
   list's private section, such as `github.io`, `gitlab.io` or
   `cloudfront.net`. The platform hands the names under it to its customers, and

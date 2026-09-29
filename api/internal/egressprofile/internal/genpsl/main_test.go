@@ -45,8 +45,18 @@ func TestDecoderAgreesWithXNet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(nodes) < 5000 {
-		t.Fatalf("decoded %d nodes, want the whole list (thousands)", len(nodes))
+	// The walk reaches every node exactly once: x/net's nodes table holds one 5-byte record
+	// per trie node, and each node is a distinct domain name. A decoder that skipped a
+	// subtree or revisited one would miss this count or repeat a name.
+	if want := len(tb.nodes) / 5; len(nodes) != want {
+		t.Fatalf("walked %d nodes, the nodes table holds %d", len(nodes), want)
+	}
+	names := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		if names[n.name] {
+			t.Fatalf("walked %q twice", n.name)
+		}
+		names[n.name] = true
 	}
 	var normal, wild, except int
 	for _, n := range nodes {

@@ -4,7 +4,10 @@ import "time"
 
 // EgressProfileWarningDTO is a note about a stored host entry (PRD #1906 Decision 4).
 // Codes: "multi_publisher_override", the entry reaches a host where many unrelated
-// publishers serve content and an admin admitted it with an explicit override; and
+// publishers serve content and an admin admitted it with an explicit override;
+// "multi_publisher_needs_override" (reads only), the current multi-publisher list flags
+// the stored entry (the list grew after the profile was written) and it has no override,
+// so it matches nothing until the override is added or the entry removed; and
 // "stale_entry" (reads only), the current rules no longer accept the stored entry, so it
 // matches nothing until the profile is edited.
 type EgressProfileWarningDTO struct {
@@ -17,8 +20,9 @@ type EgressProfileWarningDTO struct {
 // list. Hosts are the normalized entries (an exact host or "*.base"; a wildcard matches
 // proper subdomains of base, not base itself). MultiPublisherOverride is the subset of
 // Hosts an admin accepted despite the multi-publisher warning, and Warnings repeats one
-// warning per such entry on every read, not only on the write, plus a stale_entry warning
-// on read for any stored entry the current rules refuse.
+// warning per such entry on every read, not only on the write, plus a
+// multi_publisher_needs_override or stale_entry warning on read for any stored entry the
+// current rules flag without an override or refuse.
 //
 // Name, Description and Hosts are admin-authored display strings: the api validates them
 // (termsafe, IDNA A-labels), and the CLI still renders them through its sanitizing cell

@@ -260,6 +260,16 @@ func TestMultiPublisher(t *testing.T) {
 		// An exact host that is a private-section public suffix: the platform's own apex.
 		"github.io", "gitlab.io", "githubusercontent.com", "cloudfront.net", "blogspot.com",
 		"vendor.platformsh.site", // "*.platformsh.site" is a rule, so this is a suffix itself
+		// Second review of PRD #1906 M1: more hosts that serve every publisher by path.
+		"bitbucket.org", "api.bitbucket.org", "*.bitbucket.org",
+		"archive.org", "web.archive.org", "*.archive.org",
+		"cdnjs.cloudflare.com", "*.cloudflare.com",
+		"crates.io", "index.crates.io",
+		"rubygems.org", "index.rubygems.org", "*.rubygems.org",
+		"repo1.maven.org", "central.maven.org", "*.maven.org", "repo.maven.apache.org", "*.maven.apache.org",
+		"test.pypi.org", "*.pypi.org",
+		"gitee.com", "ghcr.io", "raw.github.com",
+		"gist.githubusercontent.com", "*.githubusercontent.com",
 	}
 	for _, e := range flagged {
 		if reason, ok := MultiPublisher(e); !ok || reason == "" {
@@ -276,6 +286,9 @@ func TestMultiPublisher(t *testing.T) {
 		"vendor.github.io", "vendor.gitlab.io", // one site under a private suffix
 		"xs3.cn-north-1.amazonaws.com.cn",
 		"example.org", "docs.golang.org.example.com",
+		"maven.apache.org",             // Apache's own Maven documentation: only the repository host is listed
+		"blog.cloudflare.com",          // Cloudflare's own blog: only cdnjs is listed
+		"notarchive.org", "xcrates.io", // label boundary
 	}
 	for _, e := range clean {
 		if reason, ok := MultiPublisher(e); ok {
@@ -474,5 +487,66 @@ func TestWarningsForStaleEntry(t *testing.T) {
 	}
 	if w := WarningsFor([]string{"docs.vendor.com"}, nil); len(w) != 0 {
 		t.Errorf("clean profile warnings = %+v, want none", w)
+	}
+}
+
+// TestStoredMultiPublisherWithoutOverride: a stored entry the CURRENT multi-publisher list
+// flags but that carries no override (the list grew after the profile was written) must
+// match nothing and carry a warning; with the override it matches and carries the override
+// warning (PRD #1906 M1 review, fail closed at the trust boundary).
+func TestStoredMultiPublisherWithoutOverride(t *testing.T) {
+	hosts := []string{"docs.vendor.com", "api.github.com", "*.kawasaki.jp", "*.archive.org"}
+
+	eff := EffectiveEntries(hosts, nil)
+	if strings.Join(eff, ",") != "docs.vendor.com" {
+		t.Fatalf("EffectiveEntries without overrides = %v, want only docs.vendor.com", eff)
+	}
+	for _, h := range []string{"api.github.com", "web.archive.org", "evil.foo.kawasaki.jp"} {
+		if Match(h, eff) {
+			t.Errorf("Match(%q) through an unoverridden or stale entry", h)
+		}
+	}
+	if !Match("docs.vendor.com", eff) {
+		t.Error("a clean entry stopped matching")
+	}
+	want := map[string]string{
+		"api.github.com": WarningCodeMultiPublisherNeedsOverride,
+		"*.archive.org":  WarningCodeMultiPublisherNeedsOverride,
+		"*.kawasaki.jp":  WarningCodeStaleEntry,
+	}
+	got := WarningsFor(hosts, nil)
+	if len(got) != len(want) {
+		t.Fatalf("warnings = %+v, want %v", got, want)
+	}
+	for _, w := range got {
+		if want[w.Entry] != w.Code || w.Message == "" {
+			t.Errorf("warning %+v, want code %q with a message", w, want[w.Entry])
+		}
+	}
+
+	// With the override (stored normalized, or in a non-canonical form) it matches.
+	for _, over := range [][]string{{"api.github.com"}, {"API.GitHub.com."}} {
+		eff = EffectiveEntries(hosts, over)
+		if strings.Join(eff, ",") != "docs.vendor.com,api.github.com" {
+			t.Fatalf("EffectiveEntries(%v) = %v, want docs.vendor.com,api.github.com", over, eff)
+		}
+		if !Match("api.github.com", eff) {
+			t.Errorf("Match(api.github.com) with override %v = false", over)
+		}
+		codes := map[string]string{}
+		for _, w := range WarningsFor(hosts, over) {
+			codes[w.Entry] = w.Code
+		}
+		if codes["api.github.com"] != WarningCodeMultiPublisherOverride {
+			t.Errorf("override %v: api.github.com warning = %q, want %q", over, codes["api.github.com"], WarningCodeMultiPublisherOverride)
+		}
+	}
+
+	// Normalized and de-duplicated; never nil, so a snapshot stores [] not null.
+	if eff := EffectiveEntries([]string{"DOCS.vendor.com.", "docs.vendor.com"}, nil); strings.Join(eff, ",") != "docs.vendor.com" {
+		t.Errorf("EffectiveEntries = %v, want one normalized entry", eff)
+	}
+	if eff := EffectiveEntries(nil, nil); eff == nil || len(eff) != 0 {
+		t.Errorf("EffectiveEntries(nil) = %#v, want an empty non-nil slice", eff)
 	}
 }
