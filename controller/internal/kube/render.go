@@ -631,8 +631,9 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 		data[caCertKey] = cfg.APICAPEM
 	}
 	// The fetcher CA (PRD #1906 M5), isolated workers only. Written once at creation like
-	// the api CA; a lane worker is run-bound, so a fetcher CA rotation reaches the next
-	// lane worker rather than stranding a long-lived one.
+	// the api CA, from the bundle the controller read once at boot: a rotated fetcher CA
+	// reaches only lane workers created after a controller restart, and an existing lane
+	// worker keeps the CA it was created with.
 	if w.Isolated && len(cfg.FetcherCAPEM) > 0 {
 		data[fetcherCACertKey] = cfg.FetcherCAPEM
 	}

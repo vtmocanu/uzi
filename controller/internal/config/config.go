@@ -5,6 +5,7 @@ package config
 
 import (
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -291,7 +292,7 @@ type Config struct {
 	// e.g. uzi-workers-isolated). Its default-deny NetworkPolicy (DNS, the api, the
 	// fetcher, the model host) is what removes the general network client, so it must
 	// differ from every other namespace this controller renders into, and from the
-	// controller's own (CheckIsolatedLaneNotNamespace, called at boot).
+	// controller's own (CheckIsolatedLaneOwnNamespace, called at boot).
 	WorkerIsolatedNamespace string
 	// WorkerIsolatedFetcherURL is the uzi-fetcher service URL a lane worker dials
 	// (UZI_WORKER_ISOLATED_FETCHER_URL → the pod's UZI_FETCHER_URL). https only, no
@@ -585,17 +586,29 @@ func validateFetcherURL(raw string) error {
 	return nil
 }
 
-// CheckIsolatedLaneNotNamespace refuses a lane namespace equal to other, the
-// controller's own namespace as read at boot. The lane's default-deny policy must never
-// be applied to (or relaxed for) the release namespace holding the api and this
-// controller. A lane that is off, or an unknown (empty) other, passes.
-func CheckIsolatedLaneNotNamespace(cfg Config, other string) error {
-	if cfg.WorkerIsolatedNamespace == "" || other == "" {
+// CheckIsolatedLaneOwnNamespace refuses a lane namespace equal to the controller's own
+// namespace, as returned by readOwn (in-cluster: the ServiceAccount mount's namespace
+// file). The lane's default-deny policy must never be applied to (or relaxed for) the
+// release namespace holding the api and this controller. A lane that is off passes
+// without calling readOwn; with the lane on, an unreadable or empty own namespace is
+// refused, because the separation cannot then be verified.
+func CheckIsolatedLaneOwnNamespace(cfg Config, readOwn func() (string, error)) error {
+	if cfg.WorkerIsolatedNamespace == "" {
 		return nil
 	}
-	if cfg.WorkerIsolatedNamespace == other {
+	own, err := readOwn()
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE is set but the controller's own namespace could not be read "+
+			"to verify the lane differs from it: %w", err)
+	}
+	own = strings.TrimSpace(own)
+	if own == "" {
+		return errors.New("UZI_WORKER_ISOLATED_NAMESPACE is set but the controller's own namespace is empty, " +
+			"so the lane cannot be verified to differ from it")
+	}
+	if cfg.WorkerIsolatedNamespace == own {
 		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE (%q) must differ from the controller's own namespace (%q)",
-			cfg.WorkerIsolatedNamespace, other)
+			cfg.WorkerIsolatedNamespace, own)
 	}
 	return nil
 }

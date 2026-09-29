@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"strings"
 	"testing"
 )
@@ -129,20 +130,46 @@ func TestLoadIsolatedNamespaceMustDifferFromTheDockerNamespace(t *testing.T) {
 	}
 }
 
-// ...and from the controller's own namespace, which main reads in-cluster at boot.
-func TestCheckIsolatedLaneNotTheControllerNamespace(t *testing.T) {
-	cfg := Config{WorkerIsolatedNamespace: "uzi-workers-isolated"}
-	if err := CheckIsolatedLaneNotNamespace(cfg, "uzi-workers-isolated"); err == nil ||
-		!strings.Contains(err.Error(), "controller's own namespace") {
-		t.Fatalf("err = %v, want a refusal naming the controller's own namespace", err)
-	}
-	if err := CheckIsolatedLaneNotNamespace(cfg, "uzi"); err != nil {
-		t.Fatalf("a distinct controller namespace must pass: %v", err)
-	}
-	if err := CheckIsolatedLaneNotNamespace(Config{}, "uzi"); err != nil {
-		t.Fatalf("a lane that is off must pass: %v", err)
-	}
-	if err := CheckIsolatedLaneNotNamespace(cfg, ""); err != nil {
-		t.Fatalf("an unknown controller namespace must pass: %v", err)
-	}
+// ...and from the controller's own namespace, which main reads in-cluster at boot. With
+// the lane configured, an unreadable or empty own namespace refuses to boot: the
+// separation cannot be verified.
+func TestCheckIsolatedLaneOwnNamespace(t *testing.T) {
+	lane := Config{WorkerIsolatedNamespace: "uzi-workers-isolated"}
+	unreadable := func() (string, error) { return "", errors.New("open namespace file: no such file or directory") }
+	ns := func(v string) func() (string, error) { return func() (string, error) { return v, nil } }
+
+	t.Run("lane unset, namespace unreadable: ok and never read", func(t *testing.T) {
+		called := false
+		read := func() (string, error) { called = true; return unreadable() }
+		if err := CheckIsolatedLaneOwnNamespace(Config{}, read); err != nil {
+			t.Fatalf("a lane that is off must pass: %v", err)
+		}
+		if called {
+			t.Fatal("a lane that is off must not read the controller's own namespace")
+		}
+	})
+	t.Run("lane set, namespace unreadable: refused", func(t *testing.T) {
+		err := CheckIsolatedLaneOwnNamespace(lane, unreadable)
+		if err == nil || !strings.Contains(err.Error(), "controller's own namespace") ||
+			!strings.Contains(err.Error(), "no such file") {
+			t.Fatalf("err = %v, want a refusal naming the unreadable own namespace and the cause", err)
+		}
+	})
+	t.Run("lane set, namespace empty: refused", func(t *testing.T) {
+		if err := CheckIsolatedLaneOwnNamespace(lane, ns(" \n")); err == nil ||
+			!strings.Contains(err.Error(), "controller's own namespace") {
+			t.Fatalf("err = %v, want a refusal for an empty own namespace", err)
+		}
+	})
+	t.Run("lane set, equal: refused", func(t *testing.T) {
+		if err := CheckIsolatedLaneOwnNamespace(lane, ns("uzi-workers-isolated\n")); err == nil ||
+			!strings.Contains(err.Error(), "must differ from the controller's own namespace") {
+			t.Fatalf("err = %v, want a refusal naming the controller's own namespace", err)
+		}
+	})
+	t.Run("lane set, distinct: ok", func(t *testing.T) {
+		if err := CheckIsolatedLaneOwnNamespace(lane, ns("uzi\n")); err != nil {
+			t.Fatalf("a distinct controller namespace must pass: %v", err)
+		}
+	})
 }

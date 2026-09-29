@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 
 	"k8s.io/client-go/kubernetes"
@@ -75,17 +74,15 @@ func main() {
 	// REFUSE TO BOOT on an isolated lane namespace equal to this controller's own
 	// (PRD #1906 M5). Config.Load already refused one equal to either worker namespace;
 	// the controller's own namespace is only knowable in-cluster, from the namespace file
-	// the ServiceAccount mount carries beside the token InClusterConfig just read. An
-	// unreadable file is logged and the check skipped: there is then no namespace to
-	// compare against.
-	if cfg.WorkerIsolatedNamespace != "" {
-		raw, nsErr := os.ReadFile(serviceAccountNamespaceFile)
-		if nsErr != nil {
-			log.Warn("could not read the controller's own namespace; skipping the lane-namespace separation check", "error", nsErr)
-		} else if err := config.CheckIsolatedLaneNotNamespace(cfg, strings.TrimSpace(string(raw))); err != nil {
-			log.Error("isolated lane configuration", "error", err)
-			os.Exit(1)
-		}
+	// the ServiceAccount mount carries beside the token InClusterConfig just read. With
+	// the lane configured, an unreadable or empty file also refuses to boot: the
+	// separation cannot be verified. With the lane off the file is never read.
+	if err := config.CheckIsolatedLaneOwnNamespace(cfg, func() (string, error) {
+		raw, err := os.ReadFile(serviceAccountNamespaceFile)
+		return string(raw), err
+	}); err != nil {
+		log.Error("isolated lane configuration", "error", err)
+		os.Exit(1)
 	}
 
 	materializerCfg := kube.RenderConfig{
