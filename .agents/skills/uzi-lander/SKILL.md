@@ -259,10 +259,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
      'GUIDANCE'` (single-quoted), `SINCE=$(date -u +%Y-%m-%dT%H:%M:%SZ)` captured first,
      `S/wait-mrrework.sh OWNER/REPO PR 45 60 "$SINCE"`, review its commit, trail `fix rework`.
      Exit 3 means the rework is still running: re-run the waiter with the same `$SINCE`.
-     A 409 "disabled" means rework is off for that run: `uzi run mr-rework RUN --enabled`,
-     retry, then `uzi run mr-rework RUN --enabled=false` once the rework run exists, or uzi
-     auto-reworks on every later bot comment; do not downgrade a big fix to a local one
-     because the lane was off. A `task` run (`uzi handoff`) refuses `uzi run rework`: hand
+     On-demand rework ignores the per-run and per-user auto-rework settings, so a run
+     created with `--mr-rework=false` can still be reworked and needs no toggle. A 409
+     "disabled" is the admin kill-switch: report it, never downgrade a big fix to a local
+     one because of it. A `task` run (`uzi handoff`) refuses `uzi run rework`: hand
      the fix off instead (`uzi handoff --base <PR branch> --file BRIEF`, no `--mr`), then
      push its tip onto the PR branch with a lease once it fast-forwards from the PR head.
      **A rework already running** (uzi starts one on new bot comments; a second `uzi run
@@ -290,8 +290,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
    `mergeable` before waiting on checks.
    A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows
-   onto an older base, so bot findings that CI calls a missing Task target (or other
-   workflow-versus-tree skew) are artifacts: rebase onto `main` before fixing anything.
+   onto an older base, which can make CI call a Task target the branch lacks. On such a
+   finding, check the target on current `main`; when `main` defines it, rebase onto `main`,
+   rerun CI, then assess whatever finding remains.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
