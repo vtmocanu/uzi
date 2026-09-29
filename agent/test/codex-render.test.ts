@@ -24,6 +24,7 @@ import {
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
+  CLAUDE_LONG_COMMAND_APPEND,
   WORKER_RUNTIME_APPEND,
 } from "../src/prompt.js";
 
@@ -436,6 +437,14 @@ describe("renderCodexRun — prompts", () => {
       run.perRolePrompts.get("a"),
       `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
     );
+  });
+
+  it("carries the command-lifetime rule but not the Claude-only long-command recipe", () => {
+    const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
+    const prompt = run.perRolePrompts.get("a") ?? "";
+    assert.ok(prompt.includes("is stopped and its result is lost"));
+    assert.ok(!prompt.includes(CLAUDE_LONG_COMMAND_APPEND));
+    assert.ok(!prompt.includes("run_in_background"));
   });
 });
 
