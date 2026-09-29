@@ -193,6 +193,7 @@ type markerPageDB struct {
 	iid              int64
 	url              string
 	candidateQueries int
+	beginErr         error
 }
 
 func (db *markerPageDB) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
@@ -220,6 +221,9 @@ func (db *markerPageDB) Exec(_ context.Context, _ string, args ...interface{}) (
 }
 
 func (db *markerPageDB) Begin(context.Context) (pgx.Tx, error) {
+	if db.beginErr != nil {
+		return nil, db.beginErr
+	}
 	return &markerTx{db: db}, nil
 }
 
@@ -300,6 +304,25 @@ func TestIncrementalSyncMatchesMarkerBeyondRotatingPage(t *testing.T) {
 	}
 	if !next.Finding.Equal(start.Add(201*time.Second)) || db.settled != target {
 		t.Fatalf("second pass: mark=%v settled=%s", next.Finding, db.settled)
+	}
+}
+
+func TestIncrementalSyncSettlementFailureHoldsMarks(t *testing.T) {
+	repo, user := uuid.New(), uuid.New()
+	iid := int64(31)
+	db := &markerPageDB{pendingPageDB: &pendingPageDB{ops: []store.FindingGroupClaimOperation{{
+		ID: uuid.New(), UserID: user, RepoID: repo, Phase: "issue_recorded", IssueIID: &iid,
+		IssueURL: "https://example.com/issues/31", CreatedAt: time.Now().Add(-time.Minute),
+	}}}, beginErr: fmt.Errorf("settlement database unavailable")}
+	cache := &fakeStore{}
+	svc := newTestService(cache)
+	svc.SetFindingGroupDB(db)
+	start := Marks{Finding: time.Now().Add(-time.Hour)}
+	got, err := svc.IncrementalSync(context.Background(), repo, 7, &fakeForge{findingIssues: []forge.Issue{{
+		IID: 32, UpdatedAt: time.Now(),
+	}}}, start)
+	if err == nil || got != start || len(cache.upserts) != 0 {
+		t.Fatalf("mark=%v error=%v cache writes=%d", got, err, len(cache.upserts))
 	}
 }
 

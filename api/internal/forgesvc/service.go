@@ -294,6 +294,9 @@ func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([
 		}
 		// A failed or raced settlement stays claimed for a later pass.
 	}
+	if reconcileErr != nil {
+		return ops, finish, reconcileErr
+	}
 	return ops, finish, nil
 }
 
