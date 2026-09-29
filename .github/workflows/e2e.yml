@@ -82,6 +82,17 @@ jobs:
           go-version: "1.27"
           check-latest: true
 
+      # A docker-container buildx builder, made current, so the harness's
+      # `compose build` can import the agent image's read-only registry layer cache
+      # (e2e/docker-compose.e2e.yml `cache_from`). The harness needs these images in
+      # the local daemon after `compose build`; default-load=true makes that guarantee
+      # explicit for the docker-container builder (current Compose also exports them
+      # locally). No login and no registry write: the cache refs are public and
+      # nothing is pushed.
+      - uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e  # v4
+        with:
+          driver-opts: default-load=true
+
       - name: Run compose E2E (stub executor)
         # Pin the harness rundir to a known path so the upload + issue steps can find
         # its artifacts (RUNROOT defaults to a $$-suffixed temp dir otherwise).
