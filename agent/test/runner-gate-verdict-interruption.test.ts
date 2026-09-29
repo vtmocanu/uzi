@@ -1007,6 +1007,12 @@ function resumeWith(s: Scenario, ...rows: UserInput[]): { flight: Flight; rows: 
   return { flight, rows };
 }
 
+function assertHeldInputGet(runId: string): void {
+  const reads = api.inputGets.get(runId) ?? 0;
+  assert.ok(reads > 0, "a GET entered before its reply was checked");
+  assert.equal(api.inputGetSendAttempts.get(runId) ?? 0, reads - 1, "the entered GET has not attempted a response before release");
+}
+
 /** Wait for the flight's first gate, approve it, and let the flight end. */
 async function approveFirstGate(s: Scenario, flight: Flight, ms = 8_000): Promise<void> {
   await until(() => s.gates(flight).length >= 1 || flight.finished, ms);
@@ -1019,21 +1025,37 @@ const RECOVERY_REASON = "could not read plan-gate inputs after the resume";
 describe("#1604 — delivery on resume: no plan is offered before the inputs sent before the release are read", () => {
   it("delayed GET", () =>
     scenario(async (s) => {
-      api.delayInputGets(s.runId, 400);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
-      await approveFirstGate(s, flight);
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
-      assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      const hold = api.holdNextInputGet(s.runId);
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delayed GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        assert.equal(s.gates(flight).length, 0, "no plan is offered before the held GET returns");
+        hold.release();
+        await approveFirstGate(s, flight);
+        assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+        assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      } finally {
+        hold.release();
+      }
     }));
 
   it("delayed ACK", () =>
     scenario(async (s) => {
-      api.delayInputReceipts("ack", 400);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
-      await until(() => api.inputReceiptReplies.some((r) => r.kind === "ack"));
-      api.delayInputReceipts("ack", 0);
-      await approveFirstGate(s, flight);
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+      const release = api.holdNextInputReceipt("ack");
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
+        assert.ok(await until(() => api.inputReceiptCalls.some((r) => r.runId === s.runId && r.kind === "ack")), "the ACK entered the fake API");
+        assert.equal(api.inputReceiptReplies.filter((r) => r.runId === s.runId && r.kind === "ack").length, 0,
+          "the held ACK has not replied before release");
+        assert.equal(s.gates(flight).length, 0, "no plan is offered before the held ACK returns");
+        release();
+        await approveFirstGate(s, flight);
+        assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+      } finally {
+        release();
+      }
     }));
 
   for (const which of ["GET", "ACK"] as const) {
@@ -1118,32 +1140,48 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
 
   it("a cancel beats a pending revise (routed while the delivery waiter is parked)", () =>
     scenario(async (s) => {
-      // The first GET is slow, so the executor is already parked on the delivery wait when the
-      // cancel is routed (the abort listener runs while the waiter is armed).
-      api.delayInputGets(s.runId, 600);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK), s.input("cancel"));
-      await s.finish(flight);
-      assert.equal(s.gates(flight).length, 0, "no plan was offered");
-      assert.equal(s.model.turns.length, 0, "no revision turn");
-      // The cancel ends the run as a cancel (REASON_CANCELLED), never as the AbortError a cancel
-      // routed while the delivery waiter is parked used to reject it with.
-      const failed = s.states(flight).find((b) => b.status === "failed");
-      assert.equal(failed?.failure_reason, "run cancelled", `ended cancelled: ${s.statuses(flight).join(",")}`);
+      // The entered GET proves the delivery waiter is armed before the cancel and revise route.
+      const hold = api.holdNextInputGet(s.runId);
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK), s.input("cancel"));
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delivery GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        assert.equal(s.gates(flight).length, 0, "no plan was offered while delivery was held");
+        hold.release();
+        await s.finish(flight);
+        assert.equal(s.gates(flight).length, 0, "no plan was offered");
+        assert.equal(s.model.turns.length, 0, "no revision turn");
+        // The cancel ends the run as a cancel (REASON_CANCELLED), never as the AbortError a cancel
+        // routed while the delivery waiter is parked used to reject it with.
+        const failed = s.states(flight).find((b) => b.status === "failed");
+        assert.equal(failed?.failure_reason, "run cancelled", `ended cancelled: ${s.statuses(flight).join(",")}`);
+      } finally {
+        hold.release();
+      }
     }));
 
   it("an approve submitted during delayed delivery goes stale; the revise wins", () =>
     scenario(async (s) => {
-      api.delayInputGets(s.runId, 400);
-      const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
-      await tick(100);
-      const [approve] = s.send(s.input("approve_plan"));
-      await approveFirstGate(s, flight);
-      // This claim carries no resume_plan_at, so it fails closed: an approve read before its first
-      // gate is stale, with the unjudged notice, and never applied as approval (discarded).
-      assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
-      await assertDisposedApprove(s, approve!.id);
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
-      assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      const hold = api.holdNextInputGet(s.runId);
+      try {
+        const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delivery GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        assert.equal(s.gates(flight).length, 0, "no gate was offered while the revise was unread");
+        const [approve] = s.send(s.input("approve_plan"));
+        hold.release();
+        await approveFirstGate(s, flight);
+        // This claim carries no resume_plan_at, so it fails closed: an approve read before its first
+        // gate is stale, with the unjudged notice, and never applied as approval (discarded).
+        assert.ok(s.texts(flight).includes(REPLAY_UNJUDGED_NOTICE), s.texts(flight).join(" | "));
+        await assertDisposedApprove(s, approve!.id);
+        assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+        assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
+      } finally {
+        hold.release();
+      }
     }));
 });
 
@@ -1272,22 +1310,32 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
     scenario(async (s) => {
       const { row } = await releaseAtGate(s, () => s.send(s.input("approve_plan"))[0]!, "unacked");
       api.failInputGets(s.runId, 5, 503);
-      api.delayInputGets(s.runId, 1_000, 1, (api.inputGets.get(s.runId) ?? 0) + 5);
-      const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
-      assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
-      assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the approve was read");
-      await tick(200);
-      await assertDisposedApprove(s, row.id);
-      assertNoApproval(s);
-      assert.equal(flight.finished, false, `the stub's plan waits at the gate: ${s.statuses(flight).join(",")}`);
-      assert.ok(s.texts(flight).includes(STALE_APPROVE_NOTICE), s.texts(flight).join(" | "));
-      // Round 4 (finding 1): every executor's first gate waits for the replayed backlog, so the
-      // transient read failures earn the one waiting line (the stub no longer offers its plan first).
-      assert.equal(s.texts(flight).filter((t) => t === STATUS_WAITING_DELIVERY).length, 1, s.texts(flight).join(" | "));
-      const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(row.id));
-      assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "the gate is reported only after the replayed approve was read");
-      s.send(s.input("cancel"));
-      await s.finish(flight);
+      const afterReads = (api.inputGets.get(s.runId) ?? 0) + 5;
+      const hold = api.holdNextInputGet(s.runId, afterReads);
+      try {
+        const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
+        assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > afterReads, 3_000), "the post-retry GET entered the fake API");
+        await hold.entered;
+        assertHeldInputGet(s.runId);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(s.gates(flight).length, 0, "the stub cannot offer its gate before the replayed backlog is read");
+        hold.release();
+        assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
+        assert.ok(await until(() => api.isAcked(s.runId, row.id), 3_000), "the approve was read");
+        await assertDisposedApprove(s, row.id);
+        assertNoApproval(s);
+        assert.equal(flight.finished, false, `the stub's plan waits at the gate: ${s.statuses(flight).join(",")}`);
+        assert.ok(await until(() => s.texts(flight).includes(STALE_APPROVE_NOTICE), 3_000), s.texts(flight).join(" | "));
+        // Round 4 (finding 1): every executor's first gate waits for the replayed backlog, so the
+        // transient read failures earn the one waiting line (the stub no longer offers its plan first).
+        assert.equal(s.texts(flight).filter((t) => t === STATUS_WAITING_DELIVERY).length, 1, s.texts(flight).join(" | "));
+        const ackAt = api.timeline.findIndex((e, i) => i >= flight.timelineFrom && e.type === "receipt_reply" && e.kind === "ack" && e.httpStatus === 200 && e.ids.includes(row.id));
+        assert.ok(ackAt >= 0 && s.stateAt("awaiting_approval", flight.timelineFrom) > ackAt, "the gate is reported only after the replayed approve was read");
+        s.send(s.input("cancel"));
+        await s.finish(flight);
+      } finally {
+        hold.release();
+      }
     }));
 });
 
