@@ -44,6 +44,9 @@ through `[0.52.0]`.)
 - **uzi's self-improvement runs gate through the Taskfile and re-check old recommendations.**
   On a repo opted into uzi dogfooding, the self-improvement run now passes `task gate:repo` plus the touched components' gates and, for web changes, the production build (reporting a missing `task` as a gate failure) instead of a stale hand-written test list, confirms a judge recommendation still holds on current code (and is not already fixed by an open merge request) before acting on it, prefers a fix several recommendations share, and never edits the built-in agent templates copied verbatim from upstream.
 
+- **A run whose branch carries a secret gets a chance to remove it before publishing ([#1932](https://github.com/vtmocanu/uzi/issues/1932)).**
+  When the worker's local secret scan flags an unpublished commit at the end of a run, the lead is asked to rewrite that commit out of history (up to twice) before anything is pushed; if it cannot, or the finding is below an already-published checkpoint, the run fails `push_secret_blocked` without pushing. No checkpoint is published while a finding is live, and the failure reason now says the worker's pre-push scan flagged the branch instead of claiming GitHub Push Protection (GH013) rejected it.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
