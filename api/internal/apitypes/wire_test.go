@@ -692,7 +692,7 @@ func TestIncidentalFindingBacklogDTOTags(t *testing.T) {
 
 func TestIncidentalFindingIssueDraftDTOTags(t *testing.T) {
 	assertTags(t, "IncidentalFindingIssueDraftDTO", IncidentalFindingIssueDraftDTO{},
-		"title", "description", "location", "labels", "provenance")
+		"disposition_id", "title", "description", "location", "labels", "provenance")
 }
 
 // TestIncidentalFindingFileResultDTOTags pins the PRD #333 M5/M6 file-response shape. warning

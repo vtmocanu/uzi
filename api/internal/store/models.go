@@ -260,21 +260,39 @@ type CustodyEpisodeNotice struct {
 }
 
 type FindingDisposition struct {
-	ID            uuid.UUID          `json:"id"`
-	UserID        uuid.UUID          `json:"user_id"`
-	RepoID        uuid.UUID          `json:"repo_id"`
-	Location      string             `json:"location"`
-	Status        string             `json:"status"`
-	FiledIssueIid pgtype.Int8        `json:"filed_issue_iid"`
-	FiledIssueUrl string             `json:"filed_issue_url"`
-	FilingSince   pgtype.Timestamptz `json:"filing_since"`
-	DismissReason pgtype.Text        `json:"dismiss_reason"`
-	ContentHash   string             `json:"content_hash"`
-	LastTitle     string             `json:"last_title"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	ResolvedAt    pgtype.Timestamptz `json:"resolved_at"`
-	SetVia        pgtype.Text        `json:"set_via"`
-	CloseSyncedAt pgtype.Timestamptz `json:"close_synced_at"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	Location         string             `json:"location"`
+	Status           string             `json:"status"`
+	FiledIssueIid    pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl    string             `json:"filed_issue_url"`
+	FilingSince      pgtype.Timestamptz `json:"filing_since"`
+	DismissReason    pgtype.Text        `json:"dismiss_reason"`
+	ContentHash      string             `json:"content_hash"`
+	LastTitle        string             `json:"last_title"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
+	SetVia           pgtype.Text        `json:"set_via"`
+	CloseSyncedAt    pgtype.Timestamptz `json:"close_synced_at"`
+	GroupOperationID pgtype.UUID        `json:"group_operation_id"`
+}
+
+type FindingGroupMember struct {
+	OperationID   uuid.UUID `json:"operation_id"`
+	DispositionID uuid.UUID `json:"disposition_id"`
+	FindingID     uuid.UUID `json:"finding_id"`
+}
+
+type FindingGroupOperation struct {
+	ID         uuid.UUID          `json:"id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	Phase      string             `json:"phase"`
+	DeadlineAt pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	IssueIid   pgtype.Int8        `json:"issue_iid"`
+	IssueUrl   string             `json:"issue_url"`
 }
 
 type ForgeConnection struct {

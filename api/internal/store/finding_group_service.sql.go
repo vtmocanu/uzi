@@ -21,7 +21,7 @@ type FindingGroupDB interface {
 	Begin(context.Context) (pgx.Tx, error)
 }
 
-type FindingGroupMember struct {
+type FindingGroupClaimMember struct {
 	DispositionID uuid.UUID
 	FindingID     uuid.UUID
 	RepoID        uuid.UUID
@@ -30,7 +30,7 @@ type FindingGroupMember struct {
 	Description   string
 	Labels        []byte
 }
-type FindingGroupOperation struct {
+type FindingGroupClaimOperation struct {
 	ID        uuid.UUID
 	UserID    uuid.UUID
 	RepoID    uuid.UUID
@@ -43,8 +43,8 @@ type FindingGroupOperation struct {
 
 // ClaimFindingGroup atomically claims 1-50 unique open dispositions in one repo.
 // The newest existing evidence is captured for each member under ordered row locks.
-func ClaimFindingGroup(ctx context.Context, db FindingGroupDB, user uuid.UUID, ids []uuid.UUID, deadline time.Time) (FindingGroupOperation, []FindingGroupMember, error) {
-	var zero FindingGroupOperation
+func ClaimFindingGroup(ctx context.Context, db FindingGroupDB, user uuid.UUID, ids []uuid.UUID, deadline time.Time) (FindingGroupClaimOperation, []FindingGroupClaimMember, error) {
+	var zero FindingGroupClaimOperation
 	if len(ids) < 1 || len(ids) > 50 || !deadline.After(time.Now()) {
 		return zero, nil, ErrFindingGroupUnavailable
 	}
@@ -59,7 +59,7 @@ func ClaimFindingGroup(ctx context.Context, db FindingGroupDB, user uuid.UUID, i
 	if err != nil {
 		return zero, nil, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	rows, err := tx.Query(ctx, `SELECT id, repo_id, location FROM finding_dispositions
         WHERE user_id=$1 AND id=ANY($2::uuid[]) ORDER BY id FOR UPDATE`, user, ids)
 	if err != nil {
@@ -87,9 +87,9 @@ func ClaimFindingGroup(ctx context.Context, db FindingGroupDB, user uuid.UUID, i
 	if len(coords) != len(unique) {
 		return zero, nil, ErrFindingGroupUnavailable
 	}
-	members := make([]FindingGroupMember, 0, len(coords))
+	members := make([]FindingGroupClaimMember, 0, len(coords))
 	for _, c := range coords {
-		var m FindingGroupMember
+		var m FindingGroupClaimMember
 		m.DispositionID, m.RepoID, m.Location = c.id, c.repo, c.location
 		if c.repo != coords[0].repo {
 			return zero, nil, ErrFindingGroupMixedRepo
@@ -108,7 +108,7 @@ func ClaimFindingGroup(ctx context.Context, db FindingGroupDB, user uuid.UUID, i
 		}
 		members = append(members, m)
 	}
-	var op FindingGroupOperation
+	var op FindingGroupClaimOperation
 	err = tx.QueryRow(ctx, `INSERT INTO finding_group_operations(user_id,repo_id,deadline_at)
         SELECT $1,$2,$3 WHERE $3::timestamptz > now() RETURNING id,created_at`, user, coords[0].repo, deadline).Scan(&op.ID, &op.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -167,7 +167,7 @@ func SettleFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.UU
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var iid int64
 	var url string
 	var repo uuid.UUID
@@ -227,7 +227,7 @@ func releaseFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.U
 	if err != nil {
 		return false, err
 	}
-	defer tx.Rollback(ctx)
+	defer func() { _ = tx.Rollback(ctx) }()
 	var phase string
 	var expired bool
 	err = tx.QueryRow(ctx, `SELECT phase,deadline_at<=now() FROM finding_group_operations
@@ -273,8 +273,8 @@ func releaseFindingGroup(ctx context.Context, db FindingGroupDB, user, id uuid.U
 	return true, nil
 }
 
-func GetPendingFindingGroup(ctx context.Context, db DBTX, user, id uuid.UUID) (FindingGroupOperation, error) {
-	var o FindingGroupOperation
+func GetPendingFindingGroup(ctx context.Context, db DBTX, user, id uuid.UUID) (FindingGroupClaimOperation, error) {
+	var o FindingGroupClaimOperation
 	err := db.QueryRow(ctx, `SELECT id,user_id,repo_id,phase,deadline_at,created_at,issue_iid,issue_url
         FROM finding_group_operations WHERE id=$1 AND user_id=$2 AND phase NOT IN ('released','settled')`, id, user).
 		Scan(&o.ID, &o.UserID, &o.RepoID, &o.Phase, &o.Deadline, &o.CreatedAt, &o.IssueIID, &o.IssueURL)
