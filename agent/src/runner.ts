@@ -10310,6 +10310,11 @@ export class RunRunner {
       onStep?.("checkpoint_upload");
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
+        // An early HTTP success does not prove the streamed git pack completed. spawnGit's
+        // exit promise never rejects and, inside a boundary, settles only after root reap.
+        // Abandon an unread tail so the producer cannot stay blocked on pipe backpressure.
+        if (!packed.pack.readableEnded) packed.pack.destroy();
+        if (await packed.exited !== 0) throw new Error("checkpoint pack producer failed");
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.

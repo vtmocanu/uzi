@@ -3637,9 +3637,10 @@ export class GitCache {
 
   /**
    * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
-   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack }` where `tipOid`
-   * is the tracking-ref tip (the same the checkpoint fetched back) and `pack` STREAMS the
-   * packfile bytes; null when there is no tracking ref yet (nothing to publish).
+   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack, exited }` where
+   * `tipOid` is the tracking-ref tip (the same the checkpoint fetched back), `pack`
+   * STREAMS the packfile bytes, and `exited` settles with the producer's exit code;
+   * null when there is no tracking ref yet (nothing to publish).
    *
    * The exclude boundary mirrors the reseed's floor: `refs/remotes/origin/<branch>` when
    * origin carries the branch, else the default branch — so the pack carries only what the
@@ -3658,7 +3659,7 @@ export class GitCache {
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
-  ): Promise<{ tipOid: string; pack: Readable } | null> {
+  ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
@@ -3676,12 +3677,12 @@ export class GitCache {
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
       onStep?.("checkpoint_pack");
-      const { stdout } = await this.spawnGit(
+      const { stdout, exited } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
         `${wanted}\n^${pinned.excludeSha}\n`,
       );
-      return { tipOid: wanted, pack: stdout };
+      return { tipOid: wanted, pack: stdout, exited };
     }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
@@ -3724,12 +3725,12 @@ export class GitCache {
     const wanted = wantRev;
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     onStep?.("checkpoint_pack");
-    const { stdout } = await this.spawnGit(
+    const { stdout, exited } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
       `${wanted}\n^${excludeSha}\n`,
     );
-    return { tipOid: wantRev, pack: stdout };
+    return { tipOid: wantRev, pack: stdout, exited };
   }
 
   private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {

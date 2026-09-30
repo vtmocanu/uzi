@@ -70,7 +70,8 @@ function spyPublish(
     ...args: unknown[]
   ) => {
     events.push("publish");
-    (args[2] as Readable | undefined)?.resume(); // drain the pack so the git child can exit
+    const pack = args[2] as Readable | undefined;
+    if (pack) for await (const _chunk of pack) { /* wait for git to exit before the fake ACK */ }
     if (opts.throws) throw new Error("boom publish");
     calls += 1;
     // A non-2xx result models an UNCONFIRMED publish: it did NOT confirmably land.
@@ -909,7 +910,8 @@ describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue
       ...args: unknown[]
     ) => {
       calls += 1;
-      (args[2] as Readable | undefined)?.resume(); // drain the pack so pack-objects can exit
+      const pack = args[2] as Readable | undefined;
+      if (pack) for await (const _chunk of pack) { /* wait for git to exit before the fake ACK */ }
       return result;
     };
     return {
@@ -1215,7 +1217,7 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
     const orig = git.checkpointPack.bind(git);
     (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => {
       if (opts.throws) throw new Error("boom checkpointPack");
-      return { tipOid: opts.tipOid ?? "PACKTIP", pack: { resume() {} } };
+      return { tipOid: opts.tipOid ?? "PACKTIP", pack: { readableEnded: true }, exited: Promise.resolve(0) };
     };
     return () => {
       (git as unknown as { checkpointPack: unknown }).checkpointPack = orig;
