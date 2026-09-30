@@ -321,15 +321,18 @@ pipe would also turn a MATCH into rc 141; but do not use that pipe form for chec
 below: with `pipefail` off it reads a failed log read as "no match".)
 It also turns job control off (`set +m`), so a Ctrl-C is delivered to the shell as well as to the
 running command. Bash runs the `INT` trap (the cleanup) only when that command itself dies of the
-signal: a plain `sleep`, a loop of short `sleep`s, or `timeout --foreground` all do. A command that
-catches Ctrl-C and exits normally instead (kubectl's own interrupt handling can do this, and plain
-`timeout` without `--foreground` never passes the Ctrl-C on) returns you to the prompt WITHOUT any
-cleanup. **The only proof that cleanup ran is a `cleanup done` line**, printed on the terminal and
+signal: a plain `sleep` and a loop of short `sleep`s do, and so does `timeout --foreground` when
+(and only when) the command it wraps dies of it. A command that catches Ctrl-C and exits normally
+instead (kubectl's own interrupt handling can do this, also inside `timeout --foreground`) returns
+you to the prompt WITHOUT any cleanup; plain `timeout` without `--foreground` never passes the
+Ctrl-C on at all, so nothing happens until its N seconds run out. A Ctrl-C at an idle prompt (for
+example to clear a half-typed line) DOES run the cleanup and ends the attempt: clear a line with
+Ctrl-U instead. **The only proof that cleanup ran is a `cleanup done` line**, printed on the terminal and
 written to `CLEANUP_LOG`: if a Ctrl-C returns you to a prompt without it, run `exit 1`. Judge each
 check's result yourself and, to abort an attempt, run `exit 1` (the trap then cleans up). Once the
-trap is installed, `exit`, a closed terminal (HUP), TERM, and a Ctrl-C that kills the running
-command all run the cleanup; a signal that arrives while a command is running is acted on when
-that command returns. **So every wait in steps 1 to 10 must be time-limited**: a loop of short
+trap is installed, `exit`, a closed terminal (HUP), TERM, a Ctrl-C at an idle prompt, and a
+Ctrl-C that kills the running command all run the cleanup; a HUP or TERM that arrives while a
+command is running is acted on when that command returns. **So every wait in steps 1 to 10 must be time-limited**: a loop of short
 `sleep`s with a bounded number of rounds, or `timeout --foreground <N> <command>`; never
 `kubectl logs -f` or an unbounded wait. The sketch's own rollouts are capped at `--timeout=300s`.
 When a bound expires, either repeat the bounded wait or abort with `exit 1`; an expired wait is
@@ -337,8 +340,9 @@ never a pass. A terminal closed at an idle prompt may be seen as end-of-input ra
 hangup; the cleanup still runs completely, but then exits with the last command's status (or 1
 if that status was 0 and the cleanup failed) and logs that status, not 129. The cleanup writes its
 actions and verification results to `CLEANUP_LOG` (and to the terminal if it is still there):
-read that file after every attempt, and treat a missing `cleanup done failed=0` line as a cleanup
-that did not complete (run the dead-shell fallback below).
+step 0 empties it, so it holds only this attempt's cleanup. Read that file after every attempt,
+and treat a missing `cleanup done failed=0` line as a cleanup that did not complete (run the
+dead-shell fallback below).
 
 Because `pipefail` is off, a failed read looks like "no match". **Every check must fail closed on
 a read error**: capture the output first and check the read succeeded, then match on the captured
@@ -377,12 +381,12 @@ that separates "absent" from an exec error, e.g. `kubectl exec <scratch-pod> -c 
 ### Cleanup contract (install it first)
 
 The order is fixed: **record the prior state, install the trap, then change the setting and apply
-the deny rule.** The trap fires on `EXIT`, `INT`, `TERM` and `HUP`, so success, failure, interrupt (a Ctrl-C that kills the running command;
-see the one-shell paragraph above for when it does not), a closed terminal, an `exit` to abort, and (during step 0, while
+the deny rule.** The trap fires on `EXIT`, `INT`, `TERM` and `HUP`, so success, failure, interrupt (a Ctrl-C at an idle prompt, or one that kills the running
+command; see the one-shell paragraph above for when it does not), a closed terminal, an `exit` to abort, and (during step 0, while
 `errexit` is still on) a `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
 **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
-restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt, or
-1 when cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
+restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt;
+1 when that status was 0 and cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
 restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later; step 0 runs under
 `set -euo pipefail`, which the sketch relaxes to `set +m` and `set +e +u +o pipefail` once the raise is done; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
 the chosen policy type so it cannot resolve to a standard NetworkPolicy):
@@ -394,6 +398,7 @@ DENY_KIND='networkpolicies.crd.antrea.io'          # Antrea; or the cluster's su
 DENY_NS_ARGS=(-n '<worker-namespace>')             # empty array () for a cluster-scoped policy
 API_NS='<api-namespace>'; API_DEPLOY='<api-deployment>'; API_CM='<api-configmap>'
 CLEANUP_LOG="$HOME/uzi-1742-acceptance-<n>.cleanup.log"   # survives a closed terminal
+: >"$CLEANUP_LOG"                                          # this attempt's cleanup only
 
 deny_kubectl() { kubectl ${DENY_NS_ARGS[@]+"${DENY_NS_ARGS[@]}"} "$@"; }
 override_state() {   # "WORKER_HEARTBEAT_STALE=<v>" when a direct env override exists, else empty
