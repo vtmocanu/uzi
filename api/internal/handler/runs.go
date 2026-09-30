@@ -104,10 +104,10 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	for _, row := range rows {
 		item := apitypes.RunListItemDTO{
 			RunDTO:     runToDTO(row.Run, row.PriorityClass, h.cfg.RunTimeout, extCap, h.cfg.RunForgeUnreachableMaxParks, now),
-			RepoPath:   row.RepoPath,
+			RepoPath:   row.RepoPath.String, // "" for a repo-less job run (PRD #1908)
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 		}
-		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
+		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
 		usageRow, hasUsage := usage[row.Run.ID]
@@ -174,11 +174,11 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		email := row.OwnerEmail
 		item := apitypes.RunListItemDTO{
 			RunDTO:     runToDTO(row.Run, row.PriorityClass, h.cfg.RunTimeout, extCap, h.cfg.RunForgeUnreachableMaxParks, now),
-			RepoPath:   row.RepoPath,
+			RepoPath:   row.RepoPath.String, // "" for a repo-less job run (PRD #1908)
 			WorkerName: textPtrValue(row.WorkerName.Valid, row.WorkerName.String),
 			OwnerEmail: &email,
 		}
-		item.ForgeType = row.ForgeType // per-run MR/PR noun (PRD #65 D2)
+		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
 		item.IsRevising = revising[row.Run.ID]      // nil map ⇒ false (issue #750)

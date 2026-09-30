@@ -372,8 +372,8 @@ func TestListRunsAttachesUsageOnlyWhenPresent(t *testing.T) {
 	// result renders no usage (never a fake 0).
 	st := &runsStore{
 		userRuns: []store.ListRunsForUserRow{
-			{Run: store.Run{ID: withUsageID, Status: "completed"}, RepoPath: "g/r"},
-			{Run: store.Run{ID: noUsageID, Status: "queued"}, RepoPath: "g/r"}, // no usage rows → absent
+			{Run: store.Run{ID: withUsageID, Status: "completed"}, RepoPath: pgtype.Text{String: "g/r", Valid: true}},
+			{Run: store.Run{ID: noUsageID, Status: "queued"}, RepoPath: pgtype.Text{String: "g/r", Valid: true}}, // no usage rows → absent
 		},
 		runUsageTotals: []store.RunUsageTotal{{
 			RunID: withUsageID, InputTokens: 1200, OutputTokens: 800,
@@ -414,7 +414,7 @@ func TestListRunsAttachesUsageOnlyWhenPresent(t *testing.T) {
 func TestListRunsUsageTotalsErrorIs500(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	st := &runsStore{
-		userRuns:          []store.ListRunsForUserRow{{Run: store.Run{ID: uuid.New(), Status: "completed"}, RepoPath: "g/r"}},
+		userRuns:          []store.ListRunsForUserRow{{Run: store.Run{ID: uuid.New(), Status: "completed"}, RepoPath: pgtype.Text{String: "g/r", Valid: true}}},
 		runUsageTotalsErr: errors.New("boom"),
 	}
 	h := newRunsHandler(t, st)

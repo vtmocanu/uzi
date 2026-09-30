@@ -1547,7 +1547,7 @@ func TestCreateRunInputChatFollowUp409(t *testing.T) {
 func TestListRunsReturnsUsersRuns(t *testing.T) {
 	user := store.User{ID: uuid.New()}
 	st := &runsStore{userRuns: []store.ListRunsForUserRow{
-		{Run: store.Run{ID: uuid.New(), Status: "queued"}, RepoPath: "grp/repo", WorkerName: pgtype.Text{String: "laptop", Valid: true}},
+		{Run: store.Run{ID: uuid.New(), Status: "queued"}, RepoPath: pgtype.Text{String: "grp/repo", Valid: true}, WorkerName: pgtype.Text{String: "laptop", Valid: true}},
 	}}
 	h := newRunsHandler(t, st)
 	rec := httptest.NewRecorder()
@@ -1565,6 +1565,33 @@ func TestListRunsReturnsUsersRuns(t *testing.T) {
 	}
 	if st.lastRunsArg.UserID != user.ID {
 		t.Fatalf("ListRuns must scope to the requesting user")
+	}
+}
+
+// A repo-less job row (NULL repo_path/forge_type after the PRD #1908 LEFT JOINs) renders with
+// empty repo fields, not an error.
+func TestListRunsRepoLessJobRow(t *testing.T) {
+	user := store.User{ID: uuid.New()}
+	st := &runsStore{userRuns: []store.ListRunsForUserRow{{Run: store.Run{ID: uuid.New(), Status: "queued", Kind: runkind.Job}}}}
+	h := newRunsHandler(t, st)
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, "/api/runs", nil)
+	h.ListRuns(rec, req.WithContext(mw.ContextWithUser(req.Context(), user)))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListRuns = %d, want 200", rec.Code)
+	}
+	var body struct {
+		Runs []struct {
+			RepoPath  string `json:"repo_path"`
+			ForgeType string `json:"forge_type"`
+			Kind      string `json:"kind"`
+		} `json:"runs"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if len(body.Runs) != 1 || body.Runs[0].RepoPath != "" || body.Runs[0].ForgeType != "" || body.Runs[0].Kind != runkind.Job {
+		t.Fatalf("job row = %+v, want empty repo fields and kind job", body.Runs)
 	}
 }
 
@@ -1614,7 +1641,7 @@ func TestAdminListWorkersAndRuns(t *testing.T) {
 			{Worker: store.Worker{ID: uuid.New(), Name: "w1", Status: "online"}, Busy: true, ActiveRuns: 1, OwnerEmail: "u@example.com"},
 		},
 		activeRuns: []store.ListActiveRunsAllRow{
-			{Run: store.Run{ID: revisingRun, Status: "awaiting_approval"}, RepoPath: "grp/repo", OwnerEmail: "u@example.com"},
+			{Run: store.Run{ID: revisingRun, Status: "awaiting_approval"}, RepoPath: pgtype.Text{String: "grp/repo", Valid: true}, OwnerEmail: "u@example.com"},
 		},
 		// The run is mid-replan: its latest plan-ish message is a plan_revising, so the admin
 		// list must enrich is_revising the same way ListRuns does (issue #750).

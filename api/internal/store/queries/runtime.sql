@@ -568,8 +568,10 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
        -- distinct from the outer forge_connections c.
        (EXISTS (SELECT 1 FROM recovery_captures c WHERE c.run_id = r.id AND c.user_id = r.user_id AND c.state = 'available'))::boolean AS has_available_capture
 FROM runs r
-JOIN repos rp ON rp.id = r.repo_id
-JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
+-- PRD #1908: LEFT JOINs so a repo-less JOB run (repo_id NULL) is listed with NULL repo_path and
+-- forge_type. Every other listed kind has a repo and a connection, so its row is unchanged.
+LEFT JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2); every repo has a connection
 LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 LEFT JOIN run_reviews rv
@@ -577,9 +579,9 @@ LEFT JOIN run_reviews rv
       AND rv.user_id = r.user_id       -- self-standing owner scope; see the note above
 WHERE r.user_id = @user_id
   -- Exclude chat AND judge (PRD #46): both are repo-less meta-runs the general Runs
-  -- list never shows. self_improve has a real repo and stays visible. The repos
-  -- INNER JOIN already drops the repo-less kinds; this predicate is the explicit,
-  -- refactor-proof guard (a future LEFT JOIN must not leak judge runs here).
+  -- list never shows. self_improve has a real repo and stays visible. The repos join is a
+  -- LEFT JOIN since PRD #1908 (a job run is repo-less and listed), so this predicate is now the
+  -- ONLY thing keeping the repo-less chat and judge meta-runs out (runkind.Listed mirrors it).
   AND r.kind NOT IN ('chat', 'judge')
   AND (sqlc.narg('repo_id')::uuid IS NULL OR r.repo_id = sqlc.narg('repo_id'))
   AND (sqlc.narg('issue_iid')::bigint IS NULL OR r.issue_iid = sqlc.narg('issue_iid'))
@@ -685,8 +687,10 @@ SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name
        -- @background_grace_cutoff (now − RUN_BACKGROUND_GRACE) is the D4 fail-open flag.
        fn_run_priority_class(r.kind, r.priority, r.created_at < @background_grace_cutoff) AS priority_class
 FROM runs r
-JOIN repos rp ON rp.id = r.repo_id
-JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
+-- PRD #1908: LEFT JOINs so a repo-less JOB run (repo_id NULL) is listed with NULL repo_path and
+-- forge_type (see ListRunsForUser).
+LEFT JOIN repos rp ON rp.id = r.repo_id
+LEFT JOIN forge_connections c ON c.id = rp.connection_id   -- forge_type for the per-run MR/PR noun (PRD #65 D2)
 LEFT JOIN issues i ON i.repo_id = r.repo_id AND i.forge_issue_iid = r.issue_iid   -- PRD #411: 1:1 (issues UNIQUE (repo_id, forge_issue_iid)); yields the issue web URL for the run's #<iid> link
 LEFT JOIN workers w ON w.id = r.worker_id
 JOIN users u ON u.id = r.user_id

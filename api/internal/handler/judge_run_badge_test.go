@@ -121,7 +121,7 @@ func runsStoreWithOneRun(t *testing.T) (*runsStore, uuid.UUID) {
 		ownerID: ownerID,
 		userRuns: []store.ListRunsForUserRow{{
 			Run:      store.Run{ID: runID, UserID: ownerID, Status: "completed", Kind: "issue"},
-			RepoPath: "g/r",
+			RepoPath: pgtype.Text{String: "g/r", Valid: true},
 		}},
 	}, runID
 }
