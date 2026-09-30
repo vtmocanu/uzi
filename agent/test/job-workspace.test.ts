@@ -122,6 +122,17 @@ describe("job workspace (PRD #1908 M4)", () => {
     assert.strictEqual(await mode(ws.work), 0o2770, "work is widened just before the session");
   });
 
+  it("creates work/outputs for the agent: 2770 under the uid split (group-writable while work is still closed), 0700 otherwise (PRD #1909 M4)", async () => {
+    const mode = async (p: string) => (await fsp.stat(p)).mode & 0o7777;
+    const split = await createJobWorkspace(await tmpRoot(), randomUUID(), true);
+    assert.strictEqual(split.outputsDir, path.join(split.work, "outputs"));
+    assert.strictEqual(await mode(split.outputsDir), 0o2770);
+    assert.strictEqual(await mode(split.work), 0o2750);
+    const single = await createJobWorkspace(await tmpRoot(), randomUUID(), false);
+    assert.strictEqual(await mode(single.outputsDir), 0o700);
+    assert.deepStrictEqual(await fsp.readdir(single.outputsDir), []);
+  });
+
   it("non-split modes stay 0700/0600 for the worker's own uid", async () => {
     const ws = await createJobWorkspace(await tmpRoot(), randomUUID(), false);
     assert.strictEqual((await fsp.stat(ws.home)).mode & 0o7777, 0o700);

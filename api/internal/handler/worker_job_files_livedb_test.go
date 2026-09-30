@@ -31,6 +31,13 @@ type jobFileRouteEnv struct {
 
 func setupJobFileRouteLiveDB(t *testing.T) *jobFileRouteEnv {
 	t.Helper()
+	return setupJobFileRouteLimitsLiveDB(t, workersvc.JobFileLimits{})
+}
+
+// setupJobFileRouteLimitsLiveDB is setupJobFileRouteLiveDB over a store with the given limits (a
+// zero field takes its default).
+func setupJobFileRouteLimitsLiveDB(t *testing.T, limits workersvc.JobFileLimits) *jobFileRouteEnv {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set")
@@ -47,7 +54,7 @@ func setupJobFileRouteLiveDB(t *testing.T) *jobFileRouteEnv {
 	q := store.New(pool)
 	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
 	svc.SetTxBeginner(pool)
-	jf := workersvc.NewJobFiles(pool, newHandlerTestBox(t), workersvc.JobFileLimits{}, nil)
+	jf := workersvc.NewJobFiles(pool, newHandlerTestBox(t), limits, nil)
 	svc.SetJobFiles(jf)
 	h := &Handler{q: q, wsvc: svc}
 	e := &jobRouteEnv{pool: pool, router: h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil)), tokens: map[uuid.UUID]string{}}

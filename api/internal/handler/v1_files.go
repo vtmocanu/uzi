@@ -111,9 +111,19 @@ const (
 	v1TypeXLSX = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
 	v1TypeText = "text/plain"
 	v1TypeJSON = "application/json"
+	v1TypeHTML = "text/html"
 )
 
-// v1IsTextType reports whether t is one of the UTF-8 text family the input allowlist takes.
+// v1OutputTypes are the extra types a worker OUTPUT may be, on top of v1UploadTypes (PRD #1909 D6:
+// the output allowlist is the input allowlist plus HTML). HTML is stored and served as data
+// (attachment, nosniff, octet-stream); it is never rendered by the API.
+var v1OutputTypes = map[string]string{
+	".html": v1TypeHTML,
+	".htm":  v1TypeHTML,
+}
+
+// v1IsTextType reports whether t is one of the UTF-8 text family the INPUT allowlist takes (HTML is
+// not: only an inspector built with allowHTML takes it, see v1UploadInspector.textType).
 func v1IsTextType(t string) bool {
 	switch t {
 	case v1TypeText, "text/markdown", "text/csv", v1TypeJSON:
@@ -141,10 +151,13 @@ func v1Unsupported(msg string) error { return &v1UploadRefusal{msg: msg} }
 // bounded by the per-file cap the reservation already enforced).
 type v1UploadInspector struct {
 	declared []string // the types the Content-Type and the extension declare; may be empty.
-	detected string
-	text     bool
-	carry    []byte // an incomplete UTF-8 sequence at the end of the previous chunk.
-	json     bytes.Buffer
+	// allowHTML widens the text family with text/html: the worker OUTPUT allowlist. The input
+	// route leaves it false, so an uploaded HTML file is refused exactly as before.
+	allowHTML bool
+	detected  string
+	text      bool
+	carry     []byte // an incomplete UTF-8 sequence at the end of the previous chunk.
+	json      bytes.Buffer
 }
 
 // v1DeclaredTypes returns the types a part declares: its Content-Type (application/octet-stream and
@@ -155,6 +168,16 @@ type v1UploadInspector struct {
 // application/vnd.ms-excel is CSV when the file is named .csv (spreadsheet tools label a CSV that
 // way; the text check still runs over the bytes, so a real workbook is refused).
 func v1DeclaredTypes(partContentType, displayName string) []string {
+	return declaredTypes(partContentType, displayName, false)
+}
+
+// v1OutputDeclaredTypes is v1DeclaredTypes for a worker output: no part Content-Type, and the file
+// name's extension may also declare HTML.
+func v1OutputDeclaredTypes(displayName string) []string {
+	return declaredTypes("", displayName, true)
+}
+
+func declaredTypes(partContentType, displayName string, allowHTML bool) []string {
 	var out []string
 	ext := strings.ToLower(path.Ext(displayName))
 	if ct := strings.TrimSpace(partContentType); ct != "" {
@@ -176,6 +199,8 @@ func v1DeclaredTypes(partContentType, displayName string) []string {
 	}
 	if ext != "" {
 		if t, ok := v1UploadTypes[ext]; ok {
+			out = append(out, t)
+		} else if t, ok := v1OutputTypes[ext]; ok && allowHTML {
 			out = append(out, t)
 		} else {
 			out = append(out, "unsupported/"+ext)
@@ -204,6 +229,11 @@ func v1AllowedExtensions() string {
 	}
 	sort.Strings(exts)
 	return strings.Join(exts, ", ")
+}
+
+// textType reports whether d is in the UTF-8 text family this inspector takes.
+func (in *v1UploadInspector) textType(d string) bool {
+	return v1IsTextType(d) || (in.allowHTML && d == v1TypeHTML)
 }
 
 func (in *v1UploadInspector) Begin(head []byte) (string, error) {
@@ -239,7 +269,7 @@ func (in *v1UploadInspector) Begin(head []byte) (string, error) {
 	// name different specific types (text/plain is the generic one and yields to the other).
 	specific := ""
 	for _, d := range in.declared {
-		if !v1IsTextType(d) {
+		if !in.textType(d) {
 			return "", v1Unsupported("the file's content is text but it was declared as " + v1DeclaredLabel(d))
 		}
 		if d == v1TypeText {
@@ -457,10 +487,7 @@ func (h *Handler) V1FileUpload(w http.ResponseWriter, r *http.Request) {
 	// replacing the server-wide one for this route only, and the write deadline follows it by
 	// v1FileWriteGrace so the response can still be written. A writer that does not support
 	// deadlines (a test recorder) keeps the server's own.
-	deadline := time.Now().Add(jf.Limits().RequestDeadline)
-	rc := http.NewResponseController(w)
-	_ = rc.SetReadDeadline(deadline)
-	_ = rc.SetWriteDeadline(deadline.Add(v1FileWriteGrace))
+	deadline := setJobFileDeadlines(w, jf.Limits().RequestDeadline)
 
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	mr, err := r.MultipartReader()
@@ -526,6 +553,18 @@ func (h *Handler) V1FileUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	httpx.JSON(w, http.StatusCreated, v1FileDTO(stored))
+}
+
+// setJobFileDeadlines applies the job-files request deadline to this route's connection (see the
+// comment at V1FileUpload's call): the read deadline is now + d, the write deadline follows it by
+// v1FileWriteGrace, and the read deadline is returned. Shared by the v1 input upload and the
+// worker output upload.
+func setJobFileDeadlines(w http.ResponseWriter, d time.Duration) time.Time {
+	deadline := time.Now().Add(d)
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(deadline)
+	_ = rc.SetWriteDeadline(deadline.Add(v1FileWriteGrace))
+	return deadline
 }
 
 // writeV1FileError maps a job-file store error. deadline is the request's read deadline: when the

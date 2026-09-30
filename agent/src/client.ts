@@ -67,6 +67,8 @@ import {
   type RecoveryReserveRequest,
   type RecoveryReserveResponse,
   type RecoveryUploadManifest,
+  type JobFileUploadMeta,
+  type JobFileUploadResponse,
   type RecoveryCaptureStatusResponse,
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
@@ -161,6 +163,8 @@ const PR_DESC_MAX_RETRY_AFTER_MS = 60_000;
 
 /** Bound on one whole job-input download (PRD #1909): the api caps a file at 25 MiB by default. */
 const JOB_FILE_DOWNLOAD_TIMEOUT_MS = 300_000;
+/** Default per-request timeout of an output-file upload (the runner passes a size-scaled one). */
+const JOB_FILE_UPLOAD_TIMEOUT_MS = 300_000;
 
 /** HTTP 429 from a pr-description route. Only the stage route carries its own limiter (the
  *  per-worker bucket it shares with proposals and findings), but a 429 on any of the four routes
@@ -1673,6 +1677,49 @@ export class WorkerClient {
       // Release the socket whether the sink finished or threw (a no-op on a fully read body).
       body.destroy();
     }
+  }
+
+  /** Upload one output file of a job (POST /worker/runs/{id}/files, PRD #1909 M4): the raw bytes
+   *  are the body and the metadata rides the `X-Uzi-Job-File` header as compact JSON (the
+   *  X-Uzi-Recovery-Manifest pattern; non-ASCII is escaped as a JSON unicode sequence so the header stays a valid header
+   *  value). `body` is a Buffer (the report and findings, already in memory) or a FACTORY for a
+   *  Readable, called once per attempt so a retry re-reads the file instead of reusing a spent
+   *  stream: a file is never buffered whole. ONE attempt per call (the caller retries, see
+   *  job-outputs.ts); `timeoutMs` bounds the whole request and `signal` aborts it. Resolves with
+   *  the api's status (201 stored, 200 the retry of an already stored file) and the file. Throws
+   *  RequestError on non-2xx (its body is a bounded read): 409 stale claim or finished run, 413
+   *  limit, 415 type, 422 integrity, 503 busy or unavailable, 507 quota. */
+  async uploadJobFile(
+    runId: string,
+    meta: JobFileUploadMeta,
+    body: Buffer | (() => Readable | Promise<Readable>),
+    signal?: AbortSignal,
+    timeoutMs: number = JOB_FILE_UPLOAD_TIMEOUT_MS,
+  ): Promise<{ status: number; file: JobFileUploadResponse }> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/files`;
+    // JSON.stringify leaves non-ASCII as is, which fetch refuses in a header value: escape every
+    // character outside printable ASCII (the JSON unicode escape decodes to the same string).
+    const header = JSON.stringify(meta).replace(/[^\x20-\x7e]/g, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    const init: RequestInit & { duplex?: "half" } = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Job-File": header,
+      },
+      signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(timeoutMs)]) : AbortSignal.timeout(timeoutMs),
+    };
+    if (typeof body === "function") {
+      init.body = Readable.toWeb(await body()) as unknown as ReadableStream;
+      init.duplex = "half";
+    } else {
+      init.body = new Uint8Array(body);
+    }
+    const res = await fetch(this.baseUrl + path, init);
+    if (res.status !== 200 && res.status !== 201) throw await this.toError("POST", path, res);
+    const text = await res.text();
+    return { status: res.status, file: JSON.parse(text) as JobFileUploadResponse };
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).

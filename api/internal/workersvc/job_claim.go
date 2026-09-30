@@ -79,6 +79,14 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	if err := s.q.ClearJobResultForRun(ctx, run.ID); err != nil {
 		return nil, fmt.Errorf("clear earlier job result: %w", err)
 	}
+	// The same for the earlier flight's OUTPUT files and refusal rows (PRD #1909 M4): they belong
+	// to the flight that uploaded them, and the new flight uploads its own. The generation bump
+	// fences a late upload of the old flight (StoreJobOutput re-checks it after its write).
+	if s.jobFiles != nil {
+		if err := s.jobFiles.ClearRunOutputs(ctx, run.ID); err != nil {
+			return nil, fmt.Errorf("clear earlier job outputs: %w", err)
+		}
+	}
 	choice, err := s.claimSecretID(ctx, wkr, run)
 	if err != nil {
 		return nil, jobCredentialErr(err)

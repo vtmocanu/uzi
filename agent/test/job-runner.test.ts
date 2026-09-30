@@ -11,6 +11,7 @@ import type { HookInput, Options as SdkOptions } from "@anthropic-ai/claude-agen
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { WorkerClient } from "../src/client.js";
 import { JobFileTimeoutError, RequestError } from "../src/client.js";
+import type { JobFileUploadMeta, JobFileUploadResponse } from "../src/protocol.js";
 import {
   buildJobPrompt,
   buildJobResultServer,
@@ -66,6 +67,8 @@ interface Calls {
   states: { id: string; body: StateRequest }[];
   messages: { messages: OutgoingMessage[]; generation?: number }[];
   results: { id: string; body: JobResultRequest }[];
+  /** Every uploadJobFile attempt: its metadata and the bytes it sent (drained). */
+  uploads: { id: string; meta: JobFileUploadMeta; bytes: Buffer; streamed: boolean }[];
   acks: number[][];
   applied: number[][];
 }
@@ -74,6 +77,8 @@ function fakeClient(opts: {
   inputs?: () => UserInput[];
   receipts?: boolean;
   postJobResult?: (id: string, body: JobResultRequest) => Promise<void>;
+  /** Decide one upload attempt (default: stored, 201). May throw a RequestError. */
+  uploadJobFile?: (id: string, meta: JobFileUploadMeta, attempt: number) => Promise<{ status: number; file: JobFileUploadResponse }>;
   reportState?: (id: string, body: StateRequest) => unknown;
   downloadJobFile?: (
     id: string,
@@ -84,7 +89,8 @@ function fakeClient(opts: {
     timeoutMs?: number,
   ) => Promise<void>;
 } = {}): { client: WorkerClient; calls: Calls } {
-  const calls: Calls = { order: [], states: [], messages: [], results: [], acks: [], applied: [] };
+  const calls: Calls = { order: [], states: [], messages: [], results: [], uploads: [], acks: [], applied: [] };
+  const attempts = new Map<string, number>();
   const client = {
     reportState: async (id: string, body: StateRequest) => {
       calls.states.push({ id, body });
@@ -119,6 +125,26 @@ function fakeClient(opts: {
       calls.order.push(`download:${fileId}`);
       if (!opts.downloadJobFile) throw new Error("unexpected download");
       await opts.downloadJobFile(id, fileId, generation, sink, signal, timeoutMs);
+    },
+    uploadJobFile: async (
+      id: string,
+      meta: JobFileUploadMeta,
+      body: Buffer | (() => Readable | Promise<Readable>),
+    ) => {
+      let bytes: Buffer;
+      if (Buffer.isBuffer(body)) bytes = body;
+      else {
+        const parts: Buffer[] = [];
+        for await (const chunk of await body()) parts.push(Buffer.from(chunk as Uint8Array));
+        bytes = Buffer.concat(parts);
+      }
+      calls.uploads.push({ id, meta, bytes, streamed: !Buffer.isBuffer(body) });
+      calls.order.push(`upload:${meta.display_name}`);
+      const key = `${meta.display_name}:${meta.sha256}`;
+      const attempt = (attempts.get(key) ?? 0) + 1;
+      attempts.set(key, attempt);
+      if (opts.uploadJobFile) return opts.uploadJobFile(id, meta, attempt);
+      return { status: 201, file: { id: "f", display_name: meta.display_name, storage_name: `${meta.sha256}.txt`, content_type: "text/plain", byte_size: meta.size, sha256: meta.sha256, state: "attached", expires_at: null } };
     },
     hasFeature: () => false,
   } as unknown as WorkerClient;
@@ -156,7 +182,7 @@ function scripted(
 }
 
 function newRunner(client: WorkerClient, jobsRoot: string, queryFn: SdkQueryFn, extra: Record<string, unknown> = {}): JobRunner {
-  return new JobRunner(client, nullLogger(), { queryFn, jobsRoot, batchMs: 5, cancelPollMs: 10, ...extra });
+  return new JobRunner(client, nullLogger(), { queryFn, jobsRoot, batchMs: 5, cancelPollMs: 10, outputRetryDelaysMs: [1, 1], ...extra });
 }
 
 describe("job SDK options: the effective tool surface (PRD #1908 M4)", () => {
@@ -396,7 +422,11 @@ describe("JobRunner (PRD #1908 M4)", () => {
     assert.strictEqual(inputBody, "the document body");
     assert.strictEqual(activeDuringRun, 1, "the job holds a run slot while it runs");
     assert.strictEqual(registry.size, 0, "and releases it at the end");
-    assert.deepStrictEqual(calls.order, ["state:running", "result", "state:completed"], "running first, the result BEFORE completed");
+    assert.deepStrictEqual(
+      calls.order,
+      ["state:running", "upload:report.md", "upload:findings.json", "result", "state:completed"],
+      "running first, the outputs and then the result BEFORE completed",
+    );
     assert.ok(calls.states.every((s) => s.body.claim_generation === GEN), "every state report carries claim_generation");
     assert.deepStrictEqual(calls.results[0]!.body, { claim_generation: GEN, ...GOOD_RESULT });
     assert.ok(calls.messages.length > 0 && calls.messages.every((m) => m.generation === GEN), "messages flow through the batcher stamped with the generation");
@@ -564,7 +594,7 @@ describe("JobRunner (PRD #1908 M4)", () => {
       yield RESULT_OK;
     });
     await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
-    assert.deepStrictEqual(calls.order, ["state:running", "result"]);
+    assert.deepStrictEqual(calls.order, ["state:running", "upload:report.md", "upload:findings.json", "result"]);
   });
 
   it("a rejected result post (400) reports failed and never completed", async () => {
@@ -579,7 +609,7 @@ describe("JobRunner (PRD #1908 M4)", () => {
       yield RESULT_OK;
     });
     await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
-    assert.deepStrictEqual(calls.order, ["state:running", "result", "state:failed"]);
+    assert.deepStrictEqual(calls.order, ["state:running", "upload:report.md", "upload:findings.json", "result", "state:failed"]);
     assert.match(calls.states[1]!.body.failure_reason!, /could not store the job result/);
   });
 
@@ -881,5 +911,229 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
     const last = calls.states.at(-1)!.body;
     assert.strictEqual(last.status, "failed");
     assert.match(last.failure_reason!, /^job input files refused: job input file name is not a storage name/);
+  });
+});
+
+describe("JobRunner output files (PRD #1909 M4)", () => {
+  const sha = (b: string | Buffer): string => createHash("sha256").update(b).digest("hex");
+  const refusal = (status: number, reason: string): RequestError =>
+    new RequestError("POST", "/api/worker/runs/x/files", status, JSON.stringify({ error: "refused", reason }));
+
+  /** A session that writes `files` (relative to the workspace) and submits `result`. */
+  function sessionWriting(files: Record<string, string | Buffer>, result: Record<string, unknown>, after?: (cwd: string) => Promise<void>): SdkQueryFn {
+    return scripted(async function* ({ options }) {
+      const cwd = options.cwd!;
+      for (const [rel, content] of Object.entries(files)) {
+        await fsp.mkdir(path.dirname(path.join(cwd, rel)), { recursive: true });
+        await fsp.writeFile(path.join(cwd, rel), content);
+      }
+      yield INIT_OK;
+      const res = await callSubmit(options, result);
+      assert.strictEqual(res.isError, undefined, JSON.stringify(res));
+      if (after) await after(cwd);
+      yield RESULT_OK;
+    });
+  }
+
+  it("uploads report.md and findings.json (built from the submitted result) before the result post, then the listed files, streaming the files", async () => {
+    const { client, calls } = fakeClient();
+    const big = Buffer.alloc(3 * 1024 * 1024, "x");
+    const qf = sessionWriting(
+      { "outputs/summary.csv": "a,b\n1,2\n", "outputs/deep/blob.txt": big, ["sources/" + sha("src")]: "src" },
+      { ...GOOD_RESULT, output_files: ["outputs/summary.csv", "outputs/deep/blob.txt", "sources/" + sha("src")] },
+    );
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    const names = calls.uploads.map((u) => u.meta.display_name);
+    assert.deepStrictEqual(names, ["report.md", "findings.json", "summary.csv", "blob.txt", sha("src")]);
+    assert.deepStrictEqual(calls.order.slice(0, 1), ["state:running"]);
+    assert.strictEqual(calls.order.indexOf("result"), 6, "every upload precedes the result post");
+    assert.strictEqual(calls.order.at(-1), "state:completed");
+    const [report, findings, csv, blob] = calls.uploads;
+    assert.strictEqual(report!.bytes.toString(), GOOD_RESULT.report_md);
+    assert.deepStrictEqual(JSON.parse(findings!.bytes.toString()), GOOD_RESULT.findings);
+    assert.strictEqual(report!.streamed, false, "the report is in memory already");
+    assert.strictEqual(csv!.streamed, true, "a file is streamed from disk, never handed over whole");
+    assert.strictEqual(blob!.streamed, true);
+    for (const u of calls.uploads) {
+      assert.strictEqual(u.meta.claim_generation, GEN);
+      assert.strictEqual(u.meta.size, u.bytes.length);
+      assert.strictEqual(u.meta.sha256, sha(u.bytes), "the digest is of the exact bytes sent");
+    }
+    assert.strictEqual(blob!.meta.size, big.length);
+    // The posted result never carries output_files: the api refuses unknown fields.
+    assert.deepStrictEqual(calls.results[0]!.body, { claim_generation: GEN, ...GOOD_RESULT });
+  });
+
+  it("with no output_files it still uploads the report and findings, and an empty report is not uploaded", async () => {
+    const { client, calls } = fakeClient();
+    await newRunner(client, await tmpJobsRoot(), sessionWriting({}, { status: "completed", report_md: "" })).execute(jobClaim());
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["findings.json"]);
+    assert.strictEqual(calls.order.at(-1), "state:completed");
+  });
+
+  it("redacts the model credential from the uploaded report and findings", async () => {
+    const { client, calls } = fakeClient();
+    const secret = "sk-fixture-model-credential";
+    const qf = sessionWriting({}, { status: "completed", report_md: `leaked ${secret} here`, findings: [{ severity: "info", message_md: `also ${secret}` }] });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    for (const u of calls.uploads) assert.ok(!u.bytes.toString().includes(secret), `${u.meta.display_name} leaked the credential`);
+  });
+
+  it("a refused upload (413, 415, 422, 507) is logged and the job still completes; the next files are still uploaded", async () => {
+    const { client, calls } = fakeClient({
+      uploadJobFile: async (_id, meta) => {
+        if (meta.display_name === "report.md") throw refusal(507, "owner_quota");
+        if (meta.display_name === "big.txt") throw refusal(413, "file_too_large");
+        if (meta.display_name === "bad.txt") throw refusal(415, "unsupported_file_type");
+        if (meta.display_name === "torn.txt") throw refusal(422, "sha256_mismatch");
+        return { status: 201, file: {} as JobFileUploadResponse };
+      },
+    });
+    const { logger, lines } = recordingLogger();
+    const qf = sessionWriting(
+      { "outputs/big.txt": "1", "outputs/bad.txt": "2", "outputs/torn.txt": "3", "outputs/ok.txt": "4" },
+      { ...GOOD_RESULT, output_files: ["outputs/big.txt", "outputs/bad.txt", "outputs/torn.txt", "outputs/ok.txt"] },
+    );
+    const runner = new JobRunner(client, logger, { queryFn: qf, jobsRoot: await tmpJobsRoot(), batchMs: 5, cancelPollMs: 10, outputRetryDelaysMs: [1, 1] });
+    await runner.execute(jobClaim());
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["report.md", "findings.json", "big.txt", "bad.txt", "torn.txt", "ok.txt"], "no refusal is retried and none stops the rest");
+    assert.strictEqual(calls.order.at(-1), "state:completed", "the job completes");
+    assert.ok(calls.results.length === 1 && calls.states.every((s) => s.body.status !== "failed"));
+    const refused = lines.filter((l) => (l as { msg?: string }).msg === "job output file refused") as Array<{ reason: string; status: number }>;
+    assert.deepStrictEqual(refused.map((l) => l.status), [507, 413, 415, 422]);
+    assert.deepStrictEqual(refused.map((l) => l.reason), ["owner_quota", "file_too_large", "unsupported_file_type", "sha256_mismatch"]);
+  });
+
+  it("retries a transport failure with the bounded backoff, then treats the file as refused: the job still completes", async () => {
+    const { client, calls } = fakeClient({
+      uploadJobFile: async (_id, meta) => {
+        if (meta.display_name === "report.md") throw new TypeError("fetch failed");
+        if (meta.display_name === "findings.json") throw new RequestError("POST", "/x", 503, '{"reason":"uploads_busy"}');
+        return { status: 201, file: {} as JobFileUploadResponse };
+      },
+    });
+    await newRunner(client, await tmpJobsRoot(), sessionWriting({}, GOOD_RESULT)).execute(jobClaim());
+    const attempts = (n: string): number => calls.uploads.filter((u) => u.meta.display_name === n).length;
+    assert.strictEqual(attempts("report.md"), 3, "OUTPUT_UPLOAD_ATTEMPTS attempts, no more");
+    assert.strictEqual(attempts("findings.json"), 3, "a 503 uploads_busy is retried like a transport failure");
+    assert.strictEqual(calls.order.at(-1), "state:completed");
+  });
+
+  it("recovers when a retry succeeds", async () => {
+    const { client, calls } = fakeClient({
+      uploadJobFile: async (_id, _meta, attempt) => {
+        if (attempt === 1) throw new TypeError("fetch failed");
+        return { status: 200, file: {} as JobFileUploadResponse };
+      },
+    });
+    await newRunner(client, await tmpJobsRoot(), sessionWriting({}, GOOD_RESULT)).execute(jobClaim());
+    assert.strictEqual(calls.uploads.length, 4, "each of the two files took two attempts");
+    assert.strictEqual(calls.order.at(-1), "state:completed");
+  });
+
+  it("a 409 stops the uploads: no further file is offered, and the result post is left to be refused the same way", async () => {
+    const { client, calls } = fakeClient({
+      uploadJobFile: async () => {
+        throw new RequestError("POST", "/x", 409, '{"disposition":"stale_claim"}');
+      },
+      postJobResult: async () => {
+        throw new RequestError("POST", "/x", 409, '{"disposition":"stale_claim"}');
+      },
+    });
+    const qf = sessionWriting({ "outputs/a.txt": "a" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt"] });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["report.md"], "one attempt, then nothing more");
+    assert.deepStrictEqual(calls.order, ["state:running", "upload:report.md", "result"], "the stale result post abandons: no completed, no failed");
+  });
+
+  it("stops the uploads when the api takes no files for the run (404, files_unavailable), without retrying", async () => {
+    for (const err of [new RequestError("POST", "/x", 404, "{}"), new RequestError("POST", "/x", 503, '{"reason":"files_unavailable"}')]) {
+      const { client, calls } = fakeClient({ uploadJobFile: async () => { throw err; } });
+      await newRunner(client, await tmpJobsRoot(), sessionWriting({}, GOOD_RESULT)).execute(jobClaim());
+      assert.strictEqual(calls.uploads.length, 1, `status ${err.status}: one attempt`);
+      assert.strictEqual(calls.order.at(-1), "state:completed", "the job still completes");
+    }
+  });
+
+  it("refuses a bad output_files at submit, while the model can fix it: escape, absolute, symlink out, directory, missing, too many", async () => {
+    const jobsRoot = await tmpJobsRoot();
+    const { client } = fakeClient();
+    const outside = path.join(path.dirname(jobsRoot), "outside.txt");
+    await fsp.mkdir(path.dirname(jobsRoot), { recursive: true });
+    await fsp.writeFile(outside, "secret");
+    const verdicts: Record<string, boolean> = {};
+    const qf = scripted(async function* ({ options }) {
+      const cwd = options.cwd!;
+      await fsp.mkdir(path.join(cwd, "outputs/dir"), { recursive: true });
+      await fsp.symlink(outside, path.join(cwd, "outputs/link.txt"));
+      await fsp.symlink(path.join(cwd, "inputs/01-doc.md"), path.join(cwd, "outputs/to-input.txt"));
+      await fsp.writeFile(path.join(cwd, "outputs/ok.txt"), "ok");
+      await fsp.symlink(path.join(cwd, "outputs/ok.txt"), path.join(cwd, "outputs/inner-link.txt"));
+      yield INIT_OK;
+      const cases: Record<string, string[]> = {
+        "dotdot": ["outputs/../inputs/01-doc.md"],
+        "absolute": ["/etc/passwd"],
+        "outside symlink": ["outputs/link.txt"],
+        "symlink to inputs": ["outputs/to-input.txt"],
+        "directory": ["outputs/dir"],
+        "missing": ["outputs/nope.txt"],
+        "not under outputs": ["inputs/01-doc.md"],
+        "too many": Array.from({ length: 51 }, (_, i) => `outputs/f${i}.txt`),
+        "ok": ["outputs/ok.txt"],
+        "symlink inside outputs": ["outputs/inner-link.txt"],
+      };
+      for (const [name, output_files] of Object.entries(cases)) {
+        const r = await callSubmit(options, { ...GOOD_RESULT, output_files });
+        verdicts[name] = r.isError === true;
+      }
+      yield RESULT_OK;
+    });
+    await newRunner(client, jobsRoot, qf).execute(jobClaim());
+    assert.deepStrictEqual(verdicts, {
+      dotdot: true,
+      absolute: true,
+      "outside symlink": true,
+      "symlink to inputs": true,
+      directory: true,
+      missing: true,
+      "not under outputs": true,
+      "too many": true,
+      ok: false,
+      "symlink inside outputs": false,
+    });
+  });
+
+  it("re-checks at upload time: a listed file swapped for an outside symlink after the submit is skipped, the job completes", async () => {
+    const jobsRoot = await tmpJobsRoot();
+    const outside = path.join(path.dirname(jobsRoot), "outside.txt");
+    await fsp.mkdir(path.dirname(jobsRoot), { recursive: true });
+    await fsp.writeFile(outside, "secret");
+    const { client, calls } = fakeClient();
+    const qf = sessionWriting({ "outputs/a.txt": "a" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt"] }, async (cwd) => {
+      await fsp.rm(path.join(cwd, "outputs/a.txt"));
+      await fsp.symlink(outside, path.join(cwd, "outputs/a.txt"));
+    });
+    await newRunner(client, jobsRoot, qf).execute(jobClaim());
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["report.md", "findings.json"]);
+    assert.strictEqual(calls.order.at(-1), "state:completed");
+  });
+
+  it("creates outputs/ in the workspace before the session", async () => {
+    const { client } = fakeClient();
+    let isDir = false;
+    const qf = scripted(async function* ({ options }) {
+      isDir = (await fsp.stat(path.join(options.cwd!, "outputs"))).isDirectory();
+      yield INIT_OK;
+      await callSubmit(options, GOOD_RESULT);
+      yield RESULT_OK;
+    });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    assert.ok(isDir);
+  });
+
+  it("tells the model about outputs/ and output_files", () => {
+    const { server } = buildJobResultServer({});
+    const tools = (server as unknown as { instance: { _registeredTools: Record<string, { description?: string }> } }).instance._registeredTools;
+    assert.match(tools["submit_job_result"]!.description ?? "", /output_files/);
   });
 });

@@ -1031,6 +1031,29 @@ export interface JobResultRequest {
   findings: JobFindingBody[];
 }
 
+/** The metadata of one output-file upload (PRD #1909 M4): the `X-Uzi-Job-File` header of
+ *  POST /worker/runs/{id}/files, whose body is the file's raw bytes. `claim_generation` is the
+ *  fence, `size` and `sha256` are what the api verifies against the streamed bytes. */
+export interface JobFileUploadMeta {
+  claim_generation: number;
+  display_name: string;
+  size: number;
+  sha256: string;
+}
+
+/** The api's answer to a stored output (mirrors apitypes.V1FileDTO): 201 for a new file, 200
+ *  when a retry found the file its first attempt stored. */
+export interface JobFileUploadResponse {
+  id: string;
+  display_name: string;
+  storage_name: string;
+  content_type: string;
+  byte_size: number;
+  sha256: string;
+  state: string;
+  expires_at: string | null;
+}
+
 /** One named input document of a job (PRD #1908). */
 export interface ClaimJobInput {
   name: string;

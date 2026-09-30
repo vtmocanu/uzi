@@ -225,3 +225,44 @@ SELECT id, storage_name, display_name, byte_size, sha256, content_type
   FROM job_files
  WHERE run_id = @run_id AND direction = 'input' AND state = 'attached'
  ORDER BY created_at ASC, id ASC;
+
+-- name: FindJobOutputFile :one
+-- Output upload idempotency (PRD #1909 M4): a retried POST of the same content under the same
+-- display name for the same run and claim generation finds the file the first attempt stored, so
+-- the retry stores nothing twice and is not charged against the per-job caps again. Only a
+-- committed file ('attached' while the job runs, 'available' after) matches; a reservation still
+-- streaming does not.
+SELECT * FROM job_files
+ WHERE run_id = @run_id AND direction = 'output' AND claim_generation = @claim_generation
+   AND state IN ('attached', 'available')
+   AND sha256 = @sha256 AND display_name = @display_name
+ ORDER BY created_at ASC, id ASC
+ LIMIT 1;
+
+-- name: InsertJobOutputRefusal :execrows
+-- Records one refused output (PRD #1909 D4). Bounded: nothing is inserted once the run already
+-- has @max_rows refusal rows (the per-job output file cap), and an identical refusal (same name,
+-- size and reason) is recorded once, so a retried refused upload does not fill the table. The
+-- result is the number of rows inserted (0 or 1); a refusal that is not recorded is still a
+-- refusal. The bound is checked in the statement, not under a lock: uploads for one run are
+-- sequential from its worker, and concurrent ones can overshoot by at most the upload slot count.
+INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason)
+SELECT @run_id::uuid, @display_name::text, @byte_size::bigint, @reason::text
+ WHERE (SELECT count(*) FROM job_output_refusals WHERE run_id = @run_id::uuid) < @max_rows::bigint
+   AND NOT EXISTS (SELECT 1 FROM job_output_refusals
+                    WHERE run_id = @run_id::uuid AND display_name = @display_name::text
+                      AND byte_size = @byte_size::bigint AND reason = @reason::text);
+
+-- name: DeleteJobOutputFilesForRun :execrows
+-- Re-claim (PRD #1909 M4): drops every output row of the run, in any state, so the new flight
+-- starts with none of an earlier flight's. The chunks cascade.
+DELETE FROM job_files WHERE run_id = @run_id AND direction = 'output';
+
+-- name: DeleteJobOutputRefusalsForRun :execrows
+DELETE FROM job_output_refusals WHERE run_id = @run_id;
+
+-- name: DeleteJobOutputFile :execrows
+-- Drops one output of a run whose upload finished after its claim went stale (the fence re-check
+-- after the write). Scoped to the run and the uploading generation.
+DELETE FROM job_files
+ WHERE id = @id AND run_id = @run_id AND direction = 'output' AND claim_generation = @claim_generation;

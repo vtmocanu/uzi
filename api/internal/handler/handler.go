@@ -1252,6 +1252,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// (a job is not a lane run yet; PRD #1906 M8 adds the route when jobs move to the lane).
 		r.Get("/runs/{id}/files/{fileID}", h.WorkerJobInputFile)
 
+		// Job output upload (PRD #1909 D4, M4): the worker stores the report, the findings JSON
+		// and the files it kept before it posts the result. Raw body + X-Uzi-Job-File metadata
+		// header; fenced exactly like the job-result route, BEFORE the body is read. Also NOT in
+		// laneWorkerAllowlist, for the same reason as the download above.
+		r.Post("/runs/{id}/files", h.WorkerJobOutputFile)
+
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's
 		// user_id (a foreign run id is 404), never a bare run_id lookup.

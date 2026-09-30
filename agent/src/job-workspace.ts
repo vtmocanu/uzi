@@ -8,6 +8,8 @@
 //     work/                         the SDK cwd and the path-guard root
 //       inputs/NN-<name>            the caller's named input documents
 //       inputs/<sha256>.<ext>       an uploaded input file (PRD #1909), read-only, content-named
+//       outputs/                    where the agent writes deliverable files (PRD #1909 M4); the
+//                                   runner uploads the ones submit_job_result lists
 //
 // Under the PRD #51 uid split (UZI_UID_SPLIT=1) the SDK CLI runs as the `runner` uid while this
 // worker process creates the tree, so 0700 would lock the CLI out of its own HOME, cwd and
@@ -106,6 +108,8 @@ export interface JobWorkspace {
   work: string;
   /** `work/inputs`. */
   inputsDir: string;
+  /** `work/outputs`: the agent's deliverables (PRD #1909 M4), writable by the agent. */
+  outputsDir: string;
 }
 
 /** Refusal of an unsafe input name or a write that escaped the workspace. */
@@ -158,7 +162,7 @@ async function assertRealJobsRoot(jobsRoot: string): Promise<void> {
   }
 }
 
-/** Create `<jobsRoot>/<runId>` (0700 single-uid; under the uid split the setgid codex-session modes: root 2750, home 2770, work 2750 then 2770, inputs 2750, files 0640) with its home/work/inputs subtree. A leftover tree for the
+/** Create `<jobsRoot>/<runId>` (0700 single-uid; under the uid split the setgid codex-session modes: root 2750, home 2770, work 2750 then 2770, inputs 2750, outputs 2770, files 0640) with its home/work/inputs/outputs subtree. A leftover tree for the
  *  same run id (a requeue on this worker after a hard kill) is removed first. */
 export async function createJobWorkspace(
   jobsRoot: string,
@@ -176,15 +180,21 @@ export async function createJobWorkspace(
   const home = path.join(root, "home");
   const work = path.join(root, "work");
   const inputsDir = path.join(work, "inputs");
+  const outputsDir = path.join(work, "outputs");
   await fs.mkdir(home, { mode: m.home });
   await fs.mkdir(work, { mode: m.work });
   await fs.mkdir(inputsDir, { mode: m.inputs });
+  await fs.mkdir(outputsDir, { mode: m.workOpen });
   // mkdir's mode is masked by the umask and drops setgid: set the final modes explicitly.
   await fs.chmod(root, m.root);
   await fs.chmod(home, m.home);
   await fs.chmod(work, m.work);
   await fs.chmod(inputsDir, m.inputs);
-  return { root, home, work, inputsDir };
+  // The agent writes here (under the uid split it is the runner uid, in the setgid group): the
+  // session mode of work itself. The parent stays closed until openJobWorkspace, so nothing can
+  // swap this directory for a link before the session starts.
+  await fs.chmod(outputsDir, m.workOpen);
+  return { root, home, work, inputsDir, outputsDir };
 }
 
 /** Write each input to `inputs/NN-<name>` and return the relative paths (`inputs/NN-<name>`) in

@@ -70,6 +70,53 @@ func (q *Queries) AttachInputJobFiles(ctx context.Context, arg AttachInputJobFil
 	return items, nil
 }
 
+const deleteJobOutputFile = `-- name: DeleteJobOutputFile :execrows
+DELETE FROM job_files
+ WHERE id = $1 AND run_id = $2 AND direction = 'output' AND claim_generation = $3
+`
+
+type DeleteJobOutputFileParams struct {
+	ID              uuid.UUID   `json:"id"`
+	RunID           pgtype.UUID `json:"run_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+}
+
+// Drops one output of a run whose upload finished after its claim went stale (the fence re-check
+// after the write). Scoped to the run and the uploading generation.
+func (q *Queries) DeleteJobOutputFile(ctx context.Context, arg DeleteJobOutputFileParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteJobOutputFile, arg.ID, arg.RunID, arg.ClaimGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteJobOutputFilesForRun = `-- name: DeleteJobOutputFilesForRun :execrows
+DELETE FROM job_files WHERE run_id = $1 AND direction = 'output'
+`
+
+// Re-claim (PRD #1909 M4): drops every output row of the run, in any state, so the new flight
+// starts with none of an earlier flight's. The chunks cascade.
+func (q *Queries) DeleteJobOutputFilesForRun(ctx context.Context, runID pgtype.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteJobOutputFilesForRun, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteJobOutputRefusalsForRun = `-- name: DeleteJobOutputRefusalsForRun :execrows
+DELETE FROM job_output_refusals WHERE run_id = $1
+`
+
+func (q *Queries) DeleteJobOutputRefusalsForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteJobOutputRefusalsForRun, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const expireJobFiles = `-- name: ExpireJobFiles :one
 WITH upd AS (
     UPDATE job_files SET state = 'expired', updated_at = now()
@@ -129,6 +176,56 @@ func (q *Queries) FinalizeJobFile(ctx context.Context, arg FinalizeJobFileParams
 		arg.ChunkCount,
 		arg.ExpiresAt,
 		arg.ID,
+	)
+	var i JobFile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ProductID,
+		&i.RunID,
+		&i.Direction,
+		&i.ClaimGeneration,
+		&i.StorageName,
+		&i.DisplayName,
+		&i.ContentType,
+		&i.ByteSize,
+		&i.Sha256,
+		&i.ChunkCount,
+		&i.State,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
+const findJobOutputFile = `-- name: FindJobOutputFile :one
+SELECT id, user_id, product_id, run_id, direction, claim_generation, storage_name, display_name, content_type, byte_size, sha256, chunk_count, state, expires_at, created_at, updated_at FROM job_files
+ WHERE run_id = $1 AND direction = 'output' AND claim_generation = $2
+   AND state IN ('attached', 'available')
+   AND sha256 = $3 AND display_name = $4
+ ORDER BY created_at ASC, id ASC
+ LIMIT 1
+`
+
+type FindJobOutputFileParams struct {
+	RunID           pgtype.UUID `json:"run_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	Sha256          pgtype.Text `json:"sha256"`
+	DisplayName     string      `json:"display_name"`
+}
+
+// Output upload idempotency (PRD #1909 M4): a retried POST of the same content under the same
+// display name for the same run and claim generation finds the file the first attempt stored, so
+// the retry stores nothing twice and is not charged against the per-job caps again. Only a
+// committed file ('attached' while the job runs, 'available' after) matches; a reservation still
+// streaming does not.
+func (q *Queries) FindJobOutputFile(ctx context.Context, arg FindJobOutputFileParams) (JobFile, error) {
+	row := q.db.QueryRow(ctx, findJobOutputFile,
+		arg.RunID,
+		arg.ClaimGeneration,
+		arg.Sha256,
+		arg.DisplayName,
 	)
 	var i JobFile
 	err := row.Scan(
@@ -248,6 +345,43 @@ func (q *Queries) InsertJobFileChunk(ctx context.Context, arg InsertJobFileChunk
 		arg.Sealed,
 	)
 	return err
+}
+
+const insertJobOutputRefusal = `-- name: InsertJobOutputRefusal :execrows
+INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason)
+SELECT $1::uuid, $2::text, $3::bigint, $4::text
+ WHERE (SELECT count(*) FROM job_output_refusals WHERE run_id = $1::uuid) < $5::bigint
+   AND NOT EXISTS (SELECT 1 FROM job_output_refusals
+                    WHERE run_id = $1::uuid AND display_name = $2::text
+                      AND byte_size = $3::bigint AND reason = $4::text)
+`
+
+type InsertJobOutputRefusalParams struct {
+	RunID       uuid.UUID `json:"run_id"`
+	DisplayName string    `json:"display_name"`
+	ByteSize    int64     `json:"byte_size"`
+	Reason      string    `json:"reason"`
+	MaxRows     int64     `json:"max_rows"`
+}
+
+// Records one refused output (PRD #1909 D4). Bounded: nothing is inserted once the run already
+// has @max_rows refusal rows (the per-job output file cap), and an identical refusal (same name,
+// size and reason) is recorded once, so a retried refused upload does not fill the table. The
+// result is the number of rows inserted (0 or 1); a refusal that is not recorded is still a
+// refusal. The bound is checked in the statement, not under a lock: uploads for one run are
+// sequential from its worker, and concurrent ones can overshoot by at most the upload slot count.
+func (q *Queries) InsertJobOutputRefusal(ctx context.Context, arg InsertJobOutputRefusalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertJobOutputRefusal,
+		arg.RunID,
+		arg.DisplayName,
+		arg.ByteSize,
+		arg.Reason,
+		arg.MaxRows,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const listJobInputFilesForClaim = `-- name: ListJobInputFilesForClaim :many
