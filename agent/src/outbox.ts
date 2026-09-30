@@ -1436,8 +1436,12 @@ export class Outbox {
         throw err;
       }
     }
-    await this.fsyncDir(path.dirname(dst), kind === "finalize");
-    await fs.rm(tmp, { force: true }).catch(() => undefined);
+    try {
+      await this.fsyncDir(path.dirname(dst), kind === "finalize");
+    } finally {
+      // The installed destination stays intact even when strict directory fsync fails.
+      await fs.rm(tmp, { force: true }).catch(() => undefined);
+    }
     return adopted;
   }
 

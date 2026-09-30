@@ -49,6 +49,11 @@ describe("issue #1742 finalize durability at the filesystem boundary", () => {
       assert.equal(result.written, false);
       assert.equal(msgs(lines).includes("finalize record durable"), false);
       assert.deepEqual(outbox.listPendingFinalizes(), []);
+      const files = await fsp.readdir(path.join(root, RUN_A));
+      assert.equal(files.some((name) => name.endsWith(".tmp")), false, "the temporary hard link is cleaned up");
+      if (location === "run") {
+        assert.ok(files.includes("finalize-3.json"), "the installed destination survives the fsync failure");
+      }
     });
   }
 

@@ -29,6 +29,17 @@ func TestFinalizeResumeAllowanceCompletesOnlyAtNewGenerationLiveDB(t *testing.T)
 		t.Fatalf("after Register status = %q, want queued", got)
 	}
 
+	var allowanceGeneration int64
+	var requeues int32
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT COALESCE(finalize_resume_generation, -1), requeue_count FROM runs WHERE id = $1`, runID).
+		Scan(&allowanceGeneration, &requeues); err != nil {
+		t.Fatalf("read allowance provenance: %v", err)
+	}
+	if allowanceGeneration != 1 || requeues != 2 {
+		t.Fatalf("after Register finalize_resume_generation=%d requeue_count=%d, want 1/2", allowanceGeneration, requeues)
+	}
+
 	wkr, err := e.q.GetWorkerByID(e.ctx, wid)
 	if err != nil {
 		t.Fatalf("GetWorkerByID: %v", err)
