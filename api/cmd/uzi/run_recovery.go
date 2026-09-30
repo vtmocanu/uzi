@@ -35,11 +35,13 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"with exact run and hold ids, disposition, archive availability, worker, age, and the " +
 			"owner-wide custody summary. With a run id, show that run's retained holds: each hold's exact id, " +
 			"claim generation, server-derived disposition, and the latest capture's state.\n\n" +
-			"Owner-only: you see only your own runs' holds. A disposition of `source_only` or " +
-			"`needs_action` awaits your decision — recover the archive with `run export` when one " +
-			"is available, or discard the held source with `run discard <run-id> --hold <hold-id> " +
-			"--yes`. An `archive_ready` hold releases itself once its archive is durable; `active` is " +
-			"healthy protection of a still-running run and needs nothing.\n\n" +
+			"Owner-only: you see only your own runs' holds. An `archive_ready` hold has a recovery " +
+			"archive: recover it with `run export`; the hold releases itself once the archive is " +
+			"durable. A `source_only` or `needs_action` hold has no archive and awaits your " +
+			"decision to discard it with `run discard <run-id> --hold <hold-id> --yes`. `source_only` " +
+			"means no archive exists and custody of the worker's local source is retained: it may be " +
+			"the only copy, so discarding it can destroy the work. `active` is healthy protection " +
+			"of a still-running run and needs nothing.\n\n" +
 			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
 			"plus a `captures` array listing that hold's " +
@@ -129,7 +131,7 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		if h.Attention == "source_only" || h.Attention == "needs_action" {
 			decisionNeeded++
 		}
-		if h.State == "open" && h.HasAvailableCapture {
+		if h.HasAvailableCapture {
 			exportable++
 		}
 		rows = append(rows, []string{
@@ -149,8 +151,13 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 	p.Printf("open_holds: %d  custody_hold_limit: %d  decision_needed: %d  blocked_runs: %d\n",
 		a.OpenHolds, a.CustodyHoldLimit, a.DecisionNeeded, a.BlockedRuns)
 	if !gf.quiet {
+		first := true
 		for _, h := range open {
 			if line := sourceOnlyLine(h); line != "" {
+				if first {
+					p.Printf("\n")
+					first = false
+				}
 				p.Printf("run %s %s\n", cellText(h.RunID), line)
 			}
 		}
@@ -166,7 +173,7 @@ func sourceOnlyLine(h apitypes.RecoveryCustodyHoldDTO) string {
 	if h.Attention != "source_only" {
 		return ""
 	}
-	return fmt.Sprintf("hold %s: no recovery archive; custody of worker %s's local source is retained (export unavailable)",
+	return fmt.Sprintf("hold %s: no recovery archive; custody of worker %s's local source is retained (export unavailable; it may be the only copy)",
 		cellText(h.ID), cellText(recoveryWorkerLabel(h)))
 }
 
@@ -270,7 +277,7 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		if h.Attention == "source_only" || h.Attention == "needs_action" {
 			decisionNeeded++
 		}
-		if h.State == "open" && h.HasAvailableCapture {
+		if h.HasAvailableCapture {
 			exportable++
 		}
 		rows = append(rows, []string{
@@ -292,9 +299,6 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 	}
 	if !gf.quiet {
 		for _, h := range holds {
-			if h.State != "open" {
-				continue
-			}
 			if line := sourceOnlyLine(h); line != "" {
 				p.Printf("%s\n", line)
 			}
