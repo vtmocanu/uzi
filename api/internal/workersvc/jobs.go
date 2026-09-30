@@ -81,7 +81,7 @@ const (
 	maxJobFailureReasonBytes = 500
 )
 
-// jobInputNameRE mirrors the job_inputs.name CHECK (00271); '..' is rejected separately.
+// jobInputNameRE mirrors the job_inputs.name CHECK (00275); '..' is rejected separately.
 var jobInputNameRE = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$`)
 
 // JobCaller identifies who is acting on a job. ProductID nil is a uzc_ (CLI/user token) caller,

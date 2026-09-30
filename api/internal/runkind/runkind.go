@@ -5,7 +5,7 @@
 // The authoritative set lives in the database: the runs_kind_check CHECK
 // constraint, redefined by the highest-numbered migration under
 // api/internal/store/migrations/ that touches it (today
-// 00271_run_job_kind.sql). The constants and All() below mirror that
+// 00275_run_job_kind.sql). The constants and All() below mirror that
 // constraint in DB CHECK order; runkind_migration_test.go reads the live
 // migration and fails if the two ever drift, in either direction and in order.
 //

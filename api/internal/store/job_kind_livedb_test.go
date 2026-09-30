@@ -14,7 +14,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Live-DB coverage for PRD #1908 M1 (migration 00271): the repo-less `job` run kind, its
+// Live-DB coverage for PRD #1908 M1 (migration 00275): the repo-less `job` run kind, its
 // job_type discriminator, the four job tables and products.allowed_job_types. Skipped unless
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres; run via e2e/run-store-it.sh.
 
@@ -257,7 +257,7 @@ func TestJobTypesMatchDBChecksLiveDB(t *testing.T) {
 }
 
 // TestFnWorkerCanClaimNeverAdmitsDockerJobLiveDB: fn_worker_can_claim is deliberately unchanged
-// by migration 00271. A docker worker admits only allow-listed repos plus repo-less JUDGE runs,
+// by migration 00275. A docker worker admits only allow-listed repos plus repo-less JUDGE runs,
 // so a repo-less job is not admitted. The function can return NULL (a NULL run_repo_id makes the
 // allow-list arm NULL), so the result is scanned into a nullable bool and asserted IS NOT TRUE.
 func TestFnWorkerCanClaimNeverAdmitsDockerJobLiveDB(t *testing.T) {

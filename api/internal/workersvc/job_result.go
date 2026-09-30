@@ -16,7 +16,7 @@ import (
 // job_result.go is the worker's job-result ingest (PRD #1908): the one structured result a
 // `job` run posts before it reports `completed`, and the no-result invariant that backs it.
 
-// Job-result bounds. The job_results / job_findings CHECKs (migration 00271) are the backstop;
+// Job-result bounds. The job_results / job_findings CHECKs (migration 00275) are the backstop;
 // these are the ingest caps the handler enforces before anything is persisted.
 const (
 	JobResultMaxFindings         = 200
