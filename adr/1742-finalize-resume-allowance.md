@@ -319,21 +319,26 @@ later checks that are expected to fail (step 1's "no durable line yet", the pre-
 `terminal-<G>.json`") do not end the session. (With `pipefail` on, a `kubectl logs ... | grep -q`
 pipe would also turn a MATCH into rc 141; but do not use that pipe form for checks at all, see
 below: with `pipefail` off it reads a failed log read as "no match".)
-It also turns job control off (`set +m`), so Ctrl-C during a running command (a wait loop, a
-rollout) reaches the shell and runs the cleanup, not only the foreground command. Judge each
-check's result yourself and, to abort an attempt, run `exit 1` (the trap then cleans up). Once
-the trap is installed, Ctrl-C (INT), `exit`, a closed terminal (HUP) or TERM all end the attempt
-and run the cleanup; on a signal that arrives while a command is running, the cleanup starts when
-that command returns. **So every wait in steps 1 to 10 must be time-limited**: a loop of short `sleep`s with a
-bounded number of rounds, or `timeout --foreground <N> <command>` (without `--foreground`,
-`timeout` runs the command in its own process group and a Ctrl-C then waits out the full N);
-never `kubectl logs -f` or an unbounded wait. The sketch's own rollouts are capped at
-`--timeout=300s`. When a bound expires, either repeat the bounded wait or abort with `exit 1`;
-an expired wait is never a pass. A terminal closed at an idle prompt may be seen as end-of-input
-rather than a hangup; the cleanup still runs completely, but then exits with the last command's
-status (or 1 if the cleanup failed) and logs that status, not 129. The cleanup writes its actions
-and verification results to `CLEANUP_LOG` (and to the terminal if it is still there): read that
-file after an attempt that ended by a closed terminal.
+It also turns job control off (`set +m`), so a Ctrl-C is delivered to the shell as well as to the
+running command. Bash runs the `INT` trap (the cleanup) only when that command itself dies of the
+signal: a plain `sleep`, a loop of short `sleep`s, or `timeout --foreground` all do. A command that
+catches Ctrl-C and exits normally instead (kubectl's own interrupt handling can do this, and plain
+`timeout` without `--foreground` never passes the Ctrl-C on) returns you to the prompt WITHOUT any
+cleanup. **The only proof that cleanup ran is a `cleanup done` line**, printed on the terminal and
+written to `CLEANUP_LOG`: if a Ctrl-C returns you to a prompt without it, run `exit 1`. Judge each
+check's result yourself and, to abort an attempt, run `exit 1` (the trap then cleans up). Once the
+trap is installed, `exit`, a closed terminal (HUP), TERM, and a Ctrl-C that kills the running
+command all run the cleanup; a signal that arrives while a command is running is acted on when
+that command returns. **So every wait in steps 1 to 10 must be time-limited**: a loop of short
+`sleep`s with a bounded number of rounds, or `timeout --foreground <N> <command>`; never
+`kubectl logs -f` or an unbounded wait. The sketch's own rollouts are capped at `--timeout=300s`.
+When a bound expires, either repeat the bounded wait or abort with `exit 1`; an expired wait is
+never a pass. A terminal closed at an idle prompt may be seen as end-of-input rather than a
+hangup; the cleanup still runs completely, but then exits with the last command's status (or 1
+if that status was 0 and the cleanup failed) and logs that status, not 129. The cleanup writes its
+actions and verification results to `CLEANUP_LOG` (and to the terminal if it is still there):
+read that file after every attempt, and treat a missing `cleanup done failed=0` line as a cleanup
+that did not complete (run the dead-shell fallback below).
 
 Because `pipefail` is off, a failed read looks like "no match". **Every check must fail closed on
 a read error**: capture the output first and check the read succeeded, then match on the captured
@@ -372,8 +377,8 @@ that separates "absent" from an exec error, e.g. `kubectl exec <scratch-pod> -c 
 ### Cleanup contract (install it first)
 
 The order is fixed: **record the prior state, install the trap, then change the setting and apply
-the deny rule.** The trap fires on `EXIT`, `INT`, `TERM` and `HUP`, so success, failure, interrupt (Ctrl-C, which
-reaches the shell because the sketch turns job control off), a closed terminal, an `exit` to abort, and (during step 0, while
+the deny rule.** The trap fires on `EXIT`, `INT`, `TERM` and `HUP`, so success, failure, interrupt (a Ctrl-C that kills the running command;
+see the one-shell paragraph above for when it does not), a closed terminal, an `exit` to abort, and (during step 0, while
 `errexit` is still on) a `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
 **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
 restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt, or
@@ -446,8 +451,8 @@ trap 'cleanup 129' HUP
 kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
 kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
-set +m               # no job control: Ctrl-C during a running command then reaches THIS shell,
-                     # so the INT trap (cleanup) fires; with job control only the command stops.
+set +m               # no job control: Ctrl-C also reaches THIS shell; the INT trap (cleanup) fires
+                     # when the running command dies of it. Check for the "cleanup done" line.
 set +e +u +o pipefail   # errexit/nounset/pipefail only guard the raise above. Later steps run
                      # checks that are EXPECTED to fail (no durable line yet, no terminal-<G>.json),
                      # and pipefail would turn `kubectl logs ... | grep -q ...` into rc 141
