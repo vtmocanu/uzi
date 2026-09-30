@@ -70,11 +70,45 @@ func (q *Queries) AttachInputJobFiles(ctx context.Context, arg AttachInputJobFil
 	return items, nil
 }
 
+const clearGeneratedOutputRefusal = `-- name: ClearGeneratedOutputRefusal :execrows
+DELETE FROM job_output_refusals
+ WHERE run_id = $1::uuid
+   AND display_name = $2::text
+   AND post_id = $3::bigint
+   AND EXISTS (SELECT 1 FROM runs
+                WHERE id = $1::uuid AND claim_generation = $4::bigint
+                  AND claim_released_at IS NULL)
+`
+
+type ClearGeneratedOutputRefusalParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	DisplayName     string    `json:"display_name"`
+	PostID          int64     `json:"post_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Deletes the row post @post_id owns for one name, once its file is stored. Scoped to the post: an
+// older post's generation finishing after a newer post took over the names matches nothing, so it
+// cannot clear the newer post's marker (the file of a superseded post is not what the marker
+// promises). Fenced like the insert.
+func (q *Queries) ClearGeneratedOutputRefusal(ctx context.Context, arg ClearGeneratedOutputRefusalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, clearGeneratedOutputRefusal,
+		arg.RunID,
+		arg.DisplayName,
+		arg.PostID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteGeneratedOutputRefusals = `-- name: DeleteGeneratedOutputRefusals :execrows
 DELETE FROM job_output_refusals
  WHERE run_id = $1::uuid
    AND display_name = ANY($2::text[])
-   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND post_id IS NOT NULL
    AND EXISTS (SELECT 1 FROM runs
                 WHERE id = $1::uuid AND claim_generation = $3::bigint
                   AND claim_released_at IS NULL)
@@ -86,13 +120,13 @@ type DeleteGeneratedOutputRefusalsParams struct {
 	ClaimGeneration int64     `json:"claim_generation"`
 }
 
-// Clears the refusal rows the server's own output generation owns for the given names (PRD #1909
-// M4): the generation_pending marker, a generation_failed / generation_timeout row, or a refusal
-// the generation recorded (file_too_large, a quota). NOT the worker's own rows: a worker-reported
-// drop (reason worker_*) and the reserved_name refusal of an upload under a reserved name stay.
-// Used to rewrite the markers when a result is (re-)posted, and to clear one when its file is
-// stored. FENCED like InsertJobOutputRefusal: a no-op unless @claim_generation is the run's CURRENT
-// generation and the claim is not released, so a stale flight cannot clear the new flight's rows.
+// Clears every refusal row the server's own output generation owns (post_id IS NOT NULL: the
+// generation_pending marker, a generation_failed / generation_timeout row, or a refusal the
+// generation recorded such as file_too_large or a quota) for the given names, whichever post wrote
+// it (PRD #1909 M4). NOT the worker's own rows: a worker-reported drop and the reserved_name
+// refusal carry no post_id and stay. Used when a result is (re-)posted: the new post takes over the
+// names, so an earlier post's rows go with it. FENCED: a no-op unless @claim_generation is the
+// run's CURRENT generation and the claim is not released.
 func (q *Queries) DeleteGeneratedOutputRefusals(ctx context.Context, arg DeleteGeneratedOutputRefusalsParams) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteGeneratedOutputRefusals, arg.RunID, arg.DisplayNames, arg.ClaimGeneration)
 	if err != nil {
@@ -397,6 +431,63 @@ func (q *Queries) GetOwnedJobRun(ctx context.Context, arg GetOwnedJobRunParams) 
 	return id, err
 }
 
+const hasGeneratedOutputMarker = `-- name: HasGeneratedOutputMarker :one
+SELECT EXISTS (SELECT 1 FROM job_output_refusals
+                WHERE run_id = $1::uuid AND display_name = $2::text
+                  AND post_id = $3::bigint)::boolean
+`
+
+type HasGeneratedOutputMarkerParams struct {
+	RunID       uuid.UUID `json:"run_id"`
+	DisplayName string    `json:"display_name"`
+	PostID      int64     `json:"post_id"`
+}
+
+// Whether post @post_id still owns a row for the name: false means a newer post of the run took
+// over the names (or a re-claim cleared them), so the post's generation is superseded and must not
+// store its file (PRD #1909 M4).
+func (q *Queries) HasGeneratedOutputMarker(ctx context.Context, arg HasGeneratedOutputMarkerParams) (bool, error) {
+	row := q.db.QueryRow(ctx, hasGeneratedOutputMarker, arg.RunID, arg.DisplayName, arg.PostID)
+	var column_1 bool
+	err := row.Scan(&column_1)
+	return column_1, err
+}
+
+const insertGeneratedOutputMarker = `-- name: InsertGeneratedOutputMarker :execrows
+INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason, post_id)
+SELECT $1::uuid, $2::text, 0, $3::text, $4::bigint
+ WHERE EXISTS (SELECT 1 FROM runs
+                WHERE id = $1::uuid AND claim_generation = $5::bigint
+                  AND claim_released_at IS NULL)
+`
+
+type InsertGeneratedOutputMarkerParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	DisplayName     string    `json:"display_name"`
+	Reason          string    `json:"reason"`
+	PostID          int64     `json:"post_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Writes the generation_pending marker of one generated output (PRD #1909 M4), owned by the post
+// @post_id. NOT bounded by the per-run refusal cap (InsertJobOutputRefusal): a run has at most one
+// marker or outcome row per reserved name, because every post first deletes the earlier post's rows
+// (DeleteGeneratedOutputRefusals) in the same transaction. FENCED on the claim generation like the
+// other refusal writes.
+func (q *Queries) InsertGeneratedOutputMarker(ctx context.Context, arg InsertGeneratedOutputMarkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, insertGeneratedOutputMarker,
+		arg.RunID,
+		arg.DisplayName,
+		arg.Reason,
+		arg.PostID,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const insertJobFileChunk = `-- name: InsertJobFileChunk :exec
 INSERT INTO job_file_chunks (file_id, chunk_index, length, sealed)
 VALUES ($1, $2, $3, $4)
@@ -425,9 +516,11 @@ SELECT $1::uuid, $2::text, $3::bigint, $4::text
  WHERE EXISTS (SELECT 1 FROM runs
                 WHERE id = $1::uuid AND claim_generation = $5::bigint
                   AND claim_released_at IS NULL)
-   AND (SELECT count(*) FROM job_output_refusals WHERE run_id = $1::uuid) < $6::bigint
+   AND (SELECT count(*) FROM job_output_refusals
+         WHERE run_id = $1::uuid AND post_id IS NULL) < $6::bigint
    AND NOT EXISTS (SELECT 1 FROM job_output_refusals
-                    WHERE run_id = $1::uuid AND display_name = $2::text
+                    WHERE run_id = $1::uuid AND post_id IS NULL
+                      AND display_name = $2::text
                       AND byte_size = $3::bigint AND reason = $4::text)
 `
 
@@ -446,6 +539,10 @@ type InsertJobOutputRefusalParams struct {
 // result is the number of rows inserted (0 or 1); a refusal that is not recorded is still a
 // refusal. The bound is checked in the statement, not under a lock: uploads for one run are
 // sequential from its worker, and concurrent ones can overshoot by at most the upload slot count.
+// The rows the server's own output generation owns (post_id IS NOT NULL: its generation_pending
+// marker and outcome, InsertGeneratedOutputMarker) are neither counted against the bound nor
+// matched by the duplicate check: they are at most two per run and are not the worker's refusals, so
+// neither can crowd the other out.
 // FENCED: the row is inserted only while @claim_generation is the run's CURRENT generation and the
 // claim is not released, so a stale flight's refusal that arrives after a re-claim has cleared the
 // outputs (ClearRunOutputs) is dropped instead of surviving into the new flight.
@@ -539,6 +636,21 @@ func (q *Queries) LockReservedJobFile(ctx context.Context, id uuid.UUID) (JobFil
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const nextJobOutputPostID = `-- name: NextJobOutputPostID :one
+SELECT nextval('job_output_post_seq')::bigint
+`
+
+// The id of one job-result post (PRD #1909 M4): drawn inside the result transaction AFTER the run
+// row is locked FOR UPDATE, so the posts of one run take ascending ids in commit order (the lock is
+// held from the draw to the commit). The generation of an older post uses that order to see it has
+// been superseded (workersvc.startJobResultOutputs).
+func (q *Queries) NextJobOutputPostID(ctx context.Context) (int64, error) {
+	row := q.db.QueryRow(ctx, nextJobOutputPostID)
+	var column_1 int64
+	err := row.Scan(&column_1)
+	return column_1, err
 }
 
 const reclaimJobFilesForRecovery = `-- name: ReclaimJobFilesForRecovery :one
@@ -684,9 +796,9 @@ UPDATE job_output_refusals
    SET reason = $1::text, byte_size = $2::bigint
  WHERE run_id = $3::uuid
    AND display_name = $4::text
-   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND post_id = $5::bigint
    AND EXISTS (SELECT 1 FROM runs
-                WHERE id = $3::uuid AND claim_generation = $5::bigint
+                WHERE id = $3::uuid AND claim_generation = $6::bigint
                   AND claim_released_at IS NULL)
 `
 
@@ -695,20 +807,21 @@ type SettleGeneratedOutputRefusalParams struct {
 	ByteSize        int64     `json:"byte_size"`
 	RunID           uuid.UUID `json:"run_id"`
 	DisplayName     string    `json:"display_name"`
+	PostID          int64     `json:"post_id"`
 	ClaimGeneration int64     `json:"claim_generation"`
 }
 
-// Turns the generation-owned row of a name (the generation_pending marker, see
-// DeleteGeneratedOutputRefusals for the set) into the outcome of the generation (a refusal reason),
-// in place, so the marker is replaced atomically and is never lost to the per-run row cap that
-// InsertJobOutputRefusal applies. 0 rows means there was no marker; the caller then inserts the
-// refusal. Fenced on the claim generation like the insert.
+// Turns the row post @post_id owns for a name (its generation_pending marker) into the outcome of
+// the generation (a refusal reason), in place (PRD #1909 M4). 0 rows means the post was superseded
+// (a newer post deleted its rows) or the claim is stale: the caller records nothing, because the
+// newer post's own marker says the file is missing. Fenced on the claim generation like the insert.
 func (q *Queries) SettleGeneratedOutputRefusal(ctx context.Context, arg SettleGeneratedOutputRefusalParams) (int64, error) {
 	result, err := q.db.Exec(ctx, settleGeneratedOutputRefusal,
 		arg.Reason,
 		arg.ByteSize,
 		arg.RunID,
 		arg.DisplayName,
+		arg.PostID,
 		arg.ClaimGeneration,
 	)
 	if err != nil {

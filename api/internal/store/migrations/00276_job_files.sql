@@ -90,6 +90,11 @@ CREATE TABLE job_file_chunks (
     PRIMARY KEY (file_id, chunk_index)
 );
 
+-- job_output_post_seq numbers the job-result posts whose generated outputs (report.md,
+-- findings.json) the server stores (job_output_refusals.post_id). It is drawn inside the result
+-- transaction after the run row is locked, so one run's posts take ascending ids in commit order.
+CREATE SEQUENCE job_output_post_seq;
+
 -- 3. job_output_refusals: an output the worker offered that the quotas or the type allowlist
 -- refused. The job still completes; its result lists these (PRD #1909 D4). Bounded per job by
 -- the output file cap in the service. The cascade removes them with the run.
@@ -103,6 +108,13 @@ CREATE TABLE job_output_refusals (
                AND display_name !~ '[\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]'),
     byte_size    bigint NOT NULL CHECK (byte_size >= 0),
     reason       text NOT NULL CHECK (char_length(reason) BETWEEN 1 AND 200),
+    -- post_id is set only on the rows the server's own output generation owns (the
+    -- generation_pending marker of report.md / findings.json and its outcome): the id (from
+    -- job_output_post_seq) of the job-result post that wrote them. NULL on every worker-reported
+    -- drop and upload refusal. It scopes a generation's writes to its own post, so an older post
+    -- cannot clear or settle a newer post's marker, and it keeps these rows out of the per-run
+    -- refusal cap.
+    post_id      bigint,
     created_at   timestamptz NOT NULL DEFAULT now()
 );
 CREATE INDEX idx_job_output_refusals_run ON job_output_refusals (run_id);
@@ -131,5 +143,6 @@ ALTER TABLE runs DROP COLUMN job_protocol;
 ALTER TABLE recovery_captures DROP CONSTRAINT recovery_captures_reserved_bytes_check;
 ALTER TABLE recovery_captures DROP COLUMN reserved_bytes;
 DROP TABLE job_output_refusals;
+DROP SEQUENCE job_output_post_seq;
 DROP TABLE job_file_chunks;
 DROP TABLE job_files;

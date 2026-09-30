@@ -165,6 +165,7 @@ func TestDrainGeneratedOutputsGivesUpAtItsBoundLiveDB(t *testing.T) {
 	e.svc.genReplyBound = 20 * time.Millisecond
 	e.svc.genTimeout = 50 * time.Millisecond
 	e.svc.genDrainBound = 50 * time.Millisecond
+	e.svc.genCancelGrace = 20 * time.Millisecond
 	stall := make(chan struct{})
 	e.svc.genHook = func(*genJob) { <-stall }
 	u := e.seedJobUser(t)

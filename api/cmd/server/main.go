@@ -1532,12 +1532,16 @@ func run() error {
 	// ingest reply. ORDER: after the HTTP drain above (no request can start one any more, so the
 	// service's WaitGroup sees no new Add) and BEFORE the deferred pool.Close (they store through
 	// the pool). The service refuses new ones from here on (recorded generation_failed) and this
-	// waits for the running ones for at most 15 s. Budget: the HTTP drain above is up to 10 s, so
-	// 10 s + 15 s stays inside the default 30 s Kubernetes termination grace (the chart sets none).
-	// A generation still running at the bound is not lost silently: SubmitJobResult committed a
-	// generation_pending refusal row for each generated file with the result, and only storing the
-	// file (or recording its failure) removes it, so an abandoned one (this bound, a SIGKILL, a
-	// crash) stays visible as generation_pending.
+	// waits for the running ones for 15 s; it then cancels their service-owned context, which ends
+	// the storage work they are blocked in (pool acquire, lock wait, queries), and waits 2 s more
+	// for them to return. So the worst case is 17 s, not the 60 s storage deadline: a generation
+	// holding a pooled connection does not make the deferred pool.Close wait that long. Budget: the
+	// HTTP drain above is up to 10 s, so 10 s + 17 s stays inside the default 30 s Kubernetes
+	// termination grace (the chart sets none). A generation that does not return even then (stuck
+	// outside a context-aware call) is left behind, and is not lost silently: SubmitJobResult
+	// committed a generation_pending refusal row for each generated file with the result, and only
+	// storing the file (or recording its failure) removes it, so an abandoned one (this bound, a
+	// SIGKILL, a crash) stays visible as generation_pending.
 	if !wsvc.DrainGeneratedOutputs() {
 		slog.Warn("shutdown: generated job outputs still in flight at the drain deadline")
 	}

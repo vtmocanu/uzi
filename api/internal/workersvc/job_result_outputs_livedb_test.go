@@ -170,17 +170,22 @@ func TestStoreJobOutputRefusesReservedNamesLiveDB(t *testing.T) {
 }
 
 // TestSubmitJobResultRecordsWorkerRefusedOutputsLiveDB: the outputs the worker reports dropping
-// become refusal rows, deduped on a re-post and bounded by OutputsMaxFiles. The bound is on all the
-// run's refusal rows, so the two generation_pending markers written first take two of the five
-// slots while the generation runs (the worker's rows fill the other three); once the files are
-// stored the markers are gone.
+// become refusal rows, deduped on a re-post and bounded by OutputsMaxFiles. The generation markers
+// are NOT counted against that bound (they carry a post_id), so the worker's drops get the whole
+// cap: five reported, three recorded, while the two markers exist beside them and after the files
+// are stored.
 //
-// MUTATION CHECK: dropping the RefusedOutputs loop in SubmitJobResult leaves no rows.
+// MUTATION CHECK: dropping the RefusedOutputs loop in SubmitJobResult leaves no rows; removing the
+// `post_id IS NULL` filter from the count in InsertJobOutputRefusal records only 1 of the 3 while
+// the two markers are pending (the during-generation assertion goes red).
 func TestSubmitJobResultRecordsWorkerRefusedOutputsLiveDB(t *testing.T) {
 	l := wide()
-	l.OutputsMaxFiles = 5
+	l.OutputsMaxFiles = 3
 	e := newJFEnv(t, l)
 	e.svc.SetJobFiles(e.jf)
+	e.svc.genReplyBound = 20 * time.Millisecond
+	stall := make(chan struct{})
+	e.svc.genHook = func(*genJob) { <-stall }
 	u := e.seedJobUser(t)
 	wkr, run := e.heldJob(t, u)
 	sub := JobResultSubmission{Status: "completed", ReportMD: "r", RefusedOutputs: []JobRefusedOutput{
@@ -194,10 +199,14 @@ func TestSubmitJobResultRecordsWorkerRefusedOutputsLiveDB(t *testing.T) {
 		if err := e.svc.SubmitJobResult(e.ctx, wkr, run, 1, sub); err != nil {
 			t.Fatalf("submit %d: %v", i, err)
 		}
-		e.svc.WaitForGeneratedOutputs()
 	}
+	if n := e.refusalCount(t, run); n != 3+2 {
+		t.Fatalf("refusal rows while the generation is pending = %d, want 5 (3 worker drops at OutputsMaxFiles 3, none doubled, plus the 2 markers)", n)
+	}
+	close(stall)
+	e.svc.WaitForGeneratedOutputs()
 	if n := e.refusalCount(t, run); n != 3 {
-		t.Fatalf("refusal rows = %d, want 3 (OutputsMaxFiles 5 less the 2 generation markers), none doubled", n)
+		t.Fatalf("refusal rows after the files were stored = %d, want the 3 worker drops", n)
 	}
 	var reason string
 	if err := e.pool.QueryRow(e.ctx, `SELECT reason FROM job_output_refusals WHERE run_id = $1 AND display_name = 'huge.pdf'`, run).Scan(&reason); err != nil || reason != WorkerRefusalTooLarge {

@@ -487,6 +487,7 @@ type JobOutputRefusal struct {
 	DisplayName string             `json:"display_name"`
 	ByteSize    int64              `json:"byte_size"`
 	Reason      string             `json:"reason"`
+	PostID      pgtype.Int8        `json:"post_id"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 

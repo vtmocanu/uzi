@@ -261,7 +261,15 @@ const (
 	// drain takes up to 10 s and the default termination grace is 30 s (Kubernetes; Compose's stop
 	// grace is only 10 s), so this stays well inside the remainder.
 	generatedOutputsDrainBound = 15 * time.Second
+	// generatedOutputsCancelGrace is how long DrainGeneratedOutputs waits, after the drain bound
+	// elapsed and it cancelled the generations' context (errGenShutdown), for them to return.
+	generatedOutputsCancelGrace = 2 * time.Second
 )
+
+// errGenShutdown is the cancellation cause DrainGeneratedOutputs gives the generations' base
+// context when its bound elapsed: a generation cut off by it is recorded generation_failed, not
+// generation_timeout (shutdown, not its own deadline, ended it).
+var errGenShutdown = errors.New("workersvc: shutdown cancelled the generated-output storage")
 
 // The reasons recorded, under a reserved name, for a generated output. The refusal rows of a run
 // are what its result listing shows as refused files (PRD #1909 M5 reads job_output_refusals), so
@@ -270,7 +278,8 @@ const (
 //   - generation_pending: NOT a refusal. The result transaction (SubmitJobResult) writes one per
 //     file the server will generate; it means "report.md / findings.json is being generated and is
 //     not stored yet". It is deleted when the file is stored, and replaced by the outcome below when
-//     the generation gives up. A row that is still pending when the run is read is either a
+//     the generation gives up. Every generation-owned row carries the id of the post that wrote it
+//     (job_output_refusals.post_id) and only that post's generation may clear or settle it. A row that is still pending when the run is read is either a
 //     generation in flight (seconds) or one that was abandoned (the process stopped or crashed, or
 //     shutdown did not wait for it), which leaves the marker behind on purpose: the file is not
 //     there, and nothing else would say so. The result listing should show it as "not available
@@ -281,7 +290,8 @@ const (
 //
 // A file the generation could not store for a policy reason carries that refusal's own reason
 // (file_too_large, a quota) in place of the marker. Rows with a worker_* reason and the
-// reserved_name refusal are the worker's, never the generation's (the queries tell them apart).
+// reserved_name refusal are the worker's, never the generation's: they carry no post_id, which is
+// what the queries tell them apart by, and they alone count against the per-run refusal cap.
 const (
 	RefusalGenerationPending = "generation_pending"
 	RefusalGenerationTimeout = "generation_timeout"
@@ -298,14 +308,26 @@ type genJob struct {
 	wkr  store.Worker
 	run  store.Run
 	gen  int64
+	seq  int64 // the post id (job_output_refusals.post_id), ascending in commit order per run
 	sub  JobResultSubmission
 	done chan struct{}
 }
 
 // runGen is the per-run generation state. Its presence in Service.genRuns means one generation of
-// the run is running; pending is the single queued one behind it.
+// the run is running; pending is the single queued one behind it. owner is the run's user, whose
+// share of the process-wide cap the entry holds; running is the post id of the generation running.
 type runGen struct {
+	owner   uuid.UUID
+	running int64
 	pending *genJob
+}
+
+// newest is the highest post id the run's entry holds (the running or the pending generation).
+func (r *runGen) newest() int64 {
+	if r.pending != nil {
+		return max(r.running, r.pending.seq)
+	}
+	return r.running
 }
 
 // generatedNames lists the names a submission would generate: report.md only for a non-empty
@@ -322,64 +344,76 @@ func generatedNames(sub JobResultSubmission) []string {
 // its own short detached context.
 func (s *Service) recordGenerationRefusals(job *genJob) {
 	for _, name := range generatedNames(job.sub) {
-		s.jobFiles.settleGenerated(context.Background(), job.run.ID, job.gen, name, 0, RefusalGenerationFailed)
+		s.jobFiles.settleGenerated(context.Background(), job.run.ID, job.gen, job.seq, name, 0, RefusalGenerationFailed)
 	}
 }
 
 // markGenerationPending writes, inside the result transaction, the generation_pending marker of
-// each file the server will generate for sub, after clearing the generation-owned rows of both
-// reserved names (an earlier post's marker, failure or refusal): a re-post rewrites its own markers
-// and leaves no stale one. Because the markers commit WITH the result, a crash or kill between the
-// commit and the storage leaves them behind instead of silence. They go first, ahead of the
-// worker-reported refusals, so the per-run row cap cannot crowd them out.
-func (j *JobFiles) markGenerationPending(ctx context.Context, q *store.Queries, runID uuid.UUID, gen int64, sub JobResultSubmission) error {
+// each file the server will generate for sub, owned by the post id seq, after clearing the
+// generation-owned rows of both reserved names (an earlier post's marker, failure or refusal): a
+// re-post rewrites the markers and leaves no stale one, and the earlier post's generation, finding
+// its marker gone, knows it is superseded. Because the markers commit WITH the result, a crash or
+// kill between the commit and the storage leaves them behind instead of silence. They are not
+// bounded by the per-run refusal cap (InsertGeneratedOutputMarker): there are at most two per run,
+// so prior refusals cannot crowd them out and they do not take a slot of the worker-reported drops.
+func (j *JobFiles) markGenerationPending(ctx context.Context, q *store.Queries, runID uuid.UUID, gen, seq int64, sub JobResultSubmission) error {
 	if _, err := q.DeleteGeneratedOutputRefusals(ctx, store.DeleteGeneratedOutputRefusalsParams{
 		RunID: runID, DisplayNames: generatedOutputNames, ClaimGeneration: gen,
 	}); err != nil {
 		return err
 	}
 	for _, name := range generatedNames(sub) {
-		if _, err := q.InsertJobOutputRefusal(ctx, store.InsertJobOutputRefusalParams{
-			RunID: runID, DisplayName: name, Reason: RefusalGenerationPending,
-			ClaimGeneration: gen, MaxRows: int64(j.limits.OutputsMaxFiles),
-		}); err != nil {
+		n, err := q.InsertGeneratedOutputMarker(ctx, store.InsertGeneratedOutputMarkerParams{
+			RunID: runID, DisplayName: name, Reason: RefusalGenerationPending, PostID: seq, ClaimGeneration: gen,
+		})
+		if err != nil {
 			return err
+		}
+		if n == 0 {
+			// Fenced out: the claim generation is no longer the run's (the result transaction's own
+			// fence read it under FOR UPDATE, so this is not expected).
+			return ErrStaleClaim
 		}
 	}
 	return nil
 }
 
-// settleGenerated records the outcome of a generated output that was not stored: the marker is
-// updated in place to reason (SettleGeneratedOutputRefusal), or, when there is none, the refusal is
-// inserted. Best effort on a fresh short context, like insertRefusal: a failure is logged and the
-// marker stays pending.
-func (j *JobFiles) settleGenerated(ctx context.Context, runID uuid.UUID, gen int64, name string, byteSize int64, reason string) {
+// settleGenerated records the outcome of a generated output of post seq that was not stored: the
+// post's marker is updated in place to reason (SettleGeneratedOutputRefusal). When the post no
+// longer owns a row for name it has been superseded by a newer post, whose own marker says the file
+// is missing, and nothing is recorded. Best effort on a fresh short context: a failure is logged and
+// the marker stays pending.
+func (j *JobFiles) settleGenerated(ctx context.Context, runID uuid.UUID, gen, seq int64, name string, byteSize int64, reason string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	n, err := store.New(j.db).SettleGeneratedOutputRefusal(rctx, store.SettleGeneratedOutputRefusalParams{
-		RunID: runID, DisplayName: name, ByteSize: byteSize, Reason: reason, ClaimGeneration: gen,
-	})
-	if err != nil {
+	if _, err := store.New(j.db).SettleGeneratedOutputRefusal(rctx, store.SettleGeneratedOutputRefusalParams{
+		RunID: runID, DisplayName: name, ByteSize: byteSize, Reason: reason, PostID: seq, ClaimGeneration: gen,
+	}); err != nil {
 		slog.Warn("job files: settling a generated output marker", "run", runID.String(), "file", name, "error", err)
-		return
-	}
-	if n == 0 {
-		j.insertRefusal(ctx, runID, gen, name, byteSize, reason)
 	}
 }
 
-// clearGenerated deletes the generation-owned rows of name once its file is stored. Idempotent and
+// clearGenerated deletes the row post seq owns for name once its file is stored. Idempotent and
 // best effort (a failure is logged and leaves a stale pending marker next to a stored file, which a
 // re-post or re-claim clears). It runs right after the file's commit, not in it: a crash between
-// the two leaves the file and a pending marker, never a missing file without a marker.
-func (j *JobFiles) clearGenerated(ctx context.Context, runID uuid.UUID, gen int64, name string) {
+// the two leaves the file and a pending marker, never a missing file without a marker. It matches
+// the post's own row only, so a generation that finishes after a newer post took over clears
+// nothing of the newer post's.
+func (j *JobFiles) clearGenerated(ctx context.Context, runID uuid.UUID, gen, seq int64, name string) {
 	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
 	defer cancel()
-	if _, err := store.New(j.db).DeleteGeneratedOutputRefusals(rctx, store.DeleteGeneratedOutputRefusalsParams{
-		RunID: runID, DisplayNames: []string{name}, ClaimGeneration: gen,
+	if _, err := store.New(j.db).ClearGeneratedOutputRefusal(rctx, store.ClearGeneratedOutputRefusalParams{
+		RunID: runID, DisplayName: name, PostID: seq, ClaimGeneration: gen,
 	}); err != nil {
 		slog.Warn("job files: clearing a generated output marker", "run", runID.String(), "file", name, "error", err)
 	}
+}
+
+// ownsGenerated reports whether post seq still owns a row for name, i.e. no newer post (or
+// re-claim) took the names over. A generation that does not own its marker is superseded and must
+// not store its file.
+func (j *JobFiles) ownsGenerated(ctx context.Context, runID uuid.UUID, seq int64, name string) (bool, error) {
+	return store.New(j.db).HasGeneratedOutputMarker(ctx, store.HasGeneratedOutputMarkerParams{RunID: runID, DisplayName: name, PostID: seq})
 }
 
 // generatedOutputsMax is the process-wide cap on runs with a generation in flight: the upload write
@@ -391,18 +425,49 @@ func (s *Service) generatedOutputsMax() int {
 	return max(1, s.jobFiles.limits.MaxConcurrentWrites)
 }
 
+// generatedOutputsPerOwnerMax is the share of the process-wide cap one owner's runs may hold: the
+// upload per-owner write slot bound, at least 1, so one owner's runs cannot fill every slot and
+// starve another owner's generations.
+func (s *Service) generatedOutputsPerOwnerMax() int {
+	return max(1, s.jobFiles.limits.MaxConcurrentWritesPerOwner)
+}
+
+// genBaseCtx returns the context every generation derives from, created on first use. It is
+// service-owned, NOT the request's and not context.Background(), so DrainGeneratedOutputs can cancel
+// the generations still running when its bound elapses.
+func (s *Service) genBaseCtx() context.Context {
+	s.genMu.Lock()
+	defer s.genMu.Unlock()
+	return s.genBaseLocked()
+}
+
+func (s *Service) genBaseLocked() context.Context {
+	if s.genBase == nil {
+		s.genBase, s.genCancel = context.WithCancelCause(context.Background())
+	}
+	return s.genBase
+}
+
 // DrainGeneratedOutputs is the shutdown half of startJobResultOutputs: it makes the service refuse
-// new generations (recorded as generation_failed) and waits for the ones already started, at most
-// generatedOutputsDrainBound, and reports whether they all finished. The caller
-// MUST run it after the HTTP server has drained (no request can start one any more) and BEFORE the
-// database pool closes (a generation stores through the pool). A pending generation behind a
-// running one is recorded generation_failed instead of started, so the wait is one storage long.
-// The wait is capped at generatedOutputsDrainBound (far below generatedOutputsTimeout) so shutdown
-// fits the default termination grace; a generation still running then is left to its
-// generation_pending marker (written in the result transaction), which a hard stop leaves visible.
+// new generations (recorded as generation_failed) and waits for the ones already started, and
+// reports whether they all finished on their own. The caller MUST run it after the HTTP server has
+// drained (no request can start one any more) and BEFORE the database pool closes (a generation
+// stores through the pool). A pending generation behind a running one is recorded generation_failed
+// instead of started, so the wait is one storage long.
+//
+// The wait is bounded twice. After generatedOutputsDrainBound (far below generatedOutputsTimeout) it
+// cancels the generations' service-owned base context (genBaseCtx, cause errGenShutdown), which ends
+// the storage work a generation is blocked in (its pool acquire, its advisory-lock wait, its
+// queries), and then waits at most generatedOutputsCancelGrace more for them to return. So the real
+// worst case is the drain bound plus the grace, not the storage deadline: a pool.Close behind it
+// does not wait the storage timeout out for a connection a generation holds. A generation that does
+// not return within the grace (one stuck outside a context-aware call) is left behind and this
+// returns false; it leaves its generation_pending marker, written in the result transaction, which a
+// hard stop leaves visible too.
 func (s *Service) DrainGeneratedOutputs() bool {
 	s.genMu.Lock()
 	s.genClosed = true
+	cancel := s.genCancel
 	s.genMu.Unlock()
 	done := make(chan struct{})
 	go func() { s.genWG.Wait(); close(done) }()
@@ -416,8 +481,21 @@ func (s *Service) DrainGeneratedOutputs() bool {
 	case <-done:
 		return true
 	case <-t.C:
-		return false
 	}
+	if cancel != nil {
+		cancel(errGenShutdown)
+	}
+	grace := generatedOutputsCancelGrace
+	if s.genCancelGrace > 0 {
+		grace = s.genCancelGrace
+	}
+	g := time.NewTimer(grace)
+	defer g.Stop()
+	select {
+	case <-done:
+	case <-g.C:
+	}
+	return false
 }
 
 // WaitForGeneratedOutputs blocks until every generated-output storage started by SubmitJobResult
@@ -429,26 +507,40 @@ func (s *Service) WaitForGeneratedOutputs() { s.genWG.Wait() }
 // stored, scrubbed findings) as output files of the run. It runs from SubmitJobResult AFTER the
 // result transaction committed, so the files are built from what the result store holds (the api's
 // scrub), never from a worker upload. The worker-reported dropped outputs are recorded in the
-// result transaction itself, independent of this.
+// result transaction itself, independent of this. seq is the post id of the result (see
+// NextJobOutputPostID): ascending per run in commit order.
 //
 // Bounded design: per run at most ONE generation runs and at most ONE waits behind it, and a newer
 // post replaces the waiting one (latest wins; the replaced one is superseded, recorded nowhere,
-// because the newer post carries the content the result store now holds). Process-wide at most
-// generatedOutputsMax runs have a generation in flight; a post beyond that is recorded as
-// generation_failed. So a worker re-posting with varying content holds at most two submissions
-// (about 4 MiB each) per run and one goroutine per run, never a queue of them. The per-run state
+// because the newer post carries the content the result store now holds). "Newer" is the post id,
+// the COMMIT order, not the order the posts reach this function: an older post that arrives after a
+// newer one is itself the superseded one and is dropped here. Process-wide at most
+// generatedOutputsMax runs have a generation in flight, and at most generatedOutputsPerOwnerMax of
+// them belong to one owner; a post beyond either is recorded as generation_failed. So a worker
+// re-posting with varying content holds at most two submissions (about 4 MiB each) per run and one
+// goroutine per run, never a queue of them, and one owner cannot hold every slot. The per-run state
 // also serialises the replace-then-insert of a run's files, so two posts cannot leave two report.md
 // rows.
 //
-// Each generation runs in a goroutine tracked by the service (genWG) on a context DETACHED from the
-// request (context.WithoutCancel) with its own timeout (generatedOutputsTimeout): a worker that
-// disconnects does not cancel it, and a slow one does not fail the request. The caller waits for
-// its job at most generatedOutputsReplyBound (or until its own ctx ends) and then answers
-// regardless, because the result is already committed and a late reply would only make the worker
-// treat a stored result as failed. An output it cannot store (a refusal, the timeout, a panic, any
-// other failure) is recorded in job_output_refusals (RefusalGenerationTimeout /
-// RefusalGenerationFailed for the last two), never dropped silently and never failing the ingest.
-// After DrainGeneratedOutputs, a post is refused with generation_failed instead of started.
+// Each generation runs in a goroutine tracked by the service (genWG) on a context derived from the
+// service's own base (genBaseCtx), DETACHED from the request, with its own timeout
+// (generatedOutputsTimeout): a worker that disconnects does not cancel it, a slow one does not fail
+// the request, and DrainGeneratedOutputs cancels the base when its bound elapses. The caller waits
+// for its job at most generatedOutputsReplyBound (or until its own ctx ends, or until the job is
+// superseded) and then answers regardless, because the result is already committed and a late reply
+// would only make the worker treat a stored result as failed. An output it cannot store (a refusal,
+// the timeout, a panic, any other failure) is recorded in job_output_refusals
+// (RefusalGenerationTimeout / RefusalGenerationFailed for the last two), never dropped silently and
+// never failing the ingest. After DrainGeneratedOutputs, a post is refused with generation_failed
+// instead of started.
+//
+// Superseded posts. Every post deletes the earlier post's generation-owned rows and writes its own
+// (markGenerationPending), so a generation stores its file only while its own row exists
+// (storeGeneratedOutput) and settles or clears only rows of its own post. A post committed after the
+// generation checked its row can still see that generation store once more: the newer post's
+// generation runs after it (per-run serialisation, enqueued after its own commit) and replaces the
+// content. That window exists only inside one api process; the per-run serialisation is in-memory,
+// so two api replicas serving one run's posts are not ordered against each other.
 //
 // Lock order: the result transaction (runs row FOR UPDATE, job_results, job_findings) is COMMITTED
 // before anything here starts, so no runs or result row lock is held while Reserve takes the
@@ -461,11 +553,11 @@ func (s *Service) WaitForGeneratedOutputs() { s.genWG.Wait() }
 //
 // Idempotent: a re-post with the same content stores nothing new (the unique output index, or the
 // lookup); a re-post with different content replaces the earlier file of the same name.
-func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, run store.Run, gen int64, sub JobResultSubmission) {
+func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, run store.Run, gen, seq int64, sub JobResultSubmission) {
 	if s.jobFiles == nil {
 		return
 	}
-	job := &genJob{wkr: wkr, run: run, gen: gen, sub: sub, done: make(chan struct{})}
+	job := &genJob{wkr: wkr, run: run, gen: gen, seq: seq, sub: sub, done: make(chan struct{})}
 	s.genMu.Lock()
 	switch st := s.genRuns[run.ID]; {
 	case s.genClosed:
@@ -473,6 +565,12 @@ func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, r
 		s.recordGenerationRefusals(job)
 		return
 	case st != nil:
+		if seq < st.newest() {
+			// A newer post (committed after this one) reached here first: it already owns the names and
+			// its generation, running or waiting, carries the newer content.
+			s.genMu.Unlock()
+			return
+		}
 		if st.pending != nil {
 			close(st.pending.done) // superseded by the newer post
 		}
@@ -483,11 +581,20 @@ func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, r
 		slog.Warn("job files: too many generations in flight, output not stored", "run", run.ID.String())
 		s.recordGenerationRefusals(job)
 		return
+	case s.genOwners[run.UserID] >= s.generatedOutputsPerOwnerMax():
+		s.genMu.Unlock()
+		slog.Warn("job files: owner's share of the generations in flight is full, output not stored", "run", run.ID.String(), "owner", run.UserID.String())
+		s.recordGenerationRefusals(job)
+		return
 	default:
 		if s.genRuns == nil {
 			s.genRuns = map[uuid.UUID]*runGen{}
 		}
-		s.genRuns[run.ID] = &runGen{}
+		if s.genOwners == nil {
+			s.genOwners = map[uuid.UUID]int{}
+		}
+		s.genRuns[run.ID] = &runGen{owner: run.UserID, running: seq}
+		s.genOwners[run.UserID]++
 		s.genWG.Add(1)
 		s.genMu.Unlock()
 		go s.runGenerations(job)
@@ -502,8 +609,9 @@ func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, r
 }
 
 // runGenerations runs a run's generation and then the one pending behind it, until none is left;
-// it owns the run's entry in genRuns and the genWG count taken by startJobResultOutputs. A pending
-// job met after shutdown began is recorded generation_failed instead of run.
+// it owns the run's entry in genRuns (and its owner's count in genOwners) and the genWG count taken
+// by startJobResultOutputs. A pending job met after shutdown began is recorded generation_failed
+// instead of run.
 func (s *Service) runGenerations(job *genJob) {
 	defer s.genWG.Done()
 	closed := false
@@ -520,20 +628,25 @@ func (s *Service) runGenerations(job *genJob) {
 		st.pending = nil
 		if next == nil {
 			delete(s.genRuns, job.run.ID)
+			if s.genOwners[st.owner]--; s.genOwners[st.owner] <= 0 {
+				delete(s.genOwners, st.owner)
+			}
 			s.genMu.Unlock()
 			return
 		}
+		st.running = next.seq
 		closed = s.genClosed
 		s.genMu.Unlock()
 		job = next
 	}
 }
 
-// runGeneration runs one job under its own timeout and closes its done channel. A panic is
-// recovered (the goroutine is detached, so nothing above it would catch it and the api would
-// exit), logged, and recorded generation_failed for every name the job would have generated.
+// runGeneration runs one job under its own timeout, derived from the service's base context, and
+// closes its done channel. A panic is recovered (the goroutine is detached, so nothing above it
+// would catch it and the api would exit), logged, and recorded generation_failed for every name the
+// job would have generated.
 func (s *Service) runGeneration(job *genJob) {
-	gctx, cancel := context.WithTimeout(context.Background(), s.generatedOutputsTimeout())
+	gctx, cancel := context.WithTimeout(s.genBaseCtx(), s.generatedOutputsTimeout())
 	defer cancel()
 	defer close(job.done)
 	defer func() {
@@ -545,7 +658,7 @@ func (s *Service) runGeneration(job *genJob) {
 	if s.genHook != nil {
 		s.genHook(job)
 	}
-	s.storeJobResultOutputs(gctx, job.wkr, job.run, job.gen, job.sub)
+	s.storeJobResultOutputs(gctx, job.wkr, job.run, job.gen, job.seq, job.sub)
 }
 
 func (s *Service) generatedOutputsTimeout() time.Duration {
@@ -564,28 +677,29 @@ func (s *Service) generatedOutputsReplyBound() time.Duration {
 
 // storeJobResultOutputs is the body of one generation (runGeneration); ctx carries the storage
 // deadline. Name, content type and scrubbing rules: see startJobResultOutputs.
-func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, run store.Run, gen int64, sub JobResultSubmission) {
+func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, run store.Run, gen, seq int64, sub JobResultSubmission) {
 	jf := s.jobFiles
 	if jf == nil {
 		return
 	}
 	// Record a generation that did not finish: report.md and findings.json are the only names
-	// this path writes. A failure observed after ctx expired is labelled generation_timeout even
-	// when the underlying error merely raced the deadline: the deadline is the likelier cause and
-	// the label is an operator hint, not a diagnosis.
+	// this path writes. A failure observed after ctx ended is labelled generation_timeout when the
+	// storage deadline ended it, and generation_failed when shutdown cancelled it (errGenShutdown); a
+	// failure that merely raced the deadline is labelled a timeout too: the deadline is the likelier
+	// cause and the label is an operator hint, not a diagnosis.
 	record := func(name string, err error) {
 		if err == nil {
 			return
 		}
 		reason := RefusalGenerationFailed
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !errors.Is(context.Cause(ctx), errGenShutdown) {
 			reason = RefusalGenerationTimeout
 		}
 		slog.Warn("job files: generated output not stored", "run", run.ID.String(), "file", name, "reason", reason, "error", err)
-		jf.settleGenerated(ctx, run.ID, gen, name, 0, reason)
+		jf.settleGenerated(ctx, run.ID, gen, seq, name, 0, reason)
 	}
 	if sub.ReportMD != "" {
-		record(JobOutputReportName, s.storeGeneratedOutput(ctx, wkr, run, gen, JobOutputReportName, "text/markdown", []byte(sub.ReportMD)))
+		record(JobOutputReportName, s.storeGeneratedOutput(ctx, wkr, run, gen, seq, JobOutputReportName, "text/markdown", []byte(sub.ReportMD)))
 	}
 	findings := make([]generatedFindingJSON, 0, len(sub.Findings))
 	for _, f := range sub.Findings {
@@ -600,20 +714,26 @@ func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, r
 	if err := enc.Encode(findings); err != nil {
 		record(JobOutputFindingsName, err)
 	} else {
-		record(JobOutputFindingsName, s.storeGeneratedOutput(ctx, wkr, run, gen, JobOutputFindingsName, "application/json", buf.Bytes()))
+		record(JobOutputFindingsName, s.storeGeneratedOutput(ctx, wkr, run, gen, seq, JobOutputFindingsName, "application/json", buf.Bytes()))
 	}
 }
 
-// storeGeneratedOutput stores one server-generated output (see startJobResultOutputs). A cap or
-// quota refusal is recorded here and returns nil; any other failure is returned for the caller to
-// record.
-func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, run store.Run, gen int64, name, contentType string, content []byte) error {
+// storeGeneratedOutput stores one server-generated output of post seq (see startJobResultOutputs).
+// A cap or quota refusal is recorded here and returns nil; any other failure is returned for the
+// caller to record. A post that no longer owns its row for the name is superseded and stores
+// nothing (nil): the newer post's generation stores the current content.
+func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, run store.Run, gen, seq int64, name, contentType string, content []byte) error {
 	jf := s.jobFiles
+	if own, err := jf.ownsGenerated(ctx, run.ID, seq, name); err != nil {
+		return err
+	} else if !own {
+		return nil
+	}
 	sum := sha256.Sum256(content)
 	p := JobOutputParams{ClaimGeneration: gen, DisplayName: name, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])}
 	if p.Size > jf.limits.OutputFileMaxBytes {
 		// Refused before any lookup or reservation: over the per-file cap, recorded like any refusal.
-		jf.settleGenerated(ctx, run.ID, gen, name, p.Size, RefusalFileTooLarge)
+		jf.settleGenerated(ctx, run.ID, gen, seq, name, p.Size, RefusalFileTooLarge)
 		return nil
 	}
 	if _, err := store.New(jf.db).DeleteStaleGeneratedJobOutput(ctx, store.DeleteStaleGeneratedJobOutputParams{
@@ -624,7 +744,7 @@ func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, ru
 	if _, ok, err := jf.findOutput(ctx, run.ID, p); err != nil {
 		return err
 	} else if ok {
-		jf.clearGenerated(ctx, run.ID, gen, name)
+		jf.clearGenerated(ctx, run.ID, gen, seq, name)
 		return nil
 	}
 	runID := run.ID
@@ -639,36 +759,31 @@ func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, ru
 	})
 	if err != nil {
 		if errors.Is(err, errJobOutputDuplicate) {
-			return nil // a concurrent post of the same result is storing it; it clears the marker
+			return nil // an identical file is being stored by a concurrent writer; its own clear settles the marker
 		}
-		return s.settleRefusal(ctx, run.ID, gen, p, err)
+		return s.settleRefusal(ctx, run.ID, gen, seq, p, err)
 	}
 	stored, err := jf.Write(ctx, row.ID, run.UserID, bytes.NewReader(content), WriteOptions{ContentType: contentType})
 	if err != nil {
-		return s.settleRefusal(ctx, run.ID, gen, p, err)
+		return s.settleRefusal(ctx, run.ID, gen, seq, p, err)
 	}
 	if _, ferr := s.fenceJobOutput(ctx, wkr, run.ID, gen); ferr != nil && !errors.Is(ferr, ErrRunTerminal) {
 		jf.dropStaleOutput(ctx, run.ID, stored.ID, gen)
 		return nil
 	}
-	jf.clearGenerated(ctx, run.ID, gen, name)
+	jf.clearGenerated(ctx, run.ID, gen, seq, name)
 	return nil
 }
 
 // settleRefusal turns a refusal of a generated output into its row (replacing the pending marker)
 // and returns nil; any other error is returned for the caller to record as a generation failure.
-func (s *Service) settleRefusal(ctx context.Context, runID uuid.UUID, gen int64, p JobOutputParams, err error) error {
+func (s *Service) settleRefusal(ctx context.Context, runID uuid.UUID, gen, seq int64, p JobOutputParams, err error) error {
 	var ref *JobFileRefusedError
 	if !errors.As(err, &ref) {
 		return err
 	}
-	s.jobFiles.settleGenerated(ctx, runID, gen, p.DisplayName, max(p.Size, 0), ref.Reason)
+	s.jobFiles.settleGenerated(ctx, runID, gen, seq, p.DisplayName, max(p.Size, 0), ref.Reason)
 	return nil
-}
-
-func isRefusal(err error) bool {
-	var ref *JobFileRefusedError
-	return errors.As(err, &ref)
 }
 
 // dropStaleOutput deletes an output whose claim went stale mid-upload. Best effort: a failure is

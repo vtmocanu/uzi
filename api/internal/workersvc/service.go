@@ -1713,10 +1713,19 @@ type Service struct {
 	genClosed     bool
 	genMax        int
 	genDrainBound time.Duration
-	genHook       func(*genJob) // test seam: called at the start of each generation
-	genWG         sync.WaitGroup
-	genTimeout    time.Duration
-	genReplyBound time.Duration
+	// genOwners counts, per owner (run.UserID), the runs with a generation in flight (genMu);
+	// genBase is the context every generation derives from, genCancel its cancel, used by
+	// DrainGeneratedOutputs when its bound elapses (genMu); genCancelGrace overrides the wait after
+	// that cancel when positive (tests).
+	genOwners      map[uuid.UUID]int
+	genBase        context.Context
+	genCancel      context.CancelCauseFunc
+	genCancelGrace time.Duration
+	genHook        func(*genJob)             // test seam: called at the start of each generation
+	genPostHook    func(JobResultSubmission) // test seam: called after the result commit, before its generation is queued
+	genWG          sync.WaitGroup
+	genTimeout     time.Duration
+	genReplyBound  time.Duration
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time

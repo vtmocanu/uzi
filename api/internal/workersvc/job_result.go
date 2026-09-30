@@ -133,11 +133,17 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 	}
 	// The generation_pending markers of the files the server will generate, and the outputs the
 	// worker reported dropping, are recorded here, in the result transaction, so neither depends on
-	// the detached generation below (fenced on the claim generation and bounded by the per-run
-	// output file cap in the statement itself). The markers make a generation that never finishes
+	// the detached generation below (fenced on the claim generation in the statement itself; the
+	// worker drops are bounded by the per-run output file cap, the markers are not: they carry the
+	// post id and do not count against it). The markers make a generation that never finishes
 	// (crash, kill) visible instead of silent: see RefusalGenerationPending.
+	var postID int64
 	if s.jobFiles != nil {
-		if err = s.jobFiles.markGenerationPending(ctx, qtx, runID, claimGeneration, sub); err != nil {
+		// Drawn after the run row lock above, so this run's posts take ascending ids in commit order.
+		if postID, err = qtx.NextJobOutputPostID(ctx); err != nil {
+			return err
+		}
+		if err = s.jobFiles.markGenerationPending(ctx, qtx, runID, claimGeneration, postID, sub); err != nil {
 			return err
 		}
 		for i, r := range sub.RefusedOutputs {
@@ -155,7 +161,10 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.startJobResultOutputs(ctx, wkr, run, claimGeneration, sub)
+	if s.genPostHook != nil {
+		s.genPostHook(sub)
+	}
+	s.startJobResultOutputs(ctx, wkr, run, claimGeneration, postID, sub)
 	return nil
 }
 

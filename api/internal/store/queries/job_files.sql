@@ -253,6 +253,10 @@ SELECT * FROM job_files
 -- result is the number of rows inserted (0 or 1); a refusal that is not recorded is still a
 -- refusal. The bound is checked in the statement, not under a lock: uploads for one run are
 -- sequential from its worker, and concurrent ones can overshoot by at most the upload slot count.
+-- The rows the server's own output generation owns (post_id IS NOT NULL: its generation_pending
+-- marker and outcome, InsertGeneratedOutputMarker) are neither counted against the bound nor
+-- matched by the duplicate check: they are at most two per run and are not the worker's refusals, so
+-- neither can crowd the other out.
 -- FENCED: the row is inserted only while @claim_generation is the run's CURRENT generation and the
 -- claim is not released, so a stale flight's refusal that arrives after a re-claim has cleared the
 -- outputs (ClearRunOutputs) is dropped instead of surviving into the new flight.
@@ -261,10 +265,31 @@ SELECT @run_id::uuid, @display_name::text, @byte_size::bigint, @reason::text
  WHERE EXISTS (SELECT 1 FROM runs
                 WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
                   AND claim_released_at IS NULL)
-   AND (SELECT count(*) FROM job_output_refusals WHERE run_id = @run_id::uuid) < @max_rows::bigint
+   AND (SELECT count(*) FROM job_output_refusals
+         WHERE run_id = @run_id::uuid AND post_id IS NULL) < @max_rows::bigint
    AND NOT EXISTS (SELECT 1 FROM job_output_refusals
-                    WHERE run_id = @run_id::uuid AND display_name = @display_name::text
+                    WHERE run_id = @run_id::uuid AND post_id IS NULL
+                      AND display_name = @display_name::text
                       AND byte_size = @byte_size::bigint AND reason = @reason::text);
+
+-- name: NextJobOutputPostID :one
+-- The id of one job-result post (PRD #1909 M4): drawn inside the result transaction AFTER the run
+-- row is locked FOR UPDATE, so the posts of one run take ascending ids in commit order (the lock is
+-- held from the draw to the commit). The generation of an older post uses that order to see it has
+-- been superseded (workersvc.startJobResultOutputs).
+SELECT nextval('job_output_post_seq')::bigint;
+
+-- name: InsertGeneratedOutputMarker :execrows
+-- Writes the generation_pending marker of one generated output (PRD #1909 M4), owned by the post
+-- @post_id. NOT bounded by the per-run refusal cap (InsertJobOutputRefusal): a run has at most one
+-- marker or outcome row per reserved name, because every post first deletes the earlier post's rows
+-- (DeleteGeneratedOutputRefusals) in the same transaction. FENCED on the claim generation like the
+-- other refusal writes.
+INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason, post_id)
+SELECT @run_id::uuid, @display_name::text, 0, @reason::text, @post_id::bigint
+ WHERE EXISTS (SELECT 1 FROM runs
+                WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
+                  AND claim_released_at IS NULL);
 
 -- name: DeleteJobOutputFilesForRun :execrows
 -- Re-claim (PRD #1909 M4): drops every output row of the run, in any state, so the new flight
@@ -282,35 +307,55 @@ DELETE FROM job_output_refusals
  WHERE id IN (SELECT r.id FROM job_output_refusals r WHERE r.run_id = @run_id FOR UPDATE SKIP LOCKED);
 
 -- name: DeleteGeneratedOutputRefusals :execrows
--- Clears the refusal rows the server's own output generation owns for the given names (PRD #1909
--- M4): the generation_pending marker, a generation_failed / generation_timeout row, or a refusal
--- the generation recorded (file_too_large, a quota). NOT the worker's own rows: a worker-reported
--- drop (reason worker_*) and the reserved_name refusal of an upload under a reserved name stay.
--- Used to rewrite the markers when a result is (re-)posted, and to clear one when its file is
--- stored. FENCED like InsertJobOutputRefusal: a no-op unless @claim_generation is the run's CURRENT
--- generation and the claim is not released, so a stale flight cannot clear the new flight's rows.
+-- Clears every refusal row the server's own output generation owns (post_id IS NOT NULL: the
+-- generation_pending marker, a generation_failed / generation_timeout row, or a refusal the
+-- generation recorded such as file_too_large or a quota) for the given names, whichever post wrote
+-- it (PRD #1909 M4). NOT the worker's own rows: a worker-reported drop and the reserved_name
+-- refusal carry no post_id and stay. Used when a result is (re-)posted: the new post takes over the
+-- names, so an earlier post's rows go with it. FENCED: a no-op unless @claim_generation is the
+-- run's CURRENT generation and the claim is not released.
 DELETE FROM job_output_refusals
  WHERE run_id = @run_id::uuid
    AND display_name = ANY(@display_names::text[])
-   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND post_id IS NOT NULL
+   AND EXISTS (SELECT 1 FROM runs
+                WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
+                  AND claim_released_at IS NULL);
+
+-- name: ClearGeneratedOutputRefusal :execrows
+-- Deletes the row post @post_id owns for one name, once its file is stored. Scoped to the post: an
+-- older post's generation finishing after a newer post took over the names matches nothing, so it
+-- cannot clear the newer post's marker (the file of a superseded post is not what the marker
+-- promises). Fenced like the insert.
+DELETE FROM job_output_refusals
+ WHERE run_id = @run_id::uuid
+   AND display_name = @display_name::text
+   AND post_id = @post_id::bigint
    AND EXISTS (SELECT 1 FROM runs
                 WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
                   AND claim_released_at IS NULL);
 
 -- name: SettleGeneratedOutputRefusal :execrows
--- Turns the generation-owned row of a name (the generation_pending marker, see
--- DeleteGeneratedOutputRefusals for the set) into the outcome of the generation (a refusal reason),
--- in place, so the marker is replaced atomically and is never lost to the per-run row cap that
--- InsertJobOutputRefusal applies. 0 rows means there was no marker; the caller then inserts the
--- refusal. Fenced on the claim generation like the insert.
+-- Turns the row post @post_id owns for a name (its generation_pending marker) into the outcome of
+-- the generation (a refusal reason), in place (PRD #1909 M4). 0 rows means the post was superseded
+-- (a newer post deleted its rows) or the claim is stale: the caller records nothing, because the
+-- newer post's own marker says the file is missing. Fenced on the claim generation like the insert.
 UPDATE job_output_refusals
    SET reason = @reason::text, byte_size = @byte_size::bigint
  WHERE run_id = @run_id::uuid
    AND display_name = @display_name::text
-   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND post_id = @post_id::bigint
    AND EXISTS (SELECT 1 FROM runs
                 WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
                   AND claim_released_at IS NULL);
+
+-- name: HasGeneratedOutputMarker :one
+-- Whether post @post_id still owns a row for the name: false means a newer post of the run took
+-- over the names (or a re-claim cleared them), so the post's generation is superseded and must not
+-- store its file (PRD #1909 M4).
+SELECT EXISTS (SELECT 1 FROM job_output_refusals
+                WHERE run_id = @run_id::uuid AND display_name = @display_name::text
+                  AND post_id = @post_id::bigint)::boolean;
 
 -- name: DeleteStaleGeneratedJobOutput :execrows
 -- A re-posted job result replaces the files the server generated from it (report.md and
