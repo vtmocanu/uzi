@@ -152,6 +152,38 @@ func TestCancelRevokedProductJobsLiveDB(t *testing.T) {
 	}
 }
 
+// A running job whose runner has consumed its revocation cancel under the CURRENT claim is still
+// winding down: the sweep must not pick it again (with more than a batch of those, the oldest
+// would refill every batch and starve newer revoked jobs). A cancel consumed under an EARLIER
+// claim does not count, so a requeued and reclaimed job gets a fresh cancel.
+func TestCancelRevokedProductJobsConsumedCancelLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	owner := e.seedJobUser(t)
+	product, token := e.seedProduct(t, owner, []string{"research"})
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+	current := e.seedOriginJob(t, owner, "running", &w, &product, &token)
+	reclaimed := e.seedOriginJob(t, owner, "running", &w, &product, &token)
+	e.exec(`UPDATE runs SET claim_generation = 2 WHERE id = ANY($1)`, []uuid.UUID{current, reclaimed})
+	e.exec(`INSERT INTO run_user_inputs (run_id, kind, body, consumed_at, consumed_claim_generation)
+	        VALUES ($1, 'cancel', 'revoked', now(), 2), ($2, 'cancel', 'revoked', now(), 1)`, current, reclaimed)
+	e.exec(`UPDATE product_tokens SET revoked = true WHERE id = $1`, token)
+
+	rows, err := e.q.ListRevokedProductJobs(e.ctx, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := map[uuid.UUID]bool{}
+	for _, r := range rows {
+		selected[r.ID] = true
+	}
+	if selected[current] {
+		t.Fatal("a job that consumed its cancel under the current claim is selected again")
+	}
+	if !selected[reclaimed] {
+		t.Fatal("a reclaimed job whose only cancel was consumed under an earlier claim is not selected")
+	}
+}
+
 // A job created with a uzc_ token has no product origin: token and product revokes cannot select
 // it, and only its owner's deactivation cancels it.
 func TestCancelRevokedProductJobsCLIJobLiveDB(t *testing.T) {

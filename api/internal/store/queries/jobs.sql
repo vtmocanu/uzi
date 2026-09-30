@@ -327,9 +327,13 @@ RETURNING id, user_id, status;
 -- Token EXPIRY is deliberately absent: an expired, unrevoked token never cancels a job that was
 -- authorized while it was valid. A uzc_-created job has NULL product_id and NULL
 -- product_token_id, so the LEFT JOINs give it no revoked/disabled signal and only the owner
--- clause can select it. A NON-queued job with an unconsumed cancel input is skipped: its cancel
--- is already in flight for a poller to consume, so a re-run of the pass is a no-op rather than a
--- second input. A QUEUED job is never skipped: it has no poller, so a pending cancel left by the
+-- clause can select it. A NON-queued job that already has a cancel for its CURRENT claim is
+-- skipped: an unconsumed one is in flight for a poller to consume, and one consumed under the
+-- current claim_generation has been handed to the runner, so a re-run of the pass is a no-op
+-- rather than a second input, and a job still winding down after consuming its cancel cannot
+-- hold a batch slot pass after pass (with more than @batch such jobs, the oldest would refill
+-- every batch and starve newer revoked jobs of their cancel). A cancel consumed under an EARLIER
+-- claim does not count: a requeued and reclaimed job gets a fresh one. A QUEUED job is never skipped: it has no poller, so a pending cancel left by the
 -- stale-worker requeue (RequeueRunsOfStaleWorkers) would otherwise strand it queued forever; the
 -- pass takes the server-side queued cancel for it.
 SELECT r.id, r.user_id
@@ -346,6 +350,7 @@ SELECT r.id, r.user_id
         OR NOT u.is_active)
    AND (r.status = 'queued'
         OR NOT EXISTS (SELECT 1 FROM run_user_inputs i
-                        WHERE i.run_id = r.id AND i.kind = 'cancel' AND i.consumed_at IS NULL))
+                        WHERE i.run_id = r.id AND i.kind = 'cancel'
+                          AND (i.consumed_at IS NULL OR i.consumed_claim_generation = r.claim_generation)))
  ORDER BY r.created_at, r.id
  LIMIT @batch::int;
