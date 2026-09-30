@@ -44,7 +44,7 @@ A token stops working on its **next request** when any of these happens:
 | Your account is deactivated | an admin |
 | The token expires | automatic |
 
-**Revoking cuts off jobs.** Revoking a product token, disabling or deleting its product, or deactivating your account also cancels that product's queued and running jobs. A token that merely expires does not cancel them. See [Jobs](./jobs.md#worker-requirement-and-rollout).
+**Revoking cuts off jobs.** Revoking a product token, disabling or deleting its product, or deactivating your account also cancels that product's non-terminal jobs. A token that merely expires does not cancel them. See [Jobs](./jobs.md#trust-model).
 
 **A password change and logging out do NOT revoke product tokens**, exactly as for CLI tokens. If a token may have leaked, revoke it or use Revoke all.
 
@@ -65,4 +65,4 @@ Product registration is an admin-only browser action under **Admin → Products*
 
 `/api/v1` is described by the checked-in OpenAPI 3.1 document `api/openapi/v1.yaml`, and a test keeps it identical to the router. Changes are **additive only**: new paths, new optional request fields, new response fields. Removing or renaming a path, field or enum value, or making an optional request field required, is breaking. A breaking change keeps the old shape working for **at least two minor releases and at least 90 days, whichever is later**, announced in the [changelog](./changelog.md), or ships under a new `/api/v2`. The internal `/api/*` routes are not covered: products must not call them.
 
-`/api/v1` shares one per-user request budget (`V1_RATE_LIMIT_MAX` requests per `V1_RATE_LIMIT_WINDOW`, 120 per minute by default); creating a job also counts against the sign-in budget (`RATE_LIMIT_MAX`, 10 per minute). Over either you get a 429 with `Retry-After`.
+`/api/v1` shares one per-user request budget (`V1_RATE_LIMIT_MAX` requests per `V1_RATE_LIMIT_WINDOW`, 120 per minute by default); creating a job also has a separate per-user counter sized by `RATE_LIMIT_MAX` and its window (10 per minute). Over either you get a 429 with `Retry-After`.

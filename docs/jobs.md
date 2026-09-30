@@ -40,7 +40,7 @@ A product token sees only jobs created for its own product. A `uzc_` token sees 
 
 ## Statuses
 
-`queued`, `running`, `waiting`, `completed`, `failed`, `cancelled`. The last three are final. A job **never parks**: hitting a usage limit, the wall-clock limit, a recovery situation or a disabled credential fails the job instead of leaving it waiting, so read `failure_reason` on a `failed` job.
+`queued`, `running`, `waiting`, `completed`, `failed`, `cancelled`. The last three are final. `waiting` is only a defensive mapping for the internal park states; a job never parks, so you should not see it in practice. A job **never parks**: hitting a usage limit, the wall-clock limit, a recovery situation or a disabled credential fails the job instead of leaving it waiting, so read `failure_reason` on a `failed` job.
 
 ## Cancel
 
@@ -53,7 +53,7 @@ A product token sees only jobs created for its own product. A `uzc_` token sees 
 ## Limits and refusals
 
 - **Active jobs:** at most **10** non-terminal jobs per user (429 `over_cap`). An admin can change it with the `job_max_active_per_user` setting.
-- **Request rate:** `/api/v1` has its own per-user budget, 120 per minute by default. Creating a job also counts against the sign-in budget (10 per minute by default). A 429 without a `reason` carries `Retry-After`. See [Configuration](./configuration.md).
+- **Request rate:** `/api/v1` has its own per-user budget, 120 per minute by default. `POST /api/v1/jobs` also has its own separate per-user counter, sized by the same `RATE_LIMIT_MAX` and window as the sign-in limiter (10 per minute by default); it does not share a count with sign-in attempts. A 429 without a `reason` carries `Retry-After`. See [Configuration](./configuration.md).
 - **Body size:** a create body over 4 MiB is a 413; the prompt is capped at 256 KiB.
 
 | Status | `reason` | Meaning |
@@ -63,6 +63,7 @@ A product token sees only jobs created for its own product. A `uzc_` token sees 
 | 403 | `job_type_not_allowed` | The product does not allow this job type |
 | 404 | `not_found` | No such job for this caller |
 | 409 | `job_terminal` | Cancel of a finished job |
+| 413 | `payload_too_large` | The create body is over 4 MiB |
 | 422 | `invalid_request`, `unknown_job_type`, `not_supported`, `no_model_credential` | Bad request, or you have no usable Anthropic credential |
 | 429 | `over_cap` | Active-job cap reached |
 
@@ -74,6 +75,6 @@ A product token sees only jobs created for its own product. A `uzc_` token sees 
 
 ## Worker requirement and rollout
 
-Only a non-Docker worker that advertises the `job_runner_v1` capability claims jobs, and an ephemeral worker is provisioned for a queued job when needed. If a job's bound ephemeral worker registers without `job_runner_v1`, or never registers, the job fails (`no_job_capable_worker` or `ephemeral_worker_never_registered`) rather than waiting. **Deploy the api and the chart's worker image tag together:** an older worker image never claims jobs, so a job queued against a fleet that has not rolled will sit `queued` or fail as above.
+Only a non-Docker worker that advertises the `job_runner_v1` capability claims jobs, and, if you opted in to ephemeral workers, an ephemeral worker is provisioned for a queued job when needed. Without that opt-in the job waits `queued` for a capable worker of yours and counts toward the active-job cap. If a job's bound ephemeral worker registers without `job_runner_v1`, or never registers, the job fails (`no_job_capable_worker` or `ephemeral_worker_never_registered`) rather than waiting. **Deploy the api and the chart's worker image tag together:** an older worker image never claims jobs, so a job queued against a fleet that has not rolled will sit `queued` or fail as above.
 
 Design rationale: the job run kind ADR, adr/1908-job-run-kind.md in the repo.

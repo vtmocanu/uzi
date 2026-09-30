@@ -813,7 +813,7 @@ uzi job list [--limit N] [--cursor C]
 - **`list`** is newest first, 50 per page by default, and prints the `--cursor` for the next page.
 - **`--json`** prints the raw API objects. Text from the server is sanitized for the terminal.
 
-Refusals print the server's reason: for example a 403 `job_type_not_allowed`, a 422 `no_model_credential` (add an Anthropic credential in uzi), or a 429 `over_cap` (10 active jobs per user by default).
+`uzi job` needs a `uzc_` user token: a `uzp_` product token is refused by the CLI and a `uza_` admin token is refused by `/api/v1`. Refusals print the server's error message (not the machine `reason` token): for example a 422 about no model credential (add an Anthropic credential in uzi) or a 429 when you reach the active-job cap (10 per user by default). A `job_type_not_allowed` 403 applies only to product tokens, so `uzi job` does not hit it.
 
 ## Recovering unpublished work: `uzi run export`
 

@@ -117,8 +117,12 @@ code did not support:
 5. **Workspace confinement.** The job runner uses `Read`, `Write`, `Glob`,
    `Grep` and the in-process `submit_job_result` tool, with
    `settingSources: []`. A path guard is rooted at the per-run workspace, and
-   a job-only Glob/Grep pattern screen denies absolute, `~`, `..`, extglob,
-   bracket, whitespace-led and `$` patterns. Workspaces live under
+   a job-only Glob/Grep pattern screen (`jobGlobEscapeReason`,
+   `agent/src/job-runner.ts`) denies a pattern that is absolute or
+   home-relative (`/`, `\`, `~`, including right after a `{`, `,`, `(`, `|`,
+   `[` or whitespace opener), or contains `..`, `$` or NUL, or starts or ends
+   with whitespace. Plain extglob and bracket patterns such as `src/*.[ch]`
+   or `@(a|b).md` are allowed. Workspaces live under
    `<dataDir>/jobs`, which the entrypoint converges on every root boot to
    `worker:codex-session` mode 3710 (setgid, sticky, group traverse only;
    `agent/templates/entrypoint.sh`).
