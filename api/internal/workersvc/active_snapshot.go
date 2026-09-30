@@ -36,6 +36,20 @@ type ActiveSnapshot struct {
 	// its server-side closure is unexpired every run it owns is closed to every claimant and the
 	// worker itself is refused any claim (#1391, D11).
 	PendingOverflow bool `json:"pending_overflow"`
+	// FinalizeResume (issue #1742) is carried ONLY on a register snapshot: the attempts whose
+	// executor finished and whose worker holds an authenticated finalize-pending record, but no
+	// journaled terminal outcome, at the named exact claim generation. It is never an outcome and
+	// never a lease; Register uses it to re-queue (never complete) the run through the ordinary
+	// claim path. Omitted by an older worker, ignored by an older api (the snapshot is parsed
+	// leniently).
+	FinalizeResume []FinalizeResumeEntry `json:"finalize_resume,omitempty"`
+}
+
+// FinalizeResumeEntry is one finalize-pending attempt a restarting worker attests on its register
+// snapshot (issue #1742): the run and the exact claim generation whose executor finished.
+type FinalizeResumeEntry struct {
+	RunID           string `json:"run_id"`
+	ClaimGeneration int64  `json:"claim_generation"`
 }
 
 // ActiveRunEntry is one attempt in an ActiveSnapshot. run_id is a uuid string; claim_generation

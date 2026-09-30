@@ -525,6 +525,17 @@ export interface ActiveSnapshot {
   register_nonce?: string;
   active: ActiveSnapshotEntry[];
   pending_overflow: boolean;
+  /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
+   *  named exact claim generation and whose authenticated finalize-pending record survived a
+   *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
+   *  api re-queues such a run through the ordinary claim path. Never sent on a heartbeat/claim. */
+  finalize_resume?: FinalizeResumeEntry[];
+}
+
+/** Issue #1742: one finalize-pending attempt attested on the register snapshot. */
+export interface FinalizeResumeEntry {
+  run_id: string;
+  claim_generation: number;
 }
 
 export interface HeartbeatRequest {
