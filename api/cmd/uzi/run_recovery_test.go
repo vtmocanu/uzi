@@ -571,3 +571,126 @@ func TestRunDiscardConfirmEOFDeclines(t *testing.T) {
 		t.Fatalf("EOF must decline and mutate nothing; got %+v", fc.DiscardHoldCalls)
 	}
 }
+
+// TestOwnerRecoveryHintsSplitByArchive proves the owner listing offers `run export` only for
+// the hold with an available archive, discard for both decision holds, and explains the
+// source_only hold's missing archive with a custody line.
+func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: ownerRecoveryFixture()}), "run", "recovery")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	for _, want := range []string{
+		"run run-a hold hold-a: no recovery archive; custody of worker worker-a's local source is retained (export unavailable)",
+		"1 hold(s) have a recovery archive: recover with `uzi run export`",
+		"2 hold(s) await a decision: discard with `uzi run discard <run-id> --hold <hold-id> --yes`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "or discard with") || strings.Count(out, "custody of worker") != 1 {
+		t.Errorf("stale hint or custody line for a non-source_only hold:\n%s", out)
+	}
+}
+
+func TestOwnerRecoveryQuietSuppressesGuidance(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: ownerRecoveryFixture()}), "--quiet", "run", "recovery")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out, "custody of worker") || strings.Contains(out, "await a decision") ||
+		strings.Contains(out, "recovery archive") {
+		t.Errorf("--quiet printed guidance:\n%s", out)
+	}
+}
+
+func TestRunRecoverySourceOnlyNoExportSuggestion(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	for _, want := range []string{
+		"hold hold-run1-gen1: no recovery archive; custody of worker alpha's local source is retained (export unavailable)",
+		"1 hold(s) await a decision: discard with `uzi run discard run1 --hold <hold-id> --yes`",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("missing %q in:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "uzi run export") || strings.Contains(out, "have a recovery archive") {
+		t.Errorf("export suggested for a hold with no archive:\n%s", out)
+	}
+}
+
+func TestRunRecoveryArchiveReadyGetsExportHint(t *testing.T) {
+	dto := recoveryHoldsFixture()
+	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
+		{ID: "hold-r", RunID: "run1", Generation: 1, State: "open", Attention: "archive_ready",
+			WorkerID: "w1", WorkerName: "alpha", HasAvailableCapture: true, CaptureState: "available"},
+	}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(out, "1 hold(s) have a recovery archive: recover with `uzi run export`") {
+		t.Errorf("export hint absent:\n%s", out)
+	}
+	if strings.Contains(out, "await a decision") || strings.Contains(out, "custody of worker") {
+		t.Errorf("archive_ready hold got decision/custody guidance:\n%s", out)
+	}
+}
+
+func TestRunRecoveryNeedsActionGetsDiscard(t *testing.T) {
+	dto := recoveryHoldsFixture()
+	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
+		{ID: "hold-n", RunID: "run1", Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
+	}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.Contains(out, "1 hold(s) await a decision: discard with `uzi run discard run1 --hold <hold-id> --yes`") ||
+		strings.Contains(out, "uzi run export") || strings.Contains(out, "custody of worker") {
+		t.Errorf("needs_action guidance wrong:\n%s", out)
+	}
+}
+
+func TestRunRecoveryQuietSuppressesGuidance(t *testing.T) {
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}), "--quiet", "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out, "custody of worker") || strings.Contains(out, "await a decision") {
+		t.Errorf("--quiet printed guidance:\n%s", out)
+	}
+}
+
+// TestSourceOnlyLineSanitizes proves a hostile hold id / worker name cannot forge lines or
+// inject escapes through the custody line, in either renderer.
+func TestSourceOnlyLineSanitizes(t *testing.T) {
+	h := apitypes.RecoveryCustodyHoldDTO{
+		ID: "h1\nforged line", RunID: "run1\x1b[31m", Generation: 1, State: "open", Attention: "source_only",
+		WorkerName: "evil\r\x1b]0;x\x07name\nforged", CreatedAt: time.Now().Add(-time.Hour),
+	}
+	if got := sourceOnlyLine(h); strings.ContainsAny(got, "\n\r\x1b\x07") {
+		t.Errorf("sourceOnlyLine leaked control bytes: %q", got)
+	}
+	dto := apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{h}}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.ContainsAny(out, "\x1b\r\x07") || strings.Contains(out, "\nforged") {
+		t.Errorf("owner listing leaked hostile bytes: %q", out)
+	}
+	h.RunID = "run1"
+	out, _, code = runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{
+		Holds: []apitypes.RecoveryCustodyHoldDTO{h}}}), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.ContainsAny(out, "\x1b\r\x07") || strings.Contains(out, "\nforged") {
+		t.Errorf("run view leaked hostile bytes: %q", out)
+	}
+}
