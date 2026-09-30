@@ -1275,7 +1275,10 @@ export class GitCache {
    * classify the record's pinned `sourceSha` against it, for the restart sweep. `reposRoot` is
    * private, so the sweep cannot build the path itself; this is the only door, and it refuses a
    * name that is not a plain basename (no separator, not `.`/`..`) so a tampered-but-re-MACed
-   * record can never point outside the repos root.
+   * record can never point outside the repos root. The bare must ALSO be a real directory (not a
+   * symlink) whose realpath sits DIRECTLY under `realpath(reposRoot)`, so a symlinked
+   * `<name>.git` that points elsewhere is `missing_bare` too. `defaultBranch` is only used as a
+   * ref name after a strict character check plus `git check-ref-format`.
    *   - `missing_bare`: the name is unsafe or no bare with that name exists;
    *   - `missing_sha`: the bare lacks `sourceSha` as a commit (not verifiable);
    *   - `on_default`: `sourceSha` is an ancestor of the bare's `<defaultBranch>` ref
@@ -1302,6 +1305,14 @@ export class GitCache {
     }
     const barePath = path.join(this.reposRoot, bareDir);
     if (path.dirname(barePath) !== this.reposRoot) return { status: "missing_bare" };
+    try {
+      const st = await fs.lstat(barePath);
+      if (st.isSymbolicLink() || !st.isDirectory()) return { status: "missing_bare" };
+      const [realBare, realRoot] = await Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+      if (path.dirname(realBare) !== realRoot) return { status: "missing_bare" };
+    } catch {
+      return { status: "missing_bare" };
+    }
     if (!(await isBareRepo(barePath))) return { status: "missing_bare" };
     if (!/^[0-9a-f]{40}$/.test(sourceSha)) return { status: "missing_sha", barePath };
     return this.withLock(barePath, async () => {
@@ -1309,7 +1320,7 @@ export class GitCache {
         return { status: "missing_sha" as const, barePath };
       }
       const db = defaultBranch.trim();
-      if (db && !db.startsWith("-") && !/[\s~^:?*[\\]|\.\./.test(db) && ![...db].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)) {
+      if (await this.isPlainBranchName(barePath, db)) {
         for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
           if (!(await this.refExists(barePath, ref))) continue;
           if ((await this.tryGit(barePath, ["merge-base", "--is-ancestor", sourceSha, ref])) === 0) {
@@ -1319,6 +1330,19 @@ export class GitCache {
       }
       return { status: "unpublished" as const, barePath };
     });
+  }
+
+  /** A journaled default-branch name safe to splice into a ref: printable ASCII only, no leading
+   *  `-`, no `@{`, none of the ref-format metacharacters, and accepted by
+   *  `git check-ref-format refs/heads/<name>` (which does no `@{-N}` expansion). */
+  private async isPlainBranchName(barePath: string, name: string): Promise<boolean> {
+    if (!name || name.startsWith("-") || name.includes("@{")) return false;
+    if (/[\s~^:?*[\\]|\.\./.test(name)) return false;
+    for (const ch of name) {
+      const c = ch.charCodeAt(0);
+      if (c < 0x21 || c > 0x7e) return false;
+    }
+    return (await this.tryGit(barePath, ["check-ref-format", `refs/heads/${name}`])) === 0;
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
@@ -5449,7 +5473,7 @@ export class GitCache {
    */
   async produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number; boundBeforeWrite?: boolean },
   ): Promise<RecoveryBundleResult> {
     const maxBytes = opts.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES;
     return this.withLock(barePath, async () => {
@@ -5488,6 +5512,19 @@ export class GitCache {
             };
           }
           prereqs = [mb];
+        }
+      }
+      // issue #1742: bound a SELF-CONTAINED bundle BEFORE writing it when the caller asks (the
+      // restart sweep, which cannot shrink the history with a forge prerequisite). The estimate is
+      // the on-disk size of every object reachable from H (`rev-list --objects --disk-usage`,
+      // git >= 2.31); it approximates the pack's size, and an unreadable estimate (older git)
+      // falls through to the post-write size check below, which always still runs.
+      if (opts.boundBeforeWrite === true && prereqs.length === 0) {
+        const estimate = await this.runGit(barePath, ["rev-list", "--objects", "--disk-usage", h])
+          .then((out) => Number.parseInt(out.trim(), 10))
+          .catch(() => Number.NaN);
+        if (Number.isFinite(estimate) && estimate > maxBytes) {
+          throw new RecoveryBundleTooLargeError(estimate, maxBytes);
         }
       }
       // Create the transient named ref at H, build the bundle from EXACTLY that ref, verify
