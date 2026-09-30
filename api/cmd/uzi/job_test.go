@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -293,5 +294,34 @@ func TestJobResultTerminalWithoutResult(t *testing.T) {
 		if last != want {
 			t.Errorf("%s: last line = %q, want %q", id, last, want)
 		}
+	}
+}
+
+func TestJobResultEmptyReport(t *testing.T) {
+	fc := &uzicli.FakeClient{JobResultByID: map[string]apitypes.V1JobResultDTO{
+		"j": {JobStatus: "completed", Result: &apitypes.V1JobResultBodyDTO{Status: "ok", ReportMd: "  \n "}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "job", "result", "j")
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if !strings.HasSuffix(out, "REPORT\n    (empty)\n") {
+		t.Errorf("empty report should print a labelled placeholder, got:\n%q", out)
+	}
+}
+
+// An admin (uza_) token is refused by /api/v1, so `uzi job` says so before any request.
+func TestJobRefusesAdminToken(t *testing.T) {
+	tok := clitoken.PrefixAdmin + strings.Repeat("c", 43)
+	_, errOut, code, built := runWithToken(t, fakeEnv(nil), tok, "job", "list")
+	if code != uzicli.ExitUsage || built {
+		t.Errorf("exit = %d built = %v, want usage exit and no client", code, built)
+	}
+	if !strings.Contains(errOut, "the job commands need a uzc_ user token") || strings.Contains(errOut, tok) {
+		t.Errorf("stderr = %q, want the admin-token hint without the token", errOut)
+	}
+	_, _, code, built = runWithToken(t, fakeEnv(nil), "uzc_"+strings.Repeat("d", 43), "job", "list")
+	if code != uzicli.ExitOK || !built {
+		t.Errorf("a uzc_ token must proceed: exit = %d built = %v", code, built)
 	}
 }

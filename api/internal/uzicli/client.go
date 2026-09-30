@@ -1076,7 +1076,7 @@ func buildStatusError(status int, msg, reason, retryAfter string) *ExitError {
 		}
 		switch reason {
 		case "insufficient_scope":
-			return Exitf(ExitAuth, "%s: this token's scope does not allow that; the jobs API needs a token with the jobs scope", msg)
+			return Exitf(ExitAuth, "%s: this token's scope does not allow that; the jobs API needs a token with the jobs:run scope (create, cancel) or jobs:read scope (reads)", msg)
 		case "job_type_not_allowed":
 			return Exitf(ExitAuth, "%s: this product token is not allowed to create jobs of that type", msg)
 		}

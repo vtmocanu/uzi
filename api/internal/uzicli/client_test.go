@@ -1492,7 +1492,7 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 // A jobs-API 403 names its typed reason, not the admin-scope hint.
 func TestHTTPClient403JobReasons(t *testing.T) {
 	for reason, want := range map[string]string{
-		"insufficient_scope":   "jobs scope",
+		"insufficient_scope":   "jobs:run scope (create, cancel) or jobs:read scope (reads)",
 		"job_type_not_allowed": "not allowed to create jobs",
 	} {
 		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

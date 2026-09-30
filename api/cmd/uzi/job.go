@@ -98,7 +98,7 @@ func newJobCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 				}
 				req.WallSeconds = &budget
 			}
-			c, err := env.client(gf)
+			c, err := env.jobClient(gf)
 			if err != nil {
 				return err
 			}
@@ -129,7 +129,7 @@ func newJobGetCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Show a job's status",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := env.client(gf)
+			c, err := env.jobClient(gf)
 			if err != nil {
 				return err
 			}
@@ -154,7 +154,7 @@ func newJobResultCmd(env Env, gf *globalFlags) *cobra.Command {
 			"status and no result.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := env.client(gf)
+			c, err := env.jobClient(gf)
 			if err != nil {
 				return err
 			}
@@ -180,7 +180,7 @@ func newJobCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 			"printed status may still read running for a moment.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, err := env.client(gf)
+			c, err := env.jobClient(gf)
 			if err != nil {
 				return err
 			}
@@ -210,7 +210,7 @@ func newJobListCmd(env Env, gf *globalFlags) *cobra.Command {
 			if cmd.Flags().Changed("limit") && (limit < 1 || limit > 100) {
 				return uzicli.Exitf(uzicli.ExitUsage, "--limit must be from 1 to 100")
 			}
-			c, err := env.client(gf)
+			c, err := env.jobClient(gf)
 			if err != nil {
 				return err
 			}
@@ -293,8 +293,13 @@ func renderJobResult(p *uzicli.Printer, r apitypes.V1JobResultDTO) {
 			p.Println(line)
 		}
 	}
+	report := strings.TrimSpace(r.Result.ReportMd)
+	if report == "" {
+		p.Println("\nREPORT\n    (empty)")
+		return
+	}
 	p.Println("\nREPORT")
-	for _, line := range strings.Split(uzicli.SanitizeTTY(strings.TrimSpace(r.Result.ReportMd)), "\n") {
+	for _, line := range strings.Split(uzicli.SanitizeTTY(report), "\n") {
 		p.Printf("    %s\n", line)
 	}
 }

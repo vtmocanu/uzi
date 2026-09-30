@@ -139,15 +139,17 @@ export function AdminProducts() {
                 }, "Failed to update product")
               }
               // Reported inline on the card (not the page banner, which can be scrolled
-              // off-screen): resolves to the error text, or null once saved and reloaded.
+              // off-screen): resolves to the error text, or to the list the server stored.
               onJobTypes={async (allowed_job_types) => {
+                let saved: string[];
                 try {
-                  await api.adminUpdateProduct(p.id, { allowed_job_types });
+                  const { product } = await api.adminUpdateProduct(p.id, { allowed_job_types });
+                  saved = product.allowed_job_types ?? allowed_job_types;
                 } catch (err) {
-                  return errorMessage(err, "Failed to save the job types");
+                  return { error: errorMessage(err, "Failed to save the job types") };
                 }
                 await reload();
-                return null;
+                return { error: null, saved };
               }}
               onDelete={() =>
                 run(async () => {
@@ -397,8 +399,9 @@ function ProductCard({
   truncatedAt: number | null;
   onToggle: (enabled: boolean) => Promise<boolean>;
   // Sends the product's whole new allow-list (PATCH allowed_job_types; [] clears it) and
-  // resolves to the error text on failure, null once saved and the list reloaded.
-  onJobTypes: (allowed: string[]) => Promise<string | null>;
+  // resolves to the error text on failure, or the list the server stored once saved (the
+  // list was then reloaded, but a failed reload keeps the old data, so `saved` is the basis).
+  onJobTypes: (allowed: string[]) => Promise<{ error: string } | { error: null; saved: string[] }>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
 }) {
@@ -420,7 +423,12 @@ function ProductCard({
   // Job types save optimistically: the box shows the new state at once (dimmed, "Saving…"),
   // then "Saved." on success, or reverts with an inline error beside the boxes on failure.
   // absent = an api predating PRD #1908 (rollout skew): no job types to edit.
-  const storedTypes = product.allowed_job_types;
+  // A saved list stays the basis until the product prop changes (a successful reload),
+  // so a failed reload cannot revert the boxes or make the next toggle drop this change.
+  const propTypes = product.allowed_job_types;
+  const [savedTypes, setSavedTypes] = useState<string[] | null>(null);
+  useEffect(() => setSavedTypes(null), [propTypes]);
+  const storedTypes = propTypes === undefined ? undefined : (savedTypes ?? propTypes);
   const [pendingTypes, setPendingTypes] = useState<string[] | null>(null);
   const [typesStatus, setTypesStatus] = useState<"saving" | "saved" | null>(null);
   const [typesError, setTypesError] = useState("");
@@ -435,10 +443,11 @@ function ProductCard({
     setPendingTypes(next);
     setTypesStatus("saving");
     setTypesError("");
-    const err = await onJobTypes(next);
+    const res = await onJobTypes(next);
+    if (res.error === null) setSavedTypes(res.saved);
     setPendingTypes(null);
-    setTypesStatus(err === null ? "saved" : null);
-    setTypesError(err ?? "");
+    setTypesStatus(res.error === null ? "saved" : null);
+    setTypesError(res.error ?? "");
   };
 
   // What the delete will stop: an enabled product's active tokens. A disabled

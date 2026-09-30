@@ -309,6 +309,24 @@ describe("AdminProducts job-type save feedback (PRD #1908 review)", () => {
     expect(researchIn(card).getAttribute("aria-disabled")).toBeNull();
   });
 
+  it("keeps the saved list as the basis when the reload after a save fails", async () => {
+    mockApi.adminUpdateProduct
+      .mockResolvedValueOnce({ product: aProduct({ allowed_job_types: ["research"] }) })
+      .mockResolvedValueOnce({ product: aProduct({ allowed_job_types: [] }) });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    // The save succeeds but the reload that follows it fails (old data is kept).
+    mockApi.adminListProducts.mockRejectedValue(new Error("network down"));
+    fireEvent.click(researchIn(card));
+    await waitFor(() => expect(within(card).getByRole("status").textContent).toBe("Job types saved."));
+    // Not reverted to the stale stored list while claiming "saved".
+    expect(researchIn(card).checked).toBe(true);
+    // The next toggle is built from the saved list: it unchecks (sends []), not re-checks.
+    fireEvent.click(researchIn(card));
+    await waitFor(() => expect(mockApi.adminUpdateProduct).toHaveBeenCalledTimes(2));
+    expect(mockApi.adminUpdateProduct).toHaveBeenLastCalledWith("prod-a", { allowed_job_types: [] });
+  });
+
   it("reverts the box and shows the error beside it when the save fails", async () => {
     mockApi.adminUpdateProduct.mockRejectedValueOnce(new ApiError(400, "allowed_job_types: unknown job type"));
     renderPage();

@@ -14,6 +14,7 @@ import (
 
 	"github.com/spf13/cobra"
 
+	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
@@ -456,8 +457,9 @@ const msgProductTokenCLI = "product tokens (" + producttoken.Prefix + ") only wo
 
 // rejectProductToken fails fast when the resolved credential ($UZI_TOKEN or the
 // active context's stored token) is a product token (PRD #1907 M6). A product
-// token authenticates only /api/v1, which the CLI does not call, so refusing here
-// names the fix before any request is built. resolveSettings is the one place
+// token is for an external product's own integration, never for the CLI (`uzi job`
+// calls /api/v1 with a uzc_ user token), so refusing here names the fix before any
+// request is built. resolveSettings is the one place
 // both token sources merge, and env.client builds every authenticated client from
 // it.
 func rejectProductToken(token string) error {
@@ -501,6 +503,24 @@ func (env Env) client(gf *globalFlags) (uzicli.Client, error) {
 	s, err := resolveSettings(env, gf)
 	if err != nil {
 		return nil, err
+	}
+	return env.NewClient(s), nil
+}
+
+// msgAdminTokenJob is the fixed message for an admin (uza_) token handed to a job command:
+// /api/v1 accepts user tokens only and would answer 401.
+const msgAdminTokenJob = "the job commands need a uzc_ user token; admin (" + clitoken.PrefixAdmin +
+	") tokens are not accepted by /api/v1: use a context or token holding a uzc_ token"
+
+// jobClient is env.client for the `uzi job` commands, which call /api/v1: it refuses an
+// admin (uza_) token up front with a usage error rather than letting the request 401.
+func (env Env) jobClient(gf *globalFlags) (uzicli.Client, error) {
+	s, err := resolveSettings(env, gf)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasPrefix(s.Token, clitoken.PrefixAdmin) {
+		return nil, uzicli.Exitf(uzicli.ExitUsage, "%s", msgAdminTokenJob)
 	}
 	return env.NewClient(s), nil
 }
