@@ -297,6 +297,21 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 		return store.JobFile{}, refusal(RefusalLimit, RefusalFileTooLarge)
 	}
 
+	if p.RunID != nil {
+		// The run must be a job of THIS owner: SumRunJobFiles counts across owners, so without this
+		// a caller could reserve against (and be charged into the caps of) another owner's job. It
+		// is a plain read taken BEFORE the advisory keys, never a row lock inside them: a runs row
+		// held FOR UPDATE elsewhere would otherwise stall every stored-files admission
+		// instance-wide. runs.user_id and runs.kind are immutable, and the job_files.run_id foreign
+		// key stops the run being deleted under the insert.
+		if _, err := store.New(j.db).GetOwnedJobRun(ctx, store.GetOwnedJobRunParams{ID: *p.RunID, UserID: p.UserID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.JobFile{}, ErrJobRunNotFound
+			}
+			return store.JobFile{}, err
+		}
+	}
+
 	tx, err := j.db.Begin(ctx)
 	if err != nil {
 		return store.JobFile{}, err
@@ -308,14 +323,6 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 	q := store.New(tx)
 
 	if p.RunID != nil {
-		// The run must be a job of THIS owner: SumRunJobFiles counts across owners, so without this
-		// a caller could reserve against (and be charged into the caps of) another owner's job.
-		if _, err := q.LockOwnedJobRun(ctx, store.LockOwnedJobRunParams{ID: *p.RunID, UserID: p.UserID}); err != nil {
-			if errors.Is(err, pgx.ErrNoRows) {
-				return store.JobFile{}, ErrJobRunNotFound
-			}
-			return store.JobFile{}, err
-		}
 		cur, err := q.SumRunJobFiles(ctx, store.SumRunJobFilesParams{RunID: pgconv.UUID(*p.RunID), Direction: p.Direction})
 		if err != nil {
 			return store.JobFile{}, err

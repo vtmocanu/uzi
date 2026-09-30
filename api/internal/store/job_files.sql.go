@@ -149,6 +149,27 @@ func (q *Queries) GetJobFileForOwner(ctx context.Context, arg GetJobFileForOwner
 	return i, err
 }
 
+const getOwnedJobRun = `-- name: GetOwnedJobRun :one
+SELECT id FROM runs WHERE id = $1 AND user_id = $2 AND kind = 'job'
+`
+
+type GetOwnedJobRunParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Reservation's ownership check: the run must be a kind='job' run of @user_id. A plain read, taken
+// BEFORE the stored-files advisory keys so a runs row lock held elsewhere can never stall the
+// instance-wide admission queue. runs.user_id and runs.kind never change, and the job_files.run_id
+// foreign key stops a concurrent delete of the run under the insert. Zero rows: the run is not the
+// caller's, or not a job.
+func (q *Queries) GetOwnedJobRun(ctx context.Context, arg GetOwnedJobRunParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getOwnedJobRun, arg.ID, arg.UserID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const insertJobFileChunk = `-- name: InsertJobFileChunk :exec
 INSERT INTO job_file_chunks (file_id, chunk_index, length, sealed)
 VALUES ($1, $2, $3, $4)
@@ -169,25 +190,6 @@ func (q *Queries) InsertJobFileChunk(ctx context.Context, arg InsertJobFileChunk
 		arg.Sealed,
 	)
 	return err
-}
-
-const lockOwnedJobRun = `-- name: LockOwnedJobRun :one
-SELECT id FROM runs WHERE id = $1 AND user_id = $2 AND kind = 'job' FOR KEY SHARE
-`
-
-type LockOwnedJobRunParams struct {
-	ID     uuid.UUID `json:"id"`
-	UserID uuid.UUID `json:"user_id"`
-}
-
-// Reservation's ownership check: the run must be a kind='job' run of @user_id. FOR KEY SHARE keeps
-// the run from being deleted under the insert without blocking its ordinary status updates. Zero
-// rows: the run is not the caller's, or not a job.
-func (q *Queries) LockOwnedJobRun(ctx context.Context, arg LockOwnedJobRunParams) (uuid.UUID, error) {
-	row := q.db.QueryRow(ctx, lockOwnedJobRun, arg.ID, arg.UserID)
-	var id uuid.UUID
-	err := row.Scan(&id)
-	return id, err
 }
 
 const lockReservedJobFile = `-- name: LockReservedJobFile :one
@@ -400,6 +402,27 @@ func (q *Queries) StampCaptureReservation(ctx context.Context, arg StampCaptureR
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const sumCommittedSharedBytes = `-- name: SumCommittedSharedBytes :one
+SELECT (
+  COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state <> 'expired'), 0)
+  + COALESCE((SELECT sum(COALESCE(c.byte_size, 0)) FROM recovery_captures c
+               WHERE c.state = 'available'
+                 AND ($1::uuid IS NULL OR c.id <> $1::uuid)), 0)
+)::bigint AS committed_bytes
+`
+
+// The bytes actually on the books, for the bind-time reclaim: every non-expired job file plus every
+// 'available' recovery capture by its bound byte_size. Unlike SumStoredFileBytes it deliberately
+// leaves out the unverified in-flight reservations (preparing/uploading captures), so a reclaim
+// sized from it can never be inflated by bytes another upload only declared. @exclude_capture_id
+// leaves the capture being bound out (it is not 'available' yet, so this is belt and braces).
+func (q *Queries) SumCommittedSharedBytes(ctx context.Context, excludeCaptureID pgtype.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, sumCommittedSharedBytes, excludeCaptureID)
+	var committed_bytes int64
+	err := row.Scan(&committed_bytes)
+	return committed_bytes, err
 }
 
 const sumReclaimableJobFileBytes = `-- name: SumReclaimableJobFileBytes :one

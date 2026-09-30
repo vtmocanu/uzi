@@ -548,6 +548,7 @@ type Store interface {
 	InsertCaptureChunk(ctx context.Context, arg store.InsertCaptureChunkParams) error
 	MarkCaptureReady(ctx context.Context, arg store.MarkCaptureReadyParams) (store.RecoveryCapture, error)
 	MarkCaptureState(ctx context.Context, arg store.MarkCaptureStateParams) (store.RecoveryCapture, error)
+	MarkCaptureFailed(ctx context.Context, arg store.MarkCaptureFailedParams) (store.RecoveryCapture, error)
 	GetCaptureForOwner(ctx context.Context, arg store.GetCaptureForOwnerParams) (store.RecoveryCapture, error)
 	ListCapturesForRunOwner(ctx context.Context, arg store.ListCapturesForRunOwnerParams) ([]store.RecoveryCapture, error)
 	ListCaptureChunks(ctx context.Context, captureID uuid.UUID) ([]store.RecoveryCaptureChunk, error)

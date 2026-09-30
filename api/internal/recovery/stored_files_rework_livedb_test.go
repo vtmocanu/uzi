@@ -6,7 +6,10 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -183,5 +186,96 @@ func TestRecoveryRetryClearsStaleReasonLiveDB(t *testing.T) {
 	}
 	if err := e.pool.QueryRow(e.ctx, `SELECT reason FROM recovery_captures WHERE id = $1`, id).Scan(&reason); err != nil || reason != nil {
 		t.Fatalf("after the retry's admission: reason = %v (err %v), want NULL", reason, err)
+	}
+}
+
+// TestRecoveryStalledReservationCannotInflateReclaimLiveDB: the bind-time reclaim is sized from
+// COMMITTED bytes, never from another capture's unverified in-flight reservation. A worker that
+// admits a capture declaring a large size and never streams it must not let a later, tiny verified
+// upload reclaim (expire) job files to make room for bytes that were never sent.
+//
+// CALIBRATION: size the excess in reclaimForBudget from store.SumStoredFiles (which counts the
+// preparing/uploading reservations) instead of SumCommittedSharedBytes; both subtests then expire a
+// job file and go red.
+func TestRecoveryStalledReservationCannotInflateReclaimLiveDB(t *testing.T) {
+	t.Run("another capture stalls after admission", func(t *testing.T) {
+		e := newSFEnv(t)
+		svc, jf := e.recovery(1000), e.jobFiles()
+		var victims []uuid.UUID
+		for i, name := range []string{"v1.txt", "v2.txt", "v3.txt", "v4.txt"} {
+			victims = append(victims, e.availableJobFile(t, jf, name, 200, 10-i))
+		}
+		stalled := bytes.Repeat([]byte("b"), 800)
+		capB := e.newCapture(t, svc)
+		if _, done, err := svc.admit(e.ctx, e.wkr, e.runID, capB, manifestOf(stalled)); err != nil || done {
+			t.Fatalf("admit B (800 declared, 800 reclaimable) = done %v, %v; want admitted", done, err)
+		}
+
+		one := []byte("c")
+		capC := e.newCapture(t, svc)
+		if _, err := svc.Upload(e.ctx, e.wkr, e.runID, capC, manifestOf(one), bytes.NewReader(one)); err != nil {
+			t.Fatalf("1-byte upload: %v", err)
+		}
+		if st, _ := e.captureState(t, capC); st != "available" {
+			t.Fatalf("capture C = %q, want available", st)
+		}
+		for i, v := range victims {
+			if got := e.jobState(t, v); got != "available" {
+				t.Errorf("victim %d = %q, want available: a 1-byte verified upload reclaimed a file for B's unsent reservation", i+1, got)
+			}
+		}
+	})
+
+	t.Run("same worker stalls one capture and uploads another", func(t *testing.T) {
+		e := newSFEnv(t)
+		svc, jf := e.recovery(1000), e.jobFiles()
+		victim := e.availableJobFile(t, jf, "big.txt", 900, 5)
+		stalled := bytes.Repeat([]byte("b"), 900)
+		capB := e.newCapture(t, svc)
+		if _, done, err := svc.admit(e.ctx, e.wkr, e.runID, capB, manifestOf(stalled)); err != nil || done {
+			t.Fatalf("admit B (900 declared, 900 reclaimable) = done %v, %v; want admitted", done, err)
+		}
+
+		body := bytes.Repeat([]byte("a"), 100)
+		capA := e.newCapture(t, svc)
+		if _, err := svc.Upload(e.ctx, e.wkr, e.runID, capA, manifestOf(body), bytes.NewReader(body)); err != nil {
+			t.Fatalf("100-byte upload (900 + 100 fits exactly): %v", err)
+		}
+		if got := e.jobState(t, victim); got != "available" {
+			t.Fatalf("victim = %q, want available: 900 committed + 100 verified fits the 1000 budget with no reclaim", got)
+		}
+	})
+}
+
+// TestMarkCaptureFailedNeverOverwritesADiscardLiveDB: the upload-failure write is conditional on
+// the capture still being in a state an upload can be in, so a discard or expiry that commits
+// between recordFailure's read and its write is not overwritten (and later revived by a retry).
+//
+// CALIBRATION: drop the AND state IN (...) guard from the MarkCaptureFailed query; the discarded and
+// expired captures then flip to needs_action and this test goes red.
+func TestMarkCaptureFailedNeverOverwritesADiscardLiveDB(t *testing.T) {
+	e := newSFEnv(t)
+	svc := e.recovery(1000)
+	reason := pgtype.Text{String: "upload failed; retry available", Valid: true}
+
+	for _, state := range []string{"discarded", "expired", "available"} {
+		id := e.newCapture(t, svc)
+		e.exec(`UPDATE recovery_captures SET state = $2 WHERE id = $1`, id, state)
+		if _, err := e.q.MarkCaptureFailed(e.ctx, store.MarkCaptureFailedParams{Reason: reason, ID: id}); !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("%s: MarkCaptureFailed = %v, want pgx.ErrNoRows (nothing written)", state, err)
+		}
+		if got, _ := e.captureState(t, id); got != state {
+			t.Fatalf("%s capture became %q after a failure write", state, got)
+		}
+	}
+	for _, state := range []string{"preparing", "uploading", "needs_action"} {
+		id := e.newCapture(t, svc)
+		e.exec(`UPDATE recovery_captures SET state = $2 WHERE id = $1`, id, state)
+		if _, err := e.q.MarkCaptureFailed(e.ctx, store.MarkCaptureFailedParams{Reason: reason, ID: id}); err != nil {
+			t.Fatalf("%s: MarkCaptureFailed = %v, want it recorded", state, err)
+		}
+		if got, _ := e.captureState(t, id); got != "needs_action" {
+			t.Fatalf("%s capture = %q after a failure write, want needs_action", state, got)
+		}
 	}
 }

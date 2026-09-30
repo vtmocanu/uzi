@@ -27,7 +27,7 @@ func storedFilesOwnerObjID(owner uuid.UUID) int32 {
 //
 // Never take it while holding a lock a stored-files path can want the other way round. The global
 // lock order is: (1) a recovery_captures row lock, if the path takes one; (2) the owner key; (3) the
-// shared key; (4) job_files rows, and a runs row FOR KEY SHARE (Reserve's ownership check). The recovery admit and stream transactions take a capture row
+// shared key; (4) job_files rows. No path takes a runs row lock inside the keys: Reserve's ownership check is a plain read made before them. The recovery admit and stream transactions take a capture row
 // first and these keys after; the job-file Reserve and Sweep take only these keys and job_files
 // rows (never a capture row), so no path waits on a capture row while holding a key. A path that
 // takes the keys must therefore never afterwards wait on a recovery_captures row, and the

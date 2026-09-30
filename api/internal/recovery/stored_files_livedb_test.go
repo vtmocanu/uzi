@@ -191,12 +191,12 @@ func TestRecoveryAdmissionCountsJobBytesLiveDB(t *testing.T) {
 	}
 }
 
-// TestRecoveryAdmissionReclaimsJobFilesInOrderLiveDB: when only the shared budget is short,
-// admission reclaims job files (expired-by-time first, then the oldest available), stops as soon as
-// the archive fits, and never touches an attached, in-TTL unattached or reserved file. When even
-// reclaiming everything reclaimable would not fit the archive, it is refused and NOTHING is
-// reclaimed (the reclaim rolls back with the admission transaction).
-func TestRecoveryAdmissionReclaimsJobFilesInOrderLiveDB(t *testing.T) {
+// TestRecoveryBindReclaimsJobFilesInOrderLiveDB: when only the shared budget is short, a verified
+// upload reclaims job files AT BIND (expired-by-time first, then the oldest available), stops as
+// soon as the archive fits, and never touches an attached, in-TTL unattached or reserved file. A
+// second archive that could not fit even if every reclaimable file were freed is refused at
+// ADMISSION (its headroom check, not a bind rollback: nothing is stamped, nothing is reclaimed).
+func TestRecoveryBindReclaimsJobFilesInOrderLiveDB(t *testing.T) {
 	e := newSFEnv(t)
 	svc, jf := e.recovery(600), e.jobFiles()
 	live := uuid.New()
@@ -233,14 +233,18 @@ func TestRecoveryAdmissionReclaimsJobFilesInOrderLiveDB(t *testing.T) {
 	}
 
 	// Now 300 job + 250 recovery = 550 of 600. A 400-byte archive needs 350 freed, but only the
-	// newer available file (100) is reclaimable: refused, and the reclaim rolls back.
+	// newer available file (100) is reclaimable: admission refuses it before anything is stamped
+	// or reclaimed.
 	big := bytes.Repeat([]byte("b"), 400)
 	c2 := e.newCapture(t, svc)
 	if _, err := svc.Upload(e.ctx, e.wkr, e.runID, c2, manifestOf(big), bytes.NewReader(big)); !errors.Is(err, ErrQuota) {
 		t.Fatalf("archive that cannot fit even after reclaim = %v, want ErrQuota", err)
 	}
 	if got := e.jobState(t, newer); got != "available" {
-		t.Fatalf("a refused archive reclaimed a job file: newer = %q, want available (the reclaim must roll back)", got)
+		t.Fatalf("a refused archive reclaimed a job file: newer = %q, want available", got)
+	}
+	if st, reserved := e.captureState(t, c2); st == "uploading" || reserved != nil {
+		t.Fatalf("a refused archive was stamped: state %q reserved %v, want no reservation", st, reserved)
 	}
 }
 

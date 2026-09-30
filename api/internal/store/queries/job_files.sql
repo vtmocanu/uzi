@@ -30,11 +30,26 @@ SELECT
              WHERE c.state IN ('available', 'preparing', 'uploading')
                AND (sqlc.narg('exclude_capture_id')::uuid IS NULL OR c.id <> sqlc.narg('exclude_capture_id')::uuid)), 0)::bigint AS instance_recovery_bytes;
 
--- name: LockOwnedJobRun :one
--- Reservation's ownership check: the run must be a kind='job' run of @user_id. FOR KEY SHARE keeps
--- the run from being deleted under the insert without blocking its ordinary status updates. Zero
--- rows: the run is not the caller's, or not a job.
-SELECT id FROM runs WHERE id = @id AND user_id = @user_id AND kind = 'job' FOR KEY SHARE;
+-- name: GetOwnedJobRun :one
+-- Reservation's ownership check: the run must be a kind='job' run of @user_id. A plain read, taken
+-- BEFORE the stored-files advisory keys so a runs row lock held elsewhere can never stall the
+-- instance-wide admission queue. runs.user_id and runs.kind never change, and the job_files.run_id
+-- foreign key stops a concurrent delete of the run under the insert. Zero rows: the run is not the
+-- caller's, or not a job.
+SELECT id FROM runs WHERE id = @id AND user_id = @user_id AND kind = 'job';
+
+-- name: SumCommittedSharedBytes :one
+-- The bytes actually on the books, for the bind-time reclaim: every non-expired job file plus every
+-- 'available' recovery capture by its bound byte_size. Unlike SumStoredFileBytes it deliberately
+-- leaves out the unverified in-flight reservations (preparing/uploading captures), so a reclaim
+-- sized from it can never be inflated by bytes another upload only declared. @exclude_capture_id
+-- leaves the capture being bound out (it is not 'available' yet, so this is belt and braces).
+SELECT (
+  COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state <> 'expired'), 0)
+  + COALESCE((SELECT sum(COALESCE(c.byte_size, 0)) FROM recovery_captures c
+               WHERE c.state = 'available'
+                 AND (sqlc.narg('exclude_capture_id')::uuid IS NULL OR c.id <> sqlc.narg('exclude_capture_id')::uuid)), 0)
+)::bigint AS committed_bytes;
 
 -- name: SumRunJobFiles :one
 -- One run's live (non-expired) files of one direction: the per-job file-count and byte caps.

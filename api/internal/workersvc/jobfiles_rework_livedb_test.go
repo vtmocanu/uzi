@@ -16,7 +16,7 @@ import (
 // be a job of the same owner. SumRunJobFiles counts across owners, so without the check another
 // owner's job would be charged (and its caps consumed) by a stranger's reservation.
 //
-// CALIBRATION: delete the LockOwnedJobRun check from JobFiles.Reserve; the foreign reservation then
+// CALIBRATION: delete the GetOwnedJobRun check from JobFiles.Reserve; the foreign reservation then
 // inserts and this test goes red.
 func TestJobFilesReserveRefusesForeignRunLiveDB(t *testing.T) {
 	e := newJFEnv(t, wide())

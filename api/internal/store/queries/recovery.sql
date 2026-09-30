@@ -49,6 +49,16 @@ SET state = @state, reason = sqlc.narg('reason'), updated_at = now()
 WHERE id = @id
 RETURNING *;
 
+-- name: MarkCaptureFailed :one
+-- The upload-failure write: needs_action with a bounded reason, but ONLY from a state an upload can
+-- still be in. The state guard is the write's own compare-and-set, so a discard, expiry or success
+-- that commits between the caller's read and this write is never overwritten (and a discarded
+-- capture is never revived by a later retry). Zero rows: the capture moved on; nothing was written.
+UPDATE recovery_captures
+SET state = 'needs_action', reason = sqlc.narg('reason'), updated_at = now()
+WHERE id = @id AND state IN ('preparing', 'uploading', 'needs_action')
+RETURNING *;
+
 -- name: GetCaptureForOwner :one
 -- D6: strict owner-scoped by-id read of one capture. The (id, run_id, user_id) triple is
 -- the owner-authorization seam every metadata/download path funnels through — an admin
