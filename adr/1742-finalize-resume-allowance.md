@@ -54,7 +54,9 @@ directory (`agent/src/outbox.ts`):
 - **MAC domain.** Its own domain label, `uzi.outbox.finalize.v1`, beside the terminal journal's, so
   a finalize record can never be replayed as a terminal journal (or any other kind) under the
   worker-local key. It reuses the outbox's temp-file write with fsync, the no-replace `link`
-  install and the directory fsync.
+  install and the directory fsync. An existing file is adopted only after its MAC, run id
+  and generation verify; an invalid file is retained but never attested. Finalize directory fsync
+  failures fail the write instead of using the older outbox records' best-effort fallback.
 - **Durable point.** The worker logs `finalize record durable` (with `run_id` and
   `claim_generation`) only after the temp file's fsync, the no-replace link and the directory
   fsync have all succeeded. That line, together with the file's presence, is the proof both

@@ -1508,11 +1508,8 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
  * (push, MR, terminal report) rather than take one of its non-terminal early returns? The four
  * early returns (an owner pause park, the completion hold, the wall-clock park, the in-place
  * credential-switch release) each already reported their own non-terminal state and finalize
- * nothing. The finalize-pending record write in phasePreflightHandoff reads this predicate. The
- * early-return checks at the top of phasePublish are separate `if`s that name the same four fields
- * by hand: nothing enforces that correspondence in code. agent/test/issue-1742-finalize-record.test.ts
- * pins only this predicate (false for each of the four fields, true for none), not phasePublish's
- * own checks, so change one side only together with the other.
+ * nothing. Both the finalize-pending write and phasePublish use this predicate: a non-terminal
+ * result never writes a finalize record or reaches the finalize boundary.
  */
 export function isFinalizeBoundResult(
   result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased">,
@@ -4457,75 +4454,76 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
-    // Issue #1742: the four non-terminal early returns below (pausedAt, completionHeld, walled,
-    // switchReleased) are exactly the results isFinalizeBoundResult() excludes; the finalize-pending
-    // record write in phasePreflightHandoff reads that predicate. Keep them in step.
-    // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
-    // `paused` and set flight.parked). The run is non-terminal and already reported — there is
-    // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
-    // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
-    // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
-    // never reach this branch.
-    if (result.pausedAt) {
-      // PRD #1171 m4: needs NO own permit. Issue #1764: a Codex executor now sets pausedAt, and
-      // executeClaim then calls phasePublish directly, BYPASSING the finalize withBoundary (its
-      // credential reconcile is refused once the run is `paused`); the runner's terminal
-      // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
-      // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run parked on an owner-requested pause; skipping finalization", {
-        run_id: runId,
-      });
-      return;
-    }
-    // PRD #1226 M3 (D3/D6): the run entered the recoverable COMPLETION HOLD — a repeated
-    // no-progress completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed
-    // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
-    // non-terminal and the hold seam already handled the transition, so there is nothing to
-    // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
-    // finally preserves its HOME for resume. In M3 this branch is dead (the seam is unwired, so
-    // completionHeld is never set) — M4 wires the seam and this becomes live.
-    if (result.completionHeld) {
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run entered the completion hold; skipping finalization", {
-        run_id: runId,
-        reason: result.completionHeld.reason,
-      });
-      return;
-    }
-    // PRD #1497 M2: the run PARKED at its WALL-CLOCK limit (ctx.parkForWall → "parked", or
-    // "undeliverable" so the flight ends non-terminal keeping the work, D17). Like the pause park and
-    // the completion hold above, the run is non-terminal and the wall seam already handled it (a
-    // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
-    // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
-    // clone + HOME (enterWallPark set the flags) for a resume. Keyed on the executor's result so no
-    // non-wall path can reach this branch.
-    if (result.walled) {
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run parked at its wall-clock limit; skipping finalization", {
-        run_id: runId,
-        reason: result.walled.reason,
-      });
-      return;
-    }
-    // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
-    // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
-    // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
-    // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
-    // park and the completion hold above, the run is non-terminal and already handled, so there is
-    // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
-    // (idempotent — the release already drained it) and return; the finally retires the clone
-    // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
-    // Keyed on the executor's result so no non-release path can reach this branch.
-    if (result.switchReleased) {
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run released for a credential switch in place; skipping finalization", {
-        run_id: runId,
-      });
+    // The same predicate gates the write-ahead record and entry into finalization.
+    if (!isFinalizeBoundResult(result)) {
+      // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
+      // `paused` and set flight.parked). The run is non-terminal and already reported — there is
+      // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
+      // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
+      // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
+      // never reach this branch.
+      if (result.pausedAt) {
+        // PRD #1171 m4: needs NO own permit. Issue #1764: a Codex executor now sets pausedAt, and
+        // executeClaim then calls phasePublish directly, BYPASSING the finalize withBoundary (its
+        // credential reconcile is refused once the run is `paused`); the runner's terminal
+        // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
+        // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run parked on an owner-requested pause; skipping finalization", {
+          run_id: runId,
+        });
+        return;
+      }
+      // PRD #1226 M3 (D3/D6): the run entered the recoverable COMPLETION HOLD — a repeated
+      // no-progress completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed
+      // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
+      // non-terminal and the hold seam already handled the transition, so there is nothing to
+      // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
+      // finally preserves its HOME for resume. In M3 this branch is dead (the seam is unwired, so
+      // completionHeld is never set) — M4 wires the seam and this becomes live.
+      if (result.completionHeld) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run entered the completion hold; skipping finalization", {
+          run_id: runId,
+          reason: result.completionHeld.reason,
+        });
+        return;
+      }
+      // PRD #1497 M2: the run PARKED at its WALL-CLOCK limit (ctx.parkForWall → "parked", or
+      // "undeliverable" so the flight ends non-terminal keeping the work, D17). Like the pause park and
+      // the completion hold above, the run is non-terminal and the wall seam already handled it (a
+      // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
+      // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
+      // clone + HOME (enterWallPark set the flags) for a resume. Keyed on the executor's result so no
+      // non-wall path can reach this branch.
+      if (result.walled) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run parked at its wall-clock limit; skipping finalization", {
+          run_id: runId,
+          reason: result.walled.reason,
+        });
+        return;
+      }
+      // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
+      // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
+      // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+      // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
+      // park and the completion hold above, the run is non-terminal and already handled, so there is
+      // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
+      // (idempotent — the release already drained it) and return; the finally retires the clone
+      // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+      // Keyed on the executor's result so no non-release path can reach this branch.
+      if (result.switchReleased) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run released for a credential switch in place; skipping finalization", {
+          run_id: runId,
+        });
+        return;
+      }
       return;
     }
     // issue #1783: the finalize boundary. It sits BELOW the park/hold/wall/switch early returns

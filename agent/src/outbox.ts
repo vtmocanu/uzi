@@ -1436,7 +1436,7 @@ export class Outbox {
         throw err;
       }
     }
-    await this.fsyncDir(path.dirname(dst));
+    await this.fsyncDir(path.dirname(dst), kind === "finalize");
     await fs.rm(tmp, { force: true }).catch(() => undefined);
     return adopted;
   }
@@ -1476,7 +1476,7 @@ export class Outbox {
               },
               { path: dir, kind: "finalize" },
             );
-            await this.fsyncDir(this.root);
+            await this.fsyncDir(this.root, true);
             adopted = await this.installExclusive(dst, serialized, "finalize");
           });
         } catch (err) {
@@ -1486,7 +1486,11 @@ export class Outbox {
           // An existing winner was adopted: keep ITS on-disk `since`, not this call's clock.
           const existing = await this.readAuthed(dst, MAC_DOMAIN_FINALIZE);
           const meta = existing ? coerceFinalize(existing, runId, claimGeneration) : null;
-          if (meta) since = meta.since;
+          if (!meta) {
+            this.runs.get(runId)?.finalizes.delete(claimGeneration);
+            return fail("existing_finalize_invalid");
+          }
+          since = meta.since;
         }
         const rs = this.ensureInMemoryRun(runId, since);
         if (!rs.finalizes.has(claimGeneration)) rs.finalizes.set(claimGeneration, { claimGeneration, since });
@@ -2015,14 +2019,15 @@ export class Outbox {
     await this.fsyncDir(dir);
   }
 
-  private async fsyncDir(dir: string): Promise<void> {
+  private async fsyncDir(dir: string, strict = false): Promise<void> {
     let dh: Awaited<ReturnType<typeof fs.open>> | undefined;
     try {
       dh = await fs.open(dir, fsConstants.O_RDONLY);
       await dh.sync();
     } catch (err) {
-      // Some filesystems reject a directory fsync; the rename is already durable
-      // for the file bytes, so degrade rather than fail the write.
+      // Finalize attestation requires durable directory entries. Existing message/terminal
+      // writes retain their best-effort behavior on filesystems that reject directory fsync.
+      if (strict) throw err;
       this.log.debug("outbox: directory fsync skipped", { dir, error: errText(err) });
     } finally {
       if (dh) await dh.close().catch(() => undefined);

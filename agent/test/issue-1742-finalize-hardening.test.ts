@@ -27,6 +27,60 @@ import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runner, simu
 // fetch-back.
 installHarness();
 
+describe("issue #1742 finalize durability at the filesystem boundary", () => {
+  for (const location of ["root", "run"] as const) {
+    it(`refuses a failed ${location} directory fsync through the real helper`, async () => {
+      const root = tmpRoot();
+      const { logger, lines } = recordingLogger();
+      const outbox = makeOutbox(root, { log: logger });
+      await outbox.init();
+      const realOpen = fsp.open.bind(fsp);
+      const failingDir = location === "root" ? root : path.join(root, RUN_A);
+      mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+        const handle = await realOpen(...args);
+        if (args[0] === failingDir) {
+          mock.method(handle, "sync", async () => {
+            throw Object.assign(new Error("injected directory I/O failure"), { code: "EIO" });
+          });
+        }
+        return handle;
+      });
+      const result = await outbox.journalFinalize(RUN_A, 3);
+      assert.equal(result.written, false);
+      assert.equal(msgs(lines).includes("finalize record durable"), false);
+      assert.deepEqual(outbox.listPendingFinalizes(), []);
+    });
+  }
+
+  for (const invalid of ["bad_mac", "wrong_identity", "symlink"] as const) {
+    it(`refuses to adopt an existing ${invalid} finalize record`, async () => {
+      const root = tmpRoot();
+      const { logger, lines } = recordingLogger();
+      const outbox = makeOutbox(root, { log: logger });
+      await outbox.init();
+      await outbox.journalFinalize(RUN_B, 4);
+      const donor = path.join(root, RUN_B, "finalize-4.json");
+      const dir = path.join(root, RUN_A);
+      const target = path.join(dir, "finalize-3.json");
+      await fsp.mkdir(dir);
+      if (invalid === "symlink") await fsp.symlink(donor, target);
+      else {
+        const body = await fsp.readFile(donor, "utf8");
+        await fsp.writeFile(target, invalid === "bad_mac" ? body.replace(RUN_B, RUN_A) : body);
+      }
+      const before = await fsp.readFile(target, "utf8");
+      const durableBefore = msgs(lines).filter((m) => m === "finalize record durable").length;
+      const result = await outbox.journalFinalize(RUN_A, 3);
+      assert.equal(result.written, false);
+      assert.equal(result.reason, "existing_finalize_invalid");
+      assert.equal(msgs(lines).filter((m) => m === "finalize record durable").length, durableBefore);
+      assert.equal(outbox.listPendingFinalizes().some((p) => p.run_id === RUN_A), false);
+      assert.equal(await fsp.readFile(target, "utf8"), before, "never replaces the existing record");
+      if (invalid === "symlink") assert.equal((await fsp.lstat(target)).isSymbolicLink(), true);
+    });
+  }
+});
+
 const roots: string[] = [];
 afterEach(async () => {
   mock.restoreAll();
