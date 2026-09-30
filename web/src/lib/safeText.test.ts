@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { readFileSync } from "node:fs";
-import { stripUnsafeChars } from "./safeText";
+import { splitUnsafeChars, stripUnsafeChars } from "./safeText";
 
 // Issue #124. The corpus below deliberately MIRRORS the one the api pins for `sanitizeTTY`
 // (api/cmd/uzi/tui_render_test.go:61), which is the scrubber this util converges on — a
@@ -183,5 +183,28 @@ describe("shared termsafe corpus", () => {
       const ch = String.fromCodePoint(parseInt(e.cp, 16));
       expect(/[\p{Cc}\p{Cf}]/u.test(ch), `U+${e.cp} ${e.name}`).toBe(e.unsafe);
     }
+  });
+});
+
+describe("splitUnsafeChars", () => {
+  it("isolates each unsafe character as its own piece and keeps the text around it", () => {
+    expect(splitUnsafeChars(`a${RLO}${RLO}b${ZWSP}`)).toEqual([
+      { text: "a", unsafe: false },
+      { text: RLO, unsafe: true },
+      { text: RLO, unsafe: true },
+      { text: "b", unsafe: false },
+      { text: ZWSP, unsafe: true },
+    ]);
+  });
+
+  it("agrees with stripUnsafeChars: the safe pieces are exactly the stripped text", () => {
+    const s = `x${ESC}[31m\ty\n${RLO}z`;
+    const parts = splitUnsafeChars(s);
+    expect(parts.filter((p) => !p.unsafe).map((p) => p.text).join("")).toBe(stripUnsafeChars(s));
+    expect(parts.map((p) => p.text).join("")).toBe(s);
+  });
+
+  it("returns no pieces for empty input", () => {
+    expect(splitUnsafeChars("")).toEqual([]);
   });
 });

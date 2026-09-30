@@ -21,5 +21,6 @@ export * from "./runsDemo";
 export * from "./chat";
 export * from "./cliTokens";
 export * from "./productTokens";
+export * from "./productSkills";
 export * from "./memory";
 export * from "./buildInfo";

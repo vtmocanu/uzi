@@ -335,7 +335,10 @@ export interface TemplateAllocationsInput {
 
 // ── Agent skills (PRD #16) ────────────────────────────────────────────────
 
-export type SkillScope = "builtin" | "global" | "user";
+// "product" (PRD #1909 M6 D9) is a product's approved skill set. The skills listing never
+// returns it (product skills are managed per product under Admin, Products); it is here so
+// every exhaustive scope mirror (SCOPE_LABEL) names it and a leaked row renders labelled.
+export type SkillScope = "builtin" | "global" | "user" | "product";
 
 // Skill is a stored SKILL.md playbook. body is the markdown content (returned,
 // unlike a secret — it is user-authored and editable). user_id is set only for
@@ -1548,6 +1551,65 @@ export interface Product {
    *  and outcome_pending): a mid-deploy api pod predating #1908 omits the key, so every read
    *  falls back (`?? []`, or hides the editor) instead of crashing the Products page. */
   allowed_job_types?: string[];
+}
+
+// ProductPatch is the PATCH /api/admin/products/{id} body: every field optional, an omitted
+// one kept. The skills source (PRD #1909 M6): skills_repo_url "" clears it; skills_token is
+// WRITE-ONLY (sealed, never read back) and clear_skills_token removes the stored one. Moving
+// the repo URL to another origin drops the stored token server-side.
+export interface ProductPatch {
+  description?: string;
+  enabled?: boolean;
+  allowed_job_types?: string[];
+  skills_repo_url?: string;
+  skills_ref?: string;
+  skills_token?: string;
+  clear_skills_token?: boolean;
+}
+
+// ── Product skill sets (PRD #1909 M6, apitypes/product_skills.go) ──────────
+// ProductSkill is one skill of a product's set: name, description and the SKILL.md body.
+// Every field is UNTRUSTED text from the product's external repo: render as plain text.
+export interface ProductSkill {
+  name: string;
+  description: string;
+  body: string;
+}
+
+// ProductSkillDrop names a skill a sync did not stage and why. name is "" (and count set)
+// only for the aggregated over_limit note of files past the read bound.
+export interface ProductSkillDrop {
+  name: string;
+  reason: "invalid" | "too_large" | "duplicate" | "over_limit" | "secret" | (string & {});
+  count?: number;
+}
+
+// ProductSkills is GET /api/admin/products/{id}/skills and the response of the sync and
+// apply writes. The clone token is write-only: config.skills_token_set is all that is ever
+// said about it. config.enabled is false when UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS is empty
+// (the feature is off). applied.sha is "" and applied_at/applied_by null before a first
+// apply; staged is null when nothing waits for approval. applied_by/staged_by are user ids.
+export interface ProductSkills {
+  config: {
+    skills_repo_url: string;
+    skills_ref: string;
+    skills_token_set: boolean;
+    enabled: boolean;
+  };
+  applied: {
+    sha: string;
+    applied_at: string | null;
+    applied_by: string | null;
+    skills: ProductSkill[];
+  };
+  staged: {
+    sha: string;
+    staged_at: string;
+    staged_by: string | null;
+    skills: ProductSkill[];
+    dropped: ProductSkillDrop[];
+    diff: { added: string[]; changed: string[]; removed: string[]; unchanged: string[] };
+  } | null;
 }
 
 // AdminDeleteProductResponse is DELETE /api/admin/products/{id}

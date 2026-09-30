@@ -72,6 +72,9 @@ export function Skills() {
     for (const s of skills) {
       if (s.scope === "builtin") builtin.push(s);
       else if (s.scope === "global") global.push(s);
+      // Product skill sets (PRD #1909) are never listed here; a leaked row must not be
+      // shown as another user's private skill.
+      else if (s.scope === "product") continue;
       else if (s.user_id === user?.id) mine.push(s);
       else others.push(s); // admin-only: another user's private skill
     }

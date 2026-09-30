@@ -85,3 +85,41 @@ describe("mockApi — product-token lists (PRD #1907)", () => {
     expect(created).toEqual([...created].sort((a, b) => b - a));
   });
 });
+
+describe("mockApi — product skill sets (PRD #1909 M6)", () => {
+  it("syncs into a staged diff, applies only the named sha, and never returns a token", async () => {
+    const api = await reload();
+    const before = await api.adminGetProductSkills("prod-helpdesk");
+    expect(before.staged).toBeNull();
+    const synced = await api.adminSyncProductSkills("prod-helpdesk");
+    const staged = synced.staged!;
+    expect(staged.diff).toEqual({
+      added: ["escalation-check"],
+      changed: ["reply-tone"],
+      removed: ["legacy-macros"],
+      unchanged: ["ticket-triage"],
+    });
+    await expect(api.adminApplyProductSkills("prod-helpdesk", "f".repeat(40))).rejects.toMatchObject({ status: 409 });
+    const applied = await api.adminApplyProductSkills("prod-helpdesk", staged.sha);
+    expect(applied.applied.sha).toBe(staged.sha);
+    expect(applied.staged).toBeNull();
+
+    const token = "tok" + "en-value-1234";
+    await api.adminUpdateProduct("prod-helpdesk", { skills_token: token });
+    expect(JSON.stringify(await api.adminGetProductSkills("prod-helpdesk"))).not.toContain(token);
+  });
+
+  it("refuses a sync with no repo and drops the token when the repo moves host", async () => {
+    const api = await reload();
+    await expect(api.adminSyncProductSkills("prod-metrics")).rejects.toMatchObject({ status: 409 });
+    await expect(
+      api.adminUpdateProduct("prod-helpdesk", { skills_repo_url: "https://evil.example/x" }),
+    ).rejects.toMatchObject({ status: 400 });
+    await expect(
+      api.adminUpdateProduct("prod-helpdesk", { skills_repo_url: "https://user:pw@github.com/x" }),
+    ).rejects.toMatchObject({ status: 400 });
+    // Same host: the token stays.
+    await api.adminUpdateProduct("prod-helpdesk", { skills_repo_url: "https://github.com/acme/other" });
+    expect((await api.adminGetProductSkills("prod-helpdesk")).config.skills_token_set).toBe(true);
+  });
+});

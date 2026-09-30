@@ -69,6 +69,7 @@ describe("scope helpers", () => {
     expect(SCOPE_LABEL.builtin).toBe("Builtin");
     expect(SCOPE_LABEL.global).toBe("Global");
     expect(SCOPE_LABEL.user).toBe("Mine");
+    expect(SCOPE_LABEL.product).toBe("Product");
   });
 
   it("maps scope to a badge tone", () => {

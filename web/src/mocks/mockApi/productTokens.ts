@@ -1,6 +1,8 @@
 import type {
   AdminProductToken,
   Product,
+  ProductPatch,
+  ProductSkills,
   ProductToken,
   ProductTokenExpiry,
   ProductTokenScope,
@@ -12,7 +14,15 @@ import {
   PRODUCT_NAME_MAX_BYTES,
 } from "../../lib/productText";
 import { JOB_TYPES } from "../../lib/jobTypes";
-import { mockProducts, mockProductTokens } from "../data";
+import {
+  MOCK_SKILLS_APPLIED_SHA,
+  MOCK_SKILLS_REPO_SHA,
+  mockAdmin,
+  mockProducts,
+  mockProductSkillsApplied,
+  mockProductSkillsRepo,
+  mockProductTokens,
+} from "../data";
 import { delay, requireAdmin, requireSession, users } from "./shared";
 
 // ── Product registry + product tokens (PRD #1907) ────────────────────────────
@@ -92,6 +102,88 @@ const withCount = (p: StoredProduct): Product => ({
   ...p,
   active_token_count: productTokens.filter((t) => t.product_id === p.id && isActive(t)).length,
 });
+
+// ── Product skill sets (PRD #1909 M6) ────────────────────────────────────────
+// Per-product source, applied set and staged snapshot. The mock instance has the feature
+// on (a non-empty allowlist: github.com only). The token is a boolean here: the real api
+// seals it and never returns it, and nothing in the mock may hold one either.
+type SkillsState = {
+  url: string;
+  ref: string;
+  tokenSet: boolean;
+  applied: ProductSkills["applied"];
+  staged: ProductSkills["staged"];
+};
+const SKILLS_ALLOWED_ORIGINS = ["https://github.com"];
+const skillsState = new Map<string, SkillsState>([
+  [
+    "prod-helpdesk",
+    {
+      url: "https://github.com/acme/helpdesk-skills",
+      ref: "main",
+      tokenSet: true,
+      applied: {
+        sha: MOCK_SKILLS_APPLIED_SHA,
+        applied_at: new Date(Date.now() - 9 * 86_400_000).toISOString(),
+        applied_by: mockAdmin.id,
+        skills: mockProductSkillsApplied.map((s) => ({ ...s })),
+      },
+      staged: null,
+    },
+  ],
+]);
+let skillsSyncing = false;
+
+function skillsOf(id: string): SkillsState {
+  let st = skillsState.get(id);
+  if (!st) {
+    st = { url: "", ref: "", tokenSet: false, applied: { sha: "", applied_at: null, applied_by: null, skills: [] }, staged: null };
+    skillsState.set(id, st);
+  }
+  return st;
+}
+
+function skillsView(id: string): ProductSkills {
+  const st = skillsOf(id);
+  return structuredClone({
+    config: { skills_repo_url: st.url, skills_ref: st.ref, skills_token_set: st.tokenSet, enabled: true },
+    applied: st.applied,
+    staged: st.staged,
+  });
+}
+
+// The PATCH gate for the skills source, the server's validateProductSkillsURL in brief.
+function applySkillsPatch(id: string, patch: ProductPatch) {
+  const st = skillsOf(id);
+  if (patch.skills_repo_url !== undefined && patch.skills_repo_url !== "") {
+    let u: URL;
+    try {
+      u = new URL(patch.skills_repo_url);
+    } catch {
+      throw new ApiError(400, "skills_repo_url must be a valid URL");
+    }
+    if (u.protocol !== "https:") throw new ApiError(400, "skills_repo_url must use https");
+    if (u.username || u.password) throw new ApiError(400, "skills_repo_url must not embed credentials; use skills_token");
+    if (!SKILLS_ALLOWED_ORIGINS.includes(u.origin)) {
+      throw new ApiError(400, "skills_repo_url is not on the UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS allowlist");
+    }
+  }
+  if (patch.skills_token !== undefined && (patch.skills_token.trim() === "" || /\s/.test(patch.skills_token))) {
+    throw new ApiError(400, "skills_token must not contain whitespace or control characters");
+  }
+  const origin = (raw: string) => (raw ? new URL(raw).origin : "");
+  if (patch.skills_repo_url !== undefined && patch.skills_repo_url !== st.url) {
+    if (st.url && origin(patch.skills_repo_url) !== origin(st.url)) st.tokenSet = false;
+    st.url = patch.skills_repo_url;
+    st.staged = null;
+  }
+  if (patch.skills_ref !== undefined && patch.skills_ref !== st.ref) {
+    st.ref = patch.skills_ref;
+    st.staged = null;
+  }
+  if (patch.clear_skills_token) st.tokenSet = false;
+  else if (patch.skills_token !== undefined) st.tokenSet = true;
+}
 
 function findProduct(id: string): StoredProduct {
   const p = products.find((x) => x.id === id);
@@ -211,12 +303,16 @@ export const productTokensApi = {
     products = [p, ...products];
     return delay({ product: withCount(p) }, 200);
   },
-  adminUpdateProduct: async (
-    id: string,
-    patch: { description?: string; enabled?: boolean; allowed_job_types?: string[] },
-  ) => {
+  adminUpdateProduct: async (id: string, patch: ProductPatch) => {
     requireAdmin();
-    if (patch.description === undefined && patch.enabled === undefined && patch.allowed_job_types === undefined) {
+    const skillsKeys = ["skills_repo_url", "skills_ref", "skills_token", "clear_skills_token"] as const;
+    const touchesSkills = skillsKeys.some((k) => patch[k] !== undefined);
+    if (
+      patch.description === undefined &&
+      patch.enabled === undefined &&
+      patch.allowed_job_types === undefined &&
+      !touchesSkills
+    ) {
       throw new ApiError(400, "nothing to update: set description, enabled and/or allowed_job_types");
     }
     // Validated before any write, like the server (a bad list changes nothing).
@@ -229,6 +325,7 @@ export const productTokensApi = {
     if (patch.enabled !== undefined) p.enabled = patch.enabled;
     // PATCH semantics (admin_products.go): omitted keeps the list, [] clears it.
     if (allowed !== undefined) p.allowed_job_types = allowed;
+    if (touchesSkills) applySkillsPatch(id, patch);
     return delay({ product: withCount(p) });
   },
   adminDeleteProduct: async (id: string) => {
@@ -240,6 +337,88 @@ export const productTokensApi = {
     p.enabled = false;
     p.deleted_at = new Date().toISOString();
     return delay({ product: withCount(p), stopped_token_count: wasEnabled ? active : 0 });
+  },
+  adminGetProductSkills: async (id: string) => {
+    requireAdmin();
+    findProduct(id);
+    return delay(skillsView(id));
+  },
+  // Sync stages the mock repo: every skill of mockProductSkillsRepo, diffed by name against
+  // the applied set. A repo URL containing "unreachable" answers the server's fixed 502.
+  adminSyncProductSkills: async (id: string) => {
+    const me = requireAdmin();
+    const p = findProduct(id);
+    if (p.deleted_at !== null) throw new ApiError(409, "product is deleted");
+    const st = skillsOf(id);
+    if (st.url === "") throw new ApiError(409, "this product has no skills repo configured");
+    if (skillsSyncing) {
+      throw new ApiError(429, "another product skills sync is already running; try again shortly");
+    }
+    skillsSyncing = true;
+    try {
+      await delay(null, 700);
+      if (st.url.includes("unreachable")) {
+        throw new ApiError(502, "could not read the skills repo (check the URL, ref and token)");
+      }
+      const repo = mockProductSkillsRepo.map((s) => ({ ...s }));
+      const current = new Map(st.applied.skills.map((s) => [s.name, s]));
+      const names = new Set(repo.map((s) => s.name));
+      const sorted = (xs: string[]) => [...xs].sort();
+      st.staged = {
+        sha: MOCK_SKILLS_REPO_SHA,
+        staged_at: new Date().toISOString(),
+        staged_by: me.id,
+        skills: repo,
+        dropped: [
+          { name: "draft-notes", reason: "invalid" },
+          { name: "", reason: "over_limit", count: 2 },
+        ],
+        diff: {
+          added: sorted(repo.filter((s) => !current.has(s.name)).map((s) => s.name)),
+          changed: sorted(
+            repo
+              .filter((s) => {
+                const c = current.get(s.name);
+                return c !== undefined && (c.body !== s.body || c.description !== s.description);
+              })
+              .map((s) => s.name),
+          ),
+          removed: sorted([...current.keys()].filter((n) => !names.has(n))),
+          unchanged: sorted(
+            repo
+              .filter((s) => {
+                const c = current.get(s.name);
+                return c !== undefined && c.body === s.body && c.description === s.description;
+              })
+              .map((s) => s.name),
+          ),
+        },
+      };
+    } finally {
+      skillsSyncing = false;
+    }
+    return skillsView(id);
+  },
+  adminApplyProductSkills: async (id: string, expectedSha: string) => {
+    const me = requireAdmin();
+    const p = findProduct(id);
+    if (!/^[0-9a-f]{40}$/.test(expectedSha)) {
+      throw new ApiError(400, "expected_sha must be the 40-hex commit id of the staged set");
+    }
+    if (p.deleted_at !== null) throw new ApiError(409, "product is deleted");
+    const st = skillsOf(id);
+    if (st.staged === null) throw new ApiError(409, "no skills are staged for this product; sync first");
+    if (st.staged.sha !== expectedSha) {
+      throw new ApiError(409, "the staged set changed since you reviewed it; review it again");
+    }
+    st.applied = {
+      sha: st.staged.sha,
+      applied_at: new Date().toISOString(),
+      applied_by: me.id,
+      skills: st.staged.skills,
+    };
+    st.staged = null;
+    return delay(skillsView(id), 300);
   },
   adminListProductTokens: async () => {
     requireAdmin();

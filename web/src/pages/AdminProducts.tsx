@@ -6,6 +6,9 @@
 // next to the product they unlock. Soft-deleted products (D9) stay listed, last, as the
 // audit trail; they have no controls, since a deleted product cannot change.
 //
+// Each live product card ends in its skill set (PRD #1909 M6, components/ProductSkills.tsx),
+// collapsed and loaded on open: the approve view for skills synced from the product's repo.
+//
 // Product names/descriptions (admin-written) and token names/owner emails
 // (user-written) are untrusted text: React text nodes only, never HTML.
 
@@ -40,6 +43,7 @@ import {
   productTokenExpiryText,
 } from "../components/ProductTokens";
 import { PackageIcon } from "../components/icons";
+import { ProductSkillsPanel } from "../components/ProductSkills";
 import { JOB_TYPES, jobTypeLabel } from "../lib/jobTypes";
 import { stripUnsafeChars } from "../lib/safeText";
 
@@ -565,6 +569,10 @@ function ProductCard({
         ) : (
           <ProductTokenTable tokens={tokens} onRevoke={onRevoke} />
         )}
+
+        {/* PRD #1909 M6: the product's skill set (source, staged review, approved set).
+            A deleted product cannot change, so it gets no panel. */}
+        {!deleted && <ProductSkillsPanel product={product} />}
       </Card>
     </section>
   );

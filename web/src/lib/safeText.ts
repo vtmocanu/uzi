@@ -87,3 +87,21 @@ const UNSAFE_CHAR = /(?![\n\t])[\p{Cc}\p{Cf}]/gu;
 export function stripUnsafeChars(s: string): string {
   return s.replace(UNSAFE_CHAR, "");
 }
+
+// The same predicate as UNSAFE_CHAR, wrapped in one capture group so `split` keeps each
+// offender as its own odd-indexed piece. Not global: split iterates on its own.
+const UNSAFE_CHAR_SPLIT = /((?![\n\t])[\p{Cc}\p{Cf}])/u;
+
+/**
+ * Split text into plain runs and single unsafe characters, for a surface that must SHOW
+ * hidden characters rather than drop them: an approval review (PRD #1909 M6, product skill
+ * bodies from an external repo) where the approver needs to know the text carries an
+ * override or a zero-width character, not a cleaned copy that hides it. The caller renders
+ * each `unsafe` piece as a visible code-point marker, never as the raw character.
+ */
+export function splitUnsafeChars(s: string): { text: string; unsafe: boolean }[] {
+  return s
+    .split(UNSAFE_CHAR_SPLIT)
+    .map((text, i) => ({ text, unsafe: i % 2 === 1 }))
+    .filter((p) => p.text !== "");
+}

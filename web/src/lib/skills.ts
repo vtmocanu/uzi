@@ -66,6 +66,7 @@ export const SCOPE_LABEL: Record<SkillScope, string> = {
   builtin: "Builtin",
   global: "Global",
   user: "Mine",
+  product: "Product",
 };
 
 // scopeBadgeTone maps a scope to a ui Badge tone (kept here so the page and the

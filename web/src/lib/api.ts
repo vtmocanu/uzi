@@ -50,6 +50,8 @@ import type {
   AdminProductToken,
   MintableProduct,
   Product,
+  ProductPatch,
+  ProductSkills,
   ProductToken,
   ProductTokenMint,
   ProductTokenExpiry,
@@ -1852,11 +1854,19 @@ const realApi = {
       description,
       allowed_job_types: allowedJobTypes,
     }),
-  adminUpdateProduct: (
-    id: string,
-    patch: { description?: string; enabled?: boolean; allowed_job_types?: string[] },
-  ) =>
+  adminUpdateProduct: (id: string, patch: ProductPatch) =>
     request<{ product: Product }>("PATCH", `/admin/products/${id}`, patch),
+  // PRD #1909 M6: a product's skill set. GET is the admin view (the clone token only as
+  // set/not set); sync STAGES the repo's skills for review; apply approves the staged set
+  // named by its commit sha (a 409 if the staged set moved since the admin reviewed it).
+  adminGetProductSkills: (id: string) =>
+    request<ProductSkills>("GET", `/admin/products/${id}/skills`),
+  adminSyncProductSkills: (id: string) =>
+    request<ProductSkills>("POST", `/admin/products/${id}/skills/sync`),
+  adminApplyProductSkills: (id: string, expectedSha: string) =>
+    request<ProductSkills>("POST", `/admin/products/${id}/skills/apply`, {
+      expected_sha: expectedSha,
+    }),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
   // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.
