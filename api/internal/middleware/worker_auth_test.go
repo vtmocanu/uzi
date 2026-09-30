@@ -105,7 +105,7 @@ func TestRequireWorkerLookupFailureStatus(t *testing.T) {
 		want int
 	}{
 		{"store failure is retryable", errWorkerStore{err: errors.New("dial tcp: connect: connection refused")}, http.StatusServiceUnavailable},
-		{"cancelled request is retryable", errWorkerStore{err: fmt.Errorf("lookup: %w", context.Canceled)}, http.StatusServiceUnavailable},
+		{"context.Canceled lookup error on a live request returns 503", errWorkerStore{err: fmt.Errorf("lookup: %w", context.Canceled)}, http.StatusServiceUnavailable},
 		{"wrapped no-rows is unauthorized", errWorkerStore{err: fmt.Errorf("lookup: %w", pgx.ErrNoRows)}, http.StatusUnauthorized},
 		{"hash mismatch is unauthorized", rowWorkerStore{worker: store.Worker{ID: uuid.New(), TokenHash: otherHash}}, http.StatusUnauthorized},
 	}
