@@ -50,6 +50,7 @@ import (
 	"github.com/go-git/go-git/v5/storage/memory"
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/packbudget"
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
@@ -1034,162 +1035,31 @@ func forwardPack(ctx context.Context, remote *git.Remote, auth transport.AuthMet
 	return err
 }
 
-// scanPackBudget walks the pack and rejects it (ErrPackTooLarge) the instant any
-// budget bound is exceeded, before any object is resolved into the unbounded
-// in-memory storer. It reads the object count from the pack header, then for each
-// object reads its header (NextObjectHeader) and fully consumes its inflated body
-// (NextObject) to keep the scanner aligned. It honours ctx, checking cancellation at
-// the top of every object iteration so a timed-out/cancelled publish stops promptly
-// rather than inflating the whole pack.
-//
-// The subtlety this pre-pass exists for: an object header's declared Length bounds
-// the INFLATED, UNRESOLVED content — for a non-delta object that is the object
-// itself, but for a DELTA object (OFS/REF) it is only the delta INSTRUCTION stream,
-// NOT the reconstructed object. go-git's UpdateObjectStorage later reconstructs each
-// delta to its full target size (patch_delta.go grows a buffer to targetSz, with no
-// hard cap — maxObjectPreallocBytes is only a prealloc hint). So a delta with a tiny
-// instruction stream (well under the per-object cap) can declare a target size of
-// many GiB and OOM the shared api. Bounding by Length alone would miss it entirely.
-//
-// Therefore, for a delta object we inflate its (Length-bounded, ≤ maxPackObjectBytes)
-// body and read the target size — the SECOND unsigned LEB128 varint of the delta
-// header (`[base-size][target-size][ops...]`) — and cap THAT. The `total` counter
-// tracks reconstructed bytes (targetSz for deltas, Length otherwise), which is
-// exactly what lands in the storer, so it genuinely bounds the apply. Because this
-// validates the SAME immutable pack []byte that UpdateObjectStorage later parses,
-// there is no TOCTOU.
-//
-// The reconstructed-size counter is NOT enough on its own: the DUAL of the bomb above
-// is a delta with a tiny (even zero) declared target behind a ~maxPackObjectBytes
-// INSTRUCTION stream. It contributes ~0 to `total`, so the reconstructed caps wave it
-// through, yet the scanner must still zlib-inflate its whole instruction stream to
-// stay aligned — and many such deltas up to the wire cap force ~GiBs of uncancellable
-// single-core CPU. The `inflationWork` counter sums every object's declared Length
-// (the bytes this scanner actually inflates, delta and non-delta alike) and caps it
-// at maxPackInflationWorkBytes, checked BEFORE inflating the object that would cross
-// it — so total inflation is bounded regardless of declared target sizes. The two
-// counters coexist: `total` defends the storer/OOM path, `inflationWork` the CPU path.
-//
-// A pack whose header or an object header cannot be parsed is a genuinely malformed
-// pack: it returns ErrPackInvalid (a best-effort "unsupported" skip), never a 5xx.
-// A declared-size overrun (a lying delta/object whose zlib stream inflates past its
-// header Length) surfaces from the scanner's bounded writer as
-// ErrInflatedSizeMismatch and is treated as ErrPackTooLarge.
+// scanPackBudget rejects a worker pack that would inflate past the budget constants above,
+// before any object is resolved into the unbounded in-memory storer. The walk itself lives in
+// packbudget.Scan (shared with agentsource's untrusted clone); this wrapper supplies the
+// checkpoint-publish limits and maps the shared errors onto ErrPackTooLarge / ErrPackInvalid.
+// A context error is returned as is. Because it validates the SAME immutable pack []byte that
+// UpdateObjectStorage later parses, there is no TOCTOU.
 func scanPackBudget(ctx context.Context, pack []byte) error {
-	if len(pack) == 0 {
-		return nil
-	}
-	scanner := packfile.NewScanner(bytes.NewReader(pack))
-	_, objects, err := scanner.Header()
-	if err != nil {
-		return ErrPackInvalid // malformed header
-	}
-	if objects > maxPackObjects {
+	err := packbudget.Scan(ctx, pack, packbudget.Limits{
+		ObjectBytes:        maxPackObjectBytes,
+		TotalBytes:         maxPackTotalBytes,
+		InflationWorkBytes: maxPackInflationWorkBytes,
+		Objects:            maxPackObjects,
+	})
+	switch {
+	case errors.Is(err, packbudget.ErrTooLarge):
 		return ErrPackTooLarge
+	case errors.Is(err, packbudget.ErrInvalid):
+		return ErrPackInvalid
 	}
-	var total int64         // cumulative RECONSTRUCTED bytes (targetSz for deltas, Length otherwise)
-	var inflationWork int64 // cumulative bytes this scanner zlib-inflates across all objects
-	for i := uint32(0); i < objects; i++ {
-		// Inflating an object is uncancellable single-core work; honour a
-		// cancelled/timed-out publish before starting the next one.
-		if err := ctx.Err(); err != nil {
-			return err
-		}
-		h, err := scanner.NextObjectHeader()
-		if err != nil {
-			// A declared-size overrun on the PREVIOUS object surfaces here as a size
-			// mismatch; anything else is a genuinely malformed pack.
-			if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
-				return ErrPackTooLarge
-			}
-			return ErrPackInvalid
-		}
-		// The header Length bounds the inflated/unresolved content (the delta
-		// instruction stream for a delta). Cap it first — this both rejects an
-		// oversize non-delta object and keeps the delta body we inflate below to
-		// ≤ maxPackObjectBytes.
-		if h.Length < 0 || h.Length > maxPackObjectBytes {
-			return ErrPackTooLarge
-		}
-		// Bound the CUMULATIVE inflation work BEFORE inflating this object. h.Length is
-		// exactly the number of bytes the scanner will zlib-inflate for it, so summing
-		// it over every object bounds total inflation CPU — the axis a tiny-target
-		// delta bomb slips past the reconstructed-size caps below.
-		inflationWork += h.Length
-		if inflationWork > maxPackInflationWorkBytes {
-			return ErrPackTooLarge
-		}
-
-		var contributed int64
-		switch h.Type {
-		case plumbing.OFSDeltaObject, plumbing.REFDeltaObject:
-			// Inflate the delta body into a capped buffer (the scanner bounds the
-			// write to h.Length ≤ 32 MiB) and read the reconstructed target size.
-			var buf bytes.Buffer
-			if _, _, err := scanner.NextObject(&buf); err != nil {
-				if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
-					return ErrPackTooLarge
-				}
-				return ErrPackInvalid
-			}
-			b := buf.Bytes()
-			if _, b, err = readDeltaVarint(b); err != nil { // base size (discard)
-				return ErrPackInvalid
-			}
-			var targetSz int64
-			if targetSz, _, err = readDeltaVarint(b); err != nil { // reconstructed size
-				return ErrPackInvalid
-			}
-			if targetSz > maxPackObjectBytes {
-				return ErrPackTooLarge
-			}
-			contributed = targetSz
-		default:
-			// Consume and advance past the object body; the scanner's bounded writer
-			// still surfaces an overrun as a size mismatch.
-			if _, _, err := scanner.NextObject(io.Discard); err != nil {
-				if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
-					return ErrPackTooLarge
-				}
-				return ErrPackInvalid
-			}
-			contributed = h.Length
-		}
-
-		total += contributed
-		if total > maxPackTotalBytes {
-			return ErrPackTooLarge
-		}
-	}
-	return nil
+	return err
 }
 
-// readDeltaVarint decodes one unsigned little-endian base-128 varint from the head
-// of b using git's DELTA-header size encoding (accumulate the low 7 bits of each
-// byte, continue while the high bit 0x80 is set) and returns the value, the bytes
-// after it, and an error on a truncated stream or a shift that would overflow int64.
-// This is git's delta size encoding — the same decodeLEB128 patch_delta.go applies to
-// the delta header's base/target sizes — and is DELIBERATELY not the packfile
-// object-header length encoding, which packs the type into the first byte and shifts
-// differently.
-func readDeltaVarint(b []byte) (val int64, rest []byte, err error) {
-	var shift uint
-	for i := 0; i < len(b); i++ {
-		c := b[i]
-		// Cap the shift before applying it: a valid target size for our caps needs at
-		// most a few bytes, so a varint this long is a malformed/hostile header. This
-		// also keeps val non-negative (bit 63 is never written).
-		if shift >= 63 {
-			return 0, nil, errors.New("pushbroker: delta varint overflow")
-		}
-		val |= int64(c&0x7f) << shift
-		shift += 7
-		if c&0x80 == 0 {
-			return val, b[i+1:], nil
-		}
-	}
-	return 0, nil, errors.New("pushbroker: delta varint truncated")
-}
+// readDeltaVarint is packbudget.ReadDeltaVarint (git's delta-header LEB128), kept so the
+// pack-assembly tests in this package keep pinning the decode.
+func readDeltaVarint(b []byte) (int64, []byte, error) { return packbudget.ReadDeltaVarint(b) }
 
 // fetchBaseRefs fetches ONLY the branch, the default branch, and the branch's
 // checkpoint ref — never every head. Because a specific refspec for an

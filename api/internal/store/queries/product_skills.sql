@@ -3,7 +3,7 @@
 -- skills_token_sealed is the sealed read-only clone token. The products queries use
 -- `SELECT *` / `RETURNING *`, so it is IN store.Product: every DTO that renders a product is an
 -- explicit field list (apitypes.ProductDTO, apitypes.ProductSkillsDTO) and never embeds the row,
--- and TestProductSkillsTokenNeverInAnyResponse pins that over every admin product route.
+-- and TestProductSkillsTokenNeverInAnyResponseLiveDB pins that over every admin product route.
 --
 -- SCOPE PREDICATES. A skills query that filters on scope uses an explicit IN list, never `<>`:
 -- the vocabulary now has four members and a `<> 'user'` read would silently include 'product'

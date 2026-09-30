@@ -380,6 +380,10 @@ export function buildJobSdkOptions(input: {
     env: input.env,
     // 🔴 ISOLATION: the literal `settingSources: []` (semgrep/settings-sources-isolation.yml).
     settingSources: [],
+    // A product skill body is admin-approved but repo-authored text, and the plugin's skills would
+    // otherwise run their inline shell (`!cmd` blocks) under bypassPermissions, past the closed tool
+    // set. Always off for a job, skills or not (SDK Settings.disableSkillShellExecution).
+    settings: { disableSkillShellExecution: true },
     // The load-bearing restriction: the SDK `tools` option really confines under bypassPermissions,
     // where `allowedTools` would not. `Skill` joins the list only for a job that carries skills.
     tools: [...JOB_BASE_TOOLS, ...(withSkills ? [SKILL_TOOL] : []), ...input.toolNames],

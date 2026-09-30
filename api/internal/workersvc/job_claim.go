@@ -134,9 +134,14 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 	// Product skills (PRD #1909 D9): a job started through a registered product gets exactly that
 	// product's approved skills and no other skill; a uzc_ job has no origin product and gets none.
 	// Re-read on every claim, so a reapply or a disabled product takes effect on the next claim.
-	productRows, err := s.q.ListProductSkillsForRun(ctx, run.ID)
-	if err != nil {
-		return nil, fmt.Errorf("list product skills: %w", err)
+	// An empty UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS turns the feature off: applied skills stay in
+	// the database but none is delivered (and the read is skipped).
+	var productRows []store.ListProductSkillsForRunRow
+	if s.p.ProductSkillsEnabled {
+		productRows, err = s.q.ListProductSkillsForRun(ctx, run.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list product skills: %w", err)
+		}
 	}
 	skills, skillDrops := assembleProductSkills(productRows, s.p.SkillMaxBytes, s.p.SkillsMaxPerRun)
 

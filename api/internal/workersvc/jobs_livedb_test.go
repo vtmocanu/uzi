@@ -35,7 +35,9 @@ type jobEnv struct {
 func setupJobLiveDB(t *testing.T, cap int) jobEnv {
 	t.Helper()
 	env := setupCodexLiveDB(t)
-	svc := New(env.q, env.box, testParams())
+	params := testParams()
+	params.ProductSkillsEnabled = true // the product-skills allowlist is non-empty on this instance
+	svc := New(env.q, env.box, params)
 	svc.SetTxBeginner(env.pool)
 	if cap > 0 {
 		svc.SetHealthSettings(jobCapFake{cap: cap})

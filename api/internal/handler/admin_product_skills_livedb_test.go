@@ -324,6 +324,37 @@ func TestProductSkillsTokenNeverInAnyResponseLiveDB(t *testing.T) {
 		t.Errorf("the fetch was given a file cap of %d, want SKILL_MAX_BYTES", e.fake.maxes[len(e.fake.maxes)-1])
 	}
 
+	// The apply responses (success and the stale-set 409) and the stale-source sync 409 are
+	// scanned too.
+	rec = e.apply(t, id, psSHA('b'))
+	note("apply stale sha", rec)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("apply with a stale sha = %d %q, want 409", rec.Code, rec.Body.String())
+	}
+	rec = e.apply(t, id, psSHA('a'))
+	note("apply ok", rec)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("apply = %d %q", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	e.fake.hook = func() {
+		if _, err := e.pool.Exec(t.Context(), `UPDATE products SET skills_ref = 'moved' WHERE id = $1`, id); err != nil {
+			t.Errorf("move the ref mid-sync: %v", err)
+		}
+	}
+	e.fake.mu.Unlock()
+	rec = e.sync(t, id)
+	note("sync source changed", rec)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("sync whose source changed mid-flight = %d %q, want 409", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	e.fake.hook = nil
+	e.fake.mu.Unlock()
+	if _, err := e.pool.Exec(t.Context(), `UPDATE products SET skills_ref = 'main' WHERE id = $1`, id); err != nil {
+		t.Fatal(err)
+	}
+
 	// A failing fetch: the response is generic and never the remote's error text.
 	e.fake.err = errors.New("REMOTE-ERROR-MARKER unable to access the repository")
 	rec = e.sync(t, id)
@@ -781,4 +812,114 @@ func storeProductWithSealedToken() store.Product {
 		ID: uuid.New(), Name: "p", SkillsRepoUrl: psRepoURL, SkillsRef: "main",
 		SkillsTokenSealed: []byte("SEALED-BYTES"), SkillsAppliedSha: psSHA('a'),
 	}
+}
+
+// TestProductSkillsSyncIsSingleFlightLiveDB: one sync clones at a time instance-wide (the clone
+// decodes an untrusted pack into memory). A second sync while one is in flight is a 429 with a
+// fixed message and makes no fetch; once the first finishes a sync is accepted again.
+func TestProductSkillsSyncIsSingleFlightLiveDB(t *testing.T) {
+	e := psSetup(t)
+	first, second := e.product(t), e.product(t)
+	e.configure(t, first, nil)
+	e.configure(t, second, nil)
+	e.fake.files = []agentsource.SkillFile{psSkillFile("one", "one", "first", "body one")}
+
+	entered, release := make(chan struct{}), make(chan struct{})
+	e.fake.mu.Lock()
+	e.fake.hook = func() {
+		close(entered)
+		<-release
+	}
+	e.fake.mu.Unlock()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- e.sync(t, first) }()
+	<-entered
+
+	calls := e.fake.callCount()
+	rec := e.sync(t, second)
+	if rec.Code != http.StatusTooManyRequests || !strings.Contains(rec.Body.String(), "already running") {
+		t.Fatalf("a concurrent sync = %d %q, want 429 naming that one is running", rec.Code, rec.Body.String())
+	}
+	if e.fake.callCount() != calls {
+		t.Fatal("the refused concurrent sync still cloned")
+	}
+
+	e.fake.mu.Lock()
+	e.fake.hook = nil
+	e.fake.mu.Unlock()
+	close(release)
+	if rec := <-done; rec.Code != http.StatusOK {
+		t.Fatalf("the first sync = %d %q, want 200", rec.Code, rec.Body.String())
+	}
+	if rec := e.sync(t, second); rec.Code != http.StatusOK {
+		t.Fatalf("a sync after the first finished = %d %q, want 200 (the flag must be released)", rec.Code, rec.Body.String())
+	}
+}
+
+// TestProductSkillsTokenClearedOnOriginChangeLiveDB: the sealed clone token belongs to the
+// repo's origin. A URL edit that moves to another origin (or clears the URL) drops it; a path-only
+// edit keeps it; a PATCH that supplies a new token alongside the new URL keeps the NEW one.
+func TestProductSkillsTokenClearedOnOriginChangeLiveDB(t *testing.T) {
+	e := psSetup(t)
+	other := "https://other.example.com"
+	e.h.cfg.ProductSkillsAllowedBaseURLs = []string{psAllowedBase, other}
+	tok := psToken()
+
+	tokenSet := func(t *testing.T, id string) bool {
+		t.Helper()
+		return e.view(t, id).Config.SkillsTokenSet
+	}
+	fresh := func(t *testing.T) string {
+		t.Helper()
+		id := e.product(t)
+		e.configure(t, id, map[string]any{"skills_token": tok})
+		if !tokenSet(t, id) {
+			t.Fatal("setup: token not set")
+		}
+		return id
+	}
+
+	t.Run("another origin drops the token", func(t *testing.T) {
+		id := fresh(t)
+		if rec := e.patch(t, id, map[string]any{"skills_repo_url": other + "/acme/r.git"}); rec.Code != http.StatusOK {
+			t.Fatalf("PATCH = %d %q", rec.Code, rec.Body.String())
+		}
+		if tokenSet(t, id) {
+			t.Fatal("the old token survived a move to another origin")
+		}
+		var sealed []byte
+		if err := e.pool.QueryRow(t.Context(), `SELECT skills_token_sealed FROM products WHERE id = $1`, id).Scan(&sealed); err != nil {
+			t.Fatal(err)
+		}
+		if sealed != nil {
+			t.Fatal("the sealed token is still stored")
+		}
+	})
+	t.Run("a path-only change keeps it", func(t *testing.T) {
+		id := fresh(t)
+		if rec := e.patch(t, id, map[string]any{"skills_repo_url": psAllowedBase + "/acme/another.git"}); rec.Code != http.StatusOK {
+			t.Fatalf("PATCH = %d %q", rec.Code, rec.Body.String())
+		}
+		if !tokenSet(t, id) {
+			t.Fatal("a same-origin URL edit dropped the token")
+		}
+	})
+	t.Run("clearing the URL drops it", func(t *testing.T) {
+		id := fresh(t)
+		if rec := e.patch(t, id, map[string]any{"skills_repo_url": ""}); rec.Code != http.StatusOK {
+			t.Fatalf("PATCH = %d %q", rec.Code, rec.Body.String())
+		}
+		if tokenSet(t, id) {
+			t.Fatal("the token survived clearing the URL")
+		}
+	})
+	t.Run("a new token in the same PATCH is kept", func(t *testing.T) {
+		id := fresh(t)
+		if rec := e.patch(t, id, map[string]any{"skills_repo_url": other + "/acme/r.git", "skills_token": tok + "-new"}); rec.Code != http.StatusOK {
+			t.Fatalf("PATCH = %d %q", rec.Code, rec.Body.String())
+		}
+		if !tokenSet(t, id) {
+			t.Fatal("the token supplied with the new URL was dropped")
+		}
+	})
 }

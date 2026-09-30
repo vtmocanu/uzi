@@ -42,9 +42,11 @@ type SkillFile struct {
 // `.claude/skills/*/SKILL.md`, returning the resolved commit SHA, the files and any notes
 // (too_large, duplicate, over_limit). It shares fetchTip with FetchRoleFiles, so the redirect
 // allowlist, same-origin credential guard, wire cap, timeout and token scrub are the same code.
-// opts.Dir is ignored. maxFileBytes bounds one SKILL.md (an oversized file is skipped WITHOUT
-// reading its blob, with a too_large note); the total read is bounded by MaxSkillFiles *
-// maxFileBytes. Only regular files in real directories are read (a symlink, a submodule or a
+// opts.Dir is ignored. Memory is bounded in two layers: fetchTip pre-scans the fetched pack and
+// refuses one whose RECONSTRUCTED size passes clonePackLimits (ErrPackBudget) before anything is
+// decoded into the in-memory storer; then maxFileBytes bounds one SKILL.md (an oversized file
+// is skipped, decided from its tree-entry blob size without reading its content, with a
+// too_large note) and the total content read is bounded by MaxSkillFiles * maxFileBytes. Only regular files in real directories are read (a symlink, a submodule or a
 // non-directory entry is skipped, never followed). A repo with neither root is a valid empty set.
 func FetchSkillFiles(ctx context.Context, opts CloneOptions, maxFileBytes int) (sha string, files []SkillFile, notes []Note, err error) {
 	if maxFileBytes <= 0 {
@@ -119,7 +121,8 @@ func readSkillFiles(commit *object.Commit, maxFileBytes int) ([]SkillFile, []Not
 				return nil, nil, ferr
 			}
 			seen[e.Name] = struct{}{}
-			// Skip an oversized file WITHOUT reading its blob: the OOM guard on a hostile single file.
+			// Skip an oversized file without reading its content (its blob was already decoded into the
+			// storer, bounded by the pack pre-scan in fetchTip): the guard on a hostile single file.
 			if f.Size > int64(maxFileBytes) {
 				notes = append(notes, Note{Name: slug, Reason: NoteTooLarge})
 				continue

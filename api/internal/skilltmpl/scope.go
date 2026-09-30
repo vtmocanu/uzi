@@ -2,7 +2,7 @@ package skilltmpl
 
 // The skill scope vocabulary: the four values of the skills.scope column. It mirrors the
 // skills_scope_check CHECK (migration 00277_product_skills.sql; 00040_skills.sql created it with
-// the first three) and is pinned to it by TestSkillScopesMatchDBCheckLiveDB, and to the delivery
+// the first three) and is pinned to it by TestSkillsScopeConstraintNameLiveDB, and to the delivery
 // precedence table workersvc.scopeRank by TestScopeRankCoversEveryScope, so a fifth scope cannot
 // be added to one without the others going red.
 //

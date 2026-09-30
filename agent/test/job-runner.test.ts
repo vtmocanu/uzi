@@ -1211,6 +1211,7 @@ describe("JobRunner product skills (PRD #1909 M6)", () => {
     assert.deepStrictEqual(seen.options!.tools, ["Read", "Write", "Glob", "Grep", "mcp__job__submit_job_result"]);
     assert.deepStrictEqual(seen.options!.skills, [], "[] switches skills off; omitting the key would not");
     assert.strictEqual(seen.options!.plugins, undefined);
+    assert.deepStrictEqual(seen.options!.settings, { disableSkillShellExecution: true });
     assert.ok(!String(seen.options!.systemPrompt).includes("PRODUCT SKILLS"));
   });
 
@@ -1233,6 +1234,9 @@ describe("JobRunner product skills (PRD #1909 M6)", () => {
     assert.deepStrictEqual(o.tools, ["Read", "Write", "Glob", "Grep", "Skill", "mcp__job__submit_job_result"]);
     assert.deepStrictEqual(o.skills, ["uzi:brand-voice"]);
     assert.deepStrictEqual(o.settingSources, []);
+    // A skill body is repo-authored text: its inline shell (`!cmd` blocks) must never execute
+    // under bypassPermissions.
+    assert.deepStrictEqual(o.settings, { disableSkillShellExecution: true });
     assert.match(skillMd, /name: "brand-voice"/);
     assert.match(skillMd, /Be brief\./);
     assert.ok(pluginInWorkspace, "the plugin dir is a sibling of work/, inside the workspace root");

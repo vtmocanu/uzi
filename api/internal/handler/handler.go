@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/go-chi/chi/v5"
@@ -106,8 +107,12 @@ type Handler struct {
 	// agentsource.FetchSkillFiles; a test injects a fake so the admin sync route is exercised
 	// without a network clone.
 	productSkillsFetch productSkillsFetcher
-	svc                *forgesvc.Service
-	wsvc               *workersvc.Service
+	// productSkillsSyncing is the instance-wide single-flight of the product skills sync: one
+	// clone of an untrusted repo at a time, so concurrent admin syncs cannot multiply the
+	// memory a clone decodes. A second sync while one runs is refused with a 429.
+	productSkillsSyncing atomic.Bool
+	svc                  *forgesvc.Service
+	wsvc                 *workersvc.Service
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service

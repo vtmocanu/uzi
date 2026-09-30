@@ -107,6 +107,23 @@ func TestProductJobClaimSkillsLiveDB(t *testing.T) {
 		}
 	})
 
+	t.Run("an empty allowlist turns the feature off: applied skills are not delivered", func(t *testing.T) {
+		u := e.seedJobUser(t)
+		e.ownJobsCleanup(t, u)
+		e.makeTokenDefault(t, u)
+		prod, tok := e.seedProduct(t, u, []string{"research"})
+		e.seedSkill(t, "applied-"+suffix, "product", nil, &prod, "applied body")
+		e.svc.p.ProductSkillsEnabled = false
+		t.Cleanup(func() { e.svc.p.ProductSkillsEnabled = true })
+		if _, err := e.svc.CreateJobRun(e.ctx, jobReq(productCaller(u, prod, tok))); err != nil {
+			t.Fatalf("CreateJobRun: %v", err)
+		}
+		pl := e.claimNextJob(t, u)
+		if pl.Skills == nil || len(pl.Skills) != 0 {
+			t.Fatalf("with product skills disabled the claim's skills = %#v, want a non-nil empty slice", pl.Skills)
+		}
+	})
+
 	t.Run("a uzc_ job (no origin product) gets no product skill, even with product skills in the database", func(t *testing.T) {
 		u := e.seedJobUser(t)
 		e.ownJobsCleanup(t, u)

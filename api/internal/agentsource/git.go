@@ -1,6 +1,7 @@
 package agentsource
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -24,6 +25,7 @@ import (
 	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"github.com/go-git/go-git/v5/storage/memory"
 
+	"github.com/vtmocanu/uzi/api/internal/packbudget"
 	"github.com/vtmocanu/uzi/api/internal/redirectguard"
 )
 
@@ -55,16 +57,25 @@ const maxTotalBytes = MaxFiles * MaxBytes
 // and a real roster repo's pack plus git/protocol overhead is a few MB — so a
 // legitimate source never trips it, while a hostile one is bounded to tens of MiB.
 //
-// RESIDUAL (documented, see adr/0602 threat model): this bounds COMPRESSED wire bytes,
-// not the RECONSTRUCTED/inflated size. A zlib decompression-bomb pack (small on the
-// wire, huge inflated) still inflates into the storer under this cap. Closing that half
-// needs a reconstructed-size pre-scan of the pack analogous to
-// pushbroker.scanPackBudget; it is a deliberate follow-up, not implemented here. The
-// mitigating preconditions make the residual acceptable: the source must be on the
-// admin-configured AGENT_SOURCE_ALLOWED_BASE_URLS allowlist AND the feature explicitly
-// enabled (both off by default), reconcile is single-flight on one goroutine, and the
-// 60s cloneTimeout bounds the inflation wall-clock.
+// This bounds COMPRESSED wire bytes only. The RECONSTRUCTED/inflated size is bounded
+// separately by clonePackLimits, enforced by packbudget.Scan over the fetched pack BEFORE it
+// is decoded into the storer (fetchCommit), so a zlib or delta bomb that is small on the wire
+// is refused rather than inflated. The source must also be on the admin-configured allowlist
+// and the 60s cloneTimeout bounds wall-clock.
 const maxCloneWireBytes = 48 << 20 // 48 MiB cumulative off-the-wire ceiling
+
+// clonePackLimits is the reconstructed-size budget of one fetched pack (packbudget.Scan). It is
+// sized for a depth-1 snapshot of a skills or role repo: a SKILL.md or role file is capped at
+// well under 1 MiB, so 16 MiB per object and 64 MiB reconstructed in total leave generous room
+// for the other files of a real repo's tip while bounding the memory a hostile source can make
+// the api allocate to 64 MiB (the 64 MiB-of-zeros bomb is ~64 KiB on the wire). The inflation
+// work cap bounds the scan's own CPU.
+var clonePackLimits = packbudget.Limits{
+	ObjectBytes:        16 << 20,
+	TotalBytes:         64 << 20,
+	InflationWorkBytes: 128 << 20,
+	Objects:            50000,
+}
 
 // maxCloneRedirects caps redirect hops on the http(s) clone. go-git's own policy
 // already permits a redirect only on the initial ref-advertisement request; this is a
@@ -78,6 +89,10 @@ var sha40Re = regexp.MustCompile(`^[0-9a-fA-F]{40}$`)
 // wire cap is crossed. It surfaces through go-git's pack decode as a read error; the
 // fetch wrapper detects the trip flag and reports a clean, PAT-free message.
 var errCloneWireBudget = errors.New("agentsource: clone exceeded wire budget")
+
+// ErrPackBudget is returned (wrapped) when the fetched pack would inflate past clonePackLimits:
+// a decompression or delta bomb, refused before any object is decoded.
+var ErrPackBudget = packbudget.ErrTooLarge
 
 // CloneOptions carries the (already-trimmed, already-allowlist-rechecked) inputs a
 // single fetch needs. Token is the sealed clone credential decrypted by the caller;
@@ -166,6 +181,11 @@ func fetchTip(ctx context.Context, opts CloneOptions) (*object.Commit, string, e
 
 	st := memory.NewStorage()
 	if ferr := fetchCommit(adv.ctx, adv.session, adv.refs.Capabilities, want, st); ferr != nil {
+		if errors.Is(ferr, packbudget.ErrTooLarge) {
+			// The pre-scan refused the pack; its text carries no token. %w keeps the
+			// sentinel matchable (ErrPackBudget) for callers and tests.
+			return nil, "", fmt.Errorf("agentsource: clone failed: %w", ErrPackBudget)
+		}
 		return nil, "", adv.wrap("clone failed", ferr)
 	}
 
@@ -308,7 +328,17 @@ func fetchCommit(ctx context.Context, session transport.UploadPackSession, adv *
 	}
 	defer func() { _ = resp.Close() }()
 
-	return packfile.UpdateObjectStorage(st, buildSideband(req.Capabilities, resp))
+	// Buffer the (wire-capped, compressed) pack and pre-scan it for its RECONSTRUCTED size
+	// BEFORE it is decoded into the unbounded in-memory storer: a zlib or delta bomb is small
+	// on the wire and would otherwise inflate fully before any per-file cap runs.
+	pack, err := io.ReadAll(buildSideband(req.Capabilities, resp))
+	if err != nil {
+		return err
+	}
+	if err := packbudget.Scan(ctx, pack, clonePackLimits); err != nil {
+		return err
+	}
+	return packfile.UpdateObjectStorage(st, bytes.NewReader(pack))
 }
 
 // buildSideband wraps the upload-pack response in a sideband demuxer when the negotiated

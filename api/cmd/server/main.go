@@ -333,6 +333,7 @@ func run() error {
 		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
 		SkillsMaxPerRun:             cfg.SkillsMaxPerRun,
+		ProductSkillsEnabled:        len(cfg.ProductSkillsAllowedBaseURLs) > 0,
 		ChatIdleTimeout:             cfg.ChatIdleTimeout,
 		ChatMaxTurns:                cfg.ChatMaxTurns,
 		WorkerChatIdleTimeout:       cfg.WorkerChatIdleTimeout,

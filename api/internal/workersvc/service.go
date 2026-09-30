@@ -1437,6 +1437,10 @@ type Params struct {
 	// the claim so the worker enforces the same limits (no server/worker drift).
 	SkillMaxBytes   int
 	SkillsMaxPerRun int
+	// ProductSkillsEnabled mirrors "UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS is non-empty" (PRD
+	// #1909 D9): with it false the feature is off instance-wide and a job claim carries no
+	// product skills, even if some were applied while the allowlist was set.
+	ProductSkillsEnabled bool
 
 	// Chat lifecycle knobs (PRD #39 Decision 3). ChatIdleTimeout is the SERVER idle
 	// backstop the sweep applies (complete a chat whose last message is older than

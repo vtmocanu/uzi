@@ -348,12 +348,22 @@ func (h *Handler) AdminSyncProductSkills(w http.ResponseWriter, r *http.Request)
 		token = string(plain)
 	}
 
-	sha, files, notes, ferr := h.fetchProductSkills()(r.Context(), agentsource.CloneOptions{
-		CloneURL:        p.SkillsRepoUrl,
-		Ref:             p.SkillsRef,
-		Token:           token,
-		RedirectAllowed: h.cfg.ProductSkillsBaseURLAllowed,
-	}, h.cfg.SkillMaxBytes)
+	// Single-flight, instance-wide: the clone decodes an untrusted pack into memory, so only one
+	// runs at a time (the pack pre-scan bounds ONE clone; this bounds how many run at once).
+	if !h.productSkillsSyncing.CompareAndSwap(false, true) {
+		w.Header().Set("Retry-After", "30")
+		httpx.Error(w, http.StatusTooManyRequests, "another product skills sync is already running; try again shortly")
+		return
+	}
+	sha, files, notes, ferr := func() (string, []agentsource.SkillFile, []agentsource.Note, error) {
+		defer h.productSkillsSyncing.Store(false)
+		return h.fetchProductSkills()(r.Context(), agentsource.CloneOptions{
+			CloneURL:        p.SkillsRepoUrl,
+			Ref:             p.SkillsRef,
+			Token:           token,
+			RedirectAllowed: h.cfg.ProductSkillsBaseURLAllowed,
+		}, h.cfg.SkillMaxBytes)
+	}()
 	if ferr != nil {
 		// agentsource scrubs the token from its errors; even so the text is for the log only.
 		slog.Error("admin sync product skills: fetch", "product_id", id, "error", ferr)
@@ -647,6 +657,11 @@ func applySkillsSourcePatch(ctx context.Context, q *store.Queries, cur store.Pro
 	if p.ref != nil {
 		params.SkillsRef = pgtype.Text{String: *p.ref, Valid: true}
 	}
+	// The sealed token was issued for the repo's ORIGIN: a URL change to another origin (or
+	// clearing the URL) must not carry it along, unless this same PATCH supplies a new one.
+	if p.repoURL != nil && p.sealed == nil && !skillsURLSameOrigin(cur.SkillsRepoUrl, *p.repoURL) {
+		params.ClearToken = true
+	}
 	updated, err := q.UpdateProductSkillsSource(ctx, params)
 	if err != nil {
 		return cur, err
@@ -657,4 +672,32 @@ func applySkillsSourcePatch(ctx context.Context, q *store.Queries, cur store.Pro
 		}
 	}
 	return updated, nil
+}
+
+// skillsURLSameOrigin reports whether the stored URL and the new one share a normalized
+// scheme+host+port origin (https default port 443, host case-folded). A token cannot outlive a
+// change of origin: an empty old URL has no origin a token could have leaked from, so it counts as
+// the same; an empty new URL (the source is cleared) or an unparseable one does not.
+func skillsURLSameOrigin(oldRaw, newRaw string) bool {
+	if oldRaw == "" {
+		return true
+	}
+	a, aok := skillsURLOrigin(oldRaw)
+	b, bok := skillsURLOrigin(newRaw)
+	return aok && bok && a == b
+}
+
+func skillsURLOrigin(raw string) (string, bool) {
+	u, err := url.Parse(raw)
+	if err != nil || u.Host == "" {
+		return "", false
+	}
+	port := u.Port()
+	if port == "" {
+		port = "443"
+		if strings.EqualFold(u.Scheme, "http") {
+			port = "80"
+		}
+	}
+	return strings.ToLower(u.Scheme) + "://" + strings.ToLower(u.Hostname()) + ":" + port, true
 }
