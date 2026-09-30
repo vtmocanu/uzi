@@ -109,7 +109,19 @@ interface ResolveArgs {
   claimGeneration: number;
   send: SendTerminalState;
   signal?: AbortSignal;
+  /**
+   * Issue #1512 single-flight: what to do when another resolve for the same (runId, claimGeneration)
+   * journal is already in flight on this outbox. "wait" (default) serialises behind it, then runs this
+   * caller's own resolve (which re-reads the journal, so it is a no-op if the first one retired it).
+   * "skip" returns at once (the heartbeat sweep and the drain-retire resolve: the in-flight owner is
+   * already driving the journal, and the next heartbeat retries).
+   */
+  ifBusy?: "wait" | "skip";
 }
+
+/** Issue #1512: the in-flight resolves, keyed by the outbox instance (shared by the Worker and every
+ *  runner lane, and usable with duck-typed test fakes) and then by "runId NUL generation". */
+const inFlightResolves = new WeakMap<object, Map<string, Promise<void>>>();
 
 /**
  * Journal a run-lane terminal outcome WRITE-AHEAD, then resolve it. The site has already closed /
@@ -222,6 +234,35 @@ export async function sendUnjournaledTerminal(
  * (the write-ahead path) and postTerminalState (the judge/review path).
  */
 export async function resolvePendingTerminal(deps: TerminalOutboxDeps, args: ResolveArgs): Promise<void> {
+  // Issue #1512: single-flight per journal. The heartbeat sweep, the drain-retire resolve, the boot
+  // resolve, the live hook's re-drive and every lane's site can all reach the same journal; two
+  // concurrent sends of one terminal would race each other's retire. The registry is process-local
+  // and keyed by the outbox instance.
+  let inFlight = inFlightResolves.get(deps.outbox);
+  if (!inFlight) {
+    inFlight = new Map();
+    inFlightResolves.set(deps.outbox, inFlight);
+  }
+  const key = `${args.runId}\u0000${args.claimGeneration}`;
+  for (let busy = inFlight.get(key); busy; busy = inFlight.get(key)) {
+    if (args.ifBusy === "skip") return;
+    await busy; // never rejects (see below); loop in case another waiter registered first
+  }
+  // No await between the last check and the registration, so exactly one caller becomes the owner.
+  const run = resolvePendingTerminalOnce(deps, args);
+  const settled = run.then(
+    () => undefined,
+    () => undefined,
+  );
+  inFlight.set(key, settled);
+  try {
+    await run;
+  } finally {
+    if (inFlight.get(key) === settled) inFlight.delete(key);
+  }
+}
+
+async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: ResolveArgs): Promise<void> {
   const { outbox, log } = deps;
   const { runId, claimGeneration, send, signal } = args;
   const journal = await outbox.readTerminalJournal(runId, claimGeneration);

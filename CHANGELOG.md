@@ -41,6 +41,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A run's finished outcome whose report failed no longer waits for a worker restart when the run left no messages behind ([#1512](https://github.com/vtmocanu/uzi/issues/1512)).**
+  A worker now re-sends every journaled terminal outcome (completed or failed) on each successful heartbeat, not only after a run's spilled messages drain, so a run that finished or hit a fatal 401 during an outage, with nothing spilled, is reported once the api is reachable instead of stranding until boot or re-claim. Sends are single-flight per outcome, skip a run still live on the worker and an outcome the failing-run hook is holding, and a terminal-only run (including a blocked one) now appears in the worker's fleet outbox depth.
 - **Worker authentication answers 503, not 401, when its database lookup fails ([#1989](https://github.com/vtmocanu/uzi/issues/1989)).**
   During a short database outage behind a running api, worker requests got `401 invalid worker token`, which the worker treats as a permanent credential rejection, so running runs failed. A store lookup failure now returns 503, which the worker's existing retry handles like any other transient error: message delivery retries for a bounded window and then spills to the worker outbox if a usable one exists, and registration retries with backoff. A missing, unknown or mismatched worker token still gets 401.
 - **A checkpoint counts as published only when its git pack was produced in full ([#1725](https://github.com/vtmocanu/uzi/issues/1725)).**

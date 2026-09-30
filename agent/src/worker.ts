@@ -125,6 +125,9 @@ export class Worker {
    *  still running). */
   private draining = false;
 
+  /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
+  private sweepingTerminals = false;
+
   async run(signal: AbortSignal): Promise<void> {
     // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
     // A worker whose `/nix` store is missing the baked go/python3/gcc/pip/openssl (a stale seed
@@ -309,35 +312,109 @@ export class Worker {
     for (const entry of outbox.listPendingTerminals()) {
       if (entry.run_id !== runId) continue;
       if (signal?.aborted) return;
-      const gen = entry.claim_generation;
-      // #1539 (B2/N4): the live run's permanent-failure hook holds this terminal's resolve while it
-      // aborts + reaps between its durable install and its own send. Sending here would race the hook's
-      // resolve, so SKIP and record the skip — the hook's `finally` release reads it and re-drives one
-      // resolve if its own send failed, so the terminal is never stranded until boot.
-      if (outbox.isTerminalResolveHeld(runId, gen)) {
-        outbox.noteHeldSkip(runId, gen);
-        this.log.info("outbox: terminal resolve held by the live run's permanent-failure hook; skipping the drain resolve", {
-          run_id: runId,
-          claim_generation: gen,
-        });
-        continue;
-      }
-      try {
-        await resolvePendingTerminal(deps, {
-          runId,
-          claimGeneration: gen,
-          // State-only send stamped with the journal's generation (mirrors resolveBootTerminals): a
-          // superseded generation is refused stale_claim and local-retired (D11), never mis-applied.
-          send: this.replaySend(runId, gen),
-          signal,
-        });
-      } catch (err) {
-        this.log.warn("outbox: post-drain terminal resolve failed for a run; leaving it listed for a later resolve", {
-          run_id: runId,
-          error: errMessage(err),
-        });
-      }
+      await this.resolveLiveTerminal(outbox, deps, entry, "drain", signal);
     }
+  }
+
+  /**
+   * Issue #1512: the live re-resolve the drain-retire hook could not give a run with NO message
+   * records. A journaled terminal whose send failed (an api outage, a fatal 401, a non-terminal 409)
+   * used to wait for the next boot or re-claim unless the run also had spilled messages to drain,
+   * because the only live re-resolve was {@link resolveRunTerminal}, fired from the drainer, and the
+   * drainer iterates `runsWithPending()` (message records only). This sweep is fired, fire-and-forget,
+   * after each successful heartbeat and walks every pending terminal journal. Single-flight (a tick
+   * during a sweep is a no-op), aborts with the signal, and never throws: a failing entry is logged
+   * and the rest continue. A journal the api answers with a non-terminal 409 is re-sent on each
+   * heartbeat (no backoff; the single-flight and the heartbeat cadence bound the rate, and the
+   * "state report not applied server-side" log makes it visible).
+   */
+  private async sweepPendingTerminals(signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    if (this.sweepingTerminals) return; // single-flight
+    this.sweepingTerminals = true;
+    try {
+      const deps = makeTerminalOutboxDeps(outbox, this.client, {
+        gapFillMax: this.config.gapFillMax,
+        terminalMaxBytes: this.config.outboxTerminalMaxBytes,
+        log: this.log,
+      });
+      if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+      for (const entry of outbox.listPendingTerminals()) {
+        if (signal?.aborted) return;
+        await this.resolveLiveTerminal(outbox, deps, entry, "sweep", signal);
+      }
+    } finally {
+      this.sweepingTerminals = false;
+    }
+  }
+
+  /**
+   * The ONE per-journal step shared by the heartbeat sweep and the drain-retire resolve. The checks
+   * run in this ORDER, and the order is load-bearing:
+   *  1. a blocked journal is owner-resolved, never auto-retried;
+   *  2. (sweep only) a run with undrained message segments belongs to the drainer, whose retire hook
+   *     resolves the terminal once the segments are gone;
+   *  3. the #1539 HOLD comes BEFORE liveness: the live run's permanent-failure hook holds the resolve
+   *     while it aborts and reaps, and its `finally` release re-drives one resolve only if a skip was
+   *     RECORDED here. A live-run check first would return without recording and strand the terminal;
+   *  4. only then skip a run that is live in this process: its own lane sends through
+   *     `flight.reportState` plus the recovery-terminal driver, which {@link replaySend} would bypass
+   *     (receipt gate, credential switch, recovery-hold release);
+   *  5. resolve (single-flight, "skip" when busy) and, once the journal is settled, retire the #1742
+   *     finalize record the way the boot resolve does.
+   * Never throws; a failing entry is logged and left listed for the next heartbeat / drain / boot.
+   */
+  private async resolveLiveTerminal(
+    outbox: Outbox,
+    deps: NonNullable<ReturnType<typeof makeTerminalOutboxDeps>>,
+    entry: { run_id: string; claim_generation: number; blocked: boolean },
+    via: "sweep" | "drain",
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const runId = entry.run_id;
+    const gen = entry.claim_generation;
+    if (entry.blocked) return;
+    if (via === "sweep" && outbox.hasUndrainedMessages(runId)) return;
+    if (outbox.isTerminalResolveHeld(runId, gen)) {
+      outbox.noteHeldSkip(runId, gen);
+      this.log.info("outbox: terminal resolve held by the live run's permanent-failure hook; skipping the resolve", {
+        run_id: runId,
+        claim_generation: gen,
+        via,
+      });
+      return;
+    }
+    if (this.isRunLiveHere(runId)) return;
+    try {
+      await resolvePendingTerminal(deps, {
+        runId,
+        claimGeneration: gen,
+        // State-only send stamped with the journal's generation (mirrors resolveBootTerminals): a
+        // superseded generation is refused stale_claim and local-retired (D11), never mis-applied.
+        send: this.replaySend(runId, gen),
+        signal,
+        ifBusy: "skip",
+      });
+      const stillPending = outbox
+        .listPendingTerminals()
+        .some((p) => p.run_id === runId && p.claim_generation === gen);
+      if (!stillPending) await outbox.retireFinalizesThrough(runId, gen);
+    } catch (err) {
+      this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
+        run_id: runId,
+        via,
+        error: errMessage(err),
+      });
+    }
+  }
+
+  /** Whether this process is executing `runId` (the registry when wired, else the runner's own
+   *  execution tracking; the typeof guard covers test fakes that lack `isExecuting`). */
+  private isRunLiveHere(runId: string): boolean {
+    if (this.activeRuns) return this.activeRuns.has(runId);
+    const runner = this.runner as { isExecuting?: (id: string) => boolean };
+    return typeof runner.isExecuting === "function" ? runner.isExecuting(runId) : false;
   }
 
   private async registerWithRetry(signal: AbortSignal): Promise<void> {
@@ -577,6 +654,11 @@ export class Worker {
         void this.drainOutbox(signal).catch((err) => {
           this.log.warn("outbox drain failed", { error: errMessage(err) });
         });
+        // Issue #1512: also re-resolve journaled terminals that have no message records (the
+        // drainer never visits those). Fire-and-forget for the same reason as the drain above.
+        void this.sweepPendingTerminals(signal).catch((err) => {
+          this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
+        });
       }
       await sleep(this.config.heartbeatIntervalMs, signal);
     }
@@ -584,12 +666,15 @@ export class Worker {
 
   /** PRD #1391 M5: assemble the per-run outbox depth for the heartbeat, mapping every
    *  run with pending outbox depth to the wire {@link OutboxHeartbeatEntry} shape
-   *  (`pending_terminal` is always 0 in Run A). Undefined when there is no outbox or
+   *  (`pending_terminal` counts the run's journaled terminals; a terminal-only run, with no message
+   *  records, is listed too, issue #1512). Undefined when there is no outbox or
    *  nothing pending, so the heartbeat wire stays byte-identical. */
   private outboxEntries(): OutboxHeartbeatEntry[] | undefined {
     if (!this.outbox) return undefined;
     const entries: OutboxHeartbeatEntry[] = [];
-    for (const runId of this.outbox.runsWithPending()) {
+    const runIds = new Set(this.outbox.runsWithPending());
+    for (const t of this.outbox.listPendingTerminals()) runIds.add(t.run_id);
+    for (const runId of runIds) {
       const d = this.outbox.depthFor(runId);
       if (!d) continue;
       entries.push({

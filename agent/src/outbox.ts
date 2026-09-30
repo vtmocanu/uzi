@@ -1138,10 +1138,12 @@ export class Outbox {
   // A process-local, in-memory hold keyed by (runId, generation). The live run's permanent-failure
   // hook takes it BEFORE it installs its `failed` journal and releases it in a `finally` after its own
   // resolve, so the per-worker DRAINER (`Worker.resolveRunTerminal`, which fires when the run's spilled
-  // segments retire) cannot send the journaled `failed` during the hook's abort-then-reap window and
+  // segments retire) and the heartbeat terminal sweep (issue #1512) cannot send the journaled `failed` during the hook's abort-then-reap window and
   // race the hook's own resolve. It is deliberately NOT gated on `disabled`: it is a coordination flag
   // between two in-process callers, independent of whether the durable store is writable. The boot
-  // resolve and RunRunner.resolveRunPendingTerminals ignore the hold — only the drainer honours it.
+  // resolve and RunRunner.resolveRunPendingTerminals ignore the hold — only the drainer and the
+  // heartbeat sweep honour it, and they check it BEFORE their live-run check so a skip is always
+  // recorded for the hook's release to re-drive.
 
   /** Terminals whose resolve the live run's own hook is currently driving; the drainer skips these. */
   private readonly heldTerminalResolves = new Set<string>();

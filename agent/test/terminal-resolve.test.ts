@@ -525,3 +525,78 @@ describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3
     assert.equal(scripted.bodies.length, 1, "no re-send (the append errored transiently)");
   });
 });
+
+// Issue #1512: single-flight per journal.
+describe("resolvePendingTerminal single-flight (issue #1512)", () => {
+  it("a default ('wait') caller serialises behind the in-flight resolve, then no-ops once it retired the journal", async () => {
+    const { outbox } = await mkOutbox();
+    const deps = depsFor(outbox, new FakeClient());
+    await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    let sends = 0;
+    const send = async (): Promise<StateAck> => {
+      sends += 1;
+      concurrent += 1;
+      maxConcurrent = Math.max(maxConcurrent, concurrent);
+      await gate;
+      concurrent -= 1;
+      return { applied: true, status: "failed" };
+    };
+    const owner = resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send });
+    const waiterA = resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send });
+    const waiterB = resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send, ifBusy: "wait" });
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(sends, 1, "the waiters have not sent while the owner is in flight");
+    release();
+    await Promise.all([owner, waiterA, waiterB]);
+    assert.equal(sends, 1, "the waiters re-read the journal, found it retired, and did not send");
+    assert.equal(maxConcurrent, 1);
+  });
+
+  it("a 'wait' caller still sends if the owner left the journal pending", async () => {
+    const { outbox } = await mkOutbox();
+    const deps = depsFor(outbox, new FakeClient());
+    await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    const s1 = scriptedSend([{ applied: false, status: "running" }]);
+    const s2 = scriptedSend([{ applied: true, status: "failed" }]);
+    await Promise.all([
+      resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: s1.send }),
+      resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: s2.send }),
+    ]);
+    assert.equal(s1.bodies.length, 1);
+    assert.equal(s2.bodies.length, 1, "serialised: the second resolve ran after the first kept the journal");
+    assert.equal(outbox.hasPendingTerminal("r1", GEN), false);
+  });
+
+  it("a 'skip' caller returns at once while one is in flight, and a different generation is independent", async () => {
+    const { outbox } = await mkOutbox();
+    const deps = depsFor(outbox, new FakeClient());
+    await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    await outbox.journalTerminal("r1", GEN + 1, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const owner = resolvePendingTerminal(deps, {
+      runId: "r1",
+      claimGeneration: GEN,
+      send: async () => {
+        await gate;
+        return { applied: true, status: "failed" };
+      },
+    });
+    const skipped = scriptedSend([{ applied: true, status: "failed" }]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: skipped.send, ifBusy: "skip" });
+    assert.equal(skipped.bodies.length, 0, "skip did not send");
+    const other = scriptedSend([{ applied: true, status: "failed" }]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN + 1, send: other.send, ifBusy: "skip" });
+    assert.equal(other.bodies.length, 1, "a different generation is not blocked");
+    release();
+    await owner;
+    // The registry entry is cleared: a later skip caller is no longer skipped.
+    const later = scriptedSend([{ applied: true, status: "failed" }]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: later.send, ifBusy: "skip" });
+    assert.equal(later.bodies.length, 0, "the journal is retired, so nothing to send (not skipped-forever)");
+  });
+});
