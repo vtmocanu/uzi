@@ -299,12 +299,14 @@ so no other hosted worker or run is touched. Do not assume the cluster's CNI:
   exists only when `workers.fqdnEgress.enabled` is set with provider `antrea`; without it there is
   no chart policy to outrank, but the rule must still win over anything else that applies.
 - **Otherwise**, the supported equivalent on a CNI that implements it: the CNI's supported
-  cluster-scoped deny policy (for example a Kubernetes AdminNetworkPolicy, or its successor
-  `policy.networking.k8s.io` API if the cluster has moved to it) with a `Deny` egress rule to the
-  api pods, its subject a pods selector (namespace selector plus the same unique pod label)
-  matching only the scratch worker pod, and a priority that wins. Such a policy is evaluated
-  before ordinary NetworkPolicies. Check that the cluster's CNI actually implements it: the API
-  server accepting the object proves nothing about enforcement.
+  cluster-scoped deny policy: a ClusterNetworkPolicy (`policy.networking.k8s.io/v1alpha2`) in
+  tier `Admin`, which is evaluated before ordinary NetworkPolicies (tier `Baseline` is overridden
+  by them, so it cannot deny), or, alongside it, a Kubernetes AdminNetworkPolicy
+  (`policy.networking.k8s.io/v1alpha1`), whichever the CNI actually implements. Either carries a
+  `Deny` egress rule to the api pods, its subject a pods selector (namespace selector plus the
+  same unique pod label) matching only the scratch worker pod, and a priority that wins. Check
+  enforcement: the API server accepting the object proves nothing about whether the CNI applies
+  it.
 
 Both objects use the exact name `uzi-1742-acceptance-<n>` and the pod-only scope.
 
@@ -325,7 +327,10 @@ Both objects use the exact name `uzi-1742-acceptance-<n>` and the pod-only scope
 - **GitOps self-heal can revert a `kubectl set env` mid-test**, silently restoring the short
   window while the check runs (a false failure), or leave the override behind afterwards. Pause
   sync for the api application for the duration, or raise and restore the value through the
-  deployment's own values path instead, adapting the sketch's `set_stale` and `restore_stale`.
+  deployment's own values path instead, adapting the sketch's `restore_stale` and the raise step (step 3).
+- **Each `kubectl set env` on the api rolls its single `Recreate` pod**, a brief outage for all
+  users and workers. The sketch does it twice (raise, restore), so schedule the acceptance for a
+  window where that is acceptable.
 - Deploy the release first (api, then the worker image).
 - The scratch task must request a merge request (`uzi handoff --mr`, or an issue run on the
   scratch repository), because step 5 expects run A to reach `completed` with one.
@@ -338,7 +343,7 @@ The order is fixed: **record the prior state, install the trap, then change the 
 the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt and a
 `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
 **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
-restorations, reports any failure, and exits with the original status (non-zero on interrupt, or
+restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt, or
 1 when cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
 restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later under
 `set -euo pipefail`; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
@@ -358,9 +363,9 @@ override_state() {   # "WORKER_HEARTBEAT_STALE=<v>" when a direct env override e
 }
 restore_stale() {    # put the recorded override back, or remove the override when there was none
   if [ -n "$PRIOR_STATE" ]; then
-    kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" "$PRIOR_STATE"
+    kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" "$PRIOR_STATE" || return
   else
-    kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE-'
+    kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE-' || return
   fi
   kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY"
 }
@@ -378,9 +383,17 @@ cleanup() {          # 2. Install BEFORE any change.
   restore_stale;                                              local res_rc=$?   # runs whatever the delete returned
   [ "$del_rc" -eq 0 ] || { echo "CLEANUP: deleting $DENY_NAME returned $del_rc" >&2; failed=1; }
   [ "$res_rc" -eq 0 ] || { echo "CLEANUP: restoring WORKER_HEARTBEAT_STALE returned $res_rc" >&2; failed=1; }
-  if deny_kubectl get "$DENY_KIND" "$DENY_NAME" >/dev/null 2>&1; then
-    echo "CLEANUP FAILED: $DENY_NAME still exists" >&2; failed=1; fi
-  if [ "$(override_state)" != "$PRIOR_STATE" ]; then
+  # Verify. Only a NotFound read counts as "object gone"; any other read error is a failure.
+  local out get_rc now_state
+  out="$(deny_kubectl get "$DENY_KIND" "$DENY_NAME" 2>&1)"; get_rc=$?
+  if [ "$get_rc" -eq 0 ]; then
+    echo "CLEANUP FAILED: $DENY_NAME still exists" >&2; failed=1
+  elif [[ "$out" != *NotFound* && "$out" != *'not found'* ]]; then
+    echo "CLEANUP FAILED: cannot verify $DENY_NAME is gone: $out" >&2; failed=1; fi
+  now_state="$(override_state)"; get_rc=$?
+  if [ "$get_rc" -ne 0 ]; then
+    echo "CLEANUP FAILED: cannot read the WORKER_HEARTBEAT_STALE override" >&2; failed=1
+  elif [ "$now_state" != "$PRIOR_STATE" ]; then
     echo "CLEANUP FAILED: WORKER_HEARTBEAT_STALE override is not '${PRIOR_STATE}'" >&2; failed=1; fi
   if [ "$failed" -ne 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
   exit "$rc"
@@ -420,8 +433,10 @@ Two separate scratch runs, A (completion control) and B (one-shot control). Each
 deterministic: the outage is applied **before** the executor hands off, and the restart happens
 only after the durable point is proven.
 
-The **durable point** has two parts, both required: the scratch worker's log shows `finalize record
-durable run_id=<id> claim_generation=<G>`, **and** `kubectl exec <scratch-pod> -c worker -- test
+The **durable point** has two parts, both required: the scratch worker's log (JSON lines only)
+has a line with `"msg":"finalize record durable"`, `"run_id":"<id>"` and `"claim_generation":<G>`
+(a number, unquoted; match `"claim_generation":<G>` followed by a non-digit so G=1 does not match
+G=12), **and** `kubectl exec <scratch-pod> -c worker -- test
 -f /data/outbox/<id>/finalize-<G>.json` succeeds. The feed's executor `result` line is **not** a
 trigger.
 
@@ -435,11 +450,14 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
 0. **Record, then install the cleanup contract above** through its last step: write the prior
    `WORKER_HEARTBEAT_STALE` state (override value if any, ConfigMap value, or "default") **on issue
    #1742 as a comment before changing anything**, install the trap, raise the stale window, delete
-   any leftover object. The comment is what the dead-shell fallback restores from.
+   any leftover object. The comment is what the dead-shell fallback restores from. The issue is a
+   public place: record only the `WORKER_HEARTBEAT_STALE` value or state (override value, ConfigMap
+   value, or "default") and nothing else about the deployment's configuration.
 1. **Run A.** Start a small scratch run that requests a merge request (`uzi handoff --mr` or an
    issue run) on the scratch repository and wait until it is `running`. While its executor is
    still working, apply the deny policy (the outage now precedes the hand-off, so no terminal can
-   land). Confirm the log has **no** `finalize record durable` line for A at G yet. If it
+   land). Confirm the log has **no** `"msg":"finalize record durable"` line for A at G yet (same match as
+   above). If it
    already does, the hand-off beat the cut: abort this attempt (the trap cleans up) and repeat
    with a new scratch run.
 2. Wait for the durable point at G (both parts).
@@ -449,10 +467,9 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    graceful-shutdown path runs) so the container restarts in place and `/data` survives; confirm
    the pod's container `restartCount` rose and the same pod kept its `/data`. Then delete the deny
    policy by its exact name so the restarted process can register.
-5. Expect for A: the scratch worker's log shows `register finalize snapshot` including G; the api's
-   register commit line ("worker register active snapshot committed") shows
-   `finalize_allowance_used` as 1 (rendered `"finalize_allowance_used":1` with the JSON log format
-   or `finalize_allowance_used=1` with the text format); `runs.finalize_resume_generation = G`; A
+5. Expect for A: the scratch worker's log has a `"msg":"register finalize snapshot"` line whose
+   `claim_generations_sample` array includes G; the api's register commit line ("worker register
+   active snapshot committed", JSON) shows `"finalize_allowance_used":1`; `runs.finalize_resume_generation = G`; A
    is re-claimed at G+1 and reaches `completed` with its merge request through the normal
    completion path at the next claim generation (the claim-generation fences, plus the completion
    permit where the run is interlocked), never `failed`/`worker_lost`.
@@ -460,7 +477,7 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    generation G; B is re-queued under the allowance.
 7. When B shows `running` at G+1, re-apply the deny policy **before** the re-run's executor
    returns. Wait for the durable point at G+1 (both parts), **repeating step 1's abort check:
-   if `finalize record durable` already exists for B at G+1 before the cut was applied, abort
+   if a `"msg":"finalize record durable"` line already exists for B at G+1 before the cut was applied, abort
    the attempt.** Then run the pre-kill check at G+1, kill the agent process and delete the
    policy.
 8. Expect for B: `failed` with `fail_origin = worker_lost`; `finalize_resume_generation` still G
