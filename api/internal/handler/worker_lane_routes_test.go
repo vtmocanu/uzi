@@ -78,7 +78,7 @@ func TestLaneWorkerRouteTable(t *testing.T) {
 	limiters := newProbeLimiters()
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
 	mainRouter := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
 	tlsRouter := h.WorkerRoutes(limiters[4])
 
 	guardPtr := reflect.ValueOf(laneWorkerRouteGuard).Pointer()
