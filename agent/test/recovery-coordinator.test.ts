@@ -637,11 +637,11 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
     await coord.forgetGeneration(runId, 2); // ENOENT: a no-op, never a throw
   });
 
-  it("a record written into the run dir BETWEEN the listing and the removal survives (issue #1751 N5)", async () => {
+  it("a successor pin queued during generation cleanup survives (issue #1751 N5)", async () => {
     const coord = makeCoordinator();
     const runId = "run-forget-race";
     await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
-    // The live successor writes its own record right after forgetGeneration listed the dir.
+    // The live successor requests its pin after cleanup lists the dir; it must survive serialization.
     const late = new RecoveryCoordinator({
       client: new FakeClient(),
       git: new FakeGit(),
@@ -652,14 +652,38 @@ describe("RecoveryCoordinator — exact generation identity end to end (PRD #134
     });
     const internal = coord as unknown as { listRecords: (runId: string) => Promise<unknown[]> };
     const list = internal.listRecords.bind(coord);
+    let latePin: ReturnType<RecoveryCoordinator["pin"]> | undefined;
     internal.listRecords = async (id: string) => {
       const out = await list(id);
-      await late.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 2 });
+      // Do not await the pin inside cleanup's critical section: it correctly waits for cleanup.
+      latePin = late.pin({ runId, sourceSha: H_PRIME, kind: "issue", branch: "b", generation: 2 });
       return out;
     };
     await coord.forgetGeneration(runId, 1);
+    assert.ok(latePin, "the successor pin was requested during cleanup");
+    assert.ok(await latePin, "the queued pin completed after cleanup");
     const left = await late.inspect(runId);
     assert.deepEqual(left.map((r) => [r.generation, r.sourceSha]), [[2, H_PRIME]], "the concurrent record survives");
+  });
+
+  it("an unlisted successor bundle written between listing and removal survives (issue #1751 N5)", async () => {
+    const coord = makeCoordinator();
+    const runId = "run-forget-bundle-race";
+    await coord.pin({ runId, sourceSha: H, kind: "issue", branch: "b", generation: 1 });
+    const bundle = path.join(root, runId, "successor.bundle");
+    const internal = coord as unknown as { listRecords: (runId: string) => Promise<unknown[]> };
+    const list = internal.listRecords.bind(coord);
+    internal.listRecords = async (id: string) => {
+      const records = await list(id);
+      // Bundle production stays outside the journal lock; never recursively delete its bytes
+      // merely because the earlier authenticated-record listing had no sibling yet.
+      await fsp.writeFile(bundle, "retained successor work");
+      return records;
+    };
+    await coord.forgetGeneration(runId, 1);
+    assert.equal(fs.readFileSync(bundle, "utf8"), "retained successor work");
+    internal.listRecords = list;
+    assert.deepEqual(await coord.inspect(runId), []);
   });
 
   it("release() of the LAST generation sweeps the run dir recursively: tampered .json, orphan .bundle and .tmp go too (issue #1751 NB2)", async () => {

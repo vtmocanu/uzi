@@ -186,6 +186,14 @@ added to the server hold DTO.
 
 This refines ADR-1296 D5; see its 2026-09-30 amendment.
 
+Journal writes and cleanup share a per-run in-process lock, keyed by the configured recovery
+directory and shared across coordinators. The sweep's authenticated existence check and rename
+are serialized with generation cleanup and legacy whole-run release: a settled record cannot be
+resurrected between them. Ordinary writes use the same lock so cleanup cannot remove a sibling
+record being installed. Bundle production and API calls stay outside this lock. This relies on
+the existing invariant that one worker process owns a data directory; no cross-process locking
+protocol is added.
+
 **(b) The early-cut limit (no new capture path for G).** The early cut is a crash before
 fetch-back and the finalization pin, with committed work only in the runner clone. Such a cut
 carries a finalize record, so D3 applies, but G's own recovery record is still the early base pin.

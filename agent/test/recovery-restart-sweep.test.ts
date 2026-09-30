@@ -1,8 +1,9 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import { createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
@@ -104,6 +105,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  mock.restoreAll();
   fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
 });
 
@@ -376,6 +378,74 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
     assert.equal(client.reserveCalls[0]!.req.source_sha, laterSha);
   });
 
+  for (const cleanup of ["forget", "release", "legacy_release"] as const) {
+    it(`does not resurrect a settled journal when ${cleanup} races between the sweep check and rename`, async () => {
+      const writer = coordinator();
+      const record = await writer.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
+      assert.ok(record);
+      const sibling = cleanup === "legacy_release" ? undefined : await writer.pin({
+        runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 8,
+      });
+      const records = [record, ...(sibling ? [sibling] : [])];
+      const deleter = coordinator(); // same directory, another coordinator in this worker process
+      const dir = path.join(cache.recoveryRoot, "r1");
+      let entered!: () => void;
+      const paused = new Promise<void>((resolve) => { entered = resolve; });
+      let resume!: () => void;
+      const released = new Promise<void>((resolve) => { resume = resolve; });
+      const realMkdir = fsp.mkdir.bind(fsp);
+      mock.method(fsp, "mkdir", async (...args: Parameters<typeof fsp.mkdir>) => {
+        if (args[0] === dir) {
+          entered(); // writeRecord has already passed the sweep's authenticated existence check
+          await released;
+        }
+        return realMkdir(...args);
+      });
+      // Make deletion IO synchronous at this seam, so one event-loop turn deterministically
+      // drains an unlocked deletion before the writer resumes. No timing-based sleep is used.
+      mock.method(deleter as unknown as { listRecords(runId: string): Promise<RecoveryRecord[]> },
+        "listRecords", async () => records);
+      const realRm = fsp.rm.bind(fsp);
+      mock.method(fsp, "rm", async (...args: Parameters<typeof fsp.rm>) => {
+        const p = String(args[0]);
+        if (p === dir || p.startsWith(`${dir}${path.sep}`)) {
+          fs.rmSync(...args);
+          return;
+        }
+        return realRm(...args);
+      });
+      const realRmdir = fsp.rmdir.bind(fsp);
+      mock.method(fsp, "rmdir", async (...args: Parameters<typeof fsp.rmdir>) => {
+        if (args[0] === dir) {
+          fs.rmdirSync(...args);
+          return;
+        }
+        return realRmdir(...args);
+      });
+      const write = (writer as unknown as { writeSweepRecord(record: RecoveryRecord): Promise<void> })
+        .writeSweepRecord({ ...record, state: "needs_action", reason: "race_control" });
+      let deletion: Promise<void> | undefined;
+      try {
+        await paused;
+        deletion = cleanup === "forget" ? deleter.forgetGeneration("r1", 7)
+          : deleter.release("r1", cleanup === "release" ? 7 : undefined);
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        resume();
+        await Promise.all([write, deletion]);
+      } finally {
+        resume();
+        await Promise.allSettled([write, ...(deletion ? [deletion] : [])]);
+        mock.restoreAll();
+      }
+      assert.deepEqual((await writer.inspect("r1")).map((r) => r.generation),
+        cleanup === "legacy_release" ? [] : [8], "settled generation must stay deleted; siblings stay intact");
+      await assert.rejects(
+        (writer as unknown as { writeSweepRecord(record: RecoveryRecord): Promise<void> }).writeSweepRecord(record),
+        /was removed during the restart sweep/,
+      );
+    });
+  }
+
   it("does not resurrect a record the live flight removed while the sweep bundles", async () => {
     const client = new FakeClient();
     const coord = coordinator(client);
@@ -472,13 +542,18 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
     await coord.pin({ runId: "r1", sourceSha: baseSha, kind: "issue", branch: "agent/issue-1", generation: 1 }); // early pin
     await coord.pin({ runId: "r2", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 1, ...FIN });
     const sweeper = coordinator(client);
-    const priv = sweeper as unknown as { writeRecord: (r: RecoveryRecord) => Promise<void> };
-    const real = priv.writeRecord.bind(sweeper);
-    priv.writeRecord = async (r) => {
-      if (r.runId === "r1") throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+    const priv = sweeper as unknown as { writeRecordUnlocked: (r: RecoveryRecord) => Promise<void> };
+    const real = priv.writeRecordUnlocked.bind(sweeper);
+    let refused = false;
+    priv.writeRecordUnlocked = async (r) => {
+      if (r.runId === "r1") {
+        refused = true;
+        throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      }
       return real(r);
     };
     await sweeper.resumePending();
+    assert.equal(refused, true, "the first record's write really failed");
     assert.equal((await only(coord, "r2")).state, "uploaded");
     assert.equal(client.uploadCalls.length, 1);
   });

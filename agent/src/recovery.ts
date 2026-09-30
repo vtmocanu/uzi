@@ -25,6 +25,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 
 import type { Logger } from "./log.js";
+import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
   RecoveryCaptureStatusResponse,
   RecoveryHold,
@@ -241,6 +242,10 @@ export function canonicalJson(value: unknown): string {
   }
   return `{${parts.join(",")}}`;
 }
+
+// All coordinators in this worker process share the configured recovery directory. Reuse the
+// keyed FIFO mutex for local journal IO only; one worker process owns each data directory.
+const recoveryJournalLocks = new RunDiskLocks();
 
 /**
  * The persistent, authenticated durable-recovery coordinator (PRD #1296 M3).
@@ -610,7 +615,7 @@ export class RecoveryCoordinator {
         if (generation !== undefined) {
           await this.removeGenerationRecords(runId, generation, "sweep_if_last");
         } else {
-          await this.removeRunDir(runId);
+          await this.withJournalLock(runId, () => this.removeRunDir(runId));
         }
       }
     } catch (err) {
@@ -903,8 +908,17 @@ export class RecoveryCoordinator {
     return path.join(this.runDir(record.runId), `${record.captureId}.bundle`);
   }
 
-  /** Atomically write the record with a fresh MAC (0600 file, 0700 dir). */
+  private withJournalLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn);
+  }
+
+  /** Serialize local writes with cleanup (0600 file, 0700 dir). */
   private async writeRecord(record: RecoveryRecord): Promise<void> {
+    await this.withJournalLock(record.runId, () => this.writeRecordUnlocked(record));
+  }
+
+  /** Atomic rename with a fresh MAC. The caller holds this run's journal lock. */
+  private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
     if (!this.key) return;
     const mac = this.computeMac(record);
     const dir = this.runDir(record.runId);
@@ -998,15 +1012,18 @@ export class RecoveryCoordinator {
    * The restart sweep's journal write (issue #1742): re-check that the record still exists and
    * authenticates, and throw {@link RecordGoneError} when it does not, so a sweep that is
    * bundling/uploading while the live successor flight's cleanup ({@link forgetGeneration} /
-   * {@link release}) deletes the record never resurrects it. The check and the rename are not
-   * atomic, so a delete landing between them can still be undone by this write; the check
-   * narrows that window to those two adjacent fs calls rather than closing it.
+   * {@link release}) deletes the record never resurrects it. Check and rename share the same
+   * per-run in-process lock as cleanup: either this write completes before cleanup removes it,
+   * or cleanup wins and this write refuses the missing record. Bundling and RPCs stay outside.
    */
   private async writeSweepRecord(record: RecoveryRecord): Promise<void> {
-    if (!(await this.readRecord(this.recordPath(record)))) throw new RecordGoneError(record);
-    await this.writeRecord(record);
+    await this.withJournalLock(record.runId, async () => {
+      if (!(await this.readRecord(this.recordPath(record)))) throw new RecordGoneError(record);
+      await this.writeRecordUnlocked(record);
+    });
   }
 
+  /** The caller holds this run's journal lock, including for legacy whole-run release. */
   private async removeRunDir(runId: string): Promise<void> {
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
   }
@@ -1025,6 +1042,15 @@ export class RecoveryCoordinator {
    *   attempted, and a non-empty (or already gone) dir is left as is.
    */
   private async removeGenerationRecords(
+    runId: string,
+    generation: number,
+    dirMode: "sweep_if_last" | "rmdir_if_empty",
+  ): Promise<void> {
+    await this.withJournalLock(runId, () => this.removeGenerationRecordsUnlocked(runId, generation, dirMode));
+  }
+
+  /** Generation selection and cleanup run under the same lock as every journal write. */
+  private async removeGenerationRecordsUnlocked(
     runId: string,
     generation: number,
     dirMode: "sweep_if_last" | "rmdir_if_empty",
