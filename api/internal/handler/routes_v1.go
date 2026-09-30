@@ -59,8 +59,12 @@ func (h *Handler) mountV1Routes(r chi.Router, authLimiter, v1Limiter *mw.Limiter
 
 		// PRD #1909 D5: upload an input file, then reference it from POST /jobs (input_file_ids).
 		// The jobs:run scope: a caller that may create jobs may upload their inputs. No extra
-		// limiter: the per-user v1Limiter above bounds request rate, and the byte quotas
-		// (workersvc.JobFiles.Reserve) bound what a caller can hold.
+		// limiter: the per-user v1Limiter above bounds request rate, the byte quotas
+		// (workersvc.JobFiles.Reserve) bound what a caller can hold, and the concurrent-write
+		// slots (workersvc.JobFiles.AcquireWrite, process-wide and per owner) bound how many
+		// uploads stream at once. The request rate does NOT bound that: each streaming upload holds
+		// a pooled database connection until its body is read, however few requests per minute.
+		// V1FileUpload also sets the route's own body read deadline.
 		r.With(run).Post("/files", h.V1FileUpload)
 	})
 }

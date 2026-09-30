@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -45,7 +46,18 @@ type v1UploadOpts struct {
 	sha      string            // X-Uzi-File-Sha256; "" omits.
 	hdr      map[string]string // extra or overriding request headers.
 	field    string            // the part's form name; "" = "file".
+	// preamble adds a form field of that many bytes BEFORE the file part; chunked sends the body
+	// with no Content-Length; failBody ends the body, just before the closing boundary, with this
+	// read error (a disconnect or a read deadline).
+	preamble int
+	chunked  bool
+	failBody error
 }
+
+// errAfter is a reader that yields err at once.
+type errAfter struct{ err error }
+
+func (r errAfter) Read([]byte) (int, error) { return 0, r.err }
 
 func sizePtr(n int64) *int64 { return &n }
 
@@ -74,6 +86,11 @@ func (e *v1JobsEnv) uploadTo(router http.Handler, bearer string, data []byte, o 
 	if field == "" {
 		field = "file"
 	}
+	if o.preamble > 0 {
+		if err := mw.WriteField("note", strings.Repeat("n", o.preamble)); err != nil {
+			e.t.Fatal(err)
+		}
+	}
 	h := textproto.MIMEHeader{}
 	// Quote by hand: %q would spell a non-ASCII or invisible character as a \u escape, which the
 	// server's header parser reads back as a literal "u202e".
@@ -89,7 +106,16 @@ func (e *v1JobsEnv) uploadTo(router http.Handler, bearer string, data []byte, o 
 	_, _ = pw.Write(data)
 	_ = mw.Close()
 
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/files", &buf)
+	var body io.Reader = &buf
+	if o.failBody != nil {
+		// Everything but the closing boundary ("\r\n--" + boundary + "--\r\n"), then the error.
+		cut := buf.Len() - (len(mw.Boundary()) + 8)
+		body = io.MultiReader(bytes.NewReader(buf.Bytes()[:cut]), errAfter{o.failBody})
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/files", body)
+	if o.chunked || o.failBody != nil {
+		req.ContentLength = -1
+	}
 	req.Header.Set("Content-Type", mw.FormDataContentType())
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
@@ -247,7 +273,7 @@ func TestV1FilesDisplayNameLiveDB(t *testing.T) {
 		{"z" + zw + "ero.md", []byte("hi"), "zero.md"},
 		{"", []byte("hi"), "upload"},
 		{"dir/", []byte("hi"), "dir"}, // the multipart reader already takes the basename.
-		{strings.Repeat("n", 400) + ".txt", []byte("hi"), strings.Repeat("n", v1FileDisplayNameMaxBytes)},
+		{strings.Repeat("n", 400) + ".txt", []byte("hi"), strings.Repeat("n", v1FileDisplayNameMaxBytes-len(".txt")) + ".txt"}, // the stem is cut, the extension kept.
 	} {
 		f := e.uploadOK(uzc, c.data, v1UploadOpts{filename: c.filename})
 		if f.DisplayName != c.want {

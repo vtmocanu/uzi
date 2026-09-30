@@ -2,7 +2,9 @@ package handler
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -144,12 +146,19 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "job create 422 file_unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":["` + uuid.NewString() + `"]}`, want: 422},
 		{name: "job create 413 too_many_files", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":[` + strings.TrimSuffix(strings.Repeat(`"`+uuid.NewString()+`",`, 11), ",") + `]}`, want: 413},
 
+		// A body that breaks mid-upload: a disconnect is 400, a read deadline is 408.
+		{name: "upload 400 body read failed", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 400,
+			mp: &v1UploadOpts{filename: "a.txt", failBody: io.ErrClosedPipe}, mpData: []byte("hello")},
+		{name: "upload 408 body read deadline", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 408,
+			mp: &v1UploadOpts{filename: "a.txt", failBody: os.ErrDeadlineExceeded}, mpData: []byte("hello")},
+
 		// whoami's 429 (the rate limiter, on the tight router)
 		{name: "whoami 429", method: "GET", specPath: "/whoami", url: "/api/v1/whoami", want: 429, tight: true, primeThenCall: true},
 
 		// Last: it unwires the file store, so no later case may need one.
 		{name: "upload 503", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 503, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello"),
 			pre: func() { e.h.wsvc.SetJobFiles(nil) }},
+		{name: "job create 503 files_unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":["` + uuid.NewString() + `"]}`, want: 503},
 	}
 
 	produced := map[string]bool{} // "METHOD /path STATUS"

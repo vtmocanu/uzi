@@ -81,6 +81,8 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
     get:
       operationId: listJobs
       summary: List jobs
@@ -289,6 +291,10 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "408":
+          $ref: "#/components/responses/RequestTimeout"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "415":
@@ -357,13 +363,41 @@ components:
     UnsupportedMediaType:
       description: >-
         The file's bytes are not a supported type, or disagree with the type its
-        Content-Type or file name declares (reason unsupported_file_type).
+        Content-Type or file name declares (reason unsupported_file_type). The message
+        names the specific refusal, and for an unrecognised extension lists the allowed
+        ones.
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    BadRequest:
+      description: >-
+        POST /files: the request body ended or broke before the file was read, for
+        example the client disconnected (reason invalid_request).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    RequestTimeout:
+      description: >-
+        POST /files: the body was not fully received within the upload deadline
+        (120 seconds by default; UZI_RECOVERY_REQUEST_DEADLINE), so a stalled upload is
+        cut off (reason request_timeout).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     ServiceUnavailable:
-      description: This deployment has no file store configured (reason files_unavailable).
+      description: >-
+        This deployment has no file store configured (reason files_unavailable, on
+        POST /files and on POST /jobs with input_file_ids), or, on POST /files, too many
+        uploads are streaming at once, process-wide or for this user (reason
+        uploads_busy; retry after the number of seconds in the Retry-After header).
+      headers:
+        Retry-After:
+          description: "Present with reason uploads_busy: the seconds to wait before retrying."
+          schema:
+            type: integer
       content:
         application/json:
           schema:

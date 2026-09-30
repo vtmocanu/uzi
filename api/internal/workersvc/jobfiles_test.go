@@ -1,10 +1,18 @@
 package workersvc
 
 import (
+	"context"
+	"errors"
+	"io"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // jobfiles_test.go: the parts of the PRD #1909 M1 job-file store that need no database.
@@ -16,6 +24,7 @@ func TestJobFileLimitsDefaults(t *testing.T) {
 		OutputFileMaxBytes: 25 << 20, OutputsMaxFiles: 50, OutputsMaxBytes: 100 << 20,
 		PerOwnerBytes: 256 << 20, InstanceBytes: 1 << 30, StoredFilesBudgetBytes: 4 << 30,
 		Retention: 7 * 24 * time.Hour, UploadTTL: time.Hour, RequestDeadline: 120 * time.Second,
+		MaxConcurrentWrites: 4, MaxConcurrentWritesPerOwner: 2,
 	}
 	if l != want {
 		t.Fatalf("defaults = %+v, want the PRD #1909 D1 table %+v", l, want)
@@ -106,3 +115,107 @@ func TestReserveParamsValidate(t *testing.T) {
 		t.Fatalf("an output with a run was refused: %v", err)
 	}
 }
+
+// TestJobFilesAcquireWrite: the concurrent-write slots are bounded process-wide and per owner, a
+// refused acquire holds nothing, and release is idempotent and returns the slot.
+func TestJobFilesAcquireWrite(t *testing.T) {
+	jf := NewJobFiles(nil, nil, JobFileLimits{MaxConcurrentWrites: 3, MaxConcurrentWritesPerOwner: 2}, nil)
+	a, b, c := uuid.New(), uuid.New(), uuid.New()
+	ra1, err := jf.AcquireWrite(a)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ra2, _ := jf.AcquireWrite(a)
+	if _, err := jf.AcquireWrite(a); !errors.Is(err, ErrJobFileUploadsBusy) {
+		t.Fatalf("a third slot for one owner: %v, want ErrJobFileUploadsBusy", err)
+	}
+	rb, err := jf.AcquireWrite(b)
+	if err != nil {
+		t.Fatalf("another owner's first slot: %v", err)
+	}
+	if _, err := jf.AcquireWrite(c); !errors.Is(err, ErrJobFileUploadsBusy) {
+		t.Fatalf("a fourth slot process-wide: %v, want ErrJobFileUploadsBusy", err)
+	}
+	ra1()
+	ra1() // idempotent: must not free a second slot.
+	if _, err := jf.AcquireWrite(c); err != nil {
+		t.Fatalf("a freed slot was not reusable: %v", err)
+	}
+	if _, err := jf.AcquireWrite(uuid.New()); !errors.Is(err, ErrJobFileUploadsBusy) {
+		t.Fatalf("a double release freed more than one slot: %v", err)
+	}
+	ra2()
+	rb()
+	// Defaults: 4 in all, 2 per owner.
+	d := NewJobFiles(nil, nil, JobFileLimits{}, nil)
+	if l := d.Limits(); l.MaxConcurrentWrites != 4 || l.MaxConcurrentWritesPerOwner != 2 {
+		t.Errorf("default write slots = %d / %d, want 4 / 2", l.MaxConcurrentWrites, l.MaxConcurrentWritesPerOwner)
+	}
+}
+
+// beginRecorder is a JobFilesDB that only records Begin: it lets a test see when Write first wants
+// a connection.
+type beginRecorder struct {
+	store.DBTX
+	begins chan struct{}
+}
+
+// Exec absorbs the best-effort reservation release a failed Write issues.
+func (b *beginRecorder) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
+	return pgconn.CommandTag{}, nil
+}
+
+func (b *beginRecorder) Begin(context.Context) (pgx.Tx, error) {
+	b.begins <- struct{}{}
+	return nil, errors.New("no database in this test")
+}
+
+// TestJobFilesWriteReadsFirstChunkBeforeBegin: a client that has sent nothing holds no database
+// connection; the transaction begins only once the first chunk (or the end of the body) is in.
+func TestJobFilesWriteReadsFirstChunkBeforeBegin(t *testing.T) {
+	box, err := secretbox.New([]byte("0123456789abcdef0123456789abcdef"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rec := &beginRecorder{begins: make(chan struct{}, 1)}
+	jf := NewJobFiles(rec, box, JobFileLimits{}, nil)
+	pr, pw := io.Pipe()
+	done := make(chan error, 1)
+	go func() {
+		_, err := jf.Write(context.Background(), uuid.New(), uuid.New(), pr, WriteOptions{ContentType: "text/plain"})
+		done <- err
+	}()
+	select {
+	case <-rec.begins:
+		t.Fatal("Write began a transaction before any body byte arrived")
+	case <-time.After(300 * time.Millisecond):
+	}
+	_, _ = pw.Write([]byte("hello"))
+	_ = pw.Close()
+	select {
+	case <-rec.begins:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Write never began its transaction after the body arrived")
+	}
+	if err := <-done; err == nil {
+		t.Fatal("Write succeeded with no database")
+	}
+
+	// A body that fails before the first chunk never reaches the database at all.
+	rec2 := &beginRecorder{begins: make(chan struct{}, 1)}
+	jf2 := NewJobFiles(rec2, box, JobFileLimits{}, nil)
+	_, err = jf2.Write(context.Background(), uuid.New(), uuid.New(), errReader{io.ErrClosedPipe}, WriteOptions{ContentType: "text/plain"})
+	var be *JobFileBodyError
+	if !errors.As(err, &be) || !errors.Is(err, io.ErrClosedPipe) {
+		t.Fatalf("a failing body: %v, want a JobFileBodyError wrapping the cause", err)
+	}
+	select {
+	case <-rec2.begins:
+		t.Fatal("a body that failed before its first chunk still began a transaction")
+	default:
+	}
+}
+
+type errReader struct{ err error }
+
+func (r errReader) Read([]byte) (int, error) { return 0, r.err }

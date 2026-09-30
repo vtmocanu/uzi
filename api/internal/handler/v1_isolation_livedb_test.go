@@ -47,6 +47,13 @@ import (
 // mounted, as it is on a hosted deployment) and the hosted service wired as main does.
 func v1LiveDB(t *testing.T) (*Handler, *pgxpool.Pool) {
 	t.Helper()
+	return v1LiveDBMax(t, 0)
+}
+
+// v1LiveDBMax is v1LiveDB with the pool capped at maxConns connections (0 keeps pgx's default), for
+// the tests that measure what holds a connection.
+func v1LiveDBMax(t *testing.T, maxConns int32) (*Handler, *pgxpool.Pool) {
+	t.Helper()
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
 		t.Skip("UZI_TEST_DATABASE_URL not set; run via ./e2e/run-store-it.sh for live-DB coverage")
@@ -55,7 +62,14 @@ func v1LiveDB(t *testing.T) (*Handler, *pgxpool.Pool) {
 	if err := store.Migrate(ctx, dsn); err != nil {
 		t.Fatalf("migrate: %v", err)
 	}
-	pool, err := store.OpenPool(ctx, dsn)
+	pcfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	if maxConns > 0 {
+		pcfg.MaxConns = maxConns
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, pcfg)
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}

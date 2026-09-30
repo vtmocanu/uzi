@@ -69,6 +69,33 @@ data:
             proxy_set_header X-Forwarded-Proto $scheme;
         }
 
+        # Input-file upload (PRD #1909): exact-match, so the larger body limit and longer
+        # timeouts apply to this route only (/api/ keeps nginx's 1 MiB default). Same headers as
+        # /api/ (XFF appended). client_max_body_size = the api's default per-file cap
+        # (UZI_JOB_INPUT_FILE_MAX_BYTES, 25 MiB) plus multipart framing; raise both together, and
+        # web.ingress.annotations' proxy-body-size in front. Request buffering stays ON (the
+        # default): nginx takes the whole body from a slow client before the api sees any of it.
+        # proxy_*_timeout exceed the api's request deadline (UZI_RECOVERY_REQUEST_DEADLINE, 120 s)
+        # plus its 15 s response grace.
+        location = /api/v1/files {
+            client_max_body_size 26m;
+            client_body_timeout 120s;
+            proxy_request_buffering on;
+            proxy_send_timeout 150s;
+            proxy_read_timeout 150s;
+    {{ if .Values.web.nginx.dynamicResolution }}
+            set $api_upstream {{ $svc }}.{{ $ns }}.svc.cluster.local:{{ $port }};
+            proxy_pass http://$api_upstream$request_uri;
+    {{ else }}
+            proxy_pass http://{{ $svc }}:{{ $port }};
+    {{ end }}
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+
         # SPA fallback: any non-file route serves index.html for client routing.
         location / {
             try_files $uri $uri/ /index.html;

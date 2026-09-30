@@ -156,3 +156,99 @@ func TestV1UploadInspectorSplitRunes(t *testing.T) {
 		t.Errorf("valid JSON split across chunks refused: %v", err)
 	}
 }
+
+// TestSanitizeUploadNameKeepsExtension (B2): a long name is shortened in its STEM and keeps its
+// extension, and the declared type derives from the full untruncated name.
+func TestSanitizeUploadNameKeepsExtension(t *testing.T) {
+	for _, in := range []string{
+		strings.Repeat("r", 196) + ".v2.pdf",
+		strings.Repeat("報", 67) + ".pdf",
+		strings.Repeat("x", 500) + ".pdf",
+		strings.Repeat("é", 300) + ".markdown",
+	} {
+		got := sanitizeUploadName(in)
+		ext := in[strings.LastIndex(in, "."):]
+		if !strings.HasSuffix(got, ext) || len(got) > v1FileDisplayNameMaxBytes || !utf8.ValidString(got) {
+			t.Errorf("sanitizeUploadName(%d bytes ending %q) = %d bytes %q: want <= %d bytes, valid UTF-8, keeping the extension",
+				len(in), ext, len(got), got, v1FileDisplayNameMaxBytes)
+		}
+		if d := v1DeclaredTypes("", cleanUploadName(in)); len(d) != 1 || strings.HasPrefix(d[0], "unsupported/") {
+			t.Errorf("declared types of the untruncated %q = %v, want the extension's type", ext, d)
+		}
+	}
+	// A "extension" too long to be one is cut like the rest of the name, never kept whole.
+	long := "a." + strings.Repeat("z", 300)
+	if got := sanitizeUploadName(long); len(got) > v1FileDisplayNameMaxBytes {
+		t.Errorf("a name with a %d-byte extension was left at %d bytes", 300, len(got))
+	}
+	// A name with only an extension survives.
+	if got := sanitizeUploadName(".pdf"); got != ".pdf" {
+		t.Errorf("sanitizeUploadName(.pdf) = %q", got)
+	}
+}
+
+// TestV1UploadInspectorAliasesAndDetail: the accepted aliases, the BOM, and the refusal messages
+// (fixed text; an unknown extension lists the allowed ones and echoes nothing).
+func TestV1UploadInspectorAliasesAndDetail(t *testing.T) {
+	run := func(ctype, fname string, body []byte) (string, error) {
+		in := &v1UploadInspector{declared: v1DeclaredTypes(ctype, fname)}
+		got, err := in.Begin(body)
+		if err == nil {
+			err = in.Chunk(body)
+		}
+		if err == nil {
+			err = in.End()
+		}
+		return got, err
+	}
+	ok := []struct {
+		ctype, fname, want string
+		body               []byte
+	}{
+		{"application/json", "a.json", "application/json", append([]byte("\xef\xbb\xbf"), `{"a":1}`...)},
+		{"application/vnd.ms-excel", "a.csv", "text/csv", []byte("a,b\n1,2\n")},
+		{"text/x-markdown", "a.md", "text/markdown", []byte("# t\n")},
+		{"image/jpg", "a.jpg", "image/jpeg", []byte{0xff, 0xd8, 0xff, 0xe0, 0}},
+	}
+	for _, c := range ok {
+		if got, err := run(c.ctype, c.fname, c.body); err != nil || got != c.want {
+			t.Errorf("%s %s: got %q, %v; want %q", c.ctype, c.fname, got, err, c.want)
+		}
+	}
+	if _, err := run("application/vnd.ms-excel", "a.txt", []byte("a,b\n")); err == nil {
+		t.Error("the excel alias was accepted for a non-.csv name")
+	}
+	detail := []struct {
+		ctype, fname, want string
+		body               []byte
+	}{
+		{"", "a.txt", "text files must not contain NUL bytes", []byte("a\x00b")},
+		{"", "a.json", "declared as JSON but is not valid JSON", []byte(`{"a":`)},
+		{"text/csv", "a.md", "the declared type and the file extension disagree", []byte("a")},
+		{"", "a.exe", ".csv, .docx, .jpeg, .jpg, .json, .markdown, .md, .pdf, .png, .txt, .xlsx", []byte("hi")},
+	}
+	for _, c := range detail {
+		_, err := run(c.ctype, c.fname, c.body)
+		var d workersvc.RefusalDetailer
+		if err == nil || !errors.As(err, &d) || !strings.Contains(d.RefusalDetail(), c.want) {
+			t.Errorf("%s %s: refusal %v, want a detail containing %q", c.ctype, c.fname, err, c.want)
+		}
+	}
+	_, err := run("application/x-qzqz", "a.qzqz", []byte("hi"))
+	if err == nil || strings.Contains(err.Error(), "qzqz") {
+		t.Errorf("the refusal for an unknown type echoes client input: %v", err)
+	}
+}
+
+func TestParseV1FileSize(t *testing.T) {
+	for _, s := range []string{"0", "5", "26214400", "007"} {
+		if _, err := parseV1FileSize(s); err != nil {
+			t.Errorf("parseV1FileSize(%q): %v", s, err)
+		}
+	}
+	for _, s := range []string{"", "+5", "-5", " 5", "5 ", "0x5", "5.0", "1_0", "99999999999999999999"} {
+		if _, err := parseV1FileSize(s); err == nil {
+			t.Errorf("parseV1FileSize(%q) accepted", s)
+		}
+	}
+}

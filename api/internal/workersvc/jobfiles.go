@@ -9,10 +9,10 @@ import (
 	"hash"
 	"io"
 	"log/slog"
-	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -91,6 +91,9 @@ const (
 type JobFileRefusedError struct {
 	Kind   RefusalKind
 	Reason string
+	// Detail is an optional fixed, server-authored sentence saying why an Inspector refused the
+	// bytes. It is never built from client input.
+	Detail string
 }
 
 func (e *JobFileRefusedError) Error() string { return "job file refused: " + e.Reason }
@@ -98,6 +101,26 @@ func (e *JobFileRefusedError) Error() string { return "job file refused: " + e.R
 func refusal(kind RefusalKind, reason string) error {
 	return &JobFileRefusedError{Kind: kind, Reason: reason}
 }
+
+// inspectorRefusal is refusal for an Inspector error: the reason it names (or def), and its
+// RefusalDetailer text when it offers one.
+func inspectorRefusal(err error, def string) error {
+	ref := &JobFileRefusedError{Kind: RefusalInvalid, Reason: refusalReasonOf(err, def)}
+	var d RefusalDetailer
+	if errors.As(err, &d) {
+		ref.Detail = d.RefusalDetail()
+	}
+	return ref
+}
+
+// JobFileBodyError is a failure reading the upload body (client disconnect, read deadline,
+// malformed framing, an over-limit body), as opposed to a database or inspection failure. Unwrap
+// exposes the cause, so errors.Is(err, os.ErrDeadlineExceeded) and errors.As(*http.MaxBytesError)
+// see through it.
+type JobFileBodyError struct{ Err error }
+
+func (e *JobFileBodyError) Error() string { return "job file upload body: " + e.Err.Error() }
+func (e *JobFileBodyError) Unwrap() error { return e.Err }
 
 // Sentinel errors of the job-file store.
 var (
@@ -113,6 +136,8 @@ var (
 	ErrJobFileIntegrity = errors.New("workersvc: job file integrity check failed")
 	// ErrJobFileInvalid: a malformed reservation request (bad direction, name or digest).
 	ErrJobFileInvalid = errors.New("workersvc: invalid job file request")
+	// ErrJobFileUploadsBusy: AcquireWrite found no free upload slot (process-wide or the owner's).
+	ErrJobFileUploadsBusy = errors.New("workersvc: too many concurrent job file uploads")
 	// ErrJobFilesUnavailable: the store has no encryption key or no database wired.
 	ErrJobFilesUnavailable = errors.New("workersvc: job files unavailable")
 )
@@ -132,6 +157,12 @@ type JobFileLimits struct {
 	Retention              time.Duration // how long a finished job's files stay downloadable.
 	UploadTTL              time.Duration // how long an unattached input lives.
 	RequestDeadline        time.Duration // one upload/download request+transaction deadline.
+	// MaxConcurrentWrites bounds the uploads streaming at once, per API process (AcquireWrite):
+	// each holds one pooled database connection for its whole body read, so this is what keeps a
+	// crowd of slow clients from taking the pool. MaxConcurrentWritesPerOwner is the share one
+	// owner may hold, so one caller cannot take every slot.
+	MaxConcurrentWrites         int
+	MaxConcurrentWritesPerOwner int
 }
 
 // withDefaults fills a zero field with the PRD #1909 D1 default.
@@ -164,6 +195,11 @@ func (l JobFileLimits) withDefaults() JobFileLimits {
 	if l.RequestDeadline <= 0 {
 		l.RequestDeadline = 120 * time.Second
 	}
+	fillInt(&l.MaxConcurrentWrites, 4)
+	fillInt(&l.MaxConcurrentWritesPerOwner, 2)
+	if l.MaxConcurrentWritesPerOwner > l.MaxConcurrentWrites {
+		l.MaxConcurrentWritesPerOwner = l.MaxConcurrentWrites
+	}
 	return l
 }
 
@@ -180,6 +216,12 @@ type JobFiles struct {
 	box    *secretbox.Box
 	limits JobFileLimits
 	now    func() time.Time
+
+	// writeMu guards writeHeld, the per-owner count of held write slots; writeSlots is the
+	// process-wide semaphore (its capacity is limits.MaxConcurrentWrites).
+	writeMu    sync.Mutex
+	writeHeld  map[uuid.UUID]int
+	writeSlots chan struct{}
 }
 
 // NewJobFiles builds the store. box is required by Write and Open (a nil box makes them return
@@ -188,7 +230,43 @@ func NewJobFiles(db JobFilesDB, box *secretbox.Box, limits JobFileLimits, now fu
 	if now == nil {
 		now = time.Now
 	}
-	return &JobFiles{db: db, box: box, limits: limits.withDefaults(), now: now}
+	l := limits.withDefaults()
+	return &JobFiles{
+		db: db, box: box, limits: l, now: now,
+		writeHeld:  map[uuid.UUID]int{},
+		writeSlots: make(chan struct{}, l.MaxConcurrentWrites),
+	}
+}
+
+// AcquireWrite takes one upload slot for owner without waiting: it fails with
+// ErrJobFileUploadsBusy when the process-wide slots are all taken or the owner already holds its
+// share. The caller takes it BEFORE Reserve, so a refused request holds no reservation and no
+// connection, and calls the returned release when the upload is finished (it is idempotent).
+// Write streams the body while holding a pooled connection, so the slot count is the bound on how
+// many connections uploads can hold.
+func (j *JobFiles) AcquireWrite(owner uuid.UUID) (release func(), err error) {
+	j.writeMu.Lock()
+	defer j.writeMu.Unlock()
+	if j.writeHeld[owner] >= j.limits.MaxConcurrentWritesPerOwner {
+		return nil, ErrJobFileUploadsBusy
+	}
+	select {
+	case j.writeSlots <- struct{}{}:
+	default:
+		return nil, ErrJobFileUploadsBusy
+	}
+	j.writeHeld[owner]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			j.writeMu.Lock()
+			defer j.writeMu.Unlock()
+			if j.writeHeld[owner]--; j.writeHeld[owner] <= 0 {
+				delete(j.writeHeld, owner)
+			}
+			<-j.writeSlots
+		})
+	}, nil
 }
 
 // Limits returns the effective limits (defaults filled), for callers that size a request body.
@@ -411,6 +489,12 @@ type WriteOptions struct {
 // releases the reservation in the same call (the sweep is the backstop when that release fails).
 // An unattached input rests 'unattached' with the upload TTL; an output, or an input already
 // bound to a run, rests 'attached' with no expiry until its run ends.
+//
+// The first chunk is read from body BEFORE the transaction begins, so a client that sends nothing
+// holds no database connection; a later chunk is read inside it. Neither read observes ctx (a body
+// read blocks in the network), so the caller must bound the body with a read deadline on the
+// request (V1FileUpload does) and cap concurrent writes with AcquireWrite, which is what limits the
+// connections a slow client can hold. A body read failure is returned as a *JobFileBodyError.
 func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reader, opt WriteOptions) (file store.JobFile, err error) {
 	if j.box == nil {
 		return store.JobFile{}, ErrJobFilesUnavailable
@@ -422,6 +506,15 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 			j.releaseBestEffort(ctx, id, owner)
 		}
 	}()
+
+	// Read the first chunk BEFORE taking a connection: a client that stalls before it sends data
+	// never holds one. A later chunk is read inside the transaction; the caller bounds that with
+	// AcquireWrite and a read deadline on the request.
+	buf := make([]byte, JobFileChunkSize)
+	n, readErr := io.ReadFull(body, buf)
+	if readErr != nil && !errors.Is(readErr, io.EOF) && !errors.Is(readErr, io.ErrUnexpectedEOF) {
+		return store.JobFile{}, &JobFileBodyError{Err: readErr}
+	}
 
 	tx, err := j.db.Begin(ctx)
 	if err != nil {
@@ -444,13 +537,12 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 
 	contentType := opt.ContentType
 	hasher := sha256.New()
-	buf := make([]byte, JobFileChunkSize)
-	// One byte past the declared size is enough to tell an overlong body from an exact one.
-	src := io.LimitReader(body, declared+1)
+	// One byte past the declared size is enough to tell an overlong body from an exact one; the
+	// first chunk (already read) counts against it.
+	src := io.LimitReader(body, declared+1-int64(n))
 	var total int64
 	index := 0
 	for {
-		n, readErr := io.ReadFull(src, buf)
 		if n > 0 {
 			plain := buf[:n]
 			if index == 0 && opt.Inspector != nil {
@@ -460,13 +552,13 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 				}
 				ct, ierr := opt.Inspector.Begin(head)
 				if ierr != nil {
-					return store.JobFile{}, refusal(RefusalInvalid, refusalReasonOf(ierr, RefusalUnsupported))
+					return store.JobFile{}, inspectorRefusal(ierr, RefusalUnsupported)
 				}
 				contentType = ct
 			}
 			if opt.Inspector != nil {
 				if ierr := opt.Inspector.Chunk(plain); ierr != nil {
-					return store.JobFile{}, refusal(RefusalInvalid, refusalReasonOf(ierr, RefusalContentInvalid))
+					return store.JobFile{}, inspectorRefusal(ierr, RefusalContentInvalid)
 				}
 			}
 			total += int64(n)
@@ -486,16 +578,13 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 			index++
 		}
 		if readErr == nil {
+			n, readErr = io.ReadFull(src, buf)
 			continue
 		}
 		if errors.Is(readErr, io.EOF) || errors.Is(readErr, io.ErrUnexpectedEOF) {
 			break
 		}
-		var tooLarge *http.MaxBytesError
-		if errors.As(readErr, &tooLarge) {
-			return store.JobFile{}, refusal(RefusalInvalid, RefusalSizeMismatch)
-		}
-		return store.JobFile{}, readErr
+		return store.JobFile{}, &JobFileBodyError{Err: readErr}
 	}
 	if total != declared {
 		return store.JobFile{}, refusal(RefusalInvalid, RefusalSizeMismatch)
@@ -506,7 +595,7 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 	}
 	if opt.Inspector != nil {
 		if ierr := opt.Inspector.End(); ierr != nil {
-			return store.JobFile{}, refusal(RefusalInvalid, refusalReasonOf(ierr, RefusalContentInvalid))
+			return store.JobFile{}, inspectorRefusal(ierr, RefusalContentInvalid)
 		}
 	}
 	ext, ok := JobFileExt(contentType)
@@ -543,6 +632,10 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 // RefusalReasoner lets an Inspector name the refusal reason it wants recorded; an Inspector error
 // that does not implement it is reported under the default reason.
 type RefusalReasoner interface{ RefusalReason() string }
+
+// RefusalDetailer lets an Inspector attach a fixed, server-authored sentence to its refusal; it
+// must never contain client input.
+type RefusalDetailer interface{ RefusalDetail() string }
 
 func refusalReasonOf(err error, def string) string {
 	var r RefusalReasoner

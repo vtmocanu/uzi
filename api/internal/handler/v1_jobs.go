@@ -47,6 +47,7 @@ import (
 //	                             owner's or product's, already attached, expired, or listed twice)
 //	413 too_many_files           more input_file_ids than UZI_JOB_INPUTS_MAX_FILES
 //	413 job_bytes_exceeded       the attached files total more than UZI_JOB_INPUTS_MAX_BYTES
+//	503 files_unavailable        input_file_ids was sent but this deployment has no file store
 //	429 over_cap                 the user's non-terminal job cap
 //	429 (no reason, Retry-After) the rate limiters
 const (

@@ -46,7 +46,13 @@ type v1JobsEnv struct {
 
 func newV1JobsEnv(t *testing.T, jobCap int) *v1JobsEnv {
 	t.Helper()
-	h, pool := v1LiveDB(t)
+	return newV1JobsEnvMax(t, jobCap, 0)
+}
+
+// newV1JobsEnvMax is newV1JobsEnv over a pool capped at maxConns (0 = pgx's default).
+func newV1JobsEnvMax(t *testing.T, jobCap int, maxConns int32) *v1JobsEnv {
+	t.Helper()
+	h, pool := v1LiveDBMax(t, maxConns)
 	if jobCap > 0 {
 		h.wsvc.SetHealthSettings(v1JobCapFake{cap: jobCap})
 	}

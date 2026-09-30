@@ -1417,6 +1417,12 @@ web:
       # self-heals, but churn is avoided).
       nginx.ingress.kubernetes.io/proxy-read-timeout: "3600"
       nginx.ingress.kubernetes.io/proxy-send-timeout: "3600"
+      # Input-file upload (PRD #1909, POST /api/v1/files): ingress-nginx defaults the request
+      # body limit to 1m and would refuse any real upload before web nginx sees it. 26m = the
+      # api's default per-file cap (25 MiB) plus multipart framing, matching web nginx's
+      # `location = /api/v1/files`; web nginx still limits every other /api/ path to 1m. Raise it
+      # together with UZI_JOB_INPUT_FILE_MAX_BYTES.
+      nginx.ingress.kubernetes.io/proxy-body-size: "26m"
     # dev-cluster serves a *.example.com default wildcard cert at the
     # controller, so no per-host TLS block is needed there. Set tls.enabled: true +
     # a secretName (and a cert-manager annotation) for a cluster without one.
@@ -1430,6 +1436,9 @@ web:
   # Gateway (or the router in front of it) terminates it; nothing TLS-specific renders here.
   # /api/ws is a long-lived WebSocket: raise the idle timeout on whatever sits in front of
   # the Gateway, as the ingress-nginx annotations above do for Ingress.
+  # Likewise the request BODY limit: POST /api/v1/files carries up to ~26 MiB (25 MiB file +
+  # multipart framing), so raise any body-size limit on the Gateway/router in front to at least
+  # that (the annotation mechanism, if any, is implementation-specific, so none is set here).
   httpRoute:
     enabled: false
     # e.g. [uzi.example.com]
