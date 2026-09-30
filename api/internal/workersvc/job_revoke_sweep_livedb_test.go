@@ -243,9 +243,35 @@ func TestCancelRevokedProductJobsRequeuedWithPendingCancelLiveDB(t *testing.T) {
 		t.Fatal("running job must hold exactly one pending cancel and stay running")
 	}
 
-	// The worker dies and the stale-worker requeue returns the job to queued, its cancel input
-	// still unconsumed.
-	e.exec(`UPDATE runs SET status = 'queued', worker_id = NULL, claimed_at = NULL, started_at = NULL WHERE id = $1`, running)
+	// The worker dies (its heartbeat goes stale) and the REAL stale-worker requeue returns the job
+	// to queued. It keeps worker_id (resume affinity) and started_at, and leaves the unconsumed
+	// cancel input pending, which is the state production hands the sweep.
+	e.exec(`UPDATE workers SET last_heartbeat_at = now() - interval '10 minutes' WHERE id = $1`, w)
+	requeued, err := e.q.RequeueRunsOfStaleWorkers(e.ctx, store.RequeueRunsOfStaleWorkersParams{
+		MaxRequeues: 5,
+		Cutoff:      pgtype.Timestamptz{Time: time.Now().Add(-45 * time.Second), Valid: true},
+	})
+	// The statement is global, so other tests' stale workers may requeue too: assert on this job.
+	requeuedJob := false
+	for _, r := range requeued {
+		requeuedJob = requeuedJob || r.ID == running
+	}
+	if err != nil || !requeuedJob {
+		t.Fatalf("RequeueRunsOfStaleWorkers = %v, %v; want it to requeue the running job", requeued, err)
+	}
+	var kept struct {
+		status  string
+		worker  *uuid.UUID
+		started *time.Time
+	}
+	if err := e.pool.QueryRow(e.ctx, `SELECT status, worker_id, started_at FROM runs WHERE id = $1`, running).
+		Scan(&kept.status, &kept.worker, &kept.started); err != nil {
+		t.Fatal(err)
+	}
+	if kept.status != "queued" || kept.worker == nil || *kept.worker != w || kept.started == nil || e.pendingCancels(t, running) != 1 {
+		t.Fatalf("requeued state = %+v, pending cancels %d; want queued, worker_id and started_at kept, one pending cancel",
+			kept, e.pendingCancels(t, running))
+	}
 
 	if n, err := e.svc.CancelRevokedProductJobs(e.ctx); err != nil || n != 1 {
 		t.Fatalf("pass over the requeued job = %d, %v; want 1, nil", n, err)

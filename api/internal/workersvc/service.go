@@ -3733,6 +3733,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.State == "credential_switch_failed" {
 		return s.failCredentialSwitch(ctx, owned, wkr, req)
 	}
+	// PRD #1908 D-E: a job never parks. The job runner reports only running/completed/failed, and
+	// pauseRefusalReason already refuses an owner pause, so a park report for a job is a protocol
+	// error: refuse it rather than stall a run whose cancel nothing would consume.
+	if owned.Kind == runkind.Job {
+		switch req.State {
+		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused":
+			return owned, false, fmt.Errorf("%w: a job run never parks (%s)", ErrInvalidState, req.State)
+		}
+	}
 	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The
 	// fence below engages only when the report STAMPS a generation, so a worker advertising
 	// credential_switch_v1 could otherwise bypass it entirely by OMITTING claim_generation on a

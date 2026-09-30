@@ -259,6 +259,17 @@ func (s *Service) finishRunClaimTx(ctx context.Context, run store.Run, payload *
 		}
 	}
 	origin := claimAssemblyOrigin(assemblyErr)
+	if credDisabled && run.Kind == runkind.Job {
+		// PRD #1908 D-E: a job never parks. A disabled credential fails it closed, with the
+		// origin the assembly-time credential refusals use, rather than the credential_disabled
+		// park, which keeps worker_id and would leave a job nothing consumes a cancel for.
+		credDisabled = false
+		if assemblyErr == nil {
+			assemblyErr = errCredentialDisabled
+		}
+		assemblyErr = fmt.Errorf("%w: %w", errCredentialUnavailable, assemblyErr)
+		origin = "credential_unavailable"
+	}
 	// Only credential authority faults may park, and only on a custody-holding kind: a judge
 	// stays terminal. Guardrail and provisioning failures remain terminal even if an account
 	// changes concurrently.

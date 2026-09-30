@@ -14731,6 +14731,7 @@ WITH consumed_wall AS (
           SELECT 1 FROM runs r
           WHERE r.id = u.run_id AND r.id = $3 AND r.worker_id = $4
             AND r.status = 'running'
+            AND r.kind <> 'job'
             AND r.completion_attempts = 0
             AND r.claim_released_at IS NULL
             AND r.started_at < ($5::timestamptz
@@ -14754,6 +14755,8 @@ UPDATE runs SET
     updated_at         = now()
 WHERE runs.id = $3 AND runs.worker_id = $4
   AND runs.status = 'running'
+  -- PRD #1908 D-E: a job never parks; its wall limit fails it (FailJobsPastWallDeadline).
+  AND runs.kind <> 'job'
   AND runs.completion_attempts = 0
   AND runs.started_at < ($5::timestamptz
         - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)

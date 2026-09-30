@@ -2906,6 +2906,7 @@ WITH consumed_wall AS (
           SELECT 1 FROM runs r
           WHERE r.id = u.run_id AND r.id = @id AND r.worker_id = @worker_id
             AND r.status = 'running'
+            AND r.kind <> 'job'
             AND r.completion_attempts = 0
             AND r.claim_released_at IS NULL
             AND r.started_at < (sqlc.arg('now')::timestamptz
@@ -2931,6 +2932,8 @@ UPDATE runs SET
 -- analyzer's outer name scope (bare `id`/`status` would read ambiguous — RecordCompletionAttempt).
 WHERE runs.id = @id AND runs.worker_id = @worker_id
   AND runs.status = 'running'
+  -- PRD #1908 D-E: a job never parks; its wall limit fails it (FailJobsPastWallDeadline).
+  AND runs.kind <> 'job'
   AND runs.completion_attempts = 0
   AND runs.started_at < (sqlc.arg('now')::timestamptz
         - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
