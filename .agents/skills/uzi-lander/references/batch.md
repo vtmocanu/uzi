@@ -45,8 +45,8 @@ Watch several PRs' CI at once with `S/watch-prs-ci.sh <PR> [<PR>...]` in the bac
 
 ## 3. Order the green batch
 
-**Our PRs first, the routine Renovate minor/patch batch last.** Renovate auto-rebases its own
-PRs when `main` moves, so landing ours first keeps them fresh for free; the reverse re-stales
+**Our PRs first, the routine Renovate minor/patch batch last.** Renovate rebases its own PRs
+in its night window (references/renovate.md), so landing ours first keeps them fresh for free; the reverse re-stales
 ours against the new deps. It also isolates dependency breakage (features settled, then deps)
 and confines lockfile stacking (references/merge-mechanics.md) to one end phase. The one
 carve-out is §2: a dependency PR that FIXES a repo-wide red goes first.
