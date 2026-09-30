@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -88,17 +89,47 @@ func TestRequireWorkerRejectsMissingAndBadTokens(t *testing.T) {
 	}
 }
 
-// The lookup must not leak whether a token exists via a different error type.
-func TestRequireWorkerTreatsAllLookupFailuresAsUnauthorized(t *testing.T) {
-	st := errWorkerStore{err: errors.New("db exploded")}
-	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	req := httptest.NewRequest(http.MethodPost, "/api/worker/heartbeat", nil)
-	req.Header.Set("Authorization", "Bearer uzw_whatever")
-	rec := httptest.NewRecorder()
-	RequireWorker(st)(next).ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", rec.Code)
+// Issue #1989: only a missing token row is a credential rejection. A store failure
+// (a database outage behind a live api) is a retryable 503, so the worker rides it out
+// instead of failing its run; an unknown token and a hash mismatch stay 401.
+func TestRequireWorkerLookupFailureStatus(t *testing.T) {
+	_, otherHash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
 	}
+	cases := []struct {
+		name string
+		st   WorkerStore
+		want int
+	}{
+		{"store failure is retryable", errWorkerStore{err: errors.New("dial tcp: connect: connection refused")}, http.StatusServiceUnavailable},
+		{"cancelled request is retryable", errWorkerStore{err: fmt.Errorf("lookup: %w", context.Canceled)}, http.StatusServiceUnavailable},
+		{"wrapped no-rows is unauthorized", errWorkerStore{err: fmt.Errorf("lookup: %w", pgx.ErrNoRows)}, http.StatusUnauthorized},
+		{"hash mismatch is unauthorized", rowWorkerStore{worker: store.Worker{ID: uuid.New(), TokenHash: otherHash}}, http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Error("next handler reached on a failed worker lookup")
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/worker/heartbeat", nil)
+			req.Header.Set("Authorization", "Bearer uzw_whatever")
+			rec := httptest.NewRecorder()
+			RequireWorker(tc.st)(next).ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}
+
+// rowWorkerStore returns its row for any hash, so the middleware's constant-time
+// re-check is the only thing standing between a mismatched row and the handler.
+type rowWorkerStore struct{ worker store.Worker }
+
+func (r rowWorkerStore) GetWorkerByTokenHash(context.Context, []byte) (store.Worker, error) {
+	return r.worker, nil
 }
 
 type errWorkerStore struct{ err error }

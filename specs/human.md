@@ -549,6 +549,7 @@ can be assumed.
   malformed request means the worker *build* is broken; that is flagged, never stopped, and
   the remedy is rolling the image.
 - Operators can disable the automatic stop without losing the flag.
+- Worker authentication returns 401 for a missing, unknown, or mismatched Bearer token, and 503 for a store lookup failure so the worker can retry. (AI-synced 2026-09-30)
 
 ## Feature #102 — Board v2: column rename, label chips, manual order, non-PRD issues
 

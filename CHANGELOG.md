@@ -41,6 +41,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Worker authentication answers 503, not 401, when its database lookup fails ([#1989](https://github.com/vtmocanu/uzi/issues/1989)).**
+  During a short database outage behind a running api, worker requests got `401 invalid worker token`, which the worker treats as a permanent credential rejection, so running runs failed. A store lookup failure now returns 503, which the worker's existing retry handles like any other transient error: message delivery retries for a bounded window and then spills to the worker outbox if a usable one exists, and registration retries with backoff. A missing, unknown or mismatched worker token still gets 401.
 - **A checkpoint counts as published only when its git pack was produced in full ([#1725](https://github.com/vtmocanu/uzi/issues/1725)).**
   The worker used to record a checkpoint as confirmed as soon as the api answered `published: true`, even if the `git pack-objects` streaming it then failed. It now also requires the pack producer to exit cleanly; otherwise the publish is treated as unconfirmed and retried from the attempted tip, like any other ambiguous result. The production api already reads the whole pack first, so this closes a latent gap rather than a live failure. The worker crash the issue first described was fixed by #1804.
 

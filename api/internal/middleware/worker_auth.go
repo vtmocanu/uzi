@@ -2,7 +2,11 @@ package middleware
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net/http"
+
+	"github.com/jackc/pgx/v5"
 
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
@@ -44,9 +48,23 @@ func RequireWorker(q WorkerStore) func(http.Handler) http.Handler {
 			hash := jointoken.Hash(token)
 			wkr, err := q.GetWorkerByTokenHash(r.Context(), hash)
 			if err != nil {
-				// Do not distinguish "no such token" from other lookup failures —
-				// a probing worker learns nothing about which tokens exist.
-				httpx.Error(w, http.StatusUnauthorized, "invalid worker token")
+				// Only "no such token" is a credential rejection (401, which the worker
+				// treats as permanent). Any other lookup failure — a connect or query
+				// error during a database outage behind a live api — is a 503 the worker
+				// retries (issue #1989). This adds no token-existence oracle: a store
+				// failure does not depend on which tokens exist, and an unknown token and
+				// a hash mismatch still get the identical 401.
+				if errors.Is(err, pgx.ErrNoRows) {
+					httpx.Error(w, http.StatusUnauthorized, "invalid worker token")
+					return
+				}
+				// A cancelled or timed-out request context is the client going away, not
+				// an infrastructure fault: still a 503, but not logged as one. The log
+				// carries the error only, never the token or its hash.
+				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+					slog.Warn("worker auth: token lookup failed; answering 503", "error", err)
+				}
+				httpx.Error(w, http.StatusServiceUnavailable, "worker authentication temporarily unavailable")
 				return
 			}
 			// Belt-and-suspenders constant-time credential check. The row was
