@@ -565,8 +565,10 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
   // Issue #1512: the fatal-401 permanent-failure hook journals `failed`, its own send fails, and the
   // run has NO message-outbox records (nothing spilled), so the drainer never visits it. Before the
   // heartbeat terminal sweep the journal stranded until a restart or re-claim. A Worker over the same
-  // Outbox now delivers it on the next successful heartbeat. Boot cannot be the deliverer: the
-  // client's reportState only works once a heartbeat has succeeded, and boot resolves before that.
+  // Outbox now delivers it on the next successful heartbeat. Boot cannot be the deliverer, by
+  // construction: the heartbeat fails until reportState has been ATTEMPTED once, and with no
+  // successful heartbeat no sweep runs, so that first attempt is the boot resolve's and it fails. On
+  // the base (no sweep) nothing retries after it, so this test is red there on every run.
   it("#1512: a fatal-401 `failed` journal with no message records is delivered by the next successful heartbeat", async () => {
     const { gitlab } = fakeGitlab();
     const outbox = await mkOutbox();
@@ -592,23 +594,24 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
     assert.equal(outbox.hasPendingTerminal(runId, gen), true, "precondition: the failed terminal is journaled and unsent");
     assert.deepEqual(outbox.runsWithPending(), [], "precondition: the run has no message records for the drainer to visit");
 
-    let healthy = false;
-    let heartbeats = 0;
+    let bootAttempted = false;
     const delivered: Array<{ runId: string; body: StateRequest }> = [];
     const client = sweepClient({
       heartbeat: async () => {
-        heartbeats += 1;
-        if (heartbeats <= 3) throw new Error("api still down");
-        healthy = true;
+        if (!bootAttempted) throw new Error("api still down");
       },
       reportState: async (id, body) => {
-        if (!healthy) throw new Error("api still down");
+        if (!bootAttempted) {
+          bootAttempted = true;
+          throw new Error("api still down");
+        }
         delivered.push({ runId: id, body });
         return { applied: true, status: "failed" };
       },
     });
     const w = startSweepWorker({ outbox, client });
     try {
+      await pollUntil(() => bootAttempted, 3000, "the boot resolve attempted (and failed) the send");
       await pollUntil(() => delivered.length > 0, 3000, "the next successful heartbeat delivers the failed terminal");
       await pollUntil(() => !outbox.hasPendingTerminal(runId, gen), 3000, "the journal retires");
     } finally {

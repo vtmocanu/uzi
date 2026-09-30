@@ -298,7 +298,7 @@ export class Worker {
    * be false-timeouted. Now the drain's own retire is that "later resolve": the segments are gone, so
    * the N3 guard passes and the fenced terminal lands. Mirrors resolveBootTerminals, scoped to runId;
    * a no-op when the run has no pending terminal. Never throws on an expected failure — a still-failing
-   * send is left listed for the next drain / boot, exactly as the boot resolve leaves it.
+   * send is left listed for the next heartbeat sweep / drain / boot, exactly as the boot resolve leaves it.
    */
   private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;

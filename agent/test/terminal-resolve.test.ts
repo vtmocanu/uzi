@@ -548,7 +548,10 @@ describe("resolvePendingTerminal single-flight (issue #1512)", () => {
     const owner = resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send });
     const waiterA = resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send });
     const waiterB = resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send, ifBusy: "wait" });
-    await new Promise((r) => setTimeout(r, 20));
+    // Wait for the OBSERVED event (the owner is inside its gated send), not a fixed delay, then give
+    // the waiters a few macrotasks in which an unserialised one would have sent.
+    for (let i = 0; i < 400 && sends === 0; i++) await new Promise((r) => setTimeout(r, 5));
+    for (let i = 0; i < 5; i++) await new Promise((r) => setImmediate(r));
     assert.equal(sends, 1, "the waiters have not sent while the owner is in flight");
     release();
     await Promise.all([owner, waiterA, waiterB]);
@@ -560,14 +563,30 @@ describe("resolvePendingTerminal single-flight (issue #1512)", () => {
     const { outbox } = await mkOutbox();
     const deps = depsFor(outbox, new FakeClient());
     await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
-    const s1 = scriptedSend([{ applied: false, status: "running" }]);
-    const s2 = scriptedSend([{ applied: true, status: "failed" }]);
+    let concurrent = 0;
+    let maxConcurrent = 0;
+    const tracked = (acks: StateAck[]) => {
+      const inner = scriptedSend(acks);
+      return {
+        bodies: inner.bodies,
+        send: async (...args: Parameters<typeof inner.send>) => {
+          concurrent += 1;
+          maxConcurrent = Math.max(maxConcurrent, concurrent);
+          await new Promise((r) => setTimeout(r, 15)); // a send long enough for an unserialised peer to overlap it
+          concurrent -= 1;
+          return inner.send(...args);
+        },
+      };
+    };
+    const s1 = tracked([{ applied: false, status: "running" }]);
+    const s2 = tracked([{ applied: true, status: "failed" }]);
     await Promise.all([
       resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: s1.send }),
       resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: s2.send }),
     ]);
     assert.equal(s1.bodies.length, 1);
     assert.equal(s2.bodies.length, 1, "serialised: the second resolve ran after the first kept the journal");
+    assert.equal(maxConcurrent, 1, "the two sends never overlapped");
     assert.equal(outbox.hasPendingTerminal("r1", GEN), false);
   });
 

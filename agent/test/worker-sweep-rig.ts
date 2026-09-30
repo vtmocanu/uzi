@@ -13,6 +13,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ChatClaimResponse, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
+import type { Logger } from "../src/log.js";
 import { sleep } from "../src/util.js";
 
 // Issue #1512: shared rig for the heartbeat terminal-sweep tests. A real Outbox on a tmp dir, a
@@ -79,6 +80,7 @@ export function startSweepWorker(opts: {
   client: WorkerClient;
   activeRuns?: ActiveRunRegistry;
   runner?: Partial<RunRunner>;
+  log?: Logger;
 }): { stop: () => Promise<void> } {
   const controller = new AbortController();
   const runner = {
@@ -94,7 +96,7 @@ export function startSweepWorker(opts: {
     { execute: async () => {} } as unknown as ChatRunner,
     { execute: async () => {} } as unknown as JudgeRunner,
     { execute: async () => {} } as unknown as ReviewRunner,
-    nullLogger(),
+    opts.log ?? nullLogger(),
     () => ({ ok: true, missing: [] }),
     opts.outbox,
     new Map(),
@@ -116,4 +118,20 @@ export async function pollUntil(pred: () => boolean, ms: number, label: string):
     await sleep(5);
   }
   throw new Error(`timed out waiting for: ${label}`);
+}
+
+/** A logger that records every info-level call, so a test can prove which code path logged. */
+export function recordingLogger(): { log: Logger; info: Array<{ msg: string; fields: Record<string, unknown> }> } {
+  const info: Array<{ msg: string; fields: Record<string, unknown> }> = [];
+  const base = nullLogger();
+  const log: Logger = {
+    ...base,
+    info(msg: string, fields?: Record<string, unknown>) {
+      info.push({ msg, fields: fields ?? {} });
+    },
+    child() {
+      return log;
+    },
+  };
+  return { log, info };
 }

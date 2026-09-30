@@ -4,7 +4,7 @@ import fs from "node:fs/promises";
 
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { OutboxHeartbeatEntry, StateAck, StateRequest } from "../src/protocol.js";
-import { mkSweepOutbox, pollUntil, startSweepWorker, sweepClient } from "./worker-sweep-rig.js";
+import { mkSweepOutbox, pollUntil, recordingLogger, startSweepWorker, sweepClient } from "./worker-sweep-rig.js";
 import { sleep } from "../src/util.js";
 
 // Issue #1512: the heartbeat-driven terminal sweep. A journaled run terminal whose send failed and
@@ -32,18 +32,12 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
   it("2. a no-spill `completed` journal whose boot send failed is delivered by a later heartbeat", async () => {
     const outbox = await rig();
     await outbox.journalTerminal(RUN, 3, "running", 0, { status: "completed", branch: "agent/issue-1" });
-    let healthy = false;
-    let heartbeats = 0;
+    // Health flips on an observed event (the boot resolve's failed send), never on time or a count.
     const sent: Array<{ runId: string; body: StateRequest }> = [];
     let failedSends = 0;
     const client = sweepClient({
-      heartbeat: async () => {
-        heartbeats += 1;
-        if (heartbeats <= 3) throw new Error("api down");
-        healthy = true;
-      },
       reportState: async (runId, body) => {
-        if (!healthy) {
+        if (failedSends === 0) {
           failedSends += 1;
           throw new Error("api down");
         }
@@ -67,19 +61,23 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
   it("3. post-drain replay failure: the drain-retire send fails, a later heartbeat sweep delivers", async () => {
     const outbox = await rig();
     await outbox.appendSegment(RUN, 2, [{ seq: 1, kind: "text", payload: { text: "hi" } }]);
-    await outbox.journalTerminal(RUN, 2, "running", 1, { status: "failed" });
-    let healthy = false;
-    let heartbeats = 0;
-    let failedSends = 0;
+    // The journal is installed only AFTER the boot resolve has finished (a few heartbeats in), and the
+    // segment stays unreplayable until then, so the drain-retire's resolve is the ONLY send that can
+    // fail after the drain: a base without the heartbeat sweep has nothing that retries it.
+    let replayAllowed = false;
+    let failedAfterDrain = 0;
+    let beats = 0;
     const sent: StateRequest[] = [];
     const client = sweepClient({
       heartbeat: async () => {
-        heartbeats += 1;
-        if (heartbeats >= 6) healthy = true;
+        beats += 1;
+      },
+      postMessages: async () => {
+        if (!replayAllowed) throw new Error("api down");
       },
       reportState: async (_runId, body) => {
-        if (!healthy) {
-          failedSends += 1;
+        if (failedAfterDrain === 0) {
+          if (!outbox.hasUndrainedMessages(RUN)) failedAfterDrain += 1;
           throw new Error("api down");
         }
         sent.push(body);
@@ -88,13 +86,16 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
     });
     const w = startSweepWorker({ outbox, client });
     try {
+      await pollUntil(() => beats >= 3, 3000, "worker booted and the boot resolve finished");
+      await outbox.journalTerminal(RUN, 2, "running", 1, { status: "failed" });
+      replayAllowed = true;
       await pollUntil(() => sent.length > 0, 3000, "the sweep delivers after the drain-retire send failed");
       await pollUntil(() => !outbox.hasPendingTerminal(RUN, 2), 3000, "journal retires");
     } finally {
       await w.stop();
     }
     assert.equal(outbox.hasUndrainedMessages(RUN), false, "the spilled segment drained");
-    assert.ok(failedSends >= 2, `boot and the drain-retire both failed first (got ${failedSends})`);
+    assert.equal(failedAfterDrain, 1, "a post-drain replay failed first, then a later heartbeat delivered");
     assert.equal(sent.length, 1);
   });
 
@@ -222,7 +223,8 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
     try {
       await pollUntil(() => beats > 0, 2000, "worker booted");
       await outbox.journalTerminal(RUN, 3, "running", 0, { status: "failed" });
-      await pollUntil(() => !outbox.hasPendingTerminal(RUN, 3), 2000, "stale-retired");
+      // staleRetired is committed after the journal leaves the pending list, so poll the final state.
+      await pollUntil(() => outbox.depthFor(RUN)?.staleRetired === 1, 2000, "stale-retired");
       const seen = beats;
       await pollUntil(() => beats >= seen + 4, 2000, "more heartbeats");
     } finally {
@@ -266,6 +268,9 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
     const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
     let beats = 0;
     let sends = 0;
+    const rec = recordingLogger();
+    const heldSkips = (via: string) =>
+      rec.info.filter((e) => e.msg.includes("held by the live run's permanent-failure hook") && e.fields.via === via).length;
     const client = sweepClient({
       heartbeat: async () => {
         beats += 1;
@@ -275,7 +280,7 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
         return applied("failed");
       },
     });
-    const w = startSweepWorker({ outbox, client, activeRuns: registry });
+    const w = startSweepWorker({ outbox, client, activeRuns: registry, log: rec.log });
     try {
       await pollUntil(() => beats > 0, 2000, "worker booted");
       registry.add(RUN, 9);
@@ -285,13 +290,16 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
       const seen = beats;
       await pollUntil(() => beats >= seen + 4, 2000, "heartbeats");
       assert.equal(sends, 0, "sweep: held+live is not sent");
+      assert.ok(heldSkips("sweep") >= 1, "the sweep path itself logged the held skip");
       assert.deepEqual(outbox.releaseTerminalResolve(RUN, 9), { skipped: true }, "sweep recorded the held skip (hold checked BEFORE liveness)");
 
       // Drain-retire path: a spilled segment whose retire fires the drain-retire resolve.
       outbox.holdTerminalResolve(RUN, 9);
       await outbox.appendSegment(RUN, 9, [{ seq: 1, kind: "text", payload: { text: "y" } }]);
-      const seen2 = beats;
-      await pollUntil(() => !outbox.hasUndrainedMessages(RUN) && beats >= seen2 + 2, 2000, "the drain retires the segment");
+      // The sweep skips a run with undrained segments, so the first held skip logged via "drain" is
+      // the drain-retire's own (resolveRunTerminal after the segment retired).
+      await pollUntil(() => heldSkips("drain") >= 1, 2000, "the drain-retire logged its own held skip");
+      assert.ok(!outbox.hasUndrainedMessages(RUN), "the drain retired the segment");
       assert.equal(sends, 0, "drain-retire: held+live is not sent");
       assert.deepEqual(outbox.releaseTerminalResolve(RUN, 9), { skipped: true }, "drain-retire recorded the held skip");
     } finally {
@@ -301,7 +309,17 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
 
   it("6. concurrency: boot resolve + drain-retire + several sweeps over one journal send exactly once at a time", async () => {
     const outbox = await rig();
-    await outbox.journalTerminal(RUN, 3, "running", 0, { status: "failed" });
+    await outbox.appendSegment(RUN, 3, [{ seq: 1, kind: "text", payload: { text: "z" } }]);
+    await outbox.journalTerminal(RUN, 3, "running", 1, { status: "failed" });
+    // Observe the drain retiring the segment: the drain-retire resolve runs right after it, inside
+    // the same drainOutbox step, while the boot resolve still holds the journal in flight.
+    let drainRetired = false;
+    const realDrainRun = outbox.drainRun.bind(outbox);
+    outbox.drainRun = (async (...args: Parameters<typeof realDrainRun>) => {
+      const res = await realDrainRun(...args);
+      if (res.retired) drainRetired = true;
+      return res;
+    }) as typeof outbox.drainRun;
     let release!: () => void;
     const gate = new Promise<void>((r) => (release = r));
     let concurrent = 0;
@@ -325,7 +343,9 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
     try {
       await pollUntil(() => calls === 1, 2000, "the boot resolve is in flight");
       // Boot blocks the claim gate, but the heartbeat loop runs: let sweeps fire while it is held.
-      await pollUntil(() => beats >= 6, 2000, "heartbeats while the boot send is gated");
+      await pollUntil(() => drainRetired, 2000, "the drain retired the spilled segment (drain-retire fires)");
+      const seen = beats;
+      await pollUntil(() => beats >= seen + 4, 2000, "heartbeats after the drain-retire while the boot send is gated");
       assert.equal(calls, 1, "sweeps skipped while a resolve for the journal was in flight");
       assert.equal(maxConcurrent, 1);
       release();
