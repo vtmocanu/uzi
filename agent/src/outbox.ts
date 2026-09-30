@@ -72,6 +72,9 @@ const MAC_DOMAIN_MANIFEST = "uzi.outbox.manifest.v1";
  *  segment/range/manifest labels so a terminal journal's MAC can never be replayed as a
  *  different record kind under the same worker-local key. */
 const MAC_DOMAIN_TERMINAL = "uzi.outbox.terminal.v1";
+/** Issue #1742: the finalize-pending record's own domain label, so its MAC can never be replayed as
+ *  a terminal journal (or any other kind) under the same worker-local key. */
+const MAC_DOMAIN_FINALIZE = "uzi.outbox.finalize.v1";
 
 const MANIFEST_FILE = "manifest.json";
 const KEY_FILE = ".key";
@@ -81,6 +84,9 @@ const RESERVE_FILE = ".reserve";
  *  first-writer-wins file, `terminal-<claim_generation>.json`. */
 const TERMINAL_FILE_PREFIX = "terminal-";
 const TERMINAL_FILE_SUFFIX = ".json";
+/** Issue #1742: the per-run finalize-pending record filename, `finalize-<claimGeneration>.json`. */
+const FINALIZE_FILE_PREFIX = "finalize-";
+const FINALIZE_FILE_SUFFIX = ".json";
 
 /** The fixed reason a quota / ENOSPC drop records; replay expands the range into
  *  one status tombstone per seq carrying this reason (batcher.ts:152-180). */
@@ -216,6 +222,36 @@ interface RunState {
   manifest: ManifestData;
   recordBytes: Map<string, number>;
   terminals: Map<number, TerminalMeta>;
+  /** Issue #1742: the run's pending finalize-pending records keyed by claim generation. */
+  finalizes: Map<number, FinalizeMeta>;
+}
+
+/** Issue #1742: in-memory metadata for one finalize-pending record. It records only that the
+ *  executor of this generation returned success and the worker had begun finalizing; it is never an
+ *  outcome and never a terminal journal. */
+interface FinalizeMeta {
+  claimGeneration: number;
+  since: number;
+}
+
+/** Issue #1742: one pending finalize record listed by {@link Outbox.listPendingFinalizes}. */
+export interface PendingFinalize {
+  run_id: string;
+  claim_generation: number;
+}
+
+/** Issue #1742: the outcome of {@link Outbox.journalFinalize}. It never throws; a failure is a
+ *  `written:false` with a short reason and the run continues exactly as it did before the record. */
+export interface FinalizeJournalResult {
+  written: boolean;
+  reason?: string;
+}
+
+/** The on-disk finalize record: identity and time only, no status, report body or phase. */
+interface FinalizeRecordData {
+  run_id: string;
+  claim_generation: number;
+  since: number;
 }
 
 /** The per-run outbox depth surfaced on the heartbeat (M5) and in `uzi admin
@@ -237,7 +273,7 @@ export interface OutboxDepth {
  *  seam that throws `ENOSPC` to exercise the reserve path. */
 export type RawWriteSeam = (
   write: () => Promise<void>,
-  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" },
+  ctx: { path: string; kind: RecordFileKind | "manifest" | "terminal" | "finalize" },
 ) => Promise<void>;
 
 export interface OutboxOptions {
@@ -481,6 +517,7 @@ export class Outbox {
       const result = await this.loadTerminals(runId);
       authenticated += result.authenticated;
       rejected += result.rejected;
+      await this.loadFinalizes(runId);
     }
 
     this.log.info("outbox terminal journal load", {
@@ -555,7 +592,7 @@ export class Outbox {
         recordBytes.set(rec.file, 0); // referenced file missing/gone; accounts as 0
       }
     }
-    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map() });
+    this.runs.set(runId, { runId, manifest, recordBytes, terminals: new Map(), finalizes: new Map() });
     if (manifest.spilledUnclean) this.uncleanAtInit.push(runId);
   }
 
@@ -593,6 +630,34 @@ export class Outbox {
       result.authenticated++;
     }
     return result;
+  }
+
+  /** Issue #1742: adopt a run's authenticated finalize-pending records (`finalize-<generation>.json`)
+   *  at init. An unauthenticated, unparseable, misfiled or symlinked record is ignored: not loaded,
+   *  left on disk, one warn. The filename is the source of truth for the generation. */
+  private async loadFinalizes(runId: string): Promise<void> {
+    if (!this.validRunId(runId)) return;
+    const dir = this.runDir(runId);
+    let names: string[];
+    try {
+      names = await fs.readdir(dir);
+    } catch {
+      return;
+    }
+    for (const name of names) {
+      const gen = parseFinalizeFileName(name);
+      if (gen === undefined) continue;
+      const parsed = await this.readAuthed(path.join(dir, name), MAC_DOMAIN_FINALIZE);
+      const meta = parsed ? coerceFinalize(parsed, runId, gen) : null;
+      if (!meta) {
+        this.log.warn("outbox: unauthenticated or misfiled finalize record ignored (left on disk)", {
+          run_id: runId,
+          file: name,
+        });
+        continue;
+      }
+      this.ensureInMemoryRun(runId, meta.since).finalizes.set(meta.claimGeneration, meta);
+    }
   }
 
   // ── writes ──────────────────────────────────────────────────────────────────
@@ -954,6 +1019,7 @@ export class Outbox {
       if (
         rs.manifest.records.length === 0 &&
         rs.terminals.size === 0 &&
+        rs.finalizes.size === 0 &&
         now - rs.manifest.updatedAt > this.retentionMs
       ) {
         toRemove.push(runId);
@@ -987,6 +1053,7 @@ export class Outbox {
     if (!rs) return false; // no longer tracked (already removed / retired)
     if (rs.manifest.records.length !== 0) return false; // a record was appended after the decision
     if (rs.terminals.size !== 0) return false; // a terminal journal was installed after the decision
+    if (rs.finalizes.size !== 0) return false; // a finalize record was installed after the decision
     if (now - rs.manifest.updatedAt <= this.retentionMs) return false; // no longer past retention
     await this.removeRun(runId);
     return true;
@@ -1169,7 +1236,7 @@ export class Outbox {
             { path: dir, kind: "terminal" },
           );
           await this.fsyncDir(this.root);
-          return this.installTerminalExclusive(dst, serialized);
+          return this.installExclusive(dst, serialized, "terminal");
         });
       } catch (err) {
         if (isENOSPC(err)) {
@@ -1328,10 +1395,10 @@ export class Outbox {
   /** Install a terminal journal crash-atomically and EXCLUSIVELY (D4): temp write → fsync →
    *  no-replace `link()` (EEXIST means a first writer already won this generation) → dir fsync →
    *  remove temp. Returns whether an existing winner was adopted rather than freshly installed.
-   *  The reserve/ENOSPC handling now lives in {@link journalTerminal}, wrapping this call AND the
+   *  The reserve/ENOSPC handling now lives in {@link journalTerminal} (and {@link journalFinalize}), wrapping this call AND the
    *  run-dir mkdir together, so the whole sequence uses (and replenishes) the reserve exactly once
    *  on a full volume — the temp write and the `link()` both ride that single release. */
-  private async installTerminalExclusive(dst: string, serialized: string): Promise<boolean> {
+  private async installExclusive(dst: string, serialized: string, kind: "terminal" | "finalize"): Promise<boolean> {
     const tmp = `${dst}.${randomUUID()}.tmp`;
     const doWrite = async () => {
       const fh = await fs.open(
@@ -1347,7 +1414,7 @@ export class Outbox {
       }
     };
     try {
-      await this.rawWrite(doWrite, { path: tmp, kind: "terminal" });
+      await this.rawWrite(doWrite, { path: tmp, kind });
     } catch (err) {
       await fs.rm(tmp, { force: true }).catch(() => undefined);
       throw err;
@@ -1370,6 +1437,84 @@ export class Outbox {
     return adopted;
   }
 
+  /**
+   * Issue #1742: journal that the executor of `claimGeneration` returned a finalize-bound result,
+   * write-ahead of every later finalize step. Installs `finalize-<claimGeneration>.json` with the
+   * terminal journal's mechanics (temp write with fsync, no-replace `link()`, directory fsync) under
+   * the run's lock, sealed with its own MAC domain. The body is `{run_id, claim_generation, since}`
+   * only. Idempotent: an existing record for the generation is adopted (reported as written).
+   *
+   * Never throws. The `finalize record durable` line is logged only after the directory fsync
+   * completed; any failure logs `finalize record not written` and returns `written:false`.
+   */
+  async journalFinalize(runId: string, claimGeneration: number): Promise<FinalizeJournalResult> {
+    const fail = (reason: string): FinalizeJournalResult => {
+      this.log.warn("finalize record not written", { run_id: runId, claim_generation: claimGeneration, reason });
+      return { written: false, reason };
+    };
+    try {
+      if (this.disabled || !this.key) return fail("outbox_disabled");
+      return await this.withRunLock(runId, async () => {
+        if (!this.validRunId(runId)) return fail("invalid_run_id");
+        const dir = this.runDir(runId);
+        if (await this.isSymlink(dir)) return fail("run_dir_symlink");
+        const since = this.now();
+        const record: FinalizeRecordData = { run_id: runId, claim_generation: claimGeneration, since };
+        const serialized = this.seal(MAC_DOMAIN_FINALIZE, record);
+        const dst = path.join(dir, finalizeFileName(claimGeneration));
+        try {
+          await this.withReserveOnEnospc(async () => {
+            await this.rawWrite(
+              async () => {
+                await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+              },
+              { path: dir, kind: "finalize" },
+            );
+            await this.fsyncDir(this.root);
+            await this.installExclusive(dst, serialized, "finalize");
+          });
+        } catch (err) {
+          return fail(isENOSPC(err) ? "enospc" : `write_failed: ${errText(err)}`);
+        }
+        const rs = this.ensureInMemoryRun(runId, since);
+        if (!rs.finalizes.has(claimGeneration)) rs.finalizes.set(claimGeneration, { claimGeneration, since });
+        this.log.info("finalize record durable", { run_id: runId, claim_generation: claimGeneration });
+        return { written: true };
+      });
+    } catch (err) {
+      return fail(`unexpected: ${errText(err)}`);
+    }
+  }
+
+  /** Issue #1742: every pending finalize record, EXCLUDING a run that also holds a pending terminal
+   *  journal (the journal and its #1391 lease win). Read from memory. */
+  listPendingFinalizes(): PendingFinalize[] {
+    const out: PendingFinalize[] = [];
+    for (const rs of this.runs.values()) {
+      if (rs.terminals.size > 0) continue;
+      for (const f of rs.finalizes.values()) out.push({ run_id: rs.runId, claim_generation: f.claimGeneration });
+    }
+    return out;
+  }
+
+  /** Issue #1742: retire one finalize record (unlink the file, drop it from the pending set). */
+  async retireFinalize(runId: string, claimGeneration: number): Promise<void> {
+    if (this.disabled) return;
+    await this.withRunLock(runId, async () => {
+      if (!this.validRunId(runId)) return;
+      await fs
+        .rm(path.join(this.runDir(runId), finalizeFileName(claimGeneration)), { force: true })
+        .catch(() => undefined);
+      this.runs.get(runId)?.finalizes.delete(claimGeneration);
+    });
+  }
+
+  /** Issue #1742: retire exactly the given records, one at a time. One failure never blocks the rest
+   *  (retireFinalize swallows its own unlink errors). */
+  async retireFinalizes(entries: readonly PendingFinalize[]): Promise<void> {
+    for (const e of entries) await this.retireFinalize(e.run_id, e.claim_generation);
+  }
+
   /** Get an existing in-memory run entry, or create one WITHOUT writing a manifest to disk — a run
    *  may carry a terminal journal with no message manifest, and forcing an empty manifest write here
    *  would be a needless durable side effect. */
@@ -1387,7 +1532,7 @@ export class Outbox {
       since,
       updatedAt: since,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -1496,7 +1641,7 @@ export class Outbox {
       since: t,
       updatedAt: t,
     };
-    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map() };
+    const rs: RunState = { runId, manifest, recordBytes: new Map(), terminals: new Map(), finalizes: new Map() };
     this.runs.set(runId, rs);
     return rs;
   }
@@ -1923,6 +2068,29 @@ function parseTerminalFileName(name: string): number | undefined {
   if (!/^\d+$/.test(mid)) return undefined; // no sign, no separators, no leading `+`
   const gen = Number(mid);
   return Number.isInteger(gen) && gen >= 0 ? gen : undefined;
+}
+
+/** The `finalize-<generation>.json` filename for a claim generation (issue #1742). */
+function finalizeFileName(claimGeneration: number): string {
+  return `${FINALIZE_FILE_PREFIX}${claimGeneration}${FINALIZE_FILE_SUFFIX}`;
+}
+
+/** The claim generation a finalize-record filename names, or undefined when the name is not one. */
+function parseFinalizeFileName(name: string): number | undefined {
+  if (!name.startsWith(FINALIZE_FILE_PREFIX) || !name.endsWith(FINALIZE_FILE_SUFFIX)) return undefined;
+  const mid = name.slice(FINALIZE_FILE_PREFIX.length, name.length - FINALIZE_FILE_SUFFIX.length);
+  if (!/^\d+$/.test(mid)) return undefined;
+  const gen = Number(mid);
+  return Number.isInteger(gen) && gen >= 0 ? gen : undefined;
+}
+
+/** Validate an authenticated finalize-record object: the embedded run id must match the directory
+ *  and the embedded generation the filename. Null on any mismatch. */
+function coerceFinalize(obj: Record<string, unknown>, runId: string, fileGen: number): FinalizeMeta | null {
+  if (obj.run_id !== runId) return null;
+  if (typeof obj.claim_generation !== "number" || obj.claim_generation !== fileGen) return null;
+  if (typeof obj.since !== "number") return null;
+  return { claimGeneration: obj.claim_generation, since: obj.since };
 }
 
 /** The set of legal blocked reasons, mirroring {@link TerminalBlockedReason}. */

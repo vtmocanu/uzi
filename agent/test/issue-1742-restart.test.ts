@@ -19,8 +19,9 @@ import { Outbox, type RawWriteSeam } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 import { api, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
 
-// M1 fault probes. The paused write is a synthetic reachable cut after the executor
-// returned and before journal installation. It does not prove the historical #1730 path.
+// M1/M2 fault probes. The paused write is a synthetic reachable cut after the executor
+// returned and after the finalize-pending record is durable, before terminal journal installation.
+// It does not prove the historical #1730 path.
 installHarness();
 
 const roots: string[] = [];
@@ -47,6 +48,16 @@ async function terminalFiles(root: string, runId: string): Promise<string[]> {
   return names.filter((name) => /^terminal-[0-9]+[.]json$/.test(name)).sort();
 }
 
+async function finalizeFiles(root: string, runId: string): Promise<string[]> {
+  const names = await fsp.readdir(path.join(root, runId)).catch((err: NodeJS.ErrnoException) => {
+    if (err.code === "ENOENT") return [];
+    throw err;
+  });
+  return names.filter((name) => /^finalize-[0-9]+[.]json$/.test(name)).sort();
+}
+
+const FIXTURE = new URL("../../fixtures/worker-register-snapshot/finalize-resume.json", import.meta.url);
+
 async function registerAfterRestart(outbox: Outbox, withRegistry = true): Promise<ActiveSnapshot | undefined> {
   let sent: ActiveSnapshot | undefined;
   const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
@@ -72,8 +83,8 @@ async function registerAfterRestart(outbox: Outbox, withRegistry = true): Promis
   return sent;
 }
 
-describe("issue #1742 M1 restart fault probes", () => {
-  it("has no terminal to reload at a post-executor, pre-journal cut", async () => {
+describe("issue #1742 restart fault probes", () => {
+  it("survives a restart at a post-executor cut after the finalize record is durable, with no terminal journal", async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "issue-1742-cut-"));
     roots.push(dir);
     const root = path.join(dir, "outbox");
@@ -116,18 +127,29 @@ describe("issue #1742 M1 restart fault probes", () => {
       ]);
       assert.equal(executorReturned, true, "the real executor returned before the terminal write");
       const disk = await terminalFiles(root, claim.run_id);
-      const restarted = makeOutbox(root);
-      await restarted.init();
-      const loaded = restarted.listPendingTerminals();
-      assert.deepEqual(disk, [], "the paused write has installed no journal");
+      assert.deepEqual(disk, [], "the paused write has installed no terminal journal");
       assert.equal(
         api.states.some((state) => state.runId === claim.run_id && (state.body.status === "completed" || state.body.status === "failed")),
         false,
         "the terminal report has not been sent at the cut",
       );
-      assert.equal(loaded.length, disk.length, "restart loaded count matches the disk inventory");
+      assert.deepEqual(await finalizeFiles(root, claim.run_id), ["finalize-3.json"], "the finalize record is durable at the cut");
+      const restarted = makeOutbox(root);
+      await restarted.init();
+      assert.deepEqual(restarted.listPendingTerminals(), [], "restart loaded no terminal journal");
+      assert.deepEqual(restarted.listPendingFinalizes(), [{ run_id: claim.run_id, claim_generation: 3 }],
+        "the finalize record authenticates in a restarted Outbox");
       const snapshot = await registerAfterRestart(restarted);
-      assert.equal(snapshot, undefined, "without a loaded journal Worker sends no register snapshot");
+      const fixture = JSON.parse(await fsp.readFile(FIXTURE, "utf8")) as ActiveSnapshot;
+      assert.ok(snapshot, "the restarted Worker sends a register snapshot carrying the finalize record");
+      assert.deepEqual(
+        { ...snapshot, finalize_resume: snapshot.finalize_resume?.map((e) => ({ ...e, run_id: fixture.finalize_resume![0]!.run_id })) },
+        fixture,
+        "the register snapshot equals the shared contract fixture (run id normalized)",
+      );
+      assert.equal(snapshot.finalize_resume?.[0]?.run_id, claim.run_id);
+      assert.deepEqual(await finalizeFiles(root, claim.run_id), [], "an accepted register retired the offered record");
+      assert.deepEqual(restarted.listPendingFinalizes(), []);
     } finally {
       releaseWrite();
       await execution;

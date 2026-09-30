@@ -1503,6 +1503,21 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
   "awaiting_followup",
 ]);
 
+/**
+ * Issue #1742: is this executor result FINALIZE-BOUND, i.e. does phasePublish go on to finalize it
+ * (push, MR, terminal report) rather than take one of its non-terminal early returns? The four
+ * early returns (an owner pause park, the completion hold, the wall-clock park, the in-place
+ * credential-switch release) each already reported their own non-terminal state and finalize
+ * nothing. The finalize-pending record write in phasePreflightHandoff reads this predicate, and the
+ * early-return checks at the top of phasePublish must name exactly the same four fields: change one
+ * side only together with the other (agent/test/issue-1742-finalize-record.test.ts pins each field).
+ */
+export function isFinalizeBoundResult(
+  result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased">,
+): boolean {
+  return !result.pausedAt && !result.completionHeld && !result.walled && !result.switchReleased;
+}
+
 function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | undefined {
   return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
 }
@@ -1788,7 +1803,8 @@ export class RunRunner {
    *
    *  Not durable, and that is worth stating rather than implying: the map is worker
    *  memory, so a worker death re-queues the run and the resuming worker starts a
-   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1). */
+   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1); a run that
+   *  used the issue #1742 one-shot finalize-resume allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2). */
   private readonly questionDeadlines = new Map<string, number>();
   /** PRD #88: the question id a run is currently parked on. Seeded from the claim on a
    *  resume so a re-park re-uses the SAME id rather than minting a new one — which is
@@ -2505,6 +2521,8 @@ export class RunRunner {
           runLog,
           parkSink,
         );
+        // Issue #1742 retirement site (c): the api accepted the limit park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "limit_park_accepted");
         // parked === true is the ONLY thing that preserves on-disk state; see the
         // carve-out in the finally.
         //
@@ -2590,6 +2608,8 @@ export class RunRunner {
             preventive: err instanceof DiskParkSignal && err.preventive && steering.getPauseMode() !== "disk",
           },
         );
+        // Issue #1742 retirement site (c): the api accepted the disk park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "disk_park_accepted");
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -2603,6 +2623,8 @@ export class RunRunner {
           reportState,
           runLog,
         );
+        // Issue #1742 retirement site (c): the api accepted the recovery_wait park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
       } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
         // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
@@ -2809,6 +2831,8 @@ export class RunRunner {
         // pause_failed and left the run running), preserve the session and leave it for the
         // sweeper to requeue rather than failing a run the owner asked to pause.
         flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 });
+        // Issue #1742 retirement site (c): the api accepted the owner pause park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "pause_park_accepted");
         if (!flight.parked) {
           flight.preserveSession = true;
           runLog.info(
@@ -2871,6 +2895,8 @@ export class RunRunner {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         flight.parked = true;
+        // Issue #1742 retirement site (c): the api itself parked this generation at its wall limit.
+        await this.retireFinalizeRecord(flight, "server_wall_park");
         runLog.info(
           "run parked server-side at its wall-clock limit; retaining clone + HOME and leaving it non-terminal for a resume",
           { run_id: flight.runId },
@@ -3258,6 +3284,46 @@ export class RunRunner {
     }
   }
 
+  /**
+   * Issue #1742: write the finalize-pending record for this flight's generation when `result` is
+   * finalize-bound ({@link isFinalizeBoundResult}) and a usable outbox is wired. Never throws.
+   */
+  private async journalFinalizeRecord(flight: RunFlight, result: ExecutorResult): Promise<void> {
+    if (!this.outbox || this.outbox.isDisabled()) return;
+    if (!isFinalizeBoundResult(result)) return;
+    try {
+      await this.outbox.journalFinalize(flight.runId, flight.claimGeneration);
+    } catch (err) {
+      this.log.warn("finalize record not written", {
+        run_id: flight.runId,
+        claim_generation: flight.claimGeneration,
+        reason: `unexpected: ${errMessage(err)}`,
+      });
+    }
+  }
+
+  /**
+   * Issue #1742: retire this flight's finalize-pending record once the generation's fate is durably
+   * recorded elsewhere. The retirement sites are: journalAndSendTerminal after the terminal journal
+   * is installed, journalAndSendTerminal after an unjournaled terminal send resolved, and the
+   * executeClaim catch after the api accepted a park (limit, recovery, pause, server wall park).
+   * The graceful-shutdown branch deliberately never calls this, so the record survives a SIGTERM.
+   * Never throws.
+   */
+  private async retireFinalizeRecord(flight: RunFlight, site: string): Promise<void> {
+    if (!this.outbox) return;
+    try {
+      await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
+    } catch (err) {
+      this.log.warn("finalize record retire failed", {
+        run_id: flight.runId,
+        claim_generation: flight.claimGeneration,
+        site,
+        error: errMessage(err),
+      });
+    }
+  }
+
   /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
    *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
@@ -3335,6 +3401,9 @@ export class RunRunner {
       messagesThroughSeq: fence,
       body,
     });
+    // Issue #1742 retirement site (a): G's terminal journal is installed, so the #1391 lease takes
+    // over and the finalize-pending record is no longer needed (independent of the send below).
+    if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
     // #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
     // failure hook) BEFORE the resolve/send.
     await beforeResolve?.();
@@ -3342,6 +3411,9 @@ export class RunRunner {
       // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
       // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
       await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
+      // Issue #1742 retirement site (b): no journal could be installed and the unjournaled terminal
+      // send resolved, so the api holds G's outcome.
+      await this.retireFinalizeRecord(flight, "unjournaled_terminal_sent");
     } else {
       await resolvePendingTerminal(deps, {
         runId: flight.runId,
@@ -4370,6 +4442,9 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
+    // Issue #1742: the four non-terminal early returns below (pausedAt, completionHeld, walled,
+    // switchReleased) are exactly the results isFinalizeBoundResult() excludes; the finalize-pending
+    // record write in phasePreflightHandoff reads that predicate. Keep them in step.
     // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
     // `paused` and set flight.parked). The run is non-terminal and already reported — there is
     // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
@@ -8792,6 +8867,13 @@ export class RunRunner {
     let diskParked = false;
     try {
       result = await executor.run(ctx);
+      // Issue #1742: the executor returned. If the result is finalize-bound, journal a durable
+      // finalize-pending record NOW, before the finally's ticker stop and report-chain drain and
+      // before every later finalize await, so a worker restart anywhere in finalize leaves proof
+      // the executor of this generation succeeded. Awaited; never throws (a failure is logged by
+      // the outbox as `finalize record not written` and the run continues exactly as before).
+      // Only this run lane writes it, and a rejected executor.run never reaches this line.
+      await this.journalFinalizeRecord(flight, result);
     } catch (err) {
       diskParked = err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk");
       throw err;

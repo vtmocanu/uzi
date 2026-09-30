@@ -81,6 +81,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
       listPendingTerminals: () => [],
+      listPendingFinalizes: () => [],
       runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -129,6 +130,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
       listPendingTerminals: () => [],
+      listPendingFinalizes: () => [],
       runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -182,6 +184,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // Empty until the drain retires the segments — mirroring a terminal journaled AFTER boot and
       // only re-resolvable once the N3 undrained-messages guard would let it through.
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
+      listPendingFinalizes: () => [],
       runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -261,6 +264,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       uncleanRuns: () => [],
       isDisabled: () => false,
       listPendingTerminals: () => (retired ? [{ run_id: "r1", claim_generation: 5 }] : []),
+      listPendingFinalizes: () => [],
       runsWithPending: () => (retired ? [] : ["r1"]),
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -334,6 +338,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
       listPendingTerminals: () => [],
+      listPendingFinalizes: () => [],
       runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {
@@ -383,6 +388,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       // pending terminal, so the store is enabled and lists nothing (resolveBootTerminals no-ops).
       isDisabled: () => false,
       listPendingTerminals: () => [],
+      listPendingFinalizes: () => [],
       runsWithPending: () => ["r1"],
       depthFor: (id: string) => depth(id),
       drainRun: async () => {

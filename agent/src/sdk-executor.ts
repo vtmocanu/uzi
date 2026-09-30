@@ -1681,7 +1681,8 @@ export class SdkExecutor implements Executor {
        *  bound already states its own: this is worker memory, so a worker death
        *  re-queues the run, execute() runs fresh, and the count restarts at 0. The
        *  real lifetime ceiling is QUESTION_MAX x (RUN_MAX_REQUEUES + 1) — 10 on
-       *  defaults, not 5 — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
+       *  defaults, not 5 (a run that used the issue #1742 one-shot finalize-resume
+       *  allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2)) — exactly as QUESTION_TIMEOUT_SECONDS multiplies for the
        *  identical reason. Documenting one and not the other would be worse than
        *  documenting neither: a reader who finds the timeout's caveat reasonably
        *  infers the cap has none. */

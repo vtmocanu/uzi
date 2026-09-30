@@ -1,4 +1,9 @@
-import type { ActiveSnapshot, ActiveSnapshotEntry, ActiveSnapshotPhase } from "./protocol.js";
+import type {
+  ActiveSnapshot,
+  ActiveSnapshotEntry,
+  ActiveSnapshotPhase,
+  FinalizeResumeEntry,
+} from "./protocol.js";
 import type { PendingTerminal } from "./outbox.js";
 
 /** PRD #1391 Run B M4: the outbox pending-terminal lister the registry reads (a function seam so the
@@ -168,11 +173,22 @@ export class ActiveRunRegistry {
    * to re-claim) every pending run this worker owns BEFORE its register-time orphan pass — regardless
    * of the cap, even cap 0, where a non-empty subset would be rejected whole when cap < count. Draws
    * the shared epoch so ordering stays monotonic with the post-register heartbeat/claim snapshots.
+   * Issue #1742: `finalizeResume` (the caller's once-captured offered set) rides it as
+   * `finalize_resume`, on this register snapshot only.
    */
-  buildRegisterSnapshot(): ActiveSnapshot {
+  buildRegisterSnapshot(finalizeResume: readonly FinalizeResumeEntry[] = []): ActiveSnapshot {
     this.epoch += 1;
     const pending = this.pendingLister ? this.pendingLister() : [];
-    return { snapshot_epoch: this.epoch, active: [], pending_overflow: pending.length > 0 };
+    return {
+      snapshot_epoch: this.epoch,
+      active: [],
+      pending_overflow: pending.length > 0,
+      // Issue #1742: the finalize-pending set the caller captured for this register. The key is
+      // omitted when empty, and build() (heartbeat/claim) never carries it.
+      ...(finalizeResume.length > 0
+        ? { finalize_resume: finalizeResume.map((e) => ({ run_id: e.run_id, claim_generation: e.claim_generation })) }
+        : {}),
+    };
   }
 
   /**

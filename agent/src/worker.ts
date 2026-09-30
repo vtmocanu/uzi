@@ -1,7 +1,7 @@
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { replaySegment } from "./batcher.js";
-import type { Outbox } from "./outbox.js";
+import type { Outbox, PendingFinalize } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
@@ -336,7 +336,17 @@ export class Worker {
     // before the retry loop so a re-register re-sends the same snapshot. Undefined for an ordinary
     // worker with no pending journals (or no registry) ⇒ the register wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
-    const initialSnapshot = this.buildRegisterSnapshot();
+    // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
+    // snapshot. After an accepted register exactly this set is retired, never a re-listing, so a
+    // record a live flight writes later survives.
+    const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
+    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
+    const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
+    this.log.info("register finalize snapshot", {
+      count: sentFinalizes.length,
+      claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
+      claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
+    });
     this.log.info("register terminal snapshot", {
       authenticated_pending: pending.length,
       claim_generations_sample: pending.slice(0, 8).map((entry) => entry.claim_generation),
@@ -451,6 +461,18 @@ export class Worker {
           worker_id: res.worker_id ?? null,
         });
         this.dindPrune?.setWorkerId(res.worker_id);
+        // Issue #1742: the api accepted this register, so retire exactly the offered finalize set
+        // (`sentFinalizes`, what the snapshot carried). A failed register never reaches here. A
+        // retire failure must not turn an accepted register into a retry loop.
+        if (sentFinalizes.length > 0) {
+          try {
+            await this.outbox?.retireFinalizes(sentFinalizes);
+          } catch (err) {
+            this.log.warn("register finalize snapshot: retiring the offered records failed", {
+              error: errMessage(err),
+            });
+          }
+        }
         return;
       } catch (err) {
         // A 401/403 is a PERMANENT auth rejection of the worker join token (rotated or
@@ -586,10 +608,13 @@ export class Worker {
    * register handler accepts the field unconditionally): the gate is purely "do we hold a pending
    * outcome to protect". Undefined when there is no registry or nothing pending.
    */
-  private buildRegisterSnapshot(): ActiveSnapshot | undefined {
+  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[]): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
-    if (!this.outbox || this.outbox.listPendingTerminals().length === 0) return undefined;
-    return this.activeRuns.buildRegisterSnapshot();
+    if (!this.outbox) return undefined;
+    // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
+    // finalize_resume), even with no pending terminal journal.
+    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
+    return this.activeRuns.buildRegisterSnapshot(finalizes);
   }
 
   /**
