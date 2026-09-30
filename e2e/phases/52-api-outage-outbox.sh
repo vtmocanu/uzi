@@ -676,7 +676,15 @@ f42_restart_cycle() {
   fi
   if [ -z "$err" ]; then
     # Baseline of the agent's "registered" log lines, so the post-restart wait can prove a NEW register.
-    regs_before="$("${COMPOSE[@]}" logs agent 2>/dev/null | grep -cw 'registered' || true)"
+    # A failed log read must not yield a 0 baseline (the agent's earlier register would then pass the wait).
+    rc=0; regs_before="$("${COMPOSE[@]}" logs agent 2>/dev/null)" || rc=$?
+    if [ "$rc" = 0 ]; then
+      regs_before="$(printf '%s\n' "$regs_before" | grep -c '"msg":"registered"' || true)"
+    else
+      err="could not read the agent logs for the register baseline (exit $rc)"
+    fi
+  fi
+  if [ -z "$err" ]; then
     say "SIGKILLing the agent container with the api still down (run $run generation $gen)"
     rc=0; "${COMPOSE[@]}" kill -s SIGKILL agent >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || err="could not SIGKILL the agent container (exit $rc)"
@@ -690,7 +698,7 @@ f42_restart_cycle() {
   # registerWithRetry). f42_wait_reclaim / the fail waits remain the judges of the run outcome.
   deadline=$((SECONDS + 90))
   while [ "$SECONDS" -lt "$deadline" ]; do
-    regs_now="$("${COMPOSE[@]}" logs agent 2>/dev/null | grep -cw 'registered' || true)"
+    regs_now="$("${COMPOSE[@]}" logs agent 2>/dev/null | grep -c '"msg":"registered"' || true)"
     [ "${regs_now:-0}" -gt "${regs_before:-0}" ] && break
     sleep 1
   done

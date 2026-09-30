@@ -300,15 +300,21 @@ so no other hosted worker or run is touched. Do not assume the cluster's CNI:
   no chart policy to outrank, but the rule must still win over anything else that applies.
 - **Otherwise**, the supported equivalent on a CNI that implements it: the CNI's supported
   cluster-scoped deny policy: a ClusterNetworkPolicy (`policy.networking.k8s.io/v1alpha2`) in
-  tier `Admin`, which is evaluated before ordinary NetworkPolicies (tier `Baseline` is overridden
-  by them, so it cannot deny), or, alongside it, a Kubernetes AdminNetworkPolicy
-  (`policy.networking.k8s.io/v1alpha1`), whichever the CNI actually implements. Either carries a
+  tier `Admin`, which is evaluated before ordinary NetworkPolicies (tier `Baseline` can be
+  overridden by them, so it cannot be relied on to deny), or instead a Kubernetes
+  AdminNetworkPolicy (`policy.networking.k8s.io/v1alpha1`), whichever the CNI actually
+  implements. Apply exactly ONE deny object (the cleanup deletes one `DENY_KIND`). It carries a
   `Deny` egress rule to the api pods, its subject a pods selector (namespace selector plus the
   same unique pod label) matching only the scratch worker pod, and a priority that wins. Check
   enforcement: the API server accepting the object proves nothing about whether the CNI applies
   it.
 
-Both objects use the exact name `uzi-1742-acceptance-<n>` and the pod-only scope.
+Whichever kind is used, the one deny object has the exact name `uzi-1742-acceptance-<n>` and the
+pod-only scope.
+
+**Run steps 0 to 10 in ONE shell session** (the trap below is installed in step 0 and must stay
+in effect until step 10); running the sketch as a standalone script would fire its `EXIT` trap
+immediately and undo the raise.
 
 ### Preconditions
 
@@ -367,7 +373,7 @@ restore_stale() {    # put the recorded override back, or remove the override wh
   else
     kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE-' || return
   fi
-  kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY"
+  kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 }
 
 # 1. Record FIRST, and record it on issue #1742 (comment) before any change.
@@ -377,7 +383,8 @@ echo "prior WORKER_HEARTBEAT_STALE: override='${PRIOR_STATE}' configmap='${PRIOR
 
 cleanup() {          # 2. Install BEFORE any change.
   local rc="${1:-$?}" failed=0
-  trap - EXIT INT TERM
+  trap - EXIT
+  trap '' INT TERM   # a second signal must not cut cleanup short
   set +e             # a failing command must not skip the rest of cleanup
   deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found; local del_rc=$?
   restore_stale;                                              local res_rc=$?   # runs whatever the delete returned
@@ -385,11 +392,11 @@ cleanup() {          # 2. Install BEFORE any change.
   [ "$res_rc" -eq 0 ] || { echo "CLEANUP: restoring WORKER_HEARTBEAT_STALE returned $res_rc" >&2; failed=1; }
   # Verify. Only a NotFound read counts as "object gone"; any other read error is a failure.
   local out get_rc now_state
-  out="$(deny_kubectl get "$DENY_KIND" "$DENY_NAME" 2>&1)"; get_rc=$?
-  if [ "$get_rc" -eq 0 ]; then
-    echo "CLEANUP FAILED: $DENY_NAME still exists" >&2; failed=1
-  elif [[ "$out" != *NotFound* && "$out" != *'not found'* ]]; then
-    echo "CLEANUP FAILED: cannot verify $DENY_NAME is gone: $out" >&2; failed=1; fi
+  out="$(deny_kubectl get "$DENY_KIND" "$DENY_NAME" --ignore-not-found -o name 2>&1)"; get_rc=$?
+  if [ "$get_rc" -ne 0 ]; then
+    echo "CLEANUP FAILED: cannot verify $DENY_NAME is gone: $out" >&2; failed=1
+  elif [ -n "$out" ]; then
+    echo "CLEANUP FAILED: $DENY_NAME still exists" >&2; failed=1; fi
   now_state="$(override_state)"; get_rc=$?
   if [ "$get_rc" -ne 0 ]; then
     echo "CLEANUP FAILED: cannot read the WORKER_HEARTBEAT_STALE override" >&2; failed=1
@@ -404,7 +411,7 @@ trap 'cleanup 143' TERM
 
 # 3. Only now change the setting and apply the deny rule.
 kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
-kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY"
+kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
 ```
 
@@ -419,7 +426,7 @@ kubectl -n '<api-namespace>' set env 'deploy/<api-deployment>' '<recorded-overri
 kubectl -n '<api-namespace>' rollout status 'deploy/<api-deployment>'
 kubectl [-n '<worker-namespace>'] delete '<deny-kind>' 'uzi-1742-acceptance-<n>' --ignore-not-found
 # Verify both: the object is gone, and the deployment's override matches the record.
-kubectl [-n '<worker-namespace>'] get '<deny-kind>' 'uzi-1742-acceptance-<n>'   # must report NotFound
+kubectl [-n '<worker-namespace>'] get '<deny-kind>' 'uzi-1742-acceptance-<n>' --ignore-not-found -o name   # must exit 0 and print nothing
 kubectl -n '<api-namespace>' get deploy '<api-deployment>' -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].env}'
 ```
 
