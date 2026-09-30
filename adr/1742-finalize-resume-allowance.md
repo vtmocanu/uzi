@@ -29,7 +29,8 @@ Two facts bound the design. First, nothing the worker can write before finalize 
 run *succeeded*: the outcome is the terminal journal, and synthesizing one early would be a lie
 that a completion permit would then have to trust. Second, the api already re-runs a re-queued
 run through the ordinary claim path, which re-runs the executor at the next claim generation and
-completes only through the completion permit (generation fence and status check). So the fix
+completes only through the normal completion path (the claim-generation fences, plus the completion
+permit where the run is interlocked). So the fix
 does not have to complete anything; it only has to stop the api failing the run.
 
 ## Decision
@@ -44,8 +45,9 @@ directory (`agent/src/outbox.ts`):
   finalize-bound result: the non-terminal early returns `phasePublish` already takes (`pausedAt`,
   `completionHeld`, `walled`, `switchReleased`) are excluded through one shared predicate
   (`isFinalizeBoundResult`). A rejected `executor.run` (a disk park, a pause-now signal, an
-  error) never reaches the write. The write is awaited; if it fails (outbox disabled, `ENOSPC`)
-  the run logs `finalize record not written` and continues exactly as before.
+  error) never reaches the write. The write is awaited; if it fails (for example `ENOSPC`)
+  the run logs `finalize record not written` and continues exactly as before. A worker with no
+  outbox, or a disabled one, writes no record and logs nothing.
 - **What.** `{run_id, claim_generation, since}` only: no status, no report body, no phase. It is
   never a terminal journal and never creates a terminal lease; committed files are never read as
   completion authority.
@@ -110,14 +112,16 @@ no live exact-generation `terminal_pending` lease.
   (`requeue_count < RUN_MAX_REQUEUES`; an ordinary requeue, no allowance mark), or when it is
   **over budget and the one-shot allowance is available** (`RUN_MAX_REQUEUES > 0` and
   `finalize_resume_generation IS NULL`), in which case it also sets `finalize_resume_generation =
-  claim_generation`. It sets the same columns as `RequeueWorkerRuns` and never decrements
+  claim_generation`. It sets the same columns as `RequeueWorkerRuns` (except `budget_paused_seconds`, which is omitted
+  because the query pins `status = running`) and never decrements
   `requeue_count`, so ADR-1390 D2's refund rule is untouched.
 - `FailAttestedFinalizeRunsOverCap` fails an attested run that is over budget with the allowance
   unavailable (already used, or `RUN_MAX_REQUEUES=0`), `fail_origin = worker_lost`, exactly like
   `FailWorkerRunsOverCap`. The two queries are disjoint; failing runs first.
 - Non-attested runs go through the unchanged `FailWorkerRunsOverCap` / `RequeueWorkerRuns`. The
   requeued run is re-claimed by the same worker (affinity) at G+1 by the unchanged `ClaimRun`, and
-  completes only through the unchanged permit and generation fences.
+  completes only through the unchanged completion path (the claim-generation fences, plus the
+  completion permit where the run is interlocked).
 - `RUN_MAX_REQUEUES=0` stays "never re-queue": the allowance is off at 0.
 - The api logs `finalize_resume_offered`, `finalize_requeued`, `finalize_allowance_used` and
   `finalize_failed` on the register commit line ("worker register active snapshot committed"), and
@@ -201,21 +205,24 @@ exist. What happens in each case:
 or server change and `--json` is unchanged. `uzi run recovery` (both the owner view and the per-run
 view) now prints, for a `source_only` hold, `hold <id>: no recovery archive; custody of worker
 <name>'s local source is retained (export unavailable; it may be the only copy)`. It offers
-`uzi run export` only for an open hold that has an available archive, and `uzi run discard` for
-`source_only` and `needs_action` holds, with a warning that the retained source may be the only
-copy. `landing_state` is not widened.
+`uzi run export` only for an open hold that has an available archive, and suggests `uzi run
+discard` for holds awaiting a decision. The discard hint itself prints no warning: the only-copy
+wording is in the `source_only` line above, in the `uzi run discard --help` text, and in the
+interactive discard prompt. `landing_state` is not widened.
 
 ### D5: diagnostics
 
 Worker log lines: `finalize record durable` (the durable-point proof), `finalize record not
-written` (with a reason), `register finalize snapshot` (count and a sample of generations) and
+written` (a write failure such as `ENOSPC`, with a reason; a disabled or absent outbox writes no
+record and logs nothing), `register finalize snapshot` (count and a sample of generations) and
 `recovery restart sweep` (per record). Api register counts as in D3.
 
 ## Invariants future code must respect
 
 - A finalize record is **never an outcome and never a lease**. Nothing may complete a run, create a
   terminal journal or a `terminal_pending` lease from it, or read committed files as completion
-  authority. A run completes only through the completion permit at its own claim generation.
+  authority. A run completes only through the normal completion path at its own claim generation (the
+  claim-generation fences, plus the completion permit where the run is interlocked).
 - The api may act on a finalize attestation only for a run that is owned by the registering worker,
   still `running`, unreleased, not chat, at the **exact** attested generation, with no live
   exact-generation terminal lease. Widening any of these widens what a worker token can do to a
@@ -249,8 +256,9 @@ written` (with a reason), `register finalize snapshot` (count and a sample of ge
   transitional. No acknowledgment or fenced proof is added for it.
 - **The live-lease plus MAC-rejected-journal mixed case** (a live exact-generation terminal lease
   meeting a journal that fails its MAC) belongs to #1974 and is unchanged here.
-- **Restarts slower than the stale windows** are still failed by the sweeper before the worker can
-  register; the record cannot help a worker that never comes back in time.
+- **Restarts slower than the stale windows** are handled by the sweeper before the worker can
+  register: an under-budget run is re-queued, and only an over-budget one is failed. The record
+  cannot help a worker that never comes back in time.
 - **Attempt bounds.** A run that used the allowance has one more attempt than the budget: the
   honest lifetime bound of the per-attempt question cap and answer deadline becomes `x
   (RUN_MAX_REQUEUES + 2)` for that run (`x (RUN_MAX_REQUEUES + 1)` otherwise).
@@ -282,19 +290,21 @@ already admits the workers, so adding another NetworkPolicy can never take that 
 cut therefore needs a policy that can *deny*, and it must apply to **only the scratch worker pod**
 so no other hosted worker or run is touched. Do not assume the cluster's CNI:
 
-- **Where Antrea is installed** (the hosted workers' egress already uses Antrea-native policy, see
-  `deploy/chart/templates/worker-fqdn-egress.yaml`), use a namespaced `crd.antrea.io`
-  NetworkPolicy: `appliedTo` a `podSelector` matching only the scratch worker pod (its unique
-  `uzi.dev/hosted-worker-id` label), one egress `Drop` rule to the api pods, at a priority that
-  wins over the worker-egress policy (a lower number wins; the chart's default worker-egress
-  policy is priority 5 in tier `application`, so pick a number below it in the same tier, or a
-  tier evaluated earlier).
-- **Otherwise**, the supported equivalent on a CNI that implements it: a Kubernetes
-  AdminNetworkPolicy (`policy.networking.k8s.io`) with a `Deny` egress rule to the api pods, its
-  `subject` a `pods` selector (namespace selector plus the same unique pod label) matching only
-  the scratch worker pod, and a priority that wins. An AdminNetworkPolicy is cluster-scoped and is
-  evaluated before ordinary NetworkPolicies. Check that the cluster's CNI actually implements it:
-  the API server accepting the object proves nothing about enforcement.
+- **Where Antrea is installed**, use a namespaced `crd.antrea.io` NetworkPolicy: `appliedTo` a
+  `podSelector` matching only the scratch worker pod (its unique `uzi.dev/hosted-worker-id`
+  label), one egress `Drop` rule to the api pods, at a priority that wins over any other Antrea
+  policy applied to the worker (a lower number wins, within the same tier or a tier evaluated
+  earlier). The chart's worker-egress Antrea policy
+  (`deploy/chart/templates/worker-fqdn-egress.yaml`, default priority 5 in tier `application`)
+  exists only when `workers.fqdnEgress.enabled` is set with provider `antrea`; without it there is
+  no chart policy to outrank, but the rule must still win over anything else that applies.
+- **Otherwise**, the supported equivalent on a CNI that implements it: the CNI's supported
+  cluster-scoped deny policy (for example a Kubernetes AdminNetworkPolicy, or its successor
+  `policy.networking.k8s.io` API if the cluster has moved to it) with a `Deny` egress rule to the
+  api pods, its subject a pods selector (namespace selector plus the same unique pod label)
+  matching only the scratch worker pod, and a priority that wins. Such a policy is evaluated
+  before ordinary NetworkPolicies. Check that the cluster's CNI actually implements it: the API
+  server accepting the object proves nothing about enforcement.
 
 Both objects use the exact name `uzi-1742-acceptance-<n>` and the pod-only scope.
 
@@ -304,59 +314,105 @@ Both objects use the exact name `uzi-1742-acceptance-<n>` and the pod-only scope
 - The cut stops the scratch worker's heartbeats. The stale sweeper would fail an over-budget run
   after two stale windows (`WORKER_HEARTBEAT_STALE`, default 45s), so for the duration of the
   check the maintainer raises `WORKER_HEARTBEAT_STALE` on the api and restores it afterwards. This
-  is a global api setting, so its restoration is part of cleanup, not an afterthought.
+  is a global api setting, so its restoration is part of cleanup, not an afterthought. Reading the
+  prior value takes care: the chart injects the api's settings through a ConfigMap `envFrom`
+  (`deploy/chart/templates/api-deployment.yaml`, values under `api.config` in
+  `deploy/chart/values.yaml`), and an explicit container `env` entry overrides it. So the prior
+  state is one of three things: a direct `env` override on the deployment, a ConfigMap value, or
+  the built-in default. The sketch below raises the setting with a direct `env` override and
+  restores it by putting the override back (or removing it when there was none), which returns
+  the ConfigMap or default value to effect.
+- **GitOps self-heal can revert a `kubectl set env` mid-test**, silently restoring the short
+  window while the check runs (a false failure), or leave the override behind afterwards. Pause
+  sync for the api application for the duration, or raise and restore the value through the
+  deployment's own values path instead, adapting the sketch's `set_stale` and `restore_stale`.
 - Deploy the release first (api, then the worker image).
+- The scratch task must request a merge request (`uzi handoff --mr`, or an issue run on the
+  scratch repository), because step 5 expects run A to reach `completed` with one.
+- On a Docker-lane worker pod the pod has more than one container: every `kubectl exec` below
+  names the worker container with `-c worker`.
 
 ### Cleanup contract (install it first)
 
-The order is fixed: **record the prior `WORKER_HEARTBEAT_STALE`, install the trap, then change the
-setting and apply the deny rule.** The trap fires on `EXIT INT TERM`, so success, failure,
-interrupt and a `set -e` abort all run it, and it does both things: deletes the exact-named deny
-object **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior value. It then verifies both
-restorations. Sketch (a Bash shell; `<...>` are placeholders; set `DENY_KIND` to the resource that
-matches the chosen policy type, fully qualified so it cannot resolve to a standard
-NetworkPolicy):
+The order is fixed: **record the prior state, install the trap, then change the setting and apply
+the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt and a
+`set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
+**and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
+restorations, reports any failure, and exits with the original status (non-zero on interrupt, or
+1 when cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
+restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later under
+`set -euo pipefail`; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
+the chosen policy type so it cannot resolve to a standard NetworkPolicy):
 
 ```bash
+set -euo pipefail
 DENY_NAME='uzi-1742-acceptance-<n>'
-DENY_KIND='networkpolicies.crd.antrea.io'          # Antrea; or adminnetworkpolicies.policy.networking.k8s.io
-DENY_NS_ARGS=(-n '<worker-namespace>')             # empty array () for the cluster-scoped AdminNetworkPolicy
-API_NS='<api-namespace>'; API_DEPLOY='<api-deployment>'
+DENY_KIND='networkpolicies.crd.antrea.io'          # Antrea; or the cluster's supported deny policy resource
+DENY_NS_ARGS=(-n '<worker-namespace>')             # empty array () for a cluster-scoped policy
+API_NS='<api-namespace>'; API_DEPLOY='<api-deployment>'; API_CM='<api-configmap>'
 
-api_stale() {   # the api's configured value; empty = unset (the 45s default)
-  kubectl -n "$API_NS" get deploy "$API_DEPLOY" \
-    -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].env[?(@.name=="WORKER_HEARTBEAT_STALE")].value}'
+deny_kubectl() { kubectl ${DENY_NS_ARGS[@]+"${DENY_NS_ARGS[@]}"} "$@"; }
+override_state() {   # "WORKER_HEARTBEAT_STALE=<v>" when a direct env override exists, else empty
+  kubectl -n "$API_NS" get deploy "$API_DEPLOY" -o jsonpath=\
+'{range .spec.template.spec.containers[?(@.name=="api")].env[?(@.name=="WORKER_HEARTBEAT_STALE")]}{.name}={.value}{end}'
 }
-set_stale() {   # use your deployment's own mechanism if the api env is managed elsewhere
-  if [ -n "$1" ]; then kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" "WORKER_HEARTBEAT_STALE=$1"
-  else kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE-'; fi
+restore_stale() {    # put the recorded override back, or remove the override when there was none
+  if [ -n "$PRIOR_STATE" ]; then
+    kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" "$PRIOR_STATE"
+  else
+    kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE-'
+  fi
   kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY"
 }
 
-PRIOR_STALE="$(api_stale)"                         # 1. record FIRST
-echo "recorded prior WORKER_HEARTBEAT_STALE='${PRIOR_STALE}' (empty = unset)"
+# 1. Record FIRST, and record it on issue #1742 (comment) before any change.
+PRIOR_STATE="$(override_state)"                    # empty = no direct override
+PRIOR_CM="$(kubectl -n "$API_NS" get cm "$API_CM" -o jsonpath='{.data.WORKER_HEARTBEAT_STALE}')"
+echo "prior WORKER_HEARTBEAT_STALE: override='${PRIOR_STATE}' configmap='${PRIOR_CM}' (both empty = built-in default)"
 
-cleanup() {                                        # 2. install BEFORE any change
-  local rc=$?; trap - EXIT INT TERM
-  kubectl "${DENY_NS_ARGS[@]}" delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found
-  set_stale "$PRIOR_STALE"
-  if kubectl "${DENY_NS_ARGS[@]}" get "$DENY_KIND" "$DENY_NAME" >/dev/null 2>&1; then
-    echo "CLEANUP FAILED: $DENY_NAME still exists" >&2; rc=1; fi
-  if [ "$(api_stale)" != "$PRIOR_STALE" ]; then
-    echo "CLEANUP FAILED: WORKER_HEARTBEAT_STALE is not '${PRIOR_STALE}'" >&2; rc=1; fi
+cleanup() {          # 2. Install BEFORE any change.
+  local rc="${1:-$?}" failed=0
+  trap - EXIT INT TERM
+  set +e             # a failing command must not skip the rest of cleanup
+  deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found; local del_rc=$?
+  restore_stale;                                              local res_rc=$?   # runs whatever the delete returned
+  [ "$del_rc" -eq 0 ] || { echo "CLEANUP: deleting $DENY_NAME returned $del_rc" >&2; failed=1; }
+  [ "$res_rc" -eq 0 ] || { echo "CLEANUP: restoring WORKER_HEARTBEAT_STALE returned $res_rc" >&2; failed=1; }
+  if deny_kubectl get "$DENY_KIND" "$DENY_NAME" >/dev/null 2>&1; then
+    echo "CLEANUP FAILED: $DENY_NAME still exists" >&2; failed=1; fi
+  if [ "$(override_state)" != "$PRIOR_STATE" ]; then
+    echo "CLEANUP FAILED: WORKER_HEARTBEAT_STALE override is not '${PRIOR_STATE}'" >&2; failed=1; fi
+  if [ "$failed" -ne 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
   exit "$rc"
 }
-trap cleanup EXIT INT TERM
+trap 'cleanup' EXIT
+trap 'cleanup 130' INT
+trap 'cleanup 143' TERM
 
-set_stale '<raised-value>'                         # 3. only now change the setting
-kubectl "${DENY_NS_ARGS[@]}" delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
+# 3. Only now change the setting and apply the deny rule.
+kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
+kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY"
+deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
 ```
 
-If the shell itself dies before the trap runs, re-run step 0 of the procedure: it deletes the same
-exact name and restores the setting from the value recorded on the issue. After the trap the
-maintainer confirms both restorations by hand as well (the object is absent; the api's
-`WORKER_HEARTBEAT_STALE` equals the recorded value). The scratch runs are cancelled or left
-terminal; no other object is created.
+**If the shell itself dies before the trap runs**, do not re-run step 0: it would record the
+current, already raised value as the "prior" one. Restore explicitly from the values recorded on
+the issue in step 0:
+
+```bash
+# Values below come from the issue comment written in step 0, never from the live deployment.
+kubectl -n '<api-namespace>' set env 'deploy/<api-deployment>' '<recorded-override>'   # e.g. WORKER_HEARTBEAT_STALE=<v>
+#   or, when the record says there was no direct override:   'WORKER_HEARTBEAT_STALE-'
+kubectl -n '<api-namespace>' rollout status 'deploy/<api-deployment>'
+kubectl [-n '<worker-namespace>'] delete '<deny-kind>' 'uzi-1742-acceptance-<n>' --ignore-not-found
+# Verify both: the object is gone, and the deployment's override matches the record.
+kubectl [-n '<worker-namespace>'] get '<deny-kind>' 'uzi-1742-acceptance-<n>'   # must report NotFound
+kubectl -n '<api-namespace>' get deploy '<api-deployment>' -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].env}'
+```
+
+After the trap (or the explicit restore) the maintainer confirms both restorations by hand as
+well: the object is absent, and the api's `WORKER_HEARTBEAT_STALE` state equals the recorded one.
+The scratch runs are cancelled or left terminal; no other object is created.
 
 ### Procedure
 
@@ -365,33 +421,48 @@ deterministic: the outage is applied **before** the executor hands off, and the 
 only after the durable point is proven.
 
 The **durable point** has two parts, both required: the scratch worker's log shows `finalize record
-durable run_id=<id> claim_generation=<G>`, **and** `kubectl exec <scratch-pod> -- test -f
-/data/outbox/<id>/finalize-<G>.json` succeeds. The feed's executor `result` line is **not** a
+durable run_id=<id> claim_generation=<G>`, **and** `kubectl exec <scratch-pod> -c worker -- test
+-f /data/outbox/<id>/finalize-<G>.json` succeeds. The feed's executor `result` line is **not** a
 trigger.
 
-0. Run the cleanup contract above through its last step (record, trap, raise the stale window,
-   delete any leftover object).
-1. **Run A.** Start a small `task` run on the scratch repository and wait until it is `running`.
-   While its executor is still working, apply the deny policy (the outage now precedes the
-   hand-off, so no terminal can land). Confirm the log has **no** `finalize record durable` line
-   for A at G yet. If it already does, the hand-off beat the cut: abort this attempt (the trap
-   cleans up) and repeat with a new scratch run.
+The **pre-kill check** runs immediately before each kill (steps 4 and 7): `finalize-<G>.json` must
+exist **and** `terminal-<G>.json` must not (`kubectl exec <scratch-pod> -c worker -- test -f
+/data/outbox/<id>/finalize-<G>.json` succeeds and the same `test -f .../terminal-<G>.json` fails).
+A run that is not interlocked can push and journal its terminal outcome with only the api blocked,
+which retires the finalize record; killing then would test a different path. If the check fails,
+abort the attempt (the trap cleans up) and repeat with a new scratch run.
+
+0. **Record, then install the cleanup contract above** through its last step: write the prior
+   `WORKER_HEARTBEAT_STALE` state (override value if any, ConfigMap value, or "default") **on issue
+   #1742 as a comment before changing anything**, install the trap, raise the stale window, delete
+   any leftover object. The comment is what the dead-shell fallback restores from.
+1. **Run A.** Start a small scratch run that requests a merge request (`uzi handoff --mr` or an
+   issue run) on the scratch repository and wait until it is `running`. While its executor is
+   still working, apply the deny policy (the outage now precedes the hand-off, so no terminal can
+   land). Confirm the log has **no** `finalize record durable` line for A at G yet. If it
+   already does, the hand-off beat the cut: abort this attempt (the trap cleans up) and repeat
+   with a new scratch run.
 2. Wait for the durable point at G (both parts).
 3. In the api database set A's `requeue_count = RUN_MAX_REQUEUES` (the state after an earlier
    eviction).
-4. Restart only the agent process: kill it abruptly (SIGKILL, so no graceful-shutdown path runs)
-   so the container restarts in place and `/data` survives; confirm the pod's container
-   `restartCount` rose and the same pod kept its `/data`. Then delete the deny policy by its exact
-   name so the restarted process can register.
+4. Run the pre-kill check. Then restart only the agent process: kill it abruptly (SIGKILL, so no
+   graceful-shutdown path runs) so the container restarts in place and `/data` survives; confirm
+   the pod's container `restartCount` rose and the same pod kept its `/data`. Then delete the deny
+   policy by its exact name so the restarted process can register.
 5. Expect for A: the scratch worker's log shows `register finalize snapshot` including G; the api's
-   register commit log line shows `finalize_allowance_used=1`; `runs.finalize_resume_generation =
-   G`; A is re-claimed at G+1 and reaches `completed` with its merge request through the normal
-   completion permit, never `failed`/`worker_lost`.
-6. **Run B**, a new scratch run. Repeat steps 1 to 4 at its generation G; B is re-queued under the
-   allowance.
+   register commit line ("worker register active snapshot committed") shows
+   `finalize_allowance_used` as 1 (rendered `"finalize_allowance_used":1` with the JSON log format
+   or `finalize_allowance_used=1` with the text format); `runs.finalize_resume_generation = G`; A
+   is re-claimed at G+1 and reaches `completed` with its merge request through the normal
+   completion path at the next claim generation (the claim-generation fences, plus the completion
+   permit where the run is interlocked), never `failed`/`worker_lost`.
+6. **Run B**, a new scratch run that also requests a merge request. Repeat steps 1 to 4 at its
+   generation G; B is re-queued under the allowance.
 7. When B shows `running` at G+1, re-apply the deny policy **before** the re-run's executor
-   returns. Wait for the durable point at G+1 (both parts), then kill the agent process and delete
-   the policy.
+   returns. Wait for the durable point at G+1 (both parts), **repeating step 1's abort check:
+   if `finalize record durable` already exists for B at G+1 before the cut was applied, abort
+   the attempt.** Then run the pre-kill check at G+1, kill the agent process and delete the
+   policy.
 8. Expect for B: `failed` with `fail_origin = worker_lost`; `finalize_resume_generation` still G
    (the allowance is not reused); and `uzi run recovery <B>` shows either an `archive_ready` hold
    whose archive `uzi run export` downloads (a finalization-pinned source), or a `source_only` hold
@@ -400,5 +471,5 @@ trigger.
 9. Optional pod-loss variant (Docker lane): delete the pod instead of killing the process at step
    4. The finalize record on `/data` still drives the allowance. For a cut before fetch-back, G's
    hold reports `source_only` (D4b).
-10. Let the trap run (or run the same two deletions and restorations by hand), verify both
-    restorations, and record the observed outcome on issue #1742.
+10. Let the trap run (or run the explicit restore above), verify both restorations, and record the
+    observed outcome on issue #1742.
