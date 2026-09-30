@@ -380,9 +380,11 @@ components:
             $ref: "#/components/schemas/Error"
     RequestTimeout:
       description: >-
-        POST /files: the body was not fully received within the upload deadline
-        (120 seconds by default; UZI_RECOVERY_REQUEST_DEADLINE), so a stalled upload is
-        cut off (reason request_timeout).
+        POST /files: the body was not fully received within the upload deadline, so a
+        stalled upload is cut off (reason request_timeout). The deadline is at least
+        UZI_RECOVERY_REQUEST_DEADLINE (120 seconds by default) and grows with the declared
+        file size at 100 KiB/s (256 seconds for a 25 MiB file), and it never exceeds 10
+        minutes (or UZI_RECOVERY_REQUEST_DEADLINE itself when that is set higher).
       content:
         application/json:
           schema:

@@ -21,6 +21,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 	"unicode/utf8"
@@ -1703,6 +1704,14 @@ type Service struct {
 	// jobFiles is the PRD #1909 job-file store the upload/download surfaces reach through
 	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
 	jobFiles *JobFiles
+	// genMu guards genLocks, the per-run generated-output locks; genWG tracks the detached
+	// generated-output storages (startJobResultOutputs); genTimeout and genReplyBound override the
+	// package defaults when positive (tests).
+	genMu         sync.Mutex
+	genLocks      map[uuid.UUID]*runGenLock
+	genWG         sync.WaitGroup
+	genTimeout    time.Duration
+	genReplyBound time.Duration
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time

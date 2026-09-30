@@ -457,7 +457,8 @@ func TestJobFilesSweepLiveDB(t *testing.T) {
 	e := newJFEnv(t, l)
 	u := e.seedUser(t)
 
-	// Reservations: one past 2x the request deadline, one fresh.
+	// Reservations: one past the stale cutoff (the max upload deadline plus a RequestDeadline), one
+	// within it (older than 2x the request deadline: a slow live upload is not swept).
 	stale, err := e.jf.Reserve(e.ctx, ReserveParams{UserID: u, Direction: JobFileInput, DisplayName: "stale.txt", DeclaredSize: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -466,7 +467,8 @@ func TestJobFilesSweepLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	e.exec(`UPDATE job_files SET created_at = now() - interval '3 minutes' WHERE id = $1`, stale.ID)
+	e.exec(`UPDATE job_files SET created_at = now() - make_interval(secs => $2) WHERE id = $1`, stale.ID, (l.StaleReservationCutoff() + time.Minute).Seconds())
+	e.exec(`UPDATE job_files SET created_at = now() - interval '5 minutes' WHERE id = $1`, fresh.ID)
 
 	// Outputs: one on a live run, one on a run that finished an hour ago.
 	liveRun := e.jobFor(t, u)

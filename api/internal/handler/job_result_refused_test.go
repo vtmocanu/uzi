@@ -78,3 +78,19 @@ func TestDecodeJobResultRefusedOutputsStream(t *testing.T) {
 		t.Error("refused_outputs past the cap were accepted")
 	}
 }
+
+// A refused_outputs entry naming a server-generated file (any case, or a path ending in one) is
+// dropped: those two names are the server's own.
+func TestValidateRefusedOutputsDropsReservedNames(t *testing.T) {
+	sub, err := validateAndScrubJobResult(workerJobResultRequest{Status: "completed", RefusedOutputs: []workerRefusedOutputBody{
+		{DisplayName: "report.md", Reason: "worker_empty"},
+		{DisplayName: "outputs/Findings.JSON", Reason: "worker_unreadable"},
+		{DisplayName: "keep.txt", Reason: "worker_busy"},
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(sub.RefusedOutputs) != 1 || sub.RefusedOutputs[0].DisplayName != "keep.txt" {
+		t.Fatalf("refused outputs = %+v, want only keep.txt", sub.RefusedOutputs)
+	}
+}

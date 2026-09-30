@@ -74,8 +74,9 @@ type JobResultSubmission struct {
 // a failure part-way leaves the earlier result untouched.
 //
 // After the commit the server stores the result's report.md and findings.json as output files and
-// records the outputs the worker reported dropping (storeJobResultOutputs; its comment has the
-// lock order: those writes run OUTSIDE this transaction). They never fail the ingest.
+// records the outputs the worker reported dropping (startJobResultOutputs; its comment has the
+// lock order and the bounds: those writes run OUTSIDE this transaction, on a context detached from
+// the request, and the reply waits for them at most a few seconds). They never fail the ingest.
 //
 // Errors: ErrRunNotFound (not held by this worker), ErrNotJobRun, ErrStaleClaim (generation
 // mismatch or released claim), ErrRunTerminal.
@@ -131,7 +132,7 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 	if err = tx.Commit(ctx); err != nil {
 		return err
 	}
-	s.storeJobResultOutputs(ctx, wkr, run, claimGeneration, sub)
+	s.startJobResultOutputs(ctx, wkr, run, claimGeneration, sub)
 	return nil
 }
 

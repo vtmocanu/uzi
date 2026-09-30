@@ -493,13 +493,13 @@ func (h *Handler) V1FileUpload(w http.ResponseWriter, r *http.Request) {
 	// Bound the wall time of the body read. A body read does not observe the request context, so a
 	// client that stalls would otherwise hold its goroutine (and, once streaming, its database
 	// connection) until the server's ReadTimeout, and that timeout (15 s in cmd/server) is also
-	// shorter than a maximum-size upload needs. The read deadline is now + the job-files request
-	// deadline (JobFileLimits.UploadDeadline: RequestDeadline, 120 s by default, or declared size / 100 KiB/s when that is longer: 256 s at 25 MiB),
-	// replacing the server-wide one for this route only, and the write deadline follows it by
+	// shorter than a maximum-size upload needs. The read deadline is now + UploadDeadline: at least
+	// the job-files RequestDeadline (120 s by default), longer for a large DECLARED size
+	// (declared / 100 KiB/s, so a maximum-size upload at the slowest assumed rate is not cut off
+	// mid-body: 256 s at 25 MiB), and never more than max(RequestDeadline, MaxUploadDeadline). It
+	// replaces the server-wide deadline for this route only, and the write deadline follows it by
 	// v1FileWriteGrace so the response can still be written. A writer that does not support
-	// deadlines (a test recorder) keeps the server's own. The deadline scales with the DECLARED
-	// size (JobFileLimits.UploadDeadline: at least RequestDeadline, and declared / 100 KiB/s for a
-	// large file, so a maximum-size upload at the slowest assumed rate is not cut off mid-body).
+	// deadlines (a test recorder) keeps the server's own.
 	uploadDeadline := jf.Limits().UploadDeadline(declared, jf.Limits().InputFileMaxBytes)
 	deadline := setJobFileDeadlines(w, uploadDeadline)
 

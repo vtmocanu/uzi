@@ -247,7 +247,10 @@ func decodeRefusedOutputsStream(dec *json.Decoder, dst *[]workerRefusedOutputBod
 // validateRefusedOutputs checks and sanitises the worker-reported dropped outputs: the reason must
 // be on the workersvc.WorkerRefusalReasons allowlist (a worker cannot write free text into a
 // refusal row), the name goes through the same sanitiser as an uploaded file's, and a repeated
-// (name, reason) is kept once. The order of first appearance is kept.
+// (name, reason) is kept once. The order of first appearance is kept. An entry whose sanitised name
+// is one of the server-generated names (workersvc.IsReservedJobOutputName) is dropped: those two
+// files are the server's own, a worker never offers them, and a refusal row under one would read as
+// the server's own output being refused.
 func validateRefusedOutputs(in []workerRefusedOutputBody) ([]workersvc.JobRefusedOutput, error) {
 	if len(in) > workersvc.JobResultMaxRefusedOutputs {
 		return nil, fmt.Errorf("at most %d refused_outputs", workersvc.JobResultMaxRefusedOutputs)
@@ -262,6 +265,9 @@ func validateRefusedOutputs(in []workerRefusedOutputBody) ([]workersvc.JobRefuse
 			return nil, fmt.Errorf("refused_outputs[%d]: display_name is too long", i)
 		}
 		e := workersvc.JobRefusedOutput{DisplayName: sanitizeUploadName(r.DisplayName), Reason: r.Reason}
+		if workersvc.IsReservedJobOutputName(e.DisplayName) {
+			continue
+		}
 		if !seen[e] {
 			seen[e] = true
 			out = append(out, e)

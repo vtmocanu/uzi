@@ -56,7 +56,7 @@ func (e jfEnv) outputsNamed(t *testing.T, run uuid.UUID, name string) []uuid.UUI
 // a re-post with the same content stores nothing new and one with different content replaces them;
 // they do not count against the per-job output caps.
 //
-// MUTATION CHECK: removing the storeJobResultOutputs call from SubmitJobResult leaves no file and
+// MUTATION CHECK: removing the startJobResultOutputs call from SubmitJobResult leaves no file and
 // turns this red.
 func TestSubmitJobResultStoresGeneratedOutputsLiveDB(t *testing.T) {
 	l := wide()

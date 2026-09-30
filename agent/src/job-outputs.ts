@@ -73,7 +73,12 @@ const BAD_PATH_CHARS = /[\\\p{C}\p{Zl}\p{Zp}]/u;
 export function logSafe(s: string, max = 300): string {
   return s
     .slice(0, max)
-    .replace(/[\p{C}\p{Zl}\p{Zp}]/gu, (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+    .replace(/[\p{C}\p{Zl}\p{Zp}]/gu, (c) => {
+      const cp = c.codePointAt(0)!;
+      // Astral code points (private use planes, tag characters) escape whole as \u{...}; the BMP
+      // keeps the fixed four-digit \uXXXX form.
+      return cp > 0xffff ? `\\u{${cp.toString(16)}}` : `\\u${cp.toString(16).padStart(4, "0")}`;
+    });
 }
 
 const byteLen = (s: string): number => Buffer.byteLength(s, "utf8");
@@ -282,9 +287,12 @@ const OUTPUT_UPLOAD_RETRY_DELAYS_MS: readonly number[] = [1000, 3000];
 
 /** The floor of one upload's timeout and the slowest rate it assumes (bytes per second): a file's
  *  timeout is max(floor, size / rate), bounded by the time left to the deadline. The api's read
- *  deadline for the same file is max(RequestDeadline, size / the same rate) (workersvc
- *  UploadDeadline), never longer than this floor at the api's per-file cap, so the api does not cut
- *  a body off that the worker is still sending. */
+ *  deadline for the same file is min(max(RequestDeadline, size / the same rate), 10 min) (workersvc
+ *  UploadDeadline, ceiling MaxUploadDeadline). Both scale with size at the same rate, and the
+ *  worker's floor (300 s) is above the api's default RequestDeadline (120 s), so the worker's
+ *  per-attempt timeout is never shorter than the api's read deadline (a size whose api deadline
+ *  hits the 10 min ceiling has size / rate >= 600 s here too); the api therefore does not cut a
+ *  body off that the worker is still sending. The invariant assumes RequestDeadline <= 300 s. */
 const UPLOAD_MIN_TIMEOUT_MS = 300_000;
 const UPLOAD_MIN_RATE_BPS = 100 * 1024;
 

@@ -35,3 +35,37 @@ func TestJobFileLimitsUploadDeadline(t *testing.T) {
 		t.Errorf("small file under a 10 s RequestDeadline = %s, want 10s", got)
 	}
 }
+
+// TestJobFileLimitsUploadDeadlineCeiling: a raised per-file cap cannot stretch an upload past
+// MaxUploadDeadline (256 MiB at 100 KiB/s would be about 44 minutes), and an operator-set
+// RequestDeadline above the ceiling is honoured as the floor, not clipped.
+func TestJobFileLimitsUploadDeadlineCeiling(t *testing.T) {
+	const mib = 1 << 20
+	l := JobFileLimits{}.withDefaults()
+	if got := l.UploadDeadline(256*mib, 256*mib); got != MaxUploadDeadline {
+		t.Errorf("256 MiB under a 256 MiB cap = %s, want the %s ceiling", got, MaxUploadDeadline)
+	}
+	if got := l.UploadDeadline(58*mib, 256*mib); got != time.Duration((58*mib+UploadMinRateBytesPerSecond-1)/UploadMinRateBytesPerSecond)*time.Second {
+		t.Errorf("58 MiB = %s, want the scaled value (under the ceiling)", got)
+	}
+	long := JobFileLimits{RequestDeadline: 20 * time.Minute}.withDefaults()
+	if got := long.UploadDeadline(256*mib, 256*mib); got != 20*time.Minute {
+		t.Errorf("RequestDeadline above the ceiling = %s, want it honoured (20m)", got)
+	}
+}
+
+// TestStaleReservationCutoffCoversMaxUploadDeadline: the sweep must never release the reservation
+// of an upload that is still within its deadline, whatever the limits.
+func TestStaleReservationCutoffCoversMaxUploadDeadline(t *testing.T) {
+	for _, l := range []JobFileLimits{
+		JobFileLimits{}.withDefaults(),
+		JobFileLimits{RequestDeadline: 5 * time.Second}.withDefaults(),
+		JobFileLimits{RequestDeadline: 30 * time.Minute}.withDefaults(),
+		JobFileLimits{OutputFileMaxBytes: 1 << 30, InputFileMaxBytes: 1 << 30}.withDefaults(),
+	} {
+		maxDeadline := max(l.UploadDeadline(1<<40, 1<<40), l.UploadDeadline(0, 0))
+		if got := l.StaleReservationCutoff(); got <= maxDeadline {
+			t.Errorf("RequestDeadline %s: cutoff %s is not beyond the max upload deadline %s", l.RequestDeadline, got, maxDeadline)
+		}
+	}
+}

@@ -1254,8 +1254,9 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 
 		// Job output upload (PRD #1909 D4, M4): the worker stores the files it kept before it
 		// posts the result (the report and the findings JSON are the server's, stored from the
-		// result). Raw body + X-Uzi-Job-File metadata header; fenced exactly like the job-result route, BEFORE the body is read. Also NOT in
-		// laneWorkerAllowlist, for the same reason as the download above.
+		// result). Raw body + X-Uzi-Job-File metadata header; fenced exactly like the job-result
+		// route, BEFORE the body is read. Also NOT in laneWorkerAllowlist, for the same reason as
+		// the download above.
 		r.Post("/runs/{id}/files", h.WorkerJobOutputFile)
 
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent

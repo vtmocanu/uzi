@@ -209,19 +209,41 @@ func (l JobFileLimits) withDefaults() JobFileLimits {
 // before the worker gives up on it.
 const UploadMinRateBytesPerSecond = 100 << 10
 
+// MaxUploadDeadline is the absolute ceiling of one upload's wall time, whatever the declared size
+// or the per-file cap: a raised per-file cap cannot stretch a stalled or trickling upload past it
+// (256 MiB at 100 KiB/s would be about 44 minutes). An operator-set RequestDeadline above it is
+// honoured as the floor instead (see UploadDeadline).
+const MaxUploadDeadline = 10 * time.Minute
+
 // UploadDeadline is the wall time one upload of declared bytes may take to arrive:
 // max(RequestDeadline, declared / UploadMinRateBytesPerSecond), where declared is bounded by
-// fileMax (the per-file cap of the direction), so it never exceeds
-// max(RequestDeadline, fileMax / 100 KiB/s): 256 s at the default 25 MiB cap. A small file keeps
-// the plain RequestDeadline. A non-positive declared size counts as zero.
+// fileMax (the per-file cap of the direction), and the result never exceeds
+// max(RequestDeadline, MaxUploadDeadline). At the default 25 MiB cap that is 256 s; a small file
+// keeps the plain RequestDeadline. A non-positive declared size counts as zero.
 func (l JobFileLimits) UploadDeadline(declared, fileMax int64) time.Duration {
-	d := l.RequestDeadline
-	if d <= 0 {
-		d = 120 * time.Second
-	}
+	d := l.requestDeadlineOrDefault()
 	declared = min(max(declared, 0), max(fileMax, 0))
 	scaled := time.Duration((declared+UploadMinRateBytesPerSecond-1)/UploadMinRateBytesPerSecond) * time.Second
-	return max(d, scaled)
+	return min(max(d, scaled), l.maxUploadDeadline())
+}
+
+func (l JobFileLimits) requestDeadlineOrDefault() time.Duration {
+	if l.RequestDeadline <= 0 {
+		return 120 * time.Second
+	}
+	return l.RequestDeadline
+}
+
+// maxUploadDeadline is the largest value UploadDeadline can return.
+func (l JobFileLimits) maxUploadDeadline() time.Duration {
+	return max(l.requestDeadlineOrDefault(), MaxUploadDeadline)
+}
+
+// StaleReservationCutoff is how old a 'reserved' row must be before the sweep releases it: the
+// largest possible UploadDeadline plus one RequestDeadline of margin (the commit transaction and
+// clock skew), so a live upload, however slow, is never swept from under its own write.
+func (l JobFileLimits) StaleReservationCutoff() time.Duration {
+	return l.maxUploadDeadline() + l.requestDeadlineOrDefault()
 }
 
 // ClampWriteSlots bounds the upload write slots by the database pool size. Each streaming upload
@@ -864,7 +886,7 @@ func (j *JobFiles) Sweep(ctx context.Context) (JobFilesSweepResult, error) {
 	q := store.New(tx)
 	now := j.now()
 	var res JobFilesSweepResult
-	if res.ReleasedReservations, err = q.ReleaseStaleJobFileReservations(ctx, pgconv.Time(now.Add(-2*j.limits.RequestDeadline))); err != nil {
+	if res.ReleasedReservations, err = q.ReleaseStaleJobFileReservations(ctx, pgconv.Time(now.Add(-j.limits.StaleReservationCutoff()))); err != nil {
 		return JobFilesSweepResult{}, fmt.Errorf("release stale job file reservations: %w", err)
 	}
 	if res.Settled, err = q.SettleTerminalJobFiles(ctx, j.limits.Retention.Seconds()); err != nil {

@@ -61,12 +61,14 @@ COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state = 'reserved'), 
 -- One run's live (non-expired) files of one direction: the per-job file-count and byte caps. The
 -- two files the SERVER generates from a job's stored result (report.md and findings.json, see
 -- workersvc.SubmitJobResult) are not the job's own outputs and do not count against the per-job
--- caps; the worker output route refuses those two names, so an output carrying one is always the
--- server's. They still count toward the owner, instance and shared-budget sums.
+-- caps; the worker output route refuses those two names (case-insensitively), and the server writes
+-- exactly these two constants, so the match here is EXACT (no lower(): a locale-dependent fold such as
+-- U+0130 would exempt a name the Go predicate, strings.EqualFold, does not treat as reserved).
+-- They still count toward the owner, instance and shared-budget sums.
 SELECT count(*)::bigint AS file_count, COALESCE(sum(byte_size), 0)::bigint AS total_bytes
   FROM job_files
  WHERE run_id = @run_id AND direction = @direction AND state <> 'expired'
-   AND NOT (direction = 'output' AND lower(display_name) IN ('report.md', 'findings.json'));
+   AND NOT (direction = 'output' AND display_name IN ('report.md', 'findings.json'));
 
 -- name: ReserveJobFile :one
 -- Admission: the row in state 'reserved' at the DECLARED size, before any chunk is written.

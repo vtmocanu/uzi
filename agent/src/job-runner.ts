@@ -956,17 +956,36 @@ export class JobRunner {
     // result post below is refused the same way. `outputs.deadlineAt` is the upload phase's own
     // deadline (uploadPhaseDeadline: past the model's wall budget, inside the api's backstop grace).
     // report.md and findings.json are not uploaded: the api stores them from the result it scrubs.
-    const uploaded = await uploadJobOutputs({
-      client: this.client,
-      log,
-      runId,
-      generation: generation!,
-      workDir: outputs.workDir,
-      secretPaths: this.secretPaths,
-      outputFiles: store.outputFiles ?? [],
-      deadlineAt: outputs.deadlineAt,
-      ...(this.outputRetryDelaysMs ? { retryDelaysMs: this.outputRetryDelaysMs } : {}),
+    // An owner cancel during the upload phase: the session's cancel poll has stopped by now, so a
+    // watcher runs through this phase and aborts the uploads; the job then ends exactly as a cancel
+    // during the session does (failed 'run cancelled', which the consumed cancel input's stop
+    // verdict turns into the cancelled terminal) and no result is posted.
+    const uploadAbort = new AbortController();
+    const stopUploadPoll = new AbortController();
+    let cancelledInUpload = false;
+    const uploadPoll = this.watchCancel(runId, generation!, stopUploadPoll.signal, log, () => {
+      cancelledInUpload = true;
+      uploadAbort.abort();
     });
+    let uploaded: Awaited<ReturnType<typeof uploadJobOutputs>>;
+    try {
+      uploaded = await uploadJobOutputs({
+        client: this.client,
+        log,
+        runId,
+        generation: generation!,
+        workDir: outputs.workDir,
+        secretPaths: this.secretPaths,
+        outputFiles: store.outputFiles ?? [],
+        deadlineAt: outputs.deadlineAt,
+        signal: uploadAbort.signal,
+        ...(this.outputRetryDelaysMs ? { retryDelaysMs: this.outputRetryDelaysMs } : {}),
+      });
+    } finally {
+      stopUploadPoll.abort();
+      await uploadPoll.catch(() => undefined);
+    }
+    if (cancelledInUpload) return this.fail(runId, generation, "run cancelled");
     // POST the result FIRST: the api fails a job that completes with no stored result. The files the
     // worker dropped itself ride along so the api can record them as refusals.
     const body: JobResultRequest = {

@@ -250,39 +250,171 @@ type generatedFindingJSON struct {
 	Line      *int32  `json:"line,omitempty"`
 }
 
-// storeJobResultOutputs stores report.md (the stored, scrubbed report_md) and findings.json (the
+// Bounds of the generated-output storage (startJobResultOutputs). The ingest reply waits for it at
+// most generatedOutputsReplyBound, well inside the server's write timeout and the worker's http
+// timeout, and the storage itself is cut off after generatedOutputsTimeout.
+const (
+	generatedOutputsReplyBound = 3 * time.Second
+	generatedOutputsTimeout    = 60 * time.Second
+)
+
+// The reasons recorded, under the reserved name, when a generated output could not be stored.
+const (
+	RefusalGenerationTimeout = "generation_timeout" // the storage did not finish within its bound
+	RefusalGenerationFailed  = "generation_failed"  // the storage failed for a non-refusal reason
+)
+
+// runGenLock serialises the generated-output storage of one run (see acquireRunGen).
+type runGenLock struct {
+	ch   chan struct{}
+	refs int
+}
+
+// acquireRunGen takes the per-run generation lock, giving up when ctx ends. One process stores at
+// most one result's generated outputs per run at a time, so two re-posts of a result with different
+// content cannot interleave their replace-then-insert and leave two report.md rows. The lock is
+// in-process: concurrent re-posts landing on DIFFERENT api replicas are not serialised (accepted:
+// the worker posts a result once, sequentially, and never re-posts concurrently).
+func (s *Service) acquireRunGen(ctx context.Context, id uuid.UUID) (func(), error) {
+	s.genMu.Lock()
+	l := s.genLocks[id]
+	if l == nil {
+		if s.genLocks == nil {
+			s.genLocks = map[uuid.UUID]*runGenLock{}
+		}
+		l = &runGenLock{ch: make(chan struct{}, 1)}
+		s.genLocks[id] = l
+	}
+	l.refs++
+	s.genMu.Unlock()
+	unref := func() {
+		s.genMu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(s.genLocks, id)
+		}
+		s.genMu.Unlock()
+	}
+	select {
+	case l.ch <- struct{}{}:
+		return func() { <-l.ch; unref() }, nil
+	case <-ctx.Done():
+		unref()
+		return nil, ctx.Err()
+	}
+}
+
+// WaitForGeneratedOutputs blocks until every generated-output storage started by SubmitJobResult
+// has finished. The storage runs detached from the request, so a caller that must observe its
+// effect (a test, an orderly shutdown) waits here.
+func (s *Service) WaitForGeneratedOutputs() { s.genWG.Wait() }
+
+// startJobResultOutputs stores report.md (the stored, scrubbed report_md) and findings.json (the
 // stored, scrubbed findings) as output files of the run, and records the outputs the worker
 // reported dropping. It runs from SubmitJobResult AFTER the result transaction committed, so the
 // files are built from what the result store holds (the api's scrub), never from a worker upload.
-// It never fails the ingest: a cap or quota refusal is recorded in job_output_refusals, any other
-// failure is logged, and the next post of the result tries again.
+//
+// The storage runs in a goroutine tracked by the service (genWG) on a context DETACHED from the
+// request (context.WithoutCancel) with its own timeout (generatedOutputsTimeout): a worker that
+// disconnects does not cancel it, and a slow one does not fail the request. The caller waits for
+// it at most generatedOutputsReplyBound (or until its own ctx ends) and then answers regardless,
+// because the result is already committed and a late reply would only make the worker treat a
+// stored result as failed. Nothing is lost by answering early: the goroutine finishes the storage,
+// and an output it cannot store (a refusal, the timeout, any other failure) is recorded in
+// job_output_refusals (RefusalGenerationTimeout / RefusalGenerationFailed for the last two), never
+// dropped silently and never failing the ingest. A re-post is not needed for retry (no worker
+// re-posts a committed result): the recorded row is the outcome.
 //
 // Lock order: the result transaction (runs row FOR UPDATE, job_results, job_findings) is COMMITTED
 // before anything here starts, so no runs or result row lock is held while Reserve takes the
 // stored-files advisory keys (owner, then shared); Reserve's own run read is a plain read taken
-// before the keys, exactly as for a worker upload. The fence is re-read after each write instead
-// (fenceJobOutput), and a file whose claim went stale meanwhile is dropped, as StoreJobOutput does.
-// The writes take no upload slot: the body is in memory, so the write holds a connection only for
-// the insert, never for a slow client.
+// before the keys, exactly as for a worker upload. The per-run generation lock (acquireRunGen) is
+// taken first and held across the keys, and nothing that holds the keys waits on it. The fence is
+// re-read after each write instead (fenceJobOutput), and a file whose claim went stale meanwhile
+// is dropped, as StoreJobOutput does. The writes take no upload slot: the body is in memory, so
+// the write holds a connection only for the insert, never for a slow client.
 //
 // Idempotent: a re-post with the same content stores nothing new (the unique output index, or the
 // lookup); a re-post with different content replaces the earlier file of the same name.
+func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, run store.Run, gen int64, sub JobResultSubmission) {
+	if s.jobFiles == nil {
+		return
+	}
+	gctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), s.generatedOutputsTimeout())
+	done := make(chan struct{})
+	s.genWG.Add(1)
+	go func() {
+		defer s.genWG.Done()
+		defer cancel()
+		defer close(done)
+		s.storeJobResultOutputs(gctx, wkr, run, gen, sub)
+	}()
+	t := time.NewTimer(s.generatedOutputsReplyBound())
+	defer t.Stop()
+	select {
+	case <-done:
+	case <-t.C:
+	case <-ctx.Done():
+	}
+}
+
+func (s *Service) generatedOutputsTimeout() time.Duration {
+	if s.genTimeout > 0 {
+		return s.genTimeout
+	}
+	return generatedOutputsTimeout
+}
+
+func (s *Service) generatedOutputsReplyBound() time.Duration {
+	if s.genReplyBound > 0 {
+		return s.genReplyBound
+	}
+	return generatedOutputsReplyBound
+}
+
+// storeJobResultOutputs is the body of startJobResultOutputs; ctx carries the storage deadline.
 func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, run store.Run, gen int64, sub JobResultSubmission) {
 	jf := s.jobFiles
 	if jf == nil {
 		return
 	}
+	// Record a generation that did not finish: report.md and findings.json are the only names
+	// this path writes.
+	record := func(name string, err error) {
+		if err == nil {
+			return
+		}
+		reason := RefusalGenerationFailed
+		if ctx.Err() != nil {
+			reason = RefusalGenerationTimeout
+		}
+		slog.Warn("job files: generated output not stored", "run", run.ID.String(), "file", name, "reason", reason, "error", err)
+		jf.insertRefusal(ctx, run.ID, gen, name, 0, reason)
+	}
+	release, err := s.acquireRunGen(ctx, run.ID)
+	if err != nil {
+		record(JobOutputReportName, err)
+		record(JobOutputFindingsName, err)
+		return
+	}
+	defer release()
 	if sub.ReportMD != "" {
-		s.storeGeneratedOutput(ctx, wkr, run, gen, JobOutputReportName, "text/markdown", []byte(sub.ReportMD))
+		record(JobOutputReportName, s.storeGeneratedOutput(ctx, wkr, run, gen, JobOutputReportName, "text/markdown", []byte(sub.ReportMD)))
 	}
 	findings := make([]generatedFindingJSON, 0, len(sub.Findings))
 	for _, f := range sub.Findings {
 		findings = append(findings, generatedFindingJSON(f))
 	}
-	if raw, err := json.MarshalIndent(findings, "", "  "); err != nil {
+	// SetEscapeHTML(false): json.Marshal would write <, > and & as \u003c and friends (six bytes for
+	// one), inflating findings full of markup past the per-file cap for no reason.
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(findings); err != nil {
 		slog.Warn("job files: encoding findings.json", "run", run.ID.String(), "error", err)
 	} else {
-		s.storeGeneratedOutput(ctx, wkr, run, gen, JobOutputFindingsName, "application/json", raw)
+		record(JobOutputFindingsName, s.storeGeneratedOutput(ctx, wkr, run, gen, JobOutputFindingsName, "application/json", buf.Bytes()))
 	}
 	for i, r := range sub.RefusedOutputs {
 		if i >= jf.limits.OutputsMaxFiles {
@@ -292,25 +424,27 @@ func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, r
 	}
 }
 
-// storeGeneratedOutput stores one server-generated output (see storeJobResultOutputs).
-func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, run store.Run, gen int64, name, contentType string, content []byte) {
+// storeGeneratedOutput stores one server-generated output (see startJobResultOutputs). A cap or
+// quota refusal is recorded here and returns nil; any other failure is returned for the caller to
+// record.
+func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, run store.Run, gen int64, name, contentType string, content []byte) error {
 	jf := s.jobFiles
 	sum := sha256.Sum256(content)
 	p := JobOutputParams{ClaimGeneration: gen, DisplayName: name, Size: int64(len(content)), SHA256: hex.EncodeToString(sum[:])}
-	warn := func(msg string, err error) {
-		slog.Warn("job files: "+msg, "run", run.ID.String(), "file", name, "error", err)
+	if p.Size > jf.limits.OutputFileMaxBytes {
+		// Refused before any lookup or reservation: over the per-file cap, recorded like any refusal.
+		jf.insertRefusal(ctx, run.ID, gen, name, p.Size, RefusalFileTooLarge)
+		return nil
 	}
 	if _, err := store.New(jf.db).DeleteStaleGeneratedJobOutput(ctx, store.DeleteStaleGeneratedJobOutputParams{
 		RunID: pgconv.UUID(run.ID), ClaimGeneration: int8Ptr(&gen), DisplayName: name, Sha256: p.SHA256,
 	}); err != nil {
-		warn("replacing a generated output", err)
-		return
+		return err
 	}
 	if _, ok, err := jf.findOutput(ctx, run.ID, p); err != nil {
-		warn("looking up a generated output", err)
-		return
+		return err
 	} else if ok {
-		return
+		return nil
 	}
 	runID := run.ID
 	row, err := jf.Reserve(ctx, ReserveParams{
@@ -324,23 +458,24 @@ func (s *Service) storeGeneratedOutput(ctx context.Context, wkr store.Worker, ru
 	})
 	if err != nil {
 		if errors.Is(err, errJobOutputDuplicate) {
-			return // a concurrent post of the same result is storing it
+			return nil // a concurrent post of the same result is storing it
 		}
 		if rerr := jf.recordRefusal(ctx, run.ID, gen, p, err); !isRefusal(rerr) {
-			warn("reserving a generated output", rerr)
+			return rerr
 		}
-		return
+		return nil
 	}
 	stored, err := jf.Write(ctx, row.ID, run.UserID, bytes.NewReader(content), WriteOptions{ContentType: contentType})
 	if err != nil {
 		if rerr := jf.recordRefusal(ctx, run.ID, gen, p, err); !isRefusal(rerr) {
-			warn("writing a generated output", rerr)
+			return rerr
 		}
-		return
+		return nil
 	}
 	if _, ferr := s.fenceJobOutput(ctx, wkr, run.ID, gen); ferr != nil && !errors.Is(ferr, ErrRunTerminal) {
 		jf.dropStaleOutput(ctx, run.ID, stored.ID, gen)
 	}
+	return nil
 }
 
 func isRefusal(err error) bool {

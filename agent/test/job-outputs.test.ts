@@ -363,6 +363,9 @@ describe("uploadJobOutputs (PRD #1909 M4 rework)", () => {
   it("logSafe escapes format, control and separator characters and bounds the length", () => {
     assert.strictEqual(logSafe("a\u202eb\u0000c\u2028d"), "a\\u202eb\\u0000c\\u2028d");
     assert.strictEqual(logSafe("x".repeat(500), 10), "x".repeat(10));
+    // An astral code point (a private-use plane character) is escaped whole, never as two surrogates.
+    assert.strictEqual(logSafe("a\u{F0000}b"), "a\\u{f0000}b");
+    assert.strictEqual(logSafe("\u{E0041}"), "\\u{e0041}");
   });
 
   it("the upload phase ends JOB_UPLOAD_ALLOWANCE_MS after the wall budget deadline, inside the api's 300 s backstop grace", () => {

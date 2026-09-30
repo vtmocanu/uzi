@@ -78,7 +78,7 @@ function fakeClient(opts: {
   receipts?: boolean;
   postJobResult?: (id: string, body: JobResultRequest) => Promise<void>;
   /** Decide one upload attempt (default: stored, 201). May throw a RequestError. */
-  uploadJobFile?: (id: string, meta: JobFileUploadMeta, attempt: number) => Promise<{ status: number; file: JobFileUploadResponse }>;
+  uploadJobFile?: (id: string, meta: JobFileUploadMeta, attempt: number, signal?: AbortSignal) => Promise<{ status: number; file: JobFileUploadResponse }>;
   reportState?: (id: string, body: StateRequest) => unknown;
   downloadJobFile?: (
     id: string,
@@ -130,6 +130,7 @@ function fakeClient(opts: {
       id: string,
       meta: JobFileUploadMeta,
       body: Buffer | (() => Readable | Promise<Readable>),
+      signal?: AbortSignal,
     ) => {
       let bytes: Buffer;
       if (Buffer.isBuffer(body)) bytes = body;
@@ -143,7 +144,7 @@ function fakeClient(opts: {
       const key = `${meta.display_name}:${meta.sha256}`;
       const attempt = (attempts.get(key) ?? 0) + 1;
       attempts.set(key, attempt);
-      if (opts.uploadJobFile) return opts.uploadJobFile(id, meta, attempt);
+      if (opts.uploadJobFile) return opts.uploadJobFile(id, meta, attempt, signal);
       return { status: 201, file: { id: "f", display_name: meta.display_name, storage_name: `${meta.sha256}.txt`, content_type: "text/plain", byte_size: meta.size, sha256: meta.sha256, state: "attached", expires_at: null } };
     },
     hasFeature: () => false,
@@ -1046,6 +1047,36 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
     assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["a.txt"], "one attempt, then nothing more");
     assert.deepStrictEqual(calls.order, ["state:running", "upload:a.txt", "result"], "the stale result post abandons: no completed, no failed");
     assert.strictEqual(calls.results[0]!.body.refused_outputs, undefined, "nothing is reported on a stale claim");
+  });
+
+  it("an owner cancel during the upload phase aborts the uploads, posts no result and ends the job as cancelled", async () => {
+    let cancelAt = 0;
+    let sawSignal = false;
+    const { client, calls } = fakeClient({
+      receipts: true,
+      inputs: () => (cancelAt > 0 && Date.now() >= cancelAt ? [{ id: 77, kind: "cancel" } as UserInput] : []),
+      uploadJobFile: async (_id, _meta, _attempt, signal) => {
+        sawSignal = signal !== undefined;
+        cancelAt = Date.now() + 20;
+        // A stalled upload: only the abort signal ends it (bounded so a missing signal fails fast).
+        await new Promise<void>((resolve) => {
+          const t = setTimeout(resolve, 2000);
+          signal?.addEventListener("abort", () => { clearTimeout(t); resolve(); }, { once: true });
+        });
+        throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      },
+    });
+    const qf = sessionWriting({ "outputs/a.txt": "a", "outputs/b.txt": "b" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt", "outputs/b.txt"] });
+    const t0 = Date.now();
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    assert.ok(sawSignal, "uploadJobOutputs was given an AbortSignal");
+    assert.ok(Date.now() - t0 < 1500, "the cancel aborted the stalled upload promptly");
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["a.txt"], "no further file is offered after the cancel");
+    assert.strictEqual(calls.results.length, 0, "no result is posted after a cancel");
+    const last = calls.states.at(-1)!.body;
+    assert.strictEqual(last.status, "failed");
+    assert.strictEqual(last.failure_reason, "run cancelled");
+    assert.deepStrictEqual(calls.applied, [[77]]);
   });
 
   it("stops the uploads when the api takes no files for the run (404, files_unavailable), without retrying", async () => {
