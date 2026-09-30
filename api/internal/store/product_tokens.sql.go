@@ -72,7 +72,7 @@ func (q *Queries) CountActiveProductTokensForUserProduct(ctx context.Context, ar
 const createProduct = `-- name: CreateProduct :one
 INSERT INTO products (name, description, created_by, allowed_job_types)
 VALUES ($1, $2, $3, COALESCE($4::text[], '{}'))
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
 `
 
 type CreateProductParams struct {
@@ -104,6 +104,12 @@ func (q *Queries) CreateProduct(ctx context.Context, arg CreateProductParams) (P
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
 	)
 	return i, err
 }
@@ -186,7 +192,7 @@ func (q *Queries) CreateProductToken(ctx context.Context, arg CreateProductToken
 }
 
 const getProduct = `-- name: GetProduct :one
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types FROM products WHERE id = $1
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at FROM products WHERE id = $1
 `
 
 // One product by id, soft-deleted included (callers check enabled / deleted_at).
@@ -203,12 +209,18 @@ func (q *Queries) GetProduct(ctx context.Context, id uuid.UUID) (Product, error)
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
 	)
 	return i, err
 }
 
 const getProductForUpdate = `-- name: GetProductForUpdate :one
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types FROM products WHERE id = $1 FOR UPDATE
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at FROM products WHERE id = $1 FOR UPDATE
 `
 
 // One product by id, soft-deleted included, ROW-LOCKED for the rest of the transaction.
@@ -230,6 +242,12 @@ func (q *Queries) GetProductForUpdate(ctx context.Context, id uuid.UUID) (Produc
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
 	)
 	return i, err
 }
@@ -267,8 +285,11 @@ type GetProductTokenForAuthRow struct {
 // every generated row type and no DTO edit can leak it (the reasoning on
 // ListAllCLITokensForAdmin in cli_tokens.sql, applied to the whole table rather than to
 // the admin list alone). Do not "simplify" a product_tokens query to SELECT * /
-// RETURNING * or sqlc.embed(product_tokens). (The products queries may use *: that
-// table holds no credential material.)
+// RETURNING * or sqlc.embed(product_tokens). (The products queries may use *: the table
+// holds no access credential. Since PRD #1909 M6 it does hold products.skills_token_sealed,
+// a SEALED read-only clone token for the product's skills repo, so store.Product carries
+// it: every products DTO is an explicit field list and never embeds the row, see
+// product_skills.sql.)
 //
 // The /api/v1 auth lookup for a uzp_ Bearer (RequireV1Caller, PRD #1907 D4). Every
 // condition is re-read on EVERY request and every one fails closed (no row):
@@ -391,7 +412,7 @@ func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int3
 }
 
 const listEnabledProducts = `-- name: ListEnabledProducts :many
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
   FROM products
  WHERE enabled
    AND deleted_at IS NULL
@@ -418,6 +439,12 @@ func (q *Queries) ListEnabledProducts(ctx context.Context) ([]Product, error) {
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.AllowedJobTypes,
+			&i.SkillsRepoUrl,
+			&i.SkillsRef,
+			&i.SkillsTokenSealed,
+			&i.SkillsAppliedSha,
+			&i.SkillsAppliedBy,
+			&i.SkillsAppliedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -696,7 +723,7 @@ UPDATE products
        updated_at = now()
  WHERE id = $4
    AND deleted_at IS NULL
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
 `
 
 type UpdateProductParams struct {
@@ -733,6 +760,12 @@ func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (P
 		&i.CreatedAt,
 		&i.UpdatedAt,
 		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
 	)
 	return i, err
 }

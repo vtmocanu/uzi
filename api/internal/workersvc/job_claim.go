@@ -57,7 +57,8 @@ func jobCredentialErr(err error) error {
 }
 
 // assembleJobClaim builds the claim payload for an already-claimed kind='job' run (PRD #1908).
-// A job has no repo, no forge connection, no memory and no skills, so it forks in assembleClaim
+// A job has no repo, no forge connection and no memory, and carries no skill but its product's
+// approved ones (none for a uzc_ job), so it forks in assembleClaim
 // BEFORE GetRunClaimContext (which INNER-JOINs repos) and before any PAT decrypt: the payload
 // carries the model credential, the job block and the wall budget, and nothing else. The
 // credential resolves through the SAME ladder the ordinary Claude run lane uses (a per-run
@@ -130,6 +131,15 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		})
 	}
 
+	// Product skills (PRD #1909 D9): a job started through a registered product gets exactly that
+	// product's approved skills and no other skill; a uzc_ job has no origin product and gets none.
+	// Re-read on every claim, so a reapply or a disabled product takes effect on the next claim.
+	productRows, err := s.q.ListProductSkillsForRun(ctx, run.ID)
+	if err != nil {
+		return nil, fmt.Errorf("list product skills: %w", err)
+	}
+	skills, skillDrops := assembleProductSkills(productRows, s.p.SkillMaxBytes, s.p.SkillsMaxPerRun)
+
 	// The owner's Claude model lane, then a frozen per-run model when it is compatible. Best
 	// effort: a lookup error logs and the runner uses its own default, it never fails the claim.
 	var defaultModel *string
@@ -159,6 +169,9 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		DefaultEffort:          resolveEffortPtr(defaultEffort),
 		ToolPackages:           []string{},
 		DeniedToolPackages:     toolprofile.DenylistNames(),
+		// The skill caps the worker re-enforces over the product skills this claim carries.
+		SkillMaxBytes:   s.p.SkillMaxBytes,
+		SkillsMaxPerRun: s.p.SkillsMaxPerRun,
 	}
 	if s.jobFiles != nil {
 		l := s.jobFiles.Limits()
@@ -180,8 +193,8 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		RequeueCount:      run.RequeueCount,
 		Secrets:           ClaimSecrets{AnthropicOAuthToken: string(cred.Token)},
 		Agents:            []ClaimAgent{},
-		Skills:            []ClaimSkill{},
-		SkillsDropped:     []ClaimSkillDrop{},
+		Skills:            skills,
+		SkillsDropped:     skillDrops,
 		Config:            cfg,
 	}, nil
 }

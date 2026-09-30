@@ -6,8 +6,11 @@
 -- every generated row type and no DTO edit can leak it (the reasoning on
 -- ListAllCLITokensForAdmin in cli_tokens.sql, applied to the whole table rather than to
 -- the admin list alone). Do not "simplify" a product_tokens query to SELECT * /
--- RETURNING * or sqlc.embed(product_tokens). (The products queries may use *: that
--- table holds no credential material.)
+-- RETURNING * or sqlc.embed(product_tokens). (The products queries may use *: the table
+-- holds no access credential. Since PRD #1909 M6 it does hold products.skills_token_sealed,
+-- a SEALED read-only clone token for the product's skills repo, so store.Product carries
+-- it: every products DTO is an explicit field list and never embeds the row, see
+-- product_skills.sql.)
 --
 -- name: GetProductTokenForAuth :one
 -- The /api/v1 auth lookup for a uzp_ Bearer (RequireV1Caller, PRD #1907 D4). Every

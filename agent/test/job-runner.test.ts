@@ -1195,3 +1195,105 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
     assert.match(tools["submit_job_result"]!.description ?? "", /output_files/);
   });
 });
+
+describe("JobRunner product skills (PRD #1909 M6)", () => {
+  const SKILL = { name: "brand-voice", description: "How this product writes", body: "# Brand voice\nBe brief." };
+
+  it("a job with no skills is unchanged: no Skill tool, no plugin, an explicit empty skills list", async () => {
+    const { client } = fakeClient();
+    const seen: { options?: SdkOptions } = {};
+    const qf = scripted(async function* ({ options }) {
+      yield INIT_OK;
+      await callSubmit(options, GOOD_RESULT);
+      yield RESULT_OK;
+    }, seen);
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({ skills: [], skills_dropped: [] }));
+    assert.deepStrictEqual(seen.options!.tools, ["Read", "Write", "Glob", "Grep", "mcp__job__submit_job_result"]);
+    assert.deepStrictEqual(seen.options!.skills, [], "[] switches skills off; omitting the key would not");
+    assert.strictEqual(seen.options!.plugins, undefined);
+    assert.ok(!String(seen.options!.systemPrompt).includes("PRODUCT SKILLS"));
+  });
+
+  it("a job with skills gets the Skill tool, the plugin and the qualified names, and still denies Bash, Web* and subagents", async () => {
+    const { client } = fakeClient();
+    const seen: { options?: SdkOptions } = {};
+    let skillMd = "";
+    let pluginInWorkspace = false;
+    const qf = scripted(async function* ({ options }) {
+      const plugin = options.plugins?.[0] as { type: string; path: string; skipMcpDiscovery?: boolean };
+      skillMd = await fsp.readFile(path.join(plugin.path, "skills", "brand-voice", "SKILL.md"), "utf8");
+      // The plugin sits inside the workspace root but OUTSIDE the path-guard root (work/).
+      pluginInWorkspace = path.dirname(plugin.path) === path.dirname(options.cwd!) && !plugin.path.startsWith(options.cwd! + path.sep);
+      yield { ...INIT_OK, tools: [...INIT_OK.tools, "Skill"] };
+      await callSubmit(options, GOOD_RESULT);
+      yield RESULT_OK;
+    }, seen);
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({ skills: [SKILL], skills_dropped: [] }));
+    const o = seen.options!;
+    assert.deepStrictEqual(o.tools, ["Read", "Write", "Glob", "Grep", "Skill", "mcp__job__submit_job_result"]);
+    assert.deepStrictEqual(o.skills, ["uzi:brand-voice"]);
+    assert.deepStrictEqual(o.settingSources, []);
+    assert.match(skillMd, /name: "brand-voice"/);
+    assert.match(skillMd, /Be brief\./);
+    assert.ok(pluginInWorkspace, "the plugin dir is a sibling of work/, inside the workspace root");
+    assert.match(String(o.systemPrompt), /PRODUCT SKILLS/);
+    for (const dis of ["Bash", "WebFetch", "WebSearch", "Agent", "Task", "Edit", "NotebookEdit"]) {
+      assert.ok((o.disallowedTools ?? []).includes(dis), `${dis} stays disallowed with skills present`);
+      assert.ok(!(o.tools as string[]).includes(dis), `${dis} is not offered with skills present`);
+    }
+    assert.deepStrictEqual(Object.keys(o.mcpServers ?? {}), ["job"]);
+  });
+
+  it("the init-frame check admits Skill only for a job that carries skills", async () => {
+    assert.deepStrictEqual(disallowedEffectiveTools({ ...INIT_OK, tools: [...INIT_OK.tools, "Skill"] }), ["Skill"]);
+    assert.deepStrictEqual(disallowedEffectiveTools({ ...INIT_OK, tools: [...INIT_OK.tools, "Skill"] }, { skills: true }), []);
+    assert.deepStrictEqual(disallowedEffectiveTools({ ...INIT_OK, tools: [...INIT_OK.tools, "Skill", "Bash"] }, { skills: true }), ["Bash"]);
+    // and a session that lists Skill on a no-skills job is aborted
+    const { client, calls } = fakeClient();
+    const qf = scripted(async function* () {
+      yield { ...INIT_OK, tools: [...INIT_OK.tools, "Skill"] };
+      yield RESULT_OK;
+    });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    const failed = calls.states.find((s) => s.body.status === "failed");
+    assert.match(failed?.body.failure_reason ?? "", /tools outside the job policy: Skill/);
+  });
+
+  it("logs the server's drops and the worker's cap drops as run messages, and delivers only the survivors", async () => {
+    const { client, calls } = fakeClient();
+    const seen: { options?: SdkOptions } = {};
+    const big = { name: "too-big", description: "d", body: "x".repeat(100) };
+    const qf = scripted(async function* ({ options }) {
+      yield { ...INIT_OK, tools: [...INIT_OK.tools, "Skill"] };
+      await callSubmit(options, GOOD_RESULT);
+      yield RESULT_OK;
+    }, seen);
+    await newRunner(client, await tmpJobsRoot(), qf).execute(
+      jobClaim({
+        skills: [SKILL, big, { name: "Bad Name!", description: "d", body: "b" }],
+        skills_dropped: [{ name: "server-dropped", reason: "over_limit" }],
+        config: { skill_max_bytes: 50, skills_max_per_run: 5 },
+      }),
+    );
+    assert.deepStrictEqual(seen.options!.skills, ["uzi:brand-voice"]);
+    const texts = calls.messages.flatMap((m) => m.messages).map((m) => (m.payload as { text?: string }).text ?? "");
+    assert.ok(texts.some((t) => t.includes('"server-dropped"') && t.includes("maximum number")));
+    assert.ok(texts.some((t) => t.includes('"too-big"') && t.includes("maximum allowed size")));
+    assert.ok(texts.some((t) => t.includes("Bad Name!") && t.includes("dropped")));
+  });
+
+  it("when every skill is dropped the job runs as a no-skills job", async () => {
+    const { client } = fakeClient();
+    const seen: { options?: SdkOptions } = {};
+    const qf = scripted(async function* ({ options }) {
+      yield INIT_OK;
+      await callSubmit(options, GOOD_RESULT);
+      yield RESULT_OK;
+    }, seen);
+    await newRunner(client, await tmpJobsRoot(), qf).execute(
+      jobClaim({ skills: [{ name: "too-big", description: "d", body: "x".repeat(100) }], config: { skill_max_bytes: 50 } }),
+    );
+    assert.deepStrictEqual(seen.options!.tools, ["Read", "Write", "Glob", "Grep", "mcp__job__submit_job_result"]);
+    assert.deepStrictEqual(seen.options!.skills, []);
+  });
+});

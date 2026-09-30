@@ -5,6 +5,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/skilltmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -20,18 +21,24 @@ const (
 	// SKILLS_MAX_PER_RUN; lowest-precedence skills are dropped first. The name is
 	// not delivered at all.
 	DropOverLimit = "over_limit"
+	// DropTooLarge: a product skill was dropped because its body exceeds SKILL_MAX_BYTES (the cap
+	// was lowered after the set was approved). The worker's own cap check uses the same code.
+	DropTooLarge = "too_large"
 )
 
 // scopeRank orders skill scopes for name-collision precedence and cap eviction:
 // user (3) > global (2) > builtin (1). An unknown scope ranks 0 (should never
-// occur; the DB CHECK constrains scope).
+// occur; the DB CHECK constrains scope). PRODUCT (PRD #1909) deliberately also ranks 0: a product
+// skill never enters this precedence union (ListRunSkillAllocations excludes the scope, and a
+// product job's skills are assembled apart, assembleProductSkills), so it has no rank to win or
+// lose by. TestScopeRankCoversEveryScope pins the whole table to skilltmpl.Scopes.
 func scopeRank(scope string) int {
 	switch scope {
-	case "user":
+	case skilltmpl.ScopeUser:
 		return 3
-	case "global":
+	case skilltmpl.ScopeGlobal:
 		return 2
-	case "builtin":
+	case skilltmpl.ScopeBuiltin:
 		return 1
 	default:
 		return 0
@@ -176,4 +183,30 @@ func assembleRunSkills(rows []store.ListRunSkillAllocationsRow, maxPerRun int) a
 	}
 
 	return assembledSkills{union: union, perTemplate: perTemplate, dropped: dropped}
+}
+
+// assembleProductSkills builds the skills of a product JOB (PRD #1909 D9) from the product's
+// approved skill rows. A product job receives exactly these and nothing else: no user, global or
+// builtin skill and no repo skill, so what shapes the product's output is what the product ships.
+// The same caps as a run's union apply: a body over maxBytes (<=0 means no cap) is dropped as
+// DropTooLarge, then the set is cut to maxPerRun (<=0 means no cap) in name order, the rest
+// dropped as DropOverLimit. Output is sorted by name and the drops by name then reason, so the
+// claim payload is byte-stable. Both results are non-nil.
+func assembleProductSkills(rows []store.ListProductSkillsForRunRow, maxBytes, maxPerRun int) ([]ClaimSkill, []ClaimSkillDrop) {
+	sorted := append([]store.ListProductSkillsForRunRow(nil), rows...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].Name < sorted[j].Name })
+	skills := make([]ClaimSkill, 0, len(sorted))
+	dropped := []ClaimSkillDrop{}
+	for _, r := range sorted {
+		if maxBytes > 0 && len(r.Body) > maxBytes {
+			dropped = append(dropped, ClaimSkillDrop{Name: r.Name, Reason: DropTooLarge})
+			continue
+		}
+		if maxPerRun > 0 && len(skills) >= maxPerRun {
+			dropped = append(dropped, ClaimSkillDrop{Name: r.Name, Reason: DropOverLimit})
+			continue
+		}
+		skills = append(skills, ClaimSkill{Name: r.Name, Description: r.Description, Body: r.Body})
+	}
+	return skills, dropped
 }

@@ -106,7 +106,7 @@ func (h *Handler) V1FileDownload(w http.ResponseWriter, r *http.Request) {
 	hd.Set("X-Content-Type-Options", "nosniff")
 	// The filename is the content-derived storage name (<sha256>.<ext>: [0-9a-f.a-z] only), never
 	// the uploader's display name, so the header needs no quoting or escaping and cannot carry
-	// control or bidi characters. Fall back to the digest when a row has no storage name.
+	// control or bidi characters. Fall back to the file id (a UUID, equally header-safe) when a row has no storage name.
 	name := f.StorageName.String
 	if name == "" {
 		name = f.ID.String()

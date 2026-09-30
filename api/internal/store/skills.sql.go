@@ -15,7 +15,7 @@ import (
 const createSkill = `-- name: CreateSkill :one
 INSERT INTO skills (name, description, body, scope, user_id, updated_by)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, name, description, body, scope, user_id, updated_by, created_at, updated_at
+RETURNING id, name, description, body, scope, user_id, updated_by, created_at, updated_at, product_id
 `
 
 type CreateSkillParams struct {
@@ -49,6 +49,7 @@ func (q *Queries) CreateSkill(ctx context.Context, arg CreateSkillParams) (Skill
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProductID,
 	)
 	return i, err
 }
@@ -63,11 +64,11 @@ func (q *Queries) DeleteSharedAllocations(ctx context.Context, templateID uuid.U
 }
 
 const deleteSkill = `-- name: DeleteSkill :execrows
-DELETE FROM skills WHERE id = $1 AND scope <> 'builtin'
+DELETE FROM skills WHERE id = $1 AND scope IN ('global', 'user')
 `
 
-// Never deletes a builtin (the handler returns 409 first); the scope guard is
-// belt-and-suspenders.
+// Never deletes a builtin (the handler returns 409 first) and never a product skill (only an
+// apply replaces those); the scope guard is belt-and-suspenders.
 func (q *Queries) DeleteSkill(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteSkill, id)
 	if err != nil {
@@ -91,12 +92,14 @@ func (q *Queries) DeleteUserAllocations(ctx context.Context, arg DeleteUserAlloc
 }
 
 const getSkill = `-- name: GetSkill :one
-SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at FROM skills WHERE id = $1
+SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at, product_id FROM skills WHERE id = $1
 `
 
 // Unfiltered fetch for the write path: the handler loads the row, then applies
 // the scope-based write authz in Go (builtin/global admin-only, user owner-only)
-// and maps an unauthorized user-scope row to 404 so existence never leaks.
+// and maps an unauthorized user-scope row to 404 so existence never leaks. It does return a
+// product-scope row (the admin product routes share it); every handler that takes a skill id
+// from a caller treats scope 'product' as not found (authorizeSkillWrite, allocatable*).
 func (q *Queries) GetSkill(ctx context.Context, id uuid.UUID) (Skill, error) {
 	row := q.db.QueryRow(ctx, getSkill, id)
 	var i Skill
@@ -110,14 +113,15 @@ func (q *Queries) GetSkill(ctx context.Context, id uuid.UUID) (Skill, error) {
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProductID,
 	)
 	return i, err
 }
 
 const getSkillForViewer = `-- name: GetSkillForViewer :one
-SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at FROM skills
+SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at, product_id FROM skills
 WHERE id = $1
-  AND ($2::boolean
+  AND (($2::boolean AND scope IN ('builtin', 'global', 'user'))
        OR scope IN ('builtin', 'global')
        OR (scope = 'user' AND user_id = $3))
 `
@@ -142,6 +146,7 @@ func (q *Queries) GetSkillForViewer(ctx context.Context, arg GetSkillForViewerPa
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProductID,
 	)
 	return i, err
 }
@@ -149,7 +154,7 @@ func (q *Queries) GetSkillForViewer(ctx context.Context, arg GetSkillForViewerPa
 const insertBuiltinSkill = `-- name: InsertBuiltinSkill :execrows
 INSERT INTO skills (name, description, body, scope)
 VALUES ($1, $2, $3, 'builtin')
-ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING
+ON CONFLICT (name) WHERE scope IN ('builtin', 'global') DO NOTHING
 `
 
 type InsertBuiltinSkillParams struct {
@@ -209,6 +214,7 @@ SELECT a.template_id, a.skill_id, a.user_id, a.created_at,
 FROM agent_skill_allocations a
 JOIN skills s ON s.id = a.skill_id
 WHERE a.template_id = $1
+  AND s.scope IN ('builtin', 'global', 'user')
   AND (a.user_id IS NULL OR a.user_id = $2)
 ORDER BY (a.user_id IS NOT NULL), s.name
 `
@@ -270,8 +276,8 @@ SELECT at.name AS template_name,
 FROM agent_skill_allocations a
 JOIN agent_templates at ON at.id = a.template_id
 JOIN skills s ON s.id = a.skill_id
-WHERE (a.user_id IS NULL AND s.scope <> 'user')
-   OR (a.user_id = $1 AND (s.scope <> 'user' OR s.user_id = $1))
+WHERE (a.user_id IS NULL AND s.scope IN ('builtin', 'global'))
+   OR (a.user_id = $1 AND (s.scope IN ('builtin', 'global') OR (s.scope = 'user' AND s.user_id = $1)))
 ORDER BY at.name, s.name
 `
 
@@ -327,8 +333,8 @@ func (q *Queries) ListRunSkillAllocations(ctx context.Context, userID pgtype.UUI
 
 const listSkillsForViewer = `-- name: ListSkillsForViewer :many
 
-SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at FROM skills
-WHERE $1::boolean
+SELECT id, name, description, body, scope, user_id, updated_by, created_at, updated_at, product_id FROM skills
+WHERE ($1::boolean AND scope IN ('builtin', 'global', 'user'))
    OR scope IN ('builtin', 'global')
    OR (scope = 'user' AND user_id = $2)
 ORDER BY scope, name
@@ -340,10 +346,19 @@ type ListSkillsForViewerParams struct {
 }
 
 // Skills -------------------------------------------------------------------
+//
+// SCOPE VOCABULARY (PRD #1909 M6): builtin | global | user | product (skilltmpl.Scopes; the
+// skills_scope_check CHECK). 'product' skills belong to one product and are delivered only to
+// that product's jobs (product_skills.sql, ListProductSkillsForRun); they never appear in a
+// viewer listing, an allocation or a run's allocation union. So every predicate in this file
+// that filters on scope names its scopes in an explicit IN list. A `scope <> 'x'` here would
+// silently admit 'product'.
 // Read authz: builtin + global are visible to everyone; a user's own private
 // skills are visible only to that user; admins see all scopes. This is NOT the
 // agent-templates all-shared read — copying that verbatim would leak private
 // user skills.
+// Product skills are in NO branch: not even an admin lists them here (they are read through
+// the admin product route, ListProductSkills).
 func (q *Queries) ListSkillsForViewer(ctx context.Context, arg ListSkillsForViewerParams) ([]Skill, error) {
 	rows, err := q.db.Query(ctx, listSkillsForViewer, arg.IsAdmin, arg.ViewerID)
 	if err != nil {
@@ -363,6 +378,7 @@ func (q *Queries) ListSkillsForViewer(ctx context.Context, arg ListSkillsForView
 			&i.UpdatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.ProductID,
 		); err != nil {
 			return nil, err
 		}
@@ -379,7 +395,7 @@ INSERT INTO agent_skill_allocations (template_id, skill_id, user_id)
 SELECT t.id, s.id, NULL
 FROM agent_templates t, skills s
 WHERE t.name = $1 AND t.scope <> 'user'
-  AND s.name = $2    AND s.scope <> 'user'
+  AND s.name = $2    AND s.scope IN ('builtin', 'global')
 ON CONFLICT DO NOTHING
 `
 
@@ -408,9 +424,9 @@ type SeedSharedSkillAllocationByNameParams struct {
 // returned 0 here, and 0 means unambiguously "no such shared agent template".
 //
 // Both scope guards are load-bearing, and the skills one is the sharper:
-// uq_skills_shared_name is a PARTIAL unique index (WHERE scope <> 'user'), so
+// uq_skills_shared_name is a PARTIAL unique index (WHERE scope IN ('builtin','global')), so
 // `WHERE name = @skill_name` alone matches every user's private skill of that
-// name too — N users, N rows, each a SHARED (user_id NULL) allocation pointing at
+// name too (and every product's) — N rows, each a SHARED (user_id NULL) allocation pointing at
 // a private body. ListRunSkillAllocations' scope predicates would refuse to ship
 // those, but that is the second layer; this must not be the first-layer bug it
 // exists to backstop.
@@ -428,8 +444,8 @@ SET description = $1,
     body = $2,
     updated_by = $3,
     updated_at = now()
-WHERE id = $4
-RETURNING id, name, description, body, scope, user_id, updated_by, created_at, updated_at
+WHERE id = $4 AND scope IN ('builtin', 'global', 'user')
+RETURNING id, name, description, body, scope, user_id, updated_by, created_at, updated_at, product_id
 `
 
 type UpdateSkillParams struct {
@@ -440,7 +456,8 @@ type UpdateSkillParams struct {
 }
 
 // Edits the mutable fields. name and scope are immutable and never touched here.
-// Also used by the builtin reset path to re-apply the embedded definition.
+// Also used by the builtin reset path to re-apply the embedded definition. A product skill is
+// changed only by an apply (product_skills.sql), never here.
 func (q *Queries) UpdateSkill(ctx context.Context, arg UpdateSkillParams) (Skill, error) {
 	row := q.db.QueryRow(ctx, updateSkill,
 		arg.Description,
@@ -459,6 +476,7 @@ func (q *Queries) UpdateSkill(ctx context.Context, arg UpdateSkillParams) (Skill
 		&i.UpdatedBy,
 		&i.CreatedAt,
 		&i.UpdatedAt,
+		&i.ProductID,
 	)
 	return i, err
 }

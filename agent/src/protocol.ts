@@ -1129,8 +1129,9 @@ export interface ClaimResponse {
   pipeline?: ClaimPipeline | null;
   /** PRD #1908: the job block of a kind="job" claim (the repo-less run kind): the caller's job
    *  type, title, prompt and named input documents, in ordinal order. Present only for a job
-   *  claim; a job claim carries no repo, forge PAT, memory or skills. The prompt and input
-   *  contents are UNTRUSTED caller text. */
+   *  claim; a job claim carries no repo, forge PAT or memory, and its `skills` are ONLY the
+   *  approved skills of the product that started the job (PRD #1909 D9; none for a uzc_ job).
+   *  The prompt and input contents are UNTRUSTED caller text. */
   job?: ClaimJob;
   /** PRD #1908: the job's wall-clock budget in seconds; the job runner aborts and reports
    *  failed at this bound. Present only on a job claim. */

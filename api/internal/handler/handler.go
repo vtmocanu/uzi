@@ -101,9 +101,13 @@ type Handler struct {
 	// box is the generic secret cipher used by the per-user secret endpoints
 	// (Anthropic token). svc owns the forge-specific machinery (which also holds
 	// its own box for PAT sealing); the two share the same key material.
-	box  *secretbox.Box
-	svc  *forgesvc.Service
-	wsvc *workersvc.Service
+	box *secretbox.Box
+	// productSkillsFetch reads a product's skills repo (PRD #1909 M6). nil means
+	// agentsource.FetchSkillFiles; a test injects a fake so the admin sync route is exercised
+	// without a network clone.
+	productSkillsFetch productSkillsFetcher
+	svc                *forgesvc.Service
+	wsvc               *workersvc.Service
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service

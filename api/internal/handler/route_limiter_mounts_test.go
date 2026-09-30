@@ -346,6 +346,7 @@ var wantRouteMounts = []routeMount{
 	// /cli-tokens sibling) ride the same credential-surface limiter, each in its own
 	// (pattern, user) bucket.
 	{"GET", "/api/admin/products", limAuth},
+	{"GET", "/api/admin/products/{id}/skills", limAuth},
 	{"GET", "/api/admin/product-tokens", limAuth},
 	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
 	// privilege_report (no forge call) → noLimiter.
@@ -610,6 +611,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #1907 M4: register a product and admin-revoke one product token (D8) —
 	// cookie-only admin DB writes, no forge call → noLimiter.
 	{"POST", "/api/admin/products", noLimiter},
+	{"POST", "/api/admin/products/{id}/skills/apply", noLimiter},
+	{"POST", "/api/admin/products/{id}/skills/sync", noLimiter},
 	{"POST", "/api/admin/product-tokens/{id}/revoke", noLimiter},
 	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
 	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A

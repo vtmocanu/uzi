@@ -1307,6 +1307,9 @@ type Store interface {
 	// owner's own allocated user templates ride the claim, not every template.
 	ListClaimAgentTemplates(ctx context.Context, userID pgtype.UUID) ([]store.AgentTemplate, error)
 	ListRunSkillAllocations(ctx context.Context, userID pgtype.UUID) ([]store.ListRunSkillAllocationsRow, error)
+	// ListProductSkillsForRun reads the approved product skills of the product that started a
+	// JOB run (PRD #1909 D9), from job_origins. Empty for a uzc_ job and for every non-job run.
+	ListProductSkillsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListProductSkillsForRunRow, error)
 	// Tier-1 tool provisioning (PRD #18 M4): the run owner's per-repo package list
 	// and the admin allowlist it is re-validated against at claim time.
 	GetRepoToolProfile(ctx context.Context, arg store.GetRepoToolProfileParams) (store.RepoToolProfile, error)

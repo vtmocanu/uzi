@@ -1,12 +1,21 @@
 -- Skills -------------------------------------------------------------------
+--
+-- SCOPE VOCABULARY (PRD #1909 M6): builtin | global | user | product (skilltmpl.Scopes; the
+-- skills_scope_check CHECK). 'product' skills belong to one product and are delivered only to
+-- that product's jobs (product_skills.sql, ListProductSkillsForRun); they never appear in a
+-- viewer listing, an allocation or a run's allocation union. So every predicate in this file
+-- that filters on scope names its scopes in an explicit IN list. A `scope <> 'x'` here would
+-- silently admit 'product'.
 
 -- name: ListSkillsForViewer :many
 -- Read authz: builtin + global are visible to everyone; a user's own private
 -- skills are visible only to that user; admins see all scopes. This is NOT the
 -- agent-templates all-shared read — copying that verbatim would leak private
 -- user skills.
+-- Product skills are in NO branch: not even an admin lists them here (they are read through
+-- the admin product route, ListProductSkills).
 SELECT * FROM skills
-WHERE sqlc.arg(is_admin)::boolean
+WHERE (sqlc.arg(is_admin)::boolean AND scope IN ('builtin', 'global', 'user'))
    OR scope IN ('builtin', 'global')
    OR (scope = 'user' AND user_id = sqlc.arg(viewer_id))
 ORDER BY scope, name;
@@ -15,14 +24,16 @@ ORDER BY scope, name;
 -- Single-skill read with the same visibility rule as ListSkillsForViewer.
 SELECT * FROM skills
 WHERE id = sqlc.arg(id)
-  AND (sqlc.arg(is_admin)::boolean
+  AND ((sqlc.arg(is_admin)::boolean AND scope IN ('builtin', 'global', 'user'))
        OR scope IN ('builtin', 'global')
        OR (scope = 'user' AND user_id = sqlc.arg(viewer_id)));
 
 -- name: GetSkill :one
 -- Unfiltered fetch for the write path: the handler loads the row, then applies
 -- the scope-based write authz in Go (builtin/global admin-only, user owner-only)
--- and maps an unauthorized user-scope row to 404 so existence never leaks.
+-- and maps an unauthorized user-scope row to 404 so existence never leaks. It does return a
+-- product-scope row (the admin product routes share it); every handler that takes a skill id
+-- from a caller treats scope 'product' as not found (authorizeSkillWrite, allocatable*).
 SELECT * FROM skills WHERE id = $1;
 
 -- name: CreateSkill :one
@@ -34,19 +45,20 @@ RETURNING *;
 
 -- name: UpdateSkill :one
 -- Edits the mutable fields. name and scope are immutable and never touched here.
--- Also used by the builtin reset path to re-apply the embedded definition.
+-- Also used by the builtin reset path to re-apply the embedded definition. A product skill is
+-- changed only by an apply (product_skills.sql), never here.
 UPDATE skills
 SET description = @description,
     body = @body,
     updated_by = @updated_by,
     updated_at = now()
-WHERE id = @id
+WHERE id = @id AND scope IN ('builtin', 'global', 'user')
 RETURNING *;
 
 -- name: DeleteSkill :execrows
--- Never deletes a builtin (the handler returns 409 first); the scope guard is
--- belt-and-suspenders.
-DELETE FROM skills WHERE id = @id AND scope <> 'builtin';
+-- Never deletes a builtin (the handler returns 409 first) and never a product skill (only an
+-- apply replaces those); the scope guard is belt-and-suspenders.
+DELETE FROM skills WHERE id = @id AND scope IN ('global', 'user');
 
 -- name: InsertBuiltinSkill :execrows
 -- Idempotent seed used by the startup reconciler: insert a missing builtin,
@@ -54,7 +66,7 @@ DELETE FROM skills WHERE id = @id AND scope <> 'builtin';
 -- builtin's name via the uq_skills_shared_name partial unique index.
 INSERT INTO skills (name, description, body, scope)
 VALUES (@name, @description, @body, 'builtin')
-ON CONFLICT (name) WHERE scope <> 'user' DO NOTHING;
+ON CONFLICT (name) WHERE scope IN ('builtin', 'global') DO NOTHING;
 
 -- Skill allocations --------------------------------------------------------
 
@@ -67,6 +79,7 @@ SELECT a.template_id, a.skill_id, a.user_id, a.created_at,
 FROM agent_skill_allocations a
 JOIN skills s ON s.id = a.skill_id
 WHERE a.template_id = sqlc.arg(template_id)
+  AND s.scope IN ('builtin', 'global', 'user')
   AND (a.user_id IS NULL OR a.user_id = sqlc.arg(viewer_id))
 ORDER BY (a.user_id IS NOT NULL), s.name;
 
@@ -107,9 +120,9 @@ ON CONFLICT DO NOTHING;
 -- returned 0 here, and 0 means unambiguously "no such shared agent template".
 --
 -- Both scope guards are load-bearing, and the skills one is the sharper:
--- uq_skills_shared_name is a PARTIAL unique index (WHERE scope <> 'user'), so
+-- uq_skills_shared_name is a PARTIAL unique index (WHERE scope IN ('builtin','global')), so
 -- `WHERE name = @skill_name` alone matches every user's private skill of that
--- name too — N users, N rows, each a SHARED (user_id NULL) allocation pointing at
+-- name too (and every product's) — N rows, each a SHARED (user_id NULL) allocation pointing at
 -- a private body. ListRunSkillAllocations' scope predicates would refuse to ship
 -- those, but that is the second layer; this must not be the first-layer bug it
 -- exists to backstop.
@@ -117,7 +130,7 @@ INSERT INTO agent_skill_allocations (template_id, skill_id, user_id)
 SELECT t.id, s.id, NULL
 FROM agent_templates t, skills s
 WHERE t.name = @template_name AND t.scope <> 'user'
-  AND s.name = @skill_name    AND s.scope <> 'user'
+  AND s.name = @skill_name    AND s.scope IN ('builtin', 'global')
 ON CONFLICT DO NOTHING;
 
 -- name: ListRunSkillAllocations :many
@@ -144,6 +157,6 @@ SELECT at.name AS template_name,
 FROM agent_skill_allocations a
 JOIN agent_templates at ON at.id = a.template_id
 JOIN skills s ON s.id = a.skill_id
-WHERE (a.user_id IS NULL AND s.scope <> 'user')
-   OR (a.user_id = @user_id AND (s.scope <> 'user' OR s.user_id = @user_id))
+WHERE (a.user_id IS NULL AND s.scope IN ('builtin', 'global'))
+   OR (a.user_id = @user_id AND (s.scope IN ('builtin', 'global') OR (s.scope = 'user' AND s.user_id = @user_id)))
 ORDER BY at.name, s.name;

@@ -120,6 +120,12 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// and their token rows are listed (D9: the audit trail). The writes are
 			// cookie-only, in the group below.
 			r.With(authLimiter.PerUserMiddleware).Get("/products", h.AdminListProducts)
+			// A product's skill set (PRD #1909 M6): its skills source config (the clone token only
+			// as set/not set), the applied skills and the staged snapshot with its diff. A read a
+			// uza_ token may make (it carries skill bodies, which uzi admins may see) and on
+			// authLimiter's per-user budget like the registry read beside it. The sync and apply
+			// writes are cookie-only, in the group below.
+			r.With(authLimiter.PerUserMiddleware).Get("/products/{id}/skills", h.AdminGetProductSkills)
 			r.With(authLimiter.PerUserMiddleware).Get("/product-tokens", h.AdminListProductTokens)
 			// Egress profiles (PRD #1906 M1): the named site lists an official-sources
 			// research run will be bound to. Reads only here, so a uza_ token can list and
@@ -216,6 +222,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Post("/products", h.AdminCreateProduct)
 			r.Patch("/products/{id}", h.AdminPatchProduct)
 			r.Delete("/products/{id}", h.AdminDeleteProduct)
+			// Product skill sets (PRD #1909 M6): sync STAGES the product's skills repo (the one
+			// egress path, through the same bounded clone the agent source uses) and apply is the
+			// admin approval that replaces the product's applied skills in one transaction.
+			// Nothing reaches a job before apply. Cookie-only, so a uza_ Bearer 401s before the
+			// handler; no per-user limiter, like the agent-source sync beside it.
+			r.Post("/products/{id}/skills/sync", h.AdminSyncProductSkills)
+			r.Post("/products/{id}/skills/apply", h.AdminApplyProductSkills)
 			r.Post("/product-tokens/{id}/revoke", h.AdminRevokeProductToken)
 			// Egress profile writes (PRD #1906 M1): create, full replace, delete. Cookie-only
 			// admin writes, so a uza_ Bearer 401s before the handler and the CLI stays

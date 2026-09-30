@@ -94,7 +94,7 @@ import { buildForgeToolsServer, FORGE_SERVER_NAME } from "./forge-tools.js";
 import { buildFindingsToolsServer, FINDINGS_SERVER_NAME } from "./findings-tools.js";
 import { isTransientStatus, type WorkerClient } from "./client.js";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
-import { qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
+import { describeSkillDrop, qualifiedSkillName, type SkillDrop } from "./skills-plugin.js";
 import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
 import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
 import { defaultQueryFn, providerErrorMessage } from "./sdk-messages.js";
@@ -4381,27 +4381,6 @@ function planMaxRevisionsOf(config: ClaimConfig | null | undefined): number {
   if (typeof v === "number" && Number.isFinite(v) && v >= 0)
     return Math.floor(v);
   return DEFAULT_MAX_REVISIONS;
-}
-
-/** Human-readable run-message text for a dropped skill, by reason code. Unknown
- *  codes degrade to a generic line rather than dropping the log. */
-function describeSkillDrop(name: string, reason: string): string {
-  switch (reason) {
-    case "shadowed":
-      return `skill "${name}" was shadowed by a higher-precedence skill of the same name and will not be loaded`;
-    case "over_limit":
-      return `skill "${name}" was dropped: the run exceeded the maximum number of skills`;
-    case "too_large":
-      return `skill "${name}" was dropped: its body exceeds the maximum allowed size`;
-    case "repo_collision":
-      return `repo skill "${name}" was skipped: a higher-precedence skill of the same name is already loaded`;
-    case "shadowed_by_claude":
-      return `repo skill "${name}" from .agents/skills was skipped: a real .claude/skills skill of the same name takes precedence`;
-    case "repo_invalid":
-      return `repo skill "${name}" was skipped: invalid name, description, or body`;
-    default:
-      return `skill "${name}" was dropped (${reason})`;
-  }
 }
 
 /**

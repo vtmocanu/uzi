@@ -145,3 +145,24 @@ export function enforceSkillCaps(
   }
   return { kept, dropped };
 }
+
+/** Human-readable run-message text for a dropped skill, by reason code. Unknown
+ *  codes degrade to a generic line rather than dropping the log. */
+export function describeSkillDrop(name: string, reason: string): string {
+  switch (reason) {
+    case "shadowed":
+      return `skill "${name}" was shadowed by a higher-precedence skill of the same name and will not be loaded`;
+    case "over_limit":
+      return `skill "${name}" was dropped: the run exceeded the maximum number of skills`;
+    case "too_large":
+      return `skill "${name}" was dropped: its body exceeds the maximum allowed size`;
+    case "repo_collision":
+      return `repo skill "${name}" was skipped: a higher-precedence skill of the same name is already loaded`;
+    case "shadowed_by_claude":
+      return `repo skill "${name}" from .agents/skills was skipped: a real .claude/skills skill of the same name takes precedence`;
+    case "repo_invalid":
+      return `repo skill "${name}" was skipped: invalid name, description, or body`;
+    default:
+      return `skill "${name}" was dropped (${reason})`;
+  }
+}

@@ -119,39 +119,59 @@ type CloneOptions struct {
 // is PAT-scrubbed.
 func FetchRoleFiles(ctx context.Context, opts CloneOptions) (sha string, files []SourceFile, err error) {
 	scrub := scrubber(opts.Token)
+	commit, resolved, terr := fetchTip(ctx, opts)
+	if terr != nil {
+		return "", nil, terr
+	}
+	files, ferr := readRoleFiles(commit, opts.Dir)
+	if ferr != nil {
+		return "", nil, fmt.Errorf("agentsource: read role files: %s", scrub(ferr.Error()))
+	}
+	return resolved, files, nil
+}
+
+// fetchTip is the bounded, guarded clone shared by FetchRoleFiles and FetchSkillFiles: validate
+// the ref, run the ONE ref-advertisement round trip, resolve the wanted hash, shallow-fetch that
+// single commit into an in-memory storer and return it with its full SHA. Every control
+// documented on FetchRoleFiles (the redirect allowlist and same-origin guard, the wire-size cap,
+// the 60s timeout, the clone-token scrub, BasicAuth attached only when a token is set) lives
+// here, so a second reader of a clone cannot drift from the first. Every returned error is
+// scrubbed of opts.Token.
+func fetchTip(ctx context.Context, opts CloneOptions) (*object.Commit, string, error) {
+	scrub := scrubber(opts.Token)
 
 	// The ref is validated with go-git plumbing (git-check-ref-format via
 	// ReferenceName.Validate, or a 40-hex SHA) BEFORE any network op — a hostile ref
 	// name never reaches the refspec layer (the fetch asks for a resolved HASH).
 	refName, isSHA, rerr := classifyRef(opts.Ref)
 	if rerr != nil {
-		return "", nil, rerr
+		return nil, "", rerr
 	}
 
 	// advertise performs the single ref-advertisement round trip (URL validate →
 	// guarded transport → upload-pack session → AdvertisedReferencesContext), the setup
-	// FetchRoleFiles shares with ListRemoteRefs. It resolves both jobs the previous
+	// fetchTip shares with ListRemoteRefs. It resolves both jobs the previous
 	// implementation used two round trips for: resolving a named branch/tag to a hash,
 	// and driving the fetch.
 	adv, aerr := advertise(ctx, opts)
 	if aerr != nil {
-		return "", nil, aerr
+		return nil, "", aerr
 	}
 	defer adv.close()
 
 	want, werr := resolveWant(adv.refs, refName)
 	if werr != nil {
-		return "", nil, werr
+		return nil, "", werr
 	}
 
 	st := memory.NewStorage()
 	if ferr := fetchCommit(adv.ctx, adv.session, adv.refs.Capabilities, want, st); ferr != nil {
-		return "", nil, adv.wrap("clone failed", ferr)
+		return nil, "", adv.wrap("clone failed", ferr)
 	}
 
 	commit, commitErr := resolveCommit(st, want)
 	if commitErr != nil {
-		return "", nil, fmt.Errorf("agentsource: resolve commit: %s", scrub(commitErr.Error()))
+		return nil, "", fmt.Errorf("agentsource: resolve commit: %s", scrub(commitErr.Error()))
 	}
 	resolved := commit.Hash.String()
 
@@ -159,16 +179,11 @@ func FetchRoleFiles(ctx context.Context, opts CloneOptions) (sha string, files [
 	// (Depth 1 fetches only the default branch's tip snapshot — an arbitrary historical
 	// SHA's objects are not present). Fail with a clear, non-hanging error otherwise.
 	if isSHA && !strings.EqualFold(resolved, strings.TrimSpace(opts.Ref)) {
-		return "", nil, fmt.Errorf(
+		return nil, "", fmt.Errorf(
 			"agentsource: pinned commit %s is not the fetched tip %s (a full-SHA pin must be the source's current default-branch tip at shallow clone depth; pin a tag or branch instead)",
 			strings.TrimSpace(opts.Ref), resolved)
 	}
-
-	files, ferr := readRoleFiles(commit, opts.Dir)
-	if ferr != nil {
-		return "", nil, fmt.Errorf("agentsource: read role files: %s", scrub(ferr.Error()))
-	}
-	return resolved, files, nil
+	return commit, resolved, nil
 }
 
 // transportForEndpoint builds the transport that drives ONE fetch. For an http(s)

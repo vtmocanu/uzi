@@ -13,6 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/skilltmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -44,16 +45,16 @@ type allocationsWriteRequest struct {
 // allocatableAsShared reports whether a skill may be a shared allocation: only
 // builtin/global skills (a shared row must reference a skill every user can see).
 func allocatableAsShared(s store.Skill) bool {
-	return s.Scope == "builtin" || s.Scope == "global"
+	return skilltmpl.IsShared(s.Scope)
 }
 
 // allocatableAsMine reports whether actor may allocate s to their own overlay:
 // any builtin/global skill, or actor's own user skill.
 func allocatableAsMine(s store.Skill, actor store.User) bool {
-	if s.Scope == "builtin" || s.Scope == "global" {
+	if skilltmpl.IsShared(s.Scope) {
 		return true
 	}
-	return s.Scope == "user" && s.UserID.Valid && uuid.UUID(s.UserID.Bytes) == actor.ID
+	return s.Scope == skilltmpl.ScopeUser && s.UserID.Valid && uuid.UUID(s.UserID.Bytes) == actor.ID
 }
 
 // GetTemplateSkills returns the skills allocated to a template that the caller

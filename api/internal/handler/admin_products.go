@@ -262,6 +262,12 @@ var errProductDeleted = errors.New("product is deleted")
 // (D9): a deleted product can never be re-enabled or edited, and UpdateProduct's
 // deleted_at guard plus the products_deleted_is_disabled CHECK back this handler up.
 // An unknown id is a 404.
+//
+// The skills source (PRD #1909 D9) is edited here too: skills_repo_url (https, no userinfo, on
+// UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS; "" clears it), skills_ref, and the WRITE-ONLY clone token
+// (skills_token seals a new one, clear_skills_token removes it; the response only ever says
+// skills_token_set through GET .../skills). Changing the repo URL or ref discards a staged
+// snapshot of the old source.
 func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -276,13 +282,23 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 		Description     *string   `json:"description"`
 		Enabled         *bool     `json:"enabled"`
 		AllowedJobTypes *[]string `json:"allowed_job_types"`
+		// The skills source (PRD #1909 M6). SkillsToken is write-only.
+		SkillsRepoURL    *string `json:"skills_repo_url"`
+		SkillsRef        *string `json:"skills_ref"`
+		SkillsToken      *string `json:"skills_token"`
+		ClearSkillsToken *bool   `json:"clear_skills_token"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Description == nil && req.Enabled == nil && req.AllowedJobTypes == nil {
-		httpx.Error(w, http.StatusBadRequest, "nothing to update: set description, enabled and/or allowed_job_types")
+	skillsPatch, serr := h.parseSkillsSourcePatch(id, req.SkillsRepoURL, req.SkillsRef, req.SkillsToken, req.ClearSkillsToken)
+	if serr != nil {
+		httpx.Error(w, http.StatusBadRequest, serr.Error())
+		return
+	}
+	if req.Description == nil && req.Enabled == nil && req.AllowedJobTypes == nil && !skillsPatch.set() {
+		httpx.Error(w, http.StatusBadRequest, "nothing to update: set description, enabled, allowed_job_types and/or the skills source")
 		return
 	}
 	var allowed []string
@@ -333,6 +349,11 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			return err
+		}
+		if skillsPatch.set() {
+			if updated, err = applySkillsSourcePatch(r.Context(), q, updated, skillsPatch); err != nil {
+				return err
+			}
 		}
 		active, err = q.CountActiveProductTokensForProduct(r.Context(), id)
 		return err

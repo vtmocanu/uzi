@@ -855,13 +855,18 @@ components:
             characters removed. Untrusted text: render it inert.
         content_type:
           type: string
-          description: The type detected from the bytes.
+          description: >-
+            The type detected from the bytes. May be an empty string for an expired file, whose
+            bytes are gone: the stored row does not guarantee a retained identity once expired.
         byte_size:
           type: integer
           format: int64
         sha256:
           type: string
-          description: The SHA-256 of the file's bytes, lowercase hexadecimal.
+          description: >-
+            The SHA-256 of the file's bytes, lowercase hexadecimal. May be an empty string for an
+            expired file, whose bytes are gone: the stored row does not guarantee a retained
+            identity once expired.
         direction:
           type: string
           enum:

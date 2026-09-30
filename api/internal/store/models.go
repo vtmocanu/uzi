@@ -559,15 +559,30 @@ type PrDescriptionVersion struct {
 }
 
 type Product struct {
-	ID              uuid.UUID          `json:"id"`
-	Name            string             `json:"name"`
-	Description     string             `json:"description"`
-	Enabled         bool               `json:"enabled"`
-	DeletedAt       pgtype.Timestamptz `json:"deleted_at"`
-	CreatedBy       pgtype.UUID        `json:"created_by"`
-	CreatedAt       pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
-	AllowedJobTypes []string           `json:"allowed_job_types"`
+	ID                uuid.UUID          `json:"id"`
+	Name              string             `json:"name"`
+	Description       string             `json:"description"`
+	Enabled           bool               `json:"enabled"`
+	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy         pgtype.UUID        `json:"created_by"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes   []string           `json:"allowed_job_types"`
+	SkillsRepoUrl     string             `json:"skills_repo_url"`
+	SkillsRef         string             `json:"skills_ref"`
+	SkillsTokenSealed []byte             `json:"skills_token_sealed"`
+	SkillsAppliedSha  string             `json:"skills_applied_sha"`
+	SkillsAppliedBy   pgtype.UUID        `json:"skills_applied_by"`
+	SkillsAppliedAt   pgtype.Timestamptz `json:"skills_applied_at"`
+}
+
+type ProductSkillStaged struct {
+	ProductID uuid.UUID          `json:"product_id"`
+	SourceSha string             `json:"source_sha"`
+	StagedBy  pgtype.UUID        `json:"staged_by"`
+	StagedAt  pgtype.Timestamptz `json:"staged_at"`
+	Skills    []byte             `json:"skills"`
+	Dropped   []byte             `json:"dropped"`
 }
 
 type ProductToken struct {
@@ -1079,6 +1094,7 @@ type Skill struct {
 	UpdatedBy   pgtype.UUID        `json:"updated_by"`
 	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt   pgtype.Timestamptz `json:"updated_at"`
+	ProductID   pgtype.UUID        `json:"product_id"`
 }
 
 type SlackRunMessage struct {

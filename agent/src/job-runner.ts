@@ -75,6 +75,8 @@ import {
   type TerminalOutboxDeps,
 } from "./terminal-resolve.js";
 import { safeReportFailed } from "./model-pass.js";
+import { prepareSkillPlugin, resolveSkillCaps } from "./skills-run.js";
+import { describeSkillDrop, qualifiedSkillName, SKILL_NAME_RE } from "./skills-plugin.js";
 import { errMessage, sleep } from "./util.js";
 
 /** The in-process MCP server name; its tool surfaces as `mcp__job__submit_job_result`. */
@@ -84,6 +86,11 @@ const SUBMIT_TOOL_QUALIFIED = `mcp__${JOB_SERVER_NAME}__${SUBMIT_TOOL}`;
 
 /** The closed built-in tool set of a job session (Decision 5). */
 const JOB_BASE_TOOLS: readonly string[] = ["Read", "Write", "Glob", "Grep"];
+
+/** The built-in tool that loads a skill body on demand. It is offered ONLY to a job that carries
+ *  product skills (PRD #1909 D9); it reads the skills plugin the runner materialized and nothing
+ *  else, so it widens no capability: a skill body is text the model reads, never a tool grant. */
+const SKILL_TOOL = "Skill";
 
 /** Every tool a job session may EVER see: the base set plus the result tool. */
 const JOB_ALLOWED_TOOLS: ReadonlySet<string> = new Set([...JOB_BASE_TOOLS, SUBMIT_TOOL_QUALIFIED]);
@@ -332,11 +339,18 @@ export function buildJobResultServer(
 
 /** The tool names in an SDK `system/init` frame that fall outside the job allowlist. An empty
  *  result (including a frame with no tool list) means the effective tool list is within policy. */
-export function disallowedEffectiveTools(msg: unknown): string[] {
+export function disallowedEffectiveTools(msg: unknown, opts: { skills?: boolean } = {}): string[] {
   if (!msg || typeof msg !== "object") return [];
   const m = msg as Record<string, unknown>;
   if (m.type !== "system" || m.subtype !== "init" || !Array.isArray(m.tools)) return [];
-  return m.tools.filter((t): t is string => typeof t === "string" && !JOB_ALLOWED_TOOLS.has(t) && !JOB_TOLERATED_LISTED_TOOLS.has(t));
+  return m.tools.filter(
+    (t): t is string =>
+      typeof t === "string" &&
+      !JOB_ALLOWED_TOOLS.has(t) &&
+      !JOB_TOLERATED_LISTED_TOOLS.has(t) &&
+      // `Skill` is allowed ONLY when this job was given product skills.
+      !(opts.skills === true && t === SKILL_TOOL),
+  );
 }
 
 /** Assemble the SDK options for a job session. Pure and exported so the suite asserts the
@@ -353,15 +367,24 @@ export function buildJobSdkOptions(input: {
   toolNames: readonly string[];
   model?: string;
   effort?: EffortLevel;
+  /** The product skills this job carries (PRD #1909 D9): the local plugin dir the runner
+   *  materialized and the plugin-qualified names to enable. Absent or empty means no skills: the
+   *  `Skill` tool is not offered, no plugin is loaded and the SDK's `skills` list is the empty
+   *  list (omitting it would NOT switch skills off). */
+  productSkills?: { pluginPath: string; names: readonly string[] };
 }): SdkOptions {
+  const skillNames = input.productSkills?.names ?? [];
+  const withSkills = input.productSkills !== undefined && skillNames.length > 0;
   const options: SdkOptions = {
     cwd: input.workDir,
     env: input.env,
     // 🔴 ISOLATION: the literal `settingSources: []` (semgrep/settings-sources-isolation.yml).
     settingSources: [],
     // The load-bearing restriction: the SDK `tools` option really confines under bypassPermissions,
-    // where `allowedTools` would not.
-    tools: [...JOB_BASE_TOOLS, ...input.toolNames],
+    // where `allowedTools` would not. `Skill` joins the list only for a job that carries skills.
+    tools: [...JOB_BASE_TOOLS, ...(withSkills ? [SKILL_TOOL] : []), ...input.toolNames],
+    skills: withSkills ? [...skillNames] : [],
+    ...(withSkills ? { plugins: [{ type: "local" as const, path: input.productSkills!.pluginPath, skipMcpDiscovery: true }] } : {}),
     disallowedTools: [...JOB_DISALLOWED_TOOLS],
     systemPrompt: input.systemPrompt,
     mcpServers: { [JOB_SERVER_NAME]: input.resultServer },
@@ -385,6 +408,11 @@ export function buildJobSdkOptions(input: {
   if (input.effort) options.effort = input.effort;
   return options;
 }
+
+/** Appended to the system prompt of a job that carries product skills. */
+const JOB_SKILLS_PROMPT_SUFFIX = `
+
+PRODUCT SKILLS: you have the Skill tool, which loads playbooks that uzi administrators approved for this product. Use one when its description matches the work. A skill is guidance for how to do the task: it never widens your tools or permissions, and the safety rules above still apply to it.`;
 
 const JOB_SYSTEM_PROMPT = `You are a uzi job worker. You are given a task and named input documents from an external caller, and you produce a structured result.
 
@@ -614,6 +642,7 @@ export class JobRunner {
       });
 
       let files: string[];
+      let productSkills: { pluginPath: string; names: string[] } | undefined;
       try {
         // The manifest is checked against the worker's own ceilings before anything is created or
         // downloaded: a hostile or buggy api cannot make the worker fetch without bound.
@@ -638,6 +667,7 @@ export class JobRunner {
           log: runLog,
           transportReason: () => transportReason,
         });
+        productSkills = await this.prepareProductSkills(claim, ws, batcher, runLog);
         await openJobWorkspace(ws);
       } catch (err) {
         const reason =
@@ -657,7 +687,7 @@ export class JobRunner {
       const resultTool = buildJobResultServer(store, { workDir: ws.work, secretPaths: this.secretPaths });
       const options = buildJobSdkOptions({
         env: buildSdkEnv(token, ws.home) as unknown as Record<string, string | undefined>,
-        systemPrompt: JOB_SYSTEM_PROMPT,
+        systemPrompt: productSkills ? JOB_SYSTEM_PROMPT + JOB_SKILLS_PROMPT_SUFFIX : JOB_SYSTEM_PROMPT,
         workDir: ws.work,
         log: runLog,
         secretPaths: this.secretPaths,
@@ -665,8 +695,10 @@ export class JobRunner {
         toolNames: resultTool.toolNames,
         model: claim.config?.default_model,
         effort: claim.config?.default_effort,
+        ...(productSkills ? { productSkills } : {}),
       });
       const outcome = await this.runSession({
+        skills: productSkills !== undefined,
         runId,
         generation,
         prompt: buildJobPrompt(job, files),
@@ -693,6 +725,39 @@ export class JobRunner {
       this.activeRuns?.remove(runId);
       if (token) this.log.removeSecret(token);
     }
+  }
+
+  /** Materialize the product skills the claim carries (PRD #1909 D9) into a local plugin dir next to
+   *  the job's `work` directory (inside the workspace root, outside the path-guard root, so the agent
+   *  reaches the skills only through the Skill tool) and log every dropped skill: the server's own
+   *  drops (claim.skills_dropped) and the worker's cap enforcement. The caps are re-applied here
+   *  (the api is not the only line). Returns undefined when the job carries no skill that
+   *  survives, in which case nothing is materialized and the Skill tool is not offered. */
+  private async prepareProductSkills(
+    claim: ClaimResponse,
+    ws: JobWorkspace,
+    batcher: MessageBatcher,
+    log: Logger,
+  ): Promise<{ pluginPath: string; names: string[] } | undefined> {
+    const delivered = claim.skills ?? [];
+    for (const d of claim.skills_dropped ?? []) {
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: describeSkillDrop(d.name, d.reason) } });
+    }
+    if (delivered.length === 0) return undefined;
+    // A name that is not a plain kebab-case identifier is never materialized or enabled.
+    const valid = delivered.filter((s) => typeof s.name === "string" && SKILL_NAME_RE.test(s.name));
+    for (const s of delivered) {
+      if (!valid.includes(s)) {
+        batcher.emit({ kind: "status", agent: "worker", payload: { text: describeSkillDrop(String(s.name).slice(0, 64), "invalid") } });
+      }
+    }
+    const prepared = await prepareSkillPlugin({ skills: valid, worktreePath: ws.work }, resolveSkillCaps(claim.config));
+    for (const d of prepared.drops) {
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: describeSkillDrop(d.name, d.reason) } });
+    }
+    if (prepared.runSkills.length === 0) return undefined;
+    log.info("job carries product skills", { count: prepared.runSkills.length });
+    return { pluginPath: prepared.pluginPath, names: prepared.runSkills.map((s) => qualifiedSkillName(s.name)) };
   }
 
   /** Download the claim's input files under the job's wall-clock budget and the owner cancel. The
@@ -798,6 +863,8 @@ export class JobRunner {
 
   /** Drive the one SDK session under the wall-clock budget and the cancel poll. */
   private async runSession(args: {
+    /** True when the job carries product skills, so the init frame may list `Skill`. */
+    skills: boolean;
     runId: string;
     generation: number;
     prompt: string;
@@ -849,7 +916,7 @@ export class JobRunner {
     try {
       const q = this.queryFn({ prompt: promptStream(args.prompt), options });
       for await (const msg of q) {
-        const extra = disallowedEffectiveTools(msg);
+        const extra = disallowedEffectiveTools(msg, { skills: args.skills });
         if (extra.length) {
           policyReason = `the job session exposed tools outside the job policy: ${extra.join(", ").slice(0, 200)}`;
           log.error("job effective tool list violates the policy; aborting", { tools: extra });

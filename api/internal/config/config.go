@@ -145,6 +145,12 @@ type Config struct {
 	// means nothing is allowed until an admin configures it (AgentSourceBaseURLAllowed
 	// returns false on a nil list).
 	AgentSourceAllowedBaseURLs []string
+	// ProductSkillsAllowedBaseURLs is the SEPARATE SSRF allowlist for product skill sets
+	// (PRD #1909 D9, UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS): the only base URLs a product's
+	// skills_repo_url may target. Same shape as AgentSourceAllowedBaseURLs (normalized
+	// scheme+host, https only) but a DISTINCT list, so enabling one source never widens the
+	// other. EMPTY means the feature is off: ProductSkillsBaseURLAllowed is false for every URL.
+	ProductSkillsAllowedBaseURLs []string
 	// ForgePollInterval is the per-enabled-repo incremental poll cadence.
 	ForgePollInterval time.Duration
 	// ForgeReconcileEvery is the number of incremental polls between full
@@ -891,6 +897,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.AgentSourceAllowedBaseURLs = agentSourceAllowed
+	// PRD #1909 M6: the product-skills allowlist, default EMPTY (feature off, instance still boots).
+	productSkillsAllowed, err := parseBaseURLAllowlist("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", getenv("UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS", ""))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.ProductSkillsAllowedBaseURLs = productSkillsAllowed
 	cfg.ForgePollInterval = parseDuration("FORGE_POLL_INTERVAL", time.Minute)
 	cfg.ForgeReconcileEvery = parseInt("FORGE_RECONCILE_EVERY", 10)
 	cfg.ForgeHTTPTimeout = parseDuration("FORGE_HTTP_TIMEOUT", 15*time.Second)
@@ -1920,6 +1932,14 @@ func (c Config) ForgeBaseURLAllowed(raw string) bool {
 // instance must still boot. Nothing is allowed until the list is configured, which
 // AgentSourceBaseURLAllowed enforces by returning false on a nil list.
 func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
+	return parseBaseURLAllowlist("AGENT_SOURCE_ALLOWED_BASE_URLS", raw)
+}
+
+// parseBaseURLAllowlist is the shared parser of the optional (may-be-empty) https base-URL
+// allowlists: every present entry is normalized via NormalizeForgeBaseURL and deduped, a
+// non-https or malformed entry is a hard boot error naming envName, and an empty list returns nil
+// (feature off).
+func parseBaseURLAllowlist(envName, raw string) ([]string, error) {
 	var out []string
 	seen := map[string]struct{}{}
 	for _, part := range strings.Split(raw, ",") {
@@ -1929,7 +1949,7 @@ func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
 		}
 		norm, err := NormalizeForgeBaseURL(part)
 		if err != nil {
-			return nil, fmt.Errorf("AGENT_SOURCE_ALLOWED_BASE_URLS: %w", err)
+			return nil, fmt.Errorf("%s: %w", envName, err)
 		}
 		if _, dup := seen[norm]; dup {
 			continue
@@ -1938,6 +1958,23 @@ func parseAgentSourceAllowedBaseURLs(raw string) ([]string, error) {
 		out = append(out, norm)
 	}
 	return out, nil
+}
+
+// ProductSkillsBaseURLAllowed reports whether raw normalizes to an allowlisted product-skills
+// base URL (PRD #1909 D9). It checks the SEPARATE ProductSkillsAllowedBaseURLs list and is false
+// when that list is empty. NormalizeForgeBaseURL keeps only scheme and host, so it does NOT
+// reject URL userinfo: the caller (the admin product PATCH) refuses userinfo itself.
+func (c Config) ProductSkillsBaseURLAllowed(raw string) bool {
+	norm, err := NormalizeForgeBaseURL(raw)
+	if err != nil {
+		return false
+	}
+	for _, a := range c.ProductSkillsAllowedBaseURLs {
+		if a == norm {
+			return true
+		}
+	}
+	return false
 }
 
 // AgentSourceBaseURLAllowed reports whether raw normalizes to an allowlisted

@@ -123,12 +123,16 @@ func validateSkillFields(req skillWriteRequest, maxBytes int) (validatedSkill, e
 // ok=true carries status 0.
 func authorizeSkillWrite(actor store.User, s store.Skill) (int, bool) {
 	switch s.Scope {
-	case "builtin", "global":
+	case skilltmpl.ScopeBuiltin, skilltmpl.ScopeGlobal:
 		if actor.IsAdmin {
 			return 0, true
 		}
 		return http.StatusForbidden, false
-	case "user":
+	case skilltmpl.ScopeProduct:
+		// A product skill is changed only by the admin apply route, never by a skill-id route, and
+		// no skill route may confirm that the id exists: 404 for everyone, admins included.
+		return http.StatusNotFound, false
+	case skilltmpl.ScopeUser:
 		if s.UserID.Valid && uuid.UUID(s.UserID.Bytes) == actor.ID {
 			return 0, true
 		}
@@ -149,7 +153,7 @@ func resetSkillStatus(actor store.User, s store.Skill) (int, bool) {
 	if status, ok := authorizeSkillWrite(actor, s); !ok {
 		return status, false
 	}
-	if s.Scope != "builtin" {
+	if s.Scope != skilltmpl.ScopeBuiltin {
 		return http.StatusBadRequest, false
 	}
 	return 0, true
@@ -165,7 +169,8 @@ func resetSkillDenyMessage(status int) string {
 }
 
 // ListSkills returns every skill visible to the caller: builtin ∪ global ∪ the
-// caller's own user skills. Admins see all scopes. This is deliberately NOT the
+// caller's own user skills. Admins see builtin, global and every user's skills, but never a
+// product skill (those are read through the admin product route). This is deliberately NOT the
 // agent-templates all-shared read — that would leak private user skills.
 func (h *Handler) ListSkills(w http.ResponseWriter, r *http.Request) {
 	actor, ok := mw.UserFromContext(r.Context())
@@ -241,12 +246,12 @@ func (h *Handler) CreateSkill(w http.ResponseWriter, r *http.Request) {
 
 	var userID pgtype.UUID
 	switch req.Scope {
-	case "global":
+	case skilltmpl.ScopeGlobal:
 		if !actor.IsAdmin {
 			httpx.Error(w, http.StatusForbidden, "only admins can create global skills")
 			return
 		}
-	case "user":
+	case skilltmpl.ScopeUser:
 		userID = pgconv.UUID(actor.ID)
 	default:
 		httpx.Error(w, http.StatusBadRequest, "scope must be 'global' or 'user'")
@@ -323,7 +328,7 @@ func (h *Handler) DeleteSkill(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if s.Scope == "builtin" {
+	if s.Scope == skilltmpl.ScopeBuiltin {
 		httpx.Error(w, http.StatusConflict, "builtin skills cannot be deleted; reset them instead")
 		return
 	}
