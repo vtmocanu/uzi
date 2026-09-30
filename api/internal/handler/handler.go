@@ -1246,6 +1246,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// one transaction upserts the result and replaces the run's findings.
 		r.Post("/runs/{id}/job-result", h.WorkerJobResult)
 
+		// Job input download (PRD #1909 D8): the worker pulls each attached input file named in
+		// its claim. Fenced on the worker holding the run, the claim generation (query param) and
+		// the file being an attached input of THIS run. Deliberately NOT in laneWorkerAllowlist
+		// (a job is not a lane run yet; PRD #1906 M8 adds the route when jobs move to the lane).
+		r.Get("/runs/{id}/files/{fileID}", h.WorkerJobInputFile)
+
 		// Chat-agent read surface (PRD #39 M3, Decision 7): the chat agent
 		// investigates its OWNER'S runs. Every query is scoped to the worker's
 		// user_id (a foreign run id is 404), never a bare run_id lookup.

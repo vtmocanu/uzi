@@ -7,6 +7,7 @@
 //     home/                         the SDK HOME (transcripts); NOT inside the agent's file jail
 //     work/                         the SDK cwd and the path-guard root
 //       inputs/NN-<name>            the caller's named input documents
+//       inputs/<sha256>.<ext>       an uploaded input file (PRD #1909), read-only, content-named
 //
 // Under the PRD #51 uid split (UZI_UID_SPLIT=1) the SDK CLI runs as the `runner` uid while this
 // worker process creates the tree, so 0700 would lock the CLI out of its own HOME, cwd and
@@ -23,6 +24,7 @@
 // O_CREAT|O_EXCL|O_NOFOLLOW, then its realpath is checked to be inside the workspace, so a name
 // can never write outside it or through a planted symlink.
 
+import { createHash, randomBytes } from "node:crypto";
 import { constants as fsc, promises as fs } from "node:fs";
 import path from "node:path";
 
@@ -33,6 +35,12 @@ import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** The server's input-name shape (api job_inputs validation), mirrored client-side. */
 const INPUT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
+
+/** The storage name of an uploaded input file (PRD #1909 D6): `<sha256>.<ext>` with the extension
+ *  from the api's input allowlist (workersvc jobFileExt minus the output-only html). It can never
+ *  collide with an inline `NN-<name>` input: that shape has a dash at index 2. */
+const STORAGE_NAME_RE = /^[0-9a-f]{64}\.(pdf|txt|md|csv|json|docx|xlsx|png|jpg)$/;
+const SHA256_RE = /^[0-9a-f]{64}$/;
 
 /** The workspace paths of one job run. */
 export interface JobWorkspace {
@@ -51,6 +59,15 @@ export class JobInputError extends Error {
   constructor(message: string) {
     super(message);
     this.name = "JobInputError";
+  }
+}
+
+/** A downloaded input file's bytes failed verification (wrong size, digest mismatch or a truncated
+ *  stream). The runner reports it as an integrity failure, distinct from a transport failure. */
+export class JobFileIntegrityError extends JobInputError {
+  constructor(message: string) {
+    super(message);
+    this.name = "JobFileIntegrityError";
   }
 }
 
@@ -145,6 +162,89 @@ export async function writeJobInputs(
     written.push(`inputs/${file}`);
   }
   return written;
+}
+
+/** One uploaded input file of the claim manifest, as the writer needs it. */
+export interface JobInputFileSpec {
+  /** The storage name `<sha256>.<ext>`. */
+  name: string;
+  /** The declared plaintext size in bytes. */
+  size: number;
+  /** The declared lowercase hex SHA-256. */
+  sha256: string;
+}
+
+/** Stream an uploaded input file into `inputs/<storage name>` and return its workspace-relative
+ *  path. The bytes go to `inputs/.partial-<rand>` (O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, the
+ *  workspace file mode), are hashed as they are written and counted against the declared size
+ *  (more bytes than declared aborts at once; fewer, or a digest that is not the declared one, is a
+ *  JobFileIntegrityError). Only a verified file reaches its final name, published with link(2) so an
+ *  existing entry at the target (a planted symlink included) is refused rather than replaced, and
+ *  is then made read-only. Any failure removes the partial: nothing unverified is left under
+ *  `inputs/`. `body` is consumed to its end; a stream error is rethrown as is. */
+export async function writeJobInputFile(
+  ws: JobWorkspace,
+  file: JobInputFileSpec,
+  body: AsyncIterable<Uint8Array>,
+  split: boolean = uidSplitActive(),
+  partialSuffix: string = randomBytes(8).toString("hex"),
+): Promise<string> {
+  if (typeof file.name !== "string" || !STORAGE_NAME_RE.test(file.name)) {
+    throw new JobInputError("job input file name is not a storage name");
+  }
+  if (typeof file.sha256 !== "string" || !SHA256_RE.test(file.sha256) || !file.name.startsWith(file.sha256)) {
+    throw new JobInputError("job input file digest does not match its storage name");
+  }
+  if (!Number.isSafeInteger(file.size) || file.size <= 0) {
+    throw new JobInputError("job input file size is not a positive integer");
+  }
+  if (!/^[0-9a-f]{1,32}$/.test(partialSuffix)) throw new JobInputError("job input partial name is invalid");
+  const workReal = await fs.realpath(ws.work);
+  const inputsReal = path.join(workReal, "inputs");
+  const partial = path.join(ws.inputsDir, `.partial-${partialSuffix}`);
+  const target = path.join(ws.inputsDir, file.name);
+  const m = modes(split);
+  const handle = await fs.open(partial, fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW, m.file);
+  let closed = false;
+  try {
+    await handle.chmod(m.file); // umask-independent
+    const hash = createHash("sha256");
+    let total = 0;
+    for await (const chunk of body) {
+      total += chunk.length;
+      if (total > file.size) throw new JobFileIntegrityError("job input file is larger than its declared size");
+      hash.update(chunk);
+      let off = 0;
+      while (off < chunk.length) {
+        const { bytesWritten } = await handle.write(chunk, off, chunk.length - off);
+        off += bytesWritten;
+      }
+    }
+    if (total !== file.size) throw new JobFileIntegrityError("job input file is shorter than its declared size");
+    if (hash.digest("hex") !== file.sha256) throw new JobFileIntegrityError("job input file does not match its declared digest");
+    await handle.chmod(m.file & ~0o222); // read-only from here on
+    await handle.close();
+    closed = true;
+    if ((await fs.realpath(partial)) !== path.join(inputsReal, path.basename(partial))) {
+      throw new JobInputError("job input resolved outside the job workspace");
+    }
+    try {
+      await fs.link(partial, target); // EEXIST for anything already at the target: never overwrites
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "EEXIST") throw new JobInputError("job input file name is already taken");
+      throw err;
+    }
+    await fs.unlink(partial);
+    if ((await fs.realpath(target)) !== path.join(inputsReal, file.name)) {
+      await fs.rm(target, { force: true }).catch(() => undefined);
+      throw new JobInputError("job input resolved outside the job workspace");
+    }
+    return `inputs/${file.name}`;
+  } catch (err) {
+    if (!closed) await handle.close().catch(() => undefined);
+    await fs.rm(partial, { force: true }).catch(() => undefined);
+    throw err;
+  }
 }
 
 /** Widen `work` to its session mode (group-writable under the uid split). Call it after the inputs

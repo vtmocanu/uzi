@@ -1071,6 +1071,8 @@ type Store interface {
 	ClearJobResultForRun(ctx context.Context, runID uuid.UUID) error
 	// ListJobInputsForClaim reads a claimed job's named inputs for claim assembly (PRD #1908).
 	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
+	// ListJobInputFilesForClaim reads a claimed job's attached input files for the claim manifest (PRD #1909).
+	ListJobInputFilesForClaim(ctx context.Context, runID pgtype.UUID) ([]store.ListJobInputFilesForClaimRow, error)
 	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
 	FailJobsPastWallDeadline(ctx context.Context, arg store.FailJobsPastWallDeadlineParams) ([]store.FailJobsPastWallDeadlineRow, error)
 	// ListRevokedProductJobs backs the PRD #1908 D14 product-revoke sweep (CancelRevokedProductJobs).

@@ -250,6 +250,53 @@ func (q *Queries) InsertJobFileChunk(ctx context.Context, arg InsertJobFileChunk
 	return err
 }
 
+const listJobInputFilesForClaim = `-- name: ListJobInputFilesForClaim :many
+SELECT id, storage_name, display_name, byte_size, sha256, content_type
+  FROM job_files
+ WHERE run_id = $1 AND direction = 'input' AND state = 'attached'
+ ORDER BY created_at ASC, id ASC
+`
+
+type ListJobInputFilesForClaimRow struct {
+	ID          uuid.UUID   `json:"id"`
+	StorageName pgtype.Text `json:"storage_name"`
+	DisplayName string      `json:"display_name"`
+	ByteSize    int64       `json:"byte_size"`
+	Sha256      pgtype.Text `json:"sha256"`
+	ContentType pgtype.Text `json:"content_type"`
+}
+
+// The attached input files of a job, for the claim manifest (PRD #1909 D8). NOT caller-scoped: the
+// claim path runs as the worker that just claimed the run and the run id comes from the claimed
+// row. Only files attached to THIS run, direction 'input', state 'attached'; a stable order so a
+// re-claim renders the same manifest.
+func (q *Queries) ListJobInputFilesForClaim(ctx context.Context, runID pgtype.UUID) ([]ListJobInputFilesForClaimRow, error) {
+	rows, err := q.db.Query(ctx, listJobInputFilesForClaim, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJobInputFilesForClaimRow{}
+	for rows.Next() {
+		var i ListJobInputFilesForClaimRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.StorageName,
+			&i.DisplayName,
+			&i.ByteSize,
+			&i.Sha256,
+			&i.ContentType,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockReservedJobFile = `-- name: LockReservedJobFile :one
 SELECT id, user_id, product_id, run_id, direction, claim_generation, storage_name, display_name, content_type, byte_size, sha256, chunk_count, state, expires_at, created_at, updated_at FROM job_files WHERE id = $1 AND state = 'reserved' FOR UPDATE
 `

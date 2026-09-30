@@ -831,6 +831,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/task-review", noLimiter},
 	// PRD #1908: the job runner's structured result POST, worker-authenticated and unlimited like task-review.
 	{"POST", "/api/worker/runs/{id}/job-result", noLimiter},
+	// PRD #1909 M3: the worker input-file download, worker-authenticated and unlimited like job-result.
+	{"GET", "/api/worker/runs/{id}/files/{fileID}", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
 	// PRD #362 M1: the run-lane executor posts its intent/plan summaries back. Worker
 	// writes scoped to the worker's own run, no forge call → noLimiter. Bounded by the

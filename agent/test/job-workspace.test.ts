@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 
 import {
   createJobWorkspace,
@@ -12,7 +12,9 @@ import {
   JobInputError,
   reapStaleJobWorkspaces,
   removeJobWorkspace,
+  writeJobInputFile,
   writeJobInputs,
+  JobFileIntegrityError,
 } from "../src/job-workspace.js";
 import { nullLogger } from "./helpers.js";
 
@@ -133,5 +135,110 @@ describe("job workspace (PRD #1908 M4)", () => {
     await assert.rejects(() => createJobWorkspace(jobsRoot, randomUUID()), /symlink or not a directory/);
     assert.strictEqual(await reapStaleJobWorkspaces(jobsRoot, nullLogger()), 0);
     assert.ok((await fsp.stat(stale)).isDirectory(), "the symlink target was not reaped");
+  });
+});
+
+describe("uploaded input files (PRD #1909 M3)", () => {
+  const bytes = Buffer.from("%PDF-1.7 pretend pdf bytes");
+  const digest = createHash("sha256").update(bytes).digest("hex");
+  const spec = { name: `${digest}.pdf`, size: bytes.length, sha256: digest };
+  async function* chunks(...parts: Buffer[]): AsyncGenerator<Buffer> {
+    for (const c of parts) yield c;
+  }
+  const inputsLeft = async (ws: { inputsDir: string }): Promise<string[]> => (await fsp.readdir(ws.inputsDir)).sort();
+
+  it("streams, verifies and publishes inputs/<storage name> read-only, next to inline inputs", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    const inline = await writeJobInputs(ws, [{ name: "doc.md", content: "hi" }]);
+    const rel = await writeJobInputFile(ws, spec, chunks(bytes.subarray(0, 5), bytes.subarray(5)));
+    assert.strictEqual(rel, `inputs/${digest}.pdf`);
+    assert.deepStrictEqual(await inputsLeft(ws), ["01-doc.md", `${digest}.pdf`], "no partial left, no name collision with inline inputs");
+    assert.deepStrictEqual(inline, ["inputs/01-doc.md"]);
+    const target = path.join(ws.inputsDir, `${digest}.pdf`);
+    assert.ok((await fsp.readFile(target)).equals(bytes));
+    assert.strictEqual((await fsp.stat(target)).mode & 0o777, 0o400, "read-only single-uid mode");
+  });
+
+  it("uses the read-only variant of the uid-split file mode", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID(), true).catch(() => undefined);
+    if (!ws) return; // the setgid modes need privileges some CI sandboxes lack
+    await writeJobInputFile(ws, spec, chunks(bytes), true);
+    assert.strictEqual((await fsp.stat(path.join(ws.inputsDir, spec.name))).mode & 0o777, 0o440);
+  });
+
+  it("rejects a digest mismatch and leaves nothing under inputs/", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    const tampered = Buffer.from(bytes);
+    tampered[3] = tampered[3]! ^ 0xff;
+    await assert.rejects(() => writeJobInputFile(ws, spec, chunks(tampered)), JobFileIntegrityError);
+    assert.deepStrictEqual(await inputsLeft(ws), []);
+  });
+
+  it("rejects more bytes than declared, at once, and fewer bytes than declared", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    let pulled = 0;
+    async function* endless(): AsyncGenerator<Buffer> {
+      for (;;) {
+        pulled++;
+        yield Buffer.alloc(bytes.length, 1);
+      }
+    }
+    await assert.rejects(() => writeJobInputFile(ws, spec, endless()), /larger than its declared size/);
+    assert.ok(pulled <= 2, "an oversize body is aborted after the first excess chunk, not drained");
+    await assert.rejects(() => writeJobInputFile(ws, spec, chunks(bytes.subarray(0, bytes.length - 1))), /shorter than its declared size/);
+    assert.deepStrictEqual(await inputsLeft(ws), []);
+  });
+
+  it("rejects a stream error mid-body (a torn connection) and cleans up", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    async function* torn(): AsyncGenerator<Buffer> {
+      yield bytes.subarray(0, 4);
+      throw new Error("terminated");
+    }
+    await assert.rejects(() => writeJobInputFile(ws, spec, torn()), /terminated/);
+    assert.deepStrictEqual(await inputsLeft(ws), []);
+  });
+
+  for (const bad of [
+    "../etc/passwd",
+    "01-doc.md",
+    `${"a".repeat(63)}.pdf`,
+    `${"A".repeat(64)}.pdf`,
+    `${"a".repeat(64)}.html`,
+    `${"a".repeat(64)}.pdf/x`,
+    `${"a".repeat(64)}.exe`,
+    "",
+  ]) {
+    it(`rejects the storage name ${JSON.stringify(bad)}`, async () => {
+      const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+      await assert.rejects(() => writeJobInputFile(ws, { name: bad, size: 3, sha256: "a".repeat(64) }, chunks(Buffer.from("abc"))), JobInputError);
+      assert.deepStrictEqual(await inputsLeft(ws), []);
+    });
+  }
+
+  it("rejects a digest that is not the storage name's, and a non-positive size", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    await assert.rejects(() => writeJobInputFile(ws, { ...spec, sha256: "b".repeat(64) }, chunks(bytes)), JobInputError);
+    await assert.rejects(() => writeJobInputFile(ws, { ...spec, size: 0 }, chunks(bytes)), JobInputError);
+  });
+
+  it("refuses a symlink planted at the partial path (O_EXCL|O_NOFOLLOW) without writing through it", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    const victim = path.join(path.dirname(ws.root), "victim.txt");
+    await fsp.writeFile(victim, "untouched");
+    await fsp.symlink(victim, path.join(ws.inputsDir, ".partial-abc123"));
+    await assert.rejects(() => writeJobInputFile(ws, spec, chunks(bytes), false, "abc123"), { code: "EEXIST" });
+    assert.strictEqual(await fsp.readFile(victim, "utf8"), "untouched");
+  });
+
+  it("refuses a symlink planted at the final target and never follows or replaces it", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    const victim = path.join(path.dirname(ws.root), "victim.txt");
+    await fsp.writeFile(victim, "untouched");
+    await fsp.symlink(victim, path.join(ws.inputsDir, spec.name));
+    await assert.rejects(() => writeJobInputFile(ws, spec, chunks(bytes)), JobInputError);
+    assert.strictEqual(await fsp.readFile(victim, "utf8"), "untouched");
+    assert.ok((await fsp.lstat(path.join(ws.inputsDir, spec.name))).isSymbolicLink());
+    assert.deepStrictEqual(await inputsLeft(ws), [spec.name], "the partial is removed");
   });
 });

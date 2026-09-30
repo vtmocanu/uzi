@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/toolprofile"
 )
@@ -18,6 +19,22 @@ type ClaimJob struct {
 	Title  string          `json:"title"`
 	Prompt string          `json:"prompt"`
 	Inputs []ClaimJobInput `json:"inputs"`
+	// Files is the manifest of the job's attached binary/text input files (PRD #1909 D8), always
+	// present ([] when none), in (created_at, id) order. The worker downloads each through
+	// GET /api/worker/runs/{id}/files/{fileID} and verifies its sha256.
+	Files []ClaimJobFile `json:"files"`
+}
+
+// ClaimJobFile is one attached input file of a job. Name is the storage name
+// (`<sha256>.<ext>`, the on-disk name under inputs/); DisplayName is the uploader's label and is
+// UNTRUSTED text.
+type ClaimJobFile struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	DisplayName string `json:"display_name"`
+	Size        int64  `json:"size"`
+	SHA256      string `json:"sha256"`
+	ContentType string `json:"content_type"`
 }
 
 // ClaimJobInput is one named input document of a job.
@@ -85,9 +102,24 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		Title:  run.IssueTitle,
 		Prompt: run.IssueDescription,
 		Inputs: make([]ClaimJobInput, 0, len(inputs)),
+		Files:  make([]ClaimJobFile, 0),
 	}
 	for _, in := range inputs {
 		job.Inputs = append(job.Inputs, ClaimJobInput{Name: in.Name, Content: in.ContentMd})
+	}
+	files, err := s.q.ListJobInputFilesForClaim(ctx, pgconv.UUID(run.ID))
+	if err != nil {
+		return nil, fmt.Errorf("list job input files: %w", err)
+	}
+	for _, f := range files {
+		job.Files = append(job.Files, ClaimJobFile{
+			ID:          f.ID.String(),
+			Name:        f.StorageName.String,
+			DisplayName: f.DisplayName,
+			Size:        f.ByteSize,
+			SHA256:      f.Sha256.String,
+			ContentType: f.ContentType.String,
+		})
 	}
 
 	// The owner's Claude model lane, then a frozen per-run model when it is compatible. Best

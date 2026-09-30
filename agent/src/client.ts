@@ -1,4 +1,4 @@
-import type { Readable } from "node:stream";
+import { Readable } from "node:stream";
 import type { Logger } from "./log.js";
 import {
   WORKER_API_PREFIX,
@@ -149,6 +149,9 @@ export class PrDescriptionConflict extends RequestError {
 /** Upper bound on {@link PrDescriptionRateLimited.retryAfterMs}: a caller that sleeps on it
  *  must not be parked for hours (or on Infinity) by a hostile or broken `Retry-After`. */
 const PR_DESC_MAX_RETRY_AFTER_MS = 60_000;
+
+/** Bound on one whole job-input download (PRD #1909): the api caps a file at 25 MiB by default. */
+const JOB_FILE_DOWNLOAD_TIMEOUT_MS = 300_000;
 
 /** HTTP 429 from a pr-description route. Only the stage route carries its own limiter (the
  *  per-worker bucket it shares with proposals and findings), but a 429 on any of the four routes
@@ -1616,6 +1619,36 @@ export class WorkerClient {
    *  413. */
   async postJobResult(runId: string, body: JobResultRequest): Promise<void> {
     await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/job-result`, body);
+  }
+
+  /** Download one attached input file of a job (GET /worker/runs/{id}/files/{fileID}, PRD #1909
+   *  D8), streaming the body to `sink` without buffering the file. `claimGeneration` is the job
+   *  flight's generation (the api fences on it). `sink` receives the body plus the server's
+   *  advertised length and SHA-256 (informational: the writer verifies the bytes itself against the
+   *  claim manifest) and must consume the stream to its end; a body cut short by a server abort
+   *  rejects the stream, so a truncated 200 never reads as complete. Throws RequestError on non-2xx.
+   *  The whole download is bounded by JOB_FILE_DOWNLOAD_TIMEOUT_MS. */
+  async downloadJobFile(
+    runId: string,
+    fileId: string,
+    claimGeneration: number,
+    sink: (body: Readable, meta: { contentLength: number | null; sha256: string | null }) => Promise<void>,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(fileId)}?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
+    const timeout = AbortSignal.timeout(JOB_FILE_DOWNLOAD_TIMEOUT_MS);
+    const res = await fetch(this.baseUrl + path, {
+      method: "GET",
+      headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version },
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    });
+    if (res.status !== 200) throw await this.toError("GET", path, res);
+    if (!res.body) throw new Error("job file download returned no body");
+    const len = Number(res.headers.get("content-length"));
+    await sink(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>), {
+      contentLength: Number.isInteger(len) && len >= 0 && res.headers.get("content-length") !== null ? len : null,
+      sha256: res.headers.get("x-uzi-file-sha256"),
+    });
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).

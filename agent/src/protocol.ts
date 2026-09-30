@@ -1031,12 +1031,26 @@ export interface ClaimJobInput {
   content: string;
 }
 
+/** One attached input file of a job (PRD #1909 D8; mirrors workersvc.ClaimJobFile). `name` is the
+ *  storage name `<sha256>.<ext>` the file lands under in `inputs/`; `display_name` is the
+ *  uploader's label and is UNTRUSTED text. */
+export interface ClaimJobFile {
+  id: string;
+  name: string;
+  display_name: string;
+  size: number;
+  sha256: string;
+  content_type: string;
+}
+
 /** The job block of a kind="job" claim (PRD #1908). */
 export interface ClaimJob {
   type: string;
   title: string;
   prompt: string;
   inputs: ClaimJobInput[];
+  /** PRD #1909: the attached input files; absent from an older server's claim. */
+  files?: ClaimJobFile[];
 }
 
 /**

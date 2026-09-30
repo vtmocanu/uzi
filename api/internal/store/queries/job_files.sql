@@ -215,3 +215,13 @@ UPDATE job_files
    AND state = 'unattached'
    AND expires_at > now()
 RETURNING id, byte_size;
+
+-- name: ListJobInputFilesForClaim :many
+-- The attached input files of a job, for the claim manifest (PRD #1909 D8). NOT caller-scoped: the
+-- claim path runs as the worker that just claimed the run and the run id comes from the claimed
+-- row. Only files attached to THIS run, direction 'input', state 'attached'; a stable order so a
+-- re-claim renders the same manifest.
+SELECT id, storage_name, display_name, byte_size, sha256, content_type
+  FROM job_files
+ WHERE run_id = @run_id AND direction = 'input' AND state = 'attached'
+ ORDER BY created_at ASC, id ASC;
