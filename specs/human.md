@@ -851,6 +851,18 @@ Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/1908-repo-less-jobs-api.
 - Job runs appear in the web runs list and run detail with their report and findings. `uzi job create|get|result|cancel|list` mirrors the API. (AI-synced 2026-09-30)
 - `/api/v1` breaking changes fail `gate:repo`. (AI-synced 2026-09-30)
 
+## Feature #1909 — Job files and product skill sets
+
+Tracked as GitHub issue vtmocanu/uzi#1909; PRD at `prds/1909-job-files-product-skills.md`.
+
+- A `uzc_` or `uzp_` caller can upload input files for a job and download the job's input and output files; a caller sees only files of jobs it can see, and a product only its own uploads. (AI-synced 2026-09-30)
+- File types are checked by content, not name; files are stored sealed and served only as downloads (attachment, `nosniff`, `application/octet-stream`). (AI-synced 2026-09-30)
+- Per-file, per-job, per-owner and instance caps apply, and job files and run recovery archives share one hard stored-file budget; recovery wins by reclaiming expired then oldest finished-job files, never those of a live job. (AI-synced 2026-09-30)
+- An output over a cap or quota is refused and listed; the job still completes. (AI-synced 2026-09-30)
+- A result's `source_url` is set only when the file's hash matches a page the same job fetched; nothing the agent claims sets it. (AI-synced 2026-09-30)
+- An admin can give a product a skills repo (allowlisted base URLs, write-only clone token); synced skills reach that product's jobs only after the admin approves the exact commit, and no other run ever receives a product skill. (AI-synced 2026-09-30)
+- New jobs run only on workers that advertise `job_files_v1`. (AI-synced 2026-09-30)
+
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
 Tracked as GitHub issue vtmocanu/uzi#1390; PRD at `prds/1390-outage-requeue-readoption.md`.
