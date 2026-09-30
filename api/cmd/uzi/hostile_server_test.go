@@ -102,6 +102,9 @@ func TestHostileServerCannotDriveTheTerminal(t *testing.T) {
 		// the report and findings). Escape sequences, OSC titles and bidi overrides must not reach
 		// the terminal in any field, and a newline in a single-line field must not forge a row.
 		hostile := func(s string) string { return s + esc2J + oscTitle + "\u202e" + "\nFORGED" }
+		// forge appends a newline plus a well-formed finding row: if a single-line field kept
+		// its newline, the row would start a line and be counted below.
+		forge := func(s string) string { return s + "\n- [high] FORGED" }
 		line := 3
 		j := apitypes.V1JobDTO{
 			ID: "j1", Type: "research", Status: "failed", Title: hostile("title"),
@@ -116,8 +119,8 @@ func TestHostileServerCannotDriveTheTerminal(t *testing.T) {
 				Result: &apitypes.V1JobResultBodyDTO{
 					Status: hostile("ok"), ReportMd: hostile("report") + "\nsecond line",
 					Findings: []apitypes.V1JobFindingDTO{
-						{Severity: hostile("sev"), MessageMd: hostile("msg"), URL: sp(hostile("http://e.example/"))},
-						{Severity: "low", MessageMd: "m", File: sp(hostile("f.go")), Line: &line},
+						{Severity: hostile("sev"), MessageMd: forge(hostile("msg")), URL: sp(forge(hostile("http://e.example/")))},
+						{Severity: forge("low"), MessageMd: "m", File: sp(forge(hostile("f.go"))), Line: &line},
 					},
 				},
 			}},
@@ -144,7 +147,7 @@ func TestHostileServerCannotDriveTheTerminal(t *testing.T) {
 			}
 		}
 		out, _, _ = runCLI(t, fakeEnv(fc), "job", "result", "j1")
-		if n := strings.Count(out, "- ["); n != 2 {
+		if n := strings.Count(out, "\n- ["); n != 2 {
 			t.Errorf("job result rendered %d finding lines, want 2 (an embedded newline forged one):\n%q", n, out)
 		}
 		for _, want := range []string{"report", "second line", "msg", "f.go", ":3)"} {

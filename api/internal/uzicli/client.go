@@ -1022,7 +1022,7 @@ const ReasonGateRevisionMismatch = "gate_revision_mismatch"
 func statusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
 	reason := serverErrReason(body)
-	e := buildStatusError(status, msg, retryAfter)
+	e := buildStatusError(status, msg, reason, retryAfter)
 	e.Reason = reason
 	if reason == ReasonGateRevisionMismatch {
 		e.CurrentGateRevision = serverErrCurrentGateRevision(body)
@@ -1030,7 +1030,7 @@ func statusError(status int, body []byte, retryAfter string) *ExitError {
 	return e
 }
 
-func buildStatusError(status int, msg, retryAfter string) *ExitError {
+func buildStatusError(status int, msg, reason, retryAfter string) *ExitError {
 	switch {
 	case status == http.StatusTooManyRequests:
 		// A 429 is a rate-limit shed, not a bad request: the server (or the forge it
@@ -1068,10 +1068,17 @@ func buildStatusError(status int, msg, retryAfter string) *ExitError {
 		}
 		return Exitf(ExitAuth, "%s", msg)
 	case status == http.StatusForbidden:
-		// The only 403 a CLI read verb hits is the admin_ro scope gate
-		// (RequireAdminRO); owner-scoped reads 404 a foreign resource, never 403.
+		// Two 403 families reach the CLI: the admin_ro scope gate on admin views, and the jobs
+		// API's typed reasons for a uzp_ product token. Owner-scoped reads 404 a foreign
+		// resource, never 403. Branch on the typed reason so each gets the right hint.
 		if msg == "" {
 			msg = "forbidden"
+		}
+		switch reason {
+		case "insufficient_scope":
+			return Exitf(ExitAuth, "%s: this token's scope does not allow that; the jobs API needs a token with the jobs scope", msg)
+		case "job_type_not_allowed":
+			return Exitf(ExitAuth, "%s: this product token is not allowed to create jobs of that type", msg)
 		}
 		return Exitf(ExitAuth, "%s: your token lacks the required scope (admin views need an admin-scoped token)", msg)
 	case status == http.StatusNotFound:

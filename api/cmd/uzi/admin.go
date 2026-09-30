@@ -908,8 +908,6 @@ func productStateCell(p apitypes.ProductDTO) string {
 	}
 }
 
-// tsCell renders a nullable timestamp. "-" means the column is genuinely empty, not
-// unknown: never used, or (for expires_at) never expires.
 // allowedJobTypesCell renders a product's allowed job types (PRD #1908), "-" for none.
 func allowedJobTypesCell(types []string) string {
 	if len(types) == 0 {
@@ -918,6 +916,8 @@ func allowedJobTypesCell(types []string) string {
 	return cellText(strings.Join(types, ","))
 }
 
+// tsCell renders a nullable timestamp. "-" means the column is genuinely empty, not
+// unknown: never used, or (for expires_at) never expires.
 func tsCell(t *time.Time) string {
 	if t == nil {
 		return "-"

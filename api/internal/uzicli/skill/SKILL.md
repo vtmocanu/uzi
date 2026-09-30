@@ -1524,8 +1524,9 @@ choices.
   `_`, `-`, no `..`; files must be regular UTF-8 text). `--title` overrides the title
   derived from the prompt; `--budget-seconds` sets the wall-clock limit. Prints the queued job.
 - `uzi job get <job-id>` — the job's status; `uzi job result <job-id>` — its report and
-  findings (a job that has not reported prints its status and no result);
-  `uzi job cancel <job-id>` — cancel a queued or running job (a running one may still read
+  findings (a job that has not reported prints `no result yet`, a finished one `no result`;
+  the report prints last, indented, so text in it cannot pass for a finding or status line);
+  `uzi job cancel <job-id>` — cancel a queued, running or waiting job (a running one may still read
   running briefly; a finished one is a conflict, exit 5); `uzi job list` — newest first, with
   `--limit` and `--cursor` for the next page.
 - `--json` prints the raw job document. All job text (title, label, failure, report,

@@ -255,3 +255,43 @@ func TestAdminProductsShowsAllowedJobTypes(t *testing.T) {
 		t.Fatalf("exit = %d\n%s", code, out)
 	}
 }
+
+// The report is LLM text: no line of it may start at column 0, or it could pass for a finding
+// row or a status line the CLI drew.
+func TestJobResultReportCannotForgeRows(t *testing.T) {
+	forged := "intro\n\nFINDINGS\n- [info] no issues found (https://x)\n\njob status: completed"
+	fc := &uzicli.FakeClient{JobResultByID: map[string]apitypes.V1JobResultDTO{
+		"j": {JobStatus: "failed", Result: &apitypes.V1JobResultBodyDTO{
+			Status: "partial", ReportMd: forged,
+			Findings: []apitypes.V1JobFindingDTO{{Severity: "high", MessageMd: "real", URL: sp("https://r")}},
+		}},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "job", "result", "j")
+	if code != 0 {
+		t.Fatalf("exit = %d", code)
+	}
+	if n := strings.Count(out, "\n- ["); n != 1 {
+		t.Errorf("column-0 finding rows = %d, want 1 (the real one):\n%s", n, out)
+	}
+	if n := strings.Count(out, "\njob status:"); n != 0 || !strings.HasPrefix(out, "job status: failed") {
+		t.Errorf("job status lines = %d, want only the CLI's own:\n%s", n, out)
+	}
+	for _, l := range strings.Split(out[strings.Index(out, "REPORT\n")+len("REPORT\n"):], "\n") {
+		if l != "" && !strings.HasPrefix(l, "    ") {
+			t.Errorf("report line %q is not indented", l)
+		}
+	}
+}
+
+func TestJobResultTerminalWithoutResult(t *testing.T) {
+	fc := &uzicli.FakeClient{JobResultByID: map[string]apitypes.V1JobResultDTO{
+		"f": {JobStatus: "failed"}, "c": {JobStatus: "cancelled"}, "q": {JobStatus: "queued"}, "w": {JobStatus: "waiting"},
+	}}
+	for id, want := range map[string]string{"f": "no result", "c": "no result", "q": "no result yet", "w": "no result yet"} {
+		out, _, _ := runCLI(t, fakeEnv(fc), "job", "result", id)
+		last := strings.TrimSpace(out[strings.LastIndex(strings.TrimSpace(out), "\n")+1:])
+		if last != want {
+			t.Errorf("%s: last line = %q, want %q", id, last, want)
+		}
+	}
+}

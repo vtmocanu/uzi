@@ -41,8 +41,9 @@ func TestDerivedJobTitleFitsServiceLimit(t *testing.T) {
 		"emoji":      strings.Repeat("😀", 100),
 		"cjk second": "\n  \n" + strings.Repeat("漢字", 60) + "\nrest",
 		"ascii":      strings.Repeat("a", 500),
-		// A cut that lands right after a space leaves trailing whitespace, which the
-		// service refuses; the derived title must trim it instead of falling back.
+		// A cut that lands right after a space leaves trailing whitespace; the service trims
+		// it, but the handler's own termsafe pre-check refused it and fell back to the
+		// default title, so the derived title must be trimmed here.
 		"rune cut after space": strings.Repeat("a", 79) + " bcdef",
 		"byte cut after space": strings.Repeat("😀", 49) + " " + strings.Repeat("😀", 5),
 	} {

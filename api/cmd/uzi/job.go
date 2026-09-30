@@ -175,8 +175,8 @@ func newJobResultCmd(env Env, gf *globalFlags) *cobra.Command {
 func newJobCancelCmd(env Env, gf *globalFlags) *cobra.Command {
 	return &cobra.Command{
 		Use:   "cancel <job-id>",
-		Short: "Cancel a queued or running job",
-		Long: "Cancel a queued or running job. A running job is stopped by its worker, so the " +
+		Short: "Cancel a queued, running or waiting job",
+		Long: "Cancel a queued, running or waiting job. A running job is stopped by its worker, so the " +
 			"printed status may still read running for a moment.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -266,26 +266,36 @@ func renderJobDetail(p *uzicli.Printer, j apitypes.V1JobDTO) error {
 	return p.Table(nil, rows)
 }
 
-// renderJobResult prints a job's report as flowing text and each finding as one folded line.
+// renderJobResult prints the status lines, then the findings, then the report last and
+// indented one level under its label. The report is LLM text and SanitizeTTY keeps newlines,
+// so an unindented report could forge a finding row or a status line; every report line is
+// indented, so anything at column 0 was drawn by the CLI itself.
 func renderJobResult(p *uzicli.Printer, r apitypes.V1JobResultDTO) {
 	p.Printf("job status: %s\n", uzicli.CellText(r.JobStatus))
 	if r.Result == nil {
-		p.Println("no result yet")
-		return
-	}
-	p.Printf("result status: %s\n\n", uzicli.CellText(r.Result.Status))
-	p.Println("REPORT")
-	p.Println(r.Result.ReportMd)
-	if len(r.Result.Findings) == 0 {
-		return
-	}
-	p.Println("\nFINDINGS")
-	for _, f := range r.Result.Findings {
-		line := fmt.Sprintf("- [%s] %s", uzicli.CellText(f.Severity), uzicli.CellText(f.MessageMd))
-		if loc := findingLocation(f); loc != "" {
-			line += " (" + loc + ")"
+		// A finished job that never reported will not report now; only a live one might yet.
+		switch r.JobStatus {
+		case "completed", "failed", "cancelled":
+			p.Println("no result")
+		default:
+			p.Println("no result yet")
 		}
-		p.Println(line)
+		return
+	}
+	p.Printf("result status: %s\n", uzicli.CellText(r.Result.Status))
+	if len(r.Result.Findings) > 0 {
+		p.Println("\nFINDINGS")
+		for _, f := range r.Result.Findings {
+			line := fmt.Sprintf("- [%s] %s", uzicli.CellText(f.Severity), uzicli.CellText(f.MessageMd))
+			if loc := findingLocation(f); loc != "" {
+				line += " (" + loc + ")"
+			}
+			p.Println(line)
+		}
+	}
+	p.Println("\nREPORT")
+	for _, line := range strings.Split(uzicli.SanitizeTTY(strings.TrimSpace(r.Result.ReportMd)), "\n") {
+		p.Printf("    %s\n", line)
 	}
 }
 
@@ -356,18 +366,20 @@ func readJobInputs(specs []string) ([]apitypes.V1JobInputDTO, error) {
 
 // readRegularFile reads a local file the user named, refusing anything that is not a regular
 // file (a FIFO or device could block or never end) and anything over max bytes or not UTF-8.
+// The open is non-blocking, so a path swapped to a FIFO between the stat and the open cannot
+// hang the open itself; the fstat on the opened handle then refuses it.
 func readRegularFile(path, what string, max int64) (string, error) {
 	if fi, err := os.Stat(path); err != nil {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read %s: %v", what, err)
 	} else if !fi.Mode().IsRegular() {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "%s %q is not a regular file", what, path)
 	}
-	f, err := os.Open(path) //nolint:gosec // G304: the operator's own argument to their local CLI.
+	f, err := os.OpenFile(path, os.O_RDONLY|openNonblock, 0) //nolint:gosec // G304: the operator's own argument to their local CLI.
 	if err != nil {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read %s: %v", what, err)
 	}
 	defer func() { _ = f.Close() }()
-	// Re-check on the opened handle so a swap between the stat and the open is caught.
+	// Re-check on the opened handle: a swap after the stat is caught here.
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
 		return "", uzicli.Exitf(uzicli.ExitUsage, "%s %q is not a regular file", what, path)
 	}

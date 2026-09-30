@@ -1488,3 +1488,21 @@ func TestCreateRunWireBodySeededPlan(t *testing.T) {
 		})
 	}
 }
+
+// A jobs-API 403 names its typed reason, not the admin-scope hint.
+func TestHTTPClient403JobReasons(t *testing.T) {
+	for reason, want := range map[string]string{
+		"insufficient_scope":   "jobs scope",
+		"job_type_not_allowed": "not allowed to create jobs",
+	} {
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"error":"denied","reason":"` + reason + `"}`))
+		}))
+		_, err := newTestClient(srv).AdminListUsers(context.Background())
+		srv.Close()
+		if ExitCodeFor(err) != ExitAuth || !strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "admin-scoped") {
+			t.Errorf("%s: err = %v, want exit auth with %q and no admin hint", reason, err, want)
+		}
+	}
+}
