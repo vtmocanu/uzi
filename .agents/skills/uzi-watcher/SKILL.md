@@ -47,6 +47,9 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
 - **Conditional approve**: deltas the implementation needs → `revise`, since
   `approve` starts implementing at once. Only for non-blocking advice: approve, then
   send it with `uzi run follow-up`; it may arrive after work starts.
+- **Reply budget**: a co-steer takes several rounds, and a Codex buddy's fourth
+  consecutive reply is held. When co-steering starts, run `peers.py budget allow buddy
+  --replies 10` once (session-peers *Longer loops*), not a reset per round.
 - **Issues you file**: buddy-review the final draft; label `reviewed` per the root `CLAUDE.md` rule.
 
 ## The loop, per run
@@ -56,12 +59,9 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
    label. When the user has authorized dispatch and the label is missing, add it with the
    native forge CLI (`gh issue edit ISSUE_NUM --repo OWNER/REPO --add-label uzi` in this
    GitHub repo), then verify the forge reports it. A direct label edit reaches uzi's cache
-   on the next poller sync, so let step 2 attempt creation once; only if it returns the
-   specific "not marked as uzi's work" rejection while the forge still shows the label,
-   or (for an issue filed moments ago) "issue not found on this repo's board", retry that
-   same create call after short waits for up to 90 seconds (one full default poll interval
-   plus sync margin). Stop immediately on any other error; never turn a
-   generic failure into repeated create attempts.
+   on the next poller sync, so create through `scripts/create-run.sh` (step 2): it retries
+   only the label-sync refusals ("not marked as uzi's work", "issue not found on this
+   repo's board") for up to 90 seconds and stops at once on any other error.
    `uzi run list --json` for in-flight runs. **Only ask the user on a *confident*
    cross-issue blocker** (the target depends on another run's code landing first, or a
    sharp same-file overlap). Independent issues parallelize fine — do not gate on ordinary
@@ -70,7 +70,7 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
 
    ```
    # build the flag from the decision: --mr-rework=false (off) | --mr-rework (on) | omit (inherit)
-   uzi run create --repo REPO_ID --issue ISSUE_NUM --mr-rework=false --json
+   <this skill's directory>/scripts/create-run.sh REPO_ID ISSUE_NUM --mr-rework=false
    ```
 
    Pass `--mr-rework` (v0.70.0) to control whether uzi auto-reworks this run's MR from
@@ -514,7 +514,8 @@ ids on the same way.
 
 ## Keep this skill (and its scripts) current
 
-This skill and its `scripts/` (`watch-run.sh` to poll a uzi run to a gate, park or
+This skill and its `scripts/` (`create-run.sh` to create a run through the label-sync
+retry; `watch-run.sh` to poll a uzi run to a gate, park or
 terminal state; `backup-runs.sh` / `backup-loop.sh` to snapshot in-flight run work from
 worker PVCs) are living documents — **update them in the same session you find them
 wanting.** When a run surprises you with a new failure mode, a plan trap this list does not
