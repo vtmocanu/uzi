@@ -355,7 +355,7 @@ export function SteerQueueCard({
               <PauseMenu run={run} busy={busy} onPause={onPause} />
             )}
             <Button variant="danger" disabled={busy} onClick={onStop}>
-              Stop run
+              {takesFollowUps ? "Stop run" : "Stop job"}
             </Button>
           </div>
         </>

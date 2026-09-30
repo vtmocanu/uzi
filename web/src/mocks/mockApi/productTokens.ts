@@ -22,7 +22,7 @@ import { delay, requireAdmin, requireSession, users } from "./shared";
 type OwnedProductToken = ProductToken & { user_id: string };
 type StoredProduct = Omit<Product, "active_token_count">;
 
-let products: StoredProduct[] = mockProducts.map((p) => ({ ...p, allowed_job_types: [...p.allowed_job_types] }));
+let products: StoredProduct[] = mockProducts.map((p) => ({ ...p, allowed_job_types: [...(p.allowed_job_types ?? [])] }));
 let productTokens: OwnedProductToken[] = mockProductTokens.map((t) => ({ ...t, scopes: [...t.scopes] }));
 let productCounter = 0;
 let productTokenCounter = 0;

@@ -187,9 +187,16 @@ export function JobResultPanel({ run }: { run: Run }) {
             </div>
 
             <div className="space-y-1.5">
-              <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">
-                Findings{counts ? <span className="ml-2 font-normal normal-case tracking-normal">{counts}</span> : null}
-              </h3>
+              {/* The counts sit beside the heading, not inside it: nested, a screen reader read
+                  the heading as one run-on word ("Findings1 error, …"). */}
+              <div className="flex flex-wrap items-baseline gap-x-2">
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-faint">Findings</h3>
+                {counts && (
+                  <p className="text-xs text-faint" data-testid="job-findings-counts">
+                    {counts}
+                  </p>
+                )}
+              </div>
               {result.findings.length === 0 ? (
                 <p className="text-sm text-faint">No findings.</p>
               ) : (

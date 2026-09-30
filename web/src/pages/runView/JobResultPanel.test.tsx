@@ -54,6 +54,10 @@ describe("JobResultPanel (PRD #1908)", () => {
       "Info",
     ]);
     expect(screen.getByText("1 error, 1 warning, 1 note")).toBeTruthy();
+    // The counts are not inside the heading: its accessible name is exactly "Findings", not
+    // the run-on "Findings1 error, …" a nested span produced.
+    expect(screen.getByRole("heading", { level: 3, name: "Findings" })).toBeTruthy();
+    expect(screen.queryByRole("heading", { name: /Findings\s*1 error/ })).toBeNull();
 
     // file:line is plain code text.
     const loc = within(items[0]).getByText("legacy-rollback.md:42");
@@ -103,7 +107,7 @@ describe("JobResultPanel (PRD #1908)", () => {
     const label = origin.querySelector("q")!;
     // RLO (U+202E) stripped; the markup is text, not a <b> element.
     expect(label.textContent).toBe("opstsil-kcehc <b>admin</b> (verified by uzi)");
-    expect(label.textContent).not.toContain("‮");
+    expect(label.textContent).not.toContain("\u202E");
     expect(origin.querySelector("b")).toBeNull();
   });
 
@@ -162,7 +166,9 @@ describe("job run chrome (PRD #1908)", () => {
     );
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.getByText("A job takes no follow-ups. Stopping it cancels the job.")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Stop run" })).toBeTruthy();
+    // The button names the thing the heading names ("Stop this job"); the old run copy is gone.
+    expect(screen.getByRole("button", { name: "Stop job" })).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
   });
 
   it("a job is never extendable or credential-switchable, whatever its cap", () => {

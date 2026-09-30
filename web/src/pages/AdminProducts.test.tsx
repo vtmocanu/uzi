@@ -285,6 +285,88 @@ describe("AdminProducts allowed job types (PRD #1908)", () => {
   });
 });
 
+describe("AdminProducts job-type save feedback (PRD #1908 review)", () => {
+  const researchIn = (el: HTMLElement) =>
+    within(el).getByRole("checkbox", { name: "Research" }) as HTMLInputElement;
+
+  it("shows the new state at once while saving, then says Saved", async () => {
+    let resolve!: (v: { product: Product }) => void;
+    mockApi.adminUpdateProduct.mockReturnValueOnce(new Promise((r) => (resolve = r)));
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    fireEvent.click(researchIn(card));
+    // Optimistic: checked immediately, marked busy, and a visible "Saving" line.
+    expect(researchIn(card).checked).toBe(true);
+    expect(researchIn(card).getAttribute("aria-disabled")).toBe("true");
+    expect(within(card).getByRole("status").textContent).toBe("Saving job types…");
+    // A second click mid-save sends nothing more.
+    fireEvent.click(researchIn(card));
+    expect(mockApi.adminUpdateProduct).toHaveBeenCalledTimes(1);
+    mockApi.adminListProducts.mockResolvedValue({ products: [aProduct({ allowed_job_types: ["research"] })] });
+    resolve({ product: aProduct({ allowed_job_types: ["research"] }) });
+    await waitFor(() => expect(within(card).getByRole("status").textContent).toBe("Job types saved."));
+    expect(researchIn(card).checked).toBe(true);
+    expect(researchIn(card).getAttribute("aria-disabled")).toBeNull();
+  });
+
+  it("reverts the box and shows the error beside it when the save fails", async () => {
+    mockApi.adminUpdateProduct.mockRejectedValueOnce(new ApiError(400, "allowed_job_types: unknown job type"));
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    fireEvent.click(researchIn(card));
+    const alert = await within(card).findByRole("alert");
+    expect(alert.textContent).toBe("allowed_job_types: unknown job type");
+    expect(researchIn(card).checked).toBe(false);
+    expect(within(card).getByRole("status").textContent).toBe("");
+    // Not the page banner, which can sit scrolled off-screen above the list.
+    expect(screen.getAllByRole("alert")).toEqual([alert]);
+  });
+
+  it("links each type's hint as a description, not as part of the checkbox name", async () => {
+    renderPage();
+    const box = researchIn(await productCard("Helpdesk assistant"));
+    const hint = document.getElementById(box.getAttribute("aria-describedby") ?? "");
+    expect(hint?.textContent).toBe("Works from the inputs it is sent and returns a report with findings.");
+  });
+
+  it("names stored types this page does not list, and does not claim 'only the checked types'", async () => {
+    mockApi.adminListProducts.mockResolvedValue({ products: [aProduct({ allowed_job_types: ["future_type"] })] });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    expect(researchIn(card).checked).toBe(false);
+    expect(within(card).getByText("future_type")).toBeTruthy();
+    expect(
+      within(card).getByText("No listed type is checked: users’ tokens for this product can create only the types named above."),
+    ).toBeTruthy();
+    expect(within(card).queryByText(/can create only the checked types\.$/)).toBeNull();
+  });
+
+  it("renders a product from an api that predates job types (field absent) without crashing", async () => {
+    const legacy = aProduct();
+    delete legacy.allowed_job_types;
+    const legacyDeleted = aProduct({ id: "prod-b", name: "Old importer", enabled: false, deleted_at: daysAgo(2) });
+    delete legacyDeleted.allowed_job_types;
+    mockApi.adminListProducts.mockResolvedValue({ products: [legacy, legacyDeleted] });
+    renderPage();
+    const card = await productCard("Helpdesk assistant");
+    // The card renders; there is no job-type editor for a server that cannot store one.
+    expect(within(card).getByRole("switch", { name: "Disable Helpdesk assistant" })).toBeTruthy();
+    expect(within(card).queryByRole("checkbox")).toBeNull();
+    expect(within(await productCard("Old importer")).queryByText(/^Job types:/)).toBeNull();
+  });
+
+  it("locks the register form's boxes while the register request is in flight", async () => {
+    mockApi.adminCreateProduct.mockReturnValueOnce(new Promise(() => {}));
+    renderPage();
+    const form = await screen.findByRole("form", { name: "Register a product" });
+    fireEvent.change(within(form).getByLabelText("Name"), { target: { value: "CRM sync" } });
+    fireEvent.click(within(form).getByRole("button", { name: "Register product" }));
+    await waitFor(() => expect(researchIn(form).getAttribute("aria-disabled")).toBe("true"));
+    fireEvent.click(researchIn(form));
+    expect(researchIn(form).checked).toBe(false);
+  });
+});
+
 describe("AdminProducts register form (review item 1)", () => {
   it("takes the description on one line, since the server refuses any newline", async () => {
     renderPage();

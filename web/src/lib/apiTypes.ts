@@ -1485,8 +1485,10 @@ export interface Product {
   active_token_count: number;
   /** Job types this product may create (apitypes.ProductDTO.AllowedJobTypes, PRD #1908);
    *  empty allows none (fail-closed). The mapper normalizes a nil slice to [], so it is
-   *  always present and never null on the wire. */
-  allowed_job_types: string[];
+   *  never null on the wire. OPTIONAL for the api/web rollout skew (as Run.credential_override
+   *  and outcome_pending): a mid-deploy api pod predating #1908 omits the key, so every read
+   *  falls back (`?? []`, or hides the editor) instead of crashing the Products page. */
+  allowed_job_types?: string[];
 }
 
 // AdminDeleteProductResponse is DELETE /api/admin/products/{id}

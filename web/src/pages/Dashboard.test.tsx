@@ -733,3 +733,37 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     expect(screen.queryByText("cordoned")).toBeNull();
   });
 });
+
+// PRD #1908: a repo-less job run's recent-runs row. It has no repo path, so its meta line
+// opens with the kind chip, with no empty path or stray leading space before it; the issue
+// row beside it is the positive control that the path renders when there is one.
+describe("Dashboard — a job row without a repo path (PRD #1908)", () => {
+  it("renders the job row with its kind chip first and no repo path", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({ id: "run-issue", issue_title: "Issue row", issue_iid: 12 }),
+        aRun({
+          id: "run-job",
+          kind: "job",
+          repo_id: null,
+          repo_path: "",
+          forge_type: "",
+          issue_iid: null,
+          issue_title: "Summarise the incident timeline",
+        }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const metaOf = (title: string) => screen.getByText(title).parentElement!.querySelector("p.flex")!;
+    // Control: the issue row's meta line starts with its repo path.
+    expect(metaOf("Issue row").textContent).toMatch(/^vtmocanu\/uzi /);
+    // The job row's meta line starts with the kind chip itself: no path, no leading space.
+    const jobMeta = metaOf("Summarise the incident timeline");
+    expect(jobMeta.textContent).toMatch(/^job$/i);
+    expect(jobMeta.textContent).not.toContain("vtmocanu/uzi");
+    expect(screen.getByRole("link", { name: "Open run: Summarise the incident timeline" })).toBeTruthy();
+  });
+});

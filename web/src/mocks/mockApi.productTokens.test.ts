@@ -28,9 +28,9 @@ describe("mockApi — product registry validation (PRD #1907)", () => {
 
   it("rejects an invisible formatting character in a product name and in a description update", async () => {
     const api = await reload();
-    await expect(api.adminCreateProduct("CRM‮sync", "", [])).rejects.toMatchObject({ status: 400 });
+    await expect(api.adminCreateProduct("CRM\u202Esync", "", [])).rejects.toMatchObject({ status: 400 });
     await expect(
-      api.adminUpdateProduct("prod-helpdesk", { description: "zero​width" }),
+      api.adminUpdateProduct("prod-helpdesk", { description: "zero\u200Bwidth" }),
     ).rejects.toMatchObject({ status: 400 });
   });
 

@@ -31,7 +31,7 @@ const repoless: Partial<Run> = {
   kind: "job",
 };
 
-const HOSTILE_LABEL = "ops‮tsil-kcehc <b>admin</b> (verified by uzi)";
+const HOSTILE_LABEL = "ops\u202Etsil-kcehc <b>admin</b> (verified by uzi)";
 
 const HOSTILE_REPORT = [
   "## Summary",
