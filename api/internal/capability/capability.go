@@ -145,6 +145,7 @@ const AdviceClaimFenceV1 = "advice_claim_fence_v1"
 // in the protocol vocabulary below, NEVER in `vocabulary`, `required_capabilities` or the web
 // capability picker.
 const JobRunnerV1 = "job_runner_v1"
+
 // IsolatedFetchV1 is the PROTOCOL capability a worker self-reports (PRD #1906 M4/M5) to declare it
 // runs the isolated research runner (the fixed tool set and the fetch_url tool) and is wired to a
 // fetcher. It is one of the TWO facts ClaimRun's dedicated isolated-lane clause keys on for a
