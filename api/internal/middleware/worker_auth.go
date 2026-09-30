@@ -58,10 +58,12 @@ func RequireWorker(q WorkerStore) func(http.Handler) http.Handler {
 					httpx.Error(w, http.StatusUnauthorized, "invalid worker token")
 					return
 				}
-				// A cancelled or timed-out request context is the client going away, not
-				// an infrastructure fault: still a 503, but not logged as one. The log
-				// carries the error only, never the token or its hash.
-				if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+				// A request whose own context is done is the client going away, not an
+				// infrastructure fault: still a 503, but not logged as one. Test the request
+				// context rather than the error chain: a database dial or pool timeout also
+				// unwraps to context.DeadlineExceeded, and that outage must be logged. The
+				// log carries the error only, never the token or its hash.
+				if r.Context().Err() == nil {
 					slog.Warn("worker auth: token lookup failed; answering 503", "error", err)
 				}
 				httpx.Error(w, http.StatusServiceUnavailable, "worker authentication temporarily unavailable")

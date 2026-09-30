@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -121,6 +123,44 @@ func TestRequireWorkerLookupFailureStatus(t *testing.T) {
 				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
 			}
 		})
+	}
+}
+
+// A store failure on a live request is an outage and is logged, even when the error
+// itself unwraps to context.DeadlineExceeded (a database dial or pool timeout). A
+// request whose own context is already done is the client going away: still a 503,
+// but not logged.
+func TestRequireWorkerLogsStoreFailureOnlyForLiveRequests(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dialTimeout := errWorkerStore{err: fmt.Errorf("dial tcp: i/o timeout: %w", context.DeadlineExceeded)}
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	serve := func(ctx context.Context) int {
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/worker/heartbeat", nil)
+		req.Header.Set("Authorization", "Bearer uzw_whatever")
+		rec := httptest.NewRecorder()
+		RequireWorker(dialTimeout)(next).ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := serve(context.Background()); code != http.StatusServiceUnavailable {
+		t.Fatalf("live request: status = %d, want 503", code)
+	}
+	if !strings.Contains(buf.String(), "worker auth: token lookup failed") {
+		t.Fatalf("live request: store failure not logged; log = %q", buf.String())
+	}
+
+	buf.Reset()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if code := serve(cancelled); code != http.StatusServiceUnavailable {
+		t.Fatalf("cancelled request: status = %d, want 503", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("cancelled request: logged %q, want nothing", buf.String())
 	}
 }
 
