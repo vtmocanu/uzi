@@ -165,3 +165,4 @@ Completion evidence for M1–M8 (2026-09-30, branch `agent/issue-1908`, final tr
     - Workspaces live under `<dataDir>/jobs`, owned by `worker:codex-session` with mode 3710 (setgid and sticky) under the uid split, so the Codex command uid cannot reach them. Single-uid workers use mode 0700.
   - **Rollout.** The api and the chart's worker image tag ship together. An old worker image never claims a job.
   - **Decision 1 as built.** The `job` shape clause requires `repo_id IS NULL`. A later repo-bound type widens it.
+- 2026-09-30: M9 handed off to the maintainer, by explicit human decision on run `agent/issue-1908`. The hosted k8s acceptance needs this branch merged and deployed with a worker image that ships `job_runner_v1`. The implementation run has no cluster access and cannot deploy. So the run opens its PR with M1–M8 complete, and M9 stays unchecked here until the maintainer runs the acceptance after deploy. The PRD stays in `prds/` until then.
