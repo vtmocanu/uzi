@@ -97,6 +97,63 @@ func TestHostileServerCannotDriveTheTerminal(t *testing.T) {
 		}
 	})
 
+	t.Run("job-detail-list-result", func(t *testing.T) {
+		// PRD #1908 M7: every job text field is untrusted (a product supplies the label, an LLM
+		// the report and findings). Escape sequences, OSC titles and bidi overrides must not reach
+		// the terminal in any field, and a newline in a single-line field must not forge a row.
+		hostile := func(s string) string { return s + esc2J + oscTitle + "\u202e" + "\nFORGED" }
+		line := 3
+		j := apitypes.V1JobDTO{
+			ID: "j1", Type: "research", Status: "failed", Title: hostile("title"),
+			RequestedByLabel: sp(hostile("label")), FailureReason: sp(hostile("reason")), CreatedAt: past,
+		}
+		cur := "cur" + esc2J
+		fc := &uzicli.FakeClient{
+			JobByID:     map[string]apitypes.V1JobDTO{"j1": j},
+			JobListPage: apitypes.V1JobListDTO{Jobs: []apitypes.V1JobDTO{j}, NextCursor: &cur},
+			JobResultByID: map[string]apitypes.V1JobResultDTO{"j1": {
+				JobStatus: hostile("completed"),
+				Result: &apitypes.V1JobResultBodyDTO{
+					Status: hostile("ok"), ReportMd: hostile("report") + "\nsecond line",
+					Findings: []apitypes.V1JobFindingDTO{
+						{Severity: hostile("sev"), MessageMd: hostile("msg"), URL: sp(hostile("http://e.example/"))},
+						{Severity: "low", MessageMd: "m", File: sp(hostile("f.go")), Line: &line},
+					},
+				},
+			}},
+			JobCreated: j,
+		}
+		for _, args := range [][]string{
+			{"job", "get", "j1"}, {"job", "cancel", "j1"}, {"job", "list"}, {"job", "result", "j1"},
+			{"job", "create", "--type", "research", "--prompt", "p"},
+		} {
+			out, _, code := runCLI(t, fakeEnv(fc), args...)
+			if code != 0 {
+				t.Fatalf("%v: exit = %d", args, code)
+			}
+			assertNoTerminalControl(t, strings.Join(args, " "), out)
+		}
+		out, _, _ := runCLI(t, fakeEnv(fc), "job", "list")
+		if n := len(strings.Split(strings.TrimRight(out, "\n"), "\n")); n != 3 {
+			t.Errorf("job list rendered %d lines, want 3 (header + row + cursor hint):\n%q", n, out)
+		}
+		out, _, _ = runCLI(t, fakeEnv(fc), "job", "get", "j1")
+		for _, want := range []string{"title", "label", "(reported by the product)", "reason"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("job get lost %q: %q", want, out)
+			}
+		}
+		out, _, _ = runCLI(t, fakeEnv(fc), "job", "result", "j1")
+		if n := strings.Count(out, "- ["); n != 2 {
+			t.Errorf("job result rendered %d finding lines, want 2 (an embedded newline forged one):\n%q", n, out)
+		}
+		for _, want := range []string{"report", "second line", "msg", "f.go", ":3)"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("job result lost %q: %q", want, out)
+			}
+		}
+	})
+
 	t.Run("admin-users", func(t *testing.T) {
 		// An email is the last field anyone would think to sanitize, which is exactly why
 		// the boundary rather than a call-site audit is the fix.

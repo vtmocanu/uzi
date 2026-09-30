@@ -51,8 +51,17 @@ type FakeClient struct {
 	AdminHealthDoc apitypes.HealthDocDTO
 	AdminCLITokens []apitypes.AdminCLITokenDTO
 	AdminProducts  []apitypes.ProductDTO
-	AdminUsageV    apitypes.AdminUsageDTO
-	RateLimits     []apitypes.AdminRateLimitRowDTO
+
+	// Repo-less jobs (uzi job, PRD #1908 M7).
+	JobCreated    apitypes.V1JobDTO
+	JobByID       map[string]apitypes.V1JobDTO
+	JobResultByID map[string]apitypes.V1JobResultDTO
+	JobListPage   apitypes.V1JobListDTO
+	JobCreateReqs []apitypes.V1JobCreateRequest
+	JobCancelIDs  []string
+	JobListCalls  []JobListCall
+	AdminUsageV   apitypes.AdminUsageDTO
+	RateLimits    []apitypes.AdminRateLimitRowDTO
 	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide
 	// per-user Codex rows.
 	CodexRateLimits []apitypes.CodexAdminRateLimitRowDTO

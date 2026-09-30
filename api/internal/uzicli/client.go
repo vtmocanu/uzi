@@ -216,6 +216,16 @@ type Client interface {
 	// /api/admin/products, in the admin READ group, so a uza_ token reads it. Every
 	// product, soft-deleted ones included, with its active-token count.
 	AdminListProducts(ctx context.Context) ([]apitypes.ProductDTO, error)
+	// The repo-less job verbs (PRD #1908 M7), over the stable /api/v1/jobs API (a uzc_ token is
+	// accepted there). JobCreate posts a job; JobGet/JobResult/JobCancel address one by id (a
+	// foreign, absent or malformed id is one 404 → ExitNotFound; cancelling a finished job is a
+	// 409 → ExitConflict); JobList is one keyset page, newest first (limit 0 and an empty cursor
+	// take the server defaults).
+	JobCreate(ctx context.Context, req apitypes.V1JobCreateRequest) (apitypes.V1JobDTO, error)
+	JobGet(ctx context.Context, id string) (apitypes.V1JobDTO, error)
+	JobResult(ctx context.Context, id string) (apitypes.V1JobResultDTO, error)
+	JobCancel(ctx context.Context, id string) (apitypes.V1JobDTO, error)
+	JobList(ctx context.Context, limit int, cursor string) (apitypes.V1JobListDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows

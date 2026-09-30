@@ -234,6 +234,11 @@ uzi ci fix <ref> [--repo <repo-id>]
 uzi handoff [--message <text>] [--file <path>] [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>
+uzi job create --type <type> (--prompt <text> | --prompt-file <path>) [--title <text>] [--input <name=@file>] [--budget-seconds <n>]
+uzi job get <job-id>
+uzi job result <job-id>
+uzi job cancel <job-id>
+uzi job list [--limit <n>] [--cursor <cursor>]
 uzi admin users
 uzi admin runs
 uzi admin workers
@@ -1510,6 +1515,22 @@ choices.
   hint instead.
 - `uzi handoff rm <run-id>` — delete a finished no-MR task's remote branch with your own
   credentials. A task that opened a merge request is exempt (delete it via the MR).
+
+### Jobs — repo-less prompt-and-report runs
+
+- `uzi job create --type research --prompt <text>` (or `--prompt-file <path>`, `-` for
+  stdin) — create a repo-less job (PRD #1908) over the `/api/v1/jobs` API. `--input
+  name=@file` attaches a named text input (repeatable; names are letters, digits, `.`,
+  `_`, `-`, no `..`; files must be regular UTF-8 text). `--title` overrides the title
+  derived from the prompt; `--budget-seconds` sets the wall-clock limit. Prints the queued job.
+- `uzi job get <job-id>` — the job's status; `uzi job result <job-id>` — its report and
+  findings (a job that has not reported prints its status and no result);
+  `uzi job cancel <job-id>` — cancel a queued or running job (a running one may still read
+  running briefly; a finished one is a conflict, exit 5); `uzi job list` — newest first, with
+  `--limit` and `--cursor` for the next page.
+- `--json` prints the raw job document. All job text (title, label, failure, report,
+  findings) is untrusted: the plain view strips control characters, and `requested_by_label`
+  is shown as reported by the product.
 
 ### Onboarding & concepts — `uzi docs`
 

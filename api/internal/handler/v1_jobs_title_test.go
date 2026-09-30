@@ -41,6 +41,10 @@ func TestDerivedJobTitleFitsServiceLimit(t *testing.T) {
 		"emoji":      strings.Repeat("😀", 100),
 		"cjk second": "\n  \n" + strings.Repeat("漢字", 60) + "\nrest",
 		"ascii":      strings.Repeat("a", 500),
+		// A cut that lands right after a space leaves trailing whitespace, which the
+		// service refuses; the derived title must trim it instead of falling back.
+		"rune cut after space": strings.Repeat("a", 79) + " bcdef",
+		"byte cut after space": strings.Repeat("😀", 49) + " " + strings.Repeat("😀", 5),
 	} {
 		t.Run(name, func(t *testing.T) {
 			title := derivedJobTitle("research", prompt)
@@ -54,6 +58,16 @@ func TestDerivedJobTitleFitsServiceLimit(t *testing.T) {
 				t.Fatalf("service refused derived title %q (%d bytes)", title, len(title))
 			}
 		})
+	}
+}
+
+// TestDerivedJobTitleTrimsTrailingSpace pins the exact derived text when a cut lands after a space.
+func TestDerivedJobTitleTrimsTrailingSpace(t *testing.T) {
+	if got, want := derivedJobTitle("research", strings.Repeat("a", 79)+" bcdef"), strings.Repeat("a", 79); got != want {
+		t.Fatalf("got %q, want %q", got, want)
+	}
+	if got := derivedJobTitle("research", strings.Repeat("😀", 49)+" "+strings.Repeat("😀", 5)); strings.HasSuffix(got, " ") || got == "research job" {
+		t.Fatalf("got %q", got)
 	}
 }
 
