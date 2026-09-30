@@ -158,7 +158,7 @@ func newSettleEnv(t *testing.T) *settleEnv {
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 
 	e := &settleEnv{
-		t: t, ctx: ctx, pool: pool, router: h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim),
+		t: t, ctx: ctx, pool: pool, router: h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim),
 		fake: fake, wsvc: wsvc, user: uuid.New(), workerA: uuid.New(), workerB: uuid.New(), repo: uuid.New(),
 	}
 	connID := uuid.New()

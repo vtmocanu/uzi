@@ -478,6 +478,16 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		dto.PrDescription = desc
 		dto.PrDescriptionOutcome = outcome
 	}
+	// PRD #1908 D-D: the job block, for a kind='job' run only. GetRunForViewer above already
+	// applied the owner-or-admin read rule, so the block is exactly as visible as the run.
+	// Best-effort: a lookup error leaves job absent rather than failing the run read.
+	if run.Kind == runkind.Job {
+		if detail, err := h.wsvc.RunJobDetail(r.Context(), run); err != nil {
+			slog.Error("run job detail", "run_id", run.ID, "error", err)
+		} else {
+			dto.Job = runJobDTO(detail)
+		}
+	}
 	// PRD #1353: the server-derived per-in-progress-milestone LIVE LANES, additive to
 	// milestones_agents and populated ONLY on this run-detail read for a non-terminal run
 	// (D9 — the board/list stay a single now-line). Best-effort: a derivation error leaves

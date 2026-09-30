@@ -168,6 +168,11 @@ output: prefixed
 vars:
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
   GOLANGCI_LINT_VERSION: v2.13.2
+  # The pinned OpenAPI diff tool behind check:api-v1-compat (PRD #1908 Decision 11). Passed to
+  # scripts/oasdiff.sh as an ARGUMENT, like the golangci-lint pin above, so `task`'s echo shows the
+  # resolved version. The wrapper carries the per-arch sha256 pins and refuses any other version.
+  # renovate: datasource=github-releases depName=oasdiff-taskfile packageName=oasdiff/oasdiff
+  OASDIFF_VERSION: v1.32.1
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
@@ -293,6 +298,13 @@ tasks:
       # build-Go guard: no network and no real release binary. It protects the
       # archive-cache trust boundary and the go/toolchain compatibility seam.
       - task: test:golangci-wrapper
+      # Hermetic tests of the oasdiff wrapper's verified-archive cache (PRD #1908 M5): fake
+      # curl/uname, a real fixture tarball, no network. Same protection as the line above.
+      - task: test:oasdiff-wrapper
+      # Hermetic exit-code contract for the compat gate below (fake oasdiff wrapper, throwaway
+      # git repos): proves it fails closed when origin/main is unreachable and that its
+      # liveness canary is required.
+      - task: test:api-v1-compat-check
       # Hermetic exit-code contract for the sqlc-drift gate (scripts/sqlc-drift-gate.sh):
       # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
       # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
@@ -367,6 +379,14 @@ tasks:
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
       # `scan:secrets` too. Belongs in gate:repo, not a component gate.
       - task: check:skill-size
+      # /api/v1 backward-compatibility gate (PRD #1908 Decision 11): oasdiff diffs the spec on
+      # origin/main against the tree's and fails on any breaking change. It sits here, not in
+      # gate:api, because CI's lint-repo job already runs `task gate:repo` (so no
+      # .github/workflows edit is needed) and because a breaking spec change is a tree fact,
+      # not a Go fact. It fetches origin/main itself when a shallow checkout lacks it, so it
+      # needs the network only then and for the cached oasdiff download; a fetch it cannot
+      # make fails the gate closed. Before `scan:secrets`, which is deliberately last.
+      - task: check:api-v1-compat
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -900,6 +920,16 @@ tasks:
     cmds:
       - ./scripts/golangci-lint.test.sh
 
+  test:oasdiff-wrapper:
+    desc: hermetic tests of the verified oasdiff archive cache (fake curl/uname, real fixture tarball, no network)
+    cmds:
+      - ./scripts/oasdiff.test.sh
+
+  test:api-v1-compat-check:
+    desc: hermetic exit-code contract for check:api-v1-compat (fake oasdiff wrapper, throwaway git repos, no network)
+    cmds:
+      - ./scripts/check-api-v1-compat.test.sh
+
   test:scan-secrets:
     desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)
     cmds:
@@ -1128,6 +1158,26 @@ tasks:
       # silently. The explicit canary arg makes this echo show what is scanned. See the
       # script header.
       - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
+
+  check:api-v1-compat:
+    desc: api/openapi/v1.yaml has no breaking change against origin/main (oasdiff), with a canary proving a removed response field reddens it
+    cmds:
+      # The /api/v1 document is the stable external contract (its own header: additive changes
+      # only), and nothing else stops a PR from removing a field a product already parses.
+      # scripts/check-api-v1-compat.sh first proves the instrument (a committed base/revision pair
+      # in scripts/api-v1-compat-canary that DROPS a response field must exit 1, the base against
+      # itself must exit 0), then diffs `git show origin/main:api/openapi/v1.yaml` against the
+      # tree's copy and fails on any breaking change (--fail-on ERR). The diff tool is oasdiff at
+      # the static OASDIFF_VERSION pin, acquired by scripts/oasdiff.sh (per-arch sha256-verified
+      # release archive, retried download, cached under $HOME/.cache): no diff logic lives in the
+      # repo and the tool is not in devbox.json (worker config). If refs/remotes/origin/main is
+      # absent (CI's lint-repo job checks out shallow) the script fetches exactly that ref with
+      # `git fetch --no-tags --depth=1`; if the fetch fails, or the base has no spec, it exits 2
+      # and the gate FAILS CLOSED rather than reading "no baseline" as "no breaking change".
+      # Exit 2 = instrument broken, 1 = breaking change, 0 = clean (task itself reports 201).
+      # No .github/workflows edit: the lint-repo job runs `task gate:repo`, which lists this.
+      # See the script header.
+      - ./scripts/check-api-v1-compat.sh "{{.OASDIFF_VERSION}}" scripts/api-v1-compat-canary api/openapi/v1.yaml
 
   check:skill-size:
     desc: no repo skill's SKILL.md exceeds the 65536-byte runtime cap (over-cap skills are dropped silently at run time), with a canary proving the detector fired

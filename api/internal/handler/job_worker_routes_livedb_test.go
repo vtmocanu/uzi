@@ -271,6 +271,32 @@ func TestWorkerJobResultIngestLiveDB(t *testing.T) {
 			t.Fatalf("status %d, want 401", code)
 		}
 	})
+	t.Run("ownership and kind are checked before the body is read", func(t *testing.T) {
+		// An over-cap body would be a 413 if the api read it first. A worker that does not hold the
+		// run must get 404, and a non-job run 403 not_for_job, without the body being consulted.
+		huge := `{"claim_generation":1,"status":"completed","report_md":"` + strings.Repeat("r", jobResultMaxBodyBytes+1024) + `"}`
+		if code, _ := post(huge); code != http.StatusRequestEntityTooLarge {
+			t.Fatalf("control: the holder's over-cap body: status %d, want 413", code)
+		}
+		other := e.seedWorker(t, e.user)
+		if code, _ := e.do(other, "POST", url, huge); code != http.StatusNotFound {
+			t.Fatalf("a worker not holding the run, over-cap body: status %d, want 404 (ownership before the body)", code)
+		}
+		chat := e.seedChat(t, e.user, e.worker)
+		code, out := e.do(e.worker, "POST", "/api/worker/runs/"+chat.String()+"/job-result", huge)
+		if code != http.StatusForbidden || out["reason"] != "not_for_job" {
+			t.Fatalf("a non-job run, over-cap body: status %d body %v, want 403 not_for_job (kind before the body)", code, out)
+		}
+	})
+	t.Run("a repeated findings key is refused", func(t *testing.T) {
+		body := `{"claim_generation":1,"status":"completed","findings":[{"severity":"info","message_md":"a"}],"findings":[{"severity":"info","message_md":"b"}]}`
+		if code, out := post(body); code != http.StatusBadRequest {
+			t.Fatalf("status %d body %v, want 400", code, out)
+		}
+		if r, f := e.jobResultCounts(t, run); r != 0 || f != 0 {
+			t.Fatalf("a refused body wrote %d results, %d findings", r, f)
+		}
+	})
 	t.Run("a valid post persists and a repeat replaces the findings", func(t *testing.T) {
 		first := `{"claim_generation":1,"status":"completed","report_md":"first","findings":[` +
 			`{"severity":"info","message_md":"a"},{"severity":"error","message_md":"b","file":"x.go","line":3},` +

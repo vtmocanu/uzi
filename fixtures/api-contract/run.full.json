@@ -186,6 +186,32 @@
     "published_at": "2020-01-02T03:04:05Z"
   },
   "pr_description_outcome": "x",
+  "job": {
+    "type": "x",
+    "inputs": [
+      {
+        "name": "x",
+        "size_bytes": 1
+      }
+    ],
+    "origin": {
+      "requested_by_label": "x",
+      "product_name": "x"
+    },
+    "result": {
+      "status": "x",
+      "report_md": "x",
+      "findings": [
+        {
+          "severity": "x",
+          "message_md": "x",
+          "url": "x",
+          "file": "x",
+          "line": 1
+        }
+      ]
+    }
+  },
   "pipeline_ref": "x",
   "pipeline_web_url": "x",
   "fix_verdict": "x",

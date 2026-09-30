@@ -72,6 +72,9 @@ services:
       # Per-user budget on the forge-proxying endpoints (verify/projects/sync/move).
       FORGE_RATE_LIMIT_MAX: ${FORGE_RATE_LIMIT_MAX:-30}
       FORGE_RATE_LIMIT_WINDOW: ${FORGE_RATE_LIMIT_WINDOW:-1m}
+      # Per-user budget on the whole /api/v1 external API (job clients poll).
+      V1_RATE_LIMIT_MAX: ${V1_RATE_LIMIT_MAX:-120}
+      V1_RATE_LIMIT_WINDOW: ${V1_RATE_LIMIT_WINDOW:-1m}
       # Optional startup admin seed. Unset => no seeding. If set, the API creates
       # this admin after migrations (only if absent) and refuses to boot on an
       # invalid seed password.

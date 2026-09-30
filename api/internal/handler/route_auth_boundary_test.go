@@ -168,7 +168,7 @@ func TestWorkerControllerRoutesAreBearerOnly(t *testing.T) {
 
 	// Routes is NOT variadic (9 fixed *mw.Limiter params) — call positionally.
 	mainRouter := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
 	// WorkerRoutes takes the single proposalLimiter (position 4).
 	tlsRouter := h.WorkerRoutes(limiters[4])
 

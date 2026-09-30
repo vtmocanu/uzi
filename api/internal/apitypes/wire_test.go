@@ -287,6 +287,38 @@ func TestRunDTOTags(t *testing.T) {
 	if !contains(got, "usage") {
 		t.Fatalf("RunDTO with Usage set must include usage key, got %v", got)
 	}
+	// PRD #1908 D-D: job is omitempty (job runs' detail read only): absent when nil, present when set.
+	if contains(tagSet(t, RunDTO{}), "job") {
+		t.Fatal("RunDTO without a Job must not carry the job key")
+	}
+	if got := tagSet(t, RunDTO{Job: &RunJobDTO{}}); !contains(got, "job") {
+		t.Fatalf("RunDTO with Job set must include job key, got %v", got)
+	}
+}
+
+func TestRunJobDTOTags(t *testing.T) {
+	assertTags(t, "RunJobDTO", RunJobDTO{}, "type", "inputs", "origin", "result")
+	assertTags(t, "RunJobInputDTO", RunJobInputDTO{}, "name", "size_bytes")
+	assertTags(t, "RunJobOriginDTO", RunJobOriginDTO{}, "requested_by_label", "product_name")
+	assertTags(t, "RunJobResultDTO", RunJobResultDTO{}, "status", "report_md", "findings")
+	assertTags(t, "RunJobFindingDTO", RunJobFindingDTO{}, "severity", "message_md", "url", "file", "line")
+}
+
+// The /api/v1/jobs wire is part of the stable external contract (PRD #1907 D12): adding a key
+// is additive, so the tag sets are pinned and a change here is a deliberate edit. None carries
+// a product or token id, an owner, a fail_origin or any internal run column.
+func TestV1JobDTOTags(t *testing.T) {
+	assertTags(t, "V1JobDTO", V1JobDTO{}, "id", "type", "status", "title", "requested_by_label",
+		"failure_reason", "wall_seconds", "created_at", "started_at", "finished_at")
+	assertTags(t, "V1JobListDTO", V1JobListDTO{}, "jobs", "next_cursor")
+	assertTags(t, "V1JobResultDTO", V1JobResultDTO{}, "job_status", "result")
+	assertTags(t, "V1JobResultBodyDTO", V1JobResultBodyDTO{}, "status", "report_md", "findings")
+	assertTags(t, "V1JobFindingDTO", V1JobFindingDTO{}, "severity", "message_md", "url", "file", "line")
+	assertTags(t, "V1JobMessagesDTO", V1JobMessagesDTO{}, "messages")
+	assertTags(t, "V1JobMessageDTO", V1JobMessageDTO{}, "seq", "created_at", "type", "text")
+	assertTags(t, "V1JobInputDTO", V1JobInputDTO{}, "name", "content")
+	// The request is all-omitempty except type and prompt; tagSet reads the marshalled zero value.
+	assertTags(t, "V1JobCreateRequest", V1JobCreateRequest{}, "type", "prompt")
 }
 
 func TestRunListItemDTOTags(t *testing.T) {
@@ -903,7 +935,9 @@ func TestMintProductTokenResponseTags(t *testing.T) {
 
 func TestProductDTOTags(t *testing.T) {
 	assertTags(t, "ProductDTO", ProductDTO{},
-		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count")
+		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count",
+		// PRD #1908 D-C: the job types the product's tokens may create; never null on the wire.
+		"allowed_job_types")
 }
 
 // /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries

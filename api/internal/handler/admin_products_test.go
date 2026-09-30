@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 
@@ -165,6 +166,10 @@ func TestAdminProductWritesRejectBadInputBeforeTheStore(t *testing.T) {
 			productJSON(t, map[string]string{"name": "ok", "description": "line1\nline2"})},
 		{"create: description over cap", h.AdminCreateProduct, http.MethodPost, "",
 			productJSON(t, map[string]string{"name": "ok", "description": strings.Repeat("d", 1001)})},
+		{"create: unknown job type", h.AdminCreateProduct, http.MethodPost, "", `{"name":"ok","allowed_job_types":["research","code_review"]}`},
+		{"create: allowed_job_types wrong shape", h.AdminCreateProduct, http.MethodPost, "", `{"name":"ok","allowed_job_types":"research"}`},
+		{"patch: unknown job type", h.AdminPatchProduct, http.MethodPatch, id, `{"allowed_job_types":["nope"]}`},
+		{"patch: empty job type entry", h.AdminPatchProduct, http.MethodPatch, id, `{"allowed_job_types":[""]}`},
 		{"patch: bad id", h.AdminPatchProduct, http.MethodPatch, "not-a-uuid", `{"enabled":false}`},
 		{"patch: empty body object", h.AdminPatchProduct, http.MethodPatch, id, `{}`},
 		{"patch: name is immutable", h.AdminPatchProduct, http.MethodPatch, id, `{"name":"renamed"}`},
@@ -182,5 +187,39 @@ func TestAdminProductWritesRejectBadInputBeforeTheStore(t *testing.T) {
 				t.Fatalf("status %d (%s), want 400", rec.Code, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestValidateAllowedJobTypes (PRD #1908 D-C): each entry must be a known job type; the result is
+// de-duplicated in first-seen order and never nil.
+func TestValidateAllowedJobTypes(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		in   []string
+		want []string
+		bad  bool
+	}{
+		{"nil is the empty list", nil, []string{}, false},
+		{"empty stays empty", []string{}, []string{}, false},
+		{"one known type", []string{"research"}, []string{"research"}, false},
+		{"duplicates collapse", []string{"research", "research"}, []string{"research"}, false},
+		{"unknown type", []string{"translate"}, nil, true},
+		{"unknown after a known one", []string{"research", "translate"}, nil, true},
+		{"empty entry", []string{""}, nil, true},
+		{"case matters", []string{"Research"}, nil, true},
+		{"whitespace is not trimmed", []string{" research"}, nil, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := validateAllowedJobTypes(tc.in)
+			if (err != nil) != tc.bad {
+				t.Fatalf("err = %v, want error %v", err, tc.bad)
+			}
+			if !tc.bad && (got == nil || !slices.Equal(got, tc.want)) {
+				t.Fatalf("got %#v, want %#v (non-nil)", got, tc.want)
+			}
+		})
+	}
+	if got := jobTypesOrEmpty(nil); got == nil || len(got) != 0 {
+		t.Fatalf("jobTypesOrEmpty(nil) = %#v, want a non-nil empty slice (the wire is never null)", got)
 	}
 }

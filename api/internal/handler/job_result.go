@@ -142,12 +142,19 @@ func decodeJobResultBytes(body []byte) (workerJobResultRequest, error) {
 	if tok, err := dec.Token(); err != nil || tok != json.Delim('{') {
 		return req, errors.New("request body must be a JSON object")
 	}
+	seen := map[string]bool{}
 	for dec.More() {
 		keyTok, err := dec.Token()
 		if err != nil {
 			return req, err
 		}
 		key, _ := keyTok.(string)
+		// A repeated key is refused, never merged: findings in particular would otherwise be
+		// appended across occurrences and get past the count check one array at a time.
+		if seen[key] {
+			return req, fmt.Errorf("duplicate field %q", key)
+		}
+		seen[key] = true
 		switch key {
 		case "claim_generation":
 			err = dec.Decode(&req.ClaimGeneration)

@@ -1,0 +1,14 @@
+{
+  "type": "x",
+  "title": "x",
+  "prompt": "x",
+  "inputs": [
+    {
+      "name": "x",
+      "content": "x"
+    }
+  ],
+  "requested_by_label": "x",
+  "wall_seconds": 1,
+  "egress_profile": "x"
+}

@@ -77,6 +77,9 @@ func v1LiveDB(t *testing.T) (*Handler, *pgxpool.Pool) {
 		WorkerHeartbeatStale:  time.Minute,
 	}
 	wsvc := workersvc.New(q, box, workersvc.Params{})
+	// As cmd/server wires it: a job create needs the transaction beginner (its cap check and
+	// inserts are one atomic unit), so the /api/v1/jobs tests run through the same service.
+	wsvc.SetTxBeginner(pool)
 	h := New(pool, q, cfg, box, nil, wsvc, nil, hub.New(), settings.New(q, time.Minute))
 	h.SetHostedSvc(hostedsvc.New(q, box, time.Now, cfg.WorkerHeartbeatStale))
 	return h, pool
@@ -89,7 +92,7 @@ func v1LiveDB(t *testing.T) (*Handler, *pgxpool.Pool) {
 func v1Routers(h *Handler) (routes, workerRoutes http.Handler) {
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
 	proposal := lim()
-	routes = h.Routes(lim(), lim(), lim(), lim(), proposal, lim(), lim(), lim(), lim())
+	routes = h.Routes(lim(), lim(), lim(), lim(), proposal, lim(), lim(), lim(), lim(), lim())
 	return routes, h.WorkerRoutes(proposal)
 }
 

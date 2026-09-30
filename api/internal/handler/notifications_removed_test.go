@@ -18,7 +18,7 @@ import (
 func TestNotificationsInboxRoutesAreGone(t *testing.T) {
 	noLimit := mw.NewLimiter(100000, time.Minute, nil)
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
-	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
+	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
 
 	for _, tc := range []struct{ method, path string }{
 		{http.MethodGet, "/api/notifications"},

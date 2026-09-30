@@ -102,6 +102,36 @@ SELECT f.ordinal, f.severity, f.message_md, f.url, f.file, f.line
    AND (sqlc.narg('product_id')::uuid IS NULL OR o.product_id = sqlc.narg('product_id')::uuid)
  ORDER BY f.ordinal ASC;
 
+-- name: GetJobOriginForRun :one
+-- The origin of a job run for the run-detail read (PRD #1908 D-D): the untrusted requested_by_label
+-- and the creating product's NAME (NULL for a uzc_-created job). NOT caller-scoped: the run-read
+-- authorization (owner or admin) was decided by the handler before this runs.
+SELECT o.requested_by_label, p.name AS product_name
+  FROM job_origins o
+  LEFT JOIN products p ON p.id = o.product_id
+ WHERE o.run_id = @run_id;
+
+-- name: ListJobInputSizesForRun :many
+-- The run-detail view of a job's inputs: name and byte size only (the content can be 1 MiB and is
+-- not part of the run detail). Bounded by @lim; ordinal order. Same authorization note as
+-- GetJobOriginForRun.
+SELECT name, octet_length(content_md)::int AS size_bytes
+  FROM job_inputs
+ WHERE run_id = @run_id
+ ORDER BY ordinal ASC
+ LIMIT @lim;
+
+-- name: GetJobResultForRun :one
+SELECT status, report_md
+  FROM job_results
+ WHERE run_id = @run_id;
+
+-- name: ListJobFindingsForRun :many
+SELECT ordinal, severity, message_md, url, file, line
+  FROM job_findings
+ WHERE run_id = @run_id
+ ORDER BY ordinal ASC;
+
 -- name: UpsertJobResult :exec
 -- The worker's job-result ingest (PRD #1908): the run's one structured result, idempotent on
 -- run_id so a retried POST replaces the earlier body. Runs in the ingest transaction, after the

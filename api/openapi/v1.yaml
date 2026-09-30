@@ -7,6 +7,10 @@
 # least two minor releases and at least 90 days, whichever is later) or a new
 # /api/v2 prefix. The internal /api/* routes are NOT part of this contract.
 #
+# The jobs endpoints (PRD #1908) are described below; the same rule applies to them.
+# scripts/oasdiff.sh runs `task check:api-v1-compat`, which diffs this file against the
+# copy on origin/main and fails on any breaking change.
+#
 # Paths below are relative to the single server url, /api/v1: "/whoami" is served
 # at GET /api/v1/whoami. TestV1OpenAPIRouteParity (api/internal/handler) asserts
 # that this document's operations and the production router's /api/v1 routes are
@@ -45,6 +49,185 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+  /jobs:
+    post:
+      operationId: createJob
+      summary: Create a job
+      description: >-
+        Queues a job that runs as the token's user, on that user's own Anthropic
+        credential. Needs the jobs:run scope. A product token may create only the job
+        types its product allows. The job starts queued and runs to completion with no
+        approval step; poll GET /jobs/{id} for progress.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/JobCreateRequest"
+      responses:
+        "201":
+          description: The queued job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+    get:
+      operationId: listJobs
+      summary: List jobs
+      description: >-
+        The caller's jobs, newest first, one page at a time. A user token sees all of
+        its user's jobs; a product token sees only the jobs created through its own
+        product. Needs the jobs:read scope.
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Page size, 1 to 100. The default is 50.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+        - name: cursor
+          in: query
+          required: false
+          description: The next_cursor of the previous page. Opaque.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: One page of jobs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobList"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /jobs/{id}:
+    get:
+      operationId: getJob
+      summary: Get a job
+      description: >-
+        One job's state. Needs the jobs:read scope. A job the caller cannot see (another
+        user's, another product's, or unknown) is 404.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /jobs/{id}/result:
+    get:
+      operationId: getJobResult
+      summary: Get a job's result
+      description: >-
+        The job's report and findings. The result is null until the job has reported
+        one; job_status says whether it can still arrive (queued, running or waiting)
+        or never will (failed, cancelled). Needs the jobs:read scope.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job's status and, once reported, its result.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobResult"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /jobs/{id}/messages:
+    get:
+      operationId: listJobMessages
+      summary: Read a job's progress messages
+      description: >-
+        A narrowed progress feed: the agent's text, status and error lines, oldest first,
+        after the given seq. Tool input and output are never included. Poll again with
+        after set to the last seq returned. Needs the jobs:read scope.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+        - name: after
+          in: query
+          required: false
+          description: Return only messages with a seq greater than this. The default is 0.
+          schema:
+            type: integer
+            minimum: 0
+      responses:
+        "200":
+          description: The messages after the given seq (at most one bounded page).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobMessages"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+  /jobs/{id}/cancel:
+    post:
+      operationId: cancelJob
+      summary: Cancel a job
+      description: >-
+        Cancels a queued or running job. A queued job ends cancelled at once; a running
+        one is stopped by its worker, so the returned job may still read running for a
+        moment. Needs the jobs:run scope.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job after the cancel request.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
 components:
   securitySchemes:
     bearerAuth:
@@ -63,23 +246,74 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: >-
+        The token lacks the scope the endpoint needs (reason insufficient_scope), or, on
+        POST /jobs, a product token asked for a job type its product does not allow
+        (reason job_type_not_allowed; a product with an empty allow-list allows none).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    NotFound:
+      description: >-
+        No such job, or a job the caller cannot see: another user's job, another
+        product's job and a malformed id all answer the same (reason not_found).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Conflict:
+      description: The job has already finished (reason job_terminal).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    PayloadTooLarge:
+      description: The request body is over the size limit (reason payload_too_large).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Unprocessable:
+      description: >-
+        The request is understood but refused. The reason says why: invalid_request (a
+        malformed or invalid body or query parameter; the message names the field),
+        unknown_job_type, not_supported (egress_profile is reserved and refused for
+        now) or no_model_credential (the user has no usable Anthropic credential in
+        uzi).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     TooManyRequests:
       description: >-
-        The per-user request budget for /api/v1 is spent. Retry after the number
-        of seconds in the Retry-After header.
+        Either the per-user request budget for /api/v1 is spent (no reason field; retry
+        after the number of seconds in the Retry-After header), or, on POST /jobs, the
+        user already has the maximum number of unfinished jobs (reason over_cap; retry
+        once one finishes or is cancelled).
       headers:
         Retry-After:
           description: >-
-            An upper bound, in seconds, on how long to wait: the budget is a
-            fixed window and this is always the full window length, so the
-            budget may reset sooner. A retry after this many seconds does not
-            land in the window that was exhausted.
+            Present when the request budget is spent. An upper bound, in seconds, on
+            how long to wait: the budget is a fixed window and this is always the full
+            window length, so the budget may reset sooner. A retry after this many
+            seconds does not land in the window that was exhausted.
           schema:
             type: integer
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+  parameters:
+    JobId:
+      name: id
+      in: path
+      required: true
+      description: The job id.
+      schema:
+        type: string
+        format: uuid
   schemas:
     Error:
       type: object
@@ -89,6 +323,11 @@ components:
         error:
           type: string
           description: A human-readable message.
+        reason:
+          type: string
+          description: >-
+            A stable machine-readable code for the failure, on the errors that have
+            one (see each response). Branch on this, not on the message.
     Whoami:
       type: object
       required:
@@ -133,4 +372,242 @@ components:
           type: string
           format: uuid
         name:
+          type: string
+    JobCreateRequest:
+      type: object
+      required:
+        - type
+        - prompt
+      properties:
+        type:
+          type: string
+          description: The job type.
+          enum:
+            - research
+        title:
+          type:
+            - string
+            - "null"
+          description: >-
+            A short label, at most 200 bytes. Derived from the first line of the
+            prompt when omitted.
+        prompt:
+          type: string
+          description: What the job should do, at most 256 KiB.
+        inputs:
+          type:
+            - array
+            - "null"
+          description: >-
+            Named text the job can read, at most 20 inputs and 1 MiB in total. Names
+            are 1 to 100 characters of letters, digits, dot, underscore or hyphen,
+            starting with a letter or digit, unique within the job.
+          items:
+            $ref: "#/components/schemas/JobInput"
+        requested_by_label:
+          type:
+            - string
+            - "null"
+          description: >-
+            Who the job is for, in the caller's own words, at most 200 bytes. Shown to
+            the job's owner as attribution reported by the product; never used to
+            decide access.
+        wall_seconds:
+          type:
+            - integer
+            - "null"
+          description: >-
+            A wall-clock limit for the job, in seconds. Values above the instance
+            ceiling (8 hours) are clamped to it. The instance default applies when
+            omitted.
+        egress_profile:
+          type:
+            - string
+            - "null"
+          description: Reserved. Any value is refused with reason not_supported.
+    JobInput:
+      type: object
+      required:
+        - name
+        - content
+      properties:
+        name:
+          type: string
+        content:
+          type: string
+    Job:
+      type: object
+      required:
+        - id
+        - type
+        - status
+        - title
+        - requested_by_label
+        - failure_reason
+        - wall_seconds
+        - created_at
+        - started_at
+        - finished_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        type:
+          type: string
+          description: The job type, one of the values POST /jobs accepts.
+        status:
+          type: string
+          description: >-
+            queued (waiting for a worker), running, waiting (held until a model
+            credential or capacity is available; it resumes by itself), and the
+            terminal completed, failed and cancelled.
+          enum:
+            - queued
+            - running
+            - waiting
+            - completed
+            - failed
+            - cancelled
+        title:
+          type: string
+        requested_by_label:
+          type:
+            - string
+            - "null"
+        failure_reason:
+          type:
+            - string
+            - "null"
+          description: Why the job failed; null unless it failed.
+        wall_seconds:
+          type:
+            - integer
+            - "null"
+          description: The job's wall-clock limit; null while the instance default applies.
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+        finished_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+    JobList:
+      type: object
+      required:
+        - jobs
+        - next_cursor
+      properties:
+        jobs:
+          type: array
+          items:
+            $ref: "#/components/schemas/Job"
+        next_cursor:
+          type:
+            - string
+            - "null"
+          description: Pass as cursor to fetch the next page; null on the last page.
+    JobResult:
+      type: object
+      required:
+        - job_status
+        - result
+      properties:
+        job_status:
+          type: string
+          description: The job's status, as in Job.
+          enum:
+            - queued
+            - running
+            - waiting
+            - completed
+            - failed
+            - cancelled
+        result:
+          description: The job's result; null until it has reported one.
+          oneOf:
+            - $ref: "#/components/schemas/JobResultBody"
+            - type: "null"
+    JobResultBody:
+      type: object
+      required:
+        - status
+        - report_md
+        - findings
+      properties:
+        status:
+          type: string
+          description: A short lowercase token the job reported for its own outcome.
+        report_md:
+          type: string
+          description: The report, markdown. Untrusted text; render it inert.
+        findings:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobFinding"
+    JobFinding:
+      type: object
+      required:
+        - severity
+        - message_md
+        - url
+        - file
+        - line
+      properties:
+        severity:
+          type: string
+          enum:
+            - info
+            - warning
+            - error
+        message_md:
+          type: string
+        url:
+          type:
+            - string
+            - "null"
+          description: An http or https location; null when the finding names a file or nothing.
+        file:
+          type:
+            - string
+            - "null"
+        line:
+          type:
+            - integer
+            - "null"
+          description: A line in file; null unless file is set.
+    JobMessages:
+      type: object
+      required:
+        - messages
+      properties:
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobMessage"
+    JobMessage:
+      type: object
+      required:
+        - seq
+        - created_at
+        - type
+        - text
+      properties:
+        seq:
+          type: integer
+        created_at:
+          type: string
+          format: date-time
+        type:
+          type: string
+          enum:
+            - text
+            - status
+            - error
+        text:
           type: string

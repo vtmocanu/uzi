@@ -8701,9 +8701,12 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 //     nothing has claimed yet, excluding the chat lane (which never carries capability
 //     requirements and is served by ClaimChatRun).
 //
-//   - cardinality(r.required_capabilities) > 0 — a run with no capability requirement is
-//     never "unplaceable for a capability", so it is not our concern (mirrors
-//     health.go's len(RequiredCapabilities) > 0 guard on the display reason).
+//   - cardinality(r.required_capabilities) > 0 — for every kind EXCEPT 'job', a run with no
+//     capability requirement is never "unplaceable for a capability", so it is not our
+//     concern (mirrors health.go's len(RequiredCapabilities) > 0 guard on the display
+//     reason). A kind='job' run always has required_capabilities = '{}' yet CAN be
+//     unplaceable: it needs an online, non-docker worker advertising 'job_runner_v1'. That
+//     kind is decided by the job arm of the OR below (PRD #1908 D-A), not by this conjunct.
 //
 //   - NOT EXISTS (an online, non-draining, NON-ephemeral worker of the user whose
 //     EFFECTIVE caps are a superset of the run's) — the SAME effective-caps fold as

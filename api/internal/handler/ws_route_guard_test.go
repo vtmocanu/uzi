@@ -89,7 +89,7 @@ func (wsGuardRow) Scan(...any) error { return errWSGuardDB }
 // generated SQL: getCLITokenByHash selects "FROM cli_tokens", getUserByID (the cookie
 // branch's only lookup) selects "FROM users".
 const (
-	wsGuardCLITokenRead = "FROM cli_tokens"
+	wsGuardCLITokenRead = "FROM cli_tokens" //nolint:gosec // G101: an SQL fragment the fake store matches on, not a credential.
 	wsGuardUserRead     = "FROM users"
 )
 
@@ -112,7 +112,7 @@ func wsGuardRouter(t *testing.T) (http.Handler, *wsGuardDB, uuid.UUID) {
 		hub:  hub.New(),
 	}
 	noLimit := mw.NewLimiter(100000, time.Minute, nil)
-	return h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit), db, runID
+	return h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit), db, runID
 }
 
 // -------------------------------------------------------------------------
@@ -147,7 +147,7 @@ func TestWSRouteRejectsUncredentialedUpgrade(t *testing.T) {
 	// A cookie that is PRESENT but not parseable gets the middleware's own diagnostic,
 	// which is the proof the middleware ran at all.
 	req := httptest.NewRequest(http.MethodGet, url, nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: "not-a-jwt"})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: "not-a-jwt"}) //nolint:gosec // G124: test-only request cookie.
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, req)
 	if rec.Code != http.StatusUnauthorized {
@@ -186,7 +186,7 @@ func TestWSRouteBogusBearerDoesNotFallBackToCookie(t *testing.T) {
 	// takes the cookie branch and is observed doing so. Without this, the "users was
 	// never read" assertion below could be satisfied by a trace that records nothing.
 	req := httptest.NewRequest(http.MethodGet, url, nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only request cookie.
 	router.ServeHTTP(httptest.NewRecorder(), req)
 	if !db.saw(wsGuardUserRead) {
 		t.Fatalf("a cookie-only upgrade did not read users; the query trace cannot observe the cookie branch, so the fallback assertion below would be vacuous\nrecorded: %v", db.queries)
@@ -195,7 +195,7 @@ func TestWSRouteBogusBearerDoesNotFallBackToCookie(t *testing.T) {
 	// The attack, on a FRESH trace so the control above cannot colour it.
 	router, db, runID = wsGuardRouter(t)
 	req = httptest.NewRequest(http.MethodGet, "/api/ws?run="+runID.String(), nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: jwt}) //nolint:gosec // G124: test-only request cookie.
 	req.Header.Set("Authorization", "Bearer uzc_not-a-real-token")
 	rec := httptest.NewRecorder()
 	router.ServeHTTP(rec, req)

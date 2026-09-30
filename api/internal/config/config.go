@@ -206,6 +206,16 @@ type Config struct {
 	// trips a user reordering their own backlog is a bug, not protection.
 	BoardOrderRateLimitMax    int
 	BoardOrderRateLimitWindow time.Duration
+	// V1RateLimitMax/Window is the dedicated per-user budget for the whole /api/v1
+	// subtree (PRD #1908 D-B), keyed on the caller's user AFTER RequireV1Caller so minting
+	// more tokens buys no extra budget. It replaces the authLimiter (10/min) budget PRD
+	// #1907 put there: a job client polls GET /api/v1/jobs/{id} and its messages feed, so
+	// 10/min is unusable for the API's whole purpose. The default (120/min, two requests a
+	// second) leaves headroom for one polling client per user with a few jobs in flight.
+	// POST /api/v1/jobs additionally rides authLimiter per user (a create is the spend
+	// action, so it keeps the tighter credential-surface budget on top of this one).
+	V1RateLimitMax    int
+	V1RateLimitWindow time.Duration
 	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
 	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
@@ -878,6 +888,8 @@ func Load() (Config, error) {
 	cfg.CLIPollRateLimitWindow = parseDuration("CLI_POLL_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.BoardOrderRateLimitMax = parseInt("BOARD_ORDER_RATE_LIMIT_MAX", 120)
 	cfg.BoardOrderRateLimitWindow = parseDuration("BOARD_ORDER_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.V1RateLimitMax = parseInt("V1_RATE_LIMIT_MAX", 120)
+	cfg.V1RateLimitWindow = parseDuration("V1_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)

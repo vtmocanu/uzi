@@ -849,8 +849,9 @@ const ChatCreateRoutePattern = "/api/chats/"
 // per-user budget on the two endpoints that churn cluster objects (PRD #58
 // Decision 8) — hosted provision and worker delete; cliPollLimiter is a dedicated
 // per-(path,IP) budget on POST /api/auth/cli/poll (PRD #64 M5), sized to exceed the
-// server-returned poll cadence so uzi login cannot trip its own rate limit.
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter *mw.Limiter) http.Handler {
+// server-returned poll cadence so uzi login cannot trip its own rate limit; v1Limiter is the
+// dedicated per-user budget on the whole /api/v1 subtree (PRD #1908 D-B).
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -886,7 +887,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		h.mountWorkersRoutes(r, hostedLimiter)
 		// The stable external API (PRD #1907): its own auth (RequireV1Caller, Bearer
 		// only) and a per-user limit; read mountV1Routes before adding anything here.
-		h.mountV1Routes(r, authLimiter)
+		h.mountV1Routes(r, authLimiter, v1Limiter)
 
 		// Runs (PRD #64): the core CLI loop is RequireUser — list/get/messages/inputs,
 		// /{id}/review (Decision 21), and the forge FileIssue write (PRD #365 M1). The

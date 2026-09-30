@@ -538,3 +538,93 @@ func TestAdminListProductTokensTruncatedLiveDB(t *testing.T) {
 		}
 	})
 }
+
+// TestAdminProductAllowedJobTypesLiveDB (PRD #1908 D-C): the cookie-only admin create and patch
+// accept and return allowed_job_types, validated against the known job types and de-duplicated;
+// an omitted or null field keeps the stored value, an empty list clears it, and the stored value
+// is what a product token's job create is checked against.
+func TestAdminProductAllowedJobTypesLiveDB(t *testing.T) {
+	h, pool := v1LiveDB(t)
+	routes, _ := v1Routers(h)
+	admin := cliSeedUser(t, pool, true)
+	jwt := cliMintJWT(t, pool, admin)
+	stored := func(id string) []string {
+		var got []string
+		if err := pool.QueryRow(t.Context(), `SELECT allowed_job_types FROM products WHERE id = $1`, id).Scan(&got); err != nil {
+			t.Fatalf("read allowed_job_types: %v", err)
+		}
+		return got
+	}
+	create := func(body string) (int, apitypes.ProductDTO) {
+		rec := cookieReq(t, routes, http.MethodPost, "/api/admin/products", jwt, body)
+		if rec.Code != http.StatusCreated {
+			return rec.Code, apitypes.ProductDTO{}
+		}
+		return rec.Code, apDecodeProduct(t, rec.Code, rec.Body.String()).Product
+	}
+	patch := func(id, body string) (int, apitypes.ProductDTO) {
+		rec := cookieReq(t, routes, http.MethodPatch, "/api/admin/products/"+id, jwt, body)
+		if rec.Code != http.StatusOK {
+			return rec.Code, apitypes.ProductDTO{}
+		}
+		return rec.Code, apDecodeProduct(t, rec.Code, rec.Body.String()).Product
+	}
+
+	// Omitted: the empty allow-list (fail-closed), returned as [] and never null.
+	code, none := create(`{"name":"NoTypes ` + uuid.NewString() + `"}`)
+	if code != http.StatusCreated || none.AllowedJobTypes == nil || len(none.AllowedJobTypes) != 0 {
+		t.Fatalf("create without the field: %d %+v, want 201 with allowed_job_types []", code, none)
+	}
+	rec := cookieReq(t, routes, http.MethodPost, "/api/admin/products", jwt, `{"name":"NullTypes `+uuid.NewString()+`","allowed_job_types":null}`)
+	if rec.Code != http.StatusCreated || !strings.Contains(rec.Body.String(), `"allowed_job_types":[]`) {
+		t.Fatalf("create with null: %d %s, want 201 and []", rec.Code, rec.Body.String())
+	}
+
+	// Duplicates collapse; the store and the response agree.
+	code, p := create(`{"name":"Researcher ` + uuid.NewString() + `","allowed_job_types":["research","research"]}`)
+	if code != http.StatusCreated || len(p.AllowedJobTypes) != 1 || p.AllowedJobTypes[0] != "research" {
+		t.Fatalf("create with a duplicate: %d %+v, want [research]", code, p)
+	}
+	if got := stored(p.ID); len(got) != 1 || got[0] != "research" {
+		t.Fatalf("stored = %v, want [research]", got)
+	}
+	if listed := apListProducts(t, routes, jwt)[p.ID]; len(listed.AllowedJobTypes) != 1 || listed.AllowedJobTypes[0] != "research" {
+		t.Errorf("GET /api/admin/products lists allowed_job_types %v, want [research]", listed.AllowedJobTypes)
+	}
+
+	// Unknown types are refused and store nothing.
+	if code, _ := create(`{"name":"Bad ` + uuid.NewString() + `","allowed_job_types":["translate"]}`); code != http.StatusBadRequest {
+		t.Errorf("create with an unknown type = %d, want 400", code)
+	}
+	if code, _ := patch(p.ID, `{"allowed_job_types":["research","translate"]}`); code != http.StatusBadRequest {
+		t.Errorf("patch with an unknown type = %d, want 400", code)
+	}
+	if got := stored(p.ID); len(got) != 1 {
+		t.Errorf("a refused patch changed the stored list to %v", got)
+	}
+
+	// An unrelated patch, and an explicit null, keep the list; an empty list clears it.
+	if code, got := patch(p.ID, `{"description":"still allowed"}`); code != http.StatusOK || len(got.AllowedJobTypes) != 1 {
+		t.Errorf("description-only patch: %d %+v, want the list kept", code, got)
+	}
+	if code, got := patch(p.ID, `{"description":"x","allowed_job_types":null}`); code != http.StatusOK || len(got.AllowedJobTypes) != 1 {
+		t.Errorf("null patch: %d %+v, want the list kept", code, got)
+	}
+
+	// The stored list is what a job create is checked against, for a live product token.
+	e := &v1JobsEnv{t: t, h: h, pool: pool, routes: routes}
+	owner, _ := e.user()
+	pid := uuid.MustParse(p.ID)
+	tok := v1MintProductToken(t, h.q, owner, pid, producttoken.Scopes, nil)
+	if r := e.call(http.MethodPost, "/api/v1/jobs", tok.token, v1MinimalJob); r.status != http.StatusCreated {
+		t.Fatalf("job create with research allowed: %d %s, want 201", r.status, r.body)
+	}
+	code, cleared := patch(p.ID, `{"allowed_job_types":[]}`)
+	if code != http.StatusOK || cleared.AllowedJobTypes == nil || len(cleared.AllowedJobTypes) != 0 {
+		t.Fatalf("clearing patch: %d %+v, want [] (not null)", code, cleared)
+	}
+	e.want(e.call(http.MethodPost, "/api/v1/jobs", tok.token, v1MinimalJob), http.StatusForbidden, "job_type_not_allowed")
+	if code, got := patch(p.ID, `{"allowed_job_types":["research"]}`); code != http.StatusOK || len(got.AllowedJobTypes) != 1 {
+		t.Errorf("re-allow patch: %d %+v", code, got)
+	}
+}

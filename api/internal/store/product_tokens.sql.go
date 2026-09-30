@@ -70,21 +70,29 @@ func (q *Queries) CountActiveProductTokensForUserProduct(ctx context.Context, ar
 }
 
 const createProduct = `-- name: CreateProduct :one
-INSERT INTO products (name, description, created_by)
-VALUES ($1, $2, $3)
+INSERT INTO products (name, description, created_by, allowed_job_types)
+VALUES ($1, $2, $3, COALESCE($4::text[], '{}'))
 RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
 `
 
 type CreateProductParams struct {
-	Name        string      `json:"name"`
-	Description string      `json:"description"`
-	CreatedBy   pgtype.UUID `json:"created_by"`
+	Name            string      `json:"name"`
+	Description     string      `json:"description"`
+	CreatedBy       pgtype.UUID `json:"created_by"`
+	AllowedJobTypes []string    `json:"allowed_job_types"`
 }
 
 // Register a product (admin). A live product with the same case-insensitive name fails
 // uq_products_live_name (23505; the handler maps it to 409).
+// allowed_job_types (PRD #1908 D-C) is a NULLABLE argument: NULL leaves the column default
+// (empty, which allows no job type). The handler validates each entry against runkind.JobTypes.
 func (q *Queries) CreateProduct(ctx context.Context, arg CreateProductParams) (Product, error) {
-	row := q.db.QueryRow(ctx, createProduct, arg.Name, arg.Description, arg.CreatedBy)
+	row := q.db.QueryRow(ctx, createProduct,
+		arg.Name,
+		arg.Description,
+		arg.CreatedBy,
+		arg.AllowedJobTypes,
+	)
 	var i Product
 	err := row.Scan(
 		&i.ID,
@@ -515,6 +523,7 @@ SELECT p.id,
        p.created_by,
        p.created_at,
        p.updated_at,
+       p.allowed_job_types,
        (SELECT count(*)
           FROM product_tokens t
          WHERE t.product_id = p.id
@@ -533,6 +542,7 @@ type ListProductsRow struct {
 	CreatedBy        pgtype.UUID        `json:"created_by"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes  []string           `json:"allowed_job_types"`
 	ActiveTokenCount int64              `json:"active_token_count"`
 }
 
@@ -557,6 +567,7 @@ func (q *Queries) ListProducts(ctx context.Context) ([]ListProductsRow, error) {
 			&i.CreatedBy,
 			&i.CreatedAt,
 			&i.UpdatedAt,
+			&i.AllowedJobTypes,
 			&i.ActiveTokenCount,
 		); err != nil {
 			return nil, err
@@ -681,19 +692,21 @@ const updateProduct = `-- name: UpdateProduct :one
 UPDATE products
    SET description = COALESCE($1::text, description),
        enabled = COALESCE($2::boolean, enabled),
+       allowed_job_types = COALESCE($3::text[], allowed_job_types),
        updated_at = now()
- WHERE id = $3
+ WHERE id = $4
    AND deleted_at IS NULL
 RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types
 `
 
 type UpdateProductParams struct {
-	Description pgtype.Text `json:"description"`
-	Enabled     pgtype.Bool `json:"enabled"`
-	ID          uuid.UUID   `json:"id"`
+	Description     pgtype.Text `json:"description"`
+	Enabled         pgtype.Bool `json:"enabled"`
+	AllowedJobTypes []string    `json:"allowed_job_types"`
+	ID              uuid.UUID   `json:"id"`
 }
 
-// Admin edit of the mutable fields (description, enabled). Each is a NULLABLE argument:
+// Admin edit of the mutable fields (description, enabled, allowed_job_types). Each is a NULLABLE argument:
 // NULL keeps the column's current value (COALESCE against the row being updated), so a
 // PATCH naming one field never reads-then-writes the other: the COALESCE is evaluated
 // on the row version the UPDATE writes, so a concurrent PATCH of a different field is
@@ -703,7 +716,12 @@ type UpdateProductParams struct {
 // and 409 for a deleted one); the products_deleted_is_disabled CHECK backs this up.
 // The name is immutable here: it is the label users recognise tokens by.
 func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (Product, error) {
-	row := q.db.QueryRow(ctx, updateProduct, arg.Description, arg.Enabled, arg.ID)
+	row := q.db.QueryRow(ctx, updateProduct,
+		arg.Description,
+		arg.Enabled,
+		arg.AllowedJobTypes,
+		arg.ID,
+	)
 	var i Product
 	err := row.Scan(
 		&i.ID,

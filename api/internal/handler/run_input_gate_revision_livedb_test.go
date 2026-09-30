@@ -48,7 +48,7 @@ func TestCreateRunInputGateRevisionMismatchLiveDB(t *testing.T) {
 	wsvc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, wsvc: wsvc, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
-	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim)
+	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 
 	owner, connID, repoID, wkrID := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 	uniq := func(id uuid.UUID) int64 { return int64(binary.BigEndian.Uint64(id[:8]) >> 1) }

@@ -50,7 +50,7 @@ func TestWorkerPrDescriptionRoutesLiveDB(t *testing.T) {
 	wsvc.SetTxBeginner(pool)
 	h := &Handler{pool: pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: wsvc}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
-	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim)
+	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 
 	exec := func(sql string, args ...any) {
 		t.Helper()

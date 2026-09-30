@@ -26,6 +26,7 @@ type ProductDTO struct {
 	DeletedAt        *time.Time `json:"deleted_at"`
 	CreatedAt        time.Time  `json:"created_at"`
 	ActiveTokenCount int64      `json:"active_token_count"`
+	AllowedJobTypes  []string   `json:"allowed_job_types"`
 }
 
 // AdminDeleteProductResponse is the DELETE /api/admin/products/{id} response (PRD #1907

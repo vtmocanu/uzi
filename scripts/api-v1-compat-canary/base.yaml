@@ -1,0 +1,38 @@
+# Positive control for `task check:api-v1-compat` (PRD #1908 Decision 11). base.yaml and
+# revision.yaml describe one endpoint; the revision REMOVES a response field
+# (Widget.color), which oasdiff must report as a breaking change. If it does not, the
+# compat gate is broken and reads green vacuously, so scripts/check-api-v1-compat.sh
+# refuses to run the real comparison. The two files differ in that one field only.
+openapi: 3.1.0
+info:
+  title: compat canary
+  version: 1.0.0
+paths:
+  /widgets/{id}:
+    get:
+      operationId: getWidget
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: The widget.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Widget"
+components:
+  schemas:
+    Widget:
+      type: object
+      required:
+        - id
+        - color
+      properties:
+        id:
+          type: string
+        color:
+          type: string

@@ -18,6 +18,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/config"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // PRD #1907 D12 / M3: api/openapi/v1.yaml is the stable external contract, and these
@@ -62,8 +64,14 @@ type oaResponse struct {
 	Content map[string]oaMedia `yaml:"content"`
 }
 
+type oaRequestBody struct {
+	Required bool               `yaml:"required"`
+	Content  map[string]oaMedia `yaml:"content"`
+}
+
 type oaOperation struct {
 	OperationID string                `yaml:"operationId"`
+	RequestBody *oaRequestBody        `yaml:"requestBody"`
 	Responses   map[string]oaResponse `yaml:"responses"`
 }
 
@@ -145,7 +153,7 @@ func v1RouterOperations(t *testing.T) map[string]bool {
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
 	// Hosting on, as in route_limiter_mounts_test.go, so the table is the full one.
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
-	router := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
+	router := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
 	cr, ok := router.(chi.Routes)
 	if !ok {
 		t.Fatalf("Routes returned %T, not a chi.Routes", router)
@@ -222,34 +230,69 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 	}
 }
 
-// v1OperationDTOs names the Go DTO each operation's 200 response serializes. Every
-// spec operation must be listed: a new endpoint states its DTO here and the schema
-// check below binds the two.
-var v1OperationDTOs = map[string]reflect.Type{
-	"GET /api/v1/whoami": reflect.TypeFor[apitypes.V1WhoamiDTO](),
+// v1OpShape names, per operation, the success status, the Go DTO its response serializes and,
+// for a body-carrying operation, the Go request type. Every spec operation must be listed: a new
+// endpoint states its DTOs here and the schema check below binds the two.
+type v1OpShape struct {
+	status  string
+	dto     reflect.Type
+	request reflect.Type
 }
 
-// TestV1OpenAPISchemasMatchDTOs (PRD #1907 M3): each operation's 200 schema matches
-// its DTO's JSON shape, recursively.
+var v1OperationShapes = map[string]v1OpShape{
+	"GET /api/v1/whoami":             {status: "200", dto: reflect.TypeFor[apitypes.V1WhoamiDTO]()},
+	"POST /api/v1/jobs":              {status: "201", dto: reflect.TypeFor[apitypes.V1JobDTO](), request: reflect.TypeFor[apitypes.V1JobCreateRequest]()},
+	"GET /api/v1/jobs":               {status: "200", dto: reflect.TypeFor[apitypes.V1JobListDTO]()},
+	"GET /api/v1/jobs/{id}":          {status: "200", dto: reflect.TypeFor[apitypes.V1JobDTO]()},
+	"GET /api/v1/jobs/{id}/result":   {status: "200", dto: reflect.TypeFor[apitypes.V1JobResultDTO]()},
+	"GET /api/v1/jobs/{id}/messages": {status: "200", dto: reflect.TypeFor[apitypes.V1JobMessagesDTO]()},
+	"POST /api/v1/jobs/{id}/cancel":  {status: "200", dto: reflect.TypeFor[apitypes.V1JobDTO]()},
+}
+
+// TestV1OpenAPISchemasMatchDTOs (PRD #1907 M3, extended by PRD #1908 M5): each operation's
+// success schema (and request body schema) matches its Go type's JSON shape, recursively.
 func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 	spec := loadV1Spec(t)
-	for key, op := range v1SpecOperations(t, spec) {
-		dto, ok := v1OperationDTOs[key]
+	ops := v1SpecOperations(t, spec)
+	for key := range v1OperationShapes {
+		if _, ok := ops[key]; !ok {
+			t.Errorf("v1OperationShapes lists %s, which the spec does not describe", key)
+		}
+	}
+	for key, op := range ops {
+		shape, ok := v1OperationShapes[key]
 		if !ok {
-			t.Errorf("%s has no entry in v1OperationDTOs: name the DTO its 200 response serializes", key)
+			t.Errorf("%s has no entry in v1OperationShapes: name the DTO its success response serializes", key)
 			continue
 		}
-		resp, ok := op.Responses["200"]
+		resp, ok := op.Responses[shape.status]
 		if !ok {
-			t.Errorf("%s documents no 200 response", key)
+			t.Errorf("%s documents no %s response", key, shape.status)
 			continue
 		}
 		media, ok := resp.Content["application/json"]
 		if !ok || media.Schema == nil {
-			t.Errorf("%s: 200 has no application/json schema", key)
+			t.Errorf("%s: %s has no application/json schema", key, shape.status)
 			continue
 		}
-		(&oaChecker{t: t, spec: spec}).match(key+" 200", media.Schema, dto)
+		(&oaChecker{t: t, spec: spec}).match(key+" "+shape.status, media.Schema, shape.dto)
+
+		if shape.request == nil {
+			if op.RequestBody != nil {
+				t.Errorf("%s documents a requestBody but v1OperationShapes names no request type", key)
+			}
+			continue
+		}
+		if op.RequestBody == nil {
+			t.Errorf("%s: v1OperationShapes names a request type but the spec has no requestBody", key)
+			continue
+		}
+		rb, ok := op.RequestBody.Content["application/json"]
+		if !ok || rb.Schema == nil || !op.RequestBody.Required {
+			t.Errorf("%s: requestBody must be required application/json with a schema", key)
+			continue
+		}
+		(&oaChecker{t: t, spec: spec}).match(key+" request", rb.Schema, shape.request)
 	}
 
 	// The scopes enum is the Go vocabulary, in order.
@@ -259,6 +302,44 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 	}
 	if got := whoami.Properties["scopes"].Items.Enum; !slices.Equal(got, producttoken.Scopes) {
 		t.Errorf("Whoami scopes enum = %v, want producttoken.Scopes %v", got, producttoken.Scopes)
+	}
+}
+
+// TestV1OpenAPIEnumsMatchGo binds the jobs schemas' closed vocabularies to the Go values the
+// server produces, so a status, job type or severity added on one side cannot drift from the other.
+func TestV1OpenAPIEnumsMatchGo(t *testing.T) {
+	spec := loadV1Spec(t)
+	enumOf := func(schema, prop string) []string {
+		t.Helper()
+		s := spec.Comps.Schemas[schema]
+		if s == nil || s.Properties[prop] == nil {
+			t.Fatalf("components.schemas.%s.properties.%s is missing", schema, prop)
+		}
+		return s.Properties[prop].Enum
+	}
+	sevs := make([]string, 0, len(workersvc.JobFindingSeverities))
+	for k := range workersvc.JobFindingSeverities {
+		sevs = append(sevs, k)
+	}
+	sort.Strings(sevs)
+	for _, c := range []struct {
+		schema, prop string
+		want         []string
+	}{
+		{"JobCreateRequest", "type", runkind.JobTypes()},
+		{"Job", "status", workersvc.JobPublicStatuses},
+		{"JobResult", "job_status", workersvc.JobPublicStatuses},
+		{"JobFinding", "severity", sevs},
+		// The kinds ListJobMessagesForCaller selects (queries/jobs.sql).
+		{"JobMessage", "type", []string{"text", "status", "error"}},
+	} {
+		got := enumOf(c.schema, c.prop)
+		if c.prop == "severity" {
+			got = slices.Sorted(slices.Values(got))
+		}
+		if !slices.Equal(got, c.want) {
+			t.Errorf("%s.%s enum = %v, want %v", c.schema, c.prop, got, c.want)
+		}
 	}
 }
 

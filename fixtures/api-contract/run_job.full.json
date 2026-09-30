@@ -1,0 +1,26 @@
+{
+  "type": "x",
+  "inputs": [
+    {
+      "name": "x",
+      "size_bytes": 1
+    }
+  ],
+  "origin": {
+    "requested_by_label": "x",
+    "product_name": "x"
+  },
+  "result": {
+    "status": "x",
+    "report_md": "x",
+    "findings": [
+      {
+        "severity": "x",
+        "message_md": "x",
+        "url": "x",
+        "file": "x",
+        "line": 1
+      }
+    ]
+  }
+}

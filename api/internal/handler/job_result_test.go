@@ -152,6 +152,8 @@ func TestDecodeJobResultBytesCapsFindingsWhileStreaming(t *testing.T) {
 		"unknown finding field":   `{"status":"completed","findings":[{"severity":"info","message_md":"x","bogus":1}]}`,
 		"trailing value":          `{"status":"completed"} {}`,
 		"not an object":           `[]`,
+		"repeated findings key":   `{"status":"completed","findings":[{"severity":"info","message_md":"a"}],"findings":[{"severity":"info","message_md":"b"}]}`,
+		"repeated status key":     `{"status":"completed","status":"partial"}`,
 	} {
 		if _, err := decodeJobResultBytes([]byte(b)); err == nil {
 			t.Fatalf("%s: want an error", name)

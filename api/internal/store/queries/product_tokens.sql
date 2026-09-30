@@ -205,8 +205,10 @@ SELECT t.id,
 -- name: CreateProduct :one
 -- Register a product (admin). A live product with the same case-insensitive name fails
 -- uq_products_live_name (23505; the handler maps it to 409).
-INSERT INTO products (name, description, created_by)
-VALUES ($1, $2, $3)
+-- allowed_job_types (PRD #1908 D-C) is a NULLABLE argument: NULL leaves the column default
+-- (empty, which allows no job type). The handler validates each entry against runkind.JobTypes.
+INSERT INTO products (name, description, created_by, allowed_job_types)
+VALUES (sqlc.arg(name), sqlc.arg(description), sqlc.arg(created_by), COALESCE(sqlc.narg(allowed_job_types)::text[], '{}'))
 RETURNING *;
 
 -- name: ListProducts :many
@@ -221,6 +223,7 @@ SELECT p.id,
        p.created_by,
        p.created_at,
        p.updated_at,
+       p.allowed_job_types,
        (SELECT count(*)
           FROM product_tokens t
          WHERE t.product_id = p.id
@@ -259,7 +262,7 @@ SELECT count(*)
    AND (expires_at IS NULL OR expires_at > now());
 
 -- name: UpdateProduct :one
--- Admin edit of the mutable fields (description, enabled). Each is a NULLABLE argument:
+-- Admin edit of the mutable fields (description, enabled, allowed_job_types). Each is a NULLABLE argument:
 -- NULL keeps the column's current value (COALESCE against the row being updated), so a
 -- PATCH naming one field never reads-then-writes the other: the COALESCE is evaluated
 -- on the row version the UPDATE writes, so a concurrent PATCH of a different field is
@@ -271,6 +274,7 @@ SELECT count(*)
 UPDATE products
    SET description = COALESCE(sqlc.narg(description)::text, description),
        enabled = COALESCE(sqlc.narg(enabled)::boolean, enabled),
+       allowed_job_types = COALESCE(sqlc.narg(allowed_job_types)::text[], allowed_job_types),
        updated_at = now()
  WHERE id = sqlc.arg(id)
    AND deleted_at IS NULL

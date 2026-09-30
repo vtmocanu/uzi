@@ -872,7 +872,7 @@ func TestCodexWritesAreCookieOnly(t *testing.T) {
 	limiters := newProbeLimiters()
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8]).(chi.Routes)
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9]).(chi.Routes)
 
 	want := map[string]bool{
 		"POST /api/me/secrets/codex_auth":            true,

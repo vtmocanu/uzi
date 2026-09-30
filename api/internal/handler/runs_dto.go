@@ -688,3 +688,33 @@ func (h *Handler) overlayCodexAccountActions(ctx context.Context, dtos ...*apity
 		}
 	}
 }
+
+// runJobDTO maps the service's job block to the wire shape; nil in, nil out (a non-job run).
+// Slices are never nil on the wire.
+func runJobDTO(d *workersvc.JobRunDetail) *apitypes.RunJobDTO {
+	if d == nil {
+		return nil
+	}
+	out := &apitypes.RunJobDTO{
+		Type:   d.JobType,
+		Inputs: make([]apitypes.RunJobInputDTO, 0, len(d.Inputs)),
+		Origin: apitypes.RunJobOriginDTO{RequestedByLabel: d.RequestedByLabel, ProductName: d.ProductName},
+	}
+	for _, in := range d.Inputs {
+		out.Inputs = append(out.Inputs, apitypes.RunJobInputDTO{Name: in.Name, SizeBytes: in.SizeBytes})
+	}
+	if d.Result != nil {
+		res := &apitypes.RunJobResultDTO{
+			Status:   d.Result.Status,
+			ReportMd: d.Result.ReportMD,
+			Findings: make([]apitypes.RunJobFindingDTO, 0, len(d.Result.Findings)),
+		}
+		for _, f := range d.Result.Findings {
+			res.Findings = append(res.Findings, apitypes.RunJobFindingDTO{
+				Severity: f.Severity, MessageMd: f.MessageMD, URL: f.URL, File: f.File, Line: f.Line,
+			})
+		}
+		out.Result = res
+	}
+	return out
+}

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -14,6 +15,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/termsafe"
 )
@@ -70,8 +72,34 @@ func validateProductDescription(raw string) (string, error) {
 	return desc, nil
 }
 
+// validateAllowedJobTypes checks each entry against the known job types (runkind.JobTypes,
+// the mirror of the products_allowed_job_types_check CHECK) and returns the list de-duplicated
+// in first-seen order, never nil. An unknown entry is an error naming it; the empty list is
+// valid (the product may create no job).
+func validateAllowedJobTypes(in []string) ([]string, error) {
+	out := make([]string, 0, len(in))
+	for _, t := range in {
+		if !slices.Contains(runkind.JobTypes(), t) {
+			return nil, fmt.Errorf("allowed_job_types: unknown job type %q (known: %s)", t, strings.Join(runkind.JobTypes(), ", "))
+		}
+		if !slices.Contains(out, t) {
+			out = append(out, t)
+		}
+	}
+	return out, nil
+}
+
+// jobTypesOrEmpty is the wire form of a products.allowed_job_types value: never nil.
+func jobTypesOrEmpty(in []string) []string {
+	if in == nil {
+		return []string{}
+	}
+	return slices.Clone(in)
+}
+
 func productDTO(p store.Product, activeTokens int64) apitypes.ProductDTO {
 	return apitypes.ProductDTO{
+		AllowedJobTypes:  jobTypesOrEmpty(p.AllowedJobTypes),
 		ID:               p.ID.String(),
 		Name:             p.Name,
 		Description:      p.Description,
@@ -101,6 +129,7 @@ func (h *Handler) AdminListProducts(w http.ResponseWriter, r *http.Request) {
 			DeletedAt:        timePtr(p.DeletedAt.Valid, p.DeletedAt.Time),
 			CreatedAt:        p.CreatedAt.Time,
 			ActiveTokenCount: p.ActiveTokenCount,
+			AllowedJobTypes:  jobTypesOrEmpty(p.AllowedJobTypes),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"products": out})
@@ -175,11 +204,17 @@ func (h *Handler) AdminCreateProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Name        string `json:"name"`
-		Description string `json:"description"`
+		Name            string   `json:"name"`
+		Description     string   `json:"description"`
+		AllowedJobTypes []string `json:"allowed_job_types"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	allowed, err := validateAllowedJobTypes(req.AllowedJobTypes)
+	if err != nil {
+		httpx.Error(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	name, err := validateProductName(req.Name)
@@ -196,6 +231,8 @@ func (h *Handler) AdminCreateProduct(w http.ResponseWriter, r *http.Request) {
 		Name:        name,
 		Description: desc,
 		CreatedBy:   pgtype.UUID{Bytes: actor.ID, Valid: true},
+		// Never nil: an omitted list is the empty allow-list (fail-closed), explicitly.
+		AllowedJobTypes: allowed,
 	})
 	if err != nil {
 		if isUniqueViolation(err) {
@@ -212,8 +249,9 @@ func (h *Handler) AdminCreateProduct(w http.ResponseWriter, r *http.Request) {
 // errProductDeleted is the PATCH/DELETE refusal for a soft-deleted product.
 var errProductDeleted = errors.New("product is deleted")
 
-// AdminPatchProduct edits a live product's description and/or enabled flag. Fields the
-// body omits keep their value; a body naming neither is a 400. The name is immutable
+// AdminPatchProduct edits a live product's description, enabled flag and/or allowed job
+// types. Fields the body omits keep their value (an explicit null counts as omitted; an
+// empty allowed_job_types list clears the allow-list); a body naming none is a 400. The name is immutable
 // (it is the label users recognise their tokens by).
 //
 // Disabling a product makes every one of its tokens fail the /api/v1 auth lookup on
@@ -235,16 +273,26 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Description *string `json:"description"`
-		Enabled     *bool   `json:"enabled"`
+		Description     *string   `json:"description"`
+		Enabled         *bool     `json:"enabled"`
+		AllowedJobTypes *[]string `json:"allowed_job_types"`
 	}
 	if err := httpx.DecodeJSON(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Description == nil && req.Enabled == nil {
-		httpx.Error(w, http.StatusBadRequest, "nothing to update: set description and/or enabled")
+	if req.Description == nil && req.Enabled == nil && req.AllowedJobTypes == nil {
+		httpx.Error(w, http.StatusBadRequest, "nothing to update: set description, enabled and/or allowed_job_types")
 		return
+	}
+	var allowed []string
+	if req.AllowedJobTypes != nil {
+		a, err := validateAllowedJobTypes(*req.AllowedJobTypes)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		allowed = a
 	}
 	var desc *string
 	if req.Description != nil {
@@ -266,6 +314,9 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 	if req.Enabled != nil {
 		params.Enabled = pgtype.Bool{Bool: *req.Enabled, Valid: true}
 	}
+	// allowed is non-nil (possibly empty) exactly when the body named the field; nil is NULL,
+	// which UpdateProduct COALESCEs to the current value.
+	params.AllowedJobTypes = allowed
 	var (
 		updated store.Product
 		active  int64

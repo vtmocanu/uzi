@@ -188,15 +188,17 @@ func TestV1SubtreeRequiresV1CallerLiveDB(t *testing.T) {
 	}
 }
 
-// TestV1RateLimitPerUserLiveDB (D15): the /api/v1 limiter runs after RequireV1Caller
+// TestV1RateLimitPerUserLiveDB (D15, D-B): the /api/v1 limiter (v1Limiter) runs after RequireV1Caller
 // and keys on the user, so a second token of the same user shares the budget while
 // another user's does not; a refused (401) request spends none.
 func TestV1RateLimitPerUserLiveDB(t *testing.T) {
 	h, pool := v1LiveDB(t)
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
 	const budget = 2
-	authLimiter := mw.NewLimiter(budget, time.Hour, nil)
-	routes := h.Routes(authLimiter, lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
+	// PRD #1908 D-B: the subtree rides the DEDICATED v1Limiter (the last Routes argument);
+	// authLimiter is generous here and only guards the create route.
+	v1Limiter := mw.NewLimiter(budget, time.Hour, nil)
+	routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), v1Limiter)
 
 	a := cliSeedUser(t, pool, false)
 	productA := v1SeedProduct(t, h.q, a)

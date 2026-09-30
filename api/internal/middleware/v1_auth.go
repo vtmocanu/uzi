@@ -249,7 +249,9 @@ func RequireScope(scope string) func(http.Handler) http.Handler {
 				return
 			}
 			if !p.HasScope(scope) {
-				httpx.Error(w, http.StatusForbidden, "token lacks the required scope")
+				// A stable machine reason (PRD #1908 D10), so a client can tell this 403
+				// from the jobs API's job_type_not_allowed 403.
+				httpx.ErrorReason(w, http.StatusForbidden, "token lacks the required scope", "insufficient_scope")
 				return
 			}
 			next.ServeHTTP(w, r)

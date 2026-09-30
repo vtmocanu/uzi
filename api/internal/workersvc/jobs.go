@@ -180,6 +180,10 @@ func IsNoModelCredential(err error) bool {
 	return errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrNoUsableCredential)
 }
 
+// JobPublicStatuses is the closed public status vocabulary JobStatus returns, in lifecycle
+// order. api/openapi/v1.yaml enumerates exactly these; TestV1OpenAPIEnumsMatchGo binds the two.
+var JobPublicStatuses = []string{"queued", "running", "waiting", "completed", "failed", "cancelled"}
+
 // JobStatus maps a raw runs.status to the public job status vocabulary. The mapping is total over
 // the runs_status_check catalog (pinned by TestJobStatusCoversStatusCatalogLiveDB); an unknown
 // value maps to "running" (never terminal) so a future status cannot read as finished.
@@ -660,4 +664,93 @@ func (s *Service) CancelJob(ctx context.Context, caller JobCaller, runID uuid.UU
 		return JobView{}, err
 	}
 	return s.GetJobForCaller(ctx, caller, runID)
+}
+
+// maxJobDetailInputs bounds the inputs listed on the run detail (the create cap is maxJobInputs;
+// the DB has no row-count CHECK, so the read bounds itself).
+const maxJobDetailInputs = 50
+
+// JobInputSize is one input of a job as the run detail shows it: the name and the content's byte
+// size, never the content.
+type JobInputSize struct {
+	Name      string
+	SizeBytes int
+}
+
+// JobRunResult is a job's stored result for the run detail.
+type JobRunResult struct {
+	Status   string
+	ReportMD string
+	Findings []JobFindingView
+}
+
+// JobRunDetail is the job-specific block of the cookie run detail (PRD #1908 D-D). It is read
+// AFTER the caller passed the run-read authorization (owner or admin), so nothing here is
+// caller-scoped in SQL. Result is nil while no result row exists.
+type JobRunDetail struct {
+	JobType          string
+	Inputs           []JobInputSize
+	RequestedByLabel *string
+	ProductName      *string
+	Result           *JobRunResult
+}
+
+// jobDetailStore is the run-detail read surface; *store.Queries satisfies it.
+type jobDetailStore interface {
+	GetJobOriginForRun(ctx context.Context, runID uuid.UUID) (store.GetJobOriginForRunRow, error)
+	ListJobInputSizesForRun(ctx context.Context, arg store.ListJobInputSizesForRunParams) ([]store.ListJobInputSizesForRunRow, error)
+	GetJobResultForRun(ctx context.Context, runID uuid.UUID) (store.GetJobResultForRunRow, error)
+	ListJobFindingsForRun(ctx context.Context, runID uuid.UUID) ([]store.ListJobFindingsForRunRow, error)
+}
+
+// RunJobDetail loads the job block for a kind='job' run the caller may already read. A run of
+// another kind returns (nil, nil). The result's free text was scrubbed at ingest.
+func (s *Service) RunJobDetail(ctx context.Context, run store.Run) (*JobRunDetail, error) {
+	if run.Kind != runkind.Job {
+		return nil, nil
+	}
+	q, ok := s.q.(jobDetailStore)
+	if !ok {
+		return nil, errHarnessStoreUnavailable
+	}
+	d := &JobRunDetail{JobType: run.JobType.String, Inputs: []JobInputSize{}}
+	origin, err := q.GetJobOriginForRun(ctx, run.ID)
+	switch {
+	case err == nil:
+		d.RequestedByLabel = textPtr(origin.RequestedByLabel)
+		d.ProductName = textPtr(origin.ProductName)
+	case errors.Is(err, pgx.ErrNoRows):
+		// A job row without an origin cannot be created through CreateJobRun; render it bare.
+	default:
+		return nil, err
+	}
+	inputs, err := q.ListJobInputSizesForRun(ctx, store.ListJobInputSizesForRunParams{RunID: run.ID, Lim: maxJobDetailInputs})
+	if err != nil {
+		return nil, err
+	}
+	for _, in := range inputs {
+		d.Inputs = append(d.Inputs, JobInputSize{Name: in.Name, SizeBytes: int(in.SizeBytes)})
+	}
+	res, err := q.GetJobResultForRun(ctx, run.ID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return d, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	rows, err := q.ListJobFindingsForRun(ctx, run.ID)
+	if err != nil {
+		return nil, err
+	}
+	findings := make([]JobFindingView, 0, len(rows))
+	for _, f := range rows {
+		fv := JobFindingView{Ordinal: int(f.Ordinal), Severity: f.Severity, MessageMD: f.MessageMd, URL: textPtr(f.Url), File: textPtr(f.File)}
+		if f.Line.Valid {
+			n := int(f.Line.Int32)
+			fv.Line = &n
+		}
+		findings = append(findings, fv)
+	}
+	d.Result = &JobRunResult{Status: res.Status, ReportMD: res.ReportMd, Findings: findings}
+	return d, nil
 }

@@ -523,6 +523,28 @@ func (q *Queries) GetJobForCaller(ctx context.Context, arg GetJobForCallerParams
 	return i, err
 }
 
+const getJobOriginForRun = `-- name: GetJobOriginForRun :one
+SELECT o.requested_by_label, p.name AS product_name
+  FROM job_origins o
+  LEFT JOIN products p ON p.id = o.product_id
+ WHERE o.run_id = $1
+`
+
+type GetJobOriginForRunRow struct {
+	RequestedByLabel pgtype.Text `json:"requested_by_label"`
+	ProductName      pgtype.Text `json:"product_name"`
+}
+
+// The origin of a job run for the run-detail read (PRD #1908 D-D): the untrusted requested_by_label
+// and the creating product's NAME (NULL for a uzc_-created job). NOT caller-scoped: the run-read
+// authorization (owner or admin) was decided by the handler before this runs.
+func (q *Queries) GetJobOriginForRun(ctx context.Context, runID uuid.UUID) (GetJobOriginForRunRow, error) {
+	row := q.db.QueryRow(ctx, getJobOriginForRun, runID)
+	var i GetJobOriginForRunRow
+	err := row.Scan(&i.RequestedByLabel, &i.ProductName)
+	return i, err
+}
+
 const getJobResultForCaller = `-- name: GetJobResultForCaller :one
 SELECT jr.status, jr.report_md, jr.created_at, jr.updated_at
   FROM job_results jr
@@ -556,6 +578,24 @@ func (q *Queries) GetJobResultForCaller(ctx context.Context, arg GetJobResultFor
 		&i.CreatedAt,
 		&i.UpdatedAt,
 	)
+	return i, err
+}
+
+const getJobResultForRun = `-- name: GetJobResultForRun :one
+SELECT status, report_md
+  FROM job_results
+ WHERE run_id = $1
+`
+
+type GetJobResultForRunRow struct {
+	Status   string `json:"status"`
+	ReportMd string `json:"report_md"`
+}
+
+func (q *Queries) GetJobResultForRun(ctx context.Context, runID uuid.UUID) (GetJobResultForRunRow, error) {
+	row := q.db.QueryRow(ctx, getJobResultForRun, runID)
+	var i GetJobResultForRunRow
+	err := row.Scan(&i.Status, &i.ReportMd)
 	return i, err
 }
 
@@ -648,6 +688,90 @@ func (q *Queries) ListJobFindingsForCaller(ctx context.Context, arg ListJobFindi
 			&i.File,
 			&i.Line,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listJobFindingsForRun = `-- name: ListJobFindingsForRun :many
+SELECT ordinal, severity, message_md, url, file, line
+  FROM job_findings
+ WHERE run_id = $1
+ ORDER BY ordinal ASC
+`
+
+type ListJobFindingsForRunRow struct {
+	Ordinal   int32       `json:"ordinal"`
+	Severity  string      `json:"severity"`
+	MessageMd string      `json:"message_md"`
+	Url       pgtype.Text `json:"url"`
+	File      pgtype.Text `json:"file"`
+	Line      pgtype.Int4 `json:"line"`
+}
+
+func (q *Queries) ListJobFindingsForRun(ctx context.Context, runID uuid.UUID) ([]ListJobFindingsForRunRow, error) {
+	rows, err := q.db.Query(ctx, listJobFindingsForRun, runID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJobFindingsForRunRow{}
+	for rows.Next() {
+		var i ListJobFindingsForRunRow
+		if err := rows.Scan(
+			&i.Ordinal,
+			&i.Severity,
+			&i.MessageMd,
+			&i.Url,
+			&i.File,
+			&i.Line,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listJobInputSizesForRun = `-- name: ListJobInputSizesForRun :many
+SELECT name, octet_length(content_md)::int AS size_bytes
+  FROM job_inputs
+ WHERE run_id = $1
+ ORDER BY ordinal ASC
+ LIMIT $2
+`
+
+type ListJobInputSizesForRunParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	Lim   int32     `json:"lim"`
+}
+
+type ListJobInputSizesForRunRow struct {
+	Name      string `json:"name"`
+	SizeBytes int32  `json:"size_bytes"`
+}
+
+// The run-detail view of a job's inputs: name and byte size only (the content can be 1 MiB and is
+// not part of the run detail). Bounded by @lim; ordinal order. Same authorization note as
+// GetJobOriginForRun.
+func (q *Queries) ListJobInputSizesForRun(ctx context.Context, arg ListJobInputSizesForRunParams) ([]ListJobInputSizesForRunRow, error) {
+	rows, err := q.db.Query(ctx, listJobInputSizesForRun, arg.RunID, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJobInputSizesForRunRow{}
+	for rows.Next() {
+		var i ListJobInputSizesForRunRow
+		if err := rows.Scan(&i.Name, &i.SizeBytes); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

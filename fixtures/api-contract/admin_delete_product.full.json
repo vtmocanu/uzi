@@ -6,7 +6,10 @@
     "enabled": true,
     "deleted_at": "2020-01-02T03:04:05Z",
     "created_at": "2020-01-02T03:04:05Z",
-    "active_token_count": 1
+    "active_token_count": 1,
+    "allowed_job_types": [
+      "x"
+    ]
   },
   "stopped_token_count": 1
 }

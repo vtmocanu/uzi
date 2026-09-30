@@ -484,6 +484,11 @@ type RunDTO struct {
 	// display text.
 	PrDescription        *RunPrDescriptionDTO `json:"pr_description"`
 	PrDescriptionOutcome *string              `json:"pr_description_outcome"`
+	// Job is the kind='job' block of the run detail (PRD #1908 D-D): the job type, its inputs
+	// (name and byte size, never the content), who requested it and the stored result. Present
+	// ONLY on the single-run detail read (GetRun) of a job run, under the same owner-or-admin
+	// authorization as the rest of the run; omitted for every other kind and on list reads.
+	Job *RunJobDTO `json:"job,omitempty"`
 	// ci_fix context (PRD #6), all null for an issue run: the failing ref, the
 	// failing pipeline's web URL (from the frozen snapshot), and the fix verdict
 	// (verified|fix_failed|not_code|null-while-unverified).
@@ -1097,4 +1102,49 @@ type RunEventDTO struct {
 	// decides whether a run reads as still live, so an unrecognised value must never reach
 	// a consumer as-is.
 	Status string `json:"status,omitempty"` // set on "state" frames
+}
+
+// RunJobDTO is the job block of GET /api/runs/{id} for a kind='job' run (PRD #1908 D-D). Every
+// free-text field is untrusted display text (a product supplied the label and the prompt-driven
+// agent the result); clients render it inert.
+type RunJobDTO struct {
+	// Type is the closed job type enum (today "research").
+	Type string `json:"type"`
+	// Inputs lists the job's named inputs, at most 50, as name and size in bytes.
+	Inputs []RunJobInputDTO `json:"inputs"`
+	// Origin says who requested the job.
+	Origin RunJobOriginDTO `json:"origin"`
+	// Result is null until the job's result row exists.
+	Result *RunJobResultDTO `json:"result"`
+}
+
+// RunJobInputDTO is one input of a job: its name and the byte size of its content.
+type RunJobInputDTO struct {
+	Name      string `json:"name"`
+	SizeBytes int    `json:"size_bytes"`
+}
+
+// RunJobOriginDTO is the job's audit origin. RequestedByLabel is an UNTRUSTED end-user label a
+// product supplied (attribution only, never an authorization input); ProductName is the name of
+// the product whose token created the job, null for a job a user created with a CLI token.
+type RunJobOriginDTO struct {
+	RequestedByLabel *string `json:"requested_by_label"`
+	ProductName      *string `json:"product_name"`
+}
+
+// RunJobResultDTO is the stored result of a job run.
+type RunJobResultDTO struct {
+	Status   string             `json:"status"`
+	ReportMd string             `json:"report_md"`
+	Findings []RunJobFindingDTO `json:"findings"`
+}
+
+// RunJobFindingDTO is one structured finding of a job result. Location is either a URL or a
+// file with an optional line; the unused members are null.
+type RunJobFindingDTO struct {
+	Severity  string  `json:"severity"`
+	MessageMd string  `json:"message_md"`
+	URL       *string `json:"url"`
+	File      *string `json:"file"`
+	Line      *int    `json:"line"`
 }
