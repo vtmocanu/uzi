@@ -74,6 +74,9 @@ func v1LiveDBMax(t *testing.T, maxConns int32) (*Handler, *pgxpool.Pool) {
 		t.Fatalf("open pool: %v", err)
 	}
 	t.Cleanup(pool.Close)
+	if err := pool.Ping(ctx); err != nil {
+		t.Fatalf("ping: %v", err)
+	}
 
 	q := store.New(pool)
 	box := newHandlerTestBox(t)

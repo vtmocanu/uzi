@@ -219,3 +219,23 @@ func TestJobFilesWriteReadsFirstChunkBeforeBegin(t *testing.T) {
 type errReader struct{ err error }
 
 func (r errReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestClampWriteSlots(t *testing.T) {
+	cases := []struct {
+		pool          int32
+		global, owner int
+	}{
+		{0, 1, 1}, {1, 1, 1}, {2, 1, 1}, {3, 1, 1}, {4, 2, 1}, {5, 2, 1}, {6, 3, 1}, {8, 4, 2}, {64, 4, 2},
+	}
+	for _, c := range cases {
+		l := ClampWriteSlots(c.pool, JobFileLimits{})
+		if l.MaxConcurrentWrites != c.global || l.MaxConcurrentWritesPerOwner != c.owner {
+			t.Errorf("pool %d: slots %d/%d, want %d/%d", c.pool, l.MaxConcurrentWrites, l.MaxConcurrentWritesPerOwner, c.global, c.owner)
+		}
+	}
+	// An explicit smaller value is kept; the other defaults are filled.
+	l := ClampWriteSlots(64, JobFileLimits{MaxConcurrentWrites: 3, MaxConcurrentWritesPerOwner: 9})
+	if l.MaxConcurrentWrites != 3 || l.MaxConcurrentWritesPerOwner != 3 || l.InputsMaxFiles != 10 {
+		t.Errorf("explicit limits: got %d/%d files %d", l.MaxConcurrentWrites, l.MaxConcurrentWritesPerOwner, l.InputsMaxFiles)
+	}
+}

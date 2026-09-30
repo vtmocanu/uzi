@@ -150,6 +150,65 @@ func TestV1FilesStalledUploadsBoundedLiveDB(t *testing.T) {
 	e.eventually(func() bool { return e.reservedRows(ownerA) == 0 }, "a disconnected upload's reservation is released")
 }
 
+// TestV1FilesStalledUploadsHalfPoolLiveDB: on the smallest production pool (pgx's default floor of
+// four connections) with the slots clamped as cmd/server clamps them (workersvc.ClampWriteSlots),
+// stalled uploads from two users never hold more than half the pool, and an unrelated query plus
+// another user's authenticated request still succeed.
+func TestV1FilesStalledUploadsHalfPoolLiveDB(t *testing.T) {
+	e := newV1JobsEnvMax(t, 0, 4)
+	e.wireFiles(workersvc.ClampWriteSlots(e.pool.Config().MaxConns, workersvc.JobFileLimits{RequestDeadline: 60 * time.Second}))
+	srv := httptest.NewServer(e.routes)
+	t.Cleanup(srv.Close)
+	addr := srv.Listener.Addr().String()
+	_, uzcA := e.user()
+	_, uzcB := e.user()
+	_, uzcC := e.user()
+
+	const big = 3 << 20
+	var held []*stalledClient
+	t.Cleanup(func() {
+		for _, c := range held {
+			_ = c.conn.Close()
+		}
+	})
+	for i, tok := range []string{uzcA, uzcA, uzcB, uzcB} {
+		c := openStalledUpload(t, addr, tok, big, 1500<<10)
+		resp, answered := c.response(400 * time.Millisecond)
+		if answered {
+			if resp.StatusCode != http.StatusServiceUnavailable || reasonOf(t, resp) != "uploads_busy" {
+				t.Fatalf("stalled upload %d: unexpected answer %d", i, resp.StatusCode)
+			}
+			continue
+		}
+		held = append(held, c)
+	}
+	if len(held) != 2 {
+		t.Fatalf("%d stalled uploads streaming on a 4-connection pool, want the clamped 2", len(held))
+	}
+	if n := e.pool.Stat().AcquiredConns(); n > 2 {
+		t.Fatalf("%d of 4 pooled connections held by stalled uploads, want at most half", n)
+	}
+	qctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	var one int
+	if err := e.pool.QueryRow(qctx, `SELECT 1`).Scan(&one); err != nil {
+		t.Fatalf("an unrelated query failed while uploads stall: %v", err)
+	}
+	req, err := http.NewRequestWithContext(qctx, http.MethodGet, "http://"+addr+"/api/v1/jobs", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer "+uzcC)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("another user's authenticated request failed while uploads stall: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("another user's authenticated request answered %d, want 200", resp.StatusCode)
+	}
+}
+
 // TestV1FilesStalledBeforeDataHoldsNoConnectionLiveDB: a client that sends the part header and then
 // nothing must not hold a database connection: Write reads the first chunk before it begins its
 // transaction.

@@ -203,6 +203,33 @@ func (l JobFileLimits) withDefaults() JobFileLimits {
 	return l
 }
 
+// ClampWriteSlots bounds the upload write slots by the database pool size. Each streaming upload
+// holds one pooled connection for its whole body read, so the process-wide slots may take at most
+// half the pool (at least 1), leaving the rest for auth and every other query; the per-owner share
+// is at most half that bound (at least 1), so one owner cannot take every slot. Zero limit fields take their defaults first, and a caller's
+// explicit smaller value is kept. A non-positive poolMax is treated as 1.
+func ClampWriteSlots(poolMax int32, l JobFileLimits) JobFileLimits {
+	l = l.withDefaults()
+	bound := int(poolMax / 2)
+	if bound < 1 {
+		bound = 1
+	}
+	if l.MaxConcurrentWrites > bound {
+		l.MaxConcurrentWrites = bound
+	}
+	ownerBound := bound / 2
+	if ownerBound < 1 {
+		ownerBound = 1
+	}
+	if l.MaxConcurrentWritesPerOwner > ownerBound {
+		l.MaxConcurrentWritesPerOwner = ownerBound
+	}
+	if l.MaxConcurrentWritesPerOwner > l.MaxConcurrentWrites {
+		l.MaxConcurrentWritesPerOwner = l.MaxConcurrentWrites
+	}
+	return l
+}
+
 // JobFilesDB is the pgx pool surface the store needs: queries plus the ability to begin the
 // bounded transactions. *pgxpool.Pool satisfies it.
 type JobFilesDB interface {

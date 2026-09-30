@@ -62,7 +62,8 @@ func (h *Handler) mountV1Routes(r chi.Router, authLimiter, v1Limiter *mw.Limiter
 		// limiter: the per-user v1Limiter above bounds request rate, the byte quotas
 		// (workersvc.JobFiles.Reserve) bound what a caller can hold, and the concurrent-write
 		// slots (workersvc.JobFiles.AcquireWrite, process-wide and per owner) bound how many
-		// uploads stream at once. The request rate does NOT bound that: each streaming upload holds
+		// uploads stream at once; cmd/server clamps them to half the database pool
+		// (workersvc.ClampWriteSlots), so stalled uploads cannot take every connection. The request rate does NOT bound that: each streaming upload holds
 		// a pooled database connection until its body is read, however few requests per minute.
 		// V1FileUpload also sets the route's own body read deadline.
 		r.With(run).Post("/files", h.V1FileUpload)

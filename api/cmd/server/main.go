@@ -377,7 +377,10 @@ func run() error {
 	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker
 	// transfer routes reach through wsvc.JobFiles(), and the job_files_sweep pass below. The
 	// request deadline is the recovery archive's: both are one bounded upload transaction.
-	jobFiles := workersvc.NewJobFiles(pool, box, workersvc.JobFileLimits{
+	// The upload write slots are clamped to half the actual pool (ClampWriteSlots): each streaming
+	// upload holds a pooled connection, and store.OpenPool sets no pool_max_conns, so the pgx
+	// default (max(4, NumCPU)) can equal the fixed slot count.
+	jobFiles := workersvc.NewJobFiles(pool, box, workersvc.ClampWriteSlots(pool.Config().MaxConns, workersvc.JobFileLimits{
 		InputFileMaxBytes:      cfg.JobInputFileMaxBytes,
 		InputsMaxFiles:         cfg.JobInputsMaxFiles,
 		InputsMaxBytes:         cfg.JobInputsMaxBytes,
@@ -390,7 +393,7 @@ func run() error {
 		Retention:              cfg.JobFilesRetention,
 		UploadTTL:              cfg.JobUploadTTL,
 		RequestDeadline:        cfg.RecoveryRequestDeadline,
-	}, nil)
+	}), nil)
 	wsvc.SetJobFiles(jobFiles)
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
