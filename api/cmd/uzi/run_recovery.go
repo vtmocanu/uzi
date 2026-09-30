@@ -39,8 +39,9 @@ func newRunRecoveryCmd(env Env, gf *globalFlags) *cobra.Command {
 			"archive: recover it with `run export`; the hold releases itself once the archive is " +
 			"durable. A `source_only` or `needs_action` hold has no archive and awaits your " +
 			"decision to discard it with `run discard <run-id> --hold <hold-id> --yes`. `source_only` " +
-			"means no archive exists and custody of the worker's local source is retained: it may be " +
-			"the only copy, so discarding it can destroy the work. `active` is healthy protection " +
+			"means no archive exists and custody of the worker's local source is retained. For " +
+			"`source_only` and `needs_action` holds the retained source may be the only copy, so " +
+			"discarding one can destroy the work. `active` is healthy protection " +
 			"of a still-running run and needs nothing.\n\n" +
 			"Without a run id, --json emits the entire owner-wide aggregate and holds DTO, " +
 			"including settled holds. With a run id, --json emits each of the run's hold DTOs " +
@@ -277,7 +278,7 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		if h.Attention == "source_only" || h.Attention == "needs_action" {
 			decisionNeeded++
 		}
-		if h.HasAvailableCapture {
+		if h.State == "open" && h.HasAvailableCapture {
 			exportable++
 		}
 		rows = append(rows, []string{

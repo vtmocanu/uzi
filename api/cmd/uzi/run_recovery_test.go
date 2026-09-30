@@ -586,7 +586,7 @@ func TestOwnerRecoveryHintsSplitByArchive(t *testing.T) {
 		t.Fatalf("exit = %d", code)
 	}
 	for _, want := range []string{
-		"\nrun run-a hold hold-a: no recovery archive; custody of worker worker-a's local source is retained (export unavailable; it may be the only copy)",
+		"blocked_runs: 1\n\nrun run-a hold hold-a: no recovery archive; custody of worker worker-a's local source is retained (export unavailable; it may be the only copy)",
 		"1 hold(s) have a recovery archive: recover with `uzi run export`",
 		"2 hold(s) await a decision: discard with `uzi run discard <run-id> --hold <hold-id> --yes`",
 	} {
@@ -647,7 +647,7 @@ func TestRecoveryHelpTiesExportToArchiveReady(t *testing.T) {
 		"An `archive_ready` hold has a recovery archive: recover it with `run export`",
 		"A `source_only` or `needs_action` hold has no archive and awaits your decision to discard it",
 		"`source_only` means no archive exists and custody of the worker's local source is retained",
-		"it may be the only copy",
+		"For `source_only` and `needs_action` holds the retained source may be the only copy, so discarding one can destroy the work",
 	} {
 		if !strings.Contains(flat, want) {
 			t.Errorf("help missing %q:\n%s", want, out)
@@ -702,6 +702,21 @@ func TestRunRecoveryArchiveReadyGetsExportHint(t *testing.T) {
 	}
 	if strings.Contains(out, "await a decision") || strings.Contains(out, "custody of worker") {
 		t.Errorf("archive_ready hold got decision/custody guidance:\n%s", out)
+	}
+}
+
+func TestRunRecoveryReleasedHoldGetsNoExportHint(t *testing.T) {
+	dto := recoveryHoldsFixture()
+	dto.Holds = []apitypes.RecoveryCustodyHoldDTO{
+		{ID: "hold-rel", RunID: "run1", Generation: 1, State: "released", Attention: "settled",
+			WorkerID: "w1", HasAvailableCapture: true, CaptureState: "available"},
+	}
+	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{RecoveryHoldsResult: dto}), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d", code)
+	}
+	if strings.Contains(out, "uzi run export") || strings.Contains(out, "have a recovery archive") {
+		t.Errorf("export suggested for a released hold:\n%s", out)
 	}
 }
 
