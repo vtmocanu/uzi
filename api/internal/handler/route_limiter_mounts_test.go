@@ -518,12 +518,16 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M2: the input-file upload rides only the subtree's per-user v1Limiter; the byte
 	// quotas (workersvc.JobFiles.Reserve) bound what a caller can store.
 	{"POST", "/api/v1/files", limV1},
+	// PRD #1909 M5: the job-file reads (the listing above and the download) ride only the subtree's
+	// per-user v1Limiter, like the other jobs:read routes.
+	{"GET", "/api/v1/files/{id}", limV1},
 	// PRD #1908 M5: the jobs endpoints. Every /api/v1 route inherits v1Limiter from the
 	// subtree's r.Use; the create additionally rides authLimiter per user (D-B).
 	{"GET", "/api/v1/jobs", limV1},
 	{"POST", "/api/v1/jobs", limAuthAndV1},
 	{"GET", "/api/v1/jobs/{id}", limV1},
 	{"POST", "/api/v1/jobs/{id}/cancel", limV1},
+	{"GET", "/api/v1/jobs/{id}/files", limV1},
 	{"GET", "/api/v1/jobs/{id}/messages", limV1},
 	{"GET", "/api/v1/jobs/{id}/result", limV1},
 	{"GET", "/api/vault/status", noLimiter},

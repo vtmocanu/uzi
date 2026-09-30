@@ -375,3 +375,82 @@ DELETE FROM job_files
 -- after the write). Scoped to the run and the uploading generation.
 DELETE FROM job_files
  WHERE id = @id AND run_id = @run_id AND direction = 'output' AND claim_generation = @claim_generation;
+
+-- name: ListJobFilesForRun :many
+-- The files of one job for the result and GET /jobs/{id}/files (PRD #1909 M5): its attached inputs
+-- and its outputs, in every state a caller can observe (a run's files are never 'reserved' once
+-- committed, and 'unattached' files have no run). NOT caller-scoped: the service has already
+-- resolved the job through GetJobForCaller.
+--
+-- source_url (PRD #1909 D7) is set ONLY for an OUTPUT whose sha256 equals the non-empty sha256 of
+-- an 'allowed' fetch recorded in run_fetches for THIS SAME run (rf.run_id = f.run_id). run_fetches
+-- is written by the fetch service from the forwarded run credential, so nothing the agent or the
+-- worker claims about a file's origin reaches it. A refused fetch has no bytes and an empty
+-- sha256, and an expired file with no retained hash never matches. The earliest such fetch wins
+-- (created_at, id), so the answer is stable; the final URL (after redirects) is the origin when the
+-- fetch recorded one.
+SELECT f.id, f.display_name, COALESCE(f.content_type, '')::text AS content_type, f.byte_size,
+       COALESCE(f.sha256, '')::text AS sha256, f.direction, f.state, f.expires_at,
+       COALESCE(src.source_url, '')::text AS source_url
+  FROM job_files f
+  LEFT JOIN LATERAL (
+        SELECT COALESCE(NULLIF(rf.final_url, ''), rf.url) AS source_url
+          FROM run_fetches rf
+         WHERE f.direction = 'output'
+           AND rf.run_id = f.run_id
+           AND rf.verdict = 'allowed'
+           AND rf.sha256 <> ''
+           AND rf.sha256 = f.sha256
+         ORDER BY rf.created_at, rf.id
+         LIMIT 1) src ON true
+ WHERE f.run_id = @run_id
+   AND f.state IN ('attached', 'available', 'expired')
+ ORDER BY f.created_at, f.id
+ LIMIT @max_rows;
+
+-- name: ListJobOutputRefusalsForRun :many
+-- Every refusal row of a run (the worker's drops, upload refusals and the server's generation
+-- markers and outcomes), oldest first. Bounded: the per-run refusal cap plus at most two
+-- generation rows, so @max_rows is only a backstop. Not caller-scoped (see ListJobFilesForRun).
+SELECT display_name, byte_size, reason
+  FROM job_output_refusals
+ WHERE run_id = @run_id
+ ORDER BY created_at, id
+ LIMIT @max_rows;
+
+-- name: ListJobSourcesForRun :many
+-- The source log of one job run (PRD #1909 D7): this run's run_fetches rows, oldest first. The
+-- columns a product needs; the fetch service wrote them, and its text fields are escaped and
+-- bounded at write time. Not caller-scoped (see ListJobFilesForRun).
+SELECT url, final_url, verdict, reason, http_status, content_type, bytes, sha256, finished_at
+  FROM run_fetches
+ WHERE run_id = @run_id
+ ORDER BY created_at, id
+ LIMIT @max_rows;
+
+-- name: GetJobFileForCaller :one
+-- GET /files/{id} ownership (PRD #1909 M5). The caller must own the file (user_id), and:
+--   * a file with NO run yet (an 'unattached' input) is visible only to the product it was uploaded
+--     through (product_id IS NOT DISTINCT FROM the caller's: a uzc_ caller, NULL, sees only files
+--     uploaded with no product, a uzp_ caller only its own product's), the model
+--     AttachInputJobFiles uses;
+--   * a file of a run (an attached input, or an output, stored with no product because the worker
+--     has none) is visible exactly as its job is, the GetJobForCaller predicate: the job is a
+--     kind='job' run of the caller and, for a product caller, originated from that product. The
+--     listing on GET /jobs/{id}/files uses the same predicate through the job, so a file it lists
+--     is one the caller can fetch.
+-- A reserved (not yet committed) file is never returned. Every mismatch reads as no row.
+SELECT f.* FROM job_files f
+ WHERE f.id = @id
+   AND f.user_id = @user_id
+   AND f.state <> 'reserved'
+   AND ((f.run_id IS NULL
+         AND f.product_id IS NOT DISTINCT FROM sqlc.narg('product_id')::uuid)
+        OR (f.run_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM runs r
+                          JOIN job_origins o ON o.run_id = r.id
+                         WHERE r.id = f.run_id
+                           AND r.kind = 'job'
+                           AND r.user_id = @user_id
+                           AND (sqlc.narg('product_id')::uuid IS NULL
+                                OR o.product_id = sqlc.narg('product_id')::uuid))));

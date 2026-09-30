@@ -376,6 +376,65 @@ func (q *Queries) GetJobFileChunk(ctx context.Context, arg GetJobFileChunkParams
 	return i, err
 }
 
+const getJobFileForCaller = `-- name: GetJobFileForCaller :one
+SELECT f.id, f.user_id, f.product_id, f.run_id, f.direction, f.claim_generation, f.storage_name, f.display_name, f.content_type, f.byte_size, f.sha256, f.chunk_count, f.state, f.expires_at, f.created_at, f.updated_at FROM job_files f
+ WHERE f.id = $1
+   AND f.user_id = $2
+   AND f.state <> 'reserved'
+   AND ((f.run_id IS NULL
+         AND f.product_id IS NOT DISTINCT FROM $3::uuid)
+        OR (f.run_id IS NOT NULL
+            AND EXISTS (SELECT 1 FROM runs r
+                          JOIN job_origins o ON o.run_id = r.id
+                         WHERE r.id = f.run_id
+                           AND r.kind = 'job'
+                           AND r.user_id = $2
+                           AND ($3::uuid IS NULL
+                                OR o.product_id = $3::uuid))))
+`
+
+type GetJobFileForCallerParams struct {
+	ID        uuid.UUID   `json:"id"`
+	UserID    uuid.UUID   `json:"user_id"`
+	ProductID pgtype.UUID `json:"product_id"`
+}
+
+// GET /files/{id} ownership (PRD #1909 M5). The caller must own the file (user_id), and:
+//   - a file with NO run yet (an 'unattached' input) is visible only to the product it was uploaded
+//     through (product_id IS NOT DISTINCT FROM the caller's: a uzc_ caller, NULL, sees only files
+//     uploaded with no product, a uzp_ caller only its own product's), the model
+//     AttachInputJobFiles uses;
+//   - a file of a run (an attached input, or an output, stored with no product because the worker
+//     has none) is visible exactly as its job is, the GetJobForCaller predicate: the job is a
+//     kind='job' run of the caller and, for a product caller, originated from that product. The
+//     listing on GET /jobs/{id}/files uses the same predicate through the job, so a file it lists
+//     is one the caller can fetch.
+//
+// A reserved (not yet committed) file is never returned. Every mismatch reads as no row.
+func (q *Queries) GetJobFileForCaller(ctx context.Context, arg GetJobFileForCallerParams) (JobFile, error) {
+	row := q.db.QueryRow(ctx, getJobFileForCaller, arg.ID, arg.UserID, arg.ProductID)
+	var i JobFile
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ProductID,
+		&i.RunID,
+		&i.Direction,
+		&i.ClaimGeneration,
+		&i.StorageName,
+		&i.DisplayName,
+		&i.ContentType,
+		&i.ByteSize,
+		&i.Sha256,
+		&i.ChunkCount,
+		&i.State,
+		&i.ExpiresAt,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+	)
+	return i, err
+}
+
 const getJobFileForOwner = `-- name: GetJobFileForOwner :one
 SELECT id, user_id, product_id, run_id, direction, claim_generation, storage_name, display_name, content_type, byte_size, sha256, chunk_count, state, expires_at, created_at, updated_at FROM job_files WHERE id = $1 AND user_id = $2
 `
@@ -561,6 +620,86 @@ func (q *Queries) InsertJobOutputRefusal(ctx context.Context, arg InsertJobOutpu
 	return result.RowsAffected(), nil
 }
 
+const listJobFilesForRun = `-- name: ListJobFilesForRun :many
+SELECT f.id, f.display_name, COALESCE(f.content_type, '')::text AS content_type, f.byte_size,
+       COALESCE(f.sha256, '')::text AS sha256, f.direction, f.state, f.expires_at,
+       COALESCE(src.source_url, '')::text AS source_url
+  FROM job_files f
+  LEFT JOIN LATERAL (
+        SELECT COALESCE(NULLIF(rf.final_url, ''), rf.url) AS source_url
+          FROM run_fetches rf
+         WHERE f.direction = 'output'
+           AND rf.run_id = f.run_id
+           AND rf.verdict = 'allowed'
+           AND rf.sha256 <> ''
+           AND rf.sha256 = f.sha256
+         ORDER BY rf.created_at, rf.id
+         LIMIT 1) src ON true
+ WHERE f.run_id = $1
+   AND f.state IN ('attached', 'available', 'expired')
+ ORDER BY f.created_at, f.id
+ LIMIT $2
+`
+
+type ListJobFilesForRunParams struct {
+	RunID   pgtype.UUID `json:"run_id"`
+	MaxRows int32       `json:"max_rows"`
+}
+
+type ListJobFilesForRunRow struct {
+	ID          uuid.UUID          `json:"id"`
+	DisplayName string             `json:"display_name"`
+	ContentType string             `json:"content_type"`
+	ByteSize    int64              `json:"byte_size"`
+	Sha256      string             `json:"sha256"`
+	Direction   string             `json:"direction"`
+	State       string             `json:"state"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	SourceUrl   string             `json:"source_url"`
+}
+
+// The files of one job for the result and GET /jobs/{id}/files (PRD #1909 M5): its attached inputs
+// and its outputs, in every state a caller can observe (a run's files are never 'reserved' once
+// committed, and 'unattached' files have no run). NOT caller-scoped: the service has already
+// resolved the job through GetJobForCaller.
+//
+// source_url (PRD #1909 D7) is set ONLY for an OUTPUT whose sha256 equals the non-empty sha256 of
+// an 'allowed' fetch recorded in run_fetches for THIS SAME run (rf.run_id = f.run_id). run_fetches
+// is written by the fetch service from the forwarded run credential, so nothing the agent or the
+// worker claims about a file's origin reaches it. A refused fetch has no bytes and an empty
+// sha256, and an expired file with no retained hash never matches. The earliest such fetch wins
+// (created_at, id), so the answer is stable; the final URL (after redirects) is the origin when the
+// fetch recorded one.
+func (q *Queries) ListJobFilesForRun(ctx context.Context, arg ListJobFilesForRunParams) ([]ListJobFilesForRunRow, error) {
+	rows, err := q.db.Query(ctx, listJobFilesForRun, arg.RunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJobFilesForRunRow{}
+	for rows.Next() {
+		var i ListJobFilesForRunRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.DisplayName,
+			&i.ContentType,
+			&i.ByteSize,
+			&i.Sha256,
+			&i.Direction,
+			&i.State,
+			&i.ExpiresAt,
+			&i.SourceUrl,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listJobInputFilesForClaim = `-- name: ListJobInputFilesForClaim :many
 SELECT id, storage_name, display_name, byte_size, sha256, content_type
   FROM job_files
@@ -597,6 +736,106 @@ func (q *Queries) ListJobInputFilesForClaim(ctx context.Context, runID pgtype.UU
 			&i.ByteSize,
 			&i.Sha256,
 			&i.ContentType,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listJobOutputRefusalsForRun = `-- name: ListJobOutputRefusalsForRun :many
+SELECT display_name, byte_size, reason
+  FROM job_output_refusals
+ WHERE run_id = $1
+ ORDER BY created_at, id
+ LIMIT $2
+`
+
+type ListJobOutputRefusalsForRunParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	MaxRows int32     `json:"max_rows"`
+}
+
+type ListJobOutputRefusalsForRunRow struct {
+	DisplayName string `json:"display_name"`
+	ByteSize    int64  `json:"byte_size"`
+	Reason      string `json:"reason"`
+}
+
+// Every refusal row of a run (the worker's drops, upload refusals and the server's generation
+// markers and outcomes), oldest first. Bounded: the per-run refusal cap plus at most two
+// generation rows, so @max_rows is only a backstop. Not caller-scoped (see ListJobFilesForRun).
+func (q *Queries) ListJobOutputRefusalsForRun(ctx context.Context, arg ListJobOutputRefusalsForRunParams) ([]ListJobOutputRefusalsForRunRow, error) {
+	rows, err := q.db.Query(ctx, listJobOutputRefusalsForRun, arg.RunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJobOutputRefusalsForRunRow{}
+	for rows.Next() {
+		var i ListJobOutputRefusalsForRunRow
+		if err := rows.Scan(&i.DisplayName, &i.ByteSize, &i.Reason); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listJobSourcesForRun = `-- name: ListJobSourcesForRun :many
+SELECT url, final_url, verdict, reason, http_status, content_type, bytes, sha256, finished_at
+  FROM run_fetches
+ WHERE run_id = $1
+ ORDER BY created_at, id
+ LIMIT $2
+`
+
+type ListJobSourcesForRunParams struct {
+	RunID   uuid.UUID `json:"run_id"`
+	MaxRows int32     `json:"max_rows"`
+}
+
+type ListJobSourcesForRunRow struct {
+	Url         string             `json:"url"`
+	FinalUrl    string             `json:"final_url"`
+	Verdict     string             `json:"verdict"`
+	Reason      string             `json:"reason"`
+	HttpStatus  int32              `json:"http_status"`
+	ContentType string             `json:"content_type"`
+	Bytes       int64              `json:"bytes"`
+	Sha256      string             `json:"sha256"`
+	FinishedAt  pgtype.Timestamptz `json:"finished_at"`
+}
+
+// The source log of one job run (PRD #1909 D7): this run's run_fetches rows, oldest first. The
+// columns a product needs; the fetch service wrote them, and its text fields are escaped and
+// bounded at write time. Not caller-scoped (see ListJobFilesForRun).
+func (q *Queries) ListJobSourcesForRun(ctx context.Context, arg ListJobSourcesForRunParams) ([]ListJobSourcesForRunRow, error) {
+	rows, err := q.db.Query(ctx, listJobSourcesForRun, arg.RunID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListJobSourcesForRunRow{}
+	for rows.Next() {
+		var i ListJobSourcesForRunRow
+		if err := rows.Scan(
+			&i.Url,
+			&i.FinalUrl,
+			&i.Verdict,
+			&i.Reason,
+			&i.HttpStatus,
+			&i.ContentType,
+			&i.Bytes,
+			&i.Sha256,
+			&i.FinishedAt,
 		); err != nil {
 			return nil, err
 		}

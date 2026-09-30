@@ -175,6 +175,11 @@ func contractCases() []contractCase {
 		newContractCase[V1JobMessagesDTO]("v1_job_messages"),
 		// PRD #1909 M2: the uploaded-file DTO. expires_at is a present-as-null pointer.
 		newContractCase[V1FileDTO]("v1_file"),
+		// PRD #1909 M5: the job-file read DTOs. expires_at and source_url are present-as-null.
+		newContractCase[V1JobFileDTO]("v1_job_file"),
+		newContractCase[V1JobFilesDTO]("v1_job_files"),
+		newContractCase[V1JobRefusedFileDTO]("v1_job_refused_file"),
+		newContractCase[V1JobSourceDTO]("v1_job_source"),
 		// PRD #1908 D-D: the job block of the run detail. It is omitempty on RunDTO (so
 		// run.zero.json is unchanged) and nested in run.full.json; the standalone pair pins
 		// its own nullability surface (origin members, result).

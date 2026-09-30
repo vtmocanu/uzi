@@ -312,7 +312,12 @@ func TestV1JobDTOTags(t *testing.T) {
 		"failure_reason", "wall_seconds", "created_at", "started_at", "finished_at")
 	assertTags(t, "V1JobListDTO", V1JobListDTO{}, "jobs", "next_cursor")
 	assertTags(t, "V1JobResultDTO", V1JobResultDTO{}, "job_status", "result")
-	assertTags(t, "V1JobResultBodyDTO", V1JobResultBodyDTO{}, "status", "report_md", "findings")
+	assertTags(t, "V1JobResultBodyDTO", V1JobResultBodyDTO{}, "status", "report_md", "findings", "sources", "files", "refused_files")
+	// PRD #1909 M5: the job-file read DTOs.
+	assertTags(t, "V1JobFileDTO", V1JobFileDTO{}, "id", "display_name", "content_type", "byte_size", "sha256", "direction", "state", "expires_at", "source_url")
+	assertTags(t, "V1JobRefusedFileDTO", V1JobRefusedFileDTO{}, "display_name", "byte_size", "reason")
+	assertTags(t, "V1JobFilesDTO", V1JobFilesDTO{}, "files", "refused_files")
+	assertTags(t, "V1JobSourceDTO", V1JobSourceDTO{}, "url", "final_url", "verdict", "reason", "http_status", "content_type", "byte_size", "sha256", "fetched_at")
 	assertTags(t, "V1JobFindingDTO", V1JobFindingDTO{}, "severity", "message_md", "url", "file", "line")
 	assertTags(t, "V1JobMessagesDTO", V1JobMessagesDTO{}, "messages")
 	assertTags(t, "V1JobMessageDTO", V1JobMessageDTO{}, "seq", "created_at", "type", "text")

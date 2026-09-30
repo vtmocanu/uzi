@@ -60,8 +60,9 @@ type oaMedia struct {
 }
 
 type oaResponse struct {
-	Ref     string             `yaml:"$ref"`
-	Content map[string]oaMedia `yaml:"content"`
+	Ref     string               `yaml:"$ref"`
+	Content map[string]oaMedia   `yaml:"content"`
+	Headers map[string]yaml.Node `yaml:"headers"`
 }
 
 type oaRequestBody struct {
@@ -242,6 +243,9 @@ type v1OpShape struct {
 	dto       reflect.Type
 	request   reflect.Type
 	multipart bool
+	// binary: the success response is a raw byte stream (application/octet-stream, format binary),
+	// not JSON, and dto is nil. GET /files/{id}.
+	binary bool
 }
 
 var v1OperationShapes = map[string]v1OpShape{
@@ -253,6 +257,8 @@ var v1OperationShapes = map[string]v1OpShape{
 	"GET /api/v1/jobs/{id}/messages": {status: "200", dto: reflect.TypeFor[apitypes.V1JobMessagesDTO]()},
 	"POST /api/v1/jobs/{id}/cancel":  {status: "200", dto: reflect.TypeFor[apitypes.V1JobDTO]()},
 	"POST /api/v1/files":             {status: "201", dto: reflect.TypeFor[apitypes.V1FileDTO](), multipart: true},
+	"GET /api/v1/jobs/{id}/files":    {status: "200", dto: reflect.TypeFor[apitypes.V1JobFilesDTO]()},
+	"GET /api/v1/files/{id}":         {status: "200", binary: true},
 }
 
 // TestV1OpenAPISchemasMatchDTOs (PRD #1907 M3, extended by PRD #1908 M5): each operation's
@@ -274,6 +280,13 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 		resp, ok := op.Responses[shape.status]
 		if !ok {
 			t.Errorf("%s documents no %s response", key, shape.status)
+			continue
+		}
+		if shape.binary {
+			v1CheckBinaryResponse(t, spec, key, shape.status, resp)
+			if op.RequestBody != nil {
+				t.Errorf("%s documents a requestBody but is a plain download", key)
+			}
 			continue
 		}
 		media, ok := resp.Content["application/json"]
@@ -312,6 +325,29 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 	}
 	if got := whoami.Properties["scopes"].Items.Enum; !slices.Equal(got, producttoken.Scopes) {
 		t.Errorf("Whoami scopes enum = %v, want producttoken.Scopes %v", got, producttoken.Scopes)
+	}
+}
+
+// v1CheckBinaryResponse: a download's success response offers ONLY application/octet-stream with a
+// binary string schema, and declares the headers that keep it from being rendered.
+func v1CheckBinaryResponse(t *testing.T, spec oaSpec, key, status string, resp oaResponse) {
+	t.Helper()
+	if len(resp.Content) != 1 {
+		t.Errorf("%s %s offers %d media types, want only application/octet-stream", key, status, len(resp.Content))
+	}
+	media, ok := resp.Content["application/octet-stream"]
+	if !ok || media.Schema == nil {
+		t.Errorf("%s %s has no application/octet-stream schema", key, status)
+		return
+	}
+	body := (&oaChecker{t: t, spec: spec}).resolve(key+" "+status, media.Schema)
+	if body.Type.Value != "string" || body.Format != "binary" {
+		t.Errorf("%s %s: the schema must be a string of format binary, got type %q format %q", key, status, body.Type.Value, body.Format)
+	}
+	for _, h := range []string{"Content-Disposition", "X-Content-Type-Options"} {
+		if _, ok := resp.Headers[h]; !ok {
+			t.Errorf("%s %s does not document the %s header", key, status, h)
+		}
 	}
 }
 
@@ -368,6 +404,11 @@ func TestV1OpenAPIEnumsMatchGo(t *testing.T) {
 		{"JobMessage", "type", []string{"text", "status", "error"}},
 		// The file states a caller can observe; 'reserved' is internal (never returned).
 		{"File", "state", []string{workersvc.JobFileUnattached, workersvc.JobFileAttached, workersvc.JobFileAvailable, workersvc.JobFileExpired}},
+		// A job's file is committed and run-bound: attached, available or expired (never
+		// unattached or reserved), an input or an output.
+		{"JobFile", "state", []string{workersvc.JobFileAttached, workersvc.JobFileAvailable, workersvc.JobFileExpired}},
+		{"JobFile", "direction", []string{"input", "output"}},
+		{"JobSource", "verdict", []string{"allowed", "refused"}},
 	} {
 		got := enumOf(c.schema, c.prop)
 		if c.prop == "severity" {

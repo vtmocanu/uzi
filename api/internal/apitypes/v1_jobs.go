@@ -68,10 +68,17 @@ type V1JobFindingDTO struct {
 }
 
 // V1JobResultBodyDTO is a job's stored result.
+//
+// Sources, Files and RefusedFiles are PRD #1909 M5 (additive): the run's source log as the fetch
+// service recorded it, the files of the job (inputs and outputs) and the outputs that were not
+// stored. They describe THIS job's run only. All three are present (empty, never null).
 type V1JobResultBodyDTO struct {
-	Status   string            `json:"status"`
-	ReportMd string            `json:"report_md"`
-	Findings []V1JobFindingDTO `json:"findings"`
+	Status       string                `json:"status"`
+	ReportMd     string                `json:"report_md"`
+	Findings     []V1JobFindingDTO     `json:"findings"`
+	Sources      []V1JobSourceDTO      `json:"sources"`
+	Files        []V1JobFileDTO        `json:"files"`
+	RefusedFiles []V1JobRefusedFileDTO `json:"refused_files"`
 }
 
 // V1JobResultDTO is the GET /api/v1/jobs/{id}/result response. Result is null until the job

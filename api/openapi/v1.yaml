@@ -230,6 +230,35 @@ paths:
           $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+  /jobs/{id}/files:
+    get:
+      operationId: listJobFiles
+      summary: List a job's files
+      description: >-
+        The files of one job: the input files attached to it and the output files it
+        produced, with their metadata, and refused_files, the outputs that were not stored
+        (over a quota or not an allowed type) while the job still completed. Download the
+        bytes of a file with GET /files/{id}. An output carries source_url only when its
+        SHA-256 equals the SHA-256 of a fetch the fetch service recorded as allowed in this
+        same job; nothing the agent claims about a file's origin is used. Needs the
+        jobs:read scope. A job the caller cannot see is 404.
+      parameters:
+        - $ref: "#/components/parameters/JobId"
+      responses:
+        "200":
+          description: The job's files and refused outputs.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobFiles"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
   /files:
     post:
       operationId: uploadFile
@@ -307,6 +336,64 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "507":
           $ref: "#/components/responses/InsufficientStorage"
+  /files/{id}:
+    get:
+      operationId: downloadFile
+      summary: Download a file
+      description: >-
+        The file's bytes. Every response is sent as an attachment with
+        Content-Type: application/octet-stream and X-Content-Type-Options: nosniff,
+        whatever the file's type, so it is never rendered in a browser; the filename in
+        Content-Disposition is the content-derived storage name (the SHA-256 and an
+        extension), never the uploader's name. The file's own type is in the metadata
+        (content_type). Treat the bytes as untrusted data. Needs the jobs:read scope. Only
+        the user that owns the file can read it, and a product token only files of its own
+        product's jobs (or its own unattached uploads): a file the caller cannot see is 404,
+        the same as an unknown one. An expired file is 410.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The file id.
+          schema:
+            type: string
+            format: uuid
+      responses:
+        "200":
+          description: The file's bytes.
+          headers:
+            Content-Disposition:
+              description: attachment; filename="<sha256>.<ext>".
+              schema:
+                type: string
+            X-Content-Type-Options:
+              description: Always nosniff.
+              schema:
+                type: string
+                enum:
+                  - nosniff
+            Content-Length:
+              description: The file's size in bytes.
+              schema:
+                type: integer
+                format: int64
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "410":
+          $ref: "#/components/responses/Gone"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
 components:
   securitySchemes:
     bearerAuth:
@@ -336,14 +423,20 @@ components:
             $ref: "#/components/schemas/Error"
     NotFound:
       description: >-
-        No such job, or a job the caller cannot see: another user's job, another
-        product's job and a malformed id all answer the same (reason not_found).
+        No such job or file, or one the caller cannot see: another user's, another
+        product's and a malformed id all answer the same (reason not_found).
       content:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
     Conflict:
       description: The job has already finished (reason job_terminal).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    Gone:
+      description: The file has expired and its bytes are gone (reason file_expired).
       content:
         application/json:
           schema:
@@ -692,6 +785,9 @@ components:
         - status
         - report_md
         - findings
+        - sources
+        - files
+        - refused_files
       properties:
         status:
           type: string
@@ -703,6 +799,158 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/JobFinding"
+        sources:
+          type: array
+          description: >-
+            The job's source log: every fetch the fetch service recorded for this job,
+            allowed or refused, oldest first (at most the first 500). Empty for a job that
+            fetched nothing.
+          items:
+            $ref: "#/components/schemas/JobSource"
+        files:
+          type: array
+          description: The job's input and output files, as GET /jobs/{id}/files lists them.
+          items:
+            $ref: "#/components/schemas/JobFile"
+        refused_files:
+          type: array
+          description: The outputs that were not stored, and why.
+          items:
+            $ref: "#/components/schemas/JobRefusedFile"
+    JobFiles:
+      type: object
+      required:
+        - files
+        - refused_files
+      properties:
+        files:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobFile"
+        refused_files:
+          type: array
+          items:
+            $ref: "#/components/schemas/JobRefusedFile"
+    JobFile:
+      type: object
+      required:
+        - id
+        - display_name
+        - content_type
+        - byte_size
+        - sha256
+        - direction
+        - state
+        - expires_at
+        - source_url
+      properties:
+        id:
+          type: string
+          format: uuid
+          description: Download the bytes with GET /files/{id}.
+        display_name:
+          type: string
+          description: >-
+            A file name, reduced to its last path component with control and invisible
+            characters removed. Untrusted text: render it inert.
+        content_type:
+          type: string
+          description: The type detected from the bytes.
+        byte_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+          description: The SHA-256 of the file's bytes, lowercase hexadecimal.
+        direction:
+          type: string
+          enum:
+            - input
+            - output
+        state:
+          type: string
+          description: attached (the job has not finished), available or expired.
+          enum:
+            - attached
+            - available
+            - expired
+        expires_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: >-
+            When the file expires. Null while it is attached to a job that has not
+            finished.
+        source_url:
+          type:
+            - string
+            - "null"
+          description: >-
+            For an output, the URL it was fetched from, when its SHA-256 equals that of a
+            fetch the fetch service recorded as allowed in this same job. Null otherwise,
+            always for an input. Untrusted text taken from the site's redirects; render it
+            inert.
+    JobRefusedFile:
+      type: object
+      required:
+        - display_name
+        - byte_size
+        - reason
+      properties:
+        display_name:
+          type: string
+          description: Untrusted text, render it inert.
+        byte_size:
+          type: integer
+          format: int64
+        reason:
+          type: string
+          description: >-
+            Why the output was not stored, for example a quota or an unsupported type. A
+            reason of generation_pending means a generated file (report.md or
+            findings.json) is still being stored.
+    JobSource:
+      type: object
+      required:
+        - url
+        - final_url
+        - verdict
+        - reason
+        - http_status
+        - content_type
+        - byte_size
+        - sha256
+        - fetched_at
+      properties:
+        url:
+          type: string
+          description: The URL the agent asked to fetch. Untrusted text.
+        final_url:
+          type: string
+          description: The URL after redirects; empty when the fetch did not get that far.
+        verdict:
+          type: string
+          enum:
+            - allowed
+            - refused
+        reason:
+          type: string
+          description: Why a fetch was refused; empty when it was allowed.
+        http_status:
+          type: integer
+          description: The HTTP status the site answered with; 0 when there was none.
+        content_type:
+          type: string
+        byte_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+          description: The SHA-256 of the fetched bytes, lowercase hexadecimal; empty for a refused fetch.
+        fetched_at:
+          type: string
+          format: date-time
     JobFinding:
       type: object
       required:

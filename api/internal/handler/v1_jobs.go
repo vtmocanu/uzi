@@ -385,6 +385,19 @@ func (h *Handler) V1JobResult(w http.ResponseWriter, r *http.Request) {
 				Severity: f.Severity, MessageMd: f.MessageMD, URL: f.URL, File: f.File, Line: f.Line,
 			})
 		}
+		// PRD #1909 M5: this run's source log and files, read in the same caller scope.
+		srcs, err := h.wsvc.ListJobSourcesForCaller(r.Context(), caller, id)
+		if err != nil {
+			writeV1JobError(w, "result sources", err)
+			return
+		}
+		jf, err := h.wsvc.ListJobFilesForCaller(r.Context(), caller, id)
+		if err != nil {
+			writeV1JobError(w, "result files", err)
+			return
+		}
+		body.Sources = v1JobSourceDTOs(srcs)
+		body.Files, body.RefusedFiles = v1JobFileDTOs(jf)
 		out.Result = body
 	}
 	httpx.JSON(w, http.StatusOK, out)

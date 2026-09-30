@@ -11,6 +11,39 @@
         "file": "x",
         "line": 1
       }
+    ],
+    "sources": [
+      {
+        "url": "x",
+        "final_url": "x",
+        "verdict": "x",
+        "reason": "x",
+        "http_status": 1,
+        "content_type": "x",
+        "byte_size": 1,
+        "sha256": "x",
+        "fetched_at": "2020-01-02T03:04:05Z"
+      }
+    ],
+    "files": [
+      {
+        "id": "x",
+        "display_name": "x",
+        "content_type": "x",
+        "byte_size": 1,
+        "sha256": "x",
+        "direction": "x",
+        "state": "x",
+        "expires_at": "2020-01-02T03:04:05Z",
+        "source_url": "x"
+      }
+    ],
+    "refused_files": [
+      {
+        "display_name": "x",
+        "byte_size": 1,
+        "reason": "x"
+      }
     ]
   }
 }

@@ -31,7 +31,7 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 	doc := loadV1Doc(t)
 
 	// PRD #1909 M2: a small file store, so the upload's 413 and 507 are reachable.
-	e.wireFiles(workersvc.JobFileLimits{InputFileMaxBytes: 1000, PerOwnerBytes: 2000})
+	jf := e.wireFiles(workersvc.JobFileLimits{InputFileMaxBytes: 1000, PerOwnerBytes: 2000})
 	owner, uzc := e.user()
 	product := e.product(owner, "research")
 	pTok := v1MintProductToken(t, e.h.q, owner, product, producttoken.Scopes, nil)
@@ -48,6 +48,18 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 	e.exec(`INSERT INTO run_messages (run_id, seq, kind, payload) VALUES ($1, 1, 'text', '{"text":"hi"}')`, seeded.ID)
 	toCancel := e.create(pTok.token, v1MinimalJob)
 
+	// PRD #1909 M5: a stored output with a matching allowed fetch (so source_url is non-null), one
+	// without (null), a refusal, and an expired output, for the file reads.
+	fetchedBody := []byte("a fetched page")
+	outWithSource := e.storeOutput(jf, owner, seeded.ID, "page.txt", fetchedBody)
+	e.storeOutput(jf, owner, seeded.ID, "plain.txt", []byte("no source"))
+	e.fetch(seeded.ID, "allowed", "https://example.com/p", "https://example.com/p2", sha256Hex(fetchedBody))
+	e.fetch(seeded.ID, "refused", "https://blocked.example/", "", "")
+	e.exec(`INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason) VALUES ($1, 'big.pdf', 5, 'file_too_large')`, seeded.ID)
+	expired := e.storeOutput(jf, owner, seeded.ID, "old.txt", []byte("expired"))
+	e.exec(`DELETE FROM job_file_chunks WHERE file_id = $1`, expired.ID)
+	e.exec(`UPDATE job_files SET state = 'expired' WHERE id = $1`, expired.ID)
+
 	type tc struct {
 		name          string
 		method        string
@@ -62,6 +74,9 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		mp     *v1UploadOpts
 		mpData []byte
 		pre    func() // runs before the call (the 503 case unwires the file store).
+		// binary: the 200 body is the file's raw bytes (GET /files/{id}); its headers are checked
+		// instead of a JSON schema.
+		binary bool
 	}
 	id := seeded.ID
 	cases := []tc{
@@ -127,6 +142,19 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "cancel 404", method: "POST", specPath: "/jobs/{id}/cancel", url: "/api/v1/jobs/" + uuid.NewString() + "/cancel", token: uzc, want: 404},
 		{name: "cancel 429", method: "POST", specPath: "/jobs/{id}/cancel", url: "/api/v1/jobs/" + id + "/cancel", want: 429, tight: true, primeThenCall: true},
 
+		// GET /jobs/{id}/files and GET /files/{id} (PRD #1909 M5)
+		{name: "files 200", method: "GET", specPath: "/jobs/{id}/files", url: "/api/v1/jobs/" + id + "/files", token: pTok.token, want: 200},
+		{name: "files 401", method: "GET", specPath: "/jobs/{id}/files", url: "/api/v1/jobs/" + id + "/files", token: unknown, want: 401},
+		{name: "files 403", method: "GET", specPath: "/jobs/{id}/files", url: "/api/v1/jobs/" + id + "/files", token: runOnly.token, want: 403},
+		{name: "files 404", method: "GET", specPath: "/jobs/{id}/files", url: "/api/v1/jobs/" + uuid.NewString() + "/files", token: uzc, want: 404},
+		{name: "files 429", method: "GET", specPath: "/jobs/{id}/files", url: "/api/v1/jobs/" + id + "/files", want: 429, tight: true, primeThenCall: true},
+		{name: "download 200", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + outWithSource.ID.String(), token: pTok.token, want: 200, binary: true},
+		{name: "download 401", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + outWithSource.ID.String(), token: unknown, want: 401},
+		{name: "download 403", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + outWithSource.ID.String(), token: runOnly.token, want: 403},
+		{name: "download 404", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + uuid.NewString(), token: uzc, want: 404},
+		{name: "download 410", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + expired.ID.String(), token: pTok.token, want: 410},
+		{name: "download 429", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + outWithSource.ID.String(), want: 429, tight: true, primeThenCall: true},
+
 		// POST /files (PRD #1909 D5)
 		{name: "upload 201", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 201, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
 		{name: "upload 401", method: "POST", specPath: "/files", url: "/api/v1/files", token: unknown, want: 401, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
@@ -158,6 +186,7 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		// Last: it unwires the file store, so no later case may need one.
 		{name: "upload 503", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 503, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello"),
 			pre: func() { e.h.wsvc.SetJobFiles(nil) }},
+		{name: "download 503", method: "GET", specPath: "/files/{id}", url: "/api/v1/files/" + uuid.NewString(), token: uzc, want: 503},
 		{name: "job create 503 files_unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":["` + uuid.NewString() + `"]}`, want: 503},
 	}
 
@@ -186,6 +215,14 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 				t.Fatalf("status %d %s, want %d", r.status, truncate(string(r.body), 300), c.want)
 			}
 			status := strconv.Itoa(r.status)
+			if c.binary {
+				if r.header.Get("Content-Type") != "application/octet-stream" || r.header.Get("X-Content-Type-Options") != "nosniff" ||
+					!strings.HasPrefix(r.header.Get("Content-Disposition"), "attachment;") {
+					t.Errorf("download headers = %v", r.header)
+				}
+				produced[c.method+" "+c.specPath+" "+status] = true
+				return
+			}
 			schema, documented, err := doc.responseSchema(c.method, c.specPath, status)
 			if err != nil {
 				t.Fatal(err)
