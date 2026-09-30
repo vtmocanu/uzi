@@ -52,7 +52,7 @@ func jobWorker(id, user uuid.UUID) store.Worker { return store.Worker{ID: id, Us
 func TestSubmitJobResultLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	u := e.seedJobUser(t)
-	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	wkr := jobWorker(workerID, u)
 	runID := e.seedRawJob(t, u, "running", &workerID, time.Minute, 600) // claim_generation 1
 
@@ -105,7 +105,7 @@ func TestSubmitJobResultLiveDB(t *testing.T) {
 	if err := e.svc.SubmitJobResult(e.ctx, wkr, runID, 2, first); !errors.Is(err, ErrStaleClaim) {
 		t.Fatalf("stale generation: err = %v, want ErrStaleClaim", err)
 	}
-	other := e.seedWorkerRow(t, u, false, nil, jobCap)
+	other := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	if err := e.svc.SubmitJobResult(e.ctx, jobWorker(other, u), runID, 1, first); !errors.Is(err, ErrRunNotFound) {
 		t.Fatalf("a worker not holding the run: err = %v, want ErrRunNotFound", err)
 	}
@@ -138,7 +138,7 @@ func TestSubmitJobResultLiveDB(t *testing.T) {
 func TestJobNoResultInvariantLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	u := e.seedJobUser(t)
-	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	wkr := jobWorker(workerID, u)
 
 	complete := func(t *testing.T, runID uuid.UUID, gen *int64) {
@@ -204,7 +204,7 @@ func TestJobNoResultInvariantLiveDB(t *testing.T) {
 func TestTimedOutJobNeverCompletesLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	u := e.seedJobUser(t)
-	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	wkr := jobWorker(workerID, u)
 	runID := e.seedRawJob(t, u, "running", &workerID, time.Hour, 60)
 	if n, err := e.svc.FailJobsPastWallDeadline(e.ctx, time.Hour); err != nil || n != 1 {
@@ -231,7 +231,7 @@ func TestTimedOutJobNeverCompletesLiveDB(t *testing.T) {
 func TestJobLiveStatusGuardLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	u := e.seedJobUser(t)
-	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	for _, status := range []string{"queued", "paused"} {
 		runID := e.seedRawJob(t, u, status, &workerID, 0, 600)
 		n, err := e.q.FailJobRunWithoutResult(e.ctx, store.FailJobRunWithoutResultParams{ID: runID, WorkerID: pgconv.UUID(workerID)})
@@ -262,8 +262,8 @@ func TestJobReclaimClearsEarlierResultLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
-	wkr := store.Worker{ID: workerID, UserID: u, Name: "w", Status: "online", ProtocolCapabilities: []string{jobCap}}
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
+	wkr := store.Worker{ID: workerID, UserID: u, Name: "w", Status: "online", ProtocolCapabilities: []string{jobCap, jobFilesCap}}
 
 	pl, err := e.svc.Claim(e.ctx, wkr, nil)
 	if err != nil || pl == nil || pl.ClaimGeneration != 1 {

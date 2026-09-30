@@ -401,6 +401,12 @@ export class Worker {
           // UNCONDITIONALLY: the api's ClaimRun job clause reads 'job_runner_v1' =
           // ANY(workers.protocol_capabilities), so an image without it never claims a job.
           "job_runner_v1",
+          // PRD #1909 M1: the job file protocol (input files on the claim, output uploads, the
+          // output_files field of submit_job_result). Advertised UNCONDITIONALLY, next to
+          // job_runner_v1: the api stamps every new job with runs.job_protocol and its ClaimRun job
+          // clause then lets only a worker advertising 'job_files_v1' claim it, so an api rolled
+          // ahead of the fleet never hands a new-protocol job to an image without this.
+          "job_files_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does

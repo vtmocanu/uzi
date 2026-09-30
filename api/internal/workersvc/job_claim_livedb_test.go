@@ -22,7 +22,10 @@ import (
 // guards and the wall-clock backstop. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway
 // database; run via ./e2e/run-store-it.sh.
 
-const jobCap = capability.JobRunnerV1
+const (
+	jobCap      = capability.JobRunnerV1
+	jobFilesCap = capability.JobFilesV1
+)
 
 // seedWorkerRow inserts an online worker with a fresh heartbeat and the given flags.
 func (e jobEnv) seedWorkerRow(t *testing.T, userID uuid.UUID, docker bool, maxConcurrent *int32, protocolCaps ...string) uuid.UUID {
@@ -99,8 +102,8 @@ func TestJobClaimHardClauseLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	u := e.seedJobUser(t)
 	incapable := e.seedWorkerRow(t, u, false, nil)
-	dockerCapable := e.seedWorkerRow(t, u, true, nil, jobCap)
-	capable := e.seedWorkerRow(t, u, false, nil, jobCap)
+	dockerCapable := e.seedWorkerRow(t, u, true, nil, jobCap, jobFilesCap)
+	capable := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	jobID := e.seedRawJob(t, u, "queued", nil, 0, 600)
 
 	// (1) an old-image worker never claims a job, with capability_aware on or off.
@@ -110,7 +113,7 @@ func TestJobClaimHardClauseLiveDB(t *testing.T) {
 		}
 	}
 	// (2) a docker worker never claims a job, even advertising the capability.
-	if _, err := e.q.ClaimRun(e.ctx, e.claimParams(u, dockerCapable, true, []string{jobCap}, false)); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := e.q.ClaimRun(e.ctx, e.claimParams(u, dockerCapable, true, []string{jobCap, jobFilesCap}, false)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("a docker worker claimed a job (err=%v)", err)
 	}
 	// (3) ClearRunRequiredCapabilities changes nothing: the clause is outside required_capabilities.
@@ -127,7 +130,7 @@ func TestJobClaimHardClauseLiveDB(t *testing.T) {
 		t.Fatalf("job must stay queued through the refused claims; status = %q", s)
 	}
 	// (4) a non-docker job_runner_v1 worker claims it.
-	run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, capable, false, []string{jobCap}, false))
+	run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, capable, false, []string{jobCap, jobFilesCap}, false))
 	if err != nil {
 		t.Fatalf("a non-docker job_runner_v1 worker must claim the job: %v", err)
 	}
@@ -146,7 +149,7 @@ func TestJobClaimHardClauseLiveDB(t *testing.T) {
 func TestJobClaimPeerSpreadMirrorLiveDB(t *testing.T) {
 	newBusyClaimant := func(e jobEnv, u uuid.UUID) uuid.UUID {
 		cap2 := int32(2)
-		me := e.seedWorkerRow(t, u, false, &cap2, jobCap)
+		me := e.seedWorkerRow(t, u, false, &cap2, jobCap, jobFilesCap)
 		e.seedRawJob(t, u, "running", &me, 30*time.Second, 600) // one active run: not minimum-loaded
 		return me
 	}
@@ -158,7 +161,7 @@ func TestJobClaimPeerSpreadMirrorLiveDB(t *testing.T) {
 		me := newBusyClaimant(e, u)
 		e.seedWorkerRow(t, u, false, &cap2) // idle, no job_runner_v1
 		jobID := e.seedRawJob(t, u, "queued", nil, 0, 600)
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, me, false, []string{jobCap}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, me, false, []string{jobCap, jobFilesCap}, false))
 		if err != nil {
 			t.Fatalf("busy claimant must claim: the old-image peer cannot take a job (err=%v)", err)
 		}
@@ -170,9 +173,9 @@ func TestJobClaimPeerSpreadMirrorLiveDB(t *testing.T) {
 		e := setupJobLiveDB(t, 0)
 		u := e.seedJobUser(t)
 		me := newBusyClaimant(e, u)
-		e.seedWorkerRow(t, u, true, &cap2, jobCap) // idle, advertises the cap, but docker
+		e.seedWorkerRow(t, u, true, &cap2, jobCap, jobFilesCap) // idle, advertises the cap, but docker
 		jobID := e.seedRawJob(t, u, "queued", nil, 0, 600)
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, me, false, []string{jobCap}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, me, false, []string{jobCap, jobFilesCap}, false))
 		if err != nil {
 			t.Fatalf("busy claimant must claim: a docker peer cannot take a job (err=%v)", err)
 		}
@@ -184,9 +187,9 @@ func TestJobClaimPeerSpreadMirrorLiveDB(t *testing.T) {
 		e := setupJobLiveDB(t, 0)
 		u := e.seedJobUser(t)
 		me := newBusyClaimant(e, u)
-		e.seedWorkerRow(t, u, false, &cap2, jobCap)
+		e.seedWorkerRow(t, u, false, &cap2, jobCap, jobFilesCap)
 		jobID := e.seedRawJob(t, u, "queued", nil, 0, 600)
-		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(u, me, false, []string{jobCap}, false)); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(u, me, false, []string{jobCap, jobFilesCap}, false)); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("busy claimant must defer the job to the capable idle peer (err=%v)", err)
 		}
 		if s := e.status(t, jobID); s != "queued" {
@@ -216,12 +219,12 @@ func TestCountOnlineWorkersClaimableForRunJobLiveDB(t *testing.T) {
 		}
 		return n
 	}
-	e.seedWorkerRow(t, u, false, nil)        // old image
-	e.seedWorkerRow(t, u, true, nil, jobCap) // docker, advertising
+	e.seedWorkerRow(t, u, false, nil)                     // old image
+	e.seedWorkerRow(t, u, true, nil, jobCap, jobFilesCap) // docker, advertising
 	if n := count(); n != 0 {
 		t.Fatalf("claimable workers = %d, want 0 (old image and docker cannot claim a job)", n)
 	}
-	e.seedWorkerRow(t, u, false, nil, jobCap)
+	e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	if n := count(); n != 1 {
 		t.Fatalf("claimable workers = %d, want 1 (the non-docker job_runner_v1 worker)", n)
 	}
@@ -237,7 +240,7 @@ func TestQueuedReasonNoJobCapableWorkerLiveDB(t *testing.T) {
 	if got := e.svc.queuedReason(e.ctx, time.Now(), row); got != reasonNoJobCapableWorker {
 		t.Fatalf("queuedReason = %q, want %q", got, reasonNoJobCapableWorker)
 	}
-	e.seedWorkerRow(t, u, false, nil, jobCap)
+	e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	if got := e.svc.queuedReason(e.ctx, time.Now(), row); got == reasonNoJobCapableWorker {
 		t.Fatalf("queuedReason still %q with a job-capable worker online", got)
 	}
@@ -273,14 +276,14 @@ func TestJobClaimPayloadLiveDB(t *testing.T) {
 	if got, err := e.svc.Claim(e.ctx, old, nil); err != nil || got != nil {
 		t.Fatalf("old-image worker Claim = %v, %v; want idle", got, err)
 	}
-	dockID := e.seedWorkerRow(t, u, true, nil, jobCap)
-	dock := store.Worker{ID: dockID, UserID: u, Name: "dock", Status: "online", DockerEnabled: pgtype.Bool{Bool: true, Valid: true}, ProtocolCapabilities: []string{jobCap}}
+	dockID := e.seedWorkerRow(t, u, true, nil, jobCap, jobFilesCap)
+	dock := store.Worker{ID: dockID, UserID: u, Name: "dock", Status: "online", DockerEnabled: pgtype.Bool{Bool: true, Valid: true}, ProtocolCapabilities: []string{jobCap, jobFilesCap}}
 	if got, err := e.svc.Claim(e.ctx, dock, nil); err != nil || got != nil {
 		t.Fatalf("docker worker Claim = %v, %v; want idle", got, err)
 	}
 
-	capID := e.seedWorkerRow(t, u, false, nil, jobCap, capability.RecoveryArchiveV1)
-	capable := store.Worker{ID: capID, UserID: u, Name: "capable", Status: "online", ProtocolCapabilities: []string{capability.RecoveryArchiveV1, jobCap}}
+	capID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap, capability.RecoveryArchiveV1)
+	capable := store.Worker{ID: capID, UserID: u, Name: "capable", Status: "online", ProtocolCapabilities: []string{capability.RecoveryArchiveV1, jobCap, jobFilesCap}}
 	pl, err := e.svc.Claim(e.ctx, capable, nil)
 	if err != nil {
 		t.Fatalf("Claim(capable): %v", err)
@@ -347,9 +350,9 @@ func TestJobEmptyAutoPoolFailsClosedLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
+	workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	e.exec(`UPDATE workers SET anthropic_bind_mode = 'auto' WHERE id = $1`, workerID)
-	wkr := store.Worker{ID: workerID, UserID: u, Name: "auto", Status: "online", ProtocolCapabilities: []string{jobCap}, AnthropicBindMode: BindModeAuto}
+	wkr := store.Worker{ID: workerID, UserID: u, Name: "auto", Status: "online", ProtocolCapabilities: []string{jobCap, jobFilesCap}, AnthropicBindMode: BindModeAuto}
 
 	pl, err := e.svc.Claim(e.ctx, wkr, nil)
 	if err != nil || pl != nil {
@@ -407,7 +410,7 @@ func TestJobEndToEndEphemeralProvisionRegisterClaimLiveDB(t *testing.T) {
 	if inGap() {
 		t.Fatal("a job with a bound ephemeral worker must not be re-surfaced (one per run)")
 	}
-	registered, _, err := e.svc.Register(e.ctx, eph, "test", "", nil, nil, []string{jobCap}, nil)
+	registered, _, err := e.svc.Register(e.ctx, eph, "test", "", nil, nil, []string{jobCap, jobFilesCap}, nil)
 	if err != nil {
 		t.Fatalf("Register: %v", err)
 	}
@@ -544,7 +547,7 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		u := e.seedJobUser(t)
 		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
 		w := e.seedEphemeralWorker(t, u, v.ID)
-		e.registerEphemeral(t, w, jobCap)
+		e.registerEphemeral(t, w, jobCap, jobFilesCap)
 		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 0 {
 			t.Fatalf("pass = %d, %v; want 0", n, err)
 		}
@@ -559,8 +562,8 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
 		w := e.seedEphemeralWorker(t, u, v.ID)
 		e.registerEphemeral(t, w) // old image, online: unservable
-		capable := e.seedWorkerRow(t, u, false, nil, jobCap)
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, capable, false, []string{jobCap}, false))
+		capable := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(u, capable, false, []string{jobCap, jobFilesCap}, false))
 		if err != nil || run.ID != v.ID {
 			t.Fatalf("capable worker ClaimRun = %v, %v; want the job", run.ID, err)
 		}
@@ -592,7 +595,7 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		u := e.seedJobUser(t)
 		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
 		w := e.seedEphemeralWorker(t, u, v.ID)
-		e.registerEphemeral(t, w, jobCap)
+		e.registerEphemeral(t, w, jobCap, jobFilesCap)
 		goStale(e, t, w.ID)
 		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 0 {
 			t.Fatalf("pass = %d, %v; want 0 (the worker registered, it merely went stale)", n, err)
@@ -626,7 +629,7 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		u := e.seedJobUser(t)
 		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
 		w := e.seedEphemeralWorker(t, u, v.ID)
-		e.registerEphemeral(t, w, jobCap)
+		e.registerEphemeral(t, w, jobCap, jobFilesCap)
 		e.exec(`UPDATE workers SET docker_enabled = true WHERE id = $1`, w.ID)
 		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 1 {
 			t.Fatalf("pass = %d, %v; want 1", n, err)
@@ -645,7 +648,7 @@ func TestFailJobsWithUnservableEphemeralLiveDB(t *testing.T) {
 		v, _ := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u)))
 		w := e.seedEphemeralWorker(t, u, v.ID)
 		e.registerEphemeral(t, w) // incapable
-		other := e.seedWorkerRow(t, u, false, nil, jobCap)
+		other := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 		e.exec(`UPDATE runs SET worker_id = $2 WHERE id = $1`, v.ID, other)
 		if n, err := e.svc.FailJobsWithUnservableEphemeral(e.ctx, deadline); err != nil || n != 0 {
 			t.Fatalf("pass = %d, %v; want 0 failed jobs", n, err)
@@ -697,7 +700,7 @@ func TestJobParkGuardsLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	env := setupInterlockLiveDB(t)
 	u := env.userID
-	w := e.seedWorkerRow(t, u, false, nil, jobCap)
+	w := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	wid := pgtype.UUID{Bytes: w, Valid: true}
 	job := e.seedRawJob(t, u, "running", &w, time.Minute, 600)
 	issue := env.seedActiveRunOwnedBy(t, w)
@@ -790,7 +793,7 @@ func TestJobWallPassesSkipJobLiveDB(t *testing.T) {
 	params := store.RequestWallParksParams{Now: pgtype.Timestamptz{Time: now, Valid: true}, GlobalTimeoutSeconds: 7200, WorkerStaleCutoff: pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true}}
 
 	// RequestWallParks: a live, wall_park_v1 worker holding an out-of-time run.
-	wj := e.seedWorkerRow(t, u, false, nil, jobCap, capability.WallParkV1)
+	wj := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap, capability.WallParkV1)
 	wi := e.seedWorkerRow(t, u, false, nil, capability.WallParkV1)
 	job := e.seedRawJob(t, u, "running", &wj, past, 600)
 	issue := env.seedActiveRunOwnedBy(t, wi)
@@ -809,7 +812,7 @@ func TestJobWallPassesSkipJobLiveDB(t *testing.T) {
 	}
 
 	// ParkRunsAtWall: a worker WITHOUT wall_park_v1 (incapable) holding an out-of-time run.
-	wj2 := e.seedWorkerRow(t, u, false, nil, jobCap)
+	wj2 := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	wi2 := e.seedWorkerRow(t, u, false, nil)
 	job2 := e.seedRawJob(t, u, "running", &wj2, past, 600)
 	issue2 := env.seedActiveRunOwnedBy(t, wi2)
@@ -837,7 +840,7 @@ func TestFailJobsPastWallDeadlineLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	env := setupInterlockLiveDB(t)
 	u := env.userID
-	w := e.seedWorkerRow(t, u, false, nil, jobCap)
+	w := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
 	over := e.seedRawJob(t, u, "running", &w, 600*time.Second+jobWallBackstopGraceSeconds*time.Second+30*time.Second, 600)
 	inGrace := e.seedRawJob(t, u, "running", &w, 700*time.Second, 600)
 	fresh := e.seedRawJob(t, u, "running", &w, 30*time.Second, 600)

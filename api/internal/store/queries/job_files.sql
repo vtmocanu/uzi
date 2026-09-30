@@ -1,0 +1,147 @@
+-- Job files (PRD #1909 M1). The service layer is workersvc/jobfiles.go; the shared lock and
+-- byte sums are store/storedfiles.go. Bytes live in Postgres as AAD-sealed chunks, in the shape
+-- of recovery_capture_chunks.
+--
+-- Every quota read here runs UNDER store.LockStoredFiles (the owner key, then the shared key), in
+-- the transaction that then inserts or stamps the reservation. That lock, not a snapshot rule, is
+-- what stops two concurrent admissions from both passing a check that only one fits.
+
+-- name: SumStoredFileBytes :one
+-- The four sums an admission compares against its quotas. Job bytes count every job_files state
+-- except 'expired' (reserved, unattached, attached and available all hold quota). Recovery bytes
+-- count 'available' captures by their bound byte_size and 'preparing'/'uploading' captures by the
+-- reserved_bytes their upload admission stamped (NULL counts as zero); needs_action, expired and
+-- discarded captures stop counting. @exclude_capture_id leaves the capture being admitted out of
+-- its own sum (a NULL id excludes nothing).
+SELECT
+  COALESCE((SELECT sum(f.byte_size) FROM job_files f
+             WHERE f.user_id = @user_id AND f.state <> 'expired'), 0)::bigint AS owner_job_bytes,
+  COALESCE((SELECT sum(f.byte_size) FROM job_files f
+             WHERE f.state <> 'expired'), 0)::bigint AS instance_job_bytes,
+  COALESCE((SELECT sum(CASE WHEN c.state = 'available' THEN COALESCE(c.byte_size, 0)
+                            ELSE COALESCE(c.reserved_bytes, 0) END)
+              FROM recovery_captures c
+             WHERE c.user_id = @user_id
+               AND c.state IN ('available', 'preparing', 'uploading')
+               AND (sqlc.narg('exclude_capture_id')::uuid IS NULL OR c.id <> sqlc.narg('exclude_capture_id')::uuid)), 0)::bigint AS owner_recovery_bytes,
+  COALESCE((SELECT sum(CASE WHEN c.state = 'available' THEN COALESCE(c.byte_size, 0)
+                            ELSE COALESCE(c.reserved_bytes, 0) END)
+              FROM recovery_captures c
+             WHERE c.state IN ('available', 'preparing', 'uploading')
+               AND (sqlc.narg('exclude_capture_id')::uuid IS NULL OR c.id <> sqlc.narg('exclude_capture_id')::uuid)), 0)::bigint AS instance_recovery_bytes;
+
+-- name: SumRunJobFiles :one
+-- One run's live (non-expired) files of one direction: the per-job file-count and byte caps.
+SELECT count(*)::bigint AS file_count, COALESCE(sum(byte_size), 0)::bigint AS total_bytes
+  FROM job_files
+ WHERE run_id = @run_id AND direction = @direction AND state <> 'expired';
+
+-- name: ReserveJobFile :one
+-- Admission: the row in state 'reserved' at the DECLARED size, before any chunk is written.
+-- sha256 is set only when the caller declared one (checked against the streamed bytes).
+INSERT INTO job_files (user_id, product_id, run_id, direction, claim_generation, display_name, byte_size, sha256, state)
+VALUES (@user_id, sqlc.narg('product_id'), sqlc.narg('run_id'), @direction, sqlc.narg('claim_generation'),
+        @display_name, @byte_size, sqlc.narg('sha256'), 'reserved')
+RETURNING *;
+
+-- name: LockReservedJobFile :one
+-- Row-locks a reservation for the streaming write. Zero rows: it is gone (released or swept) or
+-- already committed.
+SELECT * FROM job_files WHERE id = @id AND state = 'reserved' FOR UPDATE;
+
+-- name: InsertJobFileChunk :exec
+INSERT INTO job_file_chunks (file_id, chunk_index, length, sealed)
+VALUES (@file_id, @chunk_index, @length, @sealed);
+
+-- name: FinalizeJobFile :one
+-- Commits a reservation: the streamed size, the content identity and the resting state. An
+-- input with no run yet rests 'unattached' with the upload TTL; an output (or an input already
+-- bound to a run) rests 'attached' with no expiry until the run ends.
+UPDATE job_files
+   SET state = @state, byte_size = @byte_size, sha256 = @sha256, storage_name = @storage_name,
+       content_type = @content_type, chunk_count = @chunk_count,
+       expires_at = sqlc.narg('expires_at'), updated_at = now()
+ WHERE id = @id AND state = 'reserved'
+RETURNING *;
+
+-- name: GetJobFileForOwner :one
+-- Owner-scoped read: a file that is not the caller's reads as no row.
+SELECT * FROM job_files WHERE id = @id AND user_id = @user_id;
+
+-- name: GetJobFileChunk :one
+SELECT length, sealed FROM job_file_chunks WHERE file_id = @file_id AND chunk_index = @chunk_index;
+
+-- name: ReleaseJobFileReservation :execrows
+-- The reservation goes back the moment its upload fails. Only a 'reserved' row of this owner is
+-- ever deleted; a committed file is never touched.
+DELETE FROM job_files WHERE id = @id AND user_id = @user_id AND state = 'reserved';
+
+-- name: ReleaseStaleJobFileReservations :execrows
+-- The backstop for a reservation whose request died without releasing it (a crash, a lost
+-- context): reserved rows older than @cutoff. Chunks cascade, and a reserved row has none (the
+-- streaming write commits its chunks and the finalize together).
+DELETE FROM job_files WHERE state = 'reserved' AND created_at < @cutoff;
+
+-- name: SettleTerminalJobFiles :execrows
+-- Attached files of a terminal job become downloadable 'available' files with their retention
+-- clock starting at the run's end.
+UPDATE job_files f
+   SET state = 'available',
+       expires_at = COALESCE(r.finished_at, now()) + make_interval(secs => @retention_seconds::float8),
+       updated_at = now()
+  FROM runs r
+ WHERE f.run_id = r.id
+   AND f.state = 'attached'
+   AND r.status IN ('completed', 'failed', 'cancelled');
+
+-- name: ExpireJobFiles :execrows
+-- The retention sweep: unattached and available files past expires_at flip to 'expired' AND lose
+-- their chunks in the one statement (the ExpireReadyCaptures shape), so an expired file stops
+-- costing bytes while its row stays as an honest tombstone. Never touches reserved or attached.
+WITH expiring AS (
+    SELECT f.id FROM job_files f
+     WHERE f.state IN ('unattached', 'available') AND f.expires_at IS NOT NULL AND f.expires_at < @now
+),
+del AS (
+    DELETE FROM job_file_chunks WHERE file_id IN (SELECT id FROM expiring)
+)
+UPDATE job_files SET state = 'expired', updated_at = now()
+ WHERE id IN (SELECT id FROM expiring);
+
+-- name: ReclaimJobFilesForRecovery :one
+-- Recovery admission (PRD #1909 D2): free at least @need bytes of job files, in this order: files
+-- already past their expiry (unattached or available), then the oldest 'available' files. NEVER
+-- an attached file (its job is live), a reserved one (an upload is in flight), or an unattached
+-- one still inside its TTL. Picked files lose their chunks and flip to 'expired' in one
+-- statement; the result is the bytes actually freed (possibly less than @need: the caller
+-- re-checks the budget). Runs under store.LockStoredFiles, so nothing races the sums.
+WITH cand AS (
+    SELECT f.id, f.byte_size,
+           COALESCE(sum(f.byte_size) OVER (
+               ORDER BY (f.state IN ('unattached', 'available') AND f.expires_at IS NOT NULL AND f.expires_at < @now::timestamptz) DESC,
+                        f.created_at, f.id) - f.byte_size, 0) AS bytes_before
+      FROM job_files f
+     WHERE (f.state IN ('unattached', 'available') AND f.expires_at IS NOT NULL AND f.expires_at < @now::timestamptz)
+        OR f.state = 'available'
+),
+picked AS (
+    SELECT id FROM cand WHERE bytes_before < @need::bigint
+),
+del AS (
+    DELETE FROM job_file_chunks WHERE file_id IN (SELECT id FROM picked)
+),
+upd AS (
+    UPDATE job_files SET state = 'expired', updated_at = now()
+     WHERE id IN (SELECT id FROM picked)
+    RETURNING byte_size
+)
+SELECT COALESCE(sum(byte_size), 0)::bigint AS freed_bytes FROM upd;
+
+-- name: StampCaptureReservation :execrows
+-- Recovery admission (PRD #1909 D4): the upload's reserved size, and the 'uploading' state that
+-- makes the shared sums count it while the chunk stream runs outside the lock. Also the retry
+-- path: a needs_action capture retried gets its reservation counted again. A capture that is
+-- available, expired or discarded is not stampable (zero rows).
+UPDATE recovery_captures
+   SET state = 'uploading', reserved_bytes = @reserved_bytes, updated_at = now()
+ WHERE id = @id AND state IN ('preparing', 'uploading', 'needs_action');

@@ -38,6 +38,7 @@ func TestProductTokenMintLockClassMatchesSQL(t *testing.T) {
 		"JudgeDispositionCoordLockClass": JudgeDispositionCoordLockClass,
 		"RunBranchLockClass":             RunBranchLockClass,
 		"CheckpointRetentionLockClass":   CheckpointRetentionLockClass,
+		"StoredFilesLockClass":           StoredFilesLockClass,
 	} {
 		if got, ok := classes[name]; !ok || got != int64(v) {
 			t.Errorf("source parse gave %s = %d (found %t), compiled value %d", name, got, ok, v)

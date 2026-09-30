@@ -946,8 +946,12 @@ WITH target AS (
       -- @capability_aware kill-switch: an old-image worker would route a job to the issue executor,
       -- and a docker worker never serves a repo-less non-judge run. @is_docker_worker is the
       -- claimant's docker flag, @worker_protocol_caps its stored protocol_capabilities.
+      -- PRD #1909 M1 (the job_files_v1 ROLLOUT GATE): a job stamped with runs.job_protocol (every job
+      -- created since the file protocol landed) additionally needs 'job_files_v1'; a pre-change job
+      -- (job_protocol NULL) stays claimable by any job_runner_v1 worker. Same OUTSIDE-the-bypasses rule.
       AND (r.kind <> 'job'
-           OR (NOT @is_docker_worker::boolean AND 'job_runner_v1' = ANY(@worker_protocol_caps::text[])))
+           OR (NOT @is_docker_worker::boolean AND 'job_runner_v1' = ANY(@worker_protocol_caps::text[])
+               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(@worker_protocol_caps::text[]))))
       -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
       -- its SAME alias's account authority is on hold (D1's hold class):
       --   (1) quarantine: the linked account is quarantined and is still the run's
@@ -1110,8 +1114,10 @@ WITH target AS (
                 -- PRD #1908 (D-A): MIRROR the job-runner claim clause for the peer, or fleet-spread could
                 -- DEFER a job to a docker or old-image peer that could never claim it. Reads the peer's
                 -- OWN docker flag and workers.protocol_capabilities.
+                -- PRD #1909 M1: and the job_files_v1 arm for a stamped job (runs.job_protocol).
                 AND (r.kind <> 'job'
-                     OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)))
+                     OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)
+                         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))))
                 -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
                 -- busy worker never defers this run to a peer that cannot claim it.
                 AND NOT (
@@ -6466,7 +6472,7 @@ SELECT id, user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
-       egress_profile_id,
+       egress_profile_id, job_protocol,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
@@ -6673,8 +6679,10 @@ WHERE run.id = @run_id
   AND (run.egress_profile_id IS NULL OR 'isolated_fetch_v1' = ANY(w.protocol_capabilities))
   AND (run.egress_profile_id IS NULL OR NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL))
   -- PRD #1908 (D-A): MIRROR ClaimRun's job-runner clause (non-docker AND job_runner_v1).
+  -- PRD #1909 M1: and the job_files_v1 arm for a stamped job (runs.job_protocol).
   AND (run.kind <> 'job'
-       OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
+       OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
+           AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
   AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
@@ -6894,7 +6902,10 @@ WHERE w.user_id = @user_id
   AND w.draining_since IS NULL
   AND NOT w.ephemeral
   AND NOT COALESCE(w.docker_enabled, false)
-  AND 'job_runner_v1' = ANY(w.protocol_capabilities);
+  AND 'job_runner_v1' = ANY(w.protocol_capabilities)
+  -- PRD #1909 M1: a job stamped with runs.job_protocol (@requires_job_files) also needs the
+  -- 'job_files_v1' protocol capability; the caller passes runs.job_protocol IS NOT NULL.
+  AND (NOT @requires_job_files::boolean OR 'job_files_v1' = ANY(w.protocol_capabilities));
 
 -- name: ListUnplaceableQueuedRunsForEphemeral :many
 -- The trigger query for the ephemeral auto-provisioner (PRD #529 M2). It returns the
@@ -6979,6 +6990,8 @@ WHERE r.status = 'queued'
         AND NOT wj.ephemeral
         AND NOT COALESCE(wj.docker_enabled, false)
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
+        -- PRD #1909 M1: and 'job_files_v1' for a stamped job (runs.job_protocol).
+        AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(wj.protocol_capabilities))
   ))
   )
   AND NOT EXISTS (
@@ -7071,7 +7084,8 @@ WHERE r.status = 'queued'
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         -- PRD #1908 (D-A): for a 'job' the capable set is the job-runner set (non-docker AND
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
-        AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
+        AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
+                                 AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
   )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -7080,7 +7094,8 @@ WHERE r.status = 'queued'
         AND w.draining_since IS NULL
         AND NOT w.ephemeral
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
-        AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
+        AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
+                                 AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
         AND (w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
                   WHERE r2.worker_id = w.id

@@ -148,18 +148,19 @@ func (s *Service) Reserve(ctx context.Context, wkr store.Worker, runID uuid.UUID
 	return apitypes.RecoveryReserveResponse{CaptureID: cap.ID.String(), State: cap.State}, nil
 }
 
-// lockedCapture is the row-locked snapshot the upload transaction reads before streaming.
+// lockedCapture is the row-locked snapshot the upload transactions read before streaming.
 type lockedCapture struct {
-	runID      uuid.UUID
-	userID     uuid.UUID
-	origWorker pgtype.UUID
-	state      string
-	bound      bool
-	byteSize   pgtype.Int8
-	checksum   pgtype.Text
-	holdState  string
-	expiresAt  pgtype.Timestamptz
-	reason     pgtype.Text
+	runID         uuid.UUID
+	userID        uuid.UUID
+	origWorker    pgtype.UUID
+	state         string
+	bound         bool
+	byteSize      pgtype.Int8
+	checksum      pgtype.Text
+	holdState     string
+	expiresAt     pgtype.Timestamptz
+	reason        pgtype.Text
+	reservedBytes pgtype.Int8
 }
 
 // Upload streams one octet-stream bundle into AAD-sealed ~1 MiB chunks and commits them
@@ -212,74 +213,154 @@ func (s *Service) doUpload(ctx context.Context, wkr store.Worker, runID, capture
 	return s.upload(ctx, wkr, runID, captureID, manifest, body)
 }
 
-// upload runs the transactional body of Upload. Its errors are handled (needs_action
-// recording) by the caller.
+// upload runs the two transactions of an upload: a SHORT admission transaction under the
+// stored-files lock (admit), then the chunk-streaming transaction outside it (stream). Its errors
+// are handled (needs_action recording) by the caller.
 func (s *Service) upload(ctx context.Context, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest, body io.Reader) (apitypes.RecoveryCaptureStatusResponse, error) {
+	if receipt, done, err := s.admit(ctx, wkr, runID, captureID, manifest); err != nil || done {
+		return receipt, err
+	}
+	return s.stream(ctx, wkr, runID, captureID, manifest, body)
+}
+
+// lockCapture row-locks the capture and applies the authorization every upload transaction shares:
+// the capture must belong to this run + owner, be held by THIS worker, and its hold must be open. A
+// different/later worker cannot adopt authority on a terminal run; the run's own status is
+// irrelevant here (post-terminal recovery, D2). A DIFFERENT manifest already bound under this id is
+// a conflict, never an overwrite.
+func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest) (lockedCapture, error) {
+	var lc lockedCapture
+	err := tx.QueryRow(ctx, `SELECT c.run_id, c.user_id, c.original_worker_id, c.state, c.manifest_bound,
+			c.byte_size, c.checksum, c.expires_at, c.reason, h.state, c.reserved_bytes
+		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id = c.hold_id
+		WHERE c.id = $1 FOR UPDATE OF c`, captureID).Scan(
+		&lc.runID, &lc.userID, &lc.origWorker, &lc.state, &lc.bound,
+		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState, &lc.reservedBytes)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return lockedCapture{}, ErrCaptureNotFound
+		}
+		return lockedCapture{}, err
+	}
+	if lc.runID != runID || lc.userID != wkr.UserID {
+		return lockedCapture{}, ErrCaptureNotFound
+	}
+	if !lc.origWorker.Valid || uuid.UUID(lc.origWorker.Bytes) != wkr.ID {
+		return lockedCapture{}, ErrNotAuthorized
+	}
+	if lc.holdState != "open" {
+		return lockedCapture{}, ErrNotAuthorized
+	}
+	if lc.state != "available" && lc.bound &&
+		(lc.byteSize.Int64 != manifest.ByteSize || !strings.EqualFold(lc.checksum.String, manifest.Checksum)) {
+		return lockedCapture{}, ErrManifestConflict
+	}
+	return lc, nil
+}
+
+// admit is the SHORT admission transaction (PRD #1909 D4): under the stored-files lock (the owner
+// key, then the shared-budget key, the same order the job-file store takes) it sums the retained
+// recovery bytes (available by byte_size, preparing/uploading by reserved_bytes) and the job-file
+// bytes, applies the owner, instance and shared-budget ceilings to the DECLARED size, reclaims job
+// files when only the shared budget is short, and stamps the capture 'uploading' with
+// reserved_bytes = the declared size. The chunk stream then runs OUTSIDE the lock, still counted by
+// that reservation. done reports a lost-ACK receipt (an already-available capture): nothing to
+// stream, nothing re-charged.
+//
+// Reclaim order (PRD #1909 D2): job files past their expiry, then the oldest available job files,
+// never a file attached to a live job and never one being uploaded. Recovery wins: an archive is
+// refused (ErrQuota) only when reclaiming every reclaimable job file still would not fit it, and in
+// that case the reclaim is rolled back with the transaction, so a refused capture destroys nothing.
+func (s *Service) admit(ctx context.Context, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest) (apitypes.RecoveryCaptureStatusResponse, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	lc, err := lockCapture(ctx, tx, wkr, runID, captureID, manifest)
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, err
+	}
+	// Lost-ACK idempotency: an already-ready capture returns its existing receipt without
+	// re-uploading, re-charging quota or overwriting bytes.
+	if lc.state == "available" {
+		return statusFromLocked(captureID, lc), true, nil
+	}
+
+	if err := store.LockStoredFiles(ctx, tx, wkr.UserID); err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, err
+	}
+	qtx := store.New(tx)
+	// The quota check is on the DECLARED size (the actual bytes are verified == declared in the
+	// stream, so this is sound). A breach records needs_action and retains the source (the caller),
+	// never a global stop or an eviction of another archive.
+	declared := manifest.ByteSize
+	sums, err := store.SumStoredFiles(ctx, qtx, wkr.UserID, captureID)
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, err
+	}
+	if s.limits.ReadyPayloadPerOwner > 0 && sums.OwnerRecoveryBytes+declared > s.limits.ReadyPayloadPerOwner {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, ErrQuota
+	}
+	if s.limits.InstanceBytes > 0 && sums.InstanceRecoveryBytes+declared > s.limits.InstanceBytes {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, ErrQuota
+	}
+	if budget := s.limits.StoredFilesBudgetBytes; budget > 0 && sums.SharedBytes()+declared > budget {
+		if _, err := qtx.ReclaimJobFilesForRecovery(ctx, store.ReclaimJobFilesForRecoveryParams{
+			Now:  pgconv.Time(s.now()),
+			Need: sums.SharedBytes() + declared - budget,
+		}); err != nil {
+			return apitypes.RecoveryCaptureStatusResponse{}, false, err
+		}
+		// Re-sum rather than trust the freed figure: a concurrent sweep may have expired some of
+		// the same files, and the sum is what the budget bounds.
+		if sums, err = store.SumStoredFiles(ctx, qtx, wkr.UserID, captureID); err != nil {
+			return apitypes.RecoveryCaptureStatusResponse{}, false, err
+		}
+		if sums.SharedBytes()+declared > budget {
+			return apitypes.RecoveryCaptureStatusResponse{}, false, ErrQuota
+		}
+	}
+
+	n, err := qtx.StampCaptureReservation(ctx, store.StampCaptureReservationParams{
+		ReservedBytes: pgtype.Int8{Int64: declared, Valid: true},
+		ID:            captureID,
+	})
+	if err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, err
+	}
+	if n == 0 {
+		// A discarded or expired capture is not uploadable: nothing to reserve against.
+		return apitypes.RecoveryCaptureStatusResponse{}, false, ErrNotAvailable
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return apitypes.RecoveryCaptureStatusResponse{}, false, err
+	}
+	return apitypes.RecoveryCaptureStatusResponse{}, false, nil
+}
+
+// stream is the chunk-streaming transaction, run OUTSIDE the stored-files lock so a long upload
+// never blocks the other store's admission. It re-locks the capture and re-checks that the
+// reservation admit stamped is still this upload's: a capture flipped to needs_action in between
+// (the stalled-upload sweep) has lost its reservation, and completing it would put bytes on the
+// books that no admission counted, so it answers ErrBusy and the worker retries through admit.
+func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest, body io.Reader) (apitypes.RecoveryCaptureStatusResponse, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return apitypes.RecoveryCaptureStatusResponse{}, err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 
-	var lc lockedCapture
-	err = tx.QueryRow(ctx, `SELECT c.run_id, c.user_id, c.original_worker_id, c.state, c.manifest_bound,
-			c.byte_size, c.checksum, c.expires_at, c.reason, h.state
-		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id = c.hold_id
-		WHERE c.id = $1 FOR UPDATE OF c`, captureID).Scan(
-		&lc.runID, &lc.userID, &lc.origWorker, &lc.state, &lc.bound,
-		&lc.byteSize, &lc.checksum, &lc.expiresAt, &lc.reason, &lc.holdState)
+	lc, err := lockCapture(ctx, tx, wkr, runID, captureID, manifest)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return apitypes.RecoveryCaptureStatusResponse{}, ErrCaptureNotFound
-		}
 		return apitypes.RecoveryCaptureStatusResponse{}, err
 	}
-
-	// Authorize: the capture must belong to this run + owner, be held by THIS worker, and
-	// its hold must be open. A different/later worker cannot adopt authority on a terminal
-	// run; the run's own status is irrelevant here (post-terminal recovery, D2).
-	if lc.runID != runID || lc.userID != wkr.UserID {
-		return apitypes.RecoveryCaptureStatusResponse{}, ErrCaptureNotFound
-	}
-	if !lc.origWorker.Valid || uuid.UUID(lc.origWorker.Bytes) != wkr.ID {
-		return apitypes.RecoveryCaptureStatusResponse{}, ErrNotAuthorized
-	}
-	if lc.holdState != "open" {
-		return apitypes.RecoveryCaptureStatusResponse{}, ErrNotAuthorized
-	}
-
-	// Lost-ACK idempotency: an already-ready capture returns its existing receipt without
-	// re-uploading, re-charging quota or overwriting bytes.
 	if lc.state == "available" {
-		return statusFromLocked(captureID, lc), nil
+		return statusFromLocked(captureID, lc), nil // a concurrent upload of this capture won.
 	}
-	// A different manifest already bound under this id is a conflict, never an overwrite.
-	if lc.bound && (lc.byteSize.Int64 != manifest.ByteSize || !strings.EqualFold(lc.checksum.String, manifest.Checksum)) {
-		return apitypes.RecoveryCaptureStatusResponse{}, ErrManifestConflict
-	}
-
-	// Quota pre-check on the DECLARED size (the actual bytes are verified == declared
-	// below, so this is sound). The instance ceiling is applied to THIS owner's upload —
-	// it records needs_action and retains the source, never a global stop or an eviction.
-	if s.limits.ReadyPayloadPerOwner > 0 {
-		var ownerReady int64
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(byte_size),0) FROM recovery_captures
-			WHERE user_id = $1 AND state = 'available' AND id <> $2`, wkr.UserID, captureID).Scan(&ownerReady); err != nil {
-			return apitypes.RecoveryCaptureStatusResponse{}, err
-		}
-		if ownerReady+manifest.ByteSize > s.limits.ReadyPayloadPerOwner {
-			return apitypes.RecoveryCaptureStatusResponse{}, ErrQuota
-		}
-	}
-	if s.limits.InstanceBytes > 0 {
-		var instanceReady int64
-		if err := tx.QueryRow(ctx, `SELECT COALESCE(SUM(byte_size),0) FROM recovery_captures
-			WHERE state = 'available' AND id <> $1`, captureID).Scan(&instanceReady); err != nil {
-			return apitypes.RecoveryCaptureStatusResponse{}, err
-		}
-		if instanceReady+manifest.ByteSize > s.limits.InstanceBytes {
-			return apitypes.RecoveryCaptureStatusResponse{}, ErrQuota
-		}
+	if lc.state != "uploading" || !lc.reservedBytes.Valid || lc.reservedBytes.Int64 != manifest.ByteSize {
+		return apitypes.RecoveryCaptureStatusResponse{}, ErrBusy
 	}
 
 	// A retry starts from zero: drop any chunk rows from a prior attempt under this id.

@@ -78,7 +78,7 @@ func TestCancelRevokedProductJobsLiveDB(t *testing.T) {
 			e := setupJobLiveDB(t, 0)
 			owner := e.seedJobUser(t)
 			product, token := e.seedProduct(t, owner, []string{"research"})
-			w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+			w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
 			queued := e.seedOriginJob(t, owner, "queued", nil, &product, &token)
 			running := e.seedOriginJob(t, owner, "running", &w, &product, &token)
 
@@ -160,7 +160,7 @@ func TestCancelRevokedProductJobsConsumedCancelLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	owner := e.seedJobUser(t)
 	product, token := e.seedProduct(t, owner, []string{"research"})
-	w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
 	current := e.seedOriginJob(t, owner, "running", &w, &product, &token)
 	reclaimed := e.seedOriginJob(t, owner, "running", &w, &product, &token)
 	e.exec(`UPDATE runs SET claim_generation = 2 WHERE id = ANY($1)`, []uuid.UUID{current, reclaimed})
@@ -190,7 +190,7 @@ func TestCancelRevokedProductJobsCLIJobLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	owner := e.seedJobUser(t)
 	product, token := e.seedProduct(t, owner, []string{"research"})
-	w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
 	queued := e.seedOriginJob(t, owner, "queued", nil, nil, nil)
 	running := e.seedOriginJob(t, owner, "running", &w, nil, nil)
 
@@ -223,7 +223,7 @@ func TestCancelRevokedProductJobsExpiredTokenLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	owner := e.seedJobUser(t)
 	product, token := e.seedProduct(t, owner, []string{"research"})
-	w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
 	queued := e.seedOriginJob(t, owner, "queued", nil, &product, &token)
 	running := e.seedOriginJob(t, owner, "running", &w, &product, &token)
 	e.exec(`UPDATE product_tokens SET expires_at = now() - interval '1 hour' WHERE id = $1`, token)
@@ -241,7 +241,7 @@ func TestCancelRevokedProductJobsPendingCancelSkippedLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	owner := e.seedJobUser(t)
 	product, token := e.seedProduct(t, owner, []string{"research"})
-	w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
 	running := e.seedOriginJob(t, owner, "running", &w, &product, &token)
 	e.exec(`INSERT INTO run_user_inputs (run_id, kind) VALUES ($1, 'cancel')`, running)
 	e.exec(`UPDATE product_tokens SET revoked = true WHERE id = $1`, token)
@@ -262,7 +262,7 @@ func TestCancelRevokedProductJobsRequeuedWithPendingCancelLiveDB(t *testing.T) {
 	e := setupJobLiveDB(t, 0)
 	owner := e.seedJobUser(t)
 	product, token := e.seedProduct(t, owner, []string{"research"})
-	w := e.seedWorkerRow(t, owner, false, nil, jobCap)
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
 	running := e.seedOriginJob(t, owner, "running", &w, &product, &token)
 
 	if n, err := e.q.RevokeProductToken(e.ctx, store.RevokeProductTokenParams{ID: token, UserID: owner}); err != nil || n != 1 {

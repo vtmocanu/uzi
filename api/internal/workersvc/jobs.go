@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/settings"
@@ -411,6 +412,8 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 			IssueDescription:  v.prompt,
 			BudgetWallSeconds: v.wall,
 			Harness:           string(resolved.Harness),
+			// The rollout stamp: only a worker advertising capability.JobFilesV1 may claim this job.
+			JobProtocol: pgtype.Int2{Int16: capability.JobProtocolFiles, Valid: true},
 		})
 		if err != nil {
 			return store.Run{}, err

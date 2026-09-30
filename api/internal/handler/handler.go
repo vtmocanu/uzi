@@ -508,6 +508,8 @@ func (h *Handler) recoveryLimits() recovery.Limits {
 		MaxConcurrentDownloads: h.cfg.RecoveryMaxConcurrentDownloads,
 		RequestDeadline:        h.cfg.RecoveryRequestDeadline,
 		UploadRetryWindow:      h.cfg.RecoveryUploadRetryWindow,
+		// PRD #1909 D2: recovery admission counts job-file bytes against the shared budget.
+		StoredFilesBudgetBytes: h.cfg.StoredFilesBudgetBytes,
 		// PRD #1349 M5 (D6/D10): the owner custody-hold aggregate reports the SAME admission
 		// ceiling ClaimRun/health gate on, so the board alert and `uzi run recovery` never
 		// disagree with the claim path. Sourced from workersvc's exported constant rather than

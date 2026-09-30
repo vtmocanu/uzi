@@ -212,6 +212,25 @@ const RunBranchLockClass int32 = 0x757A7262 // "uzrb"
 // two unrelated runs' tries fail for a moment, and a failed try never deletes anything.
 const CheckpointRetentionLockClass int32 = 0x757A6372 // "uzcr"
 
+// StoredFilesLockClass is the class half of the two-int advisory lock pair that serializes
+// admission to the stored-file quotas (PRD #1909 D4): job files and recovery-archive uploads both
+// take it, through LockStoredFiles (storedfiles.go), before summing the retained bytes and
+// reserving their own. It is taken as TWO keys in a fixed order, always: first
+// (StoredFilesLockClass, objid derived from the owner), then (StoredFilesLockClass, the fixed
+// shared-budget objid). Every path uses that one order, so two admissions can never deadlock, and
+// the second key makes the instance and shared-budget checks exact across owners.
+//
+// It exists for the reason HostedProvisionLockClass records: under READ COMMITTED two concurrent
+// admissions each sum against their own snapshot and both pass a check that only one fits. The
+// lock is a mutex, so the second admission's sums run only after the first commits and see its
+// reservation. An owner objid that collides with another owner's, or with the shared key, only
+// serializes two unrelated admissions for a moment (the same transaction re-taking a key it holds
+// is a no-op): a contention non-event, never a correctness one. XACT-scoped: released on commit
+// or rollback. The two-int space is disjoint from RegistrationLockKey's one-bigint space, and
+// TestProductTokenMintLockClassMatchesSQL enumerates this constant with every other *LockClass and
+// fails on any collision.
+const StoredFilesLockClass int32 = 0x757A7366 // "uzsf"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

@@ -1064,7 +1064,7 @@ type Store interface {
 	// reasonNoJobCapableWorker — the run's non-bypassable job-runner claim clause can never be
 	// satisfied. A per-run lookup like CountOnlineWorkersSatisfyingCodexHarness above, and off the
 	// hot path for the same reason.
-	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingJobRunner(ctx context.Context, arg store.CountOnlineWorkersSatisfyingJobRunnerParams) (int64, error)
 	// ClearJobResultForRun drops a job run's result and findings at claim assembly (PRD #1908):
 	// a result from an earlier flight must not satisfy a later flight's no-result invariant.
 	ClearJobResultForRun(ctx context.Context, runID uuid.UUID) error
@@ -1697,6 +1697,9 @@ type Service struct {
 	q   Store
 	box *secretbox.Box
 	p   Params
+	// jobFiles is the PRD #1909 job-file store the upload/download surfaces reach through
+	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
+	jobFiles *JobFiles
 	// now is time.Now in production; overridable in tests for deterministic
 	// cutoffs.
 	now func() time.Time

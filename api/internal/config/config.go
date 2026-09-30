@@ -744,6 +744,21 @@ type Config struct {
 	RecoveryMaxConcurrentDownloads int           // UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS — concurrent downloads per API process. Default 2.
 	RecoveryRequestDeadline        time.Duration // UZI_RECOVERY_REQUEST_DEADLINE — per upload/download request+transaction deadline. Default 120s.
 
+	// Job-file limits (PRD #1909 D1). Every knob is operator-configurable with the PRD default;
+	// byte ceilings are int64. parseInt/parseInt64/parseDuration floor at >0, so a non-positive
+	// or malformed override falls back to the default rather than disabling a ceiling.
+	JobInputFileMaxBytes   int64         // UZI_JOB_INPUT_FILE_MAX_BYTES — one input file. Default 25 MiB.
+	JobInputsMaxFiles      int           // UZI_JOB_INPUTS_MAX_FILES — input files per job. Default 10.
+	JobInputsMaxBytes      int64         // UZI_JOB_INPUTS_MAX_BYTES — total input bytes per job. Default 50 MiB.
+	JobOutputFileMaxBytes  int64         // UZI_JOB_OUTPUT_FILE_MAX_BYTES — one output file. Default 25 MiB.
+	JobOutputsMaxFiles     int           // UZI_JOB_OUTPUTS_MAX_FILES — output files per job. Default 50.
+	JobOutputsMaxBytes     int64         // UZI_JOB_OUTPUTS_MAX_BYTES — total output bytes per job. Default 100 MiB.
+	JobFilesPerOwnerBytes  int64         // UZI_JOB_FILES_PER_OWNER_BYTES — retained job-file bytes per owner. Default 256 MiB.
+	JobFilesInstanceBytes  int64         // UZI_JOB_FILES_INSTANCE_BYTES — retained job-file bytes, instance-wide. Default 1 GiB.
+	StoredFilesBudgetBytes int64         // UZI_STORED_FILES_BUDGET_BYTES — the shared ceiling on job files PLUS recovery archives (job-file bytes + recovery bytes, reservations included). Default 4 GiB.
+	JobFilesRetention      time.Duration // UZI_JOB_FILES_RETENTION — how long a finished job's files stay downloadable. Default 168h (7d).
+	JobUploadTTL           time.Duration // UZI_JOB_UPLOAD_TTL — an uploaded input never attached to a job. Default 1h.
+
 	// SalvageForges (PRD #1867, UZI_SALVAGE_FORGES) is the comma list of forge kinds
 	// (github, gitlab, forgejo; trimmed and lower-cased) whose failed runs the salvage sweep
 	// copies into refs/uzi-salvage/<run-id>. Default empty: OFF. It is enabled per forge only
@@ -1271,6 +1286,19 @@ func Load() (Config, error) {
 	cfg.RecoveryMaxConcurrentUploads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_UPLOADS", 2)
 	cfg.RecoveryMaxConcurrentDownloads = parseInt("UZI_RECOVERY_MAX_CONCURRENT_DOWNLOADS", 2)
 	cfg.RecoveryRequestDeadline = parseDuration("UZI_RECOVERY_REQUEST_DEADLINE", 120*time.Second)
+
+	// Job-file limits (PRD #1909 D1).
+	cfg.JobInputFileMaxBytes = parseInt64("UZI_JOB_INPUT_FILE_MAX_BYTES", 25<<20)
+	cfg.JobInputsMaxFiles = parseInt("UZI_JOB_INPUTS_MAX_FILES", 10)
+	cfg.JobInputsMaxBytes = parseInt64("UZI_JOB_INPUTS_MAX_BYTES", 50<<20)
+	cfg.JobOutputFileMaxBytes = parseInt64("UZI_JOB_OUTPUT_FILE_MAX_BYTES", 25<<20)
+	cfg.JobOutputsMaxFiles = parseInt("UZI_JOB_OUTPUTS_MAX_FILES", 50)
+	cfg.JobOutputsMaxBytes = parseInt64("UZI_JOB_OUTPUTS_MAX_BYTES", 100<<20)
+	cfg.JobFilesPerOwnerBytes = parseInt64("UZI_JOB_FILES_PER_OWNER_BYTES", 256<<20)
+	cfg.JobFilesInstanceBytes = parseInt64("UZI_JOB_FILES_INSTANCE_BYTES", 1<<30)
+	cfg.StoredFilesBudgetBytes = parseInt64("UZI_STORED_FILES_BUDGET_BYTES", 4<<30)
+	cfg.JobFilesRetention = parseDuration("UZI_JOB_FILES_RETENTION", 7*24*time.Hour)
+	cfg.JobUploadTTL = parseDuration("UZI_JOB_UPLOAD_TTL", time.Hour)
 
 	salvageForges, err := parseSalvageForges(getenv("UZI_SALVAGE_FORGES", ""))
 	if err != nil {

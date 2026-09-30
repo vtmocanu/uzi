@@ -42,8 +42,10 @@ SELECT allowed_job_types
 -- required_capabilities is '{}' (the worker gate is the protocol capability, not this array).
 -- issue_title carries the caller's title and issue_description the prompt, the same columns
 -- prompt/task runs use. harness is the @harness parameter from the atomic create seam.
-INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness)
-VALUES (@run_id, @user_id, 'job', @job_type, @issue_title, @issue_description, true, '{}', sqlc.narg('budget_wall_seconds'), 'manual', @harness)
+-- job_protocol is the PRD #1909 M1 rollout stamp (capability.JobProtocolFiles): a stamped job is
+-- claimable only by a worker that also advertises 'job_files_v1'.
+INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness, job_protocol)
+VALUES (@run_id, @user_id, 'job', @job_type, @issue_title, @issue_description, true, '{}', sqlc.narg('budget_wall_seconds'), 'manual', @harness, sqlc.narg('job_protocol')::smallint)
 RETURNING *;
 
 -- name: CreateJobInput :exec
@@ -252,7 +254,9 @@ SELECT w.id AS worker_id, r.id AS run_id, r.user_id AS user_id,
    AND (
         (w.last_heartbeat_at IS NOT NULL
          AND NOT (NOT COALESCE(w.docker_enabled, false)
-                  AND 'job_runner_v1' = ANY(w.protocol_capabilities)))
+                  AND 'job_runner_v1' = ANY(w.protocol_capabilities)
+                  -- PRD #1909 M1: a stamped job (runs.job_protocol) also needs 'job_files_v1'.
+                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
         OR (w.last_heartbeat_at IS NULL AND w.created_at < @deadline_cutoff)
    )
    AND NOT EXISTS (

@@ -174,8 +174,9 @@ const (
 	// reasonNoCodexCapableWorker it names a NON-BYPASSABLE block: ClaimRun's dedicated job clause sits
 	// outside fn_worker_can_claim, required_capabilities and the capability-aware kill-switch, so a
 	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
-	// comes online. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
-	reasonNoJobCapableWorker = "no online worker supports jobs (job_runner_v1); update or provision a non-Docker worker"
+	// comes online. PRD #1909 M1: a job stamped with runs.job_protocol additionally needs
+	// 'job_files_v1', so the text names both. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
+	reasonNoJobCapableWorker = "no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker"
 	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
 	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
 	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
@@ -867,7 +868,10 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// job_runner_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable job clause can never be
 	// satisfied). Same placement, guard and degrade rules as the Codex rungs above.
 	if r.Kind == runkind.Job {
-		c, cerr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, r.UserID)
+		// PRD #1909 M1: a job stamped with runs.job_protocol also needs 'job_files_v1'.
+		c, cerr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, store.CountOnlineWorkersSatisfyingJobRunnerParams{
+			UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid,
+		})
 		if cerr != nil {
 			slog.Error("health: count online workers satisfying job runner", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {

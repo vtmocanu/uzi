@@ -233,6 +233,29 @@ func TestFilterProtocol_KeepsJobRunnerV1(t *testing.T) {
 	}
 }
 
+// TestFilterProtocol_KeepsJobFilesV1 pins PRD #1909 M1: job_files_v1, the rollout gate for
+// new-protocol jobs, survives registration (ClaimRun's job clause reads it off
+// workers.protocol_capabilities), is not a scheduler capability, and orders right after
+// job_runner_v1 in protocolOrder. Removing it from protocolVocabulary makes FilterProtocol drop
+// it, and a worker could then never claim a new job.
+func TestFilterProtocol_KeepsJobFilesV1(t *testing.T) {
+	if got := FilterProtocol([]string{JobFilesV1, JobRunnerV1, AdviceClaimFenceV1}); !reflect.DeepEqual(got, []string{AdviceClaimFenceV1, JobRunnerV1, JobFilesV1}) {
+		t.Errorf("FilterProtocol([job files, job runner, advice fence]) = %v, want [%q %q %q]", got, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1)
+	}
+	if got := Filter([]string{JobFilesV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", JobFilesV1, got)
+	}
+	if got := SelfReportable([]string{JobFilesV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", JobFilesV1, got)
+	}
+	if JobFilesV1 != "job_files_v1" {
+		t.Errorf("JobFilesV1 = %q: the SQL clauses and agent/src/worker.ts spell it job_files_v1", JobFilesV1)
+	}
+	if JobProtocolFiles != 2 {
+		t.Errorf("JobProtocolFiles = %d: the runs_job_protocol_check migration allows >= 2 and CreateJobRun stamps this", JobProtocolFiles)
+	}
+}
+
 // TestUnmet_SubsetPresent pins the empty result when every required capability is present
 // in the effective set — the run is approvable/claimable by that worker (PRD #84 M4 4c).
 func TestUnmet_SubsetPresent(t *testing.T) {

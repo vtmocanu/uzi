@@ -52,8 +52,8 @@ func TestJobClaimCredentialDisabledFailsLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			workerID := e.seedWorkerRow(t, u, false, nil, jobCap)
-			wkr := store.Worker{ID: workerID, UserID: u, Name: "w", Status: "online", ProtocolCapabilities: []string{jobCap}}
+			workerID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
+			wkr := store.Worker{ID: workerID, UserID: u, Name: "w", Status: "online", ProtocolCapabilities: []string{jobCap, jobFilesCap}}
 			if tc.disableEarly {
 				e.exec(disableOwnerAnthropicRowsSQL, u)
 			} else {

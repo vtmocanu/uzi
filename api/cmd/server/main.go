@@ -378,6 +378,25 @@ func run() error {
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked
 	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
 	// workersvc import) and reads run status itself for stale-click handling.
+	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker
+	// transfer routes reach through wsvc.JobFiles(), and the job_files_sweep pass below. The
+	// request deadline is the recovery archive's: both are one bounded upload transaction.
+	jobFiles := workersvc.NewJobFiles(pool, box, workersvc.JobFileLimits{
+		InputFileMaxBytes:      cfg.JobInputFileMaxBytes,
+		InputsMaxFiles:         cfg.JobInputsMaxFiles,
+		InputsMaxBytes:         cfg.JobInputsMaxBytes,
+		OutputFileMaxBytes:     cfg.JobOutputFileMaxBytes,
+		OutputsMaxFiles:        cfg.JobOutputsMaxFiles,
+		OutputsMaxBytes:        cfg.JobOutputsMaxBytes,
+		PerOwnerBytes:          cfg.JobFilesPerOwnerBytes,
+		InstanceBytes:          cfg.JobFilesInstanceBytes,
+		StoredFilesBudgetBytes: cfg.StoredFilesBudgetBytes,
+		Retention:              cfg.JobFilesRetention,
+		UploadTTL:              cfg.JobUploadTTL,
+		RequestDeadline:        cfg.RecoveryRequestDeadline,
+	}, nil)
+	wsvc.SetJobFiles(jobFiles)
+
 	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
 
 	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →
@@ -852,6 +871,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "fetch_reservations_stale",
 			Run:  fetchctl.New(pool, settingsCache).SweepStale,
+		},
+		// Job files (PRD #1909 M1): release stale reservations, move a finished job's files to
+		// 'available' with the retention clock, and expire unattached/available files past
+		// expires_at (chunks deleted, row kept). Always registered: with no job files it is three
+		// statements matching nothing.
+		sweeper.Pass{
+			Name: "job_files_sweep",
+			Run:  jobFiles.SweepPass,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484

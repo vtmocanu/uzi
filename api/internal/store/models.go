@@ -429,6 +429,32 @@ type IssueProposal struct {
 	ConfirmingSince pgtype.Timestamptz `json:"confirming_since"`
 }
 
+type JobFile struct {
+	ID              uuid.UUID          `json:"id"`
+	UserID          uuid.UUID          `json:"user_id"`
+	ProductID       pgtype.UUID        `json:"product_id"`
+	RunID           pgtype.UUID        `json:"run_id"`
+	Direction       string             `json:"direction"`
+	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
+	StorageName     pgtype.Text        `json:"storage_name"`
+	DisplayName     string             `json:"display_name"`
+	ContentType     pgtype.Text        `json:"content_type"`
+	ByteSize        int64              `json:"byte_size"`
+	Sha256          pgtype.Text        `json:"sha256"`
+	ChunkCount      int32              `json:"chunk_count"`
+	State           string             `json:"state"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type JobFileChunk struct {
+	FileID     uuid.UUID `json:"file_id"`
+	ChunkIndex int32     `json:"chunk_index"`
+	Length     int32     `json:"length"`
+	Sealed     []byte    `json:"sealed"`
+}
+
 type JobFinding struct {
 	ID        uuid.UUID   `json:"id"`
 	RunID     uuid.UUID   `json:"run_id"`
@@ -453,6 +479,15 @@ type JobOrigin struct {
 	ProductTokenID   pgtype.UUID        `json:"product_token_id"`
 	RequestedByLabel pgtype.Text        `json:"requested_by_label"`
 	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+}
+
+type JobOutputRefusal struct {
+	ID          uuid.UUID          `json:"id"`
+	RunID       uuid.UUID          `json:"run_id"`
+	DisplayName string             `json:"display_name"`
+	ByteSize    int64              `json:"byte_size"`
+	Reason      string             `json:"reason"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
 }
 
 type JobResult struct {
@@ -598,6 +633,7 @@ type RecoveryCapture struct {
 	ExpiresAt              pgtype.Timestamptz `json:"expires_at"`
 	CreatedAt              pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+	ReservedBytes          pgtype.Int8        `json:"reserved_bytes"`
 }
 
 type RecoveryCaptureChunk struct {
@@ -825,6 +861,7 @@ type Run struct {
 	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
 	EgressSnapshot              []byte             `json:"egress_snapshot"`
 	JobType                     pgtype.Text        `json:"job_type"`
+	JobProtocol                 pgtype.Int2        `json:"job_protocol"`
 }
 
 type RunCompletionAttempt struct {
