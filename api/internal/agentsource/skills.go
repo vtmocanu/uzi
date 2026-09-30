@@ -43,7 +43,7 @@ type SkillFile struct {
 // (too_large, duplicate, over_limit). It shares fetchTip with FetchRoleFiles, so the redirect
 // allowlist, same-origin credential guard, wire cap, timeout and token scrub are the same code.
 // opts.Dir is ignored. Memory is bounded in two layers: fetchTip pre-scans the fetched pack and
-// refuses one whose RECONSTRUCTED size passes clonePackLimits (ErrPackBudget) before anything is
+// refuses one whose RECONSTRUCTED size passes skillPackLimits (ErrPackBudget) before anything is
 // decoded into the in-memory storer; then maxFileBytes bounds one SKILL.md (an oversized file
 // is skipped, decided from its tree-entry blob size without reading its content, with a
 // too_large note) and the total content read is bounded by MaxSkillFiles * maxFileBytes. Only regular files in real directories are read (a symlink, a submodule or a
@@ -53,7 +53,7 @@ func FetchSkillFiles(ctx context.Context, opts CloneOptions, maxFileBytes int) (
 		return "", nil, nil, errors.New("agentsource: skill file size cap must be positive")
 	}
 	scrub := scrubber(opts.Token)
-	commit, resolved, terr := fetchTip(ctx, opts)
+	commit, resolved, terr := fetchTip(ctx, opts, skillPackLimits)
 	if terr != nil {
 		return "", nil, nil, terr
 	}

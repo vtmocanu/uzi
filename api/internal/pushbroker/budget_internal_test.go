@@ -12,59 +12,10 @@ import (
 )
 
 // These internal tests exercise the delta-aware inflation budget directly (the
-// unexported scanPackBudget and readDeltaVarint). They hand-assemble packfiles so a
+// unexported scanPackBudget). They hand-assemble packfiles so a
 // DELTA object can declare a huge reconstructed target size behind a tiny
 // instruction stream — the exact shape scanPackBudget exists to refuse and that a
 // header-Length-only bound would wave through.
-
-// TestReadDeltaVarint pins git's delta-header LEB128 decode: low 7 bits per byte,
-// continue while 0x80 is set, little-endian, with truncation and overflow rejected.
-func TestReadDeltaVarint(t *testing.T) {
-	t.Run("roundtrip", func(t *testing.T) {
-		for _, v := range []uint64{0, 1, 127, 128, 300, 16384, 1 << 20, 40 << 20} {
-			enc := writeDeltaVarint(v)
-			got, rest, err := readDeltaVarint(enc)
-			if err != nil {
-				t.Fatalf("v=%d: err = %v", v, err)
-			}
-			if uint64(got) != v {
-				t.Fatalf("v=%d: decoded %d", v, got)
-			}
-			if len(rest) != 0 {
-				t.Fatalf("v=%d: rest = %v, want empty", v, rest)
-			}
-		}
-	})
-
-	t.Run("rest_preserved", func(t *testing.T) {
-		enc := append(writeDeltaVarint(300), 0xaa, 0xbb)
-		got, rest, err := readDeltaVarint(enc)
-		if err != nil || got != 300 {
-			t.Fatalf("val = %d, err = %v", got, err)
-		}
-		if !bytes.Equal(rest, []byte{0xaa, 0xbb}) {
-			t.Fatalf("rest = %v, want [aa bb]", rest)
-		}
-	})
-
-	t.Run("truncated", func(t *testing.T) {
-		// A single byte with the continuation bit set and nothing after it.
-		if _, _, err := readDeltaVarint([]byte{0x80}); err == nil {
-			t.Fatal("truncated varint accepted")
-		}
-		if _, _, err := readDeltaVarint(nil); err == nil {
-			t.Fatal("empty input accepted")
-		}
-	})
-
-	t.Run("overflow", func(t *testing.T) {
-		// Ten continuation bytes overshoot int64; must be rejected, never wrap negative.
-		big := bytes.Repeat([]byte{0xff}, 10)
-		if _, _, err := readDeltaVarint(big); err == nil {
-			t.Fatal("overflowing varint accepted")
-		}
-	})
-}
 
 // TestScanPackBudgetRejectsDeltaBomb is the core regression: a REF_DELTA whose
 // instruction stream is a few bytes (well under the 32 MiB per-object cap on the
@@ -186,7 +137,7 @@ func TestScanPackBudgetMalformed(t *testing.T) {
 		buf.WriteString("PACK")
 		_ = binary.Write(&buf, binary.BigEndian, uint32(2))
 		_ = binary.Write(&buf, binary.BigEndian, uint32(1))
-		sum := sha1.Sum(buf.Bytes())
+		sum := sha1.Sum(buf.Bytes()) //nolint:gosec // pack trailer checksum is SHA-1 by format.
 		buf.Write(sum[:])
 		if err := scanPackBudget(context.Background(), buf.Bytes()); !errors.Is(err, ErrPackInvalid) {
 			t.Fatalf("err = %v, want ErrPackInvalid", err)
@@ -202,7 +153,7 @@ func TestScanPackBudgetTooManyObjects(t *testing.T) {
 	buf.WriteString("PACK")
 	_ = binary.Write(&buf, binary.BigEndian, uint32(2))
 	_ = binary.Write(&buf, binary.BigEndian, uint32(maxPackObjects+1))
-	sum := sha1.Sum(buf.Bytes())
+	sum := sha1.Sum(buf.Bytes()) //nolint:gosec // pack trailer checksum is SHA-1 by format.
 	buf.Write(sum[:])
 	if err := scanPackBudget(context.Background(), buf.Bytes()); !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("err = %v, want ErrPackTooLarge", err)
@@ -244,13 +195,13 @@ func assemblePack(t *testing.T, objs ...[]byte) []byte {
 	if err := binary.Write(&buf, binary.BigEndian, uint32(2)); err != nil { // version
 		t.Fatalf("write version: %v", err)
 	}
-	if err := binary.Write(&buf, binary.BigEndian, uint32(len(objs))); err != nil { // count
+	if err := binary.Write(&buf, binary.BigEndian, uint32(len(objs))); err != nil { //nolint:gosec // test packs hold a handful of objects. count
 		t.Fatalf("write count: %v", err)
 	}
 	for _, o := range objs {
 		buf.Write(o)
 	}
-	sum := sha1.Sum(buf.Bytes())
+	sum := sha1.Sum(buf.Bytes()) //nolint:gosec // pack trailer checksum is SHA-1 by format.
 	buf.Write(sum[:])
 	return buf.Bytes()
 }
@@ -306,7 +257,7 @@ func bigInstructionDelta(baseSz uint64, instrBytes int) []byte {
 // packObjHeader encodes the packfile per-object type+length header: the type in bits
 // 4-6 of the first byte with the low 4 size bits, then 7 size bits per continuation
 // byte. This is the OBJECT-header encoding — deliberately different from the delta
-// size varint readDeltaVarint decodes.
+// size varint packbudget.ReadDeltaVarint decodes.
 func packObjHeader(typ byte, size uint64) []byte {
 	first := (typ << 4) | byte(size&0x0f)
 	size >>= 4
@@ -325,7 +276,7 @@ func packObjHeader(typ byte, size uint64) []byte {
 	}
 }
 
-// writeDeltaVarint is the inverse of readDeltaVarint: git's delta size LEB128.
+// writeDeltaVarint is the inverse of packbudget.ReadDeltaVarint: git's delta size LEB128.
 func writeDeltaVarint(v uint64) []byte {
 	var out []byte
 	for {

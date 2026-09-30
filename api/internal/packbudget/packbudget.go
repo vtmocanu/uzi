@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 
 	"github.com/go-git/go-git/v5/plumbing"
@@ -25,6 +26,36 @@ var (
 	// malformed pack, distinct from an oversize one.
 	ErrInvalid = errors.New("packbudget: pack is malformed")
 )
+
+// Bound names the Limits axis that tripped, so an admin can tell which limit to act on.
+type Bound string
+
+// The four Limits axes.
+const (
+	BoundObjects       Bound = "object count"
+	BoundObjectBytes   Bound = "per-object size"
+	BoundTotalBytes    Bound = "total reconstructed size"
+	BoundInflationWork Bound = "inflation work"
+)
+
+// BudgetError is the error Scan returns when a Limits bound is exceeded. It matches ErrTooLarge
+// under errors.Is, and its text names the bound and the limit; it carries only sizes, never a
+// URL or credential.
+type BudgetError struct {
+	Bound Bound
+	Limit int64
+}
+
+func (e *BudgetError) Error() string {
+	unit := "bytes"
+	if e.Bound == BoundObjects {
+		unit = "objects"
+	}
+	return fmt.Sprintf("%s: %s limit of %d %s exceeded", ErrTooLarge.Error(), e.Bound, e.Limit, unit)
+}
+
+// Is makes a BudgetError match the ErrTooLarge sentinel.
+func (e *BudgetError) Is(target error) bool { return target == ErrTooLarge }
 
 // Limits are the four bounds Scan enforces.
 type Limits struct {
@@ -56,7 +87,7 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 		return ErrInvalid
 	}
 	if objects > lim.Objects {
-		return ErrTooLarge
+		return &BudgetError{BoundObjects, int64(lim.Objects)}
 	}
 	var total, inflationWork int64
 	for i := uint32(0); i < objects; i++ {
@@ -66,16 +97,16 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 		h, err := scanner.NextObjectHeader()
 		if err != nil {
 			if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
-				return ErrTooLarge
+				return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 			}
 			return ErrInvalid
 		}
 		if h.Length < 0 || h.Length > lim.ObjectBytes {
-			return ErrTooLarge
+			return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 		}
 		inflationWork += h.Length
 		if inflationWork > lim.InflationWorkBytes {
-			return ErrTooLarge
+			return &BudgetError{BoundInflationWork, lim.InflationWorkBytes}
 		}
 
 		var contributed int64
@@ -84,7 +115,7 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 			var buf bytes.Buffer
 			if _, _, err := scanner.NextObject(&buf); err != nil {
 				if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
-					return ErrTooLarge
+					return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 				}
 				return ErrInvalid
 			}
@@ -97,13 +128,13 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 				return ErrInvalid
 			}
 			if targetSz > lim.ObjectBytes {
-				return ErrTooLarge
+				return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 			}
 			contributed = targetSz
 		default:
 			if _, _, err := scanner.NextObject(io.Discard); err != nil {
 				if errors.Is(err, packfile.ErrInflatedSizeMismatch) {
-					return ErrTooLarge
+					return &BudgetError{BoundObjectBytes, lim.ObjectBytes}
 				}
 				return ErrInvalid
 			}
@@ -112,7 +143,7 @@ func Scan(ctx context.Context, pack []byte, lim Limits) error {
 
 		total += contributed
 		if total > lim.TotalBytes {
-			return ErrTooLarge
+			return &BudgetError{BoundTotalBytes, lim.TotalBytes}
 		}
 	}
 	return nil

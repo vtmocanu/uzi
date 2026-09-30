@@ -346,21 +346,26 @@ rather than a fourth bespoke format uzi would need to teach a parser about.
   memory a hostile tip forces. `Depth:1`+`SingleBranch` bound history and the
   60s clone timeout bounds wall-clock, but neither bounds bytes. The clone's
   scoped `http.Client` adds a **cumulative wire-size cap** (`maxCloneWireBytes`,
-  tens of MiB — generous for 16×64KB role files plus pack/protocol overhead)
-  that errors the clone cleanly, stopping the plain giant-blob vector (a tip
-  carrying one multi-GB blob) before it can OOM the api. **Residual, accepted
-  and documented:** the wire cap bounds COMPRESSED bytes, not the
-  RECONSTRUCTED/inflated size, so a zlib decompression-bomb pack (small on the
-  wire, huge inflated) is not yet bounded on the CLONE path. Closing that half
-  needs a reconstructed-size pre-scan of the fetched pack analogous to
-  `pushbroker`'s `scanPackBudget` (which solves the same problem for the inbound
-  checkpoint pack); it is a deliberate follow-up, not implemented here. The
-  residual is acceptable because the mitigating preconditions are strong: the
-  source must be on the admin-configured allowlist AND the feature explicitly
-  enabled (both off by default), reconcile is single-flight on one goroutine,
-  and the 60s timeout bounds the inflation wall-clock. An admin who allowlists
-  and enables a malicious source has already handed it the far larger asset this
-  ADR is about (Bash-agent system prompts).
+  48 MiB) that errors the clone cleanly, stopping the plain giant-blob vector
+  (a tip carrying one multi-GB blob). The wire cap bounds COMPRESSED bytes
+  only, so (PRD #1909) `fetchCommit` buffers the wire-capped pack and runs
+  `packbudget.Scan` over it BEFORE it is decoded into the storer, refusing a
+  zlib or delta bomb (small on the wire, huge inflated) with `ErrPackBudget`.
+  The scan is the extraction of `pushbroker`'s `scanPackBudget`, which solves
+  the same problem for the inbound checkpoint pack. It enforces four bounds:
+  object count, per-object size (the declared target size for a delta),
+  cumulative reconstructed size, and cumulative inflation work; the error names
+  which one tripped. The agent source is any allowlisted repo (the default
+  folder is `.claude/agents` of an ordinary code repo), so `FetchRoleFiles`
+  uses generous limits (`rolePackLimits`: 64 MiB per object, 512 MiB
+  reconstructed, 1 GiB inflation work, 50000 objects) sized so a tip the wire
+  cap admitted in practice still syncs, while `FetchSkillFiles` uses tight ones
+  (16 MiB, 64 MiB, 128 MiB). The per-clone peak is the wire buffer (up to 48
+  MiB) plus the reconstructed budget plus parser overhead. The remaining
+  mitigating preconditions are unchanged: the source must be on the
+  admin-configured allowlist AND the feature explicitly enabled (both off by
+  default), reconcile is single-flight on one goroutine, and the 60s timeout
+  bounds wall-clock.
 - **Credential.** A private-repo token is sealed in `secretbox`, distinct
   from the forge push PAT, read-only, and scoped to clone only — it can
   never push.

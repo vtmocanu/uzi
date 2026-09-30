@@ -348,7 +348,7 @@ func (h *Handler) AdminSyncProductSkills(w http.ResponseWriter, r *http.Request)
 		token = string(plain)
 	}
 
-	// Single-flight, instance-wide: the clone decodes an untrusted pack into memory, so only one
+	// Single-flight per api process (not across replicas): the clone decodes an untrusted pack into memory, so only one
 	// runs at a time (the pack pre-scan bounds ONE clone; this bounds how many run at once).
 	if !h.productSkillsSyncing.CompareAndSwap(false, true) {
 		w.Header().Set("Retry-After", "30")

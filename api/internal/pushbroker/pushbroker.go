@@ -1057,10 +1057,6 @@ func scanPackBudget(ctx context.Context, pack []byte) error {
 	return err
 }
 
-// readDeltaVarint is packbudget.ReadDeltaVarint (git's delta-header LEB128), kept so the
-// pack-assembly tests in this package keep pinning the decode.
-func readDeltaVarint(b []byte) (int64, []byte, error) { return packbudget.ReadDeltaVarint(b) }
-
 // fetchBaseRefs fetches ONLY the branch, the default branch, and the branch's
 // checkpoint ref — never every head. Because a specific refspec for an
 // unadvertised ref fails the whole fetch, it first lists the remote's advertised
