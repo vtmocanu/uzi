@@ -33,6 +33,7 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Built-in agents synced to skills v0.43.0.** The architect (v11) splits PRDs into vertical slices and runs them in parallel only with disjoint ownership; the reviewer (v18) adds a separate spec-fidelity pass; the tester (v17) and coder (v18) test through named seams or the public interface. The `prd-lifecycle` skill archives a PRD whose only open items are maintainer live-acceptance checks, listing them in the merge request instead of leaving the file in `prds/` forever.
 - **`/api/v1` has its own rate limit: `V1_RATE_LIMIT_MAX` / `V1_RATE_LIMIT_WINDOW` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
   Default 120 requests per minute per user across all of `/api/v1`. It replaces the sign-in budget (`RATE_LIMIT_MAX`, 10 per minute) that #1907 mounted there, which a product polling job status would exhaust at once. `POST /api/v1/jobs` still also counts against `RATE_LIMIT_MAX`, since a create is the spend action. See [Configuration](docs/configuration.md).
 - **A `check:api-v1-compat` gate refuses breaking changes to `api/openapi/v1.yaml` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
