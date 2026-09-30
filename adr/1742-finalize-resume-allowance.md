@@ -314,10 +314,12 @@ pod-only scope.
 
 **Run steps 0 to 10 in ONE shell session** (the trap below is installed in step 0 and must stay
 in effect until step 10); running the sketch as a standalone script would fire its `EXIT` trap
-immediately and undo the raise. The sketch turns `errexit` off again once the raise is done, so the
+immediately and undo the raise. The sketch turns `errexit` and `pipefail` off again once the raise is done, so the
 later checks that are expected to fail (step 1's "no durable line yet", the pre-kill "no
-`terminal-<G>.json`") do not end the session; judge each check's result yourself and, to abort an
-attempt, run `exit` (the trap then cleans up).
+`terminal-<G>.json`") do not end the session, and a `kubectl logs ... | grep -q ...` check reports
+a match as a match (with `pipefail` on, the upstream SIGPIPE would make a match look like a miss).
+Judge each check's result yourself and, to abort an attempt, run `exit` (the trap then cleans up).
+Ctrl-C (INT) at any point also ends the attempt and runs the cleanup.
 
 ### Preconditions
 
@@ -349,13 +351,13 @@ attempt, run `exit` (the trap then cleans up).
 ### Cleanup contract (install it first)
 
 The order is fixed: **record the prior state, install the trap, then change the setting and apply
-the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt and a
-`set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
+the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt, an `exit` to abort,
+and (during step 0, while `errexit` is still on) a `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
 **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
 restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt, or
 1 when cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
-restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later under
-`set -euo pipefail`; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
+restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later; step 0 runs under
+`set -euo pipefail`, which the sketch relaxes to `set +e +o pipefail` once the raise is done; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
 the chosen policy type so it cannot resolve to a standard NetworkPolicy):
 
 ```bash
@@ -416,8 +418,10 @@ trap 'cleanup 143' TERM
 kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
 kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
-set +e   # errexit only guards the raise above; later steps run checks that are EXPECTED to fail
-         # (no durable line yet, no terminal-<G>.json). The EXIT/INT/TERM traps stay installed.
+set +e +o pipefail   # errexit/pipefail only guard the raise above. Later steps run checks that are
+                     # EXPECTED to fail (no durable line yet, no terminal-<G>.json), and pipefail
+                     # would turn `kubectl logs ... | grep -q ...` into rc 141 (SIGPIPE) on a MATCH.
+                     # The EXIT/INT/TERM traps stay installed.
 ```
 
 **If the shell itself dies before the trap runs**, do not re-run step 0: it would record the
