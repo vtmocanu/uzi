@@ -9,9 +9,13 @@
 //
 // Under the PRD #51 uid split (UZI_UID_SPLIT=1) the SDK CLI runs as the `runner` uid while this
 // worker process creates the tree, so 0700 would lock the CLI out of its own HOME, cwd and
-// inputs. There the jobs root is a runner-group carve-out (entrypoint.sh: worker:runner 3775,
-// like agent-home), the run root/inputs are group-traversable/readable (2750) and home/work are
-// group-writable (2770), inputs files 0640. Never world-accessible; single-uid stays 0700/0600.
+// inputs. There the jobs root is a `codex-session` group carve-out (entrypoint.sh: worker:codex-session
+// 3770; gid 10004 holds only worker + runner, NOT `runner`, whose members include the Codex
+// command shell uid 10003), and setgid makes every child inherit that group. The run root/inputs
+// are group-traversable/readable (2750) and home is group-writable (2770), inputs files 0640.
+// `work` is created 2750 and only widened to 2770 by openJobWorkspace AFTER the inputs are
+// written, so a group member cannot swap `work/inputs` for a symlink while the worker writes.
+// The per-run tree is never world-accessible; single-uid stays 0700/0600.
 //
 // The caller's input names are server-validated, but this module re-validates defensively: a name
 // is a single path segment (no separator, no `..`, no leading dot) and each file is created with
@@ -59,10 +63,10 @@ export function jobInputFileName(index: number, name: string): string {
 }
 
 /** Directory/file modes for the current uid layout (`split` = the PRD #51 worker/runner split). */
-function modes(split: boolean): { root: number; home: number; work: number; inputs: number; file: number } {
+function modes(split: boolean): { root: number; home: number; work: number; workOpen: number; inputs: number; file: number } {
   return split
-    ? { root: 0o2750, home: 0o2770, work: 0o2770, inputs: 0o2750, file: 0o640 }
-    : { root: 0o700, home: 0o700, work: 0o700, inputs: 0o700, file: 0o600 };
+    ? { root: 0o2750, home: 0o2770, work: 0o2750, workOpen: 0o2770, inputs: 0o2750, file: 0o640 }
+    : { root: 0o700, home: 0o700, work: 0o700, workOpen: 0o700, inputs: 0o700, file: 0o600 };
 }
 
 /** Refuse a jobs root that is a symlink or not a directory (an attacker-planted link would
@@ -140,6 +144,12 @@ export async function writeJobInputs(
     written.push(`inputs/${file}`);
   }
   return written;
+}
+
+/** Widen `work` to its session mode (group-writable under the uid split). Call it after the inputs
+ *  are written and immediately before the SDK session starts; until then `work` is not group-writable. */
+export async function openJobWorkspace(ws: JobWorkspace, split: boolean = uidSplitActive()): Promise<void> {
+  await fs.chmod(ws.work, modes(split).workOpen);
 }
 
 /** Remove a job workspace tree. Best-effort by contract: a cleanup failure is logged and never

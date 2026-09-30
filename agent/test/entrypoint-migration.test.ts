@@ -527,6 +527,24 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     }
   });
 
+  it("jobs root converges every boot to worker:codex-session 3770 (never group runner, never world), even when worker-owned", () => {
+    const h = makeHarness();
+    try {
+      fs.mkdirSync(h.nix);
+      fs.mkdirSync(path.join(h.data, "jobs"), { recursive: true, mode: 0o700 }); // a legacy/earlier-image root
+      fs.writeFileSync(h.token, "t");
+      const r = run(h, { STUB_NOOP: "1" });
+      assert.equal(r.status, 0, `run must succeed (stderr: ${r.stderr})`);
+      const jobs = `${h.data}/jobs`;
+      assert.ok(opMatches(r.ops, "chown 0:0", jobs), "jobs is reclaimed to root first");
+      assert.ok(opMatches(r.ops, "chmod 3770", jobs), "jobs is chmod 3770");
+      assert.ok(opMatches(r.ops, "chown worker:codex-session", jobs), "jobs is handed to worker:codex-session");
+      assert.ok(!r.ops.some((o) => o.includes(jobs) && (o.includes("worker:runner") || o.includes("3775"))), "jobs is never group runner / 3775");
+    } finally {
+      fs.rmSync(h.root, { recursive: true, force: true });
+    }
+  });
+
   it("PVC-root alignment RUNS on the k8s fsGroup fingerprint (setgid /nix), NO-OP on compose", () => {
     // k8s: /nix carries the kubelet fsGroup setgid bit -> alignment reclaims + chmod 2775 +
     // restores group 10001 on BOTH mount roots without touching content ownership.

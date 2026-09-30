@@ -89,7 +89,7 @@ export class Worker {
     // PRD #1908 M4: the repo-less `job` run lane's runner. Trailing so no existing positional
     // caller moves. The default rejects a job claim instead of running it (the rejection is only logged as a warning by the claim loop, the run is not reported failed): production
     // (main.ts) always passes the real runner, and the api only routes a job to a worker that
-    // advertised job_runner_v1, which this image does only alongside a wired runner.
+    // advertised job_runner_v1, which this image advertises unconditionally (main.ts always wires the real runner; a Worker built without one, as in tests, rejects the claim).
     private readonly jobRunner: Pick<JobRunner, "execute"> = {
       execute: () => Promise.reject(new Error("no job runner wired")),
     },

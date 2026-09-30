@@ -236,8 +236,7 @@ require_real_carveout_root() {
     exit 1
   fi
 }
-# `jobs` (PRD #1908): the repo-less job run workspaces; the runner-uid SDK CLI needs group access.
-for d in runner agent-home provision jobs; do
+for d in runner agent-home provision; do
   "$MKDIR" -p "$DATA_DIR/$d"
   # SYMLINK-ROOT GUARD (PRD #1493 M2 rework, BLOCKING): a legacy single-uid /data was
   # attacker-writable, so a carve-out ROOT itself may be a planted symlink (e.g.
@@ -290,6 +289,23 @@ for d in runner agent-home provision jobs; do
   [ -O "$DATA_DIR/$d" ] && "$CHMOD" 3775 "$DATA_DIR/$d"   # only on a fresh (root-owned) dir
   "$CHOWN" "$RUNNER_TREE_OWNER" "$DATA_DIR/$d"
 done
+
+# `jobs` (PRD #1908): the repo-less job run workspaces. It is grouped to `codex-session` (gid 10004:
+# worker + the runner uid only), NOT `runner`: `runner-cmd` (uid 10003, the Codex command shell)
+# is a member of `runner`, so a `runner` group here would let a concurrent Codex run's shell read
+# other jobs' inputs and plant files in their work/home. Setgid makes every worker-created child
+# inherit codex-session; 3770 (sticky, no world bits) keeps it untraversable by anyone else.
+# Unlike the parents above this CONVERGES EVERY BOOT: a `jobs` left worker-owned 0700 (a
+# single-uid start) or worker:runner 3775 (the earlier image) is reclaimed to root (chown needs
+# only CAP_CHOWN), chmod'd (root owns it now, so no CAP_FOWNER needed), then handed back. The
+# content is per-run scratch that the worker's startup reaper removes, so re-owning the root
+# alone is enough; the reaper runs after the drop.
+JOBS_TREE_OWNER=worker:codex-session
+"$MKDIR" -p "$DATA_DIR/jobs"
+require_real_carveout_root "$DATA_DIR/jobs"
+"$CHOWN" 0:0 "$DATA_DIR/jobs"
+"$CHMOD" 3770 "$DATA_DIR/jobs"
+"$CHOWN" "$JOBS_TREE_OWNER" "$DATA_DIR/jobs"
 
 # --- (a2b) PRD #1493 M2: one-time, ownership-aware migration of a POPULATED legacy
 # single-uid /data volume, so uid 10002 (runner) can use it after first split enablement ----

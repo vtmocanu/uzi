@@ -38,6 +38,7 @@ import { ASYNC_DEFERRAL_TOOLS, buildPathGuardHook, buildPreToolUseHook, NESTED_A
 import {
   createJobWorkspace,
   JobInputError,
+  openJobWorkspace,
   reapStaleJobWorkspaces,
   removeJobWorkspace,
   writeJobInputs,
@@ -111,9 +112,14 @@ const JOB_TOLERATED_LISTED_TOOLS: ReadonlySet<string> = new Set(["ListMcpResourc
 /** Why a Glob `pattern` / Grep `glob` escapes the workspace, or undefined when it does not. The
  *  path guard only screens file_path/path/notebook_path, so the pattern fields are screened here:
  *  absolute, home-relative, or any `..` (including inside a brace alternative) is denied. */
-export function jobGlobEscapeReason(pattern: unknown): string | undefined {
+function jobGlobEscapeReason(pattern: unknown): string | undefined {
   if (typeof pattern !== "string") return undefined;
-  if (/^[/\\~]/.test(pattern) || /[{,][/\\~]/.test(pattern)) {
+  // Leading/trailing whitespace could smuggle a start-of-pattern anchor past the checks below.
+  if (pattern !== pattern.trim()) return "a job glob pattern must not start or end with whitespace";
+  // Absolute/home-relative at the start, or right after a group/alternation/class opener or a
+  // brace/comma/whitespace separator (`{/etc,x}`, `@(/etc)/x`, `+(/a|/etc)`, `[/]etc/*`); any `$`
+  // (variable expansion such as `$HOME/*`).
+  if (/^[/\\~]/.test(pattern) || /[{,(|[\s][/\\~]/.test(pattern) || pattern.includes("$")) {
     return "a job glob pattern must be relative to the job workspace";
   }
   if (pattern.includes("..") || pattern.includes("\0")) {
@@ -123,7 +129,7 @@ export function jobGlobEscapeReason(pattern: unknown): string | undefined {
 }
 
 /** PreToolUse hook (job lane only) denying a Glob `pattern` or Grep `glob` that escapes the workspace. */
-export function buildJobGlobGuardHook(log: Logger): (input: HookInput) => Promise<HookJSONOutput> {
+function buildJobGlobGuardHook(log: Logger): (input: HookInput) => Promise<HookJSONOutput> {
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse") return {};
     const ti = input.tool_input as Record<string, unknown> | undefined;
@@ -508,6 +514,7 @@ export class JobRunner {
       try {
         ws = await createJobWorkspace(this.jobsRoot, runId);
         files = await writeJobInputs(ws, job.inputs);
+        await openJobWorkspace(ws);
       } catch (err) {
         const reason = err instanceof JobInputError ? `job input refused: ${err.message}` : `could not prepare the job workspace: ${errMessage(err)}`;
         runLog.warn("job workspace setup failed", { error: errMessage(err) });

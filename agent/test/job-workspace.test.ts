@@ -7,6 +7,7 @@ import { randomUUID } from "node:crypto";
 
 import {
   createJobWorkspace,
+  openJobWorkspace,
   jobInputFileName,
   JobInputError,
   reapStaleJobWorkspaces,
@@ -101,15 +102,18 @@ describe("job workspace (PRD #1908 M4)", () => {
     assert.strictEqual(await reapStaleJobWorkspaces(jobsRoot, nullLogger()), 0);
   });
 
-  it("under the uid split the tree is group-runner accessible (2750/2770, files 0640), never world", async () => {
+  it("under the uid split the tree is group accessible (files 0640), never world, and work opens only after the inputs are written", async () => {
     const ws = await createJobWorkspace(await tmpRoot(), randomUUID(), true);
     const mode = async (p: string) => (await fsp.stat(p)).mode & 0o7777;
     assert.strictEqual(await mode(ws.root), 0o2750);
     assert.strictEqual(await mode(ws.home), 0o2770);
-    assert.strictEqual(await mode(ws.work), 0o2770);
+    assert.strictEqual(await mode(ws.work), 0o2750, "work is not group-writable while inputs are written");
     assert.strictEqual(await mode(ws.inputsDir), 0o2750);
     const [rel] = await writeJobInputs(ws, [{ name: "doc.md", content: "x" }], true);
     assert.strictEqual(await mode(path.join(ws.work, rel!)), 0o640);
+    assert.strictEqual(await mode(ws.work), 0o2750, "writing inputs leaves work closed");
+    await openJobWorkspace(ws, true);
+    assert.strictEqual(await mode(ws.work), 0o2770, "work is widened just before the session");
   });
 
   it("non-split modes stay 0700/0600 for the worker's own uid", async () => {
