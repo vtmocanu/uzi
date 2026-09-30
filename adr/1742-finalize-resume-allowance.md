@@ -397,8 +397,8 @@ DENY_NAME='uzi-1742-acceptance-<n>'
 DENY_KIND='networkpolicies.crd.antrea.io'          # Antrea; or the cluster's supported deny policy resource
 DENY_NS_ARGS=(-n '<worker-namespace>')             # empty array () for a cluster-scoped policy
 API_NS='<api-namespace>'; API_DEPLOY='<api-deployment>'; API_CM='<api-configmap>'
-CLEANUP_LOG="$HOME/uzi-1742-acceptance-<n>.cleanup.log"   # survives a closed terminal
-if [ -s "$CLEANUP_LOG" ]; then   # a previous attempt under this <n>: its cleanup must have completed
+CLEANUP_LOG="$HOME/uzi-1742-acceptance.cleanup.log"   # ONE log for every attempt; survives a closed terminal
+if [ -e "$CLEANUP_LOG" ]; then   # any previous attempt: its cleanup must have completed
   LAST_DONE="$(grep '^cleanup done ' "$CLEANUP_LOG" | tail -n 1 || true)"
   case "$LAST_DONE" in
     'cleanup done failed=0 '*) ;;
@@ -406,7 +406,8 @@ if [ -s "$CLEANUP_LOG" ]; then   # a previous attempt under this <n>: its cleanu
        exit 1 ;;              # nothing changed yet and no trap installed
   esac
 fi
-: >"$CLEANUP_LOG"                                          # this attempt's cleanup only
+echo "attempt $DENY_NAME started $(date -u +%FT%TZ)" >"$CLEANUP_LOG"   # a start marker, never an empty file:
+                                     # a shell that dies from here on leaves a log with no done line
 
 deny_kubectl() { kubectl ${DENY_NS_ARGS[@]+"${DENY_NS_ARGS[@]}"} "$@"; }
 override_state() {   # "WORKER_HEARTBEAT_STALE=<v>" when a direct env override exists, else empty
@@ -473,8 +474,9 @@ set +e +u +o pipefail   # errexit/nounset/pipefail only guard the raise above. L
                      # (SIGPIPE) on a MATCH. The EXIT/INT/TERM/HUP traps stay installed.
 ```
 
-**If the shell itself dies before the trap runs, or any attempt's `CLEANUP_LOG` lacks a
-`cleanup done failed=0` line** (step 0 refuses to start in that case), do not re-run step 0: it would record the
+**If the shell itself dies before the trap runs, or `CLEANUP_LOG` does not end with a
+`cleanup done failed=0` line** (step 0 then refuses to start, and exiting closes that session:
+read `CLEANUP_LOG` for the reason), do not re-run step 0: it would record the
 current, already raised value as the "prior" one. Restore explicitly from the values recorded on
 the issue in step 0:
 
@@ -487,6 +489,8 @@ kubectl [-n '<worker-namespace>'] delete '<deny-kind>' 'uzi-1742-acceptance-<n>'
 # Verify both: the object is gone, and the deployment's override matches the record.
 kubectl [-n '<worker-namespace>'] get '<deny-kind>' 'uzi-1742-acceptance-<n>' --ignore-not-found -o name   # must exit 0 and print nothing
 kubectl -n '<api-namespace>' get deploy '<api-deployment>' -o jsonpath='{.spec.template.spec.containers[?(@.name=="api")].env}'
+# Only after BOTH verifications pass, mark the manual cleanup complete so step 0 may start again:
+echo "cleanup done failed=0 exit=0 (manual fallback $(date -u +%FT%TZ))" >>"$HOME/uzi-1742-acceptance.cleanup.log"
 ```
 
 After the trap (or the explicit restore) the maintainer confirms both restorations by hand as
