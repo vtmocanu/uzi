@@ -316,17 +316,21 @@ pod-only scope.
 in effect until step 10); running the sketch as a standalone script would fire its `EXIT` trap
 immediately and undo the raise. The sketch turns `errexit`, `nounset` and `pipefail` off again once the raise is done, so the
 later checks that are expected to fail (step 1's "no durable line yet", the pre-kill "no
-`terminal-<G>.json`") do not end the session, and a `kubectl logs ... | grep -q ...` check reports
-a match as a match (with `pipefail` on, the upstream SIGPIPE would make a match look like a miss).
+`terminal-<G>.json`") do not end the session. (With `pipefail` on, a `kubectl logs ... | grep -q`
+pipe would also turn a MATCH into rc 141; but do not use that pipe form for checks at all, see
+below: with `pipefail` off it reads a failed log read as "no match".)
 It also turns job control off (`set +m`), so Ctrl-C during a running command (a wait loop, a
 rollout) reaches the shell and runs the cleanup, not only the foreground command. Judge each
-check's result yourself and, to abort an attempt, run `exit` (the trap then cleans up). Once the
-trap is installed, Ctrl-C, `exit`, a closed terminal or TERM all end the attempt and run the
-cleanup.
+check's result yourself and, to abort an attempt, run `exit 1` (the trap then cleans up). Once
+the trap is installed, Ctrl-C (INT), `exit`, a closed terminal (HUP) or TERM all end the attempt
+and run the cleanup; on a signal that arrives while a command is running, the cleanup starts when
+that command returns (at most the `--timeout=300s` of a rollout). The cleanup writes its actions
+and verification results to `CLEANUP_LOG` (and to the terminal if it is still there): read that
+file after an attempt that ended by a closed terminal.
 
 Because `pipefail` is off, a failed read looks like "no match". **Every check must fail closed on
 a read error**: capture the output first and check the read succeeded, then match on the captured
-text, for example `out="$(kubectl logs <scratch-pod> -c worker)" || { echo READ FAILED; exit; }`
+text, for example `out="$(kubectl logs <scratch-pod> -c worker)" || { echo READ FAILED; exit 1; }`
 followed by `grep -q ... <<<"$out"`; and for a must-not-exist file print an explicit state token
 that separates "absent" from an exec error, e.g. `kubectl exec <scratch-pod> -c worker -- sh -c
 'test -f F && echo PRESENT || echo ABSENT'` and proceed only on `ABSENT`.
@@ -361,8 +365,8 @@ that separates "absent" from an exec error, e.g. `kubectl exec <scratch-pod> -c 
 ### Cleanup contract (install it first)
 
 The order is fixed: **record the prior state, install the trap, then change the setting and apply
-the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt (Ctrl-C, which reaches
-the shell because the sketch turns job control off), an `exit` to abort, and (during step 0, while
+the deny rule.** The trap fires on `EXIT`, `INT`, `TERM` and `HUP`, so success, failure, interrupt (Ctrl-C, which
+reaches the shell because the sketch turns job control off), a closed terminal, an `exit` to abort, and (during step 0, while
 `errexit` is still on) a `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
 **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
 restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt, or
@@ -377,6 +381,7 @@ DENY_NAME='uzi-1742-acceptance-<n>'
 DENY_KIND='networkpolicies.crd.antrea.io'          # Antrea; or the cluster's supported deny policy resource
 DENY_NS_ARGS=(-n '<worker-namespace>')             # empty array () for a cluster-scoped policy
 API_NS='<api-namespace>'; API_DEPLOY='<api-deployment>'; API_CM='<api-configmap>'
+CLEANUP_LOG="$HOME/uzi-1742-acceptance-<n>.cleanup.log"   # survives a closed terminal
 
 deny_kubectl() { kubectl ${DENY_NS_ARGS[@]+"${DENY_NS_ARGS[@]}"} "$@"; }
 override_state() {   # "WORKER_HEARTBEAT_STALE=<v>" when a direct env override exists, else empty
@@ -400,8 +405,10 @@ echo "prior WORKER_HEARTBEAT_STALE: override='${PRIOR_STATE}' configmap='${PRIOR
 cleanup() {          # 2. Install BEFORE any change.
   local rc="${1:-$?}" failed=0
   trap - EXIT
-  trap '' INT TERM   # a second signal must not cut cleanup short
+  trap '' INT TERM HUP   # a second signal (or the hangup itself) must not cut cleanup short
   set +e             # a failing command must not skip the rest of cleanup
+  exec 9>&2 >>"$CLEANUP_LOG" 2>&1   # a hung-up terminal must not make kubectl's writes fail
+  echo "cleanup $(date -u +%FT%TZ) status=$rc"
   deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found; local del_rc=$?
   restore_stale;                                              local res_rc=$?   # runs whatever the delete returned
   [ "$del_rc" -eq 0 ] || { echo "CLEANUP: deleting $DENY_NAME returned $del_rc" >&2; failed=1; }
@@ -419,11 +426,14 @@ cleanup() {          # 2. Install BEFORE any change.
   elif [ "$now_state" != "$PRIOR_STATE" ]; then
     echo "CLEANUP FAILED: WORKER_HEARTBEAT_STALE override is not '${PRIOR_STATE}'" >&2; failed=1; fi
   if [ "$failed" -ne 0 ] && [ "$rc" -eq 0 ]; then rc=1; fi
+  echo "cleanup done failed=$failed exit=$rc"
+  cat "$CLEANUP_LOG" >&9 2>/dev/null   # best effort: show it on the terminal if still there
   exit "$rc"
 }
 trap 'cleanup' EXIT
 trap 'cleanup 130' INT
 trap 'cleanup 143' TERM
+trap 'cleanup 129' HUP
 
 # 3. Only now change the setting and apply the deny rule.
 kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
