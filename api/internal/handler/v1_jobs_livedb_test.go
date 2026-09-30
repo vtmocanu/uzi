@@ -176,6 +176,8 @@ func TestV1JobsAuthAndScopeLiveDB(t *testing.T) {
 		{"GET", "/api/v1/jobs/" + id + "/result", "", producttoken.ScopeJobsRead},
 		{"GET", "/api/v1/jobs/" + id + "/messages", "", producttoken.ScopeJobsRead},
 		{"POST", "/api/v1/jobs/" + id + "/cancel", "", producttoken.ScopeJobsRun},
+		// PRD #1909 M2: the upload needs jobs:run. Its scope check runs before the body is read.
+		{"POST", "/api/v1/files", "", producttoken.ScopeJobsRun},
 	}
 	const unauthorized = "{\"error\":\"invalid token\"}\n"
 	for _, rt := range routes {

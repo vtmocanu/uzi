@@ -41,6 +41,9 @@ import (
 //	ErrJobOverCap          429 over_cap
 //	ErrJobNotFound         404 not_found
 //	ErrJobTerminal         409 job_terminal
+//	ErrJobFileUnavailable  422 file_unavailable
+//	*JobFileRefusedError   413 too_many_files | job_bytes_exceeded (the per-job input caps)
+//	ErrJobFilesUnavailable 503 (no job-file store wired)
 var (
 	ErrJobInvalid        = errors.New("job request is invalid")
 	ErrJobTypeUnknown    = errors.New("unknown job type")
@@ -49,6 +52,10 @@ var (
 	ErrJobOverCap        = errors.New("too many active jobs")
 	ErrJobNotFound       = errors.New("job not found")
 	ErrJobTerminal       = errors.New("job is already finished")
+	// ErrJobFileUnavailable: an input file id cannot be attached: it is unknown, another owner's,
+	// another product's, already attached, expired, not an input, or listed twice. The causes read
+	// the same by design (422 file_unavailable).
+	ErrJobFileUnavailable = errors.New("an input file is unavailable")
 )
 
 // JobInvalidError is the field-naming ErrJobInvalid: errors.Is(err, ErrJobInvalid) holds.
@@ -105,11 +112,16 @@ type JobInput struct {
 
 // CreateJobParams is a job create request after transport decoding.
 type CreateJobParams struct {
-	Caller           JobCaller
-	JobType          string
-	Title            string
-	Prompt           string
-	Inputs           []JobInput
+	Caller  JobCaller
+	JobType string
+	Title   string
+	Prompt  string
+	Inputs  []JobInput
+	// InputFileIDs are the ids of uploaded files (POST /api/v1/files) to attach as the job's input
+	// files. Every id must be an unattached, unexpired input the caller uploaded through the same
+	// product (or with a user token, for a user-token caller); otherwise the create is refused with
+	// ErrJobFileUnavailable. Distinct ids only.
+	InputFileIDs     []uuid.UUID
 	RequestedByLabel *string
 	// WallSeconds is the optional wall-clock limit; nil uses the instance default. Values above
 	// the 8h ceiling are clamped to it.
@@ -354,6 +366,9 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 	if err != nil {
 		return JobView{}, err
 	}
+	if err := s.checkInputFileIDs(p.InputFileIDs); err != nil {
+		return JobView{}, err
+	}
 	if p.Caller.ProductID != nil && p.Caller.ProductTokenID == nil {
 		// The revoke sweep keys on the token id; a product job without one could never be revoked.
 		return JobView{}, jobInvalid("caller", "a product caller requires its token id")
@@ -397,6 +412,17 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 		if err := qq.LockJobCreate(ctx, p.Caller.UserID); err != nil {
 			return store.Run{}, err
 		}
+		if len(p.InputFileIDs) > 0 {
+			// Lock order of a create that attaches files: the job-create key (above), then the
+			// stored-files owner key and shared key (store.LockStoredFiles), then job_files rows
+			// (the attach UPDATE below). Nothing takes the job-create key while holding the
+			// stored-files keys, so the two classes cannot deadlock. Taking the keys before the
+			// attach is what the reclaim and expiry statements rely on: they re-check state, but
+			// only ever run under the same keys.
+			if err := store.LockStoredFilesQ(ctx, qq, p.Caller.UserID); err != nil {
+				return store.Run{}, err
+			}
+		}
 		active, err := qq.CountActiveJobRunsForUser(ctx, p.Caller.UserID)
 		if err != nil {
 			return store.Run{}, err
@@ -424,6 +450,9 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 			}); err != nil {
 				return store.Run{}, err
 			}
+		}
+		if err := s.attachInputFiles(ctx, qq, p, run.ID); err != nil {
+			return store.Run{}, err
 		}
 		// The origin's product columns are set ONLY for a product-token caller.
 		origin := store.CreateJobOriginParams{RunID: run.ID, RequestedByLabel: pgconv.TextPtr(v.label)}
@@ -758,4 +787,57 @@ func (s *Service) RunJobDetail(ctx context.Context, run store.Run) (*JobRunDetai
 	}
 	d.Result = &JobRunResult{Status: res.Status, ReportMD: res.ReportMd, Findings: findings}
 	return d, nil
+}
+
+// checkInputFileIDs applies the checks that need no database: the per-job file count (413
+// too_many_files, before anything is read) and the distinctness of the ids (a duplicate reads as
+// an unavailable file, like every other id that cannot be attached).
+func (s *Service) checkInputFileIDs(ids []uuid.UUID) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	if s.jobFiles == nil {
+		return ErrJobFilesUnavailable
+	}
+	if len(ids) > s.jobFiles.Limits().InputsMaxFiles {
+		return refusal(RefusalLimit, RefusalTooManyFiles)
+	}
+	seen := make(map[uuid.UUID]struct{}, len(ids))
+	for _, id := range ids {
+		if _, dup := seen[id]; dup {
+			return ErrJobFileUnavailable
+		}
+		seen[id] = struct{}{}
+	}
+	return nil
+}
+
+// attachInputFiles binds the uploaded input files to the new run with one guarded UPDATE
+// (queries/job_files.sql AttachInputJobFiles), inside the create transaction and under the
+// stored-files keys the caller took. It succeeds only when EVERY id matched; the sum of the
+// attached bytes is then held to the per-job input cap. Any error rolls the whole create back.
+func (s *Service) attachInputFiles(ctx context.Context, q *store.Queries, p CreateJobParams, runID uuid.UUID) error {
+	if len(p.InputFileIDs) == 0 {
+		return nil
+	}
+	rows, err := q.AttachInputJobFiles(ctx, store.AttachInputJobFilesParams{
+		RunID:     pgconv.UUID(runID),
+		Ids:       p.InputFileIDs,
+		UserID:    p.Caller.UserID,
+		ProductID: pgconv.UUIDPtr(p.Caller.ProductID),
+	})
+	if err != nil {
+		return err
+	}
+	if len(rows) != len(p.InputFileIDs) {
+		return ErrJobFileUnavailable
+	}
+	var total int64
+	for _, r := range rows {
+		total += r.ByteSize
+	}
+	if total > s.jobFiles.Limits().InputsMaxBytes {
+		return refusal(RefusalLimit, RefusalJobBytes)
+	}
+	return nil
 }

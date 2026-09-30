@@ -12,6 +12,64 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const attachInputJobFiles = `-- name: AttachInputJobFiles :many
+UPDATE job_files
+   SET run_id = $1, state = 'attached', expires_at = NULL, updated_at = now()
+ WHERE id = ANY($2::uuid[])
+   AND user_id = $3
+   AND product_id IS NOT DISTINCT FROM $4::uuid
+   AND direction = 'input'
+   AND state = 'unattached'
+   AND expires_at > now()
+RETURNING id, byte_size
+`
+
+type AttachInputJobFilesParams struct {
+	RunID     pgtype.UUID `json:"run_id"`
+	Ids       []uuid.UUID `json:"ids"`
+	UserID    uuid.UUID   `json:"user_id"`
+	ProductID pgtype.UUID `json:"product_id"`
+}
+
+type AttachInputJobFilesRow struct {
+	ID       uuid.UUID `json:"id"`
+	ByteSize int64     `json:"byte_size"`
+}
+
+// Job create (PRD #1909 D5): attach uploaded inputs to a new job in ONE guarded statement. A row
+// matches only when it is the caller's own (user_id), was uploaded through the same product
+// (IS NOT DISTINCT FROM: a user-token upload, NULL, attaches only for a user-token caller, and a
+// product's upload only for that product), is an 'unattached' input and has not expired. The
+// caller compares the number of rows returned with the number of distinct ids it sent: every
+// mismatch (unknown id, another owner's or product's file, an attached, expired or output file)
+// reads the same. Runs under store.LockStoredFiles, in the create transaction: the reclaim and
+// expiry statements re-check state, but rely on that lock order. The file leaves its upload TTL:
+// expires_at is NULL while attached, and the sweep settles it when the job ends.
+func (q *Queries) AttachInputJobFiles(ctx context.Context, arg AttachInputJobFilesParams) ([]AttachInputJobFilesRow, error) {
+	rows, err := q.db.Query(ctx, attachInputJobFiles,
+		arg.RunID,
+		arg.Ids,
+		arg.UserID,
+		arg.ProductID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []AttachInputJobFilesRow{}
+	for rows.Next() {
+		var i AttachInputJobFilesRow
+		if err := rows.Scan(&i.ID, &i.ByteSize); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const expireJobFiles = `-- name: ExpireJobFiles :one
 WITH upd AS (
     UPDATE job_files SET state = 'expired', updated_at = now()

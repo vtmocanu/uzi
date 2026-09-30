@@ -20,13 +20,16 @@ type V1JobInputDTO struct {
 // with 422 not_supported until PRD #1906 lands site-list egress. The optional fields accept
 // an explicit null as "omitted".
 type V1JobCreateRequest struct {
-	Type             string          `json:"type"`
-	Title            *string         `json:"title,omitempty"`
-	Prompt           string          `json:"prompt"`
-	Inputs           []V1JobInputDTO `json:"inputs,omitempty"`
-	RequestedByLabel *string         `json:"requested_by_label,omitempty"`
-	WallSeconds      *int            `json:"wall_seconds,omitempty"`
-	EgressProfile    *string         `json:"egress_profile,omitempty"`
+	Type   string          `json:"type"`
+	Title  *string         `json:"title,omitempty"`
+	Prompt string          `json:"prompt"`
+	Inputs []V1JobInputDTO `json:"inputs,omitempty"`
+	// InputFileIDs are ids returned by POST /api/v1/files, attached to the job as input files
+	// (PRD #1909 D5). At most UZI_JOB_INPUTS_MAX_FILES; each id may be listed once.
+	InputFileIDs     []string `json:"input_file_ids,omitempty"`
+	RequestedByLabel *string  `json:"requested_by_label,omitempty"`
+	WallSeconds      *int     `json:"wall_seconds,omitempty"`
+	EgressProfile    *string  `json:"egress_profile,omitempty"`
 }
 
 // V1JobDTO is one job as the API shows it. Status is the small public vocabulary

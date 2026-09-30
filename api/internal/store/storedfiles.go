@@ -40,6 +40,13 @@ func LockStoredFiles(ctx context.Context, db DBTX, owner uuid.UUID) error {
 	return err
 }
 
+// LockStoredFilesQ is LockStoredFiles for a caller that holds only the transaction-bound *Queries
+// (a create transaction's insert closure): it locks through the queries' own DBTX, so q MUST have
+// been built over a transaction (store.New(tx)), never over the pool.
+func LockStoredFilesQ(ctx context.Context, q *Queries, owner uuid.UUID) error {
+	return LockStoredFiles(ctx, q.db, owner)
+}
+
 // StoredFilesSums are the byte totals an admission compares against its quotas. Job bytes count
 // every job_files state except 'expired'. Recovery bytes count 'available' captures by their bound
 // byte_size and 'preparing'/'uploading' captures by the reserved_bytes their upload admission

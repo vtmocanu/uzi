@@ -8,6 +8,9 @@
       "content": "x"
     }
   ],
+  "input_file_ids": [
+    "x"
+  ],
   "requested_by_label": "x",
   "wall_seconds": 1,
   "egress_profile": "x"

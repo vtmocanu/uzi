@@ -76,8 +76,8 @@ const (
 
 // RefusalKind classifies a refusal for the caller's status mapping: a Limit refusal is a cap on
 // what one file or one job may be (an input answers 413), a Quota refusal is the owner's,
-// instance's or shared budget being full (an input answers 413 with the reason; a worker output
-// answers 507), an Invalid refusal is a malformed or mismatching upload (422 or 415).
+// instance's or shared budget being full (both an input upload and a worker output answer 507), an
+// Invalid refusal is a malformed or mismatching upload (422, or 415 for an unsupported type).
 type RefusalKind int
 
 // The refusal kinds.

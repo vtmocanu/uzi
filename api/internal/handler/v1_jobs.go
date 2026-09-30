@@ -43,6 +43,10 @@ import (
 //	422 unknown_job_type         type is not a known job type
 //	422 not_supported            egress_profile (no egress control exists yet)
 //	422 no_model_credential      the user has no usable Anthropic credential
+//	422 file_unavailable         an input_file_ids entry cannot be attached (unknown, another
+//	                             owner's or product's, already attached, expired, or listed twice)
+//	413 too_many_files           more input_file_ids than UZI_JOB_INPUTS_MAX_FILES
+//	413 job_bytes_exceeded       the attached files total more than UZI_JOB_INPUTS_MAX_BYTES
 //	429 over_cap                 the user's non-terminal job cap
 //	429 (no reason, Retry-After) the rate limiters
 const (
@@ -98,6 +102,7 @@ func v1JobID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 // logged 500 with no detail.
 func writeV1JobError(w http.ResponseWriter, op string, err error) {
 	var invalid *workersvc.JobInvalidError
+	var refused *workersvc.JobFileRefusedError
 	switch {
 	case errors.As(err, &invalid):
 		httpx.ErrorReason(w, http.StatusUnprocessableEntity, invalid.Error(), v1ReasonInvalidRequest)
@@ -113,6 +118,12 @@ func writeV1JobError(w http.ResponseWriter, op string, err error) {
 		httpx.ErrorReason(w, http.StatusForbidden, "this token may not create jobs of this type", v1ReasonTypeNotAllowed)
 	case errors.Is(err, workersvc.ErrJobOverCap):
 		httpx.ErrorReason(w, http.StatusTooManyRequests, "too many active jobs; wait for one to finish or cancel one", v1ReasonOverCap)
+	case errors.Is(err, workersvc.ErrJobFileUnavailable):
+		httpx.ErrorReason(w, http.StatusUnprocessableEntity, "an input file is unavailable: it does not exist, is not yours, was uploaded through a different token, is already attached, has expired, or is listed twice", v1ReasonFileGone)
+	case errors.As(err, &refused):
+		writeV1FileRefusal(w, refused)
+	case errors.Is(err, workersvc.ErrJobFilesUnavailable):
+		httpx.ErrorReason(w, http.StatusServiceUnavailable, "file inputs are not available on this server", v1ReasonFilesDisabled)
 	case errors.Is(err, workersvc.ErrJobNotFound):
 		httpx.ErrorReason(w, http.StatusNotFound, "job not found", v1ReasonNotFound)
 	case errors.Is(err, workersvc.ErrJobTerminal):
@@ -242,6 +253,14 @@ func (h *Handler) V1JobCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, in := range req.Inputs {
 		params.Inputs = append(params.Inputs, workersvc.JobInput{Name: in.Name, Content: in.Content})
+	}
+	for i, raw := range req.InputFileIDs {
+		id, perr := uuid.Parse(raw)
+		if perr != nil {
+			httpx.ErrorReason(w, http.StatusUnprocessableEntity, fmt.Sprintf("invalid input_file_ids[%d]: not a file id", i), v1ReasonInvalidRequest)
+			return
+		}
+		params.InputFileIDs = append(params.InputFileIDs, id)
 	}
 	view, err := h.wsvc.CreateJobRun(r.Context(), params)
 	if err != nil {

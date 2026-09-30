@@ -515,6 +515,9 @@ var wantRouteMounts = []routeMount{
 	// (routes_v1.go), so it keys on the caller's user, not the token: minting more tokens
 	// buys no budget.
 	{"GET", "/api/v1/whoami", limV1},
+	// PRD #1909 M2: the input-file upload rides only the subtree's per-user v1Limiter; the byte
+	// quotas (workersvc.JobFiles.Reserve) bound what a caller can store.
+	{"POST", "/api/v1/files", limV1},
 	// PRD #1908 M5: the jobs endpoints. Every /api/v1 route inherits v1Limiter from the
 	// subtree's r.Use; the create additionally rides authLimiter per user (D-B).
 	{"GET", "/api/v1/jobs", limV1},

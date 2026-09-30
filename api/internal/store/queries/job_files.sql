@@ -195,3 +195,23 @@ SELECT COALESCE(sum(f.byte_size), 0)::bigint AS reclaimable_bytes
 UPDATE recovery_captures
    SET state = 'uploading', reserved_bytes = @reserved_bytes, reason = NULL, updated_at = now()
  WHERE id = @id AND state IN ('preparing', 'uploading', 'needs_action');
+
+-- name: AttachInputJobFiles :many
+-- Job create (PRD #1909 D5): attach uploaded inputs to a new job in ONE guarded statement. A row
+-- matches only when it is the caller's own (user_id), was uploaded through the same product
+-- (IS NOT DISTINCT FROM: a user-token upload, NULL, attaches only for a user-token caller, and a
+-- product's upload only for that product), is an 'unattached' input and has not expired. The
+-- caller compares the number of rows returned with the number of distinct ids it sent: every
+-- mismatch (unknown id, another owner's or product's file, an attached, expired or output file)
+-- reads the same. Runs under store.LockStoredFiles, in the create transaction: the reclaim and
+-- expiry statements re-check state, but rely on that lock order. The file leaves its upload TTL:
+-- expires_at is NULL while attached, and the sweep settles it when the job ends.
+UPDATE job_files
+   SET run_id = @run_id, state = 'attached', expires_at = NULL, updated_at = now()
+ WHERE id = ANY(@ids::uuid[])
+   AND user_id = @user_id
+   AND product_id IS NOT DISTINCT FROM sqlc.narg('product_id')::uuid
+   AND direction = 'input'
+   AND state = 'unattached'
+   AND expires_at > now()
+RETURNING id, byte_size;

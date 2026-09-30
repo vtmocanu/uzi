@@ -11,6 +11,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // TestV1SpecContractLiveDB (PRD #1908 M5): every /api/v1 operation's success AND error responses,
@@ -27,6 +28,8 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 	e := newV1JobsEnv(t, 4)
 	doc := loadV1Doc(t)
 
+	// PRD #1909 M2: a small file store, so the upload's 413 and 507 are reachable.
+	e.wireFiles(workersvc.JobFileLimits{InputFileMaxBytes: 1000, PerOwnerBytes: 2000})
 	owner, uzc := e.user()
 	product := e.product(owner, "research")
 	pTok := v1MintProductToken(t, e.h.q, owner, product, producttoken.Scopes, nil)
@@ -53,6 +56,10 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		want          int
 		tight         bool // run through the router whose v1 budget is one request per user
 		primeThenCall bool // spend the tight budget with a first request, then make this one
+		// A multipart upload case (POST /files): mpData is the file, mp its part and headers.
+		mp     *v1UploadOpts
+		mpData []byte
+		pre    func() // runs before the call (the 503 case unwires the file store).
 	}
 	id := seeded.ID
 	cases := []tc{
@@ -118,8 +125,31 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "cancel 404", method: "POST", specPath: "/jobs/{id}/cancel", url: "/api/v1/jobs/" + uuid.NewString() + "/cancel", token: uzc, want: 404},
 		{name: "cancel 429", method: "POST", specPath: "/jobs/{id}/cancel", url: "/api/v1/jobs/" + id + "/cancel", want: 429, tight: true, primeThenCall: true},
 
+		// POST /files (PRD #1909 D5)
+		{name: "upload 201", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 201, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
+		{name: "upload 401", method: "POST", specPath: "/files", url: "/api/v1/files", token: unknown, want: 401, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
+		{name: "upload 403", method: "POST", specPath: "/files", url: "/api/v1/files", token: readOnly.token, want: 403, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
+		{name: "upload 413", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 413, mp: &v1UploadOpts{filename: "a.txt"}, mpData: textBytes(1001)},
+		{name: "upload 415", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 415, mp: &v1UploadOpts{filename: "a.pdf"}, mpData: []byte("not a pdf")},
+		{name: "upload 422", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 422, mp: &v1UploadOpts{filename: "a.txt", size: sizePtr(-1)}, mpData: []byte("hello")},
+		{name: "upload 422 size mismatch", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 422, mp: &v1UploadOpts{filename: "a.txt", size: sizePtr(9)}, mpData: []byte("hello")},
+		{name: "upload 429", method: "POST", specPath: "/files", url: "/api/v1/files", want: 429, tight: true, primeThenCall: true, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
+		{name: "upload 507", method: "POST", specPath: "/files", url: "/api/v1/files", token: func() string {
+			_, tok := e.user()
+			for range 2 {
+				e.uploadOK(tok, textBytes(1000), v1UploadOpts{filename: "fill.txt"})
+			}
+			return tok
+		}(), want: 507, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello")},
+		{name: "job create 422 file_unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":["` + uuid.NewString() + `"]}`, want: 422},
+		{name: "job create 413 too_many_files", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","input_file_ids":[` + strings.TrimSuffix(strings.Repeat(`"`+uuid.NewString()+`",`, 11), ",") + `]}`, want: 413},
+
 		// whoami's 429 (the rate limiter, on the tight router)
 		{name: "whoami 429", method: "GET", specPath: "/whoami", url: "/api/v1/whoami", want: 429, tight: true, primeThenCall: true},
+
+		// Last: it unwires the file store, so no later case may need one.
+		{name: "upload 503", method: "POST", specPath: "/files", url: "/api/v1/files", token: uzc, want: 503, mp: &v1UploadOpts{filename: "a.txt"}, mpData: []byte("hello"),
+			pre: func() { e.h.wsvc.SetJobFiles(nil) }},
 	}
 
 	produced := map[string]bool{} // "METHOD /path STATUS"
@@ -134,7 +164,15 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 				}
 				router = e.tight
 			}
-			r := v1Call(router, c.method, c.url, token, c.body)
+			if c.pre != nil {
+				c.pre()
+			}
+			var r v1CallResult
+			if c.mp != nil {
+				r = e.uploadTo(router, token, c.mpData, *c.mp)
+			} else {
+				r = v1Call(router, c.method, c.url, token, c.body)
+			}
 			if r.status != c.want {
 				t.Fatalf("status %d %s, want %d", r.status, truncate(string(r.body), 300), c.want)
 			}

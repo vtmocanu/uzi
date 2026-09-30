@@ -233,10 +233,15 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 // v1OpShape names, per operation, the success status, the Go DTO its response serializes and,
 // for a body-carrying operation, the Go request type. Every spec operation must be listed: a new
 // endpoint states its DTOs here and the schema check below binds the two.
+//
+// A multipart operation (POST /files) names no Go request type: its requestBody must be a required
+// multipart/form-data object with a binary `file` property, and its response DTO is matched like
+// any other.
 type v1OpShape struct {
-	status  string
-	dto     reflect.Type
-	request reflect.Type
+	status    string
+	dto       reflect.Type
+	request   reflect.Type
+	multipart bool
 }
 
 var v1OperationShapes = map[string]v1OpShape{
@@ -247,6 +252,7 @@ var v1OperationShapes = map[string]v1OpShape{
 	"GET /api/v1/jobs/{id}/result":   {status: "200", dto: reflect.TypeFor[apitypes.V1JobResultDTO]()},
 	"GET /api/v1/jobs/{id}/messages": {status: "200", dto: reflect.TypeFor[apitypes.V1JobMessagesDTO]()},
 	"POST /api/v1/jobs/{id}/cancel":  {status: "200", dto: reflect.TypeFor[apitypes.V1JobDTO]()},
+	"POST /api/v1/files":             {status: "201", dto: reflect.TypeFor[apitypes.V1FileDTO](), multipart: true},
 }
 
 // TestV1OpenAPISchemasMatchDTOs (PRD #1907 M3, extended by PRD #1908 M5): each operation's
@@ -277,6 +283,10 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 		}
 		(&oaChecker{t: t, spec: spec}).match(key+" "+shape.status, media.Schema, shape.dto)
 
+		if shape.multipart {
+			v1CheckMultipartBody(t, spec, key, op)
+			continue
+		}
 		if shape.request == nil {
 			if op.RequestBody != nil {
 				t.Errorf("%s documents a requestBody but v1OperationShapes names no request type", key)
@@ -302,6 +312,30 @@ func TestV1OpenAPISchemasMatchDTOs(t *testing.T) {
 	}
 	if got := whoami.Properties["scopes"].Items.Enum; !slices.Equal(got, producttoken.Scopes) {
 		t.Errorf("Whoami scopes enum = %v, want producttoken.Scopes %v", got, producttoken.Scopes)
+	}
+}
+
+// v1CheckMultipartBody: a multipart operation's requestBody is required, offers ONLY
+// multipart/form-data, and describes a `file` property that is a required binary string.
+func v1CheckMultipartBody(t *testing.T, spec oaSpec, key string, op oaOperation) {
+	t.Helper()
+	if op.RequestBody == nil || !op.RequestBody.Required {
+		t.Errorf("%s: a multipart operation needs a required requestBody", key)
+		return
+	}
+	if len(op.RequestBody.Content) != 1 {
+		t.Errorf("%s: requestBody offers %d media types, want only multipart/form-data", key, len(op.RequestBody.Content))
+	}
+	media, ok := op.RequestBody.Content["multipart/form-data"]
+	if !ok || media.Schema == nil {
+		t.Errorf("%s: requestBody has no multipart/form-data schema", key)
+		return
+	}
+	c := &oaChecker{t: t, spec: spec}
+	body := c.resolve(key+" request", media.Schema)
+	file := body.Properties["file"]
+	if file == nil || file.Format != "binary" || !slices.Contains(body.Required, "file") {
+		t.Errorf("%s: the multipart schema must require a `file` property of format binary", key)
 	}
 }
 
@@ -332,6 +366,8 @@ func TestV1OpenAPIEnumsMatchGo(t *testing.T) {
 		{"JobFinding", "severity", sevs},
 		// The kinds ListJobMessagesForCaller selects (queries/jobs.sql).
 		{"JobMessage", "type", []string{"text", "status", "error"}},
+		// The file states a caller can observe; 'reserved' is internal (never returned).
+		{"File", "state", []string{workersvc.JobFileUnattached, workersvc.JobFileAttached, workersvc.JobFileAvailable, workersvc.JobFileExpired}},
 	} {
 		got := enumOf(c.schema, c.prop)
 		if c.prop == "severity" {

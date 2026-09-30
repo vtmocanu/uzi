@@ -56,5 +56,11 @@ func (h *Handler) mountV1Routes(r chi.Router, authLimiter, v1Limiter *mw.Limiter
 		r.With(read).Get("/jobs/{id}/result", h.V1JobResult)
 		r.With(read).Get("/jobs/{id}/messages", h.V1JobMessages)
 		r.With(run).Post("/jobs/{id}/cancel", h.V1JobCancel)
+
+		// PRD #1909 D5: upload an input file, then reference it from POST /jobs (input_file_ids).
+		// The jobs:run scope: a caller that may create jobs may upload their inputs. No extra
+		// limiter: the per-user v1Limiter above bounds request rate, and the byte quotas
+		// (workersvc.JobFiles.Reserve) bound what a caller can hold.
+		r.With(run).Post("/files", h.V1FileUpload)
 	})
 }

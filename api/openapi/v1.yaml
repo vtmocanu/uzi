@@ -228,6 +228,79 @@ paths:
           $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+  /files:
+    post:
+      operationId: uploadFile
+      summary: Upload an input file
+      description: >-
+        Stores one file for use as a job input. Send multipart/form-data with the
+        file in a part named file, and declare its exact size in the X-Uzi-File-Size
+        header (required: the server reserves exactly that many bytes before it reads
+        the body, and refuses an upload whose bytes differ). A sha256 in
+        X-Uzi-File-Sha256 is verified against the bytes when given. Needs the jobs:run
+        scope. The type is detected from the bytes and must agree with the part's
+        Content-Type and the file name's extension: PDF, PNG, JPEG, DOCX and XLSX
+        (the ZIP-based Office formats need their type or extension declared), and
+        UTF-8 text (text/plain, text/markdown, text/csv, application/json; JSON must
+        parse). Anything else is refused with reason unsupported_file_type. The file
+        is stored under a name derived from its content, never from the uploader's;
+        display_name is the uploader's file name reduced to its last path component
+        and stripped of control and invisible characters. The file starts unattached
+        and expires after UZI_JOB_UPLOAD_TTL (default 1 hour) unless a job create
+        references it in input_file_ids. Only the user, and for a product token only
+        the product, that uploaded a file can attach it, to one job.
+      parameters:
+        - name: X-Uzi-File-Size
+          in: header
+          required: true
+          description: The file's exact size in bytes.
+          schema:
+            type: integer
+            format: int64
+            minimum: 1
+        - name: X-Uzi-File-Sha256
+          in: header
+          required: false
+          description: The file's SHA-256 as 64 lowercase hexadecimal characters.
+          schema:
+            type: string
+            pattern: "^[0-9a-f]{64}$"
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+                  description: The file. Only the first part with this name is read.
+      responses:
+        "201":
+          description: The stored file, in state unattached.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/File"
+        "401":
+          $ref: "#/components/responses/Unauthorized"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "413":
+          $ref: "#/components/responses/PayloadTooLarge"
+        "415":
+          $ref: "#/components/responses/UnsupportedMediaType"
+        "422":
+          $ref: "#/components/responses/Unprocessable"
+        "429":
+          $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
+        "507":
+          $ref: "#/components/responses/InsufficientStorage"
 components:
   securitySchemes:
     bearerAuth:
@@ -270,7 +343,36 @@ components:
           schema:
             $ref: "#/components/schemas/Error"
     PayloadTooLarge:
-      description: The request body is over the size limit (reason payload_too_large).
+      description: >-
+        The request is over a size limit. Reason payload_too_large: the request body is
+        over the size limit. On POST /files, reason file_too_large: the declared file
+        size is over the per-file cap (UZI_JOB_INPUT_FILE_MAX_BYTES). On POST /jobs,
+        reason too_many_files (more input_file_ids than UZI_JOB_INPUTS_MAX_FILES) or
+        job_bytes_exceeded (the attached files total more than
+        UZI_JOB_INPUTS_MAX_BYTES).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    UnsupportedMediaType:
+      description: >-
+        The file's bytes are not a supported type, or disagree with the type its
+        Content-Type or file name declares (reason unsupported_file_type).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    ServiceUnavailable:
+      description: This deployment has no file store configured (reason files_unavailable).
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InsufficientStorage:
+      description: >-
+        The stored-file quota is full: the user's own, the instance's, or the budget
+        shared with recovery archives (reason storage_quota_exceeded). Retry after
+        stored files expire.
       content:
         application/json:
           schema:
@@ -281,7 +383,10 @@ components:
         malformed or invalid body or query parameter; the message names the field),
         unknown_job_type, not_supported (egress_profile is reserved and refused for
         now) or no_model_credential (the user has no usable Anthropic credential in
-        uzi).
+        uzi). On POST /files, also empty_file, size_mismatch (the streamed size is not
+        X-Uzi-File-Size) and sha256_mismatch. On POST /jobs, also file_unavailable (an
+        input_file_ids entry is unknown, belongs to another user or product, is already
+        attached, has expired, or is listed twice).
       content:
         application/json:
           schema:
@@ -404,6 +509,18 @@ components:
             starting with a letter or digit, unique within the job.
           items:
             $ref: "#/components/schemas/JobInput"
+        input_file_ids:
+          type:
+            - array
+            - "null"
+          description: >-
+            Ids of files uploaded with POST /files, attached to the job as input files.
+            At most 10 (UZI_JOB_INPUTS_MAX_FILES), each listed once, together at most
+            50 MiB (UZI_JOB_INPUTS_MAX_BYTES). Each must be unattached, unexpired and
+            uploaded by the same user and, for a product token, the same product.
+          items:
+            type: string
+            format: uuid
         requested_by_label:
           type:
             - string
@@ -611,3 +728,51 @@ components:
             - error
         text:
           type: string
+    File:
+      type: object
+      required:
+        - id
+        - display_name
+        - storage_name
+        - content_type
+        - byte_size
+        - sha256
+        - state
+        - expires_at
+      properties:
+        id:
+          type: string
+          format: uuid
+        display_name:
+          type: string
+          description: >-
+            The uploader's file name reduced to its last path component, with control
+            and invisible characters removed. Untrusted text: render it inert.
+        storage_name:
+          type: string
+          description: The content-derived name, the file's sha256 and a type extension.
+        content_type:
+          type: string
+          description: The type detected from the bytes.
+        byte_size:
+          type: integer
+          format: int64
+        sha256:
+          type: string
+          description: The SHA-256 of the file's bytes, lowercase hexadecimal.
+        state:
+          type: string
+          description: unattached, attached, available or expired.
+          enum:
+            - unattached
+            - attached
+            - available
+            - expired
+        expires_at:
+          type:
+            - string
+            - "null"
+          format: date-time
+          description: >-
+            When the file expires. Null while it is attached to a job that has not
+            finished.
