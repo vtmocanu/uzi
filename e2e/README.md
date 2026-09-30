@@ -48,7 +48,9 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
 - `E2E_ONLY=<glob[,glob]>` — run only the phases whose slug matches one of these
   comma-separated globs (e.g. `E2E_ONLY='mr-*,happy-*'`). `critical: yes` phases
   (boot seed, worker-online, happy path) always run regardless, so a subset still
-  boots a usable stack.
+  boots a usable stack. Selection does not add non-critical prerequisites. Phase 52's
+  recovery assertions use the CLI binary and token from `cli-smoke`, so run its focused
+  acceptance with `E2E_ONLY=cli-smoke,api-outage-outbox ./e2e/run-e2e.sh`.
 - `E2E_SKIP=<glob[,glob]>` — the inverse: skip the phases whose slug matches. As
   with `E2E_ONLY`, critical phases are never skipped.
 - `E2E_STRICT_LEAKS=1` — make an end-of-phase quarantine **LEAK** (a non-terminal
