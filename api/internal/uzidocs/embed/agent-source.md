@@ -205,6 +205,10 @@ a filter on what gets stored. Treat a role body from a source repo you
 don't fully trust the same way you'd treat any other code you're about to
 run: read it, don't skim it.
 
+## Clone size limit
+
+A sync clones the tip of the pinned ref, and before it decodes anything it checks the size the fetched pack would **inflate to**. A repo whose tip has a single object over 64 MiB, more than 512 MiB in total once reconstructed, or more than 50,000 objects, is refused and the sync fails with an error naming the pack-size budget (`pack exceeds inflation budget`) instead of inflating into the api's memory. (The clone is still limited to 48 MiB on the wire and 60 seconds.) Ordinary repos are far under this, but it is a change for a very large, highly compressible repo that previously synced: if you hit it, point the source at a smaller repo. The same pre-scan guards [product skill sets](./skills.md#product-skills), with tighter limits (16 MiB per object, 64 MiB in total).
+
 ## Trust model
 
 The design and threat model behind approve-before-apply, the SSRF

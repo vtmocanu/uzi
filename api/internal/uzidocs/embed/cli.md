@@ -716,6 +716,14 @@ A few worth knowing:
   tokens are refused on `/api/v1`, and a deleted product can never be
   re-enabled. Read-only: registering, editing, deleting a product and
   revoking one of its tokens are browser-only admin actions.
+  `admin products skills <product>` (a product's name or id) shows one
+  product's skill set read-only (PRD #1909): the source config (repo URL, ref,
+  whether a clone token is set, never its value, and whether the instance has
+  product skills enabled), the applied set (commit sha, when, skill names) and
+  any staged snapshot waiting for approval with its diff and the skills the
+  sync dropped and why. It works with a `uza_` token, like the rest of
+  `uzi admin`; setting the source, syncing and approving stay browser-only. See
+  [Product skills](./skills.md#product-skills).
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it
@@ -832,14 +840,18 @@ uzi job get <job-id>
 uzi job result <job-id>
 uzi job cancel <job-id>
 uzi job list [--limit N] [--cursor C]
+uzi job files <job-id>
+uzi job file get <file-id> [-o path]
 ```
 
-- **`create`** needs `--type` and exactly one of `--prompt <text>` or `--prompt-file <path>` (`-` reads stdin). `--input name=@file` attaches a named text input and repeats (at most 20, 1 MiB in total, UTF-8 regular files only). `--title` overrides the title derived from the prompt; `--budget-seconds` sets the wall-clock limit (the server caps it at 8 hours). It prints the queued job.
+- **`create`** needs `--type` and exactly one of `--prompt <text>` or `--prompt-file <path>` (`-` reads stdin). `--input name=@file` attaches a named text input and repeats (at most 20, 1 MiB in total, UTF-8 regular files only). `--file <path>` attaches a file (PDF, PNG, JPEG, DOCX, XLSX or UTF-8 text; repeatable): each one is uploaded first, then attached to the job by id, so a rejected file stops the create before any job exists. `--title` overrides the title derived from the prompt; `--budget-seconds` sets the wall-clock limit (the server caps it at 8 hours). It prints the queued job.
 - **`get`** shows the job's status; `REQUESTED_BY` is marked as reported by the product, not a verified identity.
 - **`result`** prints the job status, then findings, then the report indented under its label. A job that has not reported prints `no result yet`; a finished one that never reported prints `no result`.
 - **`cancel`** cancels a queued, running or waiting job; a running job may still read `running` for a moment. A finished job exits with a conflict error.
 - **`list`** is newest first, 50 per page by default, and prints the `--cursor` for the next page.
 - **`--json`** prints the raw API objects. Text from the server is sanitized for the terminal.
+- **`files`** lists a job's input and output files (id, name, direction, size, short sha256, state, expiry and, for an output whose hash matches an allowed fetch in that job, its source URL), then any outputs that were refused and why. See [Job files](./jobs.md#job-files).
+- **`file get`** downloads one file by its id (from `files`) to disk. It never prints the bytes and **never overwrites**: with no `-o` it writes to the file's content-derived storage name (`<sha256>.<ext>`) in the current directory, and it refuses if that path, or the `-o` path, already exists. An expired file is reported as expired (the server answers 410).
 
 `uzi job` needs a `uzc_` user token: a `uzp_` product token is refused by the CLI and a `uza_` admin token is refused by `/api/v1`. Refusals print the server's error message (not the machine `reason` token): for example a 422 about no model credential (add an Anthropic credential in uzi) or a 429 when you reach the active-job cap (10 per user by default). A `job_type_not_allowed` 403 applies only to product tokens, so `uzi job` does not hit it.
 

@@ -140,6 +140,16 @@ operator-configurable environment variable on the API:
 | Retained captures per owner | 256 | Total captures you can have on file at once. |
 | Unresolved recovery holds per owner | 8 | At the limit, uzi pauses admitting **new** runs for you until you resolve or discard some. A requeued run that still holds its own unresolved work is still admitted, even past the limit, until that one run alone holds 8. Fixed today, not yet an environment variable. |
 
+### Shared stored-file budget
+
+Recovery archives and [job files](./jobs.md#job-files) live in the same database, so they share one ceiling: `UZI_STORED_FILES_BUDGET_BYTES` (4 GiB by default, the same figure as the instance byte quota above). Both stores count against it: recovery-archive bytes (ready archives, plus the declared size of an upload still in flight) **plus** job-file bytes (every non-expired job file, reservations included). It is a hard combined limit, and **recovery wins**:
+
+- When a recovery upload would not fit the budget, uzi first reclaims job files to make room, in this order: files already past their expiry, then the oldest `available` job files (those of finished jobs). It **never** reclaims a file attached to a job that is still running, a file whose upload is in flight, or an unattached upload still inside its one-hour window. A reclaimed job file becomes expired: its bytes are deleted and a later download is a 410.
+- Admission itself deletes nothing: it only checks that enough reclaimable job-file bytes exist. The reclaim runs once the upload's size and checksum have verified, and only for the bytes that upload actually delivered, so a worker that declares a size and never sends the bytes cannot expire anyone's files.
+- Only if reclaiming everything reclaimable still would not fit is the archive refused, exactly as an over-quota archive is refused above. Job files never reclaim recovery archives; a job-file upload over the budget is refused 507 `storage_quota_exceeded`.
+
+The owner and instance recovery quotas in the table above still apply on top of the shared budget. If you raise the budget or either store's quota, size the database volume for the budget plus your ordinary data ([Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909)). The design is recorded in [ADR-1909](../adr/1909-stored-file-budget.md).
+
 ## Custody: why a worker won't disappear
 
 While a run's committed work is unpublished and not yet durably captured

@@ -496,6 +496,29 @@ conjunction, so a token at 10% of its 5-hour allowance and 98% of its 7-day one 
 | `UZI_AUTOSELECT_MAX_STALENESS` | `3 × UZI_USAGE_POLL_INTERVAL` | How old a usage reading may be and still steer a choice — steering on numbers Anthropic has moved past is worse than not steering. The default **tracks** the poll interval and matches what the meters already call stale, so the two agree; overriding it re-opens that divergence. **With the poller disabled (`UZI_USAGE_POLL_INTERVAL=0`) this computes to `0`, nothing is ever fresh, and auto-selection degrades to the worker's ordinary binding** — the correct outcome for a gauge nothing updates. |
 | `UZI_AUTOSELECT_INFLIGHT_PENALTY` | `3` | Points subtracted from a token's ranking score per run currently spending it, so several claims inside one poll interval do not all pile onto the same emptiest credential. `0` disables the bias. |
 
+## Job files and product skill sets (PRD #1909)
+
+See [Jobs](jobs.md#job-files) for what a job file is and [Agent skills](skills.md#product-skills) for product skill sets; [ADR-1909](../adr/1909-stored-file-budget.md) records why job files and recovery archives share one budget. Every byte limit is an integer number of bytes; `UZI_JOB_FILES_RETENTION` and `UZI_JOB_UPLOAD_TTL` are Go durations (`168h`, `1h`). A set-but-malformed or non-positive value falls back to its default rather than failing boot, except the allowlist at the end of the table.
+
+| Var | Default | Notes |
+|---|---|---|
+| `UZI_JOB_INPUT_FILE_MAX_BYTES` | `26214400` (25 MiB) | The largest single input file `POST /api/v1/files` accepts (413 `file_too_large` over it). Clamped to the worker's fixed ceiling of 256 MiB: a higher value is lowered at boot with a warning, because a worker refuses any job input over its own ceiling and a higher limit would accept jobs every worker then refuses. |
+| `UZI_JOB_INPUTS_MAX_FILES` | `10` | Input files one job may carry. Clamped to the worker ceiling of 64. |
+| `UZI_JOB_INPUTS_MAX_BYTES` | `52428800` (50 MiB) | Total input bytes one job may carry. Clamped to the worker ceiling of 1 GiB. |
+| `UZI_JOB_OUTPUT_FILE_MAX_BYTES` | `26214400` (25 MiB) | The largest single output file the api stores. A larger one is refused and listed in the result's `refused_files`; the job still completes. |
+| `UZI_JOB_OUTPUTS_MAX_FILES` | `50` | Output files stored per job. |
+| `UZI_JOB_OUTPUTS_MAX_BYTES` | `104857600` (100 MiB) | Total output bytes stored per job. |
+| `UZI_JOB_FILES_PER_OWNER_BYTES` | `268435456` (256 MiB) | Retained job-file bytes (every state except expired, reservations included) per owner. Over it, an upload is refused 507 `storage_quota_exceeded`. |
+| `UZI_JOB_FILES_INSTANCE_BYTES` | `1073741824` (1 GiB) | Retained job-file bytes across the whole deployment. |
+| `UZI_STORED_FILES_BUDGET_BYTES` | `4294967296` (4 GiB) | The shared ceiling on **job-file bytes plus recovery-archive bytes**, reservations included. Both stores admit against it, and recovery wins a conflict: see [Recovering unpublished work](run-recovery.md#shared-stored-file-budget). |
+| `UZI_JOB_FILES_RETENTION` | `168h` (7 days) | How long a finished job's files stay downloadable, counted from when the job ends. After it the bytes are deleted and the file row stays as an expired record (a download is 410 `file_expired`). |
+| `UZI_JOB_UPLOAD_TTL` | `1h` | How long an uploaded input that no job has attached stays before it expires. |
+| `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS` | *(empty)* | Comma-separated SSRF allowlist for a product's skills repo URL; every entry must be an absolute `https://` URL or boot fails. A **separate** list from `AGENT_SOURCE_ALLOWED_BASE_URLS`, so enabling one never widens the other. An **empty** list is not a boot error: it turns product skill sets **off**. No product skills repo URL can be saved, a sync is refused, and claim-time delivery stops too, so skills a product already has applied stay in the database but no job receives them until you set an entry again. |
+
+**Sizing the database volume.** Job files are stored in Postgres (sealed 1 MiB chunks), on the same volume as everything else. The 4 GiB `UZI_STORED_FILES_BUDGET_BYTES` default equals the recovery-archive instance quota the chart's default 5Gi data volume was already sized for, so turning job files on never lets stored files exceed it. The budget is a fixed number, not scaled to the volume (the api cannot reliably know the volume size). If you raise `UZI_STORED_FILES_BUDGET_BYTES`, `UZI_JOB_FILES_INSTANCE_BYTES` or the recovery quotas, size the database volume for the budget plus your ordinary data. Deleted chunk space is reused after vacuum rather than returned to the filesystem, so the quota, not the disk size, is the control.
+
+**Helm.** None of these has a first-class chart value. Set them in the freeform `api.config` map (rendered into the api ConfigMap by `deploy/chart/templates/api-configmap.yaml`), for example `api.config.UZI_JOB_FILES_RETENTION: "72h"`.
+
 ## Run-usage history refold (PRD #1079)
 
 Each Claude Agent SDK `query()` call reports only its own leg's cost, not a session

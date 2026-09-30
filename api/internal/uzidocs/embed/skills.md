@@ -84,6 +84,52 @@ message in the run's transcript so it is never a silent surprise. When
 skills and repo skills combined exceed the cap, repo skills (lowest
 precedence) are the ones dropped first.
 
+## Product skills
+
+A product that starts [jobs](./jobs.md) can carry its own domain playbooks: how to analyse a vendor's datasheets, what a good comparison looks like. They live in the product's own git repo, so they do not drift from the product's source of truth. A product skill set is a separate, fifth source: it is **not** one of the four above, it never appears in the Skills page or in template allocations, and it reaches **only that product's jobs**.
+
+**Operator switch.** Off by default. An operator turns it on by listing the allowed repo hosts in `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS` ([Configuration](./configuration.md#job-files-and-product-skill-sets-prd-1909)). While that list is empty no repo can be configured, a sync is refused, and no job receives product skills, including skills already approved.
+
+### Set it up (admins)
+
+On **Admin → Products**, open the product's skills panel:
+
+1. Enter the **repo URL** (an `https://` URL on the allowlist, with no credentials in it), and optionally a **branch, tag or commit** (the default branch when empty). A pinned tag or commit is the safer choice: a floating branch sends every push to the next sync you approve.
+2. For a private repo, paste a read-only **clone token** (for example a deploy token or a fine-grained read-only token on the skills repo). It is **write-only**: stored sealed, sent only to that repo's host, never shown again and never returned by any endpoint, which only say whether one is set. An empty token means a public repo. Rotating `UZI_SECRET_KEY` invalidates it like every other sealed secret.
+3. Click **Sync**. uzi clones the repo, reads the skills and **stages** them: nothing reaches a job yet.
+4. Review the staged diff (skills added, changed, removed, unchanged, and any skill that was dropped with its reason) and click **Approve**. Approval is tied to the commit: it applies exactly the set you reviewed, records which admin approved it and the commit sha, and a sync that replaced the staged set in between is refused so you review again.
+
+Approving replaces the product's whole applied set in one step; a job claims either the old set or the new one, never a mix. Changing the repo URL or ref discards a staged set (a snapshot of the old source must not stay approvable), but the applied skills keep serving until you approve a new set. **Moving the repo to a different origin (another host or port), or removing the URL, deletes the stored clone token** unless the same save provides a new one, so a token issued for one host is never carried to another.
+
+`uzi admin products skills <product>` prints the same state read-only (see [CLI](./cli.md)); setting the source, syncing and approving are browser actions.
+
+### What a job gets
+
+- **Only its own product's approved skills.** A job started through a product token receives that product's applied skills and **no** user, global, builtin or repo skill, so what shapes the product's output is exactly what the product ships. Jobs started with your own `uzc_` token (no product) and every non-job run get no product skills at all.
+- **Only for an enabled product.** A disabled or deleted product delivers nothing. Delivery is read again on every claim, so a new approval, or disabling the product, takes effect on the next job.
+- **Never a staged set.** Only approved skills are delivered.
+- **Skill shell is off.** Inline shell execution in a skill body is disabled for jobs, skills or not: a job's tools are the closed set described in [Jobs](./jobs.md#trust-model).
+
+### What is read from the repo
+
+uzi reads `skills/*/SKILL.md` and `.claude/skills/*/SKILL.md` at the repo root (if a name is in both, `skills/` wins). Symlinks, submodules and stray files are skipped, never followed. From each `SKILL.md` it keeps **only** `name`, `description` and the body; every other frontmatter key (`allowed-tools`, `hooks`, `model`, and the rest) is dropped, because a skill's capabilities are the job runner's fixed tool set and never a repo's say-so. The name is the frontmatter `name`, else the directory name, and must be kebab-case.
+
+The same caps as any skill apply, and a skill that breaks one is **dropped, not fatal**, and listed in the staged view with its reason:
+
+| Reason | Meaning |
+|---|---|
+| `invalid` | Not valid UTF-8 or frontmatter, a bad name, a missing or over-long or multi-line description, or an empty body |
+| `too_large` | The `SKILL.md`, or its body, is over the skill size cap (64 KiB, `SKILL_MAX_BYTES`) |
+| `duplicate` | Another skill already has that name |
+| `over_limit` | More skills than a run may carry (32, `SKILLS_MAX_PER_RUN`; the first 32 by name are kept), or more than 64 skill files in the repo |
+| `secret` | The body contains a full provider token |
+
+### Size and concurrency limits
+
+- **Pack-size budget.** The clone checks the size the fetched pack would **inflate to** before decoding any of it, and refuses a repo whose tip passes 16 MiB per object or 64 MiB in total, or whose clone passes 48 MiB on the wire. A skills repo is a handful of small files, so this only stops oversized or hostile repos; the sync then fails with a generic "could not read the skills repo" message (the detail is in the api log only, never the response).
+- **One sync at a time** per api process. A second Sync while one runs is refused 429 with `Retry-After`; it is not coordinated across api replicas.
+- **Bodies are visible to uzi admins**, and they are untrusted prompt text: review the diff before approving, and use a repo whose review discipline you trust.
+
 ## Repo skills (opt-in, default off)
 
 A repo can carry its own skills in `.claude/skills/*/SKILL.md`, the same

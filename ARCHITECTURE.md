@@ -265,6 +265,7 @@ model); this section is the map. User-facing usage is
   agent templates (editable, resettable, never deletable), Go-embedded from
   `api/internal/skilltmpl/builtins/` (no `.claude/skills/` mirror), currently
   `prd-lifecycle`.
+- **Product scope** (PRD #1909). A fifth scope, `product` (`skills.product_id`), holds a registered product's approved skills. It is deliberately invisible to every list, allocation and non-job claim (each query filters on an explicit scope list), and `assembleProductSkills` hands a job exactly its origin product's skills, for an enabled product, only while `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS` is non-empty. They are synced through the agent-source bounded clone path into a staged snapshot (`product_skill_staged`) and applied by an admin by commit sha. See [docs/skills.md](docs/skills.md#product-skills).
 - **Default allocations** (PRD #72 M2). A builtin with no allocation row reaches
   *nobody*, not its scoped subagents and not the lead (the union
   `ListRunSkillAllocations` builds is what the lead receives). So each builtin
@@ -1053,6 +1054,11 @@ chain in the diagram above, with no intervening `running`.
   [PRD #1349](prds/1349-recovery-custody-hardening.md) and
   [adr/1296-durable-run-recovery.md](adr/1296-durable-run-recovery.md) (with
   its 2026-09-14 PRD #1349 amendment).
+  Since PRD #1909, recovery archives and job files count against one shared
+  stored-file budget (`UZI_STORED_FILES_BUDGET_BYTES`): recovery admission takes
+  the same advisory locks as job-file admission and, when the budget is short,
+  reclaims expired then oldest finished-job files before refusing a capture
+  (see [adr/1909-stored-file-budget.md](adr/1909-stored-file-budget.md)).
 - **Milestone tracker reconciliation** (PRD #122/#265/#390) — a milestone-structured
   `issue` run shows a *reported-complete* tracker (`runs.milestones_completed`,
   monotone union, never "verified"), fed by mid-run `report_progress` and the lead's
@@ -1337,6 +1343,8 @@ usage is [docs/findings.md](docs/findings.md).
 - **Jobs never park.** A usage or time limit, recovery, or a disabled credential fails the job. The wall-clock budget (`budget_wall_seconds`) is enforced by the runner with a sweeper backstop.
 - **Confinement.** The agent job runner (`agent/src/job-runner.ts`, `job-workspace.ts`) exposes only `Read`/`Write`/`Glob`/`Grep` and `submit_job_result`, confined to a per-run workspace under `<dataDir>/jobs`; inputs and the prompt are untrusted. Worker routes that assume a repo (publish, memory, forge reads, MR threads, trace/review, task-review) refuse a job run with 403 `not_for_job`.
 - **Revocation.** Revoking a product token, disabling or deleting a product, or deactivating the owner cancels that product's non-terminal jobs (a sweep in `workersvc`); expiry alone never cancels, and `uzc_` jobs are cancelled only on owner deactivation.
+
+- **Job files and product skill sets (PRD #1909).** A job can take uploaded input files and return output files. They are stored in Postgres like recovery archives (`job_files` plus sealed, AAD-bound 1 MiB `job_file_chunks`), are named by content (`<sha256>.<ext>`), and are served only as attachments (`/api/v1/files/{id}`). Inputs reach the worker through the claim's manifest and `/api/worker/runs/{id}/files` (join-token auth, only for the run the worker holds) and are verified by sha256 before use; outputs go back the same way before the job reports, and a refused output is listed while the job still completes. The result's `sources` and each output's `source_url` are read from the fetch service's own `run_fetches` (PRD #1906), matched by hash within the same run, never taken from the agent. **Job files and recovery archives share one stored-file budget** admitted under one pair of advisory locks; the lock order, the reclaim order and the `job_files_v1` rollout gate (`runs.job_protocol`, a `ClaimRun` clause outside `fn_worker_can_claim`) are recorded in [ADR-1909](adr/1909-stored-file-budget.md). A product's skill set is a fifth skill scope (`skills.scope = 'product'`, see [Agent skills](#agent-skills)) synced from the product's own repo, staged, and delivered only to that product's jobs. Design and decision log: `prds/1909-job-files-product-skills.md`. Until PRD #1906 M8 wires jobs to the no-internet lane, a job has no fetch service and its `sources` is empty.
 
 User-facing behaviour is in [docs/jobs.md](docs/jobs.md).
 

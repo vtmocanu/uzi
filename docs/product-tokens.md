@@ -11,7 +11,7 @@ A **product token** (`uzp_…`) lets an external product call uzi **as you**. Yo
 ## What it can and cannot reach
 
 - **Only `/api/v1`**, the stable external API. Everywhere else, including every `/api/*` route the web app and the `uzi` CLI use, `/api/ws` and every admin route, a product token is treated exactly like an unknown token. This is structural: product tokens live in their own table that the internal routes never read.
-- **`GET /api/v1/whoami`**, which returns your user (id, display name), the product, and the token's scopes, and **the jobs endpoints** (`/api/v1/jobs`), gated by the scopes below. See [Jobs](./jobs.md).
+- **`GET /api/v1/whoami`**, which returns your user (id, display name), the product, and the token's scopes, **the jobs endpoints** (`/api/v1/jobs`), and **the file endpoints** (`POST /api/v1/files`, `GET /api/v1/jobs/{id}/files`, `GET /api/v1/files/{id}`), gated by the scopes below. See [Jobs](./jobs.md) and [Job files](./jobs.md#job-files).
 - **Never admin.** `/api/v1` drops admin authority for every caller, so a token an admin minted still acts as a plain user.
 - **`/api/v1` also accepts your own `uzc_` CLI token** (user scope), for scripts. `uza_` tokens and browser cookies are refused there.
 
@@ -26,6 +26,8 @@ The `uzi` CLI cannot use a product token: it needs a CLI token (`uzc_` or `uza_`
 Minting is a browser action only (no CLI or Bearer mint), so a stolen token cannot mint replacements.
 
 **Scopes:** `jobs:run` (start and cancel jobs) and `jobs:read` (read status and results). Pick at least one; a token can never do more than its scopes. A token with `jobs:run` can still only start the **job types its product allows** (below), and sees only its own product's jobs.
+
+**Files follow the same scopes.** `jobs:run` uploads input files, `jobs:read` lists and downloads a job's files. An upload made with a product token is scoped to that product: only a token of the same product can attach it to a job, and until it is attached only that product can see it. After that a file is visible exactly as its job is, so a product token reads only the files of its own product's jobs. Another product's file, or a file of your own `uzc_` jobs, is a 404. Files expire (7 days after the job ends by default), so download what you need.
 
 **Expiry:** 30 days, 90 days (default), 1 year, or never. The server sets the timestamp. Choose "never" only for unattended products you trust, and watch its last-used entry.
 
