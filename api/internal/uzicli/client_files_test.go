@@ -62,6 +62,8 @@ func TestHTTPUploadFileHeadersAndStatuses(t *testing.T) {
 		var ee *ExitError
 		if !errors.As(err, &ee) || ee.Code != want.code || !strings.Contains(ee.Error(), want.msg) {
 			t.Errorf("status %d: err = %v", status, err)
+		} else if (status == 415 || status == 507) && ee.Reason != "r" {
+			t.Errorf("status %d: Reason = %q, want r", status, ee.Reason)
 		}
 	}
 }
@@ -92,5 +94,8 @@ func TestHTTPDownloadFile(t *testing.T) {
 	var ee *ExitError
 	if !errors.As(err, &ee) || ee.Code != ExitNotFound || !strings.Contains(ee.Error(), "file expired") {
 		t.Errorf("410 err = %v", err)
+	}
+	if ee.Reason != "file_expired" {
+		t.Errorf("410 Reason = %q, want file_expired", ee.Reason)
 	}
 }

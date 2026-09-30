@@ -11,6 +11,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -118,9 +119,14 @@ func newJobFileGetCmd(env Env, gf *globalFlags) *cobra.Command {
 		Long: "Download one file by id (list ids with `job files`). It is written to -o <path>, or by " +
 			"default to its storage name (<sha256>.<ext>) in the current directory. An existing " +
 			"file is never overwritten: the command refuses instead. The bytes are streamed to a " +
-			"temporary file next to the target and renamed into place only when complete; when the " +
-			"storage name carries the file's sha256 the digest is verified. The bytes are " +
-			"untrusted data: open them with care. An expired file is reported as expired.",
+			"hidden temporary file (.uzi-download-*.tmp) next to the target and linked into place " +
+			"only when complete, so nothing appears at the target name until then; an interrupted " +
+			"download may leave only that temporary file behind. The size is checked against the " +
+			"response's Content-Length, and the sha256 is verified when the server's storage name " +
+			"(<sha256>.<ext>) carries it; with -o the file's sha256 is still taken from that " +
+			"storage name, so only a server that sends no name skips the digest check. -o names a " +
+			"path: `-o -` writes a file called `-`, not standard output. The bytes are untrusted " +
+			"data: open them with care. An expired file is reported as expired.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.jobClient(gf)
@@ -140,6 +146,8 @@ func newJobFileGetCmd(env Env, gf *globalFlags) *cobra.Command {
 				target = dl.StorageName
 			} else if strings.TrimSpace(out) == "" {
 				return uzicli.Exitf(uzicli.ExitUsage, "-o needs a path")
+			} else if out == "-" {
+				return uzicli.Exitf(uzicli.ExitUsage, "-o - is not standard output: the file is always saved to a path (use -o ./- for a file named -)")
 			}
 			n, sum, err := saveDownload(dl, target)
 			if err != nil {
@@ -157,55 +165,18 @@ func newJobFileGetCmd(env Env, gf *globalFlags) *cobra.Command {
 	return cmd
 }
 
-// saveDownload streams dl to target without ever replacing an existing file: the name is
-// reserved with O_EXCL first, the bytes go to a temp file in the same directory, and the temp is
-// renamed over the reservation only after the size and, when the storage name carries one, the
-// sha256 check out. Any failure removes both the temp and the reservation.
+// saveDownload streams dl to target via uzicli.SafeSaveDownload: the bytes go to a temp file
+// next to the target and are hard-linked into place only after the size and, when the storage
+// name carries one, the sha256 check out. Nothing exists at target until then, so an interrupt
+// or a failed transfer leaves no partial file there, and an existing path is never replaced.
 func saveDownload(dl *uzicli.FileDownload, target string) (int64, string, error) {
-	dir := filepath.Dir(target)
-	placeholder, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // G304: the operator's own -o argument to their local CLI.
-	if err != nil {
-		if os.IsExist(err) {
-			return 0, "", uzicli.Exitf(uzicli.ExitUsage, "%q already exists: refusing to overwrite it (choose another -o path or remove it)", target)
-		}
-		return 0, "", uzicli.Exitf(uzicli.ExitGeneric, "cannot create %q: %v", target, err)
+	want := ""
+	if m := storageNameRE.FindStringSubmatch(dl.StorageName); m != nil {
+		want = m[1]
 	}
-	_ = placeholder.Close()
-	done := false
-	tmpPath := ""
-	defer func() {
-		if !done {
-			_ = os.Remove(target)
-			if tmpPath != "" {
-				_ = os.Remove(tmpPath)
-			}
-		}
-	}()
-	tmp, err := os.CreateTemp(dir, ".uzi-download-*")
-	if err != nil {
-		return 0, "", uzicli.Exitf(uzicli.ExitGeneric, "cannot write next to %q: %v", target, err)
-	}
-	tmpPath = tmp.Name()
-	h := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, h), dl.Body)
-	if cerr := tmp.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return 0, "", uzicli.Exitf(uzicli.ExitUnreachable, "download failed: %v", err)
-	}
-	if dl.Size >= 0 && n != dl.Size {
-		return 0, "", uzicli.Exitf(uzicli.ExitUnreachable, "download incomplete: got %d of %d bytes", n, dl.Size)
-	}
-	sum := hex.EncodeToString(h.Sum(nil))
-	if m := storageNameRE.FindStringSubmatch(dl.StorageName); m != nil && m[1] != sum {
-		return 0, "", uzicli.Exitf(uzicli.ExitGeneric, "downloaded bytes do not match the file's sha256 (%s, expected %s): not saved", sum, m[1])
-	}
-	if err := os.Rename(tmpPath, target); err != nil {
-		return 0, "", uzicli.Exitf(uzicli.ExitGeneric, "cannot move the download into place: %v", err)
-	}
-	done = true
-	return n, sum, nil
+	return uzicli.SafeSaveDownload(target, dl.Size, want, func(w io.Writer) (int64, error) {
+		return io.Copy(w, dl.Body)
+	})
 }
 
 // uploadJobFiles uploads every --file path and returns the stored file ids, in order. Each file
@@ -216,11 +187,27 @@ func uploadJobFiles(ctx context.Context, c uzicli.Client, paths []string) ([]str
 	for _, path := range paths {
 		id, err := uploadJobFile(ctx, c, path)
 		if err != nil {
-			return nil, err
+			return nil, withUnattachedIDs(err, ids)
 		}
 		ids = append(ids, id)
 	}
 	return ids, nil
+}
+
+// withUnattachedIDs names the file ids an aborted multi-file upload already stored, so the
+// operator can see what was left unattached. The exit code and Reason of an *ExitError survive.
+func withUnattachedIDs(err error, ids []string) error {
+	if len(ids) == 0 {
+		return err
+	}
+	wrapped := fmt.Errorf("%w; %d file(s) already uploaded stay unattached and expire on their own: %s", err, len(ids), strings.Join(ids, ", "))
+	var ee *uzicli.ExitError
+	if errors.As(err, &ee) {
+		cp := *ee
+		cp.Err = wrapped
+		return &cp
+	}
+	return wrapped
 }
 
 func uploadJobFile(ctx context.Context, c uzicli.Client, path string) (string, error) {

@@ -8,10 +8,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -34,6 +36,8 @@ type filesServer struct {
 	skills    apitypes.ProductSkillsDTO
 	products  []apitypes.ProductDTO
 	uploadErr int
+	// uploadErrAfter, when > 0, lets that many uploads succeed before uploadErr fires.
+	uploadErrAfter int
 }
 
 type uploadSeen struct {
@@ -45,7 +49,7 @@ func (fs *filesServer) handler(t *testing.T) http.Handler {
 	mux.HandleFunc("POST /api/v1/files", func(w http.ResponseWriter, r *http.Request) {
 		fs.mu.Lock()
 		defer fs.mu.Unlock()
-		if fs.uploadErr != 0 {
+		if fs.uploadErr != 0 && len(fs.uploads) >= fs.uploadErrAfter {
 			w.WriteHeader(fs.uploadErr)
 			_, _ = w.Write([]byte(`{"error":"nope","reason":"x"}`))
 			return
@@ -446,5 +450,194 @@ func TestAdminProductsSkillsHostileStringsEscaped(t *testing.T) {
 		if strings.HasPrefix(line, "FORGED_ROW") {
 			t.Errorf("a newline forged a row: %q", line)
 		}
+	}
+}
+
+// truncatedFileServer promises 1000 bytes under a valid storage name, sends 10 and aborts the
+// connection (http.ErrAbortHandler), like a server or proxy dying mid-stream.
+func truncatedFileServer(t *testing.T, name string, onPartial func()) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte("0123456789"))
+		w.(http.Flusher).Flush()
+		if onPartial != nil {
+			onPartial()
+		}
+		panic(http.ErrAbortHandler)
+	}))
+}
+
+func TestJobFileGetAbortedDownloadLeavesNothingAndNextGetSucceeds(t *testing.T) {
+	body := "file bytes"
+	name := sha256Hex(body) + ".txt"
+	srv := truncatedFileServer(t, name, nil)
+	dir := t.TempDir()
+	t.Chdir(dir)
+	_, _, code := runCLI(t, httpEnv(srv), "job", "file", "get", "f1")
+	srv.Close()
+	if code == 0 {
+		t.Fatalf("an aborted download exited 0")
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+		t.Errorf("files left behind after an aborted download: %v", ents)
+	}
+	fs := &filesServer{fileBody: body, fileName: name}
+	good := httptest.NewServer(fs.handler(t))
+	defer good.Close()
+	if out, _, code := runCLI(t, httpEnv(good), "job", "file", "get", "f1"); code != 0 {
+		t.Fatalf("the next get exit = %d\n%s", code, out)
+	}
+	if b, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(b) != body {
+		t.Errorf("file = %q, %v", b, err)
+	}
+}
+
+// A file another process puts at the target while the download streams is never replaced.
+func TestJobFileGetNeverReplacesFileAppearingMidDownload(t *testing.T) {
+	body := "file bytes"
+	name := sha256Hex(body) + ".txt"
+	dir := t.TempDir()
+	t.Chdir(dir)
+	target := filepath.Join(dir, name)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
+		_, _ = w.Write([]byte(body[:4]))
+		w.(http.Flusher).Flush()
+		// Wait until the client has its temp file open, so the seed lands mid-download.
+		for deadline := time.Now().Add(5 * time.Second); time.Now().Before(deadline); time.Sleep(10 * time.Millisecond) {
+			found := false
+			ents, _ := os.ReadDir(dir)
+			for _, e := range ents {
+				found = found || strings.HasPrefix(e.Name(), ".uzi-download-")
+			}
+			if found {
+				break
+			}
+		}
+		if err := os.WriteFile(target, []byte("precious"), 0o600); err != nil {
+			t.Errorf("seed: %v", err)
+		}
+		_, _ = w.Write([]byte(body[4:]))
+	}))
+	defer srv.Close()
+	_, errOut, code := runCLI(t, httpEnv(srv), "job", "file", "get", "f1")
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, "refusing to overwrite") {
+		t.Errorf("exit = %d stderr = %q", code, errOut)
+	}
+	if b, _ := os.ReadFile(target); string(b) != "precious" {
+		t.Errorf("a file that appeared mid-download was replaced: %q", b)
+	}
+	ents, _ := os.ReadDir(dir)
+	if len(ents) != 1 {
+		t.Errorf("temp file left behind: %v", ents)
+	}
+}
+
+// TestHelperJobFileGetStalled is the child half of TestJobFileGetInterruptedLeavesNothingAtTarget:
+// it runs `job file get` against the URL in the environment and is killed by the parent.
+func TestHelperJobFileGetStalled(t *testing.T) {
+	url := os.Getenv("UZI_TEST_HELPER_URL")
+	if url == "" {
+		t.Skip("helper process only")
+	}
+	if err := os.Chdir(os.Getenv("UZI_TEST_HELPER_DIR")); err != nil {
+		t.Fatal(err)
+	}
+	env := fakeEnv(nil)
+	env.NewClient = func(uzicli.Settings) uzicli.Client {
+		return &uzicli.HTTPClient{BaseURL: url, Token: "uzc_test", HTTP: http.DefaultClient}
+	}
+	runCLI(t, env, "job", "file", "get", "f1")
+}
+
+// Ctrl-C (SIGINT) kills the CLI without running deferred cleanup, so nothing may exist at the
+// target name while the body is still streaming.
+func TestJobFileGetInterruptedLeavesNothingAtTarget(t *testing.T) {
+	name := sha256Hex("whole file") + ".txt"
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
+		w.Header().Set("Content-Length", "1000")
+		_, _ = w.Write([]byte("0123456789"))
+		w.(http.Flusher).Flush()
+		select {
+		case <-release:
+		case <-r.Context().Done():
+		}
+	}))
+	defer srv.Close()
+	defer close(release)
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperJobFileGetStalled$")
+	cmd.Env = append(os.Environ(), "UZI_TEST_HELPER_URL="+srv.URL, "UZI_TEST_HELPER_DIR="+dir)
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	waited := make(chan error, 1)
+	go func() { waited <- cmd.Wait() }()
+	// Wait until the child has started writing (something exists in the directory), then interrupt.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if ents, _ := os.ReadDir(dir); len(ents) > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			_ = cmd.Process.Kill()
+			t.Fatal("the child never began the download")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if err := cmd.Process.Signal(syscall.SIGINT); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(10 * time.Second):
+		_ = cmd.Process.Kill()
+		t.Fatal("the child survived SIGINT")
+	}
+	if _, err := os.Lstat(filepath.Join(dir, name)); err == nil {
+		t.Fatalf("an interrupted download left %s at the target name", name)
+	}
+	// A later get into the same directory is unaffected by whatever the interrupt left.
+	fs := &filesServer{fileBody: "whole file", fileName: name}
+	good := httptest.NewServer(fs.handler(t))
+	defer good.Close()
+	t.Chdir(dir)
+	if out, _, code := runCLI(t, httpEnv(good), "job", "file", "get", "f1"); code != 0 {
+		t.Fatalf("the next get exit = %d\n%s", code, out)
+	}
+}
+
+func TestJobFileGetRefusesDashOutput(t *testing.T) {
+	fs := &filesServer{fileBody: "x", fileName: sha256Hex("x")}
+	srv := httptest.NewServer(fs.handler(t))
+	defer srv.Close()
+	dir := t.TempDir()
+	t.Chdir(dir)
+	_, errOut, code := runCLI(t, httpEnv(srv), "job", "file", "get", "f1", "-o", "-")
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, "not standard output") {
+		t.Errorf("exit = %d stderr = %q", code, errOut)
+	}
+	if ents, _ := os.ReadDir(dir); len(ents) != 0 {
+		t.Errorf("files left behind: %v", ents)
+	}
+}
+
+func TestJobCreateFilePartialUploadNamesUnattachedIDs(t *testing.T) {
+	a := writeTemp(t, "a.txt", "x")
+	b := writeTemp(t, "b.txt", "y")
+	fs := &filesServer{uploadErr: http.StatusUnsupportedMediaType, uploadErrAfter: 1}
+	srv := httptest.NewServer(fs.handler(t))
+	defer srv.Close()
+	_, errOut, code := runCLI(t, httpEnv(srv), "job", "create", "--type", "research", "--prompt", "p", "--file", a, "--file", b)
+	if code != uzicli.ExitUsage || !strings.Contains(errOut, "file-1") || !strings.Contains(errOut, "unattached") {
+		t.Errorf("exit = %d stderr = %q", code, errOut)
+	}
+	if len(fs.jobBodies) != 0 {
+		t.Errorf("a job was created after a failed upload")
 	}
 }

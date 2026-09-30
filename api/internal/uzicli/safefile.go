@@ -71,7 +71,7 @@ func SafeWriteVerifiedFile(dest string, expectedSize int64, expectedChecksum str
 	dir := filepath.Dir(dest)
 
 	// (2) Create the private temp file in dest's own directory.
-	tmp, tmpName, err := createExclTemp(dir)
+	tmp, tmpName, err := createExclTemp(dir, ".uzi-export-")
 	if err != nil {
 		return err
 	}
@@ -117,13 +117,13 @@ func SafeWriteVerifiedFile(dest string, expectedSize int64, expectedChecksum str
 // random name, returning the open file and its path. A random name plus O_EXCL means two
 // concurrent exports into the same directory cannot collide onto one temp; on the rare
 // EEXIST it retries with fresh randomness.
-func createExclTemp(dir string) (*os.File, string, error) {
+func createExclTemp(dir, prefix string) (*os.File, string, error) {
 	for attempt := 0; attempt < 10; attempt++ {
 		var b [9]byte
 		if _, err := rand.Read(b[:]); err != nil {
 			return nil, "", Exitf(ExitGeneric, "cannot generate a temp file name: %v", err)
 		}
-		name := filepath.Join(dir, ".uzi-export-"+hex.EncodeToString(b[:])+".tmp")
+		name := filepath.Join(dir, prefix+hex.EncodeToString(b[:])+".tmp")
 		//nolint:gosec // G304: name is a random temp file this helper builds inside the operator's own --output directory; creating it is the command's purpose, not untrusted inclusion.
 		f, err := os.OpenFile(name, os.O_CREATE|os.O_WRONLY|os.O_EXCL, 0o600)
 		if err == nil {
@@ -135,4 +135,53 @@ func createExclTemp(dir string) (*os.File, string, error) {
 		return nil, "", Exitf(ExitGeneric, "cannot create a temp file in %q: %v", dir, err)
 	}
 	return nil, "", Exitf(ExitGeneric, "cannot create a unique temp file in %q after several attempts", dir)
+}
+
+// SafeSaveDownload is the `uzi job file get` counterpart of SafeWriteVerifiedFile: the same
+// temp-file-then-os.Link sequence, so nothing ever appears at dest until the bytes are complete
+// and verified, and an existing path (file or symlink, including one that appears mid-download)
+// is refused, never replaced. Unlike the export helper the manifest values are optional:
+// expectedSize < 0 skips the size check and an empty expectedChecksum skips the digest check
+// (a download whose name carries no sha256 and whose response had no Content-Length). It
+// returns the byte count and the sha256 of what was streamed. The temp file is named
+// `.uzi-download-<random>.tmp` in dest's directory; an interrupt that kills the process before
+// the deferred removal leaves only that clearly named file, never anything at dest, and a later
+// run is unaffected by it.
+//
+// Errors: an occupied dest is ExitUsage; a stream failure or size shortfall is
+// ExitUnreachable; a digest mismatch is ExitGeneric.
+func SafeSaveDownload(dest string, expectedSize int64, expectedChecksum string, stream ArchiveStreamFunc) (int64, string, error) {
+	if _, err := os.Lstat(dest); err == nil {
+		return 0, "", Exitf(ExitUsage, "%q already exists: refusing to overwrite it (choose another -o path or remove it)", dest)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, "", Exitf(ExitGeneric, "cannot stat %q: %v", dest, err)
+	}
+	tmp, tmpName, err := createExclTemp(filepath.Dir(dest), ".uzi-download-")
+	if err != nil {
+		return 0, "", err
+	}
+	defer func() { _ = os.Remove(tmpName) }()
+
+	hasher := sha256.New()
+	written, streamErr := stream(io.MultiWriter(tmp, hasher))
+	if cerr := tmp.Close(); cerr != nil && streamErr == nil {
+		streamErr = cerr
+	}
+	if streamErr != nil {
+		return 0, "", Exitf(ExitUnreachable, "download failed: %v", streamErr)
+	}
+	if expectedSize >= 0 && written != expectedSize {
+		return 0, "", Exitf(ExitUnreachable, "download incomplete: got %d of %d bytes", written, expectedSize)
+	}
+	sum := hex.EncodeToString(hasher.Sum(nil))
+	if expectedChecksum != "" && !strings.EqualFold(sum, expectedChecksum) {
+		return 0, "", Exitf(ExitGeneric, "downloaded bytes do not match the file's sha256 (%s, expected %s): not saved", sum, strings.ToLower(expectedChecksum))
+	}
+	if err := os.Link(tmpName, dest); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return 0, "", Exitf(ExitUsage, "%q appeared during the download: refusing to overwrite it; nothing was written there", dest)
+		}
+		return 0, "", Exitf(ExitGeneric, "cannot move the download into place: %v", err)
+	}
+	return written, sum, nil
 }

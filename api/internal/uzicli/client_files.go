@@ -123,21 +123,26 @@ func (c *HTTPClient) DownloadFile(ctx context.Context, id string) (*FileDownload
 // the shared mapping.
 func fileStatusError(status int, body []byte, retryAfter string) *ExitError {
 	msg := serverErrMsg(body)
+	var e *ExitError
 	switch status {
 	case http.StatusGone:
-		return Exitf(ExitNotFound, "file expired: its bytes are gone and cannot be downloaded")
+		e = Exitf(ExitNotFound, "file expired: its bytes are gone and cannot be downloaded")
 	case http.StatusUnsupportedMediaType:
 		if msg == "" {
 			msg = "the file type is not supported"
 		}
-		return Exitf(ExitUsage, "unsupported file type: %s", msg)
+		e = Exitf(ExitUsage, "unsupported file type: %s", msg)
 	case http.StatusInsufficientStorage:
 		if msg == "" {
 			msg = "storage quota exceeded"
 		}
-		return Exitf(ExitGeneric, "storage quota exceeded: %s", strings.TrimSpace(msg))
+		e = Exitf(ExitGeneric, "storage quota exceeded: %s", strings.TrimSpace(msg))
+	default:
+		return statusError(status, body, retryAfter)
 	}
-	return statusError(status, body, retryAfter)
+	// Carry the typed reason like statusError does, so a caller can branch on it.
+	e.Reason = serverErrReason(body)
+	return e
 }
 
 // AdminProductSkills reads one product's skill set (GET /api/admin/products/{id}/skills): the
