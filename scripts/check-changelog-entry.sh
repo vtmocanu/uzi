@@ -16,8 +16,9 @@
 # uncommitted and untracked, so a pre-commit `task gate` agrees with CI). When any path in it
 # is shipping (scripts/lib/shipping-paths.sh, the oracle's own definition), one of these must
 # hold:
-#   - CHANGELOG.md gains at least one line (removals alone do not count; the landing
-#     tooling's changelog guard owns deletions).
+#   - CHANGELOG.md's `## [Unreleased]` section gains a nonblank line (a blank line, a
+#     removal or an edit under a released version does not count; the landing tooling's
+#     changelog guard owns deletions).
 #   - A non-merge commit on the branch carries `Changelog: none` (the oracle's regex). The
 #     repo squashes with COMMIT_MESSAGES, so the line reaches the squash body and exempts
 #     the merge at release time too; it is therefore PR-wide by design. Add a reason.
@@ -26,8 +27,10 @@
 #     branch squashed under a non-docs PR title still fails there: a stricter later check,
 #     never a bypass.
 #   - Every shipping path is a dependency manifest (basename go.mod, go.sum, Dockerfile or
-#     devbox.lock). Dependency bumps are cited in bulk at cut time, as before; this only
-#     spares the bot branch a per-PR commit. deploy/chart/** is never exempt.
+#     devbox.lock) AND every shipping commit is `chore(deps):`/`fix(deps):`/`build(deps):`
+#     typed, so a behavior edit to a Dockerfile under a fix title is not spared.
+#     Dependency bumps are cited in bulk at cut time, as before; this only spares the
+#     bot branch a per-PR commit. deploy/chart/** is never exempt.
 # Merge commits (a pull_request checkout's synthetic merge, a merged-in main) are skipped
 # for messages, so their "Merge ..." subject neither breaks nor satisfies a rule.
 #
@@ -89,36 +92,51 @@ pass() { echo "check-changelog-entry.sh: OK: $1"; exit 0; }
 
 [ "$shipping" = 1 ] || pass "no shipping path changed since $(git rev-parse --short "$BASE")"
 
-git diff "$BASE" -- CHANGELOG.md > "$TMP/changelog.diff"
-grep -qE '^\+[^+]|^\+$' "$TMP/changelog.diff" && pass "CHANGELOG.md gains an entry"
+# The [Unreleased] section's lines, from its heading to the next `## [` heading.
+unreleased() { awk '/^## \[Unreleased\]/ {f=1; next} /^## \[/ {f=0} f'; }
+{ git show "$BASE:CHANGELOG.md" 2>/dev/null || true; } | unreleased > "$TMP/unreleased.base"
+{ cat CHANGELOG.md 2>/dev/null || true; } | unreleased > "$TMP/unreleased.head"
+# A nonblank line the base section lacks; a blank line or an edit under a released
+# version does not count.
+diff "$TMP/unreleased.base" "$TMP/unreleased.head" > "$TMP/unreleased.diff" || true
+grep -qE '^> .*[^[:space:]]' "$TMP/unreleased.diff" && pass "CHANGELOG.md [Unreleased] gains an entry"
 
 git log --no-merges --format=%B "$BASE..HEAD" > "$TMP/bodies"
 grep -qiE '^Changelog:[[:space:]]*none' "$TMP/bodies" && pass "a branch commit carries 'Changelog: none'"
 
-# docs exemption: at least one shipping commit, all of them docs-typed, nothing shipping
-# left uncommitted.
-docs_ok=1
-shipping_commits=0
-while read -r sha; do
-  [ -n "$sha" ] || continue
-  touches=0
+# all_shipping_commits <subject-ERE>: true when at least one non-merge branch commit
+# touches a shipping path, every such commit's subject matches, and no shipping path is
+# left uncommitted (the committed subjects must describe the whole diff).
+all_shipping_commits() {
+  local n=0 sha f touches
+  while read -r sha; do
+    [ -n "$sha" ] || continue
+    touches=0
+    while read -r f; do
+      [ -n "$f" ] || continue
+      if is_shipping "$f"; then touches=1; break; fi
+    done < <(git diff-tree --no-commit-id --name-only -r "$sha")
+    [ "$touches" = 1 ] || continue
+    n=$((n + 1))
+    git log -1 --format=%s "$sha" > "$TMP/subject"
+    grep -qE "$1" "$TMP/subject" || return 1
+  done < <(git rev-list --no-merges "$BASE..HEAD")
+  [ "$n" -gt 0 ] || return 1
+  { git diff --name-only HEAD --; git ls-files --others --exclude-standard; } > "$TMP/uncommitted"
   while read -r f; do
     [ -n "$f" ] || continue
-    if is_shipping "$f"; then touches=1; break; fi
-  done < <(git diff-tree --no-commit-id --name-only -r "$sha")
-  [ "$touches" = 1 ] || continue
-  shipping_commits=$((shipping_commits + 1))
-  git log -1 --format=%s "$sha" > "$TMP/subject"
-  grep -qE '^docs(\([^)]*\))?:' "$TMP/subject" || docs_ok=0
-done < <(git rev-list --no-merges "$BASE..HEAD")
-{ git diff --name-only HEAD --; git ls-files --others --exclude-standard; } > "$TMP/uncommitted"
-while read -r f; do
-  [ -n "$f" ] || continue
-  if is_shipping "$f"; then docs_ok=0; break; fi
-done < "$TMP/uncommitted"
-[ "$docs_ok" = 1 ] && [ "$shipping_commits" -gt 0 ] && pass "every shipping commit is docs-typed"
+    if is_shipping "$f"; then return 1; fi
+  done < "$TMP/uncommitted"
+  return 0
+}
 
-[ "$manifest_only" = 1 ] && pass "only dependency manifests changed (cited in bulk at cut time)"
+all_shipping_commits '^docs(\([^)]*\))?:' && pass "every shipping commit is docs-typed"
+
+# Dependency exemption: manifest paths only AND every shipping commit dependency-typed
+# (Renovate's `chore(deps):` / `fix(deps):`), so a behavior edit to a Dockerfile under a
+# fix title is not spared.
+[ "$manifest_only" = 1 ] && all_shipping_commits '^(chore|fix|build)\(deps\)!?:' \
+  && pass "only dependency manifests changed, in dependency-typed commits (cited in bulk at cut time)"
 
 echo "check-changelog-entry.sh: FAIL: shipping paths changed with no CHANGELOG.md entry:" >&2
 sed 's/^/  /' "$TMP/shipping" | head -20 >&2

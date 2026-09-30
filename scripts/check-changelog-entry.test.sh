@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=20
+FLOOR=25
 cases=0
 passed=0
 
@@ -21,7 +21,8 @@ fresh() {
   mkdir -p "$d/seed/scripts/lib" "$d/seed/api" "$d/seed/deploy/chart"
   cp "$ROOT/scripts/check-changelog-entry.sh" "$d/seed/scripts/"
   cp "$ROOT/scripts/lib/shipping-paths.sh" "$d/seed/scripts/lib/"
-  printf '# Changelog\n\n## [Unreleased]\n' > "$d/seed/CHANGELOG.md"
+  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n- old\n' > "$d/seed/CHANGELOG.md"
+  echo 'FROM scratch' > "$d/seed/api/Dockerfile"
   echo 'package api' > "$d/seed/api/x.go"
   echo 'module x' > "$d/seed/api/go.mod"
   echo 'a: 1' > "$d/seed/deploy/chart/values.yaml"
@@ -34,6 +35,11 @@ fresh() {
   W="$d/work"
 }
 commit() { git -C "$W" add -A; git -C "$W" commit -qm "$1"; }
+# unrel <line>: insert a line directly under `## [Unreleased]`.
+unrel() {
+  awk -v l="$1" '{print} /^## \[Unreleased\]/ {print ""; print l}' "$W/CHANGELOG.md" > "$W/CHANGELOG.tmp"
+  mv "$W/CHANGELOG.tmp" "$W/CHANGELOG.md"
+}
 
 # expect <want-rc> <label>
 expect() {
@@ -57,13 +63,19 @@ expect 0 "non-shipping change only"
 fresh bare-fix; echo '// y' >> "$W/api/x.go"; commit "fix(api): y"
 expect 1 "shipping change, no entry"
 
-fresh with-entry; echo '// y' >> "$W/api/x.go"; printf '\n### Fixed\n\n- y (#1)\n' >> "$W/CHANGELOG.md"; commit "fix(api): y"
-expect 0 "shipping change with a CHANGELOG line"
+fresh with-entry; echo '// y' >> "$W/api/x.go"; unrel '- y (#1)'; commit "fix(api): y"
+expect 0 "shipping change with an [Unreleased] line"
+
+fresh blank-line; echo '// y' >> "$W/api/x.go"; unrel ''; commit "fix(api): y"
+expect 1 "a blank [Unreleased] line is not an entry"
+
+fresh released-section; echo '// y' >> "$W/api/x.go"; printf -- '- y (#1)\n' >> "$W/CHANGELOG.md"; commit "fix(api): y"
+expect 1 "a line under a released version is not an entry"
 
 fresh deletion-only; echo '// y' >> "$W/api/x.go"; printf '# Changelog\n' > "$W/CHANGELOG.md"; commit "fix(api): y"
 expect 1 "CHANGELOG removal alone is not an entry"
 
-fresh uncommitted-entry; echo '// y' >> "$W/api/x.go"; commit "fix(api): y"; printf '\n- y (#1)\n' >> "$W/CHANGELOG.md"
+fresh uncommitted-entry; echo '// y' >> "$W/api/x.go"; commit "fix(api): y"; unrel '- y (#1)'
 expect 0 "uncommitted CHANGELOG line counts (pre-commit gate)"
 
 fresh untracked-shipping; echo 'package api' > "$W/api/new.go"
@@ -83,6 +95,15 @@ expect 1 "docs commit plus uncommitted shipping change is not exempt"
 
 fresh manifest-only; echo 'require y v1' >> "$W/api/go.mod"; commit "chore(deps): bump y"
 expect 0 "dependency manifest only"
+
+fresh dockerfile-deps; echo 'FROM scratch@sha256:abc' > "$W/api/Dockerfile"; commit "chore(deps): update scratch digest"
+expect 0 "dependency-typed Dockerfile bump"
+
+fresh dockerfile-fix; echo 'USER 0' >> "$W/api/Dockerfile"; commit "fix(api): run as root"
+expect 1 "a fix-titled Dockerfile edit is not a dependency bump"
+
+fresh manifest-uncommitted; echo 'require y v1' >> "$W/api/go.mod"; commit "chore(deps): bump y"; echo 'USER 0' >> "$W/api/Dockerfile"
+expect 1 "an uncommitted manifest edit is not covered by the deps subject"
 
 fresh manifest-plus-code; echo 'require y v1' >> "$W/api/go.mod"; echo '// y' >> "$W/api/x.go"; commit "chore(deps): bump y"
 expect 1 "manifest plus source is not exempt"
