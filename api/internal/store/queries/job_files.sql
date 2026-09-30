@@ -39,17 +39,23 @@ SELECT
 SELECT id FROM runs WHERE id = @id AND user_id = @user_id AND kind = 'job';
 
 -- name: SumCommittedSharedBytes :one
--- The bytes actually on the books, for the bind-time reclaim: every non-expired job file plus every
--- 'available' recovery capture by its bound byte_size. Unlike SumStoredFileBytes it deliberately
--- leaves out the unverified in-flight reservations (preparing/uploading captures), so a reclaim
--- sized from it can never be inflated by bytes another upload only declared. @exclude_capture_id
--- leaves the capture being bound out (it is not 'available' yet, so this is belt and braces).
+-- The bytes actually on the books, for the bind-time reclaim. committed_bytes is every job file
+-- that is neither 'expired' nor 'reserved' (available/attached, verified bytes) plus every
+-- 'available' recovery capture by its bound byte_size. It deliberately leaves out BOTH kinds of
+-- unverified declared bytes: in-flight capture reservations (preparing/uploading) and job files
+-- still in state 'reserved' (size declared at admission, nothing verified yet). A reclaim sized
+-- from committed_bytes therefore can never be inflated by bytes another party only declared.
+-- reserved_job_bytes returns the 'reserved' job-file bytes separately: the caller does not size a
+-- reclaim from them, but must leave that room free, because a job-file Write never re-checks the
+-- budget. @exclude_capture_id leaves the capture being bound out (it is not 'available' yet, so
+-- this is belt and braces).
 SELECT (
-  COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state <> 'expired'), 0)
+  COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state NOT IN ('expired', 'reserved')), 0)
   + COALESCE((SELECT sum(COALESCE(c.byte_size, 0)) FROM recovery_captures c
                WHERE c.state = 'available'
                  AND (sqlc.narg('exclude_capture_id')::uuid IS NULL OR c.id <> sqlc.narg('exclude_capture_id')::uuid)), 0)
-)::bigint AS committed_bytes;
+)::bigint AS committed_bytes,
+COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state = 'reserved'), 0)::bigint AS reserved_job_bytes;
 
 -- name: SumRunJobFiles :one
 -- One run's live (non-expired) files of one direction: the per-job file-count and byte caps.

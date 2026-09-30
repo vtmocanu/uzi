@@ -406,23 +406,34 @@ func (q *Queries) StampCaptureReservation(ctx context.Context, arg StampCaptureR
 
 const sumCommittedSharedBytes = `-- name: SumCommittedSharedBytes :one
 SELECT (
-  COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state <> 'expired'), 0)
+  COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state NOT IN ('expired', 'reserved')), 0)
   + COALESCE((SELECT sum(COALESCE(c.byte_size, 0)) FROM recovery_captures c
                WHERE c.state = 'available'
                  AND ($1::uuid IS NULL OR c.id <> $1::uuid)), 0)
-)::bigint AS committed_bytes
+)::bigint AS committed_bytes,
+COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state = 'reserved'), 0)::bigint AS reserved_job_bytes
 `
 
-// The bytes actually on the books, for the bind-time reclaim: every non-expired job file plus every
-// 'available' recovery capture by its bound byte_size. Unlike SumStoredFileBytes it deliberately
-// leaves out the unverified in-flight reservations (preparing/uploading captures), so a reclaim
-// sized from it can never be inflated by bytes another upload only declared. @exclude_capture_id
-// leaves the capture being bound out (it is not 'available' yet, so this is belt and braces).
-func (q *Queries) SumCommittedSharedBytes(ctx context.Context, excludeCaptureID pgtype.UUID) (int64, error) {
+type SumCommittedSharedBytesRow struct {
+	CommittedBytes   int64 `json:"committed_bytes"`
+	ReservedJobBytes int64 `json:"reserved_job_bytes"`
+}
+
+// The bytes actually on the books, for the bind-time reclaim. committed_bytes is every job file
+// that is neither 'expired' nor 'reserved' (available/attached, verified bytes) plus every
+// 'available' recovery capture by its bound byte_size. It deliberately leaves out BOTH kinds of
+// unverified declared bytes: in-flight capture reservations (preparing/uploading) and job files
+// still in state 'reserved' (size declared at admission, nothing verified yet). A reclaim sized
+// from committed_bytes therefore can never be inflated by bytes another party only declared.
+// reserved_job_bytes returns the 'reserved' job-file bytes separately: the caller does not size a
+// reclaim from them, but must leave that room free, because a job-file Write never re-checks the
+// budget. @exclude_capture_id leaves the capture being bound out (it is not 'available' yet, so
+// this is belt and braces).
+func (q *Queries) SumCommittedSharedBytes(ctx context.Context, excludeCaptureID pgtype.UUID) (SumCommittedSharedBytesRow, error) {
 	row := q.db.QueryRow(ctx, sumCommittedSharedBytes, excludeCaptureID)
-	var committed_bytes int64
-	err := row.Scan(&committed_bytes)
-	return committed_bytes, err
+	var i SumCommittedSharedBytesRow
+	err := row.Scan(&i.CommittedBytes, &i.ReservedJobBytes)
+	return i, err
 }
 
 const sumReclaimableJobFileBytes = `-- name: SumReclaimableJobFileBytes :one

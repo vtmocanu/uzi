@@ -3,6 +3,7 @@ package recovery
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/google/uuid"
@@ -243,6 +244,67 @@ func TestRecoveryStalledReservationCannotInflateReclaimLiveDB(t *testing.T) {
 		}
 		if got := e.jobState(t, victim); got != "available" {
 			t.Fatalf("victim = %q, want available: 900 committed + 100 verified fits the 1000 budget with no reclaim", got)
+		}
+	})
+}
+
+// TestRecoveryStalledJobFileReservationCannotInflateReclaimLiveDB: a job file still in state
+// 'reserved' (size declared, nothing written) is not committed bytes, so it cannot drive the
+// bind-time reclaim, and the bind leaves its declared room free instead of reclaiming to cover it
+// (a job-file Write never re-checks the budget).
+//
+// Budget 1000; a victim's 900-byte file is available. An attacker reserves a 100-byte job file and
+// never writes, then uploads a verified 1-byte capture. Committed 900 + verified 1 fits, so nothing
+// is reclaimed; but 900 committed + 100 reserved + 1 verified = 1001 exceeds the budget, so the
+// upload fails ErrQuota (rolled back) and the victim's file stays available. Without the stalled
+// reservation the same upload succeeds and the victim stays available.
+//
+// CALIBRATION: count 'reserved' job files in committed_bytes again (state <> 'expired' in
+// SumCommittedSharedBytes); the excess becomes 1 and the victim is expired, so the first subtest
+// goes red.
+func TestRecoveryStalledJobFileReservationCannotInflateReclaimLiveDB(t *testing.T) {
+	one := []byte("c")
+
+	t.Run("stalled reservation refuses the upload and destroys nothing", func(t *testing.T) {
+		e := newSFEnv(t)
+		svc, jf := e.recovery(1000), e.jobFiles()
+		victim := e.availableJobFile(t, jf, "big.txt", 900, 5)
+
+		attacker := uuid.New()
+		e.exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, attacker, fmt.Sprintf("sf-%s@e2e", attacker))
+		res, err := jf.Reserve(e.ctx, workersvc.ReserveParams{UserID: attacker, Direction: workersvc.JobFileInput, DisplayName: "stall.txt", DeclaredSize: 100})
+		if err != nil {
+			t.Fatalf("attacker Reserve: %v", err)
+		}
+
+		capID := e.newCapture(t, svc)
+		if _, err := svc.Upload(e.ctx, e.wkr, e.runID, capID, manifestOf(one), bytes.NewReader(one)); !errors.Is(err, ErrQuota) {
+			t.Fatalf("1-byte upload with 900 committed + 100 reserved = %v, want ErrQuota (1001 > 1000)", err)
+		}
+		if got := e.jobState(t, victim); got != "available" {
+			t.Fatalf("victim = %q, want available: a stalled reservation must not expire another user's file", got)
+		}
+		if got := e.jobState(t, res.ID); got != "reserved" {
+			t.Fatalf("attacker reservation = %q, want it untouched", got)
+		}
+		if st, _ := e.captureState(t, capID); st == "available" {
+			t.Fatalf("capture = %q, want it not bound", st)
+		}
+	})
+
+	t.Run("control without the reservation succeeds", func(t *testing.T) {
+		e := newSFEnv(t)
+		svc, jf := e.recovery(1000), e.jobFiles()
+		victim := e.availableJobFile(t, jf, "big.txt", 900, 5)
+		capID := e.newCapture(t, svc)
+		if _, err := svc.Upload(e.ctx, e.wkr, e.runID, capID, manifestOf(one), bytes.NewReader(one)); err != nil {
+			t.Fatalf("1-byte upload (900 + 1 fits): %v", err)
+		}
+		if st, _ := e.captureState(t, capID); st != "available" {
+			t.Fatalf("capture = %q, want available", st)
+		}
+		if got := e.jobState(t, victim); got != "available" {
+			t.Fatalf("victim = %q, want available", got)
 		}
 	})
 }

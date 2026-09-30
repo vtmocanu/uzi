@@ -6,6 +6,9 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // PRD #1909 M1 rework, at the job-file store: Reserve refuses a run that is not the reserving
@@ -92,5 +95,27 @@ func TestJobFilesSweepSkipsWriterHeldReservationLiveDB(t *testing.T) {
 	}
 	if r, err := e.jf.Sweep(e.ctx); err != nil || r.ReleasedReservations != 1 {
 		t.Fatalf("sweep after the writer finished = %+v, %v; want the stale reservation released", r, err)
+	}
+}
+
+// TestJobFilesRunDeletedUnderInsertMapsToNotFoundLiveDB: a run deleted between Reserve's ownership
+// read and its insert surfaces as the job_files.run_id foreign-key violation from the insert. The
+// insert here goes straight at the query with a run id that no longer exists (the deleted-run
+// state), and the resulting error must be recognised by isRunFKViolation, which Reserve maps to
+// ErrJobRunNotFound.
+//
+// CALIBRATION: rename the constraint name compared in isRunFKViolation; this test goes red.
+func TestJobFilesRunDeletedUnderInsertMapsToNotFoundLiveDB(t *testing.T) {
+	e := newJFEnv(t, wide())
+	owner := e.seedUser(t)
+	gone := uuid.New()
+	_, err := store.New(e.pool).ReserveJobFile(e.ctx, store.ReserveJobFileParams{
+		UserID: owner, RunID: pgconv.UUIDPtr(&gone), Direction: JobFileOutput, DisplayName: "o.txt", ByteSize: 10,
+	})
+	if err == nil {
+		t.Fatal("insert against a missing run succeeded")
+	}
+	if !isRunFKViolation(err) {
+		t.Fatalf("insert error = %v, want the job_files_run_id_fkey violation recognised", err)
 	}
 }

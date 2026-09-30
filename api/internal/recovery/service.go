@@ -273,7 +273,8 @@ func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captur
 // one attached to a live job or being uploaded) happens in stream (reclaimForBudget) only after the
 // upload's size and checksum verified, and it is sized from COMMITTED bytes only (see
 // reclaimForBudget), so a worker that declares a size and sends no bytes, or garbage, cannot expire
-// anyone's files, and neither can its stalled reservation inflate another upload's reclaim. Admission
+// anyone's files, and neither can a stalled capture or job-file reservation inflate another
+// upload's reclaim. Admission
 // keeps counting reservations: that is what makes the admission decision honest.
 func (s *Service) admit(ctx context.Context, wkr store.Worker, runID, captureID uuid.UUID, manifest apitypes.RecoveryUploadManifest) (apitypes.RecoveryCaptureStatusResponse, bool, error) {
 	tx, err := s.pool.Begin(ctx)
@@ -420,21 +421,23 @@ func (s *Service) stream(ctx context.Context, wkr store.Worker, runID, captureID
 }
 
 // reclaimForBudget runs in the stream transaction AFTER the upload's size and checksum verified,
-// just before the manifest binds. When the COMMITTED bytes (every non-expired job file plus every
-// available recovery capture, store SumCommittedSharedBytes) plus the verified size exceed the shared
-// stored-files budget, it reclaims exactly that excess of job files (ReclaimJobFilesForRecovery) and
-// re-sums; if the total still does not fit, the upload fails ErrQuota and the transaction rolls back
-// (no bind, no chunks, and the reclaim with it). Nothing else destroys job files on a recovery
+// just before the manifest binds. When the COMMITTED bytes (every job file that is neither expired
+// nor still 'reserved', plus every available recovery capture, store SumCommittedSharedBytes) plus
+// the verified size exceed the shared stored-files budget, it reclaims exactly that excess of job
+// files (ReclaimJobFilesForRecovery) and re-sums; if the committed bytes, the reserved job-file
+// bytes and the verified size together still do not fit, the upload fails ErrQuota and the
+// transaction rolls back (no bind, no chunks, and the reclaim with it). Nothing else destroys job files on a recovery
 // upload's behalf.
 //
-// WHY COMMITTED BYTES ONLY. The sum deliberately leaves out every other capture's unverified
-// in-flight reservation (preparing/uploading, reserved_bytes). Counting them would let a worker
-// admit capture B declaring a large size, never stream it, then upload a tiny capture C: C's bind
-// would see B's declared bytes as used and reclaim (destroy) other users' job files to make room
-// for bytes that were never sent. Sized from committed bytes, the excess can never exceed `verified`,
+// WHY COMMITTED BYTES ONLY. The reclaim-sizing sum deliberately leaves out unverified declared
+// bytes: every other capture's in-flight reservation (preparing/uploading, reserved_bytes) and every
+// job file still in state 'reserved'. Counting them would let a caller declare a large size, never
+// send it, then upload a tiny capture: its bind would see the declared bytes as used and reclaim
+// (destroy) other users' job files to make room for bytes that were never sent. Sized from committed bytes, the excess can never exceed `verified`,
 // the bytes this upload actually delivered. This cannot let the committed total pass the budget:
-// this bind re-sums the committed bytes under LockStoredFiles and only proceeds when committed +
-// verified <= budget (the re-check below), and every other committer (a job-file Reserve, another
+// this bind re-sums under LockStoredFiles and only proceeds when committed + reserved job-file bytes
+// + verified <= budget (the re-check below; job-file reservations are not reclaimed for, but their
+// room is left free, since a job-file Write never re-checks the budget), and every other committer (a job-file Reserve, another
 // bind) does the same under the same lock, so the invariant "committed <= budget" holds after every
 // commit. Reservations affect only ADMISSION (admit and job-file Reserve still count them, so
 // nobody is admitted into room that is already spoken for); a reservation that loses the race to a
@@ -456,25 +459,26 @@ func (s *Service) reclaimForBudget(ctx context.Context, tx pgx.Tx, qtx *store.Qu
 	if err := store.LockStoredFiles(ctx, tx, owner); err != nil {
 		return err
 	}
-	committed, err := qtx.SumCommittedSharedBytes(ctx, pgtype.UUID{Bytes: captureID, Valid: true})
+	sums, err := qtx.SumCommittedSharedBytes(ctx, pgtype.UUID{Bytes: captureID, Valid: true})
 	if err != nil {
 		return err
 	}
-	excess := committed + verified - budget
-	if excess <= 0 {
-		return nil
+	if excess := sums.CommittedBytes + verified - budget; excess > 0 {
+		if _, err := qtx.ReclaimJobFilesForRecovery(ctx, store.ReclaimJobFilesForRecoveryParams{
+			Now:  pgconv.Time(s.now()),
+			Need: excess,
+		}); err != nil {
+			return err
+		}
+		// Re-sum rather than trust the freed figure: it is the sum the budget bounds.
+		if sums, err = qtx.SumCommittedSharedBytes(ctx, pgtype.UUID{Bytes: captureID, Valid: true}); err != nil {
+			return err
+		}
 	}
-	if _, err := qtx.ReclaimJobFilesForRecovery(ctx, store.ReclaimJobFilesForRecoveryParams{
-		Now:  pgconv.Time(s.now()),
-		Need: excess,
-	}); err != nil {
-		return err
-	}
-	// Re-sum rather than trust the freed figure: it is the sum the budget bounds.
-	if committed, err = qtx.SumCommittedSharedBytes(ctx, pgtype.UUID{Bytes: captureID, Valid: true}); err != nil {
-		return err
-	}
-	if committed+verified > budget {
+	// The check ALSO counts job-file reservations, with or without a reclaim: a job-file Write never
+	// re-checks the budget, so the bind must leave their declared room free instead of reclaiming to
+	// cover it.
+	if sums.CommittedBytes+sums.ReservedJobBytes+verified > budget {
 		return ErrQuota
 	}
 	return nil

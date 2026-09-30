@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -302,8 +303,9 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 		// a caller could reserve against (and be charged into the caps of) another owner's job. It
 		// is a plain read taken BEFORE the advisory keys, never a row lock inside them: a runs row
 		// held FOR UPDATE elsewhere would otherwise stall every stored-files admission
-		// instance-wide. runs.user_id and runs.kind are immutable, and the job_files.run_id foreign
-		// key stops the run being deleted under the insert.
+		// instance-wide. runs.user_id and runs.kind are immutable. A run deleted between this read
+		// and the insert below is not prevented: the job_files.run_id foreign key rejects the insert,
+		// and that violation is mapped to ErrJobRunNotFound.
 		if _, err := store.New(j.db).GetOwnedJobRun(ctx, store.GetOwnedJobRunParams{ID: *p.RunID, UserID: p.UserID}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return store.JobFile{}, ErrJobRunNotFound
@@ -358,12 +360,22 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 		Sha256:          pgconv.TextOrNull(p.DeclaredSHA256),
 	})
 	if err != nil {
+		if isRunFKViolation(err) {
+			return store.JobFile{}, ErrJobRunNotFound
+		}
 		return store.JobFile{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.JobFile{}, err
 	}
 	return row, nil
+}
+
+// isRunFKViolation reports a foreign-key violation (SQLSTATE 23503) on job_files.run_id: the run
+// was deleted between Reserve's ownership read and its insert.
+func isRunFKViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == "job_files_run_id_fkey"
 }
 
 func int8Ptr(p *int64) pgtype.Int8 {
