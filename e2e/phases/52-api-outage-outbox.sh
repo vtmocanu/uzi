@@ -722,13 +722,41 @@ f42_wait_reclaim() {
   fail "issue 1742: run $run was never re-claimed and running at generation $gen (status=${s:-none} generation=${g:-none})"
 }
 
+# This single-worker harness retains the predecessor clone across the container restart.
+# The exact G+1 claim MUST capture it and park before G+2 executes. A direct G+1 completion
+# is a failure here, not an acceptable alternate path. Pin the extra claim to ordered log
+# evidence and an available capture at EXACT G+1, never accept an arbitrary later generation.
+f42_assert_capture_park() {
+  local run="$1" gen="$2" log_file="$RUNROOT/.f42-capture.log" recovery_file="$RUNROOT/.f42-capture.json"
+  "${COMPOSE[@]}" logs --no-color agent > "$log_file" 2>/dev/null \
+    || fail "issue 1742: could not read predecessor-capture evidence for $run"
+  jq -Rse --arg run "$run" --argjson gen "$gen" '
+    [split("\n")[] | sub("^[^{]*"; "") | fromjson? | select(.run_id == $run)] as $events |
+    [$events | to_entries[] | select(.value.msg == "run claimed") | .key] as $claims |
+    [$events | to_entries[] | select(.value.msg == "run parked for transient recovery"
+      and .value.detail == "recovering retained work before reseeding") | .key] as $parks |
+    [$events | to_entries[] | select(.value.msg == "recovery: park/early-terminal disposition outcome"
+      and .value.claim_generation == $gen and .value.state == "uploaded") | .key] as $captures |
+    ($claims | length) == 3 and ($parks | length) == 1 and ($captures | length) == 1
+    and $claims[1] < $parks[0] and $parks[0] < $captures[0] and $captures[0] < $claims[2]
+  ' "$log_file" >/dev/null \
+    || fail "issue 1742: run $run lacks the exact G+1 capture/park then G+2 claim sequence"
+  uzi_cli run recovery "$run" --json > "$recovery_file" \
+    || fail "issue 1742: could not read recovery captures for $run"
+  jq -e --argjson gen "$gen" '
+    [.[] | select(.generation == $gen) | .captures[]? | select(.state == "available")] | length == 1
+  ' "$recovery_file" >/dev/null \
+    || fail "issue 1742: run $run has no unique available capture at generation $gen"
+  pass "run $run: exact generation $gen captured retained work and parked before the next claim"
+}
+
 # The api is up here, so a failure to resolve the budget can fail at once.
 F42_MAX="$(f42_max_requeues)" || fail "issue 1742: cannot resolve RUN_MAX_REQUEUES from the rendered compose config: $(f42_max_requeues 2>&1 >/dev/null || true)"
 
 # -----------------------------------------------------------------------------
 # CASE 7 (A, completion control): the durable finalize record lets the run resume at G+1 even with the
-# requeue budget spent, and it completes there.
-say "CASE 7: finalize record durable + agent restart during an api outage, budget spent -> re-claimed at G+1 and completes (never worker_lost)"
+# requeue budget spent. G+1 captures the retained predecessor clone and parks; G+2 completes.
+say "CASE 7: finalize restart on spent budget -> G+1 capture park -> G+2 completes (never worker_lost)"
 make_outbox_run
 RUN_F1="$OUTBOX_RUN"
 GEN_F1="$(rb_run_field "$RUN_F1" claim_generation)"
@@ -745,14 +773,16 @@ wait_status "$RUN_F1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_D
   || fail "case 7: run $RUN_F1 carries fail_origin=$(rb_run_field "$RUN_F1" fail_origin) — the orphan pass failed a run the finalize allowance should have resumed"
 [ "$(rb_run_field "$RUN_F1" finalize_resume_generation)" = "$GEN_F1" ] \
   || fail "case 7: finalize_resume_generation is '$(rb_run_field "$RUN_F1" finalize_resume_generation)', want $GEN_F1 — the allowance was not consumed for the durable finalize generation"
-[ "$(rb_run_field "$RUN_F1" claim_generation)" = "$((GEN_F1 + 1))" ] \
-  || fail "case 7: run $RUN_F1 completed at generation $(rb_run_field "$RUN_F1" claim_generation), want $((GEN_F1 + 1)) (re-claimed once after the restart)"
-pass "case 7: run $RUN_F1 was re-claimed at generation $((GEN_F1 + 1)) on a spent budget (finalize_resume_generation=$GEN_F1) and completed, never worker_lost"
+f42_assert_capture_park "$RUN_F1" "$((GEN_F1 + 1))"
+[ "$(rb_run_field "$RUN_F1" claim_generation)" = "$((GEN_F1 + 2))" ] \
+  || fail "case 7: run $RUN_F1 completed at generation $(rb_run_field "$RUN_F1" claim_generation), want $((GEN_F1 + 2)) after the proved G+1 capture park"
+pass "case 7: run $RUN_F1 captured at generation $((GEN_F1 + 1)) and completed at $((GEN_F1 + 2)); finalize_resume_generation=$GEN_F1, never worker_lost"
 
 # -----------------------------------------------------------------------------
-# CASE 8 (B, one-shot control): the allowance is used ONCE. A second interruption at G+1 leaves the
+# CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 capture park, a second
+# interruption of the EXECUTING generation G+2 leaves the
 # spent budget to fail the run as worker_lost, and the failed run's recovery hold is never a silent empty one.
-say "CASE 8: allowance is one-shot: resumed at G+1, interrupted again at G+1 -> failed worker_lost, finalize_resume_generation stays G"
+say "CASE 8: allowance is one-shot: G+1 capture park, G+2 finalize interrupted -> worker_lost, mark stays G"
 make_outbox_run
 RUN_F2="$OUTBOX_RUN"
 GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
@@ -764,15 +794,16 @@ else
   api_back
   f42_cut_judge "$rc" "$RUN_F2" "$GEN_F2"
 fi
-f42_wait_reclaim "$RUN_F2" "$((GEN_F2 + 1))" 120
+f42_wait_reclaim "$RUN_F2" "$((GEN_F2 + 2))" 120
+f42_assert_capture_park "$RUN_F2" "$((GEN_F2 + 1))"
 [ "$(rb_run_field "$RUN_F2" finalize_resume_generation)" = "$GEN_F2" ] \
   || fail "case 8: after the first interruption finalize_resume_generation is '$(rb_run_field "$RUN_F2" finalize_resume_generation)', want $GEN_F2"
 # The allowance is charged as a requeue, and the second cut below must NOT reset the counter downward.
 [ "$(rb_run_field "$RUN_F2" requeue_count)" = "$((F42_MAX + 1))" ] \
   || fail "case 8: after the allowance requeue requeue_count is '$(rb_run_field "$RUN_F2" requeue_count)', want $((F42_MAX + 1)) (RUN_MAX_REQUEUES $F42_MAX + the one charged requeue)"
-pass "case 8: run $RUN_F2 re-queued under the allowance and running at generation $((GEN_F2 + 1)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
-# Second cut, at G+1, as soon as the re-run is running: the api goes down before its (short) stream ends.
-GEN_F2B=$((GEN_F2 + 1))
+pass "case 8: run $RUN_F2 used the allowance, captured at G+1, and is executing at generation $((GEN_F2 + 2)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
+# Second cut at the proved EXECUTING G+2: G+1 was the retained-clone capture, not an executor turn.
+GEN_F2B=$((GEN_F2 + 2))
 say "second cut: run $RUN_F2 at generation $GEN_F2B"
 rc=0; f42_cut "$RUN_F2" "$GEN_F2B" || rc=$?
 if [ "$rc" = 0 ]; then

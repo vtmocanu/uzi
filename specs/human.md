@@ -868,11 +868,11 @@ Tracked as GitHub issue vtmocanu/uzi#1393; PRD at `prds/1391-worker-outbox-durab
 - While a worker still holds an unsent outcome for a run, no second execution of that run ever starts. (AI-synced 2026-09-17)
 - An outcome the api permanently refuses is shown on the run as held on the worker, and is resolved only by the owner explicitly discarding it, never on a timer. (AI-synced 2026-09-17)
 
-## Feature #1742 — A worker restart after the agent finished does not fail the run
+## Feature #1742: A worker restart after the agent finished does not fail the run
 
 Tracked as GitHub issue vtmocanu/uzi#1742; ADR at `adr/1742-finalize-resume-allowance.md`.
 
-- A worker restart after the agent finished but before the run's outcome was durably recorded resumes the run once, instead of failing it `worker_lost` when its re-queue budget is already spent; the resumed attempt completes only through the normal completion path at the next claim generation (the claim-generation fences, plus the completion permit where the run is interlocked). (AI-synced 2026-09-30)
+- A worker restart after the agent finished but before the run's outcome was durably recorded resumes the run once, instead of failing it `worker_lost` when its re-queue budget is already spent; the resumed attempt completes only through the normal completion path at a later claim generation (the next claim, or the one after it when that claim first captures retained work and parks) (the claim-generation fences, plus the completion permit where the run is interlocked). (AI-synced 2026-09-30)
 - The residual window stays: a crash before the worker's finalize record is durable (after the agent's final turn but before the agent call returns, or during the record's own write) behaves as before, re-queued under budget and failed `worker_lost` over budget. (AI-synced 2026-09-30)
 - The extra resume is once per run, and `RUN_MAX_REQUEUES=0` still means a run is never re-queued. A restart slower than the stale windows is handled by the sweeper first: an under-budget run is re-queued and only an over-budget one is failed. (AI-synced 2026-09-30)
 - After such a restart, `uzi run recovery` is honest about the source. A finalization-pinned head that is verifiable in the worker's local repository and not yet on the default branch becomes an exportable archive (`archive_ready`, `uzi run export`); otherwise the hold is retained `source_only` custody, reported as "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)", and export is not offered for it. (AI-synced 2026-09-30)

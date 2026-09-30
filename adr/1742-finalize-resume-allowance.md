@@ -28,8 +28,9 @@ honest about what survives such a restart.
 Two facts bound the design. First, nothing the worker can write before finalize ends proves the
 run *succeeded*: the outcome is the terminal journal, and synthesizing one early would be a lie
 that a completion permit would then have to trust. Second, the api already re-runs a re-queued
-run through the ordinary claim path, which re-runs the executor at the next claim generation and
-completes only through the normal completion path (the claim-generation fences, plus the completion
+run through the ordinary claim path. When a predecessor clone survives, the next claim first
+captures retained work and parks; a later claim then re-runs the executor. Completion still goes
+only through the normal completion path (the claim-generation fences, plus the completion
 permit where the run is interlocked). So the fix
 does not have to complete anything; it only has to stop the api failing the run.
 
@@ -556,16 +557,20 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
 5. Expect for A: the scratch worker's log has a `"msg":"register finalize snapshot"` line whose
    `claim_generations_sample` array includes G; the api's register commit line ("worker register
    active snapshot committed", JSON) shows `"finalize_allowance_used":1`; `runs.finalize_resume_generation = G`; A
-   is re-claimed at G+1 and reaches `completed` with its merge request through the normal
-   completion path at the next claim generation (the claim-generation fences, plus the completion
-   permit where the run is interlocked), never `failed`/`worker_lost`.
+   is re-claimed at G+1. If the predecessor clone survives, prove G+1's retained-work capture
+   and recovery park, then completion at G+2; without that clone, completion is at G+1. Both paths
+   use the normal completion path (claim-generation fences and the completion permit where
+   interlocked), never `failed`/`worker_lost`. Record the exact generation and recovery evidence;
+   an unexplained extra claim is a failure, not an allowed tolerance.
 6. **Run B**, a new scratch run that also requests a merge request. Repeat steps 1 to 4 at its
    generation G; B is re-queued under the allowance.
-7. When B shows `running` at G+1, re-apply the deny policy **before** the re-run's executor
-   returns. Wait for the durable point at G+1 (both parts), **repeating step 1's abort check:
-   if a `"msg":"finalize record durable"` line already exists for B at G+1 before the cut was applied, abort
-   the attempt.** Then run the pre-kill check at G+1, kill the agent process and delete the
-   policy.
+7. If B's predecessor clone survives, prove the G+1 retained-work capture and recovery park,
+   then wait for the executing generation E = G+2. Without that clone E = G+1. Re-apply the deny
+   policy **before** E's executor returns. Wait for the durable point at E (both parts),
+   **repeating step 1's abort check: if a `"msg":"finalize record durable"` line already exists
+   for B at E before the cut was applied, abort the attempt.** Then run the pre-kill check at E,
+   kill the agent process and delete the policy. Never interrupt a capture-only claim as though
+   it had run an executor.
 8. Expect for B: `failed` with `fail_origin = worker_lost`; `finalize_resume_generation` still G
    (the allowance is not reused); and `uzi run recovery <B>` shows either an `archive_ready` hold
    whose archive `uzi run export` downloads (a finalization-pinned source), or a `source_only` hold
