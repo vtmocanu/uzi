@@ -196,7 +196,7 @@ describe("job SDK options: the effective tool surface (PRD #1908 M4)", () => {
     };
     it("denies absolute, home, and parent-traversal patterns", async () => {
       const g = hook();
-      for (const p of ["../../**/*", "/etc/**", "~/.ssh/*", "a/../../b", "{../..,x}/*", "{/etc,x}/*", "..\\x", "@(/etc)/x", "+(/a|/etc)", "[/]etc/*", " /etc/*", "x/* ", "$HOME/*", "a/$X", "x, ~/y"]) {
+      for (const p of ["../../**/*", "/etc/**", "~/.ssh/*", "a/../../b", "{../..,x}/*", "{/etc,x}/*", "..\\x", "@(/etc)/x", "+(/a|/etc)", "[/]etc/*", "+(a|/etc)", "@(a|~/x)", "a /etc/*", " /etc/*", "x/* ", "$HOME/*", "a/$X", "x, ~/y"]) {
         assert.strictEqual(await g("Glob", { pattern: p }), "deny", `Glob ${p}`);
         assert.strictEqual(await g("Grep", { pattern: "x", glob: p }), "deny", `Grep ${p}`);
       }

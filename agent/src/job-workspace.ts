@@ -1,8 +1,9 @@
 // The per-run job workspace (PRD #1908, Decision 5): a scratch directory tree the repo-less `job`
 // run kind works in, at `<worker data root>/jobs/<run_id>`. It lives OUTSIDE the clone
-// (`runner/`) and attempt roots, is created at claim with mode 0700, and is removed at terminal.
+// (`runner/`) and attempt roots, is created at claim with mode 0700 (single-uid) or the setgid codex-session group modes below
+// (uid split), and is removed at terminal.
 //
-//   <jobsRoot>/<run_id>/            0700, the whole tree removed at terminal
+//   <jobsRoot>/<run_id>/            0700 (uid split: 2750), the whole tree removed at terminal
 //     home/                         the SDK HOME (transcripts); NOT inside the agent's file jail
 //     work/                         the SDK cwd and the path-guard root
 //       inputs/NN-<name>            the caller's named input documents
@@ -10,7 +11,7 @@
 // Under the PRD #51 uid split (UZI_UID_SPLIT=1) the SDK CLI runs as the `runner` uid while this
 // worker process creates the tree, so 0700 would lock the CLI out of its own HOME, cwd and
 // inputs. There the jobs root is a `codex-session` group carve-out (entrypoint.sh: worker:codex-session
-// 3770; gid 10004 holds only worker + runner, NOT `runner`, whose members include the Codex
+// 3710 (group traverse only: the worker alone creates/lists entries); gid 10004 holds only worker + runner, NOT `runner`, whose members include the Codex
 // command shell uid 10003), and setgid makes every child inherit that group. The run root/inputs
 // are group-traversable/readable (2750) and home is group-writable (2770), inputs files 0640.
 // `work` is created 2750 and only widened to 2770 by openJobWorkspace AFTER the inputs are
@@ -84,7 +85,7 @@ async function assertRealJobsRoot(jobsRoot: string): Promise<void> {
   }
 }
 
-/** Create `<jobsRoot>/<runId>` (0700; group-runner modes under the uid split) with its home/work/inputs subtree. A leftover tree for the
+/** Create `<jobsRoot>/<runId>` (0700 single-uid; under the uid split the setgid codex-session modes: root 2750, home 2770, work 2750 then 2770, inputs 2750, files 0640) with its home/work/inputs subtree. A leftover tree for the
  *  same run id (a requeue on this worker after a hard kill) is removed first. */
 export async function createJobWorkspace(
   jobsRoot: string,

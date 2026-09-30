@@ -527,7 +527,7 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
     }
   });
 
-  it("jobs root converges every boot to worker:codex-session 3770 (never group runner, never world), even when worker-owned", () => {
+  it("jobs root converges every boot to worker:codex-session 3710 (never group runner, never world), even when worker-owned", () => {
     const h = makeHarness();
     try {
       fs.mkdirSync(h.nix);
@@ -537,7 +537,7 @@ describe("PRD #1493 M2: root-branch migration ownership map (portable, record-on
       assert.equal(r.status, 0, `run must succeed (stderr: ${r.stderr})`);
       const jobs = `${h.data}/jobs`;
       assert.ok(opMatches(r.ops, "chown 0:0", jobs), "jobs is reclaimed to root first");
-      assert.ok(opMatches(r.ops, "chmod 3770", jobs), "jobs is chmod 3770");
+      assert.ok(opMatches(r.ops, "chmod 3710", jobs), "jobs is chmod 3710");
       assert.ok(opMatches(r.ops, "chown worker:codex-session", jobs), "jobs is handed to worker:codex-session");
       assert.ok(!r.ops.some((o) => o.includes(jobs) && (o.includes("worker:runner") || o.includes("3775"))), "jobs is never group runner / 3775");
     } finally {
