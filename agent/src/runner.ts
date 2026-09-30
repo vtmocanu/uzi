@@ -3313,8 +3313,9 @@ export class RunRunner {
   /**
    * Issue #1742: retire this flight's finalize-pending record once the generation's fate is durably
    * recorded elsewhere. The retirement sites are: journalAndSendTerminal after the terminal journal
-   * is installed, journalAndSendTerminal after an unjournaled terminal send resolved, and the
-   * executeClaim catch after the api accepted a park (limit, recovery, pause, server wall park).
+   * is installed; journalAndSendTerminal after an unjournaled terminal send resolved; the
+   * executeClaim catch after the api accepted a limit, disk, recovery, pause or server-wall park;
+   * the accepted vault-lock park; and the accepted completion hold in phasePublish.
    * The graceful-shutdown branch deliberately never calls this, so the record survives a SIGTERM.
    * Never throws.
    */

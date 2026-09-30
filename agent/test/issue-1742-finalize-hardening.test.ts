@@ -134,7 +134,16 @@ describe("issue #1742 finalize hardening: Outbox write seams", () => {
     assert.equal(res.written, false);
     assert.match(res.reason ?? "", /injected dir fsync failure/);
     assert.equal(msgs(lines).includes("finalize record durable"), false);
-    assert.deepEqual(outbox.listPendingFinalizes(), [], "an unconfirmed-durable record is never offered");
+    assert.deepEqual(outbox.listPendingFinalizes(), [], "an unconfirmed-durable record is not listed in this process");
+    // The link happened before the fsync failed, so the file IS on disk: the safe, intended behaviour.
+    assert.deepEqual(await finalizeFiles(root, RUN_A), ["finalize-3.json"], "the linked file is on disk after the failure");
+    // A restarted Outbox loads it (and would offer it) until it is retired.
+    const restarted = makeOutbox(root);
+    await restarted.init();
+    assert.deepEqual(restarted.listPendingFinalizes(), [{ run_id: RUN_A, claim_generation: 3 }]);
+    await restarted.retireFinalize(RUN_A, 3);
+    assert.deepEqual(await finalizeFiles(root, RUN_A), [], "retireFinalize removes the linked file");
+    assert.deepEqual(restarted.listPendingFinalizes(), []);
   });
 
   it("an adopt after an unconfirmed install keeps the on-disk `since`, not the retry's clock", async () => {

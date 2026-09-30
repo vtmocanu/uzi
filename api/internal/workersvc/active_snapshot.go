@@ -1,6 +1,7 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
@@ -44,6 +45,11 @@ type ActiveSnapshot struct {
 	// claim path. Omitted by an older worker, ignored by an older api (the snapshot is parsed
 	// leniently).
 	FinalizeResume []FinalizeResumeEntry `json:"finalize_resume,omitempty"`
+
+	// finalizeResumeMalformed is set by UnmarshalJSON when finalize_resume had a wrong wire type
+	// and was dropped. Only the register path (validateFinalizeResume) logs it, with the worker id;
+	// heartbeat and claim snapshots stay silent about the field.
+	finalizeResumeMalformed bool
 }
 
 // UnmarshalJSON decodes an ActiveSnapshot with FinalizeResume decoded as a SEPARATE lenient step
@@ -53,6 +59,10 @@ type ActiveSnapshot struct {
 // Active terminal_pending leases or pending_overflow (#1391). Every other field keeps the strict
 // typed decode it had before the finalize list existed.
 func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
+	// json.Unmarshaler convention: a JSON null is a no-op.
+	if string(bytes.TrimSpace(data)) == "null" {
+		return nil
+	}
 	type plain ActiveSnapshot
 	aux := struct {
 		*plain
@@ -62,12 +72,13 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 		return err
 	}
 	s.FinalizeResume = nil
+	s.finalizeResumeMalformed = false
 	if len(aux.FinalizeResume) == 0 || string(aux.FinalizeResume) == "null" {
 		return nil
 	}
 	var list []FinalizeResumeEntry
 	if err := json.Unmarshal(aux.FinalizeResume, &list); err != nil {
-		slog.Warn("finalize_resume has an invalid wire shape; ignoring the list and keeping the rest of the snapshot")
+		s.finalizeResumeMalformed = true
 		return nil
 	}
 	s.FinalizeResume = list
@@ -160,6 +171,11 @@ type validatedFinalizeResume struct {
 // ActiveSnapshot.UnmarshalJSON already dropped it without failing the rest of the snapshot.
 func (s *Service) validateFinalizeResume(wkr store.Worker, snap *ActiveSnapshot) (validatedFinalizeResume, bool) {
 	var out validatedFinalizeResume
+	if snap != nil && snap.finalizeResumeMalformed {
+		slog.Warn("finalize_resume has an invalid wire shape; ignoring the list and keeping the rest of the snapshot",
+			"worker_id", wkr.ID.String())
+		return out, false
+	}
 	if snap == nil || len(snap.FinalizeResume) == 0 {
 		return out, false
 	}

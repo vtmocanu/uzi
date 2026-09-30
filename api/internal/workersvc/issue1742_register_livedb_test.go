@@ -181,9 +181,10 @@ func TestRegisterAttestedFinalizeLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		// seed
-		gen, requeues int64
-		priorMark     int64 // 0 = NULL
-		maxRequeues   int
+		gen         int64
+		requeues    int32
+		priorMark   int64 // 0 = NULL
+		maxRequeues int
 		// offered attestation generation (-1 = the seeded generation)
 		offerGen int64
 		overflow bool
@@ -214,7 +215,7 @@ func TestRegisterAttestedFinalizeLiveDB(t *testing.T) {
 			p.RunMaxRequeues = tc.maxRequeues
 			svc := snapshotSvc(env, p)
 			workerID := seedSnapshotWorker(t, env, userID, "old-nonce")
-			runID := seedOutageRun(t, env, userID, repoID, workerID, "running", "issue", tc.gen, int32(tc.requeues))
+			runID := seedOutageRun(t, env, userID, repoID, workerID, "running", "issue", tc.gen, tc.requeues)
 			if tc.priorMark != 0 {
 				env.exec(`UPDATE runs SET finalize_resume_generation = $2 WHERE id = $1`, runID, tc.priorMark)
 			}
@@ -230,7 +231,7 @@ func TestRegisterAttestedFinalizeLiveDB(t *testing.T) {
 			if got := statusOf(t, env, runID); got != tc.want.status {
 				t.Fatalf("status = %q, want %q", got, tc.want.status)
 			}
-			if got := requeueCountOf(t, env, runID); int32(got) != tc.want.requeues {
+			if got := requeueCountOf(t, env, runID); got != int(tc.want.requeues) {
 				t.Fatalf("requeue_count = %d, want %d", got, tc.want.requeues)
 			}
 			if got := failOriginOf(t, env, runID); got != tc.want.origin {

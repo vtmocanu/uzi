@@ -184,11 +184,15 @@ describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
     const done = worker.run(controller.signal);
     try {
       await pollUntil(() => !outbox.hasPendingTerminal(RUN, 4), 2000, "the boot resolve retired the terminal");
-      await pollUntil(
-        () => outbox.listPendingFinalizes().some((e) => e.run_id === RUN && e.claim_generation === 6),
-        2000,
-        "RUN's finalize records at <= G were retired, leaving only the higher generation",
-      );
+      const runDir = path.join(tmpRoots[tmpRoots.length - 1]!, "outbox", RUN);
+      const finalizeNames = async (): Promise<string[]> =>
+        (await fsp.readdir(runDir)).filter((n) => n.startsWith("finalize-")).sort();
+      // Wait on the files themselves: the per-run deduped list shows gen 6 before gens 3 and 4 are unlinked.
+      let names: string[] = await finalizeNames();
+      for (let i = 0; i < 200 && names.join() !== "finalize-6.json"; i++) {
+        await sleep(10);
+        names = await finalizeNames();
+      }
       // RUN2's record was offered on the accepted register and retired there; RUN keeps only gen 6.
       assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN, claim_generation: 6 }]);
       // The list dedupes by run (highest generation), so assert the files themselves.

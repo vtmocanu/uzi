@@ -1503,8 +1503,11 @@ export class Outbox {
    *  the WHOLE finalize_resume list on a duplicate run_id or on more than its entry cap, so the list
    *  is deduplicated by run (the HIGHEST generation wins) and capped at
    *  {@link FINALIZE_RESUME_MAX_ENTRIES}. The cap keeps the oldest `since` first (run_id tiebreak),
-   *  so the selection is deterministic; the omitted records stay on disk and are offered by a later
-   *  register once these are retired. */
+   *  so the selection is deterministic; the omitted records stay on disk and are offered at the NEXT
+   *  BOOT's register, not a later one in this process (the snapshot is built once per boot). The cap
+   *  mirrors the api's DEFAULT ACTIVE_SNAPSHOT_MAX_ENTRIES, which is operator-configurable: an api
+   *  configured below the offered count drops the WHOLE list, and the worker then still retires the
+   *  offered records after the accepted register. That is a documented limit. */
   listPendingFinalizes(): PendingFinalize[] {
     const best: { run_id: string; claim_generation: number; since: number }[] = [];
     for (const rs of this.runs.values()) {

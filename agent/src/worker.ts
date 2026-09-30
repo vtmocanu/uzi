@@ -347,8 +347,9 @@ export class Worker {
     // wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
-    // snapshot. After an accepted register exactly this set is retired, never a re-listing, so a
-    // record a live flight writes later survives.
+    // snapshot. After an accepted register the offered records (and any lower-generation records of
+    // the same offered runs) are retired, never a re-listing, so a record a live flight writes later
+    // survives.
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
@@ -473,8 +474,9 @@ export class Worker {
           worker_id: res.worker_id ?? null,
         });
         this.dindPrune?.setWorkerId(res.worker_id);
-        // Issue #1742: the api accepted this register, so retire exactly the offered finalize set
-        // (`sentFinalizes`, what the snapshot carried). A failed register never reaches here. A
+        // Issue #1742: the api accepted this register, so retire the offered finalize records
+        // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
+        // offered runs. A failed register never reaches here. A
         // retire failure must not turn an accepted register into a retry loop.
         if (sentFinalizes.length > 0) {
           try {

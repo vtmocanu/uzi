@@ -2257,7 +2257,7 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		if err != nil {
 			return store.Worker{}, "", err
 		}
-		s.publishRegisterSweeps(ctx, append(finalizeFailed, orphanFailed...), append(finalizeRequeued, requeued...))
+		s.publishRegisterOutcome(ctx, finalizeFailed, orphanFailed, finalizeRequeued, requeued)
 		return store.Worker(row), nonce, nil
 	}
 
@@ -2331,8 +2331,17 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 			"worker_id", wkr.ID.String(), "snapshot_offered", false,
 			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
 	}
-	s.publishRegisterSweeps(ctx, append(finalizeFailed, orphanFailed...), append(finalizeRequeued, requeued...))
+	s.publishRegisterOutcome(ctx, finalizeFailed, orphanFailed, finalizeRequeued, requeued)
 	return store.Worker(row), nonce, nil
+}
+
+// publishRegisterOutcome merges the attested finalize-resume transitions with the ordinary orphan
+// pass (failed and requeued separately) and publishes them post-commit; both Register branches
+// (tx and tx-less) call it so the merge is one code path.
+func (s *Service) publishRegisterOutcome(ctx context.Context, finalizeFailed, orphanFailed, finalizeRequeued, requeued []uuid.UUID) {
+	failed := append(append([]uuid.UUID{}, finalizeFailed...), orphanFailed...)
+	queued := append(append([]uuid.UUID{}, finalizeRequeued...), requeued...)
+	s.publishRegisterSweeps(ctx, failed, queued)
 }
 
 // publishRegisterSweeps fans a register-time orphan pass out post-commit (PRD #1390 M2a):
