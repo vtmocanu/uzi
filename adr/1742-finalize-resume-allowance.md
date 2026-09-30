@@ -324,11 +324,14 @@ rollout) reaches the shell and runs the cleanup, not only the foreground command
 check's result yourself and, to abort an attempt, run `exit 1` (the trap then cleans up). Once
 the trap is installed, Ctrl-C (INT), `exit`, a closed terminal (HUP) or TERM all end the attempt
 and run the cleanup; on a signal that arrives while a command is running, the cleanup starts when
-that command returns. **So every wait in steps 1 to 10 must be time-limited** (a bounded `sleep`
-loop, or `timeout <N> <command>`; never `kubectl logs -f` or an unbounded wait): the sketch's own
-rollouts are capped at `--timeout=300s`. A terminal closed at an idle prompt may be seen as
-end-of-input rather than a hangup; the cleanup still runs completely, but then exits 0 and logs
-`status=0`. The cleanup writes its actions
+that command returns. **So every wait in steps 1 to 10 must be time-limited**: a loop of short `sleep`s with a
+bounded number of rounds, or `timeout --foreground <N> <command>` (without `--foreground`,
+`timeout` runs the command in its own process group and a Ctrl-C then waits out the full N);
+never `kubectl logs -f` or an unbounded wait. The sketch's own rollouts are capped at
+`--timeout=300s`. When a bound expires, either repeat the bounded wait or abort with `exit 1`;
+an expired wait is never a pass. A terminal closed at an idle prompt may be seen as end-of-input
+rather than a hangup; the cleanup still runs completely, but then exits with the last command's
+status (or 1 if the cleanup failed) and logs that status, not 129. The cleanup writes its actions
 and verification results to `CLEANUP_LOG` (and to the terminal if it is still there): read that
 file after an attempt that ended by a closed terminal.
 
