@@ -226,6 +226,15 @@ type Client interface {
 	JobResult(ctx context.Context, id string) (apitypes.V1JobResultDTO, error)
 	JobCancel(ctx context.Context, id string) (apitypes.V1JobDTO, error)
 	JobList(ctx context.Context, limit int, cursor string) (apitypes.V1JobListDTO, error)
+	// The job-file verbs (PRD #1909 M7). JobFiles lists a job's input and output files;
+	// UploadFile stores one input file (multipart, with the size and sha256 headers the server
+	// requires) and returns it; DownloadFile opens a file's bytes (the caller closes Body; an
+	// expired file is an ExitNotFound error). AdminProductSkills is the read-only admin view of a
+	// product's skill set (GET /api/admin/products/{id}/skills, a uza_ token works).
+	JobFiles(ctx context.Context, id string) (apitypes.V1JobFilesDTO, error)
+	UploadFile(ctx context.Context, name string, size int64, sha256 string, r io.Reader) (apitypes.V1FileDTO, error)
+	DownloadFile(ctx context.Context, id string) (*FileDownload, error)
+	AdminProductSkills(ctx context.Context, productID string) (apitypes.ProductSkillsDTO, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows

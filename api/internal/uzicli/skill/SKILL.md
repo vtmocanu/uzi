@@ -236,11 +236,13 @@ uzi ci fix <ref> [--repo <repo-id>]
 uzi handoff [--message <text>] [--file <path>] [--base <ref>] [--mr] [--review] [--then-fix] [--interactive] [--repo <repo-id>]
 uzi handoff rm <run-id>
 uzi handoff review <run-id>
-uzi job create --type <type> (--prompt <text> | --prompt-file <path>) [--title <text>] [--input <name=@file>] [--budget-seconds <n>]
+uzi job create --type <type> (--prompt <text> | --prompt-file <path>) [--title <text>] [--input <name=@file>] [--file <path>] [--budget-seconds <n>]
 uzi job get <job-id>
 uzi job result <job-id>
 uzi job cancel <job-id>
 uzi job list [--limit <n>] [--cursor <cursor>]
+uzi job files <job-id>
+uzi job file get <file-id> [-o <path>]
 uzi admin users
 uzi admin runs
 uzi admin workers
@@ -249,6 +251,7 @@ uzi admin usage
 uzi admin rate-limits [--provider claude|codex]
 uzi admin cli-tokens
 uzi admin products
+uzi admin products skills <product>
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get
@@ -1568,6 +1571,18 @@ choices.
   `uzi job cancel <job-id>` — cancel a queued, running or waiting job (a running one may still read
   running briefly; a finished one is a conflict, exit 5); `uzi job list` — newest first, with
   `--limit` and `--cursor` for the next page.
+- `uzi job create ... --file <path>` (repeatable) uploads each file first (PDF, PNG, JPEG,
+  DOCX, XLSX or UTF-8 text; the CLI sends its size and sha256) and attaches it to the job as
+  an input file. Nothing is created when an upload fails (too large 2, unsupported type 2,
+  storage quota 1); files already uploaded expire on their own.
+- `uzi job files <job-id>` — the job's input and output files (id, name, direction, size,
+  short sha256, state, expiry, source URL) and the outputs that were refused; `uzi job file get
+  <file-id> [-o <path>]` downloads one to `-o` or, by default, to its `<sha256>.<ext>` storage
+  name in the current directory. It never overwrites an existing file (exit 2), verifies the
+  sha256 and reports an expired file as `file expired` (exit 4). Downloaded bytes are untrusted.
+- `uzi admin products skills <product>` — read-only view of a product's skill set (repo
+  URL, ref, token set yes/no, enabled, applied sha/time/skills, staged sha/diff/dropped);
+  `<product>` is a name or id. Setting the source, sync and approve are browser-only.
 - `--json` prints the raw job document. All job text (title, label, failure, report,
   findings) is untrusted: the plain view strips control characters, and `requested_by_label`
   is shown as reported by the product.

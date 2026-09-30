@@ -49,6 +49,8 @@ func newJobCmd(env Env, gf *globalFlags) *cobra.Command {
 		newJobResultCmd(env, gf),
 		newJobCancelCmd(env, gf),
 		newJobListCmd(env, gf),
+		newJobFilesCmd(env, gf),
+		newJobFileCmd(env, gf),
 	)
 	return job
 }
@@ -56,7 +58,7 @@ func newJobCmd(env Env, gf *globalFlags) *cobra.Command {
 func newJobCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 	var (
 		jobType, prompt, promptFile, title string
-		inputs                             []string
+		inputs, files                      []string
 		budget                             int
 	)
 	cmd := &cobra.Command{
@@ -64,7 +66,9 @@ func newJobCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Create a job",
 		Long: "Create a job. The prompt is given inline (--prompt) or from a file " +
 			"(--prompt-file, '-' reads stdin). Attach named text inputs with " +
-			"--input name=@file (repeatable). The title is derived from the prompt when omitted.",
+			"--input name=@file (repeatable). Attach files (PDF, PNG, JPEG, DOCX, XLSX or UTF-8 text) " +
+			"with --file <path> (repeatable): each is uploaded first, then attached to the job. " +
+			"The title is derived from the prompt when omitted.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			if strings.TrimSpace(jobType) == "" {
@@ -102,6 +106,11 @@ func newJobCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			if len(files) > 0 {
+				if req.InputFileIDs, err = uploadJobFiles(cmd.Context(), c, files); err != nil {
+					return err
+				}
+			}
 			j, err := c.JobCreate(cmd.Context(), req)
 			if err != nil {
 				return err
@@ -114,6 +123,7 @@ func newJobCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	f := cmd.Flags()
+	f.StringArrayVar(&files, "file", nil, "attach a file, uploaded first (repeatable)")
 	f.StringVar(&jobType, "type", "", "job type (required), e.g. research")
 	f.StringVar(&prompt, "prompt", "", "the job prompt")
 	f.StringVar(&promptFile, "prompt-file", "", "read the prompt from this file ('-' for stdin)")

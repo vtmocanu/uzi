@@ -339,6 +339,8 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	products.AddCommand(newAdminProductSkillsCmd(env, gf))
+
 	guardrailImpact := &cobra.Command{
 		Use:   "guardrail-impact",
 		Short: "Pre-flight count of repos the push/merge guardrail would refuse",

@@ -71,8 +71,8 @@ func TestCommandTree(t *testing.T) {
 		// PRD #576 M7: read (status) + fix-loop re-seed (resync); Adopt/Provision are web-only.
 		"project-sync": {"status", "resync"},
 		"handoff":      {"rm", "review"},
-		"job":          {"create", "get", "result", "cancel", "list"},
-		"admin":        {"users", "runs", "workers", "usage", "rate-limits"},
+		"job":          {"create", "get", "result", "cancel", "list", "files", "file"},
+		"admin":        {"users", "runs", "workers", "usage", "rate-limits", "products"},
 		"skill":        {"status", "install"},
 		"auth":         {"token", "status"},
 	}
@@ -87,6 +87,19 @@ func TestCommandTree(t *testing.T) {
 				t.Errorf("missing %q subcommand %q", parent, kid)
 			}
 		}
+	}
+
+	// PRD #1909 M7: the nested verbs `job file get` and `admin products skills`.
+	for _, path := range [][]string{{"job", "file", "get"}, {"admin", "products", "skills"}} {
+		c := root
+		for _, name := range path {
+			if c = findCmd(c, name); c == nil {
+				t.Fatalf("missing command %v", path)
+			}
+		}
+	}
+	if f := findCmd(findCmd(root, "job"), "create").Flags().Lookup("file"); f == nil {
+		t.Errorf("job create lacks --file")
 	}
 
 	// Global flags are the whole agent contract; assert they exist.

@@ -60,6 +60,18 @@ type FakeClient struct {
 	JobCreateReqs []apitypes.V1JobCreateRequest
 	JobCancelIDs  []string
 	JobListCalls  []JobListCall
+
+	// Job files and product skills (PRD #1909 M7). FilesByJob drives JobFiles; UploadedFile is
+	// returned by UploadFile (its ID is suffixed with the call number when UploadedIDs is unset)
+	// and every upload is recorded in Uploads; DownloadBody/DownloadName drive DownloadFile;
+	// ProductSkills drives AdminProductSkills.
+	FilesByJob    map[string]apitypes.V1JobFilesDTO
+	Uploads       []FakeUpload
+	UploadedIDs   []string
+	DownloadBody  string
+	DownloadName  string
+	DownloadIDs   []string
+	ProductSkills map[string]apitypes.ProductSkillsDTO
 	AdminUsageV   apitypes.AdminUsageDTO
 	RateLimits    []apitypes.AdminRateLimitRowDTO
 	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide
