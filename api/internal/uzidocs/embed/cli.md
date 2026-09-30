@@ -903,9 +903,13 @@ uzi run recovery [--json]
   Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ARCHIVE` (whether an
   available capture exists), `WORKER`, and `AGE`. Run and hold ids are shown in full.
   Below the table it prints the owner-wide `open_holds`, `custody_hold_limit`,
-  `decision_needed`, and `blocked_runs` aggregate, plus a recover-or-discard hint when
-  an open hold needs a decision. With no open holds it says so and still prints the
-  aggregate.
+  `decision_needed`, and `blocked_runs` aggregate. For each `source_only` hold it prints
+  `run <run-id> hold <hold-id>: no recovery archive; custody of worker <name>'s local source
+  is retained (export unavailable; it may be the only copy)`. Then it prints hints: a
+  `uzi run export` hint only when an open hold has an available archive (an `archive_ready`
+  hold), and a `uzi run discard` hint when a hold awaits a decision (`source_only` or
+  `needs_action`, which have no archive to export). With no open holds it says so and
+  still prints the aggregate.
 - Without a run id, `--json` returns the endpoint's `aggregate` and `holds` object,
   including settled holds. These hold rows have no `captures` array. Use the run id
   from this list for the detailed view and capture ids:
@@ -916,7 +920,10 @@ uzi run recovery <run-id> [--json]
 
 - The per-run view shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, an archive ready (which releases automatically), or a
-  capture-less source that needs a decision — plus the latest capture state. `--json` prints
+  capture-less source that needs a decision — plus the latest capture state. A `source_only`
+  hold prints `hold <hold-id>: no recovery archive; custody of worker <name>'s local source is
+  retained (export unavailable; it may be the only copy)`, and the same export and discard
+  hints as above follow. `--json` prints
   the raw rows for scripting, each hold with a `captures` array (id, state, source_sha,
   byte_size, created_at) whose ids `uzi run export --capture` takes; it's always `[]`
   rather than null, including when the run itself was deleted (a released hold outlives

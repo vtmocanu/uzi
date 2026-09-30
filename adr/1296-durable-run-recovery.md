@@ -378,3 +378,32 @@ generation and is inventoried separately after the next successful clone, exactl
 requires for every other evidence class. See
 [adr/1392-forge-unreachable-preclone-park.md](1392-forge-unreachable-preclone-park.md) for the
 full decision record.
+
+## Amendment 2026-09-30 — issue #1742: a finalization-pinned head is bundled at restart without a forge PAT
+
+Refines D5 (the restart-safe re-upload). Before this amendment the restart sweep could only
+re-upload a bundle that was already journaled; a `pinned` record with no bundle, including one
+pinned at the committed head H at finalization, was marked `needs_action` unconditionally, so a
+worker restart between the finalization pin and the completed report left a source-only hold with
+no archive to export even when H was sitting in the worker's local bare repository.
+
+The restart sweep now looks at the previous process's records only (snapshotted before register, so
+a live flight's record is never touched). A `pinned` record written by the finalization pin, which
+now carries MAC-covered `bareDir`, `defaultBranch` and `finalizationPin` facts, whose committed
+head is verified present in the local bare and is **not reachable from the bare's default ref**, is
+bundled **self-contained without a forge PAT**: no forge tip is fetched, so there is no forge
+prerequisite to satisfy. The bundle is journaled and uploaded at the record's exact generation, and
+the hold becomes `archive_ready`. Three limits carry over from the rest of D5:
+
+- The size cap (`RECOVERY_MAX_BUNDLE_BYTES`, 64 MiB) is enforced on the bytes written while
+  streaming, so an oversized bundle stops early and the hold stays `needs_action` (`oversized`).
+  Without forge history to subtract, a PAT-less self-contained bundle may be oversized on a large
+  repository.
+- An **early pin** (the start-tip pin, or any pin that is not the finalization pin) is never
+  bundled at restart and never read as "no unpublished work"; it is marked
+  `early_pin_only_after_restart`. A finalization-pinned head already reachable from the default
+  ref is marked `no_unpublished_work_after_restart`, and a head or bare that cannot be verified
+  `source_not_verifiable_after_restart`.
+- Release evidence is unchanged: the hold leaves `open` only on one of the five classes above.
+
+See [adr/1742-finalize-resume-allowance.md](1742-finalize-resume-allowance.md) (D4).

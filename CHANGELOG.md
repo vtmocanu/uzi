@@ -46,6 +46,15 @@ through `[0.52.0]`.)
 - **A checkpoint counts as published only when its git pack was produced in full ([#1725](https://github.com/vtmocanu/uzi/issues/1725)).**
   The worker used to record a checkpoint as confirmed as soon as the api answered `published: true`, even if the `git pack-objects` streaming it then failed. It now also requires the pack producer to exit cleanly; otherwise the publish is treated as unconfirmed and retried from the attempted tip, like any other ambiguous result. The production api already reads the whole pack first, so this closes a latent gap rather than a live failure. The worker crash the issue first described was fixed by #1804.
 
+- **A worker restart after the agent finished no longer fails the run `worker_lost` ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
+  The worker now writes a small authenticated finalize-pending record the moment the agent call returns a result that is headed for finalize, and a restarted worker attests it on register. For a run still running at exactly that generation, the api re-queues it once even when its `RUN_MAX_REQUEUES` budget is already spent (a new `runs.finalize_resume_generation` column records the one use), and the run completes only through the normal completion permit at the next claim generation; the record is never an outcome. It is off at `RUN_MAX_REQUEUES=0`, a run that used it has one more attempt than the budget (the question cap and answer deadline bound becomes `x (RUN_MAX_REQUEUES + 2)`), and a crash before the record is durable, or a restart slower than the stale windows, behaves as before. See [ADR-1742](adr/1742-finalize-resume-allowance.md).
+
+- **A restart after the finalization pin leaves an exportable recovery archive ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
+  On restart the worker now bundles a finalization-pinned head that is present in its local repository and not yet on the default branch, without a forge token, and uploads it so the hold becomes `archive_ready` and `uzi run export` works. The bundle size cap is now enforced on the bytes written, so an oversized one stops early and, on a large repository, a token-less bundle may be oversized and stay a retained-source hold. An early pin is never bundled or read as "no unpublished work". A crash before fetch-back gives that generation's own hold no archive: if the run resumes the work is captured under the next generation, otherwise the hold reports retained source-only custody, and on a Docker-lane worker the clone does not survive a pod loss.
+
+- **`uzi run recovery` no longer suggests `uzi run export` for a hold that has no archive ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
+  A `source_only` hold now prints "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)", the export hint appears only when an open hold has an available archive, and a hold awaiting a decision gets a discard hint that warns the retained source may be the only copy. `--json` output is unchanged.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

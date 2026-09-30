@@ -978,7 +978,7 @@ chain in the diagram above, with no intervening `running`.
   crash still resumes and an answer to a superseded question is rejected. Bounds
   are an absolute answer deadline (`QUESTION_TIMEOUT_SECONDS`, default 24h) and a
   per-run cap (`QUESTION_MAX`, default 5), both worker-in-memory (a requeue resets
-  both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**). **Only the
+  both, so the honest worst case is each **× (RUN_MAX_REQUEUES + 1)**, or **× (RUN_MAX_REQUEUES + 2)** for a run that used the one-shot finalize-resume allowance, issue #1742). **Only the
   deadline fails the run closed**; exhausting the cap emits a feed notice and the
   lead proceeds on its own judgment (the one cap-adjacent failure is pre-run-only:
   looping on questions without ever reaching a plan). **Autopilot never parks**:
