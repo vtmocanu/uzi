@@ -231,7 +231,7 @@ func TestQueuedReasonJobFilesLiveDB(t *testing.T) {
 			t.Fatalf("a pre-change job got %q although a job_runner_v1 worker can claim it", got)
 		}
 	})
-	if !strings.Contains(reasonNoJobCapableWorker, jobCap) && strings.Contains(reasonNoJobCapableWorker, jobFilesCap) {
+	if !strings.Contains(reasonNoJobCapableWorker, jobCap) || !strings.Contains(reasonNoJobCapableWorker, jobFilesCap) {
 		t.Fatalf("reasonNoJobCapableWorker = %q must name both %s and %s", reasonNoJobCapableWorker, jobCap, jobFilesCap)
 	}
 }

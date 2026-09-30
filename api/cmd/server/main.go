@@ -374,10 +374,6 @@ func run() error {
 		SalvageForges: cfg.SalvageForges,
 	})
 
-	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
-	// Reject-without-reason buttons. It rides workersvc's ownership-checked
-	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
-	// workersvc import) and reads run status itself for stale-click handling.
 	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker
 	// transfer routes reach through wsvc.JobFiles(), and the job_files_sweep pass below. The
 	// request deadline is the recovery archive's: both are one bounded upload transaction.
@@ -397,6 +393,10 @@ func run() error {
 	}, nil)
 	wsvc.SetJobFiles(jobFiles)
 
+	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
+	// Reject-without-reason buttons. It rides workersvc's ownership-checked
+	// SubmitInput (via the gateSubmitter adapter, which keeps slacksvc free of a
+	// workersvc import) and reads run status itself for stale-click handling.
 	slackGate := slacksvc.NewGatekeeper(q, gateSubmitter{wsvc}, slackPoster, slog.Default())
 
 	// Reply-from-Slack handler (PRD #25 M5): inbound message.im thread replies →

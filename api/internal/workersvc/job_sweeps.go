@@ -20,7 +20,7 @@ const jobWallBackstopGraceSeconds = 300
 // Failure reasons stamped on a job whose run-bound ephemeral worker cannot serve it. They are
 // user-visible through the job's failure_reason, so they name the cause and the fix.
 const (
-	jobFailNoCapableWorker    = "the worker provisioned for this job does not support jobs; update the worker image"
+	jobFailNoCapableWorker    = "the worker provisioned for this job lacks the job_runner_v1 capability (or, for a job created with files support, job_files_v1); update the worker image"
 	jobFailWorkerNeverArrived = "the worker provisioned for this job never registered before the provisioning deadline"
 	jobFailPastWallDeadline   = "the job exceeded its time budget"
 )
@@ -31,8 +31,8 @@ const (
 // otherwise delete a never-booted worker silently and leave the still-queued job to be
 // re-provisioned every deadline.
 //
-// For each ephemeral worker bound to a job that either registered without job_runner_v1 or never
-// registered by the provision deadline (provisionDeadline before now), in ONE transaction: the
+// For each ephemeral worker bound to a job that either registered without job_runner_v1 (or, for a
+// job stamped with runs.job_protocol, without job_files_v1) or never registered by the provision deadline (provisionDeadline before now), in ONE transaction: the
 // job is failed by a conditional UPDATE (status='queued' AND worker_id IS NULL, so a capable
 // worker that claimed the job first keeps it), then the worker row is deleted with the same
 // busy and custody guards DeleteEphemeralWorkerForRun carries (the controller tears the pod down

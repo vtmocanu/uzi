@@ -19,7 +19,11 @@
 --
 -- sha256 / storage_name / content_type are NULL only while the row is 'reserved': a streamed
 -- upload learns them from the bytes. storage_name is `<sha256>.<ext>`, derived from the content
--- and the DETECTED type, never from the uploader (D6); display_name is sanitised metadata only.
+-- and the DETECTED type, never from the uploader (D6); display_name is sanitised metadata only:
+-- no path separators, no control characters and no Unicode format (Cf), line (Zl) or paragraph
+-- (Zp) separator characters (bidi overrides and isolates, zero-width characters, the BOM). The
+-- service's validate applies the complete Cf/Zl/Zp test; the CHECK here is the backstop over the
+-- ranges that matter. job_output_refusals.display_name carries the same CHECK.
 CREATE TABLE job_files (
     id              uuid PRIMARY KEY DEFAULT gen_random_uuid(),
     user_id         uuid NOT NULL REFERENCES users ON DELETE CASCADE,
@@ -32,7 +36,8 @@ CREATE TABLE job_files (
     display_name    text NOT NULL
         CHECK (char_length(display_name) BETWEEN 1 AND 255
                AND display_name !~ '[/\\]'
-               AND display_name !~ '[[:cntrl:]]'),
+               AND display_name !~ '[[:cntrl:]]'
+               AND display_name !~ '[\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]'),
     content_type    text CHECK (content_type IN (
         'application/pdf', 'image/png', 'image/jpeg', 'text/plain', 'text/markdown',
         'text/csv', 'application/json', 'text/html',
@@ -85,7 +90,8 @@ CREATE TABLE job_output_refusals (
     display_name text NOT NULL
         CHECK (char_length(display_name) BETWEEN 1 AND 255
                AND display_name !~ '[/\\]'
-               AND display_name !~ '[[:cntrl:]]'),
+               AND display_name !~ '[[:cntrl:]]'
+               AND display_name !~ '[\u00AD\u061C\u180E\u200B-\u200F\u2028-\u202E\u2060-\u206F\uFEFF\uFFF9-\uFFFB]'),
     byte_size    bigint NOT NULL CHECK (byte_size >= 0),
     reason       text NOT NULL CHECK (char_length(reason) BETWEEN 1 AND 200),
     created_at   timestamptz NOT NULL DEFAULT now()

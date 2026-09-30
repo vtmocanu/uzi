@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -99,6 +100,9 @@ func refusal(kind RefusalKind, reason string) error {
 
 // Sentinel errors of the job-file store.
 var (
+	// ErrJobRunNotFound: Reserve's RunID is not a kind='job' run of the reserving owner (it does
+	// not exist, belongs to someone else, or is not a job). It reads the same in every case.
+	ErrJobRunNotFound = errors.New("workersvc: job run not found")
 	// ErrJobFileNotFound: no file matches (id, owner), or it is still only a reservation.
 	ErrJobFileNotFound = errors.New("workersvc: job file not found")
 	// ErrJobFileExpired: the file existed but its bytes are gone.
@@ -257,6 +261,14 @@ func (p ReserveParams) validate() error {
 		if r < 0x20 || r == 0x7f || (r >= 0x80 && r < 0xa0) {
 			return ErrJobFileInvalid
 		}
+		// Format (Cf: bidi overrides and isolates, zero-width and joiner characters, the BOM),
+		// line separator (Zl) and paragraph separator (Zp) characters let a name display as
+		// something it is not (a right-to-left override spoofing an extension) or break a line.
+		// The job_files and job_output_refusals display_name CHECKs (migration 00276) mirror the
+		// ranges that matter; this is the complete test.
+		if unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
+			return ErrJobFileInvalid
+		}
 	}
 	if p.DeclaredSHA256 != "" && !sha256HexRe.MatchString(p.DeclaredSHA256) {
 		return ErrJobFileInvalid
@@ -296,6 +308,14 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 	q := store.New(tx)
 
 	if p.RunID != nil {
+		// The run must be a job of THIS owner: SumRunJobFiles counts across owners, so without this
+		// a caller could reserve against (and be charged into the caps of) another owner's job.
+		if _, err := q.LockOwnedJobRun(ctx, store.LockOwnedJobRunParams{ID: *p.RunID, UserID: p.UserID}); err != nil {
+			if errors.Is(err, pgx.ErrNoRows) {
+				return store.JobFile{}, ErrJobRunNotFound
+			}
+			return store.JobFile{}, err
+		}
 		cur, err := q.SumRunJobFiles(ctx, store.SumRunJobFilesParams{RunID: pgconv.UUID(*p.RunID), Direction: p.Direction})
 		if err != nil {
 			return store.JobFile{}, err

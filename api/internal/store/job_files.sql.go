@@ -12,27 +12,30 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
-const expireJobFiles = `-- name: ExpireJobFiles :execrows
-WITH expiring AS (
-    SELECT f.id FROM job_files f
-     WHERE f.state IN ('unattached', 'available') AND f.expires_at IS NOT NULL AND f.expires_at < $1
+const expireJobFiles = `-- name: ExpireJobFiles :one
+WITH upd AS (
+    UPDATE job_files SET state = 'expired', updated_at = now()
+     WHERE state IN ('unattached', 'available') AND expires_at IS NOT NULL AND expires_at < $1
+    RETURNING id
 ),
 del AS (
-    DELETE FROM job_file_chunks WHERE file_id IN (SELECT id FROM expiring)
+    DELETE FROM job_file_chunks WHERE file_id IN (SELECT id FROM upd)
 )
-UPDATE job_files SET state = 'expired', updated_at = now()
- WHERE id IN (SELECT id FROM expiring)
+SELECT count(*)::bigint AS expired FROM upd
 `
 
 // The retention sweep: unattached and available files past expires_at flip to 'expired' AND lose
 // their chunks in the one statement (the ExpireReadyCaptures shape), so an expired file stops
 // costing bytes while its row stays as an honest tombstone. Never touches reserved or attached.
+// The UPDATE itself carries the state and expiry predicate (re-evaluated against the locked row
+// under READ COMMITTED) and the chunk delete follows only the rows it RETURNED, so a file whose
+// state changed concurrently (an attach) is neither expired nor stripped of its chunks. The result
+// is the number of files expired.
 func (q *Queries) ExpireJobFiles(ctx context.Context, now pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, expireJobFiles, now)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	row := q.db.QueryRow(ctx, expireJobFiles, now)
+	var expired int64
+	err := row.Scan(&expired)
+	return expired, err
 }
 
 const finalizeJobFile = `-- name: FinalizeJobFile :one
@@ -168,6 +171,25 @@ func (q *Queries) InsertJobFileChunk(ctx context.Context, arg InsertJobFileChunk
 	return err
 }
 
+const lockOwnedJobRun = `-- name: LockOwnedJobRun :one
+SELECT id FROM runs WHERE id = $1 AND user_id = $2 AND kind = 'job' FOR KEY SHARE
+`
+
+type LockOwnedJobRunParams struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// Reservation's ownership check: the run must be a kind='job' run of @user_id. FOR KEY SHARE keeps
+// the run from being deleted under the insert without blocking its ordinary status updates. Zero
+// rows: the run is not the caller's, or not a job.
+func (q *Queries) LockOwnedJobRun(ctx context.Context, arg LockOwnedJobRunParams) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockOwnedJobRun, arg.ID, arg.UserID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const lockReservedJobFile = `-- name: LockReservedJobFile :one
 SELECT id, user_id, product_id, run_id, direction, claim_generation, storage_name, display_name, content_type, byte_size, sha256, chunk_count, state, expires_at, created_at, updated_at FROM job_files WHERE id = $1 AND state = 'reserved' FOR UPDATE
 `
@@ -211,13 +233,17 @@ WITH cand AS (
 picked AS (
     SELECT id FROM cand WHERE bytes_before < $2::bigint
 ),
-del AS (
-    DELETE FROM job_file_chunks WHERE file_id IN (SELECT id FROM picked)
-),
 upd AS (
+    -- The state predicate is repeated on the UPDATE so a file whose state changed since the
+    -- snapshot (an attach) is left alone; the chunk delete follows only the RETURNED rows.
     UPDATE job_files SET state = 'expired', updated_at = now()
      WHERE id IN (SELECT id FROM picked)
-    RETURNING byte_size
+       AND ((state IN ('unattached', 'available') AND expires_at IS NOT NULL AND expires_at < $1::timestamptz)
+            OR state = 'available')
+    RETURNING id, byte_size
+),
+del AS (
+    DELETE FROM job_file_chunks WHERE file_id IN (SELECT id FROM upd)
 )
 SELECT COALESCE(sum(byte_size), 0)::bigint AS freed_bytes FROM upd
 `
@@ -260,12 +286,17 @@ func (q *Queries) ReleaseJobFileReservation(ctx context.Context, arg ReleaseJobF
 }
 
 const releaseStaleJobFileReservations = `-- name: ReleaseStaleJobFileReservations :execrows
-DELETE FROM job_files WHERE state = 'reserved' AND created_at < $1
+DELETE FROM job_files
+ WHERE id IN (SELECT f.id FROM job_files f
+               WHERE f.state = 'reserved' AND f.created_at < $1
+                 FOR UPDATE SKIP LOCKED)
 `
 
 // The backstop for a reservation whose request died without releasing it (a crash, a lost
 // context): reserved rows older than @cutoff. Chunks cascade, and a reserved row has none (the
-// streaming write commits its chunks and the finalize together).
+// streaming write commits its chunks and the finalize together). A row a live Write holds FOR
+// UPDATE is SKIPPED, never waited on: the sweep holds the shared advisory key, so waiting on a
+// slow writer would stall every admission behind it. The skipped row is picked up next tick.
 func (q *Queries) ReleaseStaleJobFileReservations(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseStaleJobFileReservations, cutoff)
 	if err != nil {
@@ -350,7 +381,7 @@ func (q *Queries) SettleTerminalJobFiles(ctx context.Context, retentionSeconds f
 
 const stampCaptureReservation = `-- name: StampCaptureReservation :execrows
 UPDATE recovery_captures
-   SET state = 'uploading', reserved_bytes = $1, updated_at = now()
+   SET state = 'uploading', reserved_bytes = $1, reason = NULL, updated_at = now()
  WHERE id = $2 AND state IN ('preparing', 'uploading', 'needs_action')
 `
 
@@ -361,14 +392,32 @@ type StampCaptureReservationParams struct {
 
 // Recovery admission (PRD #1909 D4): the upload's reserved size, and the 'uploading' state that
 // makes the shared sums count it while the chunk stream runs outside the lock. Also the retry
-// path: a needs_action capture retried gets its reservation counted again. A capture that is
-// available, expired or discarded is not stampable (zero rows).
+// path: a needs_action capture retried gets its reservation counted again, and its stale failure
+// reason is cleared. A capture that is available, expired or discarded is not stampable (zero rows).
 func (q *Queries) StampCaptureReservation(ctx context.Context, arg StampCaptureReservationParams) (int64, error) {
 	result, err := q.db.Exec(ctx, stampCaptureReservation, arg.ReservedBytes, arg.ID)
 	if err != nil {
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const sumReclaimableJobFileBytes = `-- name: SumReclaimableJobFileBytes :one
+SELECT COALESCE(sum(f.byte_size), 0)::bigint AS reclaimable_bytes
+  FROM job_files f
+ WHERE (f.state IN ('unattached', 'available') AND f.expires_at IS NOT NULL AND f.expires_at < $1::timestamptz)
+    OR f.state = 'available'
+`
+
+// The bytes ReclaimJobFilesForRecovery COULD free right now: the same selection rule (files past
+// their expiry, then every 'available' file; never attached, reserved or an unattached file inside
+// its TTL) as a READ-ONLY sum. Recovery admission checks the budget against this without
+// destroying anything; the reclaim itself waits for a verified upload.
+func (q *Queries) SumReclaimableJobFileBytes(ctx context.Context, now pgtype.Timestamptz) (int64, error) {
+	row := q.db.QueryRow(ctx, sumReclaimableJobFileBytes, now)
+	var reclaimable_bytes int64
+	err := row.Scan(&reclaimable_bytes)
+	return reclaimable_bytes, err
 }
 
 const sumRunJobFiles = `-- name: SumRunJobFiles :one

@@ -236,7 +236,9 @@ SELECT name, content_md
 --   (a) the worker REGISTERED AT LEAST ONCE (last_heartbeat_at IS NOT NULL), online or since gone
 --       stale, and does not satisfy ClaimRun's job clause: a docker worker, or one whose
 --       protocol_capabilities lack 'job_runner_v1' (an old worker image). ClaimRun will never
---       let it claim, and the gap trigger would provision another one forever.
+--       let it claim, and the gap trigger would provision another one forever. The lacking
+--       capability is job_runner_v1 or, for a job stamped with runs.job_protocol (created with
+--       files support, PRD #1909 M1), job_files_v1.
 --       cause = 'no_job_capable_worker'.
 --   (b) the worker NEVER registered by the provision deadline (last_heartbeat_at IS NULL and
 --       created_at older than @deadline_cutoff): the shape ReapEphemeralWorkers would delete

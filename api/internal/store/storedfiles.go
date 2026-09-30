@@ -25,8 +25,13 @@ func storedFilesOwnerObjID(owner uuid.UUID) int32 {
 // pool the locks would release immediately) and must run its sums and its reservation insert in
 // that same transaction.
 //
-// Never take it while holding a lock a stored-files path can want the other way round: the job-file
-// and recovery admissions take nothing but these two advisory keys and rows they insert or stamp.
+// Never take it while holding a lock a stored-files path can want the other way round. The global
+// lock order is: (1) a recovery_captures row lock, if the path takes one; (2) the owner key; (3) the
+// shared key; (4) job_files rows, and a runs row FOR KEY SHARE (Reserve's ownership check). The recovery admit and stream transactions take a capture row
+// first and these keys after; the job-file Reserve and Sweep take only these keys and job_files
+// rows (never a capture row), so no path waits on a capture row while holding a key. A path that
+// takes the keys must therefore never afterwards wait on a recovery_captures row, and the
+// sweep's reservation release SKIPs locked job_files rows rather than waiting on a writer.
 func LockStoredFiles(ctx context.Context, db DBTX, owner uuid.UUID) error {
 	if _, err := db.Exec(ctx, "SELECT pg_advisory_xact_lock($1, $2)", StoredFilesLockClass, storedFilesOwnerObjID(owner)); err != nil {
 		return err
