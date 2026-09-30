@@ -324,7 +324,11 @@ rollout) reaches the shell and runs the cleanup, not only the foreground command
 check's result yourself and, to abort an attempt, run `exit 1` (the trap then cleans up). Once
 the trap is installed, Ctrl-C (INT), `exit`, a closed terminal (HUP) or TERM all end the attempt
 and run the cleanup; on a signal that arrives while a command is running, the cleanup starts when
-that command returns (at most the `--timeout=300s` of a rollout). The cleanup writes its actions
+that command returns. **So every wait in steps 1 to 10 must be time-limited** (a bounded `sleep`
+loop, or `timeout <N> <command>`; never `kubectl logs -f` or an unbounded wait): the sketch's own
+rollouts are capped at `--timeout=300s`. A terminal closed at an idle prompt may be seen as
+end-of-input rather than a hangup; the cleanup still runs completely, but then exits 0 and logs
+`status=0`. The cleanup writes its actions
 and verification results to `CLEANUP_LOG` (and to the terminal if it is still there): read that
 file after an attempt that ended by a closed terminal.
 
@@ -444,7 +448,7 @@ set +m               # no job control: Ctrl-C during a running command then reac
 set +e +u +o pipefail   # errexit/nounset/pipefail only guard the raise above. Later steps run
                      # checks that are EXPECTED to fail (no durable line yet, no terminal-<G>.json),
                      # and pipefail would turn `kubectl logs ... | grep -q ...` into rc 141
-                     # (SIGPIPE) on a MATCH. The EXIT/INT/TERM traps stay installed.
+                     # (SIGPIPE) on a MATCH. The EXIT/INT/TERM/HUP traps stay installed.
 ```
 
 **If the shell itself dies before the trap runs**, do not re-run step 0: it would record the
