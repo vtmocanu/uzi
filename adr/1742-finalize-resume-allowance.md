@@ -398,6 +398,14 @@ DENY_KIND='networkpolicies.crd.antrea.io'          # Antrea; or the cluster's su
 DENY_NS_ARGS=(-n '<worker-namespace>')             # empty array () for a cluster-scoped policy
 API_NS='<api-namespace>'; API_DEPLOY='<api-deployment>'; API_CM='<api-configmap>'
 CLEANUP_LOG="$HOME/uzi-1742-acceptance-<n>.cleanup.log"   # survives a closed terminal
+if [ -s "$CLEANUP_LOG" ]; then   # a previous attempt under this <n>: its cleanup must have completed
+  LAST_DONE="$(grep '^cleanup done ' "$CLEANUP_LOG" | tail -n 1 || true)"
+  case "$LAST_DONE" in
+    'cleanup done failed=0 '*) ;;
+    *) echo "previous cleanup did not complete ($CLEANUP_LOG): run the dead-shell fallback first" >&2
+       exit 1 ;;              # nothing changed yet and no trap installed
+  esac
+fi
 : >"$CLEANUP_LOG"                                          # this attempt's cleanup only
 
 deny_kubectl() { kubectl ${DENY_NS_ARGS[@]+"${DENY_NS_ARGS[@]}"} "$@"; }
@@ -457,14 +465,16 @@ kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raise
 kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
 set +m               # no job control: Ctrl-C also reaches THIS shell; the INT trap (cleanup) fires
-                     # when the running command dies of it. Check for the "cleanup done" line.
+                     # when the running command dies of it (and at an idle prompt). Check for
+                     # the "cleanup done" line.
 set +e +u +o pipefail   # errexit/nounset/pipefail only guard the raise above. Later steps run
                      # checks that are EXPECTED to fail (no durable line yet, no terminal-<G>.json),
                      # and pipefail would turn `kubectl logs ... | grep -q ...` into rc 141
                      # (SIGPIPE) on a MATCH. The EXIT/INT/TERM/HUP traps stay installed.
 ```
 
-**If the shell itself dies before the trap runs**, do not re-run step 0: it would record the
+**If the shell itself dies before the trap runs, or any attempt's `CLEANUP_LOG` lacks a
+`cleanup done failed=0` line** (step 0 refuses to start in that case), do not re-run step 0: it would record the
 current, already raised value as the "prior" one. Restore explicitly from the values recorded on
 the issue in step 0:
 
