@@ -56,6 +56,10 @@ const (
 	v1ReasonPayloadTooLarge  = "payload_too_large"
 	v1JobCreateMaxBodyBytes  = 4 << 20 // prompt (256 KiB) + inputs (1 MiB) with JSON escaping headroom
 	v1JobTitleFromPromptRune = 80
+	// v1JobTitleMaxBytes mirrors workersvc's maxJobTitleBytes (unexported): the service refuses a
+	// longer title, so a derived one must fit. TestDerivedJobTitleFitsServiceLimit pins the two
+	// through the service's own validation.
+	v1JobTitleMaxBytes = 200
 )
 
 // v1JobCaller builds the service caller from the resolved principal. ProductID and
@@ -177,7 +181,7 @@ func describeV1DecodeError(err error) string {
 }
 
 // derivedJobTitle is the title of a create request that named none: the prompt's first
-// non-empty line, whitespace collapsed and cut to v1JobTitleFromPromptRune runes. A prompt whose
+// non-empty line, whitespace collapsed and cut to v1JobTitleFromPromptRune runes and v1JobTitleMaxBytes bytes. A prompt whose
 // first line is not a displayable title (control or invisible characters) falls back to a
 // generic one, so an omitted title never makes an otherwise valid request fail.
 func derivedJobTitle(jobType, prompt string) string {
@@ -189,6 +193,12 @@ func derivedJobTitle(jobType, prompt string) string {
 		t := strings.Join(fields, " ")
 		if utf8.RuneCountInString(t) > v1JobTitleFromPromptRune {
 			t = string([]rune(t)[:v1JobTitleFromPromptRune])
+		}
+		// Multi-byte runes can keep an 80-rune title over the service's byte limit: cut on a
+		// rune boundary.
+		for len(t) > v1JobTitleMaxBytes {
+			_, size := utf8.DecodeLastRuneInString(t)
+			t = t[:len(t)-size]
 		}
 		if termsafe.Validate("title", t) == nil {
 			return t

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import type {
   Run,
   RunListItem,
+  RunJob,
   Repo,
   RunMessage,
   Schedule,
@@ -145,6 +146,8 @@ import healthDocFull from "../../../fixtures/api-contract/health_doc.full.json";
 import productZero from "../../../fixtures/api-contract/product.zero.json";
 import productFull from "../../../fixtures/api-contract/product.full.json";
 import productTokenZero from "../../../fixtures/api-contract/product_token.zero.json";
+import runJobZero from "../../../fixtures/api-contract/run_job.zero.json";
+import runJobFull from "../../../fixtures/api-contract/run_job.full.json";
 import productTokenFull from "../../../fixtures/api-contract/product_token.full.json";
 import adminProductTokenZero from "../../../fixtures/api-contract/admin_product_token.zero.json";
 import adminProductTokenFull from "../../../fixtures/api-contract/admin_product_token.full.json";
@@ -255,6 +258,21 @@ void _buildInfoFull;
   void _runExtra;
   void _runZero;
   void _runFull;
+}
+
+// ── RunJob (PRD #1908 D-D) ──────────────────────────────────────────────────
+// ZeroOf exemption: inputs — the mapper always emits [] for a job with no inputs, the null
+// in run_job.zero.json is the nil-slice marshal. result and origin's members are typed
+// `X | null`, no exemption.
+{
+  const _runJobMissing: never = null as unknown as Exclude<keyof RunJob, keyof typeof runJobFull>;
+  const _runJobExtra: never = null as unknown as Exclude<keyof typeof runJobFull, keyof RunJob>;
+  const _runJobZero: ZeroOf<RunJob, "inputs"> = runJobZero;
+  const _runJobFull: Widen<RunJob> = runJobFull;
+  void _runJobMissing;
+  void _runJobExtra;
+  void _runJobZero;
+  void _runJobFull;
 }
 
 // ── RunListItem ─────────────────────────────────────────────────────────────
@@ -975,7 +993,9 @@ void _buildInfoFull;
 {
   const _productMissing: never = null as unknown as Exclude<keyof Product, keyof typeof productFull>;
   const _productExtra: never = null as unknown as Exclude<keyof typeof productFull, keyof Product>;
-  const _productZero: ZeroOf<Product> = productZero;
+  // allowed_job_types: jobTypesOrEmpty (handler/admin_products.go) normalizes the nil-slice
+  // null in product.zero.json to [], so it is never null on the wire.
+  const _productZero: ZeroOf<Product, "allowed_job_types"> = productZero;
   const _productFull: Widen<Product> = productFull;
   void _productMissing;
   void _productExtra;
@@ -1027,7 +1047,10 @@ void _buildInfoFull;
 {
   const _adminDeleteProductMissing: never = null as unknown as Exclude<keyof AdminDeleteProductResponse, keyof typeof adminDeleteProductFull>;
   const _adminDeleteProductExtra: never = null as unknown as Exclude<keyof typeof adminDeleteProductFull, keyof AdminDeleteProductResponse>;
-  const _adminDeleteProductZero: ZeroOf<AdminDeleteProductResponse> = adminDeleteProductZero;
+  const _adminDeleteProductZero: {
+    product: ZeroOf<Product, "allowed_job_types">;
+    stopped_token_count: number;
+  } = adminDeleteProductZero;
   const _adminDeleteProductFull: Widen<AdminDeleteProductResponse> = adminDeleteProductFull;
   void _adminDeleteProductMissing;
   void _adminDeleteProductExtra;
@@ -1076,6 +1099,8 @@ function hasNull(v: unknown): boolean {
 const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "run", nullable: true },
   { stem: "run_list_item", nullable: true },
+  // PRD #1908 D-D: inputs (nil slice), origin members and result are null in zero.json.
+  { stem: "run_job", nullable: true },
   { stem: "repo", nullable: true },
   { stem: "message", nullable: true },
   { stem: "schedule", nullable: true },
