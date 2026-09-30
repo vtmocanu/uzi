@@ -45,6 +45,12 @@ runs against one PRD is the expected shape, not the exception.
 
 - **Every checkbox ticked** — update the status header, then move the file.
 - **Any item still open** — update the checkboxes and **leave the file where it is**.
+- **Only live-acceptance items open** — items that only the maintainer can check in a
+  live environment (a cluster, a hosted instance, an external service), which no run
+  can tick. They do not hold the move: leave them unticked, list them in the merge
+  request description as open acceptance for the maintainer, then update the status
+  header and move the file. Every implementation, documentation and validation item
+  must still be ticked on direct evidence.
 - **Already under `prds/done/`** — a no-op. Do not move it again, do not "tidy" the
   path. Update the checkboxes if there is anything to update, and stop.
 

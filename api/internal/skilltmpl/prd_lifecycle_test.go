@@ -102,6 +102,8 @@ func TestPRDLifecycleBodyCarriesTheLoadBearingRules(t *testing.T) {
 		{"M4: declare the moved path", "prd_done_path"},
 		{"#257: sweep inbound links on archival", "git grep -lF"},
 		{"#257: sweep repoints to the done/ path", "prds/done/<file>.md"},
+		{"skills v0.43.0: live acceptance does not hold the move", "Only live-acceptance items open"},
+		{"skills v0.43.0: open acceptance is surfaced in the MR", "open acceptance for the maintainer"},
 	} {
 		if !strings.Contains(body, c.needle) {
 			t.Errorf("%s: expected the body to contain %q", c.what, c.needle)
