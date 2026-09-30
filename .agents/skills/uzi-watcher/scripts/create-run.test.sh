@@ -42,7 +42,7 @@ run sync-then-ok 30
 [ "$RC" = 0 ] || fail "sync-then-ok exit $RC: $(cat "$WORK/err")"
 [ "$CALLS_N" = 3 ] || fail "sync-then-ok made $CALLS_N calls, want 3"
 jq -e '.run.id == "r1"' "$WORK/out" >/dev/null || fail "stdout is not the clean JSON: $(cat "$WORK/out")"
-grep -q -F "is behind server" "$WORK/err" || fail "a successful create dropped uzi's stderr warning"
+[ "$(grep -c -F "is behind server" "$WORK/err")" = 3 ] || fail "stderr warnings != 3 for 3 calls: the successful attempt dropped uzi's stderr"
 [ "$(head -1 "$WORK/calls")" = "run create --repo repo-1 --issue 42 --mr-rework --json" ] \
   || fail "argv not passed through: $(head -1 "$WORK/calls")"
 
