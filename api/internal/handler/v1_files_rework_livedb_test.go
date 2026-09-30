@@ -244,9 +244,12 @@ func TestV1FilesReadDeadlineLiveDB(t *testing.T) {
 	addr := srv.Listener.Addr().String()
 	owner, uzc := e.user()
 
-	for _, send := range []int{0, 1500 << 10} { // stalled before any data, and mid-stream
+	// The declared size stays under 100 KiB/s x the 700 ms deadline (70 KiB): the route's deadline
+	// scales with the declared size (JobFileLimits.UploadDeadline), so a larger declaration would
+	// legitimately get a longer one.
+	for _, send := range []int{0, 20 << 10} { // stalled before any data, and mid-stream
 		start := time.Now()
-		c := openStalledUpload(t, addr, uzc, 3<<20, send)
+		c := openStalledUpload(t, addr, uzc, 40<<10, send)
 		resp, answered := c.response(5 * time.Second)
 		if !answered {
 			t.Fatalf("send=%d: a stalled upload was not cut off within 5s of a 700ms deadline", send)

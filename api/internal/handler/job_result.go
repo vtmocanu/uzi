@@ -36,6 +36,16 @@ type workerJobResultRequest struct {
 	Status          string                 `json:"status"`
 	ReportMd        string                 `json:"report_md"`
 	Findings        []workerJobFindingBody `json:"findings"`
+	// RefusedOutputs are the outputs the worker dropped itself (empty, over its own ceilings,
+	// unreadable, not uploaded); the api records each as a job_output_refusals row. Optional.
+	RefusedOutputs []workerRefusedOutputBody `json:"refused_outputs"`
+}
+
+// workerRefusedOutputBody is one worker-side dropped output: the display name (sanitised by the
+// upload-name path here) and a reason from the fixed workersvc.WorkerRefusalReasons allowlist.
+type workerRefusedOutputBody struct {
+	DisplayName string `json:"display_name"`
+	Reason      string `json:"reason"`
 }
 
 type workerJobFindingBody struct {
@@ -164,6 +174,8 @@ func decodeJobResultBytes(body []byte) (workerJobResultRequest, error) {
 			err = dec.Decode(&req.ReportMd)
 		case "findings":
 			err = decodeJobFindingsStream(dec, &req.Findings)
+		case "refused_outputs":
+			err = decodeRefusedOutputsStream(dec, &req.RefusedOutputs)
 		default:
 			err = fmt.Errorf("unknown field %q", key)
 		}
@@ -205,6 +217,59 @@ func decodeJobFindingsStream(dec *json.Decoder, dst *[]workerJobFindingBody) err
 	return err
 }
 
+// decodeRefusedOutputsStream reads the refused_outputs array element by element and stops at the
+// first element past workersvc.JobResultMaxRefusedOutputs (the decodeJobFindingsStream discipline).
+func decodeRefusedOutputsStream(dec *json.Decoder, dst *[]workerRefusedOutputBody) error {
+	tok, err := dec.Token()
+	if err != nil {
+		return err
+	}
+	if tok == nil { // refused_outputs: null
+		return nil
+	}
+	if tok != json.Delim('[') {
+		return errors.New("refused_outputs must be an array")
+	}
+	for dec.More() {
+		if len(*dst) >= workersvc.JobResultMaxRefusedOutputs {
+			return fmt.Errorf("at most %d refused_outputs", workersvc.JobResultMaxRefusedOutputs)
+		}
+		var r workerRefusedOutputBody
+		if err := dec.Decode(&r); err != nil {
+			return err
+		}
+		*dst = append(*dst, r)
+	}
+	_, err = dec.Token() // the closing bracket
+	return err
+}
+
+// validateRefusedOutputs checks and sanitises the worker-reported dropped outputs: the reason must
+// be on the workersvc.WorkerRefusalReasons allowlist (a worker cannot write free text into a
+// refusal row), the name goes through the same sanitiser as an uploaded file's, and a repeated
+// (name, reason) is kept once. The order of first appearance is kept.
+func validateRefusedOutputs(in []workerRefusedOutputBody) ([]workersvc.JobRefusedOutput, error) {
+	if len(in) > workersvc.JobResultMaxRefusedOutputs {
+		return nil, fmt.Errorf("at most %d refused_outputs", workersvc.JobResultMaxRefusedOutputs)
+	}
+	out := make([]workersvc.JobRefusedOutput, 0, len(in))
+	seen := map[workersvc.JobRefusedOutput]bool{}
+	for i, r := range in {
+		if !workersvc.WorkerRefusalReasons[r.Reason] {
+			return nil, fmt.Errorf("refused_outputs[%d]: unknown reason", i)
+		}
+		if len(r.DisplayName) > 4*v1FileDisplayNameMaxBytes {
+			return nil, fmt.Errorf("refused_outputs[%d]: display_name is too long", i)
+		}
+		e := workersvc.JobRefusedOutput{DisplayName: sanitizeUploadName(r.DisplayName), Reason: r.Reason}
+		if !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	return out, nil
+}
+
 // validateAndScrubJobResult is the job-result ingest gate (PRD #1908, the task-review discipline):
 // reject a bad status token, an over-cap count or field, an unknown severity, a finding that names
 // both a url and a file or a line without a file, or a non-http(s) url; strip control characters
@@ -233,6 +298,11 @@ func validateAndScrubJobResult(req workerJobResultRequest) (workersvc.JobResultS
 		}
 		sub.Findings = append(sub.Findings, fs)
 	}
+	refused, err := validateRefusedOutputs(req.RefusedOutputs)
+	if err != nil {
+		return workersvc.JobResultSubmission{}, err
+	}
+	sub.RefusedOutputs = refused
 	return sub, nil
 }
 

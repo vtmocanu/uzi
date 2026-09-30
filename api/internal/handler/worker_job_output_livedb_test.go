@@ -107,7 +107,7 @@ func TestWorkerJobOutputStoresLiveDB(t *testing.T) {
 	e := setupJobFileRouteLiveDB(t)
 	run := e.seedJob(t, e.user, e.worker)
 	body := []byte("# Report\n\nthe findings\n")
-	rec := e.upload(run, "report.md", body)
+	rec := e.upload(run, "summary.md", body)
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d, body %q", rec.Code, rec.Body.String())
 	}
@@ -514,7 +514,7 @@ func TestWorkerJobOutputBusyAndUnavailableLiveDB(t *testing.T) {
 func TestWorkerJobOutputSettlesAtTerminalLiveDB(t *testing.T) {
 	e := setupJobFileRouteLiveDB(t)
 	run := e.seedJob(t, e.user, e.worker)
-	rec := e.upload(run, "report.md", []byte("done"))
+	rec := e.upload(run, "summary.md", []byte("done"))
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status = %d", rec.Code)
 	}

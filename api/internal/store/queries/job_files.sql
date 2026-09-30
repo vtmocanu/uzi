@@ -58,10 +58,15 @@ SELECT (
 COALESCE((SELECT sum(f.byte_size) FROM job_files f WHERE f.state = 'reserved'), 0)::bigint AS reserved_job_bytes;
 
 -- name: SumRunJobFiles :one
--- One run's live (non-expired) files of one direction: the per-job file-count and byte caps.
+-- One run's live (non-expired) files of one direction: the per-job file-count and byte caps. The
+-- two files the SERVER generates from a job's stored result (report.md and findings.json, see
+-- workersvc.SubmitJobResult) are not the job's own outputs and do not count against the per-job
+-- caps; the worker output route refuses those two names, so an output carrying one is always the
+-- server's. They still count toward the owner, instance and shared-budget sums.
 SELECT count(*)::bigint AS file_count, COALESCE(sum(byte_size), 0)::bigint AS total_bytes
   FROM job_files
- WHERE run_id = @run_id AND direction = @direction AND state <> 'expired';
+ WHERE run_id = @run_id AND direction = @direction AND state <> 'expired'
+   AND NOT (direction = 'output' AND lower(display_name) IN ('report.md', 'findings.json'));
 
 -- name: ReserveJobFile :one
 -- Admission: the row in state 'reserved' at the DECLARED size, before any chunk is written.
@@ -246,20 +251,46 @@ SELECT * FROM job_files
 -- result is the number of rows inserted (0 or 1); a refusal that is not recorded is still a
 -- refusal. The bound is checked in the statement, not under a lock: uploads for one run are
 -- sequential from its worker, and concurrent ones can overshoot by at most the upload slot count.
+-- FENCED: the row is inserted only while @claim_generation is the run's CURRENT generation and the
+-- claim is not released, so a stale flight's refusal that arrives after a re-claim has cleared the
+-- outputs (ClearRunOutputs) is dropped instead of surviving into the new flight.
 INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason)
 SELECT @run_id::uuid, @display_name::text, @byte_size::bigint, @reason::text
- WHERE (SELECT count(*) FROM job_output_refusals WHERE run_id = @run_id::uuid) < @max_rows::bigint
+ WHERE EXISTS (SELECT 1 FROM runs
+                WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
+                  AND claim_released_at IS NULL)
+   AND (SELECT count(*) FROM job_output_refusals WHERE run_id = @run_id::uuid) < @max_rows::bigint
    AND NOT EXISTS (SELECT 1 FROM job_output_refusals
                     WHERE run_id = @run_id::uuid AND display_name = @display_name::text
                       AND byte_size = @byte_size::bigint AND reason = @reason::text);
 
 -- name: DeleteJobOutputFilesForRun :execrows
 -- Re-claim (PRD #1909 M4): drops every output row of the run, in any state, so the new flight
--- starts with none of an earlier flight's. The chunks cascade.
-DELETE FROM job_files WHERE run_id = @run_id AND direction = 'output';
+-- starts with none of an earlier flight's. The chunks cascade. A row an in-flight write of the
+-- earlier flight holds FOR UPDATE is SKIPPED, never waited on: the claim response must not block
+-- on an old flight's write. The skipped row is dropped by that write's own post-write fence
+-- (workersvc.StoreJobOutput, dropStaleOutput) as soon as it commits.
+DELETE FROM job_files
+ WHERE id IN (SELECT f.id FROM job_files f
+               WHERE f.run_id = @run_id AND f.direction = 'output'
+                 FOR UPDATE SKIP LOCKED);
 
 -- name: DeleteJobOutputRefusalsForRun :execrows
-DELETE FROM job_output_refusals WHERE run_id = @run_id;
+DELETE FROM job_output_refusals
+ WHERE id IN (SELECT r.id FROM job_output_refusals r WHERE r.run_id = @run_id FOR UPDATE SKIP LOCKED);
+
+-- name: DeleteStaleGeneratedJobOutput :execrows
+-- A re-posted job result replaces the files the server generated from it (report.md and
+-- findings.json): the same-name file of this run and claim generation whose content differs is
+-- dropped so the new content can be stored. A same-content file is left alone (the unique
+-- (run, generation, name, sha256) index makes the re-store a no-op). The chunks cascade.
+DELETE FROM job_files
+ WHERE id IN (SELECT f.id FROM job_files f
+               WHERE f.run_id = @run_id AND f.direction = 'output'
+                 AND f.claim_generation = @claim_generation AND f.display_name = @display_name
+                 AND f.state IN ('attached', 'available')
+                 AND f.sha256 IS DISTINCT FROM @sha256::text
+                 FOR UPDATE SKIP LOCKED);
 
 -- name: DeleteJobOutputFile :execrows
 -- Drops one output of a run whose upload finished after its claim went stale (the fence re-check

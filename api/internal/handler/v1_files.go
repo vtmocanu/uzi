@@ -212,20 +212,31 @@ func declaredTypes(partContentType, displayName string, allowHTML bool) []string
 // v1DeclaredLabel names a declared type in a refusal message. Only an allowlisted type is echoed;
 // anything else (an unknown extension or content type, both client input) reads as a fixed phrase
 // followed by the allowed set.
-func v1DeclaredLabel(d string) string {
+// allowHTML is the worker OUTPUT allowlist: text/html is then an allowlisted type too, and the
+// allowed extensions include .htm and .html.
+func v1DeclaredLabel(d string, allowHTML bool) string {
 	for _, t := range v1UploadTypes {
 		if t == d {
 			return d
 		}
 	}
-	return "an unsupported type; the allowed extensions are " + v1AllowedExtensions()
+	if allowHTML && d == v1TypeHTML {
+		return d
+	}
+	return "an unsupported type; the allowed extensions are " + v1AllowedExtensions(allowHTML)
 }
 
-// v1AllowedExtensions lists the accepted file-name extensions, sorted, for a refusal message.
-func v1AllowedExtensions() string {
-	exts := make([]string, 0, len(v1UploadTypes))
+// v1AllowedExtensions lists the accepted file-name extensions, sorted, for a refusal message; the
+// worker output allowlist (allowHTML) also names the HTML extensions.
+func v1AllowedExtensions(allowHTML bool) string {
+	exts := make([]string, 0, len(v1UploadTypes)+len(v1OutputTypes))
 	for e := range v1UploadTypes {
 		exts = append(exts, e)
+	}
+	if allowHTML {
+		for e := range v1OutputTypes {
+			exts = append(exts, e)
+		}
 	}
 	sort.Strings(exts)
 	return strings.Join(exts, ", ")
@@ -260,7 +271,7 @@ func (in *v1UploadInspector) Begin(head []byte) (string, error) {
 	if !in.text {
 		for _, d := range in.declared {
 			if d != in.detected {
-				return "", v1Unsupported("the file's content is " + in.detected + " but it was declared as " + v1DeclaredLabel(d))
+				return "", v1Unsupported("the file's content is " + in.detected + " but it was declared as " + v1DeclaredLabel(d, in.allowHTML))
 			}
 		}
 		return in.detected, nil
@@ -270,7 +281,7 @@ func (in *v1UploadInspector) Begin(head []byte) (string, error) {
 	specific := ""
 	for _, d := range in.declared {
 		if !in.textType(d) {
-			return "", v1Unsupported("the file's content is text but it was declared as " + v1DeclaredLabel(d))
+			return "", v1Unsupported("the file's content is text but it was declared as " + v1DeclaredLabel(d, in.allowHTML))
 		}
 		if d == v1TypeText {
 			continue
@@ -483,11 +494,14 @@ func (h *Handler) V1FileUpload(w http.ResponseWriter, r *http.Request) {
 	// client that stalls would otherwise hold its goroutine (and, once streaming, its database
 	// connection) until the server's ReadTimeout, and that timeout (15 s in cmd/server) is also
 	// shorter than a maximum-size upload needs. The read deadline is now + the job-files request
-	// deadline (JobFileLimits.RequestDeadline, 120 s by default: 25 MiB takes about 1.7 MB/s to fit),
+	// deadline (JobFileLimits.UploadDeadline: RequestDeadline, 120 s by default, or declared size / 100 KiB/s when that is longer: 256 s at 25 MiB),
 	// replacing the server-wide one for this route only, and the write deadline follows it by
 	// v1FileWriteGrace so the response can still be written. A writer that does not support
-	// deadlines (a test recorder) keeps the server's own.
-	deadline := setJobFileDeadlines(w, jf.Limits().RequestDeadline)
+	// deadlines (a test recorder) keeps the server's own. The deadline scales with the DECLARED
+	// size (JobFileLimits.UploadDeadline: at least RequestDeadline, and declared / 100 KiB/s for a
+	// large file, so a maximum-size upload at the slowest assumed rate is not cut off mid-body).
+	uploadDeadline := jf.Limits().UploadDeadline(declared, jf.Limits().InputFileMaxBytes)
+	deadline := setJobFileDeadlines(w, uploadDeadline)
 
 	r.Body = http.MaxBytesReader(w, r.Body, limit)
 	mr, err := r.MultipartReader()
@@ -547,6 +561,7 @@ func (h *Handler) V1FileUpload(w http.ResponseWriter, r *http.Request) {
 	}
 	stored, err := jf.Write(r.Context(), file.ID, caller.UserID, part, workersvc.WriteOptions{
 		Inspector: &v1UploadInspector{declared: v1DeclaredTypes(part.Header.Get("Content-Type"), clean)},
+		Deadline:  uploadDeadline,
 	})
 	if err != nil {
 		writeV1FileError(w, "write", err, deadline)

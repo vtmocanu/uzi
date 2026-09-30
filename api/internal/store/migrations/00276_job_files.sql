@@ -67,6 +67,15 @@ CREATE INDEX idx_job_files_user_state ON job_files (user_id, state);
 CREATE INDEX idx_job_files_run ON job_files (run_id) WHERE run_id IS NOT NULL;
 -- The expiry sweep and the recovery reclaim order scan files that can expire by time.
 CREATE INDEX idx_job_files_expiry ON job_files (expires_at) WHERE state IN ('unattached', 'available');
+-- One output per (run, claim generation, name, content): the duplicate guard behind the output
+-- route's idempotency lookup. Two concurrent uploads of the same content under the same name (a
+-- worker retry that overlaps its first attempt) cannot both be admitted: the second Reserve hits
+-- this index and the service answers with the stored file (or "still being stored"). It covers the
+-- 'reserved' state too because the worker route declares the sha256 at admission; an expired file
+-- (a tombstone) does not block a new one.
+CREATE UNIQUE INDEX uq_job_files_output_content
+    ON job_files (run_id, claim_generation, display_name, sha256)
+    WHERE direction = 'output' AND state <> 'expired';
 -- The reservation-release sweep scans stale reservations.
 CREATE INDEX idx_job_files_reserved ON job_files (created_at) WHERE state = 'reserved';
 

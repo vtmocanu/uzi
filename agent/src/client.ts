@@ -102,6 +102,8 @@ export class RequestError extends Error {
     readonly path: string,
     readonly status: number,
     readonly body: string,
+    /** The response's `Retry-After` in milliseconds, when it carried whole seconds. */
+    readonly retryAfterHeaderMs?: number,
   ) {
     super(`${method} ${path} returned ${status}: ${body}`);
     this.name = "RequestError";
@@ -2334,8 +2336,15 @@ export class WorkerClient {
     } catch {
       // ignore body read failures — the status is the signal that matters.
     }
-    return new RequestError(method, path, res.status, text);
+    return new RequestError(method, path, res.status, text, retryAfterMsOf(res.headers.get("Retry-After")));
   }
+}
+
+/** A `Retry-After` header of whole seconds as milliseconds (capped at one hour); anything else
+ *  (an HTTP date, junk, absent) is undefined, and the caller keeps its own backoff. */
+function retryAfterMsOf(h: string | null): number | undefined {
+  if (h === null || !/^\d{1,6}$/.test(h.trim())) return undefined;
+  return Math.min(Number(h.trim()), 3600) * 1000;
 }
 
 /** Most bytes of an error response body toError reads. */

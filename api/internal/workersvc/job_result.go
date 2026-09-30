@@ -19,12 +19,15 @@ import (
 // Job-result bounds. The job_results / job_findings CHECKs (migration 00275) are the backstop;
 // these are the ingest caps the handler enforces before anything is persisted.
 const (
-	JobResultMaxFindings         = 200
-	JobResultReportMaxBytes      = 1 << 20  // job_results.report_md CHECK
-	JobFindingMessageMaxBytes    = 64 << 10 // job_findings.message_md CHECK
-	JobFindingURLMaxBytes        = 2048     // job_findings.url CHECK
-	JobFindingFileMaxBytes       = 1024     // job_findings.file CHECK
-	JobFindingMaxLine            = 1 << 24  // a sane ceiling well inside int4
+	JobResultMaxFindings      = 200
+	JobResultReportMaxBytes   = 1 << 20  // job_results.report_md CHECK
+	JobFindingMessageMaxBytes = 64 << 10 // job_findings.message_md CHECK
+	JobFindingURLMaxBytes     = 2048     // job_findings.url CHECK
+	JobFindingFileMaxBytes    = 1024     // job_findings.file CHECK
+	JobFindingMaxLine         = 1 << 24  // a sane ceiling well inside int4
+	// JobResultMaxRefusedOutputs bounds the worker-reported dropped outputs of one result: the
+	// worker's own file ceiling. The service further bounds what it records by OutputsMaxFiles.
+	JobResultMaxRefusedOutputs   = 64
 	jobNoResultFailureReasonText = "The job finished without submitting a result."
 )
 
@@ -48,11 +51,20 @@ type JobFindingSubmission struct {
 	Line      *int32
 }
 
+// JobRefusedOutput is an output the worker reports it dropped itself (see WorkerRefusalReasons):
+// DisplayName already sanitised, Reason from the allowlist.
+type JobRefusedOutput struct {
+	DisplayName string
+	Reason      string
+}
+
 // JobResultSubmission is a validated, scrubbed job result.
 type JobResultSubmission struct {
 	Status   string
 	ReportMD string
 	Findings []JobFindingSubmission
+	// RefusedOutputs are the worker-side drops, deduped and bounded by the handler.
+	RefusedOutputs []JobRefusedOutput
 }
 
 // SubmitJobResult persists a job run's result for the worker that holds it. The run row is locked
@@ -60,6 +72,10 @@ type JobResultSubmission struct {
 // unreleased, not terminal) and then the result is upserted, the run's earlier findings deleted
 // and the new ones inserted, all in ONE transaction: a retried POST replaces the earlier body and
 // a failure part-way leaves the earlier result untouched.
+//
+// After the commit the server stores the result's report.md and findings.json as output files and
+// records the outputs the worker reported dropping (storeJobResultOutputs; its comment has the
+// lock order: those writes run OUTSIDE this transaction). They never fail the ingest.
 //
 // Errors: ErrRunNotFound (not held by this worker), ErrNotJobRun, ErrStaleClaim (generation
 // mismatch or released claim), ErrRunTerminal.
@@ -112,7 +128,11 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 			return err
 		}
 	}
-	return tx.Commit(ctx)
+	if err = tx.Commit(ctx); err != nil {
+		return err
+	}
+	s.storeJobResultOutputs(ctx, wkr, run, claimGeneration, sub)
+	return nil
 }
 
 // CheckJobResultTarget is the cheap pre-body check of the job-result route: the run must be held

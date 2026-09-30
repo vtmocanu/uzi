@@ -92,11 +92,17 @@ func (q *Queries) DeleteJobOutputFile(ctx context.Context, arg DeleteJobOutputFi
 }
 
 const deleteJobOutputFilesForRun = `-- name: DeleteJobOutputFilesForRun :execrows
-DELETE FROM job_files WHERE run_id = $1 AND direction = 'output'
+DELETE FROM job_files
+ WHERE id IN (SELECT f.id FROM job_files f
+               WHERE f.run_id = $1 AND f.direction = 'output'
+                 FOR UPDATE SKIP LOCKED)
 `
 
 // Re-claim (PRD #1909 M4): drops every output row of the run, in any state, so the new flight
-// starts with none of an earlier flight's. The chunks cascade.
+// starts with none of an earlier flight's. The chunks cascade. A row an in-flight write of the
+// earlier flight holds FOR UPDATE is SKIPPED, never waited on: the claim response must not block
+// on an old flight's write. The skipped row is dropped by that write's own post-write fence
+// (workersvc.StoreJobOutput, dropStaleOutput) as soon as it commits.
 func (q *Queries) DeleteJobOutputFilesForRun(ctx context.Context, runID pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteJobOutputFilesForRun, runID)
 	if err != nil {
@@ -106,11 +112,46 @@ func (q *Queries) DeleteJobOutputFilesForRun(ctx context.Context, runID pgtype.U
 }
 
 const deleteJobOutputRefusalsForRun = `-- name: DeleteJobOutputRefusalsForRun :execrows
-DELETE FROM job_output_refusals WHERE run_id = $1
+DELETE FROM job_output_refusals
+ WHERE id IN (SELECT r.id FROM job_output_refusals r WHERE r.run_id = $1 FOR UPDATE SKIP LOCKED)
 `
 
 func (q *Queries) DeleteJobOutputRefusalsForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, deleteJobOutputRefusalsForRun, runID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteStaleGeneratedJobOutput = `-- name: DeleteStaleGeneratedJobOutput :execrows
+DELETE FROM job_files
+ WHERE id IN (SELECT f.id FROM job_files f
+               WHERE f.run_id = $1 AND f.direction = 'output'
+                 AND f.claim_generation = $2 AND f.display_name = $3
+                 AND f.state IN ('attached', 'available')
+                 AND f.sha256 IS DISTINCT FROM $4::text
+                 FOR UPDATE SKIP LOCKED)
+`
+
+type DeleteStaleGeneratedJobOutputParams struct {
+	RunID           pgtype.UUID `json:"run_id"`
+	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
+	DisplayName     string      `json:"display_name"`
+	Sha256          string      `json:"sha256"`
+}
+
+// A re-posted job result replaces the files the server generated from it (report.md and
+// findings.json): the same-name file of this run and claim generation whose content differs is
+// dropped so the new content can be stored. A same-content file is left alone (the unique
+// (run, generation, name, sha256) index makes the re-store a no-op). The chunks cascade.
+func (q *Queries) DeleteStaleGeneratedJobOutput(ctx context.Context, arg DeleteStaleGeneratedJobOutputParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteStaleGeneratedJobOutput,
+		arg.RunID,
+		arg.ClaimGeneration,
+		arg.DisplayName,
+		arg.Sha256,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -350,18 +391,22 @@ func (q *Queries) InsertJobFileChunk(ctx context.Context, arg InsertJobFileChunk
 const insertJobOutputRefusal = `-- name: InsertJobOutputRefusal :execrows
 INSERT INTO job_output_refusals (run_id, display_name, byte_size, reason)
 SELECT $1::uuid, $2::text, $3::bigint, $4::text
- WHERE (SELECT count(*) FROM job_output_refusals WHERE run_id = $1::uuid) < $5::bigint
+ WHERE EXISTS (SELECT 1 FROM runs
+                WHERE id = $1::uuid AND claim_generation = $5::bigint
+                  AND claim_released_at IS NULL)
+   AND (SELECT count(*) FROM job_output_refusals WHERE run_id = $1::uuid) < $6::bigint
    AND NOT EXISTS (SELECT 1 FROM job_output_refusals
                     WHERE run_id = $1::uuid AND display_name = $2::text
                       AND byte_size = $3::bigint AND reason = $4::text)
 `
 
 type InsertJobOutputRefusalParams struct {
-	RunID       uuid.UUID `json:"run_id"`
-	DisplayName string    `json:"display_name"`
-	ByteSize    int64     `json:"byte_size"`
-	Reason      string    `json:"reason"`
-	MaxRows     int64     `json:"max_rows"`
+	RunID           uuid.UUID `json:"run_id"`
+	DisplayName     string    `json:"display_name"`
+	ByteSize        int64     `json:"byte_size"`
+	Reason          string    `json:"reason"`
+	ClaimGeneration int64     `json:"claim_generation"`
+	MaxRows         int64     `json:"max_rows"`
 }
 
 // Records one refused output (PRD #1909 D4). Bounded: nothing is inserted once the run already
@@ -370,12 +415,16 @@ type InsertJobOutputRefusalParams struct {
 // result is the number of rows inserted (0 or 1); a refusal that is not recorded is still a
 // refusal. The bound is checked in the statement, not under a lock: uploads for one run are
 // sequential from its worker, and concurrent ones can overshoot by at most the upload slot count.
+// FENCED: the row is inserted only while @claim_generation is the run's CURRENT generation and the
+// claim is not released, so a stale flight's refusal that arrives after a re-claim has cleared the
+// outputs (ClearRunOutputs) is dropped instead of surviving into the new flight.
 func (q *Queries) InsertJobOutputRefusal(ctx context.Context, arg InsertJobOutputRefusalParams) (int64, error) {
 	result, err := q.db.Exec(ctx, insertJobOutputRefusal,
 		arg.RunID,
 		arg.DisplayName,
 		arg.ByteSize,
 		arg.Reason,
+		arg.ClaimGeneration,
 		arg.MaxRows,
 	)
 	if err != nil {
@@ -697,6 +746,7 @@ const sumRunJobFiles = `-- name: SumRunJobFiles :one
 SELECT count(*)::bigint AS file_count, COALESCE(sum(byte_size), 0)::bigint AS total_bytes
   FROM job_files
  WHERE run_id = $1 AND direction = $2 AND state <> 'expired'
+   AND NOT (direction = 'output' AND lower(display_name) IN ('report.md', 'findings.json'))
 `
 
 type SumRunJobFilesParams struct {
@@ -709,7 +759,11 @@ type SumRunJobFilesRow struct {
 	TotalBytes int64 `json:"total_bytes"`
 }
 
-// One run's live (non-expired) files of one direction: the per-job file-count and byte caps.
+// One run's live (non-expired) files of one direction: the per-job file-count and byte caps. The
+// two files the SERVER generates from a job's stored result (report.md and findings.json, see
+// workersvc.SubmitJobResult) are not the job's own outputs and do not count against the per-job
+// caps; the worker output route refuses those two names, so an output carrying one is always the
+// server's. They still count toward the owner, instance and shared-budget sums.
 func (q *Queries) SumRunJobFiles(ctx context.Context, arg SumRunJobFilesParams) (SumRunJobFilesRow, error) {
 	row := q.db.QueryRow(ctx, sumRunJobFiles, arg.RunID, arg.Direction)
 	var i SumRunJobFilesRow

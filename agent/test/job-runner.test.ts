@@ -424,8 +424,8 @@ describe("JobRunner (PRD #1908 M4)", () => {
     assert.strictEqual(registry.size, 0, "and releases it at the end");
     assert.deepStrictEqual(
       calls.order,
-      ["state:running", "upload:report.md", "upload:findings.json", "result", "state:completed"],
-      "running first, the outputs and then the result BEFORE completed",
+      ["state:running", "result", "state:completed"],
+      "running first, then the result BEFORE completed (report.md and findings.json are the api's to store)",
     );
     assert.ok(calls.states.every((s) => s.body.claim_generation === GEN), "every state report carries claim_generation");
     assert.deepStrictEqual(calls.results[0]!.body, { claim_generation: GEN, ...GOOD_RESULT });
@@ -594,7 +594,7 @@ describe("JobRunner (PRD #1908 M4)", () => {
       yield RESULT_OK;
     });
     await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
-    assert.deepStrictEqual(calls.order, ["state:running", "upload:report.md", "upload:findings.json", "result"]);
+    assert.deepStrictEqual(calls.order, ["state:running", "result"]);
   });
 
   it("a rejected result post (400) reports failed and never completed", async () => {
@@ -609,7 +609,7 @@ describe("JobRunner (PRD #1908 M4)", () => {
       yield RESULT_OK;
     });
     await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
-    assert.deepStrictEqual(calls.order, ["state:running", "upload:report.md", "upload:findings.json", "result", "state:failed"]);
+    assert.deepStrictEqual(calls.order, ["state:running", "result", "state:failed"]);
     assert.match(calls.states[1]!.body.failure_reason!, /could not store the job result/);
   });
 
@@ -935,7 +935,7 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
     });
   }
 
-  it("uploads report.md and findings.json (built from the submitted result) before the result post, then the listed files, streaming the files", async () => {
+  it("uploads the listed files (streamed) before the result post, and never report.md or findings.json: the api stores those from the result", async () => {
     const { client, calls } = fakeClient();
     const big = Buffer.alloc(3 * 1024 * 1024, "x");
     const qf = sessionWriting(
@@ -944,14 +944,11 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
     );
     await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
     const names = calls.uploads.map((u) => u.meta.display_name);
-    assert.deepStrictEqual(names, ["report.md", "findings.json", "summary.csv", "blob.txt", sha("src")]);
+    assert.deepStrictEqual(names, ["summary.csv", "blob.txt", sha("src")]);
     assert.deepStrictEqual(calls.order.slice(0, 1), ["state:running"]);
-    assert.strictEqual(calls.order.indexOf("result"), 6, "every upload precedes the result post");
+    assert.strictEqual(calls.order.indexOf("result"), 4, "every upload precedes the result post");
     assert.strictEqual(calls.order.at(-1), "state:completed");
-    const [report, findings, csv, blob] = calls.uploads;
-    assert.strictEqual(report!.bytes.toString(), GOOD_RESULT.report_md);
-    assert.deepStrictEqual(JSON.parse(findings!.bytes.toString()), GOOD_RESULT.findings);
-    assert.strictEqual(report!.streamed, false, "the report is in memory already");
+    const [csv, blob] = calls.uploads;
     assert.strictEqual(csv!.streamed, true, "a file is streamed from disk, never handed over whole");
     assert.strictEqual(blob!.streamed, true);
     for (const u of calls.uploads) {
@@ -960,29 +957,22 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
       assert.strictEqual(u.meta.sha256, sha(u.bytes), "the digest is of the exact bytes sent");
     }
     assert.strictEqual(blob!.meta.size, big.length);
-    // The posted result never carries output_files: the api refuses unknown fields.
+    // The posted result never carries output_files (the api refuses unknown fields) and, with
+    // nothing dropped, no refused_outputs.
     assert.deepStrictEqual(calls.results[0]!.body, { claim_generation: GEN, ...GOOD_RESULT });
   });
 
-  it("with no output_files it still uploads the report and findings, and an empty report is not uploaded", async () => {
+  it("with no output_files nothing is uploaded and the job completes", async () => {
     const { client, calls } = fakeClient();
     await newRunner(client, await tmpJobsRoot(), sessionWriting({}, { status: "completed", report_md: "" })).execute(jobClaim());
-    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["findings.json"]);
+    assert.deepStrictEqual(calls.uploads, []);
     assert.strictEqual(calls.order.at(-1), "state:completed");
   });
 
-  it("redacts the model credential from the uploaded report and findings", async () => {
-    const { client, calls } = fakeClient();
-    const secret = "sk-fixture-model-credential";
-    const qf = sessionWriting({}, { status: "completed", report_md: `leaked ${secret} here`, findings: [{ severity: "info", message_md: `also ${secret}` }] });
-    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
-    for (const u of calls.uploads) assert.ok(!u.bytes.toString().includes(secret), `${u.meta.display_name} leaked the credential`);
-  });
-
-  it("a refused upload (413, 415, 422, 507) is logged and the job still completes; the next files are still uploaded", async () => {
+  it("a refused upload (413, 415, 422, 507) is logged and the job still completes; the next files are still uploaded, and the api's own refusals are not repeated in refused_outputs", async () => {
     const { client, calls } = fakeClient({
       uploadJobFile: async (_id, meta) => {
-        if (meta.display_name === "report.md") throw refusal(507, "owner_quota");
+        if (meta.display_name === "quota.txt") throw refusal(507, "owner_quota");
         if (meta.display_name === "big.txt") throw refusal(413, "file_too_large");
         if (meta.display_name === "bad.txt") throw refusal(415, "unsupported_file_type");
         if (meta.display_name === "torn.txt") throw refusal(422, "sha256_mismatch");
@@ -991,43 +981,54 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
     });
     const { logger, lines } = recordingLogger();
     const qf = sessionWriting(
-      { "outputs/big.txt": "1", "outputs/bad.txt": "2", "outputs/torn.txt": "3", "outputs/ok.txt": "4" },
-      { ...GOOD_RESULT, output_files: ["outputs/big.txt", "outputs/bad.txt", "outputs/torn.txt", "outputs/ok.txt"] },
+      { "outputs/quota.txt": "0", "outputs/big.txt": "1", "outputs/bad.txt": "2", "outputs/torn.txt": "3", "outputs/ok.txt": "4" },
+      { ...GOOD_RESULT, output_files: ["outputs/quota.txt", "outputs/big.txt", "outputs/bad.txt", "outputs/torn.txt", "outputs/ok.txt"] },
     );
     const runner = new JobRunner(client, logger, { queryFn: qf, jobsRoot: await tmpJobsRoot(), batchMs: 5, cancelPollMs: 10, outputRetryDelaysMs: [1, 1] });
     await runner.execute(jobClaim());
-    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["report.md", "findings.json", "big.txt", "bad.txt", "torn.txt", "ok.txt"], "no refusal is retried and none stops the rest");
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["quota.txt", "big.txt", "bad.txt", "torn.txt", "ok.txt"], "no refusal is retried and none stops the rest");
     assert.strictEqual(calls.order.at(-1), "state:completed", "the job completes");
     assert.ok(calls.results.length === 1 && calls.states.every((s) => s.body.status !== "failed"));
+    assert.strictEqual(calls.results[0]!.body.refused_outputs, undefined, "the api recorded those refusals itself");
     const refused = lines.filter((l) => (l as { msg?: string }).msg === "job output file refused") as Array<{ reason: string; status: number }>;
     assert.deepStrictEqual(refused.map((l) => l.status), [507, 413, 415, 422]);
     assert.deepStrictEqual(refused.map((l) => l.reason), ["owner_quota", "file_too_large", "unsupported_file_type", "sha256_mismatch"]);
   });
 
-  it("retries a transport failure with the bounded backoff, then treats the file as refused: the job still completes", async () => {
+  it("retries a transport failure with the bounded backoff, then reports the file in refused_outputs: the job still completes", async () => {
     const { client, calls } = fakeClient({
       uploadJobFile: async (_id, meta) => {
-        if (meta.display_name === "report.md") throw new TypeError("fetch failed");
-        if (meta.display_name === "findings.json") throw new RequestError("POST", "/x", 503, '{"reason":"uploads_busy"}');
+        if (meta.display_name === "flaky.txt") throw new TypeError("fetch failed");
+        if (meta.display_name === "busy.txt") throw new RequestError("POST", "/x", 503, '{"reason":"uploads_busy"}');
         return { status: 201, file: {} as JobFileUploadResponse };
       },
     });
-    await newRunner(client, await tmpJobsRoot(), sessionWriting({}, GOOD_RESULT)).execute(jobClaim());
+    const qf = sessionWriting(
+      { "outputs/flaky.txt": "f", "outputs/busy.txt": "b" },
+      { ...GOOD_RESULT, output_files: ["outputs/flaky.txt", "outputs/busy.txt"] },
+    );
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
     const attempts = (n: string): number => calls.uploads.filter((u) => u.meta.display_name === n).length;
-    assert.strictEqual(attempts("report.md"), 3, "OUTPUT_UPLOAD_ATTEMPTS attempts, no more");
-    assert.strictEqual(attempts("findings.json"), 3, "a 503 uploads_busy is retried like a transport failure");
+    assert.strictEqual(attempts("flaky.txt"), 3, "OUTPUT_UPLOAD_ATTEMPTS attempts, no more");
+    assert.strictEqual(attempts("busy.txt"), 3, "a 503 uploads_busy is retried like a transport failure");
+    assert.deepStrictEqual(calls.results[0]!.body.refused_outputs, [
+      { display_name: "flaky.txt", reason: "worker_upload_failed" },
+      { display_name: "busy.txt", reason: "worker_busy" },
+    ]);
     assert.strictEqual(calls.order.at(-1), "state:completed");
   });
 
-  it("recovers when a retry succeeds", async () => {
+  it("recovers when a retry succeeds, and then reports nothing", async () => {
     const { client, calls } = fakeClient({
       uploadJobFile: async (_id, _meta, attempt) => {
         if (attempt === 1) throw new TypeError("fetch failed");
         return { status: 200, file: {} as JobFileUploadResponse };
       },
     });
-    await newRunner(client, await tmpJobsRoot(), sessionWriting({}, GOOD_RESULT)).execute(jobClaim());
-    assert.strictEqual(calls.uploads.length, 4, "each of the two files took two attempts");
+    const qf = sessionWriting({ "outputs/a.txt": "a" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt"] });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    assert.strictEqual(calls.uploads.length, 2, "the file took two attempts");
+    assert.strictEqual(calls.results[0]!.body.refused_outputs, undefined);
     assert.strictEqual(calls.order.at(-1), "state:completed");
   });
 
@@ -1040,19 +1041,36 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
         throw new RequestError("POST", "/x", 409, '{"disposition":"stale_claim"}');
       },
     });
-    const qf = sessionWriting({ "outputs/a.txt": "a" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt"] });
+    const qf = sessionWriting({ "outputs/a.txt": "a", "outputs/b.txt": "b" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt", "outputs/b.txt"] });
     await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
-    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["report.md"], "one attempt, then nothing more");
-    assert.deepStrictEqual(calls.order, ["state:running", "upload:report.md", "result"], "the stale result post abandons: no completed, no failed");
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["a.txt"], "one attempt, then nothing more");
+    assert.deepStrictEqual(calls.order, ["state:running", "upload:a.txt", "result"], "the stale result post abandons: no completed, no failed");
+    assert.strictEqual(calls.results[0]!.body.refused_outputs, undefined, "nothing is reported on a stale claim");
   });
 
   it("stops the uploads when the api takes no files for the run (404, files_unavailable), without retrying", async () => {
     for (const err of [new RequestError("POST", "/x", 404, "{}"), new RequestError("POST", "/x", 503, '{"reason":"files_unavailable"}')]) {
       const { client, calls } = fakeClient({ uploadJobFile: async () => { throw err; } });
-      await newRunner(client, await tmpJobsRoot(), sessionWriting({}, GOOD_RESULT)).execute(jobClaim());
+      const qf = sessionWriting({ "outputs/a.txt": "a" }, { ...GOOD_RESULT, output_files: ["outputs/a.txt"] });
+      await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
       assert.strictEqual(calls.uploads.length, 1, `status ${err.status}: one attempt`);
       assert.strictEqual(calls.order.at(-1), "state:completed", "the job still completes");
     }
+  });
+
+  it("the upload phase has its own slice after the model's budget: a file still uploads after the wall budget has passed", async () => {
+    // The budget is 1 s; the first upload takes 1.2 s, so the second starts after the budget
+    // deadline. It used to be skipped ("the job's wall-clock budget is spent").
+    const { client, calls } = fakeClient({
+      uploadJobFile: async (_id, meta) => {
+        if (meta.display_name === "first.txt") await new Promise((r) => setTimeout(r, 1200));
+        return { status: 201, file: {} as JobFileUploadResponse };
+      },
+    });
+    const qf = sessionWriting({ "outputs/first.txt": "1", "outputs/second.txt": "2" }, { ...GOOD_RESULT, output_files: ["outputs/first.txt", "outputs/second.txt"] });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({ budget_wall_seconds: 1 }));
+    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["first.txt", "second.txt"]);
+    assert.strictEqual(calls.order.at(-1), "state:completed");
   });
 
   it("refuses a bad output_files at submit, while the model can fix it: escape, absolute, symlink out, directory, missing, too many", async () => {
@@ -1079,6 +1097,10 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
         "missing": ["outputs/nope.txt"],
         "not under outputs": ["inputs/01-doc.md"],
         "too many": Array.from({ length: 51 }, (_, i) => `outputs/f${i}.txt`),
+        "reserved report name": ["outputs/report.md"],
+        "reserved findings name": ["outputs/deep/Findings.JSON"],
+        "same file name twice": ["outputs/ok.txt", "outputs/dir2/ok.txt"],
+        "invisible character": ["outputs/a\u202eb.txt"],
         "ok": ["outputs/ok.txt"],
         "symlink inside outputs": ["outputs/inner-link.txt"],
       };
@@ -1098,6 +1120,10 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
       missing: true,
       "not under outputs": true,
       "too many": true,
+      "reserved report name": true,
+      "reserved findings name": true,
+      "same file name twice": true,
+      "invisible character": true,
       ok: false,
       "symlink inside outputs": false,
     });
@@ -1114,7 +1140,8 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
       await fsp.symlink(outside, path.join(cwd, "outputs/a.txt"));
     });
     await newRunner(client, jobsRoot, qf).execute(jobClaim());
-    assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["report.md", "findings.json"]);
+    assert.deepStrictEqual(calls.uploads, []);
+    assert.deepStrictEqual(calls.results[0]!.body.refused_outputs, [{ display_name: "a.txt", reason: "worker_unreadable" }]);
     assert.strictEqual(calls.order.at(-1), "state:completed");
   });
 

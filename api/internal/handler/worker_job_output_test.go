@@ -1,6 +1,9 @@
 package handler
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // runInspector drives an inspector over one body the way Write does (Begin on the head, Chunk, End)
 // and returns its detected type and the first refusal.
@@ -53,5 +56,43 @@ func TestOutputInspectorAllowsHTMLOnlyForOutputs(t *testing.T) {
 		if _, err := runInspector(in, body); err == nil {
 			t.Errorf("output html %s was accepted", name)
 		}
+	}
+}
+
+// TestOutputRefusalNamesHTMLAsAllowed: a refusal on an output that names the HTML type or lists the
+// allowed extensions includes HTML, since the output allowlist takes it; an INPUT refusal still
+// lists the input extensions only.
+func TestOutputRefusalNamesHTMLAsAllowed(t *testing.T) {
+	// A PDF declared as .html: the message names text/html as the declared type, not "unsupported".
+	in := &v1UploadInspector{declared: v1OutputDeclaredTypes("x.html"), allowHTML: true}
+	_, err := runInspector(in, []byte("%PDF-1.7 body"))
+	if err == nil || !strings.Contains(err.Error(), "declared as text/html") {
+		t.Fatalf("pdf declared as html: err = %v, want it to name text/html", err)
+	}
+	// An unknown extension on an output lists .html and .htm among the allowed extensions.
+	in = &v1UploadInspector{declared: v1OutputDeclaredTypes("x.exe"), allowHTML: true}
+	_, err = runInspector(in, []byte("plain text"))
+	if err == nil || !strings.Contains(err.Error(), ".html") || !strings.Contains(err.Error(), ".htm,") {
+		t.Fatalf("output .exe: err = %v, want the allowed extensions to include .html and .htm", err)
+	}
+	// The input inspector's list is unchanged.
+	in = &v1UploadInspector{declared: v1DeclaredTypes("", "x.exe")}
+	_, err = runInspector(in, []byte("plain text"))
+	if err == nil || strings.Contains(err.Error(), "html") {
+		t.Fatalf("input .exe: err = %v, want the input list without html", err)
+	}
+}
+
+// TestOutputDeclaredTypesFromFullName: the output route derives the declared types from the full
+// cleaned name (cleanUploadName), so a long name keeps its extension's meaning: a 300-byte .html
+// name still declares HTML although its stored display name is bounded.
+func TestOutputDeclaredTypesFromFullName(t *testing.T) {
+	long := strings.Repeat("a", 300) + ".html"
+	clean := cleanUploadName(long)
+	if got := v1OutputDeclaredTypes(clean); len(got) != 1 || got[0] != "text/html" {
+		t.Fatalf("declared types of the full name = %v, want [text/html]", got)
+	}
+	if bounded := sanitizeUploadName(long); len(bounded) > v1FileDisplayNameMaxBytes || !strings.HasSuffix(bounded, ".html") {
+		t.Fatalf("bounded name = %q", bounded)
 	}
 }

@@ -203,6 +203,27 @@ func (l JobFileLimits) withDefaults() JobFileLimits {
 	return l
 }
 
+// UploadMinRateBytesPerSecond is the slowest sustained upload rate the request deadline assumes
+// (100 KiB/s). The worker's per-attempt upload timeout (agent/src/job-outputs.ts,
+// UPLOAD_MIN_RATE_BPS) uses the same rate with a 300 s floor, so the api never cuts a body off
+// before the worker gives up on it.
+const UploadMinRateBytesPerSecond = 100 << 10
+
+// UploadDeadline is the wall time one upload of declared bytes may take to arrive:
+// max(RequestDeadline, declared / UploadMinRateBytesPerSecond), where declared is bounded by
+// fileMax (the per-file cap of the direction), so it never exceeds
+// max(RequestDeadline, fileMax / 100 KiB/s): 256 s at the default 25 MiB cap. A small file keeps
+// the plain RequestDeadline. A non-positive declared size counts as zero.
+func (l JobFileLimits) UploadDeadline(declared, fileMax int64) time.Duration {
+	d := l.RequestDeadline
+	if d <= 0 {
+		d = 120 * time.Second
+	}
+	declared = min(max(declared, 0), max(fileMax, 0))
+	scaled := time.Duration((declared+UploadMinRateBytesPerSecond-1)/UploadMinRateBytesPerSecond) * time.Second
+	return max(d, scaled)
+}
+
 // ClampWriteSlots bounds the upload write slots by the database pool size. Each streaming upload
 // holds one pooled connection for its whole body read, so the process-wide slots may take at most
 // half the pool (at least 1), leaving the rest for auth and every other query; the per-owner share
@@ -429,7 +450,10 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 	}
 	q := store.New(tx)
 
-	if p.RunID != nil {
+	// The two server-generated outputs (IsReservedJobOutputName) are not the job's own files: they
+	// neither count against nor are refused by the per-job file and byte caps (SumRunJobFiles leaves
+	// them out of the sums too). The owner, instance and shared-budget quotas below still apply.
+	if p.RunID != nil && (p.Direction != JobFileOutput || !IsReservedJobOutputName(p.DisplayName)) {
 		cur, err := q.SumRunJobFiles(ctx, store.SumRunJobFilesParams{RunID: pgconv.UUID(*p.RunID), Direction: p.Direction})
 		if err != nil {
 			return store.JobFile{}, err
@@ -468,12 +492,27 @@ func (j *JobFiles) Reserve(ctx context.Context, p ReserveParams) (store.JobFile,
 		if isRunFKViolation(err) {
 			return store.JobFile{}, ErrJobRunNotFound
 		}
+		if isOutputDuplicateViolation(err) {
+			return store.JobFile{}, errJobOutputDuplicate
+		}
 		return store.JobFile{}, err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return store.JobFile{}, err
 	}
 	return row, nil
+}
+
+// errJobOutputDuplicate is Reserve's answer when an output of the same run, claim generation, name
+// and content is already stored or still being stored (the uq_job_files_output_content index): the
+// caller looks the stored file up (StoreJobOutput, storeGeneratedOutput) instead of storing twice.
+var errJobOutputDuplicate = errors.New("workersvc: output already stored")
+
+// isOutputDuplicateViolation reports a unique violation (SQLSTATE 23505) on the output duplicate
+// index.
+func isOutputDuplicateViolation(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23505" && pgErr.ConstraintName == "uq_job_files_output_content"
 }
 
 // isRunFKViolation reports a foreign-key violation (SQLSTATE 23503) on job_files.run_id: the run
@@ -508,6 +547,10 @@ type WriteOptions struct {
 	// ContentType is the caller-decided allowlisted type, used when Inspector is nil.
 	ContentType string
 	Inspector   Inspector
+	// Deadline bounds the whole Write (the body reads and the transaction); zero means
+	// Limits().RequestDeadline. The upload routes pass Limits().UploadDeadline(declared, cap), so
+	// the store's bound is the same one they set on the connection's read deadline.
+	Deadline time.Duration
 }
 
 // Write streams body into AAD-sealed chunks and commits them with the file's resting state in ONE
@@ -526,7 +569,11 @@ func (j *JobFiles) Write(ctx context.Context, id, owner uuid.UUID, body io.Reade
 	if j.box == nil {
 		return store.JobFile{}, ErrJobFilesUnavailable
 	}
-	ctx, cancel := context.WithTimeout(ctx, j.limits.RequestDeadline)
+	writeDeadline := opt.Deadline
+	if writeDeadline <= 0 {
+		writeDeadline = j.limits.RequestDeadline
+	}
+	ctx, cancel := context.WithTimeout(ctx, writeDeadline)
 	defer cancel()
 	defer func() {
 		if err != nil {

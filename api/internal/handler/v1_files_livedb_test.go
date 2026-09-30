@@ -52,7 +52,19 @@ type v1UploadOpts struct {
 	preamble int
 	chunked  bool
 	failBody error
+	// deadlines, when set, is the response writer: it records the read deadline the route sets.
+	deadlines *deadlineRecorder
 }
+
+// deadlineRecorder is a response recorder that records the connection read deadline a handler sets
+// through http.ResponseController (a plain recorder does not support deadlines).
+type deadlineRecorder struct {
+	*httptest.ResponseRecorder
+	read time.Time
+}
+
+func (d *deadlineRecorder) SetReadDeadline(t time.Time) error  { d.read = t; return nil }
+func (d *deadlineRecorder) SetWriteDeadline(t time.Time) error { return nil }
 
 // errAfter is a reader that yields err at once.
 type errAfter struct{ err error }
@@ -135,7 +147,12 @@ func (e *v1JobsEnv) uploadTo(router http.Handler, bearer string, data []byte, o 
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
 	rec := httptest.NewRecorder()
-	router.ServeHTTP(rec, req.WithContext(ctx))
+	if o.deadlines != nil {
+		o.deadlines.ResponseRecorder = rec
+		router.ServeHTTP(o.deadlines, req.WithContext(ctx))
+	} else {
+		router.ServeHTTP(rec, req.WithContext(ctx))
+	}
 	return v1CallResult{status: rec.Code, header: rec.Header(), body: rec.Body.Bytes()}
 }
 

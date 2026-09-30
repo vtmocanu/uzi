@@ -1029,6 +1029,15 @@ export interface JobResultRequest {
   status: string;
   report_md: string;
   findings: JobFindingBody[];
+  /** The output files the worker dropped itself (PRD #1909 M4): the api records each as a refusal
+   *  the caller can read. Omitted when there are none. */
+  refused_outputs?: JobRefusedOutput[];
+}
+
+/** One output the worker dropped: its display name and why (the api's fixed allowlist). */
+export interface JobRefusedOutput {
+  display_name: string;
+  reason: "worker_empty" | "worker_too_large" | "worker_unreadable" | "worker_upload_failed" | "worker_busy";
 }
 
 /** The metadata of one output-file upload (PRD #1909 M4): the `X-Uzi-Job-File` header of

@@ -51,8 +51,11 @@ type workerJobFileMeta struct {
 //	409 stale claim, or the run already finished
 //	413 a limit: file_too_large, too_many_files or job_bytes_exceeded (recorded as a refusal)
 //	415 unsupported_file_type (recorded as a refusal)
-//	422 empty_file, size_mismatch, sha256_mismatch (recorded as a refusal, reservation released)
-//	503 files_unavailable, or uploads_busy with Retry-After
+//	422 empty_file, size_mismatch, sha256_mismatch, reserved_name (recorded as a refusal,
+//	    reservation released): report.md and findings.json are the server's own names
+//	    (workersvc.IsReservedJobOutputName)
+//	503 files_unavailable, or uploads_busy with Retry-After (also while an earlier attempt of the
+//	    very same upload is still streaming)
 //	507 storage_quota_exceeded: the owner's, the instance's or the shared budget is full (recorded)
 //
 // A refusal never fails the job: the worker logs it and goes on to the next file.
@@ -72,13 +75,18 @@ func (h *Handler) WorkerJobOutputFile(w http.ResponseWriter, r *http.Request) {
 	}
 	jf := h.wsvc.JobFiles()
 	// The limits are only needed for the deadline; a missing store is answered by the service
-	// AFTER its fence, so a worker that does not hold the run learns nothing from it.
+	// AFTER its fence, so a worker that does not hold the run learns nothing from it. The read
+	// deadline scales with the DECLARED size like the v1 input upload's (UploadDeadline): the worker
+	// gives each attempt max(300 s, size / 100 KiB/s), which is never shorter than this.
 	deadlineD := workerJobOutputFallbackDeadline
 	if jf != nil {
-		deadlineD = jf.Limits().RequestDeadline
+		deadlineD = jf.Limits().UploadDeadline(*meta.Size, jf.Limits().OutputFileMaxBytes)
 	}
 	deadline := setJobFileDeadlines(w, deadlineD)
 
+	// The declared types derive from the FULL cleaned name (like the input route); only the stored
+	// display name is shortened, and it keeps its extension.
+	clean := cleanUploadName(meta.DisplayName)
 	name := sanitizeUploadName(meta.DisplayName)
 	body := http.MaxBytesReader(w, r.Body, max(*meta.Size, 1))
 	res, err := h.wsvc.StoreJobOutput(r.Context(), wkr, runID, workersvc.JobOutputParams{
@@ -87,7 +95,8 @@ func (h *Handler) WorkerJobOutputFile(w http.ResponseWriter, r *http.Request) {
 		Size:            *meta.Size,
 		SHA256:          meta.SHA256,
 	}, body, workersvc.WriteOptions{
-		Inspector: &v1UploadInspector{declared: v1OutputDeclaredTypes(name), allowHTML: true},
+		Inspector: &v1UploadInspector{declared: v1OutputDeclaredTypes(clean), allowHTML: true},
+		Deadline:  deadlineD,
 	})
 	if err != nil {
 		var ref *workersvc.JobFileRefusedError

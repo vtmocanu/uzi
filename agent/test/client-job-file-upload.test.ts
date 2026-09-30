@@ -116,6 +116,25 @@ describe("WorkerClient.uploadJobFile", () => {
     );
   });
 
+  it("exposes the response's Retry-After (whole seconds) on the RequestError, in milliseconds", async () => {
+    for (const [header, want] of [["5", 5000], ["0", 0], ["Wed, 21 Oct 2026 07:28:00 GMT", undefined], ["-3", undefined], ["", undefined]] as const) {
+      const client = await serve(async (req, res) => {
+        await readAll(req);
+        res.writeHead(503, { "Content-Type": "application/json", ...(header === "" ? {} : { "Retry-After": header }) });
+        res.end('{"reason":"uploads_busy"}');
+      });
+      await assert.rejects(
+        () => client.uploadJobFile("r", META, Buffer.from("hello")),
+        (err: unknown) => err instanceof RequestError && err.status === 503 && err.retryAfterHeaderMs === want,
+        `Retry-After ${JSON.stringify(header)}`,
+      );
+      const s = server!;
+      server = undefined;
+      s.closeAllConnections();
+      await new Promise<void>((r) => s.close(() => r()));
+    }
+  });
+
   it("a timeout aborts the request", async () => {
     const client = await serve(() => {
       /* never answers */
