@@ -41,7 +41,7 @@ func TestFetcherCredentialIsolationLiveDB(t *testing.T) {
 	h := &Handler{pool: e.pool, q: q, box: box, cfg: cfg, wsvc: workersvc.New(q, box, workersvc.Params{}), settings: e.caps, hub: hub.New()}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
 	routers := map[string]http.Handler{
-		"plain": h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim),
+		"plain": h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim),
 		"tls":   h.WorkerRoutes(lim),
 	}
 
