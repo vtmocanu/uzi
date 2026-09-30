@@ -30,11 +30,11 @@ start=$SECONDS
 while :; do
   rc=0
   out="$("$UZI" run create --repo "$REPO" --issue "$ISSUE" ${1+"$@"} --json 2>"$err")" || rc=$?
+  cat "$err" >&2
   if [ "$rc" -eq 0 ]; then
     printf '%s\n' "$out"
     exit 0
   fi
-  cat "$err" >&2
   if ! grep -q -F -e "not marked as uzi's work" -e "issue not found on this repo's board" "$err"; then
     exit "$rc"
   fi
