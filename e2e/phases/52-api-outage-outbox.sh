@@ -212,13 +212,17 @@ wait_spilled() {
 # it by construction. We key on the per-attempt retry rather than the full retry-exhaustion event on
 # purpose: the terminal retry schedule is [1,2,4,8,16]s over 6 attempts, and on the CI lane where each
 # failed connect black-holes ~10s, exhaustion alone is ~90s. Including run work and api restart
-# could exceed the 120s heartbeat-stale window below and swap this into a stale-requeue failure.
+# could exceed the heartbeat-stale window below (300s) and swap this into a stale-requeue failure.
 # The FIRST failed attempt is the same
 # proof and fires ~one connect timeout after the terminal, keeping the whole outage well under the
 # window. TIMEOUT bounds it likewise. Returns 0 once observed and 1 on timeout; it never calls `fail`
 # itself (it runs with the api STOPPED) — the caller restores the api and judges after.
+# TIMEOUT defaults to 180s. The old 80s under-shot on the gitlab CI lane (nightly run 36680011794,
+# 2026-09-30): with the api down, finalize itself takes ~60s, because PR-description staging waits
+# ~10s on a failed fetch and MR creation spends ~32s in transient forge retries, so the terminal
+# was journaled ~70s after the cut and its first send failed ~80s after it.
 wait_terminal_lost() {
-  local run="$1" timeout="${2:-80}" f="$RUNROOT/.outbox-terminal.log"
+  local run="$1" timeout="${2:-180}" f="$RUNROOT/.outbox-terminal.log"
   local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ "$SECONDS" -lt "$deadline" ]; do
     "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
@@ -275,7 +279,7 @@ api_back() {
 # outage SECS longer so a real backlog accumulates, bring the api back, re-login (the
 # bounce drops the session), then assert the barrier. Spill-gated rather than
 # fixed-length: see wait_spilled for why a bare `sleep` cannot bound the spill. The
-# total stays well under the 120s heartbeat-stale window raised below (~21s worst-case
+# total stays well under the 300s heartbeat-stale window raised below (~21s worst-case
 # spill + 25s the longest hold). No `docker compose start` (no phase uses it): stop,
 # then api_back, which waits for the existing web proxy to recover.
 outage() {
@@ -295,11 +299,11 @@ outage() {
 # --- raise the api heartbeat-stale window so the outage never requeues the run --------
 # Exported so it out-ranks the env-file's E2E_WORKER_HEARTBEAT_STALE=15s (compose ranks
 # shell env above --env-file), exactly as phase 46 exports UZI_E2E_MAX_CONCURRENT_RUNS.
-export E2E_WORKER_HEARTBEAT_STALE=120s
+export E2E_WORKER_HEARTBEAT_STALE=300s
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login
-pass "api recreated with a 120s heartbeat-stale window so the outage cannot requeue the running run"
+pass "api recreated with a 300s heartbeat-stale window so the outage cannot requeue the running run"
 
 # Clear the admin owner's accumulated cross-phase recovery custody holds so the claim
 # admission gate (workersvc/budget.go: custodyHoldLimit=8) does not wedge our claims in
@@ -396,7 +400,7 @@ fi
 # while the api is down replays its messages first and its outcome only once the trace is
 # contiguous. These cases reuse the UZI_STUB_OUTBOX sentinel but with the SHORT e2e-only stream
 # (UZI_STUB_OUTBOX_TICKS) so the run reaches its terminal INSIDE a bounded outage that still stays
-# under the 120s heartbeat-stale window raised above — the worker stays leased across the outage.
+# under the 300s heartbeat-stale window raised above — the worker stays leased across the outage.
 say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked permit wait)"
 unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
 export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
@@ -413,8 +417,9 @@ rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 # first send fail while the api is unreachable, so recovery is forced through the persisted journal.
 # How long the short stream takes to get there depends on the runner's speed, not this phase (a fixed
 # 30s under-shot it on the slow gitlab CI lane — the #1391 M6 regression this replaces). The gate's
-# timeout stays under the 120s heartbeat-stale window, so the worker is never swept stale
-# mid-outage and the run is never requeued.
+# timeout stays under the 300s heartbeat-stale window, so the worker is never swept stale
+# mid-outage and the run is never requeued. Budget: the gate (180s) plus, for case 4, a container
+# restart and the api start, well inside 300s.
 
 # Cases 3-5 exercise the terminal journal, so their runs are created un-interlocked (set_interlock).
 # The trap restores the default even if a case fails.
