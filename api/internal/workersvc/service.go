@@ -1068,6 +1068,7 @@ type Store interface {
 	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
 	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
 	FailJobsPastWallDeadline(ctx context.Context, arg store.FailJobsPastWallDeadlineParams) ([]store.FailJobsPastWallDeadlineRow, error)
+	// ListRevokedProductJobs backs the PRD #1908 D14 product-revoke sweep (CancelRevokedProductJobs).
 	ListRevokedProductJobs(ctx context.Context, batch int32) ([]store.ListRevokedProductJobsRow, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,

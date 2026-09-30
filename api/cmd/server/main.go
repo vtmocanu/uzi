@@ -774,6 +774,15 @@ func run() error {
 				return q.SweepStrandedFilingFindings(ctx, pgtype.Timestamptz{Time: cutoff, Valid: true})
 			},
 		},
+		// Product-revoke sweep (PRD #1908 D14): cancels non-terminal jobs whose creating product
+		// token was explicitly revoked, whose product is disabled or deleted, or whose owner is
+		// deactivated, through the existing cancel path. Token expiry alone never cancels. It
+		// runs before the ephemeral provision pass so a revoked queued job is cancelled before a
+		// worker is provisioned for it in the same tick.
+		sweeper.Pass{
+			Name: "job_product_revoke_cancel",
+			Run:  wsvc.CancelRevokedProductJobs,
+		},
 		// Ephemeral worker auto-provisioning (PRD #529 M2): find unplaceable queued runs
 		// of opted-in users and spin one run-bound ephemeral hosted worker each, capped
 		// and concurrency-safe. Rides this ticker like the passes above rather than a
@@ -804,13 +813,6 @@ func run() error {
 			Run: func(ctx context.Context) (int64, error) {
 				return wsvc.FailJobsPastWallDeadline(ctx, cfg.RunTimeout)
 			},
-		},
-		// Product-revoke sweep (PRD #1908 D14): cancels non-terminal jobs whose creating product
-		// token was explicitly revoked, whose product is disabled or deleted, or whose owner is
-		// deactivated, through the existing cancel path. Token expiry alone never cancels.
-		sweeper.Pass{
-			Name: "job_product_revoke_cancel",
-			Run:  wsvc.CancelRevokedProductJobs,
 		},
 		// Ephemeral worker orphan/failure GC backstop (PRD #529 M5, Decision 6). Deletes
 		// ephemeral workers that can no longer make progress — owning run terminal/absent,

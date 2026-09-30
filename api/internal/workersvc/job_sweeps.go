@@ -126,8 +126,9 @@ const jobRevokeCancelReason = "the product credential that created this job was 
 //
 // Each job is cancelled through the existing cancel path (SubmitInputWithOptions, as the owner):
 // a queued job ends cancelled server-side at once, a running one gets a cancel input its job
-// runner polls and honours. A job that already has a pending cancel is not selected, so a re-run
-// is a no-op. A job that finished between the select and the cancel is skipped; any other
+// runner polls and honours. A non-queued job that already has a pending cancel is not selected,
+// so a re-run is a no-op; a queued one is always selected (no poller will consume its pending
+// cancel, e.g. after a stale-worker requeue). A job that finished between the select and the cancel is skipped; any other
 // per-job failure is logged and joined into the returned error after the rest are processed.
 // It returns the number of cancels issued.
 func (s *Service) CancelRevokedProductJobs(ctx context.Context) (int64, error) {

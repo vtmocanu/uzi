@@ -318,15 +318,20 @@ RETURNING id, user_id, status;
 -- name: ListRevokedProductJobs :many
 -- PRD #1908 D14 product-revoke sweep. The non-terminal kind='job' runs whose authorization
 -- has been withdrawn, oldest first, at most @batch per pass:
---   * the creating product token was EXPLICITLY revoked (single revoke, "Revoke all", admin
---     revoke, or a revoked OAuth grant, all of which set product_tokens.revoked);
---   * the origin's product is disabled or soft-deleted;
+--   * the creating product token was EXPLICITLY revoked (single revoke, "Revoke all" or admin
+--     revoke, all of which set product_tokens.revoked; a future revoke path such as the PRD
+--     #1910 OAuth grant revoke must set product_tokens.revoked too, or this sweep misses it);
+--   * the origin's product is disabled or soft-deleted (products_deleted_is_disabled makes a
+--     deleted product always disabled, so the deleted_at clause is belt-and-braces);
 --   * the owner is deactivated (any job, including one created with a uzc_ token).
 -- Token EXPIRY is deliberately absent: an expired, unrevoked token never cancels a job that was
 -- authorized while it was valid. A uzc_-created job has NULL product_id and NULL
 -- product_token_id, so the LEFT JOINs give it no revoked/disabled signal and only the owner
--- clause can select it. A job with an unconsumed cancel input is skipped: its cancel is already
--- in flight, so a re-run of the pass is a no-op rather than a second input.
+-- clause can select it. A NON-queued job with an unconsumed cancel input is skipped: its cancel
+-- is already in flight for a poller to consume, so a re-run of the pass is a no-op rather than a
+-- second input. A QUEUED job is never skipped: it has no poller, so a pending cancel left by the
+-- stale-worker requeue (RequeueRunsOfStaleWorkers) would otherwise strand it queued forever; the
+-- pass takes the server-side queued cancel for it.
 SELECT r.id, r.user_id
   FROM runs r
   JOIN users u ON u.id = r.user_id
@@ -339,7 +344,8 @@ SELECT r.id, r.user_id
         OR COALESCE(NOT p.enabled, false)
         OR p.deleted_at IS NOT NULL
         OR NOT u.is_active)
-   AND NOT EXISTS (SELECT 1 FROM run_user_inputs i
-                    WHERE i.run_id = r.id AND i.kind = 'cancel' AND i.consumed_at IS NULL)
+   AND (r.status = 'queued'
+        OR NOT EXISTS (SELECT 1 FROM run_user_inputs i
+                        WHERE i.run_id = r.id AND i.kind = 'cancel' AND i.consumed_at IS NULL))
  ORDER BY r.created_at, r.id
  LIMIT @batch::int;
