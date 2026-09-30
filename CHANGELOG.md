@@ -38,6 +38,11 @@ through `[0.52.0]`.)
 - **A `check:api-v1-compat` gate refuses breaking changes to `api/openapi/v1.yaml` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
   It runs an oasdiff comparison against the base in `gate:repo`, enforcing the additive-only promise in [Product tokens](docs/product-tokens.md).
 
+### Fixed
+
+- **A checkpoint counts as published only when its git pack was produced in full ([#1725](https://github.com/vtmocanu/uzi/issues/1725)).**
+  The worker used to record a checkpoint as confirmed as soon as the api answered `published: true`, even if the `git pack-objects` streaming it then failed. It now also requires the pack producer to exit cleanly; otherwise the publish is treated as unconfirmed and retried from the attempted tip, like any other ambiguous result. The production api already reads the whole pack first, so this closes a latent gap rather than a live failure. The worker crash the issue first described was fixed by #1804.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
