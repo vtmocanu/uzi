@@ -314,7 +314,10 @@ pod-only scope.
 
 **Run steps 0 to 10 in ONE shell session** (the trap below is installed in step 0 and must stay
 in effect until step 10); running the sketch as a standalone script would fire its `EXIT` trap
-immediately and undo the raise.
+immediately and undo the raise. The sketch turns `errexit` off again once the raise is done, so the
+later checks that are expected to fail (step 1's "no durable line yet", the pre-kill "no
+`terminal-<G>.json`") do not end the session; judge each check's result yourself and, to abort an
+attempt, run `exit` (the trap then cleans up).
 
 ### Preconditions
 
@@ -413,6 +416,8 @@ trap 'cleanup 143' TERM
 kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
 kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
+set +e   # errexit only guards the raise above; later steps run checks that are EXPECTED to fail
+         # (no durable line yet, no terminal-<G>.json). The EXIT/INT/TERM traps stay installed.
 ```
 
 **If the shell itself dies before the trap runs**, do not re-run step 0: it would record the
@@ -423,7 +428,7 @@ the issue in step 0:
 # Values below come from the issue comment written in step 0, never from the live deployment.
 kubectl -n '<api-namespace>' set env 'deploy/<api-deployment>' '<recorded-override>'   # e.g. WORKER_HEARTBEAT_STALE=<v>
 #   or, when the record says there was no direct override:   'WORKER_HEARTBEAT_STALE-'
-kubectl -n '<api-namespace>' rollout status 'deploy/<api-deployment>'
+kubectl -n '<api-namespace>' rollout status 'deploy/<api-deployment>' --timeout=300s
 kubectl [-n '<worker-namespace>'] delete '<deny-kind>' 'uzi-1742-acceptance-<n>' --ignore-not-found
 # Verify both: the object is gone, and the deployment's override matches the record.
 kubectl [-n '<worker-namespace>'] get '<deny-kind>' 'uzi-1742-acceptance-<n>' --ignore-not-found -o name   # must exit 0 and print nothing
