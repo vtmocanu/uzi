@@ -1,12 +1,14 @@
 package workersvc
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -369,5 +371,156 @@ func TestRegisterFinalizeKnownLimitFallsBackToMissingPathLiveDB(t *testing.T) {
 				t.Fatalf("fail_origin = %q, want %q", got, tc.wantOrigin)
 			}
 		})
+	}
+}
+
+// TestRegisterAttestedFinalizeCrossedPairingLiveDB: the pairing is positional. Run A at generation
+// 1 and run B at generation 2 offered as A:2, B:1 are handled by NEITHER attested query (no mark, no
+// allowance); the ordinary pass fails both (over budget). The correct two-pair offer handles both.
+func TestRegisterAttestedFinalizeCrossedPairingLiveDB(t *testing.T) {
+	setup := func(t *testing.T) (codexTestEnv, *Service, uuid.UUID, uuid.UUID, uuid.UUID, uuid.UUID) {
+		env := setupCodexLiveDB(t)
+		userID, _, repoID := env.seedCodexInfra(t)
+		svc := snapshotSvc(env, testParams()) // RunMaxRequeues = 1
+		wk := seedSnapshotWorker(t, env, userID, "old-nonce")
+		a := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 1, 1)
+		b := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 2, 1)
+		return env, svc, userID, wk, a, b
+	}
+	t.Run("crossed offer handles neither", func(t *testing.T) {
+		env, svc, userID, wk, a, b := setup(t)
+		registerWith(t, env, svc, userID, wk, finalizeSnap(false, fin(a, 2), fin(b, 1)))
+		for _, r := range []uuid.UUID{a, b} {
+			if got := statusOf(t, env, r); got != "failed" {
+				t.Fatalf("run %s status = %q, want failed by the ordinary pass", r, got)
+			}
+			if got := failOriginOf(t, env, r); got != "worker_lost" {
+				t.Fatalf("run %s fail_origin = %q, want worker_lost", r, got)
+			}
+			if got := requeueCountOf(t, env, r); got != 1 {
+				t.Fatalf("run %s requeue_count = %d, want 1 (no allowance requeue)", r, got)
+			}
+			if _, has := finalizeMarkOf(t, env, r); has {
+				t.Fatalf("run %s carries a finalize mark from a crossed pair", r)
+			}
+		}
+	})
+	t.Run("correct two-pair offer handles both", func(t *testing.T) {
+		env, svc, userID, wk, a, b := setup(t)
+		registerWith(t, env, svc, userID, wk, finalizeSnap(false, fin(a, 1), fin(b, 2)))
+		for r, gen := range map[uuid.UUID]int64{a: 1, b: 2} {
+			if got := statusOf(t, env, r); got != "queued" {
+				t.Fatalf("run %s status = %q, want queued", r, got)
+			}
+			if mark, has := finalizeMarkOf(t, env, r); !has || mark != gen {
+				t.Fatalf("run %s mark = (%d,%v), want (%d,true)", r, mark, has, gen)
+			}
+		}
+	})
+}
+
+// TestRegisterAttestedFinalizeExcludedShapesLiveDB: shapes the attested queries must never touch,
+// even listed at their exact generation. Each case seeds a target and an identical control that is
+// not attested; the attested pass must leave the target exactly as the ordinary pass leaves the
+// control (same status and requeue_count) and never stamp the allowance mark.
+func TestRegisterAttestedFinalizeExcludedShapesLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(t *testing.T, env codexTestEnv, userID, repoID, wk uuid.UUID) uuid.UUID
+	}{
+		{"chat run", func(t *testing.T, env codexTestEnv, userID, _, wk uuid.UUID) uuid.UUID {
+			return seedOutageChatRun(t, env, userID, wk, 1, 1)
+		}},
+		{"paused run with a released claim", func(t *testing.T, env codexTestEnv, userID, repoID, wk uuid.UUID) uuid.UUID {
+			r := seedOutageRun(t, env, userID, repoID, wk, "paused", "issue", 1, 1)
+			env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, r)
+			return r
+		}},
+		{"running run with a released claim", func(t *testing.T, env codexTestEnv, userID, repoID, wk uuid.UUID) uuid.UUID {
+			r := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 1, 1)
+			env.exec(`UPDATE runs SET claim_released_at = now() WHERE id = $1`, r)
+			return r
+		}},
+		{"awaiting_approval run", func(t *testing.T, env codexTestEnv, userID, repoID, wk uuid.UUID) uuid.UUID {
+			return seedOutageRun(t, env, userID, repoID, wk, "awaiting_approval", "issue", 1, 1)
+		}},
+		{"awaiting_input run", func(t *testing.T, env codexTestEnv, userID, repoID, wk uuid.UUID) uuid.UUID {
+			return seedOutageRun(t, env, userID, repoID, wk, "awaiting_input", "issue", 1, 1)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			userID, _, repoID := env.seedCodexInfra(t)
+			svc := snapshotSvc(env, testParams())
+			wk := seedSnapshotWorker(t, env, userID, "old-nonce")
+			target := tc.seed(t, env, userID, repoID, wk)
+			control := tc.seed(t, env, userID, repoID, wk)
+			registerWith(t, env, svc, userID, wk, finalizeSnap(false, fin(target, 1)))
+			if _, has := finalizeMarkOf(t, env, target); has {
+				t.Fatal("attested pass stamped the allowance mark on an excluded shape")
+			}
+			if got, want := statusOf(t, env, target), statusOf(t, env, control); got != want {
+				t.Fatalf("attested target status = %q, unattested control = %q: the attested pass transitioned it", got, want)
+			}
+			if got, want := requeueCountOf(t, env, target), requeueCountOf(t, env, control); got != want {
+				t.Fatalf("attested target requeue_count = %d, control = %d", got, want)
+			}
+		})
+	}
+}
+
+// TestRequeueAttestedFinalizeAllowanceUsedFlagLiveDB pins the AllowanceUsed column of the real
+// query: true only when the one-shot allowance fired, false for an under-budget requeue.
+func TestRequeueAttestedFinalizeAllowanceUsedFlagLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name          string
+		requeues      int32
+		wantAllowance bool
+	}{
+		{"over budget uses the allowance", 1, true},
+		{"under budget is an ordinary requeue", 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			env := setupCodexLiveDB(t)
+			userID, _, repoID := env.seedCodexInfra(t)
+			wk := seedSnapshotWorker(t, env, userID, "old-nonce")
+			run := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 1, tc.requeues)
+			rows, err := env.q.RequeueAttestedFinalizeRuns(env.ctx, store.RequeueAttestedFinalizeRunsParams{
+				MaxRequeues: 1, WorkerID: pgconv.UUID(wk), RunIds: []uuid.UUID{run}, ClaimGenerations: []int64{1},
+			})
+			if err != nil {
+				t.Fatalf("RequeueAttestedFinalizeRuns: %v", err)
+			}
+			if len(rows) != 1 || rows[0].ID != run || rows[0].AllowanceUsed != tc.wantAllowance {
+				t.Fatalf("rows = %+v, want one row for %s with AllowanceUsed=%v", rows, run, tc.wantAllowance)
+			}
+		})
+	}
+}
+
+// TestRegisterMalformedFinalizeWireKeepsActiveLeaseLiveDB: a snapshot decoded from JSON whose
+// finalize_resume has the wrong wire type still applies its valid Active terminal_pending lease, so
+// the run stays protected (#1391) instead of being failed worker_lost.
+func TestRegisterMalformedFinalizeWireKeepsActiveLeaseLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	svc := snapshotSvc(env, testParams())
+	wk := seedSnapshotWorker(t, env, userID, "old-nonce")
+	run := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", 1, 1)
+	raw := `{"snapshot_epoch":0,"active":[{"run_id":"` + run.String() + `","claim_generation":1,"phase":"running","terminal_pending":true}],` +
+		`"finalize_resume":[{"run_id":"` + run.String() + `","claim_generation":"1"}]}`
+	var snap ActiveSnapshot
+	if err := json.Unmarshal([]byte(raw), &snap); err != nil {
+		t.Fatalf("Unmarshal: %v", err)
+	}
+	registerWith(t, env, svc, userID, wk, &snap)
+	if lease, ok := readActiveRun(t, env, wk, run); !ok || !lease.terminalPending {
+		t.Fatalf("valid Active lease not applied: lease=%+v ok=%v", lease, ok)
+	}
+	if got := statusOf(t, env, run); got != "running" {
+		t.Fatalf("status = %q, want running (lease-protected)", got)
+	}
+	if _, has := finalizeMarkOf(t, env, run); has {
+		t.Fatal("a malformed finalize list stamped the allowance mark")
 	}
 }

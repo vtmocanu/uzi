@@ -11951,10 +11951,6 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue
                                       THEN claim_generation
                                       ELSE finalize_resume_generation END,
     health = 'ok', health_reason = NULL, health_since = NULL,
-    budget_paused_seconds = budget_paused_seconds
-        + CASE WHEN status IN ('awaiting_approval', 'awaiting_input')
-               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
-               ELSE 0 END,
     codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
     updated_at = now()
 WHERE runs.worker_id = $2

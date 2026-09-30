@@ -7,6 +7,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -83,5 +84,31 @@ func TestValidateFinalizeResumeCeiling(t *testing.T) {
 	}
 	if _, ok := svc.validateFinalizeResume(store.Worker{}, nil); ok {
 		t.Fatal("a nil snapshot has no list")
+	}
+}
+
+// TestRegisterEnqueuesJudgeForAttestedFailedRuns: an attested run failed over cap reaches
+// publishRegisterSweeps, so the register funnels it to the judge exactly like an orphan-failed run.
+func TestRegisterEnqueuesJudgeForAttestedFailedRuns(t *testing.T) {
+	w := worker()
+	attested := uuid.New()
+	fs := &fakeStore{
+		attestedFailedRuns: []uuid.UUID{attested},
+		runByIDPlain:       store.Run{ID: attested, UserID: uuid.New(), Kind: runkind.Issue, Status: "failed", Harness: string(HarnessClaude)},
+		userByID:           store.User{JudgeEnabled: true},
+		anthropic:          []byte("sealed"),
+		registerResult:     store.Worker{ID: w.ID, Status: "online"},
+	}
+	svc := New(fs, newBox(t), testParams())
+	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
+	snap := &ActiveSnapshot{FinalizeResume: []FinalizeResumeEntry{{RunID: attested.String(), ClaimGeneration: 1}}}
+	if _, _, err := svc.Register(context.Background(), w, "1", "base", nil, nil, nil, snap); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if fs.createdJudgeRun == nil {
+		t.Fatal("an attested over-cap failed run must enqueue a judge")
+	}
+	if !fs.createdJudgeRun.TargetRunID.Valid || uuid.UUID(fs.createdJudgeRun.TargetRunID.Bytes) != attested {
+		t.Errorf("judge targets %v, want the attested run %v", fs.createdJudgeRun.TargetRunID, attested)
 	}
 }

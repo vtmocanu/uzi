@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -43,6 +44,34 @@ type ActiveSnapshot struct {
 	// claim path. Omitted by an older worker, ignored by an older api (the snapshot is parsed
 	// leniently).
 	FinalizeResume []FinalizeResumeEntry `json:"finalize_resume,omitempty"`
+}
+
+// UnmarshalJSON decodes an ActiveSnapshot with FinalizeResume decoded as a SEPARATE lenient step
+// (issue #1742): a finalize_resume value of the wrong wire type (a string claim_generation, a
+// float, a non-string run_id, a non-array) drops only the finalize list, with a warning, and never
+// fails the decode of the rest of the snapshot, so a malformed attestation cannot discard valid
+// Active terminal_pending leases or pending_overflow (#1391). Every other field keeps the strict
+// typed decode it had before the finalize list existed.
+func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
+	type plain ActiveSnapshot
+	aux := struct {
+		*plain
+		FinalizeResume json.RawMessage `json:"finalize_resume"`
+	}{plain: (*plain)(s)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	s.FinalizeResume = nil
+	if len(aux.FinalizeResume) == 0 || string(aux.FinalizeResume) == "null" {
+		return nil
+	}
+	var list []FinalizeResumeEntry
+	if err := json.Unmarshal(aux.FinalizeResume, &list); err != nil {
+		slog.Warn("finalize_resume has an invalid wire shape; ignoring the list and keeping the rest of the snapshot")
+		return nil
+	}
+	s.FinalizeResume = list
+	return nil
 }
 
 // FinalizeResumeEntry is one finalize-pending attempt a restarting worker attests on its register
@@ -127,7 +156,8 @@ type validatedFinalizeResume struct {
 // for an absent list, and for an invalid one (a non-uuid run_id, a negative generation, a
 // duplicate run_id, or more than ActiveSnapshotMaxEntries entries) after a warning: the list is
 // then ignored and Register carries on, never failing. Only the register path calls it; the
-// heartbeat and claim snapshots never read the field.
+// heartbeat and claim snapshots never read the field. A wrongly TYPED list never reaches here:
+// ActiveSnapshot.UnmarshalJSON already dropped it without failing the rest of the snapshot.
 func (s *Service) validateFinalizeResume(wkr store.Worker, snap *ActiveSnapshot) (validatedFinalizeResume, bool) {
 	var out validatedFinalizeResume
 	if snap == nil || len(snap.FinalizeResume) == 0 {

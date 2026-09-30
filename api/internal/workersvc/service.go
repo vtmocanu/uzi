@@ -2329,9 +2329,7 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 	} else {
 		slog.Info("worker register orphan recovery committed",
 			"worker_id", wkr.ID.String(), "snapshot_offered", false,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued),
-			"finalize_resume_offered", finalizeOffered, "finalize_requeued", len(finalizeRequeued),
-			"finalize_allowance_used", finalizeAllowance, "finalize_failed", len(finalizeFailed))
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
 	}
 	s.publishRegisterSweeps(ctx, append(finalizeFailed, orphanFailed...), append(finalizeRequeued, requeued...))
 	return store.Worker(row), nonce, nil
