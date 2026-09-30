@@ -62,9 +62,11 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   at `NEXT=claimed_by_other`: talk to them (SendMessage), do not take it.
 - **Never in the `main` worktree.** Every local edit happens in a sibling worktree
   (`land-prep.sh` makes one); auto-clean worktrees you created once the PR merges.
-- **Run the scripts from a fresh `origin/main` worktree**, not the long-lived `main/`
-  checkout: `git fetch origin main && git worktree add --detach ../uzi-lander-tools
-  origin/main`. `takeover.sh` prints `SKILL_SCRIPTS_STALE=1` when its own copy differs.
+- **Run the scripts from your own fresh `origin/main` worktree**, not the long-lived
+  `main/` checkout, and never from one another session made (moving it moves their tools):
+  `git fetch origin main && T=$(mktemp -d ../uzi-lander-tools.XXXXXX) && git worktree add
+  --detach "$T" origin/main`. Remove it in step 8. `takeover.sh` prints
+  `SKILL_SCRIPTS_STALE=1` when its own copy differs.
 - **Never use `git stash` in landing work.** The stash list is shared by every worktree of
   the repo, so a `pop` can apply another session's entry. Commit work in progress in your
   own worktree, or save a patch file.

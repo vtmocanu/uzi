@@ -1011,10 +1011,11 @@ tasks:
       - ./e2e/lib.test.sh
 
   test:uzi-watcher-backups:
-    desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention and detached loop
+    desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
     cmds:
       - ./.agents/skills/uzi-watcher/scripts/backup-runs.test.sh
       - ./.agents/skills/uzi-watcher/scripts/backup-loop.test.sh
+      - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
 
   test:uzi-lander:
     desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance and CHANGELOG union
