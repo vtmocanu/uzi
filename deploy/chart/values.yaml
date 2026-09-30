@@ -260,10 +260,13 @@ api:
     # UZI_EPHEMERAL_PROVISION_DEADLINE: 10m    # GC deadline for never-booted / idle-stolen workers
     # UZI_EPHEMERAL_SATURATION_DELAY: 90s     # debounce before bursting on a saturated (all capable workers full) fleet
     # Job files and product skill sets (PRD #1909). Unset => config.go's defaults
-    # (docs/configuration.md). UZI_STORED_FILES_BUDGET_BYTES is the one ceiling
-    # shared by job files and run recovery archives: keep it below the api data
-    # volume's size. An empty UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS keeps product
-    # skill sets off. Uncomment to override.
+    # (docs/configuration.md; the commented values below are those defaults, except
+    # the product-skills allowlist, which defaults to empty). UZI_STORED_FILES_BUDGET_BYTES
+    # is the one ceiling shared by job files and run recovery archives: job files
+    # are sealed chunks in Postgres, so keep it below the database volume's size
+    # (database.simple.storage.size, or postgres.cluster.storage.size with
+    # the CNPG cluster). An empty UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS (the default) keeps
+    # product skill sets off. Uncomment to override.
     # UZI_JOB_INPUT_FILE_MAX_BYTES: "26214400"      # 25 MiB per input file
     # UZI_JOB_INPUTS_MAX_FILES: "10"
     # UZI_JOB_INPUTS_MAX_BYTES: "52428800"          # 50 MiB of inputs per job
@@ -275,7 +278,7 @@ api:
     # UZI_STORED_FILES_BUDGET_BYTES: "4294967296"   # 4 GiB: job files + recovery archives
     # UZI_JOB_FILES_RETENTION: 168h
     # UZI_JOB_UPLOAD_TTL: 1h
-    # UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS: https://github.com
+    # UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS: https://github.com   # EXAMPLE, not a default (default: empty, feature off)
   # Infisical-synced secret env: ENV_VAR -> the key in the `uzi-secrets` Secret.
   # JWT_SECRET and UZI_SECRET_KEY are REQUIRED (the api refuses to boot without
   # them — that guard is the backstop, so the k8s secretKeyRef stays optional:true

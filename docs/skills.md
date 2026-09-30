@@ -122,7 +122,7 @@ The same caps as any skill apply, and a skill that breaks one is **dropped, not 
 | `too_large` | The `SKILL.md`, or its body, is over the skill size cap (64 KiB, `SKILL_MAX_BYTES`) |
 | `duplicate` | Another skill already has that name |
 | `over_limit` | More skills than a run may carry (32, `SKILLS_MAX_PER_RUN`; the first 32 by name are kept), or more than 64 skill files in the repo |
-| `secret` | The body contains a full provider token |
+| `secret` | The description or the body contains a full Anthropic token (`sk-ant-…`); only that complete shape is matched, not other provider tokens or a bare `sk-ant-` mention |
 
 ### Size and concurrency limits
 

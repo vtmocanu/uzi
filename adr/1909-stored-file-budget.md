@@ -20,10 +20,11 @@
 
 PRD #1909 lets a product send files into a job and read files back. uzi has no
 object store. Recovery archives (PRD #1296) already keep sealed 1 MiB chunks as
-`bytea` in Postgres, with a 4 GiB instance quota, and the chart's default
-database volume is 5Gi of data. A job-file quota added on top of the recovery
-quota could push stored files past the volume the default deployment was sized
-for. Three further facts shaped the design:
+`bytea` in Postgres, with a 4 GiB instance quota, and the database
+volume is small: the chart's default install (`database.mode: simple`) gives it
+8Gi, and the CNPG cluster (`postgres.enabled`, off by default) 5Gi. A job-file
+quota added on top of the recovery quota could push stored files past the volume
+a default deployment was sized for. Three further facts shaped the design:
 
 - **Check-then-write overshoots.** Under READ COMMITTED, two concurrent uploads
   each sum the retained bytes against their own snapshot and both pass a check
@@ -69,9 +70,10 @@ for. Three further facts shaped the design:
    `pg_advisory_xact_lock` pair. `store.LockStoredFiles`
    (`api/internal/store/storedfiles.go`) is the only way any code takes it and
    takes two keys: first `(class, owner-derived objid)`, then
-   `(class, the fixed shared-budget objid)`. It is the **first statement of the
-   admission transaction** (a job create that attaches files takes the job-create
-   key first, then these). Locks are transaction-scoped, so they release on
+   `(class, the fixed shared-budget objid)`. The job-file reserve and sweep take it as the
+   first statement of their transaction; recovery admission takes its capture row
+   lock first, and a job create that attaches files takes the job-create key
+   first (see the full lock order below). Locks are transaction-scoped, so they release on
    commit or rollback. One fixed order means two admissions cannot deadlock, and
    the second key makes the instance and shared-budget checks exact across
    owners. An owner objid that collides with another owner's only serializes two

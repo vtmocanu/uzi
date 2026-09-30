@@ -44,7 +44,7 @@ through `[0.52.0]`.)
 - **A `check:api-v1-compat` gate refuses breaking changes to `api/openapi/v1.yaml` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
   It runs an oasdiff comparison against the base in `gate:repo`, enforcing the additive-only promise in [Product tokens](docs/product-tokens.md).
 - **Run recovery archives and job files share one stored-file budget ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
-  `UZI_STORED_FILES_BUDGET_BYTES` (default 4 GiB) caps job files plus recovery archives together; keep it below the api data volume. A recovery capture counts job-file bytes and, if needed, reclaims expired and then the oldest finished-job files (never files of a live job) before refusing with 507. See [Run recovery](docs/run-recovery.md).
+  `UZI_STORED_FILES_BUDGET_BYTES` (default 4 GiB) caps job files plus recovery archives together; keep it below the database volume (job files are sealed chunks in Postgres: `database.simple.storage.size`, or `postgres.cluster.storage.size` with the CNPG cluster; compose `pgdata`). A recovery capture counts job-file bytes and, if needed, reclaims expired and then the oldest finished-job files (never files of a live job) before refusing with 507. See [Run recovery](docs/run-recovery.md).
 - **Agent-source sync refuses a repo whose tip is too large once unpacked ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
   The clone now checks the pack's unpacked size before decoding it: a single file over 64 MiB or a tip over 512 MiB fails the sync with an error naming the limit, where before only the 48 MiB download cap applied. See [Agent source](docs/agent-source.md).
 
