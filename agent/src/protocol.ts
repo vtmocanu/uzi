@@ -1358,6 +1358,21 @@ export interface ClaimResponse {
    *  write the PR description without first reading the forge's markers (and looking an unknown
    *  region up) the way it would for an unknown record. */
   pr_description?: PrDescriptionState;
+  /** PRD #1906 M4: present ONLY on a profile-bound research run's claim (the api mints it at
+   *  claim, M3/M5). Such a claim carries an empty `secrets.forge_pat`, no Codex block, and no
+   *  repo, agents, skills or memory; the worker routes it to the IsolatedRunner before any
+   *  other dispatch and never to the RunRunner (no clone). Absent on every other claim. */
+  isolated_fetch?: IsolatedFetchClaim;
+}
+
+/** PRD #1906 M4: the fetch grant of a profile-bound run. `credential` is the per-run fetch
+ *  credential the worker sends to uzi-fetcher as a Bearer token; it is held only in the
+ *  worker process (the fetch tool's closure) and never enters the SDK child's env. `profile`
+ *  and `hosts` are the site-list snapshot taken at claim, for the prompt and the log. */
+export interface IsolatedFetchClaim {
+  credential: string;
+  profile: string;
+  hosts: string[];
 }
 
 /** PRD #1795: the approval-relevant requirements a gate presentation showed the human

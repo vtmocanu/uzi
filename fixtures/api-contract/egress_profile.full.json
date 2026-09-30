@@ -1,0 +1,22 @@
+{
+  "id": "x",
+  "name": "x",
+  "description": "x",
+  "hosts": [
+    "x"
+  ],
+  "multi_publisher_override": [
+    "x"
+  ],
+  "warnings": [
+    {
+      "entry": "x",
+      "code": "x",
+      "message": "x"
+    }
+  ],
+  "created_by": "x",
+  "updated_by": "x",
+  "created_at": "2020-01-02T03:04:05Z",
+  "updated_at": "2020-01-02T03:04:05Z"
+}

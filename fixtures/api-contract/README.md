@@ -328,6 +328,16 @@ sits on `_runExtra` it also masks any FURTHER extra key added to `full.json` (co
 Keep each assertion on its own single-purpose line so the directive suppresses exactly
 one assertion and no more.
 
+### PRD #1906 M1w: `EgressProfileDTO → EgressProfile`
+
+The admin egress profile ("site list"), registered in `apitypes/contract_test.go`. Its
+nested `EgressProfileWarningDTO` rides inside `warnings[0]` of the full fixture (never
+returned alone). `ZeroOf` exemptions, each a mapper guarantee: `hosts` and
+`multi_publisher_override` (`nonNilStrings` in `egressProfileToDTO`,
+`handler/egress_profiles.go`) and `warnings` (`make(..., 0, len(warnings))` there) are
+always `[]` on the real wire. `created_by`/`updated_by` are `string | null` in TS, so their
+zero-value `null` needs no exemption. No drift.
+
 ## What this contract CANNOT catch
 
 - **Enum narrowing.** `Widen` maps a string-literal union to `string`, so an enum

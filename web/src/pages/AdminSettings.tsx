@@ -47,6 +47,7 @@ import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { CapabilitySchedulingCard } from "./adminSettings/CapabilitySchedulingCard";
 import { CompletionInterlockCard } from "./adminSettings/CompletionInterlockCard";
 import { GithubProjectSyncCard } from "./adminSettings/GithubProjectSyncCard";
+import { FetchCapsCard } from "./adminSettings/FetchCapsCard";
 import { SlackSettingsCard } from "./adminSettings/SlackSettingsCard";
 
 // oidcStatusChip renders OIDC SSO health (PRD #45, Nit6) as a tone-coded Badge:
@@ -273,6 +274,7 @@ export function AdminSettings() {
           { id: "ephemeral-workers", label: "Ephemeral workers" },
           { id: "capability-scheduling", label: "Capability scheduling" },
           { id: "completion-interlock", label: "Completion check" },
+          { id: "fetch-caps", label: "Research fetch caps" },
         ]
       : []),
   ];
@@ -521,6 +523,12 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="github-project-sync" className="scroll-mt-6">
           <GithubProjectSyncCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="fetch-caps" className="scroll-mt-6">
+          <FetchCapsCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
     </AdminShell>

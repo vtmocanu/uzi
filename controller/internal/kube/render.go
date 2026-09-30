@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strconv"
 
@@ -88,6 +89,14 @@ const (
 const (
 	tokenKey  = "worker_token"
 	caCertKey = "ca.crt"
+	// fetcherCACertKey carries the uzi-fetcher's CA in an ISOLATED lane worker's
+	// per-worker Secret (PRD #1906 M5), next to ca.crt, so it mounts at
+	// <secret mount>/fetcher-ca.crt and UZI_FETCHER_CA_FILE points there. It is relayed
+	// exactly like the api CA (RenderConfig.FetcherCAPEM, from
+	// UZI_WORKER_ISOLATED_FETCHER_CA_FILE on the controller), so the lane namespace needs
+	// no ConfigMap and this controller no new RBAC verb. Rendered for isolated workers
+	// only: every other worker's Secret is unchanged.
+	fetcherCACertKey = "fetcher-ca.crt"
 
 	// defaultSecretMountPath is where the join-token Secret mounts unless
 	// RenderConfig.SecretMountPath overrides it (UZI_WORKER_SECRET_MOUNT_PATH). It is
@@ -285,7 +294,7 @@ const (
 // value for a docker worker, the plain value otherwise, each overridable per cluster.
 // Config validated any override string as a quantity at boot, so MustParse is safe.
 func (cfg RenderConfig) ephemeralRequest(w protocol.DesiredWorker) resource.Quantity {
-	if w.Docker {
+	if withDinD(w) {
 		if cfg.DockerEphemeralRequest != "" {
 			return resource.MustParse(cfg.DockerEphemeralRequest)
 		}
@@ -297,17 +306,72 @@ func (cfg RenderConfig) ephemeralRequest(w protocol.DesiredWorker) resource.Quan
 	return resource.MustParse(workerDefaultEphemeralRequest)
 }
 
-// namespaceFor picks a worker's namespace: the dedicated privileged docker tier for
-// a docker worker, #58's restricted default otherwise. The two never overlap (the
-// controller config refuses equal namespaces), which is what keeps the restricted
-// default's blast radius untouched even though the docker tier is privileged
-// (Decision 7 / Q-B). A docker worker with DockerNamespace unset resolves to "" and
-// is caught by the reconciler, never silently rendered into the restricted default.
+// namespaceFor picks a worker's namespace: the isolated research lane for an isolated
+// worker (PRD #1906 M5), the dedicated privileged docker tier for a docker worker, #58's
+// restricted default otherwise. The three never overlap (the controller config refuses
+// equal namespaces), which is what keeps the restricted default's blast radius untouched
+// even though the docker tier is privileged (Decision 7 / Q-B), and what keeps the lane's
+// default-deny egress from being shared with either.
+//
+// Isolated is checked FIRST, and an isolated worker never falls through to another tier:
+// with IsolatedNamespace unset, or with Docker also set (a combination the lane refuses),
+// it resolves to "". Likewise a docker worker with DockerNamespace unset resolves to "".
+// Placement turns every "" into a refusal, so the reconciler never renders such a worker,
+// and never silently into the restricted default.
 func (cfg RenderConfig) namespaceFor(w protocol.DesiredWorker) string {
+	if w.Isolated {
+		if w.Docker {
+			return ""
+		}
+		return cfg.IsolatedNamespace
+	}
 	if w.Docker {
 		return cfg.DockerNamespace
 	}
 	return cfg.Namespace
+}
+
+// Placement refusals. Each means "do not render this worker"; the reconciler logs it and
+// leaves the worker desired (never torn down), so it materializes once the controller is
+// configured, exactly the unknown-preset posture.
+var (
+	// ErrIsolatedDocker: the api asked for a lane worker WITH a DinD sidecar. The lane is
+	// restricted and never carries a privileged sidecar, and the docker namespace's egress
+	// is not the lane's, so neither tier can host it. The api never provisions this; a
+	// poll that says so is refused rather than resolved in favour of either flag.
+	ErrIsolatedDocker = errors.New("worker is both isolated and docker; the isolated lane never renders a DinD sidecar, so it is refused")
+	// ErrIsolatedLaneUnconfigured: an isolated worker with no lane namespace configured.
+	// Fail closed: it is NEVER rendered into the ordinary worker namespace, whose egress
+	// policy is wider than the lane's.
+	ErrIsolatedLaneUnconfigured = errors.New("worker is isolated but this controller has no isolated lane configured (set UZI_WORKER_ISOLATED_NAMESPACE, UZI_WORKER_ISOLATED_FETCHER_URL and UZI_WORKER_ISOLATED_FETCHER_CA_FILE)")
+	// ErrDockerTierUnconfigured: a docker worker with no docker namespace configured.
+	ErrDockerTierUnconfigured = errors.New("worker requests docker but this controller has no docker namespace configured (set UZI_WORKER_DOCKER_NAMESPACE + UZI_WORKER_DIND_IMAGE)")
+)
+
+// Placement is the render gate: the namespace w renders into, or the reason it must not
+// be rendered at all. Isolated is checked before Docker, so an isolated worker is never
+// placed by its docker flag.
+func (cfg RenderConfig) Placement(w protocol.DesiredWorker) (string, error) {
+	if w.Isolated {
+		if w.Docker {
+			return "", ErrIsolatedDocker
+		}
+		if cfg.IsolatedNamespace == "" {
+			return "", ErrIsolatedLaneUnconfigured
+		}
+		return cfg.IsolatedNamespace, nil
+	}
+	if w.Docker && cfg.DockerNamespace == "" {
+		return "", ErrDockerTierUnconfigured
+	}
+	return cfg.namespaceFor(w), nil
+}
+
+// withDinD reports whether w renders the DinD sidecar set (and its PVC, workdir,
+// anti-affinity and env). Never for an isolated worker, even if a caller skipped
+// Placement: the lane is restricted and must never carry a privileged container.
+func withDinD(w protocol.DesiredWorker) bool {
+	return w.Docker && !w.Isolated
 }
 
 // seedResources are the init container's requests/limits.
@@ -482,6 +546,19 @@ type RenderConfig struct {
 	// directory would be unguarded. The knob alone does not prevent that pairing;
 	// ValidateSecretMountWorkerImage refuses it at boot, next to ValidateSecretMountPath.
 	SecretMountPath string
+	// IsolatedNamespace is the isolated research lane's namespace (PRD #1906 M5;
+	// UZI_WORKER_ISOLATED_NAMESPACE). Empty means the lane is off, and an isolated worker
+	// in the poll is SKIPPED by Placement, never rendered into Namespace. The lane runs
+	// at the same restricted Pod Security level as Namespace, so an isolated worker never
+	// gets the DinD sidecar or the uid-split root start.
+	IsolatedNamespace string
+	// FetcherURL is rendered into an isolated worker's env as UZI_FETCHER_URL (the agent
+	// reads exactly that name). Only isolated workers get it.
+	FetcherURL string
+	// FetcherCAPEM is the uzi-fetcher's CA, relayed through an isolated worker's
+	// per-worker Secret under fetcherCACertKey and pointed at by UZI_FETCHER_CA_FILE.
+	// Only isolated workers get either.
+	FetcherCAPEM []byte
 }
 
 // secretMountPath is the effective join-token Secret mount directory.
@@ -494,6 +571,12 @@ func (c RenderConfig) secretMountPath() string {
 
 func (c RenderConfig) tokenPath() string  { return c.secretMountPath() + "/" + tokenKey }
 func (c RenderConfig) caCertPath() string { return c.secretMountPath() + "/" + caCertKey }
+
+// fetcherCACertPath is where an isolated worker finds the fetcher CA: the join-token
+// Secret's mount, key fetcherCACertKey.
+func (c RenderConfig) fetcherCACertPath() string {
+	return c.secretMountPath() + "/" + fetcherCACertKey
+}
 
 // names for one worker's objects.
 func deploymentName(id string) string { return NamePrefix + id }
@@ -547,6 +630,13 @@ func RenderSecret(cfg RenderConfig, w protocol.DesiredWorker, token string) *cor
 	if len(cfg.APICAPEM) > 0 {
 		data[caCertKey] = cfg.APICAPEM
 	}
+	// The fetcher CA (PRD #1906 M5), isolated workers only. Written once at creation like
+	// the api CA, from the bundle the controller read once at boot: a rotated fetcher CA
+	// reaches only lane workers created after a controller restart, and an existing lane
+	// worker keeps the CA it was created with.
+	if w.Isolated && len(cfg.FetcherCAPEM) > 0 {
+		data[fetcherCACertKey] = cfg.FetcherCAPEM
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      secretName(w.ID),
@@ -584,7 +674,7 @@ func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []
 		renderPVC(cfg, ns, w.ID, dataPVCName(w.ID), cfg.dataSize(w, spec)),
 		renderPVC(cfg, ns, w.ID, nixPVCName(w.ID), spec.NixSize),
 	}
-	if w.Docker {
+	if withDinD(w) {
 		pvcs = append(pvcs, renderPVC(cfg, ns, w.ID, dindDataPVCName(w.ID), cfg.dindDataSize()))
 	}
 	return pvcs
@@ -817,7 +907,18 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		// nothing in agent/ parses a CA today and nothing needs to.
 		env = append(env, corev1.EnvVar{Name: "NODE_EXTRA_CA_CERTS", Value: cfg.caCertPath()})
 	}
-	if w.Docker {
+	if w.Isolated {
+		// The isolated lane's fetcher (PRD #1906 M5): the agent reads exactly these two
+		// names (agent/src/config.ts) and advertises isolated_fetch_v1 only when both are
+		// set, so a lane pod missing either can never claim a profile-bound run. Isolated
+		// workers ONLY: no other pod learns the fetcher's address. The CA file is the
+		// fetcherCACertKey entry of this worker's own join-token Secret (RenderSecret).
+		env = append(env,
+			corev1.EnvVar{Name: "UZI_FETCHER_URL", Value: cfg.FetcherURL},
+			corev1.EnvVar{Name: "UZI_FETCHER_CA_FILE", Value: cfg.fetcherCACertPath()},
+		)
+	}
+	if withDinD(w) {
 		// The k8s branch of the keystone resolver (agent/src/docker-wiring.ts): set
 		// DOCKER_HOST EXPLICITLY, never probe. It is BOTH the socket target AND the
 		// resolver's "sidecar expected" signal — which turns on the bounded readiness
@@ -908,7 +1009,12 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	// runs as uid 0 (Decision D5); a non-root uid with added caps is inert. With the knob OFF
 	// both keep the shared pointer, so the rendered containers are byte-identical to today.
 	seedSecurity, workerSecurity := containerSecurity, containerSecurity
-	if cfg.UIDSplit {
+	// An isolated lane worker never takes the uid-split root start (PRD #1906 M5): the lane
+	// namespace enforces the restricted Pod Security level whatever workers.uidSplit says,
+	// the split exists for Codex, which refuses profile-bound runs, and the agent does not
+	// advertise isolated_fetch_v1 under the split anyway.
+	uidSplit := cfg.UIDSplit && !w.Isolated
+	if uidSplit {
 		root := int64(0)
 		containerRunAsNonRoot := false
 		workerSecurity = &corev1.SecurityContext{
@@ -1022,7 +1128,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
 		},
 	}
-	if w.Docker {
+	if withDinD(w) {
 		// Native-sidecar ordering (reviewer race, k8s half): the DinD daemon is an
 		// initContainer with restartPolicy: Always, so k8s starts it BEFORE the worker
 		// and — via the dind startupProbe — holds the worker until dockerd is actually
@@ -1111,7 +1217,7 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 		FSGroupChangePolicy: &fsGroupPolicy,
 		SeccompProfile:      &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 	}
-	if cfg.UIDSplit {
+	if uidSplit {
 		podRunAsNonRoot := false
 		podSecurity.RunAsNonRoot = &podRunAsNonRoot
 		podSecurity.RunAsUser = nil

@@ -180,6 +180,21 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	// connection, so it MUST fork before GetRunClaimContext (which INNER-JOINs
 	// repos → forge_connections and would treat a repo-less judge run as vanished)
 	// and before the bot-PAT open. Its claim carries only the Anthropic token.
+	// PRD #1906 M3: a profile-bound run (runs.egress_profile_id) is claimed only as an
+	// isolated research claim (isolateClaim, at the end). Refuse, before anything is opened,
+	// the shapes that cannot be isolated: the judge lane below has no isolation, and a Codex
+	// run's own web search is server-side (Decision 10; the schema CHECK forbids the pair,
+	// this is the backstop).
+	isolated := run.EgressProfileID.Valid
+	if isolated && (run.Kind == runkind.Judge || run.Harness == harnessCodex) {
+		return nil, errIsolatedClaimRefused
+	}
+	// PRD #1906 M5 (Decision 9): the Go backstop of ClaimRun's two-way isolated-lane clause. A
+	// profile-bound run on a worker outside the lane, or an unbound run on a lane worker, means
+	// the SQL gate did not hold: refuse before anything is opened rather than deliver it.
+	if isolated != wkr.IsolatedLane {
+		return nil, errIsolatedLaneMismatch
+	}
 	if run.Kind == runkind.Judge {
 		// PRD #1429 M3: the judge lane now threads the CLAIMING worker through too —
 		// assembleJudgeClaim's Codex branch needs it (codexClaimSecrets is worker-scoped),
@@ -234,10 +249,19 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		}
 	}
 
-	botPAT, err := s.box.Open(rc.TokenCiphertext)
-	if err != nil {
-		// box.Open errors carry no plaintext.
-		return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
+	// Decision 12: a profile-bound run's claim carries no forge credential, so its PAT is
+	// not decrypted here, and the two claim extras that would read forge-derived state for
+	// it (the PR description, and a self_improve run's open-MR set, which builds a forge
+	// client from the connection) are skipped below. GetRunClaimContext above still reads
+	// the repo and connection ROWS (the per-repo settings the claim is assembled from);
+	// nothing reaches the forge.
+	var botPAT []byte
+	if !isolated {
+		botPAT, err = s.box.Open(rc.TokenCiphertext)
+		if err != nil {
+			// box.Open errors carry no plaintext.
+			return nil, fmt.Errorf("%w: bot PAT could not be decrypted", errCredentialUnavailable)
+		}
 	}
 
 	// PRD #1429 M2 (D4): claim assembly is HARNESS-AUTHORITATIVE — the Codex/Claude split is
@@ -785,12 +809,17 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// PRD #1798 D9: the existing PR's description record, for a PR-producing run whose PR
 	// already exists. Best-effort (a read error omits it); nil keeps the wire unchanged.
-	payload.PrDescription = s.claimPrDescription(ctx, run)
+	// Skipped for a profile-bound run (it has no PR, and stripForIsolation clears it anyway).
+	if !isolated {
+		payload.PrDescription = s.claimPrDescription(ctx, run)
+	}
 
 	// issue #297: a self_improve run carries the in-flight avoid-set so the picker skips
 	// a recommendation whose fix another active run is already doing. Best-effort and
 	// self_improve-only; every other kind's claim stays byte-identical to today's.
-	if run.Kind == runkind.SelfImprove {
+	// Not for a profile-bound run: selfImproveOpenMRs builds a forge client from the
+	// connection's PAT, and stripForIsolation would clear all three anyway.
+	if run.Kind == runkind.SelfImprove && !isolated {
 		payload.InflightTargets = s.inflightTargets(ctx, run)
 		// PRD #686 M10 (D11/D12): the repo's currently-OPEN self-improve MRs' "what was
 		// proposed" text, so the picker chooses a non-overlapping improvement. Best-effort
@@ -800,6 +829,14 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// (repos.fold_improve_uzi_backlog, read from the same GetRunClaimContextRow as
 		// RepoDevboxOptIn above); false ⇒ the worker runs the generic directive (m4).
 		payload.SelfImproveDogfood = rc.FoldImproveUziBacklog
+	}
+
+	// PRD #1906 M3: last, so nothing attached above survives the strip. An unbound run
+	// skips this and its claim is byte-identical to before.
+	if isolated {
+		if err := s.isolateClaim(ctx, run, payload); err != nil {
+			return nil, err
+		}
 	}
 
 	return payload, nil

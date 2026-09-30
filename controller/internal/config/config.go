@@ -5,6 +5,7 @@ package config
 
 import (
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -278,6 +279,31 @@ type Config struct {
 	// LimitRange caps a PVC at maxPVCStorage (20Gi), so a larger value here is
 	// rejected by the apiserver unless that is raised too.
 	WorkerDinDDataSize string
+
+	// --- the isolated research lane (PRD #1906 M5) ----------------------------
+	// All three empty unless this instance offers the no-internet lane. They travel
+	// TOGETHER (validateIsolatedLane): a lane worker is rendered into
+	// WorkerIsolatedNamespace with UZI_FETCHER_URL and the fetcher's CA, and a lane
+	// worker missing either cannot fetch anything, so a half-configured lane is a boot
+	// error. Empty means an isolated worker in the poll is SKIPPED (fail closed,
+	// logged), never rendered into WorkerNamespace, whose egress is wider.
+
+	// WorkerIsolatedNamespace is the dedicated lane namespace (UZI_WORKER_ISOLATED_NAMESPACE,
+	// e.g. uzi-workers-isolated). Its default-deny NetworkPolicy (DNS, the api, the
+	// fetcher, the model host) is what removes the general network client, so it must
+	// differ from every other namespace this controller renders into, and from the
+	// controller's own (CheckIsolatedLaneOwnNamespace, called at boot).
+	WorkerIsolatedNamespace string
+	// WorkerIsolatedFetcherURL is the uzi-fetcher service URL a lane worker dials
+	// (UZI_WORKER_ISOLATED_FETCHER_URL → the pod's UZI_FETCHER_URL). https only, no
+	// userinfo, no query or fragment: the agent refuses anything else too, and the
+	// fetcher leg carries the run's fetch requests across the pod network.
+	WorkerIsolatedFetcherURL string
+	// WorkerIsolatedFetcherCAPEM is the PEM read from UZI_WORKER_ISOLATED_FETCHER_CA_FILE
+	// (a file mounted into THIS controller's pod). It is relayed into each lane worker's
+	// per-worker Secret, the same way APICAPEM is, so no new object or RBAC verb is needed
+	// in the lane namespace. It must contain at least one PEM certificate.
+	WorkerIsolatedFetcherCAPEM []byte
 }
 
 // Load reads and validates the configuration.
@@ -491,6 +517,98 @@ func loadWorkerSettings(cfg *Config) error {
 	cfg.WorkerDinDImage = strings.TrimSpace(os.Getenv("UZI_WORKER_DIND_IMAGE"))
 	if err := validateDockerTier(cfg); err != nil {
 		return err
+	}
+	// The isolated research lane (PRD #1906 M5): namespace, fetcher URL and fetcher CA,
+	// all or none. Read after the docker tier so the namespace-separation check can
+	// compare against both other tiers.
+	return loadIsolatedLane(cfg)
+}
+
+// loadIsolatedLane reads and validates the isolated lane knobs (PRD #1906 M5): all three
+// or none, an https fetcher URL, a CA file holding a PEM certificate, and a lane
+// namespace distinct from the restricted and docker worker namespaces.
+func loadIsolatedLane(cfg *Config) error {
+	ns := strings.TrimSpace(os.Getenv("UZI_WORKER_ISOLATED_NAMESPACE"))
+	rawURL := strings.TrimSpace(os.Getenv("UZI_WORKER_ISOLATED_FETCHER_URL"))
+	caPath := strings.TrimSpace(os.Getenv("UZI_WORKER_ISOLATED_FETCHER_CA_FILE"))
+	if ns == "" && rawURL == "" && caPath == "" {
+		// Lane off: an isolated worker in the poll is skipped, never rendered elsewhere.
+		return nil
+	}
+	if ns == "" || rawURL == "" || caPath == "" {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE, UZI_WORKER_ISOLATED_FETCHER_URL and " +
+			"UZI_WORKER_ISOLATED_FETCHER_CA_FILE must be set together (a lane worker without the " +
+			"fetcher URL or its CA cannot fetch anything, so a partial lane is refused rather than " +
+			"rendered)")
+	}
+	if ns == cfg.WorkerNamespace {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE (%q) must differ from UZI_WORKER_NAMESPACE (%q): "+
+			"the lane is a SEPARATE namespace whose default-deny egress policy is what removes the "+
+			"general network client", ns, cfg.WorkerNamespace)
+	}
+	if cfg.WorkerDockerNamespace != "" && ns == cfg.WorkerDockerNamespace {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE (%q) must differ from UZI_WORKER_DOCKER_NAMESPACE (%q): "+
+			"the lane must never share the privileged docker tier's namespace or egress", ns, cfg.WorkerDockerNamespace)
+	}
+	if err := validateFetcherURL(rawURL); err != nil {
+		return err
+	}
+	pem, err := os.ReadFile(caPath) //nolint:gosec // G304: the path is operator config (UZI_WORKER_ISOLATED_FETCHER_CA_FILE), not user input; reading the mounted CA bundle by its configured path is intended.
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_FETCHER_CA_FILE: read %s: %w", caPath, err)
+	}
+	if !x509.NewCertPool().AppendCertsFromPEM(pem) {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_FETCHER_CA_FILE: %s contains no PEM certificate", caPath)
+	}
+	cfg.WorkerIsolatedNamespace = ns
+	cfg.WorkerIsolatedFetcherURL = rawURL
+	cfg.WorkerIsolatedFetcherCAPEM = pem
+	return nil
+}
+
+// validateFetcherURL refuses a fetcher URL the agent would refuse at fetch time (it
+// requires a plain https URL), so the mistake surfaces at the controller's boot rather
+// than as every lane run failing its first fetch.
+func validateFetcherURL(raw string) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_FETCHER_URL is not a valid URL: %w", err)
+	}
+	if strings.ToLower(u.Scheme) != "https" {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_FETCHER_URL %q must use https (the fetcher leg carries the run's fetches across the pod network)", raw)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_FETCHER_URL %q has no host", raw)
+	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_FETCHER_URL %q must be a plain https URL (no userinfo, query or fragment)", raw)
+	}
+	return nil
+}
+
+// CheckIsolatedLaneOwnNamespace refuses a lane namespace equal to the controller's own
+// namespace, as returned by readOwn (in-cluster: the ServiceAccount mount's namespace
+// file). The lane's default-deny policy must never be applied to (or relaxed for) the
+// release namespace holding the api and this controller. A lane that is off passes
+// without calling readOwn; with the lane on, an unreadable or empty own namespace is
+// refused, because the separation cannot then be verified.
+func CheckIsolatedLaneOwnNamespace(cfg Config, readOwn func() (string, error)) error {
+	if cfg.WorkerIsolatedNamespace == "" {
+		return nil
+	}
+	own, err := readOwn()
+	if err != nil {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE is set but the controller's own namespace could not be read "+
+			"to verify the lane differs from it: %w", err)
+	}
+	own = strings.TrimSpace(own)
+	if own == "" {
+		return errors.New("UZI_WORKER_ISOLATED_NAMESPACE is set but the controller's own namespace is empty, " +
+			"so the lane cannot be verified to differ from it")
+	}
+	if cfg.WorkerIsolatedNamespace == own {
+		return fmt.Errorf("UZI_WORKER_ISOLATED_NAMESPACE (%q) must differ from the controller's own namespace (%q)",
+			cfg.WorkerIsolatedNamespace, own)
 	}
 	return nil
 }

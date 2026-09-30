@@ -259,22 +259,52 @@ type CustodyEpisodeNotice struct {
 	NotifiedAt pgtype.Timestamptz `json:"notified_at"`
 }
 
+type EgressProfile struct {
+	ID                     uuid.UUID          `json:"id"`
+	Name                   string             `json:"name"`
+	Description            string             `json:"description"`
+	Hosts                  []string           `json:"hosts"`
+	MultiPublisherOverride []string           `json:"multi_publisher_override"`
+	CreatedBy              pgtype.UUID        `json:"created_by"`
+	UpdatedBy              pgtype.UUID        `json:"updated_by"`
+	CreatedAt              pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt              pgtype.Timestamptz `json:"updated_at"`
+}
+
 type FindingDisposition struct {
-	ID            uuid.UUID          `json:"id"`
-	UserID        uuid.UUID          `json:"user_id"`
-	RepoID        uuid.UUID          `json:"repo_id"`
-	Location      string             `json:"location"`
-	Status        string             `json:"status"`
-	FiledIssueIid pgtype.Int8        `json:"filed_issue_iid"`
-	FiledIssueUrl string             `json:"filed_issue_url"`
-	FilingSince   pgtype.Timestamptz `json:"filing_since"`
-	DismissReason pgtype.Text        `json:"dismiss_reason"`
-	ContentHash   string             `json:"content_hash"`
-	LastTitle     string             `json:"last_title"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	ResolvedAt    pgtype.Timestamptz `json:"resolved_at"`
-	SetVia        pgtype.Text        `json:"set_via"`
-	CloseSyncedAt pgtype.Timestamptz `json:"close_synced_at"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	RepoID           uuid.UUID          `json:"repo_id"`
+	Location         string             `json:"location"`
+	Status           string             `json:"status"`
+	FiledIssueIid    pgtype.Int8        `json:"filed_issue_iid"`
+	FiledIssueUrl    string             `json:"filed_issue_url"`
+	FilingSince      pgtype.Timestamptz `json:"filing_since"`
+	DismissReason    pgtype.Text        `json:"dismiss_reason"`
+	ContentHash      string             `json:"content_hash"`
+	LastTitle        string             `json:"last_title"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	ResolvedAt       pgtype.Timestamptz `json:"resolved_at"`
+	SetVia           pgtype.Text        `json:"set_via"`
+	CloseSyncedAt    pgtype.Timestamptz `json:"close_synced_at"`
+	GroupOperationID pgtype.UUID        `json:"group_operation_id"`
+}
+
+type FindingGroupMember struct {
+	OperationID   uuid.UUID `json:"operation_id"`
+	DispositionID uuid.UUID `json:"disposition_id"`
+	FindingID     uuid.UUID `json:"finding_id"`
+}
+
+type FindingGroupOperation struct {
+	ID         uuid.UUID          `json:"id"`
+	UserID     uuid.UUID          `json:"user_id"`
+	RepoID     uuid.UUID          `json:"repo_id"`
+	Phase      string             `json:"phase"`
+	DeadlineAt pgtype.Timestamptz `json:"deadline_at"`
+	CreatedAt  pgtype.Timestamptz `json:"created_at"`
+	IssueIid   pgtype.Int8        `json:"issue_iid"`
+	IssueUrl   string             `json:"issue_url"`
 }
 
 type ForgeConnection struct {
@@ -793,6 +823,8 @@ type Run struct {
 	DiskParkCount               int32              `json:"disk_park_count"`
 	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
 	JobType                     pgtype.Text        `json:"job_type"`
+	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
+	EgressSnapshot              []byte             `json:"egress_snapshot"`
 }
 
 type RunCompletionAttempt struct {
@@ -825,6 +857,47 @@ type RunCredentialEpoch struct {
 	Label           pgtype.Text        `json:"label"`
 	SelectReason    pgtype.Text        `json:"select_reason"`
 	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
+}
+
+type RunFetch struct {
+	ID            uuid.UUID          `json:"id"`
+	RunID         uuid.UUID          `json:"run_id"`
+	ReservationID uuid.UUID          `json:"reservation_id"`
+	Url           string             `json:"url"`
+	FinalUrl      string             `json:"final_url"`
+	Verdict       string             `json:"verdict"`
+	Reason        string             `json:"reason"`
+	HttpStatus    int32              `json:"http_status"`
+	ContentType   string             `json:"content_type"`
+	Bytes         int64              `json:"bytes"`
+	Sha256        string             `json:"sha256"`
+	StartedAt     pgtype.Timestamptz `json:"started_at"`
+	FinishedAt    pgtype.Timestamptz `json:"finished_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+}
+
+type RunFetchCredential struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	TokenHash       []byte             `json:"token_hash"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	RevokedAt       pgtype.Timestamptz `json:"revoked_at"`
+	ReservedBytes   int64              `json:"reserved_bytes"`
+	UsedBytes       int64              `json:"used_bytes"`
+	Files           int64              `json:"files"`
+	Inflight        int64              `json:"inflight"`
+	Attempts        int64              `json:"attempts"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
+type RunFetchReservation struct {
+	ID              uuid.UUID          `json:"id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	Bytes           int64              `json:"bytes"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	Settled         bool               `json:"settled"`
+	SettledAt       pgtype.Timestamptz `json:"settled_at"`
 }
 
 type RunGatePresentation struct {
@@ -1132,6 +1205,7 @@ type Worker struct {
 	StatsDiskDindTotalInodes pgtype.Int8        `json:"stats_disk_dind_total_inodes"`
 	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
 	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
+	IsolatedLane             bool               `json:"isolated_lane"`
 }
 
 type WorkerActiveRun struct {

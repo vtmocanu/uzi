@@ -1708,6 +1708,53 @@ and the pending hosted-worker ephemeral-request
 measurement, which is issue #1598's own post-deploy check (issue #225 is
 unrelated node image accumulation).
 
+#### The isolated research lane (PRD #1906)
+
+A third, **off-by-default** worker namespace (`workers.isolatedLane.*`, default
+`uzi-workers-isolated`) for runs bound to an admin-managed site list, plus
+`uzi-fetcher`, the only path by which such a run reads web content. It is a
+different boundary from the two tiers above: their egress is an FQDN allowlist
+that is IP-level, so it cannot say "this vendor's documentation host, and not the
+other sites on its CDN"; the lane instead removes the general network client and
+puts a per-URL check in front of the one path left. Operator view:
+[docs/isolated-research-lane.md](docs/isolated-research-lane.md); rationale and
+the invariants a change must keep: [ADR-1906](adr/1906-isolated-fetch-lane.md).
+
+- **Lane pods have no internet.** A default-deny `NetworkPolicy` admits DNS, the
+  api's worker port, `uzi-fetcher`, and one model host by exact name
+  (`api.anthropic.com`) through the same Antrea or OVN provider as the standard
+  tier. It honours neither `allowWebService` nor `extraEgress`. The controller
+  renders `Isolated` workers into the lane namespace, relays the fetcher's CA in
+  the worker's own token Secret, and refuses to start when the lane is
+  half-configured or shares a namespace with itself, the standard tier or the
+  docker tier.
+- **`uzi-fetcher` is its own Deployment** (`api/cmd/fetcher`, the api image's
+  second binary), in the release namespace, so untrusted content is never parsed
+  in the process that holds the secrets. It checks each request (https/443,
+  host on the run's site list, every resolved address public, pinned connection,
+  decoded-byte caps), then reports every attempt to the api. Its own
+  `NetworkPolicy` allows the internet minus the cluster's pod, service and node
+  ranges, so an internal destination is blocked at the network layer as well.
+- **The api owns the per-run state.** It mints a per-run fetch credential at
+  claim (stored as sha256, revoked when the run leaves running), snapshots the
+  site list onto the run, reserves bytes, files and concurrency atomically
+  before each fetch, and writes the `run_fetches` source log; the fetcher holds
+  only its own service token. A fetch whose log write fails is refused.
+- **Placement is exclusive and server-set.** `ClaimRun` lets only a
+  `workers.isolated_lane` worker (written only when the api provisions a
+  run-bound hosted worker, and requiring the `isolated_fetch_v1` protocol
+  capability) claim a profile-bound run, and lane workers claim nothing else;
+  the clause sits outside `fn_worker_can_claim` and the capability kill-switch.
+  A lane worker may call only an allowlist of `/api/worker` routes.
+- **The agent runs a fixed tool set** (`Read`, `Write`, `Edit`, `Grep`, `Glob`
+  and the in-process `fetch_url` tool) and fails the run if the SDK's effective
+  tool list differs. The fetch credential stays in the worker's node process.
+
+Residuals are recorded, not closed: DNS is a channel, the model API is a
+channel, the model host check is point-in-time, and a multi-publisher host
+admitted by an override admits every publisher on it. No run is bound to a site
+list until job creation (PRD #1908, this PRD's M8), so the lane is idle.
+
 ### Worker version and upgrade health
 
 A worker's `version` is written **only at register** (`workersvc.Register`), so a worker

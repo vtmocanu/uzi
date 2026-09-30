@@ -120,6 +120,21 @@ spec:
                   key: {{ .Values.workers.controller.tokenHashSecretKey | quote }}
                   optional: true
             {{- end }}
+            {{- if include "uzi.isolatedLaneEnabled" . }}
+            {{- $fetcherToken := fromJson (include "uzi.fetcherTokenSecret" .) }}
+            # uzi-fetcher's service token, as a HASH (PRD #1906 M3/M6). Setting it is what
+            # mounts the fetcher control routes; unset, they do not exist. The api refuses
+            # to boot if it equals the controller's hash. Rendered only with the lane on.
+            # optional: true, like the controller's hash above: a missing key (source:
+            # existing, not yet populated) leaves the routes unmounted, so the lane fails
+            # closed (every fetch is refused) while the rest of the api keeps serving.
+            - name: UZI_FETCHER_TOKEN_SHA256
+              valueFrom:
+                secretKeyRef:
+                  name: {{ $fetcherToken.name }}
+                  key: {{ $fetcherToken.hashKey | quote }}
+                  optional: true
+            {{- end }}
             # The api compares hosted workers' reported version against this pinned tag
             # for the upgrade badge (PRD #422), so an intentionally-pinned worker is not
             # flagged `outdated` when appVersion has moved ahead. workers.image.tag is a

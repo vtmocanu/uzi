@@ -197,6 +197,11 @@ func lockPrDescRun(ctx context.Context, q PrDescQueries, wkr store.Worker, runID
 		}
 		return store.Run{}, err
 	}
+	// PRD #1906 M5 (Decision D-D): no runOwnedByWorker precedes this lock, so the lane purpose
+	// check is applied here.
+	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+		return store.Run{}, ErrRunNotOwned
+	}
 	return run, checkPrDescRun(run, wkr, gen)
 }
 

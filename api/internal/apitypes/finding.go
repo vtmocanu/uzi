@@ -46,21 +46,22 @@ import "time"
 // All four are omitempty: a resolved/dismissed coordinate may carry no evidence, and an open one
 // no reason/provenance.
 type IncidentalFindingDTO struct {
-	DispositionID   string                 `json:"disposition_id"`
-	FindingID       *string                `json:"finding_id,omitempty"`
-	Location        string                 `json:"location"`
-	RepoID          string                 `json:"repo_id"`
-	RepoPath        string                 `json:"repo_path"`
-	Status          string                 `json:"status"`
-	LastTitle       string                 `json:"last_title"`
-	SeenInRuns      int                    `json:"seen_in_runs"`
-	DismissReason   string                 `json:"dismiss_reason,omitempty"`
-	SetVia          string                 `json:"set_via,omitempty"`
-	FiledIssueIID   *int64                 `json:"filed_issue_iid,omitempty"`
-	FiledIssueURL   string                 `json:"filed_issue_url,omitempty"`
-	ResolvedAt      *time.Time             `json:"resolved_at,omitempty"`
-	EvidencePreview string                 `json:"evidence_preview,omitempty"`
-	Occurrences     []FindingOccurrenceDTO `json:"occurrences,omitempty"`
+	DispositionID    string                 `json:"disposition_id"`
+	GroupOperationID *string                `json:"group_operation_id,omitempty"`
+	FindingID        *string                `json:"finding_id,omitempty"`
+	Location         string                 `json:"location"`
+	RepoID           string                 `json:"repo_id"`
+	RepoPath         string                 `json:"repo_path"`
+	Status           string                 `json:"status"`
+	LastTitle        string                 `json:"last_title"`
+	SeenInRuns       int                    `json:"seen_in_runs"`
+	DismissReason    string                 `json:"dismiss_reason,omitempty"`
+	SetVia           string                 `json:"set_via,omitempty"`
+	FiledIssueIID    *int64                 `json:"filed_issue_iid,omitempty"`
+	FiledIssueURL    string                 `json:"filed_issue_url,omitempty"`
+	ResolvedAt       *time.Time             `json:"resolved_at,omitempty"`
+	EvidencePreview  string                 `json:"evidence_preview,omitempty"`
+	Occurrences      []FindingOccurrenceDTO `json:"occurrences,omitempty"`
 }
 
 // FindingOccurrenceDTO is one run's report of a finding coordinate (PRD #1183 M3): the finding
@@ -189,9 +190,49 @@ type IncidentalFindingFileResultDTO struct {
 // re-applies the write-boundary controls to the (possibly edited) body. Labels seed the
 // editable selection; the server-mandated marker is added at file time (D5), never here.
 type IncidentalFindingIssueDraftDTO struct {
-	Title       string   `json:"title"`
-	Description string   `json:"description"`
-	Location    string   `json:"location"`
-	Labels      []string `json:"labels"`
-	Provenance  string   `json:"provenance"`
+	DispositionID string   `json:"disposition_id"`
+	Title         string   `json:"title"`
+	Description   string   `json:"description"`
+	Location      string   `json:"location"`
+	Labels        []string `json:"labels"`
+	Provenance    string   `json:"provenance"`
+}
+
+// FindingGroupDraftRequest selects one to fifty disposition IDs from one repo.
+type FindingGroupDraftRequest struct {
+	IDs []string `json:"ids"`
+}
+
+type FindingGroupDraftDTO struct {
+	RepoID         string   `json:"repo_id"`
+	DispositionIDs []string `json:"disposition_ids"`
+	Title          string   `json:"title"`
+	Description    string   `json:"description"`
+	Labels         []string `json:"labels"`
+}
+
+// FindingGroupFileRequest carries the selected coordinates and optional human edits.
+type FindingGroupFileRequest struct {
+	IDs         []string `json:"ids"`
+	Title       *string  `json:"title,omitempty"`
+	Description *string  `json:"description,omitempty"`
+	Labels      []string `json:"labels,omitempty"`
+}
+
+type FindingGroupFileResultDTO struct {
+	OperationID    string                          `json:"operation_id"`
+	DispositionIDs []string                        `json:"disposition_ids"`
+	Phase          string                          `json:"phase"`
+	Issue          *IncidentalFindingFiledIssueDTO `json:"issue,omitempty"`
+	Warning        string                          `json:"warning,omitempty"`
+}
+
+// FindingGroupReleaseRequest is an explicit owner confirmation after the deadline.
+type FindingGroupReleaseRequest struct {
+	ConfirmedAbsent bool `json:"confirmed_absent"`
+}
+
+type FindingGroupReleaseResultDTO struct {
+	OperationID string `json:"operation_id"`
+	Phase       string `json:"phase"`
 }

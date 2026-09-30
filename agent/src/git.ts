@@ -3764,7 +3764,7 @@ export class GitCache {
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[] } = {},
   ): Promise<CheckpointRange | null> {
     try {
       const tipSha = await this.trackingTip(barePath, branch);
@@ -3786,6 +3786,22 @@ export class GitCache {
         (await this.isAncestor(barePath, confirmed, tipSha))
       ) {
         scanFloorShas.push(confirmed);
+      }
+      // issue #1932: extra scan floors — ONLY tips proven published (confirmed published real tips,
+      // an attempted/confirmed checkpoint tip, the published tip); a caller must never pass a local-only
+      // checkpoint floor (bridge), or content under it would go unscanned. Same admission rule as
+      // `confirmedTip`: 40-hex, resolves to itself, an ancestor of the tip; a non-ancestor is
+      // dropped and duplicates of the exclude floor or another floor are skipped.
+      for (const floor of opts.extraFloors ?? []) {
+        if (
+          SHA40_RE.test(floor) &&
+          floor !== excludeSha &&
+          !scanFloorShas.includes(floor) &&
+          (await this.revParse(barePath, `${floor}^{commit}`)) === floor &&
+          (await this.isAncestor(barePath, floor, tipSha))
+        ) {
+          scanFloorShas.push(floor);
+        }
       }
       return { tipSha, excludeSha, scanFloorShas };
     } catch (err) {
@@ -3828,6 +3844,10 @@ export class GitCache {
    *     exactly an "evil merge"'s content, excluding side-branch commits that are scanned as
    *     ordinary commits or public via the floors); an octopus merge (remerge-diff shows nothing
    *     for it) or a git without remerge-diff falls back to `git diff --text <M>^1 <M>`, a superset.
+   *     A merge whose tree equals its FIRST parent's tree (an "ours" merge, e.g. a bridge) contributes
+   *     nothing beyond that parent, whose history is scanned as ordinary commits or excluded as
+   *     published, so its stdin scan is skipped (counted trusted-clean, never untrusted): remerge-diff
+   *     would otherwise show a dropped side edit of an already-public line as ADDED.
    *     Only the diff's ADDED lines are fed (what git mode scans), so context/'-' lines of content
    *     already public cannot wedge publishing. Liveness: gitleaks' `scanned ~N bytes` must equal
    *     the bytes fed.
@@ -4042,6 +4062,16 @@ export class GitCache {
           timeout: Math.max(1, ctx.remaining()),
         })
       ).stdout.trim().split(/\s+/).length - 1;
+      // An "ours" merge (tree identical to its first parent's) adds nothing beyond that parent, whose
+      // history is scanned as ordinary commits or excluded as published. Its remerge-diff would show
+      // the side parent's dropped edits inverted, i.e. content already public as ADDED.
+      const trees = (
+        await this.execScoped("git", withDir(barePath, ["rev-parse", `${merge}^{tree}`, `${merge}^1^{tree}`]), {
+          env: gitEnv(),
+          timeout: Math.max(1, ctx.remaining()),
+        })
+      ).stdout.trim().split(/\s+/);
+      if (trees.length === 2 && SHA40_RE.test(trees[0]!) && trees[0] === trees[1]) return { kind: "ok", findings: [] };
       const common = ["--no-color", "--no-ext-diff", "--no-textconv", "--text"];
       const args = parents === 2 && (await this.remergeDiffSupported())
         ? ["show", "--remerge-diff", "--format=", ...common, merge]

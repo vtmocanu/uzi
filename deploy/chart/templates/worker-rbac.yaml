@@ -230,4 +230,55 @@ subjects:
     name: {{ .Values.workers.controllerServiceAccountName }}
     namespace: {{ .Release.Namespace }}
 {{- end }}
+{{- if include "uzi.isolatedLaneEnabled" . }}
+{{- /*
+  The controller's reach into the ISOLATED lane's namespace (PRD #1906 M6), copied from
+  the docker tier's Role above with the SAME minimal verbs. The Secrets line is identical
+  and identically load-bearing: create/delete ONLY, never get/list (read the restricted
+  Role's comment). One controller identity, now bound into a third namespace.
+*/}}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller-isolated
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
+    # Same rule, same reason as the restricted Role: get/list would let a controller
+    # compromise harvest every lane worker's join token in one call.
+    verbs: ["create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["create", "list", "delete"]
+  - apiGroups: [""]
+    resources: ["pods"]
+    # `list` only, no `get`/`watch`, and `pods/log` refused, as in the other two Roles.
+    verbs: ["list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "uzi.fullname" . }}-controller-isolated
+  namespace: {{ .Values.workers.isolatedLane.namespace }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: controller
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "uzi.fullname" . }}-controller-isolated
+subjects:
+  - kind: ServiceAccount
+    name: {{ .Values.workers.controllerServiceAccountName }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
 {{- end }}

@@ -249,3 +249,65 @@ describe("mockApi findings human Mark done + Undo (issue #1723)", () => {
     expect(after.filed).toBe(before.filed + 1);
   });
 });
+
+describe("mockApi grouped filing (issue #1724)", () => {
+  const openUzi = mine.filter((f) => f.status === "open" && f.finding_id && f.repo_id === "repo-uzi");
+  const openOther = mine.find((f) => f.status === "open" && f.finding_id && f.repo_id !== "repo-uzi");
+
+  it("fixture has two open uzi rows and an open row in another repo", () => {
+    expect(openUzi.length).toBeGreaterThanOrEqual(2);
+    expect(openOther).toBeTruthy();
+  });
+
+  it("drafts every member's location and title, then files them all under one shared issue", async () => {
+    const api = await freshApi();
+    const ids = openUzi.slice(0, 2).map((f) => f.disposition_id);
+    const draft = await api.findingGroupIssueDraft(ids);
+    expect(draft.repo_id).toBe("repo-uzi");
+    expect(draft.disposition_ids).toEqual(ids);
+    for (const f of openUzi.slice(0, 2)) {
+      expect(draft.description).toContain(f.location);
+      expect(draft.description).toContain(f.last_title);
+    }
+
+    const res = await api.fileFindingGroup({ ids, title: "edited" });
+    expect(res.phase).toBe("settled");
+    expect(res.disposition_ids).toEqual(ids);
+    expect(res.issue?.title).toBe("edited");
+
+    const filed = (await api.listFindings("filed")).findings.filter((f) => ids.includes(f.disposition_id ?? ""));
+    expect(filed).toHaveLength(2);
+    expect(new Set(filed.map((f) => f.filed_issue_iid))).toEqual(new Set([res.issue?.iid]));
+    expect(new Set(filed.map((f) => f.filed_issue_url))).toEqual(new Set([res.issue?.web_url]));
+
+    // A second attempt on the now-filed members is the 409.
+    await expect(api.fileFindingGroup({ ids })).rejects.toMatchObject({ status: 409 });
+  });
+
+  it("rejects an empty title with 400 and files nothing", async () => {
+    const api = await freshApi();
+    const ids = openUzi.slice(0, 2).map((f) => f.disposition_id);
+    await expect(api.fileFindingGroup({ ids, title: "  " })).rejects.toMatchObject({
+      status: 400,
+      message: "title must be non-empty",
+    });
+    const res = await api.fileFindingGroup({ ids, title: "ok" });
+    expect(res.issue?.title).toBe("ok");
+  });
+
+  it("approximates the server errors: mixed repos 400, unknown 404, non-fileable 409, bad count 400", async () => {
+    const api = await freshApi();
+    const [a] = openUzi;
+    await expect(
+      api.findingGroupIssueDraft([a.disposition_id, openOther!.disposition_id]),
+    ).rejects.toMatchObject({ status: 400, message: "mixed repositories" });
+    await expect(api.findingGroupIssueDraft([a.disposition_id, "nope"])).rejects.toMatchObject({ status: 404 });
+    const filed = mine.find((f) => f.status === "filed")!;
+    await expect(api.findingGroupIssueDraft([a.disposition_id, filed.disposition_id])).rejects.toMatchObject({
+      status: 409,
+    });
+    await expect(api.findingGroupIssueDraft([])).rejects.toMatchObject({ status: 400 });
+    const many = Array.from({ length: 51 }, (_, i) => `id-${i}`);
+    await expect(api.findingGroupIssueDraft(many)).rejects.toMatchObject({ status: 400 });
+  });
+});

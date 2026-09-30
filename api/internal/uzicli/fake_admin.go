@@ -4,6 +4,7 @@ import (
 	"context"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/egressprofile"
 )
 
 // fake_admin.go holds the FakeClient admin methods (uzi admin) split out of
@@ -85,6 +86,31 @@ func (f *FakeClient) AdminBlockedRepos(context.Context) (apitypes.AdminBlockedRe
 		return apitypes.AdminBlockedReposDTO{}, f.Err
 	}
 	return f.BlockedReposV, nil
+}
+
+func (f *FakeClient) AdminListEgressProfiles(context.Context) ([]apitypes.EgressProfileDTO, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return f.EgressProfiles, nil
+}
+
+func (f *FakeClient) AdminGetEgressProfile(_ context.Context, name string) (apitypes.EgressProfileDTO, error) {
+	f.LastEgressProfileName = name
+	// Same local refusal as HTTPClient.AdminGetEgressProfile, so a command test through
+	// the fake sees the exit 2 a real client gives before any request.
+	if err := egressprofile.ValidateName(name); err != nil {
+		return apitypes.EgressProfileDTO{}, Exitf(ExitUsage, "invalid egress profile name: %v", err)
+	}
+	if f.Err != nil {
+		return apitypes.EgressProfileDTO{}, f.Err
+	}
+	for _, p := range f.EgressProfiles {
+		if p.Name == name {
+			return p, nil
+		}
+	}
+	return apitypes.EgressProfileDTO{}, Exitf(ExitNotFound, "egress profile %s not found", name)
 }
 
 func (f *FakeClient) AdminAgentSource(context.Context) (apitypes.AgentSourceDTO, error) {

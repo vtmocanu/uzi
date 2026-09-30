@@ -36,6 +36,9 @@ func samplePollResponse() PollResponse {
 			// A docker-capable worker: the controller renders it with the privileged
 			// DinD native sidecar in the docker namespace (PRD #83 M3).
 			Docker: true,
+			// Isolated false here, true on the second worker (PRD #1906 M5): both states of the
+			// lane dimension ride one wire so a drop of the field on either side reddens.
+			Isolated: false,
 			// Busy true, DrainingSince nil on this worker; the second is Busy false,
 			// DrainingSince set — so BOTH states of BOTH fields appear on one wire and a drop
 			// of either field on either side reddens (PRD #422 M3/M5), the same both-states
@@ -63,6 +66,10 @@ func samplePollResponse() PollResponse {
 			// namespace — both docker states on one wire so a drop of the field is a
 			// red build on both sides.
 			Docker: false,
+			// Isolated true: the mirror of the first worker (PRD #1906 M5). A lane worker is
+			// ephemeral and never docker, which this worker also is, so the sample stays a shape
+			// the api can actually produce.
+			Isolated: true,
 			// Busy false, DrainingSince set: this worker is cordoned but idle — the mirror of
 			// the first worker, so both states of both fields ride one wire (PRD #422 M3/M5).
 			// A fixed time so the golden is stable.

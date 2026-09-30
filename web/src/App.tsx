@@ -24,6 +24,7 @@ import { AgentDetail } from "./pages/AgentDetail";
 import { Skills } from "./pages/Skills";
 import { ToolAllowlist } from "./pages/ToolAllowlist";
 import { AdminBlockedRepos } from "./pages/AdminBlockedRepos";
+import { AdminEgressProfiles } from "./pages/AdminEgressProfiles";
 import { ForgeSettings } from "./pages/ForgeSettings";
 import { Repos } from "./pages/Repos";
 import { Board } from "./pages/Board";
@@ -136,6 +137,8 @@ export const APP_ROUTES: AppRoute[] = [
   { path: "/admin/blocked-repos", element: <AdminBlockedRepos />, guard: "admin" },
   // PRD #1907 M4: the external-product registry and its token inventory.
   { path: "/admin/products", element: <AdminProducts />, guard: "admin" },
+  // PRD #1906 M1w: egress profiles ("site lists"), the only write surface for them.
+  { path: "/admin/egress-profiles", element: <AdminEgressProfiles />, guard: "admin" },
   // PRD #1484 M4: the Admin → Health tab. LAST row (D1), guarded admin like its siblings.
   { path: "/admin/health", element: <AdminHealth />, guard: "admin" },
 ];

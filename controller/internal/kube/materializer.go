@@ -147,6 +147,12 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 	if m.cfg.DockerNamespace != "" {
 		namespaces = append(namespaces, m.cfg.DockerNamespace)
 	}
+	// The isolated research lane (PRD #1906 M5), when configured: a dropped lane worker is
+	// torn down in the lane, and an unstamped uzi-hw-* object there is flagged, by the
+	// same per-namespace provenance model as the other two tiers.
+	if m.cfg.IsolatedNamespace != "" {
+		namespaces = append(namespaces, m.cfg.IsolatedNamespace)
+	}
 	for _, ns := range namespaces {
 		if err := m.observeNamespace(ctx, ns, byID); err != nil {
 			return nil, err
@@ -697,19 +703,25 @@ func (m *Materializer) withinRecycleCooldown(obs reconcile.ObservedWorker) bool 
 
 // reconcileWorker converges one desired worker.
 func (m *Materializer) reconcileWorker(ctx context.Context, w protocol.DesiredWorker, obs reconcile.ObservedWorker) error {
-	// A docker worker needs the privileged docker namespace, and this controller is
-	// not always configured for it (the kind smoke, any instance with the docker tier
-	// off). Skip RENDERING with a loud error rather than default the namespace —
-	// exactly the unknown-preset posture below: the worker stays desired (never torn
-	// down), and materializes the moment the controller is configured. This is the
-	// "no silent default" rule from config.go carried to the reconcile: never render a
-	// privileged pod into the restricted default because a namespace was unset.
-	if w.Docker && m.cfg.DockerNamespace == "" {
-		m.log.Error("desired worker requests docker but this controller has no docker namespace configured; skipping its RENDER only (set UZI_WORKER_DOCKER_NAMESPACE + UZI_WORKER_DIND_IMAGE)",
-			"worker_id", w.ID)
+	// Placement is the render gate, and nothing below runs without it. A docker worker
+	// needs the privileged docker namespace and an isolated worker the lane namespace
+	// (PRD #1906 M5), and this controller is not always configured for either (the kind
+	// smoke, any instance with the tier off). An isolated worker that is ALSO docker is
+	// refused outright. Each case skips RENDERING with a loud error rather than default
+	// the namespace — exactly the unknown-preset posture below: the worker stays desired
+	// (never torn down), and materializes the moment the controller is configured. This
+	// is the "no silent default" rule from config.go carried to the reconcile: never
+	// render a privileged pod into the restricted default, and never a lane worker into
+	// a namespace with wider egress than the lane's, because a namespace was unset.
+	//
+	// Logged and skipped, not returned: a returned error would fail every reconcile tick
+	// for as long as the worker stays desired, and with it the roll-health report.
+	ns, err := m.cfg.Placement(w)
+	if err != nil {
+		m.log.Error("desired worker cannot be placed; skipping its RENDER only (fail closed)",
+			"worker_id", w.ID, "docker", w.Docker, "isolated", w.Isolated, "error", err.Error())
 		return nil
 	}
-	ns := m.cfg.namespaceFor(w)
 
 	spec, err := m.resolver.Resolve(w.Template, w.Size)
 	if err != nil {

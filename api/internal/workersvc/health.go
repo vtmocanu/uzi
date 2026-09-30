@@ -16,11 +16,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -174,6 +176,19 @@ const (
 	// job in a fleet of old-image or docker-only workers is unclaimable until a job-capable worker
 	// comes online. Maps to the SAME healthWaitingWorker enum (runs.health_reason is free text).
 	reasonNoJobCapableWorker = "no online worker supports jobs (job_runner_v1); update or provision a non-Docker worker"
+	// reasonWaitingIsolatedLane (PRD #1906 M5) is the queued reason for a PROFILE-BOUND run: only
+	// a worker the api provisions into the isolated lane can claim it (ClaimRun's two-way lane
+	// clause), so no ordinary worker reason applies. Maps to the SAME healthWaitingWorker enum.
+	reasonWaitingIsolatedLane = "waiting for an isolated research-lane worker to pick up this run"
+	// reasonIsolatedLaneNeedsDocker (PRD #1906 M5) is the queued reason for a profile-bound run
+	// that requires docker: the lane never gets a DinD sidecar, so the provisioner never gives
+	// it a worker (ListIsolatedQueuedRunsForEphemeral excludes it) and it can never be claimed.
+	reasonIsolatedLaneNeedsDocker = "this research run requires docker, which isolated research-lane workers never have, so no worker can run it"
+	// reasonIsolatedLaneProvisioningOff (PRD #1906 M5) is the queued reason for a profile-bound
+	// run while the instance ephemeral-worker kill-switch is off: the provisioner is the only
+	// source of lane workers and it provisions nothing with the switch off, so the run waits
+	// until an admin enables ephemeral workers.
+	reasonIsolatedLaneProvisioningOff = "this research run needs an isolated research-lane worker, but ephemeral worker provisioning is turned off on this instance; an admin must enable it"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -753,6 +768,12 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if r.CodexAccountGated {
 		return reasonCodexAccountUnavailable
 	}
+	// PRD #1906 M5: a profile-bound run is claimable ONLY by an api-provisioned lane worker, so
+	// the ordinary fleet rungs below (online, capable, busy workers) cannot describe it; every one
+	// of them excludes lane workers. Placed after the owner-account blocks, which still gate it.
+	if r.EgressProfileID.Valid {
+		return s.isolatedLaneReason(ctx, r)
+	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)
 	if err != nil {
 		slog.Error("health: count online workers", "error", err)
@@ -953,6 +974,27 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 		return reasonAllWorkersBusy
 	}
 	return reasonWaitingWorker
+}
+
+// isolatedLaneReason is queuedReason's rung for a profile-bound run, which only an
+// api-provisioned lane worker can claim. It names the two blocks no lane worker will ever
+// clear before the generic wait: a docker requirement (the lane has no DinD sidecar) and the
+// instance ephemeral-worker kill-switch being off (the provisioner is the lane's only source).
+// A nil reader or a read error cannot tell, so it reports the generic wait rather than
+// inventing a block on a failed lookup.
+func (s *Service) isolatedLaneReason(ctx context.Context, r store.ListActiveRunsForHealthRow) string {
+	if slices.Contains(r.RequiredCapabilities, capability.Docker) {
+		return reasonIsolatedLaneNeedsDocker
+	}
+	if s.ephemeralSettings != nil {
+		on, err := s.ephemeralSettings.EphemeralWorkersEnabled(ctx)
+		if err != nil {
+			slog.Error("health: read ephemeral kill-switch", "run_id", r.ID, "error", err)
+		} else if !on {
+			return reasonIsolatedLaneProvisioningOff
+		}
+	}
+	return reasonWaitingIsolatedLane
 }
 
 // capabilityAwareOn reads the capability-aware scheduling kill-switch, nil-safe and

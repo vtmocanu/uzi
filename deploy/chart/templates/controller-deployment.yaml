@@ -327,6 +327,19 @@ spec:
             {{- end }}
             {{- end }}
             {{- end }}
+            {{- if include "uzi.isolatedLaneEnabled" . }}
+            # The isolated lane (PRD #1906 M6). All three together or none: the controller
+            # renders lane workers into UZI_WORKER_ISOLATED_NAMESPACE and hands each one
+            # UZI_FETCHER_URL and UZI_FETCHER_CA_FILE, relaying the CA file below (the
+            # ca.crt of the issuer that signed the fetcher's certificate) the way it relays
+            # the api's CA. With the lane off none is set and no lane worker is rendered.
+            - name: UZI_WORKER_ISOLATED_NAMESPACE
+              value: {{ .Values.workers.isolatedLane.namespace | quote }}
+            - name: UZI_WORKER_ISOLATED_FETCHER_URL
+              value: {{ include "uzi.fetcherURL" . | quote }}
+            - name: UZI_WORKER_ISOLATED_FETCHER_CA_FILE
+              value: {{ printf "%s/ca.crt" (include "uzi.controllerFetcherCADir" .) | quote }}
+            {{- end }}
           resources:
             {{- toYaml .Values.workers.controller.resources | nindent 12 }}
           volumeMounts:
@@ -336,6 +349,11 @@ spec:
             {{- if .Values.api.tls.enabled }}
             - name: api-ca
               mountPath: {{ include "uzi.controllerCADir" . }}
+              readOnly: true
+            {{- end }}
+            {{- if include "uzi.isolatedLaneEnabled" . }}
+            - name: fetcher-ca
+              mountPath: {{ include "uzi.controllerFetcherCADir" . }}
               readOnly: true
             {{- end }}
             # Writable /tmp for the read-only-root-fs container, mirroring the api's.
@@ -391,6 +409,17 @@ spec:
         - name: api-ca
           secret:
             secretName: {{ include "uzi.apiTLSSecretName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0440
+        {{- end }}
+        {{- if include "uzi.isolatedLaneEnabled" . }}
+        # The fetcher's CA, projected by key out of its serving Secret, for the same
+        # reason as api-ca above: the Secret also holds the fetcher's private key.
+        - name: fetcher-ca
+          secret:
+            secretName: {{ include "uzi.fetcherTLSSecretName" . }}
             items:
               - key: ca.crt
                 path: ca.crt

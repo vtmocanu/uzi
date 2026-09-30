@@ -201,6 +201,26 @@ is editable) on every instance, including compose ones — it's simply inert
 there, since hosting itself is off unless an admin turns it on for the
 deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
+## Research fetch caps
+
+Five limits bound what one official-sources research run may download (see
+[Egress profiles](./egress-profiles.md)). The api reads them when it admits
+every fetch of a run in the [isolated research lane](./isolated-research-lane.md);
+no run is bound to a site list yet, so nothing exercises them today.
+
+| Setting | Default | Controls |
+|---|---|---|
+| `fetch_max_file_bytes` | 26214400 (25 MiB) | The largest single download, counted after decoding. 1 to 1073741824 (1 GiB). The fetcher's own ceiling (25 MiB unless the chart's `workers.isolatedLane.fetcher.maxFileBytes` sets another value) still applies, and a value above `fetch_max_run_bytes` is capped at it. |
+| `fetch_max_run_bytes` | 209715200 (200 MiB) | The total one run may download. 1 to 10737418240 (10 GiB). |
+| `fetch_max_run_files` | 100 | How many downloads one run may make. 1 to 10000. |
+| `fetch_max_concurrent_per_run` | 4 | How many fetches one run may have in flight at once. 1 to 32. |
+| `fetch_max_run_attempts` | 500 | How many fetch requests one run may make, allowed or refused, so a run that has used up its bytes or files can't keep asking. 1 to 100000. |
+
+There is no "unlimited" value: `0` is refused. Edit them on **Admin → Instance
+→ Research fetch caps**, which shows the two byte caps in MiB (a fraction such
+as `0.5` is allowed and rounded to whole bytes) and checks each range before
+saving. No environment variable sets these caps.
+
 ## Run health
 
 uzi can flag a run that looks stuck, looping, or close to its timeout — see

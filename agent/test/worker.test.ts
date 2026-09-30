@@ -818,7 +818,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     const worker = new Worker(
       fakeConfig(), client, runRunner, {} as unknown as ChatRunner, judgeRunner, noReview,
       recordingLogger().logger, okPreflight,
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       jobRunner,
     );
     const done = worker.run(controller.signal);
@@ -837,7 +837,7 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
     const worker = new Worker(
       fakeConfig(), client, { ...noResumeRecoveries, execute: async () => { routed.push("runner"); } } as unknown as RunRunner,
       {} as unknown as ChatRunner, judgeRunner, noReview, recordingLogger().logger, okPreflight,
-      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
       jobRunner,
     );
     const done = worker.run(controller.signal);

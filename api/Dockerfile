@@ -51,12 +51,16 @@ ARG UZI_PRDS_OPEN=
 # is the deliberate reproducibility choice — which is why these coordinates arrive
 # as ldflags rather than from debug.ReadBuildInfo().
 RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT} -X main.builtAt=${UZI_BUILT_AT} -X main.commits=${UZI_COMMIT_COUNT} -X main.prdsDone=${UZI_PRDS_DONE} -X main.prdsOpen=${UZI_PRDS_OPEN}" -o /out/server ./cmd/server
+# uzi-fetcher (PRD #1906 M2) ships in the same image as /fetcher and runs as its own
+# Deployment with a different command; ENTRYPOINT stays /server.
+RUN CGO_ENABLED=0 GOOS=linux go build -buildvcs=false -ldflags="-s -w -X main.version=${UZI_VERSION#v} -X main.commit=${UZI_COMMIT}" -o /out/fetcher ./cmd/fetcher
 
 # --- runtime stage ---
 FROM gcr.io/distroless/static-debian12:nonroot@sha256:1b7b9f0f0e0a1d2155f531db587cc48ec26aaf97ab64364225f5bf18a054e66a
 # Links this package to the repository on the registry (GHCR reads this label).
 LABEL org.opencontainers.image.source="https://github.com/vtmocanu/uzi"
 COPY --from=build /out/server /server
+COPY --from=build /out/fetcher /fetcher
 EXPOSE 8080
 USER nonroot:nonroot
 ENTRYPOINT ["/server"]

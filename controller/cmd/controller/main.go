@@ -24,6 +24,10 @@ import (
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
 )
 
+// serviceAccountNamespaceFile is the in-cluster namespace file every pod's
+// ServiceAccount mount carries (the same mount rest.InClusterConfig reads the token from).
+const serviceAccountNamespaceFile = "/var/run/secrets/kubernetes.io/serviceaccount/namespace"
+
 func main() {
 	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
 	slog.SetDefault(log)
@@ -64,6 +68,20 @@ func main() {
 	kubeClient, err := kubernetes.NewForConfig(restCfg)
 	if err != nil {
 		log.Error("kube client", "error", err)
+		os.Exit(1)
+	}
+
+	// REFUSE TO BOOT on an isolated lane namespace equal to this controller's own
+	// (PRD #1906 M5). Config.Load already refused one equal to either worker namespace;
+	// the controller's own namespace is only knowable in-cluster, from the namespace file
+	// the ServiceAccount mount carries beside the token InClusterConfig just read. With
+	// the lane configured, an unreadable or empty file also refuses to boot: the
+	// separation cannot be verified. With the lane off the file is never read.
+	if err := config.CheckIsolatedLaneOwnNamespace(cfg, func() (string, error) {
+		raw, err := os.ReadFile(serviceAccountNamespaceFile)
+		return string(raw), err
+	}); err != nil {
+		log.Error("isolated lane configuration", "error", err)
 		os.Exit(1)
 	}
 
@@ -112,6 +130,13 @@ func main() {
 		// The docker worker's gated DinD prune (issue #1759) rides the disk self-heal
 		// toggle: one knob governs every automatic reclaim.
 		DinDPruneEnabled: cfg.WorkerDiskRecycleEnabled,
+		// The isolated research lane (PRD #1906 M5). Empty namespace = lane off: an
+		// isolated worker is then skipped, never rendered into Namespace. The fetcher URL
+		// and CA reach isolated pods only (UZI_FETCHER_URL, and UZI_FETCHER_CA_FILE
+		// pointing at the fetcher-ca.crt key of the worker's own Secret).
+		IsolatedNamespace: cfg.WorkerIsolatedNamespace,
+		FetcherURL:        cfg.WorkerIsolatedFetcherURL,
+		FetcherCAPEM:      cfg.WorkerIsolatedFetcherCAPEM,
 	}
 	// The apiclient doubles as the cordon-write channel (PRD #422 M4): its RequestDrain
 	// satisfies kube.Cordoner, so a busy drifted worker is cordoned and drained rather
@@ -178,7 +203,11 @@ func main() {
 		// The DinD posture at a glance (PRD #89): false here means dockerd runs as real
 		// root and a breakout is node root — worth seeing in the first log line on a
 		// cluster that opted into it.
-		"docker_rootless", cfg.WorkerDinDRootless)
+		"docker_rootless", cfg.WorkerDinDRootless,
+		// The isolated lane at a glance (PRD #1906 M5): off means isolated workers in the
+		// poll are skipped, never rendered into the worker namespace.
+		"isolated_lane", cfg.WorkerIsolatedNamespace != "",
+		"isolated_namespace", cfg.WorkerIsolatedNamespace)
 	loop.Run(ctx)
 	log.Info("controller stopped")
 }

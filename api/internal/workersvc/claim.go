@@ -369,6 +369,24 @@ type ClaimPayload struct {
 	// worker can emit the run-message log lines (the worker owns the gapless per-run
 	// seq; the server never writes run_messages). Always present (possibly empty).
 	SkillsDropped []ClaimSkillDrop `json:"skills_dropped"`
+
+	// IsolatedFetch is the fetch grant of a profile-bound research run (PRD #1906 M3,
+	// Decision 7), present ONLY on such a run's claim; the worker routes a claim carrying
+	// it to its IsolatedRunner (agent/src/protocol.ts IsolatedFetchClaim). Such a claim
+	// also carries no forge credential, no repo, no agents, skills or tool packages, and
+	// never a Codex block (isolateClaim). omitempty keeps every other claim byte-identical
+	// to today's wire. Never logged: Credential is a live bearer secret.
+	IsolatedFetch *ClaimIsolatedFetch `json:"isolated_fetch,omitempty"`
+}
+
+// ClaimIsolatedFetch is the per-run fetch grant: Credential is the plaintext uzf_ token
+// (the api keeps only its sha256), sent by the worker to uzi-fetcher as its Bearer;
+// Profile and Hosts are the run's site-list snapshot taken at its first claim, for the
+// prompt and the log (the fetcher enforces the api's copy, not this one).
+type ClaimIsolatedFetch struct {
+	Credential string   `json:"credential"`
+	Profile    string   `json:"profile"`
+	Hosts      []string `json:"hosts"`
 }
 
 // ClaimSkill is one delivered skill in the per-run union: the name+description the

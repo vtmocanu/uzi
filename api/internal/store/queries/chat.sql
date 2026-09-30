@@ -94,6 +94,10 @@ WHERE id = (
       -- codex_secret_id IS NOT NULL) so it stays closed on inconsistent/legacy data, exactly as
       -- the run lane does. No new bind param, so ClaimChatRunParams is unchanged.
       AND NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+      -- PRD #1906 M5: the chat lane never claims a profile-bound run. The schema already forbids a
+      -- profile-bound chat (runs_egress_profile_not_chat, 00270); this is the claim-side backstop,
+      -- so dropping that CHECK could never hand one to the chat executor's full tool set.
+      AND r.egress_profile_id IS NULL
       AND (r.worker_id IS NULL
            OR r.worker_id = @worker_id
            OR r.updated_at < @affinity_cutoff)

@@ -116,6 +116,12 @@ func (s *Service) inputReceipt(ctx context.Context, wkr store.Worker, runID uuid
 	if err != nil {
 		return InputReceiptResult{}, err
 	}
+	// PRD #1906 M5 (Decision D-D): the lane purpose check runOwnedByWorker applies. A run and
+	// worker on different sides of the isolated lane get the not-owned answer, before any
+	// input row is read or stamped.
+	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+		return InputReceiptResult{}, ErrRunNotOwned
+	}
 	reason := receiptInactiveReason(run, wkr, generation)
 	active := reason == ""
 	conflict := &InputReceiptConflictError{Reason: reason}

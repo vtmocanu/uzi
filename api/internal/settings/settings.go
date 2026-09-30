@@ -479,6 +479,9 @@ func Validate(key, value string) error {
 		// {0} ∪ [3600, 604800] (PRD #1189 D3) — bounds differ from the run-health seconds
 		// range, so this has its own validator rather than reusing validateHealthSeconds.
 		return validateExtensionCapSeconds(value)
+	case KeyFetchMaxFileBytes, KeyFetchMaxRunBytes, KeyFetchMaxRunFiles, KeyFetchMaxConcurrentRun, KeyFetchMaxRunAttempts:
+		// PRD #1906: positive integers within a per-key ceiling (settings_fetch_caps.go).
+		return validateFetchCap(key, value)
 	case KeyJudgeCooldownSeconds:
 		// {0} ∪ [60, 86400], identical to the run-health seconds bounds (PRD #69 M5
 		// Decision 9), so validateHealthSeconds enforces it verbatim — 0 disables the

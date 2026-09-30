@@ -55,6 +55,11 @@ import type {
   ProductTokenExpiry,
   ProductTokenScope,
   CreatedIssue,
+  FindingGroupDraft,
+  FindingGroupFileResult,
+  EgressProfile,
+  EgressProfileProblem,
+  EgressProfileWriteInput,
   ForgeConfig,
   ForgeConnection,
   Harness,
@@ -293,6 +298,26 @@ export function gateRevisionMismatchCurrent(err: unknown): number | null {
   const body = err.body as { reason?: string; current_gate_revision?: unknown } | null;
   if (body?.reason !== "gate_revision_mismatch") return null;
   return typeof body.current_gate_revision === "number" ? body.current_gate_revision : 0;
+}
+
+// egressProfileProblems returns the per-field problems of a 422 `invalid_egress_profile`
+// (PRD #1906 M1), or null when the error is anything else, so the site-list editor can pin
+// each problem to its field or host entry and surface every other failure as a banner.
+// A 422 whose problems list is empty, or holds nothing well-formed, is also null: the
+// caller then shows the generic error, so a refused save is never silent.
+export function egressProfileProblems(err: unknown): EgressProfileProblem[] | null {
+  if (!(err instanceof ApiError) || err.status !== 422) return null;
+  const body = err.body as { reason?: string; problems?: unknown } | null;
+  if (body?.reason !== "invalid_egress_profile" || !Array.isArray(body.problems)) return null;
+  const problems = body.problems.filter(
+    (p): p is EgressProfileProblem =>
+      typeof p === "object" &&
+      p !== null &&
+      typeof (p as EgressProfileProblem).field === "string" &&
+      typeof (p as EgressProfileProblem).code === "string" &&
+      typeof (p as EgressProfileProblem).message === "string",
+  );
+  return problems.length > 0 ? problems : null;
 }
 
 async function request<T>(
@@ -1652,6 +1677,19 @@ const realApi = {
   // friendly "already filed" state — the backlog is the source of truth.
   fileFinding: (id: string, body?: { title?: string; description?: string; labels?: string[] }) =>
     request<IncidentalFindingFileResult>("POST", `/findings/${id}/issue`, body ?? {}),
+  // findingGroupIssueDraft reads the deterministic, human-editable draft for filing several
+  // findings as ONE issue (issue #1724). Keyed on DISPOSITION ids, sent as one comma-separated
+  // `ids` param (1-50, one repo). 400 mixed repositories / invalid ids, 404 unknown id, 409
+  // "finding not fileable" (a member is not open, has no evidence, or is already grouped).
+  findingGroupIssueDraft: (ids: string[]) =>
+    request<FindingGroupDraft>("GET", `/findings/issue-draft?ids=${encodeURIComponent(ids.join(","))}`),
+  // fileFindingGroup is the human-gated grouped forge write (issue #1724). `ids` are disposition
+  // ids; title/description/labels are optional user EDITS re-sanitised server-side. 201 returns the
+  // created issue; 202 returns the same shape WITHOUT `issue` (uncertain or stopped: `warning` says
+  // to inspect the forge), which request() decodes like any 2xx. 409 = a member was already filed
+  // or is being filed; 502 = the forge rejected the create.
+  fileFindingGroup: (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) =>
+    request<FindingGroupFileResult>("POST", "/findings/issue", body),
   // dismissFinding triages one coordinate to `dismissed` with a required reason from the
   // closed enum (M5). A LOCAL write — no forge call, no token spend. Keys on the evidence
   // id (finding_id), like fileFinding.
@@ -1746,6 +1784,22 @@ const realApi = {
   // checks_unknown so the page can say "unknown" rather than "none blocked" (R1).
   adminListBlockedRepos: () =>
     request<AdminBlockedRepos>("GET", "/admin/blocked-repos"),
+  // Egress profiles, "site lists" (PRD #1906 M1/M1w). Reads sit in the admin read group;
+  // create/replace/delete are cookie-only admin writes (request() echoes the CSRF cookie).
+  // A refused write is a 422 whose body carries `problems` (see egressProfileProblems).
+  // The name is immutable: PUT/DELETE address it in the path and PUT's body omits it.
+  adminListEgressProfiles: () =>
+    request<{ egress_profiles: EgressProfile[] }>("GET", "/admin/egress-profiles"),
+  adminCreateEgressProfile: (input: EgressProfileWriteInput & { name: string }) =>
+    request<{ egress_profile: EgressProfile }>("POST", "/admin/egress-profiles", input),
+  adminUpdateEgressProfile: (name: string, input: EgressProfileWriteInput) =>
+    request<{ egress_profile: EgressProfile }>(
+      "PUT",
+      `/admin/egress-profiles/${encodeURIComponent(name)}`,
+      input,
+    ),
+  adminDeleteEgressProfile: (name: string) =>
+    request<null>("DELETE", `/admin/egress-profiles/${encodeURIComponent(name)}`),
 
   // Runs-in-progress count for the Runs nav badge (PRD #239). Owner-scoped, one
   // indexed count(*): the caller's non-terminal runs, kind NOT IN ('chat','judge')

@@ -56,6 +56,7 @@ import {
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
+  CLAUDE_LONG_COMMAND_APPEND,
   WORKER_RUNTIME_APPEND,
 } from "./prompt.js";
 
@@ -168,7 +169,9 @@ function toDefinition(
     //  - SUBAGENT_SAFETY_APPEND (issue #1660): the worker-owned safety block, LAST. Both
     //    rosters (assembleAgents, subagentsFromTemplates) build through here, so no role
     //    body, repo-authored included, can drop it.
-    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
+    //  - CLAUDE_LONG_COMMAND_APPEND: the Claude Bash tool's long-command recipe. This path
+    //    builds Claude subagents only (Codex renders through codex/render.ts without it).
+    prompt: `${t.prompt_body}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CLAUDE_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
     // No subagent may spawn nested agents (defense-in-depth over the fact that
     // `agents` + settingSources:[] already limit spawnable agents to these), reach
     // the run's workflow-signal MCP tools (SIGNAL_SERVER_DENY — the plan gate and

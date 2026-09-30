@@ -1,5 +1,7 @@
 import {
   type CreatedIssue,
+  type FindingGroupDraft,
+  type FindingGroupFileResult,
   type IssueDraft,
   type IncidentalFinding,
   type IncidentalFindingBacklog,
@@ -143,6 +145,24 @@ function mockIssueDraft(
   };
 }
 
+// resolveGroup validates a grouped-filing selection roughly as the server does, for the demo (issue #1724): 1..50
+// unique ids (400), all owned (404), one repo (400 "mixed repositories"), all open with evidence
+// (409 "finding not fileable"). Returns the members in request order.
+function resolveGroup(rawIds: string[]): MockFinding[] {
+  const me = requireSession();
+  const ids = [...new Set(rawIds)];
+  if (ids.length < 1 || ids.length > 50) throw new ApiError(400, "invalid ids");
+  const members: MockFinding[] = [];
+  for (const id of ids) {
+    const f = findings.find((x) => x.disposition_id === id && x.user_id === me.id);
+    if (!f) throw new ApiError(404, "finding not found");
+    members.push(f);
+  }
+  if (members.some((m) => m.repo_id !== members[0].repo_id)) throw new ApiError(400, "mixed repositories");
+  if (members.some((m) => m.status !== "open" || !m.finding_id)) throw new ApiError(409, "finding not fileable");
+  return members;
+}
+
 export const findingsApi = {
   // ── Incidental Findings backlog (PRD #333 M7) ───────────────────────────────
   listFindings: async (bucket: IncidentalFindingBucket = "to_file", repo?: string, run?: string) => {
@@ -195,6 +215,44 @@ export const findingsApi = {
         web_url: webURL,
         title: body?.title ?? f.last_title,
       },
+    };
+    return delay(res, 120);
+  },
+  // findingGroupIssueDraft approximates the server's group draft for the demo (issue #1724): 1..50 unique disposition
+  // ids, every one owned (404), one repo (400), every one open with evidence (409). The description
+  // lists every member's location and title so the preview shows the whole selection.
+  findingGroupIssueDraft: async (ids: string[]) => {
+    const members = resolveGroup(ids);
+    const draft: FindingGroupDraft = {
+      repo_id: members[0].repo_id,
+      disposition_ids: members.map((m) => m.disposition_id),
+      title: members.length > 1 ? `Findings (${members.length}): ${members[0].last_title}` : `Findings: ${members[0].last_title}`,
+      description: ["## Findings", "", ...members.map((m, i) => `${i + 1}. \`${m.last_title}\` - ${m.location}`)].join("\n"),
+      labels: ["uzi"],
+    };
+    return delay(draft, 80);
+  },
+  // fileFindingGroup files every member as ONE issue (issue #1724): all members flip to `filed`
+  // sharing one new iid and web_url. Same validation as the draft; returns the 201 shape.
+  fileFindingGroup: async (body: { ids: string[]; title?: string; description?: string; labels?: string[] }) => {
+    const members = resolveGroup(body.ids);
+    // Like the server, an explicitly empty title is rejected; an omitted one falls back to the first
+    // member's title (demo convenience).
+    if (body.title !== undefined && body.title.trim() === "") throw new ApiError(400, "title must be non-empty");
+    const iid = nextFiledIssueIid++;
+    const webURL = `https://gitlab.example.com/${members[0].repo_path}/-/issues/${iid}`;
+    const now = new Date().toISOString();
+    for (const m of members) {
+      m.status = "filed";
+      m.filed_issue_iid = iid;
+      m.filed_issue_url = webURL;
+      m.resolved_at = now;
+    }
+    const res: FindingGroupFileResult = {
+      operation_id: `mock-op-${iid}`,
+      disposition_ids: members.map((m) => m.disposition_id),
+      phase: "settled",
+      issue: { iid, web_url: webURL, title: body.title ?? members[0].last_title },
     };
     return delay(res, 120);
   },

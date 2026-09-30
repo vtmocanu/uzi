@@ -690,12 +690,12 @@ func TestIncidentalFindingDTOTags(t *testing.T) {
 	iid := int64(7)
 	now := time.Unix(0, 0)
 	full := IncidentalFindingDTO{
-		DispositionID: "d1", FindingID: &id, DismissReason: "wont_do", SetVia: "issue_close",
+		DispositionID: "d1", GroupOperationID: &id, FindingID: &id, DismissReason: "wont_do", SetVia: "issue_close",
 		FiledIssueIID: &iid, FiledIssueURL: "https://forge.example/g/a/-/issues/7", ResolvedAt: &now,
 		EvidencePreview: "x", Occurrences: []FindingOccurrenceDTO{{}},
 	}
 	assertTags(t, "IncidentalFindingDTO(full)", full,
-		"disposition_id", "finding_id", "location", "repo_id", "repo_path", "status", "last_title",
+		"disposition_id", "group_operation_id", "finding_id", "location", "repo_id", "repo_path", "status", "last_title",
 		"seen_in_runs", "dismiss_reason", "set_via", "filed_issue_iid", "filed_issue_url",
 		"resolved_at", "evidence_preview", "occurrences")
 }
@@ -724,7 +724,7 @@ func TestIncidentalFindingBacklogDTOTags(t *testing.T) {
 
 func TestIncidentalFindingIssueDraftDTOTags(t *testing.T) {
 	assertTags(t, "IncidentalFindingIssueDraftDTO", IncidentalFindingIssueDraftDTO{},
-		"title", "description", "location", "labels", "provenance")
+		"disposition_id", "title", "description", "location", "labels", "provenance")
 }
 
 // TestIncidentalFindingFileResultDTOTags pins the PRD #333 M5/M6 file-response shape. warning

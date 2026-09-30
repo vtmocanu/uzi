@@ -49,21 +49,52 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 	list.Flags().String("run", "", "narrow to the coordinates that also occur in this run id; a foreign/unknown id is an EMPTY list, never a 404")
 
 	file := &cobra.Command{
-		Use:   "file <finding-id>",
-		Short: "File a forge issue from a finding (server-templated, marker-labelled)",
+		Use:   "file <finding-id> [<finding-id>...]",
+		Short: "File a forge issue from one or more findings (server-templated, marker-labelled)",
 		Long: "File a forge issue from one finding coordinate on your own forge connection. The\n" +
 			"title, description and labels are resolved server-side from the stored, sanitised\n" +
 			"finding plus a mandatory marker label — the CLI files defaults; edit-before-file is a\n" +
-			"web action. Exit 5 if the coordinate is already filed or being filed, 4 if unknown.",
-		Args: cobra.ExactArgs(1),
+			"web action. Exit 5 if the coordinate is already filed or being filed, 4 if unknown.\n\n" +
+			"Give several finding ids (same repo) to file ONE issue covering all of them; the\n" +
+			"findings are linked to that issue. Ids that resolve to the same coordinate count once.\n" +
+			"If the filing cannot be confirmed (HTTP 202) the operation id is printed and the exit is 5;\n" +
+			"once the operation's deadline has passed and you have checked the forge and\n" +
+			"no such issue exists, run\n" +
+			"`uzi findings release <operation-id> --confirm-no-issue`.",
+		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
 			if err != nil {
 				return err
 			}
-			return runFindingsFile(env, gf, c, cmd, args[0])
+			if len(args) == 1 {
+				return runFindingsFile(env, gf, c, cmd, args[0])
+			}
+			return runFindingsFileGroup(env, gf, c, cmd, args)
 		},
 	}
+
+	release := &cobra.Command{
+		Use:   "release <operation-id> --confirm-no-issue",
+		Short: "Release a stuck group filing after confirming no forge issue was created",
+		Long: "Release the findings held by a group filing whose outcome could not be confirmed, so\n" +
+			"they can be filed again. The server accepts a release only after the operation's\n" +
+			"deadline, and you must first check the forge and find that the issue\n" +
+			"was NOT created; --confirm-no-issue records that confirmation. Exit 5 if the\n" +
+			"operation cannot be released (yet), 4 if unknown.",
+		Args: cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if confirmed, _ := cmd.Flags().GetBool("confirm-no-issue"); !confirmed {
+				return uzicli.Exitf(uzicli.ExitUsage, "release requires --confirm-no-issue: confirm on the forge that no issue was created for this operation")
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runFindingsRelease(env, gf, c, cmd, args[0])
+		},
+	}
+	release.Flags().Bool("confirm-no-issue", false, "confirm you checked the forge and no issue exists for this operation")
 
 	dismiss := &cobra.Command{
 		Use:   "dismiss <finding-id> --reason wont-do|not-an-issue",
@@ -141,7 +172,7 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, file, dismiss, resolve, stats, undo)
+	cmd.AddCommand(list, file, release, dismiss, resolve, stats, undo)
 	return cmd
 }
 
@@ -221,6 +252,10 @@ func renderFindingsBacklog(p *uzicli.Printer, b apitypes.IncidentalFindingBacklo
 // dismiss_reason and set_via are closed enums and filed_issue_iid is a structural int, so all three
 // print raw — no sanitizeTTY, unlike the agent-authored last_title.
 func findingStateLabel(f apitypes.IncidentalFindingDTO) string {
+	// A coordinate claimed by an in-flight group filing shows the operation to release/inspect.
+	if f.GroupOperationID != nil && *f.GroupOperationID != "" {
+		return "pending group " + sanitizeTTY(*f.GroupOperationID)
+	}
 	switch f.Status {
 	case dispStatusDismissed:
 		if label := dismissReasonLabel(f.DismissReason); label != "" {
@@ -382,6 +417,145 @@ func runFindingsDismiss(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Co
 	}
 	if !gf.quiet {
 		p.Printf("finding %s: dismissed (%s)\n", id, reason)
+	}
+	return nil
+}
+
+// maxGroupFindings is the server's cap on one group filing. The CLI refuses more than this many
+// DISTINCT input ids (repeats do not count) before any request so the draft lookups stay bounded.
+const maxGroupFindings = 50
+
+// releaseHint is the operator guidance shared by every unsettled group filing report.
+const releaseHint = "release is accepted only after the operation's deadline and only once you checked the forge and no such issue exists"
+
+// runFindingsFileGroup files ONE issue from several evidence ids (issue #1724). Each id is
+// resolved to its coordinate's disposition id through the issue-draft read (so older evidence
+// ids that map to the same coordinate collapse), deduped in first-seen order. An id with no
+// disposition is a usage error. The plain single-file fallback applies only when every id
+// resolved to a disposition and they all share one.
+func runFindingsFileGroup(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, ids []string) error {
+	// Cap DISTINCT input ids (the server caps distinct ids) before any request.
+	var distinct []string
+	seenIn := map[string]bool{}
+	for _, id := range ids {
+		if !seenIn[id] {
+			seenIn[id] = true
+			distinct = append(distinct, id)
+		}
+	}
+	if len(distinct) > maxGroupFindings {
+		return uzicli.Exitf(uzicli.ExitUsage, "at most %d distinct findings can be filed as one issue (got %d)", maxGroupFindings, len(distinct))
+	}
+	var dispIDs []string
+	seen := map[string]bool{}
+	for _, id := range distinct {
+		d, err := c.FindingIssueDraft(cmd.Context(), id)
+		if err != nil {
+			return err
+		}
+		if d.DispositionID == "" {
+			return uzicli.Exitf(uzicli.ExitUsage, "finding %s has no triage record yet, so it cannot be filed in a group; leave it out of the group", sanitizeTTY(id))
+		}
+		if !seen[d.DispositionID] {
+			seen[d.DispositionID] = true
+			dispIDs = append(dispIDs, d.DispositionID)
+		}
+	}
+	if len(dispIDs) == 1 {
+		return runFindingsFile(env, gf, c, cmd, distinct[0])
+	}
+	res, accepted, err := c.FileFindingGroup(cmd.Context(), dispIDs)
+	if err != nil {
+		var ee *uzicli.ExitError
+		if errors.As(err, &ee) && ee.Code == uzicli.ExitConflict {
+			return explainGroupConflict(env, cmd, c, ee, dispIDs)
+		}
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		if err := p.JSON(res); err != nil {
+			return err
+		}
+	} else {
+		if res.Issue != nil && !gf.quiet {
+			p.Printf("filed issue #%d: %s\n", res.Issue.IID, sanitizeTTY(res.Issue.Title))
+			if res.Issue.WebURL != "" {
+				p.Printf("  %s\n", res.Issue.WebURL)
+			}
+			p.Printf("linked findings: %s\n", strings.Join(res.DispositionIDs, ", "))
+		}
+		// An unsettled operation (202, or a 201 not yet settled) and any warning are always
+		// printed, --quiet included: the operation id is what the user later inspects, and must
+		// not be released blindly.
+		if res.Phase != "settled" || accepted {
+			p.Printf("operation %s (%s)\n", sanitizeTTY(res.OperationID), sanitizeTTY(res.Phase))
+		}
+		if res.Warning != "" && (res.Phase != "settled" || accepted || !gf.quiet) {
+			p.Printf("warning: %s\n", sanitizeTTY(res.Warning))
+		}
+		if res.Issue == nil {
+			p.Printf("check the forge; if no issue exists, run `uzi findings release %s --confirm-no-issue` (%s)\n", sanitizeTTY(res.OperationID), releaseHint)
+		}
+	}
+	if accepted || res.Issue == nil {
+		return uzicli.Exitf(uzicli.ExitConflict, "group filing operation %s is not settled (phase %s)", res.OperationID, res.Phase)
+	}
+	return nil
+}
+
+// explainGroupConflict enriches the group POST's plain 409 ("finding not fileable", no operation
+// id) from the backlog. The detail goes straight to stderr, one line per pending operation
+// (deduped) or non-open coordinate, because root prints the returned error through cellText,
+// which folds newlines and cuts at 200 runes and would truncate UUID operation ids. A failed
+// backlog read leaves the original error untouched.
+func explainGroupConflict(env Env, cmd *cobra.Command, c uzicli.Client, orig *uzicli.ExitError, dispIDs []string) error {
+	b, err := c.ListFindings(cmd.Context(), "all", "", "")
+	if err != nil {
+		return orig
+	}
+	selected := map[string]bool{}
+	for _, d := range dispIDs {
+		selected[d] = true
+	}
+	seenOps := map[string]bool{}
+	var lines []string
+	for _, f := range b.Findings {
+		if !selected[f.DispositionID] {
+			continue
+		}
+		switch {
+		case f.GroupOperationID != nil && *f.GroupOperationID != "":
+			if op := sanitizeTTY(*f.GroupOperationID); !seenOps[op] {
+				seenOps[op] = true
+				lines = append(lines, "pending operation "+op)
+			}
+		case f.Status != "open":
+			lines = append(lines, fmt.Sprintf("finding %s is %s", f.DispositionID, sanitizeTTY(f.Status)))
+		}
+	}
+	if len(lines) == 0 {
+		return orig
+	}
+	for _, l := range lines {
+		_, _ = fmt.Fprintln(env.Stderr, l)
+	}
+	return uzicli.Exitf(uzicli.ExitConflict, "%s (details above)", orig.Error())
+}
+
+// runFindingsRelease releases a stuck group filing operation the owner confirmed produced no
+// issue. --json emits the server's result DTO.
+func runFindingsRelease(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, opID string) error {
+	res, err := c.ReleaseFindingGroup(cmd.Context(), opID)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(res)
+	}
+	if !gf.quiet {
+		p.Printf("released operation %s\n", sanitizeTTY(res.OperationID))
 	}
 	return nil
 }

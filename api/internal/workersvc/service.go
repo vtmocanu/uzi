@@ -1672,6 +1672,14 @@ type CapabilityScheduleReader interface {
 	CapabilityAwareScheduling(ctx context.Context) (bool, error)
 }
 
+// EphemeralSettingsReader is the narrow settings view the health detector reads for the
+// instance ephemeral-worker kill-switch (PRD #1906 M5): with it off the provisioner creates no
+// isolated-lane worker, so a profile-bound run's queued reason says so. *settings.Cache
+// satisfies it. Optional (nil-safe): a nil reader reports the generic lane wait.
+type EphemeralSettingsReader interface {
+	EphemeralWorkersEnabled(ctx context.Context) (bool, error)
+}
+
 // CompletionInterlockReader is the narrow settings view createRun reads for the
 // completion-interlock switch (PRD #1226 M1, D1; #1626). *settings.Cache satisfies it.
 // Kept its own interface (interface segregation, like CapabilityScheduleReader) so a
@@ -1741,6 +1749,9 @@ type Service struct {
 	// the flag DEFAULTS ON, so tests and deployments without a settings cache route
 	// capability-aware exactly as a live instance whose admin left the default in place.
 	capabilitySettings CapabilityScheduleReader
+	// ephemeralSettings reads the instance ephemeral-worker kill-switch for the queued reason
+	// of a profile-bound run (PRD #1906 M5). Optional (nil-safe); set via SetEphemeralSettings.
+	ephemeralSettings EphemeralSettingsReader
 	// completionInterlock reads the completion-interlock switch createRun consults to decide
 	// whether to stamp completion_contract_version=1 on a new unseeded issue
 	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
@@ -1957,6 +1968,10 @@ func (s *Service) SetDockerAllowlist(r DockerAllowlistReader) { s.dockerAllowlis
 // tests) defaults the flag ON — capability matching is enforced — so the omission is
 // safe rather than a silent disable.
 func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabilitySettings = r }
+
+// SetEphemeralSettings wires the instance ephemeral-worker kill-switch reader the health
+// detector consults for a profile-bound run's queued reason (PRD #1906 M5).
+func (s *Service) SetEphemeralSettings(r EphemeralSettingsReader) { s.ephemeralSettings = r }
 
 // SetCompletionInterlockSettings wires the completion-interlock rollout-switch reader
 // createRun consults (PRD #1226 M1, D1). Call once at startup, before serving, with the
@@ -2789,6 +2804,11 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// run is unaffected. Deliberately NOT folded into WorkerCaps — it is a separate
 		// column and a separate, override-proof clause.
 		WorkerProtocolCaps: wkr.ProtocolCapabilities,
+		// PRD #1906 M5 (Decision 9): the server-set lane marker, read by ClaimRun's two-way
+		// isolated-lane clause (a profile-bound run only on a lane worker, a lane worker only a
+		// profile-bound run). It comes from the worker ROW RequireWorker loaded, which only the
+		// provisioner writes, never from anything the worker sent.
+		WorkerIsolatedLane: wkr.IsolatedLane,
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
 		IsEphemeral:           wkr.Ephemeral,
 		EphemeralRunID:        wkr.EphemeralRunID,
@@ -5174,7 +5194,30 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 		}
 		return store.Run{}, err
 	}
+	if laneMismatch(runID, run.EgressProfileID.Valid, wkr) {
+		return store.Run{}, ErrRunNotOwned
+	}
 	return run, nil
+}
+
+// laneMismatch is the PRD #1906 M5 (Decision D-D) purpose check, defence in depth behind
+// ClaimRun's two-way isolated-lane clause and assembleClaim's backstop. A profile-bound run held
+// by a worker outside the lane, or an unbound run held by a lane worker, is not a flight either
+// side should be able to report on, so every worker-facing read that authorizes a run by its
+// worker_id refuses it as not owned rather than acting on it: runOwnedByWorker, the input
+// receipts (inputReceipt), the PR-description fence (lockPrDescRun), and RunMessageGaps, whose
+// single-statement authorization carries the same predicate in SQL. The FOR UPDATE re-reads in
+// SetState, completeRunWithPermit, parkForgeUnreachable and parkDataVolumeFull run after
+// runOwnedByWorker on the same request, and both sides are immutable (runs.egress_profile_id by
+// trigger, workers.isolated_lane written only at provisioning), so they need no second check.
+// It logs the refusal, since a mismatched pair means the claim-side placement failed.
+func laneMismatch(runID uuid.UUID, profileBound bool, wkr store.Worker) bool {
+	if profileBound == wkr.IsolatedLane {
+		return false
+	}
+	slog.Warn("run and worker on different sides of the isolated lane", "run", runID, "worker", wkr.ID,
+		"profile_bound", profileBound, "isolated_lane", wkr.IsolatedLane)
+	return true
 }
 
 // clampInt32 saturates an int64 into the int32 range (0..math.MaxInt32) rather than wrapping — the
@@ -5221,9 +5264,12 @@ func (s *Service) RunMessageGaps(ctx context.Context, wkr store.Worker, runID uu
 		RunID:           runID,
 		WorkerID:        pgconv.UUID(wkr.ID),
 		ClaimGeneration: claimGeneration,
-		Through:         clampInt32(through),
-		Cursor:          clampInt32(cursor),
-		Lim:             clampInt32(limit),
+		// PRD #1906 M5 (Decision D-D): the lane purpose check (laneMismatch), in the same
+		// statement as the rest of the authorization.
+		WorkerIsolatedLane: wkr.IsolatedLane,
+		Through:            clampInt32(through),
+		Cursor:             clampInt32(cursor),
+		Lim:                clampInt32(limit),
 	})
 	if err != nil {
 		return MessageGapsPage{}, err

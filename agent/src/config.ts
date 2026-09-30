@@ -146,6 +146,14 @@ export interface Config {
    * delivery.
    */
   workerTokenFile?: string;
+  /**
+   * PRD #1906 M4: the uzi-fetcher base URL (UZI_FETCHER_URL) and the CA bundle that alone
+   * verifies its certificate (UZI_FETCHER_CA_FILE). Set only on isolated-lane worker pods.
+   * The worker advertises `isolated_fetch_v1` only when BOTH are set, and an isolated claim
+   * on a worker without them fails closed.
+   */
+  fetcherUrl?: string;
+  fetcherCaFile?: string;
   heartbeatIntervalMs: number;
   pollIntervalMs: number;
   /** How long messages accumulate before a batched POST (PRD: 500ms). */
@@ -545,6 +553,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
     runCacheLowWater: openFraction(env, "UZI_RUN_CACHE_LOW_WATER", 0.6, { includeOne: false }),
     diskHardStopEnabled: parseBoolDefaultTrue(env.UZI_DISK_HARD_STOP_ENABLED),
     workerTokenFile: env.UZI_WORKER_TOKEN_FILE?.trim() || undefined,
+    fetcherUrl: env.UZI_FETCHER_URL?.trim() || undefined,
+    fetcherCaFile: env.UZI_FETCHER_CA_FILE?.trim() || undefined,
     heartbeatIntervalMs: duration(env, "WORKER_HEARTBEAT_INTERVAL", "15s"),
     pollIntervalMs: duration(env, "WORKER_POLL_INTERVAL", "3s"),
     messageBatchMs: duration(env, "WORKER_MESSAGE_BATCH_INTERVAL", "500ms"),

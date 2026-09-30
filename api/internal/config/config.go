@@ -6,6 +6,7 @@ package config
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -652,6 +653,12 @@ type Config struct {
 	// Required when hosting is enabled, refused when it is not (see loadWorkerHosting).
 	WorkerHostingEnabled  bool
 	ControllerTokenSHA256 []byte
+	// FetcherTokenSHA256 is the sha256 of uzi-fetcher's service credential (PRD #1906 M3),
+	// decoded from the hex UZI_FETCHER_TOKEN_SHA256: the hash of the token in the fetcher's
+	// UZI_FETCHER_TOKEN_FILE, surrounding whitespace trimmed (the fetcher trims it too).
+	// Like the controller's, only the hash is held. Nil (the variable unset) means the
+	// fetcher control routes are not mounted at all; a set but malformed value refuses boot.
+	FetcherTokenSHA256 []byte
 	// HostedTokenTTL bounds how long a sealed, undelivered join token may sit at
 	// rest in Postgres before the sweep destroys it (default 1h; 0 disables the
 	// sweep, with a boot warning). This is a residual BEYOND the one Decision 3
@@ -1226,6 +1233,9 @@ func Load() (Config, error) {
 	if err := loadWorkerHosting(&cfg); err != nil {
 		return Config{}, err
 	}
+	if err := loadFetcherToken(&cfg); err != nil {
+		return Config{}, err
+	}
 	// PRD #529 M2 ephemeral worker auto-provisioning knobs. These only tune the
 	// provisioner's volume; the feature stays a strict no-op until both the instance
 	// kill-switch and a user's opt-in are on. parseInt already floors at >0, so a
@@ -1581,6 +1591,41 @@ func loadWorkerHosting(cfg *Config) error {
 	}
 	cfg.WorkerHostingEnabled = true
 	cfg.ControllerTokenSHA256 = sum
+	return nil
+}
+
+// loadFetcherToken reads UZI_FETCHER_TOKEN_SHA256 (PRD #1906 M3), the hex sha256 of
+// uzi-fetcher's service token. Unset leaves the fetcher control routes unmounted (the
+// compose default: there is no fetcher, so the endpoints do not exist). A set value must be
+// exactly 32 bytes of hex, not the hash of a well-known placeholder, and not the controller's
+// hash (WORKER_HOSTING_CONTROLLER_TOKEN_SHA256), or boot fails: it
+// authenticates a route that writes every profile-bound run's source log, so a typo must
+// not quietly leave the lane without a working log (every fetch would then be refused) or
+// worse, accept a guessable token. The value is never echoed in an error.
+func loadFetcherToken(cfg *Config) error {
+	raw := strings.TrimSpace(os.Getenv("UZI_FETCHER_TOKEN_SHA256"))
+	if raw == "" {
+		return nil
+	}
+	sum, err := hex.DecodeString(raw)
+	if err != nil {
+		return fmt.Errorf("UZI_FETCHER_TOKEN_SHA256 is not valid hex (it must be sha256 of the fetcher token, hex-encoded, not the token itself)")
+	}
+	if len(sum) != sha256.Size {
+		return fmt.Errorf("UZI_FETCHER_TOKEN_SHA256 decodes to %d bytes, expected %d (it must be sha256 of the fetcher token, hex-encoded)", len(sum), sha256.Size)
+	}
+	if name, bad := placeholderControllerToken(sum); bad {
+		return fmt.Errorf("UZI_FETCHER_TOKEN_SHA256 is the hash of the well-known placeholder %q; generate a real fetcher token with: openssl rand -base64 32", name)
+	}
+	// One credential for two services would let a compromised fetcher (the isolated lane's
+	// internet-facing process) pass RequireController, which compares only against the
+	// controller hash. Refuse the pair outright. loadWorkerHosting runs first, so
+	// ControllerTokenSHA256 is already set when hosting is on; constant-time like the
+	// middlewares' own compares, though both values are hashes the operator configured.
+	if len(cfg.ControllerTokenSHA256) != 0 && subtle.ConstantTimeCompare(sum, cfg.ControllerTokenSHA256) == 1 {
+		return fmt.Errorf("UZI_FETCHER_TOKEN_SHA256 equals WORKER_HOSTING_CONTROLLER_TOKEN_SHA256; the fetcher and the controller must hold distinct tokens (generate another with: openssl rand -base64 32)")
+	}
+	cfg.FetcherTokenSHA256 = sum
 	return nil
 }
 

@@ -650,6 +650,56 @@ export interface AdminBlockedRepos {
   requests: GuardrailOverrideRequest[];
 }
 
+// EgressProfileWarning is a note about a stored host entry of an egress profile (PRD
+// #1906 Decision 4), mirroring apitypes.EgressProfileWarningDTO. Codes:
+// "multi_publisher_override" (a multi-publisher host admitted by an explicit override),
+// "multi_publisher_needs_override" (reads only: the built-in list now flags a stored entry
+// that has no override, so it matches nothing), "stale_entry" (reads only: the current
+// rules refuse a stored entry, so it matches nothing). `message` is server text: render
+// it as plain text.
+export interface EgressProfileWarning {
+  entry: string;
+  code: string;
+  message: string;
+}
+
+// EgressProfile is the admin view of one egress profile ("site list", PRD #1906 M1),
+// mirroring apitypes.EgressProfileDTO: GET/POST/PUT /api/admin/egress-profiles. `hosts`
+// are the normalized entries (an exact host or "*.base"; a wildcard matches proper
+// subdomains only, not the apex); `multi_publisher_override` is the subset of `hosts` the
+// admin accepted despite the multi-publisher warning. The api always sends [] (never
+// null) for the three arrays.
+export interface EgressProfile {
+  id: string;
+  name: string;
+  description: string;
+  hosts: string[];
+  multi_publisher_override: string[];
+  warnings: EgressProfileWarning[];
+  created_by: string | null;
+  updated_by: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+// EgressProfileWriteInput is the PUT body (the name is immutable and not sent); the POST
+// body adds `name`. Every PUT replaces description, hosts and overrides in full.
+export interface EgressProfileWriteInput {
+  description: string;
+  hosts: string[];
+  multi_publisher_override: string[];
+}
+
+// EgressProfileProblem is one entry of a 422 `invalid_egress_profile` body's `problems`:
+// `field` is "name", "description", "hosts", "hosts[3]" or "multi_publisher_override[0]";
+// `entry` echoes the refused entry as sent, when there is one. Server text: plain text only.
+export interface EgressProfileProblem {
+  field: string;
+  entry?: string;
+  code: string;
+  message: string;
+}
+
 export interface BoardColumn {
   label_name: string;
   position: number;
@@ -953,6 +1003,15 @@ export interface AppSettings {
   // labels to a linked GitHub Projects Status field — an instance-wide rate-limit /
   // cost lever. GitLab and Forgejo repos are unaffected either way.
   github_project_sync_enabled: string;
+  // Research fetch caps (PRD #1906 Open question 1): positive base-10 integers as strings,
+  // bounds per key in api/internal/settings/settings_fetch_caps.go. The two byte caps are
+  // decoded bytes; the Admin → Instance card edits them in MiB.
+  fetch_max_file_bytes: string;
+  fetch_max_run_bytes: string;
+  fetch_max_run_files: string;
+  fetch_max_concurrent_per_run: string;
+  // How many fetch attempts one research run may make, allowed or refused (PRD #1906 M3).
+  fetch_max_run_attempts: string;
   // Instance branding config (PRD #685). All six round-trip through GET/PUT
   // /admin/settings as raw strings like every other setting — the API serves the
   // whole settings surface as strings, so app_logo_keep_name/brand_plaque are the
@@ -3856,6 +3915,7 @@ export interface IncidentalFinding {
   // rollout skew) — the same reason finding_id and the M3 additions below are optional.
   disposition_id?: string;
   finding_id?: string;
+  group_operation_id?: string;
   location: string;
   repo_id: string;
   repo_path: string;
@@ -3911,6 +3971,28 @@ export interface IncidentalFindingFiledIssue {
 // could not settle (created-with-warning — a success, never a retry signal).
 export interface IncidentalFindingFileResult {
   issue: IncidentalFindingFiledIssue;
+  warning?: string;
+}
+
+// FindingGroupDraft is GET /api/findings/issue-draft?ids=... (issue #1724): the deterministic,
+// human-editable draft for filing several findings of ONE repo as one issue. `disposition_ids`
+// echoes the deduped selection in the order the server composed the draft.
+export interface FindingGroupDraft {
+  repo_id: string;
+  disposition_ids: string[];
+  title: string;
+  description: string;
+  labels: string[];
+}
+
+// FindingGroupFileResult is the POST /api/findings/issue response (issue #1724). 201 carries
+// `issue` (phase settled or a settled-with-warning); 202 omits it when the forge outcome is
+// uncertain or stopped, and `warning` then says to inspect the forge before releasing this operation.
+export interface FindingGroupFileResult {
+  operation_id: string;
+  disposition_ids: string[];
+  phase: string;
+  issue?: IncidentalFindingFiledIssue;
   warning?: string;
 }
 

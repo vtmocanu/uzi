@@ -96,6 +96,12 @@ export interface WallParkRefresh {
   usedSeconds?: number;
 }
 
+/** Issue #1932: what `RunContext.secretRemediationGate` tells the executor to do at the done point. */
+export type SecretRemediationDecision =
+  | { action: "proceed" }
+  | { action: "remediate"; followUp: string }
+  | { action: "fail" };
+
 /**
  * Everything an executor needs to work one run.
  *
@@ -443,6 +449,18 @@ export interface RunContext {
    * diagnostics only.
    */
   checkpoint?(opts: { reap: boolean; progress?: MilestoneProgress; sink?: BoundarySink }): Promise<void>;
+  /**
+   * Issue #1932: the pre-exit secret remediation gate. Called by the executor at the done point
+   * (the lead's `signal_done`), BEFORE any done checkpoint and before the interlock, and only on a
+   * non-interactive run. The runner scans the not-yet-published commit range for secrets and
+   * decides: `proceed` (clean, untrusted scan, or nothing it may rewrite) continues to the normal
+   * done path; `remediate` carries `followUp` (built only from rendered, safe labels), which the
+   * executor sends as a follow-up turn in the SAME session so the lead can rewrite the offending
+   * commit, then it gates again on the next done; `fail` exits WITHOUT the done checkpoint so the
+   * flagged commit is never published, and the runner reports `push_secret_blocked` at finalize.
+   * Absent on the stub/test executors (treated as `proceed`).
+   */
+  secretRemediationGate?(): Promise<SecretRemediationDecision>;
   /**
    * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
    * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a

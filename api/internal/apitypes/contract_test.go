@@ -159,6 +159,12 @@ func contractCases() []contractCase {
 		// present-as-null deleted_at) and the user mint picker entry (all strings, no null).
 		newContractCase[AdminDeleteProductResponse]("admin_delete_product"),
 		newContractCase[MintableProductDTO]("mintable_product"),
+		// PRD #1906 M1w: the admin egress profile ("site list"). created_by/updated_by are
+		// present-as-null pointers on the zero value; hosts, multi_publisher_override and
+		// warnings are non-omitempty slices (nil-slice nulls the handler normalizes to [],
+		// nonNilStrings and make(..., 0, n) in egressProfileToDTO). The nested
+		// EgressProfileWarningDTO rides inside the full fixture's warnings[0].
+		newContractCase[EgressProfileDTO]("egress_profile"),
 		// PRD #1908 M5: the /api/v1/jobs wire. V1JobCreateRequest is a REQUEST body (its
 		// full.json round-trips through DisallowUnknownFields like schedule_input). The
 		// nullable pointers are present-as-null, so the response zero.json files carry nulls.

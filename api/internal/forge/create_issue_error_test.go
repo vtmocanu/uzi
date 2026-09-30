@@ -1,0 +1,163 @@
+package forge
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"strings"
+	"testing"
+)
+
+func TestCreateIssueDefinitiveRejection(t *testing.T) {
+	const token = "test-secret-value-123456"
+	for _, driver := range []struct {
+		name string
+		new  func(*testing.T, int) Forge
+	}{
+		{"gitlab", func(t *testing.T, status int) Forge {
+			m := newMockGitLab(t, map[string]http.HandlerFunc{
+				"/api/v4/projects/7/issues": issueReject(status, token),
+			})
+			return newTestDriver(t, m, token)
+		}},
+		{"github", func(t *testing.T, status int) Forge {
+			m := newMockGitHub(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/issues": issueReject(status, token),
+			})
+			return newGitHubDriver(t, m, token)
+		}},
+		{"forgejo", func(t *testing.T, status int) Forge {
+			m := newMockForgejo(t, map[string]http.HandlerFunc{
+				"/repos/acme/widgets/issues": issueReject(status, token),
+			})
+			return newForgejoDriver(t, m, token)
+		}},
+	} {
+		for _, tc := range []struct {
+			status     int
+			definitive bool
+		}{
+			{400, true}, {401, true}, {403, false}, {408, false},
+			{409, false}, {422, true}, {500, false},
+		} {
+			t.Run(fmt.Sprintf("%s/%d", driver.name, tc.status), func(t *testing.T) {
+				d := driver.new(t, tc.status)
+				_, err := d.CreateIssue(context.Background(), 7, "title", "body", nil)
+				if err == nil {
+					t.Fatal("expected create error")
+				}
+				if got := IsCreateIssueDefinitiveRejection(err); got != tc.definitive {
+					t.Fatalf("definitive = %v, want %v: %v", got, tc.definitive, err)
+				}
+				if strings.Contains(err.Error(), token) || strings.Contains(fmt.Sprintf("%+v", err), token) {
+					t.Fatal("create error leaked token")
+				}
+			})
+		}
+	}
+}
+
+func TestGitLabCreateIssueDoesNotRetryAfterPossibleCreation(t *testing.T) {
+	posts := 0
+	created := 0
+	m := newMockGitLab(t, map[string]http.HandlerFunc{
+		"/api/v4/projects/7/issues": func(w http.ResponseWriter, r *http.Request) {
+			if r.Method != http.MethodPost {
+				t.Errorf("method = %s, want POST", r.Method)
+			}
+			posts++
+			if posts == 1 {
+				created++ // GitLab persisted the issue before reporting a server error.
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusUnprocessableEntity)
+		},
+	})
+	d := newTestDriver(t, m, "test-secret-value-123456")
+	_, err := d.CreateIssue(context.Background(), 7, "title", "body", nil)
+	if err == nil {
+		t.Fatal("expected create error")
+	}
+	if IsCreateIssueDefinitiveRejection(err) {
+		t.Fatalf("first POST may have created an issue: %v", err)
+	}
+	if posts != 1 || created != 1 {
+		t.Fatalf("POSTs = %d, issues created = %d; want one of each", posts, created)
+	}
+}
+
+func TestCreateIssueNeverReplaysRedirect(t *testing.T) {
+	const token = "test-secret-value-123456"
+	for _, driver := range []struct {
+		name string
+		path string
+		new  func(*testing.T, map[string]http.HandlerFunc) Forge
+	}{
+		{"gitlab", "/api/v4/projects/7/issues", func(t *testing.T, routes map[string]http.HandlerFunc) Forge {
+			return newTestDriver(t, newMockGitLab(t, routes), token)
+		}},
+		{"github", "/repos/acme/widgets/issues", func(t *testing.T, routes map[string]http.HandlerFunc) Forge {
+			return newGitHubDriver(t, newMockGitHub(t, routes), token)
+		}},
+		{"forgejo", "/repos/acme/widgets/issues", func(t *testing.T, routes map[string]http.HandlerFunc) Forge {
+			return newForgejoDriver(t, newMockForgejo(t, routes), token)
+		}},
+	} {
+		for _, status := range []int{http.StatusTemporaryRedirect, http.StatusPermanentRedirect} {
+			t.Run(fmt.Sprintf("%s/%d", driver.name, status), func(t *testing.T) {
+				posts, replayed := 0, 0
+				// Redirect to the same URL: a replay would receive 422 and could
+				// falsely classify the already-persisted issue as rejected.
+				d := driver.new(t, map[string]http.HandlerFunc{
+					driver.path: func(w http.ResponseWriter, r *http.Request) {
+						if r.Method != http.MethodPost {
+							t.Errorf("method = %s, want POST", r.Method)
+						}
+						posts++
+						if posts == 1 {
+							w.Header().Set("Location", r.URL.Path)
+							w.WriteHeader(status)
+							return
+						}
+						replayed++
+						w.WriteHeader(http.StatusUnprocessableEntity)
+					},
+				})
+				_, err := d.CreateIssue(context.Background(), 7, "title", "body", nil)
+				if err == nil {
+					t.Fatal("expected uncertain create result")
+				}
+				if IsCreateIssueDefinitiveRejection(err) {
+					t.Fatalf("persisted issue classified as rejected: %v", err)
+				}
+				if posts != 1 || replayed != 0 {
+					t.Fatalf("POSTs = %d, replayed = %d; want 1 and 0", posts, replayed)
+				}
+				if strings.Contains(err.Error(), token) || strings.Contains(fmt.Sprintf("%+v", err), token) {
+					t.Fatal("create error leaked token")
+				}
+			})
+		}
+	}
+}
+
+func issueReject(status int, token string) http.HandlerFunc {
+	return func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = fmt.Fprintf(w, `{"message":"rejected %s"}`, token)
+	}
+}
+
+func TestCreateIssueClassificationRequiresPostResponse(t *testing.T) {
+	if IsCreateIssueDefinitiveRejection(errors.New("status 422")) {
+		t.Fatal("error text is not a definitive response")
+	}
+	for _, status := range []int{0, 403, 408, 409, 429, 500} {
+		if IsCreateIssueDefinitiveRejection(createIssueError(status, errors.New("failure"))) {
+			t.Fatalf("status %d must remain ambiguous", status)
+		}
+	}
+}

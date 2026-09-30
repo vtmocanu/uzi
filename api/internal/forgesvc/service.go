@@ -7,8 +7,11 @@ package forgesvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"regexp"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -171,11 +174,14 @@ type ForgeBuilder func(forge.Type, string, string, time.Duration) (forge.Forge, 
 
 // Service bundles the dependencies for building forge clients and syncing.
 type Service struct {
-	q            IssueStore
-	box          *secretbox.Box
-	timeout      time.Duration
-	labels       LabelConfig
-	forgeBuilder ForgeBuilder
+	q             IssueStore
+	box           *secretbox.Box
+	timeout       time.Duration
+	labels        LabelConfig
+	groupDB       findingGroupDB
+	groupCursorMu sync.Mutex
+	groupCursors  map[uuid.UUID]store.FindingGroupCursor
+	forgeBuilder  ForgeBuilder
 
 	// reworkCanceller aborts an in-flight mr_rework run when its MR leaves the opened
 	// state (issue #853). Optional (nil-safe): set via SetReworkCanceller, unset means
@@ -212,6 +218,226 @@ func NewWithForgeBuilder(q IssueStore, box *secretbox.Box, timeout time.Duration
 		s.forgeBuilder = builder
 	}
 	return s
+}
+
+// findingGroupDB supports repo-scoped reads and atomic settlement.
+type findingGroupDB interface {
+	store.DBTX
+	store.FindingGroupDB
+}
+
+// SetFindingGroupDB enables group filing reconciliation. Call at startup.
+func (s *Service) SetFindingGroupDB(db findingGroupDB) { s.groupDB = db }
+
+// pendingFindingGroups settles durable records before any forge observation. The
+// returned closure emits one warning after the pass if claims remain.
+func (s *Service) pendingFindingGroups(ctx context.Context, repoID uuid.UUID) ([]store.FindingGroupClaimOperation, func(), func(), error) {
+	noop := func() {}
+	if s.groupDB == nil {
+		return nil, noop, noop, nil
+	}
+	var reconcileErr error
+	finish := func() {
+		// The sync context may have expired during forge work. Keep diagnostics
+		// bounded, but give the aggregate its own chance to report count and age.
+		statsCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 2*time.Second)
+		defer cancel()
+		count, oldest, err := store.FindingGroupRepoPendingStats(statsCtx, s.groupDB, repoID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr, err)
+		}
+		if count == 0 && reconcileErr == nil {
+			return
+		}
+		attrs := []any{"repo_id", repoID, "pending_group_operations", count}
+		if oldest != nil {
+			age := time.Since(*oldest)
+			if age < 0 {
+				age = 0
+			}
+			attrs = append(attrs, "oldest_age", age)
+		}
+		if reconcileErr != nil {
+			attrs = append(attrs, "error", reconcileErr)
+		}
+		slog.Warn("finding group reconciliation pending", attrs...)
+	}
+	// Select a bounded page. The cursor advances only after recorded settlements succeed.
+	s.groupCursorMu.Lock()
+	if s.groupCursors == nil {
+		s.groupCursors = make(map[uuid.UUID]store.FindingGroupCursor)
+	}
+	var after *store.FindingGroupCursor
+	if cursor, ok := s.groupCursors[repoID]; ok {
+		after = &cursor
+	}
+	ops, err := store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID, after)
+	if err == nil && len(ops) == 0 && after != nil {
+		ops, err = store.ListPendingFindingGroupsForRepo(ctx, s.groupDB, repoID, nil)
+	}
+	s.groupCursorMu.Unlock()
+	if err != nil {
+		reconcileErr = err
+		return nil, finish, noop, err
+	}
+	// Settle durable issue identities before spending work on uncertain claims.
+	for _, op := range ops {
+		if op.IssueIID == nil || op.IssueURL == "" {
+			continue
+		}
+		_, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID)
+		if err != nil {
+			reconcileErr = errors.Join(reconcileErr, err)
+		}
+		// A failed or raced settlement stays claimed for a later pass.
+	}
+	if reconcileErr != nil {
+		return ops, finish, noop, reconcileErr
+	}
+	advance := func() {
+		if len(ops) == 0 {
+			return
+		}
+		last := ops[len(ops)-1]
+		s.groupCursorMu.Lock()
+		defer s.groupCursorMu.Unlock()
+		// A concurrent pass may already have advanced farther. Do not rewind it.
+		current, exists := s.groupCursors[repoID]
+		if (after == nil && !exists) || (after != nil && exists && current == *after) {
+			s.groupCursors[repoID] = store.FindingGroupCursor{CreatedAt: last.CreatedAt, ID: last.ID}
+		}
+	}
+	return ops, finish, advance, nil
+}
+
+// Marker reconciliation scans the COMPLETE unfiltered issue list (see
+// reconcileFindingGroupMarkers), but it indexes only markers naming a matchable
+// operation on the current pending page. A marker for any other id (an operation
+// settled long ago, one on another page, or text planted in an unrelated issue)
+// cannot hide a second carrier of a wanted marker, so ignoring it is safe; and
+// counting it would let settled group issues, or anyone who can open an issue,
+// grow the scan without bound. The wanted set is at most one pending page, and a
+// wanted id saturates at ambiguous on its second carrier, so the scan needs no
+// candidate or description cap.
+const (
+	findingGroupMarkerPrefix = "<!-- uzi-finding-group-operation: "
+	findingGroupMarkerSuffix = " -->"
+)
+
+// errFindingGroupScanIncomplete marks a marker scan that could not see the
+// complete issue set (the unfiltered fetch failed, including on the driver's own
+// pagination cap). FullSync keeps every unconfirmed claim and carries on with the
+// issue sync; any other reconciliation error, a database write in particular,
+// still fails the pass.
+var errFindingGroupScanIncomplete = errors.New("finding group marker scan incomplete")
+
+type findingGroupMatch struct {
+	issue     forge.Issue
+	ambiguous bool
+}
+
+// indexFindingGroupIssues maps each wanted operation id to the issue carrying its
+// marker. A repeated exact marker, even in one description, is ambiguous.
+func indexFindingGroupIssues(issues []forge.Issue, want map[uuid.UUID]struct{}) map[uuid.UUID]findingGroupMatch {
+	index := make(map[uuid.UUID]findingGroupMatch)
+	for _, issue := range issues {
+		description := issue.Description
+		for {
+			at := strings.Index(description, findingGroupMarkerPrefix)
+			if at < 0 {
+				break
+			}
+			description = description[at+len(findingGroupMarkerPrefix):]
+			if len(description) < 36+len(findingGroupMarkerSuffix) || description[36:36+len(findingGroupMarkerSuffix)] != findingGroupMarkerSuffix {
+				continue
+			}
+			id, err := uuid.Parse(description[:36])
+			if err != nil || id.String() != description[:36] {
+				continue
+			}
+			if _, wanted := want[id]; !wanted {
+				continue
+			}
+			if previous, exists := index[id]; exists {
+				previous.ambiguous = true
+				index[id] = previous
+			} else {
+				index[id] = findingGroupMatch{issue: issue}
+			}
+		}
+	}
+	return index
+}
+
+func (s *Service) recordFindingGroupMatches(ctx context.Context, repoID uuid.UUID, issues []forge.Issue, want map[uuid.UUID]struct{}) error {
+	if s.groupDB == nil {
+		return nil
+	}
+	index := indexFindingGroupIssues(issues, want)
+	if len(index) == 0 {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(index))
+	for id := range index {
+		ids = append(ids, id)
+	}
+	ops, err := store.ListPendingFindingGroupsByIDs(ctx, s.groupDB, repoID, ids)
+	if err != nil {
+		return err
+	}
+	for _, op := range ops {
+		match := index[op.ID]
+		issue := match.issue
+		if match.ambiguous || issue.IID <= 0 || issue.WebURL == "" {
+			continue
+		}
+		recorded, err := store.RecordFindingGroupIssue(ctx, s.groupDB, op.UserID, op.ID, issue.IID, issue.WebURL)
+		if err != nil {
+			return err
+		}
+		if !recorded {
+			continue
+		}
+		if _, err := store.SettleFindingGroup(ctx, s.groupDB, op.UserID, op.ID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// reconcileFindingGroupMarkers settles unconfirmed group operations whose issue
+// was created but whose iid was never recorded, by matching the durable marker
+// in issue descriptions. Only FullSync calls it, and only with the COMPLETE
+// issue list: one unfiltered, all-states ListIssues. An UpdatedAfter-filtered
+// set can return only one of two issues carrying the same marker, and a
+// label-filtered set omits an issue that was de-labeled or never labeled; either
+// hides a duplicate and turns an ambiguous marker into a unique one. Ambiguity is
+// therefore evaluated over the complete set inside recordFindingGroupMatches.
+//
+// It matches only the page's matchable operations (phase in_flight or
+// returned_uncertain with no recorded iid) and makes NO forge request when there
+// are none: a recorded op (settled by pendingFindingGroups) or a pre_call op
+// never triggers the fetch. Operations on other pages are matched as FullSync
+// rotates to them. A failed fetch returns errFindingGroupScanIncomplete with
+// nothing recorded, so every claim stays.
+func (s *Service) reconcileFindingGroupMarkers(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, pending []store.FindingGroupClaimOperation) error {
+	if s.groupDB == nil {
+		return nil
+	}
+	want := make(map[uuid.UUID]struct{})
+	for _, op := range pending {
+		if op.IssueIID == nil && (op.Phase == "in_flight" || op.Phase == "returned_uncertain") {
+			want[op.ID] = struct{}{}
+		}
+	}
+	if len(want) == 0 {
+		return nil
+	}
+	all, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{})
+	if err != nil {
+		return errors.Join(errFindingGroupScanIncomplete, err)
+	}
+	return s.recordFindingGroupMatches(ctx, repoID, all, want)
 }
 
 // SetReworkCanceller wires the mid-flight mr_rework abort collaborator (issue #853).
@@ -523,6 +749,15 @@ func (m Marks) Advance(next Marks) Marks {
 // the any-state fetch keys on the uzi label now that the PRD label has lost its
 // special meaning.)
 //
+// FullSync is also the only path that settles unconfirmed finding-group
+// operations by marker (reconcileFindingGroupMarkers): it makes one extra
+// unfiltered all-states fetch, only while a matchable operation is pending. A
+// failure of that fetch settles nothing and keeps every claim,
+// but the issue sync below still runs and reports its marks: the marks bound
+// only the label-filtered fetches, which match no markers, so advancing them
+// hides nothing from a later scan. A database error while recording a match
+// still fails the pass with the zero Marks and no cache writes.
+//
 // The third fetch closes a gap the first two structurally left open: a filed finding
 // issue carries only the finding marker label, never the uzi label, so once it CLOSES
 // the uzi fetch (uzi-labelled) never returns it and the open fetch (state=opened) no
@@ -542,6 +777,11 @@ func (m Marks) Advance(next Marks) Marks {
 // continue" path: a soft-fail would also report a mark for a window nobody read
 // (Decision 11a).
 func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge) (Marks, error) {
+	pendingGroups, finishGroups, advanceGroups, pendingErr := s.pendingFindingGroups(ctx, repoID)
+	defer finishGroups()
+	if pendingErr != nil {
+		return Marks{}, pendingErr
+	}
 	uziLabel := s.uziLabel(ctx)
 	issues, err := f.ListIssues(ctx, forgeProjectID, forge.ListIssuesOptions{Labels: []string{uziLabel}})
 	if err != nil {
@@ -579,6 +819,20 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 		findingExtra = withoutLabel(findingIssues, uziLabel)
 		findingMark = maxUpdatedAt(findingIssues)
 	}
+	// Marker reconciliation runs over the complete issue list, after every
+	// fetch above succeeded and before any cache write. An incomplete scan
+	// leaves the page's claims unsettled and the sync continues; the cursor
+	// still rotates, so recorded operations on other pages keep settling while
+	// the scan cannot complete. Any other error returns the zero Marks, leaves
+	// the cache untouched and does not advance the cursor.
+	if err := s.reconcileFindingGroupMarkers(ctx, repoID, forgeProjectID, f, pendingGroups); err != nil {
+		if !errors.Is(err, errFindingGroupScanIncomplete) {
+			return Marks{}, err
+		}
+		slog.Warn("finding group marker scan incomplete; unconfirmed operations stay claimed",
+			"repo_id", repoID, "error", err)
+	}
+	advanceGroups()
 
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return Marks{}, err
@@ -626,11 +880,24 @@ func (s *Service) FullSync(ctx context.Context, repoID uuid.UUID, forgeProjectID
 // were written; advancing a successful path's mark would skip a window whose
 // rows never reached the cache.
 //
+// IncrementalSync makes no finding-group marker match: its fetches are filtered
+// by label and by updated_after, so they are not the complete issue set marker
+// uniqueness requires. It only settles durably recorded group operations (those
+// with a stored issue iid and url) on the current pending page, and it never
+// advances the group cursor: only FullSync rotates pages, so every page is
+// examined within as many FullSync passes as there are pages, however many
+// incremental passes run between them.
+//
 // The finding fetch is SKIPPED when the finding label equals the uzi label (a
 // misconfig ValidateMerged forbids): those issues are already covered by the uzi
 // fetch, so a third round trip would be pure duplicate work. Its mark then never
 // advances, which is correct — an unissued fetch is no evidence.
 func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgeProjectID int64, f forge.Forge, m Marks) (Marks, error) {
+	_, finishGroups, _, pendingErr := s.pendingFindingGroups(ctx, repoID)
+	defer finishGroups()
+	if pendingErr != nil {
+		return m, pendingErr
+	}
 	uziLabel := s.uziLabel(ctx)
 	opts := forge.ListIssuesOptions{Labels: []string{uziLabel}}
 	if !m.PRD.IsZero() {
@@ -660,6 +927,13 @@ func (s *Service) IncrementalSync(ctx context.Context, repoID uuid.UUID, forgePr
 			return m, err
 		}
 	}
+	// No marker matching and NO cursor advance here: an UpdatedAfter-filtered,
+	// label-filtered page is not the complete set marker uniqueness needs.
+	// pendingFindingGroups above settled the recorded iids of the current page;
+	// the page rotates only in FullSync (the returned advance closure is
+	// deliberately ignored), so incremental passes cannot shift which page the
+	// next FullSync examines. Recorded-op settlement on later pages therefore
+	// happens as FullSync rotates to them.
 	if err := s.upsertIssues(ctx, repoID, issues); err != nil {
 		return m, err
 	}

@@ -107,6 +107,7 @@ uzi run inputs <id> [--json]
 uzi run expedite <id> [--clear]
 uzi run rework <id> [-m|--message <text>]
 uzi run export <id> --output <path> [--capture <id>]
+uzi run fetches <id> [--json]
 uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
@@ -155,6 +156,7 @@ uzi admin users | runs | workers | usage | rate-limits | cli-tokens | products |
 uzi admin health [--all] [--strict]
 uzi admin agent-source get | status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category label,label] | stats [--json]
+uzi admin egress-profile list | show <name>
 uzi skill status | install [--force] | install-hook | uninstall-hook
 uzi docs list [--audience user|operator|design|contributor|all]
 uzi docs show <slug>
@@ -592,6 +594,17 @@ A few worth knowing:
   run lists the whole conversation, not just steering messages; an issue or
   CI-fix run's queue starts empty and only ever holds what you actually sent
   mid-run.
+- **`run fetches <id>`** prints a research run's source log
+  ([PRD #1906](../prds/1906-official-sources-web-research.md)): one row per web
+  fetch the run attempted, oldest first, with `STARTED`, `VERDICT` (`allowed` or
+  `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
+  `FINAL URL` (after redirects). The command follows every page of the log; a read taken while the run is still fetching can miss a row that commits late.
+  Owner-only: another user's run reads as not found (exit 4), and a run that
+  never fetched, which is every run until runs can be bound to a site list, shows
+  no rows. URLs are cut in the table; `--json` prints them whole with each file's
+  sha256. The text cells are site- or agent-controlled and are printed with
+  control characters stripped. See [Isolated research
+  lane](isolated-research-lane.md#reading-the-source-log).
 - **`run expedite <id>`** bumps a **queued** run to the front of the claim
   queue, so a worker picks it up ahead of the rest. It only matters before a
   run is claimed — ordering is fixed once a worker takes it — so a non-queued
@@ -764,6 +777,21 @@ A few worth knowing:
   triage tally, the cross-user twin of `uzi review stats`. Both are read-only and
   need an `admin_ro` (`uza_`) token, same ceiling as every other `admin` verb;
   the cross-user Mark done and Undo stay cookie-only in the web UI.
+- **`admin egress-profile list` and `admin egress-profile show <name>` read the
+  [egress profiles](egress-profiles.md)** (PRD #1906), the named site lists for
+  official-sources research. `list` prints `NAME`, `HOSTS` (entry count),
+  `OVERRIDES` (multi-publisher entries admitted by an explicit override),
+  `UPDATED` and `DESCRIPTION`. `show` prints the profile's fields, then one
+  `HOST`/`OVERRIDE` row per entry, then a `warning:` line for each overridden
+  multi-publisher host, for each stored multi-publisher entry that has no
+  override (the built-in list grew; it matches nothing), and for each stored
+  entry the current rules no longer accept (it matches nothing). An entry is an exact host or `*.base`, which
+  matches proper subdomains of base but not base itself. An unknown name exits
+  4; a name that is not a profile name (lowercase letters, digits and hyphens)
+  exits 2 without a request. Names, descriptions and hosts go through the same
+  sanitizing cell path as every other untrusted field; `show` prints a host or
+  description whole, up to its 253- or 500-character maximum. Read-only, `uza_`-token, same ceiling as every other `admin`
+  verb: creating, editing and deleting a profile are cookie-only admin writes.
 - **`uzi repo remove <id>` deletes a single stale repo** — the surgical
   counterpart to deleting a whole forge connection. It only works on a
   **disabled** repo, so disable it first (`enabled` shows in `uzi repo list`);
@@ -1610,6 +1638,8 @@ uzi findings list --bucket all --json                        # filed, done and d
 uzi findings list --repo <repo-id>                           # one repo
 uzi findings list --run <run-id>                             # coordinates that also occur in that run
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
+uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
+uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
 uzi findings dismiss <finding-id> --reason wont-do           # valid, not worth doing
 uzi findings dismiss <finding-id> --reason not-an-issue      # false positive
 uzi findings resolve <finding-id>                            # mark it done yourself
@@ -1638,6 +1668,28 @@ draft before filing is a web action. It prints the created issue's number and UR
 issue was created but its local record could not settle (a success with a note, still
 exit 0), not a retry signal. Filing a coordinate that is already filed or mid-filing
 is a conflict (exit 5); an unknown or foreign `<finding-id>` is not-found (exit 4).
+
+`file` also takes several ids of one repo and files **one** issue for all of them, with
+each finding linked to it. One id takes the single-file path above. With two or
+more ids (even the same id repeated), each distinct id's draft is fetched first and
+resolved to its coordinate (older evidence ids included); duplicates count once. An id
+with no triage record yet is a usage error (exit 2) and nothing is filed, even if it is
+the only coordinate left; to file an untriaged coordinate, pass its id alone. Only when
+every id resolves to one coordinate does the call fall back to the single-file filing.
+At most 50 distinct ids per call. It is all or nothing: if any chosen
+coordinate is already filed, dismissed or held, the call is a conflict (exit 5) and
+stderr lists the `pending operation <op>` ids holding them. `--json` returns
+`{operation_id, disposition_ids, phase, issue?, warning?}`, the issue plus the linked
+disposition ids. If the filing cannot be confirmed (HTTP 202) the CLI prints the
+operation id and a release hint and exits 5; the issue may still exist. uzi's repo sync
+settles the group on its own once it finds the marked issue; that happens on the
+periodic full (reconcile) sync and on a manual board Refresh. If it does not, check the
+forge and, only once the operation's deadline has passed and no such issue exists, run
+`uzi findings release <operation-id> --confirm-no-issue`. The flag is required: without
+it the command is a usage error (exit 2), and an operation that cannot be released yet
+or is unknown exits 5 or 4. Held rows show `pending group <op>` as their state in
+`uzi findings list --bucket all`. Closing the filed issue on the forge marks every member
+Done, as for a single finding; `undo` stays per finding.
 
 `dismiss` triages a coordinate to `dismissed` so it stays gone and does not re-nag
 across later runs (`not-an-issue` is a false positive, `wont-do` is valid-but-skip).

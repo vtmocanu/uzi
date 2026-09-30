@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
 	"github.com/vtmocanu/uzi/api/internal/healthsvc"
@@ -432,6 +433,7 @@ func run() error {
 	})
 
 	svc := forgesvc.New(q, box, cfg.ForgeHTTPTimeout, settingsCache)
+	svc.SetFindingGroupDB(pool)
 
 	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3): adopt/link
 	// an existing project + seed it. Builds forges through svc (same decryption path
@@ -543,6 +545,11 @@ func run() error {
 	// Default ON — a docker-needing run is claimable only by a docker-capable worker; OFF
 	// reverts to best-effort claiming while the docker allowlist above stays enforced.
 	wsvc.SetCapabilitySettings(settingsCache)
+
+	// Ephemeral-worker kill-switch (PRD #1906 M5): the health detector reads it so a queued
+	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
+	// provisioner will never create.
+	wsvc.SetEphemeralSettings(settingsCache)
 
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
@@ -837,6 +844,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "run_salvage",
 			Run:  wsvc.SweepSalvage,
+		},
+		// Stale fetch reservations (PRD #1906 M3): a reservation older than
+		// fetchctl.StaleReservationAge belongs to a fetch whose fetcher crashed or lost its
+		// Complete; its bytes and concurrency slot go back to the run. Always registered:
+		// with no profile-bound runs it is one UPDATE matching nothing.
+		sweeper.Pass{
+			Name: "fetch_reservations_stale",
+			Run:  fetchctl.New(pool, settingsCache).SweepStale,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484

@@ -243,6 +243,13 @@ type Client interface {
 	// snapshot (PRD #602 M6): GET /api/admin/agent-source. READ-ONLY — the sync/
 	// apply writes stay web-only (cookie-only), so the CLI never triggers a fetch.
 	AdminAgentSource(ctx context.Context) (apitypes.AgentSourceDTO, error)
+	// AdminListEgressProfiles / AdminGetEgressProfile read the admin egress profiles
+	// (PRD #1906 M1): GET /api/admin/egress-profiles[/{name}], in the admin READ group,
+	// so a uza_ token reads them and a masked uzc_/non-admin is a 403 (exit 3). READ-ONLY:
+	// create/edit/delete are cookie-only admin writes, done from the web Admin page. An
+	// unknown name is a 404 (exit 4).
+	AdminListEgressProfiles(ctx context.Context) ([]apitypes.EgressProfileDTO, error)
+	AdminGetEgressProfile(ctx context.Context, name string) (apitypes.EgressProfileDTO, error)
 	// AdminJudgeBacklog reads the admin "All users" aggregate backlog (PRD #1184 M5):
 	// GET /api/admin/judge/recommendations. Every user's recommendations deduped by
 	// (category, target), attribution hidden — the reply is an unenveloped
@@ -539,6 +546,21 @@ type Client interface {
 	// created-with-warning note. An unknown/foreign id is a 404 (exit 4); an already-filed or
 	// mid-filing coordinate is a 409 (exit 5) — both come straight from statusError.
 	FileFinding(ctx context.Context, id string) (apitypes.IncidentalFindingFileResultDTO, error)
+	// FindingIssueDraft reads the issue draft for one finding (GET /api/findings/{id}/issue-draft,
+	// keyed on the EVIDENCE id). The CLI uses it only for DispositionID, which resolves any
+	// (possibly older) evidence id to its coordinate's disposition so a group file can dedupe.
+	// An unknown/foreign id is a 404 (exit 4).
+	FindingIssueDraft(ctx context.Context, evidenceID string) (apitypes.IncidentalFindingIssueDraftDTO, error)
+	// FileFindingGroup files ONE forge issue from several coordinates (issue #1724): POST
+	// /api/findings/issue {ids} keyed on DISPOSITION ids, with the server's default text. The bool
+	// is true on a 202 (the filing has not settled: pre_call/in_flight/returned_uncertain, no
+	// Issue), false on a 201. A 409 (a coordinate is not fileable) is exit 5, 400 exit 2, 404
+	// exit 4, all straight from statusError.
+	FileFindingGroup(ctx context.Context, dispositionIDs []string) (res apitypes.FindingGroupFileResultDTO, accepted bool, err error)
+	// ReleaseFindingGroup releases a stuck group filing operation after the owner confirmed no
+	// issue exists (POST /api/findings/filing-operations/{op}/release {confirmed_absent:true}).
+	// A 409 (cannot be released) is exit 5, an unknown operation exit 4.
+	ReleaseFindingGroup(ctx context.Context, operationID string) (apitypes.FindingGroupReleaseResultDTO, error)
 	// DismissFinding triages one finding coordinate to `dismissed` with a reason (PRD #333 M6):
 	// POST /api/findings/{id}/dismiss {reason}. reason is the wire enum (wont_do|not_an_issue),
 	// mapped from the hyphenated flag and validated by the COMMAND before this is reached. An
@@ -649,6 +671,13 @@ type Client interface {
 	// Archives=[]), which the run-detail summary renders as an honest "none/unsupported"
 	// rather than a false claim of an available archive.
 	RecoveryArchives(ctx context.Context, runID string) (apitypes.RecoveryArchiveSummaryDTO, error)
+	// RunFetches returns ONE page of a profile-bound research run's source log (PRD #1906
+	// M3): GET /api/runs/{id}/fetches?after=, fetch attempts allowed or refused, oldest
+	// first. after is "" for the first page, else the previous page's NextCursor; the
+	// server's default (and largest) page is used. RequireUser and strict owner-or-404
+	// server-side, like RecoveryArchives. The URL, final URL, content type and reason are
+	// site- or agent-controlled text.
+	RunFetches(ctx context.Context, runID, after string) (apitypes.RunFetchesDTO, error)
 	// DownloadRecoveryArchive streams ONE owner-owned capture's decrypted bundle bytes to
 	// w and returns the number of bytes written (PRD #1296 D4/D7): GET
 	// /api/runs/{id}/archives/{captureID}/download. It is deliberately NOT built on the

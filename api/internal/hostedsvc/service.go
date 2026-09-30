@@ -201,6 +201,8 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// reads as false here — exactly the "no sidecar" the controller wants. No
 			// need to branch on Valid.
 			Docker: row.DockerEnabled.Bool,
+			// PRD #1906 M5: the server-set lane marker (workers.isolated_lane), mapped straight through.
+			Isolated: row.IsolatedLane,
 			// busy/draining_since feed the controller's cordon/defer-roll/deadline decision
 			// (PRD #422 M3/M4/M5). Busy is a SQL boolean; draining_since is the raw nullable
 			// cordon timestamp, mapped from pgtype.Timestamptz to *time.Time below (nil == not

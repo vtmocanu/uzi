@@ -63,6 +63,15 @@ type DesiredWorker struct {
 	// COALESCEd from the nullable docker_enabled column, so a NULL (external rows
 	// never reach this poll) and an explicit false both mean "no sidecar".
 	Docker bool `json:"docker"`
+	// Isolated is the isolated-lane dimension (PRD #1906 M5), a contract the controller honours:
+	// true → it renders the worker into the no-internet lane namespace (whose default-deny
+	// NetworkPolicy allows only DNS, the api, the fetcher and the model host). Mapped from the server-set
+	// workers.isolated_lane column, which only the ephemeral provisioner writes, for a worker
+	// bound to a profile-bound run. A pod-shape dimension orthogonal to Template, like Docker,
+	// and never true together with it (the provisioner never gives a lane worker a sidecar).
+	// Always present on the wire (no omitempty) so a drop is a visible contract change, not a
+	// silent false that would render a lane worker into an ordinary namespace.
+	Isolated bool `json:"isolated"`
 	// Busy is true when the worker holds at least one non-terminal run (PRD #422 M3,
 	// Decision 5): it reuses the same active-run predicate the DeleteWorker guard uses
 	// (awaiting_approval included). The controller reads it to defer a deliberate roll of

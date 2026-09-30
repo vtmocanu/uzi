@@ -58,6 +58,14 @@ const KNOWN_CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"];
 // bump the key: like default_harness, both are validated tolerantly (undefined/null/string)
 // and merged over the SEED on load, so a stale v4 blob stays valid and reads them as null.
 const MOCK_SETTINGS_KEY = "uzi.mock.v4";
+// PRD #1906: the fetch-cap bounds, copied from api/internal/settings/settings_fetch_caps.go.
+const FETCH_CAP_BOUNDS: Record<string, [number, number]> = {
+  fetch_max_file_bytes: [1, 1 << 30],
+  fetch_max_run_bytes: [1, 10 * 2 ** 30],
+  fetch_max_run_files: [1, 10000],
+  fetch_max_concurrent_per_run: [1, 32],
+  fetch_max_run_attempts: [1, 100000],
+};
 const SEED_USER_SETTINGS: UserSettings = {
   default_model: null,
   // PRD #1551 M1/D2: the two explicit per-harness worker-model lanes; null = inherit.
@@ -135,6 +143,13 @@ const SEED_APP_SETTINGS: AppSettings = {
   completion_interlock_rollout: "true",
   // Issue #534 M2: GitHub Projects v2 sync instance kill-switch, default OFF.
   github_project_sync_enabled: "false",
+  // PRD #1906: research fetch caps at the server defaults (25 MiB per file, 200 MiB and
+  // 100 files per run, 4 concurrent fetches per run, 500 fetch attempts per run).
+  fetch_max_file_bytes: "26214400",
+  fetch_max_run_bytes: "209715200",
+  fetch_max_run_files: "100",
+  fetch_max_concurrent_per_run: "4",
+  fetch_max_run_attempts: "500",
   // PRD #685: instance branding config, all string-space. Fresh installs are
   // unbranded (app_logo_mode "default", brand_mode "none").
   app_logo_mode: "default",
@@ -240,6 +255,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // seed default ("57600") fills it on load — but reject a malformed non-string, so a bad blob
     // can't violate the AppSettings contract. Mirrors the health_near_timeout_pct tolerance.
     (a.run_extension_cap_seconds === undefined || typeof a.run_extension_cap_seconds === "string") &&
+    // PRD #1906: the five fetch caps joined without a key bump; a blob that predates them
+    // (undefined) is filled from the seed on load, a malformed non-string is refused.
+    Object.keys(FETCH_CAP_BOUNDS).every((k) => a[k] === undefined || typeof a[k] === "string") &&
     typeof a.docker_repo_allowlist === "string";
   return okUser && okApp;
 }
@@ -850,6 +868,16 @@ export const settingsApi = {
         const n = Number(value);
         if (n !== 0 && (n < 3600 || n > 604800)) throw new ApiError(400, msg);
         nonSecret.run_extension_cap_seconds = String(n);
+        continue;
+      }
+      // Research fetch caps (PRD #1906), mirroring settings_fetch_caps.go: a base-10 integer
+      // in the key's [min, max]; no zero, no "unlimited".
+      if (key in FETCH_CAP_BOUNDS) {
+        const [min, max] = FETCH_CAP_BOUNDS[key];
+        if (!/^\d+$/.test(value.trim())) throw new ApiError(400, `${key}: must be a whole number`);
+        const n = Number(value.trim());
+        if (n < min || n > max) throw new ApiError(400, `${key}: must be between ${min} and ${max}`);
+        (nonSecret as Record<string, string>)[key] = String(n);
         continue;
       }
       // docker_repo_allowlist (PRD #957): a comma-separated list of repo ids, mirroring the

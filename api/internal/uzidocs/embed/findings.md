@@ -52,6 +52,31 @@ labels you pick. Click **Edit & file** first if you want to change the title,
 description, or labels before it's created. Either way, a filed finding links
 back to the issue it became.
 
+### Filing several findings as one issue
+
+When several findings share a root cause, tick their rows and click **File as
+one issue** in the selection bar. It is enabled for 2 to 50 selected open
+findings that have evidence and belong to the same repo. uzi opens the
+editable issue draft with the repo fixed, listing every selected finding's
+location and title; change the title, description, or labels as you would for a
+single finding, then file. Once the filing settles, every selected finding shows as **Filed**
+against the same issue, and any warning uzi returns is shown with the result.
+
+Filing is all or nothing: uzi claims every selected finding before it talks to
+the forge, so a finding that is already filed, dismissed, or mid-filing blocks
+the whole group instead of leaving it half filed. The issue carries a hidden
+marker that lets uzi recognize it later.
+
+If uzi cannot confirm whether the forge created the issue, the page shows the
+operation id and tells you to check the forge. uzi's repo sync settles the group
+by itself once it finds the marked issue. If you find no issue on the forge
+after the operation's deadline, release the findings with
+[`uzi findings release`](./cli.md#incidental-findings-uzi-findings) and file
+again. Release is a CLI action; until it succeeds the findings stay held and
+show `pending group <operation-id>` in `uzi findings list --bucket all`.
+While an operation is pending, the server logs a warning, `finding group
+reconciliation pending`, with the pending count and the age of the oldest one.
+
 ## Dismissing a finding
 
 Click **Dismiss ▾** and pick a reason — **Won't do** (valid, but not worth
@@ -123,6 +148,10 @@ issue poll, reading the cache that same tick just refreshed. The repo has to
 still be **enabled** in uzi for that poll to run at all — a disabled repo's
 closes are never seen.
 
+Closing a **group** issue on the forge marks every finding filed into it Done
+via #N, the same close behaviour as above. **Undo** is still per finding: undoing
+one does not touch the others.
+
 ## Untrusted text
 
 A finding's title, description, and location are written by the agent, from
@@ -139,6 +168,8 @@ Everything here is also available from the [uzi CLI](./cli.md#incidental-finding
 ```sh
 uzi findings list                                       # what still needs triage
 uzi findings file <finding-id>                           # file it
+uzi findings file <finding-id> <finding-id> ...          # file several as one issue
+uzi findings release <operation-id> --confirm-no-issue   # free a group filing that never confirmed
 uzi findings dismiss <finding-id> --reason wont-do       # or not-an-issue
 uzi findings resolve <finding-id>                        # mark it done yourself
 uzi findings undo <disposition-id>                       # undo a done or a dismissal
@@ -149,6 +180,11 @@ uzi findings stats                                       # your triage totals, a
 issue-close sync's alike. `resolve` takes the `finding-id`, same as `file`
 and `dismiss`; `undo` takes the coordinate's `disposition_id` instead, not
 the `finding_id` the human `list` view prints — read it off `--json`.
+
+Give `file` several ids of one repo to file one issue for all of them (see
+[Filing several findings as one issue](#filing-several-findings-as-one-issue)).
+Older evidence ids resolve to their finding and duplicates count once, up to 50
+distinct findings. `--json` returns the issue and the linked disposition ids.
 
 ## Good to know
 

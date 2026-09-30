@@ -1000,6 +1000,10 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// recovery service's own owner-scoped queries. Download streams decrypted bytes
 				// with private/no-store/nosniff + a server-generated filename and no redirect.
 				r.Get("/{id}/archives", h.ListRecoveryArchives)
+				// Source log of a profile-bound research run (PRD #1906 M3). Same RequireUser
+				// group and the same strict GetRun owner-or-404 gate as the archives above, so
+				// `uzi run fetches` reaches it from a uzc_ Bearer and an admin is refused.
+				r.Get("/{id}/fetches", h.ListRunFetches)
 				r.Get("/{id}/archives/{captureID}/download", h.DownloadRecoveryArchive)
 				r.Delete("/{id}/archives/{captureID}", h.DiscardRecoveryArchive)
 				// Exact owner custody-hold DISCARD (PRD #1349 M5, D7). Same RequireUser /runs
@@ -1055,6 +1059,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 		h.mountWorkerRoutes(r, proposalLimiter)
 		h.mountControllerRoutes(r)
+		h.mountFetcherRoutes(r)
 	})
 
 	return r
@@ -1089,6 +1094,7 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 	r.Route("/api", func(r chi.Router) {
 		h.mountWorkerRoutes(r, proposalLimiter)
 		h.mountControllerRoutes(r)
+		h.mountFetcherRoutes(r)
 	})
 
 	return r
@@ -1103,6 +1109,10 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))
+		// PRD #1906 M5 (D-D): an isolated-lane worker reaches only the lifecycle routes its
+		// research runner needs (laneWorkerAllowlist); every other route here, a new one
+		// included, answers it 403. Ordinary workers pass through untouched.
+		r.Use(laneWorkerRouteGuard)
 		r.Post("/register", h.WorkerRegister)
 		r.Post("/heartbeat", h.WorkerHeartbeat)
 		r.Post("/runs/claim", h.WorkerClaim)

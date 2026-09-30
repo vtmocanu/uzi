@@ -154,6 +154,13 @@ func (s *Service) ClaimChat(ctx context.Context, wkr store.Worker) (*ChatClaimPa
 	if s.vlt != nil && !s.vlt.Unlocked(wkr.UserID) {
 		return nil, nil // idle: owner locked
 	}
+	// PRD #1906 M5 (Decision D-D): a chat run is never profile-bound (runs_egress_profile_not_chat),
+	// so every chat run is on the other side of the isolated lane from a lane worker. ClaimChatRun
+	// already excludes every ephemeral worker, which every lane worker is (ck_workers_isolated_lane);
+	// this refuses before the claim, so finishChatClaimTx's locked re-read never sees such a pair.
+	if wkr.IsolatedLane {
+		return nil, nil
+	}
 	run, err := s.q.ClaimChatRun(ctx, store.ClaimChatRunParams{
 		WorkerID: pgconv.UUID(wkr.ID),
 		UserID:   wkr.UserID,

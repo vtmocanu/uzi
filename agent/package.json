@@ -10,7 +10,7 @@
     "lint": "oxlint --config .oxlintrc.json -D correctness --report-unused-disable-directives-severity=error src test",
     "knip": "knip",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --import ./test/setup/hermetic-proc.ts --test ${UZI_AGENT_TEST_CONCURRENCY:+--test-concurrency=$UZI_AGENT_TEST_CONCURRENCY} --test-timeout=120000 test/*.test.ts",
+    "test": "node --import tsx --import ./test/setup/hermetic-proc.ts --test ${UZI_AGENT_TEST_CONCURRENCY:+--test-concurrency=$UZI_AGENT_TEST_CONCURRENCY} ${UZI_AGENT_TEST_SHARD:+--test-shard=$UZI_AGENT_TEST_SHARD} ${UZI_AGENT_TEST_JUNIT:+--test-reporter=spec --test-reporter-destination=stdout --test-reporter=junit --test-reporter-destination=$UZI_AGENT_TEST_JUNIT} --test-timeout=120000 test/*.test.ts",
     "deps-check": "npm ls --depth=0",
     "audit": "npm audit --audit-level=high --include=dev"
   },

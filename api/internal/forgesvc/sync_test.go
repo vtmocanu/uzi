@@ -52,6 +52,10 @@ type fakeForge struct {
 	findingLabel  string
 	findingIssues []forge.Issue
 	findingErr    error
+	// allIssues / allErr script the unfiltered complete-set fetch that group-marker
+	// reconciliation makes (no label, all states, no UpdatedAfter).
+	allIssues []forge.Issue
+	allErr    error
 
 	// MR-close watcher (PRD #24) scripting. mr/mrErr are the default GetMergeRequest
 	// result; mrByIID/mrErrByIID override per mrIID (for multi-candidate tests).
@@ -152,6 +156,15 @@ func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssues
 		}
 		return f.openIssues, nil
 	}
+	// The complete-set fetch used by group-marker reconciliation names no label, no
+	// state and no lower bound. It must be routed before the fall-through, which would
+	// otherwise answer it with the uzi-labelled set.
+	if isUnfilteredList(opts) {
+		if f.allErr != nil {
+			return nil, f.allErr
+		}
+		return f.allIssues, nil
+	}
 	// The finding fetch names the finding marker label (state=all). Route on the LABEL
 	// VALUE, not call order, so a reorder still discriminates it from the uzi fetch.
 	if len(opts.Labels) == 1 && opts.Labels[0] == f.findingLabelFor() {
@@ -164,6 +177,24 @@ func (f *fakeForge) ListIssues(_ context.Context, _ int64, opts forge.ListIssues
 		return nil, f.listErr
 	}
 	return f.issues, nil
+}
+
+// isUnfilteredList reports the shape of the complete-set fetch: every state, no label
+// and no UpdatedAfter bound.
+func isUnfilteredList(opts forge.ListIssuesOptions) bool {
+	return len(opts.Labels) == 0 && opts.State == forge.StateAll && opts.UpdatedAfter == nil
+}
+
+// unfilteredListCalls returns just the complete-set fetches, so a test can assert
+// that a pass made none (or exactly one) by shape, not by index.
+func (f *fakeForge) unfilteredListCalls() []forge.ListIssuesOptions {
+	var out []forge.ListIssuesOptions
+	for _, c := range f.listCalls {
+		if isUnfilteredList(c) {
+			out = append(out, c)
+		}
+	}
+	return out
 }
 
 // findingLabelFor is the label the fake routes the finding fetch on: the explicit

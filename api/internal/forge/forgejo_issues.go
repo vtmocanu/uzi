@@ -171,9 +171,17 @@ func (f *forgejo) CreateIssue(ctx context.Context, projectID int64, title, descr
 		}
 		opt.Labels = ids
 	}
-	i, _, err := c.CreateIssue(slug.owner, slug.repo, opt)
+	c, err = f.newClient(createIssueContext(ctx))
 	if err != nil {
-		return Issue{}, f.wrapErr("create issue", err)
+		return Issue{}, err
+	}
+	i, resp, err := c.CreateIssue(slug.owner, slug.repo, opt)
+	if err != nil {
+		wrapped := f.wrapErr("create issue", err)
+		if resp != nil && resp.Response != nil {
+			return Issue{}, createIssueError(resp.StatusCode, wrapped)
+		}
+		return Issue{}, wrapped
 	}
 	return toForgejoIssue(i), nil
 }

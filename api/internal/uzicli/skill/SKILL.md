@@ -179,6 +179,7 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
+uzi run fetches <run-id> [--json]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
 uzi schedule get <schedule-id>
@@ -204,7 +205,8 @@ uzi review undo <run-id> <rec-id>
 uzi review file <run-id> <rec-id> [--repo <repo-id>]
 uzi review stats
 uzi findings list [--repo <repo-id>] [--bucket to_file|filed|done|dismissed|all] [--run <run-id>]
-uzi findings file <finding-id>
+uzi findings file <finding-id> [<finding-id>...]
+uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
 uzi findings stats [--repo <repo-id>]
@@ -253,6 +255,8 @@ uzi admin agent-source get
 uzi admin agent-source status
 uzi admin review backlog [--bucket todo|filed|done|dismissed|all] [--category <label,label>]
 uzi admin review stats
+uzi admin egress-profile list
+uzi admin egress-profile show <name>
 uzi skill status [--target claude|codex|all]
 uzi skill install [--force] [--target claude|codex|all]
 uzi skill install-hook [--target claude|codex|all]
@@ -678,6 +682,13 @@ uzi version
   (without a TTY and without `--yes` it refuses and changes nothing). A cancelled prompt mutates
   nothing. An available archive is never deleted here (export it first). A foreign/absent/already
   settled hold is a 404 (exit 4).
+- `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
+  (official-sources research): every web fetch it attempted, allowed or refused, with the
+  reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only
+  (a foreign run is a 404, exit 4). The URLs, content type and reason are site- or
+  agent-controlled text; `--json` adds each file's sha256 and prints long URLs whole. The api
+  pages the log (500 rows a page, `?after=<next_cursor>`); the command follows every page and
+  prints the whole log.
 
 ### Schedules — time-driven runs
 
@@ -1316,6 +1327,23 @@ which you triage from the terminal exactly like the judge backlog.
   yours. `--json` returns `{issue:{iid,web_url,title}, warning?}`; a `warning` means
   the issue was created but its local record could not settle (a success with a note,
   still exit 0), not a retry signal.
+- `uzi findings file <finding-id> <finding-id>...` — file ONE issue for several
+  coordinates of the same repo. One id takes the single-file path. With two or more ids
+  (even a repeated one), each distinct id is resolved to its coordinate's disposition
+  (older evidence ids included) and duplicates collapse; an id with no triage record is a
+  usage error (exit 2) and nothing is filed, so to file an untriaged coordinate pass its
+  id alone. Only when every id resolves to one coordinate does it fall back to the
+  single-file filing. `--json` returns `{operation_id, disposition_ids, phase, issue?,
+  warning?}`. A 202 means the filing could not be confirmed: the operation id and phase
+  are printed and the exit is 5; a 201 whose phase is not `settled` also prints
+  `operation <id> (<phase>)` and its warning, even under `--quiet` (the issue exists).
+  Release is accepted only after the operation's deadline: check the
+  forge, and only if no such issue exists run
+  `uzi findings release <operation-id> --confirm-no-issue` (without the flag it is a
+  usage error). A 409 prints the `pending operation <op>` ids (and any non-open
+  coordinate) holding the chosen ones to stderr. Held rows show `pending group <op>` as
+  their state in `uzi findings list --bucket all` (their status is `filing`). At most 50
+  distinct ids per call; an id with no triage record yet is refused.
 - `uzi findings dismiss <finding-id> --reason wont-do|not-an-issue` — dismiss a
   coordinate (`not-an-issue` is a false positive, `wont-do` is valid-but-skip), so it
   stays gone and never re-nags across later runs. A missing or invalid `--reason` is a
@@ -1454,6 +1482,17 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   forwarding as `uzi review backlog`, but no `--run`: an anchor names a run). `stats` is
   the all-users triage tally. Same `uza_`-token, read-only ceiling as every other `uzi
   admin` verb; the cross-user Mark done / Undo stay cookie-only in the web UI.
+- `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
+  instance's egress profiles: named site lists for official-sources research. `list`
+  prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's
+  fields, then one `HOST`/`OVERRIDE` row per entry and a `warning:` line for each
+  multi-publisher host admitted by an explicit override, stored multi-publisher entry
+  with no override (`multi_publisher_needs_override`: the built-in list grew, it matches
+  nothing) or stored entry the current rules no longer accept (`stale_entry`: it matches
+  nothing). An entry is an exact host or
+  `*.base`, which matches proper subdomains of base but not base itself. Unknown name:
+  exit 4; a name that is not a lowercase slug: exit 2, nothing sent. Creating and editing a list is web-only (cookie-only admin writes). Same
+  `uza_`-token ceiling as every other `uzi admin` verb.
 
 ### PR and CI views
 

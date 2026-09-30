@@ -1,0 +1,357 @@
+{{- if include "uzi.isolatedLaneEnabled" . }}
+{{- /*
+  uzi-fetcher (PRD #1906 M2, deployed here by M6): the isolated lane's only path to web
+  content. A lane worker asks it for a URL; it checks the URL against the run's site list
+  through the api, fetches it, and the api logs the attempt. It runs /fetcher from the api
+  image (no new image) in the RELEASE namespace, as its own Deployment and identity, so the
+  untrusted-content parsing never shares a process or a mount with the api's secrets.
+
+  Objects, in order: the ServiceAccount, the service-token Secret (source: generated), the
+  serving Certificate (cert-manager), the Deployment, the Service and the NetworkPolicy.
+*/ -}}
+{{- $fetcher := include "uzi.fetcherName" . }}
+{{- $port := .Values.workers.isolatedLane.fetcher.port }}
+{{- $tokenRef := fromJson (include "uzi.fetcherTokenSecret" .) }}
+{{- $blocked := fromJsonArray (include "uzi.isolatedLaneBlockedCIDRs" .) }}
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  # Zero permissions: bound to nothing, and the pod mounts no kube token.
+  name: {{ $fetcher }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+automountServiceAccountToken: false
+{{- if .Values.imagePullSecret.name }}
+imagePullSecrets:
+  - name: {{ .Values.imagePullSecret.name }}
+{{- end }}
+{{- if eq .Values.workers.isolatedLane.fetcher.token.source "generated" }}
+{{- $token := include "uzi.fetcherToken" . }}
+{{- /*
+  The fetcher's service token and its hex sha256, in one chart-owned Secret. The fetcher
+  mounts the `token` key alone (a file, never an env var); the api reads `token-sha256`
+  as UZI_FETCHER_TOKEN_SHA256. Kept across `helm upgrade` by uzi.fetcherToken's lookup;
+  a render without cluster access (helm template, Argo CD) generates a new one each time,
+  which is why values.yaml offers token.source: existing.
+*/}}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ $tokenRef.name }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+type: Opaque
+data:
+  token: {{ $token | b64enc | quote }}
+  token-sha256: {{ $token | sha256sum | b64enc | quote }}
+{{- end }}
+{{- if and .Values.api.tls.certManager.enabled (not .Values.workers.isolatedLane.fetcher.tls.secretName) }}
+{{- /*
+  The fetcher's serving certificate, from the SAME issuer as the api's (the chart CA
+  unless api.tls.certManager.issuerRef names another). cert-manager writes ca.crt beside
+  the pair, and that ca.crt is what the controller mounts (by key, never the private key)
+  and relays to lane workers as UZI_FETCHER_CA_FILE: their one trust anchor for this hop.
+*/}}
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ $fetcher }}-tls
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+spec:
+  secretName: {{ include "uzi.fetcherTLSSecretName" . }}
+  duration: {{ .Values.api.tls.certManager.duration | quote }}
+  renewBefore: {{ .Values.api.tls.certManager.renewBefore | quote }}
+  privateKey:
+    algorithm: ECDSA
+    size: 256
+    rotationPolicy: Always
+  usages:
+    - digital signature
+    - server auth
+  # Lane workers dial the FQDN (uzi.fetcherURL); the short forms are listed so any client
+  # picking a name it can resolve does not trip a name mismatch.
+  dnsNames:
+    - {{ $fetcher }}
+    - {{ printf "%s.%s" $fetcher .Release.Namespace }}
+    - {{ printf "%s.%s.svc" $fetcher .Release.Namespace }}
+    - {{ printf "%s.%s.svc.%s" $fetcher .Release.Namespace .Values.api.tls.clusterDomain }}
+  issuerRef:
+    {{- if .Values.api.tls.certManager.issuerRef.name }}
+    {{- toYaml .Values.api.tls.certManager.issuerRef | nindent 4 }}
+    {{- else }}
+    name: {{ include "uzi.fullname" . }}-ca-issuer
+    kind: Issuer
+    group: cert-manager.io
+    {{- end }}
+{{- end }}
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ $fetcher }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+spec:
+  replicas: {{ .Values.workers.isolatedLane.fetcher.replicaCount }}
+  selector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: fetcher
+  template:
+    metadata:
+      labels:
+        {{- include "uzi.selectorLabels" . | nindent 8 }}
+        # LOAD-BEARING: the lane policy's egress, the api's ingress and this pod's own
+        # NetworkPolicy all select the fetcher by this component label.
+        app.kubernetes.io/component: fetcher
+    spec:
+      {{- if .Values.appPriorityClass.enabled }}
+      priorityClassName: {{ .Values.appPriorityClass.name | default (printf "%s-app" .Release.Name) }}
+      {{- end }}
+      serviceAccountName: {{ $fetcher }}
+      automountServiceAccountToken: false
+      {{- with .Values.imagePullSecret.name }}
+      imagePullSecrets:
+        - name: {{ . }}
+      {{- end }}
+      # The api's posture (non-root, RuntimeDefault seccomp, no privilege escalation,
+      # drop ALL, read-only root): the same image, so the same ids.
+      securityContext:
+        {{- toYaml .Values.api_podSecurityContext | nindent 8 }}
+      containers:
+        - name: fetcher
+          image: "{{ .Values.api.image.repository }}:{{ .Values.api.image.tag | default .Chart.AppVersion }}"
+          imagePullPolicy: {{ .Values.api.image.pullPolicy }}
+          command: ["/fetcher"]
+          securityContext:
+            {{- toYaml .Values.api_containerSecurityContext | nindent 12 }}
+          ports:
+            - name: https
+              containerPort: {{ $port }}
+              protocol: TCP
+          env:
+            - name: UZI_FETCHER_ADDR
+              value: {{ printf ":%v" $port | quote }}
+            - name: UZI_FETCHER_TLS_CERT
+              value: "/etc/uzi/fetcher-tls/tls.crt"
+            - name: UZI_FETCHER_TLS_KEY
+              value: "/etc/uzi/fetcher-tls/tls.key"
+            - name: UZI_API_URL
+              value: {{ include "uzi.apiInClusterURL" . | quote }}
+            # Pinned exclusively: the fetcher trusts the api's CA and nothing else for that
+            # hop, which carries its service token and every run credential.
+            - name: UZI_API_CA_FILE
+              value: "/etc/uzi/ca/ca.crt"
+            - name: UZI_FETCHER_TOKEN_FILE
+              value: "/etc/uzi/fetcher/token"
+            # The cluster's pod, service and node ranges, refused by the fetcher's own
+            # address check on top of its built-in private ranges. The NetworkPolicy below
+            # keeps every one of them out of its internet allow (excepted, or outside
+            # 2000::/3), so an internal destination is blocked twice.
+            - name: UZI_FETCHER_BLOCKED_CIDRS
+              value: {{ join "," $blocked | quote }}
+            # int64 | toString: a YAML integer arrives as a float64, and a bare quote would
+            # render 52428800 as "5.24288e+07", which the fetcher's ParseInt refuses.
+            {{- with .Values.workers.isolatedLane.fetcher.maxFileBytes }}
+            - name: UZI_FETCHER_MAX_FILE_BYTES
+              value: {{ . | int64 | toString | quote }}
+            {{- end }}
+            {{- with .Values.workers.isolatedLane.fetcher.timeout }}
+            - name: UZI_FETCHER_TIMEOUT
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.workers.isolatedLane.fetcher.maxInflight }}
+            - name: UZI_FETCHER_MAX_INFLIGHT
+              value: {{ . | int64 | toString | quote }}
+            {{- end }}
+            # The Go runtime's soft heap limit, at 90% of the container's memory limit, so the
+            # GC works harder near the limit instead of letting GOGC=100 double a large live
+            # heap past it (an OOM kill). A plain byte count, which GOMEMLIMIT accepts. Not
+            # set when the container has no memory limit (then there is nothing to stay under).
+            {{- with (.Values.workers.isolatedLane.fetcher.resources.limits | default dict).memory }}
+            - name: GOMEMLIMIT
+              value: {{ mulf (float64 (include "uzi.quantityBytes" .)) 0.9 | int64 | toString | quote }}
+            {{- end }}
+          # GET /healthz answers 200 without touching the api, on the TLS listener.
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: https
+              scheme: HTTPS
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.workers.isolatedLane.fetcher.resources | nindent 12 }}
+          volumeMounts:
+            - name: fetcher-tls
+              mountPath: /etc/uzi/fetcher-tls
+              readOnly: true
+            - name: api-ca
+              mountPath: /etc/uzi/ca
+              readOnly: true
+            - name: fetcher-token
+              mountPath: /etc/uzi/fetcher
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        # The serving pair only; the Secret's ca.crt is for the clients.
+        - name: fetcher-tls
+          secret:
+            secretName: {{ include "uzi.fetcherTLSSecretName" . }}
+            items:
+              - key: tls.crt
+                path: tls.crt
+              - key: tls.key
+                path: tls.key
+            defaultMode: 0440
+        # ca.crt alone out of the api's leaf Secret, never the api's private key.
+        - name: api-ca
+          secret:
+            secretName: {{ include "uzi.apiTLSSecretName" . }}
+            items:
+              - key: ca.crt
+                path: ca.crt
+            defaultMode: 0440
+        # The token alone, by key. With source: existing the Secret is the shared app
+        # Secret, so the projection is what keeps every other app secret off this pod.
+        - name: fetcher-token
+          secret:
+            secretName: {{ $tokenRef.name }}
+            items:
+              - key: {{ $tokenRef.tokenKey | quote }}
+                path: token
+            defaultMode: 0440
+        - name: tmp
+          emptyDir:
+            sizeLimit: 64Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ $fetcher }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+spec:
+  type: ClusterIP
+  selector:
+    {{- include "uzi.selectorLabels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+  ports:
+    - name: https
+      port: {{ $port }}
+      targetPort: https
+      protocol: TCP
+{{- /*
+  The fetcher's own NetworkPolicy. It is an internet-facing process that fetches URLs
+  chosen by untrusted content, so it is the natural SSRF target; its own address checks
+  are the first defence and this policy is the second, holding even if those checks fail.
+
+  INGRESS: lane workers only (lane namespace AND the worker pod label, in ONE peer), on the
+  fetcher port; plus api.networkPolicy.probeCIDRs, when set, for the kubelet's probes (the
+  same reason the api admits them).
+
+  EGRESS: DNS; the api's worker port; and TCP 443 to the same address space the fetcher's
+  own check admits (api/internal/fetcher/addrpolicy.go): IPv4 0.0.0.0/0 minus every range
+  that check refuses (uzi.isolatedLaneExceptV4: private, CGNAT, loopback, link-local,
+  IETF-assigned, documentation, 6to4 relay, benchmarking, multicast, reserved) and the
+  configured IPv4 cluster ranges; IPv6 2000::/3 only (so no loopback, IPv4-mapped, NAT64,
+  unique-local, link-local, site-local or multicast address is ever allowed) minus the
+  refused ranges inside it (uzi.isolatedLaneExceptV6: IETF protocol assignments 2001::/23,
+  documentation, 6to4) and any IPv6 cluster range inside it. Rules are OR'd, so DNS and
+  the api stay reachable through their selectors although their addresses are excluded
+  from the internet rule.
+*/}}
+{{- $v4 := fromJsonArray (include "uzi.isolatedLaneExceptV4" .) }}
+{{- $v6 := fromJsonArray (include "uzi.isolatedLaneExceptV6" .) }}
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ $fetcher }}
+  labels:
+    {{- include "uzi.labels" . | nindent 4 }}
+    app.kubernetes.io/component: fetcher
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "uzi.selectorLabels" . | nindent 6 }}
+      app.kubernetes.io/component: fetcher
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.isolatedLane.namespace }}
+          podSelector:
+            matchLabels:
+              app.kubernetes.io/name: uzi-hosted-worker
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    {{- with .Values.api.networkPolicy.probeCIDRs }}
+    - from:
+        {{- range . }}
+        - ipBlock:
+            cidr: {{ . }}
+        {{- end }}
+      ports:
+        - protocol: TCP
+          port: {{ $port }}
+    {{- end }}
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: {{ .Values.workers.networkPolicy.dns.namespace }}
+          podSelector:
+            matchLabels:
+              {{- toYaml .Values.workers.networkPolicy.dns.podSelector | nindent 14 }}
+      ports:
+        {{- range .Values.workers.networkPolicy.dns.ports }}
+        - protocol: UDP
+          port: {{ . }}
+        - protocol: TCP
+          port: {{ . }}
+        {{- end }}
+    - to:
+        - podSelector:
+            matchLabels:
+              {{- include "uzi.selectorLabels" . | nindent 14 }}
+              app.kubernetes.io/component: api
+      ports:
+        - protocol: TCP
+          port: {{ include "uzi.workerAPIPort" . }}
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              {{- range $v4 }}
+              - {{ . }}
+              {{- end }}
+        - ipBlock:
+            cidr: 2000::/3
+            except:
+              {{- range $v6 }}
+              - {{ . }}
+              {{- end }}
+      ports:
+        - protocol: TCP
+          port: 443
+{{- end }}

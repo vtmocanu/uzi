@@ -89,6 +89,14 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if !pending.CustodyHeld {
 		t.Fatal("custody_held must parse as true for the golden's first worker (retaining unpublished work)")
 	}
+	// Isolated (PRD #1906 M5) is a distinct bool and must round-trip to its own field: the
+	// golden's first worker is a docker worker outside the lane, the second is a lane worker.
+	// Asserting both fails a swapped tag (an Isolated field tagged json:"docker" would still
+	// satisfy DisallowUnknownFields), and a dropped value would render a lane worker into the
+	// ordinary namespace.
+	if pending.Isolated {
+		t.Fatal("isolated must parse as false for the golden's first worker (not a lane worker)")
+	}
 
 	// A worker needing no Secret written: null token, still fully desired state. The
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
@@ -128,6 +136,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	// together fail either a swapped tag or a field collapse (PRD #1296 M1).
 	if noToken.CustodyHeld {
 		t.Fatal("custody_held must parse as false for the golden's second worker (not retaining work)")
+	}
+	if !noToken.Isolated {
+		t.Fatal("isolated must parse as true for the golden's second worker (the lane worker)")
 	}
 }
 

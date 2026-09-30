@@ -13,8 +13,8 @@ import (
 // mountAdminRoutes registers the admin read/write split (PRD #64): session-or-CLI
 // reads under RequireAdminRO, cookie-only writes under RequireAdmin.
 func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.Limiter) {
-	// Admin split by ROUTING (PRD #64): 9 reads reachable by a session OR an
-	// admin-scoped CLI token, 4 writes cookie-only. The read/write split is
+	// Admin split by ROUTING (PRD #64): reads reachable by a session OR an
+	// admin-scoped CLI token, writes cookie-only. The read/write split is
 	// enforced by the middleware chain, not a handler flag, so "a read-only token
 	// reaches a write handler" is structurally impossible: the write group's
 	// RequireAuth is cookie-only, and a Bearer request 401s before any handler
@@ -121,6 +121,12 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// cookie-only, in the group below.
 			r.With(authLimiter.PerUserMiddleware).Get("/products", h.AdminListProducts)
 			r.With(authLimiter.PerUserMiddleware).Get("/product-tokens", h.AdminListProductTokens)
+			// Egress profiles (PRD #1906 M1): the named site lists an official-sources
+			// research run will be bound to. Reads only here, so a uza_ token can list and
+			// show them (`uzi admin egress-profile list|show`); create/edit/delete are
+			// cookie-only writes in the group below. No limiter: a local read.
+			r.Get("/egress-profiles", h.AdminListEgressProfiles)
+			r.Get("/egress-profiles/{name}", h.AdminGetEgressProfile)
 		})
 		// WRITES: cookie-only (RequireAuth + RequireAdmin), unchanged.
 		r.Group(func(r chi.Router) {
@@ -211,6 +217,13 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Patch("/products/{id}", h.AdminPatchProduct)
 			r.Delete("/products/{id}", h.AdminDeleteProduct)
 			r.Post("/product-tokens/{id}/revoke", h.AdminRevokeProductToken)
+			// Egress profile writes (PRD #1906 M1): create, full replace, delete. Cookie-only
+			// admin writes, so a uza_ Bearer 401s before the handler and the CLI stays
+			// read-only; the web Admin page is the editor. The name is immutable (a run will
+			// reference a list by name). No limiter: a local write, no egress.
+			r.Post("/egress-profiles", h.AdminCreateEgressProfile)
+			r.Put("/egress-profiles/{name}", h.AdminUpdateEgressProfile)
+			r.Delete("/egress-profiles/{name}", h.AdminDeleteEgressProfile)
 		})
 	})
 }
