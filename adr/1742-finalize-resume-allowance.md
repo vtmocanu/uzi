@@ -391,7 +391,10 @@ restorations (a read error during verification is a failure, never a pass), repo
 1 when that status was 0 and cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
 restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later; step 0 runs under
 `set -euo pipefail`, which the sketch relaxes to `set +m` and `set +e +u +o pipefail` once the raise is done; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
-the chosen policy type so it cannot resolve to a standard NetworkPolicy):
+the chosen policy type so it cannot resolve to a standard NetworkPolicy). The sketch requires
+`jq` and supports a literal api-container env override or no direct override. A `valueFrom`
+override is refused before any deployment change: it needs a separate restore procedure that
+preserves the original reference, rather than replacing it with an empty literal:
 
 ```bash
 set -euo pipefail
@@ -412,9 +415,18 @@ echo "attempt $DENY_NAME started $(date -u +%FT%TZ)" >"$CLEANUP_LOG"   # a start
                                      # a shell that dies from here on leaves a log with no done line
 
 deny_kubectl() { kubectl ${DENY_NS_ARGS[@]+"${DENY_NS_ARGS[@]}"} "$@"; }
-override_state() {   # "WORKER_HEARTBEAT_STALE=<v>" when a direct env override exists, else empty
-  kubectl -n "$API_NS" get deploy "$API_DEPLOY" -o jsonpath=\
-'{range .spec.template.spec.containers[?(@.name=="api")].env[?(@.name=="WORKER_HEARTBEAT_STALE")]}{.name}={.value}{end}'
+override_state() {   # literal override or empty; refuse valueFrom before changing anything
+  local deployment
+  deployment="$(kubectl -n "$API_NS" get deploy "$API_DEPLOY" --request-timeout=30s -o json)" || return
+  printf '%s\n' "$deployment" | jq -er '
+    [.spec.template.spec.containers[] | select(.name == "api")] |
+    if length != 1 then error("expected exactly one api container") else .[0] end |
+    [.env[]? | select(.name == "WORKER_HEARTBEAT_STALE")] |
+    if length == 0 then ""
+    elif length != 1 then error("duplicate heartbeat-stale overrides")
+    elif .[0] | has("valueFrom") then error("valueFrom override requires a separate exact restore procedure")
+    elif (.[0].value | type) != "string" then error("invalid literal heartbeat-stale override")
+    else "WORKER_HEARTBEAT_STALE=" + .[0].value end'
 }
 restore_stale() {    # put the recorded override back, or remove the override when there was none
   if [ -n "$PRIOR_STATE" ]; then
