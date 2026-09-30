@@ -1,13 +1,13 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { createHmac } from "node:crypto";
+import { createHmac, randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Readable } from "node:stream";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
-import { GitCache } from "../src/git.js";
+import { GitCache, RecoveryBundleTooLargeError } from "../src/git.js";
 import { canonicalJson, RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryRecord } from "../src/recovery.js";
 import type {
   RecoveryCaptureStatusResponse,
@@ -413,19 +413,11 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
     assert.deepEqual(fs.existsSync(dir) ? fs.readdirSync(dir).filter((n) => !n.endsWith(".tmp")) : [], []);
   });
 
-  it("refuses an oversized self-contained bundle BEFORE writing it", async () => {
+  it("refuses an oversized self-contained bundle and leaves no bundle file behind", async () => {
     const client = new FakeClient();
     const coord = coordinator(client);
     await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
     const outPaths: string[] = [];
-    // The post-write check also deletes an oversized file, so prove the bundle was never CREATED.
-    const gitCalls: string[][] = [];
-    const priv = cache as unknown as { runGit: (cwd: string | undefined, args: string[]) => Promise<string> };
-    const realRunGit = priv.runGit.bind(cache);
-    priv.runGit = (cwd, args) => {
-      gitCalls.push(args);
-      return realRunGit(cwd, args);
-    };
     const producer = {
       fetchDefaultTip: cache.fetchDefaultTip.bind(cache),
       resolveRestartSource: cache.resolveRestartSource.bind(cache),
@@ -439,11 +431,91 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
     });
     await sweeper.resumePending();
     assert.equal(outPaths.length, 1);
-    assert.equal(gitCalls.some((a) => a[0] === "bundle" && a[1] === "create"), false, "git bundle create never ran");
-    assert.equal(fs.existsSync(outPaths[0]!), false, "no bundle was ever written");
+    assert.equal(fs.existsSync(outPaths[0]!), false, "the partial bundle was removed");
     const rec = await only(coord, "r1");
     assert.equal(rec.reason, "oversized");
     assert.equal(rec.bundlePath, undefined);
+    assert.equal(client.reserveCalls.length, 0);
+  });
+
+  it("removes the bundle file when the record is removed before the bundle is journaled", async () => {
+    const client = new FakeClient();
+    const coord = coordinator(client);
+    await coord.pin({ runId: "r1", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 7, ...FIN });
+    let produced = "";
+    const producer = {
+      fetchDefaultTip: cache.fetchDefaultTip.bind(cache),
+      resolveRestartSource: cache.resolveRestartSource.bind(cache),
+      async produceRecoveryBundle(b: string, o: Parameters<GitCache["produceRecoveryBundle"]>[1]) {
+        // The record disappears after the sweep's existence check, BEFORE the bundle bytes exist,
+        // so the live flight's own cleanup cannot have removed the file this sweep then writes.
+        await coord.forgetGeneration("r1", 7);
+        fs.mkdirSync(path.dirname(o.outPath), { recursive: true }); // forget removed the empty run dir
+        const res = await cache.produceRecoveryBundle(b, o);
+        produced = res.bundlePath;
+        return res;
+      },
+    };
+    const sweeper = new RecoveryCoordinator({
+      client, git: producer, log: nullLogger(), recoveryRoot: cache.recoveryRoot, workerToken: TOKEN,
+    });
+    await sweeper.resumePending();
+    assert.ok(produced);
+    assert.equal(fs.existsSync(produced), false, "no orphan bundle file");
+    assert.deepEqual(await coord.inspect("r1"), []);
+    assert.equal(client.reserveCalls.length, 0);
+  });
+
+  it("a journal write failure on one record does not abort the sweep of the next", async () => {
+    const client = new FakeClient();
+    const coord = coordinator(client);
+    await coord.pin({ runId: "r1", sourceSha: baseSha, kind: "issue", branch: "agent/issue-1", generation: 1 }); // early pin
+    await coord.pin({ runId: "r2", sourceSha: workSha, kind: "issue", branch: "agent/issue-1", generation: 1, ...FIN });
+    const sweeper = coordinator(client);
+    const priv = sweeper as unknown as { writeRecord: (r: RecoveryRecord) => Promise<void> };
+    const real = priv.writeRecord.bind(sweeper);
+    priv.writeRecord = async (r) => {
+      if (r.runId === "r1") throw Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" });
+      return real(r);
+    };
+    await sweeper.resumePending();
+    assert.equal((await only(coord, "r2")).state, "uploaded");
+    assert.equal(client.uploadCalls.length, 1);
+  });
+
+  it("re-evaluates only source_not_verifiable_after_restart; other bundle-less needs_action reasons stay put", async () => {
+    const client = new FakeClient();
+    const coord = coordinator(client);
+    // Every one of these sources is fine (unpublished, present), so a re-evaluation would upload.
+    for (const reason of ["oversized", "bundle_failed", "no_unpublished_work_after_restart", "capture_error"]) {
+      writeRaw({
+        version: 1, runId: `r-${reason}`, captureId: `cap-${reason}`, sourceSha: workSha, kind: "issue",
+        branch: "agent/issue-1", generation: 3, createdAt: 1, state: "needs_action", reason, ...FIN,
+      });
+    }
+    await coordinator(client).resumePending();
+    await coordinator(client).resumePending();
+    for (const reason of ["oversized", "bundle_failed", "no_unpublished_work_after_restart", "capture_error"]) {
+      const rec = await only(coord, `r-${reason}`);
+      assert.equal(rec.state, "needs_action", reason);
+      assert.equal(rec.reason, reason);
+    }
+    assert.equal(client.reserveCalls.length, 0);
+  });
+
+  it("a non-finalization bundle-less needs_action record (live capture failure) keeps its reason", async () => {
+    const client = new FakeClient();
+    const coord = coordinator(client);
+    for (const reason of ["oversized", "bundle_failed", "capture_error"]) {
+      writeRaw({
+        version: 1, runId: `r-${reason}`, captureId: `cap-${reason}`, sourceSha: workSha, kind: "issue",
+        branch: "agent/issue-1", generation: 3, createdAt: 1, state: "needs_action", reason,
+      });
+    }
+    await coordinator(client).resumePending();
+    for (const reason of ["oversized", "bundle_failed", "capture_error"]) {
+      assert.equal((await only(coord, `r-${reason}`)).reason, reason);
+    }
     assert.equal(client.reserveCalls.length, 0);
   });
 
@@ -474,11 +546,117 @@ describe("GitCache.resolveRestartSource — containment and ref-name hardening (
     assert.notEqual((await cache.resolveRestartSource(BARE_DIR, workSha, "main")).status, "missing_bare");
   });
 
+  it("does not resolve a hostile defaultBranch through the reflog (main@{1} must not be on_default)", async () => {
+    // A permissive splice would resolve refs/remotes/origin/main@{1} through the reflog to workSha's
+    // OLD value, reporting an unpublished head as already on the default branch.
+    git(bare, ["config", "core.logAllRefUpdates", "always"]);
+    git(bare, ["update-ref", "refs/remotes/origin/main", workSha]);
+    git(bare, ["update-ref", "refs/remotes/origin/main", baseSha]);
+    assert.equal(git(bare, ["rev-parse", "refs/remotes/origin/main@{1}"]), workSha, "fixture: the reflog resolves");
+    assert.equal((await cache.resolveRestartSource(BARE_DIR, workSha, "main")).status, "unpublished");
+    assert.equal((await cache.resolveRestartSource(BARE_DIR, workSha, "main@{1}")).status, "unpublished");
+  });
+
   it("does not treat a hostile defaultBranch as a ref (no on_default for @{, non-ASCII or control names)", async () => {
     for (const db of ["main@{0}", "ma\u00efn", "ma\tin", "main.lock", "@{-1}", "main/"]) {
       const res = await cache.resolveRestartSource(BARE_DIR, baseSha, db);
       assert.equal(res.status, "unpublished", JSON.stringify(db));
     }
     assert.equal((await cache.resolveRestartSource(BARE_DIR, baseSha, "main")).status, "on_default");
+  });
+});
+
+describe("GitCache.produceRecoveryBundle — the size cap bounds the bytes actually written (issue #1742)", () => {
+  const MIB = 1024 * 1024;
+  const mkWork = (name: string): string => {
+    const w = path.join(base, name);
+    fs.mkdirSync(w);
+    execFileSync("git", ["init", "-b", "main", w], { env: GIT_ENV, stdio: "pipe" });
+    for (const [k, v] of [["user.email", "f@uzi.local"], ["user.name", "f"], ["commit.gpgsign", "false"]]) git(w, ["config", k!, v!]);
+    return w;
+  };
+  const mkBare = (name: string): string => {
+    const b = path.join(base, "data", "repos", name);
+    fs.mkdirSync(b, { recursive: true });
+    execFileSync("git", ["init", "--bare", "-b", "main", b], { env: GIT_ENV, stdio: "pipe" });
+    git(b, ["config", "gc.auto", "0"]);
+    return b;
+  };
+
+  it("refuses a delta-heavy history without ever writing more than the cap", async () => {
+    const work = mkWork("delta-work");
+    const blob = randomBytes(4 * MIB);
+    fs.writeFileSync(path.join(work, "big.bin"), blob);
+    git(work, ["add", "."]);
+    git(work, ["commit", "-m", "A"]);
+    const flipped = Buffer.from(blob);
+    flipped[0] = flipped[0]! ^ 0xff;
+    git(work, ["checkout", "--orphan", "h"]);
+    git(work, ["rm", "-rf", "-q", "."]);
+    fs.writeFileSync(path.join(work, "big.bin"), flipped);
+    git(work, ["add", "."]);
+    git(work, ["commit", "-m", "H"]);
+    const h = git(work, ["rev-parse", "HEAD"]);
+    const b = mkBare("delta.example+org+repo.git");
+    git(work, ["push", b, "main:refs/heads/main", "h:refs/heads/h"]);
+    git(b, ["gc", "--aggressive", "--prune=now", "-q"]);
+    // The old estimate (`rev-list --disk-usage` of H) sees only the delta against the other branch.
+    const cap = 1 * MIB;
+    const out = path.join(base, "delta.bundle");
+    let maxSeen = 0;
+    const poll = setInterval(() => {
+      try { maxSeen = Math.max(maxSeen, fs.statSync(out).size); } catch { /* not created yet */ }
+    }, 1);
+    try {
+      await assert.rejects(
+        cache.produceRecoveryBundle(b, { sourceSha: h, outPath: out, maxBytes: cap }),
+        (err: unknown) => err instanceof RecoveryBundleTooLargeError && err.byteSize > cap && err.maxBytes === cap,
+      );
+    } finally {
+      clearInterval(poll);
+    }
+    assert.ok(maxSeen <= cap, `the file grew to ${maxSeen} bytes, over the ${cap}-byte cap`);
+    assert.equal(fs.existsSync(out), false, "the partial file is removed");
+    assert.equal(git(b, ["for-each-ref", "refs/heads/recovered-source"]), "", "the transient ref is gone");
+  });
+
+  it("accepts a bundle that fits although its loose objects are far over the cap", async () => {
+    const work = mkWork("loose-work");
+    const buf = randomBytes(500 * 1024);
+    let h = "";
+    for (let i = 0; i < 30; i++) {
+      buf.writeUInt32BE(i, 1000 + i * 4);
+      fs.writeFileSync(path.join(work, "f.bin"), buf);
+      git(work, ["add", "."]);
+      git(work, ["commit", "-m", `c${i}`]);
+    }
+    h = git(work, ["rev-parse", "HEAD"]);
+    const b = mkBare("loose.example+org+repo.git");
+    git(b, ["config", "core.compression", "0"]);
+    // Loose objects: fetch-by-push above the unpack limit keeps them unpacked.
+    git(b, ["config", "receive.unpackLimit", "1000000"]);
+    git(work, ["push", b, "main:refs/heads/main"]);
+    const loose = execFileSync("git", ["-C", b, "count-objects", "-v"], { env: GIT_ENV, encoding: "utf8" });
+    const looseKiB = Number(/^size: (\d+)/m.exec(loose)![1]);
+    const cap = 4 * MIB;
+    assert.ok(looseKiB * 1024 > cap, `fixture: loose objects (${looseKiB} KiB) must exceed the cap`);
+    const out = path.join(base, "loose.bundle");
+    const res = await cache.produceRecoveryBundle(b, { sourceSha: h, outPath: out, maxBytes: cap });
+    assert.ok(res.byteSize > 0 && res.byteSize <= cap);
+    assert.equal(res.selfContained, true);
+    assert.equal(fs.statSync(out).size, res.byteSize);
+    git(b, ["bundle", "verify", out]);
+  });
+
+  it("a normal fitting bundle verifies and imports into a clean clone", async () => {
+    const out = path.join(base, "ok.bundle");
+    const res = await cache.produceRecoveryBundle(bare, { sourceSha: workSha, outPath: out });
+    assert.equal(fs.statSync(out).size, res.byteSize);
+    git(bare, ["bundle", "verify", out]);
+    const clone = path.join(base, "clean");
+    fs.mkdirSync(clone);
+    execFileSync("git", ["init", "-q", clone], { env: GIT_ENV, stdio: "pipe" });
+    git(clone, ["fetch", "-q", out, "refs/heads/recovered-source:refs/heads/x"]);
+    assert.equal(git(clone, ["rev-parse", "refs/heads/x"]), workSha);
   });
 });

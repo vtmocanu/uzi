@@ -2,12 +2,12 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream, type Stats } from "node:fs";
+import { constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
-import { PassThrough, Writable, type Readable } from "node:stream";
+import { PassThrough, Transform, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
@@ -5465,7 +5465,9 @@ export class GitCache {
    * nothing else. When no forge-reachable prerequisite exists (unrelated histories, or H is
    * already fully on the forge), it falls back to a SELF-CONTAINED bundle within the size
    * limit; if that exceeds RECOVERY_MAX_BUNDLE_BYTES it throws RecoveryBundleTooLargeError
-   * so the caller retains custody and surfaces needs_action rather than truncating.
+   * so the caller retains custody and surfaces needs_action rather than truncating. The size
+   * limit is enforced WHILE writing ({@link streamBundleWithCap}): the git child is killed and the
+   * partial file removed as soon as the bytes written pass the limit.
    *
    * The bundle is `git bundle verify`d against the bare (a producer self-check that its
    * prerequisites resolve) before the size/checksum are recorded. The transient named ref
@@ -5473,7 +5475,7 @@ export class GitCache {
    */
   async produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number; boundBeforeWrite?: boolean },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult> {
     const maxBytes = opts.maxBytes ?? RECOVERY_MAX_BUNDLE_BYTES;
     return this.withLock(barePath, async () => {
@@ -5514,26 +5516,14 @@ export class GitCache {
           prereqs = [mb];
         }
       }
-      // issue #1742: bound a SELF-CONTAINED bundle BEFORE writing it when the caller asks (the
-      // restart sweep, which cannot shrink the history with a forge prerequisite). The estimate is
-      // the on-disk size of every object reachable from H (`rev-list --objects --disk-usage`,
-      // git >= 2.31); it approximates the pack's size, and an unreadable estimate (older git)
-      // falls through to the post-write size check below, which always still runs.
-      if (opts.boundBeforeWrite === true && prereqs.length === 0) {
-        const estimate = await this.runGit(barePath, ["rev-list", "--objects", "--disk-usage", h])
-          .then((out) => Number.parseInt(out.trim(), 10))
-          .catch(() => Number.NaN);
-        if (Number.isFinite(estimate) && estimate > maxBytes) {
-          throw new RecoveryBundleTooLargeError(estimate, maxBytes);
-        }
-      }
       // Create the transient named ref at H, build the bundle from EXACTLY that ref, verify
       // it, then delete the ref in a finally so the bare's namespace is left untouched.
       await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
       try {
-        const args = ["bundle", "create", opts.outPath, RECOVERY_BUNDLE_REF];
+        // `-` writes the bundle to stdout so the bytes actually written are counted and capped.
+        const args = ["bundle", "create", "-", RECOVERY_BUNDLE_REF];
         for (const p of prereqs) args.push(`^${p}`);
-        await this.runGit(barePath, args);
+        await this.streamBundleWithCap(barePath, args, opts.outPath, maxBytes);
         // Producer self-check: the bundle's prerequisites resolve against the bare. The
         // authoritative proof is the clean-clone import in the conformance tests.
         await this.runGit(barePath, ["bundle", "verify", opts.outPath]);
@@ -5571,6 +5561,44 @@ export class GitCache {
         alreadyPublished: false,
       };
     });
+  }
+
+  /**
+   * issue #1742 — run `git bundle create - ...` (bundle on stdout) and write it to `outPath`
+   * through a byte counter that is a HARD bound on the bytes written: the moment the count passes
+   * `maxBytes` the git child is killed, the partial file is removed and
+   * {@link RecoveryBundleTooLargeError} (with the count seen so far) is thrown. No chunk that
+   * would push the file past `maxBytes` is ever written. Same worker-uid credential-free git env
+   * as {@link runGit} (via {@link spawnGit}), no shell, and the same GIT_TIMEOUT_MS bound.
+   */
+  private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
+    const { child, stdout, exited } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS });
+    let seen = 0;
+    const counter = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        seen += chunk.length;
+        if (seen > maxBytes) cb(new RecoveryBundleTooLargeError(seen, maxBytes));
+        else cb(null, chunk);
+      },
+    });
+    const killChild = (): void => {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    };
+    const timer = setTimeout(() => {
+      killChild();
+      counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
+    }, GIT_TIMEOUT_MS);
+    try {
+      await pipeline(stdout, counter, createWriteStream(outPath, { mode: 0o600 }));
+    } catch (err) {
+      killChild();
+      stdout.destroy();
+      await exited;
+      await fs.rm(outPath, { force: true });
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

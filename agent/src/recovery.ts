@@ -164,7 +164,7 @@ export interface RecoveryArchiveClient {
 export interface RecoveryBundleProducer {
   produceRecoveryBundle(
     barePath: string,
-    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number; boundBeforeWrite?: boolean },
+    opts: { sourceSha: string; outPath: string; forgeTip?: string; maxBytes?: number },
   ): Promise<RecoveryBundleResult>;
   fetchDefaultTip(
     barePath: string,
@@ -682,14 +682,14 @@ export class RecoveryCoordinator {
    *     with NO forge PAT (D5), exactly as before.
    *   - `needs_action` WITHOUT a bundle (a reason a previous sweep or capture recorded, e.g.
    *     `early_pin_only_after_restart`, `source_not_verifiable_after_restart`, `oversized`): never
-   *     sent to the upload path (that would rewrite the reason to `incomplete_local_inputs`). A
-   *     finalization-pinned one is re-evaluated like `pinned`, so a transient
-   *     `source_not_verifiable_after_restart` can recover; any other keeps its reason unchanged.
+   *     sent to the upload path (that would rewrite the reason to `incomplete_local_inputs`). Only a
+   *     finalization-pinned `source_not_verifiable_after_restart` (transient) is re-evaluated like
+   *     `pinned`; any other keeps its reason unchanged (no retry on every boot).
    *   - `pinned` + `finalizationPin` (the committed head H, issue #1742 D4a): resolve the bare from
    *     the journaled basename; a missing bare/commit is `source_not_verifiable_after_restart`; H
    *     already on the default branch is `no_unpublished_work_after_restart` (held untouched, no
    *     bundle); otherwise produce a PAT-less, self-contained bundle of H (no forge tip fetch,
-   *     size-bounded before it is written), journal it, and upload it at the record's exact
+   *     size-capped while it is written), journal it, and upload it at the record's exact
    *     generation.
    *   - `pinned` without the flag: the early start-tip pin, a shutdown / pause / restore-point pin
    *     that moved the source off the finalization head, or an older record that cannot say. All map
@@ -716,7 +716,15 @@ export class RecoveryCoordinator {
       try {
         await this.sweepRecord(record, done, signal);
       } catch (err) {
-        if (!(err instanceof RecordGoneError)) throw err;
+        if (!(err instanceof RecordGoneError)) {
+          // One record's failure (e.g. a journal write error) must not abort the rest of the sweep.
+          this.log.warn("recovery: restart sweep failed for a record; continuing", {
+            run_id: record.runId,
+            generation: record.generation,
+            error: errText(err),
+          });
+          continue;
+        }
         // The live flight's cleanup removed this record while the sweep worked on it: stop, and
         // drop the bundle bytes this sweep produced (the record that named them is gone).
         await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
@@ -731,7 +739,13 @@ export class RecoveryCoordinator {
     signal?: AbortSignal,
   ): Promise<void> {
     if (record.state === "pinned" || (record.state === "needs_action" && !record.bundlePath)) {
-      if (record.state === "needs_action" && !record.finalizationPin) {
+      // Only the transient `source_not_verifiable_after_restart` is re-evaluated on a later boot;
+      // every other bundle-less needs_action reason (oversized, bundle_failed, capture_error,
+      // no_unpublished_work_after_restart, ...) is final, so a boot does not retry it forever.
+      if (
+        record.state === "needs_action" &&
+        !(record.finalizationPin && record.reason === "source_not_verifiable_after_restart")
+      ) {
         done("needs_action", record.reason); // keep the recorded reason; no rewrite
         return;
       }
@@ -817,7 +831,6 @@ export class RecoveryCoordinator {
           sourceSha: record.sourceSha,
           outPath,
           forgeTip: undefined,
-          boundBeforeWrite: true,
         });
       } catch (err) {
         const reason = err instanceof RecoveryBundleTooLargeError ? "oversized" : "bundle_failed";
