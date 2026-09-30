@@ -26,7 +26,7 @@
 // A live worker cannot report `cancelled` (the api derives it from the consumed cancel input's stop
 // verdict), so an owner cancel aborts the session and reports `failed` "run cancelled".
 
-import type { Options as SdkOptions, EffortLevel, SpawnedProcess, SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
+import type { HookInput, HookJSONOutput, Options as SdkOptions, EffortLevel, SpawnedProcess, SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
@@ -98,8 +98,42 @@ const JOB_DISALLOWED_TOOLS: readonly string[] = [
   "TodoWrite",
   "ExitPlanMode",
   "AskUserQuestion",
+  // With an MCP server configured the CLI can list these; they may only ever reach the in-process
+  // job server, so they are denied by name and tolerated (not failed on) in the effective-tool check.
+  "ListMcpResourcesTool",
+  "ReadMcpResourceTool",
   ...ASYNC_DEFERRAL_TOOLS,
 ];
+
+/** Denied-by-name tools the CLI may still list in `system/init`; they are not a policy breach. */
+const JOB_TOLERATED_LISTED_TOOLS: ReadonlySet<string> = new Set(["ListMcpResourcesTool", "ReadMcpResourceTool"]);
+
+/** Why a Glob `pattern` / Grep `glob` escapes the workspace, or undefined when it does not. The
+ *  path guard only screens file_path/path/notebook_path, so the pattern fields are screened here:
+ *  absolute, home-relative, or any `..` (including inside a brace alternative) is denied. */
+export function jobGlobEscapeReason(pattern: unknown): string | undefined {
+  if (typeof pattern !== "string") return undefined;
+  if (/^[/\\~]/.test(pattern) || /[{,][/\\~]/.test(pattern)) {
+    return "a job glob pattern must be relative to the job workspace";
+  }
+  if (pattern.includes("..") || pattern.includes("\0")) {
+    return "a job glob pattern must not contain '..'";
+  }
+  return undefined;
+}
+
+/** PreToolUse hook (job lane only) denying a Glob `pattern` or Grep `glob` that escapes the workspace. */
+export function buildJobGlobGuardHook(log: Logger): (input: HookInput) => Promise<HookJSONOutput> {
+  return async (input: HookInput): Promise<HookJSONOutput> => {
+    if (input.hook_event_name !== "PreToolUse") return {};
+    const ti = input.tool_input as Record<string, unknown> | undefined;
+    const field = input.tool_name === "Glob" ? ti?.pattern : input.tool_name === "Grep" ? ti?.glob : undefined;
+    const reason = jobGlobEscapeReason(field);
+    if (!reason) return {};
+    log.warn("job guardrail denied a glob pattern", { tool: input.tool_name });
+    return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: reason } };
+  };
+}
 
 /** Fallback wall-clock budget when a claim carries none (the api always sends one). */
 const DEFAULT_BUDGET_WALL_SECONDS = 3600;
@@ -249,7 +283,7 @@ export function disallowedEffectiveTools(msg: unknown): string[] {
   if (!msg || typeof msg !== "object") return [];
   const m = msg as Record<string, unknown>;
   if (m.type !== "system" || m.subtype !== "init" || !Array.isArray(m.tools)) return [];
-  return m.tools.filter((t): t is string => typeof t === "string" && !JOB_ALLOWED_TOOLS.has(t));
+  return m.tools.filter((t): t is string => typeof t === "string" && !JOB_ALLOWED_TOOLS.has(t) && !JOB_TOLERATED_LISTED_TOOLS.has(t));
 }
 
 /** Assemble the SDK options for a job session. Pure and exported so the suite asserts the
@@ -289,6 +323,7 @@ export function buildJobSdkOptions(input: {
           matcher: ["Read", "Glob", "Grep", ...WRITE_PATH_TOOLS].join("|"),
           hooks: [buildPathGuardHook(input.workDir, input.log, input.secretPaths)],
         },
+        { matcher: "Glob|Grep", hooks: [buildJobGlobGuardHook(input.log)] },
       ],
     },
     includePartialMessages: false,
@@ -432,6 +467,9 @@ export class JobRunner {
       }
       // Every mutating report for a job MUST carry claim_generation; the api refuses one without it.
       if (typeof generation !== "number" || !Number.isInteger(generation) || generation <= 0) {
+        // The api refuses any job report that lacks claim_generation, so this report cannot land:
+        // the D-E server sweep of a silent job run is the backstop. Logged at error level.
+        runLog.error("job claim carried no claim generation; the api will refuse the failed report, the server sweep is the backstop");
         await this.fail(runId, generation, "job claim carried no claim generation");
         return;
       }
@@ -507,7 +545,7 @@ export class JobRunner {
       // The session is over: flush the messages (usage frames fold into run_usage) before any report.
       await batcher.close().catch((err) => runLog.warn("job message flush failed", { error: errMessage(err) }));
       const through = batcher.currentSeq();
-      await this.finish(claim, outcome, store, through, runLog, redactText);
+      await this.finish(claim, outcome, store, through, runLog, redactText, budgetSeconds);
     } catch (err) {
       const reason = errMessage(err);
       runLog.warn("job run failed", { error: reason });
@@ -650,6 +688,7 @@ export class JobRunner {
     messagesThroughSeq: number,
     log: Logger,
     redactText: (s: string) => string,
+    budgetSeconds: number,
   ): Promise<void> {
     const runId = claim.run_id;
     const generation = claim.claim_generation;
@@ -659,7 +698,7 @@ export class JobRunner {
         // this failed report into the cancelled terminal server-side.
         return this.fail(runId, generation, "run cancelled");
       case "deadline":
-        return this.fail(runId, generation, `the job exceeded its wall-clock budget of ${claim.budget_wall_seconds ?? DEFAULT_BUDGET_WALL_SECONDS}s and was stopped`);
+        return this.fail(runId, generation, `the job exceeded its wall-clock budget of ${budgetSeconds}s and was stopped`);
       case "limit":
         log.warn("job hit an Anthropic usage limit; failing (a job never parks)", { limit: describeLimit(outcome.error) });
         return this.fail(runId, generation, redactText(outcome.error.message), outcome.error);

@@ -87,7 +87,7 @@ export class Worker {
     private readonly newStatsCollector: (dataDir: string) => StatsCollector = (dataDir) =>
       new StatsCollector({ dataDir }),
     // PRD #1908 M4: the repo-less `job` run lane's runner. Trailing so no existing positional
-    // caller moves. The default fails a job claim loudly instead of running it: production
+    // caller moves. The default rejects a job claim instead of running it (the rejection is only logged as a warning by the claim loop, the run is not reported failed): production
     // (main.ts) always passes the real runner, and the api only routes a job to a worker that
     // advertised job_runner_v1, which this image does only alongside a wired runner.
     private readonly jobRunner: Pick<JobRunner, "execute"> = {

@@ -7,6 +7,12 @@
 //     work/                         the SDK cwd and the path-guard root
 //       inputs/NN-<name>            the caller's named input documents
 //
+// Under the PRD #51 uid split (UZI_UID_SPLIT=1) the SDK CLI runs as the `runner` uid while this
+// worker process creates the tree, so 0700 would lock the CLI out of its own HOME, cwd and
+// inputs. There the jobs root is a runner-group carve-out (entrypoint.sh: worker:runner 3775,
+// like agent-home), the run root/inputs are group-traversable/readable (2750) and home/work are
+// group-writable (2770), inputs files 0640. Never world-accessible; single-uid stays 0700/0600.
+//
 // The caller's input names are server-validated, but this module re-validates defensively: a name
 // is a single path segment (no separator, no `..`, no leading dot) and each file is created with
 // O_CREAT|O_EXCL|O_NOFOLLOW, then its realpath is checked to be inside the workspace, so a name
@@ -17,6 +23,7 @@ import path from "node:path";
 
 import type { Logger } from "./log.js";
 import { rmHomeTree } from "./rmtree.js";
+import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, RUN_ID_RE } from "./util.js";
 
 /** The server's input-name shape (api job_inputs validation), mirrored client-side. */
@@ -51,21 +58,54 @@ export function jobInputFileName(index: number, name: string): string {
   return `${String(index + 1).padStart(2, "0")}-${name}`;
 }
 
-/** Create `<jobsRoot>/<runId>` (0700) with its home/work/inputs subtree. A leftover tree for the
+/** Directory/file modes for the current uid layout (`split` = the PRD #51 worker/runner split). */
+function modes(split: boolean): { root: number; home: number; work: number; inputs: number; file: number } {
+  return split
+    ? { root: 0o2750, home: 0o2770, work: 0o2770, inputs: 0o2750, file: 0o640 }
+    : { root: 0o700, home: 0o700, work: 0o700, inputs: 0o700, file: 0o600 };
+}
+
+/** Refuse a jobs root that is a symlink or not a directory (an attacker-planted link would
+ *  redirect the reaper's rm and the workspace creation). A missing root is fine. */
+async function assertRealJobsRoot(jobsRoot: string): Promise<void> {
+  let st;
+  try {
+    st = await fs.lstat(jobsRoot);
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") return;
+    throw err;
+  }
+  if (st.isSymbolicLink() || !st.isDirectory()) {
+    throw new Error("job workspace root is a symlink or not a directory");
+  }
+}
+
+/** Create `<jobsRoot>/<runId>` (0700; group-runner modes under the uid split) with its home/work/inputs subtree. A leftover tree for the
  *  same run id (a requeue on this worker after a hard kill) is removed first. */
-export async function createJobWorkspace(jobsRoot: string, runId: string): Promise<JobWorkspace> {
+export async function createJobWorkspace(
+  jobsRoot: string,
+  runId: string,
+  split: boolean = uidSplitActive(),
+): Promise<JobWorkspace> {
   if (!RUN_ID_RE.test(runId)) throw new Error("job run id is not a UUID");
   if (!path.isAbsolute(jobsRoot)) throw new Error("job workspace root must be absolute");
+  await assertRealJobsRoot(jobsRoot);
   await fs.mkdir(jobsRoot, { recursive: true, mode: 0o700 });
+  const m = modes(split);
   const root = path.join(jobsRoot, runId);
   await fs.rm(root, { recursive: true, force: true }).catch(() => undefined);
-  await fs.mkdir(root, { mode: 0o700 });
+  await fs.mkdir(root, { mode: m.root });
   const home = path.join(root, "home");
   const work = path.join(root, "work");
   const inputsDir = path.join(work, "inputs");
-  await fs.mkdir(home, { mode: 0o700 });
-  await fs.mkdir(work, { mode: 0o700 });
-  await fs.mkdir(inputsDir, { mode: 0o700 });
+  await fs.mkdir(home, { mode: m.home });
+  await fs.mkdir(work, { mode: m.work });
+  await fs.mkdir(inputsDir, { mode: m.inputs });
+  // mkdir's mode is masked by the umask and drops setgid: set the final modes explicitly.
+  await fs.chmod(root, m.root);
+  await fs.chmod(home, m.home);
+  await fs.chmod(work, m.work);
+  await fs.chmod(inputsDir, m.inputs);
   return { root, home, work, inputsDir };
 }
 
@@ -74,6 +114,7 @@ export async function createJobWorkspace(jobsRoot: string, runId: string): Promi
 export async function writeJobInputs(
   ws: JobWorkspace,
   inputs: ReadonlyArray<{ name: string; content: string }>,
+  split: boolean = uidSplitActive(),
 ): Promise<string[]> {
   const workReal = await fs.realpath(ws.work);
   const written: string[] = [];
@@ -83,9 +124,10 @@ export async function writeJobInputs(
     const handle = await fs.open(
       target,
       fsc.O_WRONLY | fsc.O_CREAT | fsc.O_EXCL | fsc.O_NOFOLLOW,
-      0o600,
+      modes(split).file,
     );
     try {
+      await handle.chmod(modes(split).file); // umask-independent
       await handle.writeFile(input.content, "utf8");
     } finally {
       await handle.close();
@@ -115,10 +157,11 @@ export async function removeJobWorkspace(ws: JobWorkspace, log: Logger): Promise
 export async function reapStaleJobWorkspaces(jobsRoot: string, log: Logger): Promise<number> {
   let names: string[];
   try {
+    await assertRealJobsRoot(jobsRoot);
     names = await fs.readdir(jobsRoot);
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code !== "ENOENT") {
-      log.warn("job workspace reaper could not list the jobs root", { error: errMessage(err) });
+      log.warn("job workspace reaper skipped the jobs root", { error: errMessage(err) });
     }
     return 0;
   }

@@ -176,6 +176,38 @@ describe("job SDK options: the effective tool surface (PRD #1908 M4)", () => {
     assert.deepStrictEqual(disallowedEffectiveTools({ type: "assistant" }), []);
   });
 
+  it("denies the MCP resource tools by name and tolerates them in the effective-tool check", () => {
+    const o = build();
+    for (const t of ["ListMcpResourcesTool", "ReadMcpResourceTool"]) assert.ok((o.disallowedTools ?? []).includes(t), `${t} is disallowed`);
+    assert.deepStrictEqual(disallowedEffectiveTools({ ...INIT_OK, tools: [...INIT_OK.tools, "ListMcpResourcesTool", "ReadMcpResourceTool"] }), []);
+  });
+
+  describe("the glob guard (Glob pattern / Grep glob escapes)", () => {
+    const hook = () => {
+      const entries = (build().hooks?.PreToolUse ?? []) as Array<{ matcher?: string; hooks: Array<(i: HookInput) => Promise<Record<string, unknown>>> }>;
+      const e = entries.find((x) => x.matcher === "Glob|Grep");
+      assert.ok(e, "a job glob guard is wired");
+      return async (tool: string, input: Record<string, unknown>): Promise<string> => {
+        const out = (await e!.hooks[0]!({ hook_event_name: "PreToolUse", tool_name: tool, tool_input: input } as unknown as HookInput)) as {
+          hookSpecificOutput?: { permissionDecision?: string };
+        };
+        return out.hookSpecificOutput?.permissionDecision ?? "allow";
+      };
+    };
+    it("denies absolute, home, and parent-traversal patterns", async () => {
+      const g = hook();
+      for (const p of ["../../**/*", "/etc/**", "~/.ssh/*", "a/../../b", "{../..,x}/*", "{/etc,x}/*", "..\\x"]) {
+        assert.strictEqual(await g("Glob", { pattern: p }), "deny", `Glob ${p}`);
+        assert.strictEqual(await g("Grep", { pattern: "x", glob: p }), "deny", `Grep ${p}`);
+      }
+    });
+    it("allows workspace-relative patterns", async () => {
+      const g = hook();
+      assert.strictEqual(await g("Glob", { pattern: "**/*.md" }), "allow");
+      assert.strictEqual(await g("Grep", { pattern: "..", glob: "inputs/*.txt" }), "allow");
+    });
+  });
+
   describe("the path guard", () => {
     const guard = (secretPaths: string[]) => {
       const o = build(secretPaths);

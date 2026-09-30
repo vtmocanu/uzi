@@ -100,4 +100,34 @@ describe("job workspace (PRD #1908 M4)", () => {
     const jobsRoot = await tmpRoot();
     assert.strictEqual(await reapStaleJobWorkspaces(jobsRoot, nullLogger()), 0);
   });
+
+  it("under the uid split the tree is group-runner accessible (2750/2770, files 0640), never world", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID(), true);
+    const mode = async (p: string) => (await fsp.stat(p)).mode & 0o7777;
+    assert.strictEqual(await mode(ws.root), 0o2750);
+    assert.strictEqual(await mode(ws.home), 0o2770);
+    assert.strictEqual(await mode(ws.work), 0o2770);
+    assert.strictEqual(await mode(ws.inputsDir), 0o2750);
+    const [rel] = await writeJobInputs(ws, [{ name: "doc.md", content: "x" }], true);
+    assert.strictEqual(await mode(path.join(ws.work, rel!)), 0o640);
+  });
+
+  it("non-split modes stay 0700/0600 for the worker's own uid", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID(), false);
+    assert.strictEqual((await fsp.stat(ws.home)).mode & 0o7777, 0o700);
+    const [rel] = await writeJobInputs(ws, [{ name: "doc.md", content: "x" }], false);
+    assert.strictEqual((await fsp.stat(path.join(ws.work, rel!))).mode & 0o7777, 0o600);
+  });
+
+  it("refuses a symlinked jobs root (create throws, the reaper skips it and never follows)", async () => {
+    const jobsRoot = await tmpRoot();
+    const victim = path.join(path.dirname(jobsRoot), "victim");
+    await fsp.mkdir(victim);
+    const stale = path.join(victim, randomUUID());
+    await fsp.mkdir(stale);
+    await fsp.symlink(victim, jobsRoot);
+    await assert.rejects(() => createJobWorkspace(jobsRoot, randomUUID()), /symlink or not a directory/);
+    assert.strictEqual(await reapStaleJobWorkspaces(jobsRoot, nullLogger()), 0);
+    assert.ok((await fsp.stat(stale)).isDirectory(), "the symlink target was not reaped");
+  });
 });

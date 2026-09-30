@@ -236,7 +236,8 @@ require_real_carveout_root() {
     exit 1
   fi
 }
-for d in runner agent-home provision; do
+# `jobs` (PRD #1908): the repo-less job run workspaces; the runner-uid SDK CLI needs group access.
+for d in runner agent-home provision jobs; do
   "$MKDIR" -p "$DATA_DIR/$d"
   # SYMLINK-ROOT GUARD (PRD #1493 M2 rework, BLOCKING): a legacy single-uid /data was
   # attacker-writable, so a carve-out ROOT itself may be a planted symlink (e.g.
