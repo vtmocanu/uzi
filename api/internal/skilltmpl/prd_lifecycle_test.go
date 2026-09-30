@@ -104,6 +104,10 @@ func TestPRDLifecycleBodyCarriesTheLoadBearingRules(t *testing.T) {
 		{"#257: sweep repoints to the done/ path", "prds/done/<file>.md"},
 		{"skills v0.43.0: live acceptance does not hold the move", "Only live-acceptance items open"},
 		{"skills v0.43.0: open acceptance is surfaced in the MR", "open acceptance for the maintainer"},
+		{"skills v0.43.0: live acceptance is its own category", "**maintainer live acceptance**"},
+		{"skills v0.43.0: any other open item still blocks the move", "Any item still open outside maintainer live acceptance"},
+		{"skills v0.43.0: the exception needs EVERY open item in that category", "If even one open item falls in any other"},
+		{"skills v0.43.0: the reviewer applies the same exclusion", "only open items,\nif any, are maintainer live acceptance"},
 	} {
 		if !strings.Contains(body, c.needle) {
 			t.Errorf("%s: expected the body to contain %q", c.what, c.needle)
