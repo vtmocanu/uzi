@@ -159,12 +159,17 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
         return applied("failed");
       },
     });
+    // Journal and block BEFORE the worker starts: a heartbeat landing between the two calls
+    // could otherwise send and retire the still-unblocked journal during setup.
+    await outbox.journalTerminal(RUN, 2, "running", 0, { status: "failed" });
+    await outbox.markTerminalBlocked(RUN, 2, "gap_unrecoverable");
     const w = startSweepWorker({ outbox, client });
     try {
-      await sleep(30);
-      await outbox.journalTerminal(RUN, 2, "running", 0, { status: "failed" });
-      await outbox.markTerminalBlocked(RUN, 2, "gap_unrecoverable");
-      await pollUntil(() => (latest ?? []).some((e) => e.run_id === RUN), 2000, "blocked journal reported");
+      await pollUntil(
+        () => (latest ?? []).some((e) => e.run_id === RUN && e.blocked_reason === "gap_unrecoverable"),
+        2000,
+        "blocked journal reported with its reason",
+      );
       await sleep(40);
     } finally {
       await w.stop();
