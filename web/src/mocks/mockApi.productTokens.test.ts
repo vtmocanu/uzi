@@ -16,19 +16,19 @@ afterEach(() => vi.resetModules());
 describe("mockApi — product registry validation (PRD #1907)", () => {
   it("rejects a description with a newline or tab, as the server's termsafe gate does", async () => {
     const api = await reload();
-    await expect(api.adminCreateProduct("CRM sync", "line one\nline two")).rejects.toMatchObject({
+    await expect(api.adminCreateProduct("CRM sync", "line one\nline two", [])).rejects.toMatchObject({
       status: 400,
     });
-    await expect(api.adminCreateProduct("CRM sync", "a\tb")).rejects.toMatchObject({ status: 400 });
+    await expect(api.adminCreateProduct("CRM sync", "a\tb", [])).rejects.toMatchObject({ status: 400 });
     // Control: the same product with a clean one-line description is accepted.
-    await expect(api.adminCreateProduct("CRM sync", "Syncs tickets.")).resolves.toMatchObject({
+    await expect(api.adminCreateProduct("CRM sync", "Syncs tickets.", [])).resolves.toMatchObject({
       product: { name: "CRM sync", description: "Syncs tickets." },
     });
   });
 
   it("rejects an invisible formatting character in a product name and in a description update", async () => {
     const api = await reload();
-    await expect(api.adminCreateProduct("CRM‮sync", "")).rejects.toMatchObject({ status: 400 });
+    await expect(api.adminCreateProduct("CRM‮sync", "", [])).rejects.toMatchObject({ status: 400 });
     await expect(
       api.adminUpdateProduct("prod-helpdesk", { description: "zero​width" }),
     ).rejects.toMatchObject({ status: 400 });
@@ -43,9 +43,29 @@ describe("mockApi — product registry validation (PRD #1907)", () => {
 
   it("treats product names case-insensitively for uniqueness, like the server's index", async () => {
     const api = await reload();
-    await expect(api.adminCreateProduct("helpdesk ASSISTANT", "")).rejects.toMatchObject({
+    await expect(api.adminCreateProduct("helpdesk ASSISTANT", "", [])).rejects.toMatchObject({
       status: 409,
     });
+  });
+});
+
+describe("mockApi — product allowed_job_types (PRD #1908)", () => {
+  it("stores the create list, de-duplicated, and refuses an unknown type", async () => {
+    const api = await reload();
+    await expect(api.adminCreateProduct("CRM sync", "", ["research", "research"])).resolves.toMatchObject({
+      product: { allowed_job_types: ["research"] },
+    });
+    await expect(api.adminCreateProduct("Other", "", ["mining"])).rejects.toMatchObject({ status: 400 });
+  });
+
+  it("PATCH keeps the list when the field is omitted and clears it on []", async () => {
+    const api = await reload();
+    const kept = await api.adminUpdateProduct("prod-helpdesk", { description: "Still helps." });
+    expect(kept.product.allowed_job_types).toEqual(["research"]);
+    const cleared = await api.adminUpdateProduct("prod-helpdesk", { allowed_job_types: [] });
+    expect(cleared.product.allowed_job_types).toEqual([]);
+    const { products } = await api.adminListProducts();
+    expect(products.find((p) => p.id === "prod-helpdesk")?.allowed_job_types).toEqual([]);
   });
 });
 

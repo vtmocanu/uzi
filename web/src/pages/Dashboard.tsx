@@ -460,7 +460,8 @@ export function Dashboard() {
                       </p>
                     )}
                     <p className="flex flex-wrap items-center gap-x-1 text-xs text-faint">
-                      {maskRepoPath(r.repo_path, demo)}{" "}
+                      {/* PRD #1908: a repo-less job run shows only its kind chip. */}
+                      {r.repo_path && <>{maskRepoPath(r.repo_path, demo)}{" "}</>}
                       <RunIssueRef
                         issueIid={r.issue_iid}
                         issueWebUrl={r.issue_web_url}

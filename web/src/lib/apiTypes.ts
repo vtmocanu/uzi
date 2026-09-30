@@ -1483,10 +1483,10 @@ export interface Product {
   deleted_at: string | null;
   created_at: string;
   active_token_count: number;
-  /** Job types this product may create (apitypes.ProductDTO.AllowedJobTypes); the mapper
-   *  normalizes a nil slice to [], so it is never null on the wire. Optional in the type so
-   *  mock/test fixtures that predate PRD #1908 need not carry it. */
-  allowed_job_types?: string[];
+  /** Job types this product may create (apitypes.ProductDTO.AllowedJobTypes, PRD #1908);
+   *  empty allows none (fail-closed). The mapper normalizes a nil slice to [], so it is
+   *  always present and never null on the wire. */
+  allowed_job_types: string[];
 }
 
 // AdminDeleteProductResponse is DELETE /api/admin/products/{id}

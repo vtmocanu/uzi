@@ -15,6 +15,7 @@ export * from "./health";
 export * from "./agents";
 export * from "./plans";
 export * from "./runs";
+export * from "./jobs";
 export * from "./runHistories";
 export * from "./runsDemo";
 export * from "./chat";

@@ -11,6 +11,7 @@ import {
   PRODUCT_DESCRIPTION_MAX_BYTES,
   PRODUCT_NAME_MAX_BYTES,
 } from "../../lib/productText";
+import { JOB_TYPES } from "../../lib/jobTypes";
 import { mockProducts, mockProductTokens } from "../data";
 import { delay, requireAdmin, requireSession, users } from "./shared";
 
@@ -21,7 +22,7 @@ import { delay, requireAdmin, requireSession, users } from "./shared";
 type OwnedProductToken = ProductToken & { user_id: string };
 type StoredProduct = Omit<Product, "active_token_count">;
 
-let products: StoredProduct[] = mockProducts.map((p) => ({ ...p }));
+let products: StoredProduct[] = mockProducts.map((p) => ({ ...p, allowed_job_types: [...p.allowed_job_types] }));
 let productTokens: OwnedProductToken[] = mockProductTokens.map((t) => ({ ...t, scopes: [...t.scopes] }));
 let productCounter = 0;
 let productTokenCounter = 0;
@@ -59,6 +60,19 @@ function validDescription(raw: string): string {
     throw new ApiError(400, "description must not contain control characters (tabs, newlines, terminal escape sequences)");
   }
   return d;
+}
+
+// The server's allowed_job_types gate (validateAllowedJobTypes): every entry a known job
+// type, de-duplicated in first-seen order; an unknown type is a 400 naming the known set.
+function validJobTypes(raw: string[]): string[] {
+  const out: string[] = [];
+  for (const t of raw) {
+    if (!(JOB_TYPES as readonly string[]).includes(t)) {
+      throw new ApiError(400, `allowed_job_types: unknown job type "${t}" (known: ${JOB_TYPES.join(", ")})`);
+    }
+    if (!out.includes(t)) out.push(t);
+  }
+  return out;
 }
 
 // Active first, then newest (created_at desc), capped, the way both list queries order
@@ -176,8 +190,9 @@ export const productTokensApi = {
     requireAdmin();
     return delay({ products: products.map(withCount) });
   },
-  adminCreateProduct: async (name: string, description: string) => {
+  adminCreateProduct: async (name: string, description: string, allowedJobTypes: string[]) => {
     requireAdmin();
+    const allowed = validJobTypes(allowedJobTypes);
     const n = validName(name);
     const desc = validDescription(description);
     // Case-insensitive among live products, like the server's unique index.
@@ -191,21 +206,29 @@ export const productTokensApi = {
       enabled: true,
       deleted_at: null,
       created_at: new Date().toISOString(),
+      allowed_job_types: allowed,
     };
     products = [p, ...products];
     return delay({ product: withCount(p) }, 200);
   },
-  adminUpdateProduct: async (id: string, patch: { description?: string; enabled?: boolean }) => {
+  adminUpdateProduct: async (
+    id: string,
+    patch: { description?: string; enabled?: boolean; allowed_job_types?: string[] },
+  ) => {
     requireAdmin();
-    if (patch.description === undefined && patch.enabled === undefined) {
-      throw new ApiError(400, "nothing to update: set description and/or enabled");
+    if (patch.description === undefined && patch.enabled === undefined && patch.allowed_job_types === undefined) {
+      throw new ApiError(400, "nothing to update: set description, enabled and/or allowed_job_types");
     }
+    // Validated before any write, like the server (a bad list changes nothing).
+    const allowed = patch.allowed_job_types === undefined ? undefined : validJobTypes(patch.allowed_job_types);
     const p = findProduct(id);
     if (p.deleted_at !== null) {
       throw new ApiError(409, "product is deleted; a deleted product cannot be changed or re-enabled");
     }
     if (patch.description !== undefined) p.description = validDescription(patch.description);
     if (patch.enabled !== undefined) p.enabled = patch.enabled;
+    // PATCH semantics (admin_products.go): omitted keeps the list, [] clears it.
+    if (allowed !== undefined) p.allowed_job_types = allowed;
     return delay({ product: withCount(p) });
   },
   adminDeleteProduct: async (id: string) => {

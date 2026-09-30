@@ -184,7 +184,12 @@ export function formatLocalTime(iso: string | null | undefined): string | null {
 // admin cap is a real, positive number. undefined ⇒ "unknown" (rollout skew) ⇒ hidden, and a
 // real 0 ⇒ extending turned off ⇒ hidden — the two are deliberately treated the same for
 // VISIBILITY (the button is absent either way), but never conflated as VALUES elsewhere.
-export function extendEnabled(run: Pick<BudgetRun, "budget_extension_cap_seconds">): boolean {
+// A job run (PRD #1908 D-E) is never extended: its wall-clock limit is fixed at creation and
+// the server refuses every extend path for it, so the affordance is hidden whatever the cap.
+export function extendEnabled(
+  run: Pick<BudgetRun, "budget_extension_cap_seconds"> & { kind?: string },
+): boolean {
+  if (run.kind === "job") return false;
   const cap = run.budget_extension_cap_seconds;
   return typeof cap === "number" && cap > 0;
 }

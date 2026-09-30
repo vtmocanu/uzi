@@ -5,6 +5,7 @@ import {
   mockChatRuns,
   mockCrewRuns,
   mockHistoryRuns,
+  mockJobRuns,
   mockLaneRuns,
   mockOtherRunOwners,
   mockOtherUserRuns,
@@ -30,6 +31,7 @@ const seeded: Run[] = (() => {
     ...mockLaneRuns,
     ...mockHistoryRuns,
     ...mockOtherUserRuns,
+    ...mockJobRuns, // PRD #1908: a queued job is a listed, counted kind
   ])
     m.set(r.id, r);
   return [...m.values()];

@@ -15,6 +15,7 @@ export const mockProducts: Omit<Product, "active_token_count">[] = [
     enabled: true,
     deleted_at: null,
     created_at: daysAgo(45),
+    allowed_job_types: ["research"],
   },
   {
     id: "prod-metrics",
@@ -23,6 +24,8 @@ export const mockProducts: Omit<Product, "active_token_count">[] = [
     enabled: false,
     deleted_at: null,
     created_at: daysAgo(30),
+    // Reads results only; an empty allow-list lets it create no job (fail-closed).
+    allowed_job_types: [],
   },
   {
     id: "prod-legacy",
@@ -31,6 +34,7 @@ export const mockProducts: Omit<Product, "active_token_count">[] = [
     enabled: false,
     deleted_at: daysAgo(6),
     created_at: daysAgo(120),
+    allowed_job_types: ["research"],
   },
 ];
 

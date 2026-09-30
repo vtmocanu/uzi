@@ -104,5 +104,6 @@ export function isCredentialSwitchRefusedLane(
   run: Pick<Run, "kind" | "trigger_source">,
 ): boolean {
   if (run.trigger_source === "task_review") return true;
-  return run.kind === "chat" || run.kind === "judge" || run.kind === "self_improve";
+  // PRD #1908 D-E: a job resolves its credential as its owner and is never switchable.
+  return run.kind === "chat" || run.kind === "judge" || run.kind === "self_improve" || run.kind === "job";
 }

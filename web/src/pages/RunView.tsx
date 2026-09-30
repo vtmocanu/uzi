@@ -79,6 +79,7 @@ import { SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { Markdown } from "../components/Markdown";
+import { JobResultPanel } from "./runView/JobResultPanel";
 import { Alert, Badge, Button, Card, PageHeader, Spinner, StatusPill, cx, type BadgeTone } from "../components/ui";
 import { Modal } from "../components/Modal";
 import { summaryCollapse } from "../lib/prefs";
@@ -1848,7 +1849,8 @@ export function RunView() {
   // Resolve the repo's web URL (for the MR link); the run itself does not carry
   // it. Best-effort — the MR iid is shown as text if the repo is not resolvable.
   useEffect(() => {
-    if (!run) return;
+    // A repo-less run (a job, PRD #1908) has no repo and no MR to link.
+    if (!run?.repo_id) return;
     api
       .listRepos()
       .then(({ repos }: { repos: Repo[] }) => {
@@ -2211,12 +2213,17 @@ export function RunView() {
                 Runs
               </Link>
               <span>/</span>
-              <Link to={`/repos/${run.repo_id}/board`} className="transition-colors hover:text-fg">
-                Board
-              </Link>
+              {/* PRD #1908: a job run has no repo, so no board to link; its tail is "Job". */}
+              {run.repo_id ? (
+                <Link to={`/repos/${run.repo_id}/board`} className="transition-colors hover:text-fg">
+                  Board
+                </Link>
+              ) : (
+                <span className="text-muted">{run.kind === "job" ? "Job" : "No repository"}</span>
+              )}
               {/* An issue run links its card; a ci_fix run (PRD #6) has no issue —
                   its breadcrumb tail is just "CI fix". */}
-              {run.kind !== "ci_fix" && run.issue_iid != null && (
+              {run.repo_id && run.kind !== "ci_fix" && run.issue_iid != null && (
                 <>
                   <span>/</span>
                   <Link
@@ -2662,7 +2669,9 @@ export function RunView() {
         // cleanly stacked (two lines) on mobile — the two ~87-char labels would wrap
         // raggedly if we relied on flex-wrap alone at narrow widths, so the breakpoint is
         // explicit. Gated so no always-present empty <div> adds a stray space-y-5 margin
-        // on terminal runs where both panels render nothing.
+        // on terminal runs where both panels render nothing. A job (PRD #1908 D-E) never
+        // parks on a usage limit and has no MR, so neither toggle means anything for it.
+        run.kind !== "job" &&
         (canToggleWaitOnLimit(run.status) || (canSteer && canToggleMrRework(run))) && (
           <div className="flex flex-col gap-y-2 sm:flex-row sm:flex-wrap sm:items-center sm:gap-x-6">
             <LimitWaitPanel
@@ -2835,6 +2844,11 @@ export function RunView() {
           aggregate — whether to render (a real archive, a still-preparing capture, or an
           honest legacy/unavailable note on a finalization-blocked run), rendering nothing
           for an ordinary run. Owner-only: a non-owner's 404 renders nothing. */}
+      {/* PRD #1908 M7: a job run's deliverable (origin, inputs, report, findings). Placed
+          under the outcome heroes so a finished job reads outcome, then result. Renders
+          nothing for every other kind. */}
+      <JobResultPanel run={run} />
+
       <RecoveryArchivesPanel run={run} />
 
       {/* Checkpoint salvage (PRD #1867): the bounded archive copy of a failed run's last
@@ -3118,7 +3132,11 @@ export function RunCompletedLine({
           branch/MR clause (a report_only completion pushes neither), so this branch guards
           against a contradictory "Branch … Report only" line, and only promises "findings
           below" when there is actually a report_md to render below. */}
-      {run.report_only ? (
+      {run.kind === "job" ? (
+        // PRD #1908: a job pushes no branch and opens no merge request; its deliverable is
+        // the result panel below.
+        run.job?.result ? "Report and findings below." : null
+      ) : run.report_only ? (
         <>
           Report only — no merge request
           {run.report_md != null && run.report_md.trim() !== "" ? "; findings below" : ""}.

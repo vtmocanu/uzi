@@ -399,7 +399,9 @@ export function RunRow({
             )}
             <p className={`mt-0.5 min-w-0 flex flex-wrap items-center gap-x-4 overflow-x-clip text-xs text-faint ${hasHarnessLogo ? "col-span-2 sm:col-span-1 sm:col-start-2" : ""}`}>
               <span className="inline-flex min-w-0 max-w-full items-center gap-1">
-                <span className="min-w-0 truncate">{maskRepoPath(run.repo_path, demo)}</span>
+                {/* PRD #1908: a job run has no repo (repo_path ""), so the kind chip
+                    below stands alone instead of trailing an empty path. */}
+                {run.repo_path && <span className="min-w-0 truncate">{maskRepoPath(run.repo_path, demo)}</span>}
                 <span className="shrink-0">
                   <RunIssueRef
                     issueIid={run.issue_iid}

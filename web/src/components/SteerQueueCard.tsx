@@ -266,10 +266,15 @@ export function SteerQueueCard({
   if (inputs.length === 0 && (terminal || !canSteer)) return null;
 
   const parked = status ? PARKED_COPY[status] : undefined;
+  // PRD #1908: a job runs one session over its fixed inputs and never reads a follow-up, so
+  // it offers Stop only; a composer there would queue text nothing consumes.
+  const takesFollowUps = run?.kind !== "job";
 
   return (
     <Card className="space-y-3 p-4">
-      <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Steer this run</h2>
+      <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">
+        {takesFollowUps ? "Steer this run" : "Stop this job"}
+      </h2>
 
       {inputs.length > 0 && (
         <ul className="space-y-1.5">
@@ -328,16 +333,20 @@ export function SteerQueueCard({
               A follow-up does not un-park either hold: recovery_wait resumes on its
               capped backoff, and paused waits for the owner to Resume. The composer
               must promise only that the message is queued until the run resumes. */}
-          <FollowUpComposer
-            busy={busy}
-            onSend={onSend}
-            parked={
-              status === "limit_wait" ||
-              status === "pool_wait" ||
-              status === "recovery_wait" ||
-              status === "paused"
-            }
-          />
+          {takesFollowUps ? (
+            <FollowUpComposer
+              busy={busy}
+              onSend={onSend}
+              parked={
+                status === "limit_wait" ||
+                status === "pool_wait" ||
+                status === "recovery_wait" ||
+                status === "paused"
+              }
+            />
+          ) : (
+            <p className="text-sm text-muted">A job takes no follow-ups. Stopping it cancels the job.</p>
+          )}
           {/* PRD #1190: Pause ▾ sits beside Stop run, offered only for a RUNNING, pausable
               run with no pause already pending (a pending request has its own chip + actions
               in the header). Unpausable kinds and any parked status show no menu. */}

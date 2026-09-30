@@ -18,6 +18,7 @@ import {
   mockDoneMessages,
   mockFailedMessages,
   mockHistoryRuns,
+  mockJobRuns,
   mockLaneMessages,
   mockLaneRuns,
   mockLimitWaitMessages,
@@ -77,6 +78,8 @@ function seed(): MockState {
   // open them, but owned by other demo users — mockApi excludes them from the
   // caller-scoped listRuns/runsInProgressCount via mockOtherRunOwners.
   for (const r of mockOtherUserRuns) runs.set(r.id, seedRun(r));
+  // PRD #1908: repo-less job runs (queued + completed with a hostile result).
+  for (const r of mockJobRuns) runs.set(r.id, seedRun(r));
   const messages = new Map<string, RunMessage[]>();
   messages.set("run-crew", mockCrewMessages.map((m) => ({ ...m })));
   messages.set("run-lanes", mockLaneMessages.map((m) => ({ ...m })));
@@ -136,6 +139,8 @@ function seed(): MockState {
   // empty log (a queued run has no transcript yet) — both open without a 404.
   messages.set("run-mira-embed", mockBusyMessages.map((m) => ({ ...m })));
   messages.set("run-andrei-queued", []);
+  // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
+  for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });

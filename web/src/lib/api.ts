@@ -1789,9 +1789,19 @@ const realApi = {
   // its tokens' rows stay for the audit trail. Create and update answer
   // {product}, delete the bare {product, stopped_token_count}.
   adminListProducts: () => request<{ products: Product[] }>("GET", "/admin/products"),
-  adminCreateProduct: (name: string, description: string) =>
-    request<{ product: Product }>("POST", "/admin/products", { name, description }),
-  adminUpdateProduct: (id: string, patch: { description?: string; enabled?: boolean }) =>
+  // PRD #1908: allowed_job_types is the product's job-type allow-list. On create an omitted
+  // list is the empty (fail-closed) allow-list; on PATCH an omitted field keeps the stored
+  // list and [] clears it.
+  adminCreateProduct: (name: string, description: string, allowedJobTypes: string[]) =>
+    request<{ product: Product }>("POST", "/admin/products", {
+      name,
+      description,
+      allowed_job_types: allowedJobTypes,
+    }),
+  adminUpdateProduct: (
+    id: string,
+    patch: { description?: string; enabled?: boolean; allowed_job_types?: string[] },
+  ) =>
     request<{ product: Product }>("PATCH", `/admin/products/${id}`, patch),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
