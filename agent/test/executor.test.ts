@@ -210,6 +210,30 @@ describe("StubExecutor — PRD #47 M6 run-health sentinels", () => {
   });
 });
 
+describe("StubExecutor — issue #1742 re-execution on a resumed worktree", () => {
+  it("a second run on the same worktree succeeds and creates no new commit", async () => {
+    const wt = makeWorktree();
+    const count = () =>
+      Number(
+        execFileSync("git", ["-C", wt.path, "rev-list", "--count", "HEAD"], {
+          encoding: "utf8",
+          env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+        }).trim(),
+      );
+    try {
+      const first = makeCtx({ worktreePath: wt.path });
+      await new StubExecutor(nullLogger()).run(first.ctx);
+      assert.equal(count(), 1);
+      const second = makeCtx({ worktreePath: wt.path });
+      const res = await new StubExecutor(nullLogger()).run(second.ctx);
+      assert.equal(res.branch, "agent/issue-7");
+      assert.equal(count(), 1, "the re-execution must not create a second commit");
+    } finally {
+      wt.cleanup();
+    }
+  });
+});
+
 describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
   // outboxTickMs: 0 + a small outboxTicks make the steady stream run instantly so the
   // unit test is fast; the real e2e leaves the STUB_OUTBOX_* defaults (a ~90s window).

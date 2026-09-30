@@ -1565,17 +1565,29 @@ export class StubExecutor implements Executor {
     // written to the worktree's git config, and gpg signing is forced off so a
     // signing config on the host image can't block the commit.
     await this.git(ctx.worktreePath, ["add", "UZI_RUN.md"]);
-    await this.git(ctx.worktreePath, [
-      "-c",
-      `user.name=${AGENT_GIT_IDENTITY.name}`,
-      "-c",
-      `user.email=${AGENT_GIT_IDENTITY.email}`,
-      "-c",
-      "commit.gpgsign=false",
-      "commit",
-      "-m",
-      `uzi stub: work on ${label}`,
+    // Issue #1742: a re-execution of the same run (resumed from a tracking ref that
+    // already carries the marker commit) rewrites an identical marker, so the tree is
+    // clean and `git commit` would fail with "nothing to commit". Skip the commit then,
+    // like a real agent that finds its work already done; the prior commit is the work.
+    const pending = await this.git(ctx.worktreePath, [
+      "status",
+      "--porcelain",
+      "--",
+      "UZI_RUN.md",
     ]);
+    if (pending.trim() !== "") {
+      await this.git(ctx.worktreePath, [
+        "-c",
+        `user.name=${AGENT_GIT_IDENTITY.name}`,
+        "-c",
+        `user.email=${AGENT_GIT_IDENTITY.email}`,
+        "-c",
+        "commit.gpgsign=false",
+        "commit",
+        "-m",
+        `uzi stub: work on ${label}`,
+      ]);
+    }
 
     ctx.emit({
       kind: "text",
@@ -1770,7 +1782,7 @@ export class StubExecutor implements Executor {
     }
   }
 
-  private async git(cwd: string, args: string[]): Promise<void> {
+  private async git(cwd: string, args: string[]): Promise<string> {
     // Run AS the RUNNER uid (PRD #51 M5), mirroring GitCache.runGitAsRunner. The stub
     // commits into `ctx.worktreePath`, which under (b) is the RUNNER-owned clone (the
     // agent's checkout+commit tree — runner.ts wires runnerClone.path here). The real
@@ -1797,10 +1809,11 @@ export class StubExecutor implements Executor {
     const tmp = runnerTmpdir();
     if (tmp) env.TMPDIR = tmp;
     const wrapped = runnerCommand("git", ["-C", cwd, ...args]);
-    await execFileAsync(wrapped.command, wrapped.args, {
+    const { stdout } = await execFileAsync(wrapped.command, wrapped.args, {
       env,
       timeout: 60_000,
     });
+    return String(stdout);
   }
 }
 
