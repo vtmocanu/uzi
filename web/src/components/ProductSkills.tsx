@@ -20,7 +20,7 @@ import { api, type Product, type ProductPatch, type ProductSkill, type ProductSk
 import { ApiError, errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { useAuth } from "../auth/AuthContext";
-import { splitUnsafeChars, stripUnsafeChars } from "../lib/safeText";
+import { splitUnsafeChars } from "../lib/safeText";
 import { Badge, Button, Field, Input, PasswordInput, Spinner, cx } from "./ui";
 
 type Staged = NonNullable<ProductSkills["staged"]>;
@@ -60,11 +60,14 @@ function RevealedText({ text }: { text: string }) {
   );
 }
 
-const hiddenCount = (s: ProductSkill) =>
-  [s.name, s.description, s.body].reduce(
-    (n, t) => n + splitUnsafeChars(t).filter((p) => p.unsafe).length,
-    0,
-  );
+// countHidden counts the markers RevealedText draws for these strings: the review banner
+// sums exactly the text the review renders, so its number matches the red codes on screen.
+const countHidden = (texts: readonly string[]) =>
+  texts.reduce((n, t) => n + splitUnsafeChars(t).filter((p) => p.unsafe).length, 0);
+
+const skillTexts = (s: ProductSkill) => [s.name, s.description, s.body];
+
+const hiddenCount = (s: ProductSkill) => countHidden(skillTexts(s));
 
 // One skill: its name and description always visible, the SKILL.md body behind a
 // disclosure (bodies run to kilobytes; the diff is read name-first).
@@ -105,8 +108,11 @@ const DROP_REASON: Record<string, string> = {
   secret: "it contains what looks like a credential",
 };
 
+// The texts DropRow renders through RevealedText (an unknown reason is shown as sent).
+const dropTexts = (d: ProductSkillDrop) => [d.name, ...(d.reason in DROP_REASON ? [] : [d.reason])];
+
 function DropRow({ d }: { d: ProductSkillDrop }) {
-  const reason = DROP_REASON[d.reason] ?? stripUnsafeChars(d.reason);
+  const reason = DROP_REASON[d.reason] ?? <RevealedText text={d.reason} />;
   if (d.name === "") {
     return (
       <li>
@@ -176,9 +182,12 @@ export function ProductSkillsPanel({ product }: { product: Product }) {
     [product.id],
     { enabled: open, fallback: "Failed to load this product’s skills" },
   );
-  // A write's own response (sync, apply) is the freshest view; a reload supersedes it.
-  const [fresh, setFresh] = useState<ProductSkills | null>(null);
-  const view = fresh ?? data;
+  // A write's own response (sync, apply) is the freshest view, but only over the load it
+  // superseded: once a newer load lands (a reload, or a reopen's refetch) the load wins, and
+  // closing the panel drops it outright.
+  const [fresh, setFresh] = useState<{ view: ProductSkills; over: ProductSkills | null } | null>(null);
+  const view = fresh && fresh.over === data ? fresh.view : data;
+  const onFresh = (v: ProductSkills) => setFresh({ view: v, over: data });
   const refetch = async () => {
     setFresh(null);
     await reload();
@@ -189,7 +198,11 @@ export function ProductSkillsPanel({ product }: { product: Product }) {
   return (
     <details
       className="group/skills border-t border-edge pt-3"
-      onToggle={(e) => setOpen((e.currentTarget as HTMLDetailsElement).open)}
+      onToggle={(e) => {
+        const isOpen = (e.currentTarget as HTMLDetailsElement).open;
+        setOpen(isOpen);
+        if (!isOpen) setFresh(null);
+      }}
     >
       <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 text-sm font-medium text-fg marker:content-none">
         <span
@@ -226,7 +239,7 @@ export function ProductSkillsPanel({ product }: { product: Product }) {
               <Spinner /> Loading skills…
             </p>
           ) : view ? (
-            <SkillsBody product={product} view={view} onFresh={setFresh} onRefetch={refetch} />
+            <SkillsBody product={product} view={view} onFresh={onFresh} onRefetch={refetch} />
           ) : null}
         </div>
       )}
@@ -372,38 +385,43 @@ function SourceForm({
   useEffect(() => setUrl(config.skills_repo_url), [config.skills_repo_url]);
   useEffect(() => setRef(config.skills_ref), [config.skills_ref]);
 
-  const urlChanged = url.trim() !== config.skills_repo_url;
-  const refChanged = ref.trim() !== config.skills_ref;
-  const dirty = urlChanged || refChanged || token !== "" || clearToken;
   const off = !config.enabled;
-  // Moving the repo to another origin drops the stored token server-side: say so before
-  // the save, not after.
+  const urlValue = url.trim();
+  const tokenValue = token.trim();
+  const urlChanged = urlValue !== config.skills_repo_url;
+  const refChanged = ref.trim() !== config.skills_ref;
+  // With the feature off the server still accepts the two removals (an empty URL passes the
+  // allowlist check; clearing the token needs none), so they stay available. Setting a URL,
+  // a ref or a new token does not: the patch simply never carries them while off.
+  const patch: ProductPatch = {};
+  if (urlChanged && (!off || urlValue === "")) patch.skills_repo_url = urlValue;
+  if (refChanged && !off) patch.skills_ref = ref.trim();
+  if (clearToken) patch.clear_skills_token = true;
+  else if (tokenValue !== "" && !off) patch.skills_token = tokenValue;
+  const dirty = Object.keys(patch).length > 0;
+  // Moving the repo to another origin, or removing it, drops the stored token server-side:
+  // say so before the save, not after.
   const fromOrigin = originOf(config.skills_repo_url);
   const dropsToken =
-    config.skills_token_set && !clearToken && token === "" && urlChanged && fromOrigin !== null &&
-    originOf(url.trim()) !== fromOrigin;
+    config.skills_token_set && patch.clear_skills_token === undefined && patch.skills_token === undefined &&
+    patch.skills_repo_url !== undefined && fromOrigin !== null && originOf(urlValue) !== fromOrigin;
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
     if (!dirty || saving) return;
-    const patch: ProductPatch = {};
-    if (urlChanged) patch.skills_repo_url = url.trim();
-    if (refChanged) patch.skills_ref = ref.trim();
-    if (clearToken) patch.clear_skills_token = true;
-    else if (token !== "") patch.skills_token = token;
+    const sent = { ...patch };
+    const tokenDropped = sent.clear_skills_token === true || dropsToken;
     setSaving(true);
     setError("");
     try {
-      await api.adminUpdateProduct(productId, patch);
+      await api.adminUpdateProduct(productId, sent);
       setToken("");
       setClearToken(false);
-      await onSaved(
-        patch.clear_skills_token
-          ? "Source saved. The clone token was removed."
-          : patch.skills_token !== undefined
-            ? "Source saved. The new clone token is stored and cannot be shown again."
-            : "Source saved.",
-      );
+      const parts = ["Source saved."];
+      if (sent.skills_repo_url === "") parts.push("The repo URL was removed.");
+      if (tokenDropped) parts.push("The clone token was removed.");
+      else if (sent.skills_token !== undefined) parts.push("The new clone token is stored and cannot be shown again.");
+      await onSaved(parts.join(" "));
     } catch (err) {
       setError(friendly(err, "Failed to save the skills source"));
     } finally {
@@ -412,10 +430,11 @@ function SourceForm({
   };
 
   const tokenState = clearToken ? "removed on save" : config.skills_token_set ? "set" : "not set";
+  const disabledInput = "disabled:cursor-not-allowed disabled:opacity-60";
 
   return (
     <form onSubmit={save} aria-label={`Skills source for ${productName}`} className="space-y-3">
-      <fieldset disabled={off} className="space-y-3 disabled:opacity-60">
+      <fieldset className="space-y-3">
         <legend className="sr-only">Skills source</legend>
         <div className="grid items-start gap-3 sm:grid-cols-[minmax(0,1fr)_12rem]">
           <Field label="Repo URL" htmlFor={`${id}-url`}>
@@ -425,19 +444,38 @@ function SourceForm({
               inputMode="url"
               autoComplete="off"
               spellCheck={false}
-              placeholder="https://github.com/acme/helpdesk-skills"
+              placeholder={off ? "No repo" : "https://github.com/acme/helpdesk-skills"}
               value={url}
+              disabled={off}
+              className={disabledInput}
               aria-describedby={`${id}-url-hint`}
               onChange={(e) => setUrl(e.target.value)}
             />
             <p id={`${id}-url-hint`} className="text-xs text-faint">
-              Must be https on a host this instance allows. Every SKILL.md in the repo is read.
+              {off
+                ? "A new repo can be set once this instance allows a repo host."
+                : "Must be https on a host this instance allows. Every SKILL.md in the repo is read."}
               {dropsToken && (
                 <span className="mt-1 block text-warn">
-                  This moves the repo to another host, so saving removes the stored clone token.
+                  {urlValue === ""
+                    ? "Removing the repo URL also removes the stored clone token."
+                    : "This moves the repo to another host, so saving removes the stored clone token."}
                 </span>
               )}
             </p>
+            {off && config.skills_repo_url !== "" && (
+              <div>
+                {url === "" ? (
+                  <Button type="button" variant="ghost" size="sm" onClick={() => setUrl(config.skills_repo_url)}>
+                    Keep repo URL
+                  </Button>
+                ) : (
+                  <Button type="button" variant="ghost" size="sm" onClick={() => setUrl("")}>
+                    Remove repo URL
+                  </Button>
+                )}
+              </div>
+            )}
           </Field>
           <Field label="Branch, tag or commit" htmlFor={`${id}-ref`}>
             <Input
@@ -446,6 +484,8 @@ function SourceForm({
               spellCheck={false}
               placeholder="default branch"
               value={ref}
+              disabled={off}
+              className={disabledInput}
               onChange={(e) => setRef(e.target.value)}
             />
           </Field>
@@ -453,9 +493,7 @@ function SourceForm({
 
         <div className="space-y-1.5">
           <div className="flex flex-wrap items-center gap-2 text-sm">
-            <span className="font-medium text-muted" id={`${id}-token-label`}>
-              Clone token
-            </span>
+            <span className="font-medium text-muted">Clone token</span>
             <Badge tone={clearToken ? "warning" : config.skills_token_set ? "ok" : "neutral"}>
               {tokenState}
             </Badge>
@@ -470,7 +508,7 @@ function SourceForm({
               </Button>
             )}
           </div>
-          {!clearToken && (
+          {!clearToken && !off && (
             <>
               <label htmlFor={`${id}-token`} className="sr-only">
                 {config.skills_token_set ? "Replace clone token" : "Clone token"}
@@ -499,7 +537,7 @@ function SourceForm({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button type="submit" variant="secondary" size="sm" disabled={off || !dirty || saving}>
+        <Button type="submit" variant="secondary" size="sm" disabled={!dirty || saving}>
           {saving ? "Saving…" : "Save source"}
         </Button>
         <Button
@@ -522,6 +560,23 @@ function SourceForm({
         </span>
       </div>
     </form>
+  );
+}
+
+// ApprovedVersion is the "before" of a changed skill: the approved description and body, so
+// a change to either is visible side by side with the staged copy above it.
+function ApprovedVersion({ skill }: { skill: ProductSkill }) {
+  return (
+    <details className="mt-2">
+      <summary className="cursor-pointer text-xs text-muted">Show the approved version</summary>
+      <p className="mt-2 text-xs text-muted">
+        <span className="font-medium">Approved description: </span>
+        {skill.description ? <RevealedText text={skill.description} /> : "No description."}
+      </p>
+      <pre className="mt-2 max-h-72 overflow-auto rounded-md border border-dashed border-edge p-3 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap text-muted">
+        <RevealedText text={skill.body} />
+      </pre>
+    </details>
   );
 }
 
@@ -548,8 +603,32 @@ function StagedReview({
   const headingId = useId();
   const stagedByName = new Map(staged.skills.map((s) => [s.name, s]));
   const appliedByName = new Map(applied.skills.map((s) => [s.name, s]));
-  const hidden = staged.skills.reduce((n, s) => n + hiddenCount(s), 0);
   const noOp = isNoOp(staged);
+  // What the review renders, derived once and used for both the markup and the hidden-
+  // character count: added/changed show the staged copy (a change also the approved
+  // description and body), removed the approved copy, unchanged and dropped their names.
+  const groups = noOp
+    ? []
+    : GROUPS.map((g) => ({
+        ...g,
+        rows: staged.diff[g.key].map((name) => ({
+          name,
+          skill: g.key === "removed" ? appliedByName.get(name) : stagedByName.get(name),
+          before: g.key === "changed" ? appliedByName.get(name) : undefined,
+        })),
+      })).filter((g) => g.rows.length > 0);
+  const unchanged = noOp ? [] : staged.diff.unchanged;
+  const hidden = countHidden([
+    ...groups.flatMap((g) =>
+      g.rows.flatMap((r) =>
+        r.skill
+          ? [...skillTexts(r.skill), ...(r.before ? [r.before.description, r.before.body] : [])]
+          : [r.name],
+      ),
+    ),
+    ...unchanged,
+    ...staged.dropped.flatMap(dropTexts),
+  ]);
 
   return (
     <section
@@ -577,54 +656,42 @@ function StagedReview({
           Same skills as the approved set ({plural(staged.diff.unchanged.length, "skill")}).
         </p>
       ) : (
-        GROUPS.map(({ key, label, tone }) => {
-          const names = staged.diff[key];
-          if (names.length === 0) return null;
-          return (
-            <div key={key} className="space-y-1.5">
-              <h5 className="flex items-center gap-2 text-xs font-medium text-muted">
-                <Badge tone={tone}>{label}</Badge>
-                {plural(names.length, "skill")}
-              </h5>
-              <ul className="space-y-1.5">
-                {names.map((name) => {
-                  const skill = key === "removed" ? appliedByName.get(name) : stagedByName.get(name);
-                  const before = key === "changed" ? appliedByName.get(name) : undefined;
-                  if (!skill) {
-                    return (
-                      <li key={name} className="font-mono text-sm break-all text-fg">
-                        <RevealedText text={name} />
-                      </li>
-                    );
-                  }
-                  return (
-                    <SkillEntry
-                      key={name}
-                      skill={skill}
-                      extra={
-                        before && (
-                          <details className="mt-2">
-                            <summary className="cursor-pointer text-xs text-muted">
-                              Show the approved version
-                            </summary>
-                            <pre className="mt-2 max-h-72 overflow-auto rounded-md border border-dashed border-edge p-3 font-mono text-xs leading-relaxed break-words whitespace-pre-wrap text-muted">
-                              <RevealedText text={before.body} />
-                            </pre>
-                          </details>
-                        )
-                      }
-                    />
-                  );
-                })}
-              </ul>
-            </div>
-          );
-        })
+        groups.map(({ key, label, tone, rows }) => (
+          <div key={key} className="space-y-1.5">
+            <h5 className="flex items-center gap-2 text-xs font-medium text-muted">
+              <Badge tone={tone}>{label}</Badge>
+              {plural(rows.length, "skill")}
+            </h5>
+            <ul className="space-y-1.5">
+              {rows.map(({ name, skill, before }) =>
+                skill ? (
+                  <SkillEntry
+                    key={name}
+                    skill={skill}
+                    extra={before && <ApprovedVersion skill={before} />}
+                  />
+                ) : (
+                  <li key={name} className="font-mono text-sm break-all text-fg">
+                    <RevealedText text={name} />
+                  </li>
+                ),
+              )}
+            </ul>
+          </div>
+        ))
       )}
 
-      {!noOp && staged.diff.unchanged.length > 0 && (
+      {unchanged.length > 0 && (
         <p className="text-xs text-muted">
-          Unchanged: <span className="font-mono">{staged.diff.unchanged.map(stripUnsafeChars).join(", ")}</span>
+          Unchanged:{" "}
+          <span className="font-mono break-all">
+            {unchanged.map((name, i) => (
+              <span key={name}>
+                {i > 0 && ", "}
+                <RevealedText text={name} />
+              </span>
+            ))}
+          </span>
         </p>
       )}
 
@@ -641,7 +708,7 @@ function StagedReview({
 
       {hidden > 0 && (
         <p className="rounded-lg border border-danger/40 bg-danger/10 px-3 py-2 text-sm text-danger">
-          These skills contain {plural(hidden, "hidden character")}, shown above as red U+ codes.
+          This review contains {plural(hidden, "hidden character")}, shown above as red U+ codes.
           Such characters can make text read differently to you than to the model. Check each one
           before approving.
         </p>

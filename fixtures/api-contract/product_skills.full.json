@@ -1,0 +1,53 @@
+{
+  "config": {
+    "skills_repo_url": "x",
+    "skills_ref": "x",
+    "skills_token_set": true,
+    "enabled": true
+  },
+  "applied": {
+    "sha": "x",
+    "applied_at": "2020-01-02T03:04:05Z",
+    "applied_by": "x",
+    "skills": [
+      {
+        "name": "x",
+        "description": "x",
+        "body": "x"
+      }
+    ]
+  },
+  "staged": {
+    "sha": "x",
+    "staged_at": "2020-01-02T03:04:05Z",
+    "staged_by": "x",
+    "skills": [
+      {
+        "name": "x",
+        "description": "x",
+        "body": "x"
+      }
+    ],
+    "dropped": [
+      {
+        "name": "x",
+        "reason": "x",
+        "count": 1
+      }
+    ],
+    "diff": {
+      "added": [
+        "x"
+      ],
+      "changed": [
+        "x"
+      ],
+      "removed": [
+        "x"
+      ],
+      "unchanged": [
+        "x"
+      ]
+    }
+  }
+}

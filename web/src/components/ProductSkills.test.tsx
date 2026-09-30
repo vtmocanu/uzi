@@ -25,8 +25,8 @@ const APPLIED_SHA = "a".repeat(40);
 const STAGED_SHA = "0123456789abcdef0123456789abcdef01234567";
 // Assembled at runtime so no token-shaped literal sits in tracked source.
 const SECRET = "ghp" + "_" + "Zx9".repeat(12);
-const RLO = "‮"; // RIGHT-TO-LEFT OVERRIDE
-const ZWSP = "​"; // ZERO WIDTH SPACE
+const RLO = "\u202E"; // RIGHT-TO-LEFT OVERRIDE
+const ZWSP = "\u200B"; // ZERO WIDTH SPACE
 
 const product: Product = {
   id: "prod-a",
@@ -125,7 +125,8 @@ describe("ProductSkillsPanel", () => {
     const input = within(form).getByLabelText("Replace clone token") as HTMLInputElement;
     expect(input.type).toBe("password");
 
-    fireEvent.change(input, { target: { value: SECRET } });
+    // A pasted token often carries a trailing newline or spaces: only the token is sent.
+    fireEvent.change(input, { target: { value: `  ${SECRET}\n` } });
     fireEvent.click(within(form).getByRole("button", { name: "Save source" }));
 
     await waitFor(() =>
@@ -134,7 +135,7 @@ describe("ProductSkillsPanel", () => {
     await waitFor(() => expect(input.value).toBe(""));
     expect(container.innerHTML).not.toContain(SECRET);
     expect(await screen.findByText(/cannot be shown again/)).toBeTruthy();
-    // Only the unchanged fields were left out of the PATCH (no url/ref resent).
+    // The save reloads the view (toHaveBeenCalledWith above pinned the exact PATCH body).
     expect(mockApi.adminGetProductSkills).toHaveBeenCalledTimes(2);
   });
 
@@ -161,6 +162,54 @@ describe("ProductSkillsPanel", () => {
     expect(screen.queryByText(/saving removes the stored clone token/)).toBeNull();
     // An unsaved edit blocks the sync: it would read the old source.
     expect((screen.getByRole("button", { name: "Sync from repo" }) as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("clears the repo URL with skills_repo_url set to empty, and says the token goes with it", async () => {
+    mockApi.adminUpdateProduct.mockResolvedValue({ product });
+    await openPanel();
+    const url = (await screen.findByLabelText("Repo URL")) as HTMLInputElement;
+    fireEvent.change(url, { target: { value: "" } });
+    expect(screen.getByText("Removing the repo URL also removes the stored clone token.")).toBeTruthy();
+    mockApi.adminGetProductSkills.mockResolvedValue(view({}, { skills_repo_url: "", skills_token_set: false }));
+    fireEvent.click(screen.getByRole("button", { name: "Save source" }));
+    await waitFor(() =>
+      expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", { skills_repo_url: "" }),
+    );
+    expect(
+      (await screen.findByText(/^Source saved\./)).textContent,
+    ).toBe("Source saved. The repo URL was removed. The clone token was removed.");
+  });
+
+  it("keeps the two removals available while the feature is off, and nothing that sets a source", async () => {
+    mockApi.adminUpdateProduct.mockResolvedValue({ product });
+    mockApi.adminGetProductSkills.mockResolvedValue(view({}, { enabled: false }));
+    await openPanel();
+    const form = await screen.findByRole("form", { name: /Skills source/ });
+    const url = within(form).getByLabelText("Repo URL") as HTMLInputElement;
+    expect(url.disabled).toBe(true);
+    expect((within(form).getByLabelText("Branch, tag or commit") as HTMLInputElement).disabled).toBe(true);
+    // No way to paste a new token while off.
+    expect(within(form).queryByLabelText("Replace clone token")).toBeNull();
+    const syncBtn = within(form).getByRole("button", { name: "Sync from repo" }) as HTMLButtonElement;
+    const saveBtn = within(form).getByRole("button", { name: "Save source" }) as HTMLButtonElement;
+    expect(syncBtn.disabled).toBe(true);
+    expect(saveBtn.disabled).toBe(true);
+
+    const removeToken = within(form).getByRole("button", { name: "Remove token" }) as HTMLButtonElement;
+    expect(removeToken.matches(":disabled")).toBe(false);
+    fireEvent.click(removeToken);
+    fireEvent.click(within(form).getByRole("button", { name: "Remove repo URL" }));
+    expect(url.value).toBe("");
+    expect(saveBtn.disabled).toBe(false);
+    expect(syncBtn.disabled).toBe(true);
+
+    fireEvent.click(saveBtn);
+    await waitFor(() =>
+      expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", {
+        skills_repo_url: "",
+        clear_skills_token: true,
+      }),
+    );
   });
 
   it("is disabled with an explanation when the instance allowlist is empty", async () => {
@@ -245,5 +294,127 @@ describe("ProductSkillsPanel", () => {
     await openPanel();
     fireEvent.click(await screen.findByRole("button", { name: "Sync from repo" }));
     expect((await screen.findByRole("alert")).textContent).toBe(shown);
+  });
+
+  it("counts and shows hidden characters in unchanged names and removed skills, never stripping them", async () => {
+    mockApi.adminGetProductSkills.mockResolvedValue(
+      view({
+        applied: {
+          sha: APPLIED_SHA,
+          applied_at: new Date().toISOString(),
+          applied_by: "u-admin",
+          skills: [skill(`tri${ZWSP}age`), skill("legacy", `old${RLO}body`)],
+        },
+        staged: {
+          sha: STAGED_SHA,
+          staged_at: new Date().toISOString(),
+          staged_by: "u-admin",
+          skills: [skill(`tri${ZWSP}age`), skill("fresh")],
+          dropped: [],
+          diff: { added: ["fresh"], changed: [], removed: ["legacy"], unchanged: [`tri${ZWSP}age`] },
+        },
+      }),
+    );
+    const { container } = await openPanel();
+    const review = await screen.findByRole("region", { name: "Waiting for approval" });
+    // The unchanged name keeps its marker instead of reading as a plain "triage".
+    expect(within(review).getByText(/Unchanged:/).textContent).toContain("tri");
+    expect(within(review).getByText(/Unchanged:/).textContent).toContain("U+200B");
+    // The removed skill is the applied copy, and its body marker is rendered and counted.
+    expect(review.textContent).toContain("U+202E");
+    expect(review.querySelectorAll("[data-hidden-char]").length).toBe(2);
+    expect(review.textContent).toMatch(/This review contains 2 hidden characters/);
+    expect(container.textContent).not.toContain(RLO);
+    expect(container.textContent).not.toContain(ZWSP);
+  });
+
+  it("shows no hidden-character banner on a no-op sync whose unrendered names carry them", async () => {
+    mockApi.adminGetProductSkills.mockResolvedValue(
+      view({
+        staged: {
+          sha: STAGED_SHA,
+          staged_at: new Date().toISOString(),
+          staged_by: "u-admin",
+          skills: [skill(`tri${ZWSP}age`)],
+          dropped: [],
+          diff: { added: [], changed: [], removed: [], unchanged: [`tri${ZWSP}age`] },
+        },
+      }),
+    );
+    await openPanel();
+    const review = await screen.findByRole("region", { name: "Waiting for approval" });
+    expect(review.textContent).toMatch(/Same skills as the approved set/);
+    expect(review.querySelectorAll("[data-hidden-char]").length).toBe(0);
+    expect(review.textContent).not.toMatch(/hidden character/);
+  });
+
+  it("shows the approved description as well as the approved body of a changed skill", async () => {
+    mockApi.adminGetProductSkills.mockResolvedValue(
+      view({
+        applied: {
+          sha: APPLIED_SHA,
+          applied_at: new Date().toISOString(),
+          applied_by: "u-admin",
+          skills: [skill("triage"), skill("tone", "# tone", `tone${RLO} description`), skill("legacy")],
+        },
+        staged: {
+          sha: STAGED_SHA,
+          staged_at: new Date().toISOString(),
+          staged_by: "u-admin",
+          skills: [skill("triage"), skill("tone", "# tone v2", "Answer briskly"), skill("legacy")],
+          dropped: [],
+          diff: { added: [], changed: ["tone"], removed: [], unchanged: ["legacy", "triage"] },
+        },
+      }),
+    );
+    await openPanel();
+    const review = await screen.findByRole("region", { name: "Waiting for approval" });
+    const before = within(review).getByText("Show the approved version").closest("details") as HTMLElement;
+    expect(before.textContent).toMatch(/tone.*U\+202E.* description/);
+    expect(before.textContent).toContain("# tone");
+    // The approved copy is rendered in the review, so its marker is counted there.
+    expect(review.textContent).toMatch(/This review contains 1 hidden character,/);
+    expect(before.textContent).not.toContain("Answer briskly");
+    expect(review.textContent).toContain("Answer briskly");
+  });
+
+  it("drops a sync response on close, so a reopen shows the refetched view", async () => {
+    mockApi.adminSyncProductSkills.mockResolvedValue(withStaged());
+    const { container } = await openPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Sync from repo" }));
+    expect(await screen.findByRole("region", { name: "Waiting for approval" })).toBeTruthy();
+
+    // Another admin approved (or a source edit discarded the stage) while this was closed.
+    const details = container.querySelector("details") as HTMLDetailsElement;
+    details.open = false;
+    fireEvent(details, new Event("toggle"));
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+    await waitFor(() => expect(mockApi.adminGetProductSkills).toHaveBeenCalledTimes(2));
+    await screen.findByRole("region", { name: "Approved set" });
+    expect(screen.queryByRole("region", { name: "Waiting for approval" })).toBeNull();
+    expect(screen.queryByText("Update waiting for approval")).toBeNull();
+  });
+
+  it("ignores a sync response that lands after the panel was closed and reloaded", async () => {
+    // Each load is a new object, as JSON off the wire is (mockResolvedValue reuses one).
+    mockApi.adminGetProductSkills.mockImplementation(() => Promise.resolve(view()));
+    let finishSync: (v: ProductSkills) => void = () => {};
+    mockApi.adminSyncProductSkills.mockReturnValue(new Promise((r) => (finishSync = r)));
+    const { container } = await openPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Sync from repo" }));
+    await waitFor(() => expect(mockApi.adminSyncProductSkills).toHaveBeenCalled());
+
+    const details = container.querySelector("details") as HTMLDetailsElement;
+    details.open = false;
+    fireEvent(details, new Event("toggle"));
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+    await waitFor(() => expect(mockApi.adminGetProductSkills).toHaveBeenCalledTimes(2));
+    await screen.findByRole("region", { name: "Approved set" });
+
+    finishSync(withStaged());
+    await new Promise((r) => setTimeout(r, 0));
+    expect(screen.queryByRole("region", { name: "Waiting for approval" })).toBeNull();
   });
 });

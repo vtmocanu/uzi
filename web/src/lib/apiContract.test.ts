@@ -54,6 +54,7 @@ import type {
   AdminDeleteProductResponse,
   MintableProduct,
   EgressProfile,
+  ProductSkills,
 } from "./apiTypes";
 
 import buildInfoZero from "../../../fixtures/api-contract/build_info.zero.json";
@@ -162,6 +163,8 @@ import v1WhoamiZero from "../../../fixtures/api-contract/v1_whoami.zero.json";
 import v1WhoamiFull from "../../../fixtures/api-contract/v1_whoami.full.json";
 import egressProfileZero from "../../../fixtures/api-contract/egress_profile.zero.json";
 import egressProfileFull from "../../../fixtures/api-contract/egress_profile.full.json";
+import productSkillsZero from "../../../fixtures/api-contract/product_skills.zero.json";
+import productSkillsFull from "../../../fixtures/api-contract/product_skills.full.json";
 
 // The api ⇄ SPA JSON wire-contract (PRD #982). This is the VITEST HALF; the Go
 // half is api/internal/apitypes/contract_test.go. Neither reads the other: each
@@ -1089,6 +1092,39 @@ void _buildInfoFull;
   void _mintableProductFull;
 }
 
+// PRD #1909 M6: the admin product skill-set view (GET/sync/apply). applied_at/applied_by
+// and staged are typed `X | null`, no exemption. applied.skills is the one nil-slice null in
+// product_skills.zero.json: productSkillsView (handler/admin_product_skills.go) builds it with
+// make(..., 0, n), so it is never null on the wire. ZeroOf is shallow, so the nested applied
+// block carries that exemption itself (the admin_delete_product shape).
+{
+  const _productSkillsMissing: never = null as unknown as Exclude<keyof ProductSkills, keyof typeof productSkillsFull>;
+  const _productSkillsExtra: never = null as unknown as Exclude<keyof typeof productSkillsFull, keyof ProductSkills>;
+  type Staged = NonNullable<ProductSkills["staged"]>;
+  const _productSkillsConfigMissing: never = null as unknown as Exclude<keyof ProductSkills["config"], keyof typeof productSkillsFull.config>;
+  const _productSkillsConfigExtra: never = null as unknown as Exclude<keyof typeof productSkillsFull.config, keyof ProductSkills["config"]>;
+  const _productSkillsAppliedMissing: never = null as unknown as Exclude<keyof ProductSkills["applied"], keyof typeof productSkillsFull.applied>;
+  const _productSkillsAppliedExtra: never = null as unknown as Exclude<keyof typeof productSkillsFull.applied, keyof ProductSkills["applied"]>;
+  const _productSkillsStagedMissing: never = null as unknown as Exclude<keyof Staged, keyof typeof productSkillsFull.staged>;
+  const _productSkillsStagedExtra: never = null as unknown as Exclude<keyof typeof productSkillsFull.staged, keyof Staged>;
+  const _productSkillsZero: {
+    config: ZeroOf<ProductSkills["config"]>;
+    applied: ZeroOf<ProductSkills["applied"], "skills">;
+    staged: null;
+  } = productSkillsZero;
+  const _productSkillsFull: Widen<ProductSkills> = productSkillsFull;
+  void _productSkillsMissing;
+  void _productSkillsExtra;
+  void _productSkillsConfigMissing;
+  void _productSkillsConfigExtra;
+  void _productSkillsAppliedMissing;
+  void _productSkillsAppliedExtra;
+  void _productSkillsStagedMissing;
+  void _productSkillsStagedExtra;
+  void _productSkillsZero;
+  void _productSkillsFull;
+}
+
 // ── Runtime self-checks ─────────────────────────────────────────────────────
 // A contract that passes on a missing fixture, or on a zero.json with no null in
 // it, is the false-green shape this repo documents repeatedly. These fatal
@@ -1214,6 +1250,9 @@ const dtos: { stem: string; nullable: boolean }[] = [
   // PRD #1906 M1w: the admin egress profile. created_by/updated_by are present-as-null
   // pointers and the three slices are nil-slice nulls the handler normalizes to [].
   { stem: "egress_profile", nullable: true },
+  // PRD #1909 M6: applied_at/applied_by/staged are present-as-null and applied.skills is a
+  // nil-slice null in zero.json.
+  { stem: "product_skills", nullable: true },
 ];
 
 describe("api-contract fixtures are present and discriminating", () => {

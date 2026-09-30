@@ -1,0 +1,15 @@
+{
+  "config": {
+    "skills_repo_url": "",
+    "skills_ref": "",
+    "skills_token_set": false,
+    "enabled": false
+  },
+  "applied": {
+    "sha": "",
+    "applied_at": null,
+    "applied_by": null,
+    "skills": null
+  },
+  "staged": null
+}
