@@ -822,9 +822,9 @@ type Run struct {
 	GateRefusalGeneration       pgtype.Int8        `json:"gate_refusal_generation"`
 	DiskParkCount               int32              `json:"disk_park_count"`
 	CheckpointContainsLatest    pgtype.Bool        `json:"checkpoint_contains_latest"`
-	JobType                     pgtype.Text        `json:"job_type"`
 	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
 	EgressSnapshot              []byte             `json:"egress_snapshot"`
+	JobType                     pgtype.Text        `json:"job_type"`
 }
 
 type RunCompletionAttempt struct {
