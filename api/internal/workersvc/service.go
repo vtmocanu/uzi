@@ -1020,6 +1020,10 @@ type Store interface {
 	// RequeueWorkerRuns returns the re-queued run ids (PRD #1390 M2a) so Register can publish
 	// each transition post-commit, mirroring the sweeper's RequeueRunsOfStaleWorkers twin.
 	RequeueWorkerRuns(ctx context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error)
+	// The attested finalize-resume pair (issue #1742), run by Register before the ordinary orphan
+	// pass for the (run, exact generation) pairs a restarting worker attests.
+	FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error)
+	RequeueAttestedFinalizeRuns(ctx context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error)
 
 	// Run-health detector (PRD #47): the per-tick active-run scan, the per-running-run
 	// tool window (loop) and lead-lane window (in-flight, issue #1394), the single
@@ -2132,6 +2136,15 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 // nonce so the handler can echo it in the register response. When no transaction beginner is
 // wired (unit tests with a fake store), it degrades to the tx-less path: no worker-row lock and
 // no snapshot persist — a fake store never carries a snapshot.
+//
+// Issue #1742: a register snapshot may also carry a finalize_resume list (validated independently
+// of the active list; an invalid one is ignored). For each attested (run, exact claim
+// generation) still running under this worker, an attested pass runs BEFORE the ordinary orphan
+// pass: fail when over budget with the one-shot allowance unavailable, otherwise re-queue (over
+// budget only once per run, stamping runs.finalize_resume_generation). It ignores the
+// worker-level pending_overflow closure (see RequeueAttestedFinalizeRuns); the exact-generation
+// terminal lease still protects a journaled outcome. Fail runs first: the two are disjoint, and
+// failing first keeps the requeue's returned set free of anything the fail just terminated.
 func (s *Service) Register(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
 	nonce, err := mintSnapshotNonce()
 	if err != nil {
@@ -2179,12 +2192,61 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		WorkerID:    pgconv.UUID(wkr.ID),
 		MaxRequeues: max,
 	}
+	// Issue #1742: the attested finalize list, validated independently of the active list.
+	finalize, finalizeOK := s.validateFinalizeResume(wkr, snapshot)
+	finalizeOffered := 0
+	if snapshot != nil {
+		finalizeOffered = len(snapshot.FinalizeResume)
+	}
+	var finalizeFailed, finalizeRequeued []uuid.UUID
+	finalizeAllowance := 0
+	// runAttested runs the attested pass on q (the tx-bound or the plain queries). No-op without a
+	// valid list.
+	runAttested := func(q interface {
+		FailAttestedFinalizeRunsOverCap(ctx context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error)
+		RequeueAttestedFinalizeRuns(ctx context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error)
+	}) error {
+		if !finalizeOK {
+			return nil
+		}
+		failed, err := q.FailAttestedFinalizeRunsOverCap(ctx, store.FailAttestedFinalizeRunsOverCapParams{
+			FailureReason:    failParams.FailureReason,
+			WorkerID:         pgconv.UUID(wkr.ID),
+			MaxRequeues:      max,
+			RunIds:           finalize.ids,
+			ClaimGenerations: finalize.generations,
+		})
+		if err != nil {
+			return err
+		}
+		requeuedRows, err := q.RequeueAttestedFinalizeRuns(ctx, store.RequeueAttestedFinalizeRunsParams{
+			WorkerID:         pgconv.UUID(wkr.ID),
+			MaxRequeues:      max,
+			RunIds:           finalize.ids,
+			ClaimGenerations: finalize.generations,
+		})
+		if err != nil {
+			return err
+		}
+		finalizeFailed = failed
+		for _, r := range requeuedRows {
+			finalizeRequeued = append(finalizeRequeued, r.ID)
+			if r.AllowanceUsed {
+				finalizeAllowance++
+			}
+		}
+		return nil
+	}
 
 	// Tx-less degraded path: no pool wired (fake-store unit tests). No worker-row lock and no
 	// snapshot persist; still rotates the nonce and resets the epoch via RegisterWorker.
 	if s.txBeginner == nil {
 		row, err := s.q.RegisterWorker(ctx, regParams)
 		if err != nil {
+			return store.Worker{}, "", err
+		}
+		// The snapshot is never persisted here, but a valid finalize list still applies via s.q.
+		if err := runAttested(s.q); err != nil {
 			return store.Worker{}, "", err
 		}
 		orphanFailed, err := s.q.FailWorkerRunsOverCap(ctx, failParams)
@@ -2195,7 +2257,7 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 		if err != nil {
 			return store.Worker{}, "", err
 		}
-		s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+		s.publishRegisterSweeps(ctx, append(finalizeFailed, orphanFailed...), append(finalizeRequeued, requeued...))
 		return store.Worker(row), nonce, nil
 	}
 
@@ -2231,6 +2293,11 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 			return store.Worker{}, "", err
 		}
 	}
+	// (d0) Issue #1742: the attested finalize pass, after the snapshot apply (so the exact-generation
+	// lease predicate reads settled rows) and before the ordinary orphan pass.
+	if err := runAttested(qtx); err != nil {
+		return store.Worker{}, "", err
+	}
 	// (d) Orphan pass — fail-over-cap then requeue, both D11-lease/overflow-predicated (M1).
 	orphanFailed, err := qtx.FailWorkerRunsOverCap(ctx, failParams)
 	if err != nil {
@@ -2256,13 +2323,17 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 			"worker_id", wkr.ID.String(), "offered_entries", len(snapshot.Active),
 			"offered_pending_entries", pendingCount, "offered_pending_overflow", snapshot.PendingOverflow,
 			"applied", snapshotApplied, "overflow_lease_applied", snapshotApplied && snapshot.PendingOverflow,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued),
+			"finalize_resume_offered", finalizeOffered, "finalize_requeued", len(finalizeRequeued),
+			"finalize_allowance_used", finalizeAllowance, "finalize_failed", len(finalizeFailed))
 	} else {
 		slog.Info("worker register orphan recovery committed",
 			"worker_id", wkr.ID.String(), "snapshot_offered", false,
-			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued))
+			"orphan_failed", len(orphanFailed), "orphan_requeued", len(requeued),
+			"finalize_resume_offered", finalizeOffered, "finalize_requeued", len(finalizeRequeued),
+			"finalize_allowance_used", finalizeAllowance, "finalize_failed", len(finalizeFailed))
 	}
-	s.publishRegisterSweeps(ctx, orphanFailed, requeued)
+	s.publishRegisterSweeps(ctx, append(finalizeFailed, orphanFailed...), append(finalizeRequeued, requeued...))
 	return store.Worker(row), nonce, nil
 }
 

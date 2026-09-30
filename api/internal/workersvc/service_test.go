@@ -293,11 +293,16 @@ type fakeStore struct {
 	orphanFailedRuns   []uuid.UUID // ids FailWorkerRunsOverCap returns (PRD #46 register-time judge funnel)
 	requeuedWorkerRuns []uuid.UUID // ids RequeueWorkerRuns returns (PRD #1390 M2a register-time requeue publish)
 	requeueWorker      *store.RequeueWorkerRunsParams
-	registerParams     *store.RegisterWorkerParams
-	registerResult     store.Worker
-	heartbeat          store.Worker
-	heartbeatArg       *store.HeartbeatWorkerParams
-	callOrder          []string
+	// Attested finalize-resume pass (issue #1742) recordings and canned results.
+	failAttested         *store.FailAttestedFinalizeRunsOverCapParams
+	requeueAttested      *store.RequeueAttestedFinalizeRunsParams
+	attestedFailedRuns   []uuid.UUID
+	attestedRequeuedRows []store.RequeueAttestedFinalizeRunsRow
+	registerParams       *store.RegisterWorkerParams
+	registerResult       store.Worker
+	heartbeat            store.Worker
+	heartbeatArg         *store.HeartbeatWorkerParams
+	callOrder            []string
 
 	// Sweep.
 	staleCutoff pgtype.Timestamptz
@@ -1284,6 +1289,16 @@ func (f *fakeStore) FailWorkerRunsOverCap(_ context.Context, arg store.FailWorke
 	f.failOverCap = &arg
 	f.callOrder = append(f.callOrder, "fail_over_cap")
 	return f.orphanFailedRuns, nil
+}
+func (f *fakeStore) FailAttestedFinalizeRunsOverCap(_ context.Context, arg store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+	f.failAttested = &arg
+	f.callOrder = append(f.callOrder, "fail_attested")
+	return f.attestedFailedRuns, nil
+}
+func (f *fakeStore) RequeueAttestedFinalizeRuns(_ context.Context, arg store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
+	f.requeueAttested = &arg
+	f.callOrder = append(f.callOrder, "requeue_attested")
+	return f.attestedRequeuedRows, nil
 }
 func (f *fakeStore) RequeueWorkerRuns(_ context.Context, arg store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
 	f.requeueWorker = &arg

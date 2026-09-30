@@ -95,6 +95,12 @@ func (p *protocolStore) SetRunCompleted(context.Context, store.SetRunCompletedPa
 func (p *protocolStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
+func (p *protocolStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (p *protocolStore) RequeueAttestedFinalizeRuns(context.Context, store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
+	return nil, nil
+}
 func (p *protocolStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
 	return nil, nil
 }

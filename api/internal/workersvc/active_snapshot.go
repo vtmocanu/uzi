@@ -114,6 +114,51 @@ type validatedEntry struct {
 	terminalPending bool
 }
 
+// validatedFinalizeResume is the shape-validated form of ActiveSnapshot.FinalizeResume: two
+// parallel slices (the attested pair i is ids[i], generations[i]) ready to pass to the attested
+// finalize queries. Run ids are unique.
+type validatedFinalizeResume struct {
+	ids         []uuid.UUID
+	generations []int64
+}
+
+// validateFinalizeResume validates ActiveSnapshot.FinalizeResume INDEPENDENTLY of Active (issue
+// #1742): a bad finalize list never drops a valid Active list and vice versa. It returns ok=false
+// for an absent list, and for an invalid one (a non-uuid run_id, a negative generation, a
+// duplicate run_id, or more than ActiveSnapshotMaxEntries entries) after a warning: the list is
+// then ignored and Register carries on, never failing. Only the register path calls it; the
+// heartbeat and claim snapshots never read the field.
+func (s *Service) validateFinalizeResume(wkr store.Worker, snap *ActiveSnapshot) (validatedFinalizeResume, bool) {
+	var out validatedFinalizeResume
+	if snap == nil || len(snap.FinalizeResume) == 0 {
+		return out, false
+	}
+	reject := func(reason string) (validatedFinalizeResume, bool) {
+		slog.Warn("finalize resume list rejected; ignoring it", "worker_id", wkr.ID.String(), "reason", reason)
+		return validatedFinalizeResume{}, false
+	}
+	if len(snap.FinalizeResume) > s.p.ActiveSnapshotMaxEntries {
+		return reject("list exceeds the absolute entry ceiling")
+	}
+	seen := make(map[uuid.UUID]bool, len(snap.FinalizeResume))
+	for _, e := range snap.FinalizeResume {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil {
+			return reject("entry run_id is not a uuid")
+		}
+		if e.ClaimGeneration < 0 {
+			return reject("entry claim_generation is negative")
+		}
+		if seen[id] {
+			return reject("duplicate run_id in list")
+		}
+		seen[id] = true
+		out.ids = append(out.ids, id)
+		out.generations = append(out.generations, e.ClaimGeneration)
+	}
+	return out, true
+}
+
 // ReplaceWorkerActiveRuns validates a worker's active-run snapshot and, when valid, applies it
 // atomically inside the caller's transaction (PRD #1390 M2a). qtx MUST be a transaction-bound
 // *store.Queries — the function issues several statements that are only correct together.

@@ -825,6 +825,8 @@ type Run struct {
 	EgressProfileID             pgtype.UUID        `json:"egress_profile_id"`
 	EgressSnapshot              []byte             `json:"egress_snapshot"`
 	JobType                     pgtype.Text        `json:"job_type"`
+	// Issue #1742: the exact claim generation at which Register's one-shot finalize-resume allowance re-queued this run over its budget. NULL = never used; once set the allowance never fires again for the run.
+	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 }
 
 type RunCompletionAttempt struct {
