@@ -1508,9 +1508,11 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
  * (push, MR, terminal report) rather than take one of its non-terminal early returns? The four
  * early returns (an owner pause park, the completion hold, the wall-clock park, the in-place
  * credential-switch release) each already reported their own non-terminal state and finalize
- * nothing. The finalize-pending record write in phasePreflightHandoff reads this predicate, and the
- * early-return checks at the top of phasePublish must name exactly the same four fields: change one
- * side only together with the other (agent/test/issue-1742-finalize-record.test.ts pins each field).
+ * nothing. The finalize-pending record write in phasePreflightHandoff reads this predicate. The
+ * early-return checks at the top of phasePublish are separate `if`s that name the same four fields
+ * by hand: nothing enforces that correspondence in code. agent/test/issue-1742-finalize-record.test.ts
+ * pins only this predicate (false for each of the four fields, true for none), not phasePublish's
+ * own checks, so change one side only together with the other.
  */
 export function isFinalizeBoundResult(
   result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased">,
@@ -2920,6 +2922,10 @@ export class RunRunner {
         // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
         // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
         // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        // Issue #1742: deliberately NO retireFinalizeRecord here (nor in the claim-fence,
+        // RunningAckTerminalError and CredentialSwitchSignal "released" arms): none of them is an
+        // accepted park/hold for this generation, and the api only acts on a finalize record for a
+        // run still running at that exact generation, so the record stays until a register offers it.
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RunningAckTerminalError) {
@@ -2992,6 +2998,8 @@ export class RunRunner {
         // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
         // superseded claim is never parked.
         await this.handleVaultLockDeferral(err as Error, claim, flight, executor, runLog);
+        // Issue #1742 retirement site (c): the api accepted the vault_locked recovery park.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "vault_lock_park_accepted");
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -6133,6 +6141,8 @@ export class RunRunner {
     const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
       const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
       if (held) {
+        // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
+        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run entered the completion hold; skipping finalization", {

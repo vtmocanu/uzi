@@ -241,6 +241,14 @@ export class Worker {
           send: this.replaySend(entry.run_id, gen),
           signal,
         });
+        // Issue #1742: a crash between installing G's terminal journal and retiring G's finalize
+        // record leaves both files. Once the journal is settled (no longer pending), the finalize
+        // record for the run at generation <= G is obsolete, so retire it or it blocks the retention
+        // sweep. A journal left listed (blocked, transient blip) keeps its finalize record.
+        const stillPending = outbox
+          .listPendingTerminals()
+          .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
+        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -332,9 +340,11 @@ export class Worker {
     // initial snapshot with an EMPTY pending subset + `pending_overflow: true` ON the register
     // request, so those outcomes are LEASED before the api's register-time orphan pass can re-claim
     // them. Cap-independent: the empty subset + overflow protects every pending run regardless of the
-    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Built ONCE
-    // before the retry loop so a re-register re-sends the same snapshot. Undefined for an ordinary
-    // worker with no pending journals (or no registry) ⇒ the register wire stays byte-identical.
+    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Issue
+    // #1742: a worker with only finalize-pending records also sends a snapshot (`pending_overflow`
+    // false, `finalize_resume` set). Built ONCE before the retry loop so a re-register re-sends the
+    // same snapshot. Undefined for an ordinary worker with neither (or no registry) ⇒ the register
+    // wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
     // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
     // snapshot. After an accepted register exactly this set is retired, never a re-listing, so a
@@ -342,11 +352,13 @@ export class Worker {
     const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
     const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
     const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
-    this.log.info("register finalize snapshot", {
-      count: sentFinalizes.length,
-      claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
-      claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
-    });
+    if (sentFinalizes.length > 0) {
+      this.log.info("register finalize snapshot", {
+        count: sentFinalizes.length,
+        claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
+        claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
+      });
+    }
     this.log.info("register terminal snapshot", {
       authenticated_pending: pending.length,
       claim_generations_sample: pending.slice(0, 8).map((entry) => entry.claim_generation),
@@ -600,13 +612,16 @@ export class Worker {
   }
 
   /**
-   * PRD #1391 Run B M4 (D7): build the BOOT register snapshot, or undefined for an ordinary worker.
-   * Returned only when the worker holds at least one pending terminal journal — then it is an EMPTY
-   * pending subset + `pending_overflow: true`, which leases every pending run BEFORE the api's
-   * register-time orphan pass, cap-independently. Unlike the heartbeat/claim snapshot this is NOT
-   * gated on the `active_run_snapshot` FEATURE (the feature is only known AFTER register, and #1390's
-   * register handler accepts the field unconditionally): the gate is purely "do we hold a pending
-   * outcome to protect". Undefined when there is no registry or nothing pending.
+   * PRD #1391 Run B M4 (D7) and issue #1742: build the BOOT register snapshot, or undefined for an
+   * ordinary worker. Returned when the worker holds a pending terminal journal OR an offered
+   * finalize-pending record. With pending terminals it is an EMPTY pending subset +
+   * `pending_overflow: true`, which leases every pending run BEFORE the api's register-time orphan
+   * pass, cap-independently. With only finalize records there is nothing to lease, so
+   * `pending_overflow` is false and the snapshot carries just `finalize_resume`. Unlike the
+   * heartbeat/claim snapshot this is NOT gated on the `active_run_snapshot` FEATURE (the feature is
+   * only known AFTER register, and #1390's register handler accepts the field unconditionally): the
+   * gate is purely "do we hold a pending outcome or finalize record to protect". Undefined when there
+   * is no registry or nothing pending.
    */
   private buildRegisterSnapshot(finalizes: readonly PendingFinalize[]): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;

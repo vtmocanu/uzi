@@ -72,6 +72,10 @@ const MAC_DOMAIN_MANIFEST = "uzi.outbox.manifest.v1";
  *  segment/range/manifest labels so a terminal journal's MAC can never be replayed as a
  *  different record kind under the same worker-local key. */
 const MAC_DOMAIN_TERMINAL = "uzi.outbox.terminal.v1";
+/** Issue #1742: the most finalize_resume entries one register offers: the api's default
+ *  ACTIVE_SNAPSHOT_MAX_ENTRIES (it drops the whole list above its cap). */
+const FINALIZE_RESUME_MAX_ENTRIES = 256;
+
 /** Issue #1742: the finalize-pending record's own domain label, so its MAC can never be replayed as
  *  a terminal journal (or any other kind) under the same worker-local key. */
 const MAC_DOMAIN_FINALIZE = "uzi.outbox.finalize.v1";
@@ -1454,14 +1458,16 @@ export class Outbox {
     };
     try {
       if (this.disabled || !this.key) return fail("outbox_disabled");
+      if (!Number.isSafeInteger(claimGeneration) || claimGeneration < 0) return fail("invalid_claim_generation");
       return await this.withRunLock(runId, async () => {
         if (!this.validRunId(runId)) return fail("invalid_run_id");
         const dir = this.runDir(runId);
         if (await this.isSymlink(dir)) return fail("run_dir_symlink");
-        const since = this.now();
+        let since = this.now();
         const record: FinalizeRecordData = { run_id: runId, claim_generation: claimGeneration, since };
         const serialized = this.seal(MAC_DOMAIN_FINALIZE, record);
         const dst = path.join(dir, finalizeFileName(claimGeneration));
+        let adopted = false;
         try {
           await this.withReserveOnEnospc(async () => {
             await this.rawWrite(
@@ -1471,10 +1477,16 @@ export class Outbox {
               { path: dir, kind: "finalize" },
             );
             await this.fsyncDir(this.root);
-            await this.installExclusive(dst, serialized, "finalize");
+            adopted = await this.installExclusive(dst, serialized, "finalize");
           });
         } catch (err) {
           return fail(isENOSPC(err) ? "enospc" : `write_failed: ${errText(err)}`);
+        }
+        if (adopted) {
+          // An existing winner was adopted: keep ITS on-disk `since`, not this call's clock.
+          const existing = await this.readAuthed(dst, MAC_DOMAIN_FINALIZE);
+          const meta = existing ? coerceFinalize(existing, runId, claimGeneration) : null;
+          if (meta) since = meta.since;
         }
         const rs = this.ensureInMemoryRun(runId, since);
         if (!rs.finalizes.has(claimGeneration)) rs.finalizes.set(claimGeneration, { claimGeneration, since });
@@ -1486,15 +1498,34 @@ export class Outbox {
     }
   }
 
-  /** Issue #1742: every pending finalize record, EXCLUDING a run that also holds a pending terminal
-   *  journal (the journal and its #1391 lease win). Read from memory. */
+  /** Issue #1742: the finalize records to offer on a register, EXCLUDING a run that also holds a
+   *  pending terminal journal (the journal and its #1391 lease win). Read from memory. The api drops
+   *  the WHOLE finalize_resume list on a duplicate run_id or on more than its entry cap, so the list
+   *  is deduplicated by run (the HIGHEST generation wins) and capped at
+   *  {@link FINALIZE_RESUME_MAX_ENTRIES}. The cap keeps the oldest `since` first (run_id tiebreak),
+   *  so the selection is deterministic; the omitted records stay on disk and are offered by a later
+   *  register once these are retired. */
   listPendingFinalizes(): PendingFinalize[] {
-    const out: PendingFinalize[] = [];
+    const best: { run_id: string; claim_generation: number; since: number }[] = [];
     for (const rs of this.runs.values()) {
       if (rs.terminals.size > 0) continue;
-      for (const f of rs.finalizes.values()) out.push({ run_id: rs.runId, claim_generation: f.claimGeneration });
+      let top: FinalizeMeta | undefined;
+      for (const f of rs.finalizes.values()) {
+        if (!top || f.claimGeneration > top.claimGeneration) top = f;
+      }
+      if (top) best.push({ run_id: rs.runId, claim_generation: top.claimGeneration, since: top.since });
     }
-    return out;
+    best.sort((a, b) => a.since - b.since || (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0));
+    const omitted = Math.max(0, best.length - FINALIZE_RESUME_MAX_ENTRIES);
+    if (omitted > 0) {
+      this.log.warn("finalize records over the register cap; omitting the newest", {
+        offered: FINALIZE_RESUME_MAX_ENTRIES,
+        omitted,
+      });
+    }
+    return best
+      .slice(0, FINALIZE_RESUME_MAX_ENTRIES)
+      .map((e) => ({ run_id: e.run_id, claim_generation: e.claim_generation }));
   }
 
   /** Issue #1742: retire one finalize record (unlink the file, drop it from the pending set). */
@@ -1509,10 +1540,20 @@ export class Outbox {
     });
   }
 
-  /** Issue #1742: retire exactly the given records, one at a time. One failure never blocks the rest
-   *  (retireFinalize swallows its own unlink errors). */
+  /** Issue #1742: retire the given records AND every lower-generation record of the same run (a
+   *  register offers only a run's highest generation, and a lower one is superseded by it). One
+   *  failure never blocks the rest (retireFinalize swallows its own unlink errors). */
   async retireFinalizes(entries: readonly PendingFinalize[]): Promise<void> {
-    for (const e of entries) await this.retireFinalize(e.run_id, e.claim_generation);
+    for (const e of entries) await this.retireFinalizesThrough(e.run_id, e.claim_generation);
+  }
+
+  /** Issue #1742: retire the run's finalize records at generation <= `claimGeneration`. Records at a
+   *  higher generation (a live flight's) are untouched. */
+  async retireFinalizesThrough(runId: string, claimGeneration: number): Promise<void> {
+    if (this.disabled) return;
+    const gens = new Set<number>([claimGeneration]);
+    for (const g of this.runs.get(runId)?.finalizes.keys() ?? []) if (g <= claimGeneration) gens.add(g);
+    for (const g of gens) await this.retireFinalize(runId, g);
   }
 
   /** Get an existing in-memory run entry, or create one WITHOUT writing a manifest to disk — a run
@@ -2081,7 +2122,8 @@ function parseFinalizeFileName(name: string): number | undefined {
   const mid = name.slice(FINALIZE_FILE_PREFIX.length, name.length - FINALIZE_FILE_SUFFIX.length);
   if (!/^\d+$/.test(mid)) return undefined;
   const gen = Number(mid);
-  return Number.isInteger(gen) && gen >= 0 ? gen : undefined;
+  // Canonical names only: `finalize-03.json` parses to 3 but is not a name journalFinalize writes.
+  return Number.isSafeInteger(gen) && gen >= 0 && String(gen) === mid ? gen : undefined;
 }
 
 /** Validate an authenticated finalize-record object: the embedded run id must match the directory
