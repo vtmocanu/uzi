@@ -7,7 +7,7 @@
 # requires: REPO_ID UZI_WORKER_TOKEN
 # provides: -
 # handoff:  -
-# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stop/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, before its FIRST cut only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stop/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the api already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
 # restores: api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
 # =============================================================================
@@ -655,13 +655,18 @@ f42_cut_judge() {
 # error, the api is restored, and only then is the error judged. A precondition or UPDATE error skips
 # the kill (the attempt is inconclusive) but still restores the api.
 f42_restart_cycle() {
-  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0
-  "${COMPOSE[@]}" exec -T agent test -f "/data/outbox/$run/finalize-$gen.json" >/dev/null 2>&1 \
-    || err="inconclusive: /data/outbox/$run/finalize-$gen.json is not present before the restart"
-  if [ -z "$err" ]; then
-    rc=0; "${COMPOSE[@]}" exec -T agent test ! -e "/data/outbox/$run/terminal-$gen.json" >/dev/null 2>&1 || rc=$?
-    [ "$rc" = 0 ] || err="inconclusive: a terminal was already journaled (terminal-$gen.json exists) for run $run before the restart, so the restart would not interrupt finalize"
-  fi
+  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline
+  # One exec prints a state token, so an exec/container error (no token) is told apart from a
+  # journaled terminal.
+  rc=0; st="$("${COMPOSE[@]}" exec -T agent sh -c \
+    "if [ ! -f '/data/outbox/$run/finalize-$gen.json' ]; then echo NO_FINALIZE; elif [ -e '/data/outbox/$run/terminal-$gen.json' ]; then echo TERMINAL_JOURNALED; else echo READY; fi" 2>/dev/null)" || rc=$?
+  st="$(printf '%s' "$st" | tr -d '[:space:]')"
+  case "$rc:$st" in
+    0:READY) ;;
+    0:NO_FINALIZE) err="inconclusive: /data/outbox/$run/finalize-$gen.json is not present before the restart";;
+    0:TERMINAL_JOURNALED) err="inconclusive: a terminal was already journaled (terminal-$gen.json exists) for run $run before the restart, so the restart would not interrupt finalize";;
+    *) err="could not inspect /data/outbox/$run in the agent container (exec exit $rc, output '$st')";;
+  esac
   if [ -z "$err" ] && [ "$set_max" = 1 ]; then
     rc=0; db_psql "UPDATE runs SET requeue_count = $max WHERE id = '$run'" >/dev/null || rc=$?
     [ "$rc" = 0 ] || err="could not set requeue_count=$max on run $run (psql exit $rc)"
@@ -670,6 +675,8 @@ f42_restart_cycle() {
     fi
   fi
   if [ -z "$err" ]; then
+    # Baseline of the agent's "registered" log lines, so the post-restart wait can prove a NEW register.
+    regs_before="$("${COMPOSE[@]}" logs agent 2>/dev/null | grep -cw 'registered' || true)"
     say "SIGKILLing the agent container with the api still down (run $run generation $gen)"
     rc=0; "${COMPOSE[@]}" kill -s SIGKILL agent >/dev/null 2>&1 || rc=$?
     [ "$rc" = 0 ] || err="could not SIGKILL the agent container (exit $rc)"
@@ -678,6 +685,17 @@ f42_restart_cycle() {
   fi
   api_back
   [ -z "$err" ] || fail "issue 1742: $err"
+  # wait_worker_online alone proves nothing here (the raised heartbeat-stale window keeps the row
+  # online across the kill), so require a fresh "registered" line from the restarted agent (worker.ts
+  # registerWithRetry). f42_wait_reclaim / the fail waits remain the judges of the run outcome.
+  deadline=$((SECONDS + 90))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    regs_now="$("${COMPOSE[@]}" logs agent 2>/dev/null | grep -cw 'registered' || true)"
+    [ "${regs_now:-0}" -gt "${regs_before:-0}" ] && break
+    sleep 1
+  done
+  [ "${regs_now:-0}" -gt "${regs_before:-0}" ] \
+    || fail "issue 1742: the restarted agent never logged a new 'registered' line within 90s (before=$regs_before now=${regs_now:-0}) for run $run"
   wait_worker_online
 }
 # f42_wait_reclaim RUN GEN TIMEOUT — poll until RUN is running at claim generation GEN. A run that goes
@@ -789,12 +807,20 @@ F42_SILENT="$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open" and
 [ -z "$F42_SILENT" ] \
   || fail "case 8: uzi run recovery shows hold(s) on run $RUN_F2 that are neither archive_ready with a capture nor source_only/needs_action: $F42_SILENT"
 F42_REC_TXT="$(uzi_cli run recovery "$RUN_F2" 2>&1)" || fail "case 8: uzi run recovery failed (exit $?): $F42_REC_TXT"
-if [ "$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open")] | length')" -gt 0 ]; then
-  case "$F42_REC_TXT" in
-    *'uzi run export'*|*"no recovery archive; custody"*) ;;
-    *) fail "case 8: the human recovery output for run $RUN_F2 names neither the export hint nor the no-recovery-archive custody line: $F42_REC_TXT";;
+# Per open hold, the human output must carry the text matching its attention: archive_ready ->
+# export hint, source_only -> custody line, needs_action -> discard hint.
+for F42_ATT in $(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open") | .attention] | unique | .[]'); do
+  case "$F42_ATT" in
+    archive_ready) F42_WANT='uzi run export';;
+    source_only) F42_WANT='no recovery archive; custody';;
+    needs_action) F42_WANT='uzi run discard';;
+    *) continue;;
   esac
-fi
+  case "$F42_REC_TXT" in
+    *"$F42_WANT"*) ;;
+    *) fail "case 8: the human recovery output for run $RUN_F2 has an open $F42_ATT hold but lacks '$F42_WANT': $F42_REC_TXT";;
+  esac
+done
 pass "case 8: uzi run recovery on run $RUN_F2 shows no silent empty hold ($(printf '%s' "$F42_REC" | jq -r 'length') hold(s) listed)"
 
 # =============================================================================
