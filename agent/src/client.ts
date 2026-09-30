@@ -76,7 +76,15 @@ import {
   type RecoverySettleResponse,
 } from "./protocol.js";
 
-/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
+/** A job input file download hit its per-file timeout (WorkerClient#downloadJobFile), before or
+ *  after the response headers. Distinct from a torn stream so the job reports a timeout. */
+export class JobFileTimeoutError extends Error {
+  constructor(timeoutMs: number, options?: { cause?: unknown }) {
+    super(`download timed out after ${timeoutMs} ms`, options);
+    this.name = "JobFileTimeoutError";
+  }
+}
+
 /** Issue #1673: an /inputs/ack or /inputs/applied reply. `reason` says why an inactive claim is
  *  inactive: switch_pending (keep polling), released or stale (end the old flight). */
 export interface InputReceipt {
@@ -85,6 +93,7 @@ export interface InputReceipt {
   reason?: string;
 }
 
+/** Error carrying the server's HTTP status + (truncated) body for retry logic. */
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -1639,16 +1648,27 @@ export class WorkerClient {
   ): Promise<void> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(fileId)}?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
     const timeout = AbortSignal.timeout(timeoutMs);
-    const res = await fetch(this.baseUrl + path, {
-      method: "GET",
-      headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version },
-      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
-    });
+    let res: Response;
+    try {
+      res = await fetch(this.baseUrl + path, {
+        method: "GET",
+        headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version },
+        signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+      });
+    } catch (err) {
+      if (timeout.aborted && !signal?.aborted) throw new JobFileTimeoutError(timeoutMs, { cause: err });
+      throw err;
+    }
     if (res.status !== 200) throw await this.toError("GET", path, res);
     if (!res.body) throw new Error("job file download returned no body");
     const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>);
     try {
       await sink(body);
+    } catch (err) {
+      // The per-file timeout errors the body mid-stream, which a sink reports as a torn stream;
+      // name the timeout instead. (Not when the caller's own signal fired: that is its own reason.)
+      if (timeout.aborted && !signal?.aborted) throw new JobFileTimeoutError(timeoutMs, { cause: err });
+      throw err;
     } finally {
       // Release the socket whether the sink finished or threw (a no-op on a fully read body).
       body.destroy();
@@ -2263,12 +2283,37 @@ export class WorkerClient {
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {
     let text = "";
     try {
-      text = (await res.text()).slice(0, 4096).trim();
+      text = (await readBoundedText(res, ERROR_BODY_MAX_BYTES)).slice(0, 4096).trim();
     } catch {
       // ignore body read failures — the status is the signal that matters.
     }
     return new RequestError(method, path, res.status, text);
   }
+}
+
+/** Most bytes of an error response body toError reads. */
+const ERROR_BODY_MAX_BYTES = 4096;
+
+/** Read at most `maxBytes` of `res`'s body as UTF-8 text, then cancel the stream so a hostile or
+ *  unending body neither fills memory nor holds the connection. A body that ends sooner is read
+ *  whole, so a small body yields exactly what Response#text() would. A read failure rejects. */
+async function readBoundedText(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return "";
+  const reader = res.body.getReader();
+  const parts: Uint8Array[] = [];
+  let total = 0;
+  try {
+    while (total < maxBytes) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      parts.push(value.length > maxBytes - total ? value.subarray(0, maxBytes - total) : value);
+      total += parts[parts.length - 1]!.length;
+    }
+  } finally {
+    // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
+    await reader.cancel().catch(() => undefined);
+  }
+  return new TextDecoder().decode(Buffer.concat(parts));
 }
 
 /**

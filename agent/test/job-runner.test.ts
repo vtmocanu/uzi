@@ -1,5 +1,6 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +10,7 @@ import type { HookInput, Options as SdkOptions } from "@anthropic-ai/claude-agen
 
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { WorkerClient } from "../src/client.js";
-import { RequestError } from "../src/client.js";
+import { JobFileTimeoutError, RequestError } from "../src/client.js";
 import {
   buildJobPrompt,
   buildJobResultServer,
@@ -22,7 +23,7 @@ import { JobInputError } from "../src/job-workspace.js";
 import type { ClaimResponse, JobResultRequest, OutgoingMessage, StateRequest, UserInput } from "../src/protocol.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { stubJobQueryFn } from "../src/job-runner-stub.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, recordingLogger } from "./helpers.js";
 
 const GEN = 7;
 const roots: string[] = [];
@@ -740,14 +741,23 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
     ];
     for (const [name, claim, want] of cases) {
       const jobsRoot = await tmpJobsRoot();
-      const { client, calls } = fakeClient({ downloadJobFile: send(body) });
+      // execute's finally removes any workspace, so a leftover check after it proves nothing:
+      // observe the jobs root at the failed report, which runs before that cleanup.
+      let rootAtFailure: string[] | undefined;
+      const { client, calls } = fakeClient({
+        downloadJobFile: send(body),
+        reportState: (_id, b) => {
+          if (b.status === "failed") rootAtFailure = fs.existsSync(jobsRoot) ? fs.readdirSync(jobsRoot) : []; // absent = nothing created
+          return { applied: true, status: b.status };
+        },
+      });
       const flag = { ran: false };
       await newRunner(client, jobsRoot, noSession(flag)).execute(claim);
+      assert.deepStrictEqual(rootAtFailure, [], `${name}: no workspace may exist when the refusal is reported`);
       assert.ok(!calls.order.some((o) => o.startsWith("download:")), `${name}: no download may start`);
       assert.strictEqual(flag.ran, false, name);
       assert.strictEqual(calls.states.at(-1)!.body.status, "failed", name);
       assert.match(calls.states.at(-1)!.body.failure_reason!, want, name);
-      assert.strictEqual(await fsp.readdir(jobsRoot).then((l) => l.length).catch(() => 0), 0, `${name}: no workspace created`);
     }
   });
 
@@ -773,11 +783,11 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
     assert.strictEqual(calls.states.at(-1)!.body.failure_reason, 'job input file "Q3 report.pdf" failed its integrity check');
   });
 
-  it("counts download time against the budget: the session gets only what the download left", async () => {
-    const jobsRoot = await tmpJobsRoot();
+  it("counts download time against the budget: the session is handed only what the download left", async () => {
+    const DOWNLOAD_MS = 300;
     const { client, calls } = fakeClient({
       downloadJobFile: async (id, fid, g, sink) => {
-        await new Promise((r) => setTimeout(r, 600));
+        await new Promise((r) => setTimeout(r, DOWNLOAD_MS));
         await send(body)(id, fid, g, sink);
       },
     });
@@ -785,13 +795,30 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
       yield INIT_OK;
       await hang(); // never submits: only the wall-clock deadline ends it
     });
-    const t0 = Date.now();
-    await newRunner(client, jobsRoot, qf).execute(jobClaim({ budget_wall_seconds: 1 }, { files: [fileEntry()] }));
-    const elapsed = Date.now() - t0;
+    const { logger, lines } = recordingLogger();
+    const runner = new JobRunner(client, logger, { queryFn: qf, jobsRoot: await tmpJobsRoot(), batchMs: 5, cancelPollMs: 10 });
+    await runner.execute(jobClaim({ budget_wall_seconds: 2 }, { files: [fileEntry()] }));
     const last = calls.states.at(-1)!.body;
     assert.strictEqual(last.status, "failed");
-    assert.match(last.failure_reason!, /exceeded its wall-clock budget of 1s/);
-    assert.ok(elapsed < 1400, `the session ran the full budget on top of the download (${elapsed} ms)`);
+    assert.match(last.failure_reason!, /exceeded its wall-clock budget of 2s/);
+    // The session deadline is armed with the budget minus the time the download took. A timer never
+    // fires early, so the download consumed at least DOWNLOAD_MS: the handed budget is a hard bound,
+    // not a wall-clock race. The old behaviour handed the full 2000 ms.
+    const armed = lines.find((l) => (l as { msg?: string }).msg === "job exceeded its wall-clock budget; aborting") as { budget_ms?: number } | undefined;
+    assert.ok(armed, "the session deadline fired (not the download one)");
+    assert.ok(armed.budget_ms! > 0 && armed.budget_ms! <= 2000 - DOWNLOAD_MS, `the session was handed ${armed.budget_ms} ms`);
+  });
+
+  it("reports a per-file download timeout as a timeout, not an integrity failure", async () => {
+    const { client, calls } = fakeClient({
+      downloadJobFile: async () => {
+        throw new JobFileTimeoutError(300_000);
+      },
+    });
+    const flag = { ran: false };
+    await newRunner(client, await tmpJobsRoot(), noSession(flag)).execute(jobClaim({}, { files: [fileEntry()] }));
+    assert.strictEqual(flag.ran, false);
+    assert.strictEqual(calls.states.at(-1)!.body.failure_reason, 'timed out downloading job input file "Q3 report.pdf"');
   });
 
   it("fails with the budget reason, without a session, when the budget runs out during a download", async () => {

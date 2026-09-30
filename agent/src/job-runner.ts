@@ -32,7 +32,7 @@ import { z } from "zod";
 
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { MessageBatcher } from "./batcher.js";
-import type { WorkerClient } from "./client.js";
+import { JobFileTimeoutError, type WorkerClient } from "./client.js";
 import type { EmittedMessage } from "./executor.js";
 import { ASYNC_DEFERRAL_TOOLS, buildPathGuardHook, buildPreToolUseHook, NESTED_AGENT_TOOL, WRITE_PATH_TOOLS } from "./guardrails.js";
 import {
@@ -737,6 +737,9 @@ export class JobRunner {
           timeoutMs,
         );
       } catch (err) {
+        if (err instanceof JobFileTimeoutError) {
+          throw new JobFileFailure(`timed out downloading job input file "${shown}"`, err);
+        }
         if (err instanceof JobFileIntegrityError) {
           throw new JobFileFailure(`job input file "${shown}" failed its integrity check`, err);
         }

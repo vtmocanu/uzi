@@ -1288,9 +1288,9 @@ func Load() (Config, error) {
 	cfg.RecoveryRequestDeadline = parseDuration("UZI_RECOVERY_REQUEST_DEADLINE", 120*time.Second)
 
 	// Job-file limits (PRD #1909 D1).
-	cfg.JobInputFileMaxBytes = parseInt64("UZI_JOB_INPUT_FILE_MAX_BYTES", 25<<20)
-	cfg.JobInputsMaxFiles = parseInt("UZI_JOB_INPUTS_MAX_FILES", 10)
-	cfg.JobInputsMaxBytes = parseInt64("UZI_JOB_INPUTS_MAX_BYTES", 50<<20)
+	cfg.JobInputFileMaxBytes = clampToWorkerCeiling("UZI_JOB_INPUT_FILE_MAX_BYTES", parseInt64("UZI_JOB_INPUT_FILE_MAX_BYTES", 25<<20), WorkerJobInputFileMaxBytes)
+	cfg.JobInputsMaxFiles = int(clampToWorkerCeiling("UZI_JOB_INPUTS_MAX_FILES", int64(parseInt("UZI_JOB_INPUTS_MAX_FILES", 10)), WorkerJobInputsMaxFiles))
+	cfg.JobInputsMaxBytes = clampToWorkerCeiling("UZI_JOB_INPUTS_MAX_BYTES", parseInt64("UZI_JOB_INPUTS_MAX_BYTES", 50<<20), WorkerJobInputsMaxBytes)
 	cfg.JobOutputFileMaxBytes = parseInt64("UZI_JOB_OUTPUT_FILE_MAX_BYTES", 25<<20)
 	cfg.JobOutputsMaxFiles = parseInt("UZI_JOB_OUTPUTS_MAX_FILES", 50)
 	cfg.JobOutputsMaxBytes = parseInt64("UZI_JOB_OUTPUTS_MAX_BYTES", 100<<20)
@@ -2023,6 +2023,27 @@ func parseDuration(key string, def time.Duration) time.Duration {
 		return d
 	}
 	return def
+}
+
+// The worker's fixed ceilings on one job's uploaded input files (PRD #1909 D1). They mirror
+// JOB_INPUT_CEILINGS in agent/src/job-workspace.ts (TestWorkerJobInputCeilingsMatchTheAgent pins the
+// two together): a worker refuses any manifest over them whatever the claim says, so an operator
+// limit above them would accept jobs that every worker then refuses. Load clamps to them.
+const (
+	WorkerJobInputFileMaxBytes int64 = 256 << 20
+	WorkerJobInputsMaxFiles    int64 = 64
+	WorkerJobInputsMaxBytes    int64 = 1 << 30
+)
+
+// clampToWorkerCeiling returns v, or ceiling with a warning when v is above it.
+func clampToWorkerCeiling(key string, v, ceiling int64) int64 {
+	if v <= ceiling {
+		return v
+	}
+	slog.Warn(key+" is above the worker's fixed ceiling; clamping (a worker refuses any job input over it, so a higher limit would accept jobs every worker then refuses)",
+		"configured", v,
+		"clamped_to", ceiling)
+	return ceiling
 }
 
 func parseInt(key string, def int) int {

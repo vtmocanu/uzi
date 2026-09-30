@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 
-import { RequestError, WorkerClient } from "../src/client.js";
+import { JobFileTimeoutError, RequestError, WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
 
 // PRD #1909 M3: WorkerClient.downloadJobFile streams the worker input download.
@@ -110,5 +110,65 @@ describe("WorkerClient.downloadJobFile", () => {
     const started = Date.now();
     await assert.rejects(() => client.downloadJobFile("r", "f", 1, async (body) => { await collect(body); }, undefined, 50));
     assert.ok(Date.now() - started < 3000);
+  });
+
+  it("surfaces a per-file timeout that fires mid-body as JobFileTimeoutError, not a generic stream error", async () => {
+    const client = await serve((_req, res) => {
+      res.writeHead(200, { "Content-Length": "1000000" });
+      res.write("x");
+    });
+    await assert.rejects(
+      () => client.downloadJobFile("r", "f", 1, async (body) => { await collect(body); }, undefined, 50),
+      (err: unknown) => err instanceof JobFileTimeoutError,
+    );
+  });
+
+  it("does not call a caller's own abort a timeout", async () => {
+    const client = await serve((_req, res) => {
+      res.writeHead(200, { "Content-Length": "1000000" });
+      res.write("x");
+    });
+    const ac = new AbortController();
+    await assert.rejects(
+      () => client.downloadJobFile("r", "f", 1, async (body) => { setTimeout(() => ac.abort(), 20); await collect(body); }, ac.signal),
+      (err: unknown) => !(err instanceof JobFileTimeoutError),
+    );
+  });
+
+  it("reads at most 4096 bytes of a hostile error body, returns promptly and releases the connection", async () => {
+    let closed: Promise<void> = Promise.resolve();
+    const client = await serve((req, res) => {
+      closed = new Promise<void>((r) => req.socket.once("close", () => r()));
+      res.writeHead(500, { "Content-Type": "text/plain" });
+      const chunk = "e".repeat(16 * 1024);
+      const pump = (): void => {
+        // An unending body, written only as fast as the client drains it.
+        while (res.write(chunk)) {
+          /* keep filling until backpressure */
+        }
+        res.once("drain", pump);
+      };
+      pump();
+      res.on("close", () => res.removeAllListeners("drain"));
+    });
+    const started = Date.now();
+    // A per-call timeout far longer than the assertion: only a bounded read can finish in time.
+    await assert.rejects(
+      () => client.downloadJobFile("r", "f", 1, async () => undefined, undefined, 20_000),
+      (err: unknown) => err instanceof RequestError && err.status === 500 && err.body.length === 4096 && /^e+$/.test(err.body),
+    );
+    assert.ok(Date.now() - started < 3000, "the error read did not wait for the unending body");
+    await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("connection still held after the error read")), 3000))]);
+  });
+
+  it("keeps a small error body whole and trimmed", async () => {
+    const client = await serve((_req, res) => {
+      res.writeHead(500);
+      res.end('  {"error":"boom"}\n');
+    });
+    await assert.rejects(
+      () => client.downloadJobFile("r", "f", 1, async () => undefined),
+      (err: unknown) => err instanceof RequestError && err.body === '{"error":"boom"}',
+    );
   });
 });

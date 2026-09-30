@@ -3,6 +3,8 @@ package workersvc
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -109,5 +111,26 @@ func TestJobClaimCarriesInputLimitsLiveDB(t *testing.T) {
 	}
 	if pl.Config.JobInputsMaxFiles != 3 || pl.Config.JobInputsMaxBytes != 9<<20 {
 		t.Fatalf("inputs caps = %d files / %d bytes, want 3 / %d", pl.Config.JobInputsMaxFiles, pl.Config.JobInputsMaxBytes, 9<<20)
+	}
+
+	// With no job-file store the claim omits the limits: the keys are absent from the wire JSON.
+	e.svc.SetJobFiles(nil)
+	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); err != nil {
+		t.Fatalf("CreateJobRun (no store): %v", err)
+	}
+	capID2 := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
+	capable2 := store.Worker{ID: capID2, UserID: u, Name: "capable-2", Status: "online", ProtocolCapabilities: []string{jobCap, jobFilesCap}}
+	pl2, err := e.svc.Claim(e.ctx, capable2, nil)
+	if err != nil || pl2 == nil || pl2.Job == nil {
+		t.Fatalf("Claim (no store) = %+v, %v", pl2, err)
+	}
+	raw, err := json.Marshal(pl2.Config)
+	if err != nil {
+		t.Fatalf("marshal config: %v", err)
+	}
+	for _, key := range []string{"job_input_file_max_bytes", "job_inputs_max_files", "job_inputs_max_bytes"} {
+		if strings.Contains(string(raw), key) {
+			t.Fatalf("a claim on a service with no job-file store carries %q: %s", key, raw)
+		}
 	}
 }
