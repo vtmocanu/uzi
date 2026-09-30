@@ -193,6 +193,10 @@ var (
 	// the lifetime number of revisions requested, not the pending backlog. → 409.
 	ErrReviseCapReached = errors.New("plan revision limit reached")
 	ErrInvalidState     = errors.New("invalid run state")
+	// ErrJobNeverParks marks a worker-reported parking status for a job run (PRD #1908 D-E). It is
+	// always wrapped together with ErrInvalidState, so existing 400 mapping holds; the handler
+	// checks it first to name the refusal instead of listing the state it refused.
+	ErrJobNeverParks = errors.New("a job run never parks")
 	// The two forge-park precedence sentinels (PRD #1392 M1). Both are returned by SetState's
 	// forge-park transaction alongside the run row (nothing else returns them), and the handler
 	// maps each to a 409 whose body carries {run, reason}: ErrForgeParkStaleClaim → reason
@@ -3739,7 +3743,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if owned.Kind == runkind.Job {
 		switch req.State {
 		case "awaiting_input", "awaiting_approval", "awaiting_followup", "paused":
-			return owned, false, fmt.Errorf("%w: a job run never parks (%s)", ErrInvalidState, req.State)
+			return owned, false, fmt.Errorf("%w: %w (%s)", ErrInvalidState, ErrJobNeverParks, req.State)
 		}
 	}
 	// PRD #1247 M5a-1 rework (auditor fail-open finding): FAIL CLOSED for a CAPABILITY worker. The

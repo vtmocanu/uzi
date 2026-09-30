@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -21,6 +22,10 @@ func assertJobFailedNotParked(t *testing.T, run store.Run) {
 		!run.FinishedAt.Valid || run.HoldReason.Valid {
 		t.Fatalf("job = %s / origin %q / reason %q / finished %v / hold %v; want failed / credential_unavailable with a reason and no hold",
 			run.Status, run.FailOrigin.String, run.FailureReason.String, run.FinishedAt.Valid, run.HoldReason)
+	}
+	// Single prefix: the stored reason must not stack "credential unavailable: credential disabled: ...".
+	if !strings.HasPrefix(run.FailureReason.String, "credential unavailable: ") || strings.Contains(run.FailureReason.String, "credential disabled: ") {
+		t.Fatalf("failure reason = %q; want a single \"credential unavailable: \" prefix", run.FailureReason.String)
 	}
 }
 

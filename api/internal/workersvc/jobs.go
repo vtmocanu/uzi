@@ -194,8 +194,9 @@ func JobStatus(runStatus string) string {
 	case "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup":
 		return "running"
 	// A job never parks (PRD #1908 D-E): a disabled credential, a usage or time limit and a pool
-	// or recovery situation each fail it instead. These four are mapped defensively, so a row
-	// that somehow reaches one reads as the non-terminal "waiting" and never as finished.
+	// or recovery situation each fail it or requeue it to queued instead. These four are mapped
+	// defensively, so a row that somehow reaches one reads as the non-terminal "waiting" and
+	// never as finished.
 	case "pool_wait", "paused", "limit_wait", "recovery_wait":
 		return "waiting"
 	case "completed", "failed", "cancelled":

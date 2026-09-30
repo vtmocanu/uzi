@@ -1112,6 +1112,23 @@ func TestWorkerStateForeignClaimDoesNotRevealCodexAlias(t *testing.T) {
 	}
 }
 
+// TestWorkerStateJobParkingReportIs400 pins PRD #1908 D-E at the handler: a parking status for a
+// job run is a 400 whose message names the refusal (a job run never parks, and the state), not
+// the generic state list, which would include the very state refused.
+func TestWorkerStateJobParkingReportIs400(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Kind: "job", Status: "running"}})
+	rec := httptest.NewRecorder()
+	h.WorkerRunState(rec, workerReq(http.MethodPost, `{"status":"paused"}`, runID))
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body %q)", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "a job run never parks (paused)") || strings.Contains(body, "state must be one of") {
+		t.Fatalf("400 body = %q, want the job refusal naming the state, not the generic list", body)
+	}
+}
+
 func TestWorkerStateAlreadyTerminalReturns409(t *testing.T) {
 	runID := uuid.New()
 	// Owned run is cancelled; the guarded completed-update touches 0 rows.
