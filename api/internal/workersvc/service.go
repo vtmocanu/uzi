@@ -1704,11 +1704,16 @@ type Service struct {
 	// jobFiles is the PRD #1909 job-file store the upload/download surfaces reach through
 	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
 	jobFiles *JobFiles
-	// genMu guards genLocks, the per-run generated-output locks; genWG tracks the detached
-	// generated-output storages (startJobResultOutputs); genTimeout and genReplyBound override the
-	// package defaults when positive (tests).
+	// genMu guards genRuns (the runs with a generated-output storage in flight, each with at most
+	// one pending behind it) and genClosed (set by DrainGeneratedOutputs); genWG tracks the detached
+	// generated-output storages (startJobResultOutputs); genTimeout, genReplyBound and genMax
+	// override the package defaults when positive (tests).
 	genMu         sync.Mutex
-	genLocks      map[uuid.UUID]*runGenLock
+	genRuns       map[uuid.UUID]*runGen
+	genClosed     bool
+	genMax        int
+	genDrainBound time.Duration
+	genHook       func(*genJob) // test seam: called at the start of each generation
 	genWG         sync.WaitGroup
 	genTimeout    time.Duration
 	genReplyBound time.Duration

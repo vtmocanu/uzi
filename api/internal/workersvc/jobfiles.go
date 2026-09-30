@@ -867,8 +867,9 @@ type JobFilesSweepResult struct {
 // Total is the number of rows the pass changed.
 func (r JobFilesSweepResult) Total() int64 { return r.ReleasedReservations + r.Settled + r.Expired }
 
-// Sweep is the job_files_sweep pass: it releases reservations older than twice the request
-// deadline (an upload that died without releasing), moves attached files of terminal jobs to
+// Sweep is the job_files_sweep pass: it releases reservations older than
+// StaleReservationCutoff, the largest possible upload deadline plus one request deadline (an upload
+// that died without releasing), moves attached files of terminal jobs to
 // 'available' with their retention clock starting at the job's end, and expires unattached and
 // available files past their expiry, deleting the chunks and keeping the row. All three run in one
 // transaction under the stored-files lock, so the pass serializes with admission and with the

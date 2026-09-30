@@ -70,6 +70,37 @@ func (q *Queries) AttachInputJobFiles(ctx context.Context, arg AttachInputJobFil
 	return items, nil
 }
 
+const deleteGeneratedOutputRefusals = `-- name: DeleteGeneratedOutputRefusals :execrows
+DELETE FROM job_output_refusals
+ WHERE run_id = $1::uuid
+   AND display_name = ANY($2::text[])
+   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND EXISTS (SELECT 1 FROM runs
+                WHERE id = $1::uuid AND claim_generation = $3::bigint
+                  AND claim_released_at IS NULL)
+`
+
+type DeleteGeneratedOutputRefusalsParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	DisplayNames    []string  `json:"display_names"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Clears the refusal rows the server's own output generation owns for the given names (PRD #1909
+// M4): the generation_pending marker, a generation_failed / generation_timeout row, or a refusal
+// the generation recorded (file_too_large, a quota). NOT the worker's own rows: a worker-reported
+// drop (reason worker_*) and the reserved_name refusal of an upload under a reserved name stay.
+// Used to rewrite the markers when a result is (re-)posted, and to clear one when its file is
+// stored. FENCED like InsertJobOutputRefusal: a no-op unless @claim_generation is the run's CURRENT
+// generation and the claim is not released, so a stale flight cannot clear the new flight's rows.
+func (q *Queries) DeleteGeneratedOutputRefusals(ctx context.Context, arg DeleteGeneratedOutputRefusalsParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteGeneratedOutputRefusals, arg.RunID, arg.DisplayNames, arg.ClaimGeneration)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteJobOutputFile = `-- name: DeleteJobOutputFile :execrows
 DELETE FROM job_files
  WHERE id = $1 AND run_id = $2 AND direction = 'output' AND claim_generation = $3
@@ -646,6 +677,44 @@ func (q *Queries) ReserveJobFile(ctx context.Context, arg ReserveJobFileParams) 
 		&i.UpdatedAt,
 	)
 	return i, err
+}
+
+const settleGeneratedOutputRefusal = `-- name: SettleGeneratedOutputRefusal :execrows
+UPDATE job_output_refusals
+   SET reason = $1::text, byte_size = $2::bigint
+ WHERE run_id = $3::uuid
+   AND display_name = $4::text
+   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND EXISTS (SELECT 1 FROM runs
+                WHERE id = $3::uuid AND claim_generation = $5::bigint
+                  AND claim_released_at IS NULL)
+`
+
+type SettleGeneratedOutputRefusalParams struct {
+	Reason          string    `json:"reason"`
+	ByteSize        int64     `json:"byte_size"`
+	RunID           uuid.UUID `json:"run_id"`
+	DisplayName     string    `json:"display_name"`
+	ClaimGeneration int64     `json:"claim_generation"`
+}
+
+// Turns the generation-owned row of a name (the generation_pending marker, see
+// DeleteGeneratedOutputRefusals for the set) into the outcome of the generation (a refusal reason),
+// in place, so the marker is replaced atomically and is never lost to the per-run row cap that
+// InsertJobOutputRefusal applies. 0 rows means there was no marker; the caller then inserts the
+// refusal. Fenced on the claim generation like the insert.
+func (q *Queries) SettleGeneratedOutputRefusal(ctx context.Context, arg SettleGeneratedOutputRefusalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, settleGeneratedOutputRefusal,
+		arg.Reason,
+		arg.ByteSize,
+		arg.RunID,
+		arg.DisplayName,
+		arg.ClaimGeneration,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const settleTerminalJobFiles = `-- name: SettleTerminalJobFiles :execrows

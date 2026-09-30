@@ -73,10 +73,12 @@ type JobResultSubmission struct {
 // and the new ones inserted, all in ONE transaction: a retried POST replaces the earlier body and
 // a failure part-way leaves the earlier result untouched.
 //
-// After the commit the server stores the result's report.md and findings.json as output files and
-// records the outputs the worker reported dropping (startJobResultOutputs; its comment has the
-// lock order and the bounds: those writes run OUTSIDE this transaction, on a context detached from
-// the request, and the reply waits for them at most a few seconds). They never fail the ingest.
+// The generation_pending markers and the outputs the worker reported dropping are recorded in the
+// same transaction. After the commit
+// the server stores the result's report.md and findings.json as output files (startJobResultOutputs;
+// its comment has the lock order and the bounds: those writes run OUTSIDE this transaction, on a
+// context detached from the request, and the reply waits for them at most a few seconds). They never
+// fail the ingest.
 //
 // Errors: ErrRunNotFound (not held by this worker), ErrNotJobRun, ErrStaleClaim (generation
 // mismatch or released claim), ErrRunTerminal.
@@ -127,6 +129,27 @@ func (s *Service) SubmitJobResult(ctx context.Context, wkr store.Worker, runID u
 			Line:      pgconv.Int4Ptr32(f.Line),
 		}); err != nil {
 			return err
+		}
+	}
+	// The generation_pending markers of the files the server will generate, and the outputs the
+	// worker reported dropping, are recorded here, in the result transaction, so neither depends on
+	// the detached generation below (fenced on the claim generation and bounded by the per-run
+	// output file cap in the statement itself). The markers make a generation that never finishes
+	// (crash, kill) visible instead of silent: see RefusalGenerationPending.
+	if s.jobFiles != nil {
+		if err = s.jobFiles.markGenerationPending(ctx, qtx, runID, claimGeneration, sub); err != nil {
+			return err
+		}
+		for i, r := range sub.RefusedOutputs {
+			if i >= s.jobFiles.limits.OutputsMaxFiles {
+				break
+			}
+			if _, err = qtx.InsertJobOutputRefusal(ctx, store.InsertJobOutputRefusalParams{
+				RunID: runID, DisplayName: r.DisplayName, Reason: r.Reason,
+				ClaimGeneration: claimGeneration, MaxRows: int64(s.jobFiles.limits.OutputsMaxFiles),
+			}); err != nil {
+				return err
+			}
 		}
 	}
 	if err = tx.Commit(ctx); err != nil {

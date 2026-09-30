@@ -458,7 +458,7 @@ func TestJobFilesSweepLiveDB(t *testing.T) {
 	u := e.seedUser(t)
 
 	// Reservations: one past the stale cutoff (the max upload deadline plus a RequestDeadline), one
-	// within it (older than 2x the request deadline: a slow live upload is not swept).
+	// within it (a slow live upload is not swept).
 	stale, err := e.jf.Reserve(e.ctx, ReserveParams{UserID: u, Direction: JobFileInput, DisplayName: "stale.txt", DeclaredSize: 100})
 	if err != nil {
 		t.Fatal(err)
@@ -469,6 +469,13 @@ func TestJobFilesSweepLiveDB(t *testing.T) {
 	}
 	e.exec(`UPDATE job_files SET created_at = now() - make_interval(secs => $2) WHERE id = $1`, stale.ID, (l.StaleReservationCutoff() + time.Minute).Seconds())
 	e.exec(`UPDATE job_files SET created_at = now() - interval '5 minutes' WHERE id = $1`, fresh.ID)
+	// Aged past the largest upload deadline but inside the RequestDeadline margin: not swept.
+	// MUTATION CHECK: dropping the RequestDeadline margin from StaleReservationCutoff sweeps it.
+	mid, err := e.jf.Reserve(e.ctx, ReserveParams{UserID: u, Direction: JobFileInput, DisplayName: "mid.txt", DeclaredSize: 100})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.exec(`UPDATE job_files SET created_at = now() - make_interval(secs => $2) WHERE id = $1`, mid.ID, (l.maxUploadDeadline() + l.requestDeadlineOrDefault()/2).Seconds())
 
 	// Outputs: one on a live run, one on a run that finished an hour ago.
 	liveRun := e.jobFor(t, u)
@@ -489,7 +496,7 @@ func TestJobFilesSweepLiveDB(t *testing.T) {
 	if res.ReleasedReservations != 1 || res.Settled != 1 || res.Expired != 1 {
 		t.Fatalf("sweep = %+v, want 1 released, 1 settled, 1 expired", res)
 	}
-	if e.fileExists(t, stale.ID) || !e.fileExists(t, fresh.ID) {
+	if e.fileExists(t, stale.ID) || !e.fileExists(t, fresh.ID) || !e.fileExists(t, mid.ID) {
 		t.Fatal("only the stale reservation may be released")
 	}
 	if e.fileState(t, liveOut.ID) != JobFileAttached {

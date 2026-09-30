@@ -281,6 +281,37 @@ DELETE FROM job_files
 DELETE FROM job_output_refusals
  WHERE id IN (SELECT r.id FROM job_output_refusals r WHERE r.run_id = @run_id FOR UPDATE SKIP LOCKED);
 
+-- name: DeleteGeneratedOutputRefusals :execrows
+-- Clears the refusal rows the server's own output generation owns for the given names (PRD #1909
+-- M4): the generation_pending marker, a generation_failed / generation_timeout row, or a refusal
+-- the generation recorded (file_too_large, a quota). NOT the worker's own rows: a worker-reported
+-- drop (reason worker_*) and the reserved_name refusal of an upload under a reserved name stay.
+-- Used to rewrite the markers when a result is (re-)posted, and to clear one when its file is
+-- stored. FENCED like InsertJobOutputRefusal: a no-op unless @claim_generation is the run's CURRENT
+-- generation and the claim is not released, so a stale flight cannot clear the new flight's rows.
+DELETE FROM job_output_refusals
+ WHERE run_id = @run_id::uuid
+   AND display_name = ANY(@display_names::text[])
+   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND EXISTS (SELECT 1 FROM runs
+                WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
+                  AND claim_released_at IS NULL);
+
+-- name: SettleGeneratedOutputRefusal :execrows
+-- Turns the generation-owned row of a name (the generation_pending marker, see
+-- DeleteGeneratedOutputRefusals for the set) into the outcome of the generation (a refusal reason),
+-- in place, so the marker is replaced atomically and is never lost to the per-run row cap that
+-- InsertJobOutputRefusal applies. 0 rows means there was no marker; the caller then inserts the
+-- refusal. Fenced on the claim generation like the insert.
+UPDATE job_output_refusals
+   SET reason = @reason::text, byte_size = @byte_size::bigint
+ WHERE run_id = @run_id::uuid
+   AND display_name = @display_name::text
+   AND reason <> 'reserved_name' AND reason NOT LIKE 'worker\_%'
+   AND EXISTS (SELECT 1 FROM runs
+                WHERE id = @run_id::uuid AND claim_generation = @claim_generation::bigint
+                  AND claim_released_at IS NULL);
+
 -- name: DeleteStaleGeneratedJobOutput :execrows
 -- A re-posted job result replaces the files the server generated from it (report.md and
 -- findings.json): the same-name file of this run and claim generation whose content differs is

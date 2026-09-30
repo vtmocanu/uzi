@@ -1528,6 +1528,19 @@ func run() error {
 		go drain(tlsSrv)
 	}
 	drainWG.Wait()
+	// Generated job outputs (report.md, findings.json) are stored by detached goroutines after the
+	// ingest reply. ORDER: after the HTTP drain above (no request can start one any more, so the
+	// service's WaitGroup sees no new Add) and BEFORE the deferred pool.Close (they store through
+	// the pool). The service refuses new ones from here on (recorded generation_failed) and this
+	// waits for the running ones for at most 15 s. Budget: the HTTP drain above is up to 10 s, so
+	// 10 s + 15 s stays inside the default 30 s Kubernetes termination grace (the chart sets none).
+	// A generation still running at the bound is not lost silently: SubmitJobResult committed a
+	// generation_pending refusal row for each generated file with the result, and only storing the
+	// file (or recording its failure) removes it, so an abandoned one (this bound, a SIGKILL, a
+	// crash) stays visible as generation_pending.
+	if !wsvc.DrainGeneratedOutputs() {
+		slog.Warn("shutdown: generated job outputs still in flight at the drain deadline")
+	}
 	stop() // cancel ctx so the poller + sweeper + reconciler Run return (covers the server-error path too)
 	bgWG.Wait()
 	// The HTTP server has drained, so no new inline Notify can be fired; wait for

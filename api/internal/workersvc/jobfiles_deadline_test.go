@@ -67,5 +67,12 @@ func TestStaleReservationCutoffCoversMaxUploadDeadline(t *testing.T) {
 		if got := l.StaleReservationCutoff(); got <= maxDeadline {
 			t.Errorf("RequestDeadline %s: cutoff %s is not beyond the max upload deadline %s", l.RequestDeadline, got, maxDeadline)
 		}
+		// The exact formula: the largest upload deadline plus one RequestDeadline of margin.
+		if got, want := l.StaleReservationCutoff(), l.maxUploadDeadline()+l.requestDeadlineOrDefault(); got != want {
+			t.Errorf("RequestDeadline %s: cutoff %s, want maxUploadDeadline+RequestDeadline = %s", l.RequestDeadline, got, want)
+		}
+		if got := l.StaleReservationCutoff(); got < maxDeadline+l.requestDeadlineOrDefault() {
+			t.Errorf("RequestDeadline %s: cutoff %s lacks the %s margin over %s", l.RequestDeadline, got, l.requestDeadlineOrDefault(), maxDeadline)
+		}
 	}
 }
