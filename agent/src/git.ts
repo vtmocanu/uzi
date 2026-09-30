@@ -1269,6 +1269,58 @@ export class GitCache {
     return path.join(this.reposRoot, bareDirName(repoUrl));
   }
 
+  /**
+   * issue #1742 D4(a) — resolve a journaled bare-dir BASENAME (the `bareDirName` recorded on a
+   * finalization-pinned recovery record) to the private bare under this cache's repos root and
+   * classify the record's pinned `sourceSha` against it, for the restart sweep. `reposRoot` is
+   * private, so the sweep cannot build the path itself; this is the only door, and it refuses a
+   * name that is not a plain basename (no separator, not `.`/`..`) so a tampered-but-re-MACed
+   * record can never point outside the repos root.
+   *   - `missing_bare`: the name is unsafe or no bare with that name exists;
+   *   - `missing_sha`: the bare lacks `sourceSha` as a commit (not verifiable);
+   *   - `on_default`: `sourceSha` is an ancestor of the bare's `<defaultBranch>` ref
+   *     (`refs/remotes/origin/<defaultBranch>`, which every fetch updates, or the mirror-layout
+   *     `refs/heads/<defaultBranch>`), so it is already published there;
+   *   - `unpublished`: present in the bare and reachable from neither default ref (a missing
+   *     default ref counts as not reachable).
+   * Read-only; runs under the bare lock so it never observes a half-written object set.
+   */
+  async resolveRestartSource(
+    bareDir: string,
+    sourceSha: string,
+    defaultBranch: string,
+  ): Promise<{ status: "missing_bare" | "missing_sha" | "on_default" | "unpublished"; barePath?: string }> {
+    if (
+      !bareDir ||
+      bareDir === "." ||
+      bareDir === ".." ||
+      bareDir !== path.basename(bareDir) ||
+      bareDir.includes("\\") ||
+      bareDir.includes("\0")
+    ) {
+      return { status: "missing_bare" };
+    }
+    const barePath = path.join(this.reposRoot, bareDir);
+    if (path.dirname(barePath) !== this.reposRoot) return { status: "missing_bare" };
+    if (!(await isBareRepo(barePath))) return { status: "missing_bare" };
+    if (!/^[0-9a-f]{40}$/.test(sourceSha)) return { status: "missing_sha", barePath };
+    return this.withLock(barePath, async () => {
+      if ((await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${sourceSha}^{commit}`])) !== 0) {
+        return { status: "missing_sha" as const, barePath };
+      }
+      const db = defaultBranch.trim();
+      if (db && !db.startsWith("-") && !/[\s~^:?*[\\]|\.\./.test(db) && ![...db].some((ch) => ch.charCodeAt(0) < 0x20 || ch.charCodeAt(0) === 0x7f)) {
+        for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
+          if (!(await this.refExists(barePath, ref))) continue;
+          if ((await this.tryGit(barePath, ["merge-base", "--is-ancestor", sourceSha, ref])) === 0) {
+            return { status: "on_default" as const, barePath };
+          }
+        }
+      }
+      return { status: "unpublished" as const, barePath };
+    });
+  }
+
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
   async ensureClone(repoUrl: string, pat?: string, username?: string): Promise<string> {
     const barePath = this.barePathFor(repoUrl);

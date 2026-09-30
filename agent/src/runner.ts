@@ -2,7 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
@@ -1988,11 +1988,17 @@ export class RunRunner {
     return this.deliverySummary;
   }
 
+  /** issue #1742 D4(a) — the previous process's recovery records, snapshotted by the worker BEFORE
+   *  register and handed to {@link resumePendingRecoveries}. Best-effort: [] on any failure. */
+  async snapshotBootRecoveries(): Promise<RecoveryRecord[]> {
+    return this.recovery.snapshotBootRecords().catch(() => []);
+  }
+
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
    *  registration). Re-uploads any journaled bundle BYTE-IDENTICALLY with no forge PAT.
    *  Best-effort; never throws to the caller. */
-  async resumePendingRecoveries(signal?: AbortSignal): Promise<void> {
-    await this.recovery.resumePending(signal).catch((err) => {
+  async resumePendingRecoveries(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
+    await this.recovery.resumePending(signal, snapshot).catch((err) => {
       this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
     });
   }
@@ -4678,6 +4684,13 @@ export class RunRunner {
           // this generation's record after clone; matching by generation UPDATES it to the
           // committed head H here rather than minting a duplicate.
           generation: claim.claim_generation,
+          // issue #1742 D4(a): the restart-sweep facts. The finalization pin (the committed head H,
+          // NOT the early start-tip pin) records where H lives so a restart can re-verify and
+          // capture it without a forge fetch.
+          bareDir: pathBasename(barePath),
+          defaultBranch:
+            claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(barePath)) || "main",
+          finalizationPin: true,
         });
       } else {
         runLog.warn("recovery: could not resolve the original committed head to pin", {

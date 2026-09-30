@@ -143,6 +143,11 @@ export class Worker {
         `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
       );
     }
+    // issue #1742 D4(a): snapshot the previous process's recovery records BEFORE register, so the
+    // restart sweep below provably excludes any record a live flight of this process writes later.
+    // A runner stub without the method (older test doubles) simply has nothing to snapshot.
+    const bootRecoveries =
+      typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
     await this.registerWithRetry(signal);
     if (signal.aborted) return;
     // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
@@ -150,7 +155,7 @@ export class Worker {
     // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
     // resume failure must never block the claim loops, and the source stays protected by
     // the journal + the server custody hold regardless.
-    void this.runner.resumePendingRecoveries(signal).catch((err) => {
+    void this.runner.resumePendingRecoveries(signal, bootRecoveries).catch((err) => {
       this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
     });
     // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
