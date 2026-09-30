@@ -6,12 +6,12 @@ audience: user
 
 # Product tokens
 
-A **product token** (`uzp_…`) lets an external product call uzi **as you**. You mint it in Settings for a product an admin has registered, and paste it into that product. Once job endpoints ship, work the product starts will run on your own worker and model credential; today a product token can only call `whoami`.
+A **product token** (`uzp_…`) lets an external product call uzi **as you**. You mint it in Settings for a product an admin has registered, and paste it into that product. Work the product starts, [jobs](./jobs.md), runs on your own worker and model credential.
 
 ## What it can and cannot reach
 
 - **Only `/api/v1`**, the stable external API. Everywhere else, including every `/api/*` route the web app and the `uzi` CLI use, `/api/ws` and every admin route, a product token is treated exactly like an unknown token. This is structural: product tokens live in their own table that the internal routes never read.
-- **Today, one endpoint:** `GET /api/v1/whoami`, which returns your user (id, display name), the product, and the token's scopes. Job endpoints are not built yet, so the scopes below grant nothing beyond identifying the caller until they ship.
+- **`GET /api/v1/whoami`**, which returns your user (id, display name), the product, and the token's scopes, and **the jobs endpoints** (`/api/v1/jobs`), gated by the scopes below. See [Jobs](./jobs.md).
 - **Never admin.** `/api/v1` drops admin authority for every caller, so a token an admin minted still acts as a plain user.
 - **`/api/v1` also accepts your own `uzc_` CLI token** (user scope), for scripts. `uza_` tokens and browser cookies are refused there.
 
@@ -25,7 +25,7 @@ The `uzi` CLI cannot use a product token: it needs a CLI token (`uzc_` or `uza_`
 
 Minting is a browser action only (no CLI or Bearer mint), so a stolen token cannot mint replacements.
 
-**Scopes:** `jobs:run` (start and cancel jobs) and `jobs:read` (read status and results). Pick at least one; a token can never do more than its scopes.
+**Scopes:** `jobs:run` (start and cancel jobs) and `jobs:read` (read status and results). Pick at least one; a token can never do more than its scopes. A token with `jobs:run` can still only start the **job types its product allows** (below), and sees only its own product's jobs.
 
 **Expiry:** 30 days, 90 days (default), 1 year, or never. The server sets the timestamp. Choose "never" only for unattended products you trust, and watch its last-used entry.
 
@@ -44,6 +44,8 @@ A token stops working on its **next request** when any of these happens:
 | Your account is deactivated | an admin |
 | The token expires | automatic |
 
+**Revoking cuts off jobs.** Revoking a product token, disabling or deleting its product, or deactivating your account also cancels that product's queued and running jobs. A token that merely expires does not cancel them. See [Jobs](./jobs.md#worker-requirement-and-rollout).
+
 **A password change and logging out do NOT revoke product tokens**, exactly as for CLI tokens. If a token may have leaked, revoke it or use Revoke all.
 
 Each row shows the token prefix, product, scopes, expiry, **last used** and **last IP** (written at most once a minute). There is no per-request audit log, so treat an unfamiliar last IP as a reason to revoke. Lists show active tokens first and say when they were cut off (200 rows for you, 1000 for admins).
@@ -55,6 +57,7 @@ Product registration is an admin-only browser action under **Admin → Products*
 - **Register:** a name (unique among live products, case-insensitive, 200 bytes) and an optional one-line description (1000 bytes). Both are shown to every user, so control characters and invisible formatting are rejected.
 - **Disable / enable:** disabling refuses every token of the product on its next request; enabling restores them.
 - **Delete:** soft. All its tokens stop working, but their rows, last-used data and revoked state stay listed for the audit trail. A deleted product cannot be edited or re-enabled, and its name can be registered again. The confirm says how many tokens the delete stops (0 if it was already disabled).
+- **Allowed job types:** each product card has a checkbox per job type (today `research`). A product with none ticked cannot create jobs: a create is refused 403 `job_type_not_allowed`. `uzi admin products` shows them in a `JOB_TYPES` column.
 - **Revoke one token:** each product card lists its tokens with owner, prefix, last used and IP; an admin can revoke a single compromised one. This does not change the rule that admins cannot revoke a user's personal CLI tokens.
 - **Read-only from the CLI:** `uzi admin products` (needs a `uza_` token). See [CLI](./cli.md#managing-tokens).
 
@@ -62,4 +65,4 @@ Product registration is an admin-only browser action under **Admin → Products*
 
 `/api/v1` is described by the checked-in OpenAPI 3.1 document `api/openapi/v1.yaml`, and a test keeps it identical to the router. Changes are **additive only**: new paths, new optional request fields, new response fields. Removing or renaming a path, field or enum value, or making an optional request field required, is breaking. A breaking change keeps the old shape working for **at least two minor releases and at least 90 days, whichever is later**, announced in the [changelog](./changelog.md), or ships under a new `/api/v2`. The internal `/api/*` routes are not covered: products must not call them.
 
-`/api/v1` shares one per-user request budget (`RATE_LIMIT_MAX` requests per `RATE_LIMIT_WINDOW`, 10 per minute by default, the same knob as the sign-in and credential routes); over it you get a 429 with `Retry-After`.
+`/api/v1` shares one per-user request budget (`V1_RATE_LIMIT_MAX` requests per `V1_RATE_LIMIT_WINDOW`, 120 per minute by default); creating a job also counts against the sign-in budget (`RATE_LIMIT_MAX`, 10 per minute). Over either you get a 429 with `Retry-After`.

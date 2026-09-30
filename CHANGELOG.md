@@ -24,8 +24,21 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Products can run repo-less research jobs through `/api/v1/jobs` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
+  A new run kind, `job`, has no repo, issue or branch: a prompt plus named text inputs, worked by one of your workers on your Anthropic credential, ending in a report and structured findings. `POST /api/v1/jobs` creates one (the only type is `research`), and `GET /api/v1/jobs`, `/{id}`, `/{id}/result`, `/{id}/messages` and `POST /{id}/cancel` read and cancel, gated by the `jobs:run` and `jobs:read` scopes on a `uzp_` product token, or a `uzc_` CLI token for your own jobs. Admins tick the job types each product may start under Admin > Products (none by default), and a user may have at most 10 active jobs (`job_max_active_per_user`, an admin setting). A job never parks: a usage or time limit, recovery, or a disabled credential fails it, and `wall_seconds` (capped at 8 hours) bounds it. The job runs with only Read, Write, Glob, Grep and a result tool in a per-run workspace, and its prompt and inputs are untrusted. Revoking a product token, disabling or deleting the product, or deactivating the owner cancels that product's jobs; expiry alone does not. See [Jobs](docs/jobs.md).
+- **Jobs need workers that advertise `job_runner_v1`: roll the api and the worker image together ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
+  Only non-Docker workers advertising the new `job_runner_v1` capability claim jobs, and an ephemeral worker is provisioned for a queued job. If a job's bound ephemeral worker registers without the capability, or never registers, the job fails with `no_job_capable_worker` or `ephemeral_worker_never_registered` instead of waiting. Deploy the api and the chart's worker image tag together: an older worker image never claims jobs. Hosted Kubernetes acceptance of jobs is not yet done.
+- **`uzi job create|get|result|cancel|list` and job rows in the web app ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
+  The CLI drives the jobs API with your CLI token (`--prompt` or `--prompt-file`, repeatable `--input name=@file`, `--budget-seconds`), and `uzi admin products` gains a `JOB_TYPES` column. Job runs appear in the runs lists, the run page shows a job result panel (report and findings), and Admin > Products has a checkbox per allowed job type. See [CLI](docs/cli.md#uzi-job-repo-less-jobs).
 - **Product tokens and a stable `/api/v1` ([#1907](https://github.com/vtmocanu/uzi/issues/1907)).**
   Admins register external products under Admin > Products; users mint `uzp_` product tokens for them in Settings > Access (scopes, expiry, at most 10 active per product, shown once). A product token works only on `/api/v1` (today `GET /api/v1/whoami`, described in `api/openapi/v1.yaml`), never carries admin authority, and is refused everywhere else. Revoke all now also revokes product tokens; admins can revoke one, or disable or delete the product. The `uzi` CLI refuses a `uzp_` token with a clear error.
+
+### Changed
+
+- **`/api/v1` has its own rate limit: `V1_RATE_LIMIT_MAX` / `V1_RATE_LIMIT_WINDOW` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
+  Default 120 requests per minute per user across all of `/api/v1`. It replaces the sign-in budget (`RATE_LIMIT_MAX`, 10 per minute) that #1907 mounted there, which a product polling job status would exhaust at once. `POST /api/v1/jobs` still also counts against `RATE_LIMIT_MAX`, since a create is the spend action. See [Configuration](docs/configuration.md).
+- **A `check:api-v1-compat` gate refuses breaking changes to `api/openapi/v1.yaml` ([#1908](https://github.com/vtmocanu/uzi/issues/1908)).**
+  It runs an oasdiff comparison against the base in `gate:repo`, enforcing the additive-only promise in [Product tokens](docs/product-tokens.md).
 
 ## [0.85.0] - 2026-09-26
 

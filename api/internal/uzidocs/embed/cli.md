@@ -794,6 +794,27 @@ A few worth knowing:
   re-typed URL); it does **not** revoke it server-side (see
   [Managing tokens](#managing-tokens) below).
 
+## uzi job: repo-less jobs
+
+`uzi job` creates and inspects [jobs](./jobs.md), runs with no repository, over the stable `/api/v1/jobs` API with your CLI token (`uzc_`; a `uzp_` product token is refused). The only job type is `research`.
+
+```
+uzi job create --type research --prompt-file prompt.md --input notes.md=@notes.md
+uzi job get <job-id>
+uzi job result <job-id>
+uzi job cancel <job-id>
+uzi job list [--limit N] [--cursor C]
+```
+
+- **`create`** needs `--type` and exactly one of `--prompt <text>` or `--prompt-file <path>` (`-` reads stdin). `--input name=@file` attaches a named text input and repeats (at most 20, 1 MiB in total, UTF-8 regular files only). `--title` overrides the title derived from the prompt; `--budget-seconds` sets the wall-clock limit (the server caps it at 8 hours). It prints the queued job.
+- **`get`** shows the job's status; `REQUESTED_BY` is marked as reported by the product, not a verified identity.
+- **`result`** prints the job status, then findings, then the report indented under its label. A job that has not reported prints `no result yet`; a finished one that never reported prints `no result`.
+- **`cancel`** cancels a queued, running or waiting job; a running job may still read `running` for a moment. A finished job exits with a conflict error.
+- **`list`** is newest first, 50 per page by default, and prints the `--cursor` for the next page.
+- **`--json`** prints the raw API objects. Text from the server is sanitized for the terminal.
+
+Refusals print the server's reason: for example a 403 `job_type_not_allowed`, a 422 `no_model_credential` (add an Anthropic credential in uzi), or a 429 `over_cap` (10 active jobs per user by default).
+
 ## Recovering unpublished work: `uzi run export`
 
 When a run commits useful work but then fails to publish its head (a workflow or
@@ -2306,4 +2327,4 @@ error saying so. Like CLI tokens, product tokens are **not** revoked by a
 password change or logout; Revoke all, revoking one token, an admin, disabling
 or deleting the product, or deactivating the account does revoke them. Minting
 and admin product management are browser-only; the CLI has just the read-only
-`uzi admin products`. See [Product tokens](./product-tokens.md).
+`uzi admin products` (with a `JOB_TYPES` column showing the job types each product may start). See [Product tokens](./product-tokens.md).
