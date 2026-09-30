@@ -772,6 +772,12 @@ export interface ClaimConfig {
    *  question_timeout_seconds for the completion hold. Default 900s; consumed in a later unit.
    *  Absent or <= 0 from an older server ⇒ the worker falls back to its own default. */
   completion_hold_window_seconds?: number;
+  /** PRD #1909 D1: the server's job-input limits, on a job claim only (one file's bytes, files per
+   *  job, total bytes per job). Optional: a job runner clamps them to its own fixed ceilings and
+   *  uses the ceilings alone when they are absent (an older server). */
+  job_input_file_max_bytes?: number;
+  job_inputs_max_files?: number;
+  job_inputs_max_bytes?: number;
   /** The run owner's per-user default model (PRD #17). When present it overrides
    *  the lead template's model for the main thread; absent when the owner set no
    *  default, so the worker falls back to the lead template's model. */

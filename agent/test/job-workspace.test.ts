@@ -15,6 +15,10 @@ import {
   writeJobInputFile,
   writeJobInputs,
   JobFileIntegrityError,
+  JOB_INPUT_CEILINGS,
+  checkJobInputManifest,
+  resolveJobInputCaps,
+  validateJobInputFileSpec,
 } from "../src/job-workspace.js";
 import { nullLogger } from "./helpers.js";
 
@@ -195,8 +199,32 @@ describe("uploaded input files (PRD #1909 M3)", () => {
       yield bytes.subarray(0, 4);
       throw new Error("terminated");
     }
-    await assert.rejects(() => writeJobInputFile(ws, spec, torn()), /terminated/);
+    await assert.rejects(() => writeJobInputFile(ws, spec, torn()), (err: unknown) => err instanceof JobFileIntegrityError && /terminated/.test(err.message));
     assert.deepStrictEqual(await inputsLeft(ws), []);
+  });
+
+  it("a body that ends early is an integrity failure; a local write error is not relabelled as one", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    await assert.rejects(() => writeJobInputFile(ws, spec, chunks(bytes.subarray(0, 4))), JobFileIntegrityError);
+    // A null chunk makes our own length read throw: not a stream error, so not an integrity error.
+    async function* bad(): AsyncGenerator<unknown> {
+      yield null;
+    }
+    await assert.rejects(
+      () => writeJobInputFile(ws, spec, bad() as AsyncIterable<Uint8Array>),
+      (err: unknown) => !(err instanceof JobFileIntegrityError),
+    );
+    assert.deepStrictEqual(await inputsLeft(ws), []);
+  });
+
+  it("refuses a declared size over the fixed per-file ceiling before creating any file", async () => {
+    const ws = await createJobWorkspace(await tmpRoot(), randomUUID());
+    const big = { ...spec, size: JOB_INPUT_CEILINGS.fileBytes + 1 };
+    await assert.rejects(() => writeJobInputFile(ws, big, chunks(bytes)), /over the worker's per-file limit/);
+    const huge = { ...spec, size: Number.MAX_SAFE_INTEGER };
+    await assert.rejects(() => writeJobInputFile(ws, huge, chunks(bytes)), JobInputError);
+    assert.deepStrictEqual(await inputsLeft(ws), []);
+    assert.doesNotThrow(() => validateJobInputFileSpec(spec));
   });
 
   for (const bad of [
@@ -240,5 +268,26 @@ describe("uploaded input files (PRD #1909 M3)", () => {
     assert.strictEqual(await fsp.readFile(victim, "utf8"), "untouched");
     assert.ok((await fsp.lstat(path.join(ws.inputsDir, spec.name))).isSymbolicLink());
     assert.deepStrictEqual(await inputsLeft(ws), [spec.name], "the partial is removed");
+  });
+});
+
+describe("job input caps (PRD #1909 D1, worker-side)", () => {
+  const f = (name: string, size: number) => ({ name, size });
+  it("uses the fixed ceilings when the claim carries no caps, and clamps any cap above them", () => {
+    assert.deepStrictEqual(resolveJobInputCaps(undefined), { fileBytes: JOB_INPUT_CEILINGS.fileBytes, files: JOB_INPUT_CEILINGS.files, totalBytes: JOB_INPUT_CEILINGS.totalBytes });
+    assert.deepStrictEqual(resolveJobInputCaps({ job_input_file_max_bytes: 5, job_inputs_max_files: 2, job_inputs_max_bytes: 9 }), { fileBytes: 5, files: 2, totalBytes: 9 });
+    const hostile = resolveJobInputCaps({ job_input_file_max_bytes: Number.MAX_SAFE_INTEGER, job_inputs_max_files: 1e9, job_inputs_max_bytes: Number.MAX_SAFE_INTEGER });
+    assert.deepStrictEqual(hostile, { fileBytes: JOB_INPUT_CEILINGS.fileBytes, files: JOB_INPUT_CEILINGS.files, totalBytes: JOB_INPUT_CEILINGS.totalBytes });
+    assert.deepStrictEqual(resolveJobInputCaps({ job_input_file_max_bytes: -1, job_inputs_max_files: 0, job_inputs_max_bytes: 1.5 }), resolveJobInputCaps(undefined));
+  });
+
+  it("refuses too many entries, an oversize file and an oversize total, each with its own reason", () => {
+    const caps = { fileBytes: 10, files: 2, totalBytes: 15 };
+    assert.doesNotThrow(() => checkJobInputManifest([f("a", 10), f("b", 5)], caps));
+    assert.throws(() => checkJobInputManifest([f("a", 1), f("b", 1), f("c", 1)], caps), /3 input files.*limit of 2/);
+    assert.throws(() => checkJobInputManifest([f("a", 11)], caps), /per-file limit of 10/);
+    assert.throws(() => checkJobInputManifest([f("a", 10), f("b", 6)], caps), /total 16 bytes.*15/);
+    // A repeated storage name is fetched once, so it counts once towards the total.
+    assert.doesNotThrow(() => checkJobInputManifest([f("a", 10), f("a", 10)], { ...caps, totalBytes: 10 }));
   });
 });

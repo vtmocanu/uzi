@@ -41,15 +41,12 @@ describe("WorkerClient.downloadJobFile", () => {
       res.end("hello");
     });
     let got: Buffer = Buffer.alloc(0);
-    let meta: { contentLength: number | null; sha256: string | null } | undefined;
-    await client.downloadJobFile("run-1", "file-1", 7, async (body, m) => {
-      meta = m;
+    await client.downloadJobFile("run-1", "file-1", 7, async (body) => {
       got = await collect(body);
     });
     assert.strictEqual(seen.url, "/api/worker/runs/run-1/files/file-1?claim_generation=7");
     assert.strictEqual(seen.auth, `Bearer ${TOKEN}`);
     assert.strictEqual(got.toString(), "hello");
-    assert.deepStrictEqual(meta, { contentLength: 5, sha256: "ab" });
   });
 
   it("throws RequestError with the status on a non-200 and never calls the sink", async () => {
@@ -72,5 +69,46 @@ describe("WorkerClient.downloadJobFile", () => {
       setTimeout(() => res.destroy(), 10);
     });
     await assert.rejects(() => client.downloadJobFile("r", "f", 1, async (body) => { await collect(body); }));
+  });
+
+  it("destroys the response body when the sink throws, so the socket is released rather than held", async () => {
+    let closed: Promise<void> = Promise.resolve();
+    const client = await serve((req, res) => {
+      closed = new Promise<void>((r) => req.socket.once("close", () => r()));
+      res.writeHead(200, { "Content-Length": "1000000" });
+      res.write("first-chunk");
+      // The body is never finished: only the client hanging up can end this connection early.
+    });
+    await assert.rejects(
+      () => client.downloadJobFile("r", "f", 1, async () => { throw new Error("sink refused"); }),
+      /sink refused/,
+    );
+    await Promise.race([closed, new Promise((_, rej) => setTimeout(() => rej(new Error("socket still held after a sink error")), 3000))]);
+  });
+
+  it("aborts a body in flight when the caller's signal fires", async () => {
+    const client = await serve((_req, res) => {
+      res.writeHead(200, { "Content-Length": "1000000" });
+      res.write("first-chunk");
+    });
+    const ac = new AbortController();
+    const started = Date.now();
+    await assert.rejects(() =>
+      client.downloadJobFile("r", "f", 1, async (body) => {
+        setTimeout(() => ac.abort(), 30);
+        await collect(body);
+      }, ac.signal),
+    );
+    assert.ok(Date.now() - started < 3000, "the abort ended the download promptly");
+  });
+
+  it("honours a per-call timeout shorter than the default", async () => {
+    const client = await serve((_req, res) => {
+      res.writeHead(200, { "Content-Length": "1000000" });
+      res.write("x");
+    });
+    const started = Date.now();
+    await assert.rejects(() => client.downloadJobFile("r", "f", 1, async (body) => { await collect(body); }, undefined, 50));
+    assert.ok(Date.now() - started < 3000);
   });
 });

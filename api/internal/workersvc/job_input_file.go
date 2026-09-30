@@ -21,6 +21,7 @@ import (
 //   - the run is kind='job' (ErrNotJobRun);
 //   - claimGeneration is the run's CURRENT generation and the claim is not released
 //     (ErrStaleClaim), and the run is not terminal (ErrRunTerminal);
+//   - the job-file store is configured (ErrJobFilesUnavailable), checked only after the fence;
 //   - the file is an input, state 'attached', attached to THIS run (run_id match) and owned by the
 //     run's user; anything else reads as ErrJobFileNotFound, so an output, an unattached upload, or
 //     another run's file is indistinguishable from an unknown id.
@@ -28,9 +29,6 @@ import (
 // The reader fails with ErrJobFileIntegrity in place of io.EOF when the stored bytes do not verify
 // (see JobFiles.Open); the caller must abort the response rather than end it cleanly.
 func (s *Service) OpenJobInputFile(ctx context.Context, wkr store.Worker, runID, fileID uuid.UUID, claimGeneration int64) (store.JobFile, io.Reader, error) {
-	if s.jobFiles == nil {
-		return store.JobFile{}, nil, ErrJobFilesUnavailable
-	}
 	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -46,6 +44,11 @@ func (s *Service) OpenJobInputFile(ctx context.Context, wkr store.Worker, runID,
 	}
 	if terminalStatuses[run.Status] {
 		return store.JobFile{}, nil, ErrRunTerminal
+	}
+	// The store check follows the fence so a worker that does not hold the run learns nothing from
+	// it (a foreign worker reads 404 whether or not files are configured).
+	if s.jobFiles == nil {
+		return store.JobFile{}, nil, ErrJobFilesUnavailable
 	}
 	f, err := s.jobFiles.Get(ctx, fileID, run.UserID)
 	if err != nil {

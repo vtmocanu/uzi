@@ -18,6 +18,7 @@ import {
   JobRunner,
   validateJobResult,
 } from "../src/job-runner.js";
+import { JobInputError } from "../src/job-workspace.js";
 import type { ClaimResponse, JobResultRequest, OutgoingMessage, StateRequest, UserInput } from "../src/protocol.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { stubJobQueryFn } from "../src/job-runner-stub.js";
@@ -73,7 +74,14 @@ function fakeClient(opts: {
   receipts?: boolean;
   postJobResult?: (id: string, body: JobResultRequest) => Promise<void>;
   reportState?: (id: string, body: StateRequest) => unknown;
-  downloadJobFile?: (id: string, fileId: string, generation: number, sink: (body: Readable) => Promise<void>) => Promise<void>;
+  downloadJobFile?: (
+    id: string,
+    fileId: string,
+    generation: number,
+    sink: (body: Readable) => Promise<void>,
+    signal?: AbortSignal,
+    timeoutMs?: number,
+  ) => Promise<void>;
 } = {}): { client: WorkerClient; calls: Calls } {
   const calls: Calls = { order: [], states: [], messages: [], results: [], acks: [], applied: [] };
   const client = {
@@ -103,11 +111,13 @@ function fakeClient(opts: {
       id: string,
       fileId: string,
       generation: number,
-      sink: (body: Readable, meta: { contentLength: number | null; sha256: string | null }) => Promise<void>,
+      sink: (body: Readable) => Promise<void>,
+      signal?: AbortSignal,
+      timeoutMs?: number,
     ) => {
       calls.order.push(`download:${fileId}`);
       if (!opts.downloadJobFile) throw new Error("unexpected download");
-      await opts.downloadJobFile(id, fileId, generation, (body) => sink(body, { contentLength: null, sha256: null }));
+      await opts.downloadJobFile(id, fileId, generation, sink, signal, timeoutMs);
     },
     hasFeature: () => false,
   } as unknown as WorkerClient;
@@ -693,12 +703,156 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
     assert.ok(last.failure_reason!.length < 400);
   });
 
+  /** A body that yields its first chunk and then stalls until `signal` aborts, as a slow server would. */
+  const stalled = (first: Buffer) => async (_id: string, _f: string, _g: number, sink: (body: Readable) => Promise<void>, signal?: AbortSignal) => {
+    const r = new Readable({ read() {} });
+    r.push(first);
+    signal?.addEventListener("abort", () => r.destroy(new Error("The operation was aborted")), { once: true });
+    await sink(r);
+  };
+  const noSession = (flag: { ran: boolean }) =>
+    scripted(async function* () {
+      flag.ran = true;
+      yield RESULT_OK;
+    });
+
+  it("refuses a manifest over the worker's ceilings before any download, workspace or session", async () => {
+    const many = Array.from({ length: 65 }, (_, i) => fileEntry({ id: randomUUID(), name: `${createHash("sha256").update(String(i)).digest("hex")}.txt`, size: 1 }));
+    const cases: Array<[string, ClaimResponse, RegExp]> = [
+      ["too many entries", jobClaim({}, { files: many }), /input files refused: the job has 65 input files, more than the worker's limit of 64/],
+      [
+        "an oversize file",
+        jobClaim({}, { files: [fileEntry({ size: 256 * 1024 * 1024 + 1 })] }),
+        /input files refused: an input file of 268435457 bytes is larger than the worker's per-file limit/,
+      ],
+      [
+        "a total over the ceiling",
+        jobClaim({}, {
+          files: [0, 1, 2, 3, 4].map((i) => fileEntry({ id: randomUUID(), name: `${createHash("sha256").update(`t${i}`).digest("hex")}.txt`, size: 256 * 1024 * 1024 })),
+        }),
+        /input files refused: the job's input files total 1342177280 bytes/,
+      ],
+      [
+        "the claim's tighter cap",
+        jobClaim({ config: { job_inputs_max_files: 1 } }, { files: [fileEntry(), fileEntry({ id: randomUUID(), name: `${"a".repeat(64)}.pdf` })] }),
+        /more than the worker's limit of 1/,
+      ],
+    ];
+    for (const [name, claim, want] of cases) {
+      const jobsRoot = await tmpJobsRoot();
+      const { client, calls } = fakeClient({ downloadJobFile: send(body) });
+      const flag = { ran: false };
+      await newRunner(client, jobsRoot, noSession(flag)).execute(claim);
+      assert.ok(!calls.order.some((o) => o.startsWith("download:")), `${name}: no download may start`);
+      assert.strictEqual(flag.ran, false, name);
+      assert.strictEqual(calls.states.at(-1)!.body.status, "failed", name);
+      assert.match(calls.states.at(-1)!.body.failure_reason!, want, name);
+      assert.strictEqual(await fsp.readdir(jobsRoot).then((l) => l.length).catch(() => 0), 0, `${name}: no workspace created`);
+    }
+  });
+
+  it("makes no request for a manifest entry the writer would refuse (bad name, digest or size)", async () => {
+    for (const bad of [{ name: "../../etc/passwd" }, { sha256: "0".repeat(64) }, { size: 0 }, { size: Number.MAX_SAFE_INTEGER }]) {
+      const { client, calls } = fakeClient({ downloadJobFile: send(body) });
+      await newRunner(client, await tmpJobsRoot(), noSession({ ran: false })).execute(jobClaim({}, { files: [fileEntry(bad)] }));
+      assert.ok(!calls.order.some((o) => o.startsWith("download:")), `${JSON.stringify(bad)} must not reach the network`);
+      assert.strictEqual(calls.states.at(-1)!.body.status, "failed");
+    }
+  });
+
+  it("reports a stream torn after the headers as an integrity failure, not 'could not download'", async () => {
+    const { client, calls } = fakeClient({
+      downloadJobFile: async (_i, _f, _g, sink) => {
+        const r = new Readable({ read() {} });
+        r.push(body.subarray(0, 4));
+        setTimeout(() => r.destroy(new Error("terminated")), 5);
+        await sink(r);
+      },
+    });
+    await newRunner(client, await tmpJobsRoot(), noSession({ ran: false })).execute(jobClaim({}, { files: [fileEntry()] }));
+    assert.strictEqual(calls.states.at(-1)!.body.failure_reason, 'job input file "Q3 report.pdf" failed its integrity check');
+  });
+
+  it("counts download time against the budget: the session gets only what the download left", async () => {
+    const jobsRoot = await tmpJobsRoot();
+    const { client, calls } = fakeClient({
+      downloadJobFile: async (id, fid, g, sink) => {
+        await new Promise((r) => setTimeout(r, 600));
+        await send(body)(id, fid, g, sink);
+      },
+    });
+    const qf = scripted(async function* ({ hang }) {
+      yield INIT_OK;
+      await hang(); // never submits: only the wall-clock deadline ends it
+    });
+    const t0 = Date.now();
+    await newRunner(client, jobsRoot, qf).execute(jobClaim({ budget_wall_seconds: 1 }, { files: [fileEntry()] }));
+    const elapsed = Date.now() - t0;
+    const last = calls.states.at(-1)!.body;
+    assert.strictEqual(last.status, "failed");
+    assert.match(last.failure_reason!, /exceeded its wall-clock budget of 1s/);
+    assert.ok(elapsed < 1400, `the session ran the full budget on top of the download (${elapsed} ms)`);
+  });
+
+  it("fails with the budget reason, without a session, when the budget runs out during a download", async () => {
+    const { client, calls } = fakeClient({ downloadJobFile: stalled(body.subarray(0, 4)) });
+    const flag = { ran: false };
+    const t0 = Date.now();
+    await newRunner(client, await tmpJobsRoot(), noSession(flag)).execute(jobClaim({ budget_wall_seconds: 0.3 }, { files: [fileEntry()] }));
+    assert.strictEqual(flag.ran, false);
+    assert.match(calls.states.at(-1)!.body.failure_reason!, /exceeded its wall-clock budget of 0.3s/);
+    assert.ok(Date.now() - t0 < 2000);
+  });
+
+  it("an owner cancel during a slow download aborts it promptly and reports the run cancelled", async () => {
+    let cancelAt = 0;
+    const { client, calls } = fakeClient({
+      receipts: true,
+      inputs: () => (cancelAt && Date.now() >= cancelAt ? [{ id: 9, kind: "cancel", body: "" } as unknown as UserInput] : []),
+      downloadJobFile: stalled(body.subarray(0, 4)),
+    });
+    cancelAt = Date.now() + 80;
+    const flag = { ran: false };
+    const t0 = Date.now();
+    await newRunner(client, await tmpJobsRoot(), noSession(flag)).execute(jobClaim({ budget_wall_seconds: 30 }, { files: [fileEntry()] }));
+    assert.strictEqual(flag.ran, false);
+    assert.strictEqual(calls.states.at(-1)!.body.status, "failed");
+    assert.strictEqual(calls.states.at(-1)!.body.failure_reason, "run cancelled");
+    assert.deepStrictEqual(calls.acks, [[9]]);
+    assert.deepStrictEqual(calls.applied, [[9]]);
+    assert.ok(Date.now() - t0 < 3000, "the cancel did not wait for the download to finish");
+  });
+
+  it("scales a file's download timeout with its size, bounded by the remaining budget", async () => {
+    const seen: number[] = [];
+    const record = async (_i: string, _f: string, _g: number, sink: (b: Readable) => Promise<void>, _s?: AbortSignal, t?: number) => {
+      seen.push(t!);
+      await sink(Readable.from([body]));
+    };
+    const small = fileEntry();
+    const bigSha = createHash("sha256").update("big").digest("hex");
+    const big = fileEntry({ id: randomUUID(), name: `${bigSha}.pdf`, sha256: bigSha, size: 100 * 1024 * 1024 });
+    // The big file fails its size check after the timeout was chosen, which is all this test reads.
+    const { client } = fakeClient({ downloadJobFile: record });
+    await newRunner(client, await tmpJobsRoot(), noSession({ ran: false })).execute(jobClaim({ budget_wall_seconds: 100000 }, { files: [small] }));
+    await newRunner(client, await tmpJobsRoot(), noSession({ ran: false })).execute(jobClaim({ budget_wall_seconds: 100000 }, { files: [big] }));
+    await newRunner(client, await tmpJobsRoot(), noSession({ ran: false })).execute(jobClaim({ budget_wall_seconds: 100 }, { files: [big] }));
+    assert.strictEqual(seen[0], 300_000, "a small file keeps the 300 s floor");
+    assert.strictEqual(seen[1], 1_024_000, "100 MiB at 100 KiB/s");
+    assert.ok(seen[2]! <= 100_000, `bounded by the remaining budget, got ${seen[2]}`);
+  });
+
+  it("buildJobPrompt throws on a file whose storage name is not the storage shape", () => {
+    const job = { type: "t", title: "t", prompt: "p", inputs: [], files: [fileEntry({ name: 'x" injected="1' })] };
+    assert.throws(() => buildJobPrompt(job as never, []), JobInputError);
+  });
+
   it("refuses a malformed storage name from the claim as a stated failure", async () => {
     const jobsRoot = await tmpJobsRoot();
     const { client, calls } = fakeClient({ downloadJobFile: send(body) });
     await newRunner(client, jobsRoot, scripted(async function* () { yield RESULT_OK; })).execute(jobClaim({}, { files: [fileEntry({ name: "../../etc/passwd" })] }));
     const last = calls.states.at(-1)!.body;
     assert.strictEqual(last.status, "failed");
-    assert.match(last.failure_reason!, /^job input file "Q3 report.pdf" was refused: /);
+    assert.match(last.failure_reason!, /^job input files refused: job input file name is not a storage name/);
   });
 });

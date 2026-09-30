@@ -206,3 +206,31 @@ func TestWorkerJobInputFileIntegrityAbortLiveDB(t *testing.T) {
 		t.Fatalf("received the full %d bytes despite the tampered chunk", len(got))
 	}
 }
+
+// TestWorkerJobInputFileUnavailableAfterFenceLiveDB: with no job-file store wired, the store check
+// comes AFTER the ownership fence. A worker that does not hold the run reads 404 (it learns nothing
+// about the server's configuration), and the worker that does hold it gets 503 files_unavailable,
+// the same reason the v1 routes use, never a 500.
+func TestWorkerJobInputFileUnavailableAfterFenceLiveDB(t *testing.T) {
+	e := setupJobFileRouteLiveDB(t)
+	// Rebuild the router over a service with no job-file store.
+	q := store.New(e.pool)
+	svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+	svc.SetTxBeginner(e.pool)
+	h := &Handler{q: q, wsvc: svc}
+	e.router = h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+	run := e.seedJob(t, e.user, e.worker)
+	foreign := e.seedWorker(t, e.user)
+	fileID := uuid.New()
+
+	if rec := e.get(foreign, run, fileID, "?claim_generation=1"); rec.Code != http.StatusNotFound {
+		t.Fatalf("foreign worker: status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
+	}
+	if rec := e.get(e.worker, run, fileID, "?claim_generation=0"); rec.Code != http.StatusConflict {
+		t.Fatalf("stale generation: status = %d, want 409 (body %q)", rec.Code, rec.Body.String())
+	}
+	rec := e.get(e.worker, run, fileID, "?claim_generation=1")
+	if rec.Code != http.StatusServiceUnavailable || !bytes.Contains(rec.Body.Bytes(), []byte("files_unavailable")) {
+		t.Fatalf("holding worker: status = %d body %q, want 503 files_unavailable", rec.Code, rec.Body.String())
+	}
+}

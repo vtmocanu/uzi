@@ -21,12 +21,17 @@ import (
 //	403 not_for_job
 //	404 run not held by this worker, or no such input file on this run
 //	409 stale claim, or the run already finished
-//	410 the file's bytes have expired
+//	410 the file's bytes expired between the ownership check and the open (a race). A file that is
+//	    already expired when the request arrives reads as 404, like every non-attached file.
+//	503 files_unavailable: job files are not configured on this server (after the fence)
 //
 // The body is the plaintext with Content-Length and X-Uzi-File-Sha256. If the stored bytes fail
-// their integrity check after the header is out, the connection is aborted (never a short 200 that
-// looks complete): the reader surfaces workersvc.ErrJobFileIntegrity in place of io.EOF and the
-// handler panics with http.ErrAbortHandler, which net/http turns into a torn connection.
+// their integrity check after the header is out, the handler stops the response instead of ending
+// it cleanly: the reader surfaces workersvc.ErrJobFileIntegrity in place of io.EOF and the handler
+// panics with http.ErrAbortHandler, which net/http turns into an aborted connection without the
+// usual panic log. The live-DB test asserts what a client observes (a read error and a short body,
+// never a complete-looking 200), not the panic itself: net/http also tears down a response that
+// falls short of its declared Content-Length.
 func (h *Handler) WorkerJobInputFile(w http.ResponseWriter, r *http.Request) {
 	wkr, ok := mw.WorkerFromContext(r.Context())
 	if !ok {
@@ -57,6 +62,8 @@ func (h *Handler) WorkerJobInputFile(w http.ResponseWriter, r *http.Request) {
 			httpx.JSON(w, http.StatusConflict, map[string]any{"disposition": "stale_claim"})
 		case errors.Is(err, workersvc.ErrRunTerminal):
 			httpx.Error(w, http.StatusConflict, "run has already finished")
+		case errors.Is(err, workersvc.ErrJobFilesUnavailable):
+			httpx.ErrorReason(w, http.StatusServiceUnavailable, "file downloads are not available on this server", v1ReasonFilesDisabled)
 		case errors.Is(err, workersvc.ErrJobFileExpired):
 			httpx.Error(w, http.StatusGone, "file has expired")
 		case errors.Is(err, workersvc.ErrJobFileIntegrity):

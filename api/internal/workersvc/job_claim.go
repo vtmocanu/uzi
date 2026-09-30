@@ -140,6 +140,24 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 
 	wall := coalesceInt(run.BudgetWallSeconds, int(s.p.RunTimeout.Seconds()))
 	wall32 := int32(wall) //nolint:gosec // G115: a clamped wall budget, at most budgetWallCeilingSeconds
+	cfg := ClaimConfig{
+		RunTimeoutSeconds:      wall,
+		IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
+		MaxIterations:          s.p.RunMaxIterations,
+		PlanMaxRevisions:       s.p.PlanMaxRevisions,
+		QuestionMax:            s.p.QuestionMax,
+		QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
+		DefaultModel:           defaultModel,
+		DefaultEffort:          resolveEffortPtr(defaultEffort),
+		ToolPackages:           []string{},
+		DeniedToolPackages:     toolprofile.DenylistNames(),
+	}
+	if s.jobFiles != nil {
+		l := s.jobFiles.Limits()
+		cfg.JobInputFileMaxBytes = l.InputFileMaxBytes
+		cfg.JobInputsMaxFiles = l.InputsMaxFiles
+		cfg.JobInputsMaxBytes = l.InputsMaxBytes
+	}
 	return &ClaimPayload{
 		RunID:             run.ID.String(),
 		Kind:              run.Kind,
@@ -156,17 +174,6 @@ func (s *Service) assembleJobClaim(ctx context.Context, wkr store.Worker, run st
 		Agents:            []ClaimAgent{},
 		Skills:            []ClaimSkill{},
 		SkillsDropped:     []ClaimSkillDrop{},
-		Config: ClaimConfig{
-			RunTimeoutSeconds:      wall,
-			IdleTimeoutSeconds:     int(s.p.RunIdleTimeout.Seconds()),
-			MaxIterations:          s.p.RunMaxIterations,
-			PlanMaxRevisions:       s.p.PlanMaxRevisions,
-			QuestionMax:            s.p.QuestionMax,
-			QuestionTimeoutSeconds: s.p.QuestionTimeoutSeconds,
-			DefaultModel:           defaultModel,
-			DefaultEffort:          resolveEffortPtr(defaultEffort),
-			ToolPackages:           []string{},
-			DeniedToolPackages:     toolprofile.DenylistNames(),
-		},
+		Config:            cfg,
 	}, nil
 }

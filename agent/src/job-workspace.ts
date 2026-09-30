@@ -39,8 +39,62 @@ const INPUT_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/;
 /** The storage name of an uploaded input file (PRD #1909 D6): `<sha256>.<ext>` with the extension
  *  from the api's input allowlist (workersvc jobFileExt minus the output-only html). It can never
  *  collide with an inline `NN-<name>` input: that shape has a dash at index 2. */
-const STORAGE_NAME_RE = /^[0-9a-f]{64}\.(pdf|txt|md|csv|json|docx|xlsx|png|jpg)$/;
+export const STORAGE_NAME_RE = /^[0-9a-f]{64}\.(pdf|txt|md|csv|json|docx|xlsx|png|jpg)$/;
 const SHA256_RE = /^[0-9a-f]{64}$/;
+
+/** Fixed worker-side ceilings on the uploaded input files of one job (PRD #1909 D1). The api's own
+ *  limits (delivered in the claim config) can only tighten these: the worker never accepts more
+ *  than this, whatever a claim says, so a compromised api cannot make it fetch without bound. */
+export const JOB_INPUT_CEILINGS = {
+  fileBytes: 256 * 1024 * 1024,
+  files: 64,
+  totalBytes: 1024 * 1024 * 1024,
+} as const;
+
+/** The effective per-job input caps: the fixed ceilings, tightened by any positive integer cap the
+ *  claim config carries. */
+export interface JobInputCaps {
+  fileBytes: number;
+  files: number;
+  totalBytes: number;
+}
+
+/** Resolve the caps from the claim config's optional `job_input_*` fields, clamped to the ceilings. */
+export function resolveJobInputCaps(cfg: {
+  job_input_file_max_bytes?: number;
+  job_inputs_max_files?: number;
+  job_inputs_max_bytes?: number;
+} | null | undefined): JobInputCaps {
+  const clamp = (v: unknown, ceiling: number): number =>
+    typeof v === "number" && Number.isSafeInteger(v) && v > 0 ? Math.min(v, ceiling) : ceiling;
+  return {
+    fileBytes: clamp(cfg?.job_input_file_max_bytes, JOB_INPUT_CEILINGS.fileBytes),
+    files: clamp(cfg?.job_inputs_max_files, JOB_INPUT_CEILINGS.files),
+    totalBytes: clamp(cfg?.job_inputs_max_bytes, JOB_INPUT_CEILINGS.totalBytes),
+  };
+}
+
+/** Refuse a manifest over the caps before anything is downloaded: too many entries, an entry over
+ *  the per-file cap, or distinct files (one per storage name) over the total. Throws JobInputError
+ *  stating which cap. Entry shapes are validated separately (validateJobInputFileSpec). */
+export function checkJobInputManifest(files: ReadonlyArray<{ name: string; size: number }>, caps: JobInputCaps): void {
+  if (files.length > caps.files) {
+    throw new JobInputError(`the job has ${files.length} input files, more than the worker's limit of ${caps.files}`);
+  }
+  const seen = new Set<string>();
+  let total = 0;
+  for (const f of files) {
+    if (typeof f.size === "number" && f.size > caps.fileBytes) {
+      throw new JobInputError(`an input file of ${f.size} bytes is larger than the worker's per-file limit of ${caps.fileBytes} bytes`);
+    }
+    if (seen.has(f.name)) continue;
+    seen.add(f.name);
+    total += Number.isSafeInteger(f.size) ? f.size : 0;
+  }
+  if (total > caps.totalBytes) {
+    throw new JobInputError(`the job's input files total ${total} bytes, more than the worker's limit of ${caps.totalBytes} bytes`);
+  }
+}
 
 /** The workspace paths of one job run. */
 export interface JobWorkspace {
@@ -56,17 +110,19 @@ export interface JobWorkspace {
 
 /** Refusal of an unsafe input name or a write that escaped the workspace. */
 export class JobInputError extends Error {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "JobInputError";
   }
 }
 
-/** A downloaded input file's bytes failed verification (wrong size, digest mismatch or a truncated
- *  stream). The runner reports it as an integrity failure, distinct from a transport failure. */
+/** A downloaded input file's bytes failed verification: a wrong size, a digest mismatch, or a body
+ *  stream that ended early or was torn after the response headers arrived (see writeJobInputFile).
+ *  The runner reports it as an integrity failure. A failure BEFORE the headers (a refused or
+ *  unreachable request, a non-200 status) is not this: it stays a plain download failure. */
 export class JobFileIntegrityError extends JobInputError {
-  constructor(message: string) {
-    super(message);
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
     this.name = "JobFileIntegrityError";
   }
 }
@@ -174,21 +230,9 @@ export interface JobInputFileSpec {
   sha256: string;
 }
 
-/** Stream an uploaded input file into `inputs/<storage name>` and return its workspace-relative
- *  path. The bytes go to `inputs/.partial-<rand>` (O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, the
- *  workspace file mode), are hashed as they are written and counted against the declared size
- *  (more bytes than declared aborts at once; fewer, or a digest that is not the declared one, is a
- *  JobFileIntegrityError). Only a verified file reaches its final name, published with link(2) so an
- *  existing entry at the target (a planted symlink included) is refused rather than replaced, and
- *  is then made read-only. Any failure removes the partial: nothing unverified is left under
- *  `inputs/`. `body` is consumed to its end; a stream error is rethrown as is. */
-export async function writeJobInputFile(
-  ws: JobWorkspace,
-  file: JobInputFileSpec,
-  body: AsyncIterable<Uint8Array>,
-  split: boolean = uidSplitActive(),
-  partialSuffix: string = randomBytes(8).toString("hex"),
-): Promise<string> {
+/** Validate one manifest entry's name, digest and size (also against the fixed per-file ceiling)
+ *  without touching the filesystem, so a bad entry is refused before any request is made. */
+export function validateJobInputFileSpec(file: JobInputFileSpec): void {
   if (typeof file.name !== "string" || !STORAGE_NAME_RE.test(file.name)) {
     throw new JobInputError("job input file name is not a storage name");
   }
@@ -198,6 +242,41 @@ export async function writeJobInputFile(
   if (!Number.isSafeInteger(file.size) || file.size <= 0) {
     throw new JobInputError("job input file size is not a positive integer");
   }
+  if (file.size > JOB_INPUT_CEILINGS.fileBytes) {
+    throw new JobInputError("job input file size is over the worker's per-file limit");
+  }
+}
+
+/** A body iterator failure, tagged so the writer can tell a torn stream from its own write errors. */
+class BodyStreamError extends Error {}
+
+/** Re-yield `body`, wrapping an error the body itself raises in BodyStreamError. */
+async function* tagBodyErrors(body: AsyncIterable<Uint8Array>): AsyncGenerator<Uint8Array> {
+  try {
+    yield* body;
+  } catch (err) {
+    throw new BodyStreamError(errMessage(err), { cause: err });
+  }
+}
+
+/** Stream an uploaded input file into `inputs/<storage name>` and return its workspace-relative
+ *  path. The bytes go to `inputs/.partial-<rand>` (O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW, the
+ *  workspace file mode), are hashed as they are written and counted against the declared size
+ *  (more bytes than declared aborts at once; fewer, a torn stream, or a digest that is not the
+ *  declared one, is a JobFileIntegrityError; a declared size over the fixed per-file ceiling is
+ *  refused before the partial exists). Only a verified file reaches its final name, published with link(2) so an
+ *  existing entry at the target (a planted symlink included) is refused rather than replaced, and
+ *  is then made read-only. Any failure removes the partial: nothing unverified is left under
+ *  `inputs/`. `body` is consumed to its end; an error the body stream raises (a torn or aborted connection
+ *  after the headers) is a JobFileIntegrityError carrying the cause. */
+export async function writeJobInputFile(
+  ws: JobWorkspace,
+  file: JobInputFileSpec,
+  body: AsyncIterable<Uint8Array>,
+  split: boolean = uidSplitActive(),
+  partialSuffix: string = randomBytes(8).toString("hex"),
+): Promise<string> {
+  validateJobInputFileSpec(file);
   if (!/^[0-9a-f]{1,32}$/.test(partialSuffix)) throw new JobInputError("job input partial name is invalid");
   const workReal = await fs.realpath(ws.work);
   const inputsReal = path.join(workReal, "inputs");
@@ -210,7 +289,7 @@ export async function writeJobInputFile(
     await handle.chmod(m.file); // umask-independent
     const hash = createHash("sha256");
     let total = 0;
-    for await (const chunk of body) {
+    for await (const chunk of tagBodyErrors(body)) {
       total += chunk.length;
       if (total > file.size) throw new JobFileIntegrityError("job input file is larger than its declared size");
       hash.update(chunk);
@@ -243,6 +322,9 @@ export async function writeJobInputFile(
   } catch (err) {
     if (!closed) await handle.close().catch(() => undefined);
     await fs.rm(partial, { force: true }).catch(() => undefined);
+    if (err instanceof BodyStreamError) {
+      throw new JobFileIntegrityError(`job input file stream ended before it completed: ${err.message}`, { cause: err.cause });
+    }
     throw err;
   }
 }

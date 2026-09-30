@@ -1623,20 +1623,22 @@ export class WorkerClient {
 
   /** Download one attached input file of a job (GET /worker/runs/{id}/files/{fileID}, PRD #1909
    *  D8), streaming the body to `sink` without buffering the file. `claimGeneration` is the job
-   *  flight's generation (the api fences on it). `sink` receives the body plus the server's
-   *  advertised length and SHA-256 (informational: the writer verifies the bytes itself against the
-   *  claim manifest) and must consume the stream to its end; a body cut short by a server abort
-   *  rejects the stream, so a truncated 200 never reads as complete. Throws RequestError on non-2xx.
-   *  The whole download is bounded by JOB_FILE_DOWNLOAD_TIMEOUT_MS. */
+   *  flight's generation (the api fences on it). `sink` must consume the stream to its end (the
+   *  writer verifies the bytes itself against the claim manifest); a body cut short by a server
+   *  abort rejects the stream, so a truncated 200 never reads as complete. If `sink` throws, the
+   *  response body is destroyed so the socket is released at once. `signal` aborts the request or
+   *  the body in flight; `timeoutMs` bounds the whole download (default JOB_FILE_DOWNLOAD_TIMEOUT_MS).
+   *  Throws RequestError on non-2xx. */
   async downloadJobFile(
     runId: string,
     fileId: string,
     claimGeneration: number,
-    sink: (body: Readable, meta: { contentLength: number | null; sha256: string | null }) => Promise<void>,
+    sink: (body: Readable) => Promise<void>,
     signal?: AbortSignal,
+    timeoutMs: number = JOB_FILE_DOWNLOAD_TIMEOUT_MS,
   ): Promise<void> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/files/${encodeURIComponent(fileId)}?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
-    const timeout = AbortSignal.timeout(JOB_FILE_DOWNLOAD_TIMEOUT_MS);
+    const timeout = AbortSignal.timeout(timeoutMs);
     const res = await fetch(this.baseUrl + path, {
       method: "GET",
       headers: { Authorization: `Bearer ${this.token}`, "X-Client-Version": this.version },
@@ -1644,11 +1646,13 @@ export class WorkerClient {
     });
     if (res.status !== 200) throw await this.toError("GET", path, res);
     if (!res.body) throw new Error("job file download returned no body");
-    const len = Number(res.headers.get("content-length"));
-    await sink(Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>), {
-      contentLength: Number.isInteger(len) && len >= 0 && res.headers.get("content-length") !== null ? len : null,
-      sha256: res.headers.get("x-uzi-file-sha256"),
-    });
+    const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>);
+    try {
+      await sink(body);
+    } finally {
+      // Release the socket whether the sink finished or threw (a no-op on a fully read body).
+      body.destroy();
+    }
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).

@@ -83,3 +83,31 @@ func TestJobClaimFilesEmptyLiveDB(t *testing.T) {
 		t.Fatalf("files = %#v, want a non-nil empty slice", pl.Job.Files)
 	}
 }
+
+// TestJobClaimCarriesInputLimitsLiveDB (PRD #1909 D1): a job claim carries the server's input caps
+// so the worker can refuse an oversized manifest before downloading, and a claim on a service with
+// no job-file store omits them (the worker then uses its fixed ceilings alone).
+func TestJobClaimCarriesInputLimitsLiveDB(t *testing.T) {
+	l := wide()
+	l.InputFileMaxBytes, l.InputsMaxFiles, l.InputsMaxBytes = 4<<20, 3, 9<<20
+	e := newJFEnv(t, l)
+	e.svc.SetJobFiles(e.jf)
+	t.Cleanup(func() { e.svc.SetJobFiles(nil) })
+	u := e.seedJobUser(t)
+	e.makeTokenDefault(t, u)
+	if _, err := e.svc.CreateJobRun(e.ctx, jobReq(cliCaller(u))); err != nil {
+		t.Fatalf("CreateJobRun: %v", err)
+	}
+	capID := e.seedWorkerRow(t, u, false, nil, jobCap, jobFilesCap)
+	capable := store.Worker{ID: capID, UserID: u, Name: "capable", Status: "online", ProtocolCapabilities: []string{jobCap, jobFilesCap}}
+	pl, err := e.svc.Claim(e.ctx, capable, nil)
+	if err != nil || pl == nil || pl.Job == nil {
+		t.Fatalf("Claim = %+v, %v", pl, err)
+	}
+	if got := (pl.Config.JobInputFileMaxBytes); got != 4<<20 {
+		t.Fatalf("job_input_file_max_bytes = %d, want %d", got, 4<<20)
+	}
+	if pl.Config.JobInputsMaxFiles != 3 || pl.Config.JobInputsMaxBytes != 9<<20 {
+		t.Fatalf("inputs caps = %d files / %d bytes, want 3 / %d", pl.Config.JobInputsMaxFiles, pl.Config.JobInputsMaxBytes, 9<<20)
+	}
+}
