@@ -1068,6 +1068,7 @@ type Store interface {
 	ListJobInputsForClaim(ctx context.Context, runID uuid.UUID) ([]store.ListJobInputsForClaimRow, error)
 	// FailJobsPastWallDeadline is the PRD #1908 D-E wall-clock backstop for claimed/running jobs.
 	FailJobsPastWallDeadline(ctx context.Context, arg store.FailJobsPastWallDeadlineParams) ([]store.FailJobsPastWallDeadlineRow, error)
+	ListRevokedProductJobs(ctx context.Context, batch int32) ([]store.ListRevokedProductJobsRow, error)
 	// CountOnlineEligibleWorkersForRepo backs PRD #361's queued Docker-allowlist reason:
 	// how many of the caller's online workers fn_worker_can_claim accepts for this repo/kind,
 	// ignoring availability (free slots AND draining). Since issue #512 M2 it is capability-

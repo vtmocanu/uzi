@@ -964,6 +964,62 @@ func (q *Queries) ListJobsForCaller(ctx context.Context, arg ListJobsForCallerPa
 	return items, nil
 }
 
+const listRevokedProductJobs = `-- name: ListRevokedProductJobs :many
+SELECT r.id, r.user_id
+  FROM runs r
+  JOIN users u ON u.id = r.user_id
+  JOIN job_origins o ON o.run_id = r.id
+  LEFT JOIN product_tokens t ON t.id = o.product_token_id
+  LEFT JOIN products p ON p.id = o.product_id
+ WHERE r.kind = 'job'
+   AND r.status NOT IN ('completed', 'failed', 'cancelled')
+   AND (COALESCE(t.revoked, false)
+        OR COALESCE(NOT p.enabled, false)
+        OR p.deleted_at IS NOT NULL
+        OR NOT u.is_active)
+   AND NOT EXISTS (SELECT 1 FROM run_user_inputs i
+                    WHERE i.run_id = r.id AND i.kind = 'cancel' AND i.consumed_at IS NULL)
+ ORDER BY r.created_at, r.id
+ LIMIT $1::int
+`
+
+type ListRevokedProductJobsRow struct {
+	ID     uuid.UUID `json:"id"`
+	UserID uuid.UUID `json:"user_id"`
+}
+
+// PRD #1908 D14 product-revoke sweep. The non-terminal kind='job' runs whose authorization
+// has been withdrawn, oldest first, at most @batch per pass:
+//   - the creating product token was EXPLICITLY revoked (single revoke, "Revoke all", admin
+//     revoke, or a revoked OAuth grant, all of which set product_tokens.revoked);
+//   - the origin's product is disabled or soft-deleted;
+//   - the owner is deactivated (any job, including one created with a uzc_ token).
+//
+// Token EXPIRY is deliberately absent: an expired, unrevoked token never cancels a job that was
+// authorized while it was valid. A uzc_-created job has NULL product_id and NULL
+// product_token_id, so the LEFT JOINs give it no revoked/disabled signal and only the owner
+// clause can select it. A job with an unconsumed cancel input is skipped: its cancel is already
+// in flight, so a re-run of the pass is a no-op rather than a second input.
+func (q *Queries) ListRevokedProductJobs(ctx context.Context, batch int32) ([]ListRevokedProductJobsRow, error) {
+	rows, err := q.db.Query(ctx, listRevokedProductJobs, batch)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListRevokedProductJobsRow{}
+	for rows.Next() {
+		var i ListRevokedProductJobsRow
+		if err := rows.Scan(&i.ID, &i.UserID); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockJobCreate = `-- name: LockJobCreate :exec
 
 SELECT pg_advisory_xact_lock(

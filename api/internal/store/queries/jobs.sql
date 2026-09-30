@@ -314,3 +314,32 @@ WHERE kind = 'job'
                               + budget_finalize_seconds
                               + sqlc.arg('grace_seconds')::int))
 RETURNING id, user_id, status;
+
+-- name: ListRevokedProductJobs :many
+-- PRD #1908 D14 product-revoke sweep. The non-terminal kind='job' runs whose authorization
+-- has been withdrawn, oldest first, at most @batch per pass:
+--   * the creating product token was EXPLICITLY revoked (single revoke, "Revoke all", admin
+--     revoke, or a revoked OAuth grant, all of which set product_tokens.revoked);
+--   * the origin's product is disabled or soft-deleted;
+--   * the owner is deactivated (any job, including one created with a uzc_ token).
+-- Token EXPIRY is deliberately absent: an expired, unrevoked token never cancels a job that was
+-- authorized while it was valid. A uzc_-created job has NULL product_id and NULL
+-- product_token_id, so the LEFT JOINs give it no revoked/disabled signal and only the owner
+-- clause can select it. A job with an unconsumed cancel input is skipped: its cancel is already
+-- in flight, so a re-run of the pass is a no-op rather than a second input.
+SELECT r.id, r.user_id
+  FROM runs r
+  JOIN users u ON u.id = r.user_id
+  JOIN job_origins o ON o.run_id = r.id
+  LEFT JOIN product_tokens t ON t.id = o.product_token_id
+  LEFT JOIN products p ON p.id = o.product_id
+ WHERE r.kind = 'job'
+   AND r.status NOT IN ('completed', 'failed', 'cancelled')
+   AND (COALESCE(t.revoked, false)
+        OR COALESCE(NOT p.enabled, false)
+        OR p.deleted_at IS NOT NULL
+        OR NOT u.is_active)
+   AND NOT EXISTS (SELECT 1 FROM run_user_inputs i
+                    WHERE i.run_id = r.id AND i.kind = 'cancel' AND i.consumed_at IS NULL)
+ ORDER BY r.created_at, r.id
+ LIMIT @batch::int;

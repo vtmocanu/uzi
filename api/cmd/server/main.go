@@ -805,6 +805,13 @@ func run() error {
 				return wsvc.FailJobsPastWallDeadline(ctx, cfg.RunTimeout)
 			},
 		},
+		// Product-revoke sweep (PRD #1908 D14): cancels non-terminal jobs whose creating product
+		// token was explicitly revoked, whose product is disabled or deleted, or whose owner is
+		// deactivated, through the existing cancel path. Token expiry alone never cancels.
+		sweeper.Pass{
+			Name: "job_product_revoke_cancel",
+			Run:  wsvc.CancelRevokedProductJobs,
+		},
 		// Ephemeral worker orphan/failure GC backstop (PRD #529 M5, Decision 6). Deletes
 		// ephemeral workers that can no longer make progress — owning run terminal/absent,
 		// never booted past the provision deadline, or idle-stolen by a sibling — all

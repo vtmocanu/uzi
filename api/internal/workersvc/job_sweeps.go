@@ -110,3 +110,47 @@ func (s *Service) FailJobsPastWallDeadline(ctx context.Context, globalTimeout ti
 	}
 	return int64(len(rows)), nil
 }
+
+// jobRevokeSweepBatch bounds one product-revoke pass. A backlog larger than this drains over
+// the next ticks; a cancelled job leaves the selection, so the pass makes progress.
+const jobRevokeSweepBatch = 200
+
+// jobRevokeCancelReason is the operator-visible stop reason of a job cancelled by the sweep.
+const jobRevokeCancelReason = "the product credential that created this job was revoked, the product was disabled, or the owner was deactivated"
+
+// CancelRevokedProductJobs is the PRD #1908 D14 sweeper pass: it cancels every non-terminal
+// job whose creating product token was explicitly revoked, whose product is disabled or deleted,
+// or whose owner is deactivated (ListRevokedProductJobs holds the exact predicate, including why
+// token expiry and a uzc_-created job are not selected). One idempotent rule covers every revoke
+// path, so no revoke handler carries a hook.
+//
+// Each job is cancelled through the existing cancel path (SubmitInputWithOptions, as the owner):
+// a queued job ends cancelled server-side at once, a running one gets a cancel input its job
+// runner polls and honours. A job that already has a pending cancel is not selected, so a re-run
+// is a no-op. A job that finished between the select and the cancel is skipped; any other
+// per-job failure is logged and joined into the returned error after the rest are processed.
+// It returns the number of cancels issued.
+func (s *Service) CancelRevokedProductJobs(ctx context.Context) (int64, error) {
+	rows, err := s.q.ListRevokedProductJobs(ctx, jobRevokeSweepBatch)
+	if err != nil {
+		return 0, fmt.Errorf("list revoked product jobs: %w", err)
+	}
+	var (
+		n    int64
+		errs []error
+	)
+	for _, r := range rows {
+		_, err := s.SubmitInputWithOptions(ctx, r.UserID, r.ID, "cancel", jobRevokeCancelReason, nil, SubmitInputOptions{})
+		switch {
+		case err == nil:
+			n++
+			slog.Info("sweeper: cancelled a job whose product authorization was revoked", "run_id", r.ID)
+		case errors.Is(err, ErrRunTerminal), errors.Is(err, ErrRunNotFound), errors.Is(err, ErrOutcomePendingConfirmationRequired):
+			// Finished (or journaled a terminal outcome awaiting delivery) since the select.
+		default:
+			slog.Warn("sweeper: cancelling a revoked product job failed", "run_id", r.ID, "err", err)
+			errs = append(errs, fmt.Errorf("cancel job %s: %w", r.ID, err))
+		}
+	}
+	return n, errors.Join(errs...)
+}
