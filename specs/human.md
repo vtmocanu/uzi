@@ -835,6 +835,21 @@ Tracked as GitHub issue vtmocanu/uzi#1867; PRD at `prds/1867-failed-run-salvage-
 Tracked as GitHub issue vtmocanu/uzi#1907; PRD at `prds/1907-product-tokens-api-v1.md`.
 
 - An admin registers an external product; a user then mints a `uzp_` product token for it in Settings → Access, which acts as that user (once job endpoints exist, on the user's own worker and model credential) but only on the stable, versioned `/api/v1` and never with admin authority, and is refused on every other route exactly like an unknown token. A user holds at most 10 active tokens per product, chooses an expiry (30 days, 90 days by default, 1 year or never), and can revoke one token or use the existing Revoke all, which now covers product tokens too; an admin can revoke one product token or disable or delete a product, which cuts off all its tokens on their next request. A password change and logout do not revoke them. `/api/v1` changes are additive only, with a deprecation window of at least two minor releases and 90 days. Only `GET /api/v1/whoami` exists so far; job endpoints come later. (AI-synced 2026-09-29)
+- `/api/v1` now serves `whoami` and the jobs endpoints of Feature #1908. (AI-synced 2026-09-30)
+
+## Feature #1908 — Repo-less jobs over `/api/v1`
+
+Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/1908-repo-less-jobs-api.md`.
+
+- A `uzc_` or `uzp_` caller can create a repo-less `research` job over `/api/v1/jobs` with a prompt and inline text inputs, and can follow, list, cancel and read its structured result (a report plus findings). The job runs as the token's user on that user's own Claude credential, with no plan gate. (AI-synced 2026-09-30)
+- A job never touches a repo, a branch, a forge or `main`. It has no web or network tool, and the api refuses forge, memory, publish and review worker routes for it. (AI-synced 2026-09-30)
+- Docker-tier workers and worker images without the job runner never claim a job. (AI-synced 2026-09-30)
+- A `uzp_` token creates only the job types its product's admin-set allow-list names (empty allows none) and sees only its own product's jobs. A `uzc_` token may create any type and sees all of its user's jobs. (AI-synced 2026-09-30)
+- Revoking the creating product token, disabling or deleting its product, or deactivating the owner cancels the job. Token expiry alone never does. (AI-synced 2026-09-30)
+- A job fails rather than waits: a usage limit, its time budget, a disabled credential or an ephemeral worker that cannot serve it ends it `failed`. (AI-synced 2026-09-30)
+- Each user has a cap on active jobs (default 10, admin-tunable) and a per-user `/api/v1` rate limit. (AI-synced 2026-09-30)
+- Job runs appear in the web runs list and run detail with their report and findings. `uzi job create|get|result|cancel|list` mirrors the API. (AI-synced 2026-09-30)
+- `/api/v1` breaking changes fail `gate:repo`. (AI-synced 2026-09-30)
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 
