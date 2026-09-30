@@ -314,12 +314,22 @@ pod-only scope.
 
 **Run steps 0 to 10 in ONE shell session** (the trap below is installed in step 0 and must stay
 in effect until step 10); running the sketch as a standalone script would fire its `EXIT` trap
-immediately and undo the raise. The sketch turns `errexit` and `pipefail` off again once the raise is done, so the
+immediately and undo the raise. The sketch turns `errexit`, `nounset` and `pipefail` off again once the raise is done, so the
 later checks that are expected to fail (step 1's "no durable line yet", the pre-kill "no
 `terminal-<G>.json`") do not end the session, and a `kubectl logs ... | grep -q ...` check reports
 a match as a match (with `pipefail` on, the upstream SIGPIPE would make a match look like a miss).
-Judge each check's result yourself and, to abort an attempt, run `exit` (the trap then cleans up).
-Ctrl-C (INT) at any point also ends the attempt and runs the cleanup.
+It also turns job control off (`set +m`), so Ctrl-C during a running command (a wait loop, a
+rollout) reaches the shell and runs the cleanup, not only the foreground command. Judge each
+check's result yourself and, to abort an attempt, run `exit` (the trap then cleans up). Once the
+trap is installed, Ctrl-C, `exit`, a closed terminal or TERM all end the attempt and run the
+cleanup.
+
+Because `pipefail` is off, a failed read looks like "no match". **Every check must fail closed on
+a read error**: capture the output first and check the read succeeded, then match on the captured
+text, for example `out="$(kubectl logs <scratch-pod> -c worker)" || { echo READ FAILED; exit; }`
+followed by `grep -q ... <<<"$out"`; and for a must-not-exist file print an explicit state token
+that separates "absent" from an exec error, e.g. `kubectl exec <scratch-pod> -c worker -- sh -c
+'test -f F && echo PRESENT || echo ABSENT'` and proceed only on `ABSENT`.
 
 ### Preconditions
 
@@ -351,13 +361,14 @@ Ctrl-C (INT) at any point also ends the attempt and runs the cleanup.
 ### Cleanup contract (install it first)
 
 The order is fixed: **record the prior state, install the trap, then change the setting and apply
-the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt, an `exit` to abort,
-and (during step 0, while `errexit` is still on) a `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
+the deny rule.** The trap fires on `EXIT`, `INT` and `TERM`, so success, failure, interrupt (Ctrl-C, which reaches
+the shell because the sketch turns job control off), an `exit` to abort, and (during step 0, while
+`errexit` is still on) a `set -e` abort all run it. It does both things, independently: deletes the exact-named deny object
 **and** restores `WORKER_HEARTBEAT_STALE` to the recorded prior state, then verifies both
 restorations (a read error during verification is a failure, never a pass), reports any failure, and exits with the original status (non-zero on interrupt, or
 1 when cleanup itself failed). `cleanup` starts with `set +e`, so a failing delete cannot skip the
 restore and a failing restore cannot skip the verification. Sketch (bash 4.4 or later; step 0 runs under
-`set -euo pipefail`, which the sketch relaxes to `set +e +o pipefail` once the raise is done; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
+`set -euo pipefail`, which the sketch relaxes to `set +m` and `set +e +u +o pipefail` once the raise is done; `<...>` are placeholders; set `DENY_KIND` to the fully qualified resource of
 the chosen policy type so it cannot resolve to a standard NetworkPolicy):
 
 ```bash
@@ -418,10 +429,12 @@ trap 'cleanup 143' TERM
 kubectl -n "$API_NS" set env "deploy/$API_DEPLOY" 'WORKER_HEARTBEAT_STALE=<raised-value>'
 kubectl -n "$API_NS" rollout status "deploy/$API_DEPLOY" --timeout=300s
 deny_kubectl delete "$DENY_KIND" "$DENY_NAME" --ignore-not-found   # leftover from a dead shell
-set +e +o pipefail   # errexit/pipefail only guard the raise above. Later steps run checks that are
-                     # EXPECTED to fail (no durable line yet, no terminal-<G>.json), and pipefail
-                     # would turn `kubectl logs ... | grep -q ...` into rc 141 (SIGPIPE) on a MATCH.
-                     # The EXIT/INT/TERM traps stay installed.
+set +m               # no job control: Ctrl-C during a running command then reaches THIS shell,
+                     # so the INT trap (cleanup) fires; with job control only the command stops.
+set +e +u +o pipefail   # errexit/nounset/pipefail only guard the raise above. Later steps run
+                     # checks that are EXPECTED to fail (no durable line yet, no terminal-<G>.json),
+                     # and pipefail would turn `kubectl logs ... | grep -q ...` into rc 141
+                     # (SIGPIPE) on a MATCH. The EXIT/INT/TERM traps stay installed.
 ```
 
 **If the shell itself dies before the trap runs**, do not re-run step 0: it would record the
@@ -457,8 +470,10 @@ G=12), **and** `kubectl exec <scratch-pod> -c worker -- test
 trigger.
 
 The **pre-kill check** runs immediately before each kill (steps 4 and 7): `finalize-<G>.json` must
-exist **and** `terminal-<G>.json` must not (`kubectl exec <scratch-pod> -c worker -- test -f
-/data/outbox/<id>/finalize-<G>.json` succeeds and the same `test -f .../terminal-<G>.json` fails).
+exist **and** `terminal-<G>.json` must not. Read both in one exec that prints a state token, so an
+exec or connection error can never pass as "absent": `kubectl exec <scratch-pod> -c worker -- sh -c
+'d=/data/outbox/<id>; test -f $d/finalize-<G>.json || { echo NO_FINALIZE; exit; }; test -f
+$d/terminal-<G>.json && echo TERMINAL_JOURNALED || echo READY'`, and proceed only on `READY`.
 A run that is not interlocked can push and journal its terminal outcome with only the api blocked,
 which retires the finalize record; killing then would test a different path. If the check fails,
 abort the attempt (the trap cleans up) and repeat with a new scratch run.
@@ -473,7 +488,7 @@ abort the attempt (the trap cleans up) and repeat with a new scratch run.
    issue run) on the scratch repository and wait until it is `running`. While its executor is
    still working, apply the deny policy (the outage now precedes the hand-off, so no terminal can
    land). Confirm the log has **no** `"msg":"finalize record durable"` line for A at G yet (same match as
-   above). If it
+   above, on captured log text whose read succeeded; a failed read is an abort, never "no line"). If it
    already does, the hand-off beat the cut: abort this attempt (the trap cleans up) and repeat
    with a new scratch run.
 2. Wait for the durable point at G (both parts).
