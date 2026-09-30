@@ -7,6 +7,7 @@ import { RequestError } from "../src/client.js";
 import type { RunRunner } from "../src/runner.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
+import type { JobRunner } from "../src/job-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
@@ -787,6 +788,82 @@ describe("Worker — diff-review dispatch (PRD #400 M4b)", () => {
   });
 });
 
+// PRD #1908 M4 — a `job`-kind claim routes to the JobRunner (never the RunRunner or JudgeRunner),
+// and the worker advertises the job_runner_v1 protocol capability unconditionally.
+describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
+  function jobClient(claim: ClaimResponse, onRegister?: (caps: string[] | undefined) => void): WorkerClient {
+    let gave = false;
+    return {
+      register: async (_n: string, _t: string, _m: number, _c?: string[], protocolCapabilities?: string[]) => {
+        onRegister?.(protocolCapabilities);
+        return {};
+      },
+      heartbeat: async () => {},
+      claimRun: async (): Promise<ClaimResponse | null> => {
+        if (gave) return null;
+        gave = true;
+        return claim;
+      },
+      claimChat: async (): Promise<ChatClaimResponse | null> => null,
+    } as unknown as WorkerClient;
+  }
+
+  it("routes a kind=job claim to the JobRunner only", async () => {
+    const controller = new AbortController();
+    const routed: string[] = [];
+    const client = jobClient({ run_id: "job-1", kind: "job" } as unknown as ClaimResponse);
+    const runRunner = { ...noResumeRecoveries, execute: async () => { routed.push("runner"); } } as unknown as RunRunner;
+    const judgeRunner = { execute: async () => { routed.push("judge"); } } as unknown as JudgeRunner;
+    const jobRunner = { execute: async (c: ClaimResponse) => { routed.push(`job:${c.run_id}`); } } as unknown as JobRunner;
+    const worker = new Worker(
+      fakeConfig(), client, runRunner, {} as unknown as ChatRunner, judgeRunner, noReview,
+      recordingLogger().logger, okPreflight,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      jobRunner,
+    );
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && routed.length === 0; i++) await tick();
+    controller.abort();
+    await done;
+    assert.deepStrictEqual(routed, ["job:job-1"], "the job claim went to the JobRunner only");
+  });
+
+  it("still routes a judge claim to the JudgeRunner when a JobRunner is wired", async () => {
+    const controller = new AbortController();
+    const routed: string[] = [];
+    const client = jobClient({ run_id: "j-1", kind: "judge" } as unknown as ClaimResponse);
+    const judgeRunner = { execute: async () => { routed.push("judge"); } } as unknown as JudgeRunner;
+    const jobRunner = { execute: async () => { routed.push("job"); } } as unknown as JobRunner;
+    const worker = new Worker(
+      fakeConfig(), client, { ...noResumeRecoveries, execute: async () => { routed.push("runner"); } } as unknown as RunRunner,
+      {} as unknown as ChatRunner, judgeRunner, noReview, recordingLogger().logger, okPreflight,
+      undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+      jobRunner,
+    );
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 500 && routed.length === 0; i++) await tick();
+    controller.abort();
+    await done;
+    assert.deepStrictEqual(routed, ["judge"]);
+  });
+
+  it("advertises job_runner_v1 unconditionally, even with a non-advertising codex result", async () => {
+    const controller = new AbortController();
+    let caps: string[] | undefined;
+    const client = jobClient({ run_id: "x", kind: "task" } as unknown as ClaimResponse, (c) => { caps = c; });
+    const worker = new Worker(
+      fakeConfig({ codexHarness: { advertise: false, degraded: false, landlock: "unavailable", reason: "off" } }),
+      client, { ...noResumeRecoveries, execute: async () => {} } as unknown as RunRunner, {} as unknown as ChatRunner,
+      noJudge, noReview, recordingLogger().logger, okPreflight,
+    );
+    const done = worker.run(controller.signal);
+    for (let i = 0; i < 300 && caps === undefined; i++) await tick();
+    controller.abort();
+    await done;
+    assert.ok(caps?.includes("job_runner_v1"), "job_runner_v1 is on the register wire");
+  });
+});
+
 // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3 — the worker advertises the
 // `codex_harness_v1` PROTOCOL capability IFF the HONEST combined availability result
 // (resolved once, carried on config.codexHarness) says to. That result combines the
@@ -846,7 +923,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1", CODEX_HARNESS_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", CODEX_HARNESS_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -867,7 +944,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1"],
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
@@ -880,7 +957,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1"],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1"],
       "an absent availability result advertises only the always-present protocol caps",
     );
   });

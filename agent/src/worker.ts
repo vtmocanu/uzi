@@ -5,6 +5,7 @@ import type { Outbox } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
+import type { JobRunner } from "./job-runner.js";
 import type { ReviewRunner } from "./review-runner.js";
 import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
@@ -85,6 +86,13 @@ export class Worker {
     // sandbox denies. Production uses the default.
     private readonly newStatsCollector: (dataDir: string) => StatsCollector = (dataDir) =>
       new StatsCollector({ dataDir }),
+    // PRD #1908 M4: the repo-less `job` run lane's runner. Trailing so no existing positional
+    // caller moves. The default fails a job claim loudly instead of running it: production
+    // (main.ts) always passes the real runner, and the api only routes a job to a worker that
+    // advertised job_runner_v1, which this image does only alongside a wired runner.
+    private readonly jobRunner: Pick<JobRunner, "execute"> = {
+      execute: () => Promise.reject(new Error("no job runner wired")),
+    },
   ) {}
 
   /** The run lane's in-flight executions (issue #1759: a field so {@link isIdle} can read it). */
@@ -378,6 +386,10 @@ export class Worker {
           // advice post only from a worker advertising this, never on credential_switch_v1, which
           // shipped before advice posts were stamped, so older images keep posting mid-upgrade.
           "advice_claim_fence_v1",
+          // PRD #1908 M4: this image runs the repo-less `job` run kind (job-runner.ts). Advertised
+          // UNCONDITIONALLY: the api's ClaimRun job clause reads 'job_runner_v1' =
+          // ANY(workers.protocol_capabilities), so an image without it never claims a job.
+          "job_runner_v1",
         ];
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
@@ -721,6 +733,7 @@ export class Worker {
             ? this.reviewRunner.execute(claim)
             : claim.kind === "judge"
               ? this.judgeRunner.execute(claim)
+              : claim.kind === "job" ? this.jobRunner.execute(claim)
               : this.runner.execute(claim);
           const run = exec.catch((err) =>
             this.log.warn("claim/execute cycle failed", { error: errMessage(err) }),

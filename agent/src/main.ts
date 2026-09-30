@@ -18,6 +18,8 @@ import { JudgeRunner } from "./judge-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
+import { JobRunner } from "./job-runner.js";
+import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
@@ -639,6 +641,22 @@ async function main(): Promise<void> {
     ...(config.executor === "stub" ? { queryFn: stubJudgeQueryFn } : {}),
   });
 
+  // The job lane (PRD #1908 M4): a slim runner for `job` claims, the repo-less run kind. Its
+  // per-run workspaces live under `<dataDir>/jobs`, outside the clone and attempt roots. Under
+  // UZI_E2E_EXECUTOR=stub the model call is the stub job queryFn (no live Anthropic).
+  const jobRunner = new JobRunner(client, log, {
+    jobsRoot: path.join(config.dataDir, "jobs"),
+    secretPaths: workerSecretDenyPaths(config.workerTokenFile),
+    joinToken: config.workerToken,
+    activeRuns,
+    outbox,
+    outboxTerminalMaxBytes: config.outboxTerminalMaxBytes,
+    gapFillMax: config.gapFillMax,
+    outboxSpillBufferBytes: config.outboxSpillBufferBytes,
+    transientTripMs: config.transientTripMs,
+    ...(config.executor === "stub" ? { queryFn: stubJobQueryFn } : {}),
+  });
+
   // PRD #1391 M2: the Worker owns the per-worker outbox drainer + the heartbeat outbox
   // report, so it takes the same outbox + re-arm registry the runners spill into. The
   // `undefined` preserves the default boot toolchain preflight (only tests inject one).
@@ -733,6 +751,8 @@ async function main(): Promise<void> {
     dindPrune,
     diskPressure,
     runDisk,
+    undefined,
+    jobRunner,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these
@@ -778,6 +798,10 @@ async function main(): Promise<void> {
       log,
     ).catch((err) => log.warn("run HOME reclaim failed", { error: errMessage(err) }));
   }
+
+  // PRD #1908 M4: remove job workspaces a hard kill left under `<dataDir>/jobs`. Before
+  // worker.run(), so no entry can belong to a live run. Never throws.
+  await jobRunner.reapStaleWorkspaces();
 
   // Issue #1598: reap Codex command orphans (tmps + per-run caches) from a previous
   // container. MUST run here, before worker.run(): nothing may launch a run (and so no

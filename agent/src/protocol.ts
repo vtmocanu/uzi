@@ -1006,6 +1006,25 @@ export interface ReviewCommentsSnapshot {
   truncated: boolean;
 }
 
+/** One structured finding of a job result (PRD #1908): POST /worker/runs/{id}/job-result. `url`
+ *  and `file` are mutually exclusive; `line` requires `file`. */
+export interface JobFindingBody {
+  severity: "info" | "warning" | "error";
+  message_md: string;
+  url?: string;
+  file?: string;
+  line?: number;
+}
+
+/** The job runner's result POST body (PRD #1908). The api decodes it strictly (unknown fields are
+ *  refused) and REQUIRES `claim_generation`, the fence against a stale flight of the same run. */
+export interface JobResultRequest {
+  claim_generation: number;
+  status: string;
+  report_md: string;
+  findings: JobFindingBody[];
+}
+
 /** One named input document of a job (PRD #1908). */
 export interface ClaimJobInput {
   name: string;

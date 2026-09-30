@@ -23,6 +23,7 @@ import {
   type ChatClaimResponse,
   type ClaimResponse,
   type CreateProposalRequest,
+  type JobResultRequest,
   type CompletionAttemptRequest,
   type CompletionAttemptResponse,
   type CompletionPermitRequest,
@@ -1606,6 +1607,15 @@ export class WorkerClient {
       }
       return this.postJSON(path, body);
     });
+  }
+
+  /** Store a job run's structured result (POST /worker/runs/{id}/job-result, PRD #1908). The api
+   *  requires `claim_generation` in the body, so it is always sent as given (never gated by
+   *  includeClaimGeneration, which omits it for a legacy generation of 0). Throws RequestError on
+   *  non-2xx: 409 `stale_claim` (see isStaleClaimRefusal) or 409 already-finished, 400, 403, 404,
+   *  413. */
+  async postJobResult(runId: string, body: JobResultRequest): Promise<void> {
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/job-result`, body);
   }
 
   /** Create a PENDING issue proposal on a chat run (POST /worker/runs/:id/proposals).
