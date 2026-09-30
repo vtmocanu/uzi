@@ -578,7 +578,14 @@ jobs:
   lint-repo:
     runs-on: ubuntu-latest
     steps:
+      # fetch-depth 0 + an explicit fetch of origin/main: check:changelog-entry diffs the
+      # branch against merge-base(origin/main, HEAD), which a shallow checkout cannot
+      # compute. Without it the check fails closed (exit 2), never green.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7
+        with:
+          fetch-depth: 0
+      - name: Fetch origin/main for the CHANGELOG entry gate
+        run: git fetch --quiet origin +refs/heads/main:refs/remotes/origin/main
       # Go is needed for scan:secrets (gitleaks via `go install pkg@version`).
       - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
         with:

@@ -17,11 +17,13 @@
 # recorded" and "someone forgot", so it cannot tell them apart. Coverage has to be
 # measured against what actually merged.
 #
-# NOR DOES "EVERY MERGE MUST TOUCH CHANGELOG.md". That was the first version of
-# this script and it was wrong for this repo: entries are written in the RELEASE
-# MR, citing issue numbers, not in each feature MR. It passed the case it was
-# written for and failed #149, whose entry existed and was simply written
-# elsewhere. A gate that cries wolf on the normal workflow gets switched off.
+# NOR DOES "EVERY MERGE MUST TOUCH CHANGELOG.md" ON ITS OWN. That was the first
+# version of this script: it passed the case it was written for and failed #149,
+# whose entry existed and was simply written elsewhere. Entries are now written in
+# each PR under `[Unreleased]`, and scripts/check-changelog-entry.sh (gate:repo)
+# enforces that at PR time with the same exemptions plus a dependency-manifest one.
+# This oracle stays the final check: it also accepts citations written at cut time
+# and covers merges that reached main without a PR.
 #
 # WHAT IT CHECKS. For each first-parent merge in <prev-tag>..<ref> that changed
 # shipping code, at least one issue/PRD number from its branch name or commit body

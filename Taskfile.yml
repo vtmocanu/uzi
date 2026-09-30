@@ -387,6 +387,13 @@ tasks:
       # needs the network only then and for the cached oasdiff download; a fetch it cannot
       # make fails the gate closed. Before `scan:secrets`, which is deliberately last.
       - task: check:api-v1-compat
+      # PR-time CHANGELOG entry gate: a branch changing shipping paths must add a CHANGELOG.md
+      # line, carry `Changelog: none`, be docs-typed throughout, or touch only dependency
+      # manifests (the release oracle's rules, moved to the PR). Needs a merge-base with
+      # origin/main, so CI's lint-repo job checks out full history; fails closed (exit 2)
+      # without one. Its hermetic suite runs first so a gutted check cannot read green.
+      - task: test:changelog-entry
+      - task: check:changelog-entry
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -930,6 +937,11 @@ tasks:
     cmds:
       - ./scripts/check-api-v1-compat.test.sh
 
+  test:changelog-entry:
+    desc: hermetic exit-code contract for check:changelog-entry (throwaway git repos, no network), tally-guarded
+    cmds:
+      - ./scripts/check-changelog-entry.test.sh
+
   test:scan-secrets:
     desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)
     cmds:
@@ -1158,6 +1170,13 @@ tasks:
       # silently. The explicit canary arg makes this echo show what is scanned. See the
       # script header.
       - ./scripts/check-mktemp-portability.sh scripts/mktemp-portability-canary.txt
+
+  check:changelog-entry:
+    desc: a branch changing shipping paths adds a CHANGELOG.md line or is exempt (Changelog none, docs-typed, manifests only)
+    cmds:
+      # See the script header for the exemptions and why each matches the release oracle
+      # (scripts/assert-changelog-covers-release.sh), which stays the final check at cut time.
+      - ./scripts/check-changelog-entry.sh
 
   check:api-v1-compat:
     desc: api/openapi/v1.yaml has no breaking change against origin/main (oasdiff), with a canary proving a removed response field reddens it
