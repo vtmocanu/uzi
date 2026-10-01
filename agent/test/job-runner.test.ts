@@ -1501,6 +1501,52 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
     });
 
+    it("the lane tool gate allows submit_job_result (and Skill with skills) only after a verified init, and denies Bash and WebFetch always", async () => {
+      const decide = async (options: SdkOptions, tool: string, input: Record<string, unknown>): Promise<"deny" | "allow"> => {
+        for (const m of options.hooks?.PreToolUse ?? []) {
+          if (m.matcher !== undefined && !new RegExp(`^(?:${m.matcher})$`).test(tool)) continue;
+          for (const h of m.hooks) {
+            const out = (await h(
+              { hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, session_id: "s", transcript_path: "", cwd: options.cwd } as unknown as HookInput,
+              undefined,
+              { signal: new AbortController().signal },
+            )) as { hookSpecificOutput?: { permissionDecision?: string } };
+            if (out.hookSpecificOutput?.permissionDecision === "deny") return "deny";
+          }
+        }
+        return "allow";
+      };
+      for (const withSkills of [false, true]) {
+        const { client, calls } = fakeClient();
+        const seen: Record<string, string> = {};
+        const qf = scripted(async function* ({ options }) {
+          const probe = async (phase: string): Promise<void> => {
+            seen[`${phase}:submit`] = await decide(options, SUBMIT, {});
+            seen[`${phase}:skill`] = await decide(options, "Skill", { skill: "uzi:brand-voice" });
+            seen[`${phase}:fetch`] = await decide(options, "mcp__uzi_fetch__fetch_url", { url: "https://docs.example.com/" });
+            seen[`${phase}:bash`] = await decide(options, "Bash", { command: "ls" });
+            seen[`${phase}:webfetch`] = await decide(options, "WebFetch", { url: "https://example.com" });
+          };
+          await probe("before");
+          const plugin = options.plugins?.[0] as { path: string } | undefined;
+          yield withSkills
+            ? { ...LANE_INIT, tools: [...LANE_TOOLS, "Skill"], plugins: [{ name: "uzi", path: plugin!.path }], skills: ["doctor", "uzi:brand-voice"] }
+            : LANE_INIT;
+          await probe("after");
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        });
+        await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim(withSkills ? { skills: [SKILL], skills_dropped: [] } : {}));
+        assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
+        for (const k of ["submit", "skill", "fetch", "bash", "webfetch"]) assert.strictEqual(seen[`before:${k}`], "deny", `before init: ${k} (skills=${withSkills})`);
+        assert.strictEqual(seen["after:submit"], "allow", "submit_job_result after init");
+        assert.strictEqual(seen["after:fetch"], "allow", "the fetch tool after init");
+        assert.strictEqual(seen["after:skill"], withSkills ? "allow" : "deny", `Skill after init (skills=${withSkills})`);
+        assert.strictEqual(seen["after:bash"], "deny");
+        assert.strictEqual(seen["after:webfetch"], "deny");
+      }
+    });
+
     for (const [name, mutate] of [
       ["an extra tool", (f: Record<string, unknown>) => (f.tools = [...LANE_TOOLS, "Bash"])],
       ["a missing result tool", (f: Record<string, unknown>) => (f.tools = ISOLATED_TOOLS)],
@@ -1651,6 +1697,59 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
       assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["ok.txt"]);
       assert.strictEqual(calls.results[0]!.body.refused_outputs?.length, 1);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(e) a workspace-setup failure carrying the credential gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* () {
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf, { fetcherCaFile: `/nonexistent/${CRED}/ca.pem` })).execute(laneClaim());
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /fetcher CA bundle/);
+      assert.match(failed.failure_reason!, /\*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(f) a failing completed report carrying the credential gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient({
+        reportState: (_id, b) => {
+          if (b.status === "completed") throw new Error(`report refused ${CRED}`);
+          return { applied: true, status: b.status };
+        },
+      });
+      const qf = scripted(async function* ({ options }) {
+        yield LANE_INIT;
+        await callSubmit(options, GOOD_RESULT);
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /report refused \*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(g) an unexpected throw out of the run (prompt assembly) gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient();
+      let ran = false;
+      const qf = scripted(async function* () {
+        ran = true;
+        yield RESULT_OK;
+      });
+      const claim = laneClaim();
+      Object.defineProperty(claim.job!, "prompt", {
+        get() {
+          throw new Error(`prompt assembly exploded ${CRED}`);
+        },
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(claim);
+      assert.strictEqual(ran, false);
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /prompt assembly exploded \*\*\*REDACTED\*\*\*/);
       assert.ok(!rawIn(calls));
     });
   });

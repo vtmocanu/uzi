@@ -3,8 +3,10 @@
 // downloads the input file, runs a scripted session that fetches through the REAL in-process fetch
 // tool against a fake uzi-fetcher over real TLS (one allowed URL, one the fetcher refuses as
 // off_list), writes an output, submits a result, uploads the output, posts the result and reports
-// completed. The scripted session stands in for the CLI only: the tool gate, init check and options
-// are the production ones (the init frame it emits is the lane surface).
+// completed. The scripted session stands in for the CLI: it emits the lane surface as its init frame
+// (which the production init check verifies) and calls the MCP tool handlers directly, so the
+// PreToolUse tool gate is built into the options but NOT consulted here; that gate's allow/deny
+// behaviour is covered in job-runner.test.ts (the lane tool gate test).
 
 import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
