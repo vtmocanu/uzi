@@ -54,7 +54,7 @@ No `.github/workflows/**` change in implementation or validation.
 
 ## Acceptance (hosted k8s, maintainer-owned)
 
-Feature completion requires hosted k8s evidence, tracked in a linked `acceptance` issue: warm same-branch follow-up reuse, lease expiry teardown, quota eviction of a leased-idle worker, and drain/roll of a leased-idle worker. Implementation may merge before this acceptance completes; the PRD moves to `prds/done/` only after it.
+Feature completion requires hosted k8s evidence, tracked in the linked `acceptance` issue #2008: warm same-branch follow-up reuse, lease expiry teardown, quota eviction of a leased-idle worker, and drain/roll of a leased-idle worker. Implementation may merge before this acceptance completes; the PRD moves to `prds/done/` only after it.
 
 ## Decision Log
 
