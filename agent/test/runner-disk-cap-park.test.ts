@@ -8,9 +8,10 @@ import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { WorkerClient } from "../src/client.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { type CacheCapConfig, DiskGovernor, DiskParkSignal } from "../src/cache-cap.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
-import { TOKEN, api, baseUrl, client, fakeGitlab, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { TOKEN, api, baseUrl, client, fakeGitlab, git, gitlabClaim, input, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
 
@@ -54,12 +55,22 @@ interface GovernorProbe {
   sizes: Map<string, number>;
   reclaims: () => number;
   trims: () => number;
+  /** How many times the fake measurement ran. */
+  measures: () => number;
+}
+
+/** Register a sibling run that is parkable (in its executor, `running` sent and ACKed). */
+function registerRunning(probe: GovernorProbe, runId: string, home: string, requestStop: () => void): void {
+  probe.gov.register(runId, { home, requestStop, reclaimInPlace: async () => undefined });
+  probe.gov.enterRun(runId);
+  probe.gov.statusAcked(runId, probe.gov.statusRequested(runId, "running"), "running");
 }
 
 function governor(config: Partial<CacheCapConfig> = {}): GovernorProbe {
   const sizes = new Map<string, number>();
   let reclaims = 0;
   let trims = 0;
+  let measures = 0;
   const gov = new DiskGovernor({
     config: { ...CONFIG, ...config },
     log: nullLogger(),
@@ -68,7 +79,10 @@ function governor(config: Partial<CacheCapConfig> = {}): GovernorProbe {
     reclaim: async () => {
       reclaims++;
     },
-    measure: async (home) => ({ cacheBytes: sizes.get(home) ?? 0, entries: 1, truncated: false }),
+    measure: async (home) => {
+      measures++;
+      return { cacheBytes: sizes.get(home) ?? 0, entries: 1, truncated: false };
+    },
     trim: async (_home, target) => {
       trims++;
       return {
@@ -84,7 +98,7 @@ function governor(config: Partial<CacheCapConfig> = {}): GovernorProbe {
       };
     },
   });
-  return { gov, sizes, reclaims: () => reclaims, trims: () => trims };
+  return { gov, sizes, reclaims: () => reclaims, trims: () => trims, measures: () => measures };
 }
 
 async function withHomeRoot(fn: (homeRoot: string) => Promise<void>): Promise<void> {
@@ -219,7 +233,7 @@ describe("RunRunner — PRD #1809 D4 hard layer: the mid-turn pressure stop", ()
       // Another running Claude run on the worker, with smaller caches: it must not be the one stopped.
       let otherStopped = 0;
       probe.sizes.set("/other/home", GIB);
-      probe.gov.register("other-run", { home: "/other/home", requestStop: () => otherStopped++ });
+      registerRunning(probe, "other-run", "/other/home", () => otherStopped++);
       await probe.gov.boundary("other-run", async () => false);
 
       let home = "";
@@ -237,7 +251,7 @@ describe("RunRunner — PRD #1809 D4 hard layer: the mid-turn pressure stop", ()
             },
             run: async (ctx: RunContext): Promise<ExecutorResult> => {
               seedHome(home);
-              // The boundary before the turn: under the cap, and the run becomes stoppable.
+              // The boundary before the turn: under the cap.
               assert.strictEqual(await ctx.cacheCapBoundary?.(async () => false), "continue");
               // A long build mid-turn, until the turn is dropped.
               await new Promise<void>((resolve) => {
@@ -404,7 +418,7 @@ describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop an
           executor: {
             run: async (ctx: RunContext): Promise<ExecutorResult> => {
               assert.strictEqual(await ctx.cacheCapBoundary?.(async () => false), "continue");
-              // The volume crosses the hard threshold; the stop lands on this (now stoppable) run.
+              // The volume crosses the hard threshold; the stop lands on this (parkable) run.
               const stopped = new Promise<void>((resolve) => ctx.signal?.addEventListener("abort", () => resolve(), { once: true }));
               probe.gov.observe(0.95);
               await stopped;
@@ -431,7 +445,7 @@ describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop an
       const probe = governor();
       let otherStopped = 0;
       probe.sizes.set("/other/home", GIB);
-      probe.gov.register("other-run", { home: "/other/home", requestStop: () => otherStopped++ });
+      registerRunning(probe, "other-run", "/other/home", () => otherStopped++);
       await probe.gov.boundary("other-run", async () => false);
       let stoppedWhileFinalizing = -1;
       const factory: ExecutorFactory = (id) => {
@@ -463,4 +477,164 @@ describe("RunRunner — PRD #1809 D4 the mid-run disk park's reap, cache drop an
       assert.strictEqual(stoppedWhileFinalizing, 1, "the other run was stopped while the first was still finalizing");
     });
   });
+});
+
+describe("RunRunner — issue #1830: the hard layer covers a planning run and a run at a gate", () => {
+  it("a planning executor that never reaches a cache boundary is stopped and takes a COUNTED data_volume_full park", async (t) => {
+    if (!HAS_PROC_FD) return t.skip("no descriptor-pinned walk on this host: the cache drop refuses here by design");
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE, FENCE];
+      const probe = governor();
+      let home = "";
+      let inTurn: () => void = () => {};
+      const turnStarted = new Promise<void>((r) => (inTurn = r));
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        probe.sizes.set(home, 3 * GIB);
+        return {
+          homeDir: home,
+          executor: {
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedHome(home);
+              // A planning turn: no cacheCapBoundary is ever called. It runs until the turn is
+              // dropped (a bounded wait, so a missing stop is a NAMED failure, not a hang).
+              await new Promise<void>((resolve) => {
+                if (ctx.signal?.aborted) return resolve();
+                ctx.signal?.addEventListener("abort", () => resolve(), { once: true });
+                setTimeout(resolve, 3000);
+                inTurn();
+              });
+              if (ctx.pauseModeRequested?.() === "disk") throw new PauseNowSignal();
+              throw new Error("the planning run was never stopped");
+            },
+          },
+        };
+      };
+      const { gitlab } = fakeGitlab();
+      const runId = "18300000-0000-4000-8000-00000000d801";
+      const done = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov }).execute(
+        gitlabClaim(1830, { run_id: runId, claim_generation: 4 }),
+      );
+      await turnStarted;
+      probe.gov.observe(0.9);
+      await done;
+      const [park, ...more] = parks(runId);
+      assert.deepStrictEqual(more, []);
+      assert.strictEqual(park?.recovery_cause, "data_volume_full");
+      assert.strictEqual("disk_park_preventive" in (park ?? {}), false, "a hard stop is a COUNTED park");
+      assert.ok(!api.states.some((s) => s.runId === runId && s.body.status === "failed"), "never a failure");
+    });
+  });
+
+  it("a run parked at its plan gate keeps its gate: its caches are dropped in place, nothing is killed or parked, and it continues after approval", async (t) => {
+    if (!HAS_PROC_FD) return t.skip("no descriptor-pinned walk on this host: the cache drop refuses here by design");
+    await withHomeRoot(async (homeRoot) => {
+      client.protocolFeatures = [FEATURE, FENCE];
+      const probe = governor();
+      let home = "";
+      let reaped = 0;
+      let reapedAtDrop = -1;
+      let modeAtDrop: string | null | undefined = "unset";
+      let verdict: string | undefined;
+      let survivors: boolean[] = [];
+      const claim = gitlabClaim(1831, { run_id: "18300000-0000-4000-8000-00000000d802", claim_generation: 4 });
+      const factory: ExecutorFactory = (id) => {
+        home = path.join(homeRoot, id);
+        probe.sizes.set(home, 3 * GIB);
+        return {
+          homeDir: home,
+          executor: {
+            killAgentTree: () => {
+              reaped++;
+            },
+            run: async (ctx: RunContext): Promise<ExecutorResult> => {
+              seedHome(home);
+              const gated = ctx.gatePlan!("# PLAN\n\nDo the thing.");
+              // The run is at its gate (awaiting_approval ACKed): the volume crosses the threshold.
+              const deadline = Date.now() + 3000;
+              while (!api.states.some((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval")) {
+                if (Date.now() > deadline) throw new Error("never reached the gate");
+                await new Promise((r) => setTimeout(r, 5));
+              }
+              probe.gov.observe(0.95);
+              // The governor measures once to pick the run and once after the drop returned.
+              while (probe.measures() < 2) {
+                if (Date.now() > deadline) throw new Error("the in-place drop never ran");
+                await new Promise((r) => setTimeout(r, 5));
+              }
+              assert.ok(!fs.existsSync(path.join(home, ".cache", "go-build")), "the caches were dropped in place");
+              reapedAtDrop = reaped;
+              modeAtDrop = ctx.pauseModeRequested?.();
+              survivors = [
+                fs.existsSync(path.join(home, "go", "bin", "gopls")),
+                fs.existsSync(path.join(home, ".claude", "projects", "p", "sess.jsonl")),
+              ];
+              api.setInputs(claim.run_id, [input("approve_plan")]);
+              verdict = (await gated).kind;
+              throw new Error("end of the test run");
+            },
+          },
+        };
+      };
+      const { gitlab } = fakeGitlab();
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov }).execute(claim);
+      assert.strictEqual(verdict, "approve", "the run kept its gate and continued after the approval");
+      assert.strictEqual(reapedAtDrop, 0, "the in-place drop killed no process tree");
+      assert.notStrictEqual(modeAtDrop, "disk", "no disk stop was requested");
+      assert.deepStrictEqual(parks(claim.run_id), [], "never parked");
+      assert.deepStrictEqual(survivors, [true, true], "go/bin and the session transcript survive the drop");
+      assert.ok(
+        api.messages(claim.run_id).some((m) => m.kind === "status" && String(m.payload.text).includes("dropped in place")),
+        "the feed says the run kept going",
+      );
+    });
+  });
+
+  for (const wait of ["gatePlan", "awaitFollowUp"] as const) {
+    it(`a disk stop pending when the executor calls ctx.${wait} throws the park instead of reporting the wait; the park lands from running`, async () => {
+      await withHomeRoot(async (homeRoot) => {
+        client.protocolFeatures = [FEATURE, FENCE];
+        const probe = governor();
+        let threw: unknown;
+        const claim = gitlabClaim(1832, { run_id: "18300000-0000-4000-8000-00000000d803", claim_generation: 4 });
+        api.setInputs(claim.run_id, [input("approve_plan")]); // an unfixed run would be released from its gate at once
+        const factory: ExecutorFactory = (id) => {
+          const home = path.join(homeRoot, id);
+          probe.sizes.set(home, 3 * GIB);
+          return {
+            homeDir: home,
+            executor: {
+              run: async (ctx: RunContext): Promise<ExecutorResult> => {
+                probe.gov.observe(0.95); // stops THIS run (parkable: running sent and ACKed)
+                const deadline = Date.now() + 3000;
+                while (ctx.pauseModeRequested?.() !== "disk") {
+                  if (Date.now() > deadline) throw new Error("the stop was never requested");
+                  await new Promise((r) => setTimeout(r, 5));
+                }
+                try {
+                  if (wait === "gatePlan") await ctx.gatePlan!("# PLAN\n\nDo the thing.");
+                  else await ctx.awaitFollowUp!(50);
+                } catch (e) {
+                  threw = e;
+                  throw e;
+                }
+                throw new Error("the wait went through with a disk stop pending");
+              },
+            },
+          };
+        };
+        const { gitlab } = fakeGitlab();
+        await runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov }).execute(claim);
+        assert.ok(threw instanceof DiskParkSignal, `ctx.${wait} threw the disk park: ${String(threw)}`);
+        assert.ok(
+          !api.states.some((s) => s.runId === claim.run_id && String(s.body.status).startsWith("awaiting_")),
+          "no awaiting_* report was sent",
+        );
+        const [park, ...more] = parks(claim.run_id);
+        assert.deepStrictEqual(more, []);
+        assert.strictEqual(park?.recovery_cause, "data_volume_full");
+        assert.strictEqual("disk_park_preventive" in (park ?? {}), false, "COUNTED");
+      });
+    });
+  }
 });

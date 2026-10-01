@@ -71,6 +71,7 @@ import {
   isNotCodePlan,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
+import { dropRunCaches, type RunCacheDropResult } from "./run-caches.js";
 import { defaultEnvProbeSpawner, environmentFactsSummary, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "./env-probe.js";
 import { readRepoInstructions } from "./repo-instructions.js";
 import {
@@ -923,6 +924,22 @@ export class SdkExecutor implements Executor {
   }
 
   /**
+   * issue #1830: drop this run's rebuildable HOME caches in place, for a run the hard disk layer
+   * cannot park (a gate or question wait, a revision turn, finalize). Kills nothing and aborts
+   * nothing. While the background JS-deps install is unjoined it may still be reading
+   * `.npm/_cacache` (a drop under a live `npm ci` breaks it, and aborting it would cost the run its
+   * node_modules), so that subtree is kept until {@link depsJoined}; the Go caches go regardless.
+   * Never throws (dropRunCaches contract).
+   */
+  async reclaimCachesInPlace(): Promise<RunCacheDropResult> {
+    return dropRunCaches(this.homeDir, this.log, {
+      message: "run caches dropped in place at the hard disk threshold",
+      ...(this.depsJoined ? {} : { keep: [".npm/_cacache"] }),
+      
+    });
+  }
+
+  /**
    * Log every dropped skill as a run message (PRD #16): the server's assembly
    * drops that rode the claim (ctx.skillsDropped — shadowed / over-limit) plus the
    * worker's own local cap drops (too_large / over_limit over the combined set).
@@ -1005,7 +1022,12 @@ export class SdkExecutor implements Executor {
     }
   }
 
+  /** issue #1830: false from the start of {@link run} until the background JS-deps install has been
+   *  joined (or torn down in run()'s finally); true before any run, when no install exists. */
+  private depsJoined = true;
+
   async run(ctx: RunContext): Promise<ExecutorResult> {
+    this.depsJoined = false;
     this.spawnedPids.clear();
     this.deadCliPids.clear();
     this.rootStartTimes.clear();
@@ -1032,6 +1054,7 @@ export class SdkExecutor implements Executor {
       // own catch, so awaiting it can never throw here and mask the real failure.
       drive.depsAbort.abort();
       await drive.depsInstall;
+      this.depsJoined = true;
       // Reap every agent subprocess before returning, so none survives into the
       // worker's PAT-bearing push (B1). Covers the failure/cancel/no-plan paths
       // too, not just the runner's explicit pre-push call.
@@ -3538,6 +3561,7 @@ export class SdkExecutor implements Executor {
     depsInstall: Promise<JsDepsInstall>,
   ): Promise<JsDepsInstall> {
     const { results, truncated } = await depsInstall;
+    this.depsJoined = true;
     if (results.length === 0) {
       ctx.emit({
         kind: "status",

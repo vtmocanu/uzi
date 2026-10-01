@@ -11,18 +11,31 @@
 //    (`HOME=<run HOME>`) or working directory (run-procs.ts), since the CLI runs each Bash command
 //    detached, outside its groups; an unknown answer is alive. A run that stays over the cap is
 //    parked preventively (see {@link SOFT_PARK_RULE}).
-//  - the HARD layer, the per-tick pressure stop. {@link DiskGovernor.observe} runs on every stats
-//    tick (the heartbeat cadence) independently of turn boundaries; at or over the hard threshold
-//    it stops the running Claude run with the largest caches through the steering channel's
-//    worker-local `disk` pause mode (the same turn drop as an owner's `pause --now`) and the
-//    executor parks it with a COUNTED `data_volume_full` park. Only a run inside its implement
-//    loop is stoppable: a run still cloning, planning or waiting at its plan gate, and a run that
-//    has left the loop to finalize, is never a candidate (the stop is only routed to the disk park
-//    at an implement boundary or turn). A stop that has not produced a park within
-//    {@link STOP_TIMEOUT_MS} is given up, so one lost stop cannot wedge the hard layer. A stop
-//    landing while the run sits in a long wait inside the implement loop is
-//    honoured only when that wait returns, so the give-up can let the hard layer stop a SECOND run
-//    for the same pressure event while the first stop is still pending.
+//  - the HARD layer, the per-tick pressure action. {@link DiskGovernor.observe} runs on every stats
+//    tick (the heartbeat cadence) independently of turn boundaries. Issue #1830: EVERY registered
+//    run is a candidate from `register` to `unregister` (cloning, planning, gates, implement,
+//    finalize), and at or over the hard threshold the run with the largest caches gets ONE of two
+//    actions, decided AFTER it is measured:
+//      1. STOP, when it is *parkable*: its executor is in flight (`enterRun` .. `leftLoop`), the
+//         last status the runner SENT is `running` and the server's ACK of that very send was
+//         `running` too. The stop goes through the steering channel's worker-local `disk` pause
+//         mode (the same turn drop as an owner's `pause --now`) and the executor parks the run with
+//         a COUNTED `data_volume_full` park. This reaches a first planning turn and an implement
+//         turn alike. The disk park only lands from the server status `running`
+//         (ParkRunDataVolumeFull), so no stop is ever requested otherwise.
+//      2. IN-PLACE RECLAIM, for every other run (setup or clone, revision turns, gate and question
+//         waits, the approve-to-first-report window, finalize, an unknown or stale status): the
+//         run is not stopped, it keeps its gate, its pending approval and its flight, and its
+//         rebuildable caches are dropped where it stands ({@link GovernedRun.reclaimInPlace}). No
+//         process is killed. It holds its own {@link DiskGovernor.reclaiming} slot, never
+//         `stopping`, so a later park's release logic is untouched. A run that still holds bytes
+//         after the drop (or whose drop threw) is skipped for the rest of the over-threshold
+//         stretch, so the next-heaviest run (possibly parkable) is acted on instead.
+//    The runner closes the stop-then-wait race at its `reportState` choke point: a report of an
+//    `awaiting_*` status while a `disk` stop is pending throws {@link DiskParkSignal} instead of
+//    going out, so the park lands from `running`. A stop that has not produced a park within
+//    {@link STOP_TIMEOUT_MS} is given up, so one lost stop cannot wedge the hard layer, which can
+//    then stop a SECOND run for the same pressure event while the first stop is still pending.
 //
 // Both parks end the executor, so the runner's park cache drop (run-caches.ts dropRunCaches, D2)
 // runs on the way out. Both layers can be disabled (UZI_RUN_CACHE_CAP_ENABLED,
@@ -30,7 +43,7 @@
 
 import type { Logger } from "./log.js";
 import { measureRunCaches, type RunCacheBytes } from "./rmtree.js";
-import { type TrimResult, type TrimTarget, trimRunCaches } from "./run-caches.js";
+import { type RunCacheDropResult, type TrimResult, type TrimTarget, trimRunCaches } from "./run-caches.js";
 import { DEFAULT_DISK_PRESSURE_THRESHOLD } from "./disk-reclaim.js";
 import { errMessage } from "./util.js";
 
@@ -132,6 +145,9 @@ export interface GovernedRun {
   home: string;
   /** Stop the run's current turn through the steering channel's `disk` pause mode. */
   requestStop: () => void;
+  /** Issue #1830: drop the run's rebuildable caches where it stands, for a run that cannot be
+   *  parked right now. Resolves what was dropped; never needs to reject (a throw is logged). */
+  reclaimInPlace: () => Promise<RunCacheDropResult | undefined>;
 }
 
 interface RunState extends GovernedRun {
@@ -139,10 +155,20 @@ interface RunState extends GovernedRun {
   cacheBytes?: number;
   /** Consecutive turn boundaries that ended over the cap. */
   overStreak: number;
-  /** The run reached its implement loop, where a `disk` stop is routed to the disk park. */
-  stoppable: boolean;
+  /** Issue #1830: `executor.run` is in flight ({@link DiskGovernor.enterRun} .. `leftLoop`). */
+  inExecutor: boolean;
+  /** The status of the latest report the runner sent, and its send number. */
+  sentStatus?: string;
+  sentSeq: number;
+  /** The server's status in the ACK of send {@link ackedSeq} (undefined = unreadable). Only the ACK
+   *  of the LATEST send is recorded: a late ACK of an older send is ignored. */
+  ackedStatus?: string;
+  ackedSeq?: number;
   /** The hard layer asked this run to stop. */
   stopRequested: boolean;
+  /** Issue #1830: an in-place drop left this run holding bytes (or threw); it is skipped for the
+   *  rest of the over-threshold stretch so the next-heaviest run is acted on. */
+  inPlaceSkipped: boolean;
 }
 
 /** The executor's quiet-point probe: resolves true while any process of the run is alive. */
@@ -150,8 +176,8 @@ export type ProcessAliveProbe = () => Promise<boolean>;
 
 /**
  * PRD #1809 D4: the worker's per-run cache cap (soft layer) and mid-turn pressure stop (hard
- * layer). One per worker; the run runner registers each running Claude run that can take the
- * fenced disk park and unregisters it when its flight ends.
+ * layer). One per worker; the run runner registers each Claude run from its claim and unregisters
+ * it when its flight ends.
  */
 export class DiskGovernor {
   private readonly runs = new Map<string, RunState>();
@@ -163,6 +189,11 @@ export class DiskGovernor {
   private stopping: string | undefined;
   /** When {@link stopping} was asked to stop. */
   private stopRequestedAt = 0;
+  /** Issue #1830: the run an in-place drop is working on. Its own slot, never {@link stopping}: a
+   *  drop is not a park, so leftLoop, unregister's D7 reclaim and the give-up timeout skip it. */
+  private reclaiming: string | undefined;
+  /** When the last in-place drop ended: a sample taken before it is not fresh. */
+  private lastReclaimEndedAt = Number.NEGATIVE_INFINITY;
   /** When the last hard-layer selection that stopped nothing ended ({@link SELECT_INTERVAL_MS}). */
   private lastSelectionAt = Number.NEGATIVE_INFINITY;
   /** A hard-layer selection (measuring the candidates) is in flight. */
@@ -185,7 +216,43 @@ export class DiskGovernor {
 
   /** Watch a running Claude run. Idempotent per run id (a later call replaces the entry). */
   register(runId: string, run: GovernedRun): void {
-    this.runs.set(runId, { ...run, overStreak: 0, stoppable: false, stopRequested: false });
+    this.runs.set(runId, { ...run, overStreak: 0, inExecutor: false, sentSeq: 0, stopRequested: false, inPlaceSkipped: false });
+  }
+
+  /** Issue #1830: `executor.run` is about to start; the run may now take a stop (see {@link parkable}). */
+  enterRun(runId: string): void {
+    const run = this.runs.get(runId);
+    if (!run) return;
+    run.inExecutor = true;
+    run.inPlaceSkipped = false;
+  }
+
+  /**
+   * Issue #1830: the runner is about to send a report carrying `status`. Returns the send's number
+   * for {@link statusAcked}. The ACK of an earlier send no longer counts from here on.
+   */
+  statusRequested(runId: string, status: string): number {
+    const run = this.runs.get(runId);
+    if (!run) return 0;
+    if (run.sentStatus !== status) run.inPlaceSkipped = false;
+    run.sentStatus = status;
+    run.sentSeq += 1;
+    return run.sentSeq;
+  }
+
+  /** Issue #1830: the server's ACK of send `seq` carried `status` (undefined when unreadable). Only
+   *  the ACK of the latest send is recorded. */
+  statusAcked(runId: string, seq: number, status: string | undefined): void {
+    const run = this.runs.get(runId);
+    if (!run || run.sentSeq !== seq) return;
+    run.ackedSeq = seq;
+    run.ackedStatus = status;
+  }
+
+  /** A stop can become a counted park only from the server status `running`: the executor is in
+   *  flight, and the latest send AND its ACK both say `running`. */
+  private parkable(run: RunState): boolean {
+    return run.inExecutor && run.sentStatus === "running" && run.ackedSeq === run.sentSeq && run.ackedStatus === "running";
   }
 
   /**
@@ -205,16 +272,19 @@ export class DiskGovernor {
   }
 
   /**
-   * The run left its implement loop (its executor returned or threw): it is no longer a hard-stop
-   * candidate. `diskParked` says it left for a disk park, whose flight end ({@link unregister})
+   * The run left its executor (it returned or threw): it can no longer take a stop, only an
+   * in-place reclaim (finalize). `diskParked` says it left for a disk park, whose flight end ({@link unregister})
    * releases the stop as before; otherwise a stop asked of it will never become a park (it
    * finished, failed, or parked for another reason first), so it is released now.
    */
   leftLoop(runId: string, diskParked: boolean): void {
     const run = this.runs.get(runId);
-    if (run) run.stoppable = false;
+    if (run) {
+      run.inExecutor = false;
+      run.inPlaceSkipped = false;
+    }
     if (this.stopping !== runId || diskParked) return;
-    this.opts.log.warn("the run the hard layer stopped left its implement loop without a disk park; releasing the stop", {
+    this.opts.log.warn("the run the hard layer stopped left its executor without a disk park; releasing the stop", {
       run_id: runId,
     });
     this.releaseStop();
@@ -232,8 +302,7 @@ export class DiskGovernor {
   }
 
   /**
-   * The SOFT layer at one implement turn boundary. Marks the run stoppable (it is in its
-   * implement loop), measures its caches, and when they are over the cap: at a proven quiet point
+   * The SOFT layer at one implement turn boundary. Measures its caches, and when they are over the cap: at a proven quiet point
    * (`processAlive` resolves false) trims them, otherwise counts the boundary as blocked.
    * Resolves "park" when the run stays over the cap by {@link SOFT_PARK_RULE}, else "continue".
    * Never throws: a failed measurement or trim continues the run.
@@ -241,7 +310,6 @@ export class DiskGovernor {
   async boundary(runId: string, processAlive: ProcessAliveProbe): Promise<"continue" | "park"> {
     const run = this.runs.get(runId);
     if (!run) return "continue";
-    run.stoppable = true;
     // A hard stop is already on its way to this run: its pending turn drop parks it.
     if (!this.opts.config.capEnabled || run.stopRequested) return "continue";
     const cap = this.capBytes();
@@ -315,7 +383,8 @@ export class DiskGovernor {
   /**
    * The HARD layer, on every stats tick: the data volume's used fraction (undefined = unknown,
    * never acts). At or over {@link hardStopThreshold}, and with no earlier stop still in flight,
-   * measures the stoppable runs and stops the one with the largest caches. One stop at a time: the
+   * measures every registered run and acts on the one with the largest caches (a parkable run is
+   * stopped, any other has its caches dropped in place; see the header). One stop at a time: the
    * next waits until the stopped run's flight has ended (parked) AND a sample taken after that is
    * still over: `sampledAtMs` is when the sample was taken (the heartbeat observes it only after
    * its round-trip), and a sample taken before the last stopped run ended is ignored. While the
@@ -333,20 +402,22 @@ export class DiskGovernor {
       this.releaseStop();
     }
     if (usedFraction === undefined) return;
-    if (sampledAtMs < this.lastStopEndedAt) return;
+    if (sampledAtMs < Math.max(this.lastStopEndedAt, this.lastReclaimEndedAt)) return;
     const threshold = hardStopThreshold(this.opts.thresholdOf(), this.opts.config.hardMargin);
     if (usedFraction < threshold) {
       this.warnedNothingToStop = false;
       this.lastSelectionAt = Number.NEGATIVE_INFINITY;
+      for (const r of this.runs.values()) r.inPlaceSkipped = false;
       return;
     }
-    if (this.stopping !== undefined || this.selecting) return;
+    if (this.stopping !== undefined || this.selecting || this.reclaiming !== undefined) return;
     if (this.now() - this.lastSelectionAt < SELECT_INTERVAL_MS) return;
-    const candidates = [...this.runs.entries()].filter(([, r]) => r.stoppable && !r.stopRequested);
+    const candidates = [...this.runs.entries()].filter(([, r]) => !r.stopRequested && !r.inPlaceSkipped);
     if (candidates.length === 0) {
-      if (!this.warnedNothingToStop) {
+      // A registered run that is stopping or was already reclaimed this stretch is not "nothing".
+      if (this.runs.size === 0 && !this.warnedNothingToStop) {
         this.warnedNothingToStop = true;
-        this.opts.log.warn("data volume at the hard threshold, but no running Claude run can be stopped", {
+        this.opts.log.warn("data volume at the hard threshold, but no running Claude run is registered to stop or reclaim", {
           used_fraction: usedFraction,
           hard_threshold: threshold,
         });
@@ -360,7 +431,8 @@ export class DiskGovernor {
   }
 
   /** Measure the candidates (fresh, one shared deadline; a failed one falls back to its last
-   *  reading) and stop the one with the most cache bytes, when any has some. */
+   *  reading) and act on the one with the most cache bytes, when any has some: stop it when it is
+   *  parkable, else drop its caches in place. */
   private async selectAndStop(candidates: [string, RunState][], usedFraction: number, threshold: number): Promise<void> {
     const deadline = this.now() + MEASURE_DEADLINE_MS;
     let pick: [string, RunState] | undefined;
@@ -371,16 +443,21 @@ export class DiskGovernor {
     }
     if (!pick) {
       this.lastSelectionAt = this.now();
-      this.opts.log.warn("data volume at the hard threshold, but no running Claude run holds cache bytes to stop for", {
+      this.opts.log.warn("data volume at the hard threshold, but no running Claude run holds cache bytes to act on", {
         used_fraction: usedFraction,
         hard_threshold: threshold,
       });
       return;
     }
     const [runId, run] = pick;
-    // It may have ended (or left its implement loop) while it was being measured.
-    if (this.runs.get(runId) !== run || !run.stoppable) {
+    // It may have ended while it was being measured.
+    if (this.runs.get(runId) !== run || run.stopRequested) {
       this.lastSelectionAt = this.now();
+      return;
+    }
+    // Decided AFTER the measurement, from the run's state now (it may have changed phase meanwhile).
+    if (!this.parkable(run)) {
+      await this.reclaimInPlace(runId, run, usedFraction, threshold);
       return;
     }
     run.stopRequested = true;
@@ -394,6 +471,40 @@ export class DiskGovernor {
       cause: "data_volume_full",
     });
     run.requestStop();
+  }
+
+  /**
+   * Issue #1830: drop a non-parkable run's caches where it stands, under the {@link reclaiming}
+   * slot. The run keeps its gate and its flight and nothing is killed. A throw is logged. The
+   * run is re-measured afterwards: one still holding bytes (kept subtrees, a failed or skipped
+   * removal, an unreadable measurement) is skipped for the rest of the stretch.
+   */
+  private async reclaimInPlace(runId: string, run: RunState, usedFraction: number, threshold: number): Promise<void> {
+    this.reclaiming = runId;
+    this.opts.log.warn("data volume at the hard threshold; the run with the largest caches cannot be parked, dropping its caches in place", {
+      run_id: runId,
+      cache_bytes: run.cacheBytes,
+      used_fraction: usedFraction,
+      hard_threshold: threshold,
+      status: run.sentStatus,
+      acked_status: run.ackedStatus,
+      in_executor: run.inExecutor,
+      in_place: true,
+    });
+    let threw = false;
+    try {
+      await run.reclaimInPlace();
+    } catch (e) {
+      threw = true;
+      this.opts.log.warn("in-place cache drop failed", { run_id: runId, error: errMessage(e) });
+    }
+    try {
+      const left = threw ? undefined : await this.measureRun(run);
+      if (left === undefined || left > 0) run.inPlaceSkipped = true;
+    } finally {
+      this.reclaiming = undefined;
+      this.lastReclaimEndedAt = this.now();
+    }
   }
 
   /** Measure one run's caches, recording the reading; undefined when it failed. */

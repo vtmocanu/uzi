@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, HarnessError } from "./harness.js";
 import type {
   AgentSelection,
@@ -845,6 +846,14 @@ export interface Executor {
    * stub/test and Codex executors.
    */
   reapAttributedProcesses?(): Promise<void>;
+  /**
+   * issue #1830: drop the run's rebuildable HOME caches IN PLACE (run-caches.ts dropRunCaches), for
+   * a run the hard disk layer cannot park (it waits at a gate, or is finalizing). Kills no process
+   * and aborts nothing: the executor leaves out any subtree a still-running step needs (the
+   * background JS-deps install reads `.npm/_cacache` until it is joined). Never rejects. Absent on
+   * the stub/test and Codex executors; the runner then drops the HOME's caches directly.
+   */
+  reclaimCachesInPlace?(): Promise<RunCacheDropResult>;
   /** M3 (PRD #1171): a Codex-selected executor supplies this outer safety facade;
    * absence preserves Claude/stub callers (they take the literal legacy killAgentTree branch). */
   safety?: CodexExecutionSafety;

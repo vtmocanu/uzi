@@ -1443,6 +1443,10 @@ interface RunFlight {
   /** PRD #1809 D4 (N3): a mid-run disk park already dropped the run's caches before its capture,
    *  so the finally's park drop only finishes what that one could not. */
   cachesDroppedEarly?: boolean;
+  /** issue #1830: set around the self-improve finalize's `installJsDeps`, which reads
+   *  `.npm/_cacache` under the run HOME. The disk governor's in-place drop keeps that subtree while
+   *  it is set (SdkExecutor.reclaimCachesInPlace cannot know: its own install was joined long ago). */
+  jsDepsInstalling?: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
@@ -2433,7 +2437,36 @@ export class RunRunner {
     // that can take the claim-fenced disk park (a claim generation to fence it with): anything
     // else keeps today's handling. Unregistered at the end of the finally below.
     if (this.diskGovernor && runHome && !executor.safety && this.dataVolumeParkable(claim)) {
-      this.diskGovernor.register(runId, { home: runHome, requestStop: () => steering.requestDiskStop() });
+      // Issue #1830: every phase is covered. A run that cannot take the counted park right now (a
+      // gate or question wait, a revision turn, finalize) has its rebuildable caches dropped in
+      // place instead; the governor decides which, from the statuses this runner reports.
+      const home = runHome;
+      this.diskGovernor.register(runId, {
+        home,
+        requestStop: () => steering.requestDiskStop(),
+        reclaimInPlace: async () => {
+          const message = "run caches dropped in place at the hard disk threshold";
+          // The self-improve finalize's evidence install reads `.npm/_cacache`; the executor's own
+          // keep-until-joined rule does not cover it, so keep it here and bypass the executor.
+          const r =
+            executor.reclaimCachesInPlace && !flight.jsDepsInstalling
+              ? await executor.reclaimCachesInPlace()
+              : await dropRunCaches(home, runLog, {
+                  message,
+                  ...(flight.jsDepsInstalling ? { keep: [".npm/_cacache"] } : {}),
+                });
+          if (r && r.dropped.length > 0) {
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: "the data volume reached its hard threshold: this run's rebuildable caches were dropped in place and the run keeps going",
+              },
+            });
+          }
+          return r;
+        },
+      });
     }
     try {
       await this.phaseClone(claim, flight);
@@ -2718,6 +2751,10 @@ export class RunRunner {
         // implement loop, e.g. from a reclaim wait, is the same stop). Take the mid-run
         // data_volume_full recovery park: reap the tree, capture what is committed, park. The run
         // keeps its custody hold (a clone exists), and the finally drops its caches on the park.
+        // Issue #1830: a DiskParkSignal thrown by the reportState choke point replaces an
+        // `awaiting_input` report whose question feed line was already emitted (it stays, a
+        // known cosmetic wart); the park lands from `running`, so no question is open: forget its id.
+        this.openQuestionIds.delete(runId);
         flight.parked = await this.handleRecoveryExhausted(
           err,
           claim,
@@ -5164,9 +5201,13 @@ export class RunRunner {
         runHome ?? os.tmpdir(),
         result.toolEnv,
       );
-      const deps = await installJsDeps(runnerClone.path, checkEnv).catch(
-        () => ({ results: [], truncated: false }),
-      );
+      // Issue #1830: the governor's in-place drop keeps `.npm/_cacache` while this install runs.
+      flight.jsDepsInstalling = true;
+      const deps = await installJsDeps(runnerClone.path, checkEnv)
+        .catch(() => ({ results: [], truncated: false }))
+        .finally(() => {
+          flight.jsDepsInstalling = false;
+        });
       for (const note of deps.results) {
         runLog.info("self-improve: dependency install", { ...note });
       }
@@ -6985,7 +7026,21 @@ export class RunRunner {
           claim_generation: flight.claimGeneration,
           ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
         };
+        // Issue #1830: the choke point that closes the stop-then-wait race. A hard disk stop is only
+        // ever requested while the run's sent and ACKed status are both `running`; if the run then
+        // reaches a wait (gate, question, follow-up) with the sticky `disk` stop still pending, the
+        // `awaiting_*` report is NOT sent: the park lands from `running` (an awaiting_* park would
+        // be refused by ParkRunDataVolumeFull). Hooks sit after the awaitReceiptSettlement above
+        // with no await between the throw check, statusRequested and the send.
+        if (
+          (body.status === "awaiting_approval" || body.status === "awaiting_input" || body.status === "awaiting_followup") &&
+          steering.getPauseMode() === "disk"
+        ) {
+          throw new DiskParkSignal(false);
+        }
+        const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
         const ack = await this.client.reportState(runId, stamped, signal);
+        if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);
         // PRD #1247 M5b (MINOR-7): the held-state switch signal rides the state ACK too — the
         // advertised SECONDARY transport beside /inputs. Feed it into the SAME generation-checked,
         // idempotent, defer-aware trigger the inputs poll uses (tripCredentialSwitch), so a failing
@@ -9024,6 +9079,7 @@ export class RunRunner {
     let result: ExecutorResult;
     let diskParked = false;
     try {
+      this.diskGovernor?.enterRun(flight.runId);
       result = await executor.run(ctx);
       // Issue #1742: the executor returned. If the result is finalize-bound, journal a durable
       // finalize-pending record NOW, before the finally's ticker stop and report-chain drain and
@@ -9036,9 +9092,9 @@ export class RunRunner {
       diskParked = err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk");
       throw err;
     } finally {
-      // PRD #1809 D4 (N4): the run has left its implement loop, so it is no longer a hard-stop
-      // candidate (a finalizing run is not stoppable). A stop that it never turned into a disk park
-      // is released, so the hard layer can stop another run.
+      // PRD #1809 D4 (N4), issue #1830: the run has left its executor, so it can no longer take a
+      // stop (a finalizing run is only ever reclaimed in place). A stop that it never turned into
+      // a disk park is released, so the hard layer can stop another run.
       this.diskGovernor?.leftLoop(flight.runId, diskParked);
       await ticker?.stop();
       await runningReportChain;

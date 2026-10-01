@@ -26,8 +26,10 @@ const DROP_DEADLINE_MS = 5 * 60_000;
  * PRD #1809 D2: drop a parked run's rebuildable caches ({@link RUN_CACHE_SUBTREES}) from
  * its preserved HOME, keeping everything else a resume needs (the session transcript,
  * `.claude.json`, `go/bin`, unknown files). Called from `executeClaim`'s finally for a
- * Claude run that parked, i.e. whose process has ended; a live gate park never reaches
- * that finally, and a Codex run's caches live on its own per-run volume.
+ * Claude run that parked, i.e. whose process has ended, and (issue #1830) in place by the
+ * hard disk layer for a live run that cannot be parked (a gate wait, finalize), where the
+ * run keeps going and `keep` names any subtree a still-running step needs; a Codex run's
+ * caches live on its own per-run volume.
  *
  * Best-effort and NEVER throws: it runs in a `finally`, and a failed drop only means the
  * HOME keeps its caches exactly as before this change. Only the cache subtrees are
@@ -50,6 +52,7 @@ export async function dropRunCaches(home: string, log: Logger, opts: DropRunCach
   const failed: string[] = [];
   const skipped: string[] = [];
   for (const rel of RUN_CACHE_SUBTREES) {
+    if (opts.keep?.includes(rel)) continue;
     if (Date.now() >= deadline) {
       skipped.push(rel);
       continue;
@@ -107,6 +110,10 @@ export interface DropRunCachesOptions {
   message?: string;
   /** Log nothing when every subtree was already absent. */
   quietNoop?: boolean;
+  /** Subtrees ({@link RUN_CACHE_SUBTREES} entries) to leave in place; issue #1830: the in-place
+   *  drop keeps `.npm/_cacache` while a live `npm ci` is still reading it. A kept subtree is
+   *  neither dropped nor reported absent. */
+  keep?: readonly string[];
 }
 
 /** Every subtree was already absent: the drop found nothing to do. */

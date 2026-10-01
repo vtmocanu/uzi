@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
-import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import { SdkExecutor, type SdkExecutorOptions, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunContext } from "../src/executor.js";
 import { CredentialSwitchSignal, PauseNowSignal, type PauseMode, type PlanVerdict } from "../src/steering.js";
 import { DiskParkSignal } from "../src/cache-cap.js";
@@ -493,5 +493,137 @@ describe("SdkExecutor — PRD #1809 D4 process attribution (BLOCKING 1)", () => 
     await exec.run(ctx);
     await exec.reapAttributedProcesses();
     assert.deepStrictEqual(reaps, [{ home: homeDir, worktree: ctx.worktreePath }]);
+  });
+});
+
+/** A planning turn that asks the owner a question instead of submitting a plan. */
+function askUserTurn(sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [{ type: "tool_use", id: "t3", name: "mcp__uzi__ask_user", input: { questions: [{ question: "Which database?", header: "DB" }] } }],
+    },
+  } as unknown as SDKMessage;
+}
+
+describe("SdkExecutor — issue #1830 a `disk` stop reaches a PLANNING run and its waits", () => {
+  it("a disk stop during the first planning turn rejects run() with the PauseNowSignal while the disk mode is pending", async () => {
+    const runSignal = new AbortController();
+    const holder: { mode?: { value: PauseMode } } = {};
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([
+        (signal) => ({
+          async *[Symbol.asyncIterator]() {
+            // What SteeringChannel.requestDiskStop does, mid planning turn.
+            holder.mode!.value = "disk";
+            runSignal.abort(new PauseNowSignal());
+            yield* hangUntilAbort(signal);
+          },
+        }),
+      ]),
+      spawn: () => ({ pid: 7900 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+    });
+    const { ctx, mode } = makeCtx({ signal: runSignal.signal });
+    holder.mode = mode;
+    await assert.rejects(exec.run(ctx), (err: unknown) => {
+      assert.ok(err instanceof PauseNowSignal, `a PauseNowSignal, got ${String(err)}`);
+      return true;
+    });
+    assert.strictEqual(mode.value, "disk", "the runner routes the escaped signal to the counted disk park from this mode");
+  });
+
+  it("a DiskParkSignal thrown by ctx.askUser in the planning phase propagates out of run()", async () => {
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([[askUserTurn(), resultSuccess()]]),
+      spawn: () => ({ pid: 8000 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+    });
+    const { ctx } = makeCtx({
+      askUser: async () => {
+        throw new DiskParkSignal(false);
+      },
+    });
+    await assert.rejects(exec.run(ctx), (err: unknown) => err instanceof DiskParkSignal && err.preventive === false);
+  });
+
+  it("a DiskParkSignal thrown by ctx.askCompletionQuestion propagates out of run()", async () => {
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      spawn: () => ({ pid: 8100 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+    });
+    const { ctx } = makeCtx({
+      config: { max_iterations: 10 },
+      completionInterlock: true,
+      recordCompletionAttempt: async () => ({ unmet: ["m1"], attemptCount: 1 }),
+      enterCompletionHold: async () => true,
+      askCompletionQuestion: async () => {
+        throw new DiskParkSignal(false);
+      },
+    });
+    await assert.rejects(exec.run(ctx), (err: unknown) => err instanceof DiskParkSignal && err.preventive === false);
+  });
+});
+
+describe("SdkExecutor — issue #1830 reclaimCachesInPlace", () => {
+  // The cache drop is a descriptor-pinned walk that refuses on a host without it.
+  const HAS_PIN_WALK = fs.existsSync(path.join("/pro" + "c", "self", "fd"));
+
+  it("keeps .npm/_cacache until the background deps install is joined, drops it after, and Go caches always", async (t) => {
+    if (!HAS_PIN_WALK) return t.skip("no descriptor-pinned walk on this host: the cache drop refuses here by design");
+    const seed = (): void => {
+      fs.mkdirSync(path.join(homeDir, ".cache", "go-build", "0a"), { recursive: true });
+      fs.writeFileSync(path.join(homeDir, ".cache", "go-build", "0a", "x-d"), "x");
+      fs.mkdirSync(path.join(homeDir, "go", "pkg", "mod", "example.com"), { recursive: true });
+      fs.mkdirSync(path.join(homeDir, ".npm", "_cacache", "index-v5"), { recursive: true });
+    };
+    seed();
+    let releaseInstall: () => void = () => {};
+    const installGate = new Promise<void>((r) => (releaseInstall = r));
+    const installDeps: SdkExecutorOptions["installDeps"] = async () => {
+      await installGate;
+      return { results: [], truncated: false };
+    };
+    const exec = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
+      spawn: () => ({ pid: 8200 }),
+      kill: () => true,
+      cliGroupPresent: () => false,
+      installDeps,
+    });
+    const npm = path.join(homeDir, ".npm", "_cacache");
+    const seen: { beforeJoin?: boolean[]; afterJoin?: boolean[] } = {};
+    const { ctx } = makeCtx({
+      gatePlan: async () => {
+        // At the plan gate the install is still running (it is gated shut): the drop leaves its cache.
+        await exec.reclaimCachesInPlace();
+        seen.beforeJoin = [
+          fs.existsSync(path.join(homeDir, ".cache", "go-build")),
+          fs.existsSync(path.join(homeDir, "go", "pkg", "mod")),
+          fs.existsSync(npm),
+        ];
+        releaseInstall();
+        seed();
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+      // The first implement boundary comes after the join.
+      cacheCapBoundary: async () => {
+        await exec.reclaimCachesInPlace();
+        seen.afterJoin ??= [
+          fs.existsSync(path.join(homeDir, ".cache", "go-build")),
+          fs.existsSync(path.join(homeDir, "go", "pkg", "mod")),
+          fs.existsSync(npm),
+        ];
+        return "continue";
+      },
+    });
+    await exec.run(ctx);
+    assert.deepStrictEqual(seen.beforeJoin, [false, false, true], "Go caches dropped, the npm cache kept while the install runs");
+    assert.deepStrictEqual(seen.afterJoin, [false, false, false], "after the join the npm cache goes too");
   });
 });
