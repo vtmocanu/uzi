@@ -383,11 +383,12 @@ run_mr_state()          { apiget "/api/runs/$1" | jq -r '.run.mr_state // empty'
 run_health()            { apiget "/api/runs/$1" | jq -r '.run.health'; }
 # card_column IID — the board's resolved column for one issue (empty = Open).
 card_column()           { apiget "/api/repos/$REPO_ID/board" | jq -r --argjson iid "$1" '.board.cards[] | select(.iid==$iid) | .column'; }
-# run_input_delivery RUN — the delivery state of the run's newest follow_up in its
-# owner-scoped steer queue (PRD #95), derived from consumed_at EXACTLY as the web/CLI
-# derive it: "delivered" once consumed_at is set, "queued" while null, "none" when the
+# run_input_delivery RUN — the receipt state of the run's newest follow_up in its
+# owner-scoped steer queue (PRD #95), keyed on consumed_at only: "received" once consumed_at
+# is set (the worker has it; it says nothing about routing or prompt inclusion, which the
+# web/CLI derive from applied_at / included_at), "queued" while null, "none" when the
 # queue is empty. The read endpoint returns newest-first, so .[0] is the latest.
-run_input_delivery()    { apiget "/api/runs/$1/inputs" | jq -r '(.inputs // []) | if length == 0 then "none" elif (.[0].consumed_at != null) then "delivered" else "queued" end'; }
+run_input_delivery()    { apiget "/api/runs/$1/inputs" | jq -r '(.inputs // []) | if length == 0 then "none" elif (.[0].consumed_at != null) then "received" else "queued" end'; }
 
 wait_worker_online()  { wait_eq online 40 "worker status" worker_status; }
 # Poller-driven waits: PRD #6 CI badges + verification stamp, PRD #24 card moves

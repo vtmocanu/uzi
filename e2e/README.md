@@ -144,7 +144,7 @@ headers, not the rows.
 | 19 | live-ws-bearer | gitlab | no | PRD #112 M1: a Bearer (uzc_) /api/ws subscription receives a live run_message frame |
 | 20 | git-push-basic-auth | gitlab | no | PRD #97 M1: worker pushes the agent branch over git-over-HTTPS Basic auth (default coverage) |
 | 21 | protected-branch-refused | gitlab | no | PRD #97 M1: the fake remote refuses a push to main under BOTH transports (protected-branch backstop) |
-| 22 | steer-queue-delivery | gitlab | no | PRD #95: steer-queue delivery — Queued -> Delivered on consume, no run_message, no forge/token |
+| 22 | steer-queue-delivery | gitlab | no | PRD #95: steer-queue delivery — Queued -> Received on consume, no run_message, no forge/token |
 | 23 | secret-hygiene | gitlab | no | secret-hygiene assertions |
 | 24 | xff-trust-boundary | gitlab | no | PRD #58: XFF forgery from the agent container must NOT mint fresh rate-limit buckets |
 | 25 | uid-boundary | gitlab | no | PRD #51 M6: uid-boundary regression assertions (live image, setpriv-to-uid) |

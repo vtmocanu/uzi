@@ -441,18 +441,26 @@ export const mockCrewRuns: Run[] = [
 ];
 
 // Sample steer queue per run (PRD #95), so M3's SteerQueueCard has demo data across
-// every delivery state without needing a live consume: NULL consumed_at → Queued,
-// set → Delivered; the run's status decides the gate/terminal copy client-side.
+// every delivery state without needing a live consume (issue #1800): NULL consumed_at →
+// Queued, consumed_at → Received, plus applied_at → Routed, plus included_at → Included in
+// a prompt; the run's status decides the gate/terminal copy client-side. The mock worker
+// reports prompt inclusion (inclusion_reported true), so a consumed row without included_at
+// reads as waiting or "Not confirmed" rather than "no inclusion report".
 const steerInput = (
   id: number,
   body: string,
   createdMinAgo: number,
   consumedMinAgo: number | null,
+  appliedMinAgo: number | null = null,
+  includedMinAgo: number | null = null,
 ): SteerInput => ({
   id,
   body,
   created_at: minsAgo(createdMinAgo),
   consumed_at: consumedMinAgo == null ? null : minsAgo(consumedMinAgo),
+  applied_at: appliedMinAgo == null ? null : minsAgo(appliedMinAgo),
+  included_at: includedMinAgo == null ? null : minsAgo(includedMinAgo),
+  inclusion_reported: true,
   kind: "follow_up",
   disposition: null,
 });
@@ -470,39 +478,44 @@ const scopeInput = (
   body,
   created_at: minsAgo(createdMinAgo),
   consumed_at: null,
+  applied_at: null,
+  included_at: null,
+  inclusion_reported: false,
   kind: "scope",
   disposition,
 });
 
 export const mockRunInputs: Record<string, SteerInput[]> = {
-  // Live run: a pending scope directive (PRD #634), one delivered follow-up, one still
-  // queued (newest-first).
+  // Live run: a pending scope directive (PRD #634), one follow-up already included in a
+  // prompt, one still queued (newest-first).
   [LIVE_RUN_ID]: [
     scopeInput(8, "scope ceiling → complete through milestone 2 of 4", 0, null),
     steerInput(2, "also add a Prometheus histogram for heartbeat age", 1, null),
-    steerInput(1, "focus on the metrics endpoint first", 3, 2),
+    steerInput(1, "focus on the metrics endpoint first", 3, 2, 2, 1),
   ],
-  // At the gate: a follow-up consumed while parked → "Delivered — applies after approval".
-  "run-awaiting": [steerInput(3, "prefer email over Slack for the first cut", 5, 4)],
-  // PRD #517: parked awaiting a follow-up. The follow-up was consumed (non-null
-  // consumed_at) so SteerQueueCard renders the "Delivered — resumes the run" parked chip.
+  // At the gate: a follow-up received and routed while parked → "Routed — waits for approval".
+  "run-awaiting": [steerInput(3, "prefer email over Slack for the first cut", 5, 4, 4)],
+  // PRD #517: parked awaiting a follow-up. The follow-up was received and routed (non-null
+  // consumed_at and applied_at) so SteerQueueCard renders the "Routed — resumes the run" chip.
   "run-awaiting-followup": [
-    steerInput(7, "also skip the poll while the drag preview is animating out", 4, 2),
+    steerInput(7, "also skip the poll while the drag preview is animating out", 4, 2, 2),
   ],
   // Finished run: the operator retargeted the ceiling twice before the run finalized, so
   // this queue exhibits the three terminal scope dispositions (PRD #634) — an earlier
   // directive superseded by a later one, a declined one, and the applied one the run
   // finalized at — plus a follow-up that was never consumed → "Not delivered — run
+  // finished" and one the worker received whose prompt inclusion was never confirmed → "Not confirmed — run
   // finished". With the live run's pending directive, all four disposition pills are
   // reachable in mock mode.
   "run-done": [
     scopeInput(9, "scope ceiling → complete through milestone 3 of 5", 200, "applied"),
     scopeInput(11, "scope ceiling → complete through milestone 4 of 5", 205, "declined"),
     scopeInput(10, "scope ceiling → complete through milestone 2 of 5", 210, "superseded"),
+    steerInput(12, "and rename the helper while you are there", 188, 187, 187),
     steerInput(4, "one more nit: memoize the tool index", 186, null),
   ],
   "run-crew": [
     steerInput(6, "check the reduced-motion path too", 1, null),
-    steerInput(5, "make sure a long tool call still reads working", 6, 5),
+    steerInput(5, "make sure a long tool call still reads working", 6, 5, 5, 4),
   ],
 };

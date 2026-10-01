@@ -1677,7 +1677,7 @@ func compactPayload(raw json.RawMessage) string {
 // renderRunInputs prints the steer queue (follow-ups and scope directives,
 // newest-first) as a kind/body/state/age table (PRD #95 M4, #634). The body is the
 // user's own text, sanitized like any free text bound for a TTY. State is derived per
-// kind — from (consumed_at, runStatus) for a follow_up, from disposition for a scope
+// kind — from the receipt timestamps and runStatus for a follow_up, from disposition for a scope
 // directive; age is relative to created_at.
 func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) error {
 	rows := make([][]string, 0, len(inputs))
@@ -1689,7 +1689,7 @@ func renderRunInputs(p *uzicli.Printer, inputs []apitypes.SteerInputDTO, runStat
 		rows = append(rows, []string{
 			steerKindLabel(in.Kind),
 			body,
-			steerState(in.Kind, in.ConsumedAt, in.Disposition, runStatus, recoveryCause...),
+			steerState(in, runStatus, recoveryCause...),
 			relAge(in.CreatedAt),
 		})
 	}
@@ -1708,21 +1708,28 @@ func steerKindLabel(kind string) string {
 // steerState derives a steer-queue row's state label. For a kind='scope' operator
 // directive (PRD #634) the state IS its disposition (a scope row is never consumed):
 // nil → "active (scope ceiling set)", applied/declined/superseded → their explained
-// forms, any other value → the raw string. For a follow_up it derives the delivery
-// label from its consumed_at and the run's live status, mirroring PRD #95 Decision 7
-// as closely as the CLI can:
-//   - not consumed, run terminal  → "not delivered (run finished)"
-//   - not consumed, run parked    → "queued" + the park's reason suffix (usage limit /
+// forms, any other value → the raw string. For a follow_up it derives the label from the
+// row's receipt timestamps and the run's live status (issue #1800):
+//   - not consumed, run terminal   → "not delivered (run finished)"
+//   - not consumed, run parked     → "queued" + the park's reason suffix (usage limit /
 //     empty token pool / transient-recovery)
-//   - not consumed, otherwise     → "queued"
-//   - consumed, run at plan gate  → "delivered (applies after approval)"
-//   - consumed, awaiting follow-up → "delivered (resumes the run)"
-//   - consumed, run parked        → "delivered" + the park's reason suffix
-//   - consumed, otherwise         → "delivered"
+//   - not consumed, otherwise      → "queued"
+//   - included_at set              → "included in a prompt" on any run status
+//   - consumed, not included, run terminal, inclusion reported → "not confirmed (run finished)"
+//   - consumed, not included, run terminal, not reported → base + " (no inclusion report)"
+//   - consumed, not included, otherwise → base ("routed" when applied_at is set, else
+//     "received") plus one qualifier: awaiting_approval "(waits for approval)",
+//     awaiting_input "(awaits your answer)", awaiting_followup "(resumes the run)",
+//     a park's reason suffix, or "(no inclusion report)" for a legacy row.
+//
+// "Included" means the turn carrying the follow-up reached the model; it never claims the model acted
+// on it. Nothing here says "delivered" for a consumed-but-not-included row: the worker having
+// received a follow-up is not the agent having been given it. The harness (Claude or Codex)
+// does not change a label; the DTO carries no harness.
 //
 // runStatus may be "" when the run's status could not be fetched (Decision 10
-// floor): the gate/terminal nuance is then dropped and only queued/delivered
-// show — the acceptable CLI minimum.
+// floor): the gate/terminal nuance is then dropped and only the receipt-derived label shows
+// — the acceptable CLI minimum.
 //
 // The park-status arms (limit_wait PRD #35, pool_wait PRD #754, recovery_wait issue
 // #1197) are a SUFFIX on the existing answer, never a replacement for it. A park changes
@@ -1737,7 +1744,8 @@ func steerKindLabel(kind string) string {
 // empty turn; "codex_account_unavailable" (PRD #1590) names the Codex account, and
 // "vault_locked" (issue #1766) names the vault unlock the run is waiting for, and
 // "data_volume_full" (PRD #1809) names the disk space it is waiting for.
-func steerState(kind string, consumedAt *time.Time, disposition *string, runStatus string, recoveryCause ...string) string {
+func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...string) string {
+	kind, consumedAt, disposition := in.Kind, in.ConsumedAt, in.Disposition
 	// PRD #634: a scope directive's state IS its disposition — it is never consumed, so
 	// consumed_at/runStatus carry no delivery signal for it. A nil disposition means the
 	// ceiling is still pending (only reachable on a live run).
@@ -1804,32 +1812,44 @@ func steerState(kind string, consumedAt *time.Time, disposition *string, runStat
 		}
 		return "queued"
 	}
-	if runStatus == "awaiting_approval" {
-		return "delivered (applies after approval)"
+	if in.IncludedAt != nil {
+		return "included in a prompt"
 	}
-	if runStatus == "awaiting_input" {
+	base := "received"
+	if in.AppliedAt != nil {
+		base = "routed"
+	}
+	const notReportedSuffix = " (no inclusion report)"
+	if terminalRunStatuses[runStatus] {
+		if in.InclusionReported {
+			return "not confirmed (run finished)"
+		}
+		return base + notReportedSuffix
+	}
+	if !in.InclusionReported {
+		return base + notReportedSuffix
+	}
+	switch runStatus {
+	case "awaiting_approval":
+		return base + " (waits for approval)"
+	case "awaiting_input":
 		// PRD #88: the run is parked on a question, so a follow-up sits behind the
 		// answer rather than behind an approval. Distinct wording because the action
 		// the user owes is different, and telling them to approve something would be
 		// simply wrong.
-		return "delivered (applies after the question is answered)"
+		return base + " (awaits your answer)"
+	case "awaiting_followup":
+		// PRD #517: the interactive task is parked awaiting the user's next follow-up;
+		// a follow-up here is what wakes the parked run.
+		return base + " (resumes the run)"
+	case statusLimitWait:
+		return base + parkedSuffix
+	case statusPoolWait:
+		return base + heldSuffix
+	case statusRecoveryWait:
+		return base + recoveringSuffix
 	}
-	if runStatus == "awaiting_followup" {
-		// PRD #517: the interactive task is parked awaiting the user's next follow-up.
-		// Tailored copy mirroring the web twin (SteerQueueCard's "Delivered — resumes
-		// the run") — a delivered follow-up here is what wakes the parked run.
-		return "delivered (resumes the run)"
-	}
-	if runStatus == statusLimitWait {
-		return "delivered" + parkedSuffix
-	}
-	if runStatus == statusPoolWait {
-		return "delivered" + heldSuffix
-	}
-	if runStatus == statusRecoveryWait {
-		return "delivered" + recoveringSuffix
-	}
-	return "delivered"
+	return base
 }
 
 // forgeUnreachableCause is the RecoveryWaitCause a pre-clone forge-unreachable park writes

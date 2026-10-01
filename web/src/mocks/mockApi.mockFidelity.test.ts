@@ -132,6 +132,8 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await check("health_enabled", { health_enabled: "true" }, "true");
     await check("health_stall_seconds", { health_stall_seconds: "120" }, "120");
     await check("health_stall_seconds", { health_stall_seconds: "0" }, "0");
+    await check("health_tool_call_seconds", { health_tool_call_seconds: "120" }, "120");
+    await check("health_tool_call_seconds", { health_tool_call_seconds: "0" }, "0");
     await check("capability_aware_scheduling", { capability_aware_scheduling: "false" }, "false");
     await check("completion_interlock_rollout", { completion_interlock_rollout: "false" }, "false");
     await check("github_project_sync_enabled", { github_project_sync_enabled: "true" }, "true");
@@ -153,6 +155,9 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
       status: 400,
     });
     await expect(api.updateSettings({ health_stall_seconds: "30" })).rejects.toMatchObject({
+      status: 400,
+    });
+    await expect(api.updateSettings({ health_tool_call_seconds: "30" })).rejects.toMatchObject({
       status: 400,
     });
     await expect(api.updateSettings({ docker_repo_allowlist: "not-a-uuid" })).rejects.toMatchObject(

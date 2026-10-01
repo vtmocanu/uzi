@@ -1044,22 +1044,27 @@ type RunInputResponse struct {
 
 // SteerInputDTO is one steer-queue entry (PRD #95, #634), served by
 // GET /api/runs/{id}/inputs (owner-only): the message body plus its delivery status.
-// The queue now spans two kinds. For a Kind=="follow_up" row, state is derived from
-// ConsumedAt (NULL ⇒ Queued, the worker has not drained it; set ⇒ Delivered, the
-// worker consumed it for its next turn). For a Kind=="scope" operator scope directive
-// (PRD #634), state is the Disposition — applied/declined/superseded — because a scope
-// row is never consumed (it is excluded from ConsumeRunInputs, so its ConsumedAt is
-// always NULL); a nil Disposition means the ceiling is still pending on a live run.
-// Body is a pointer for the JSON-null vs value convention, though both kinds carry one.
-// This is a DISTINCT struct from the worker-facing workersvc.InputDTO, which has no
-// consumed_at.
+// The queue spans two kinds. For a Kind=="follow_up" row the state is derived from
+// the receipt timestamps: ConsumedAt NULL is Queued; ConsumedAt set is Received (the worker
+// ACKed it); AppliedAt set is Routed (steering acted on it); IncludedAt set is Included (the
+// worker reported it in an executor prompt). A nil IncludedAt means "not yet included" only when
+// InclusionReported is true: the worker that ACKed the row advertises input_inclusion_v1, or an
+// inclusion receipt set it. Otherwise a nil IncludedAt means the worker cannot say, not that the
+// follow-up was left out. For a Kind=="scope"
+// operator scope directive (PRD #634), state is the Disposition (applied/declined/superseded)
+// because a scope row is never consumed; a nil Disposition means the ceiling is still pending
+// on a live run. Body is a pointer for the JSON-null vs value convention. This is a DISTINCT
+// struct from the worker-facing workersvc.InputDTO.
 type SteerInputDTO struct {
-	ID          int64      `json:"id"`
-	Kind        string     `json:"kind"`
-	Body        *string    `json:"body"`
-	CreatedAt   time.Time  `json:"created_at"`
-	ConsumedAt  *time.Time `json:"consumed_at"`
-	Disposition *string    `json:"disposition"`
+	ID                int64      `json:"id"`
+	Kind              string     `json:"kind"`
+	Body              *string    `json:"body"`
+	CreatedAt         time.Time  `json:"created_at"`
+	ConsumedAt        *time.Time `json:"consumed_at"`
+	Disposition       *string    `json:"disposition"`
+	AppliedAt         *time.Time `json:"applied_at"`
+	IncludedAt        *time.Time `json:"included_at"`
+	InclusionReported bool       `json:"inclusion_reported"`
 }
 
 // RunEventDTO is one /api/ws frame: the live-channel counterpart to the REST

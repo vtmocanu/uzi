@@ -24,6 +24,19 @@ func TestValidateHealthSeconds(t *testing.T) {
 	}
 }
 
+func TestValidateHealthToolCallSeconds(t *testing.T) {
+	for _, v := range []string{"0", "60", "1200", "86400"} {
+		if err := Validate(KeyHealthToolCallSeconds, v); err != nil {
+			t.Errorf("Validate(health_tool_call_seconds, %q) = %v, want nil", v, err)
+		}
+	}
+	for _, v := range []string{"30", "-1", "abc", "86401"} {
+		if err := Validate(KeyHealthToolCallSeconds, v); err == nil {
+			t.Errorf("Validate(health_tool_call_seconds, %q) = nil, want a rejection", v)
+		}
+	}
+}
+
 func TestValidateHealthPercent(t *testing.T) {
 	// {0} ∪ [50, 99]: 0 disables, the floor rejects noisy low thresholds, and 100 is
 	// excluded because the sweeper fires at 100%.
@@ -71,6 +84,7 @@ func TestHealthAccessorsFallBackToDefaults(t *testing.T) {
 		want int
 	}{
 		{"stall", c.HealthStallSeconds, 300},
+		{"tool-call", c.HealthToolCallSeconds, 1200},
 		{"near-timeout", c.HealthNearTimeoutPct, 85},
 		{"queued", c.HealthQueuedSeconds, 600},
 		{"approval", c.HealthApprovalSeconds, 3600},
@@ -87,6 +101,7 @@ func TestHealthAccessorsReadStoredRows(t *testing.T) {
 		row(KeyHealthEnabled, "false"),
 		row(KeyHealthStallSeconds, "120"),
 		row(KeyHealthNearTimeoutPct, "0"), // disabled
+		row(KeyHealthToolCallSeconds, "900"),
 	}}, time.Minute)
 	ctx := context.Background()
 
@@ -95,6 +110,9 @@ func TestHealthAccessorsReadStoredRows(t *testing.T) {
 	}
 	if got, _ := c.HealthStallSeconds(ctx); got != 120 {
 		t.Errorf("HealthStallSeconds = %d, want 120", got)
+	}
+	if got, _ := c.HealthToolCallSeconds(ctx); got != 900 {
+		t.Errorf("HealthToolCallSeconds = %d, want 900", got)
 	}
 	if got, _ := c.HealthNearTimeoutPct(ctx); got != 0 {
 		t.Errorf("HealthNearTimeoutPct = %d, want 0 (disabled)", got)
@@ -111,7 +129,7 @@ func TestHealthEnabledJunkDefaultsOn(t *testing.T) {
 
 func TestHealthKeysKnownAndInDefaults(t *testing.T) {
 	for _, k := range []string{
-		KeyHealthEnabled, KeyHealthStallSeconds, KeyHealthNearTimeoutPct,
+		KeyHealthEnabled, KeyHealthStallSeconds, KeyHealthToolCallSeconds, KeyHealthNearTimeoutPct,
 		KeyHealthQueuedSeconds, KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds,
 	} {
 		if !Known(k) {

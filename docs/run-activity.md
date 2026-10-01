@@ -271,32 +271,52 @@ place, without yanking your scroll position around.
 ## Steer queue
 
 Every follow-up you send shows up in the steer queue immediately, and moves
-through one of these delivery states:
+through these delivery states:
 
 | State | Meaning |
 |---|---|
 | Queued | Not yet picked up by the worker — including while the run is sitting at a plan-approval gate. |
-| Delivered | The worker has received it. On a Claude run, queued follow-ups are folded into the agent's next work turns one per turn, in order, so with several queued a later one can show Delivered a turn or more before the agent sees it. |
-| Delivered — applies after approval | Fetched while the run was sitting at a plan-approval gate; it's buffered and, on a Claude run, takes effect once you approve. |
+| Received | The worker has fetched it. It is not in a prompt yet. |
+| Routed | The run's steering has acted on it: it is lined up for the next turn. |
+| Received / Routed — waits for approval | Fetched while the run sits at a plan-approval gate. It reaches a prompt in the first implementation prompt after you approve. |
+| Received / Routed — awaits your answer | Fetched while the run waits on a clarification question. It rides the next ordinary turn after you answer. |
+| Received / Routed — resumes the run | Fetched while an interactive run waits for its next follow-up; it becomes the next turn and resumes the run. |
+| Included in a prompt | The turn carrying it reached the model: it is in a prompt the agent was given. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
+| Not confirmed — run finished | The worker fetched it, but no prompt carrying it was confirmed before the run finished. The receipt may have been lost at shutdown, so this is not proof it was never carried. |
+| Received / Routed — no inclusion report | The worker predates inclusion reporting, so uzi cannot say whether a prompt carried it. |
 
-**"Delivered" means handed to the worker, not necessarily acted on.**
-Whether it actually changed what the agent did next is visible in its
-following messages, not in the chip. Delivered can show with nothing
-happening: the worker crashes right after fetching it, a follow-up buffered
-at a plan gate is never applied because you **reject** the plan instead of
-approving it, or the run finishes, pauses, or hits its scope ceiling before
-the follow-up's turn comes. A crash is not silent for long: a stalled agent
-trips the [`stalled` health flag](./run-health.md). In each of these cases,
-send it again: on a run that has not finished (a paused one included), from
-the steer queue if you can steer the run; on a finished run, in a new run.
+**When a follow-up is included.** Claude and Codex runs behave identically.
+Each owner follow-up is included in the next ordinary implementation prompt,
+one per turn, oldest first, so with several queued a later one stays Received
+or Routed until its turn starts. A follow-up sent at the plan gate is included
+in the first implementation prompt after you approve. Completion-rework,
+clarification and secret-gate turns carry only their own text; a follow-up
+that is waiting rides the next ordinary turn. "Included" is recorded once the
+turn carrying it reaches the model (the agent's first model activity in that
+turn). The follow-up is fenced as untrusted input in the prompt. After a
+resume, a follow-up that a worker received, and that the worker reports
+inclusion for, but that was never included is sent to the lead again at every
+re-claim; rows received by an older worker that does not report inclusion are
+not re-sent. Delivery is therefore at-least-once: a follow-up can be included
+again after a resume if the worker could not report the first inclusion. Chat messages are included when
+their chat turn starts. Diff-review, judge, job and isolated research runs
+never include follow-ups.
 
-On a Codex run, follow-ups are received but not passed to the agent at all,
-so resending does not help. Put the guidance in the issue before the run
-starts, or use a Claude run.
+**"Included" means a prompt carried it, not that the agent acted on it.**
+Whether it changed what the agent did next is visible in its following
+messages, not in the chip. A follow-up can be Included and still have no
+effect: the run finishes, pauses, or hits its scope ceiling before the agent
+gets to it, or the agent weighs it against the plan and does something else.
+A follow-up buffered at a plan gate is never included if you **reject** the
+plan instead of approving it. A crash is not silent for long: a stalled
+agent trips the [`stalled` health flag](./run-health.md). When a follow-up
+did not land, send it again: on a run that has not finished (a paused one
+included), from the steer queue if you can steer the run; on a finished run,
+in a new run.
 
 The queue stays visible, read-only, after the run finishes — so a
-"Not delivered — run finished" input doesn't just vanish.
+"Not delivered — run finished" or "Not confirmed — run finished" input doesn't just vanish.
 
 ### Scope directives
 
@@ -315,8 +335,8 @@ whether the directive changed anything:
 | Declined — not acted on | The run completed normally despite the directive — it finished its milestones (or the ceiling was never reached), so the directive changed nothing. |
 
 This closes the gap the note above names for a plain follow-up: where
-"Delivered" only tells you the worker *saw* it, a scope directive's chip
-tells you whether it *fired*.
+"Received" only tells you the worker *has* a follow-up, a scope directive's
+chip tells you whether it *fired*.
 
 ## Milestones and the now line
 

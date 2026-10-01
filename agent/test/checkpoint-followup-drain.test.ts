@@ -85,8 +85,14 @@ function fakeTurns(scripts: ScriptedTurn[], queue: string[]): { queryFn: SdkQuer
   return { queryFn, prompts };
 }
 
-function makeCtx(queue: string[]): { ctx: RunContext; pulls: Array<string | undefined> } {
+function makeCtx(
+  queue: string[],
+  overrides: Partial<RunContext> = {},
+): { ctx: RunContext; pulls: Array<string | undefined>; included: number[]; idOf: Map<string, number> } {
   const pulls: Array<string | undefined> = [];
+  // Issue #1800: ids reported through ctx.followUpIncluded, and the id each pulled body was given.
+  const included: number[] = [];
+  const idOf = new Map<string, number>();
   const ctx: RunContext = {
     runId: "r1",
     issueIid: 5,
@@ -103,12 +109,17 @@ function makeCtx(queue: string[]): { ctx: RunContext; pulls: Array<string | unde
     pullFollowUp: () => {
       const next = queue.shift();
       pulls.push(next);
-      return next;
+      if (next === undefined) return undefined;
+      const id = idOf.size + 1;
+      idOf.set(next, id);
+      return { id, body: next };
     },
+    followUpIncluded: (id) => included.push(id),
     checkpoint: async () => {},
     reportIteration: async () => undefined,
+    ...overrides,
   };
-  return { ctx, pulls };
+  return { ctx, pulls, included, idOf };
 }
 
 const PLAN: ScriptedTurn = { messages: [submitPlan("# Plan"), resultSuccess()] };
@@ -136,7 +147,7 @@ afterEach(() => {
   }
 });
 
-describe("issue #1152: queued follow-ups drain at a cooperative checkpoint", () => {
+describe("issue #1152 / #1800: a follow-up queued during a turn is pulled at the next loop top and rides the next ordinary turn", () => {
   it("delivers a follow-up queued during a checkpointing turn to the next turn", async () => {
     const queue: string[] = [];
     const { queryFn, prompts } = fakeTurns(
@@ -204,6 +215,7 @@ describe("issue #1152: queued follow-ups drain at a cooperative checkpoint", () 
     assert.strictEqual(prompts.length, 4, "planning turn + three implement turns");
     assert.ok(prompts[2]!.includes(A) && !prompts[2]!.includes(B), "iteration 2 carries the first only");
     assert.ok(prompts[3]!.includes(B) && !prompts[3]!.includes(A), "iteration 3 carries the second only");
-    assert.deepStrictEqual(pulls, [A, B], "one dequeue per ordinary turn boundary");
+    // Issue #1800: the pull happens at each implement loop top (undefined when nothing is queued).
+    assert.deepStrictEqual(pulls.filter((p) => p !== undefined), [A, B], "one dequeue per ordinary turn");
   });
 });

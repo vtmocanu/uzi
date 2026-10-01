@@ -1,6 +1,6 @@
 # shellcheck shell=bash
 # phase:    steer-queue-delivery
-# title:    PRD #95: steer-queue delivery — Queued -> Delivered on consume, no run_message, no forge/token
+# title:    PRD #95: steer-queue delivery — Queued -> Received on consume, no run_message, no forge/token
 # critical: no
 # lane:     gitlab
 # executor: any
@@ -12,7 +12,7 @@
 # restores: -
 # =============================================================================
 # PRD #95 — steer-queue delivery (Problem 3): a follow-up shows as Queued on submit,
-# flips to Delivered when the worker consumes it, is NEVER mirrored into run_messages
+# flips to Received when the worker consumes it, is NEVER mirrored into run_messages
 # (Decision 4 — the headline invariant), and spends no token / writes no forge (the
 # whole reason the queue is a DTO over run_user_inputs, not a run_message).
 #
@@ -21,8 +21,10 @@
 # (→ ConsumeInputs), consuming EVERY pending input and buffering a follow_up for the
 # agent's next turn. We submit the follow-up in the queued/claiming window BEFORE the
 # run is owned and its steering poll has run, then read it back as Queued; the gate's
-# poll then flips it to Delivered while the run sits at awaiting_approval — the S3
-# "Delivered — applies after approval" case, driven end to end by the real worker poll.
+# poll then flips it to Received while the run sits at awaiting_approval — the S3
+# S3 case (consumed_at set; not yet in a prompt; the UI reads "Received — waits for approval",
+# or "Routed — waits for approval" once steering has acted on it), driven end to end by the real
+# worker poll. The assertions here key on consumed_at only.
 # (The dropped-frame reconnect self-heal, S1, is proven in
 # web/src/lib/useRunStream.test.tsx — e2e has no browser WS, so it is not re-tested here.)
 #
@@ -42,9 +44,9 @@
 # queued (never claimed, never failed)"), which turns "unclaimed" from a ~500ms window
 # into a STABLE state. We then assert Queued twice across several worker poll cycles —
 # strictly STRONGER than the old single read, which could not tell a stable state from a
-# lucky snapshot — before unlocking and asserting the real Queued -> Delivered transition
+# lucky snapshot — before unlocking and asserting the real Queued -> Received transition
 # through the live worker exactly as before. No assertion is weakened; one is added.
-say "PRD #95: steer-queue delivery — Queued → Delivered on consume, no run_message, no forge/token"
+say "PRD #95: steer-queue delivery — Queued → Received on consume, no run_message, no forge/token"
 STEER_MRS_BEFORE="$(fake_state | jq '.mrs | length')"
 
 # Lock FIRST: the run must be un-claimable from the instant it exists.
@@ -91,18 +93,18 @@ pass "follow_up submitted: write returned the row (id=$STEER_ID); Queued is STAB
 
 # Unlock: the worker may now claim, and the run proceeds to the gate where its steering
 # poll consumes the follow_up (stamping consumed_at) while the run stays
-# awaiting_approval — Delivered, S3 flavor. Everything from here is the ORIGINAL
+# awaiting_approval — Received, S3 flavor. Everything from here is the ORIGINAL
 # assertion set, driven by the real worker poll.
 apipost /api/vault/unlock "{\"password\":\"$ADMIN_PASS\"}" >/dev/null
 [ "$(apiget /api/auth/me | jq -r '.vault.unlocked')" = true ] \
   || fail "PRD #95: the vault must be unlocked again — later phases (and the dedicated PRD #32 phase) assume an unlocked admin vault"
 wait_status "$RUN_S" awaiting_approval
-wait_eq delivered 30 "run $RUN_S follow-up delivery" run_input_delivery "$RUN_S"
+wait_eq received 30 "run $RUN_S follow-up receipt" run_input_delivery "$RUN_S"
 DLV="$(apiget "/api/runs/$RUN_S/inputs")"
-[ "$(echo "$DLV" | jq -r '.inputs[0].consumed_at')" != null ] || fail "consumed follow_up must show Delivered (consumed_at set)"
-[ "$(echo "$DLV" | jq -r '.inputs[0].id')" = "$STEER_ID" ] || fail "delivered row id drifted from the submitted id"
+[ "$(echo "$DLV" | jq -r '.inputs[0].consumed_at')" != null ] || fail "consumed follow_up must show Received (consumed_at set)"
+[ "$(echo "$DLV" | jq -r '.inputs[0].id')" = "$STEER_ID" ] || fail "received row id drifted from the submitted id"
 [ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')" = awaiting_approval ] \
-  || fail "the run should still be at the gate when the follow_up is consumed (S3 delivered-applies-after-approval)"
+  || fail "the run should still be at the gate when the follow_up is consumed (S3 received-waits-for-approval)"
 # DIAGNOSTIC (PRD #97 M4/M9), not an assertion. READ THE LABEL CAREFULLY: since M9 this
 # number spans the DELIBERATE vault-lock window, so it is a total submit→delivery span,
 # NOT a race margin. There is no race margin here any more — the lock makes Queued a
@@ -120,7 +122,7 @@ STEER_MARGIN_MS="$(jq -rn --arg c "$(echo "$DLV" | jq -r '.inputs[0].created_at'
   (($d | epochms) - ($c | epochms)) | tostring' 2>/dev/null || echo unknown)"
 [ -n "$STEER_MARGIN_MS" ] || STEER_MARGIN_MS=unknown
 say "PRD #95 DIAGNOSTIC: total submit→delivery span ≈ ${STEER_MARGIN_MS}ms (spans the deliberate vault-lock window — NOT a race margin; the lock removed the race)"
-pass "worker consumed the follow_up at the gate: queue Queued → Delivered, run still awaiting_approval (S3)"
+pass "worker consumed the follow_up at the gate: queue Queued → Received, run still awaiting_approval (S3)"
 
 # Decision 4 — the headline invariant: the follow_up is a DTO over run_user_inputs,
 # NEVER a run_message. Its body appears in NO message payload, and the gapless per-run
@@ -145,7 +147,7 @@ apiget "/api/runs/$RUN_S" | jq -e '((.run.usage.input_tokens // 0) == 0) and ((.
 pass "no forge write + no token spend for the follow_up path (MR count unchanged, no branch, run.usage zero)"
 
 # The queue survives the run going terminal (B1): cancel to clean up, then the same
-# Delivered follow_up is still readable on the now-terminal run (it lives in
+# consumed follow_up is still readable on the now-terminal run (it lives in
 # run_user_inputs, not the composer's unmounted component state).
 #
 # Terminal status is `cancelled`, NOT `failed` (PRD #503 M1, landed in #521): a cancel
@@ -167,6 +169,6 @@ wait_status "$RUN_S" cancelled
 [ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')" = "cancelled" ] \
   || fail "a live-worker cancel must terminate the run as cancelled(stop_kind=cancelled), got status='$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')' stop_kind='$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')'"
 [ "$(apiget "/api/runs/$RUN_S/inputs" | jq -r '.inputs[0].consumed_at')" != null ] \
-  || fail "the delivered follow_up must remain readable (and Delivered) after the run goes terminal (B1 survive-terminal)"
-pass "steer queue survives terminal: the Delivered follow_up is still listed on the now-terminal (cancelled) run (B1)"
+  || fail "the consumed follow_up must remain readable (consumed_at still set) after the run goes terminal (B1 survive-terminal)"
+pass "steer queue survives terminal: the consumed follow_up is still listed on the now-terminal (cancelled) run; the consumed follow_up stays consumed after the run goes terminal (B1)"
 

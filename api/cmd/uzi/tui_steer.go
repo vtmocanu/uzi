@@ -140,9 +140,9 @@ func steerSuppressedReason(a steerAccess) string {
 
 // ---- queue indicator ------------------------------------------------------
 
-// renderSteerQueue is the queued/delivered indicator (PRD #95), built on the SAME
+// renderSteerQueue is the queued/received/routed/included indicator (PRD #95), built on the SAME
 // steerState + relAge helpers `uzi run inputs` prints, so the two cannot disagree
-// about what "delivered" means.
+// about what "included" means.
 func (m tuiModel) renderSteerQueue() string {
 	q := m.detail.steer.queue
 	if len(q) == 0 {
@@ -159,7 +159,7 @@ func (m tuiModel) renderSteerQueue() string {
 			body = m.renderer.Plain(*in.Body, 48)
 		}
 		sb.WriteString("  " + m.pal.faint.Render(padCell(steerKindLabel(in.Kind), 10)+" "+
-			padCell(steerState(in.Kind, in.ConsumedAt, in.Disposition, m.detail.run.Status, strOr(m.detail.run.RecoveryWaitCause, "")), 30)+" "+
+			padCell(steerState(in, m.detail.run.Status, strOr(m.detail.run.RecoveryWaitCause, "")), 30)+" "+
 			padCell(relAge(in.CreatedAt), 5)) + " " + body + "\n")
 	}
 	return sb.String()

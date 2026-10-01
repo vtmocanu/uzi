@@ -10,44 +10,44 @@ import { FollowUpComposer } from "./FollowUpComposer";
 //
 // Critically, this card is rendered UNCONDITIONALLY by RunView — including for a terminal
 // run — and its `inputs` are lifted into useRunStream (Decision 7/B1). That is what lets
-// the queue survive the run completing and still show "Not delivered — run finished"; it
+// the queue survive the run completing and still show "Not delivered — run finished" or "Not confirmed — run finished"; it
 // could never do that from inside the !terminal-gated composer, which unmounts on
 // completion. The composer + Stop, by contrast, are only meaningful for a live run, so
 // they are gated on !terminal.
 //
-// Delivery state (Decision 7) is derived CLIENT-SIDE from (consumed_at, run.status): a
-// stamped consumed_at means the worker has the input for its next turn (not that it acted
-// on it — see the PRD's consumed-but-dropped caveats). The parked copy needs the run's
+// Delivery state (Decision 7, issue #1800) is derived CLIENT-SIDE from the input's receipt
+// timestamps and run.status: consumed_at is the worker having received it (Received),
+// applied_at is steering having routed it (Routed), and included_at is the turn carrying it
+// having reached the model (Included in a prompt). "Included" never claims the agent acted on the
+// follow-up: whether it did shows in the agent's messages. The parked copy needs the run's
 // status (awaiting_approval, or awaiting_input since PRD #88); RunView passes it via
 // `status` (optional so the card still renders without it — those cases then degrade to
-// a plain "Delivered").
+// a plain "Received" / "Routed").
 
 type Delivery = { label: string; tone: BadgeTone; title: string };
 
-// PARKED_COPY is the qualified wording for a follow-up consumed while the run is
-// blocked on a human (PRD #95 S3, extended by PRD #88). A follow-up submitted at a park
-// IS consumed immediately — the steering channel polls throughout — but the worker only
-// applies it on its next turn, which does not come until the human acts. A bare
-// "Delivered" would mislead in both cases; naming the WRONG action would too, which is
-// why this is keyed on the status rather than on one "parked" boolean.
-const PARKED_COPY: Record<string, Delivery> = {
+// PARKED_COPY is the qualifier for a follow-up the worker has received but no prompt has
+// carried yet while the run is blocked on a human (PRD #95 S3, extended by PRD #88). A
+// follow-up submitted at a park IS received immediately — the steering channel polls
+// throughout — but it reaches a prompt only on the run's next turn, which does not come
+// until the human acts. A bare "Received" would hide that wait; naming the WRONG action
+// would mislead too, which is why this is keyed on the status rather than on one "parked"
+// boolean. `suffix` follows the Received/Routed base word.
+const PARKED_COPY: Record<string, { suffix: string; title: string }> = {
   awaiting_approval: {
-    label: "Delivered — applies after approval",
-    tone: "warning",
-    title: "Handed to the worker, but it takes effect only after you approve the plan.",
+    suffix: "waits for approval",
+    title: "The worker has it, but it reaches a prompt only after you approve the plan.",
   },
   awaiting_input: {
-    label: "Delivered — applies after you answer",
-    tone: "warning",
-    title: "Handed to the worker, but it takes effect only after you answer its question.",
+    suffix: "awaits your answer",
+    title: "The worker has it, but it reaches a prompt only after you answer the agent's question.",
   },
   // PRD #517: an interactive run parked awaiting the owner's next follow-up. Sending
-  // one here is the WHOLE point — it is consumed immediately and IS what resumes the
+  // one here is the WHOLE point — it is received immediately and IS what resumes the
   // run — so the copy names the resuming action rather than a blocking gate.
   awaiting_followup: {
-    label: "Delivered — resumes the run",
-    tone: "warning",
-    title: "Handed to the worker; it picks this up as the next turn and continues the run.",
+    suffix: "resumes the run",
+    title: "The worker has it; it goes into the next turn's prompt and continues the run.",
   },
 };
 
@@ -89,9 +89,11 @@ function scopeDeliveryFor(disposition: string | null): Delivery {
 
 // deliveryFor maps one steer-queue entry to its chip. A scope directive is driven by
 // its disposition (checked FIRST, before any consumed_at logic — a scope row is never
-// consumed). The follow_up path is unchanged: order matters, the unconsumed→terminal
-// "Not delivered" case must be checked before the generic Queued.
-function deliveryFor(input: SteerInput, terminal: boolean, parked: Delivery | undefined): Delivery {
+// consumed). For a follow_up, order matters: the unconsumed→terminal "Not delivered" case
+// must be checked before the generic Queued, and included_at wins over everything else
+// (once a prompt carried it, the run status no longer changes the answer). The harness
+// (Claude or Codex) does not change a chip: the DTO carries no harness.
+function deliveryFor(input: SteerInput, terminal: boolean, status: string | undefined): Delivery {
   if (input.kind === "scope") return scopeDeliveryFor(input.disposition);
   const consumed = input.consumed_at != null;
   if (!consumed) {
@@ -100,18 +102,48 @@ function deliveryFor(input: SteerInput, terminal: boolean, parked: Delivery | un
       return {
         label: "Not delivered — run finished",
         tone: "neutral",
-        title: "The run reached a terminal state before the worker consumed this follow-up.",
+        title: "The run reached a terminal state before the worker received this follow-up.",
       };
     }
-    // Non-terminal (incl. awaiting_approval): the worker will consume it; until it does
+    // Non-terminal (incl. awaiting_approval): the worker will receive it; until it does
     // it is genuinely pending.
-    return { label: "Queued", tone: "queue", title: "Waiting for the worker to consume this follow-up." };
+    return { label: "Queued", tone: "queue", title: "Waiting for the worker to receive this follow-up." };
   }
-  if (parked) return parked;
+  if (input.included_at != null) {
+    return {
+      label: "Included in a prompt",
+      tone: "ok",
+      title:
+        "Included in a prompt the agent was given; whether it acted on it shows in the agent's messages.",
+    };
+  }
+  const base = input.applied_at != null ? "Routed" : "Received";
+  if (!input.inclusion_reported) {
+    // A worker that predates inclusion reporting cannot say whether a prompt carried it,
+    // so neither "included" nor "not confirmed" is claimed.
+    return {
+      label: `${base} — no inclusion report`,
+      tone: "neutral",
+      title:
+        "The worker has this follow-up but does not report which prompt carried it, so whether it was included is unknown.",
+    };
+  }
+  if (terminal) {
+    return {
+      label: "Not confirmed — run finished",
+      tone: "neutral",
+      title: "The worker received this follow-up, but no prompt carrying it was confirmed before the run finished.",
+    };
+  }
+  const parked = status ? PARKED_COPY[status] : undefined;
+  if (parked) return { label: `${base} — ${parked.suffix}`, tone: "warning", title: parked.title };
   return {
-    label: "Delivered",
-    tone: "ok",
-    title: "Handed to the worker for its next turn (whether it acted on it shows in the agent's messages).",
+    label: base,
+    tone: "queue",
+    title:
+      base === "Routed"
+        ? "Steering routed this follow-up; it goes into the next prompt, which has not started yet."
+        : "The worker has this follow-up; it goes into the next prompt, which has not started yet.",
   };
 }
 
@@ -239,8 +271,8 @@ export function SteerQueueCard({
 }: {
   inputs: SteerInput[];
   terminal: boolean;
-  // The run status, used only to render the parked copy ("Delivered — applies after
-  // approval" / "…after you answer"). Optional: absent degrades those to "Delivered".
+  // The run status, used only to render the parked copy ("Received — waits for approval" /
+  // "…awaits your answer"). Optional: absent degrades those to a plain "Received".
   status?: string;
   // canSteer is false for a NON-OWNER viewer (a non-owner admin can open the owner-or-
   // admin run view, but the owner-only /inputs 404s — useRunStream reports that here).
@@ -265,7 +297,6 @@ export function SteerQueueCard({
   // an empty queue still renders — it carries the composer.
   if (inputs.length === 0 && (terminal || !canSteer)) return null;
 
-  const parked = status ? PARKED_COPY[status] : undefined;
   // PRD #1908: a job runs one session over its fixed inputs and never reads a follow-up, so
   // it offers Stop only; a composer there would queue text nothing consumes.
   const takesFollowUps = run?.kind !== "job";
@@ -279,7 +310,7 @@ export function SteerQueueCard({
       {inputs.length > 0 && (
         <ul className="space-y-1.5">
           {inputs.map((i) => {
-            const d = deliveryFor(i, terminal, parked);
+            const d = deliveryFor(i, terminal, status);
             return (
               <li
                 key={i.id}
@@ -300,8 +331,9 @@ export function SteerQueueCard({
                   {/* Scope-disposition labels are sentence-length (the longest is
                       "Superseded — a later directive replaced it"), so opt into Badge's
                       `wrap` (ui.tsx) to wrap the pill on a narrow viewport instead of
-                      crushing the body text. Follow-up chips are short and stay nowrap. */}
-                  <Badge tone={d.tone} wrap={i.kind === "scope"}>
+                      crushing the body text. Follow-up chips such as "Routed — awaits your
+                      answer" are nearly as long, so they wrap too. */}
+                  <Badge tone={d.tone} wrap>
                     {d.label}
                   </Badge>
                 </span>

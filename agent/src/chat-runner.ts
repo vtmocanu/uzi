@@ -295,8 +295,10 @@ export class ChatRunner {
           const input = await source.awaitFollowUp(idleTimeoutMs);
           if (input.kind !== "message") return undefined;
           batcher.emit({ kind: "user_message", payload: { text: input.text } });
-          return input.text;
+          return { text: input.text, inputId: input.id };
         },
+        // Issue #1800: a message (the seeded first one included) whose turn reached the model.
+        followUpIncluded: (id) => source.markFollowUpIncluded?.(id),
       };
 
       const result = await executor.run(ctx);

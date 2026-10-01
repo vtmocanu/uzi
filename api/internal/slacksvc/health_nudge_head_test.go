@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/slack-go/slack"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -188,5 +189,23 @@ func TestHealthNudgeBlocksUndeliveredVerdictDoNotContradictThemselves(t *testing
 	}
 	if !strings.Contains(body, reasonVerdictUndelivered) {
 		t.Fatalf("nudge section = %q, want it to carry the detector's reason verbatim", body)
+	}
+}
+
+// TestHealthNudgeBlocksLongToolCallReasonRidesTheStalledHead pins issue #2046 on the
+// Slack surface: the long-tool-call reason maps to the stalled enum, so the nudge keeps
+// the stalled "gone quiet" head and appends the fixed reason sentence.
+func TestHealthNudgeBlocksLongToolCallReasonRidesTheStalledHead(t *testing.T) {
+	const reason = "a tool call has been in progress longer than the configured threshold"
+	blocks, _ := healthNudgeBlocks(healthStalled, reason, "", store.GetSlackRunContextRow{ID: uuid.New()}, nil, 0, time.Now())
+	if len(blocks) == 0 {
+		t.Fatal("no blocks")
+	}
+	sec, ok := blocks[0].(*slack.SectionBlock)
+	if !ok || sec.Text == nil {
+		t.Fatalf("first block = %#v, want a text section", blocks[0])
+	}
+	if !strings.Contains(sec.Text.Text, "💤") || !strings.Contains(sec.Text.Text, reason) {
+		t.Fatalf("section = %q, want the stalled head and the long-tool-call reason", sec.Text.Text)
 	}
 }

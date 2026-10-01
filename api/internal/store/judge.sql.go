@@ -620,7 +620,7 @@ func (q *Queries) ListRecommendationsForReview(ctx context.Context, reviewID uui
 }
 
 const listRunInputsForRun = `-- name: ListRunInputsForRun :many
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported FROM run_user_inputs
 WHERE run_id = $1
 ORDER BY id ASC
 LIMIT $2
@@ -661,6 +661,8 @@ func (q *Queries) ListRunInputsForRun(ctx context.Context, arg ListRunInputsForR
 			&i.AppliedAt,
 			&i.GateBinding,
 			&i.GateRevision,
+			&i.IncludedAt,
+			&i.InclusionReported,
 		); err != nil {
 			return nil, err
 		}

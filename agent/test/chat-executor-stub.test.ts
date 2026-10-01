@@ -1,7 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { StubChatExecutor, STUB_CHAT_PROPOSE, STUB_CHAT_READ } from "../src/chat-executor-stub.js";
-import type { ChatContext } from "../src/chat-executor.js";
+import type { ChatContext, ChatUserMessage } from "../src/chat-executor.js";
 import type { UziToolHandlers, ToolTextResult } from "../src/uzi-tools.js";
 import type { EmittedMessage } from "../src/executor.js";
 import { nullLogger } from "./helpers.js";
@@ -54,7 +54,10 @@ function makeCtx(
     maxTurns: 50,
     turnTimeoutMs: 5000,
     uziTools,
-    nextUserMessage: () => Promise.resolve<string | undefined>(pending.length ? pending.shift() : undefined),
+    nextUserMessage: () => {
+      const text = pending.length ? pending.shift() : undefined;
+      return Promise.resolve<ChatUserMessage | undefined>(text === undefined ? undefined : { text });
+    },
     ...overrides,
   };
   return { ctx, emits, sessions, proposeCalls, get listRunsCalls() { return listRunsCalls; }, messagesCalls };

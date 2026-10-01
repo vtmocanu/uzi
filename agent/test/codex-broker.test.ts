@@ -18,7 +18,9 @@ import {
   type SpawnCommandResult,
 } from "../src/codex/broker.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
-import { buildCodexToolHandlers } from "../src/codex/codex-executor.js";
+import { buildCodexToolHandlers, makeDefaultSpawnCommand } from "../src/codex/codex-executor.js";
+import { SupervisedChildExitTimeoutError, type CodexRootHandle, type DisposeOutcome } from "../src/codex/launcher.js";
+import { PassThrough } from "node:stream";
 import { forgeToolNames } from "../src/forge-tools.js";
 import { memoryToolNames } from "../src/memory-tools.js";
 import { reportIncidentalIssueToolName } from "../src/findings-tools.js";
@@ -823,6 +825,57 @@ describe("CodexCallbackBroker: a throwing seam denies as broker_error with the r
     // epoch is not poisoned (a clean quiesce would follow).
     assert.equal(h.registry.inFlightCallbackCount(), 0);
     assert.equal(h.registry.isPoisoned(), false);
+  });
+});
+
+describe("CodexCallbackBroker: issue #2048 command deadline through the real default spawn seam", () => {
+  const WT = "/tmp/uzi-broker-2048";
+  function deadlineBroker(clean: boolean) {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2048));
+    let disposes = 0;
+    const launch = async (): Promise<CodexRootHandle> => {
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        started: { event: "started", supervisorPid: 20, childPid: 21, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 20,
+        transport: { stdin: new PassThrough(), stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async (ms: number) => {
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+          throw new SupervisedChildExitTimeoutError(ms);
+        },
+        dispose: async (): Promise<DisposeOutcome> => {
+          disposes += 1;
+          stdout.end(); stderr.end();
+          if (!clean) return { clean: false, reason: "supervisor reported a surviving descendant" };
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+        failed: undefined,
+        whenFailed: new Promise<Error>(() => undefined),
+      };
+    };
+    const spawnCommand = makeDefaultSpawnCommand(registry, launch, 1000, WT, {}, "required", undefined, undefined, 20);
+    const h = makeBroker({ registry, spawnCommand, worktreePath: WT });
+    return { h, registry, disposes: () => disposes };
+  }
+
+  it("a command stopped at its deadline is denied command_deadline after the tree was reaped", async () => {
+    const { h, registry, disposes } = deadlineBroker(true);
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "sleep 9999" }, "root");
+    assertDenied(r, "command_deadline");
+    assert.match(r.message, /stopped at its deadline/);
+    assert.equal(disposes(), 1);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+    assert.equal(registry.inFlightCallbackCount(), 0);
+  });
+
+  it("an unclean reap at the deadline stays a broker_error and poisons the registry", async () => {
+    const { h, registry, disposes } = deadlineBroker(false);
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "sleep 9999" }, "root");
+    assertDenied(r, "broker_error");
+    assert.equal(registry.isPoisoned(), true);
+    assert.equal(disposes(), 1);
   });
 });
 

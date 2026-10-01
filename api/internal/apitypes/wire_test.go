@@ -388,7 +388,7 @@ func TestRunInputTags(t *testing.T) {
 }
 
 func TestSteerInputDTOTags(t *testing.T) {
-	assertTags(t, "SteerInputDTO", SteerInputDTO{}, "id", "kind", "body", "created_at", "consumed_at", "disposition")
+	assertTags(t, "SteerInputDTO", SteerInputDTO{}, "id", "kind", "body", "created_at", "consumed_at", "disposition", "applied_at", "included_at", "inclusion_reported")
 }
 
 func TestRecommendationDTOTags(t *testing.T) {

@@ -18,7 +18,7 @@ import {
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
-import type { HarnessEvent, HarnessItem, HarnessTerminal, RunTurnRequest } from "../src/harness.js";
+import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type HarnessTerminal, type RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
@@ -1682,6 +1682,62 @@ describe("CodexHarness: item content decode", () => {
   });
 });
 
+describe("CodexHarness: modelInitiated inclusion evidence (issue #1800)", () => {
+  const modelInitiated = (events: HarnessEvent[]): number =>
+    events.filter((e) => e.kind === "activity" && e.modelInitiated === true).length;
+  const itemNote = (method: string, type: string, threadId: string): CodexNotification => ({
+    kind: "activity",
+    method,
+    params: { threadId, item: { type } },
+  });
+
+  it("a root-thread item/started of a tool item type is marked modelInitiated; its item/completed is not", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(itemNote("item/started", "commandExecution", "th-1"))
+      .push(itemNote("item/completed", "commandExecution", "th-1"))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 1);
+  });
+
+  it("a root-thread item/completed alone (no start this turn) is not marked modelInitiated", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(itemNote("item/completed", "commandExecution", "th-1"))
+      .push(itemNote("item/completed", "mcpToolCall", "th-1"))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 0);
+  });
+
+  it("a child/foreign-thread commandExecution item is not marked modelInitiated", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(itemNote("item/started", "commandExecution", "child-thread"))
+      .push(itemNote("item/completed", "commandExecution", "child-thread"))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 0);
+  });
+
+  it("userMessage items and lifecycle / token-usage notifications stay unmarked", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(itemNote("item/started", "userMessage", "th-1"))
+      .push(itemNote("item/completed", "userMessage", "th-1"))
+      .push(tokenUsage({}, {}))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 0);
+  });
+});
+
 describe("CodexHarness: owner abort cancels a turn wedged in a broker callback", () => {
   it("an owner abort ENDS a turn wedged in a never-settling broker callback (no hang)", async () => {
     const ac = new AbortController();
@@ -1969,6 +2025,41 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     assert.equal(events[events.length - 1]!.kind, "turn_finished");
   });
 
+  it("issue #1800: a child-projected frame is not model-processing evidence; a root agentMessage frame is", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      harnessRef.emitChildFrame("th-c", [{ kind: "text", text: "child says hi" }]);
+      harnessRef.unregisterChildSink("th-c");
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"))
+      .push(agentMessage("root answer"));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "the parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 2000, "evidence turn");
+
+    const child = frames(events).filter((f) => f.origin.kind === "subagent");
+    assert.equal(child.length, 1, "one child frame");
+    assert.equal(evidencesModelProcessing(child[0]!), false, "a subagent frame never evidences the lead");
+    const root = frames(events).find((f) => f.origin.kind === "main" && f.items.some((i) => i.kind === "text" && i.text === "root answer"));
+    assert.ok(root, "the root agentMessage frame was projected");
+    assert.equal(evidencesModelProcessing(root), true);
+    const toolFrames = frames(events).filter((f) => f.origin.kind === "main" && f.items.some((i) => i.kind === "tool"));
+    const start = toolFrames.find((f) => f.items.some((i) => i.kind === "tool" && i.phase === "started"));
+    const finish = toolFrames.find((f) => f.items.some((i) => i.kind === "tool" && i.phase === "finished"));
+    assert.ok(start && finish, "the lead dispatch start and completion frames were projected");
+    assert.equal(evidencesModelProcessing(start), true, "the model-issued dispatch start counts");
+    assert.equal(evidencesModelProcessing(finish), false, "a completion (result) frame never counts");
+  });
+
   it("emitChildFrame projects only for a registered AND bound thread, scrubbed, namespaced and signal-free", async () => {
     let harnessRef!: CodexHarness;
     const broker = stubBroker(async (rt, name) => {
@@ -2074,6 +2165,8 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
 
     const results = frames(seen).flatMap((f) => f.items).filter((i) => i.kind === "tool" && i.phase === "finished" && i.name === "Agent");
     assert.equal(results.length, 1, "exactly one completion");
+    const synthesized = frames(seen).find((f) => f.items.some((i) => i.kind === "tool" && i.phase === "finished" && i.name === "Agent"));
+    assert.equal(evidencesModelProcessing(synthesized!), false, "a worker-synthesized completion is not model evidence (issue #1800)");
     // Issue #1864: one warn names the open delegation, its role, age and open child tools only.
     const openWarns = warns.filter((w) => w.msg === "codex delegation open at turn end");
     assert.equal(openWarns.length, 1, "one open-at-turn-end warn");

@@ -1093,6 +1093,8 @@ type RunUserInput struct {
 	AppliedAt               pgtype.Timestamptz `json:"applied_at"`
 	GateBinding             pgtype.Text        `json:"gate_binding"`
 	GateRevision            pgtype.Int8        `json:"gate_revision"`
+	IncludedAt              pgtype.Timestamptz `json:"included_at"`
+	InclusionReported       bool               `json:"inclusion_reported"`
 }
 
 type Skill struct {

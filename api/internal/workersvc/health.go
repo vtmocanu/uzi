@@ -35,6 +35,10 @@ import (
 type Settings interface {
 	HealthEnabled(ctx context.Context) (bool, error)
 	HealthStallSeconds(ctx context.Context) (int, error)
+	// HealthToolCallSeconds is how long the oldest open lead tool call may stay in
+	// flight on a quiet run before it is flagged stalled (issue #2046). 0 disables
+	// the long-tool-call arm.
+	HealthToolCallSeconds(ctx context.Context) (int, error)
 	HealthNearTimeoutPct(ctx context.Context) (int, error)
 	HealthQueuedSeconds(ctx context.Context) (int, error)
 	HealthApprovalSeconds(ctx context.Context) (int, error)
@@ -244,6 +248,14 @@ const (
 	// reasonOutboxQueued, is a warning only, and never touches the lease or authorizes a reclaim,
 	// fail or discard. Same fixed-string contract as its siblings.
 	reasonOutcomeUndelivered = "the run's outcome is journaled on its worker but has not been delivered"
+	// reasonLongToolCall (issue #2046) flags a running run whose oldest open lead tool call
+	// (delegation dispatches excluded) has been in flight longer than health_tool_call_seconds
+	// while the run itself has gone quiet. It maps to healthStalled, NOT healthSlow: slow
+	// renders as "near timeout" with a deadline countdown everywhere (PRD #1170), which would
+	// be a false statement here. runs.health_reason is free text and only runs.health is
+	// CHECK-constrained, so no migration. Same fixed-string contract as its siblings: no tool
+	// name, no tool input, no live duration.
+	reasonLongToolCall = "a tool call has been in progress longer than the configured threshold"
 )
 
 // pendingOutcomeFlagHeartbeats (issue #1994) is how many worker heartbeat intervals a pending
@@ -309,6 +321,7 @@ const leadToolWindowFetch = toolWindowFetch
 // below the run's own deadline by construction (PRD #1170).
 type healthThresholds struct {
 	stall          time.Duration
+	toolCall       time.Duration // issue #2046: 0 disables the long-tool-call arm
 	nearTimeoutPct int
 	queued         time.Duration
 	approval       time.Duration
@@ -464,9 +477,10 @@ func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.Li
 }
 
 // runningTarget computes the flag for a running run, priority persist-looping >
-// tool-looping > stalled > near-timeout (Decision 3, extended by PRD #108 M4 and
-// #1170 D5): looping is the strongest evidence of pathology, and near-timeout is a
-// budget-relative backstop that must not mask a more specific signal.
+// tool-looping > stalled > long tool call > near-timeout (Decision 3, extended by
+// PRD #108 M4, #1170 D5 and issue #2046): looping is the strongest evidence of
+// pathology, and near-timeout is a budget-relative backstop that must not mask a
+// more specific signal.
 func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
 	// looping, persistence flavour (PRD #108 M4). Checked FIRST, and deliberately
 	// NOT from run_messages: the arm below reads ListRunToolWindow, and this wedge IS
@@ -514,30 +528,50 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// flight (Decision 9, lead lane only since issue #1394; see leadInFlight). A long
 	// build/test-suite emits one tool_use then nothing until its result — that is
 	// working, not stalled; the same holds for an open parent `Agent` dispatch whose
-	// subagent is still working. The wall-clock slow signal still covers a
-	// pathological single call.
+	// subagent is still working. A pathological single call is covered by the
+	// long-tool-call arm below (issue #2046), then by the wall-clock slow signal.
 	if th.stall > 0 && !stats.inFlight {
 		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= th.stall {
-			// The silence may be an api outage, not a stall: if the run's OWNING worker
-			// reported a non-zero outbox depth for it (PRD #1391 M5), the agent IS working
-			// and sending — its updates are queued on the worker and will replay. Same
-			// healthStalled enum, truthful reason. Only while depth is non-zero; when the
-			// tracker reports nothing (backlog drained / cleared) normal stalled detection
-			// resumes.
-			//
-			// OWNER-GATE (trust boundary): the tracker's runIndex is "last reporter wins"
-			// with no ownership check, so the reporting worker id must EQUAL the run's
-			// current owning worker before we trust the depth. Two cases this closes: a
-			// cross-tenant worker that knows the run's UUID cannot flip a victim's stalled
-			// reason to the reassuring "queued", and after a reclaim-during-outage (run
-			// moved to worker B while runIndex still points at the offline worker A until
-			// the TTL) a genuinely-stalled B is not mislabeled "queued". An unclaimed run
-			// (worker_id NULL) never qualifies, so it falls through to the honest stall.
-			if d, reporter, ok := s.OutboxRunDepth(r.ID); ok && d.PendingMessages > 0 &&
-				r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == reporter {
+			// The silence may be an api outage, not a stall (see outboxQueuedForOwner).
+			if s.outboxQueuedForOwner(r) {
 				return healthStalled, reasonOutboxQueued
 			}
 			return healthStalled, reasonStalled
+		}
+	}
+
+	// long tool call (issue #2046): the oldest open LEAD tool call has been in flight for
+	// th.toolCall or more AND the run has been quiet for the stall window. The stalled arm
+	// above needs !inFlight, so a run hiding behind one never-returning call was invisible
+	// until the wall clock killed it; this arm is mutually exclusive with it (it needs an
+	// unmatched non-empty-id use, which is inFlight by definition).
+	//
+	// Delegation dispatches (Agent / Task) are excluded twice. (i) One visible in the tail
+	// skips the arm outright: a parent dispatch is legitimately open for as long as its
+	// subagent works. (ii) One older than the leadToolWindowFetch-row tail is invisible
+	// here, so the quiet guard covers it: every nested subagent frame bumps
+	// runs.last_activity_at (AppendMessages), so a streaming delegation keeps the run
+	// below the quiet window and this arm cannot fire. Guarantee, stated honestly: an
+	// emitting delegation is never flagged; a delegation outside the tail whose subagent
+	// has gone quiet can be.
+	//
+	// The quiet window is health_stall_seconds, the same "quiet" the stalled flag means,
+	// so Slack's "gone quiet" head and the amber lane dot stay truthful; with stall
+	// disabled (0) it falls back to the tool-call threshold itself. An ordinary call older
+	// than the tail is invisible, as in leadInFlight, and the run cannot hide behind it:
+	// with no open call in the tail stalled fires, with one in the tail this fires once
+	// that call itself reaches the threshold. The age comes from created_at (server
+	// receive time); an outbox-replayed frame only understates the age.
+	if th.toolCall > 0 && !stats.delegationOpen && !stats.oldestOpen.IsZero() && now.Sub(stats.oldestOpen) >= th.toolCall {
+		quiet := th.stall
+		if quiet == 0 {
+			quiet = th.toolCall
+		}
+		if base := stallBaseline(r); !base.IsZero() && now.Sub(base) >= quiet {
+			if s.outboxQueuedForOwner(r) {
+				return healthStalled, reasonOutboxQueued
+			}
+			return healthStalled, reasonLongToolCall
 		}
 	}
 
@@ -558,6 +592,25 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	return healthOK, ""
 }
 
+// outboxQueuedForOwner reports whether the run's silence is an api outage rather than a
+// stall: the run's OWNING worker reported a non-zero outbox depth for it (PRD #1391 M5),
+// so the agent IS working and sending, and its updates are queued on the worker and will
+// replay. Only while depth is non-zero; when the tracker reports nothing (backlog drained
+// / cleared) normal detection resumes.
+//
+// OWNER-GATE (trust boundary): the tracker's runIndex is "last reporter wins"
+// with no ownership check, so the reporting worker id must EQUAL the run's
+// current owning worker before we trust the depth. Two cases this closes: a
+// cross-tenant worker that knows the run's UUID cannot flip a victim's stalled
+// reason to the reassuring "queued", and after a reclaim-during-outage (run
+// moved to worker B while runIndex still points at the offline worker A until
+// the TTL) a genuinely-stalled B is not mislabeled "queued". An unclaimed run
+// (worker_id NULL) never qualifies, so it falls through to the honest stall.
+func (s *Service) outboxQueuedForOwner(r store.ListActiveRunsForHealthRow) bool {
+	d, reporter, ok := s.OutboxRunDepth(r.ID)
+	return ok && d.PendingMessages > 0 && r.WorkerID.Valid && uuid.UUID(r.WorkerID.Bytes) == reporter
+}
+
 // toolWindowStats are the run-health signals derivable from the tool-call window.
 type toolWindowStats struct {
 	// inFlight is true when some LEAD-lane tool_use of the current claim/query leg
@@ -565,6 +618,13 @@ type toolWindowStats struct {
 	// subagent's rows (agent_instance set) never decide it, so completed nested
 	// calls cannot hide the lead's open parent `Agent` dispatch (issue #1394).
 	inFlight bool
+	// delegationOpen is true when an unmatched lead tool_use in the window is a
+	// delegation dispatch (delegationToolNames); the long-tool-call arm skips then
+	// (issue #2046).
+	delegationOpen bool
+	// oldestOpen is the created_at of the OLDEST unmatched non-delegation lead
+	// tool_use with a non-empty id and a valid created_at; zero when there is none.
+	oldestOpen time.Time
 	// looping is true when some tool call recurs at least loopThreshold times among
 	// the newest loopWindow tool_use.
 	looping bool
@@ -593,7 +653,10 @@ func (s *Service) toolWindow(ctx context.Context, runID uuid.UUID) toolWindowSta
 	if err != nil {
 		slog.Error("health: read lead tool window", "run_id", runID, "error", err)
 	} else {
-		stats.inFlight = leadInFlight(leadRows)
+		w := analyzeLeadWindow(leadRows)
+		stats.inFlight = w.inFlight
+		stats.delegationOpen = w.delegationOpen
+		stats.oldestOpen = w.oldestOpen
 	}
 	return stats
 }
@@ -656,9 +719,40 @@ func analyzeToolWindow(rows []store.ListRunToolWindowRow) bool {
 // result, the next boundary, a stale-heartbeat requeue, or, as the backstop, the
 // wall-clock limit (SweepRunningTimeout). Codex emits `init` once per claim leg,
 // not once per internal provider epoch, so the leg is the granularity here.
+//
+// Issue #2046 reuses the same single scan for the long-tool-call arm: of the unmatched
+// uses it also reports whether any is a delegation dispatch and the created_at of the
+// oldest unmatched non-delegation one (see leadWindowStats).
 func leadInFlight(rows []store.ListRunLeadToolWindowRow) bool {
+	return analyzeLeadWindow(rows).inFlight
+}
+
+// delegationToolNames are the lead tool names that dispatch a subagent: "Agent" (Claude
+// SDK, and the Codex DISPATCH_TOOL_NAME in agent/src/codex/codex-harness.ts) and "Task"
+// (the legacy SDK alias). Such a call is legitimately open as long as its subagent works.
+var delegationToolNames = map[string]bool{"Agent": true, "Task": true}
+
+// leadWindowStats is analyzeLeadWindow's result.
+type leadWindowStats struct {
+	inFlight       bool
+	delegationOpen bool
+	// oldestOpen is the created_at of the oldest unmatched non-delegation tool_use
+	// with a non-empty id; zero if none. A row whose created_at is not valid is
+	// skipped (unknown, never aged).
+	oldestOpen time.Time
+}
+
+// analyzeLeadWindow is the one scan behind leadInFlight (same boundary rule, see
+// there) that also reports the delegation / oldest-open facts the long-tool-call arm
+// needs.
+func analyzeLeadWindow(rows []store.ListRunLeadToolWindowRow) leadWindowStats {
+	type openUse struct {
+		id      string
+		name    string
+		created time.Time
+	}
 	resultIDs := make(map[string]bool)
-	var useIDs []string
+	var uses []openUse
 scan:
 	for _, row := range rows {
 		switch row.Kind {
@@ -668,7 +762,11 @@ scan:
 			}
 		case "tool_use":
 			if id := toolUseID(row.Payload); id != "" {
-				useIDs = append(useIDs, id)
+				u := openUse{id: id, name: toolUseName(row.Payload)}
+				if row.CreatedAt.Valid {
+					u.created = row.CreatedAt.Time
+				}
+				uses = append(uses, u)
 			}
 		case "status":
 			if ev := payloadEvent(row.Payload); ev == "init" || ev == "result" {
@@ -680,12 +778,21 @@ scan:
 			}
 		}
 	}
-	for _, id := range useIDs {
-		if !resultIDs[id] {
-			return true
+	var st leadWindowStats
+	for _, u := range uses {
+		if resultIDs[u.id] {
+			continue
+		}
+		st.inFlight = true
+		if delegationToolNames[u.name] {
+			st.delegationOpen = true
+			continue
+		}
+		if !u.created.IsZero() && (st.oldestOpen.IsZero() || u.created.Before(st.oldestOpen)) {
+			st.oldestOpen = u.created
 		}
 	}
-	return false
+	return st
 }
 
 // toolCallHash is the loop-detection fingerprint of a tool_use payload:
@@ -1144,6 +1251,7 @@ func (s *Service) queuedPriorityClass(ctx context.Context, now time.Time, r stor
 func (s *Service) healthThresholds(ctx context.Context) healthThresholds {
 	return healthThresholds{
 		stall:          healthDur(s.healthSettings.HealthStallSeconds(ctx)),
+		toolCall:       healthDur(s.healthSettings.HealthToolCallSeconds(ctx)),
 		nearTimeoutPct: healthPct(s.healthSettings.HealthNearTimeoutPct(ctx)),
 		queued:         healthDur(s.healthSettings.HealthQueuedSeconds(ctx)),
 		approval:       healthDur(s.healthSettings.HealthApprovalSeconds(ctx)),
@@ -1262,6 +1370,17 @@ func toolUseID(payload []byte) string {
 		return ""
 	}
 	return p.ID
+}
+
+// toolUseName extracts a tool_use payload's tool name; "" when malformed or absent.
+func toolUseName(payload []byte) string {
+	var p struct {
+		Name string `json:"name"`
+	}
+	if err := json.Unmarshal(payload, &p); err != nil {
+		return ""
+	}
+	return p.Name
 }
 
 // payloadEvent extracts a status/error run_message's `event` ("init", "result",

@@ -798,3 +798,40 @@ func TestFetchCallerCancelIsNotTimeout(t *testing.T) {
 	r, ref = fetcherFor(publicResolver(), ca, port).Fetch(done, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
 	mustRefuse(t, r, ref, ReasonCancelled)
 }
+
+// A response whose headers arrive and whose context then ends must not come back as a
+// fetch result: the transport can race a finished response against the teardown, and the
+// body reads as a clean (possibly empty) success.
+func TestFetchCtxEndedAfterHeadersIsRefused(t *testing.T) {
+	ca := newTestCA(t)
+	_, port := upstream(t, ca.validLeaf(t, "docs.example.com"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "5")
+		_, _ = w.Write([]byte("hello"))
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var hooked atomic.Int32
+	f, _ := testFetcher(publicResolver(), ca, port, func(o *Options) {
+		o.testAfterHeaders = func(context.Context) { hooked.Add(1); cancel() }
+	})
+	r, ref := f.Fetch(ctx, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonCancelled)
+	if ref.FinalURL != "https://docs.example.com/" || ref.HTTPStatus != http.StatusOK {
+		t.Errorf("refusal = %+v, want the in-flight hop's URL and its 200", ref)
+	}
+
+	// The deadline is generous so the headers arrive first; the hook then waits it out.
+	f, _ = testFetcher(publicResolver(), ca, port, func(o *Options) {
+		o.Timeout = time.Second
+		o.testAfterHeaders = func(ctx context.Context) { hooked.Add(1); <-ctx.Done() }
+	})
+	r, ref = f.Fetch(context.Background(), "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonTimeout)
+	if ref.HTTPStatus != http.StatusOK {
+		t.Errorf("refusal = %+v, want the received 200 kept", ref)
+	}
+	if n := hooked.Load(); n != 2 {
+		t.Fatalf("testAfterHeaders ran %d times, want 2: the refusal did not come from the post-headers path", n)
+	}
+}

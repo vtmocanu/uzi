@@ -57,3 +57,44 @@ func TestInputReceiptsMigrationDownLiveDB(t *testing.T) {
 		mustExec(ctx, t, pool, stmt)
 	}
 }
+
+// Replays 00284's own Down/Up SQL over seeded rows: Down drops both inclusion columns and keeps
+// the rows, and Up re-adds them with no backfill (included_at NULL, inclusion_reported false).
+func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatal(err)
+	}
+	pool, err := store.OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pool.Close()
+	user, run := uuid.New(), uuid.New()
+	mustExec(ctx, t, pool, `INSERT INTO users (id,email,password_hash) VALUES ($1,$2,'x')`, user, fmt.Sprintf("incl-mig-%s@e2e", user))
+	mustExec(ctx, t, pool, `INSERT INTO runs (id,user_id,kind,issue_title,issue_description,status) VALUES ($1,$2,'chat','t','d','running')`, run, user)
+	var id int64
+	if err := pool.QueryRow(ctx, `INSERT INTO run_user_inputs (run_id,kind,body,consumed_at,applied_at,included_at,inclusion_reported)
+		VALUES ($1,'follow_up','x',now(),now(),now(),true) RETURNING id`, run).Scan(&id); err != nil {
+		t.Fatal(err)
+	}
+	for _, stmt := range migrationDownStatements(t, "00284_input_included_at.sql") {
+		mustExec(ctx, t, pool, stmt)
+	}
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM information_schema.columns WHERE table_name='run_user_inputs' AND column_name IN ('included_at','inclusion_reported')`); n != 0 {
+		t.Fatalf("Down left %d inclusion columns", n)
+	}
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1`, id); n != 1 {
+		t.Fatal("Down lost the seeded row")
+	}
+	for _, stmt := range migrationUpStatements(t, "00284_input_included_at.sql") {
+		mustExec(ctx, t, pool, stmt)
+	}
+	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND included_at IS NULL AND inclusion_reported = false AND applied_at IS NOT NULL`, id); n != 1 {
+		t.Fatal("Up backfilled included_at or inclusion_reported, or lost applied_at")
+	}
+}

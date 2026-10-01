@@ -800,7 +800,7 @@ export const mockRuns: Run[] = [
     // follow-up, holding its worker slot open the whole time. It is the ONLY
     // awaiting_followup fixture, so it is what makes the follow-up park reachable under
     // VITE_UZI_MOCK=1 — the board's follow-up attention strip, the run view's park
-    // announcement, and SteerQueueCard's "Delivered — resumes the run" chip render
+    // announcement, and SteerQueueCard's "Routed — resumes the run" chip render
     // nowhere without it.
     id: "run-awaiting-followup",
     repo_id: "repo-uzi",

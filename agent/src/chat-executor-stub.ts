@@ -61,7 +61,8 @@ export class StubChatExecutor implements ChatExecutorLike {
         break;
       }
       turns++;
-      await this.answer(ctx, next);
+      if (next.inputId !== undefined) ctx.followUpIncluded?.(next.inputId);
+      await this.answer(ctx, next.text);
       if (ctx.signal?.aborted) {
         endReason = "ended";
         break;

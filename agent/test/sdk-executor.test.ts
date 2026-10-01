@@ -234,6 +234,13 @@ interface CtxProbe {
   persisted: { planMd: string | null };
 }
 
+/** Issue #1800: a pullFollowUp over a queue of bodies, ids 1, 2, ... in pull order. */
+let pulledFollowUps = 0;
+function pullOf(queue: string[]): { id: number; body: string } | undefined {
+  const body = queue.shift();
+  return body === undefined ? undefined : { id: ++pulledFollowUps, body };
+}
+
 function makeCtx(
   overrides: Partial<RunContext> = {},
   verdict: PlanVerdict | PlanVerdict[] = { kind: "approve", selection: { status: "absent" } },
@@ -761,20 +768,20 @@ describe("SdkExecutor implement/review loop", () => {
     assert.strictEqual(turns.length, 1 /*plan*/ + 3 /*loop*/);
   });
 
-  it("injects a queued follow-up into the next loop turn's prompt", async () => {
+  it("injects a queued follow-up into the next implement prompt (issue #1800: pulled at the loop top)", async () => {
     const followUps = ["please also add tests"];
     const { queryFn, turns } = fakeTurns([
       [submitPlan("plan"), resultSuccess()], // planning
       [assistantText("first pass"), resultSuccess()], // loop 1 (no done)
       [assistantText("second pass"), signalDone(), resultSuccess()], // loop 2 (done)
     ]);
-    const probe = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: () => followUps.shift() });
+    const probe = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: () => pullOf(followUps) });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
 
-    // turns[0] = plan, turns[1] = loop1, turns[2] = loop2 (carries the follow-up).
-    assert.match(turns[2]!.promptText ?? "", /please also add tests/);
-    assert.match(turns[2]!.promptText ?? "", /UNTRUSTED INPUT/); // framed as data
-    assert.doesNotMatch(turns[1]!.promptText ?? "", /please also add tests/);
+    // turns[0] = plan, turns[1] = loop1 (carries the follow-up), turns[2] = loop2 (no replay).
+    assert.match(turns[1]!.promptText ?? "", /please also add tests/);
+    assert.match(turns[1]!.promptText ?? "", /UNTRUSTED INPUT/); // framed as data
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /please also add tests/);
   });
 
   it("drains the safety steer before building the implement prompt and renders it as worker guidance ahead of any follow-up (PRD #1416 M2)", async () => {
@@ -782,14 +789,16 @@ describe("SdkExecutor implement/review loop", () => {
     // buildImplementPrompt) → the steer body never reaches the prompt and the first assert reddens.
     const followUps = ["please also add tests"];
     let steerCall = 0;
+    let pullCall = 0;
     const { queryFn, turns } = fakeTurns([
       [submitPlan("plan"), resultSuccess()], // planning
-      [assistantText("first pass"), resultSuccess()], // loop 1 (drains the follow-up at its END)
+      [assistantText("first pass"), resultSuccess()], // loop 1 (nothing queued yet)
       [assistantText("second pass"), signalDone(), resultSuccess()], // loop 2 (carries steer + follow-up)
     ]);
     const probe = makeCtx({
       config: { max_iterations: 5 },
-      pullFollowUp: () => followUps.shift(),
+      // Queued only by loop 2's top (the pull sits right before the prompt is built).
+      pullFollowUp: () => (++pullCall === 2 ? pullOf(followUps) : undefined),
       // Armed for the NEXT turn (drained at iteration 2's loop top), so the steer and the
       // follow-up land on the SAME prompt (turns[2]) and their ordering is observable.
       pullSafetySteer: () => (++steerCall === 2 ? "WORKER-SAFETY-STEER-BODY-777" : undefined),
@@ -798,8 +807,8 @@ describe("SdkExecutor implement/review loop", () => {
 
     const p = turns[2]!.promptText ?? "";
     const steerIdx = p.indexOf("WORKER-SAFETY-STEER-BODY-777");
-    const openIdx = p.indexOf("<follow_up>");
-    const closeIdx = p.indexOf("</follow_up>");
+    const openIdx = p.search(/<follow_up_[0-9a-f]{16}>\n/);
+    const closeIdx = p.search(/\n<\/follow_up_[0-9a-f]{16}>/);
     assert.ok(steerIdx >= 0, "the drained safety steer reached the implement prompt");
     assert.match(p, /The worker detected a problem and is steering you/); // worker-guidance framing
     assert.ok(openIdx >= 0, "the follow-up is present on the same turn");
@@ -5475,7 +5484,7 @@ describe("SdkExecutor signal_done pr_summary (PRD #1798 M2)", () => {
         [signalDone("sess-1", {}), resultSuccess()],
       ]);
       const outcomes = [
-        { kind: "followup" as const, body: "one more thing" },
+        { kind: "followup" as const, id: 101, body: "one more thing" },
         { kind: "ended" as const, reason: "idle" as const },
       ];
       let moved: string | undefined;

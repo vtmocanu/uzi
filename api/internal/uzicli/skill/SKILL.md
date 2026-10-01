@@ -558,18 +558,31 @@ uzi version
   the agent has already moved past is rejected rather than applied to the current
   one. Exit 5 if the run is not waiting for an answer.
 - `uzi run inputs <run-id>` — the run's steer queue: the follow-ups sent to it
-  (newest first) with a delivery state — `queued` (not yet drained by the worker)
-  or `delivered` (handed to the worker for its next turn; at a plan gate it reads
-  `delivered (applies after approval)`, at a clarification park
-  `delivered (applies after the question is answered)`, and an unconsumed input on a finished run
-  reads `not delivered (run finished)`). The table's `KIND` column labels each row
+  (newest first) with a delivery state — `queued` (not yet fetched by the worker),
+  `received` (the worker has it), `routed` (steering has acted on it), or `included in a
+  prompt` (the turn carrying it reached the model; this never claims the agent acted on it). A
+  received or routed row names what it waits on: `(waits for approval)` at a plan gate
+  (it reaches the first implementation prompt after approval), `(awaits your answer)`
+  at a clarification park, `(resumes the run)` on an interactive run awaiting a
+  follow-up, or the usage-limit / token-pool / recovery park. On a finished run an
+  unfetched input reads `not delivered (run finished)` and a fetched one whose prompt
+  inclusion was not confirmed reads `not confirmed (run finished)`; that is not proof
+  no prompt carried it (a receipt can be lost at shutdown). A worker that does not report prompt
+  inclusion shows `received` or `routed` with `(no inclusion report)`. `included` is recorded once the turn carrying the follow-up
+  reaches the model; on a resume the lead is re-sent a received, not-yet-included
+  follow-up only when its worker reports inclusion (older workers' rows are not
+  re-sent), so delivery is at-least-once and a follow-up can be included again. The
+  table's `KIND` column labels each row
   `follow-up` or `scope`. A `scope` row is an operator scope directive (PRD #634): it is
   never consumed, so its state is its **disposition** — `applied (finalized at the
   ceiling)`, `declined (not acted on)`, `superseded (a later directive replaced it)`, or
   `active (scope ceiling set)` while still pending. Owner-only — a read-only admin token
   gets a 404 on another user's run. `--json` emits the raw `{id, kind, body, created_at,
-  consumed_at, disposition}` list (derive a follow-up's state yourself: `consumed_at`
-  null = queued, set = delivered; a scope row's state is its `disposition`). Both
+  consumed_at, applied_at, included_at, inclusion_reported, disposition}` list (derive a
+  follow-up's state yourself: `included_at` set = included in a prompt; else `applied_at`
+  set = routed; else `consumed_at` set = received; else queued; `inclusion_reported`
+  false = a legacy worker that cannot say, so a null `included_at` there does not mean it
+  was left out; a scope row's state is its `disposition`). Both
   `follow_up` and `scope` inputs appear; a **chat** run seeds every chat turn as a
   follow-up, so its queue lists them all (issue runs start empty).
 - `uzi run expedite <run-id>` — bump a **queued** run to the front of the claim

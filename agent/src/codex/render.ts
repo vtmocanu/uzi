@@ -47,6 +47,7 @@ import { reportIncidentalIssueToolName } from "../findings-tools.js";
 import { forgeToolNames } from "../forge-tools.js";
 import { SKILL_NAME_RE } from "../skills-plugin.js";
 import {
+  CODEX_LONG_COMMAND_APPEND,
   FINDINGS_NUDGE_APPEND,
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
@@ -359,15 +360,12 @@ function resolveRoleModel(
   return requestModel;
 }
 
-/** Render a subagent prompt as agents.ts `toDefinition` composes it, minus the Claude-only
- *  CLAUDE_LONG_COMMAND_APPEND (the Codex Bash tool has no timeout argument and waits for
- *  background descendants): the role body followed by the four shared appends, so a Codex subagent carries the
- *  same findings nudge, worker-runtime guidance, secret-fixture hygiene rule (PRD #1120)
- *  and worker-owned safety block (issue #1660) a Claude subagent does. Only that STATIC block:
+/** Render a Codex subagent prompt with the role body, shared guidance, Codex
+ *  command-lifetime guidance, and the worker-owned safety block last. Only that STATIC block:
  *  the run's operator constraints (follow-ups) are attached per dispatch by the Claude Agent
  *  guard (guardrails.ts buildAgentGuardHook) and do NOT reach Codex subagents yet (#1660). */
 function renderSubagentPrompt(agent: HarnessAgent): string {
-  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
+  return `${agent.prompt}\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`;
 }
 
 /** The character ceiling on a sanitized diagnostic `name`, mirroring broker.ts's

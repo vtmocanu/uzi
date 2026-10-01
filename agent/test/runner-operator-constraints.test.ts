@@ -150,4 +150,53 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
     assert.ok(prompt.includes("use port 5433"), "and so does the row the retry fixed");
     assert.strictEqual(prompt.split(safety).length - 1, 1, "once");
   });
+
+  // Issue #1800: a follow-up an earlier claim consumed but the api never saw included (it was
+  // pulled, then the flight ended before its prompt started) is delivered again by the next claim.
+  describe("an unincluded consumed follow-up is re-queued at claim (issue #1800)", () => {
+    const claimFor = (iid: number) =>
+      makeClaim({
+        issue_iid: iid,
+        repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+        last_seq: 0,
+      });
+    /** An executor that pulls once as a loop top would, reports it included, and returns what it saw. */
+    const pulling = (out: { pulled?: { id: number; body: string } | undefined }): Executor => ({
+      async run(ctx) {
+        out.pulled = ctx.pullFollowUp?.();
+        if (out.pulled) ctx.followUpIncluded?.(out.pulled.id);
+        return { branch: ctx.branch };
+      },
+    });
+    const run = async (claim: ReturnType<typeof claimFor>, executor: Executor): Promise<void> => {
+      await new RunRunner(client, git, () => ({ executor }), nullLogger(), 20, undefined, { pollMs: 5 }).execute(claim);
+    };
+
+    it("hands the executor a consumed follow-up with no included_at, then reports it included", async () => {
+      const claim = claimFor(81);
+      api.overrideFollowUps(claim.run_id, 200, {
+        inputs: [{ id: 4, kind: "follow_up", body: "use port 5433", inclusion_reported: true }],
+      });
+      const out: { pulled?: { id: number; body: string } } = {};
+      await run(claim, pulling(out));
+      assert.deepStrictEqual(out.pulled, { id: 4, body: "use port 5433" }, "the first pull of the new claim is the unincluded follow-up");
+      const receipts = api.inclusionCalls.filter((c) => c.runId === claim.run_id);
+      assert.ok(receipts.length >= 1, "the inclusion was reported to the api");
+      assert.deepStrictEqual(receipts[0]!.ids, [4]);
+    });
+
+    it("re-queues nothing for an included row, an old api's row, or a failed reload", async () => {
+      for (const [iid, reload] of [
+        [82, { status: 200, body: { inputs: [{ id: 4, kind: "follow_up", body: "x", inclusion_reported: true, included_at: "2026-10-01T00:00:00Z" }] } }],
+        [83, { status: 200, body: { inputs: [{ id: 4, kind: "follow_up", body: "x" }] } }],
+        [84, { status: 503, body: { error: "unavailable" } }],
+      ] as const) {
+        const claim = claimFor(iid);
+        api.overrideFollowUps(claim.run_id, reload.status, reload.body);
+        const out: { pulled?: { id: number; body: string } } = {};
+        await run(claim, pulling(out));
+        assert.strictEqual(out.pulled, undefined, `issue ${iid}: nothing re-queued`);
+      }
+    });
+  });
 });

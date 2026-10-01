@@ -6360,8 +6360,22 @@ ORDER BY id ASC;
 
 -- name: AckRunInputRows :many
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = @claim_generation,
-    consumed_worker_id = @worker_id
+    consumed_worker_id = @worker_id,
+    -- The row now belongs to this claim: a re-ACK after a resume takes whether THIS claim's worker
+    -- reports inclusion (input_inclusion_v1), but never downgrades a row already stamped included.
+    inclusion_reported = (included_at IS NOT NULL OR @inclusion_reported::boolean)
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND applied_at IS NULL
+RETURNING id, kind, body, created_at, gate_binding, gate_revision;
+
+-- name: IncludeRunInputRows :many
+-- The worker reports follow_up rows it actually included in an executor prompt. Stamps
+-- included_at once (idempotent) and sets inclusion_reported: the receipt itself proves the
+-- reporting worker supports inclusion, even for a row a legacy worker ACKed before a resume.
+-- No per-row claim fence: a follow-up recovered after a resume was consumed by an earlier
+-- claim; the service fences the CALLER's claim instead. run_id scopes the ids to this run.
+UPDATE run_user_inputs SET included_at = now(), inclusion_reported = true
+WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND kind = 'follow_up'
+  AND consumed_at IS NOT NULL AND included_at IS NULL
 RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: ApplyRunInputRows :execrows
@@ -6397,8 +6411,9 @@ WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND kind = 'approve_plan'
 -- they are applied (issue #1673): an ACKed-but-unapplied follow-up from a prior claim is already
 -- a constraint, and a subagent dispatched before the live GET/ACK replays it must carry it. The
 -- replay still reaches the lead once, by id. Ordered by id, the same rule as the /inputs FIFO
--- (ConsumeRunInputs), so the worker keeps the server's order as is.
-SELECT id, body, created_at FROM run_user_inputs
+-- (ConsumeRunInputs), so the worker keeps the server's order as is. included_at and
+-- inclusion_reported ride along so a recovering worker skips rows already reported.
+SELECT id, body, created_at, included_at, inclusion_reported FROM run_user_inputs
 WHERE run_id = @run_id AND kind = 'follow_up' AND consumed_at IS NOT NULL
 ORDER BY id ASC;
 
@@ -6406,7 +6421,10 @@ ORDER BY id ASC;
 -- The steer queue for a run, NEWEST FIRST and UNCAPPED (PRD #95 Decision 4, #634): the
 -- web + CLI steer queue reads BOTH follow_up rows and operator scope directives
 -- (kind IN ('follow_up','scope')). A follow_up's state is derived client-side from
--- consumed_at (NULL → Queued, set → Delivered); a scope row is never consumed, so its
+-- consumed_at / applied_at / included_at (consumed_at NULL → Queued; consumed_at set → Received;
+-- applied_at set → Routed; included_at set → Included in an executor prompt. A NULL included_at
+-- means "not yet included" only when inclusion_reported is true, i.e. the worker that ACKed the
+-- row (or a later inclusion receipt) shows it reports inclusion; otherwise it means unknown); a scope row is never consumed, so its
 -- state is its disposition (applied/declined/superseded, NULL → pending). Deliberately
 -- NOT the judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that
 -- would drop the newest entries behind its cap on a busy/chat run. Owner-scoping is
@@ -6416,7 +6434,7 @@ ORDER BY id ASC;
 -- model instead of minting a query-specific row type. Dropping a column here is not a
 -- local edit: it re-types this query and breaks the workersvc.Store interface, the
 -- service signature, the handler and its fake.
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported FROM run_user_inputs
 WHERE run_id = @run_id AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC;
 
@@ -6686,8 +6704,9 @@ LIMIT @lim;
 -- stop its scan at the start of the current claim/query leg and never count an
 -- orphaned call from an earlier leg as in flight. Loop detection keeps reading
 -- ListRunToolWindow unchanged. The Go side re-checks kind and payload event
--- itself rather than trusting this filter alone.
-SELECT seq, kind, payload
+-- itself rather than trusting this filter alone. created_at is the server receive
+-- time, used to age the oldest open call (issue #2046).
+SELECT seq, kind, payload, created_at
 FROM run_messages
 WHERE run_id = @run_id AND agent_instance IS NULL
   AND (kind IN ('tool_use', 'tool_result')

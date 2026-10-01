@@ -279,9 +279,27 @@ export interface SpawnCommandOptions {
   readonly signal?: AbortSignal;
 }
 
+/** Thrown by a {@link SpawnCommandSeam} when the command ran to its wall deadline. The
+ *  seam throws it ONLY after the command's whole process tree was reaped cleanly, so the
+ *  broker can tell the agent the command was stopped rather than report a generic failure. */
+export class CommandDeadlineError extends Error {
+  constructor(readonly deadlineMs: number) {
+    super(`command stopped at its deadline (${deadlineMs}ms)`);
+    this.name = "CommandDeadlineError";
+  }
+}
+
+/** The agent-facing text for a {@link CommandDeadlineError}: minutes when the deadline is
+ *  a whole number of minutes, else milliseconds. */
+function commandDeadlineMessage(deadlineMs: number): string {
+  const label = deadlineMs % 60_000 === 0 ? `${deadlineMs / 60_000} min` : `${deadlineMs}ms`;
+  return `the command was stopped at its deadline (${label}) and its process tree was reaped`;
+}
+
 /** The injected "run a shell command as the COMMAND identity" seam. `argv` is the
  *  full argv to run; production wraps it with `commandRootCommand` (uid 10003,
- *  setpriv cap-clear) before spawning. */
+ *  setpriv cap-clear) before spawning. A seam may throw {@link CommandDeadlineError}, but
+ *  only after the command's whole process tree was reaped cleanly. */
 export type SpawnCommandSeam = (argv: readonly string[], opts: SpawnCommandOptions) => Promise<SpawnCommandResult>;
 
 /** A thin memory/forge/findings/skills pass-through, keyed by tool name in
@@ -666,7 +684,13 @@ export class CodexCallbackBroker {
     }
     if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
 
-    const spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal });
+    let spawned: SpawnCommandResult;
+    try {
+      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal });
+    } catch (err) {
+      if (err instanceof CommandDeadlineError) return deny("command_deadline", commandDeadlineMessage(err.deadlineMs));
+      throw err;
+    }
     return {
       ok: true,
       output: {

@@ -1384,16 +1384,16 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 
 	// The queue state is UNCHANGED by the park — the suffix explains why nothing is
 	// moving, and must not overwrite the queued/delivered answer itself.
-	if got := steerState(kindFollowUp, nil, nil, statusLimitWait); !strings.HasPrefix(got, "queued") {
+	if got := steerState(queuedIn(), statusLimitWait); !strings.HasPrefix(got, "queued") {
 		t.Errorf("steerState(unconsumed, limit_wait) = %q, want it to still read as queued", got)
 	}
-	if got := steerState(kindFollowUp, &consumed, nil, statusLimitWait); !strings.HasPrefix(got, "delivered") {
-		t.Errorf("steerState(consumed, limit_wait) = %q, want it to still read as delivered", got)
+	if got := steerState(receivedIn(consumed), statusLimitWait); !strings.HasPrefix(got, "received") {
+		t.Errorf("steerState(consumed, limit_wait) = %q, want it to still read as received", got)
 	}
 
 	// Both say WHY nothing is happening, which is the whole point: a follow-up sitting
 	// untouched for four hours is otherwise indistinguishable from a wedged run.
-	for _, got := range []string{steerState(kindFollowUp, nil, nil, statusLimitWait), steerState(kindFollowUp, &consumed, nil, statusLimitWait)} {
+	for _, got := range []string{steerState(queuedIn(), statusLimitWait), steerState(receivedIn(consumed), statusLimitWait)} {
 		if !strings.Contains(got, "usage limit") {
 			t.Errorf("steerState on a parked run = %q, want it to name the usage-limit park", got)
 		}
@@ -1403,47 +1403,133 @@ func TestSteerStateOnAParkedRun(t *testing.T) {
 	// label would tell a user their follow-up had been dropped when it is about to be
 	// delivered. This is the shape the terminal-status map would produce if limit_wait
 	// were ever added to it.
-	if strings.Contains(steerState(kindFollowUp, nil, nil, statusLimitWait), "run finished") {
+	if strings.Contains(steerState(queuedIn(), statusLimitWait), "run finished") {
 		t.Error(`steerState(unconsumed, limit_wait) claims the run finished — a parked run resumes and its queue drains, so the follow-up has NOT been dropped`)
 	}
 
 	// recovery_wait (issue #1197) is the sibling transient-recovery park: the queue state
 	// is likewise UNCHANGED, and the suffix names the recovery reason (not a usage limit).
-	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "recovering") {
+	if got := steerState(queuedIn(), statusRecoveryWait); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "recovering") {
 		t.Errorf("steerState(unconsumed, recovery_wait) = %q, want a queued row naming the transient-recovery park", got)
 	}
-	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "recovering") {
-		t.Errorf("steerState(consumed, recovery_wait) = %q, want a delivered row naming the transient-recovery park", got)
+	if got := steerState(receivedIn(consumed), statusRecoveryWait); !strings.HasPrefix(got, "received") || !strings.Contains(got, "recovering") {
+		t.Errorf("steerState(consumed, recovery_wait) = %q, want a received row naming the transient-recovery park", got)
 	}
 
 	// PRD #1392 M5: a forge-unreachable recovery park names the FORGE, not the generic
 	// transient interruption — the queue state is still unchanged. The empty/other cause
 	// keeps the #1197 wording above (the variadic tail defaults to it).
-	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "waiting for the forge") {
+	if got := steerState(queuedIn(), statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "queued") || !strings.Contains(got, "waiting for the forge") {
 		t.Errorf("steerState(unconsumed, recovery_wait, forge) = %q, want a queued row naming the forge park", got)
 	}
-	if got := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "delivered") || !strings.Contains(got, "waiting for the forge") {
-		t.Errorf("steerState(consumed, recovery_wait, forge) = %q, want a delivered row naming the forge park", got)
+	if got := steerState(receivedIn(consumed), statusRecoveryWait, "forge_unreachable"); !strings.HasPrefix(got, "received") || !strings.Contains(got, "waiting for the forge") {
+		t.Errorf("steerState(consumed, recovery_wait, forge) = %q, want a received row naming the forge park", got)
 	}
 	// A forge park must NOT keep the generic transient-interruption wording.
-	if got := steerState(kindFollowUp, nil, nil, statusRecoveryWait, "forge_unreachable"); strings.Contains(got, "transient interruption") {
+	if got := steerState(queuedIn(), statusRecoveryWait, "forge_unreachable"); strings.Contains(got, "transient interruption") {
 		t.Errorf("steerState forge park = %q, still names the generic transient interruption", got)
 	}
 
 	// Every other status is untouched.
-	if got := steerState(kindFollowUp, nil, nil, "running"); got != "queued" {
+	if got := steerState(queuedIn(), "running"); got != "queued" {
 		t.Errorf("steerState(unconsumed, running) = %q, want %q", got, "queued")
 	}
-	if got := steerState(kindFollowUp, &consumed, nil, "awaiting_approval"); got != "delivered (applies after approval)" {
-		t.Errorf("steerState(consumed, awaiting_approval) = %q — the gate label regressed", got)
-	}
-	// PRD #517: a delivered follow-up while the run is parked awaiting_followup gets the
-	// tailored "resumes the run" copy (the web twin's wording), not the generic "delivered".
-	if got := steerState(kindFollowUp, &consumed, nil, "awaiting_followup"); got != "delivered (resumes the run)" {
-		t.Errorf("steerState(consumed, awaiting_followup) = %q, want the tailored follow-up label", got)
-	}
-	if got := steerState(kindFollowUp, nil, nil, "completed"); got != "not delivered (run finished)" {
+	if got := steerState(queuedIn(), "completed"); got != "not delivered (run finished)" {
 		t.Errorf("steerState(unconsumed, completed) = %q — the terminal label regressed", got)
+	}
+}
+
+// queuedIn is a follow-up the worker has not received (consumed_at NULL).
+func queuedIn() apitypes.SteerInputDTO {
+	return apitypes.SteerInputDTO{Kind: kindFollowUp, InclusionReported: true}
+}
+
+// receivedIn is a follow-up the worker received, not yet routed or included, on a worker
+// that reports prompt inclusion.
+func receivedIn(consumed time.Time) apitypes.SteerInputDTO {
+	return apitypes.SteerInputDTO{Kind: kindFollowUp, ConsumedAt: &consumed, InclusionReported: true}
+}
+
+// TestSteerStateEveryFollowUpState pins one label per follow-up receipt state (issue #1800).
+// The harness (Claude or Codex) does not change a label: SteerInputDTO carries no harness,
+// so the same rows read the same on both. "included" never claims the agent acted on it, and
+// no consumed-but-not-included row says "delivered".
+func TestSteerStateEveryFollowUpState(t *testing.T) {
+	now := time.Now()
+	recv := receivedIn(now)
+	routed := recv
+	routed.AppliedAt = &now
+	incl := routed
+	incl.IncludedAt = &now
+	legacyRecv := recv
+	legacyRecv.InclusionReported = false
+	legacyRouted := routed
+	legacyRouted.InclusionReported = false
+
+	cases := []struct {
+		name   string
+		in     apitypes.SteerInputDTO
+		status string
+		want   string
+	}{
+		{"queued live", queuedIn(), "running", "queued"},
+		{"queued terminal", queuedIn(), "completed", "not delivered (run finished)"},
+		{"received live", recv, "running", "received"},
+		{"received unknown status", recv, "", "received"},
+		{"routed live", routed, "running", "routed"},
+		{"received at plan gate", recv, "awaiting_approval", "received (waits for approval)"},
+		{"routed at plan gate", routed, "awaiting_approval", "routed (waits for approval)"},
+		{"received awaiting answer", recv, "awaiting_input", "received (awaits your answer)"},
+		{"routed awaiting answer", routed, "awaiting_input", "routed (awaits your answer)"},
+		{"routed awaiting follow-up", routed, "awaiting_followup", "routed (resumes the run)"},
+		{"routed usage limit", routed, statusLimitWait, "routed (run paused on a usage limit)"},
+		{"routed pool wait", routed, statusPoolWait, "routed (run held on an empty token pool)"},
+		{"routed recovery", routed, statusRecoveryWait, "routed (run recovering from a transient interruption)"},
+		{"included live", incl, "running", "included in a prompt"},
+		{"included completed", incl, "completed", "included in a prompt"},
+		{"included at plan gate", incl, "awaiting_approval", "included in a prompt"},
+		{"received then run finished", recv, "completed", "not confirmed (run finished)"},
+		{"routed then run finished", routed, "failed", "not confirmed (run finished)"},
+		{"received after a resume (non-terminal, not included)", recv, "running", "received"},
+		{"routed after a resume (non-terminal, not included)", routed, "running", "routed"},
+		{"legacy received live", legacyRecv, "running", "received (no inclusion report)"},
+		{"legacy routed live", legacyRouted, "running", "routed (no inclusion report)"},
+		{"legacy routed at gate", legacyRouted, "awaiting_approval", "routed (no inclusion report)"},
+		{"legacy received terminal", legacyRecv, "completed", "received (no inclusion report)"},
+		{"legacy routed terminal", legacyRouted, "completed", "routed (no inclusion report)"},
+		{"legacy received awaiting answer", legacyRecv, "awaiting_input", "received (no inclusion report)"},
+		{"legacy routed usage limit", legacyRouted, statusLimitWait, "routed (no inclusion report)"},
+	}
+	// Pre-existing park suffixes that may overflow the 30-cell column.
+	allowedParkSuffixes := []string{
+		" (run paused on a usage limit)",
+		" (run held on an empty token pool)",
+		" (run recovering from a transient interruption)",
+		" (run waiting for the forge)",
+		" (run held on its Codex account)",
+		" (run waiting for vault unlock)",
+		" (run waiting for disk space)",
+	}
+	hasAllowedParkSuffix := func(s string) bool {
+		for _, suf := range allowedParkSuffixes {
+			if strings.HasSuffix(s, suf) {
+				return true
+			}
+		}
+		return false
+	}
+	for _, c := range cases {
+		got := steerState(c.in, c.status)
+		if got != c.want {
+			t.Errorf("%s: steerState = %q, want %q", c.name, got, c.want)
+		}
+		// The queue column is 30 cells wide (padCell); only the long park suffixes may overflow.
+		if len([]rune(got)) > 30 && !hasAllowedParkSuffix(got) {
+			t.Errorf("%s: %q is %d cells, wider than the 30-cell queue column", c.name, got, len([]rune(got)))
+		}
+		if strings.Contains(got, "delivered") && c.in.ConsumedAt != nil {
+			t.Errorf("%s: %q says delivered for a received row", c.name, got)
+		}
 	}
 }
 
@@ -1551,7 +1637,7 @@ func TestRunStatusCellCodexHold(t *testing.T) {
 	if got := runStatusCell(other); got != "running" {
 		t.Errorf("runStatusCell(running) = %q, want \"running\"", got)
 	}
-	if got := steerState("follow_up", nil, nil, statusRecoveryWait, codexAccountUnavailableCause); got != "queued (run held on its Codex account)" {
+	if got := steerState(queuedIn(), statusRecoveryWait, codexAccountUnavailableCause); got != "queued (run held on its Codex account)" {
 		t.Errorf("steerState(codex hold) = %q", got)
 	}
 }

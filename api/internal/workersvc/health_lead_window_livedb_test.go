@@ -95,3 +95,33 @@ func TestListRunLeadToolWindowLiveDB(t *testing.T) {
 		t.Fatalf("lim 2 rows = %+v, want seqs %d, %d", lim, seq+5, seq+2)
 	}
 }
+
+// TestListRunLeadToolWindowReturnsCreatedAtLiveDB pins issue #2046 against the real
+// query: a lead tool_use inserted the way production does (created_at left to the
+// column's DEFAULT now()) comes back with a valid CreatedAt close to the server clock,
+// which is what the long-tool-call arm ages the oldest open call from.
+func TestListRunLeadToolWindowReturnsCreatedAtLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, workerID, repoID := env.seedCodexInfra(t)
+	runID := env.seedLaneRun(t, userID, workerID, repoID)
+
+	env.exec(`INSERT INTO run_messages (run_id, seq, kind, agent, payload)
+	          VALUES ($1, 1, 'tool_use', 'lead', $2)`, runID, []byte(`{"id":"open","name":"Bash","input":{}}`))
+
+	rows, err := env.q.ListRunLeadToolWindow(env.ctx, store.ListRunLeadToolWindowParams{RunID: runID, Lim: toolWindowFetch})
+	if err != nil {
+		t.Fatalf("ListRunLeadToolWindow: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("got %d rows, want 1", len(rows))
+	}
+	if !rows[0].CreatedAt.Valid {
+		t.Fatal("CreatedAt is not valid, want the column's now() default")
+	}
+	if d := time.Since(rows[0].CreatedAt.Time); d < -time.Minute || d > time.Minute {
+		t.Fatalf("CreatedAt = %v, %v from now, want within a minute", rows[0].CreatedAt.Time, d)
+	}
+	if st := analyzeLeadWindow(rows); !st.inFlight || st.oldestOpen.IsZero() {
+		t.Fatalf("analyzeLeadWindow = %+v, want an in-flight call with an age", st)
+	}
+}

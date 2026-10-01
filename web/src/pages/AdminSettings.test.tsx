@@ -55,6 +55,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
+  health_tool_call_seconds: "1200",
   health_near_timeout_pct: "85",
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
@@ -441,6 +442,17 @@ describe("AdminSettings", () => {
     );
     // The app token was left blank, so it is NOT sent.
     expect(mockApi.updateSettings.mock.calls[0][0]).not.toHaveProperty("slack_app_token");
+  });
+
+  it("saves the long tool call threshold (issue #2046)", async () => {
+    mockApi.updateSettings.mockResolvedValue(response({ health_tool_call_seconds: "600" }));
+    renderPage();
+    const field = (await screen.findByLabelText(/Long tool call after/i)) as HTMLInputElement;
+    fireEvent.change(field, { target: { value: "600" } });
+    fireEvent.click(screen.getByRole("button", { name: /save run health/i }));
+    await waitFor(() =>
+      expect(mockApi.updateSettings).toHaveBeenCalledWith({ health_tool_call_seconds: "600" }),
+    );
   });
 
   it("saves the Run health card, sending only changed fields (PRD #47)", async () => {

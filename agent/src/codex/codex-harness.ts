@@ -1374,6 +1374,7 @@ export class CodexHarness implements RunHarness {
                 attribution: {},
                 items: [],
                 signals: routed.signals,
+                assistantAuthored: true,
                 model: this.currentModel,
                 sessionId: this.threadId,
               };
@@ -1390,7 +1391,9 @@ export class CodexHarness implements RunHarness {
         }
         const frame = this.decodeItemFrame(note);
         if (frame !== undefined) return frame;
-        // A Codex item update / unknown method: liveness only.
+        // A model-issued tool item on the root thread (issue #1800 inclusion evidence); any other
+        // item update / unknown method is liveness only.
+        if (this.isModelIssuedItem(note)) return { kind: "activity", sessionId: this.threadId, modelInitiated: true };
         return { kind: "activity", sessionId: this.threadId };
       }
     }
@@ -1546,13 +1549,16 @@ export class CodexHarness implements RunHarness {
     }
   }
 
-  /** One projected main-origin, lead-attributed frame carrying `item` (never `signals`). */
+  /** One projected main-origin, lead-attributed frame carrying `item` (never `signals`). Only a
+   *  tool START is marked `assistantAuthored` (the model issued that call); a finished frame is a
+   *  result, possibly worker-synthesized, and is never model-processing evidence. */
   private leadFrame(item: HarnessItem): HarnessEvent {
     return {
       kind: "frame",
       origin: { kind: "main" },
       attribution: { agent: "lead" },
       items: [item],
+      ...(item.kind === "tool" && item.phase === "started" ? { assistantAuthored: true as const } : {}),
       model: this.currentModel,
       sessionId: this.threadId,
     };
@@ -1760,9 +1766,22 @@ export class CodexHarness implements RunHarness {
       attribution: {},
       items,
       usage,
+      assistantAuthored: true,
       model: this.currentModel,
       sessionId: this.threadId,
     };
+  }
+
+  /** True for an item/started note (never item/completed) of a model-issued tool item type on
+   *  the ACTIVE root thread. userMessage and unknown types are not model-issued. */
+  private isModelIssuedItem(note: Extract<CodexNotification, { kind: "activity" }>): boolean {
+    // Issue #1800: only a tool START proves the model issued it this turn; a completion is a result
+    // (possibly of an item started before this turn) and is never inclusion evidence.
+    if (note.method !== "item/started") return false;
+    const params = asObject(note.params);
+    if (params === undefined || params.threadId !== this.threadId) return false;
+    const type = asString(asObject(params.item)?.type);
+    return type === "commandExecution" || type === "fileChange" || type === "mcpToolCall" || type === "dynamicToolCall";
   }
 
   // VERIFIED 2026-09-10: the native both-image packaged proof drove pinned Codex

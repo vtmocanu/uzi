@@ -179,7 +179,33 @@ export interface ChatContext {
    * user message arrives the same way — a seeded follow_up input (M1 CreateChatRun).
    * `ended` vs `idle` is distinguished by ctx.signal (aborted ⇒ ended).
    */
-  nextUserMessage(): Promise<string | undefined>;
+  nextUserMessage(): Promise<ChatUserMessage | undefined>;
+  /** Issue #1800: the user message carrying input `id` was delivered to a model turn (the model
+   *  answered it). Called at most once per message, never for a message the turn cap refused
+   *  and never for a turn that failed before the model answered. The ChatRunner reports it to the
+   *  api (POST /inputs/included). Optional; absent (a stub or test) ⇒ nothing is reported. */
+  followUpIncluded?(id: number): void;
+}
+
+/** Issue #1800: does this raw SDK message evidence the model processing the turn? Only an
+ *  assistant message not marked synthetic (the SDK's placeholder for worker-synthesized notices
+ *  such as a usage-limit message). A result never counts: a limit-rejected turn reports
+ *  num_turns 1 with is_error true, so only real model output proves the message was read. */
+function chatMsgEvidencesModel(msg: unknown): boolean {
+  if (typeof msg !== "object" || msg === null) return false;
+  const rec = msg as Record<string, unknown>;
+  if (rec["type"] !== "assistant") return false;
+  const inner = rec["message"];
+  const model = typeof inner === "object" && inner !== null ? (inner as Record<string, unknown>)["model"] : undefined;
+  return model !== "<synthetic>";
+}
+
+/** One user message handed to the executor. `inputId` is the run_user_inputs id the message came
+ *  from (every message a steering channel delivers has one), reported back through
+ *  {@link ChatContext.followUpIncluded}. */
+export interface ChatUserMessage {
+  text: string;
+  inputId?: number;
 }
 
 /** The outcome of a whole chat conversation. */
@@ -364,7 +390,7 @@ export class ChatExecutor {
         break;
       }
       turns++;
-      const turn = await this.driveChatTurn(ctx, baseOptions, resumeId, next.message!);
+      const turn = await this.driveChatTurn(ctx, baseOptions, resumeId, next.message!.text, next.message!.inputId);
       if (turn.sessionId) {
         resumeId = turn.sessionId;
         if (!reportedSessionId) {
@@ -396,11 +422,11 @@ export class ChatExecutor {
    * racing the idle tick is never dropped (team task #8). `ended` vs `idle` is read
    * from ctx.signal (an aborted signal is an explicit End chat / shutdown).
    */
-  private awaitNext(ctx: ChatContext): Promise<{ message?: string; reason?: ChatEndReason }> {
+  private awaitNext(ctx: ChatContext): Promise<{ message?: ChatUserMessage; reason?: ChatEndReason }> {
     if (ctx.signal?.aborted) return Promise.resolve({ reason: "ended" });
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (r: { message?: string; reason?: ChatEndReason }): void => {
+      const finish = (r: { message?: ChatUserMessage; reason?: ChatEndReason }): void => {
         if (settled) return;
         settled = true;
         ctx.signal?.removeEventListener("abort", onAbort);
@@ -426,6 +452,7 @@ export class ChatExecutor {
     baseOptions: SdkOptions,
     resumeId: string | undefined,
     userMessage: string,
+    inputId?: number,
   ): Promise<ChatTurnResult> {
     const abort = new AbortController();
     let timedOut = false;
@@ -461,7 +488,21 @@ export class ChatExecutor {
     let resultFrame: unknown;
     try {
       const queryInstance = this.queryFn({ prompt: promptStream(userMessage), options });
+      let reportedIncluded = false;
       for await (const msg of queryInstance) {
+        // Issue #1800: stamp the message included only once the model answered it (see
+        // chatMsgEvidencesModel): system/init and rate_limit_event frames precede a turn that may
+        // still die without the model ever reading the message.
+        if (!reportedIncluded && chatMsgEvidencesModel(msg)) {
+          reportedIncluded = true;
+          if (inputId !== undefined) {
+            try {
+              ctx.followUpIncluded?.(inputId);
+            } catch (err) {
+              this.log.warn("chat: followUpIncluded handler threw", { run_id: ctx.runId, error: errMessage(err) });
+            }
+          }
+        }
         const sid = sessionIdOf(msg);
         if (sid) turnSessionId = sid;
         rateLimits.observe(msg);

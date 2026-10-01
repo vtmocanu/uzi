@@ -121,11 +121,11 @@ func TestFetcherOptionsHaveNoTestSeam(t *testing.T) {
 		t.Fatal(err)
 	}
 	opts := cfg.FetcherOptions("uzi-fetcher/test")
-	if opts.testDial != nil || opts.RootCAs != nil || opts.Resolver != nil {
+	if opts.testDial != nil || opts.testAfterHeaders != nil || opts.RootCAs != nil || opts.Resolver != nil {
 		t.Fatalf("production options carry a test seam: %+v", opts)
 	}
 	f := New(opts)
-	if f.opts.testDial != nil || f.opts.RootCAs != nil || f.opts.Resolver != net.DefaultResolver {
+	if f.opts.testDial != nil || f.opts.testAfterHeaders != nil || f.opts.RootCAs != nil || f.opts.Resolver != net.DefaultResolver {
 		t.Fatalf("New added a seam: %+v", f.opts)
 	}
 	if len(f.opts.Policy.extra) != 1 || f.opts.UserAgent != "uzi-fetcher/test" || f.opts.MaxFileBytes != cfg.MaxFileBytes || f.opts.Timeout != cfg.Timeout {

@@ -437,8 +437,14 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			"KIND and state plus a relative age. Owner-only: a read-only admin token gets 404 on " +
 			"another user's run.\n\n" +
 			"The queue lists two kinds. A follow-up (kind='follow_up') carries a delivery state — " +
-			"queued (the worker has not drained it yet) or delivered (handed to the worker for its " +
-			"next turn). An operator scope directive (kind='scope', PRD #634) carries its " +
+			"queued (the worker has not received it yet), received (the worker has it), routed " +
+			"(steering has acted on it), included in a prompt (the turn carrying it reached the model), " +
+			"not delivered (never received before the run finished), or not confirmed (received, but " +
+			"no prompt carrying it was confirmed before the run finished). A received or routed row names what it is waiting on while " +
+			"the run waits for approval, your answer, or a follow-up. A worker that does not report " +
+			"prompt inclusion shows (no inclusion report). \"Included\" never claims the " +
+			"agent acted on the follow-up; its messages show that. An operator scope directive " +
+			"(kind='scope', PRD #634) carries its " +
 			"disposition instead — applied/declined/superseded, or active while the ceiling is still " +
 			"pending — because a scope row is never consumed. Approve/reject/cancel are omitted.\n\n" +
 			"A chat run seeds every chat turn as a follow_up, so `uzi run inputs` on a chat run lists " +
@@ -457,14 +463,15 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			p := env.printer(gf)
 			if p.Format == uzicli.FormatJSON {
 				// The agent contract: emit the raw DTO list. State is derived
-				// client-side (from consumed_at + the run's status), so an agent
+				// client-side (from consumed_at, applied_at, included_at,
+				// inclusion_reported + the run's status), so an agent
 				// computes it from these fields itself — the CLI never fetches the
 				// run in --json mode.
 				return p.JSON(list)
 			}
 			// Human render only: derive the delivery state (Decision 7), which needs
 			// the run's live status for the gate/terminal nuance. One cheap GetRun; if
-			// it fails, status stays "" and the state degrades to the queued/delivered
+			// it fails, status stays "" and the state degrades to the receipt-derived
 			// floor (Decision 10). Skipped entirely for an empty queue.
 			status := ""
 			recoveryCause := ""

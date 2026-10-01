@@ -44,8 +44,9 @@ const execFileAsync = promisify(execFile);
  * The resolution of an interactive-task follow-up park (PRD #517 M3). Returned by
  * `RunContext.awaitFollowUp`. Discriminated so the loop can tell "keep going with a new
  * follow-up" apart from every way a park can END:
- *   - `followup` — the next user turn arrived; `body` is its text, folded into the next
- *     implement turn exactly as a mid-run follow-up is.
+ *   - `followup` — the next user turn arrived; `body` is its text and `id` its input id (issue
+ *     #1800), folded into the next implement turn exactly as a mid-run follow-up is and reported
+ *     included (`RunContext.followUpIncluded`) once that turn reaches the model.
  *   - `ended` — the park is over. The disposition DEPENDS on `reason` — it is not one exit:
  *       `idle`      — no follow-up arrived within the park's idle bound (M3); the run
  *                     finalizes NORMALLY (reports `completed`, pushes its branch, opens an MR
@@ -61,7 +62,7 @@ const execFileAsync = promisify(execFile);
  *                     cancel finalized as `completed` would wrongly push + open an MR.
  */
 export type FollowUpOutcome =
-  | { kind: "followup"; body: string }
+  | { kind: "followup"; id: number; body: string }
   | { kind: "ended"; reason: "idle" | "stopped" | "cancelled" };
 
 /** A message the executor emits to the run stream (seq assigned downstream). */
@@ -383,12 +384,17 @@ export interface RunContext {
    * REASON_PLAN_MISSING, as it does when this is absent. Does not count against question_max.
    */
   askPlanMissing?: () => Promise<{ kind: "answer"; answers: string[] } | { kind: "cancel" } | { kind: "unattended" }>;
-  /** M4: dequeue the next queued follow-up to inject into the next loop turn. The SDK
-   *  executor calls this at the end of every ordinary work turn and at a cooperative
-   *  checkpoint (#1152): one per turn, FIFO. The server's consumed_at ("Delivered") records
-   *  only the worker's receipt via the steering poll, not this dequeue into a prompt nor that
-   *  the model acted on it. */
-  pullFollowUp?(): string | undefined;
+  /** M4: dequeue the next queued owner follow-up ({id, body}). Issue #1800: each executor pulls it
+   *  into a dedicated owner slot only immediately before it builds an ordinary implement prompt,
+   *  FIFO and one at a time, and carries it until a turn whose prompt held it yields its first
+   *  event evidencing the model processed it (not init or lifecycle), then reports it via {@link followUpIncluded}. The server's consumed_at ("Delivered")
+   *  records only the worker's receipt via the steering poll; included_at is the separate record
+   *  that the turn carrying it reached the model (not that the model acted on it). */
+  pullFollowUp?(): { id: number; body: string } | undefined;
+  /** Issue #1800: follow-up `id` (from pullFollowUp or a park's `followup` outcome) was in a prompt
+   *  whose turn reached the model (a model-evidencing event arrived). Called once per follow-up; the runner reports
+   *  it to the api (POST /inputs/included). Optional; absent (a stub) ⇒ nothing is reported. */
+  followUpIncluded?(id: number): void;
   /** PRD #1416 M2: drain the WORKER-AUTHORITATIVE safety steer armed in-process by the runner's
    *  divergence detection, if any. Consumed with PRIORITY at each executor loop top — ahead of
    *  pullFollowUp — and rendered as worker guidance, NOT as untrusted <follow_up> user input (D3).

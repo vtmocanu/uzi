@@ -30,14 +30,14 @@ func vaultParkRun(id string) apitypes.RunDTO {
 // transient interruption. Reddening mutation: drop the vaultLockedCause arm in steerState.
 func TestSteerStateVaultLocked(t *testing.T) {
 	consumed := time.Now()
-	if got, want := steerState(kindFollowUp, nil, nil, statusRecoveryWait, vaultLockedCause), "queued (run waiting for vault unlock)"; got != want {
+	if got, want := steerState(queuedIn(), statusRecoveryWait, vaultLockedCause), "queued (run waiting for vault unlock)"; got != want {
 		t.Errorf("steerState(unconsumed, vault_locked) = %q, want %q", got, want)
 	}
-	if got, want := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait, vaultLockedCause), "delivered (run waiting for vault unlock)"; got != want {
+	if got, want := steerState(receivedIn(consumed), statusRecoveryWait, vaultLockedCause), "received (run waiting for vault unlock)"; got != want {
 		t.Errorf("steerState(consumed, vault_locked) = %q, want %q", got, want)
 	}
 	// The cause only matters on a recovery_wait run.
-	if got := steerState(kindFollowUp, nil, nil, "running", vaultLockedCause); got != "queued" {
+	if got := steerState(queuedIn(), "running", vaultLockedCause); got != "queued" {
 		t.Errorf("steerState(running, vault_locked) = %q, want %q", got, "queued")
 	}
 }

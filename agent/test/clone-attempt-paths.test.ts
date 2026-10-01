@@ -28,6 +28,7 @@ import { skillsPluginDir } from "../src/skills-plugin.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { makeFakeProcRoot, plantUnreadableUnattributed, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { HERMETIC_VIEW, restoreHermeticView } from "./setup/hermetic-proc.js";
+import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { REAL_PROCFS_DENIED, realProcfsSkip } from "./real-procfs.js";
 import { nullLogger, recordingLogger, testGitCacheOptions, noProofReseed } from "./helpers.js";
 import {
@@ -75,9 +76,8 @@ interface FakeDaemon {
   close: () => Promise<void>;
 }
 
-async function startFakeDaemon(dir: string): Promise<FakeDaemon> {
-  fs.mkdirSync(dir, { recursive: true });
-  const socket = path.join(dir, "docker.sock");
+async function startFakeDaemon(): Promise<FakeDaemon> {
+  const { socket, dispose } = shortUnixSocket();
   let seq = 0;
   const daemon: FakeDaemon = { socket, containers: new Map(), hold: undefined, close: async () => {} };
   const server = http.createServer((req, res) => {
@@ -119,11 +119,19 @@ async function startFakeDaemon(dir: string): Promise<FakeDaemon> {
       })();
     });
   });
-  await new Promise<void>((r) => server.listen(socket, r));
+  try {
+    await listenUnix(server, socket);
+  } catch (err) {
+    dispose();
+    throw err;
+  }
   daemon.close = () =>
     new Promise<void>((r) => {
       server.closeAllConnections();
-      server.close(() => r());
+      server.close(() => {
+        dispose();
+        r();
+      });
     });
   return daemon;
 }
@@ -161,7 +169,7 @@ after(() => {
 
 beforeEach(async () => {
   daemonDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-attempt-docker-"));
-  daemon = await startFakeDaemon(daemonDir);
+  daemon = await startFakeDaemon();
 });
 
 afterEach(async () => {

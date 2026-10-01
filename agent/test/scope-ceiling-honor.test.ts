@@ -402,12 +402,15 @@ describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
     const followUps = ["please also add tests"];
     const { queryFn, turns } = fakeTurns([
       [submitPlan("# Plan"), resultSuccess()], // planning turn
-      [assistantText("first pass"), resultSuccess()], // loop iter 1 (no done) → pulls follow-up
-      [assistantText("second pass"), signalDone(), resultSuccess()], // loop iter 2 carries the follow-up, done
+      [assistantText("first pass"), resultSuccess()], // loop iter 1 (no done) → carries the follow-up
+      [assistantText("second pass"), signalDone(), resultSuccess()], // loop iter 2, done
     ]);
     let served = 0;
     const probe = makeCtx({
-      pullFollowUp: () => followUps.shift(),
+      pullFollowUp: () => {
+        const body = followUps.shift();
+        return body === undefined ? undefined : { id: 1, body };
+      },
       reportIteration: async (n) => {
         served++;
         probe.iterations.push(n);
@@ -422,10 +425,11 @@ describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
       !probe.emits.some((m) => m.kind === "steer_ack"),
       "no steer_ack on the advisory path",
     );
-    // The follow-up was folded into iteration 2's prompt as UNTRUSTED user input — the
-    // pre-existing behavior, unchanged (turns[0]=plan, turns[1]=iter1, turns[2]=iter2).
-    assert.match(turns[2]!.promptText ?? "", /please also add tests/, "the follow-up rode the next turn");
-    assert.doesNotMatch(turns[1]!.promptText ?? "", /please also add tests/, "iter 1 did not carry it");
+    // Issue #1800: the follow-up is pulled at the loop top, right before the implement prompt is
+    // built, so it rides the FIRST implement turn as UNTRUSTED user input (turns[0]=plan,
+    // turns[1]=iter1, turns[2]=iter2) and, once delivered, is not replayed.
+    assert.match(turns[1]!.promptText ?? "", /please also add tests/, "the follow-up rode the first implement turn");
+    assert.doesNotMatch(turns[2]!.promptText ?? "", /please also add tests/, "iter 2 did not replay it");
     assert.ok(served >= 2, "the loop reported at least two iterations before completing");
   });
 

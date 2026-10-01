@@ -421,6 +421,7 @@ Tracked as GitLab issue vtmocanu/uzi#47; PRD at `prds/done/47-loop-hang-detectio
     because a requirement that changed is not the same artifact as one that was wrong.
     [AI-proposed; NEEDS USER RATIFICATION]
 - The "slow" health flag is a near-timeout warning at a share of the run's wall-clock budget, not a bare timer. [user, #1170]
+- A lead tool call in flight past an admin-set threshold (default 20 minutes, 0 disables) on a quiet run is flagged stalled with a fixed reason (the outbox-queued reason during an api outage); an open delegation to a subagent is never aged. (AI-synced 2026-10-01, #2046)
 - A run's owner can extend its wall-clock budget from the web or CLI, up to an admin-set allowance; the frozen budget itself never changes. [user, #1189]
 - A run that runs out of time is parked and its owner is asked to extend or stop; it is never failed for the clock alone, the park never expires, and this is not configurable. [user, #1497]
 
@@ -531,6 +532,7 @@ Tracked as GitLab issue vtmocanu/uzi#95; PRD at `prds/done/95-activity-pane-v2.m
   - The activity pane must not auto-scroll / jerk to the bottom on every incoming frame — watch a live run without being dragged along. [user 2026-07-20]
   - Show a real "who's alive": glance at the pane and see each agent's state — working / waiting / done / blocked. [user 2026-07-20]
   - A follow-up must not vanish silently — show that it exists and whether the worker has picked it up. [user 2026-07-20]
+  - The steer queue distinguishes received by the worker, routed by steering, and included in a prompt; it never says "delivered" for a follow-up no prompt included, and never claims the agent acted on it. Owner follow-ups reach the lead on both harnesses. (AI-synced 2026-10-01, issue #1800)
 - Authorized behavior change: collapse-by-default logs + an opt-in "Follow live" toggle REPLACE the global auto-scroll. [user 2026-07-20, supersedes the Feature #11 default "activity feed auto-scrolls (follows) live runs"]
 
 ## Feature #108 — Worker retry loop: stop losing runs to unsaveable messages

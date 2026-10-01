@@ -46,6 +46,7 @@
 
 import { RequestError, type InputReceipt, type WorkerClient } from "./client.js";
 import type { FollowUpOutcome } from "./executor.js";
+import { InclusionReporter } from "./inclusion-reporter.js";
 import type { Logger } from "./log.js";
 import { parseAgentSelection, type AgentSelectionParse, type UserInput } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
@@ -1389,6 +1390,8 @@ export class SteeringChannel {
   private readonly now: () => number;
   /** PRD #1247 M5b: the claim-lane generation this channel guards a credential switch against. */
   private readonly claimGeneration: number;
+  /** Issue #1800: receipts for follow-ups an executor really put into a prompt. */
+  private readonly inclusions: InclusionReporter;
 
   constructor(
     private readonly client: WorkerClient,
@@ -1403,6 +1406,7 @@ export class SteeringChannel {
     this.notify = opts.notify;
     this.now = opts.now ?? Date.now;
     this.claimGeneration = opts.claimGeneration ?? 0;
+    this.inclusions = new InclusionReporter(client, runId, this.claimGeneration, log);
     this.receiptDeadlineMs = opts.receiptDeadlineMs ?? ACTIVE_APPLY_DEADLINE_MS;
     this.replayPageLimit = opts.replayPageLimit ?? REPLAY_PAGE_LIMIT;
   }
@@ -1564,6 +1568,9 @@ export class SteeringChannel {
     // Disposed approves get their bounded stop attempts at a discard too.
     this.kickDiscard();
     if (this.discardLane) await this.discardLane;
+    // Issue #1800: the final turn's inclusion receipt is marked after the run's last report, so
+    // it is drained here (bounded) rather than left to a poll tick that may never come.
+    await this.inclusions.drain();
   }
 
   /** The current gate epoch — the plan version verdicts/revises are stamped against.
@@ -1750,9 +1757,34 @@ export class SteeringChannel {
     this.receivedFollowUps.unshift(...seeded);
   }
 
-  /** Dequeue the oldest un-consumed follow-up, or undefined if none. */
-  pullFollowUp(): string | undefined {
-    return this.takeFollowUp()?.body;
+  /** Dequeue the oldest un-consumed follow-up, or undefined if none. The id travels with the body
+   *  so the executor can report the follow-up included (markFollowUpIncluded) once a prompt that
+   *  carried it has really started. */
+  pullFollowUp(): { id: number; body: string } | undefined {
+    return this.takeFollowUp();
+  }
+
+  /** Issue #1800: the executor put follow-up `id` into a prompt whose turn reached the model. Queues an inclusion
+   *  receipt (POST /inputs/included), sent on the next poll tick and drained at stop. Idempotent
+   *  per id; a failed send is retried, an api without the route is silently dropped. */
+  markFollowUpIncluded(id: number): void {
+    this.inclusions.mark(id);
+  }
+
+  /** Issue #1800: re-queue the owner follow-ups an earlier claim consumed but the api never saw
+   *  included (GET /follow-ups rows with inclusion_reported and no included_at), oldest first, for
+   *  the lead to deliver again. Call before start(). Non-blank follow_up rows only; an id already
+   *  queued (or later routed live) is not queued twice. Only rows from an api that tracks inclusion
+   *  qualify: against an older api nothing is re-queued, as before. */
+  requeueUnincludedFollowUps(inputs: readonly UserInput[]): void {
+    const rows = inputs
+      .filter((i) => i.kind === "follow_up" && i.inclusion_reported === true && !i.included_at && !!i.body?.trim())
+      .sort((a, b) => a.id - b.id);
+    for (const input of rows) {
+      if (this.leadQueuedIds.has(input.id)) continue;
+      this.leadQueuedIds.add(input.id);
+      this.followUps.push({ id: input.id, body: input.body!.trim() });
+    }
   }
 
   /** PRD #1416 M2: arm (set/replace) the worker-authoritative safety steer. Called IN-PROCESS by
@@ -1832,6 +1864,7 @@ export class SteeringChannel {
       const f = this.takeFollowUp()!;
       return Promise.resolve<FollowUpOutcome>({
         kind: "followup",
+        id: f.id,
         body: f.body,
       });
     }
@@ -1869,7 +1902,7 @@ export class SteeringChannel {
     if (this.followUps.length) {
       const f = this.takeFollowUp()!;
       this.followUpWaiter = undefined;
-      w.resolve({ kind: "followup", body: f.body });
+      w.resolve({ kind: "followup", id: f.id, body: f.body });
       return;
     }
     if (!this.held?.hasFollowUp && this.now() - w.parkedAt >= w.idleMs) {
@@ -2402,6 +2435,9 @@ export class SteeringChannel {
       // re-evaluated every idle tick so a park with no follow-up ends on its idle bound —
       // including on a tick where getInputs threw (PRD #517 M5).
       this.serviceFollowUp();
+      // Issue #1800: report follow-ups an executor has put into a prompt. Its own request, never
+      // thrown: a failing api cannot disturb the input poll.
+      await this.inclusions.flush();
       // Issue #1673: the applied receipt starts on the next tick with these same ids, after
       // every waiter has seen the routed batch. A failed reply retries without GET or route.
       // Issue #1604: without the plan-gate inputs tracked on their own (a batch with nothing else
@@ -2416,7 +2452,7 @@ export class SteeringChannel {
 /** What the chat park loop should do next: answer a message, idle-complete, or end
  *  (an explicit End chat, or worker shutdown). */
 export type ChatInput =
-  { kind: "message"; text: string } | { kind: "idle" } | { kind: "ended" };
+  { kind: "message"; text: string; id: number } | { kind: "idle" } | { kind: "ended" };
 
 /** The input source a ChatRunner parks on between turns (PRD #39 Decision 2). The
  *  real one is ChatSteering; tests inject a fake that yields scripted ChatInputs. */
@@ -2424,6 +2460,8 @@ export interface ChatInputSource {
   start(): void;
   stop(): Promise<void>;
   awaitFollowUp(idleMs: number): Promise<ChatInput>;
+  /** Issue #1800: the message carrying input `id` reached a model turn; report it included. */
+  markFollowUpIncluded?(id: number): void;
   /** True when a receipt definitively fences this claim's old worker. */
   claimLost?(): boolean;
   /** Issue #1673: set when a routed message's applied receipt was given up; the chat must end
@@ -2474,7 +2512,9 @@ export class ChatSteering implements ChatInputSource {
   private stopped = false;
   private lost = false;
   private loop: Promise<void> | undefined;
-  private readonly followUps: string[] = [];
+  private readonly followUps: { id: number; text: string }[] = [];
+  /** Issue #1800: receipts for messages whose turn reached the model (a seeded first message included). */
+  private readonly inclusions: InclusionReporter;
   /** Issue #1673: the one input batch in flight, as in SteeringChannel ("ack" retries the ACK,
    *  "applied" retries the applied receipt without rerouting). */
   private held: { ids: number[]; phase: "ack" | "applied" } | undefined;
@@ -2504,6 +2544,7 @@ export class ChatSteering implements ChatInputSource {
     this.sleepFn = opts.sleep ?? sleep;
     this.now = opts.now ?? Date.now;
     this.onFollowUp = opts.onFollowUp;
+    this.inclusions = new InclusionReporter(client, runId, claimGeneration, log);
   }
 
   claimLost(): boolean {
@@ -2519,6 +2560,14 @@ export class ChatSteering implements ChatInputSource {
     this.stopped = true;
     this.settle({ kind: "ended" });
     if (this.loop) await this.loop;
+    // Issue #1800: the last turn's receipt is marked after the poll loop may have exited.
+    await this.inclusions.drain();
+  }
+
+  /** Issue #1800: the message carrying input `id` reached a model turn. Queues an inclusion
+   *  receipt, sent on the next poll tick and drained at stop; idempotent per id. */
+  markFollowUpIncluded(id: number): void {
+    this.inclusions.mark(id);
   }
 
   /**
@@ -2530,11 +2579,10 @@ export class ChatSteering implements ChatInputSource {
   awaitFollowUp(idleMs: number): Promise<ChatInput> {
     if (this.cancel.signal.aborted || this.stopped)
       return Promise.resolve<ChatInput>({ kind: "ended" });
-    if (this.followUps.length)
-      return Promise.resolve<ChatInput>({
-        kind: "message",
-        text: this.followUps.shift()!,
-      });
+    if (this.followUps.length) {
+      const f = this.followUps.shift()!;
+      return Promise.resolve<ChatInput>({ kind: "message", text: f.text, id: f.id });
+    }
     return new Promise<ChatInput>((resolve) => {
       this.waiter = { resolve, idleMs, parkedAt: this.now() };
     });
@@ -2547,12 +2595,12 @@ export class ChatSteering implements ChatInputSource {
     w.resolve(i);
   }
 
-  private route(kind: string, body: string | null | undefined): void {
+  private route(kind: string, body: string | null | undefined, id: number): void {
     switch (kind) {
       case "follow_up":
         if (!body || !body.trim()) break;
         if (this.onFollowUp) this.onFollowUp(body.trim());
-        else this.followUps.push(body.trim());
+        else this.followUps.push({ id, text: body.trim() });
         break;
       case "cancel":
         if (!this.cancel.signal.aborted) this.cancel.abort();
@@ -2572,8 +2620,10 @@ export class ChatSteering implements ChatInputSource {
     if (!this.waiter) return;
     if (this.cancel.signal.aborted || this.stopped)
       return this.settle({ kind: "ended" });
-    if (this.followUps.length)
-      return this.settle({ kind: "message", text: this.followUps.shift()! });
+    if (this.followUps.length) {
+      const f = this.followUps.shift()!;
+      return this.settle({ kind: "message", text: f.text, id: f.id });
+    }
     if (!this.held && this.now() - this.waiter.parkedAt >= this.waiter.idleMs)
       this.settle({ kind: "idle" });
   }
@@ -2627,7 +2677,7 @@ export class ChatSteering implements ChatInputSource {
             for (const input of inputs) {
               if (this.routedIds.has(input.id)) continue;
               this.routedIds.add(input.id);
-              this.route(input.kind, input.body ?? undefined);
+              this.route(input.kind, input.body ?? undefined, input.id);
             }
           } else if (inputs.length) this.held = { ids: inputs.slice(0, MAX_INPUT_BATCH).map((input) => input.id), phase: "ack" };
         }
@@ -2641,7 +2691,7 @@ export class ChatSteering implements ChatInputSource {
             for (const input of [...receipt.inputs].sort((a, b) => a.id - b.id)) {
               if (this.routedIds.has(input.id)) continue;
               this.routedIds.add(input.id);
-              this.route(input.kind, input.body ?? undefined);
+              this.route(input.kind, input.body ?? undefined, input.id);
             }
             // The waiter is serviced below; the applied receipt goes out on the next tick.
             this.held.phase = "applied";
@@ -2676,6 +2726,8 @@ export class ChatSteering implements ChatInputSource {
       // Route THEN service: a follow_up in the ACK is available before applied
       // starts on the next tick. Held IDs prevent another GET while it is uncertain.
       this.serviceWaiter();
+      // Issue #1800: report messages a turn has started on; its own request, never thrown.
+      await this.inclusions.flush();
       // Cancellation stops fresh GETs but cannot abandon a held receipt.
       if ((this.stopped || this.cancel.signal.aborted) && !this.held) break;
       // Wake early on a cancel only when nothing is held; a held receipt keeps its poll pace.

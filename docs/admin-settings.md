@@ -231,6 +231,7 @@ signal off, from **Admin → Instance → Run health**:
 |---|---|---|
 | Enable run-health detection | on | Turns the whole detector on or off. |
 | Stalled after | 300s (5m) | Seconds of silence, with no tool call in flight, before a running run is flagged stalled. |
+| Long tool call after | 1200s (20m) | `health_tool_call_seconds` — how long the oldest open tool call of a run's main agent may run, on a run that has also been silent for the **Stalled after** window (or for this threshold, if **Stalled after** is `0`), before it's flagged stalled. Calls to subagents are excluded. `0` turns this signal off. See [Long tool calls](./run-health.md#long-tool-calls). |
 | Near timeout at (% of wall-clock budget) | 85 | `health_near_timeout_pct` — the share of a run's wall-clock budget (`RUN_TIMEOUT`, or its frozen `budget_wall_seconds` for a milestone-scaled run, PRD #122) it must have used, in **active** running time only (time parked at a gate is excluded), before it's flagged near timeout. |
 | Extension allowance per run (seconds) | 57600 (16h) | `run_extension_cap_seconds` — the total extra wall-clock time an owner may grant a single run through [Extend](./run-health.md#giving-a-run-more-time), on top of its frozen budget. `0` turns extending off instance-wide. |
 | Stuck queued after | 600s (10m) | Seconds a run may sit queued before it's flagged waiting for worker. |

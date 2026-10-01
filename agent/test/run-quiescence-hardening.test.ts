@@ -22,6 +22,7 @@ import {
   type ProcTable,
   type ScanRequest,
 } from "../src/run-quiescence.js";
+import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { defaultCheckRunner } from "../src/self-improve.js";
 import { makeFakeProcRoot, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
@@ -520,7 +521,7 @@ describe("A-helper: request on stdin, private TMPDIR, tsx cache off, one bounded
 // ─── items 3 and 9: Docker body cap and DOCKER_HOST forms ──────────────────────────────────
 
 /** A minimal Docker Engine stand-in: GET /containers/json answers `listing()`. */
-async function startDaemon(listen: { socket: string } | { tcp: true }, listing: () => string): Promise<{ host: string; close: () => Promise<void> }> {
+async function startDaemon(listen: "unix" | "tcp", listing: () => string): Promise<{ host: string; close: () => Promise<void> }> {
   const server = http.createServer((req, res) => {
     if (req.method === "GET" && req.url?.startsWith("/containers/json")) {
       res.writeHead(200, { "content-type": "application/json" });
@@ -530,18 +531,31 @@ async function startDaemon(listen: { socket: string } | { tcp: true }, listing: 
     res.writeHead(404);
     res.end();
   });
-  if ("socket" in listen) {
-    await new Promise<void>((r) => server.listen(listen.socket, r));
+  let dispose = (): void => undefined;
+  let host: string;
+  if (listen === "unix") {
+    const short = shortUnixSocket();
+    dispose = short.dispose;
+    try {
+      await listenUnix(server, short.socket);
+    } catch (err) {
+      dispose();
+      throw err;
+    }
+    host = short.socket;
   } else {
     await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    host = `tcp://127.0.0.1:${(server.address() as AddressInfo).port}/`;
   }
-  const host = "socket" in listen ? listen.socket : `tcp://127.0.0.1:${(server.address() as AddressInfo).port}/`;
   return {
     host,
     close: () =>
       new Promise<void>((r) => {
         server.closeAllConnections();
-        server.close(() => r());
+        server.close(() => {
+          dispose();
+          r();
+        });
       }),
   };
 }
@@ -549,7 +563,7 @@ async function startDaemon(listen: { socket: string } | { tcp: true }, listing: 
 describe("A-docker-hardening", () => {
   it("a listing body above the 8 MiB cap is docker_error (the request is destroyed)", async () => {
     // A VALID empty array padded past the cap: without the cap it parses clean and reads unconfirmed.
-    const d = await startDaemon({ socket: path.join(tmp, "big.sock") }, () => `[${" ".repeat(9 * 1024 * 1024)}]`);
+    const d = await startDaemon("unix", () => `[${" ".repeat(9 * 1024 * 1024)}]`);
     try {
       const r = await teardownDocker({ dockerHost: `unix://${d.host}`, targetPaths: [CLONE], intervalMs: 10 });
       assert.equal(r.state, "docker_error");
@@ -560,7 +574,7 @@ describe("A-docker-hardening", () => {
   });
 
   it("the cap is per response and configurable; a body under it is read normally", async () => {
-    const d = await startDaemon({ socket: path.join(tmp, "small.sock") }, () => "[]");
+    const d = await startDaemon("unix", () => "[]");
     try {
       const ok = await teardownDocker({ dockerHost: `unix://${d.host}`, targetPaths: [CLONE], intervalMs: 10 });
       assert.equal(ok.state, "docker_unconfirmed");
@@ -572,8 +586,8 @@ describe("A-docker-hardening", () => {
   });
 
   it("accepts a bare /path socket and tcp://host:port/ like docker-wiring does", async () => {
-    const bare = await startDaemon({ socket: path.join(tmp, "bare.sock") }, () => "[]");
-    const tcp = await startDaemon({ tcp: true }, () => "[]");
+    const bare = await startDaemon("unix", () => "[]");
+    const tcp = await startDaemon("tcp", () => "[]");
     try {
       assert.equal((await teardownDocker({ dockerHost: bare.host, targetPaths: [CLONE], intervalMs: 10 })).state, "docker_unconfirmed");
       assert.equal((await teardownDocker({ dockerHost: tcp.host, targetPaths: [CLONE], intervalMs: 10 })).state, "docker_unconfirmed");

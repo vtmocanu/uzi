@@ -44,6 +44,13 @@ func (c *Cache) HealthStallSeconds(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyHealthStallSeconds)
 }
 
+// HealthToolCallSeconds returns how long a run's oldest open lead tool call may stay
+// in flight on an otherwise quiet run before the run is flagged stalled (issue #2046).
+// 0 disables the long-tool-call signal; otherwise it is in [60, 86400].
+func (c *Cache) HealthToolCallSeconds(ctx context.Context) (int, error) {
+	return c.intSetting(ctx, KeyHealthToolCallSeconds)
+}
+
 // HealthNearTimeoutPct returns the near-timeout threshold as a percentage of the run's
 // effective wall-clock budget (PRD #1170). 0 disables the signal; otherwise it is in
 // [50, 99]. The sweeper applies it per-run against budget_wall_seconds (or RUN_TIMEOUT)

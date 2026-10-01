@@ -240,8 +240,12 @@ export function useRunStream(runId: string) {
           body,
           created_at: new Date().toISOString(),
           consumed_at: null,
+          applied_at: null,
+          included_at: null,
+          inclusion_reported: false,
           // This optimistic path only fires for a follow_up (guarded above), so it
-          // derives its state from consumed_at and carries no scope disposition.
+          // derives its state from its receipt timestamps (all null: Queued) and carries
+          // no scope disposition.
           kind: "follow_up",
           disposition: null,
         };

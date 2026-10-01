@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 //
-// PRD #95 M3: the steer queue's five delivery states (Decision 7) are derived
-// client-side from (consumed_at, run.status), and the queue must SURVIVE the run
-// going terminal (B1) — it lives in its own card lifted to useRunStream, not inside
-// the !terminal-gated composer, so "Not delivered — run finished" is reachable.
+// PRD #95 M3 + issue #1800: the steer queue's delivery states (Decision 7) are derived
+// client-side from the receipt timestamps (consumed_at, applied_at, included_at,
+// inclusion_reported) and run.status, and the queue must SURVIVE the run going terminal
+// (B1) — it lives in its own card lifted to useRunStream, not inside the !terminal-gated
+// composer, so "Not delivered — run finished" and "Not confirmed — run finished" are
+// reachable. The harness (Claude or Codex) never changes a chip: SteerInput has no harness.
 
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
@@ -18,6 +20,9 @@ function input(over: Partial<SteerInput> = {}): SteerInput {
     body: "resume the agent",
     created_at: "2026-07-20T10:00:00Z",
     consumed_at: null,
+    applied_at: null,
+    included_at: null,
+    inclusion_reported: true,
     kind: "follow_up",
     disposition: null,
     ...over,
@@ -31,6 +36,9 @@ function scope(over: Partial<SteerInput> = {}): SteerInput {
     body: "scope ceiling → complete through milestone 2 of 4",
     created_at: "2026-07-20T10:00:00Z",
     consumed_at: null,
+    applied_at: null,
+    included_at: null,
+    inclusion_reported: false,
     kind: "scope",
     disposition: null,
     ...over,
@@ -39,119 +47,138 @@ function scope(over: Partial<SteerInput> = {}): SteerInput {
 
 const noop = () => {};
 
-describe("SteerQueueCard delivery states (Decision 7)", () => {
+const RECEIVED = "2026-07-20T10:01:00Z";
+const ROUTED = "2026-07-20T10:01:30Z";
+const INCLUDED = "2026-07-20T10:02:00Z";
+
+// Renders a single follow-up at the given run state.
+function renderCard(row: SteerInput, status: string | undefined, terminal = false) {
+  render(
+    <SteerQueueCard inputs={[row]} terminal={terminal} status={status} busy={false} onStop={noop} onSend={noop} />,
+  );
+}
+
+describe("SteerQueueCard delivery states (Decision 7, issue #1800)", () => {
   it("NULL consumed_at + live, not-at-gate → Queued", () => {
-    render(
-      <SteerQueueCard inputs={[input()]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
-    );
+    renderCard(input(), "running");
     expect(screen.getByText("Queued")).toBeTruthy();
   });
 
-  it("NULL consumed_at + awaiting_approval → still Queued (worker has not consumed it yet)", () => {
-    render(
-      <SteerQueueCard
-        inputs={[input()]}
-        terminal={false}
-        status="awaiting_approval"
-        busy={false}
-        onStop={noop}
-        onSend={noop}
-      />,
-    );
+  it("NULL consumed_at + awaiting_approval → still Queued (worker has not received it yet)", () => {
+    renderCard(input(), "awaiting_approval");
     expect(screen.getByText("Queued")).toBeTruthy();
-    expect(screen.queryByText(/applies after approval/)).toBeNull();
-  });
-
-  it("consumed + awaiting_input → names the ANSWER, not the approval (PRD #88)", () => {
-    // A follow-up submitted at a clarification park IS consumed immediately — the
-    // steering channel polls throughout — but it only takes effect on the worker's next
-    // turn, which does not come until the human answers. Reusing the gate's copy here
-    // would send the user hunting for a plan gate that is not there; a bare "Delivered"
-    // would claim the agent already has it in hand.
-    render(
-      <SteerQueueCard
-        inputs={[input({ consumed_at: "2026-07-28T00:00:01Z" })]}
-        terminal={false}
-        status="awaiting_input"
-        busy={false}
-        onStop={() => {}}
-        onSend={() => {}}
-      />,
-    );
-    expect(screen.getByText("Delivered — applies after you answer")).toBeTruthy();
-    expect(screen.queryByText(/applies after approval/)).toBeNull();
-  });
-
-  it("consumed + awaiting_approval → 'Delivered — applies after approval' (the honest gate copy, S3)", () => {
-    render(
-      <SteerQueueCard
-        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
-        terminal={false}
-        status="awaiting_approval"
-        busy={false}
-        onStop={noop}
-        onSend={noop}
-      />,
-    );
-    expect(screen.getByText("Delivered — applies after approval")).toBeTruthy();
-    // The bare "Delivered" chip must NOT also appear for this entry.
-    expect(screen.queryByText(/^Delivered$/)).toBeNull();
-  });
-
-  it("consumed + running → plain Delivered", () => {
-    render(
-      <SteerQueueCard
-        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
-        terminal={false}
-        status="running"
-        busy={false}
-        onStop={noop}
-        onSend={noop}
-      />,
-    );
-    expect(screen.getByText("Delivered")).toBeTruthy();
-  });
-
-  it("consumed + terminal → plain Delivered (a delivered input stays delivered after the run ends)", () => {
-    render(
-      <SteerQueueCard
-        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
-        terminal={true}
-        status="completed"
-        busy={false}
-        onStop={noop}
-        onSend={noop}
-      />,
-    );
-    expect(screen.getByText("Delivered")).toBeTruthy();
+    expect(screen.queryByText(/waits for approval/)).toBeNull();
   });
 
   it("NULL consumed_at + terminal → 'Not delivered — run finished'", () => {
-    render(
-      <SteerQueueCard
-        inputs={[input()]}
-        terminal={true}
-        status="completed"
-        busy={false}
-        onStop={noop}
-        onSend={noop}
-      />,
-    );
+    renderCard(input(), "completed", true);
     expect(screen.getByText("Not delivered — run finished")).toBeTruthy();
   });
 
-  it("gate copy degrades to plain Delivered when status is not provided", () => {
-    render(
-      <SteerQueueCard
-        inputs={[input({ consumed_at: "2026-07-20T10:01:00Z" })]}
-        terminal={false}
-        busy={false}
-        onStop={noop}
-        onSend={noop}
-      />,
+  it("consumed, not routed, running → Received", () => {
+    renderCard(input({ consumed_at: RECEIVED }), "running");
+    expect(screen.getByText("Received")).toBeTruthy();
+  });
+
+  it("consumed + applied, running → Routed", () => {
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "running");
+    expect(screen.getByText("Routed")).toBeTruthy();
+  });
+
+  it("received + awaiting_approval → 'Received — waits for approval'", () => {
+    renderCard(input({ consumed_at: RECEIVED }), "awaiting_approval");
+    expect(screen.getByText("Received — waits for approval")).toBeTruthy();
+    expect(screen.queryByText(/^Received$/)).toBeNull();
+  });
+
+  it("routed + awaiting_approval → 'Routed — waits for approval'", () => {
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "awaiting_approval");
+    expect(screen.getByText("Routed — waits for approval")).toBeTruthy();
+    // The state's own base word must not also read as plain Routed or as Included.
+    expect(screen.queryByText(/^Routed$/)).toBeNull();
+    expect(screen.queryByText(/Included/)).toBeNull();
+  });
+
+  it("received + awaiting_input → names the ANSWER, not the approval (PRD #88)", () => {
+    // A follow-up submitted at a clarification park is received immediately, but it reaches
+    // a prompt only on the next turn, which does not come until the human answers. Reusing
+    // the gate's copy would send the user hunting for a plan gate that is not there.
+    renderCard(input({ consumed_at: RECEIVED }), "awaiting_input");
+    expect(screen.getByText("Received — awaits your answer")).toBeTruthy();
+    expect(screen.queryByText(/waits for approval/)).toBeNull();
+  });
+
+  it("routed + awaiting_input → 'Routed — awaits your answer'", () => {
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "awaiting_input");
+    expect(screen.getByText("Routed — awaits your answer")).toBeTruthy();
+  });
+
+  it("routed + awaiting_followup → 'Routed — resumes the run' (PRD #517)", () => {
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "awaiting_followup");
+    expect(screen.getByText("Routed — resumes the run")).toBeTruthy();
+  });
+
+  it("included_at set → 'Included in a prompt' on every run status, with an honest title", () => {
+    for (const [status, terminal] of [
+      ["running", false],
+      ["awaiting_approval", false],
+      ["completed", true],
+    ] as const) {
+      cleanup();
+      renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED, included_at: INCLUDED }), status, terminal);
+      const chip = screen.getByText("Included in a prompt");
+      expect(chip).toBeTruthy();
+      expect(chip.closest("[title]")?.getAttribute("title")).toBe(
+        "Included in a prompt the agent was given; whether it acted on it shows in the agent's messages.",
+      );
+      expect(screen.queryByText(/Delivered|Not confirmed/)).toBeNull();
+    }
+  });
+
+  it("consumed, inclusion unconfirmed, terminal → 'Not confirmed — run finished'", () => {
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "completed", true);
+    const chip = screen.getByText("Not confirmed — run finished");
+    expect(chip).toBeTruthy();
+    expect(chip.closest("[title]")?.getAttribute("title")).toBe(
+      "The worker received this follow-up, but no prompt carrying it was confirmed before the run finished.",
     );
-    expect(screen.getByText("Delivered")).toBeTruthy();
-    expect(screen.queryByText(/applies after approval/)).toBeNull();
+    expect(screen.queryByText(/Not included/)).toBeNull();
+    expect(screen.queryByText(/Delivered/)).toBeNull();
+  });
+
+  it("received after a resume (non-terminal, not included) → still Received, not Not confirmed", () => {
+    renderCard(input({ consumed_at: RECEIVED }), "running");
+    expect(screen.getByText("Received")).toBeTruthy();
+    expect(screen.queryByText(/Not confirmed/)).toBeNull();
+  });
+
+  it("legacy (no inclusion report), live → 'Received/Routed — no inclusion report'", () => {
+    renderCard(input({ consumed_at: RECEIVED, inclusion_reported: false }), "running");
+    expect(screen.getByText("Received — no inclusion report")).toBeTruthy();
+    cleanup();
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED, inclusion_reported: false }), "running");
+    expect(screen.getByText("Routed — no inclusion report")).toBeTruthy();
+  });
+
+  it("legacy at a park → the no-inclusion-report chip wins over the park qualifier", () => {
+    for (const status of ["awaiting_approval", "awaiting_input", "awaiting_followup"]) {
+      cleanup();
+      renderCard(input({ consumed_at: RECEIVED, inclusion_reported: false }), status);
+      expect(screen.getByText("Received — no inclusion report")).toBeTruthy();
+      expect(screen.queryByText(/waits for approval|awaits your answer|resumes the run/)).toBeNull();
+    }
+  });
+
+  it("legacy, terminal → never claims 'Not confirmed' (the worker cannot say)", () => {
+    renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED, inclusion_reported: false }), "completed", true);
+    expect(screen.getByText("Routed — no inclusion report")).toBeTruthy();
+    expect(screen.queryByText(/Not confirmed/)).toBeNull();
+  });
+
+  it("gate copy degrades to plain Received when status is not provided", () => {
+    renderCard(input({ consumed_at: RECEIVED }), undefined);
+    expect(screen.getByText("Received")).toBeTruthy();
+    expect(screen.queryByText(/waits for approval/)).toBeNull();
   });
 });
 
@@ -259,17 +286,17 @@ describe("SteerQueueCard survives the terminal transition (B1)", () => {
     expect(screen.getByText("Stop run")).toBeTruthy();
   });
 
-  it("a stable transition keeps a delivered entry's chip: same queue, terminal flips", () => {
-    const rows = [input({ id: 5, consumed_at: "2026-07-20T10:01:00Z" })];
+  it("a stable transition keeps an included entry's chip: same queue, terminal flips", () => {
+    const rows = [input({ id: 5, consumed_at: RECEIVED, applied_at: ROUTED, included_at: INCLUDED })];
     const { rerender } = render(
       <SteerQueueCard inputs={rows} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
     );
-    expect(screen.getByText("Delivered")).toBeTruthy();
+    expect(screen.getByText("Included in a prompt")).toBeTruthy();
     // The run completes; the same lifted queue re-renders read-only, chip unchanged.
     rerender(
       <SteerQueueCard inputs={rows} terminal={true} status="completed" busy={false} onStop={noop} onSend={noop} />,
     );
-    expect(screen.getByText("Delivered")).toBeTruthy();
+    expect(screen.getByText("Included in a prompt")).toBeTruthy();
     expect(screen.queryByText("Send follow-up")).toBeNull();
   });
 });

@@ -92,10 +92,10 @@ func TestFitDiskParkLine(t *testing.T) {
 // Reddening mutation: drop the dataVolumeFullCause arm in steerState.
 func TestSteerStateDataVolumeFull(t *testing.T) {
 	consumed := time.Now()
-	if got, want := steerState(kindFollowUp, nil, nil, statusRecoveryWait, dataVolumeFullCause), "queued (run waiting for disk space)"; got != want {
+	if got, want := steerState(queuedIn(), statusRecoveryWait, dataVolumeFullCause), "queued (run waiting for disk space)"; got != want {
 		t.Errorf("steerState(unconsumed, data_volume_full) = %q, want %q", got, want)
 	}
-	if got, want := steerState(kindFollowUp, &consumed, nil, statusRecoveryWait, dataVolumeFullCause), "delivered (run waiting for disk space)"; got != want {
+	if got, want := steerState(receivedIn(consumed), statusRecoveryWait, dataVolumeFullCause), "received (run waiting for disk space)"; got != want {
 		t.Errorf("steerState(consumed, data_volume_full) = %q, want %q", got, want)
 	}
 }

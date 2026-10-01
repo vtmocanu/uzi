@@ -1432,6 +1432,17 @@ export class WorkerClient {
       { ids, claim_generation: claimGeneration })) as InputReceipt;
   }
 
+  /** Issue #1800: report follow_up rows this worker really put into an executor prompt (POST
+   *  /worker/runs/{id}/inputs/included). The reply lists only the rows newly stamped, so unlike ack
+   *  and applied its ids need not equal the request's. The server fences on the run's current
+   *  worker and generation in any status, so the receipt still lands after the terminal report. A
+   *  400 means the capability or the ids were refused; a 404 means the run is not owned or the api
+   *  predates the route (the caller tells them apart and stops sending). */
+  async includeInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
+    return (await this.postJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs/included`,
+      { ids, claim_generation: claimGeneration })) as InputReceipt;
+  }
+
   /** Issue #1604: settle this claim's own approve_plan rows that were disposed of without a gate
    *  taking them (stale, superseded, or after the gate closed) as applied with disposition
    *  'superseded' (POST /worker/runs/{id}/inputs/discarded). The server does not count such a row as
@@ -1447,7 +1458,9 @@ export class WorkerClient {
    *  seeds them into the steering channel on every claim so a follow-up an earlier claim consumed
    *  still reaches this claim's subagents. Throws a RequestError on 4xx/5xx, and an Error on a
    *  200 whose body has no `inputs` array or any row without an integer id, a string kind, and
-   *  a string or null body. */
+   *  a string or null body. Issue #1800: each row also carries `included_at` (when a follow-up
+   *  was reported as put into a prompt; omitted when null) and `inclusion_reported` (whether the
+   *  api tracks inclusion for this run; false when the field is absent). */
   async getConsumedFollowUps(runId: string): Promise<UserInput[]> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/follow-ups`;
     const res = (await this.getJSON(path)) as { inputs?: unknown } | undefined;
@@ -1456,18 +1469,30 @@ export class WorkerClient {
     if (!Array.isArray(res?.inputs)) throw new Error(`GET ${path}: response has no inputs array`);
     // Every row, not just the array: one malformed row fails the whole read, so the caller
     // retries or fails closed and never seeds half a response.
+    const out: UserInput[] = [];
     for (const row of res.inputs as unknown[]) {
-      const r = row as { id?: unknown; kind?: unknown; body?: unknown } | null;
+      const r = row as { id?: unknown; kind?: unknown; body?: unknown; included_at?: unknown; inclusion_reported?: unknown } | null;
       if (
         typeof r !== "object" ||
         r === null ||
         !Number.isSafeInteger(r.id) ||
         typeof r.kind !== "string" ||
-        !(r.body === null || r.body === undefined || typeof r.body === "string")
+        !(r.body === null || r.body === undefined || typeof r.body === "string") ||
+        !(r.included_at === null || r.included_at === undefined || typeof r.included_at === "string") ||
+        !(r.inclusion_reported === undefined || typeof r.inclusion_reported === "boolean")
       )
         throw new Error(`GET ${path}: malformed inputs row`);
+      // Issue #1800: an api that predates inclusion reporting sends neither field; absent
+      // inclusion_reported reads as false, so such a row is never re-queued as "unincluded".
+      // A raw `included_at: null` is dropped here (the spread would carry it past the type).
+      const { included_at: _rawIncludedAt, ...rest } = r as unknown as UserInput & { included_at?: unknown };
+      out.push({
+        ...rest,
+        inclusion_reported: r.inclusion_reported === true,
+        ...(typeof r.included_at === "string" && r.included_at !== "" ? { included_at: r.included_at } : {}),
+      });
     }
-    return res.inputs as UserInput[];
+    return out;
   }
 
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive

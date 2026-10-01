@@ -116,6 +116,23 @@ export class FakeApi {
   legacyConsumeOnRead = false;
   /** Issue #1604: answer POST /inputs/discarded with an untyped 404, like an api that predates it. */
   discardRouteMissing = false;
+  /** Issue #1800: answer POST /inputs/included with an untyped 404, like an api that predates it. */
+  inclusionRouteMissing = false;
+  /** Issue #1800: answer POST /inputs/included like an api that does not own the run: a TYPED 404
+   *  ({"error":"run not found","reason":"stale"}), unlike the untyped one of a missing route. */
+  inclusionNotOwned = false;
+  /** Issue #1800: fail the next `times` POST /inputs/included with this HTTP status. */
+  failingInclusions: { status: number; times: number } | undefined = undefined;
+  /** Issue #1800: when set, GET /follow-ups rows carry `inclusion_reported: true` and, once a row is
+   *  included, `included_at`, as an api that tracks inclusion does. Off, rows are served as before. */
+  inclusionTracking = false;
+  /** Issue #1800: every POST /inputs/included the api received, in arrival order. */
+  readonly inclusionCalls: Array<{ runId: string; ids: number[]; generation: number }> = [];
+  private readonly includedByRun = new Map<string, Set<number>>();
+  /** Issue #1800: whether POST /inputs/included stamped input `id` of `runId`. */
+  isInputIncluded(runId: string, id: number): boolean {
+    return this.includedByRun.get(runId)?.has(id) ?? false;
+  }
   /** Issue #1604: the approve_plan rows settled through /inputs/discarded, per run. */
   private readonly discardedByRun = new Map<string, Set<number>>();
   /** Issue #1604: the most rows one GET /inputs returns (the server's ListReplayRunInputs LIMIT);
@@ -988,6 +1005,33 @@ export class FakeApi {
       });
     }
 
+    // Issue #1800: POST /inputs/included stamps the follow_up rows a prompt really carried. Fenced on
+    // the claim generation only; rows not yet ACKed, not follow_up, or already included are skipped.
+    const includedMatch = /^\/api\/worker\/runs\/([^/]+)\/inputs\/included$/.exec(p);
+    if (req.method === "POST" && includedMatch) {
+      const runId = includedMatch[1]!;
+      const ids = json.ids as number[];
+      const generation = json.claim_generation as number;
+      this.inclusionCalls.push({ runId, ids: [...ids], generation });
+      if (this.inclusionRouteMissing) return send(res, 404, { error: "not found" });
+      if (this.inclusionNotOwned) return send(res, 404, { error: "run not found", reason: "stale" });
+      const failing = this.failingInclusions;
+      if (failing && failing.times > 0) {
+        failing.times--;
+        return send(res, failing.status, { error: "fake: inclusion failure" });
+      }
+      const current = this.receiptGeneration.get(runId);
+      if (current !== undefined && generation !== current)
+        return send(res, 200, { inputs: [], active: false, reason: "stale" });
+      const rows = this.inputsByRun.get(runId) ?? [];
+      const acked = this.ackedByRun.get(runId) ?? new Set<number>();
+      const included = this.includedByRun.get(runId) ?? new Set<number>();
+      const stamped = rows.filter((row) => ids.includes(row.id) && row.kind === "follow_up" && acked.has(row.id) && !included.has(row.id));
+      for (const row of stamped) included.add(row.id);
+      this.includedByRun.set(runId, included);
+      return send(res, 200, { inputs: stamped.map((row) => ({ id: row.id, kind: row.kind })), active: true });
+    }
+
     const receiptMatch = /^\/api\/worker\/runs\/([^/]+)\/inputs\/(ack|applied|discarded)$/.exec(p);
     if (req.method === "POST" && receiptMatch) {
       const runId = receiptMatch[1]!;
@@ -1152,7 +1196,16 @@ export class FakeApi {
         const next = queue.length > 1 ? queue.shift()! : queue[0]!;
         return send(res, next.status, next.body);
       }
-      return send(res, 200, { inputs: this.consumedFollowUpsByRun.get(runId) ?? [] });
+      const consumed = this.consumedFollowUpsByRun.get(runId) ?? [];
+      if (!this.inclusionTracking) return send(res, 200, { inputs: consumed });
+      const included = this.includedByRun.get(runId) ?? new Set<number>();
+      return send(res, 200, {
+        inputs: consumed.map((row) => ({
+          ...row,
+          inclusion_reported: true,
+          ...(included.has(row.id) ? { included_at: "2026-10-01T00:00:00Z" } : {}),
+        })),
+      });
     }
 
     // issue #559 M3: the read-only ownership probe. Not part of the runMatch

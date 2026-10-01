@@ -14,16 +14,20 @@ import (
 
 const ackRunInputRows = `-- name: AckRunInputRows :many
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = $1,
-    consumed_worker_id = $2
-WHERE run_id = $3 AND id = ANY($4::bigint[]) AND applied_at IS NULL
+    consumed_worker_id = $2,
+    -- The row now belongs to this claim: a re-ACK after a resume takes whether THIS claim's worker
+    -- reports inclusion (input_inclusion_v1), but never downgrades a row already stamped included.
+    inclusion_reported = (included_at IS NOT NULL OR $3::boolean)
+WHERE run_id = $4 AND id = ANY($5::bigint[]) AND applied_at IS NULL
 RETURNING id, kind, body, created_at, gate_binding, gate_revision
 `
 
 type AckRunInputRowsParams struct {
-	ClaimGeneration pgtype.Int8 `json:"claim_generation"`
-	WorkerID        pgtype.UUID `json:"worker_id"`
-	RunID           uuid.UUID   `json:"run_id"`
-	Ids             []int64     `json:"ids"`
+	ClaimGeneration   pgtype.Int8 `json:"claim_generation"`
+	WorkerID          pgtype.UUID `json:"worker_id"`
+	InclusionReported bool        `json:"inclusion_reported"`
+	RunID             uuid.UUID   `json:"run_id"`
+	Ids               []int64     `json:"ids"`
 }
 
 type AckRunInputRowsRow struct {
@@ -39,6 +43,7 @@ func (q *Queries) AckRunInputRows(ctx context.Context, arg AckRunInputRowsParams
 	rows, err := q.db.Query(ctx, ackRunInputRows,
 		arg.ClaimGeneration,
 		arg.WorkerID,
+		arg.InclusionReported,
 		arg.RunID,
 		arg.Ids,
 	)
@@ -504,7 +509,7 @@ WITH cancelled AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT cancelled.id, 'pause_cancel', NULL::text FROM cancelled
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 // Withdraw a pending pause AND write the kind='pause_cancel' audit row in ONE statement
@@ -530,6 +535,8 @@ func (q *Queries) CancelPauseInput(ctx context.Context, id uuid.UUID) (RunUserIn
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -2527,7 +2534,7 @@ SELECT selected.run_id, 'approve_plan', $1,
        CASE WHEN selected.run_kind NOT IN ('chat', 'judge') AND selected.run_status = 'awaiting_approval' AND selected.run_gate_revision > 0
             THEN selected.run_gate_revision END
 FROM selected
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateApprovePlanInputParams struct {
@@ -2587,6 +2594,8 @@ func (q *Queries) CreateApprovePlanInput(ctx context.Context, arg CreateApproveP
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -2679,7 +2688,7 @@ SELECT locked.id, 'approve_plan', $1,
        CASE WHEN locked.kind NOT IN ('chat', 'judge') AND locked.status = 'awaiting_approval' AND locked.gate_revision > 0
             THEN locked.gate_revision END
 FROM locked
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateGateVerdictInputParams struct {
@@ -2723,6 +2732,8 @@ func (q *Queries) CreateGateVerdictInput(ctx context.Context, arg CreateGateVerd
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -2745,7 +2756,7 @@ WITH paused_req AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT paused_req.id, 'pause', $1 FROM paused_req
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreatePauseInputParams struct {
@@ -2789,6 +2800,8 @@ func (q *Queries) CreatePauseInput(ctx context.Context, arg CreatePauseInputPara
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -3105,7 +3118,7 @@ func (q *Queries) CreateRun(ctx context.Context, arg CreateRunParams) (Run, erro
 const createRunAnswerInput = `-- name: CreateRunAnswerInput :one
 INSERT INTO run_user_inputs (run_id, kind, body, question_id)
 VALUES ($1, 'answer', $2, $3)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateRunAnswerInputParams struct {
@@ -3146,6 +3159,8 @@ func (q *Queries) CreateRunAnswerInput(ctx context.Context, arg CreateRunAnswerI
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -3154,7 +3169,7 @@ const createRunInput = `-- name: CreateRunInput :one
 
 INSERT INTO run_user_inputs (run_id, kind, body)
 VALUES ($1, $2, $3)
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateRunInputParams struct {
@@ -3189,6 +3204,8 @@ func (q *Queries) CreateRunInput(ctx context.Context, arg CreateRunInputParams) 
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -3210,7 +3227,7 @@ SELECT bumped.run_id, 'revise_plan', $1,
        CASE WHEN bumped.run_kind NOT IN ('chat', 'judge') AND bumped.run_status = 'awaiting_approval' AND bumped.run_gate_revision > 0
             THEN bumped.run_gate_revision END
 FROM bumped
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateRunReviseInputIfUnderCapParams struct {
@@ -3315,6 +3332,8 @@ func (q *Queries) CreateRunReviseInputIfUnderCap(ctx context.Context, arg Create
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -3334,7 +3353,7 @@ superseded AS (
 )
 INSERT INTO run_user_inputs (run_id, kind, body)
 SELECT capped.id, 'scope', $1 FROM capped
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateScopeCeilingInputParams struct {
@@ -3384,6 +3403,8 @@ func (q *Queries) CreateScopeCeilingInput(ctx context.Context, arg CreateScopeCe
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -3406,7 +3427,7 @@ SELECT stamped.run_id, $1, $2,
                  AND stamped.run_status = 'awaiting_approval' AND stamped.run_gate_revision > 0
             THEN stamped.run_gate_revision END
 FROM stamped
-RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision
+RETURNING id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported
 `
 
 type CreateStopVerdictInputParams struct {
@@ -3480,6 +3501,8 @@ func (q *Queries) CreateStopVerdictInput(ctx context.Context, arg CreateStopVerd
 		&i.AppliedAt,
 		&i.GateBinding,
 		&i.GateRevision,
+		&i.IncludedAt,
+		&i.InclusionReported,
 	)
 	return i, err
 }
@@ -6257,6 +6280,59 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 	return i, err
 }
 
+const includeRunInputRows = `-- name: IncludeRunInputRows :many
+UPDATE run_user_inputs SET included_at = now(), inclusion_reported = true
+WHERE run_id = $1 AND id = ANY($2::bigint[]) AND kind = 'follow_up'
+  AND consumed_at IS NOT NULL AND included_at IS NULL
+RETURNING id, kind, body, created_at, gate_binding, gate_revision
+`
+
+type IncludeRunInputRowsParams struct {
+	RunID uuid.UUID `json:"run_id"`
+	Ids   []int64   `json:"ids"`
+}
+
+type IncludeRunInputRowsRow struct {
+	ID           int64              `json:"id"`
+	Kind         string             `json:"kind"`
+	Body         pgtype.Text        `json:"body"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	GateBinding  pgtype.Text        `json:"gate_binding"`
+	GateRevision pgtype.Int8        `json:"gate_revision"`
+}
+
+// The worker reports follow_up rows it actually included in an executor prompt. Stamps
+// included_at once (idempotent) and sets inclusion_reported: the receipt itself proves the
+// reporting worker supports inclusion, even for a row a legacy worker ACKed before a resume.
+// No per-row claim fence: a follow-up recovered after a resume was consumed by an earlier
+// claim; the service fences the CALLER's claim instead. run_id scopes the ids to this run.
+func (q *Queries) IncludeRunInputRows(ctx context.Context, arg IncludeRunInputRowsParams) ([]IncludeRunInputRowsRow, error) {
+	rows, err := q.db.Query(ctx, includeRunInputRows, arg.RunID, arg.Ids)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []IncludeRunInputRowsRow{}
+	for rows.Next() {
+		var i IncludeRunInputRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Body,
+			&i.CreatedAt,
+			&i.GateBinding,
+			&i.GateRevision,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const insertRunGatePresentation = `-- name: InsertRunGatePresentation :exec
 INSERT INTO run_gate_presentations (run_id, presentation_id, revision)
 VALUES ($1, $2, $3)
@@ -7213,15 +7289,17 @@ func (q *Queries) ListCodexAccountWaitRunsPage(ctx context.Context, arg ListCode
 }
 
 const listConsumedFollowUpInputsForRun = `-- name: ListConsumedFollowUpInputsForRun :many
-SELECT id, body, created_at FROM run_user_inputs
+SELECT id, body, created_at, included_at, inclusion_reported FROM run_user_inputs
 WHERE run_id = $1 AND kind = 'follow_up' AND consumed_at IS NOT NULL
 ORDER BY id ASC
 `
 
 type ListConsumedFollowUpInputsForRunRow struct {
-	ID        int64              `json:"id"`
-	Body      pgtype.Text        `json:"body"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID                int64              `json:"id"`
+	Body              pgtype.Text        `json:"body"`
+	CreatedAt         pgtype.Timestamptz `json:"created_at"`
+	IncludedAt        pgtype.Timestamptz `json:"included_at"`
+	InclusionReported bool               `json:"inclusion_reported"`
 }
 
 // Issue #1660: the run's ALREADY-CONSUMED follow_up inputs, oldest first, for a worker to
@@ -7235,7 +7313,8 @@ type ListConsumedFollowUpInputsForRunRow struct {
 // they are applied (issue #1673): an ACKed-but-unapplied follow-up from a prior claim is already
 // a constraint, and a subagent dispatched before the live GET/ACK replays it must carry it. The
 // replay still reaches the lead once, by id. Ordered by id, the same rule as the /inputs FIFO
-// (ConsumeRunInputs), so the worker keeps the server's order as is.
+// (ConsumeRunInputs), so the worker keeps the server's order as is. included_at and
+// inclusion_reported ride along so a recovering worker skips rows already reported.
 func (q *Queries) ListConsumedFollowUpInputsForRun(ctx context.Context, runID uuid.UUID) ([]ListConsumedFollowUpInputsForRunRow, error) {
 	rows, err := q.db.Query(ctx, listConsumedFollowUpInputsForRun, runID)
 	if err != nil {
@@ -7245,7 +7324,13 @@ func (q *Queries) ListConsumedFollowUpInputsForRun(ctx context.Context, runID uu
 	items := []ListConsumedFollowUpInputsForRunRow{}
 	for rows.Next() {
 		var i ListConsumedFollowUpInputsForRunRow
-		if err := rows.Scan(&i.ID, &i.Body, &i.CreatedAt); err != nil {
+		if err := rows.Scan(
+			&i.ID,
+			&i.Body,
+			&i.CreatedAt,
+			&i.IncludedAt,
+			&i.InclusionReported,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -7317,7 +7402,7 @@ func (q *Queries) ListDockerBlockedReposForUser(ctx context.Context, arg ListDoc
 }
 
 const listFollowUpInputsForRun = `-- name: ListFollowUpInputsForRun :many
-SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision FROM run_user_inputs
+SELECT id, run_id, kind, body, consumed_at, created_at, question_id, disposition, consumed_claim_generation, consumed_worker_id, applied_at, gate_binding, gate_revision, included_at, inclusion_reported FROM run_user_inputs
 WHERE run_id = $1 AND kind IN ('follow_up', 'scope')
 ORDER BY id DESC
 `
@@ -7325,7 +7410,10 @@ ORDER BY id DESC
 // The steer queue for a run, NEWEST FIRST and UNCAPPED (PRD #95 Decision 4, #634): the
 // web + CLI steer queue reads BOTH follow_up rows and operator scope directives
 // (kind IN ('follow_up','scope')). A follow_up's state is derived client-side from
-// consumed_at (NULL → Queued, set → Delivered); a scope row is never consumed, so its
+// consumed_at / applied_at / included_at (consumed_at NULL → Queued; consumed_at set → Received;
+// applied_at set → Routed; included_at set → Included in an executor prompt. A NULL included_at
+// means "not yet included" only when inclusion_reported is true, i.e. the worker that ACKed the
+// row (or a later inclusion receipt) shows it reports inclusion; otherwise it means unknown); a scope row is never consumed, so its
 // state is its disposition (applied/declined/superseded, NULL → pending). Deliberately
 // NOT the judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that
 // would drop the newest entries behind its cap on a busy/chat run. Owner-scoping is
@@ -7358,6 +7446,8 @@ func (q *Queries) ListFollowUpInputsForRun(ctx context.Context, runID uuid.UUID)
 			&i.AppliedAt,
 			&i.GateBinding,
 			&i.GateRevision,
+			&i.IncludedAt,
+			&i.InclusionReported,
 		); err != nil {
 			return nil, err
 		}
@@ -7933,7 +8023,7 @@ func (q *Queries) ListRunCredentialEpochs(ctx context.Context, arg ListRunCreden
 }
 
 const listRunLeadToolWindow = `-- name: ListRunLeadToolWindow :many
-SELECT seq, kind, payload
+SELECT seq, kind, payload, created_at
 FROM run_messages
 WHERE run_id = $1 AND agent_instance IS NULL
   AND (kind IN ('tool_use', 'tool_result')
@@ -7948,9 +8038,10 @@ type ListRunLeadToolWindowParams struct {
 }
 
 type ListRunLeadToolWindowRow struct {
-	Seq     int32  `json:"seq"`
-	Kind    string `json:"kind"`
-	Payload []byte `json:"payload"`
+	Seq       int32              `json:"seq"`
+	Kind      string             `json:"kind"`
+	Payload   []byte             `json:"payload"`
+	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
 // The tail of a running run's LEAD lane for in-flight detection only (Decision 9,
@@ -7963,7 +8054,8 @@ type ListRunLeadToolWindowRow struct {
 // stop its scan at the start of the current claim/query leg and never count an
 // orphaned call from an earlier leg as in flight. Loop detection keeps reading
 // ListRunToolWindow unchanged. The Go side re-checks kind and payload event
-// itself rather than trusting this filter alone.
+// itself rather than trusting this filter alone. created_at is the server receive
+// time, used to age the oldest open call (issue #2046).
 func (q *Queries) ListRunLeadToolWindow(ctx context.Context, arg ListRunLeadToolWindowParams) ([]ListRunLeadToolWindowRow, error) {
 	rows, err := q.db.Query(ctx, listRunLeadToolWindow, arg.RunID, arg.Lim)
 	if err != nil {
@@ -7973,7 +8065,12 @@ func (q *Queries) ListRunLeadToolWindow(ctx context.Context, arg ListRunLeadTool
 	items := []ListRunLeadToolWindowRow{}
 	for rows.Next() {
 		var i ListRunLeadToolWindowRow
-		if err := rows.Scan(&i.Seq, &i.Kind, &i.Payload); err != nil {
+		if err := rows.Scan(
+			&i.Seq,
+			&i.Kind,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

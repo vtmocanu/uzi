@@ -109,6 +109,13 @@ type Options struct {
 	// included) can set it, Config.FetcherOptions leaves it nil (TestFetcherOptionsHaveNoTestSeam),
 	// and the policy check before it is not skipped.
 	testDial func(ctx context.Context, addr netip.AddrPort) (net.Conn, error)
+
+	// testAfterHeaders, when set, runs in hop once the response headers have arrived and
+	// before the body is read, with the fetch's own context, so this package's tests can end
+	// that context (or wait for its deadline) at that exact point. It is unexported: no
+	// other package can set it, and Config.FetcherOptions leaves it nil
+	// (TestFetcherOptionsHaveNoTestSeam).
+	testAfterHeaders func(ctx context.Context)
 }
 
 // Fetcher performs checked GETs.
@@ -203,6 +210,17 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string, entries []string, ma
 			return nil, ref
 		}
 		if res != nil {
+			// The transport can hand back a response that raced the fetch's own
+			// teardown (its deadline or the caller's cancel closing the conn), and
+			// the body then reads as a clean, possibly empty, success. A result
+			// after the context ended is refused: doc.go's timeout/cancelled contract.
+			// The status it carried is kept, as the body-read refusal in hop keeps it.
+			if ctx.Err() != nil {
+				ref := ctxRefusal(ctx)
+				ref.FinalURL = cur
+				ref.HTTPStatus = res.HTTPStatus
+				return nil, ref
+			}
 			res.FinalURL = cur
 			return res, nil
 		}
@@ -218,6 +236,9 @@ func (f *Fetcher) hop(ctx context.Context, u *url.URL, host string, hop int, max
 		return nil, "", 0, classify(ctx, err)
 	}
 	defer func() { _ = resp.Body.Close() }()
+	if f.opts.testAfterHeaders != nil {
+		f.opts.testAfterHeaders(ctx)
+	}
 
 	if isRedirect(resp.StatusCode) {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, redirectDiscardCap))

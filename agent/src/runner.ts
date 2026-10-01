@@ -7213,7 +7213,12 @@ export class RunRunner {
     let lastErr: unknown;
     for (let attempt = 1; attempt <= 3; attempt++) {
       try {
-        steering.seedOperatorConstraints(await this.client.getConsumedFollowUps(runId));
+        const consumed = await this.client.getConsumedFollowUps(runId);
+        steering.seedOperatorConstraints(consumed);
+        // Issue #1800: a follow-up an earlier claim consumed but never put into a prompt is
+        // delivered again by this claim (the same GET, so no extra request; a failed read above
+        // re-queues nothing).
+        steering.requeueUnincludedFollowUps(consumed);
         return;
       } catch (err) {
         lastErr = err;
@@ -8568,9 +8573,11 @@ export class RunRunner {
           claim.config ?? null,
         ),
       pullFollowUp: () => steering.pullFollowUp(),
+      // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
+      followUpIncluded: (id) => steering.markFollowUpIncluded(id),
       // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
       // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by
-      // both executors at their loop top ahead of the follow-up drain.
+      // both executors at their loop top ahead of the owner follow-up pull.
       pullSafetySteer: () => steering.pullSafetySteer(),
       // Issue #1660: the follow-ups received so far, attached to every later subagent dispatch.
       operatorConstraints: () => steering.operatorConstraints(),

@@ -273,8 +273,8 @@ func TestSteerApproveOnlyAtThePlanGate(t *testing.T) {
 	}
 }
 
-// The queued/delivered indicator uses the SHARED steerState + relAge helpers, so the
-// TUI and `uzi run inputs` cannot disagree about what "delivered" means.
+// The queue indicator uses the SHARED steerState + relAge helpers, so the TUI and
+// `uzi run inputs` cannot disagree about what "queued" and "received" mean.
 func TestSteerQueueIndicatorUsesTheSharedVocabulary(t *testing.T) {
 	runID := "r-own"
 	body := "please also update the docs"
@@ -290,13 +290,39 @@ func TestSteerQueueIndicatorUsesTheSharedVocabulary(t *testing.T) {
 	out := m.View().Content
 	// These strings come from steerState, not from this file — if the shared helper's
 	// wording changes, this test follows it rather than pinning a stale copy.
-	wantQueued := steerState(kindFollowUp, nil, nil, "running")
-	wantDelivered := steerState(kindFollowUp, &consumed, nil, "running")
+	wantQueued := steerState(queuedIn(), "running")
+	wantReceived := steerState(receivedIn(consumed), "running")
 	if !strings.Contains(out, wantQueued) {
 		t.Errorf("the queue indicator does not show %q\n%s", wantQueued, out)
 	}
-	if !strings.Contains(out, wantDelivered) {
-		t.Errorf("the queue indicator does not show %q\n%s", wantDelivered, out)
+	if !strings.Contains(out, wantReceived) {
+		t.Errorf("the queue indicator does not show %q\n%s", wantReceived, out)
+	}
+}
+
+// Issue #1800: a consumed row whose worker reports inclusion but never confirmed it,
+// on a terminal run, reads "not confirmed (run finished)" -- never "not included" -- and
+// the label fits the 30-column state cell untruncated.
+func TestSteerQueueTerminalUnconfirmedRowIsNotClaimedAsNotIncluded(t *testing.T) {
+	runID := "r-done"
+	run := ownedRun(runID)
+	run.Status = "completed"
+	body := "please also update the docs"
+	consumed := time.Now().Add(-time.Minute)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m = applyDetail(m, run, nil)
+	next, _ := m.Update(runInputsMsg{runID: runID, inputs: []apitypes.SteerInputDTO{
+		{ID: 1, Kind: "follow_up", Body: &body, CreatedAt: time.Now().Add(-2 * time.Minute),
+			ConsumedAt: &consumed, InclusionReported: true},
+	}})
+	m = next.(tuiModel)
+
+	block := stripANSI(m.renderSteerQueue())
+	if !strings.Contains(block, "not confirmed (run finished)") {
+		t.Errorf("terminal unconfirmed row does not read %q\n%s", "not confirmed (run finished)", block)
+	}
+	if strings.Contains(block, "not included") {
+		t.Errorf("a missing receipt must not be reported as not included\n%s", block)
 	}
 }
 
@@ -332,8 +358,8 @@ func TestSteerQueueLabelsTheScopeKind(t *testing.T) {
 	// Identify each row by a state-label substring unique to it (state labels come from
 	// the shared steerState helper and are rendered regardless of the KIND cell), so we
 	// assert on the RIGHT line rather than assuming row order.
-	scopeState := steerState("scope", nil, nil, m.detail.run.Status)
-	followState := steerState("follow_up", nil, nil, m.detail.run.Status)
+	scopeState := steerState(apitypes.SteerInputDTO{Kind: "scope"}, m.detail.run.Status)
+	followState := steerState(queuedIn(), m.detail.run.Status)
 	var scopeLine, followLine string
 	for _, line := range lines {
 		if strings.Contains(line, scopeState) {

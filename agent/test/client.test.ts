@@ -691,6 +691,78 @@ describe("getConsumedFollowUps (issue #1660)", () => {
   });
 });
 
+// Issue #1800: POST /inputs/included reports the follow-ups a prompt really carried, and GET
+// /follow-ups rows carry the api's inclusion record.
+describe("includeInputs (issue #1800)", () => {
+  beforeEach(() => {
+    api.strictReceiptGenerations = true;
+  });
+
+  it("posts the ids and generation to /inputs/included and returns the rows it newly stamped", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("incl-run", 4);
+    api.setInputs("incl-run", [{ id: 5, kind: "follow_up", body: "a" }, { id: 6, kind: "follow_up", body: "b" }]);
+    await client.ackInputs("incl-run", [5, 6], 4);
+    const first = await client.includeInputs("incl-run", [5], 4);
+    assert.strictEqual(first.active, true);
+    assert.deepStrictEqual(first.inputs.map((r) => r.id), [5]);
+    assert.deepStrictEqual(api.inclusionCalls.at(-1), { runId: "incl-run", ids: [5], generation: 4 });
+    // Not an ack/applied-style equality check: re-sending 5 with 6 stamps only the new row.
+    const second = await client.includeInputs("incl-run", [5, 6], 4);
+    assert.deepStrictEqual(second.inputs.map((r) => r.id), [6]);
+    const none = await client.includeInputs("incl-run", [5, 6], 4);
+    assert.deepStrictEqual(none, { inputs: [], active: true }, "idempotent: nothing newly stamped");
+  });
+
+  it("maps a superseded claim to an inactive receipt and an api without the route to a 404", async () => {
+    const client = newClient();
+    api.setInputClaimGeneration("incl-run", 5);
+    const stale = await client.includeInputs("incl-run", [5], 4);
+    assert.strictEqual(stale.active, false);
+    assert.strictEqual(stale.reason, "stale");
+    api.inclusionRouteMissing = true;
+    await assert.rejects(client.includeInputs("incl-run", [5], 5), (err: unknown) => err instanceof RequestError && err.status === 404);
+  });
+});
+
+describe("getConsumedFollowUps inclusion fields (issue #1800)", () => {
+  it("parses included_at and inclusion_reported, and reads a missing inclusion_reported as false", async () => {
+    const client = newClient();
+    api.overrideFollowUps("run-fu-incl", 200, {
+      inputs: [
+        { id: 1, kind: "follow_up", body: "old api row" },
+        { id: 2, kind: "follow_up", body: "never included", inclusion_reported: true },
+        { id: 3, kind: "follow_up", body: "included", inclusion_reported: true, included_at: "2026-10-01T00:00:00Z" },
+      ],
+    });
+    const rows = await client.getConsumedFollowUps("run-fu-incl");
+    assert.deepStrictEqual(
+      rows.map((r) => [r.id, r.inclusion_reported, r.included_at]),
+      [[1, false, undefined], [2, true, undefined], [3, true, "2026-10-01T00:00:00Z"]],
+    );
+  });
+
+  it("drops a raw included_at null instead of leaking it past the string|undefined type", async () => {
+    const client = newClient();
+    api.overrideFollowUps("run-fu-incl-null", 200, {
+      inputs: [{ id: 1, kind: "follow_up", body: "x", inclusion_reported: true, included_at: null }],
+    });
+    const [row] = await client.getConsumedFollowUps("run-fu-incl-null");
+    assert.ok(!("included_at" in row!), "the key is absent, not null");
+  });
+
+  it("rejects a row whose inclusion fields have the wrong type", async () => {
+    const client = newClient();
+    for (const row of [
+      { id: 1, kind: "follow_up", body: "x", included_at: 5 },
+      { id: 1, kind: "follow_up", body: "x", inclusion_reported: "yes" },
+    ]) {
+      api.overrideFollowUps("run-fu-incl-bad", 200, { inputs: [row] });
+      await assert.rejects(client.getConsumedFollowUps("run-fu-incl-bad"), /malformed inputs row/, JSON.stringify(row));
+    }
+  });
+});
+
 describe("MessageBatcher seq numbering", () => {
   it("continues gapless numbering from last_seq across flushes", async () => {
     const client = newClient();

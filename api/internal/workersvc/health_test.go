@@ -152,6 +152,9 @@ type fakeRunMessage struct {
 	kind          string
 	agentInstance string
 	payload       []byte
+	// createdAt is the row's server receive time. Zero models "unknown": the fake
+	// leaves CreatedAt invalid, which the scan treats as never aged (issue #2046).
+	createdAt time.Time
 }
 
 // leadWindowKind mirrors ListRunLeadToolWindow's kind/event filter.
@@ -182,7 +185,7 @@ func (f *healthFakeStore) ListRunLeadToolWindow(_ context.Context, arg store.Lis
 	if !ok {
 		var out []store.ListRunLeadToolWindowRow
 		for _, r := range f.window[arg.RunID] {
-			out = append(out, store.ListRunLeadToolWindowRow(r))
+			out = append(out, store.ListRunLeadToolWindowRow{Seq: r.Seq, Kind: r.Kind, Payload: r.Payload})
 		}
 		return out, nil
 	}
@@ -194,7 +197,11 @@ func (f *healthFakeStore) ListRunLeadToolWindow(_ context.Context, arg store.Lis
 		if int32(len(out)) >= arg.Lim { //nolint:gosec // G115: test fixture sizes are tiny
 			break
 		}
-		out = append(out, store.ListRunLeadToolWindowRow{Seq: m.seq, Kind: m.kind, Payload: m.payload})
+		row := store.ListRunLeadToolWindowRow{Seq: m.seq, Kind: m.kind, Payload: m.payload}
+		if !m.createdAt.IsZero() {
+			row.CreatedAt = pgconv.Time(m.createdAt)
+		}
+		out = append(out, row)
 	}
 	return out, nil
 }
@@ -258,6 +265,8 @@ func (f *healthFakeStore) SetRunHealth(_ context.Context, arg store.SetRunHealth
 type fakeHealthSettings struct {
 	enabled                                           bool
 	stall, nearTimeoutPct, queued, approval, cooldown int
+	// toolCall is the long-tool-call threshold (issue #2046); 0 (the default) disables it.
+	toolCall int
 	// PRD #1189: the per-run extension cap the `extend` SubmitInput branch reads. Zero (the
 	// default) means extending is disabled, so a test opts in with a non-zero cap.
 	runExtensionCap int
@@ -265,6 +274,9 @@ type fakeHealthSettings struct {
 
 func (s fakeHealthSettings) HealthEnabled(context.Context) (bool, error)     { return s.enabled, nil }
 func (s fakeHealthSettings) HealthStallSeconds(context.Context) (int, error) { return s.stall, nil }
+func (s fakeHealthSettings) HealthToolCallSeconds(context.Context) (int, error) {
+	return s.toolCall, nil
+}
 func (s fakeHealthSettings) HealthNearTimeoutPct(context.Context) (int, error) {
 	return s.nearTimeoutPct, nil
 }

@@ -9,6 +9,13 @@ import { WorkerClient } from "../src/client.js";
 import { GateInputDeliveryError, SteeringChannel } from "../src/steering.js";
 import type { UserInput } from "../src/protocol.js";
 
+/** Issue #1800: follow-up outcomes and chat messages now carry the input id; most tests here
+ *  assert only the kind and text, so they compare it with the id stripped. */
+function noId<T extends object>(o: T): Omit<T, "id"> {
+  const { id: _id, ...rest } = o as T & { id?: unknown };
+  return rest;
+}
+
 const TOKEN = "worker-join-token-0123456789";
 const RUN = "receipt-run";
 let api: FakeApi;
@@ -86,7 +93,7 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     {
       kind: "follow_up",
       body: "constraint",
-      delivered: async (ch) => assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "constraint" }),
+      delivered: async (ch) => assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "constraint" }),
     },
   ];
 
@@ -135,9 +142,9 @@ describe("recoverable /inputs drain (issue #1673)", () => {
     const ch = channel(clientLosingGets(1), 1);
     await until(() => api.inputReceiptCalls.some((call) => call.kind === "applied"));
     await ch.awaitReceiptSettlement();
-    assert.strictEqual(ch.pullFollowUp(), "seven");
-    assert.strictEqual(ch.pullFollowUp(), "eight");
-    assert.strictEqual(ch.pullFollowUp(), undefined, "each follow-up reaches the lead once");
+    assert.strictEqual(ch.pullFollowUp()?.body, "seven");
+    assert.strictEqual(ch.pullFollowUp()?.body, "eight");
+    assert.strictEqual(ch.pullFollowUp()?.body, undefined, "each follow-up reaches the lead once");
     assert.deepStrictEqual(ch.operatorConstraints(), ["seven", "eight"]);
   });
 
@@ -154,8 +161,8 @@ describe("recoverable /inputs drain (issue #1673)", () => {
       api.inputReceiptCalls.map((call) => [call.kind, call.ids]),
       [["ack", [7, 8]], ["applied", [8]], ["applied", [8]]],
     );
-    assert.strictEqual(ch.pullFollowUp(), "once");
-    assert.strictEqual(ch.pullFollowUp(), undefined);
+    assert.strictEqual(ch.pullFollowUp()?.body, "once");
+    assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     assert.deepStrictEqual(await unapplied(), [7], "the revise awaits its revised plan");
   });
 

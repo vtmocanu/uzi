@@ -109,6 +109,7 @@ const (
 	// keeps serving the cached value (Cache.snapshot's stale-on-error).
 	KeyCompletionInterlockRollout = "completion_interlock_rollout"
 	KeyHealthStallSeconds         = "health_stall_seconds"
+	KeyHealthToolCallSeconds      = "health_tool_call_seconds"
 	// KeyHealthNearTimeoutPct (PRD #1170) replaces the retired seconds-based health-slow
 	// setting. A percentage of the run's effective wall-clock budget (0 = disabled, else [50, 99])
 	// at which a running run is flagged near timeout — validated by validateHealthPercent,
@@ -353,6 +354,7 @@ const (
 	// cache keeps the cached value.
 	DefaultCompletionInterlockRollout = "true"
 	DefaultHealthStallSeconds         = "300"  // 5m of silence (no tool in flight)
+	DefaultHealthToolCallSeconds      = "1200" // 20m: one lead tool call open this long on a quiet run
 	DefaultHealthNearTimeoutPct       = "85"   // PRD #1170: flag at 85% of the run's wall-clock budget
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
@@ -495,6 +497,7 @@ var Defaults = map[string]string{
 	// settings page on every instance and no migration seeds it.
 	KeyCompletionInterlockRollout: DefaultCompletionInterlockRollout,
 	KeyHealthStallSeconds:         DefaultHealthStallSeconds,
+	KeyHealthToolCallSeconds:      DefaultHealthToolCallSeconds,
 	KeyHealthNearTimeoutPct:       DefaultHealthNearTimeoutPct,
 	KeyRunExtensionCapSeconds:     DefaultRunExtensionCapSeconds,
 	KeyHealthQueuedSeconds:        DefaultHealthQueuedSeconds,

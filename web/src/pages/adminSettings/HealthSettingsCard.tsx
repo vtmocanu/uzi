@@ -9,7 +9,7 @@ import {
 import { errorMessage } from "../../lib/apiError";
 import { Alert, Button, Card, Field, Input, SectionTitle } from "../../components/ui";
 
-// Each health field carries its OWN validator (PRD #1170): the four thresholds are in
+// Each health field carries its OWN validator (PRD #1170): the thresholds are in
 // seconds (validateHealthSeconds), while health_near_timeout_pct is a percent of the
 // run's wall-clock budget (validateHealthPercent) — the field types diverged when the
 // wall-clock "slow" timer became a budget-relative "near timeout" flag.
@@ -23,6 +23,12 @@ const HEALTH_FIELDS: {
     key: "health_stall_seconds",
     label: "Stalled after (seconds of silence)",
     hint: "No new activity while no tool call is in flight.",
+    validate: validateHealthSeconds,
+  },
+  {
+    key: "health_tool_call_seconds",
+    label: "Long tool call after (seconds)",
+    hint: "A single tool call still running after this long, with no other activity for the Stalled after window (or this long, if that is 0). A delegation whose subagent is still sending updates is never flagged; an older delegation, no longer among the run's recent calls, whose subagent has gone quiet can be. 0 disables this signal.",
     validate: validateHealthSeconds,
   },
   {

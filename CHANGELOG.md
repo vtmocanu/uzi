@@ -27,6 +27,12 @@ through `[0.52.0]`.)
 - **Codex runs, delegated agents and the judge apply the configured reasoning effort.**
   The executor consumes the claimed effort and sends the app-server turn parameter as `effort`; the previously used internal field name was ignored by Codex.
 
+- **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
+  A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
+
+- **A Codex command that hits its 60-minute deadline is stopped before the agent hears about it ([#2048](https://github.com/vtmocanu/uzi/issues/2048)).**
+  The command's process tree is reaped before the call returns, and the agent gets an explicit "stopped at its deadline" error instead of the generic broker failure; an unclean reap still fails closed.
+
 - **Run lists avoid scanning unrelated messages for plan revision state ([#2041](https://github.com/vtmocanu/uzi/issues/2041)).**
   A concurrently built partial index keeps the plan revision lookup scoped to plan and plan_revising frames as run histories grow, reducing board refresh delays without changing revision flags.
 
@@ -36,7 +42,18 @@ through `[0.52.0]`.)
 - **Isolated lane: provisioning follows the chart's lane setting ([#1965](https://github.com/vtmocanu/uzi/issues/1965)).**
   The api now provisions isolated-lane workers for site-list-bound runs only when the lane is enabled, detected from `UZI_FETCHER_TOKEN_SHA256`, which the chart renders into the api only when `workers.isolatedLane.enabled` and `workers.enabled` are on; a lane that is on with the fetcher token Secret key missing reads as off (fail closed). Creating a job that names a site list (`egress_profile`) on an instance without the lane is refused with 503 `isolated_lane_unavailable` and no job is created. A run already bound (for example, created before the lane was turned off) with no lane worker provisioned for it stays queued, and its queued reason now says an admin must enable the isolated research lane in the deployment; that reason takes precedence over the ephemeral-provisioning-off reason, while the requires-docker reason still comes first. A lane worker already provisioned or registered for a bound run is not recalled when the lane goes off: it can still run the job, or fail it at the provision deadline if it never registers. The 503 is checked before the site list's allowance (403) and existence (404) checks.
 
+- **Codex runs now include owner follow-ups in the agent's prompt, and the steer queue says whether a follow-up reached a prompt ([#1800](https://github.com/vtmocanu/uzi/issues/1800)).**
+  A follow-up sent to a Codex run was accepted and shown as delivered but never reached the agent; it now rides the next ordinary implementation prompt on both Claude and Codex, one per turn, and one sent at the plan gate is included in the first prompt after approval (on Claude it used to wait a turn). After a resume, a follow-up handled by a worker that reports inclusion but never included is re-sent to the lead (at-least-once, so it can appear twice). `uzi run inputs`, the TUI and the web steer queue no longer say "delivered": they show queued, received, routed, included in a prompt, or not confirmed (run finished), and rows handled by older workers read "no inclusion report". The follow-up text is fenced as untrusted input with a per-prompt tag. The steer-queue API (`/api/runs/{id}/inputs`, `uzi run inputs --json`) gains `applied_at`, `included_at` and `inclusion_reported`. See [run activity](docs/run-activity.md).
+
+### Changed
+
+- **Codex leads and subagents are told how a long gate command behaves ([#1926](https://github.com/vtmocanu/uzi/issues/1926)).**
+  A Codex command reaps its backgrounded descendants before it returns, so the agent is now told to run one long gate in the foreground to a log and read the recorded exit status, instead of backgrounding it and polling a result that no longer exists.
+
 ### Added
+
+- **Run health flags a tool call that has been running too long ([#2046](https://github.com/vtmocanu/uzi/issues/2046)).**
+  A running run is now flagged stalled, with the reason "a tool call has been in progress longer than the configured threshold", when its main agent's oldest open tool call has run for at least the new admin setting `health_tool_call_seconds` (default 20 minutes, `0` turns it off) and the run has gone quiet for the stall window. Calls to subagents are never aged. Previously a single hung command kept a run's health reading ok until the run neared its wall-clock timeout.
 
 - **Renovate proposes grouped Codex runtime upgrades.**
   Stable native-runtime releases follow the existing seven-day release age and nightly update schedule. Each PR updates the source commit and both musl archive checksums together; installer consistency checks and runtime pin parity block partial upgrades until the required compatibility work is complete.

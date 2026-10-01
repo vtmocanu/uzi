@@ -584,8 +584,9 @@ A few worth knowing:
   activity pane](./run-activity.md#steer-queue). `--json` prints the raw DTO
   instead. The `KIND` column distinguishes a follow-up from an operator
   **scope directive** (PRD #634, `uzi run stop`/`run scope` on a
-  milestone-structured issue run): a follow-up's `STATE` is a delivery state
-  (queued/delivered, as before); a scope directive's `STATE` is its
+  milestone-structured issue run): a follow-up's `STATE` is a receipt state
+  (`queued`, `received`, `routed`, `included in a prompt`, or `not delivered` /
+  `not confirmed (run finished)` once the run ends); a scope directive's `STATE` is its
   **disposition** instead — `active (scope ceiling set)` while pending,
   `applied (finalized at the ceiling)`, `declined (not acted on)`, or
   `superseded (a later directive replaced it)` — because a scope row is
@@ -1484,8 +1485,8 @@ view, where the run's branch is known.
 The steer bar sends `follow_up`, `approve_plan`, `reject_plan`, or `cancel`
 to the **run** — there's no wire to whisper to one live subagent. The lane
 rail is where you *watch* per-agent activity; the run (and its lead, who
-then directs its own subagents) is what you *steer*. A queued/delivered
-indicator above the bar reflects the same steer queue `uzi run inputs`
+then directs its own subagents) is what you *steer*. A queue indicator
+above the bar (queued, received, routed, included in a prompt) reflects the same steer queue `uzi run inputs`
 prints.
 
 ### Who can steer what
