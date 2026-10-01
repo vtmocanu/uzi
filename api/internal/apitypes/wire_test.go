@@ -951,6 +951,14 @@ func TestProductDTOTags(t *testing.T) {
 		"client_secret", "product")
 }
 
+// PRD #1910 M2: the consent page's metadata and the server-built redirect. Neither carries a
+// code, a challenge, a binding hash or the redirect URI list.
+func TestOAuthConsentDTOTags(t *testing.T) {
+	assertTags(t, "OAuthAuthorizeRequestDTO", OAuthAuthorizeRequestDTO{},
+		"product_name", "product_description", "redirect_host", "scopes", "status", "expires_at")
+	assertTags(t, "OAuthRedirectResponse", OAuthRedirectResponse{}, "redirect_url")
+}
+
 // /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries
 // no email and no admin flag.
 func TestV1WhoamiDTOTags(t *testing.T) {

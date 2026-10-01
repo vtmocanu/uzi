@@ -13,6 +13,25 @@ export function parseRedirectUriLines(text: string): string[] {
     .filter((l) => l !== "");
 }
 
+// Query keys the server itself adds to a redirect (RFC 6749 4.1.2, 4.1.2.1, RFC 9207); a registered
+// URI may not carry them. Case-sensitive on the decoded key, as the server's check is.
+const RESERVED_QUERY_KEYS = new Set(["code", "state", "iss", "error", "error_description", "error_uri"]);
+
+function hasReservedQueryKey(raw: string): boolean {
+  const q = raw.indexOf("?");
+  if (q < 0) return false;
+  for (const pair of raw.slice(q + 1).split("&")) {
+    if (pair === "") continue;
+    const key = pair.split("=", 1)[0];
+    try {
+      if (RESERVED_QUERY_KEYS.has(decodeURIComponent(key.replace(/\+/g, " ")))) return true;
+    } catch {
+      return true; // an undecodable key cannot be shown to be harmless
+    }
+  }
+  return false;
+}
+
 function uriError(raw: string): string | null {
   if (new TextEncoder().encode(raw).length > MAX_REDIRECT_URI_BYTES) {
     return `must be at most ${MAX_REDIRECT_URI_BYTES} bytes`;
@@ -30,14 +49,23 @@ function uriError(raw: string): string | null {
   } catch {
     return "is not a valid URL";
   }
+  if (hasReservedQueryKey(raw)) {
+    return "query must not contain code, state, iss, error, error_description or error_uri";
+  }
   if (u.username !== "" || u.password !== "") return "must not contain userinfo";
   if (u.hostname === "") return "must have a host";
   if (https) return null;
-  if (u.hostname !== "127.0.0.1" && u.hostname !== "[::1]") {
+  // Compare the RAW authority text, as the server does (oauthsrv.ValidateRedirectURI): the host
+  // must literally be 127.0.0.1 or [::1]. u.hostname is the WHATWG-normalised host, which would
+  // also admit 127.1, 2130706433 and [0:0:0:0:0:0:0:1] (all normalise to a loopback address).
+  const authority = raw.slice("http://".length).split(/[/?]/, 1)[0];
+  const m = /^(127\.0\.0\.1|\[::1\])(?::(\d*))?$/.exec(authority);
+  if (!m) {
     return "http is allowed only for the loopback IP literals 127.0.0.1 and [::1], never localhost";
   }
-  // Read off the raw string: URL drops a default port ("http://127.0.0.1:80/" has port "").
-  if (!/^http:\/\/[^/?]+:\d+(?:[/?]|$)/.test(raw)) return "a loopback http URL must include a port";
+  if (!m[2]) return "a loopback http URL must include a port";
+  const port = Number(m[2]);
+  if (port < 1 || port > 65535) return "port must be between 1 and 65535";
   return null;
 }
 

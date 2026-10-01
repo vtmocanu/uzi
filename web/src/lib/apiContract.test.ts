@@ -48,6 +48,8 @@ import type {
   BuildInfo,
   Product,
   ProductOAuthClient,
+  OAuthAuthorizeRequest,
+  OAuthRedirect,
   RotateProductClientSecretResponse,
   ProductToken,
   AdminProductToken,
@@ -151,6 +153,10 @@ import productZero from "../../../fixtures/api-contract/product.zero.json";
 import productFull from "../../../fixtures/api-contract/product.full.json";
 import rotateProductClientSecretZero from "../../../fixtures/api-contract/rotate_product_client_secret.zero.json";
 import rotateProductClientSecretFull from "../../../fixtures/api-contract/rotate_product_client_secret.full.json";
+import oauthAuthorizeRequestZero from "../../../fixtures/api-contract/oauth_authorize_request.zero.json";
+import oauthAuthorizeRequestFull from "../../../fixtures/api-contract/oauth_authorize_request.full.json";
+import oauthRedirectResponseZero from "../../../fixtures/api-contract/oauth_redirect_response.zero.json";
+import oauthRedirectResponseFull from "../../../fixtures/api-contract/oauth_redirect_response.full.json";
 import productTokenZero from "../../../fixtures/api-contract/product_token.zero.json";
 import runJobZero from "../../../fixtures/api-contract/run_job.zero.json";
 import runJobFull from "../../../fixtures/api-contract/run_job.full.json";
@@ -1097,6 +1103,27 @@ void _buildInfoFull;
   void _rotateExtra;
   void _rotateZero;
   void _rotateFull;
+}
+// PRD #1910 M2: the consent page's metadata and the approve / deny redirect. scopes is the
+// nil-slice null in oauth_authorize_request.zero.json that the handler normalizes to [] (never
+// null on the wire).
+{
+  const _oauthRequestMissing: never = null as unknown as Exclude<keyof OAuthAuthorizeRequest, keyof typeof oauthAuthorizeRequestFull>;
+  const _oauthRequestExtra: never = null as unknown as Exclude<keyof typeof oauthAuthorizeRequestFull, keyof OAuthAuthorizeRequest>;
+  const _oauthRequestZero: ZeroOf<OAuthAuthorizeRequest, "scopes"> = oauthAuthorizeRequestZero;
+  const _oauthRequestFull: Widen<OAuthAuthorizeRequest> = oauthAuthorizeRequestFull;
+  const _oauthRedirectMissing: never = null as unknown as Exclude<keyof OAuthRedirect, keyof typeof oauthRedirectResponseFull>;
+  const _oauthRedirectExtra: never = null as unknown as Exclude<keyof typeof oauthRedirectResponseFull, keyof OAuthRedirect>;
+  const _oauthRedirectZero: Widen<OAuthRedirect> = oauthRedirectResponseZero;
+  const _oauthRedirectFull: Widen<OAuthRedirect> = oauthRedirectResponseFull;
+  void _oauthRequestMissing;
+  void _oauthRequestExtra;
+  void _oauthRequestZero;
+  void _oauthRequestFull;
+  void _oauthRedirectMissing;
+  void _oauthRedirectExtra;
+  void _oauthRedirectZero;
+  void _oauthRedirectFull;
 }
 // PRD #1907 M4/M5: the typed admin delete response (its nested product's deleted_at is
 // `string | null`, no exemption) and the user mint-picker entry (all strings).

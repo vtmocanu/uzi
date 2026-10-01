@@ -398,6 +398,11 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/agent-templates/{id}/rendered", noLimiter},
 	{"GET", "/api/agent-templates/{id}/skills", noLimiter},
 	{"GET", "/api/auth/cli/request/{id}", noLimiter},
+	// PRD #1910 M2: the consent half of the OAuth server. authorize is unauthenticated and
+	// fronted by authLimiter's PER-IP middleware (not guarded by this table → noLimiter); the
+	// request read is a cookie-session DB read.
+	{"GET", "/api/oauth/authorize", noLimiter},
+	{"GET", "/api/oauth/requests/{id}", noLimiter},
 	{"GET", "/api/auth/config", noLimiter},
 	{"GET", "/api/auth/me", noLimiter},
 	{"GET", "/api/auth/oidc/callback", noLimiter},
@@ -629,6 +634,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/agent-templates/", noLimiter},
 	{"POST", "/api/agent-templates/{id}/reset", noLimiter},
 	{"POST", "/api/auth/cli/approve", limAuth},
+	// PRD #1910 M2: approve rides the per-user auth limiter like /cli/approve; deny does not.
+	{"POST", "/api/oauth/requests/{id}/approve", limAuth},
+	{"POST", "/api/oauth/requests/{id}/deny", noLimiter},
 	{"POST", "/api/auth/cli/deny", noLimiter},
 	{"POST", "/api/auth/cli/poll", noLimiter},
 	{"POST", "/api/auth/cli/start", noLimiter},
@@ -1220,6 +1228,37 @@ func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	for _, key := range missing {
 		t.Errorf("route %s is listed in wantRouteMounts but is not in the router — "+
 			"it was removed or renamed; update the table.", key)
+	}
+}
+
+// TestOAuthAuthorizeIsBehindThePerIPAuthLimiter pins PRD #1910 D1's rule that the unauthenticated
+// GET /api/oauth/authorize is fronted by authLimiter's per-IP Middleware. wantRouteMounts cannot
+// say it: it reads per-USER mounts only, so this route is a noLimiter row there. The request goes
+// through the real h.Routes with a budget of one (newProbeLimiters gives authLimiter exactly 1):
+// the first request from an address reaches the handler (no client_id, so it dies at the fixed
+// error page before touching a store, which this Handler does not have) and the second from the
+// same address is a 429. A different address has its own budget.
+func TestOAuthAuthorizeIsBehindThePerIPAuthLimiter(t *testing.T) {
+	limiters := newProbeLimiters()
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
+
+	get := func(remote string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/api/oauth/authorize", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	if rec := get("192.0.2.10:4000"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Cannot connect") {
+		t.Fatalf("first request = %d %q, want the fixed 400 error page from the handler", rec.Code, rec.Body.String())
+	}
+	if rec := get("192.0.2.10:4001"); rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("second request from the same address = %d, want 429 from authLimiter", rec.Code)
+	}
+	if rec := get("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
 	}
 }
 

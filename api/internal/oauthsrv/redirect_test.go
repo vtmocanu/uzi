@@ -50,6 +50,19 @@ func TestValidateRedirectURI(t *testing.T) {
 		{"non-ascii", "https://app.example.com/café", false},
 		{"nul byte", "https://app.example.com/\x00", false},
 		{"unterminated v6 host", "https://[::1/cb", false},
+		{"query with a harmless key", "https://app.example.com/cb?tenant=a&codex=1&states=2", true},
+		{"reserved key code", "https://app.example.com/cb?code=x", false},
+		{"reserved key state", "https://app.example.com/cb?a=1&state=x", false},
+		{"reserved key iss", "https://app.example.com/cb?iss=https://x", false},
+		{"reserved key error", "https://app.example.com/cb?error=x", false},
+		{"reserved key error_description", "https://app.example.com/cb?error_description=x", false},
+		{"reserved key error_uri", "https://app.example.com/cb?error_uri=x", false},
+		{"reserved key without a value", "https://app.example.com/cb?code", false},
+		{"reserved key percent-encoded", "https://app.example.com/cb?%63ode=x", false},
+		{"empty pair then a reserved key", "https://app.example.com/cb?a=b&&code=x", false},
+		{"undecodable key is refused", "https://app.example.com/cb?%zz=1", false},
+		{"reserved key is case-sensitive", "https://app.example.com/cb?Code=x&STATE=y", true},
+		{"loopback with reserved key", "http://127.0.0.1:8123/cb?code=x", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

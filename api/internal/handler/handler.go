@@ -880,6 +880,8 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 		r.Get("/branding/logo/{slot}", h.GetBrandingLogo)
 
 		h.mountAuthRoutes(r, authLimiter, cliPollLimiter)
+		// The OAuth authorization server's consent half (PRD #1910 M2): see mountOAuthRoutes.
+		h.mountOAuthRoutes(r, authLimiter)
 
 		// mountJudgeRoutes MUST precede mountMeRoutes: the /me/judge stats subrouter
 		// (r.Route("/me/judge"), in mountJudgeRoutes) and the /me/judge consent PUT

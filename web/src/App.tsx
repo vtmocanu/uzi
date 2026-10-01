@@ -18,6 +18,7 @@ import { RunDefaults } from "./pages/RunDefaults";
 import { AccessSettings } from "./pages/AccessSettings";
 import { MemorySettings } from "./pages/MemorySettings";
 import { CliAuth } from "./pages/CliAuth";
+import { Connect } from "./pages/Connect";
 import { Agents } from "./pages/Agents";
 import { AgentNew } from "./pages/AgentNew";
 import { AgentDetail } from "./pages/AgentDetail";
@@ -40,7 +41,7 @@ import { Docs } from "./pages/Docs";
 import { DocPage } from "./pages/DocPage";
 
 // The guard wrapping a route's page. "public" means the page renders with NO
-// guard (still inside AppShell) — the docs pages and the CLI-auth consent page,
+// guard (still inside AppShell) — the docs pages and the CLI-auth and Connect consent pages,
 // which handle their own auth. "guest" is the inverse of "protected": the
 // landing/login/register pages are for signed-out visitors only.
 export type RouteGuard = "guest" | "public" | "protected" | "admin";
@@ -81,6 +82,10 @@ export const APP_ROUTES: AppRoute[] = [
   // it can preserve ?request= across the login redirect (a ProtectedRoute would
   // drop the query on the way to /login).
   { path: "/cli-auth", element: <CliAuth />, guard: "public" },
+  // OAuth consent (PRD #1910): reached from /api/oauth/authorize with ?request=<id>. Not guarded,
+  // for the same reason as /cli-auth: it handles its own auth so it can keep the request across
+  // the login redirect (and store a return path for an OIDC login, which cannot carry ?next=).
+  { path: "/connect", element: <Connect />, guard: "public" },
   // Workers moved out of the Settings tabs to a first-class Factory page; the old
   // URL keeps working for bookmarks and stale deep links.
   // The <Navigate> renders unwrapped via the "public" guard, exactly as the old

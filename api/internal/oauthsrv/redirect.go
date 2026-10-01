@@ -26,7 +26,10 @@ const (
 //     section 7.3). "localhost" is never accepted: it is a name resolved by the client's
 //     resolver, not a literal;
 //   - a host, and no userinfo;
-//   - no fragment (RFC 6749 section 3.1.2), including an empty one ("https://a/b#").
+//   - no fragment (RFC 6749 section 3.1.2), including an empty one ("https://a/b#");
+//   - no query parameter the server itself appends to the redirect (reservedRedirectQueryKeys),
+//     so a registered URI cannot pre-seed a code, state, iss or error that a client might read
+//     instead of the server's.
 func ValidateRedirectURI(s string) error {
 	if s == "" {
 		return errors.New("redirect URI must not be empty")
@@ -53,6 +56,9 @@ func ValidateRedirectURI(s string) error {
 	u, err := url.Parse(s)
 	if err != nil {
 		return errors.New("redirect URI is not a valid URL")
+	}
+	if hasReservedQueryKey(u.RawQuery) {
+		return errors.New("redirect URI query must not contain code, state, iss, error, error_description or error_uri")
 	}
 	if u.User != nil {
 		return errors.New("redirect URI must not contain userinfo")
@@ -96,4 +102,46 @@ func ValidateRedirectURIs(uris []string) error {
 		seen[u] = true
 	}
 	return nil
+}
+
+// reservedRedirectQueryKeys are the query parameters the server adds to a redirect (RFC 6749
+// sections 4.1.2 and 4.1.2.1, RFC 9207). Matching is case-sensitive on the decoded key.
+var reservedRedirectQueryKeys = map[string]bool{
+	"code": true, "state": true, "iss": true,
+	"error": true, "error_description": true, "error_uri": true,
+}
+
+// hasReservedQueryKey reports whether a raw query string carries a reserved key. It splits on "&"
+// itself (not url.ParseQuery) so a malformed pair is still examined; a key that does not decode is
+// treated as reserved, since it cannot be shown to be harmless.
+func hasReservedQueryKey(rawQuery string) bool {
+	for _, pair := range strings.Split(rawQuery, "&") {
+		if pair == "" {
+			continue
+		}
+		k, _, _ := strings.Cut(pair, "=")
+		dk, err := url.QueryUnescape(k)
+		if err != nil || reservedRedirectQueryKeys[dk] {
+			return true
+		}
+	}
+	return false
+}
+
+// withoutReservedQueryKeys returns rawQuery minus every reserved pair, in order. The redirect
+// builders use it so a stored URI that predates the registration rule still cannot shadow the
+// server's own parameters.
+func withoutReservedQueryKeys(rawQuery string) string {
+	var kept []string
+	for _, pair := range strings.Split(rawQuery, "&") {
+		if pair == "" {
+			continue
+		}
+		k, _, _ := strings.Cut(pair, "=")
+		if dk, err := url.QueryUnescape(k); err != nil || reservedRedirectQueryKeys[dk] {
+			continue
+		}
+		kept = append(kept, pair)
+	}
+	return strings.Join(kept, "&")
 }

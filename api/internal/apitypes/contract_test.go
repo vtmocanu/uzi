@@ -156,6 +156,10 @@ func contractCases() []contractCase {
 		// never null on the real wire) and the rotate-secret response that carries the
 		// one-time plaintext beside the updated product.
 		newContractCase[RotateProductClientSecretResponse]("rotate_product_client_secret"),
+		// PRD #1910 M2: the /connect consent-screen metadata (scopes is a nil-slice null in
+		// zero.json, never null on the wire) and the approve / deny redirect response.
+		newContractCase[OAuthAuthorizeRequestDTO]("oauth_authorize_request"),
+		newContractCase[OAuthRedirectResponse]("oauth_redirect_response"),
 		newContractCase[ProductTokenDTO]("product_token"),
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),

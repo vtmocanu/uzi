@@ -1,0 +1,10 @@
+{
+  "product_name": "x",
+  "product_description": "x",
+  "redirect_host": "x",
+  "scopes": [
+    "x"
+  ],
+  "status": "x",
+  "expires_at": "2020-01-02T03:04:05Z"
+}

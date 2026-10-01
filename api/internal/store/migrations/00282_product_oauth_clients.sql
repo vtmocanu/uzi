@@ -8,8 +8,6 @@
 -- The CHECKs are the database half of oauthsrv's validation (at most 5 URIs, scopes drawn from the
 -- product-token scope vocabulary); the URI shape itself is validated in Go only. The secret hash
 -- and its display prefix are set and cleared together.
---
--- The migration number is a draft: it is renumbered above the live head at landing.
 ALTER TABLE products
     ADD COLUMN redirect_uris              text[]      NOT NULL DEFAULT '{}'
         CONSTRAINT products_redirect_uris_check CHECK (cardinality(redirect_uris) <= 5),

@@ -10,6 +10,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type Branding, type BuildInfo, type HealthDoc, type Repo } from "../lib/api";
 import { prefs } from "../lib/prefs";
+import { consumePendingReturn } from "../lib/pendingReturn";
 import { presetAssetForSlug, presetForSlug } from "../lib/brandPresets";
 import { CountPill, cx, type CountPillTone } from "./ui";
 import { useDemoMode } from "../lib/demoMode";
@@ -1094,8 +1095,19 @@ function PublicShell({ children }: { children: ReactNode }) {
 }
 
 export function AppShell({ children }: { children: ReactNode }) {
-  const { user } = useAuth();
+  const { user, loading: authLoading } = useAuth();
   const location = useLocation();
+  const navigate = useNavigate();
+  // Return to a consent page after a login that could not carry ?next= (PRD #1910 D3): an OIDC
+  // login always lands on "/", so /connect stored its path in sessionStorage before sending the
+  // user to /login. Consumed once, and only if it is still a /connect?request=<uuid> that passes
+  // safeNextPath; /connect clears the entry on load, so a password login that came back through
+  // ?next= never triggers a second navigation from here.
+  useEffect(() => {
+    if (authLoading || !user) return;
+    const back = consumePendingReturn();
+    if (back) navigate(back, { replace: true });
+  }, [authLoading, user, navigate]);
   const [mobileOpen, setMobileOpen] = useState(false);
   // Judge to-triage badge (PRD #98). Owned here — above the guest early return, so it
   // survives across routes and feeds both SidebarContent mounts — from

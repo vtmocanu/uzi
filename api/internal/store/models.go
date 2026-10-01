@@ -519,6 +519,37 @@ type Notification struct {
 	CreatedAt pgtype.Timestamptz `json:"created_at"`
 }
 
+type OauthAuthorizeRequest struct {
+	ID            uuid.UUID          `json:"id"`
+	ProductID     uuid.UUID          `json:"product_id"`
+	RedirectUri   string             `json:"redirect_uri"`
+	Scopes        []string           `json:"scopes"`
+	State         string             `json:"state"`
+	CodeChallenge string             `json:"code_challenge"`
+	BindingHash   []byte             `json:"binding_hash"`
+	Status        string             `json:"status"`
+	UserID        pgtype.UUID        `json:"user_id"`
+	GrantID       pgtype.UUID        `json:"grant_id"`
+	CodeHash      []byte             `json:"code_hash"`
+	CodeExpiresAt pgtype.Timestamptz `json:"code_expires_at"`
+	CreatedAt     pgtype.Timestamptz `json:"created_at"`
+	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
+}
+
+type OauthGrant struct {
+	ID                 uuid.UUID          `json:"id"`
+	UserID             uuid.UUID          `json:"user_id"`
+	ProductID          uuid.UUID          `json:"product_id"`
+	Scopes             []string           `json:"scopes"`
+	RefreshTokenHash   []byte             `json:"refresh_token_hash"`
+	RefreshTokenPrefix pgtype.Text        `json:"refresh_token_prefix"`
+	RefreshIssuedAt    pgtype.Timestamptz `json:"refresh_issued_at"`
+	RefreshLastUsedAt  pgtype.Timestamptz `json:"refresh_last_used_at"`
+	CreatedAt          pgtype.Timestamptz `json:"created_at"`
+	ConsentedAt        pgtype.Timestamptz `json:"consented_at"`
+	RevokedAt          pgtype.Timestamptz `json:"revoked_at"`
+}
+
 type PipelineStatus struct {
 	ID             int64              `json:"id"`
 	RepoID         uuid.UUID          `json:"repo_id"`
@@ -610,6 +641,7 @@ type ProductToken struct {
 	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
 	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	GrantID     pgtype.UUID        `json:"grant_id"`
 }
 
 type RecommendationDisposition struct {

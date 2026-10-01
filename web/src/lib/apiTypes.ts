@@ -1730,6 +1730,32 @@ export interface CliAuthRequestMeta {
   expires_at: string;
 }
 
+// ── OAuth consent flow (PRD #1910 M2) ─────────────────────────────────────────
+// The `/connect` consent page reads a pending authorize request and approves or denies it.
+
+// OAuthRequestStatus mirrors oauth_authorize_requests.status; only "pending" can still be decided.
+export type OAuthRequestStatus = "pending" | "approved" | "redeemed" | "denied" | "superseded";
+
+// OAuthAuthorizeRequest is GET /api/oauth/requests/{id} (apitypes.OAuthAuthorizeRequestDTO).
+// product_name and product_description are admin-written plain strings the page renders as TEXT,
+// never Markdown or HTML. redirect_host is the host (and port) the browser is sent to afterwards.
+// The code challenge, the redirect URI list and every hash are deliberately absent.
+export interface OAuthAuthorizeRequest {
+  product_name: string;
+  product_description: string;
+  redirect_host: string;
+  scopes: ProductTokenScope[];
+  status: OAuthRequestStatus;
+  expires_at: string;
+}
+
+// OAuthRedirect is the approve / deny response (apitypes.OAuthRedirectResponse): the URL the page
+// navigates to, built by the server from the product's registered redirect URI. It is the ONLY
+// URL the consent page ever navigates to; nothing from the page's own query string is used.
+export interface OAuthRedirect {
+  redirect_url: string;
+}
+
 // ── Agent memory (PRD #90) ────────────────────────────────────────────────
 // A durable per-(user, repo) learning an agent saved on a prior run, read back
 // into a future run as inert, nonce-fenced, advisory context. The webui surfaces

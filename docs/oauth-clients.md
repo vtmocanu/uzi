@@ -8,7 +8,7 @@ audience: operator
 
 An admin makes an [external product](./product-tokens.md) an **OAuth client** so that, in place of a pasted `uzp_` token, it can send a user's browser to uzi to approve access (PRD #1910). The product's id is its `client_id`. Pasted product tokens keep working for every product, client or not.
 
-> **Status.** This page covers registration only: the redirect URIs, the allowed scopes and the client secret. The authorize and token endpoints that use them ship in later milestones of PRD #1910, so a registered client cannot complete a consent flow yet.
+> **Status.** This page covers registration (the redirect URIs, the allowed scopes and the client secret) and the consent step: a registered client can send a user to `/api/oauth/authorize`, the user approves or denies on uzi's `/connect` page, and the client receives an authorization code at its redirect URI together with its own `state` and uzi's `iss` (the instance's public origin). The token endpoint that exchanges the code ships in a later milestone of PRD #1910, so a client cannot finish a connection yet.
 
 A product is an OAuth client only when it has all three of:
 
@@ -34,6 +34,7 @@ A redirect URI is matched **exactly**, so register each one the product uses.
 
 - `https` is required. `http` is accepted only for the loopback IP literals `http://127.0.0.1:<port>/…` and `http://[::1]:<port>/…`, with the port. `http://localhost` is refused.
 - No fragment (`#…`) and no user info (`user:pass@`).
+- The query may not use a name uzi adds to the redirect itself: `code`, `state`, `iss`, `error`, `error_description` and `error_uri`. Any other query parameter is kept as registered.
 - At most 5 URIs, each at most 2048 bytes, printable ASCII only, no duplicates.
 - Scopes must be a non-empty list drawn from `jobs:run` and `jobs:read` whenever there is a redirect URI. With no redirect URI the scope list must be empty too.
 
@@ -43,7 +44,7 @@ A request breaking a rule is a 400 and changes nothing.
 
 **Rotate secret** replaces the secret at once; the old one stops working with no overlap, so update the product straight away. The list shows only the secret's first characters (for example `uzs_Qm4x…`) and when it was rotated, never the value.
 
-A secret is `uzs_` plus 256 bits of randomness. Like every uzi credential it is redacted from logs, issue drafts and CI-failure snapshots.
+A secret is `uzs_` plus 256 bits of randomness. Like uzi's other bearer credentials it is redacted from logs, issue drafts and CI-failure snapshots.
 
 ## From the CLI
 

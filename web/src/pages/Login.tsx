@@ -3,7 +3,12 @@ import { Link, useNavigate, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
 import { api, MOCK_MODE, type AuthConfig } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
+import { safeNextPath } from "../lib/safeNextPath";
 import { Alert, Button, Card, Field, Input, Skeleton } from "../components/ui";
+
+// safeNextPath lives in lib/safeNextPath (the pending-return helper validates with it too);
+// re-exported so this page remains its documented home for importers and Login.test.tsx.
+export { safeNextPath };
 
 // Enumerated OIDC callback error codes (PRD #45, Decision 9). The callback only
 // ever redirects with one of these known codes; the SPA switches on them and never
@@ -19,28 +24,6 @@ const OIDC_ERROR_MESSAGES: Record<string, string> = {
 function oidcErrorMessage(code: string | null): string | null {
   if (!code) return null;
   return OIDC_ERROR_MESSAGES[code] ?? "Sign-in failed. Please try again.";
-}
-
-// safeNextPath returns a same-origin internal path to return to after login, or
-// "/dashboard" for anything unsafe. It admits only a rooted path ("/…") that is
-// NOT protocol-relative ("//host") and contains NO backslash: this feeds
-// react-router navigate() today (client-side, so "/\evil.com" is inert), but
-// window.location normalizes "\"→"/", so the day a refactor points it at
-// window.location.assign, "/\evil.com" would become a live open redirect. Reject
-// the backslash here so that refactor can't silently reopen the hole.
-//
-// INVARIANT (per-call-site, not global): this guard covers ONLY the returnTo
-// sink below (navigate(returnTo)). It is not a global open-redirect guard. Every
-// OTHER navigate() of a value derived from the URL or the server must protect its
-// own dynamic path segment — the sinks that interpolate a server id wrap it in
-// encodeURIComponent(...) so a future non-UUID id (slug, name, forge identifier)
-// cannot inject a "/", "//", or "\" path segment. A new navigate() sink is NOT
-// covered by anything here; encode its dynamic segment at the call site.
-export function safeNextPath(next: string | null): string {
-  if (next && next.startsWith("/") && !next.startsWith("//") && !next.includes("\\")) {
-    return next;
-  }
-  return "/dashboard";
 }
 
 // ssoButtonClass matches the secondary Button variant, but as an anchor: the SSO

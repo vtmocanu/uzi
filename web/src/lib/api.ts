@@ -43,6 +43,8 @@ import type {
   Card,
   ChatListResponse,
   CliAuthRequestMeta,
+  OAuthAuthorizeRequest,
+  OAuthRedirect,
   CliToken,
   CliTokenMint,
   CliTokenScope,
@@ -1914,6 +1916,17 @@ const realApi = {
     request<{ status: string }>("POST", "/auth/cli/deny", {
       request_id: requestId,
     }),
+
+  // ── OAuth consent flow (PRD #1910 M2) ──────────────────────────────────────
+  // The `/connect` page's three calls, all cookie-session reads/writes (the POSTs carry CSRF)
+  // that the server also gates on the browser-binding cookie. approve and deny answer the
+  // server-built redirect_url the page navigates to.
+  getOAuthRequest: (id: string) =>
+    request<OAuthAuthorizeRequest>("GET", `/oauth/requests/${encodeURIComponent(id)}`),
+  approveOAuthRequest: (id: string) =>
+    request<OAuthRedirect>("POST", `/oauth/requests/${encodeURIComponent(id)}/approve`),
+  denyOAuthRequest: (id: string) =>
+    request<OAuthRedirect>("POST", `/oauth/requests/${encodeURIComponent(id)}/deny`),
 
   // ── Agent memory (PRD #90 M6) — cookie-only, owner-scoped ──────────────────
   // list is newest-first across all the caller's repos (the component groups by

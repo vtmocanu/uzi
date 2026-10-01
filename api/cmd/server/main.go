@@ -780,6 +780,17 @@ func run() error {
 				return q.DeleteExpiredCLIAuthRequests(ctx)
 			},
 		},
+		// OAuth authorize requests (PRD #1910 M2) are pending for 5 minutes, and an approved one
+		// carries a 60 s authorization code. The authorize handler sweeps opportunistically;
+		// this rides the same ticker. DeleteExpiredOAuthAuthorizeRequests keeps approved and
+		// redeemed rows until their code expired more than 10 minutes ago, so M3's code replay
+		// detection still recognises a recently redeemed code.
+		sweeper.Pass{
+			Name: "oauth_authorize_requests_expired",
+			Run: func(ctx context.Context) (int64, error) {
+				return q.DeleteExpiredOAuthAuthorizeRequests(ctx)
+			},
+		},
 		// Stranded issue-filing claims (PRD #68 M3): a file handler killed after the
 		// claim (filing_since set) but before it settled leaves a row that blocks the
 		// coordinate forever. This DELETEs claims older than the clamped cutoff (>= 2x
