@@ -22,6 +22,9 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+- **The GitLab bot helper can create a new bot ([#2016](https://github.com/vtmocanu/uzi/issues/2016)).**
+  The admin script uses jq to parse user IDs and tokens, sends the PAT request as JSON, and reports response errors without exposing tokens. It accepts `--gitlab <host>` (or `--gitlab=<host>`) ahead of `GITLAB_HOSTNAME`, normalizes host URLs, and supports help and option validation. jq is now required alongside glab. Credit to @alexp3200 for the report.
+
 ### Added
 
 - **A worker holding an undelivered run outcome is shown as such, and the run is flagged stalled after a minute ([#1994](https://github.com/vtmocanu/uzi/issues/1994)).**

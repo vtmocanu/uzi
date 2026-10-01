@@ -316,8 +316,8 @@ tasks:
       # Hermetic extraction and ordered package-rule regression for the three
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
-      # Hermetic host-selection regression for scripts/create-gitlab-bot.sh (issue #2010):
-      # a fake `glab`, no network, proving the default and GITLAB_HOSTNAME win over bash's HOSTNAME.
+      # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
+      # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
       # hermetic (~instant): a fake `docker` on PATH, no daemon touched. It guards
       # the destructive e2e leaked-project reclaim's selection contract so a future
@@ -961,7 +961,7 @@ tasks:
       - node ./scripts/renovate-go-toolchain.test.mjs
 
   test:create-gitlab-bot:
-    desc: hermetic host-selection contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
+    desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
     cmds:
       - ./scripts/create-gitlab-bot.test.sh
 

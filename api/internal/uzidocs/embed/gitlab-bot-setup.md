@@ -12,6 +12,14 @@ uzi acts on the forge as **your own bot account**, never your personal identity:
 
 If self-registration is open on your GitLab instance, register a second account for the bot yourself (e.g. `uzi-bot-<yourname>`). If it's closed, ask an instance admin to create it for you, either by hand or by running `scripts/create-gitlab-bot.sh <bot-username> <group/project>`, which creates the bot, mints its PAT, and adds it as Developer in one shot.
 
+The admin helper requires `jq` and `glab`, with glab authenticated as an instance admin on the target host. Select that host with `--gitlab <host>` (also `--gitlab=<host>`), which overrides `GITLAB_HOSTNAME`; the default is `gitlab.example.com`. A leading `http://` or `https://` and trailing slashes are stripped. For example:
+
+```sh
+./scripts/create-gitlab-bot.sh --gitlab https://gitlab.example.com/ uzi-bot group/project
+```
+
+Use `--help` for usage, or `--` before positional arguments starting with `-`. Re-running reuses the bot but mints a new PAT; previous PATs remain valid until expired or revoked. If the PAT response is invalid, the script stops without printing its contents; check the bot's tokens in GitLab before retrying, since a token may already have been minted.
+
 ## 2. Create a personal access token
 
 If you provisioned the bot yourself, create its token from the bot account's **Settings → Access Tokens**:
