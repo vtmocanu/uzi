@@ -119,17 +119,18 @@ fold_resolve() {
     git -C "$dir" cat-file blob "$sha" > "$tmpd/stage$s" 2>/dev/null || { echo "changelog-union: cannot read index stage $s of $base" >&2; return 1; }
   done
   awk -v out="$tmpd/fold.out" '
+    BEGIN { K = "\034" }
     FNR == 1 { f++ }
     { L[f, FNR] = $0; N[f] = FNR }
     function trim(s) { sub(/[ \t]+$/, "", s); return s }
     function blank(s) { return s ~ /^[ \t]*$/ }
     function flush(f) {
       if (cur == "") return
-      nb[f]++; BT[f, nb[f]] = cur; BU[f, nb[f]] = curu; BH[f, nb[f]] = curh
+      nb[f]++; BT[f, nb[f]] = cur; BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
       cur = ""
     }
-    function parse(f,   i, s, isu, h) {
-      isu = 0; h = ""; cur = ""
+    function parse(f,   i, s, isu, h, sec) {
+      isu = 0; h = ""; cur = ""; sec = ""
       for (i = 1; i <= N[f]; i++) {
         s = L[f, i]
         if (s ~ /^## /) {
@@ -137,10 +138,10 @@ fold_resolve() {
           if (isu) uend[f] = i - 1
           isu = (s ~ /^## \[Unreleased\]/)
           if (isu) { nu[f]++; ustart[f] = i; uend[f] = N[f] }
-          h = ""; continue
+          h = ""; sec = trim(s); if (f == 1) ancsec[sec] = 1; continue
         }
         if (s ~ /^### /) { flush(f); h = trim(s); continue }
-        if (s ~ /^- /) { flush(f); cur = s; curu = isu; curh = h; continue }
+        if (s ~ /^- /) { flush(f); cur = s; curu = isu; curh = h; cursec = sec; continue }
         if (cur != "" && s ~ /^[ \t]+[^ \t]/) { cur = cur "\n" s; continue }
         flush(f)
         if (!blank(s) && isu) prose[f] = prose[f] "\n" s
@@ -162,29 +163,39 @@ fold_resolve() {
     END {
       for (f = 1; f <= 3; f++) { parse(f); if (nu[f] != 1) die("stage " f " does not hold exactly one ## [Unreleased] heading") }
       if (prose[1] != "" || prose[3] != "") die("a non-bullet line under [Unreleased] of the ancestor or the branch (cannot place it)")
+      # A block is identified by its subsection AND its text, with multiplicity: K-joined key.
       for (k = 1; k <= nb[1]; k++) if (BU[1, k]) {
         if (BH[1, k] == "") die("a heading-less bullet under [Unreleased] of the ancestor")
-        na++; AT[na] = BT[1, k]; inanc[BT[1, k]] = 1
+        key = BH[1, k] K BT[1, k]; if (!(key in acnt)) { na++; AK[na] = key }
+        acnt[key]++
       }
       if (na == 0) die("the ancestor [Unreleased] holds no bullet block, so there is no fold to prove")
-      for (k = 1; k <= nb[2]; k++) { if (BU[2, k]) ou[BT[2, k]] = 1; else orl[BT[2, k]] = 1 }
+      for (k = 1; k <= nb[2]; k++) {
+        if (BU[2, k]) ou[BT[2, k]] = 1
+        else {
+          orl[BT[2, k]] = 1
+          # only a release section NEWLY introduced in the base can be the fold target
+          if (!(BS[2, k] in ancsec)) nrc[BH[2, k] K BT[2, k]]++
+        }
+      }
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
         if (BH[3, k] == "") die("a heading-less bullet under [Unreleased] of the branch")
-        tu[BT[3, k]] = 1
+        tcnt[BH[3, k] K BT[3, k]]++
       }
       for (k = 1; k <= na; k++) {
-        t = AT[k]
-        if (!(t in orl)) die("no released section of the base holds the ancestor bullet verbatim (fold unproven): " title(t))
+        key = AK[k]; t = substr(key, index(key, K) + 1)
+        if (nrc[key] < acnt[key]) die("no NEW release section of the base holds the ancestor bullet under the same ### subsection, as often as the ancestor had it (fold unproven): " title(t))
         if (t in ou) die("the ancestor bullet is still under the base [Unreleased] (no fold): " title(t))
-        if (!(t in tu)) die("the branch edited or deleted an ancestor [Unreleased] bullet: " title(t))
+        if (tcnt[key] < acnt[key]) die("the branch edited, moved or deleted an ancestor [Unreleased] bullet (or one of its copies): " title(t))
       }
       oa = ""; ot = ""
       for (i = 1; i <= N[1]; i++) if (i < ustart[1] || i > uend[1]) oa = oa L[1, i] "\n"
       for (i = 1; i <= N[3]; i++) if (i < ustart[3] || i > uend[3]) ot = ot L[3, i] "\n"
       if (oa != ot) die("the branch changed the file outside [Unreleased]")
       nadd = 0
-      for (k = 1; k <= nb[3]; k++) if (BU[3, k] && !(BT[3, k] in inanc)) {
-        t = BT[3, k]
+      for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
+        t = BT[3, k]; key = BH[3, k] K t
+        if (++used[key] <= acnt[key]) continue   # an ancestor occurrence, not an addition
         if ((t in ou) || (t in orl)) die("a branch-added bullet already exists in the base: " title(t))
         if (t in seenadd) die("a branch-added bullet is repeated: " title(t))
         seenadd[t] = 1; nadd++; AD[nadd] = t; AH[nadd] = BH[3, k]

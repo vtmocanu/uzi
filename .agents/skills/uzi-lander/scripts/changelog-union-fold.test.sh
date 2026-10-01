@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Hermetic tests of changelog-union.sh's RELEASE FOLD: the base cut a release that folded its
 # [Unreleased] body into a `## [x.y.z]` section while the branch added bullets under
-# [Unreleased]. Each case builds a real throwaway repo and a real conflicting
-# `git rebase` (diff3), so the three index stages exist as in land-prep.
+# [Unreleased]. Each case builds a throwaway repo whose index is given the three conflict
+# stages directly (no real rebase: a real one of these shapes can merge cleanly, which
+# land-prep.sh's misplacement guard covers, tested in land-prep-misplaced.test.sh), plus a
+# worktree file with diff3-style markers.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -123,13 +125,13 @@ expect_ok tail
 cp "$WORK/happy.base.md" "$WORK/edit.base.md"; cp "$WORK/happy.main.md" "$WORK/edit.main.md"
 printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added REWORDED\n\n- **new added**\n  new\n\n### Fixed\n\n- **old fixed**\n  old fixed desc\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- **first**\n  first desc\n' "$HEAD_" > "$WORK/edit.branch.md"
 mkconflict edit; expect_refuse edit
-grep -Fq 'edited or deleted' <<<"$OUT" || fail "edit: wrong refusal reason: $OUT"
+grep -Fq 'moved or deleted' <<<"$OUT" || fail "edit: wrong refusal reason: $OUT"
 
 # 5. Refusal: the branch DELETED an ancestor [Unreleased] bullet.
 cp "$WORK/happy.base.md" "$WORK/del.base.md"; cp "$WORK/happy.main.md" "$WORK/del.main.md"
 printf '%s## [Unreleased]\n\n### Added\n\n- **new added**\n  new\n\n### Fixed\n\n- **old fixed**\n  old fixed desc\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- **first**\n  first desc\n' "$HEAD_" > "$WORK/del.branch.md"
 mkconflict del; expect_refuse del
-grep -Fq 'edited or deleted' <<<"$OUT" || fail "del: wrong refusal reason: $OUT"
+grep -Fq 'moved or deleted' <<<"$OUT" || fail "del: wrong refusal reason: $OUT"
 
 # 6. Refusal: no fold to prove (the base released something else; the ancestor bullets are
 #    in no released section of the base).
@@ -166,7 +168,34 @@ sed 's/^- \*\*new added\*\*/Some prose\n\n- **new added**/' "$WORK/happy.branch.
 mkconflict prose; expect_refuse prose
 grep -Fq 'non-bullet line' <<<"$OUT" || fail "prose: wrong refusal reason: $OUT"
 
-# 11. Refusal: markers in a plain file with no index stages stay the old refusal.
+# 11. Refusal (historical match): main merely DELETED the Unreleased entry; an identical bullet
+#     already sat in an OLD release and no new release section exists. Not a fold.
+printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added desc\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- **old added**\n  old added desc\n' "$HEAD_" > "$WORK/hist.base.md"
+printf '%s## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- **old added**\n  old added desc\n' "$HEAD_" > "$WORK/hist.main.md"
+printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added desc\n\n- **new added**\n  new\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- **old added**\n  old added desc\n' "$HEAD_" > "$WORK/hist.branch.md"
+mkconflict hist; expect_refuse hist
+grep -Fq 'fold unproven' <<<"$OUT" || fail "hist: wrong refusal reason: $OUT"
+
+# 12. Refusal (subsection identity): the branch MOVED an ancestor bullet from Added to Changed.
+cp "$WORK/happy.base.md" "$WORK/moved.base.md"; cp "$WORK/happy.main.md" "$WORK/moved.main.md"
+printf '%s## [Unreleased]\n\n### Added\n\n- **new added**\n  new\n\n### Changed\n\n- **old added**\n  old added desc\n\n### Fixed\n\n- **old fixed**\n  old fixed desc\n\n## [0.1.0] - 2026-01-01\n\n### Added\n\n- **first**\n  first desc\n' "$HEAD_" > "$WORK/moved.branch.md"
+mkconflict moved; expect_refuse moved
+grep -Fq 'moved or deleted' <<<"$OUT" || fail "moved: wrong refusal reason: $OUT"
+
+# 13. Refusal (multiplicity): the ancestor held the same bullet twice, the branch dropped one.
+printf '%s## [Unreleased]\n\n### Added\n\n- **twin**\n  twin desc\n\n- **twin**\n  twin desc\n' "$HEAD_" > "$WORK/twin.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Added\n\n- **twin**\n  twin desc\n\n- **twin**\n  twin desc\n' "$HEAD_" > "$WORK/twin.main.md"
+printf '%s## [Unreleased]\n\n### Added\n\n- **twin**\n  twin desc\n\n- **new added**\n  new\n' "$HEAD_" > "$WORK/twin.branch.md"
+mkconflict twin; expect_refuse twin
+grep -Fq 'moved or deleted' <<<"$OUT" || fail "twin: wrong refusal reason: $OUT"
+
+# 14. Positive control for multiplicity: both copies kept and folded -> the addition lands.
+printf '%s## [Unreleased]\n\n### Added\n\n- **twin**\n  twin desc\n\n- **twin**\n  twin desc\n\n- **new added**\n  new\n' "$HEAD_" > "$WORK/twin2.branch.md"
+cp "$WORK/twin.base.md" "$WORK/twin2.base.md"; cp "$WORK/twin.main.md" "$WORK/twin2.main.md"
+printf '%s## [Unreleased]\n\n### Added\n\n- **new added**\n  new\n\n## [0.2.0] - 2026-02-01\n\n### Added\n\n- **twin**\n  twin desc\n\n- **twin**\n  twin desc\n' "$HEAD_" > "$WORK/twin2.want.md"
+mkconflict twin2; expect_ok twin2
+
+# 15. Refusal: markers in a plain file with no index stages stay the old refusal.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **a**\n||||||| b\n- **old**\n=======\n- **b**\n>>>>>>> x\n' > "$WORK/plain.md"
 cp "$WORK/plain.md" "$WORK/plain.before"
 RC=0; OUT=$(bash "$SCRIPT" "$WORK/plain.md" 2>&1) || RC=$?

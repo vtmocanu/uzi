@@ -333,6 +333,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    them; `--allow-changelog-removals` only for a deliberate reword. Exit 10 = a uzi-owned
    branch changes workflow files: split the edit out (*Always yours*);
    `--allow-workflow-edit` only when no uzi push to the branch can follow.
+   Exit 11 = a conflict-free rebase filed the branch's new `CHANGELOG.md` bullets under a released
+   section (the base folded `[Unreleased]`): move them under `[Unreleased]` by hand, `--skip-rebase`.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
