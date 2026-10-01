@@ -37,4 +37,4 @@ Revoking cancels the connection's non-terminal jobs, including jobs started by a
 
 ## When the product or your account is switched off
 
-Disabling the product, or deactivating your account, does **not** revoke the connection. Its access tokens are refused on the next request, and nothing is deleted, so enabling the product again or reactivating your account restores the connection until its access tokens expire. Deleting a product is a soft delete that disables it for good: a deleted product cannot be enabled again, so its connections stay refused. The admin's delete confirm counts the manual tokens and the connections it stops.
+Disabling the product, or deactivating your account, does **not** revoke the connection. Its access tokens are refused on the next request, and nothing is deleted, so enabling the product again or reactivating your account restores the connection. Deleting a product is a soft delete that disables it for good: a deleted product cannot be enabled again, so its connections stay refused. The admin's delete confirm counts the manual tokens and the connections it stops.

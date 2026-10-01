@@ -267,8 +267,6 @@ UPDATE oauth_grants
        refresh_last_used_at = NULL
  WHERE id = $1 AND revoked_at IS NULL;
 
--- PRD #1910 M3: the D6 revoke paths and the connection list.
-
 -- name: LockOAuthUserGrants :exec
 -- Serializes one user's grant CREATION against that user's Revoke all. A first-consent approve
 -- inserts a grant row that no other transaction can see, or lock, until it commits, so

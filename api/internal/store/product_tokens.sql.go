@@ -718,9 +718,10 @@ UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND grant_id IS NULL
 // The panic button's product half (D8): revoke every un-revoked MANUAL product token of one
 // user (grant_id IS NULL). Access tokens of an OAuth grant are not swept here: the revoke-all
 // handler revokes every live grant first through revokeGrantLocked (grant lock, then the grant's
-// tokens), and a plain sweep of grant tokens after that could meet a grant created concurrently
-// and revoke its access token without its grant lock, leaving the grant and its refresh token
-// live (PRD #1910 D8). Called by the existing revoke-all handler (POST
+// tokens). The filter is defence in depth: the per-user lock (LockOAuthUserGrants) already
+// serializes grant creation with Revoke all, and token exchanges wait on the grant rows Revoke
+// all holds, so no grant can appear mid-sweep; the filter keeps a plain sweep from ever revoking
+// a grant's access token without its grant lock (PRD #1910 D8). Called by the existing revoke-all handler (POST
 // /api/me/cli-tokens/revoke-all, handler.RevokeAllCLITokens) in the SAME transaction as
 // RevokeAllCLITokens, so the button revokes both token kinds or neither. Idempotent, and scoped
 // to $1.

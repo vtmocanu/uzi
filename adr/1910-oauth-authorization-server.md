@@ -12,7 +12,8 @@
 > clients only, admin-registered clients, exact redirect-URI match and opaque
 > tokens. An access token is an ordinary `product_tokens` row with a `grant_id`, so
 > `RequireV1Caller` is its only enforcement path. Every mutation of a grant takes
-> the grant row lock first, and revoking a grant revokes everything under it in one
+> the grant row lock first (approve and Revoke all first take a per-user advisory lock, so a
+> first consent not yet committed cannot slip past Revoke all), and revoking a grant revokes everything under it in one
 > transaction. The token and revoke endpoints join ADR-1907's compatibility promise.
 
 ## Context
@@ -86,9 +87,11 @@ access token and a refresh token, until the connection is revoked.
    so the revoke covers its grant and code; an approve that waits behind Revoke
    all runs after it and creates a live grant of its own (a consent given after
    the button was pressed). Revoke all's plain product-token sweep skips grant
-   tokens (`grant_id IS NULL`): grants are revoked only through
-   `revokeGrantLocked`, so a grant created concurrently is never left with its
-   access token revoked but its grant and refresh token live. After the lock the path re-checks and then acts: a redemption re-reads
+   tokens (`grant_id IS NULL`) as defence in depth: grants are revoked only
+   through `revokeGrantLocked`, and the per-user lock plus the grant rows Revoke
+   all holds already keep a concurrent grant or exchange out, so a plain sweep
+   can never leave a grant with its access token revoked but its grant and
+   refresh token live. After the lock the path re-checks and then acts: a redemption re-reads
    the request, the grant's `revoked_at`, the client and the user, and counts the
    live tokens, so a revoke cannot miss a token a concurrent exchange is inserting.
 9. **Contract extension (D7).** `POST /api/oauth/token` and

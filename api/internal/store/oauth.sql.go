@@ -742,14 +742,12 @@ func (q *Queries) LockOAuthGrant(ctx context.Context, id uuid.UUID) (OauthGrant,
 }
 
 const lockOAuthUserGrants = `-- name: LockOAuthUserGrants :exec
-
 SELECT pg_advisory_xact_lock(
     1970958197,
     hashtext($1::uuid::text)
 )
 `
 
-// PRD #1910 M3: the D6 revoke paths and the connection list.
 // Serializes one user's grant CREATION against that user's Revoke all. A first-consent approve
 // inserts a grant row that no other transaction can see, or lock, until it commits, so
 // LockLiveOAuthGrantsForUser cannot wait for it: without this lock a Revoke all could finish

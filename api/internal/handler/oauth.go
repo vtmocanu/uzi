@@ -498,7 +498,10 @@ func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 
 // OAuthApprove is POST /api/oauth/requests/{id}/approve (PRD #1910 D4, D6, D8). One transaction:
 //
-//  1. the grant, lock first (D8): INSERT ... ON CONFLICT DO NOTHING; on a conflict, in a SEPARATE
+//  0. the per-user advisory lock (LockOAuthUserGrants, OAuthUserLockClass), the FIRST statement:
+//     a first-consent grant inserted but not yet committed is invisible to row locks, so Revoke
+//     all would miss it without this (D8);
+//  1. the grant, lock first among the row locks (D8): INSERT ... ON CONFLICT DO NOTHING; on a conflict, in a SEPARATE
 //     statement, SELECT the live grant FOR UPDATE (an ON CONFLICT DO NOTHING can meet a row its
 //     own statement snapshot cannot see), retrying if it was revoked meanwhile;
 //  2. for an existing live grant (re-consent): the scopes are replaced with the approved set,
@@ -511,8 +514,8 @@ func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 //     approve, or an approve after deny, finds no row (409); then this request gets its own code
 //     (256-bit random, sha256 at rest, 60 seconds, bound to the grant).
 //
-// Lock order (D8) is grant, then its product_tokens, then request rows: the request this approve
-// decides is claimed LAST, after the grant lock, so no step holds a request row while waiting for
+// Lock order (D8) is the per-user lock, then the grant, then its product_tokens, then request
+// rows: the request this approve decides is claimed LAST, after the grant lock, so no step holds a request row while waiting for
 // a grant. A claim that loses (409) rolls the grant work back with the transaction.
 //
 // Any failure rolls the whole transaction back, so the request stays pending. The response is the
