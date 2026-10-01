@@ -5,6 +5,7 @@ import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
 import { startRunGate } from "../lib/runStream";
+import { firstStartIso } from "../lib/runDuration";
 import { startRunWithCredential } from "../lib/startRun";
 import { INHERIT_SELECTION, type CredentialSelection } from "../lib/credentialOverride";
 import {
@@ -44,8 +45,9 @@ function columnLabel(issue: IssueDetail): string {
 // running (no finished_at yet — the live elapsed lives on the run view). Thin
 // wrapper over formatDuration kept co-located with the history row it feeds.
 function runDuration(run: RunListItem): string | null {
-  if (!run.started_at || !run.finished_at) return null;
-  return formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime());
+  const start = firstStartIso(run);
+  if (!start || !run.finished_at) return null;
+  return formatDuration(new Date(run.finished_at).getTime() - new Date(start).getTime());
 }
 
 export function IssueView() {
@@ -535,7 +537,7 @@ function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl
   const mrState = mrChipState(run.mr_state);
   // §3 "started": show when the run began; fall back to its queued time for a run
   // that has not started yet (started_at null).
-  const stamp = run.started_at ?? run.created_at;
+  const stamp = firstStartIso(run) ?? run.created_at;
   return (
     <li className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-edge bg-raised/40 px-3 py-2">
       <div className="min-w-0">

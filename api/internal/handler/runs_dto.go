@@ -276,6 +276,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		PrdPatchSettledAt: timePtr(r.PrdPatchSettledAt.Valid, r.PrdPatchSettledAt.Time),
 		ClaimedAt:         timePtr(r.ClaimedAt.Valid, r.ClaimedAt.Time),
 		StartedAt:         timePtr(r.StartedAt.Valid, r.StartedAt.Time),
+		FirstStartedAt:    timePtr(r.FirstStartedAt.Valid, r.FirstStartedAt.Time),
 		FinishedAt:        timePtr(r.FinishedAt.Valid, r.FinishedAt.Time),
 		CreatedAt:         r.CreatedAt.Time,
 		UpdatedAt:         r.UpdatedAt.Time,
@@ -474,10 +475,14 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// live now would otherwise creep — the #1497 fix). For every other started row `end` is now,
 	// aged client-side. It subtracts only BANKED pause time (budget_paused_seconds is credited at
 	// resume). The sweep and the health arm, which own the kill, run only while status='running'.
+	// Issue #2004: a TERMINAL run with a finished_at is frozen at that instant, so a completed or
+	// failed run's figure no longer creeps with the wall clock.
 	if r.StartedAt.Valid {
 		end := now
 		if r.Status == "paused" && r.StatusSince.Valid {
 			end = r.StatusSince.Time
+		} else if apitypes.IsTerminalRunStatus(r.Status) && r.FinishedAt.Valid {
+			end = r.FinishedAt.Time
 		}
 		used := int(end.Sub(r.StartedAt.Time).Seconds()) - int(r.BudgetPausedSeconds)
 		if used < 0 {

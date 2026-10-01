@@ -15,6 +15,7 @@ import { PlusIcon, ServerIcon } from "../components/icons";
 import { DEFAULT_WORKER_TEMPLATE, WORKER_TEMPLATES, hasTemplateDrift } from "../lib/workerTemplates";
 import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RecoveryHoldsSurface } from "../components/RecoveryHoldsSurface";
@@ -698,6 +699,7 @@ export function WorkersSettings() {
                       </Badge>
                       <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} />
+                      <WorkerPendingOutcomeBadge worker={w} />
                       <WorkerCustodyBadge worker={w} />
                     </div>
                   </div>

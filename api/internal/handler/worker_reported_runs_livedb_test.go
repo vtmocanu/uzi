@@ -90,12 +90,21 @@ func TestReportedRunsOverlayLiveDB(t *testing.T) {
 	insertSnapshot(run1, "running", 5)
 	insertSnapshot(run2, "awaiting_approval", 6)
 
+	// Issue #1994: a third run under a terminal-pending lease carries a first-seen time.
+	run3 := uuid.New()
+	seedRun(run3, 7)
+	pendingSince := time.Now().UTC().Add(-time.Hour).Truncate(time.Microsecond)
+	mustExecT(ctx, t, pool,
+		`INSERT INTO worker_active_runs (worker_id, run_id, claim_generation, phase, terminal_pending, terminal_pending_until, terminal_pending_since, snapshot_epoch, reported_at)
+		 VALUES ($1, $2, 7, 'running', true, now() + interval '1 hour', $3, 1, now())`,
+		workerA, run3, pendingSince)
+
 	byWorker := h.reportedRunsByWorker(ctx, []uuid.UUID{workerA, workerB})
 
 	// Worker A: both entries, mapped run_id/phase/generation (asserted by id, order-independent).
 	gotA := byWorker[workerA]
-	if len(gotA) != 2 {
-		t.Fatalf("worker A reported_runs = %d entries, want 2: %+v", len(gotA), gotA)
+	if len(gotA) != 3 {
+		t.Fatalf("worker A reported_runs = %d entries, want 3: %+v", len(gotA), gotA)
 	}
 	byRun := map[string]apitypes.WorkerReportedRunDTO{}
 	for _, rr := range gotA {
@@ -106,6 +115,13 @@ func TestReportedRunsOverlayLiveDB(t *testing.T) {
 	}
 	if rr := byRun[run2.String()]; rr.Phase != "awaiting_approval" || rr.ClaimGeneration != 6 {
 		t.Errorf("run2 entry = %+v, want phase=awaiting_approval gen=6", rr)
+	}
+
+	if rr := byRun[run1.String()]; rr.TerminalPending || rr.TerminalPendingSince != nil {
+		t.Errorf("live run1 entry = %+v, want terminal_pending=false since=nil", rr)
+	}
+	if rr := byRun[run3.String()]; !rr.TerminalPending || rr.TerminalPendingSince == nil || !rr.TerminalPendingSince.Equal(pendingSince) {
+		t.Errorf("pending run3 entry = %+v, want terminal_pending=true since=%v", rr, pendingSince)
 	}
 
 	// Worker B: a pre-seeded, non-nil empty slice — never absent, never nil.
@@ -137,7 +153,7 @@ func TestReportedRunsOverlayLiveDB(t *testing.T) {
 
 	var dtoA apitypes.WorkerDTO
 	h.overlayReportedRuns(&dtoA, byWorker, workerA)
-	if len(dtoA.ReportedRuns) != 2 {
-		t.Errorf("worker A dto reported_runs = %d entries, want 2 after overlay", len(dtoA.ReportedRuns))
+	if len(dtoA.ReportedRuns) != 3 {
+		t.Errorf("worker A dto reported_runs = %d entries, want 3 after overlay", len(dtoA.ReportedRuns))
 	}
 }

@@ -228,6 +228,7 @@
   "prd_patch_settled_at": "2020-01-02T03:04:05Z",
   "claimed_at": "2020-01-02T03:04:05Z",
   "started_at": "2020-01-02T03:04:05Z",
+  "first_started_at": "2020-01-02T03:04:05Z",
   "finished_at": "2020-01-02T03:04:05Z",
   "created_at": "2020-01-02T03:04:05Z",
   "updated_at": "2020-01-02T03:04:05Z",

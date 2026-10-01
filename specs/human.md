@@ -630,6 +630,7 @@ ADR at `adr/0035-run-limit-retry.md`.
 - `RUN_LIMIT_MAX_WAITS` stays at its default of 5 — a retry budget, not a
   credential-count budget; a large-pool operator raises it via env. [user 2026-07-27]
 - When a run parked on a usage limit resumes, the owner gets a Slack message in the run's thread. [user 2026-09-05, PRD #1116]
+- A run's displayed duration (runs list, board card, run and issue views, `uzi run list`, the TUI) spans from its first start to now or to its finish, parks included, even after a resume that gives it a fresh `RUN_TIMEOUT` wall; the timeout budget stays measured per resumed leg, and each resume path keeps its existing `started_at` handling. For a run started before this shipped, the duration counts from its latest start before the upgrade, or, if `started_at` was NULL at the upgrade, from its first start after it, so its earlier legs are not counted. (AI-synced 2026-10-01, #2004)
 
 ## Feature #1190 — Pause and resume a run on demand
 

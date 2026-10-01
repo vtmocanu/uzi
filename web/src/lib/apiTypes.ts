@@ -733,6 +733,10 @@ export interface LatestRun {
   id: string;
   status: RunStatus;
   mr_iid: number | null;
+  // Issue #2004: the whole-run duration anchors (see Run.first_started_at). Optional for
+  // rollout skew: an older api omits both keys.
+  first_started_at?: string | null;
+  finished_at?: string | null;
   // Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
   // null on runs created before it landed. Rendered directly through isHttpsUrl; a
   // null falls back to a forge-aware URL reconstruction (forgeUrls.ts) that picks the
@@ -2045,6 +2049,14 @@ export interface WorkerReportedRun {
   run_id: string;
   phase: string;
   claim_generation: number;
+  /** Issue #1994: true when this entry is a PENDING OUTCOME, not a live execution: the run's
+   *  outcome is journaled on the worker but not yet delivered to the api. phase still reads
+   *  "running" for such an entry, so a consumer counting running work must exclude it.
+   *  Optional for api/web version skew: an older api omits it, which reads as false. */
+  terminal_pending?: boolean;
+  /** Issue #1994: RFC3339 instant the worker first reported this pending entry at this claim
+   *  generation; null (or absent on an older api) for a live entry. */
+  terminal_pending_since?: string | null;
 }
 
 /** One run's disk size on a worker (PRD #1809 M6, D8): the bytes under the run's HOME and, of
@@ -2822,6 +2834,11 @@ export interface Run {
   budget_used_seconds?: number | null;
   claimed_at: string | null;
   started_at: string | null;
+  /** Issue #2004: when the run FIRST started; never reset. started_at is the timeout/budget
+   *  anchor and is cleared on limit/recovery/pool resumes, so it covers only the last leg.
+   *  Whole-run duration displays read this, falling back to started_at. Optional for rollout
+   *  skew: an older api omits the key; null before the run first starts. */
+  first_started_at?: string | null;
   finished_at: string | null;
   created_at: string;
   updated_at: string;

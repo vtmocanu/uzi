@@ -76,6 +76,15 @@ func TestReportedRunsCell(t *testing.T) {
 	rr := func(phase string, gen int64) apitypes.WorkerReportedRunDTO {
 		return apitypes.WorkerReportedRunDTO{RunID: "r-" + phase, Phase: phase, ClaimGeneration: gen}
 	}
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	orig := reportedRunsNow
+	reportedRunsNow = func() time.Time { return now }
+	t.Cleanup(func() { reportedRunsNow = orig })
+	ago := func(d time.Duration) *time.Time { v := now.Add(-d); return &v }
+	since7h, since2h := ago(7*time.Hour), ago(2*time.Hour)
+	pend := func(since *time.Time) apitypes.WorkerReportedRunDTO {
+		return apitypes.WorkerReportedRunDTO{RunID: "p", Phase: "running", ClaimGeneration: 1, TerminalPending: true, TerminalPendingSince: since}
+	}
 	for _, tc := range []struct {
 		name string
 		runs []apitypes.WorkerReportedRunDTO
@@ -96,6 +105,31 @@ func TestReportedRunsCell(t *testing.T) {
 			name: "unknown phase appended after known",
 			runs: []apitypes.WorkerReportedRunDTO{rr("running", 1), {RunID: "rx", Phase: "some_future_phase", ClaimGeneration: 4}},
 			want: "1 running, 1 some_future_phase",
+		},
+		{
+			name: "pending only never says running",
+			runs: []apitypes.WorkerReportedRunDTO{pend(since7h)},
+			want: "1 pending outcome (oldest 7h 0m)",
+		},
+		{
+			name: "mixed live and pending",
+			runs: []apitypes.WorkerReportedRunDTO{rr("running", 1), pend(since7h)},
+			want: "1 running, 1 pending outcome (oldest 7h 0m)",
+		},
+		{
+			name: "plural uses the oldest since",
+			runs: []apitypes.WorkerReportedRunDTO{pend(since7h), pend(since2h)},
+			want: "2 pending outcomes (oldest 7h 0m)",
+		},
+		{
+			name: "nil since omits the age",
+			runs: []apitypes.WorkerReportedRunDTO{pend(nil)},
+			want: "1 pending outcome",
+		},
+		{
+			name: "nil and set since uses the set one",
+			runs: []apitypes.WorkerReportedRunDTO{pend(nil), pend(since2h)},
+			want: "2 pending outcomes (oldest 2h 0m)",
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

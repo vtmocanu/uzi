@@ -89,6 +89,7 @@
   "prd_patch_settled_at": null,
   "claimed_at": null,
   "started_at": null,
+  "first_started_at": null,
   "finished_at": null,
   "created_at": "0001-01-01T00:00:00Z",
   "updated_at": "0001-01-01T00:00:00Z",

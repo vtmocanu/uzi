@@ -1149,6 +1149,31 @@ func TestRunAgeCell(t *testing.T) {
 			want: "2h 0m",
 		},
 		{
+			// A resumed run: StartedAt was reset on the last resume, so the span must start at
+			// FirstStartedAt (#2004), not the last leg.
+			name: "completed resumed run spans from FirstStartedAt",
+			r: apitypes.RunDTO{Status: "completed", FirstStartedAt: ago(18 * time.Hour), StartedAt: ago(5 * time.Hour),
+				FinishedAt: ago(1 * time.Hour), CreatedAt: now.Add(-20 * time.Hour)},
+			want: "17h 0m",
+		},
+		{
+			name: "failed with only FirstStartedAt still spans",
+			r:    apitypes.RunDTO{Status: "failed", FirstStartedAt: ago(3 * time.Hour), FinishedAt: ago(1 * time.Hour)},
+			want: "2h 0m",
+		},
+		{
+			name: "running resumed run ages from FirstStartedAt",
+			r: apitypes.RunDTO{Status: "running", FirstStartedAt: ago(18 * time.Hour), StartedAt: ago(4 * time.Hour),
+				CreatedAt: now.Add(-20 * time.Hour)},
+			want: "18h 0m",
+		},
+		{
+			// Older server: no first_started_at, StartedAt behaviour unchanged.
+			name: "running nil FirstStartedAt uses StartedAt",
+			r:    apitypes.RunDTO{Status: "running", StartedAt: ago(4 * time.Hour), CreatedAt: now.Add(-20 * time.Hour)},
+			want: "4h 0m",
+		},
+		{
 			// Cancelled/failed before it ever started ⇒ never ran ⇒ "-".
 			name: "terminal with no StartedAt renders dash",
 			r:    apitypes.RunDTO{Status: "cancelled", FinishedAt: ago(1 * time.Hour), CreatedAt: now.Add(-2 * time.Hour)},

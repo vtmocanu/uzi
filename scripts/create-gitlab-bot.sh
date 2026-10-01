@@ -20,19 +20,19 @@
 #   ./scripts/create-gitlab-bot.sh <bot-username> <project-path-or-id> [email]
 #
 # Env overrides:
-#   HOSTNAME     GitLab host (default: gitlab.example.com)
-#   SCOPES       PAT scope (default: api — read_api cannot write labels)
-#   EXPIRES_AT   PAT expiry, YYYY-MM-DD (default: 90 days from today; your
-#                instance may enforce a shorter admin-configured max PAT
-#                lifetime, which silently clamps a longer request)
+#   GITLAB_HOSTNAME  GitLab host (default: gitlab.example.com)
+#   SCOPES           PAT scope (default: api — read_api cannot write labels)
+#   EXPIRES_AT       PAT expiry, YYYY-MM-DD (default: 90 days from today; your
+#                    instance may enforce a shorter admin-configured max PAT
+#                    lifetime, which silently clamps a longer request)
 #
-# Requires: glab, authenticated against HOSTNAME as an instance admin. On some
-# GitLab instances an exported GITLAB_TOKEN overrides glab's stored
+# Requires: glab, authenticated against GITLAB_HOSTNAME as an instance admin. On
+# some GitLab instances an exported GITLAB_TOKEN overrides glab's stored
 # credentials and 401s the admin API, so every call here runs via
 # `env -u GITLAB_TOKEN glab ...` regardless of your shell's environment.
 set -euo pipefail
 
-HOSTNAME="${HOSTNAME:-gitlab.example.com}"
+GITLAB_HOSTNAME="${GITLAB_HOSTNAME:-gitlab.example.com}"
 SCOPES="${SCOPES:-api}"
 EXPIRES_AT="${EXPIRES_AT:-$(date -v+90d +%F 2>/dev/null || date -d '+90 days' +%F)}"
 DEVELOPER_ACCESS_LEVEL=30
@@ -44,14 +44,14 @@ usage() {
 [ $# -ge 2 ] || usage
 BOT_USERNAME="$1"
 PROJECT="$2"
-EMAIL="${3:-${BOT_USERNAME}@users.noreply.${HOSTNAME}}"
+EMAIL="${3:-${BOT_USERNAME}@users.noreply.${GITLAB_HOSTNAME}}"
 PROJECT_ENC="${PROJECT//\//%2F}"
 
 info() { printf '==> %s\n' "$1"; }
 warn() { printf '\033[33mWARN\033[0m %s\n' "$1" >&2; }
 die() { printf '\033[31mERROR\033[0m %s\n' "$1" >&2; exit 1; }
 
-glab_api() { env -u GITLAB_TOKEN glab api --hostname "$HOSTNAME" "$@"; }
+glab_api() { env -u GITLAB_TOKEN glab api --hostname "$GITLAB_HOSTNAME" "$@"; }
 
 json_field() {
   # json_field <compact-json> <key> — extracts a bare (unquoted) numeric or
@@ -61,9 +61,9 @@ json_field() {
     || printf '%s' "$1" | grep -o "\"$2\":\"[^\"]*\"" | head -1 | sed "s/.*\"$2\":\"//;s/\"\$//"
 }
 
-info "checking glab auth against $HOSTNAME"
-env -u GITLAB_TOKEN glab auth status --hostname "$HOSTNAME" >/dev/null 2>&1 \
-  || die "not authenticated against $HOSTNAME as an admin; run: glab auth login --hostname $HOSTNAME"
+info "checking glab auth against $GITLAB_HOSTNAME"
+env -u GITLAB_TOKEN glab auth status --hostname "$GITLAB_HOSTNAME" >/dev/null 2>&1 \
+  || die "not authenticated against $GITLAB_HOSTNAME as an admin; run: glab auth login --hostname $GITLAB_HOSTNAME"
 
 info "looking up existing user $BOT_USERNAME"
 existing="$(glab_api "users?username=${BOT_USERNAME}")"
@@ -108,4 +108,4 @@ echo
 printf '\033[33mSAVE THIS NOW — GitLab will not show it again:\033[0m\n'
 printf '  %s\n' "$token"
 echo
-echo "Paste it into uzi: Settings -> Forge -> Base URL https://${HOSTNAME} -> Token."
+echo "Paste it into uzi: Settings -> Forge -> Base URL https://${GITLAB_HOSTNAME} -> Token."

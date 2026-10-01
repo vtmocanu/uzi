@@ -248,8 +248,15 @@ type WorkerRunDiskDTO struct {
 // the phase is a closed server-validated enum (running | awaiting_approval | awaiting_input |
 // awaiting_followup), never worker free-text, so renderers read it without a scrub. Nested in
 // WorkerDTO.ReportedRuns, following the RecoveryCustodyHoldDTO nested-DTO precedent.
+//
+// TerminalPending (issue #1994) is true when the worker lists the attempt's outcome as journaled
+// but not yet delivered; TerminalPendingSince is the first time the api saw it pending at this
+// generation (kept across lease renewals), null for a live entry. Together they show how long an
+// outcome has been stuck on the worker.
 type WorkerReportedRunDTO struct {
-	RunID           string `json:"run_id"`
-	Phase           string `json:"phase"`
-	ClaimGeneration int64  `json:"claim_generation"`
+	RunID                string     `json:"run_id"`
+	Phase                string     `json:"phase"`
+	ClaimGeneration      int64      `json:"claim_generation"`
+	TerminalPending      bool       `json:"terminal_pending"`
+	TerminalPendingSince *time.Time `json:"terminal_pending_since"`
 }

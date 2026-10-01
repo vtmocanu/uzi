@@ -262,10 +262,13 @@ type RunDTO struct {
 	// RUN_TIMEOUT) + budget_extension_seconds, computed server-side so a client never has to
 	// know RUN_TIMEOUT. Null for a kind/state that never times out (not running, chat/judge,
 	// interactive, or no started_at) — the same predicate RunDeadline uses. BudgetUsedSeconds
-	// is the ACTIVE time so far (now - started_at - budget_paused_seconds, clamped at 0), the
-	// paused-aware "used" the header measures against the budget, NOT raw wall elapsed; null
-	// when the run never started. A new SPA against an older api sees these undefined and falls
-	// back to plain elapsed (rollout-skew safe).
+	// is the ACTIVE time in the CURRENT budget leg (end - started_at - budget_paused_seconds,
+	// clamped at 0), the paused-aware "used" the header measures against the budget, NOT raw
+	// wall elapsed and NOT total working time: started_at resets on limit/recovery/pool
+	// resumes (see first_started_at for the never-reset start). end is
+	// status_since for a paused run, finished_at for a terminal run that has one (issue #2004:
+	// so a finished run's figure no longer drifts), else now; null when the run never started. A new SPA against an
+	// older api sees these undefined and falls back to plain elapsed (rollout-skew safe).
 	BudgetTotalSeconds *int `json:"budget_total_seconds"`
 	BudgetUsedSeconds  *int `json:"budget_used_seconds"`
 	// ScopeCeiling is the operator scope ceiling (PRD #634 M2): the count of milestones the
@@ -545,9 +548,14 @@ type RunDTO struct {
 	PrdPatchSettledAt *time.Time `json:"prd_patch_settled_at"`
 	ClaimedAt         *time.Time `json:"claimed_at"`
 	StartedAt         *time.Time `json:"started_at"`
-	FinishedAt        *time.Time `json:"finished_at"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	// FirstStartedAt is when the run FIRST reached running (runs.first_started_at, issue
+	// #2004). Unlike started_at (the budget/timeout anchor, reset by the resume paths that grant
+	// a fresh wall) no writer ever resets it, so it is the display anchor for the
+	// whole-run duration. Null until the run first starts.
+	FirstStartedAt *time.Time `json:"first_started_at"`
+	FinishedAt     *time.Time `json:"finished_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
 	// only by the statements that assign runs.status). The column is backfilled and NOT
 	// NULL (migration 00163_run_status_since.sql), so a current server always sends a

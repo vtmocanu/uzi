@@ -58,6 +58,7 @@ import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { statusSinceIso } from "../lib/statusSince";
+import { firstStartIso } from "../lib/runDuration";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { SalvagePanel } from "../components/SalvagePanel";
@@ -151,8 +152,9 @@ function RunBudgetElapsed({ run }: { run: Run }) {
   const now = useNow(1000);
   const view = extendBudgetView(run, now);
   if (!view) {
-    // Plain elapsed — today's behaviour, unchanged for a null-budget kind or an older api.
-    return run.started_at ? <LiveElapsed since={run.started_at} /> : null;
+    // Plain elapsed, spanning from the first start (firstStartIso) for a null-budget kind or an older api.
+    const since = firstStartIso(run);
+    return since ? <LiveElapsed since={since} /> : null;
   }
   const deadline = formatLocalTime(view.deadlineIso);
   const tip =
@@ -181,15 +183,17 @@ function RunBudgetElapsed({ run }: { run: Run }) {
 // PRD #1189/#1190: a paused run's elapsed. The clock is stopped, so it is a STATIC span, not a
 // ticker: the frozen used time over the budget, then how much of the budget remains when the run
 // resumes (the deadline itself is omitted — it moves with the pause). A run with no wall budget
-// keeps today's plain "· clock stopped" line, measured from started_at to when the pause landed
+// keeps today's plain "· clock stopped" line, measured from the first start to when the pause landed
 // (status_since, issue #1727, with the updated_at fallback; the same instant PausedPanel shows).
 function PausedElapsed({ run }: { run: Run }) {
   if (!run.started_at) return null;
   const view = extendBudgetView(run, Date.now());
   if (!view) {
+    // Issue #2004: the no-budget line is a plain wall span, so it anchors on the first start.
+    // The `?? run.started_at` only narrows the type: firstStartIso already falls back to it.
     return (
       <span className="text-xs tabular-nums text-faint">
-        {formatDuration(Date.parse(statusSinceIso(run)) - Date.parse(run.started_at))} · clock stopped
+        {formatDuration(Date.parse(statusSinceIso(run)) - Date.parse(firstStartIso(run) ?? run.started_at))} · clock stopped
       </span>
     );
   }
@@ -2188,9 +2192,10 @@ export function RunView() {
     run.mr_web_url,
     run.mr_iid != null ? mergeRequestUrl(repoWebUrl, run.mr_iid, run.forge_type) : null,
   );
+  const firstStart = firstStartIso(run);
   const duration =
-    run.started_at && run.finished_at
-      ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
+    firstStart && run.finished_at
+      ? formatDuration(new Date(run.finished_at).getTime() - new Date(firstStart).getTime())
       : null;
   // PRD #1167 M4: Shadow's per-run surface signal, rendered as data-live/data-attention
   // on the run header block (the titleNode wrapping the breadcrumb, title and status).

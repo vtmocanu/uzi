@@ -64,6 +64,17 @@ func TestRunDuration(t *testing.T) {
 	if got := runDuration(apitypes.RunDTO{StartedAt: tp(-2 * time.Hour), FinishedAt: tp(-time.Hour)}, now); got != "1h" {
 		t.Errorf("finished run: got %q, want 1h", got)
 	}
+	// Resumed run (#2004): FirstStartedAt wins over the reset StartedAt, terminal and live.
+	if got := runDuration(apitypes.RunDTO{FirstStartedAt: tp(-10 * time.Hour), StartedAt: tp(-2 * time.Hour), FinishedAt: tp(-time.Hour)}, now); got != "9h" {
+		t.Errorf("resumed finished run: got %q, want 9h", got)
+	}
+	if got := runDuration(apitypes.RunDTO{FirstStartedAt: tp(-10 * time.Hour), StartedAt: tp(-2 * time.Hour)}, now); got != "10h" {
+		t.Errorf("resumed running run: got %q, want 10h", got)
+	}
+	// Older server (nil FirstStartedAt) keeps the StartedAt behaviour.
+	if got := runDuration(apitypes.RunDTO{FirstStartedAt: nil, StartedAt: tp(-2 * time.Hour)}, now); got != "2h" {
+		t.Errorf("nil FirstStartedAt: got %q, want 2h", got)
+	}
 }
 
 // applyMeta refreshes the non-streamed fields (milestones, health, …) but must PRESERVE the

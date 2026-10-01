@@ -66,6 +66,18 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
    cross-issue blocker** (the target depends on another run's code landing first, or a
    sharp same-file overlap). Independent issues parallelize fine — do not gate on ordinary
    parallelism; a file conflict that slips through is resolved at merge.
+
+   **Scope gate (PRD issues).** Before creating the run, apply `/prd-create`'s scope gate
+   (Step 1.2) to the issue's `prds/` file, as `/prd-start` does. A PRD written before that
+   gate existed is the usual case.
+   - **A milestone needing an unfinished PRD is a hard stop**: propose moving it or redrawing
+     the boundary; do not dispatch.
+   - **A scope-review alarm** (more than one independently valuable outcome, or an expected
+     large PR): take a concrete split (child outcomes, order, blockers) to the user as one
+     yes/no, with the buddy's view, and do not dispatch that issue meanwhile. For these
+     alarms only, if no split yields independently valuable pieces, record the reason in the
+     PRD's Decision Log, commit and push that PRD-only edit to `main` (as `/prd-create`
+     commits a PRD), and continue once the push lands: the run clones the remote.
 2. **Decide MR-rework, then create gated** (no `--plan-file`):
 
    ```
