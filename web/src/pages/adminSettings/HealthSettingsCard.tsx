@@ -28,7 +28,7 @@ const HEALTH_FIELDS: {
   {
     key: "health_tool_call_seconds",
     label: "Long tool call after (seconds)",
-    hint: "A single tool call still running after this long, with no other activity for the Stalled after window. A subagent that is still working is never flagged; one that has gone silent can be. 0 disables.",
+    hint: "A single tool call still running after this long, with no other activity for the Stalled after window (or this long, if that is 0). A subagent that is still sending updates is never flagged; one that has gone silent can be. 0 disables.",
     validate: validateHealthSeconds,
   },
   {

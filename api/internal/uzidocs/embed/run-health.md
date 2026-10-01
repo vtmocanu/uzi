@@ -63,15 +63,18 @@ has been in progress longer than the configured threshold"_, when both hold:
   **Stalled after** window (or for the long-tool-call threshold itself, if
   **Stalled after** is `0`).
 
-A call to a subagent (a delegation) is never aged: while one is open the run
-reads as working, as before. A subagent that is still sending updates never
-trips this flag. Only one that has also gone silent past the window can, and
-then only while an ordinary call of the main agent has been open past the
-threshold. The age is measured from when uzi received the call, and it only
-looks at the run's recent tool calls; a run whose older calls all fall
-outside that window still trips the plain **stalled** flag once it goes
-quiet. The flag clears as soon as the call's result arrives. Like every
-flag, it never stops the run.
+A call to a subagent (a delegation) is never aged, and while one is open
+among the run's recent tool calls this flag stays off, as before. A subagent
+that is still sending updates never trips it either. The one exception is a
+delegation old enough to have dropped out of those recent calls: if its
+subagent has also gone silent past the window while an ordinary call of the
+main agent has been open past the threshold, the run is flagged. The age is
+measured from when uzi received the call. A run whose older calls all fall
+outside the recent window still trips the plain **stalled** flag once it
+goes quiet. During an api outage, when the run's worker reports its updates
+queued, the reason says so instead. The flag clears on the next check once
+no open call is past the threshold, or as soon as new activity arrives. Like
+every flag, it never stops the run.
 
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
@@ -155,10 +158,10 @@ setting it to `0`, from **Admin → Instance → Run health** — see
 itself (how many repeats, over how large a window) isn't tunable; every other
 signal is — the plain seconds thresholds, and **near timeout**'s share of the
 run's wall-clock budget (a percent, not a duration, so it means the same
-thing regardless of the run's timeout or frozen budget). Setting **Long tool call after** to `0` turns off only the
-[long tool call](#long-tool-calls) reason. The undelivered-outcome
+thing regardless of the run's timeout or frozen budget). The undelivered-outcome
 **stalled** reason is the other exception: its threshold is fixed at 4 of the
 api's heartbeat intervals and setting **stalled** to `0` does not disable it;
-only turning run health off entirely does.
+only turning run health off entirely does. Setting **Long tool call after**
+to `0` turns off only the [long tool call](#long-tool-calls) reason.
 
 Related: [Paused on a usage limit](run-limit-wait.md) · [Why was my run stopped automatically?](run-auto-stopped.md) · [Configuration](configuration.md)

@@ -168,15 +168,15 @@ func TestHealthLongToolCallAgesTheOldestOfSeveralOpenCalls(t *testing.T) {
 // skipped, never treated as the zero time, so it cannot mask a genuinely old open call
 // beside it, in either row order.
 func TestHealthLongToolCallUnknownCreatedAtBesideAnAgedCall(t *testing.T) {
-	for _, unknownFirst := range []bool{true, false} {
+	for _, unknownOlderSeq := range []bool{true, false} {
 		old := lcUse(t, 1, "a", "Bash", 25*time.Minute)
 		unknown := lcUse(t, 2, "b", "Bash", 0)
 		unknown.createdAt = time.Time{}
-		if unknownFirst {
+		if unknownOlderSeq {
 			old.seq, unknown.seq = 2, 1
 		}
 		h, why := lcDetect(t, lcRun(7*time.Minute), []fakeRunMessage{old, unknown}, longCallSettings())
-		wantHealth(t, fmt.Sprintf("unknown created_at beside an aged call (unknownFirst=%v)", unknownFirst), h, why, healthStalled, reasonLongToolCall)
+		wantHealth(t, fmt.Sprintf("unknown created_at beside an aged call (unknownOlderSeq=%v)", unknownOlderSeq), h, why, healthStalled, reasonLongToolCall)
 	}
 }
 

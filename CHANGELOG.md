@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Added
 
 - **Run health flags a tool call that has been running too long ([#2046](https://github.com/vtmocanu/uzi/issues/2046)).**
-  A running run is now flagged stalled, with the reason "a tool call has been in progress longer than the configured threshold", when its main agent's oldest open tool call has run past the new admin setting `health_tool_call_seconds` (default 20 minutes, `0` turns it off) and the run has gone quiet for the stall window. Calls to subagents are never aged. Previously a single hung command kept a run's health reading ok until the run neared its wall-clock timeout.
+  A running run is now flagged stalled, with the reason "a tool call has been in progress longer than the configured threshold", when its main agent's oldest open tool call has run for at least the new admin setting `health_tool_call_seconds` (default 20 minutes, `0` turns it off) and the run has gone quiet for the stall window. Calls to subagents are never aged. Previously a single hung command kept a run's health reading ok until the run neared its wall-clock timeout.
 
 - **Renovate proposes grouped Codex runtime upgrades.**
   Stable native-runtime releases follow the existing seven-day release age and nightly update schedule. Each PR updates the source commit and both musl archive checksums together; installer consistency checks and runtime pin parity block partial upgrades until the required compatibility work is complete.
