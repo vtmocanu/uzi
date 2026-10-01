@@ -419,12 +419,14 @@ bundles (`resumeLive`). It is single-flight with the boot sweep (it returns at o
 in flight), touches at most `liveMaxPerPass` records per pass (default 4), least recently attempted
 first, and spaces passes with a capped exponential backoff: defaults 30 s base and 15 min cap, with no
 lifetime cap on attempts. After the first transient pass the delay is 2x the base, doubling from
-there. A pass that fails nothing resets it to the base. Candidates are only authenticated records
-with a journaled bundle that are `bundled`, or `needs_action` for a transient reason, of runs this
-worker is not executing; the upload is the journaled-bytes upload (no forge PAT, never a re-bundle).
+there. A pass with no transient failure resets it to the base. Candidates are only authenticated
+records with a journaled bundle that are `bundled`, or `needs_action` for a transient reason or
+`credential_rejected` (gated as below), of runs this worker is not executing; the upload is the
+journaled-bytes upload (no forge PAT, a journaled bundle is never re-produced).
 
 **Typed dispositions.** The api's `mapRecoveryError` now writes a stable `reason` beside `error` on
-every recovery refusal (additive; the `{"error"}` envelope is unchanged). The worker classifies a
+every recovery-service refusal (the handler's own request-shape 400s stay untyped and fall to the
+status fallback) (additive; the `{"error"}` envelope is unchanged). The worker classifies a
 failed reserve or upload by that `reason`, falling back to the HTTP status for an api without typed
 bodies:
 
@@ -440,20 +442,29 @@ bodies:
 The disposition is stored in the record's existing `reason` string, not a new field: a new
 MAC-covered field would make a rolled-back worker recompute a different MAC and refuse the record.
 The permanent reasons are honoured at every entry point (capture, boot sweep, live pass): a record
-carrying one is never uploaded again. A permanent refusal leaves the hold `needs_action` with
-custody retained; release evidence is unchanged.
+carrying one is never uploaded again. A permanent refusal leaves the worker's record `needs_action`
+with its bundle and source pin kept; the worker releases nothing, and release evidence is unchanged.
+A rolled-back (pre-#1995) worker still reads such a record but does not honour the disposition: its
+boot sweep retries it once per boot.
 
 **Immutability rules.** One per-capture cycle lock is the outer lock and the journal lock the inner
-one; a live step takes the cycle lock in skip mode, so a foreground capture or sweep step on the same
-record wins. A bundle is installed temp-then-atomic only if the record still exists with the same pin
-facts, else the step ends `source_advanced`. Guarded post-pin writes never resurrect a released
+one; a live step takes the cycle lock in skip mode, so it never waits behind a foreground capture or sweep step on the
+same record (which, in wait mode, waits for a live step that got the lock first). A bundle is installed temp-then-atomic only if the record still exists with the same pin
+facts: a removed record ends the step `record_removed`, changed pin facts end it `source_advanced`,
+and a bundle journaled meanwhile wins. Guarded post-pin writes never resurrect a released
 record. Failure marking never downgrades `uploaded` and keeps `serverCaptureId`. A pin updates an
 existing record atomically under the journal lock, with per-state field rules. Journaled bundle bytes
 are dropped only when the record file is confirmed absent; an unreadable or unauthenticated record
 keeps its bytes and is not written.
 
-**Accepted residual.** A stream already in flight when cleanup releases the record cannot be recalled:
-the server refuses it and the record is not recreated.
+**Accepted residual.** A stream already in flight when cleanup releases the record cannot be recalled.
+The server checks the hold once when the upload transaction starts, so it refuses the upload only if
+the release committed before the request began; a release that commits mid-stream lets the capture
+become `available` on a released hold (an orphan archive until it expires). Either way the worker's
+guarded write refuses to recreate the record. The `isExecuting` check is made at selection and again
+under the cycle lock, not during the upload itself, so a run resumed mid-upload can overlap it
+briefly; the bytes are immutable and a byte-identical re-upload is idempotent.
 
 **Known gap, outside this change.** `release()`'s sibling count can treat a momentarily unreadable
-sibling record as absent; it is filed separately.
+sibling record as absent and remove the run dir with that sibling's bundle; it predates this change
+(#1349/#1751) and was reported for separate follow-up.
