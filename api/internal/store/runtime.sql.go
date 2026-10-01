@@ -7741,7 +7741,7 @@ type ListPlanRevisionStateForRunsRow struct {
 
 // The plan-ish message rows ({plan, plan_revising}) for a page of runs, so the
 // "latest by seq is plan_revising ⇒ revising" fold happens in Go (planRevisingSet),
-// mirroring web derivePlanRevision. Backed by the partial index
+// mirroring web derivePlanRevision. Backed by the partial index (issue #2041)
 // idx_run_messages_plan_seq (run_id, seq) WHERE kind IN ('plan', 'plan_revising').
 func (q *Queries) ListPlanRevisionStateForRuns(ctx context.Context, runIds []uuid.UUID) ([]ListPlanRevisionStateForRunsRow, error) {
 	rows, err := q.db.Query(ctx, listPlanRevisionStateForRuns, runIds)
