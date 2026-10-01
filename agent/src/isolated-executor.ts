@@ -18,6 +18,9 @@
 //      fetch tool's hash-named downloads) out of reach of Write/Edit/MultiEdit/NotebookEdit,
 //      so a saved source always holds the bytes whose sha256 names it.
 //
+// The JobRunner's lane mode (PRD #1976) reuses these layers unchanged, parameterized by an
+// IsolationSurface (tools, MCP servers, plugin, skills) instead of copying them.
+//
 // The SDK child env is buildSdkEnv() with no provisioned tool env (so nothing a devbox
 // could add), then the lane knobs, with CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 as the
 // last assignment so no earlier key can override it. The fetch credential is never in it:
@@ -44,8 +47,11 @@ import { buildSdkEnv, type SdkEnv } from "./sdk-env.js";
 import { defaultQueryFn, isErrorResult, isResult, mapSdkMessage, promptStream } from "./sdk-messages.js";
 import { killProcessGroup, spawnDetached } from "./sdk-spawn.js";
 
-/** The fixed, named tool set of a profile-bound run (PRD #1906 Decision 5). The PRD's
- *  `submit_job_result` joins it with PRD #1908's jobs (M8); until then it is not offered. */
+/** The fixed, named tool set of a profile-bound research run (PRD #1906 Decision 5). A
+ *  profile-bound JOB (PRD #1976) runs on the JobRunner's lane mode, which reuses every layer of
+ *  this file with a wider, equally fixed surface (ISOLATED_TOOLS plus `submit_job_result`, plus
+ *  `Skill` when the job carries product skills: see {@link IsolationSurface}); this research set
+ *  itself never offers it. */
 export const ISOLATED_TOOLS: readonly string[] = ["Read", "Write", "Edit", "Grep", "Glob", FETCH_TOOL_QUALIFIED];
 
 /** Tools the session must never have, named explicitly on top of the `tools` restriction:
@@ -82,8 +88,33 @@ const RUN_SECRETS_DIR = "/run/uzi-secrets";
 const PINNED_BUILTIN_AGENTS: ReadonlySet<string> = new Set(["claude", "general-purpose", "statusline-setup"]);
 const PINNED_BUILTIN_SKILLS: ReadonlySet<string> = new Set(["doctor"]);
 
+/**
+ * What an isolated session is allowed to expose, in every layer at once: the tool gate, the
+ * init check and the SDK options all read the same surface, so they cannot drift apart. The
+ * research run uses {@link RESEARCH_SURFACE}; a profile-bound job (JobRunner lane mode) builds
+ * its own with the result server, and the single product-skills plugin only when it has skills.
+ */
+export interface IsolationSurface {
+  /** The exact effective tool list (the init frame must be set-equal to it). */
+  readonly tools: readonly string[];
+  /** The exact MCP server names (set-equal). */
+  readonly mcpServers: readonly string[];
+  /** The exact local plugin names loaded (empty: none). */
+  readonly plugins: readonly string[];
+  /** Skill names allowed in the init frame besides the pinned CLI built-ins. */
+  readonly skills: readonly string[];
+}
+
+/** Today's research surface: the fixed isolated tools, the fetch server, nothing else. */
+const RESEARCH_SURFACE: IsolationSurface = {
+  tools: ISOLATED_TOOLS,
+  mcpServers: [FETCH_SERVER_NAME],
+  plugins: [],
+  skills: [],
+};
+
 /** The builtin plugin the pinned CLI loads unless it is disabled through settings. */
-const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false };
+export const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false };
 
 const REASON_INIT_PENDING = "denied: the isolated session's tool set has not been verified yet";
 const REASON_TOOL_NOT_ALLOWED = "denied: this tool is not in the isolated run's fixed tool set";
@@ -139,14 +170,14 @@ export function isolateSdkEnv(base: SdkEnv): SdkEnv {
 }
 
 /** The init latch: closed (refusing every tool) until the init frame passes the check. */
-interface InitGate {
+export interface InitGate {
   passed: boolean;
 }
 
 /** The matcher-less PreToolUse hook: deny everything before init, and any tool outside
- *  ISOLATED_TOOLS always. */
-function buildIsolatedToolGate(gate: InitGate, log: Logger): (input: HookInput) => Promise<HookJSONOutput> {
-  const allowed = new Set(ISOLATED_TOOLS);
+ *  the surface always. */
+function buildIsolatedToolGate(gate: InitGate, log: Logger, surface: IsolationSurface): (input: HookInput) => Promise<HookJSONOutput> {
+  const allowed = new Set(surface.tools);
   return async (input: HookInput): Promise<HookJSONOutput> => {
     if (input.hook_event_name !== "PreToolUse") return {};
     let reason: string | undefined;
@@ -185,16 +216,17 @@ function isContentFrame(message: unknown): boolean {
 }
 
 /**
- * Check the SDK's `system/init` frame against the fixed tool set. Returns a reason on any
- * difference; undefined when the effective session is exactly what was requested.
+ * Check the SDK's `system/init` frame against the fixed surface (default: the research one).
+ * Returns a reason on any difference; undefined when the effective session is exactly what was
+ * requested.
  */
-export function checkIsolatedInit(message: unknown): string | undefined {
+export function checkIsolatedInit(message: unknown, surface: IsolationSurface = RESEARCH_SURFACE): string | undefined {
   const frame = asRecord(message);
   if (!frame || !isInitFrame(frame)) return "not an init frame";
 
   const tools = stringList(frame, "tools");
   if (!tools) return "init frame has a malformed tool list";
-  const want = new Set(ISOLATED_TOOLS);
+  const want = new Set(surface.tools);
   const got = new Set(tools);
   const extra = [...got].filter((t) => !want.has(t));
   const missing = [...want].filter((t) => !got.has(t));
@@ -204,13 +236,20 @@ export function checkIsolatedInit(message: unknown): string | undefined {
 
   const servers = frame["mcp_servers"];
   const names = Array.isArray(servers) ? servers.map((s) => asRecord(s)?.["name"]) : undefined;
-  if (!names || names.length !== 1 || names[0] !== FETCH_SERVER_NAME) {
-    return `MCP servers must be exactly [${FETCH_SERVER_NAME}]`;
+  if (!names || names.length !== surface.mcpServers.length || !surface.mcpServers.every((n) => names.includes(n))) {
+    return `MCP servers must be exactly [${surface.mcpServers.join(", ")}]`;
   }
 
   const plugins = frame["plugins"];
-  if (plugins !== undefined && plugins !== null && (!Array.isArray(plugins) || plugins.length > 0)) {
-    return "a plugin is loaded";
+  if (surface.plugins.length === 0) {
+    if (plugins !== undefined && plugins !== null && (!Array.isArray(plugins) || plugins.length > 0)) {
+      return "a plugin is loaded";
+    }
+  } else {
+    const pluginNames = Array.isArray(plugins) ? plugins.map((p) => asRecord(p)?.["name"]) : undefined;
+    if (!pluginNames || pluginNames.length !== surface.plugins.length || !surface.plugins.every((n) => pluginNames.includes(n))) {
+      return `plugins must be exactly [${surface.plugins.join(", ")}]`;
+    }
   }
 
   const agents = stringList(frame, "agents");
@@ -220,9 +259,55 @@ export function checkIsolatedInit(message: unknown): string | undefined {
 
   const skills = stringList(frame, "skills");
   if (!skills) return "init frame has a malformed skill list";
-  const straySkills = skills.filter((s) => !PINNED_BUILTIN_SKILLS.has(s));
+  const straySkills = skills.filter((s) => !PINNED_BUILTIN_SKILLS.has(s) && !surface.skills.includes(s));
   if (straySkills.length) return `unexpected skills: ${straySkills.join(",")}`;
   return undefined;
+}
+
+/**
+ * The per-frame guard both lanes run on every SDK message: an init frame is checked against
+ * the surface and moves the latch accordingly (a failed check closes it again); model or tool
+ * content seen while the latch is closed is refused. Returns the refusal reason, if any.
+ */
+export function guardIsolatedFrame(msg: unknown, gate: InitGate, surface: IsolationSurface): string | undefined {
+  if (isInitFrame(msg)) {
+    const refusal = checkIsolatedInit(msg, surface);
+    gate.passed = refusal === undefined;
+    return refusal;
+  }
+  if (!gate.passed && isContentFrame(msg)) return "the session produced output before its tool set was verified";
+  return undefined;
+}
+
+/** The disallow list for a surface: the isolated denials, minus anything the surface offers. */
+export function isolatedDisallowedTools(surface: IsolationSurface = RESEARCH_SURFACE): string[] {
+  return ISOLATED_DISALLOWED_TOOLS.filter((t) => !surface.tools.includes(t));
+}
+
+type PreToolUseMatchers = NonNullable<NonNullable<SdkOptions["hooks"]>["PreToolUse"]>;
+
+/** The three PreToolUse layers every isolated session carries: the matcher-less tool gate, the
+ *  path guard (worker credential paths and the run secrets dir denied) and the sources/ write
+ *  guard. A caller may append its own hooks after them. */
+export function buildIsolatedPreToolUse(input: {
+  surface: IsolationSurface;
+  gate: InitGate;
+  cwd: string;
+  log: Logger;
+  secretPaths: readonly string[];
+}): PreToolUseMatchers {
+  return [
+    // Matcher-less: runs for EVERY tool call, whatever its name.
+    { hooks: [buildIsolatedToolGate(input.gate, input.log, input.surface)] },
+    {
+      matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
+      hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR])],
+    },
+    {
+      matcher: WRITE_PATH_TOOLS.join("|"),
+      hooks: [buildSourcesWriteGuard(input.cwd, input.log)],
+    },
+  ];
 }
 
 /** The research system prompt (appended to the claude_code preset). */
@@ -279,8 +364,8 @@ export function buildIsolatedSdkOptions(input: {
     // Guardrail invariant #6 (semgrep/settings-sources-isolation.yml): nothing on disk.
     settingSources: [],
     settings: { enabledPlugins: BUILTIN_PLUGINS_DISABLED },
-    tools: [...ISOLATED_TOOLS],
-    disallowedTools: [...ISOLATED_DISALLOWED_TOOLS],
+    tools: [...RESEARCH_SURFACE.tools],
+    disallowedTools: isolatedDisallowedTools(RESEARCH_SURFACE),
     mcpServers: { [FETCH_SERVER_NAME]: input.fetchServer },
     strictMcpConfig: true,
     plugins: [],
@@ -291,18 +376,13 @@ export function buildIsolatedSdkOptions(input: {
     allowDangerouslySkipPermissions: true,
     maxTurns: input.maxTurns,
     hooks: {
-      PreToolUse: [
-        // Matcher-less: runs for EVERY tool call, whatever its name.
-        { hooks: [buildIsolatedToolGate(input.gate, input.log)] },
-        {
-          matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
-          hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR])],
-        },
-        {
-          matcher: WRITE_PATH_TOOLS.join("|"),
-          hooks: [buildSourcesWriteGuard(input.cwd, input.log)],
-        },
-      ],
+      PreToolUse: buildIsolatedPreToolUse({
+        surface: RESEARCH_SURFACE,
+        gate: input.gate,
+        cwd: input.cwd,
+        log: input.log,
+        secretPaths: input.secretPaths,
+      }),
     },
     includePartialMessages: false,
   };
@@ -381,19 +461,12 @@ export class IsolatedExecutor {
     try {
       const stream = this.queryFn({ prompt: promptStream(ctx.prompt), options });
       for await (const msg of stream) {
-        if (isInitFrame(msg)) {
-          // Every init frame is checked (a resumed or re-initialized session re-announces
-          // its tools). A failure closes the latch and ends the session.
-          refusal = checkIsolatedInit(msg);
-          gate.passed = refusal === undefined;
-          if (refusal) {
-            this.log.error("isolated session refused: effective tool set differs", { run_id: ctx.runId, reason: refusal });
-            abort.abort();
-            break;
-          }
-        } else if (!gate.passed && isContentFrame(msg)) {
-          // Model output before the init frame was checked: never act on it.
-          refusal = "the session produced output before its tool set was verified";
+        // Every init frame is checked (a resumed or re-initialized session re-announces its
+        // tools); model output before the first passing init is never acted on. A refusal
+        // closes the latch and ends the session.
+        refusal = guardIsolatedFrame(msg, gate, RESEARCH_SURFACE);
+        if (refusal) {
+          this.log.error("isolated session refused", { run_id: ctx.runId, reason: refusal });
           abort.abort();
           break;
         }

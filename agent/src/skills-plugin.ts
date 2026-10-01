@@ -18,7 +18,7 @@ import type { ClaimSkill } from "./protocol.js";
 
 /** Plugin name written to .claude-plugin/plugin.json. The SDK addresses our
  *  skills as `uzi:<name>` (plugin-qualified enable-list, sdk.d.ts:1876). */
-const SKILLS_PLUGIN_NAME = "uzi";
+export const SKILLS_PLUGIN_NAME = "uzi";
 
 /** Kebab-case skill name — the identity + on-disk directory. Mirrors the server
  *  regex (api/internal/skilltmpl NameRe). It also makes a name path-safe: the

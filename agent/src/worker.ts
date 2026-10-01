@@ -27,6 +27,12 @@ import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, C
  *  clause (M5) hands a profile-bound run only to a worker advertising it. */
 export const ISOLATED_FETCH_CAPABILITY = "isolated_fetch_v1";
 
+/** PRD #1976: the protocol capability proving this image runs a profile-bound JOB on the lane
+ *  (the JobRunner's lane mode: fetch tool, result tool, input downloads and output uploads under
+ *  the isolated surface). Advertised under exactly the isolated_fetch_v1 condition; the api sends
+ *  a job claim carrying `isolated_fetch` only to a worker advertising it. */
+export const ISOLATED_JOB_CAPABILITY = "isolated_job_v1";
+
 /** issue #1582 M2: default re-sweep interval of the ancestry-settlement journal. */
 const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
@@ -522,7 +528,7 @@ export class Worker {
         // claim there (the same uidSplitActive detector), so advertising would only attract
         // runs this worker fails.
         if (this.config.fetcherUrl && this.config.fetcherCaFile && !uidSplitActive()) {
-          protocolCapabilities.push(ISOLATED_FETCH_CAPABILITY);
+          protocolCapabilities.push(ISOLATED_FETCH_CAPABILITY, ISOLATED_JOB_CAPABILITY);
         }
         // PRD #1332 D3 (M5A / C2), refined by PRD #1493 M3: advertise the Codex harness
         // PROTOCOL capability ONLY on an HONEST availability result. The old gate was the
@@ -903,8 +909,13 @@ export class Worker {
           // PRD #1906 M4: a profile-bound research claim (`isolated_fetch`) is routed FIRST,
           // before every other dispatch, so no kind or review target can send it to a runner
           // that clones, holds tools beyond the fixed set, or reaches the RunRunner at all.
+          // PRD #1976: a profile-bound JOB (`isolated_fetch` on a `job` claim) runs on the JobRunner's
+          // lane mode, which applies the same isolated confinement and fails closed without a valid
+          // grant or the fetcher config; every other `isolated_fetch` claim stays on the IsolatedRunner.
           const exec = claim.isolated_fetch
-            ? this.executeIsolated(claim)
+            ? claim.kind === "job"
+              ? this.jobRunner.execute(claim)
+              : this.executeIsolated(claim)
             : claim.review_target_run_id
             ? this.reviewRunner.execute(claim)
             : claim.kind === "judge"

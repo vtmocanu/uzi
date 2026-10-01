@@ -18,6 +18,7 @@ import {
   type IsolatedContext,
   type IsolatedExecutorOptions,
 } from "../src/isolated-executor.js";
+import { laneJobSurface } from "../src/job-runner.js";
 import { buildFetchToolsServer } from "../src/fetch-tools.js";
 import { buildSdkEnv } from "../src/sdk-env.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -358,5 +359,64 @@ describe("isolated executor: env scope", () => {
     assert.equal(env[NONESSENTIAL], "1");
     assert.equal(env.CLAUDE_CODE_OAUTH_TOKEN, OAUTH);
     assert.ok(!Object.values(env).includes("cred"), "the fetch credential is not in the SDK env");
+  });
+});
+
+// PRD #1976: the JobRunner's lane mode reuses these layers with a wider, equally fixed surface.
+describe("isolated executor: the lane job surface (PRD #1976)", () => {
+  const SUBMIT = "mcp__job__submit_job_result";
+  /** The real research frame, adapted the way the pinned CLI would report the lane session. */
+  function laneInit(withSkills: boolean): Record<string, unknown> {
+    const f = realInit();
+    f.tools = [...ISOLATED_TOOLS, SUBMIT, ...(withSkills ? ["Skill"] : [])];
+    f.mcp_servers = [{ name: "uzi_fetch", status: "connected" }, { name: "job", status: "connected" }];
+    if (withSkills) {
+      f.plugins = [{ name: "uzi", path: "/x/.uzi-skills-work" }];
+      f.skills = [...(f.skills as string[]), "uzi:brand-voice"];
+    }
+    return f;
+  }
+
+  it("is exactly the isolated set plus submit_job_result, and Skill plus one plugin only with skills", () => {
+    assert.deepEqual([...laneJobSurface().tools], [...ISOLATED_TOOLS, SUBMIT]);
+    assert.deepEqual([...laneJobSurface().plugins], []);
+    assert.deepEqual([...laneJobSurface(["uzi:brand-voice"]).tools], [...ISOLATED_TOOLS, SUBMIT, "Skill"]);
+    assert.deepEqual([...laneJobSurface(["uzi:brand-voice"]).plugins], ["uzi"]);
+    assert.deepEqual([...laneJobSurface().mcpServers].sort(), ["job", "uzi_fetch"]);
+  });
+
+  it("accepts the lane frame with and without skills", () => {
+    assert.equal(checkIsolatedInit(laneInit(false), laneJobSurface()), undefined);
+    assert.equal(checkIsolatedInit(laneInit(true), laneJobSurface(["uzi:brand-voice"])), undefined);
+  });
+
+  it("refuses any other MCP server or plugin, a missing server, a stray skill, and Skill without skills", () => {
+    const cases: Array<[string, boolean, Record<string, unknown>, RegExp]> = [
+      ["third MCP server", false, { ...laneInit(false), mcp_servers: [{ name: "uzi_fetch" }, { name: "job" }, { name: "forge" }] }, /MCP servers/],
+      ["missing job server", false, { ...laneInit(false), mcp_servers: [{ name: "uzi_fetch" }] }, /MCP servers/],
+      ["a plugin on a no-skills job", false, { ...laneInit(false), plugins: [{ name: "uzi", path: "/x" }] }, /plugin/],
+      ["another plugin with skills", true, { ...laneInit(true), plugins: [{ name: "evil", path: "/x" }] }, /plugins must be exactly/],
+      ["two plugins with skills", true, { ...laneInit(true), plugins: [{ name: "uzi" }, { name: "evil" }] }, /plugins must be exactly/],
+      ["no plugin with skills", true, { ...laneInit(true), plugins: [] }, /plugins must be exactly/],
+      ["a stray skill", true, { ...laneInit(true), skills: ["doctor", "uzi:brand-voice", "pdf"] }, /unexpected skills: pdf/],
+      ["Skill without skills", false, { ...laneInit(false), tools: [...ISOLATED_TOOLS, SUBMIT, "Skill"] }, /extra: Skill/],
+      ["Bash", false, { ...laneInit(false), tools: [...ISOLATED_TOOLS, SUBMIT, "Bash"] }, /extra: Bash/],
+      ["no submit tool", false, { ...laneInit(false), tools: [...ISOLATED_TOOLS] }, /missing: mcp__job__submit_job_result/],
+    ];
+    for (const [name, withSkills, frame, want] of cases) {
+      assert.match(checkIsolatedInit(frame, laneJobSurface(withSkills ? ["uzi:brand-voice"] : [])) ?? "", want, name);
+    }
+  });
+
+  it("the research default is unchanged: the lane frame fails the research surface, the research frame passes it", () => {
+    assert.match(checkIsolatedInit(laneInit(false)) ?? "", /extra: mcp__job__submit_job_result/);
+    assert.equal(checkIsolatedInit(realInit()), undefined);
+  });
+
+  it("the tool gate of the research session still denies submit_job_result and Skill", async () => {
+    const o = options({ passed: true });
+    assert.equal(await simulateToolUse(o, SUBMIT, {}), "deny");
+    assert.equal(await simulateToolUse(o, "Skill", {}), "deny");
+    assert.deepEqual(o.tools, [...ISOLATED_TOOLS]);
   });
 });
