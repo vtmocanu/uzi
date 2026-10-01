@@ -2,13 +2,14 @@ package store_test
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -51,11 +52,16 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 		}
 		return n
 	}
-	ts := func(tm time.Time) pgtype.Timestamptz { return pgtype.Timestamptz{Time: tm, Valid: true} }
-	claim := func(stale time.Time, maxAttempts, lim int32) map[uuid.UUID]store.ClaimPendingSlackNotificationsRow {
-		rows, err := q.ClaimPendingSlackNotifications(ctx, store.ClaimPendingSlackNotificationsParams{
-			StaleBefore: ts(stale), MaxAttempts: maxAttempts, Lim: lim,
+	// claim's retryAfterSecs is how old (by the DATABASE clock) the last attempt must be:
+	// notStale keeps a just-attempted row out, anyStale admits every attempted row.
+	const notStale, anyStale int32 = 3600, 0
+	claimWith := func(qq *store.Queries, cctx context.Context, retryAfterSecs, maxAttempts, lim int32) ([]store.ClaimPendingSlackNotificationsRow, error) {
+		return qq.ClaimPendingSlackNotifications(cctx, store.ClaimPendingSlackNotificationsParams{
+			RetryAfterSecs: retryAfterSecs, MaxAttempts: maxAttempts, Lim: lim,
 		})
+	}
+	claim := func(retryAfterSecs, maxAttempts, lim int32) map[uuid.UUID]store.ClaimPendingSlackNotificationsRow {
+		rows, err := claimWith(q, ctx, retryAfterSecs, maxAttempts, lim)
 		if err != nil {
 			t.Fatalf("ClaimPendingSlackNotifications: %v", err)
 		}
@@ -65,9 +71,7 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 		}
 		return m
 	}
-	past := time.Now().Add(-time.Hour)
-	future := time.Now().Add(time.Hour)
-	render := []byte(`{"text":"halted"}`)
+	render := []byte(`{"title":"halted","facts":["a","b"]}`)
 
 	t.Run("insert accounting", func(t *testing.T) {
 		u := newUser()
@@ -76,8 +80,12 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 			t.Errorf("durable row: attempts=%d attempted_valid=%v delivered_valid=%v; want 1/true/false",
 				d.SlackAttempts, d.SlackAttemptedAt.Valid, d.SlackDeliveredAt.Valid)
 		}
-		if string(d.SlackRender) == "" {
-			t.Errorf("durable row lost its slack_render")
+		var want, got any
+		if err := json.Unmarshal(render, &want); err != nil {
+			t.Fatalf("unmarshal inserted render: %v", err)
+		}
+		if err := json.Unmarshal(d.SlackRender, &got); err != nil || !reflect.DeepEqual(want, got) {
+			t.Errorf("slack_render round trip = %s (err %v), want JSON-equal to %s", d.SlackRender, err, render)
 		}
 		p := insert(u, nil)
 		if p.SlackAttempts != 0 || p.SlackAttemptedAt.Valid || p.SlackRender != nil {
@@ -91,10 +99,10 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 		fresh := insert(u, render)
 		plain := insert(u, nil)
 
-		if _, ok := claim(past, 5, 100)[fresh.ID]; ok {
-			t.Errorf("row attempted just now was claimed with stale_before in the past")
+		if _, ok := claim(notStale, 5, 100)[fresh.ID]; ok {
+			t.Errorf("row attempted just now was claimed with a one-hour retry window")
 		}
-		got := claim(future, 5, 100)
+		got := claim(anyStale, 5, 100)
 		r, ok := got[fresh.ID]
 		if !ok {
 			t.Fatalf("stale durable row not claimed")
@@ -106,15 +114,15 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 			t.Errorf("non-durable row was claimed")
 		}
 		// The claim stamped attempted_at = now, so it is not stale against a past cutoff.
-		if _, ok := claim(past, 5, 100)[fresh.ID]; ok {
+		if _, ok := claim(notStale, 5, 100)[fresh.ID]; ok {
 			t.Errorf("row re-claimed immediately after a claim")
 		}
 
 		// max_attempts: attempts is now 2; cap 2 excludes it, cap 3 admits it.
-		if _, ok := claim(future, 2, 100)[fresh.ID]; ok {
+		if _, ok := claim(anyStale, 2, 100)[fresh.ID]; ok {
 			t.Errorf("row at max_attempts was claimed")
 		}
-		if _, ok := claim(future, 3, 100)[fresh.ID]; !ok {
+		if _, ok := claim(anyStale, 3, 100)[fresh.ID]; !ok {
 			t.Errorf("row under max_attempts was not claimed")
 		}
 	})
@@ -140,12 +148,12 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 		if !first.Equal(second) {
 			t.Errorf("second mark moved slack_delivered_at: %v -> %v", first, second)
 		}
-		if _, ok := claim(future, 5, 100)[n.ID]; ok {
+		if _, ok := claim(anyStale, 5, 100)[n.ID]; ok {
 			t.Errorf("delivered row was claimed")
 		}
 	})
 
-	t.Run("lim is honoured, oldest first", func(t *testing.T) {
+	t.Run("lim is honoured", func(t *testing.T) {
 		u := newUser()
 		var ids []uuid.UUID
 		for i := 0; i < 3; i++ {
@@ -155,7 +163,7 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 		}
 		// The shared DB may hold other pending rows, so assert only that a lim of 1
 		// returns exactly one row (the three rows above guarantee at least one exists).
-		if got := claim(future, 5, 1); len(got) != 1 {
+		if got := claim(anyStale, 5, 1); len(got) != 1 {
 			t.Errorf("lim=1 claimed %d rows, want 1", len(got))
 		}
 	})
@@ -204,6 +212,46 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 			if exists(id) {
 				t.Errorf("%s row survived the prune", name)
 			}
+		}
+	})
+	t.Run("concurrent claims skip locked rows", func(t *testing.T) {
+		u := newUser()
+		mine := insert(u, render)
+
+		// Tx A claims and stays open, holding row locks on everything it claimed.
+		txA, err := pool.Begin(ctx)
+		if err != nil {
+			t.Fatalf("begin A: %v", err)
+		}
+		defer func() { _ = txA.Rollback(ctx) }()
+		aRows, err := claimWith(q.WithTx(txA), ctx, anyStale, 5, 1000)
+		if err != nil {
+			t.Fatalf("claim A: %v", err)
+		}
+		aIDs := map[uuid.UUID]bool{}
+		for _, r := range aRows {
+			aIDs[r.ID] = true
+		}
+		if !aIDs[mine.ID] {
+			t.Fatalf("tx A did not claim the row it was set up to hold")
+		}
+
+		// B claims on another connection with the same params. SKIP LOCKED makes it return
+		// at once without A's ids; without it B would wait on A's locks, so a deadline turns
+		// that block into a failure (as would a duplicate id).
+		bctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		bRows, err := claimWith(q, bctx, anyStale, 5, 1000)
+		if err != nil {
+			t.Fatalf("claim B blocked or failed while A held its claim (SKIP LOCKED missing?): %v", err)
+		}
+		for _, r := range bRows {
+			if aIDs[r.ID] {
+				t.Errorf("row %s claimed by both A and B", r.ID)
+			}
+		}
+		if err := txA.Commit(ctx); err != nil {
+			t.Fatalf("commit A: %v", err)
 		}
 	})
 }

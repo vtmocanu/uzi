@@ -145,18 +145,23 @@ type mrwNotifyCall struct {
 	runID   *uuid.UUID
 	payload notifysvc.CIAutofixPayload
 	slack   *notifysvc.SlackRender
+	durable bool // Notification.DurableSlack (issue #1675)
 }
 
 type mrwNotifier struct {
 	calls []mrwNotifyCall
 	ops   *[]string
+	err   error
 }
 
 func (n *mrwNotifier) Notify(_ context.Context, note notifysvc.Notification) (store.Notification, error) {
 	p, _ := note.Payload.(notifysvc.CIAutofixPayload)
-	n.calls = append(n.calls, mrwNotifyCall{note.Kind, note.UserID, note.RunID, p, note.Slack})
+	n.calls = append(n.calls, mrwNotifyCall{note.Kind, note.UserID, note.RunID, p, note.Slack, note.DurableSlack})
 	if n.ops != nil {
 		*n.ops = append(*n.ops, "notify")
+	}
+	if n.err != nil {
+		return store.Notification{}, n.err
 	}
 	return store.Notification{ID: uuid.New()}, nil
 }
@@ -462,6 +467,9 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 		notifier.calls[0].runID == nil || *notifier.calls[0].runID != mrwSourceRunID {
 		t.Fatalf("expected one halted notification anchored to the source run, got %+v", notifier.calls)
 	}
+	if !notifier.calls[0].durable {
+		t.Errorf("the halt DM must be durable (issue #1675)")
+	}
 
 	// Second tick: the latch is set → NO second comment, NO second notify.
 	f2 := landedForge(mrwComment(200, landed(), mrwHeadSHA))
@@ -473,7 +481,9 @@ func TestMRReworkAtCapHaltsOnceThenSilent(t *testing.T) {
 }
 
 func TestMRReworkHaltLatchWriteFailsNoComment(t *testing.T) {
-	// RECORD-THEN-COMMENT: if the latch write fails, NO comment and NO notify.
+	// NOTIFY-THEN-LATCH-THEN-COMMENT (issue #1675): the durable DM is recorded before the
+	// latch, so a failed latch write has already notified once (the next tick repeats it:
+	// at-least-once), but it must NOT comment or start a run.
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
 		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120}},
@@ -485,9 +495,45 @@ func TestMRReworkHaltLatchWriteFailsNoComment(t *testing.T) {
 
 	newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5}).detect(context.Background(), mrwRepoRow(), f)
 
-	if len(f.notes) != 0 || len(notifier.calls) != 0 || len(runs.calls) != 0 {
-		t.Fatalf("a failed latch write must post nothing: notes=%d notifs=%d runs=%d",
-			len(f.notes), len(notifier.calls), len(runs.calls))
+	if len(f.notes) != 0 || len(runs.calls) != 0 {
+		t.Fatalf("a failed latch write must post no comment and start no run: notes=%d runs=%d", len(f.notes), len(runs.calls))
+	}
+	if len(notifier.calls) != 1 || !notifier.calls[0].durable {
+		t.Fatalf("a failed latch write must have notified once, durably, got %+v", notifier.calls)
+	}
+}
+
+func TestMRReworkHaltNotifyFailureRetriesNextTick(t *testing.T) {
+	// A notify that fails to persist leaves no latch and no comment; the next tick
+	// (notify healthy again) halts once: notify, latch, comment, in that order.
+	var ops []string
+	st := &mrwStore{
+		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
+		ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120}},
+		ops:        &ops,
+	}
+	runs := &mrwRuns{ops: &ops}
+	notifier := &mrwNotifier{err: context.DeadlineExceeded, ops: &ops}
+	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
+	f.cfForge.ops = &ops
+	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
+
+	d.detect(context.Background(), mrwRepoRow(), f)
+	if len(st.haltSets) != 0 || len(f.notes) != 0 {
+		t.Fatalf("a failed notify must set no latch and post no comment, got latches=%d notes=%d", len(st.haltSets), len(f.notes))
+	}
+	if got := strings.Join(ops, ","); got != "notify" {
+		t.Fatalf("first tick ops = %q, want notify only", got)
+	}
+
+	notifier.err = nil
+	ops = ops[:0]
+	d.detect(context.Background(), mrwRepoRow(), f)
+	if got := strings.Join(ops, ","); got != "notify,halt,comment" {
+		t.Fatalf("retry tick ops = %q, want notify,halt,comment", got)
+	}
+	if len(st.haltSets) != 1 || len(f.notes) != 1 {
+		t.Fatalf("retry tick: latches=%d notes=%d, want 1/1", len(st.haltSets), len(f.notes))
 	}
 }
 
@@ -639,6 +685,9 @@ func TestMRReworkIssuelessBranchDecoupled(t *testing.T) {
 		if len(notifier.calls) != 1 || notifier.calls[0].kind != "mr_rework_halted" ||
 			notifier.calls[0].runID == nil || *notifier.calls[0].runID != mrwSourceRunID {
 			t.Fatalf("expected one halted notification anchored to the source run, got %+v", notifier.calls)
+		}
+		if !notifier.calls[0].durable {
+			t.Errorf("the issueless halt DM must be durable (issue #1675)")
 		}
 	})
 }

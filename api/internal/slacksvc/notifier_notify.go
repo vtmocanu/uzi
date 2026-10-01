@@ -7,6 +7,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/slack-go/slack"
 
@@ -23,16 +24,23 @@ import (
 // it never calls GetSlackRunContext. Unlinked / opted-out / unconfirmed users drop
 // silently; every failure logs redacted and returns (a Slack problem never affects
 // the caller — the notification row is already persisted).
+//
+// A durable notification (ev.deliveryID set, issue #1675) is marked delivered after the
+// DM posts, and also on the terminal no-link outcomes (the user has no confirmed Slack
+// link, so redelivery could never succeed). Every other failure (resolve, open DM, post,
+// credential fence) leaves it pending for the Redeliverer's next claim.
 func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 	target, err := n.store.GetSlackDeliveryForUser(ctx, ev.userID)
 	if errors.Is(err, pgx.ErrNoRows) {
-		return // unlinked, opted out, or unconfirmed → drop silently
+		n.markDelivered(ctx, ev) // unlinked, opted out, or unconfirmed → drop silently
+		return
 	}
 	if err != nil {
 		n.logf("resolve delivery target", err)
 		return
 	}
 	if !target.Valid || target.String == "" {
+		n.markDelivered(ctx, ev)
 		return
 	}
 
@@ -48,6 +56,20 @@ func (n *Notifier) handleNotify(ctx context.Context, ev notifyEvent) {
 	}
 	if _, err := n.poster.PostBlocks(ctx, channel, "", fallback, blocks); err != nil {
 		n.logf("post notification", err)
+		return
+	}
+	n.markDelivered(ctx, ev)
+}
+
+// markDelivered settles a durable notification (issue #1675); a zero deliveryID is a
+// no-op. A failure only logs: the row stays pending and a later redelivery repeats the DM
+// (at-least-once).
+func (n *Notifier) markDelivered(ctx context.Context, ev notifyEvent) {
+	if ev.deliveryID == uuid.Nil {
+		return
+	}
+	if err := n.store.MarkNotificationSlackDelivered(ctx, ev.deliveryID); err != nil {
+		n.logf("mark notification delivered", err)
 	}
 }
 

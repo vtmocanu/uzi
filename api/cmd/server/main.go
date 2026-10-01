@@ -655,6 +655,10 @@ func run() error {
 	// the user sees. Every producer below (handler, poller detectors, scheduler,
 	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
 	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
+	// Slack redelivery (issue #1675): the halt DMs opt into durable delivery, and this
+	// re-enqueues the ones whose in-memory enqueue was dropped or whose post failed, via the
+	// sweeper pass registered below.
+	redeliverer := notifysvc.NewRedeliverer(q, slackNotifier, slog.Default())
 
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
@@ -903,6 +907,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "job_files_sweep",
 			Run:  jobFiles.SweepPass,
+		},
+		// Durable Slack halt DMs (issue #1675): claim up to 50 notifications whose DM was never
+		// confirmed delivered (last attempt older than notifysvc.SlackRetryAfter, under
+		// notifysvc.MaxSlackAttempts) and re-enqueue them on the notifier. Always registered:
+		// with no pending durable rows it is one UPDATE matching nothing.
+		sweeper.Pass{
+			Name: "notification_slack_redeliver",
+			Run:  redeliverer.Pass,
 		},
 	)
 	// Admin-health loop-beat: the run-liveness sweeper is one of the four loops (PRD #1484

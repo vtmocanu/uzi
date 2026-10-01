@@ -179,6 +179,7 @@ type cfNotifyCall struct {
 	runID   *uuid.UUID
 	payload notifysvc.CIAutofixPayload
 	slack   *notifysvc.SlackRender
+	durable bool // Notification.DurableSlack (issue #1675)
 }
 
 type cfNotifier struct {
@@ -189,7 +190,7 @@ type cfNotifier struct {
 
 func (n *cfNotifier) Notify(_ context.Context, note notifysvc.Notification) (store.Notification, error) {
 	p, _ := note.Payload.(notifysvc.CIAutofixPayload)
-	n.calls = append(n.calls, cfNotifyCall{note.Kind, note.UserID, note.RunID, p, note.Slack})
+	n.calls = append(n.calls, cfNotifyCall{note.Kind, note.UserID, note.RunID, p, note.Slack, note.DurableSlack})
 	if n.ops != nil {
 		*n.ops = append(*n.ops, "notify")
 	}
@@ -409,6 +410,9 @@ func TestCIAutofixCapHalts(t *testing.T) {
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" || notifier.calls[0].runID != nil {
 		t.Fatalf("expected one halted notification with no run anchor, got %+v", notifier.calls)
 	}
+	if !notifier.calls[0].durable {
+		t.Errorf("the halt DM must be durable (issue #1675)")
+	}
 }
 
 func TestCIAutofixNoProgressHalts(t *testing.T) {
@@ -450,6 +454,9 @@ func TestCIAutofixNoProgressHalts(t *testing.T) {
 	}
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" {
 		t.Fatalf("expected one halted notification, got %+v", notifier.calls)
+	}
+	if !notifier.calls[0].durable {
+		t.Errorf("the halt DM must be durable (issue #1675)")
 	}
 }
 
@@ -620,12 +627,16 @@ func TestCIAutofixIssuelessBranchCapHaltsNoComment(t *testing.T) {
 	if len(notifier.calls) != 1 || notifier.calls[0].kind != "ci_autofix_halted" || notifier.calls[0].runID != nil {
 		t.Fatalf("expected one halted notification with no run anchor, got %+v", notifier.calls)
 	}
+	if !notifier.calls[0].durable {
+		t.Errorf("the issueless halt DM must be durable (issue #1675)")
+	}
 }
 
 func TestCIAutofixHaltLatchWriteFailsNoComment(t *testing.T) {
-	// RECORD-THEN-COMMENT: the latch write must precede the comment. If
-	// SetCIAutofixHaltNotified fails, NO comment (and no notification) is posted — a
-	// comment without the latch could re-post every tick.
+	// NOTIFY-THEN-LATCH-THEN-COMMENT (issue #1675): the durable DM is recorded before the
+	// latch, so a failed latch write has already notified once (the next tick repeats it:
+	// at-least-once), but it must NOT comment, since a comment without the latch would
+	// re-post every tick.
 	st := &cfStore{
 		candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9010)},
 		attempts: map[string]store.CiAutofixAttempt{
@@ -642,11 +653,46 @@ func TestCIAutofixHaltLatchWriteFailsNoComment(t *testing.T) {
 	if len(f.notes) != 0 {
 		t.Fatalf("a failed latch write must post NO comment, got %+v", f.notes)
 	}
-	if len(notifier.calls) != 0 {
-		t.Fatalf("a failed latch write must not notify, got %+v", notifier.calls)
+	if len(notifier.calls) != 1 || !notifier.calls[0].durable {
+		t.Fatalf("a failed latch write must have notified once, durably, got %+v", notifier.calls)
 	}
 	if len(runs.calls) != 0 {
 		t.Fatalf("a halt must not start a run, got %d", len(runs.calls))
+	}
+}
+
+func TestCIAutofixHaltNotifyFailureRetriesNextTick(t *testing.T) {
+	// A notify that fails to persist leaves no latch and no comment; the next tick
+	// (notify healthy again) halts once: notify, latch, comment, in that order.
+	var ops []string
+	st := &cfStore{
+		candidates: []store.ListCIAutofixCandidateRefsRow{cfCand(9010)},
+		attempts: map[string]store.CiAutofixAttempt{
+			cfRef: {Ref: cfRef, AttemptCount: 2, LastPipelineID: pgtype.Int8{Int64: 9001, Valid: true}},
+		},
+		ops: &ops,
+	}
+	runs := &cfRuns{ops: &ops}
+	notifier := &cfNotifier{err: errors.New("db down"), ops: &ops}
+	f := &cfForge{jobs: []forge.Job{cfJob()}, logTail: "boom", ops: &ops}
+	cf := newCF(st, runs, notifier)
+
+	cf.detect(context.Background(), cfRepoRow(), f)
+	if len(st.haltSets) != 0 || len(f.notes) != 0 {
+		t.Fatalf("a failed notify must set no latch and post no comment, got latches=%d notes=%d", len(st.haltSets), len(f.notes))
+	}
+	if got := strings.Join(ops, ","); got != "notify" {
+		t.Fatalf("first tick ops = %q, want notify only", got)
+	}
+
+	notifier.err = nil
+	ops = ops[:0]
+	cf.detect(context.Background(), cfRepoRow(), f)
+	if got := strings.Join(ops, ","); got != "notify,halt,comment" {
+		t.Fatalf("retry tick ops = %q, want notify,halt,comment", got)
+	}
+	if len(st.haltSets) != 1 || len(f.notes) != 1 {
+		t.Fatalf("retry tick: latches=%d notes=%d, want 1/1", len(st.haltSets), len(f.notes))
 	}
 }
 

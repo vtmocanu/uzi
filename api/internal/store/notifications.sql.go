@@ -21,7 +21,7 @@ WHERE id IN (
     SELECT c.id FROM notifications AS c
     WHERE c.slack_render IS NOT NULL
       AND c.slack_delivered_at IS NULL
-      AND (c.slack_attempted_at IS NULL OR c.slack_attempted_at < $1::timestamptz)
+      AND (c.slack_attempted_at IS NULL OR c.slack_attempted_at < now() - make_interval(secs => $1::int4))
       AND c.slack_attempts < $2::int4
     ORDER BY c.created_at
     LIMIT $3
@@ -31,9 +31,9 @@ RETURNING id, user_id, slack_render, slack_attempts
 `
 
 type ClaimPendingSlackNotificationsParams struct {
-	StaleBefore pgtype.Timestamptz `json:"stale_before"`
-	MaxAttempts int32              `json:"max_attempts"`
-	Lim         int32              `json:"lim"`
+	RetryAfterSecs int32 `json:"retry_after_secs"`
+	MaxAttempts    int32 `json:"max_attempts"`
+	Lim            int32 `json:"lim"`
 }
 
 type ClaimPendingSlackNotificationsRow struct {
@@ -46,12 +46,13 @@ type ClaimPendingSlackNotificationsRow struct {
 // ── Issue #1675: durable Slack delivery for halt DMs ──
 // Atomically claim up to @lim undelivered durable rows for redelivery: bump the attempt
 // counter and stamp slack_attempted_at, so a concurrent sweeper (FOR UPDATE SKIP LOCKED)
-// or a later tick skips them until @stale_before passes again. A row is claimable when it
+// or a later tick skips them until @retry_after_secs seconds have passed again. A row is claimable when it
 // has a render, is not delivered, is under @max_attempts, and its last attempt is older
-// than @stale_before. A NULL slack_attempted_at is treated as claimable too (InsertNotification
+// than @retry_after_secs seconds, measured against the database clock (now()) so the
+// api clock is never compared with a database timestamp. A NULL slack_attempted_at is treated as claimable too (InsertNotification
 // always stamps it for a render, so this is only defensive). Oldest first.
 func (q *Queries) ClaimPendingSlackNotifications(ctx context.Context, arg ClaimPendingSlackNotificationsParams) ([]ClaimPendingSlackNotificationsRow, error) {
-	rows, err := q.db.Query(ctx, claimPendingSlackNotifications, arg.StaleBefore, arg.MaxAttempts, arg.Lim)
+	rows, err := q.db.Query(ctx, claimPendingSlackNotifications, arg.RetryAfterSecs, arg.MaxAttempts, arg.Lim)
 	if err != nil {
 		return nil, err
 	}

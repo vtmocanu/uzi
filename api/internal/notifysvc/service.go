@@ -9,6 +9,11 @@
 // durable audit log) plus the per-run incidental-finding Slack DM latch
 // (NotifyIncidentalFinding). The user-facing delivery is the Slack DM.
 //
+// One exception (issue #1675): a notification that opts into Notification.DurableSlack
+// (only the CI-autofix and MR-rework halt kinds) stores its Slack render on the row and
+// is read back by the Redeliverer sweep until the DM is posted or MaxSlackAttempts is
+// spent, so a dropped in-memory enqueue is retried rather than lost.
+//
 // The service is generic: it knows nothing about judges. The caller supplies the
 // kind, a jsonb payload (the event data), optional run/review anchors, and an
 // optional Slack rendering.
@@ -34,6 +39,18 @@ import (
 // not later), so the table can't grow without bound. Overridable via New for tests.
 const DefaultUserCap = 200
 
+// MaxSlackAttempts bounds the delivery attempts of a durable Slack notification
+// (issue #1675): the initial in-memory enqueue counts as attempt 1, each redelivery
+// claim adds one. At SlackRetryAfter spacing that is about 24h of retries; past it the
+// row is given up on (and becomes prunable).
+const MaxSlackAttempts = 288
+
+// SlackRetryAfter is how long after a durable row's last Slack attempt it becomes
+// claimable again by the Redeliverer. It must comfortably exceed the time a healthy
+// notifier takes to drain its queue and post, so a redelivery does not race the
+// original attempt.
+const SlackRetryAfter = 5 * time.Minute
+
 // Store is the slice of generated queries the service needs. *store.Queries
 // satisfies it; tests inject a fake to assert the persist-first ordering and the
 // prune call.
@@ -54,7 +71,10 @@ type Store interface {
 // Slacker is the best-effort Slack delivery seam. The slacksvc Notifier satisfies
 // it via PublishNotification, which enqueues onto the notifier's own goroutine and
 // returns immediately — so a Slack call never blocks or fails Notify. Optional:
-// nil (Slack off, or a test) simply skips delivery.
+// nil (Slack off, or a test) simply skips delivery. The enqueue itself is in-memory and
+// lossy (a full queue drops the DM); a render with a non-zero DeliveryID is additionally
+// stored on its row and redelivered by the Redeliverer until the notifier marks it
+// delivered (issue #1675).
 //
 // The method takes the SlackRender struct by value (PRD #268 M3), so slacksvc imports
 // notifysvc for the param type. That import is LEAF-WARD and one-directional: notifysvc
@@ -105,6 +125,11 @@ func New(q Store, slack Slacker, cap int, logger *slog.Logger) *Service {
 // re-reads the credential immediately before the Slack post and drops the DM unless it
 // is still current (see CredentialFence). nil for every notification not about one
 // credential.
+//
+// DeliveryID is the notifications row id of a DURABLE delivery (issue #1675); the
+// notifier stamps that row delivered once the DM is posted (or the owner has no Slack
+// link). Zero means not durable. Notify and the Redeliverer set it; callers never do
+// (Notify overwrites it).
 type SlackRender struct {
 	Title      string
 	Body       string
@@ -113,6 +138,24 @@ type SlackRender struct {
 	Emoji      string
 	Facts      []string
 	Credential *CredentialFence
+	DeliveryID uuid.UUID
+}
+
+// durableRender is the persisted form of a SlackRender (notifications.slack_render). It is
+// a dedicated struct so the stored shape is explicit: the credential fence and the
+// delivery id are never stored (a fenced render is not durable; the id is the row's own).
+type durableRender struct {
+	Title     string   `json:"title"`
+	Body      string   `json:"body"`
+	Link      string   `json:"link"`
+	LinkLabel string   `json:"link_label"`
+	Emoji     string   `json:"emoji"`
+	Facts     []string `json:"facts"`
+}
+
+func (d durableRender) render(id uuid.UUID) SlackRender {
+	return SlackRender{Title: d.Title, Body: d.Body, Link: d.Link, LinkLabel: d.LinkLabel,
+		Emoji: d.Emoji, Facts: d.Facts, DeliveryID: id}
 }
 
 // CredentialFence names the one credential an alert is about and the enablement
@@ -154,10 +197,16 @@ type Notification struct {
 	RunID    *uuid.UUID
 	ReviewID *uuid.UUID
 	Slack    *SlackRender
+	// DurableSlack opts into at-least-once Slack delivery (issue #1675): the render is
+	// stored on the row and redelivered by the Redeliverer until posted. Only the two
+	// halt kinds use it. Ignored for a credential-fenced render (a stale fenced DM must
+	// never be replayed) and when the Service has no Slacker.
+	DurableSlack bool
 }
 
 // Notify persists the notification row, then prunes the user's rows to the cap
-// (best-effort), then enqueues the Slack DM (best-effort). The persisted row is
+// (best-effort), then enqueues the Slack DM (best-effort; a DurableSlack notification
+// is additionally redelivered by the Redeliverer until posted). The persisted row is
 // returned. Only a failure to persist is fatal to the call; prune/Slack failures
 // are logged and swallowed. The prune and
 // Slack steps run after the durable write so neither can cost the caller the row.
@@ -171,12 +220,26 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 		payload = b
 	}
 
+	durable := n.DurableSlack && n.Slack != nil && n.Slack.Credential == nil && s.slack != nil
+	var render []byte
+	if durable {
+		b, err := json.Marshal(durableRender{
+			Title: n.Slack.Title, Body: n.Slack.Body, Link: n.Slack.Link,
+			LinkLabel: n.Slack.LinkLabel, Emoji: n.Slack.Emoji, Facts: n.Slack.Facts,
+		})
+		if err != nil {
+			return store.Notification{}, err
+		}
+		render = b
+	}
+
 	row, err := s.q.InsertNotification(ctx, store.InsertNotificationParams{
-		UserID:   n.UserID,
-		Kind:     n.Kind,
-		Payload:  payload,
-		RunID:    pgconv.UUIDPtr(n.RunID),
-		ReviewID: pgconv.UUIDPtr(n.ReviewID),
+		UserID:      n.UserID,
+		Kind:        n.Kind,
+		Payload:     payload,
+		RunID:       pgconv.UUIDPtr(n.RunID),
+		ReviewID:    pgconv.UUIDPtr(n.ReviewID),
+		SlackRender: render,
 	})
 	if err != nil {
 		return store.Notification{}, err
@@ -186,8 +249,9 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 	// the user is under the cap (a bounded index probe), so calling it every write
 	// keeps the cap tight without a scan.
 	if _, err := s.q.PruneNotificationsForUser(ctx, store.PruneNotificationsForUserParams{
-		UserID: n.UserID,
-		Keep:   s.cap,
+		UserID:      n.UserID,
+		Keep:        s.cap,
+		MaxAttempts: MaxSlackAttempts,
 	}); err != nil {
 		s.logger.Warn("notify: prune failed (best-effort)", "user", n.UserID.String(), "error", err)
 	}
@@ -195,7 +259,12 @@ func (s *Service) Notify(ctx context.Context, n Notification) (store.Notificatio
 	// Slack delivery, best-effort. Enqueues and returns; a Slack failure is handled
 	// entirely inside the notifier and never surfaces here.
 	if s.slack != nil && n.Slack != nil {
-		s.slack.PublishNotification(n.UserID, *n.Slack)
+		r := *n.Slack
+		r.DeliveryID = uuid.Nil
+		if durable {
+			r.DeliveryID = row.ID
+		}
+		s.slack.PublishNotification(n.UserID, r)
 	}
 
 	return row, nil

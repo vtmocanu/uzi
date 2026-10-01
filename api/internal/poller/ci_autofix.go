@@ -231,9 +231,17 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 			reason = haltCap
 		}
 		if !haltNotified {
-			// RECORD-THEN-COMMENT: latch halt_notified FIRST (it also stamps this
-			// pipeline). If the latch does not persist, do not comment — a comment
-			// without the latch could re-post next tick.
+			// NOTIFY-THEN-LATCH-THEN-COMMENT (issue #1675): after PRD #1650 the Slack DM
+			// may be the only halt signal (an issueless branch has no issue to comment on),
+			// so it is recorded durably FIRST. A notify that fails to persist returns before
+			// the latch and the comment, so the next tick retries the whole halt. If the
+			// latch then fails to persist we return before commenting: the next tick
+			// re-notifies (a duplicate DM, accepted) but a comment never lacks its latch.
+			// Net: the DM is at-least-once, the comment at-most-once.
+			if err := d.notifyHalt(ctx, cand, iid, haltReasonPayload(reason, d.maxAttempts)); err != nil {
+				slog.Warn("poller: ci-autofix notify halt (halt retried next tick)", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+				return
+			}
 			if err := d.q.SetCIAutofixHaltNotified(ctx, store.SetCIAutofixHaltNotifiedParams{
 				LastPipelineID: pgtype.Int8{Int64: cand.PipelineID, Valid: true},
 				RepoID:         r.ID,
@@ -242,14 +250,14 @@ func (d *CIAutoFix) detectOne(ctx context.Context, r store.ListEnabledReposWithC
 				slog.Error("poller: ci-autofix set halt-notified", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				return
 			}
-			// The issue comment is the primary outward halt signal (best-effort).
+			// The issue comment is the primary outward halt signal for an issue-backed
+			// branch (best-effort).
 			if ok {
 				if _, err := f.CreateIssueNote(ctx, r.ForgeProjectID, iid, haltCommentBody(reason, d.maxAttempts, cand.MrIid)); err != nil {
 					// Already PAT-redacted by the driver; the latch is set, so the comment is lost, not retried.
 					slog.Warn("poller: ci-autofix halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				}
 			}
-			d.notifyHalt(ctx, cand, iid, haltReasonPayload(reason, d.maxAttempts))
 		} else {
 			// Already notified: silently move last_pipeline_id past this pipeline so it
 			// is not re-evaluated. No second comment.
@@ -317,22 +325,25 @@ func (d *CIAutoFix) recordPipeline(ctx context.Context, r store.ListEnabledRepos
 	}
 }
 
-// notifyHalt lands the ci_autofix_halted notification for the ref's owner
-// (best-effort, nil-safe). No RunID (no run was started). The halt is actionable (the
+// notifyHalt lands the ci_autofix_halted notification for the ref's owner (nil-safe: a
+// nil notifier returns nil). No RunID (no run was started). The halt is actionable (the
 // owner now presses Fix CI themselves), so it also DMs on Slack (PRD #1650 D3), linking
-// to the failing pipeline. The halt_notified latch the caller sets first keeps this to
-// one notification per halt.
+// to the failing pipeline. The Slack DM is DURABLE (issue #1675): redelivered by the
+// notifysvc Redeliverer until posted. The caller notifies BEFORE setting the
+// halt_notified latch and returns the error so the halt is retried next tick, which makes
+// the DM at-least-once (a latch-write failure repeats it); the latch then keeps a settled
+// halt to one notification.
 //
 // The ref (a forge branch name) and the reason go into Body RAW: the notifier's
 // SlackMrkdwn owns their escaping, and escaping here too would double-escape them. The
 // pipeline URL is forge-supplied, so it becomes the link only when notifysvc.SafeLinkURL
 // accepts it; otherwise the DM goes out without a link.
-func (d *CIAutoFix) notifyHalt(ctx context.Context, cand store.ListCIAutofixCandidateRefsRow, iid int64, reason string) {
+func (d *CIAutoFix) notifyHalt(ctx context.Context, cand store.ListCIAutofixCandidateRefsRow, iid int64, reason string) error {
 	if d.notifier == nil {
-		return
+		return nil
 	}
 	ref := cand.Ref.String
-	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
+	_, err := d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID:  cand.UserID,
 		Kind:    "ci_autofix_halted",
 		Payload: notifysvc.CIAutofixPayload{Ref: ref, PipelineWebURL: cand.PipelineWebUrl, IssueIID: iid, Reason: reason},
@@ -344,9 +355,9 @@ func (d *CIAutoFix) notifyHalt(ctx context.Context, cand store.ListCIAutofixCand
 			Link:      notifysvc.SafeLinkURL(cand.PipelineWebUrl),
 			LinkLabel: "Open the pipeline",
 		},
-	}); err != nil {
-		slog.Warn("poller: ci-autofix notify halt", "user", cand.UserID.String(), "error", err)
-	}
+		DurableSlack: true,
+	})
+	return err
 }
 
 // issueIIDFromBranch parses the issue iid out of an agent MR branch. It is the

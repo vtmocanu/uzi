@@ -69,6 +69,14 @@ type fakeNotifStore struct {
 	secret      *store.GetSecretEnablementRow
 	secretErr   error
 	secretAsked []store.GetSecretEnablementParams
+	// Issue #1675: MarkNotificationSlackDelivered calls, in order; markErr fails each.
+	marked  []uuid.UUID
+	markErr error
+}
+
+func (f *fakeNotifStore) MarkNotificationSlackDelivered(_ context.Context, id uuid.UUID) error {
+	f.marked = append(f.marked, id)
+	return f.markErr
 }
 
 func (f *fakeNotifStore) GetSecretEnablement(_ context.Context, arg store.GetSecretEnablementParams) (store.GetSecretEnablementRow, error) {

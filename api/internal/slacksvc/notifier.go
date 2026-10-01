@@ -25,6 +25,9 @@ type NotifierStore interface {
 	// terminal transitions reach the DM. A non-chat id returns ErrNoRows.
 	GetSlackChatContext(ctx context.Context, runID uuid.UUID) (store.GetSlackChatContextRow, error)
 	GetSlackDeliveryForUser(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	// MarkNotificationSlackDelivered settles a durable notification's Slack delivery
+	// (issue #1675): called once the DM is posted, or when the owner has no Slack link.
+	MarkNotificationSlackDelivered(ctx context.Context, id uuid.UUID) error
 	GetSlackRunMessage(ctx context.Context, runID uuid.UUID) (store.SlackRunMessage, error)
 	UpsertSlackRunMessage(ctx context.Context, arg store.UpsertSlackRunMessageParams) (store.SlackRunMessage, error)
 	// SetSlackRunGate records/clears the open-gate anchor (PRD #25 M4): the notifier
@@ -204,6 +207,9 @@ type notifyEvent struct {
 	// credential is the PRD #1732 D13 fence of a credential-specific alert; nil for
 	// every other notification. handleNotify re-checks it just before posting.
 	credential *notifysvc.CredentialFence
+	// deliveryID is the notifications row of a durable delivery (issue #1675); handleNotify
+	// stamps it delivered on success. Zero for a non-durable notification.
+	deliveryID uuid.UUID
 }
 
 // healthEvent is a run-health flag change (PRD #47 M4). nudge is set only when the
@@ -243,10 +249,12 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 // Slack DM (PRD #46 M2). It implements notifysvc.Slacker. Like PublishState it MUST
 // NOT block: it enqueues and returns, dropping the event if the queue is full (Slack
 // is strictly best-effort; the notifications row, a pruned write-only event log, is
-// already persisted).
+// already persisted). A drop is not final for a durable render (non-zero
+// r.DeliveryID, issue #1675): its row stays undelivered and the notifysvc Redeliverer
+// re-enqueues it later; handleNotify marks it delivered once the DM is posted.
 func (n *Notifier) PublishNotification(userID uuid.UUID, r notifysvc.SlackRender) {
 	select {
-	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts, credential: r.Credential}:
+	case n.notifyCh <- notifyEvent{userID: userID, title: r.Title, body: r.Body, link: r.Link, linkLabel: r.LinkLabel, emoji: r.Emoji, facts: r.Facts, credential: r.Credential, deliveryID: r.DeliveryID}:
 	default:
 		n.logger.Warn("slack: notifier queue full, dropping notification", "user", userID.String())
 	}

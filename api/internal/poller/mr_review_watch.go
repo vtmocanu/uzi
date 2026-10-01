@@ -255,10 +255,18 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 
 	// GATE 4 — UNDER THE PER-MR CAP (Decision 2). At the capLimit we HALT: latch, comment
-	// once, and notify once — never a second time (halt_notified). RECORD-THEN-COMMENT:
-	// the latch write precedes the comment so a lost comment is not re-posted every tick.
+	// once, and notify once (halt_notified). NOTIFY-THEN-LATCH-THEN-COMMENT (issue #1675):
+	// the durable Slack DM is recorded first (it may be the only halt signal on an issueless
+	// branch); a notify that fails to persist returns before the latch and the comment, so
+	// the next tick retries. A latch-write failure returns before the comment: the next tick
+	// re-notifies (a duplicate DM, accepted) but a comment never lacks its latch. Net: the DM
+	// is at-least-once, the comment at-most-once.
 	if int(led.AttemptCount) >= capLimit {
 		if !led.HaltNotified {
+			if err := d.notifyHalt(ctx, cand, issueIID, capLimit); err != nil {
+				slog.Warn("poller: mr-rework notify halt (halt retried next tick)", "repo", r.PathWithNamespace, "ref", ref, "error", err)
+				return
+			}
 			if err := d.q.SetMRReworkHaltNotified(ctx, store.SetMRReworkHaltNotifiedParams{RepoID: r.ID, Ref: ref}); err != nil {
 				slog.Error("poller: mr-rework set halt-notified", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				return
@@ -269,7 +277,6 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 					slog.Warn("poller: mr-rework halt comment", "repo", r.PathWithNamespace, "ref", ref, "error", err)
 				}
 			}
-			d.notifyHalt(ctx, cand, issueIID, capLimit)
 		}
 		return
 	}
@@ -310,19 +317,22 @@ func (d *MRReviewWatch) detectOne(ctx context.Context, r store.ListEnabledReposW
 	}
 }
 
-// notifyHalt lands the mr_rework_halted notification for the MR owner (best-effort,
-// nil-safe). It anchors the row to the SOURCE run (PRD #1202 D10), where the owner can
+// notifyHalt lands the mr_rework_halted notification for the MR owner (nil-safe: a nil
+// notifier returns nil). It anchors the row to the SOURCE run (PRD #1202 D10), where the owner can
 // now press "Rework now" past the cap. The halt is actionable, so it also DMs on Slack
-// (PRD #1650 D3), linking to that run page; the halt_notified latch the caller sets
-// first keeps this to one DM per halt.
+// (PRD #1650 D3), linking to that run page. The DM is DURABLE (issue #1675), redelivered
+// by the notifysvc Redeliverer until posted. The caller notifies BEFORE setting the
+// halt_notified latch and returns the error so the halt is retried next tick, so the DM is
+// at-least-once (a latch-write failure repeats it); the latch then keeps a settled halt
+// to one DM.
 //
 // The ref (a forge branch name) goes into Body RAW: the notifier's SlackMrkdwn owns its
 // escaping, and escaping here too would double-escape it. The cap is an int, so it may
 // ride in the trusted Facts. The run link is built from the operator-set public base
 // URL; an unset base or a failed read drops the link, never the notification.
-func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkCandidatesRow, issueIID int64, capLimit int) {
+func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkCandidatesRow, issueIID int64, capLimit int) error {
 	if d.notifier == nil {
-		return
+		return nil
 	}
 	runID := cand.SourceRunID
 	ref := cand.Ref.String
@@ -331,7 +341,7 @@ func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkC
 		slog.Warn("poller: mr-rework halt DM public base URL read (sending without a link)", "error", err)
 		base = ""
 	}
-	if _, err := d.notifier.Notify(ctx, notifysvc.Notification{
+	_, err = d.notifier.Notify(ctx, notifysvc.Notification{
 		UserID: cand.UserID,
 		Kind:   "mr_rework_halted",
 		Payload: notifysvc.CIAutofixPayload{
@@ -347,9 +357,9 @@ func (d *MRReviewWatch) notifyHalt(ctx context.Context, cand store.ListMRReworkC
 			Link:  runPageLink(base, runID),
 			Facts: []string{fmt.Sprintf("`%d`-cycle limit", capLimit)},
 		},
-	}); err != nil {
-		slog.Warn("poller: mr-rework notify halt", "user", cand.UserID.String(), "error", err)
-	}
+		DurableSlack: true,
+	})
+	return err
 }
 
 // runPageLink builds the run page deep link from the operator-set public base URL,
