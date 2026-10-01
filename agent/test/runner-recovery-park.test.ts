@@ -384,6 +384,7 @@ describe("RunRunner — recovery-capture ancestry bridge (PRD #1416 M3, FIX 2)",
       assert.equal(bridge.length, 1, JSON.stringify(refused.map((l) => l.fields?.site)));
       assert.equal(bridge[0]?.fields?.kind, "scratch_present");
       assert.equal(bridge[0]?.fields?.step, "scratch_walk");
+      assert.ok(refused.some((l) => l.fields?.site === "checkpoint_publish"), "the publish that follows logs too");
       assert.ok(api.states.some((s) => s.body.status === "recovery_wait"), "a refused bridge never undoes the park");
     } finally {
       git.scratchPublicationPreflight = original;

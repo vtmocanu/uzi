@@ -423,7 +423,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assertNoPatPrefix(fields);
   });
 
-  for (const [label, sep] of [["CR", "\r"], ["LF", "\n"]] as const) {
+  for (const [label, sep] of [["CR", "\r"], ["LF", "\n"], ["U+2028", "\u2028"], ["U+2029", "\u2029"]] as const) {
     it(`redacts a secret split by a ${label} in the multi-line rawDetail (failure_reason and log)`, async () => {
       const raw = `fatal: ${PAT.slice(0, 16)}${sep}${PAT.slice(16)}\nhint: later line`;
       const detail = "fatal: " + PAT.slice(0, 16);
@@ -432,6 +432,13 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       assertNoPatPrefix(fields);
     });
   }
+
+  it("redacts a secret split by U+2028 in a logged cause", async () => {
+    const cause = new Error(`fatal: ${PAT.slice(0, 16)}\u2028${PAT.slice(16)}`);
+    const { reason, fields } = await finalizeRefusal("redact-cause-ls", cause, "exit 1", "exit 1");
+    assert.ok(!reason.includes(PAT.slice(0, 8)), reason);
+    assertNoPatPrefix(fields);
+  });
 
   it("redacts a secret that straddles the sanitized detail cap (failure_reason and log)", async () => {
     const raw = `${"x".repeat(185)}${PAT}`;

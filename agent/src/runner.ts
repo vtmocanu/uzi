@@ -1276,19 +1276,26 @@ const SCRATCH_CAUSE_TOTAL_MAX = 600;
 /** Cap on the text handed to the redactor: a runGit cause message can carry up to 64 MiB of stderr. */
 const SCRATCH_REDACT_INPUT_MAX = 4096;
 
+/** Bound `text` for the redactor and turn U+2028/U+2029 into LF: the redactor matches a token across
+ *  control characters such as LF but not across those two separators, which the first-line pick and
+ *  sanitizeForLog would otherwise turn into a cut or a `?` inside an unredacted token. */
+function redactorInput(text: string): string {
+  return text.slice(0, SCRATCH_REDACT_INPUT_MAX).replace(/[\u2028\u2029]/g, "\n");
+}
+
 /** Redact FIRST, then sanitize and cap: sanitizing first would turn a control character inside a
  *  token into `?` (the redactor no longer matches it) and a cap could leave a token prefix. The
  *  input is bounded before redaction so a huge message costs a bounded redactor pass. */
 function redactThenSanitize(redactText: (text: string) => string, text: string): string {
-  return sanitizeForLog(redactText(text.slice(0, SCRATCH_REDACT_INPUT_MAX)), SCRATCH_CAUSE_PART_MAX);
+  return sanitizeForLog(redactText(redactorInput(text)), SCRATCH_CAUSE_PART_MAX);
 }
 
 /** The DETAIL path: bound the unsplit raw text, redact it whole (the redactor matches across CR and
  *  LF, so a token split by a newline is caught only before any line split), THEN pick the first
- *  non-empty line (CR, LF, U+2028, U+2029) and sanitize and cap it. */
+ *  non-empty line and sanitize and cap it. U+2028/U+2029 become LF before redaction (redactorInput). */
 function redactThenFirstLine(redactText: (text: string) => string, text: string): string {
-  const redacted = redactText(text.slice(0, SCRATCH_REDACT_INPUT_MAX));
-  for (const raw of redacted.split(/[\r\n\u2028\u2029]/)) {
+  const redacted = redactText(redactorInput(text));
+  for (const raw of redacted.split(/[\r\n]/)) {
     const line = raw.trim();
     if (line) return sanitizeForLog(line, SCRATCH_CAUSE_PART_MAX);
   }

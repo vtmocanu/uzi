@@ -241,7 +241,7 @@ interface ExecFailure {
   stdout: string;
   stderr: string;
   detail: string;
-  /** The unsanitized equivalent of `detail` (see ScratchPublicationError.rawDetail). */
+  /** The bounded, unsplit, unsanitized source of `detail` (see ScratchPublicationError.rawDetail). */
   rawDetail: string;
 }
 
