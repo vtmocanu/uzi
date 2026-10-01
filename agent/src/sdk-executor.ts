@@ -2370,7 +2370,10 @@ export class SdkExecutor implements Executor {
       let scopeCapped: { completedCount: number; total?: number } | undefined;
       // Issue #1514: the most recent served scope fields, kept so the done exit (which never
       // reaches the loop-top gate again) can apply the same ceiling.
-      let lastServedScope: { scopeCeiling?: number; completedCount?: number } | undefined;
+      let lastServedScope: { scopeCeiling?: number; completedCount?: number; completedIds?: string[] } | undefined;
+      // Issue #1514: every completed id seen this run (progress reports + signal_done declarations);
+      // latestProgress is pruned/replaced across checkpoints, so the done-exit cap reads this union.
+      const seenCompletedIds = new Set<string>();
       // PRD #1190 M2: latched when an owner-requested pause parked the run (the loop-top pause
       // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
       // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
@@ -2412,7 +2415,7 @@ export class SdkExecutor implements Executor {
         // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
         const served = await ctx.reportIteration?.(iteration, latestProgress);
         if (served) {
-          lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount };
+          lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount, completedIds: served.completedIds };
           if (
             typeof served.maxIterations === "number" &&
             served.maxIterations > maxIterations
@@ -2811,8 +2814,10 @@ export class SdkExecutor implements Executor {
         if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
         // PRD #265 M1: latch the finished-milestone declaration the same way, so it
         // survives the terminating turn's `break` into the completed report.
-        if (turn.milestonesCompleted !== undefined)
+        if (turn.milestonesCompleted !== undefined) {
           declaredMilestonesCompleted = turn.milestonesCompleted;
+          for (const id of turn.milestonesCompleted) seenCompletedIds.add(id);
+        }
         // issue #279: latch report_only true (like done) and take the last-wins summary
         // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
         // the final ExecutorResult after the break below.
@@ -2833,7 +2838,10 @@ export class SdkExecutor implements Executor {
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
-        if (turn.progress) latestProgress = turn.progress;
+        if (turn.progress) {
+          latestProgress = turn.progress;
+          for (const id of turn.progress.completed) seenCompletedIds.add(id);
+        }
         // PRD #122 M6 (Decision 10): the lead cooperatively checkpointed a completed
         // milestone. Reap + fetch-back durably, then continue — it ended its turn and will
         // be re-prompted for the next milestone. A turn that is BOTH done and checkpoint
@@ -3171,18 +3179,18 @@ export class SdkExecutor implements Executor {
           // finishes its last permitted milestone and calls signal_done in the same turn exits
           // here. Latch the cap now so the run delivers non-closing. Legacy exit only: the
           // interlocked `unmet.length === 0` break means the server judged the run complete.
-          if (isIssueRun && !scopeCapped) {
+          if (isIssueRun) {
             const cap = scopeCapAtDone({
               served: lastServedScope,
               frozen: frozenMilestones ?? ctx.frozenMilestones,
-              completedIds: [...(declaredMilestonesCompleted ?? []), ...(latestProgress?.completed ?? [])],
+              completedIds: seenCompletedIds,
             });
             if (cap) {
-              scopeCapped = cap;
+              scopeCapped = { completedCount: cap.completedCount, total: cap.total };
               ctx.emit({
                 kind: "steer_ack",
                 agent: "worker",
-                payload: scopeSteerAckPayload(lastServedScope!.scopeCeiling!, cap.completedCount),
+                payload: scopeSteerAckPayload(cap.ceiling, cap.completedCount),
               });
             }
           }

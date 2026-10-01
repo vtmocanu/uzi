@@ -504,6 +504,38 @@ describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
       assert.equal(acks[0]!.payload["completed"], 3);
     });
 
+    it("caps when the done turn declares only the milestone it just finished (server supplies the earlier ids)", async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlanWithMilestones("# Plan", SEVEN), resultSuccess()],
+        [signalDoneDeclaring(["m3"]), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        reportIteration: async () => ({ scopeCeiling: 3, completedCount: 2, completedIds: ["m1", "m2"] }),
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.deepEqual(result.scopeCapped, { completedCount: 3, total: 7 });
+    });
+
+    it("caps when the completed ids arrive only through report_progress, with a bare signal_done", async () => {
+      const progressThenBareDone = {
+        type: "assistant",
+        session_id: "sess-1",
+        message: {
+          content: [
+            { type: "tool_use", id: "tp", name: "mcp__uzi__report_progress", input: { completed: ["m1", "m2", "m3"], in_progress: [] } },
+            { type: "tool_use", id: "td", name: "mcp__uzi__signal_done", input: {} },
+          ],
+        },
+      } as unknown as SDKMessage;
+      const { queryFn } = fakeTurns([
+        [submitPlanWithMilestones("# Plan", SEVEN), resultSuccess()],
+        [progressThenBareDone, resultSuccess()],
+      ]);
+      const probe = makeCtx({ reportIteration: async () => ({ scopeCeiling: 3 }) });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.deepEqual(result.scopeCapped, { completedCount: 3, total: 7 });
+    });
+
     it("keeps a genuinely full delivery closing (all frozen milestones declared)", async () => {
       const { queryFn } = fakeTurns([
         [submitPlanWithMilestones("# Plan", SEVEN), resultSuccess()],

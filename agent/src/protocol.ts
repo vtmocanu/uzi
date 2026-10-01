@@ -959,6 +959,9 @@ export interface IterationBudget {
    */
   scopeCeiling?: number;
   completedCount?: number;
+  /** Issue #1514: the ids behind `completedCount` (`run.milestones_completed`), so the done-exit scope
+   *  cap can union them with the ids this run declared locally. Absent when the server sent no array. */
+  completedIds?: string[];
   /** PRD #1190 M2: the server-decided pause boundary, carried off the SAME running-report ACK
    *  as the budget/scope fields (StateAck.pauseRequested). m2's loop-top pause branch reads it
    *  to decide whether to park the run at this boundary; the worker honours the boolean and the
@@ -2499,6 +2502,8 @@ export interface StateAck {
    *  gate reads them; both absent/non-numeric ⇒ no scope signal on this ACK. */
   scopeCeiling?: number;
   completedCount?: number;
+  /** Issue #1514: the ids in `run.milestones_completed` (strings only); absent when not an array. */
+  completedIds?: string[];
   /** PRD #1190 M2: the SERVER-DECIDED pause boundary, read off the SAME `{run: RunDTO}` body
    *  as `status` (the DTO's `pause_requested` field). The server owns the boundary rule
    *  (pause_mode='now', or 'milestone' once the in-flight milestone completed / on a run with

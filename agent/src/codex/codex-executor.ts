@@ -2273,7 +2273,9 @@ export class CodexExecutor implements Executor {
       // reached with milestones remaining, so the run delivers non-closing (sdk-executor parity;
       // Codex has no loop-top scope gate). Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
-      let lastServedScope: { scopeCeiling?: number; completedCount?: number } | undefined;
+      let lastServedScope: { scopeCeiling?: number; completedCount?: number; completedIds?: string[] } | undefined;
+      // Issue #1514: every completed id seen this run; latestProgress is pruned across checkpoints.
+      const seenCompletedIds = new Set<string>();
       const isIssueRun = resolveRunKind(ctx.kind) === "issue";
       const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
@@ -2314,7 +2316,7 @@ export class CodexExecutor implements Executor {
         // budget never shortens the configured/default limit or an earlier lift.
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (served) {
-          lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount };
+          lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount, completedIds: served.completedIds };
           if (typeof served.maxIterations === "number" && served.maxIterations > maxIterations) {
             maxIterations = served.maxIterations;
           }
@@ -2431,8 +2433,14 @@ export class CodexExecutor implements Executor {
           reapedSinceLastPersist = false;
           if (result.sessionId) lastSessionId = result.sessionId;
           // A quiet clarification turn does not erase milestone progress.
-          if (result.progress) latestProgress = result.progress;
-          if (result.milestonesCompleted !== undefined) declaredMilestonesCompleted = result.milestonesCompleted;
+          if (result.progress) {
+            latestProgress = result.progress;
+            for (const id of result.progress.completed) seenCompletedIds.add(id);
+          }
+          if (result.milestonesCompleted !== undefined) {
+            declaredMilestonesCompleted = result.milestonesCompleted;
+            for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
+          }
           // PRD #1798 M2: last-wins, and stamped with the worktree HEAD only on the turn that
           // carried the claims, so a later bare signal_done keeps the earlier claims with the sha
           // they were made at. A turn carrying claims is always a done turn: scanSignals (via the
@@ -2490,14 +2498,14 @@ export class CodexExecutor implements Executor {
               const cap = scopeCapAtDone({
                 served: lastServedScope,
                 frozen: milestones,
-                completedIds: [...(declaredMilestonesCompleted ?? []), ...(latestProgress?.completed ?? [])],
+                completedIds: seenCompletedIds,
               });
               if (cap) {
-                scopeCapped = cap;
+                scopeCapped = { completedCount: cap.completedCount, total: cap.total };
                 ctx.emit({
                   kind: "steer_ack",
                   agent: "worker",
-                  payload: scopeSteerAckPayload(lastServedScope!.scopeCeiling!, cap.completedCount),
+                  payload: scopeSteerAckPayload(cap.ceiling, cap.completedCount),
                 });
               }
             }

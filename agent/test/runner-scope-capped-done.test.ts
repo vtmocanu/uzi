@@ -25,8 +25,8 @@ installHarness();
 const IID = 7;
 const MILESTONES = [1, 2, 3, 4, 5, 6, 7].map((n) => ({ id: `m${n}`, title: `milestone ${n}` }));
 
-/** A planning turn freezing the 7 milestones, then ONE implement turn that declares m1..m3
- *  complete and signals done together. */
+/** A planning turn freezing the 7 milestones, then ONE implement turn that declares only m3
+ *  (the milestone it just finished; the armed ACK carries m1, m2) and signals done. */
 function planThenDoneDeclaringThree(): SdkQueryFn {
   const scripts: SDKMessage[][] = [
     [
@@ -38,7 +38,7 @@ function planThenDoneDeclaringThree(): SdkQueryFn {
     [
       assistant([
         { type: "text", text: "m3 finished" },
-        { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: { milestones_completed: ["m1", "m2", "m3"] } },
+        { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: { milestones_completed: ["m3"] } },
       ]),
       resultOk(),
     ],

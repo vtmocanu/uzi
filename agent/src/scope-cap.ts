@@ -9,17 +9,21 @@
 interface ScopeCap {
   completedCount: number;
   total: number;
+  /** The served ceiling that was reached, for the steer_ack payload. Not part of the latched
+   *  `scopeCapped` value (ExecutorResult shape is `{completedCount, total}`). */
+  ceiling: number;
 }
 
 /**
  * Returns the cap to latch at a done exit, or undefined when the run is not scope-capped.
  * Capped iff a numeric ceiling was served, the frozen list is known and non-empty, and the
- * completed count (the larger of the server's count and the frozen ids declared complete) has
+ * completed count (the larger of the server's count and the frozen ids in the union of the
+ * server's completed ids and the ids declared locally) has
  * reached the ceiling while milestones remain. `count < total` keeps a genuinely full delivery
  * closing the issue.
  */
 export function scopeCapAtDone(args: {
-  served: { scopeCeiling?: number; completedCount?: number } | undefined;
+  served: { scopeCeiling?: number; completedCount?: number; completedIds?: readonly string[] } | undefined;
   frozen: readonly { id: string }[] | undefined | null;
   completedIds: Iterable<string>;
 }): ScopeCap | undefined {
@@ -28,10 +32,11 @@ export function scopeCapAtDone(args: {
   if (!frozen || frozen.length === 0) return undefined;
   const frozenIds = new Set(frozen.map((m) => m.id));
   const done = new Set<string>();
+  for (const id of served.completedIds ?? []) if (frozenIds.has(id)) done.add(id);
   for (const id of completedIds) if (frozenIds.has(id)) done.add(id);
   const count = Math.max(served.completedCount ?? 0, done.size);
   if (count >= served.scopeCeiling && count < frozen.length) {
-    return { completedCount: count, total: frozen.length };
+    return { completedCount: count, total: frozen.length, ceiling: served.scopeCeiling };
   }
   return undefined;
 }

@@ -26,6 +26,15 @@ describe("readRunAck", () => {
     assert.equal(out.scopeCeiling, 4);
   });
 
+  it("carries the completed ids (strings only); absent for null or a missing field", async () => {
+    const withIds = await readRunAck(jsonResponse({ run: { milestones_completed: ["m1", 7, "m2"] } }));
+    assert.deepEqual(withIds.completedIds, ["m1", "m2"]);
+    const nulled = await readRunAck(jsonResponse({ run: { milestones_completed: null } }));
+    assert.equal(nulled.completedIds, undefined);
+    const missing = await readRunAck(jsonResponse({ run: {} }));
+    assert.equal(missing.completedIds, undefined);
+  });
+
   it("treats an absent milestones_completed as a completed count of 0", async () => {
     const out = await readRunAck(jsonResponse({ run: { scope_ceiling: 3 } }));
     assert.equal(out.completedCount, 0, "absent field reads as 0, same as null");

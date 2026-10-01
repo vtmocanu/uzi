@@ -8812,6 +8812,8 @@ export class RunRunner {
             b.scopeCeiling = ack.scopeCeiling;
           if (typeof ack.completedCount === "number")
             b.completedCount = ack.completedCount;
+          if (Array.isArray(ack.completedIds))
+            b.completedIds = ack.completedIds;
           // PRD #1190 M2: carry the server-decided pause boundary off the SAME ACK so the
           // loop-top pause branch reads it off `served`.
           if (typeof ack.pauseRequested === "boolean")
@@ -8832,6 +8834,7 @@ export class RunRunner {
             b.totalWallSeconds !== undefined ||
             b.scopeCeiling !== undefined ||
             b.completedCount !== undefined ||
+            b.completedIds !== undefined ||
             b.pauseRequested !== undefined ||
             b.budgetExhausted !== undefined
             ? b

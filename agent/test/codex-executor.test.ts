@@ -6946,6 +6946,17 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     const capped = await run(["m1", "m2", "m3"], ms);
     assert.deepEqual(capped.result.scopeCapped, { completedCount: 3, total: 5 });
     assert.equal(capped.emits.filter((m) => m.kind === "steer_ack").length, 1);
+    // The per-milestone shape: the lead declares only the milestone it just finished while the
+    // server's ACK carries the earlier ids.
+    {
+      const { ctx } = makeCtx({
+        frozenMilestones: ms,
+        reportIteration: async () => ({ scopeCeiling: 3, completedCount: 2, completedIds: ["m1", "m2"] }),
+      });
+      const result = await withTimeout(
+        makeExecutor(doneAt(["m3"]), bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1514 per-milestone run");
+      assert.deepEqual(result.scopeCapped, { completedCount: 3, total: 5 });
+    }
     // A genuinely full delivery (every frozen milestone declared) stays closing.
     const full = await run(["m1", "m2", "m3"], ms.slice(0, 3));
     assert.equal(full.result.scopeCapped, undefined);

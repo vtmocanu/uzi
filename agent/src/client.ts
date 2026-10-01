@@ -1152,6 +1152,8 @@ export class WorkerClient {
             ack.scopeCeiling = fields.scopeCeiling;
           if (fields.completedCount !== undefined)
             ack.completedCount = fields.completedCount;
+          if (fields.completedIds !== undefined)
+            ack.completedIds = fields.completedIds;
           // PRD #1190 M2: pass the server-decided pause boundary through so the reportIteration
           // closure can fold it into the IterationBudget the loop-top pause branch reads.
           if (fields.pauseRequested !== undefined)
@@ -2422,6 +2424,7 @@ export async function readRunAck(res: Response): Promise<{
   budgetUsedSeconds?: number;
   scopeCeiling?: number;
   completedCount?: number;
+  completedIds?: string[];
   pauseRequested?: boolean;
   budgetExhausted?: boolean;
   reason?: string;
@@ -2473,6 +2476,7 @@ export async function readRunAck(res: Response): Promise<{
       budgetUsedSeconds?: number;
       scopeCeiling?: number;
       completedCount?: number;
+      completedIds?: string[];
       pauseRequested?: boolean;
       budgetExhausted?: boolean;
       reason?: string;
@@ -2520,6 +2524,12 @@ export async function readRunAck(res: Response): Promise<{
     out.completedCount = Array.isArray(run?.milestones_completed)
       ? run.milestones_completed.length
       : 0;
+    // Issue #1514: the ids too (strings only), so the done-exit scope cap can union them with the
+    // locally declared ids. Absent unless the server sent an array.
+    if (Array.isArray(run?.milestones_completed))
+      out.completedIds = run.milestones_completed.filter(
+        (id: unknown): id is string => typeof id === "string",
+      );
     // PRD #1190 M2: the server-decided pause boundary rides the same {run: RunDTO} body. A
     // boolean only — a non-boolean (older server that omits it, unparseable value) leaves it
     // absent, which the loop-top pause branch reads as "no pause requested".
