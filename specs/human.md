@@ -898,7 +898,7 @@ Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery
 - A recovery bundle whose upload failed is retried while the worker stays up, once the api is reachable again, with bounded exponential backoff; no worker restart is needed. (AI-synced 2026-10-01)
 - An upload the api permanently refuses (ownership lost, route refused, over the size cap) or whose local bytes no longer match what was journaled leaves the worker's record `needs_action` with its bundle and source pin kept, and is not retried automatically. (AI-synced 2026-10-01)
 - A credential rejection is retried only after the worker authenticates again. (AI-synced 2026-10-01)
-- A run the worker is executing is never touched by the retry. (AI-synced 2026-10-01)
+- A run the worker is executing is not selected for the retry. (AI-synced 2026-10-01)
 
 ## Feature #1293 — Failed-run rate on the dashboard (global and per user)
 

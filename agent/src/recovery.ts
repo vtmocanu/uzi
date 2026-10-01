@@ -291,7 +291,8 @@ function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRe
 }
 
 /** A record the live pass may re-drive: a journaled bundle that is `bundled`, or `needs_action`
- *  for a transient reason. Never pinned, bundle-less, uploaded, or permanent. */
+ *  for a transient reason or `credential_rejected` (gated by the caller). Never pinned,
+ *  bundle-less, uploaded, or permanent. */
 function isLiveCandidate(record: RecoveryRecord): boolean {
   if (!hasJournaledBundle(record)) return false;
   if (record.state === "bundled") return true;
@@ -1307,10 +1308,11 @@ export class RecoveryCoordinator {
    * flight, before `nextPassAt`, or while a credential rejection is newer than the heartbeat; a
    * pass touches at most `liveMaxPerPass` records, least recently attempted first, and backs off
    * exponentially (capped) after a pass with a transient failure. Only records with a journaled
-   * bundle that are `bundled`, or `needs_action` for a transient reason, are candidates; the
-   * upload is the journaled-bytes upload (no forge PAT, never a re-bundle). A run that is
-   * executing is skipped, and each record step takes the capture-cycle lock in skip mode so a
-   * foreground capture or sweep step on the same record wins.
+   * bundle that are `bundled`, or `needs_action` for a transient reason or `credential_rejected`,
+   * are candidates; the upload is the journaled-bytes upload (no forge PAT; a journaled bundle is
+   * never re-produced). A run that is executing is skipped, and each record step takes the
+   * capture-cycle lock in skip mode, so it never waits behind a foreground capture or sweep step
+   * on the same record.
    */
   async resumeLive(opts: ResumeLiveOptions): Promise<void> {
     if (!this.enabled || this.passes.size > 0) return;

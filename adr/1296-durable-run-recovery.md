@@ -459,7 +459,7 @@ keeps its bytes and is not written.
 
 **Accepted residual.** A stream already in flight when cleanup releases the record cannot be recalled.
 The server checks the hold once when the upload transaction starts, so it refuses the upload only if
-the release committed before the request began; a release that commits mid-stream lets the capture
+the release committed before the upload transaction read the hold; a release that commits mid-stream lets the capture
 become `available` on a released hold (an orphan archive until it expires). Either way the worker's
 guarded write refuses to recreate the record. The `isExecuting` check is made at selection and again
 under the cycle lock, not during the upload itself, so a run resumed mid-upload can overlap it
