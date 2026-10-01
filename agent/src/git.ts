@@ -244,7 +244,8 @@ interface ExecFailure {
   stdout: string;
   stderr: string;
   detail: string;
-  /** The bounded, unsplit, unsanitized source of `detail` (see ScratchPublicationError.rawDetail). */
+  /** The bounded, unsplit, unsanitized failure text the runner redacts (see ScratchPublicationError.rawDetail);
+   *  it can come from a different line than `detail`, e.g. stderr with 800+ leading blank characters. */
   rawDetail: string;
 }
 
@@ -6813,9 +6814,12 @@ export class GitCache {
         stream.once("end", onEnd);
         stream.once("close", onClose);
         stream.once("error", onError);
-        // child_process resumes unread stdio at exit, so a stream that ended or was destroyed before we
-        // listened may have dropped output; refuse rather than read it as empty.
-        if (stream.readableEnded || stream.destroyed) onClose();
+        // A stream already ended before we listened is a clean empty EOF only if nothing was ever read from
+        // it (the Codex supervisor closes its stdio copies at launch, so a fast, silent git child's pipe is
+        // ended before the handle is returned). Ended after emitting data to nobody (child_process resumes
+        // unread stdio at exit), or destroyed without ending, may have dropped output: refuse.
+        if (stream.readableEnded && !stream.readableDidRead && !stream.errored) onEnd();
+        else if (stream.readableEnded || stream.destroyed) onClose();
         if (boundary.signal.aborted) onAbort();
         else boundary.signal.addEventListener("abort", onAbort, { once: true });
       });

@@ -10,8 +10,12 @@ import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harne
 import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 
-// Output streams already ended or destroyed when execScoped attaches may have lost data (child_process
-// resumes unread stdio at exit), so they are refused rather than read as empty output.
+// An output stream that ended before execScoped attached without anything ever being read from it is a clean
+// empty EOF (the Codex supervisor closes its stdio copies at launch, so a fast silent git child's pipe has
+// already ended when the handle is returned). One that emitted data to nobody (child_process resumes unread
+// stdio at exit), or was destroyed without ending, may have lost output and is refused.
+type Seen = { destroyed: boolean; readableEnded: boolean; readableDidRead: boolean };
+const snap = (s: Readable): Seen => ({ destroyed: s.destroyed, readableEnded: s.readableEnded, readableDidRead: s.readableDidRead });
 
 let fx: Fixture;
 let cache: GitCache;
@@ -24,12 +28,12 @@ function git(dir: string, ...args: string[]): string {
 }
 
 /** Real child, handed over only after it exited and its pipes closed (non-delayed otherwise). */
-function exitedFirst(seen: Array<{ destroyed: boolean; readableEnded: boolean }>): BoundaryProcessSpawner {
+function exitedFirst(seen: Seen[]): BoundaryProcessSpawner {
   return async (request: BoundaryProcessRequest): Promise<BoundaryProcessHandle> => {
     const [command, ...args] = request.argv;
     const child = spawn(command!, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
     const [code] = await once(child, "close") as [number | null];
-    for (const s of [child.stdout, child.stderr]) seen.push({ destroyed: s.destroyed, readableEnded: s.readableEnded });
+    for (const s of [child.stdout, child.stderr]) seen.push(snap(s));
     return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed: Promise.resolve({ code: code ?? 128 }) };
   };
 }
@@ -45,6 +49,27 @@ const realPipes: BoundaryProcessSpawner = async (request) => {
   return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
 };
 
+/**
+ * The Codex supervisor shape: the git child runs, then the supervisor closes its stdio copies while the
+ * handled process stays alive. Streams are handed over only once stderr has ended and been destroyed
+ * (nothing read), while stdout still holds its unread bytes.
+ */
+function supervisorShape(seen: Seen[]): BoundaryProcessSpawner {
+  return async (request) => {
+    const child = spawn("sh", ["-c", '"$@"; rc=$?; exec >&- 2>&-; sleep 0.3; exit $rc', "sh", ...request.argv],
+      { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
+    const completed = new Promise<{ code: number }>((resolve, reject) => {
+      child.once("error", reject);
+      child.once("close", (code) => resolve({ code: code ?? 128 }));
+    });
+    for (let i = 0; i < 200 && !(child.stderr.readableEnded && child.stderr.destroyed); i++) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    seen.push(snap(child.stdout), snap(child.stderr));
+    return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed };
+  };
+}
+
 async function endedStream(): Promise<PassThrough> {
   const s = new PassThrough();
   s.end();
@@ -56,6 +81,12 @@ async function endedStream(): Promise<PassThrough> {
 async function candidate(): Promise<{ bare: string; sha: string }> {
   const bare = await cache.ensureClone(fx.originPath);
   return { bare, sha: git(bare, "rev-parse", "refs/remotes/origin/main") };
+}
+
+/** A command with stdout data and empty stderr (the preflight's tip resolution). */
+function execOut(bare: string, sha: string): Promise<{ stdout: string }> {
+  return (cache as unknown as { execScoped: (c: string, a: string[], o: object) => Promise<{ stdout: string }> })
+    .execScoped("git", ["-C", bare, "rev-parse", sha], { env: GIT_ENV, timeout: 10_000 });
 }
 
 /** The preflight's object-walk command, which has empty stdout and stderr. */
@@ -70,14 +101,22 @@ const inBoundary = <T>(spawner: BoundaryProcessSpawner, fn: () => Promise<T>): P
 describe("execScoped boundary collect on already-ended streams fails closed", () => {
   // child_process resumes unread stdio when the child exits, so an exited child's output is dropped
   // while its streams read as destroyed+ended. That must never read as empty output.
-  it("refuses a real child that exited before handoff", async () => {
+  it("refuses a real child that exited before handoff with stdout data", async () => {
     const { bare, sha } = await candidate();
-    const seen: Array<{ destroyed: boolean; readableEnded: boolean }> = [];
-    await assert.rejects(inBoundary(exitedFirst(seen), () => execQuiet(bare, sha)), /subprocess output closed before end/);
-    assert.ok(seen.some((s) => s.destroyed && s.readableEnded), "no stream was destroyed+ended at handoff");
+    const seen: Seen[] = [];
+    await assert.rejects(inBoundary(exitedFirst(seen), () => execOut(bare, sha)), /subprocess output closed before end/);
+    assert.ok(seen[0]!.destroyed && seen[0]!.readableEnded && seen[0]!.readableDidRead, JSON.stringify(seen[0]));
   });
 
-  it("refuses an ended, resumed and closed PassThrough pair", async () => {
+  it("reads a real child that exited before handoff with no output as empty", async () => {
+    const { bare, sha } = await candidate();
+    const seen: Seen[] = [];
+    const out = await inBoundary(exitedFirst(seen), () => execQuiet(bare, sha));
+    assert.equal(out.stdout, "");
+    assert.ok(seen.every((s) => s.destroyed && s.readableEnded && !s.readableDidRead), JSON.stringify(seen));
+  });
+
+  it("reads an ended, resumed and closed PassThrough pair with no data as empty", async () => {
     const { bare, sha } = await candidate();
     const spawner: BoundaryProcessSpawner = async (request) => {
       const real = await realPipes(request);
@@ -85,25 +124,38 @@ describe("execScoped boundary collect on already-ended streams fails closed", ()
       return { stdin: new Writable({ write: (_c, _e, cb) => cb() }), stdout: (await endedStream()) as Readable,
         stderr: (await endedStream()) as Readable, completed: Promise.resolve({ code: 0 }) };
     };
+    assert.equal((await inBoundary(spawner, () => execQuiet(bare, sha))).stdout, "");
+  });
+
+  it("refuses an ended and closed stdout PassThrough whose data was drained", async () => {
+    const { bare, sha } = await candidate();
+    const spawner: BoundaryProcessSpawner = async () => {
+      const stdout = new PassThrough();
+      stdout.end("dropped output\n");
+      stdout.resume();
+      await once(stdout, "close");
+      const stderr = await endedStream();
+      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+    };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
   });
 
   it("refuses an ended but not destroyed stdout whose data was drained", async () => {
     const { bare, sha } = await candidate();
-    let seen: { destroyed: boolean; readableEnded: boolean } | undefined;
+    let seen: Seen | undefined;
     const spawner: BoundaryProcessSpawner = async () => {
       const stdout = new PassThrough({ autoDestroy: false });
       stdout.write("dropped output\n");
       stdout.end();
       stdout.resume();
       await once(stdout, "end");
-      seen = { destroyed: stdout.destroyed, readableEnded: stdout.readableEnded };
+      seen = snap(stdout);
       const stderr = new PassThrough();
       stderr.end();
       return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
     };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
-    assert.deepEqual(seen, { destroyed: false, readableEnded: true });
+    assert.deepEqual(seen, { destroyed: false, readableEnded: true, readableDidRead: true });
   });
 
   it("refuses publication when the scratch walk output was dropped (no fail-open)", async () => {
@@ -113,7 +165,7 @@ describe("execScoped boundary collect on already-ended streams fails closed", ()
     git(fx.originPath, "add", "-f", ".uzi/scratch/private.txt");
     git(fx.originPath, "-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "-m", "scratch history");
     const { bare, sha } = await candidate();
-    const seen: Array<{ destroyed: boolean; readableEnded: boolean }> = [];
+    const seen: Seen[] = [];
     const exited = exitedFirst(seen);
     const spawner: BoundaryProcessSpawner = (request) => request.argv.includes("--full-history") ? exited(request) : realPipes(request);
     // Control: the same history with normal pipes is refused for the scratch path.
@@ -127,7 +179,8 @@ describe("execScoped boundary collect on already-ended streams fails closed", ()
         assert.equal(err.step, "scratch_walk");
         return true;
       });
-    assert.ok(seen.some((s) => s.destroyed && s.readableEnded), "scratch walk stdout was not destroyed+ended at handoff");
+    assert.ok(seen.some((s) => s.destroyed && s.readableEnded && s.readableDidRead),
+      `scratch walk stdout handoff state: ${JSON.stringify(seen)}`);
   });
 });
 
@@ -135,6 +188,18 @@ describe("scratch publication preflight inside a boundary scope", () => {
   it("passes with real child pipes", async () => {
     const { bare, sha } = await candidate();
     assert.equal(await inBoundary(realPipes, () => cache.scratchPublicationPreflight(bare, "agent/issue-1", sha)), sha);
+  });
+
+  it("passes when each git child's empty stderr pipe ended before the handle was returned (supervisor shape)", async () => {
+    const { bare, sha } = await candidate();
+    const seen: Seen[] = [];
+    assert.equal(await inBoundary(supervisorShape(seen), () => cache.scratchPublicationPreflight(bare, "agent/issue-1", sha)), sha);
+    assert.ok(seen.length >= 2 && seen.length % 2 === 0, `calls: ${seen.length}`);
+    for (let i = 0; i < seen.length; i += 2) {
+      const e = seen[i + 1]!;
+      assert.ok(e.destroyed && e.readableEnded && !e.readableDidRead, `stderr handoff state: ${JSON.stringify(e)}`);
+    }
+    assert.ok(seen.some((s, i) => i % 2 === 0 && !s.readableEnded), "no stdout was left buffered and unended");
   });
 
   const refusals: Array<[string, string, BoundaryProcessSpawner]> = [
@@ -163,7 +228,6 @@ describe("scratch publication preflight inside a boundary scope", () => {
           assert.equal(err.kind, "exec_failed");
           assert.equal(err.step, "resolve_tip");
           assert.ok(err.detail?.includes(message), `detail: ${err.detail}`);
-          assert.notEqual(err.detail, "candidate commit is unavailable");
           return true;
         });
     });
