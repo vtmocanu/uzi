@@ -811,17 +811,27 @@ func TestFetchCtxEndedAfterHeadersIsRefused(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	f, _ := testFetcher(publicResolver(), ca, port, func(o *Options) { o.testAfterHeaders = func(context.Context) { cancel() } })
+	var hooked atomic.Int32
+	f, _ := testFetcher(publicResolver(), ca, port, func(o *Options) {
+		o.testAfterHeaders = func(context.Context) { hooked.Add(1); cancel() }
+	})
 	r, ref := f.Fetch(ctx, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
 	mustRefuse(t, r, ref, ReasonCancelled)
-	if ref.FinalURL != "https://docs.example.com/" {
-		t.Errorf("FinalURL = %q, want the hop that was in flight", ref.FinalURL)
+	if ref.FinalURL != "https://docs.example.com/" || ref.HTTPStatus != http.StatusOK {
+		t.Errorf("refusal = %+v, want the in-flight hop's URL and its 200", ref)
 	}
 
+	// The deadline is generous so the headers arrive first; the hook then waits it out.
 	f, _ = testFetcher(publicResolver(), ca, port, func(o *Options) {
-		o.Timeout = 50 * time.Millisecond
-		o.testAfterHeaders = func(ctx context.Context) { <-ctx.Done() }
+		o.Timeout = time.Second
+		o.testAfterHeaders = func(ctx context.Context) { hooked.Add(1); <-ctx.Done() }
 	})
 	r, ref = f.Fetch(context.Background(), "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
 	mustRefuse(t, r, ref, ReasonTimeout)
+	if ref.HTTPStatus != http.StatusOK {
+		t.Errorf("refusal = %+v, want the received 200 kept", ref)
+	}
+	if n := hooked.Load(); n != 2 {
+		t.Fatalf("testAfterHeaders ran %d times, want 2: the refusal did not come from the post-headers path", n)
+	}
 }

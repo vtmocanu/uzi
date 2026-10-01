@@ -214,9 +214,11 @@ func (f *Fetcher) Fetch(ctx context.Context, rawURL string, entries []string, ma
 			// teardown (its deadline or the caller's cancel closing the conn), and
 			// the body then reads as a clean, possibly empty, success. A result
 			// after the context ended is refused: doc.go's timeout/cancelled contract.
+			// The status it carried is kept, as the body-read refusal in hop keeps it.
 			if ctx.Err() != nil {
 				ref := ctxRefusal(ctx)
 				ref.FinalURL = cur
+				ref.HTTPStatus = res.HTTPStatus
 				return nil, ref
 			}
 			res.FinalURL = cur
