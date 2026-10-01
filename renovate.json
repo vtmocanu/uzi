@@ -30,6 +30,30 @@
   "customManagers": [
     {
       "customType": "regex",
+      "description": "Codex native runtime identity: keep the install version, manifest version, raw release tag and source commit together. Numeric consumers keep their existing lock keys. The two archive matches below are disjoint from this block.",
+      "managerFilePatterns": ["/^agent/codex/codex-package\\.lock$/"],
+      "matchStrings": ["CODEX_VERSION=\\d+\\.\\d+\\.\\d+\\nCODEX_MANIFEST_VERSION=\\d+\\.\\d+\\.\\d+\\nCODEX_TAG=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)\\nCODEX_SOURCE_COMMIT=(?<currentDigest>[0-9a-f]{40})"],
+      "depNameTemplate": "codex-source",
+      "packageNameTemplate": "openai/codex",
+      "datasourceTemplate": "github-releases",
+      "versioningTemplate": "regex:^rust-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$",
+      "autoReplaceStringTemplate": "CODEX_VERSION={{{replace '^rust-v' '' newValue}}}\nCODEX_MANIFEST_VERSION={{{replace '^rust-v' '' newValue}}}\nCODEX_TAG={{{newValue}}}\nCODEX_SOURCE_COMMIT={{{newDigest}}}"
+    },
+    {
+      "customType": "regex",
+      "description": "Codex musl archives: separate per-arch tag/hash matches avoid overlapping replacements. Release attachments updates the SHA256 with the raw rust-v tag; the installer checks all tags agree. Distinct aliases prevent same-file deduplication.",
+      "managerFilePatterns": ["/^agent/codex/codex-package\\.lock$/"],
+      "matchStrings": [
+        "CODEX_TAG_(?<arch>amd64)=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)\\nCODEX_SHA256_amd64=(?<currentDigest>[0-9a-f]{64})",
+        "CODEX_TAG_(?<arch>arm64)=(?<currentValue>rust-v\\d+\\.\\d+\\.\\d+)\\nCODEX_SHA256_arm64=(?<currentDigest>[0-9a-f]{64})"
+      ],
+      "depNameTemplate": "codex-package-{{{arch}}}",
+      "packageNameTemplate": "openai/codex",
+      "datasourceTemplate": "github-release-attachments",
+      "versioningTemplate": "regex:^rust-v(?<major>\\d+)\\.(?<minor>\\d+)\\.(?<patch>\\d+)$"
+    },
+    {
+      "customType": "regex",
       "description": "uzi CI tool pins carrying a `# renovate: datasource=.. depName=..` annotation on the line directly above the version literal, for pins WITHOUT a companion sha256 (currently zizmor in ci.yml). config:recommended already tracks go.mod / package-lock / Dockerfile FROM / GHA uses:; this covers versions pinned inline in shell that no built-in manager sees, VERSION only. Pins that DO have a companion sha256 (go-task, sqlc, actionlint) use the `# renovate-tarball:` marker + the github-release-attachments manager below instead, so their sha bumps in lockstep -- do NOT give a sha-carrying pin the `datasource=` marker or both managers would match it.",
       "managerFilePatterns": [
         "/^\\.github/workflows/[^/]+\\.ya?ml$/",
@@ -65,6 +89,14 @@
     }
   ],
   "packageRules": [
+    {
+      "description": "One reviewed Codex runtime upgrade PR. Stable release timestamps share the repository's seven-day age and nightly schedule. Runtime probe/launcher parity deliberately blocks a lock-only bump until upgrade work is done.",
+      "matchPackageNames": ["openai/codex"],
+      "groupName": "Codex runtime",
+      "separateMajorMinor": false,
+      "automerge": false,
+      "prBodyNotes": ["This updates the native Codex runtime, not an npm SDK. Reconcile CODEX_PROBE_EXPECTATION and CODEX_BIN with the lock, check protocol compatibility, and run the Codex guardrail/conformance checks before merging. Adding a model to uzi's curated picker is separate work."]
+    },
     {
       "description": "workers.image.repository is a PREFIX (controller appends /agent-<template>), not a resolvable image; and the worker tag is operator-advanced/decoupled from appVersion (PRD #422 Decision 1/3), so it must not be Renovate-tracked.",
       "matchFileNames": ["deploy/chart/values.yaml"],

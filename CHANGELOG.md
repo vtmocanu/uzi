@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Renovate proposes grouped Codex runtime upgrades.**
+  Stable native-runtime releases follow the existing seven-day release age and nightly update schedule. Each PR updates the source commit and both musl archive checksums together; installer consistency checks and runtime pin parity block partial upgrades until the required compatibility work is complete.
+
 - **A worker holding an undelivered run outcome is shown as such, and the run is flagged stalled after a minute ([#1994](https://github.com/vtmocanu/uzi/issues/1994)).**
   The api now records when a worker's pending outcome (journaled on the worker, not yet delivered) was first seen, per worker, run and claim generation, surviving heartbeat renewals and a worker re-register. A running or awaiting-approval run whose outcome has been pending under an unexpired lease for 4 heartbeat intervals (60s by default) gets the existing stalled flag with the reason "the run's outcome is journaled on its worker but has not been delivered"; this is a warning only and never expires the lease or reclaims, fails or discards the run. `reported_runs` entries in the worker list API carry `terminal_pending` and `terminal_pending_since`, the `RUNS` column of `uzi worker list` and `uzi admin workers` shows "N pending outcome(s) (oldest <age>)" instead of counting them as running, and Settings > Workers and the admin Runs worker strip show a badge with a per-run tooltip. See [run health](docs/run-health.md#what-the-flags-mean).
 

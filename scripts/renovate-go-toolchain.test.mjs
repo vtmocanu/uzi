@@ -23,7 +23,8 @@ const genericManager = config.customManagers.find(
   (manager) => manager.datasourceTemplate === "{{{datasource}}}",
 );
 const attachmentManager = config.customManagers.find(
-  (manager) => manager.datasourceTemplate === "github-release-attachments",
+  (manager) => manager.datasourceTemplate === "github-release-attachments" &&
+    manager.packageNameTemplate?.includes("{{#if packageName}}"),
 );
 assert(genericManager, "generic annotated-version manager is missing");
 assert(attachmentManager, "release-attachment manager is missing");

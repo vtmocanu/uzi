@@ -52,6 +52,15 @@ esac
 
 CODEX_VERSION="$(lock_val CODEX_VERSION)"
 CODEX_TAG="$(lock_val CODEX_TAG)"
+# Each Renovate match has its own tag/hash pair, so no replacement overlaps.
+# Reject a partial update on either build architecture before fetching anything.
+[[ "$CODEX_TAG" =~ ^rust-v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die "invalid stable CODEX_TAG '${CODEX_TAG}'"
+[ "$CODEX_TAG" = "rust-v${CODEX_VERSION}" ] || die "CODEX_VERSION disagrees with CODEX_TAG"
+[ "$(lock_val CODEX_MANIFEST_VERSION)" = "$CODEX_VERSION" ] || die "CODEX_MANIFEST_VERSION disagrees with CODEX_VERSION"
+for pin_arch in amd64 arm64; do
+  [ "$(lock_val "CODEX_TAG_${pin_arch}")" = "$CODEX_TAG" ] \
+    || die "CODEX_TAG_${pin_arch} disagrees with CODEX_TAG; update both tag/hash pairs together"
+done
 BASE_URL="$(lock_val CODEX_BASE_URL)"
 MUSL_TARGET="$(lock_val "CODEX_TARGET_${TARGETARCH}")"
 ARTIFACT="$(lock_val "CODEX_ARTIFACT_${TARGETARCH}")"
