@@ -169,13 +169,81 @@ function consumerInputSink(target: Writable): Writable {
   return sink;
 }
 
+/** Why publication was refused; `exec_failed` is the default for a bare reason with no classification. */
+export type ScratchPublicationKind =
+  | "tip_unavailable" | "shallow_history" | "missing_objects" | "object_walk_failed"
+  | "exec_failed" | "scratch_present" | "floor_unverified" | "checkpoint_range";
+/** The check that refused. */
+export type ScratchPublicationStep =
+  | "resolve_tip" | "shallow_check" | "object_walk" | "scratch_walk" | "floor_refresh" | "checkpoint_floor";
+
 export class ScratchPublicationError extends Error {
   readonly code = "scratch_publication_refused";
-  constructor(reason: string, cause?: unknown) {
+  readonly kind: ScratchPublicationKind;
+  readonly step?: ScratchPublicationStep;
+  /** One line, control characters stripped, capped at DETAIL_MAX; never carries env. */
+  readonly detail?: string;
+  constructor(
+    reason: string,
+    cause?: unknown,
+    opts?: { kind?: ScratchPublicationKind; step?: ScratchPublicationStep; detail?: string },
+  ) {
     super(`scratch_publication_refused: ${reason}`, { cause });
     this.name = "ScratchPublicationError";
+    this.kind = opts?.kind ?? "exec_failed";
+    if (opts?.step !== undefined) this.step = opts.step;
+    if (opts?.detail !== undefined) this.detail = opts.detail;
   }
 }
+
+const DETAIL_MAX = 200;
+
+/** First non-empty line of `text`, control characters stripped, capped at DETAIL_MAX. */
+function oneLine(text: string): string {
+  const strip = (l: string): string => Array.from(l, (c) => {
+    const n = c.charCodeAt(0);
+    return n < 0x20 || (n >= 0x7f && n <= 0x9f) ? " " : c;
+  }).join("").trim();
+  const first = text.split(/[\r\n]+/).map(strip).find((l) => l) ?? "";
+  return first.slice(0, DETAIL_MAX);
+}
+
+interface ExecFailure {
+  /** Numeric git exit status; undefined for timeout, signal, overflow and spawn errors. */
+  exitCode?: number;
+  timedOut: boolean;
+  overflow: boolean;
+  spawnError: boolean;
+  stdout: string;
+  stderr: string;
+  detail: string;
+}
+
+/** Classify an execScoped rejection (either the execFile or the boundary shape). */
+function classifyExecFailure(err: unknown): ExecFailure {
+  const e = (err ?? {}) as {
+    code?: unknown; signal?: unknown; killed?: unknown; outputExceeded?: unknown;
+    stdout?: unknown; stderr?: unknown; message?: unknown;
+  };
+  const overflow = e.outputExceeded === true || e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
+  const timedOut = !overflow && (e.killed === true || (typeof e.signal === "string" && e.signal !== ""));
+  const exitCode = !overflow && !timedOut && typeof e.code === "number" ? e.code : undefined;
+  const spawnError = !overflow && !timedOut && typeof e.code === "string";
+  const stderr = typeof e.stderr === "string" ? e.stderr : "";
+  const stdout = typeof e.stdout === "string" ? e.stdout : "";
+  const parts: string[] = [];
+  if (exitCode !== undefined) parts.push(`exit ${exitCode}`);
+  if (typeof e.signal === "string" && e.signal) parts.push(`signal ${e.signal}`);
+  if (timedOut) parts.push("timed out");
+  if (overflow) parts.push("output exceeded limit");
+  if (spawnError) parts.push(`code ${String(e.code)}`);
+  const text = oneLine(stderr) || oneLine(typeof e.message === "string" ? e.message : String(err));
+  if (text) parts.push(text);
+  return { exitCode, timedOut, overflow, spawnError, stdout, stderr, detail: oneLine(parts.join("; ")) };
+}
+
+const PUBLICATION_UNPROVEN = "cannot prove scratch-free candidate history";
+const MISSING_OBJECT_RE = /missing|bad object|unable to read|corrupt/i;
 
 const GIT_OUTPUT_ABORT_MESSAGE = "permit-held git output collection aborted: boundary deadline exceeded";
 const GIT_LOCK_WAIT_ABORT_MESSAGE = "permit-held git lock wait aborted: boundary deadline exceeded";
@@ -1396,8 +1464,7 @@ export class GitCache {
   async pushBranch(barePath: string, branch: string, pat: string, repoUrl: string, username?: string): Promise<void> {
     const scope = httpScopeForUrl(repoUrl);
     await this.withLock(barePath, async () => {
-      const tip = await this.revParse(barePath, `${runnerTrackingRef(branch)}^{commit}`);
-      if (!tip) throw new ScratchPublicationError("candidate commit is unavailable");
+      const tip = await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
       const candidate = await this.scratchPublicationPreflight(barePath, branch, tip);
       await this.refreshScratchPublicationFloor(barePath, branch, candidate, pat, scope, username);
       // A literal OID keeps the candidate fixed even if the tracking ref moves.
@@ -1405,34 +1472,116 @@ export class GitCache {
     });
   }
 
-  /** Public bridge entry point: validate the exact commit before changing custody. */
-  async scratchPublicationPreflight(barePath: string, branch: string, candidateSha?: string): Promise<string> {
+  /** Publication-path commit resolver: unlike revParse it never reads an exec failure as
+   *  "absent". Exit 1 with no output is the only absent answer; the caller passes a ref
+   *  and `^{commit}` is appended here. */
+  private async resolveCommitStrict(barePath: string, ref: string): Promise<string> {
+    let stdout: string;
     try {
-      const candidate = candidateSha ?? await this.trackingTip(barePath, branch);
-      if (!candidate || !SHA40_RE.test(candidate) ||
-          await this.revParse(barePath, `${candidate}^{commit}`) !== candidate) {
-        throw new Error("candidate commit is unavailable");
-      }
-      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") {
-        throw new Error("history is shallow");
-      }
-      // Walk all reachable objects without collecting object names. Missing objects,
-      // a deadline, or output overflow must all refuse publication.
-      await this.execScoped("git", withDir(barePath, [
-        "rev-list", "--objects", "--missing=error", "--quiet", candidate,
-      ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
-      // Full history preserves merged side branches and root commits. The pathspec
-      // matches both the exact file/symlink and everything below the directory.
-      const { stdout: touched } = await this.execScoped("git", withDir(barePath, [
-        "rev-list", "--full-history", "--max-count=1", candidate, "--", ".uzi/scratch",
-      ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
-      if (touched.trim()) throw new Error(".uzi/scratch appears in candidate history");
-      return candidate;
+      ({ stdout } = await this.execScoped("git", withDir(barePath, [
+        "rev-parse", "--verify", "--quiet", `${ref}^{commit}`,
+      ]), { env: gitEnv(), timeout: GIT_TIMEOUT_MS }));
     } catch (cause) {
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
+      const failure = classifyExecFailure(cause);
+      if (failure.exitCode === 1 && !failure.stdout.trim()) {
+        throw new ScratchPublicationError("candidate commit is unavailable", cause, {
+          kind: "tip_unavailable", step: "resolve_tip", detail: "ref does not resolve to a commit",
+        });
+      }
+      throw new ScratchPublicationError(PUBLICATION_UNPROVEN, cause, {
+        kind: "exec_failed", step: "resolve_tip", detail: failure.detail,
+      });
+    }
+    const sha = stdout.trim();
+    if (!SHA40_RE.test(sha)) {
+      throw new ScratchPublicationError(PUBLICATION_UNPROVEN, undefined, {
+        kind: "exec_failed", step: "resolve_tip", detail: oneLine(`unexpected rev-parse output: ${sha}`),
+      });
+    }
+    return sha;
+  }
+
+  /** Refusal for a failed scratch-history check; a boundary abort or a typed refusal passes through. */
+  private publicationFailure(
+    cause: unknown, step: ScratchPublicationStep, kind: ScratchPublicationKind = "exec_failed",
+  ): Error {
+    const abort = this.boundaryAbortError(cause);
+    if (abort) return abort;
+    if (cause instanceof ScratchPublicationError) return cause;
+    return new ScratchPublicationError(PUBLICATION_UNPROVEN, cause, {
+      kind, step, detail: classifyExecFailure(cause).detail,
+    });
+  }
+
+  /** Public bridge entry point: validate the exact commit before changing custody. */
+  async scratchPublicationPreflight(barePath: string, branch: string, candidateSha?: string): Promise<string> {
+    try {
+      let candidate: string;
+      if (candidateSha === undefined) {
+        candidate = await this.resolveCommitStrict(barePath, runnerTrackingRef(branch));
+      } else {
+        if (!SHA40_RE.test(candidateSha)) {
+          throw new ScratchPublicationError("candidate commit is unavailable", undefined, {
+            kind: "tip_unavailable", step: "resolve_tip", detail: "candidate is not a 40-hex commit SHA",
+          });
+        }
+        candidate = await this.resolveCommitStrict(barePath, candidateSha);
+        if (candidate !== candidateSha) {
+          throw new ScratchPublicationError("candidate commit is unavailable", undefined, {
+            kind: "tip_unavailable", step: "resolve_tip", detail: "resolved commit differs from candidate",
+          });
+        }
+      }
+      try {
+        const { stdout: shallow } = await this.execScoped("git", withDir(barePath, ["rev-parse", "--is-shallow-repository"]),
+          { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
+        if (shallow.trim() !== "false") {
+          throw new ScratchPublicationError(PUBLICATION_UNPROVEN, undefined, {
+            kind: "shallow_history", step: "shallow_check", detail: "history is shallow",
+          });
+        }
+      } catch (cause) {
+        throw this.publicationFailure(cause, "shallow_check");
+      }
+      // Walk all reachable objects without collecting object names. Missing objects,
+      // a deadline, or output overflow must all refuse publication.
+      try {
+        await this.execScoped("git", withDir(barePath, [
+          "rev-list", "--objects", "--missing=error", "--quiet", candidate,
+        ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 });
+      } catch (cause) {
+        const failure = classifyExecFailure(cause);
+        const gitExit = failure.exitCode !== undefined && failure.exitCode !== 0;
+        throw this.publicationFailure(cause, "object_walk",
+          !gitExit ? "exec_failed" : MISSING_OBJECT_RE.test(failure.stderr) ? "missing_objects" : "object_walk_failed");
+      }
+      // Full history preserves merged side branches and root commits. The pathspec
+      // matches both the exact file/symlink and everything below the directory.
+      let touched: string;
+      try {
+        ({ stdout: touched } = await this.execScoped("git", withDir(barePath, [
+          "rev-list", "--full-history", "--max-count=1", candidate, "--", ".uzi/scratch",
+        ]), { env: gitEnv(), timeout: 10_000, maxBuffer: 4_096 }));
+      } catch (cause) {
+        throw this.publicationFailure(cause, "scratch_walk");
+      }
+      if (touched.trim()) {
+        throw new ScratchPublicationError(PUBLICATION_UNPROVEN, undefined, {
+          kind: "scratch_present", step: "scratch_walk", detail: ".uzi/scratch appears in candidate history",
+        });
+      }
+      return candidate;
+    } catch (cause) {
+      // An inner check already mapped an abort; re-mapping would wrap the wrapper.
+      if (cause instanceof GitBoundaryAbortError || cause instanceof CheckpointSoftDeadlineError) throw cause;
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
-      throw new ScratchPublicationError("cannot prove scratch-free candidate history", cause);
+      throw new ScratchPublicationError(PUBLICATION_UNPROVEN, cause, {
+        kind: "exec_failed", detail: classifyExecFailure(cause).detail,
+      });
     }
   }
 
@@ -1480,7 +1629,9 @@ export class GitCache {
       const abort = this.boundaryAbortError(cause);
       if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
-      throw new ScratchPublicationError("cannot verify fresh remote floor", cause);
+      throw new ScratchPublicationError("cannot verify fresh remote floor", cause, {
+        kind: "floor_unverified", step: "floor_refresh", detail: classifyExecFailure(cause).detail,
+      });
     } finally {
       await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
     }
@@ -3742,7 +3893,9 @@ export class GitCache {
     // excluded floor remains pinned.
     if (pinned) {
       if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha)) {
-        throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs");
+        throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
+          kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
+        });
       }
       onStep?.("scratch_preflight");
       await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
@@ -3775,7 +3928,9 @@ export class GitCache {
     } catch (e) {
       const abort = this.boundaryAbortError(e);
       if (abort) throw abort;
-      throw new ScratchPublicationError("checkpoint floor cannot be resolved", e);
+      throw new ScratchPublicationError("checkpoint floor cannot be resolved", e, {
+        kind: "checkpoint_range", step: "checkpoint_floor", detail: classifyExecFailure(e).detail,
+      });
     }
 
     // PRD #1062 M2 (#1036) — the `.github/workflows` overlay. When an overlay context is
@@ -3814,7 +3969,9 @@ export class GitCache {
     if (!floor || !SHA40_RE.test(floor) ||
         await this.revParse(barePath, `${floor}^{commit}`) !== floor ||
         !(await this.isAncestorRef(barePath, floor, candidate))) {
-      throw new ScratchPublicationError("checkpoint floor is unavailable or not an ancestor of candidate");
+      throw new ScratchPublicationError("checkpoint floor is unavailable or not an ancestor of candidate", undefined, {
+        kind: "checkpoint_range", step: "checkpoint_floor", detail: "floor is unavailable or not an ancestor of candidate",
+      });
     }
   }
 
@@ -6630,8 +6787,9 @@ export class GitCache {
         stdout.oversized || stderr.oversized
           ? `subprocess output exceeded ${cap} bytes`
           : `subprocess exited ${terminal.code}`,
-      ) as Error & { code?: number; stdout?: string; stderr?: string };
+      ) as Error & { code?: number; stdout?: string; stderr?: string; outputExceeded?: boolean };
       failure.code = terminal.code;
+      if (stdout.oversized || stderr.oversized) failure.outputExceeded = true;
       failure.stdout = out;
       failure.stderr = err;
       throw failure;

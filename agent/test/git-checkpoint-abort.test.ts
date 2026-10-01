@@ -14,39 +14,36 @@ function safeAbort(error: unknown, cause: Error): boolean {
     error.cause === cause;
 }
 
-/** Stub only the Git reads before the bounded history walk; no repository is needed. */
-function preflightCache(): GitCache {
+/** Stub execScoped so the strict tip resolve and shallow probe pass and the first
+ *  bounded history walk (`rev-list`) reaches `walk`; no repository is needed. */
+function preflightCache(walk?: () => Promise<never>): GitCache {
   const cache = new GitCache("/unused-checkpoint-abort-test", nullLogger());
   const seam = cache as unknown as {
-    revParse: () => Promise<string>;
-    runGit: () => Promise<string>;
+    execScoped: (command: string, args: string[]) => Promise<{ stdout: string; stderr: string }>;
   };
-  seam.revParse = async () => SHA;
-  seam.runGit = async () => "false";
+  seam.execScoped = async (_command, args) => {
+    if (args.includes("--is-shallow-repository")) return { stdout: "false\n", stderr: "" };
+    if (args.includes("rev-list") && walk) return walk();
+    return { stdout: `${SHA}\n`, stderr: "" };
+  };
   return cache;
 }
 
 it("an aborted scratch history walk stays an abort, not a scratch refusal", async () => {
-  const cache = preflightCache();
   const abort = new DOMException("checkpoint boundary stopped", "AbortError");
-  const seam = cache as unknown as {
-    execScoped: () => Promise<never>;
-  };
-  seam.execScoped = async () => { throw abort; };
+  const cache = preflightCache(async () => { throw abort; });
 
   await assert.rejects(cache.scratchPublicationPreflight("/unused", "agent/issue-1914", SHA),
     (error: unknown) => safeAbort(error, abort));
 });
 
 it("a plain subprocess error after the held permit aborts is classified as an abort", async () => {
-  const cache = preflightCache();
   const controller = new AbortController();
-  const seam = cache as unknown as { execScoped: () => Promise<never> };
   const remote = new Error("attacker-controlled git response");
-  seam.execScoped = async () => {
+  const cache = preflightCache(async () => {
     controller.abort();
     throw remote;
-  };
+  });
 
   await assert.rejects(cache.withBoundaryProcessSpawner(
     async () => { throw new Error("unexpected child spawn"); },
