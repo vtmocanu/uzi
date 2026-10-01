@@ -85,6 +85,23 @@ func TestParseTokenForm(t *testing.T) {
 	}
 }
 
+// PRD #1910 M4: the refresh_token grant's and the RFC 7009 revoke request's parameters.
+func TestParseTokenFormRefreshAndRevokeParameters(t *testing.T) {
+	f := ParseTokenForm(url.Values{
+		"grant_type": {"refresh_token"}, "refresh_token": {"r"}, "scope": {"jobs:read"},
+		"token": {"t"}, "token_type_hint": {"access_token"},
+	})
+	if f.RefreshToken != "r" || f.Scope != "jobs:read" || !f.HasScope || f.Token != "t" || f.TokenTypeHint != "access_token" {
+		t.Fatalf("parsed = %+v", f)
+	}
+	if f := ParseTokenForm(url.Values{"scope": {""}}); !f.HasScope || f.Scope != "" {
+		t.Fatalf("an empty scope must count as present (malformed), got %+v", f)
+	}
+	if f := ParseTokenForm(url.Values{}); f.HasScope {
+		t.Fatal("an absent scope must not count as present")
+	}
+}
+
 func TestSecretMatches(t *testing.T) {
 	secret, hash, _, err := GenerateSecret()
 	if err != nil {

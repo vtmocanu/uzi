@@ -8,7 +8,7 @@ audience: operator
 
 An admin makes an [external product](./product-tokens.md) an **OAuth client** so that, in place of a pasted `uzp_` token, it can send a user's browser to uzi to approve access (PRD #1910). The product's id is its `client_id`. Pasted product tokens keep working for every product, client or not.
 
-> **Status.** This page covers registration (the redirect URIs, the allowed scopes and the client secret), the consent step and the token endpoint. A registered client can send a user to `/api/oauth/authorize`, the user approves or denies on uzi's `/connect` page (see [Connecting a product](./connect-a-product.md)), and the client receives an authorization code at its redirect URI together with its own `state` and uzi's `iss` (the instance's public origin). It then exchanges the code at `POST /api/oauth/token` (below) for an access token and a refresh token. Using the refresh token (`grant_type=refresh_token`) and revoking it (`POST /api/oauth/revoke`) ship in a later milestone of PRD #1910.
+> **Status.** This page covers registration (the redirect URIs, the allowed scopes and the client secret), the consent step, the token endpoint (code exchange and refresh) and the revoke endpoint. A registered client can send a user to `/api/oauth/authorize`, the user approves or denies on uzi's `/connect` page (see [Connecting a product](./connect-a-product.md)), and the client receives an authorization code at its redirect URI together with its own `state` and uzi's `iss` (the instance's public origin). It then exchanges the code at `POST /api/oauth/token` (below) for an access token and a refresh token, renews the access token with the refresh token, and can disconnect itself at `POST /api/oauth/revoke`.
 
 ## The token endpoint
 
@@ -21,6 +21,48 @@ The 200 response is `access_token` (a `uzp_` token valid for one hour, used as a
 - A database error is **503 `temporarily_unavailable`** with `Retry-After`, never `invalid_grant`, so a client must treat a 503 as "try again", not "the connection is gone". If a 503 followed a commit that did land, the retry presents a used code and, being fully bound, counts as a replay and revokes the connection: start a new connection then.
 - A connection already holding 10 live access tokens answers **429 `temporarily_unavailable`** with `Retry-After` (seconds until the oldest expires): reuse your current token. Rate limits answer 429 with the same body.
 - Limits are per client IP (every request) and per product (after authentication): `OAUTH_RATE_LIMIT_MAX` requests per `OAUTH_RATE_LIMIT_WINDOW`, 60 per minute by default. The per-product budget is one bucket shared by all of that product's users, so raise `OAUTH_RATE_LIMIT_MAX` for a busy multi-user product.
+
+## Refresh an access token
+
+When the one-hour access token expires (or sooner), `POST /api/oauth/token` with `grant_type=refresh_token`, the same Basic client authentication and request rules as the code exchange, and:
+
+```
+grant_type=refresh_token&refresh_token=<the uzr_ token>&scope=jobs:read
+```
+
+`scope` is optional: send a subset of the connection's current scopes to get a narrower token, never a wider one (`invalid_scope`); the connection itself is unchanged. The 200 response is `access_token`, `token_type`, `expires_in` and `scope`, and **no `refresh_token`**: uzi does not rotate refresh tokens, so keep using the one you hold. Because nothing rotates, a retried refresh, or several replicas of your product refreshing at once, are safe.
+
+```
+HTTP/1.1 200 OK
+Cache-Control: no-store
+
+{"access_token":"<a uzp_ token>","token_type":"Bearer","expires_in":3600,"scope":"jobs:run jobs:read"}
+```
+
+A refresh token stops working, with 400 `invalid_grant`, when:
+
+- it has not been used for 30 days;
+- 90 days have passed since the user last approved the connection (approving again, through the normal consent page, starts a fresh 90 days and issues a new refresh token);
+- the user or an admin revoked the connection, or the user approved again, which replaces the previous refresh token;
+- it belongs to another client, or the product's registration no longer allows the connection's scopes, or the user's account is inactive.
+
+`invalid_grant` means the connection is gone: send the user through consent again. A product that is disabled or deleted cannot authenticate at all (401 `invalid_client`); the connection itself survives and works again when the product is enabled. A 503 or a 429 (a connection already holding 10 live access tokens, with `Retry-After`) means try again later, not that the connection is gone.
+
+## Revoke from the product
+
+`POST /api/oauth/revoke` (RFC 7009), form-encoded, the same Basic client authentication, request rules, limits and `Cache-Control: no-store` as the token endpoint:
+
+```
+token=<the uzr_ or uzp_ token>&token_type_hint=refresh_token
+```
+
+`token` is required. `token_type_hint` (`refresh_token` or `access_token`) is advisory: a wrong or unknown hint still finds the token.
+
+- Revoking the **refresh token** disconnects: the connection, every access token under it and the refresh token stop working at once, and jobs those tokens started are cancelled.
+- Revoking an **access token** that the connection issued revokes only that token; the connection and its refresh token keep working.
+- A token you were not issued (an unknown, expired or already revoked token, or a token a user pasted by hand rather than one issued through OAuth) answers **200** and revokes nothing.
+- A token issued to another client is **400 `invalid_grant`** and revokes nothing.
+- 200 has an empty body. A database error is **503 `temporarily_unavailable`** with `Retry-After`: retry.
 
 These endpoints are part of the `/api/v1` compatibility promise in [Product tokens](./product-tokens.md#compatibility-promise); `api/openapi/v1.yaml` declares an `oauth2` security scheme beside `bearerAuth`.
 

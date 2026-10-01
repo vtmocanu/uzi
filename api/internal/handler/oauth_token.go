@@ -3,11 +3,13 @@ package handler
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"errors"
 	"log/slog"
 	"mime"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -42,6 +44,11 @@ const (
 	oauthStorageRetryAfter = 5
 	// oauthMaxCodeLen bounds a presented code before it is hashed: a real code is 43 characters.
 	oauthMaxCodeLen = 256
+	// oauthRefreshIdleLimit and oauthRefreshAbsoluteLimit are the refresh token's lifetimes (PRD
+	// #1910 D5): 30 days idle (from the last refresh, else from issue) and 90 days absolute from
+	// the user's latest consent (oauth_grants.consented_at, which a re-consent resets).
+	oauthRefreshIdleLimit     = 30 * 24 * time.Hour
+	oauthRefreshAbsoluteLimit = 90 * 24 * time.Hour
 	// oauthGrantRowName is the name column of an OAuth-issued product_tokens row.
 	oauthGrantRowName = "OAuth access token"
 )
@@ -119,114 +126,149 @@ func oauthBasicCredentials(r *http.Request) (id, secret string, ok bool) {
 	return id, secret, true
 }
 
-// OAuthToken is POST /api/oauth/token for grant_type=authorization_code (PRD #1910 D5 to D8).
-// limiter is the oauthLimiter whose per-IP Middleware already fronts the route; this handler draws
-// the per-client budget from it, and ONLY after the client authenticated, so a flood of failed
-// authentications for a client_id cannot exhaust that client's own budget.
+// oauthAuthenticatedClient runs the request rules and client authentication shared by POST
+// /api/oauth/token and POST /api/oauth/revoke (PRD #1910 D7) and returns the authenticated client
+// and the parsed form. ok is false when it already wrote the refusal. limiter is the oauthLimiter
+// whose per-IP Middleware fronts the route; the per-client budget is drawn from it ONLY after the
+// client authenticated, so a flood of failed authentications for a client_id cannot exhaust that
+// client's own budget.
 //
 // The order is: request rules (no query string, form-encoded, 16 KiB, no repeated parameter),
-// client authentication (HTTP Basic only), the per-client budget, then the code redemption
-// transaction (redeemOAuthCode). Nothing is consumed or revoked before the client is authenticated,
-// and a code is redeemed only after every binding check passed.
+// client authentication (HTTP Basic only), then the per-client budget. Nothing is consumed or
+// revoked before the client is authenticated.
+func (h *Handler) oauthAuthenticatedClient(w http.ResponseWriter, r *http.Request, limiter *mw.Limiter, endpoint string) (uuid.UUID, oauthsrv.TokenForm, bool) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+	ctx := r.Context()
+
+	// RFC 6749 section 3.2: parameters travel in the form body only. A query string, even an
+	// empty-valued one, is refused rather than silently merged.
+	if r.URL.RawQuery != "" {
+		oauthInvalidRequest(w, "parameters must be sent in the request body")
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/x-www-form-urlencoded" {
+		oauthInvalidRequest(w, "Content-Type must be application/x-www-form-urlencoded")
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, oauthTokenBodyCap)
+	if err := r.ParseForm(); err != nil {
+		oauthInvalidRequest(w, "the request body is not a valid form of at most 16 KiB")
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	form := oauthsrv.ParseTokenForm(r.PostForm)
+	if form.Repeated {
+		oauthInvalidRequest(w, "a parameter was sent more than once")
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+
+	// Client authentication: HTTP Basic only (D2). A second method next to it is invalid_request.
+	basicID, basicSecret, hasBasic := oauthBasicCredentials(r)
+	if hasBasic && (form.HasClientSecret || (form.ClientID != "" && form.ClientID != basicID)) {
+		oauthInvalidRequest(w, "use exactly one client authentication method")
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	if !hasBasic {
+		oauthInvalidClient(w)
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	clientID, err := uuid.Parse(basicID)
+	if err != nil {
+		oauthInvalidClient(w)
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	product, err := h.q.GetProduct(ctx, clientID)
+	known := true
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		known = false
+	case err != nil:
+		slog.Error("oauth "+endpoint+": load client", "error", err)
+		oauthUnavailable(w)
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	// Always hash and compare in constant time, so an unknown client, a product without a
+	// secret and a wrong secret are the same answer at the same cost: the dummy hash stands in
+	// for a missing one, and its comparison result never authenticates anyone.
+	storedHash, hasSecret := oauthDummySecretHash, false
+	if known && len(product.ClientSecretHash) > 0 {
+		storedHash, hasSecret = product.ClientSecretHash, true
+	}
+	secretOK := oauthsrv.SecretMatches(basicSecret, storedHash)
+	if !known || !hasSecret || !secretOK || !oauthClientFromProduct(product).IsClient() {
+		oauthInvalidClient(w)
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+
+	// The client is authenticated: only now does the per-client budget move.
+	if !limiter.Allow("client:" + clientID.String()) {
+		writeOAuthTokenError(w, &oauthTokenFailure{
+			status: http.StatusTooManyRequests, code: oauthsrv.ErrTemporarilyUnavailable,
+			retryAfter: max(1, int(limiter.Window().Seconds())),
+		}, "")
+		return uuid.Nil, oauthsrv.TokenForm{}, false
+	}
+	return clientID, form, true
+}
+
+// OAuthToken is POST /api/oauth/token for grant_type=authorization_code and refresh_token (PRD
+// #1910 D5 to D8). The request rules, client authentication and per-client budget are
+// oauthAuthenticatedClient's; the grant then runs in one transaction (redeemOAuthCode,
+// refreshOAuthToken). A code is redeemed only after every binding check passed.
 func (h *Handler) OAuthToken(limiter *mw.Limiter) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Cache-Control", "no-store")
-		w.Header().Set("Pragma", "no-cache")
+		clientID, form, ok := h.oauthAuthenticatedClient(w, r, limiter, "token")
+		if !ok {
+			return
+		}
 		ctx := r.Context()
-
-		// RFC 6749 section 3.2: parameters travel in the form body only. A query string, even an
-		// empty-valued one, is refused rather than silently merged.
-		if r.URL.RawQuery != "" {
-			oauthInvalidRequest(w, "parameters must be sent in the request body")
-			return
-		}
-		if mt, _, err := mime.ParseMediaType(r.Header.Get("Content-Type")); err != nil || mt != "application/x-www-form-urlencoded" {
-			oauthInvalidRequest(w, "Content-Type must be application/x-www-form-urlencoded")
-			return
-		}
-		r.Body = http.MaxBytesReader(w, r.Body, oauthTokenBodyCap)
-		if err := r.ParseForm(); err != nil {
-			oauthInvalidRequest(w, "the request body is not a valid form of at most 16 KiB")
-			return
-		}
-		form := oauthsrv.ParseTokenForm(r.PostForm)
-		if form.Repeated {
-			oauthInvalidRequest(w, "a parameter was sent more than once")
-			return
-		}
-
-		// Client authentication: HTTP Basic only (D2). A second method next to it is invalid_request.
-		basicID, basicSecret, hasBasic := oauthBasicCredentials(r)
-		if hasBasic && (form.HasClientSecret || (form.ClientID != "" && form.ClientID != basicID)) {
-			oauthInvalidRequest(w, "use exactly one client authentication method")
-			return
-		}
-		if !hasBasic {
-			oauthInvalidClient(w)
-			return
-		}
-		clientID, err := uuid.Parse(basicID)
-		if err != nil {
-			oauthInvalidClient(w)
-			return
-		}
-		product, err := h.q.GetProduct(ctx, clientID)
-		known := true
-		switch {
-		case errors.Is(err, pgx.ErrNoRows):
-			known = false
-		case err != nil:
-			slog.Error("oauth token: load client", "error", err)
-			oauthUnavailable(w)
-			return
-		}
-		// Always hash and compare in constant time, so an unknown client, a product without a
-		// secret and a wrong secret are the same answer at the same cost: the dummy hash stands in
-		// for a missing one, and its comparison result never authenticates anyone.
-		storedHash, hasSecret := oauthDummySecretHash, false
-		if known && len(product.ClientSecretHash) > 0 {
-			storedHash, hasSecret = product.ClientSecretHash, true
-		}
-		secretOK := oauthsrv.SecretMatches(basicSecret, storedHash)
-		if !known || !hasSecret || !secretOK || !oauthClientFromProduct(product).IsClient() {
-			oauthInvalidClient(w)
-			return
-		}
-
-		// The client is authenticated: only now does the per-client budget move.
-		if !limiter.Allow("client:" + clientID.String()) {
-			writeOAuthTokenError(w, &oauthTokenFailure{
-				status: http.StatusTooManyRequests, code: oauthsrv.ErrTemporarilyUnavailable,
-				retryAfter: max(1, int(limiter.Window().Seconds())),
-			}, "")
-			return
-		}
 
 		switch form.GrantType {
 		case "authorization_code":
+			if form.Code == "" {
+				oauthInvalidRequest(w, "code is required")
+				return
+			}
+			resp, fail, err := h.redeemOAuthCode(ctx, clientID, form)
+			if err != nil {
+				slog.Error("oauth token: redeem code", "error", err)
+				oauthUnavailable(w)
+				return
+			}
+			if fail != nil {
+				writeOAuthTokenError(w, fail, "")
+				return
+			}
+			httpx.JSON(w, http.StatusOK, resp)
+		case "refresh_token":
+			if form.RefreshToken == "" {
+				oauthInvalidRequest(w, "refresh_token is required")
+				return
+			}
+			var requested []string
+			if form.HasScope {
+				var err error
+				if requested, err = oauthsrv.ParseScopes(form.Scope); err != nil {
+					writeOAuthTokenError(w, &oauthTokenFailure{status: http.StatusBadRequest, code: oauthsrv.ErrInvalidScope}, "scope is malformed or names an unknown scope")
+					return
+				}
+			}
+			resp, fail, err := h.refreshOAuthToken(ctx, clientID, form.RefreshToken, requested)
+			if err != nil {
+				slog.Error("oauth token: refresh", "error", err)
+				oauthUnavailable(w)
+				return
+			}
+			if fail != nil {
+				writeOAuthTokenError(w, fail, "")
+				return
+			}
+			httpx.JSON(w, http.StatusOK, resp)
 		case "":
 			oauthInvalidRequest(w, "grant_type is required")
-			return
 		default:
-			writeOAuthTokenError(w, &oauthTokenFailure{status: http.StatusBadRequest, code: oauthsrv.ErrUnsupportedGrantType}, "grant_type must be authorization_code")
-			return
+			writeOAuthTokenError(w, &oauthTokenFailure{status: http.StatusBadRequest, code: oauthsrv.ErrUnsupportedGrantType}, "grant_type must be authorization_code or refresh_token")
 		}
-		if form.Code == "" {
-			oauthInvalidRequest(w, "code is required")
-			return
-		}
-
-		resp, fail, err := h.redeemOAuthCode(ctx, clientID, form)
-		if err != nil {
-			slog.Error("oauth token: redeem code", "error", err)
-			oauthUnavailable(w)
-			return
-		}
-		if fail != nil {
-			writeOAuthTokenError(w, fail, "")
-			return
-		}
-		httpx.JSON(w, http.StatusOK, resp)
 	}
 }
 
@@ -439,4 +481,139 @@ func revokeGrantOfTokenTx(ctx context.Context, q *store.Queries, grantID uuid.UU
 		return pgx.ErrNoRows
 	}
 	return revokeGrantLocked(ctx, q, grant.ID)
+}
+
+// refreshOAuthToken serves grant_type=refresh_token (PRD #1910 D5, D8) in ONE transaction in D8
+// lock order. The grant is found by sha256(refresh token) WITHOUT a lock, then locked FOR UPDATE,
+// and EVERYTHING is re-checked under that lock before a token is minted: the presented hash must
+// still equal the grant's CURRENT refresh hash (so a re-consent or revoke that committed first
+// kills it), the grant must be live and the client's own, the idle (30 days from the last refresh,
+// else from issue) and absolute (90 days from consented_at) lifetimes must hold, the product must
+// still be an enabled client allowing the grant's scopes, the user must be active, a requested
+// scope must be a non-empty subset of the grant's CURRENT scopes, and the grant must hold fewer
+// than ten live access tokens. Then a one-hour access token is minted with the requested (else the
+// grant's) scopes and refresh_last_used_at is stamped. The refresh token is NOT rotated and the
+// grant is unchanged, so a retried refresh or several replicas never revoke anything.
+//
+// requested is the already-parsed scope parameter, nil when absent. A non-nil error is a storage
+// failure (503). Every refusal rolls back, so nothing is written on failure.
+func (h *Handler) refreshOAuthToken(ctx context.Context, clientID uuid.UUID, refreshToken string, requested []string) (*apitypes.OAuthRefreshResponse, *oauthTokenFailure, error) {
+	if len(refreshToken) > oauthMaxCodeLen {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	hash := sha256.Sum256([]byte(refreshToken))
+
+	tx, err := h.beginOAuthTx(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit; every refusal relies on it to write nothing
+	q := h.q.WithTx(tx)
+
+	grantID, err := q.GetOAuthGrantIDByRefreshHash(ctx, hash[:])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	grant, err := q.LockOAuthGrant(ctx, grantID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+
+	// Re-check under the lock. The first three are the credential itself: a grant that was revoked
+	// or re-consented meanwhile no longer holds this hash, and one that belongs to another client
+	// is not this client's to refresh (nothing is revoked: the token alone is not proof of being
+	// the issuing client).
+	if grant.RevokedAt.Valid || len(grant.RefreshTokenHash) == 0 || subtle.ConstantTimeCompare(hash[:], grant.RefreshTokenHash) != 1 || grant.ProductID != clientID {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	idleFrom := grant.RefreshLastUsedAt
+	if !idleFrom.Valid {
+		idleFrom = grant.RefreshIssuedAt
+	}
+	now := time.Now()
+	if !idleFrom.Valid || now.Sub(idleFrom.Time) > oauthRefreshIdleLimit || !grant.ConsentedAt.Valid || now.Sub(grant.ConsentedAt.Time) > oauthRefreshAbsoluteLimit {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	product, err := q.GetProduct(ctx, grant.ProductID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if !oauthClientAllowsScopes(product, grant.Scopes) {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	user, err := q.GetUserByID(ctx, grant.UserID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	if err != nil {
+		return nil, nil, err
+	}
+	if !user.IsActive {
+		return nil, errOAuthInvalidGrant, nil
+	}
+
+	scopes := grant.Scopes
+	if requested != nil {
+		for _, sc := range requested {
+			if !slices.Contains(grant.Scopes, sc) {
+				return nil, &oauthTokenFailure{status: http.StatusBadRequest, code: oauthsrv.ErrInvalidScope}, nil
+			}
+		}
+		scopes = requested
+	}
+
+	// The ten-live-token bound (D5), under the grant lock, exactly as on a code exchange.
+	live, err := q.CountLiveGrantTokens(ctx, pgtype.UUID{Bytes: grant.ID, Valid: true})
+	if err != nil {
+		return nil, nil, err
+	}
+	if live.Live >= oauthMaxLiveGrantTokens {
+		wait := 1
+		if live.OldestExpiresAt.Valid {
+			wait = max(1, int(time.Until(live.OldestExpiresAt.Time).Seconds())+1)
+		}
+		return nil, &oauthTokenFailure{status: http.StatusTooManyRequests, code: oauthsrv.ErrTemporarilyUnavailable, retryAfter: wait}, nil
+	}
+
+	access, accessHash, accessPrefix, err := producttoken.Generate()
+	if err != nil {
+		return nil, nil, err
+	}
+	if _, err := q.CreateGrantProductToken(ctx, store.CreateGrantProductTokenParams{
+		UserID:      grant.UserID,
+		ProductID:   product.ID,
+		Name:        oauthGrantRowName,
+		TokenHash:   accessHash,
+		TokenPrefix: accessPrefix,
+		Scopes:      scopes,
+		ExpiresAt:   pgtype.Timestamptz{Time: now.Add(oauthAccessTokenTTL), Valid: true},
+		GrantID:     grant.ID,
+	}); errors.Is(err, pgx.ErrNoRows) {
+		return nil, errOAuthInvalidGrant, nil // the product was disabled or deleted meanwhile
+	} else if err != nil {
+		return nil, nil, err
+	}
+	if n, err := q.TouchOAuthGrantRefreshUse(ctx, grant.ID); err != nil {
+		return nil, nil, err
+	} else if n != 1 {
+		return nil, errOAuthInvalidGrant, nil
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, nil, err
+	}
+	return &apitypes.OAuthRefreshResponse{
+		AccessToken: access,
+		TokenType:   "Bearer",
+		ExpiresIn:   int64(oauthAccessTokenTTL.Seconds()),
+		Scope:       strings.Join(scopes, " "),
+	}, nil, nil
 }

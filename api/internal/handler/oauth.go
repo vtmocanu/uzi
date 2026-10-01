@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -658,18 +659,18 @@ func oauthClientAllows(p store.Product, redirectURI string, scopes []string) boo
 			break
 		}
 	}
-	if !registered {
+	return registered && oauthClientAllowsScopes(p, scopes)
+}
+
+// oauthClientAllowsScopes reports whether p is an enabled OAuth client that still allows every
+// one of scopes. The refresh grant has no redirect URI to check, so it uses this half alone.
+func oauthClientAllowsScopes(p store.Product, scopes []string) bool {
+	c := oauthClientFromProduct(p)
+	if !c.IsClient() {
 		return false
 	}
 	for _, sc := range scopes {
-		allowed := false
-		for _, a := range c.Scopes {
-			if a == sc {
-				allowed = true
-				break
-			}
-		}
-		if !allowed {
+		if !slices.Contains(c.Scopes, sc) {
 			return false
 		}
 	}

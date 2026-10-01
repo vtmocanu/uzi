@@ -335,3 +335,31 @@ SELECT g.id,
  WHERE g.user_id = sqlc.arg(user_id)
    AND g.revoked_at IS NULL
  ORDER BY g.consented_at DESC, g.id ASC;
+
+-- PRD #1910 M4: the refresh_token grant and the RFC 7009 revoke endpoint. Both run in ONE
+-- transaction in D8 lock order: an unlocked read finds the grant (or token) id, then the grant is
+-- locked FOR UPDATE (LockOAuthGrant) and EVERYTHING is re-checked under the lock, then the writes.
+
+-- name: GetOAuthGrantIDByRefreshHash :one
+-- The grant that holds the presented refresh token, found by its sha256 WITHOUT a lock: it only
+-- yields the id the handler then locks (D8). Nothing it returns is trusted until the handler
+-- compares the hash again under the lock. A revoked grant has no refresh hash, so it is no row.
+SELECT id FROM oauth_grants WHERE refresh_token_hash = $1;
+
+-- name: TouchOAuthGrantRefreshUse :execrows
+-- Stamp a successful refresh: the 30-day idle clock counts from refresh_last_used_at (or from
+-- refresh_issued_at before the first refresh). The refresh token itself is NOT rotated (D5). Run
+-- with the grant locked; guarded on revoked_at IS NULL as a belt on the lock.
+UPDATE oauth_grants SET refresh_last_used_at = now() WHERE id = $1 AND revoked_at IS NULL;
+
+-- name: GetProductTokenForOAuthRevoke :one
+-- The product token a client presents to POST /api/oauth/revoke, found by its sha256 WITHOUT a
+-- lock (the handler locks the grant first when there is one, D8). Expired and revoked rows are
+-- returned too, because both answer 200 like an unknown token. token_hash is never projected.
+SELECT id, product_id, grant_id, revoked FROM product_tokens WHERE token_hash = $1;
+
+-- name: RevokeOAuthGrantAccessToken :execrows
+-- Revoke ONE access token of a grant (RFC 7009 on an access token, which does not revoke the grant).
+-- Run with the grant locked, before any product_tokens write of this transaction. Scoped to the
+-- grant so a token that is not this grant's is never touched; idempotent.
+UPDATE product_tokens SET revoked = true WHERE id = $1 AND grant_id = $2 AND NOT revoked;

@@ -437,6 +437,24 @@ func (q *Queries) GetOAuthAuthorizeRequestByCodeHash(ctx context.Context, codeHa
 	return i, err
 }
 
+const getOAuthGrantIDByRefreshHash = `-- name: GetOAuthGrantIDByRefreshHash :one
+
+SELECT id FROM oauth_grants WHERE refresh_token_hash = $1
+`
+
+// PRD #1910 M4: the refresh_token grant and the RFC 7009 revoke endpoint. Both run in ONE
+// transaction in D8 lock order: an unlocked read finds the grant (or token) id, then the grant is
+// locked FOR UPDATE (LockOAuthGrant) and EVERYTHING is re-checked under the lock, then the writes.
+// The grant that holds the presented refresh token, found by its sha256 WITHOUT a lock: it only
+// yields the id the handler then locks (D8). Nothing it returns is trusted until the handler
+// compares the hash again under the lock. A revoked grant has no refresh hash, so it is no row.
+func (q *Queries) GetOAuthGrantIDByRefreshHash(ctx context.Context, refreshTokenHash []byte) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, getOAuthGrantIDByRefreshHash, refreshTokenHash)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
 const getOwnProductTokenGrantID = `-- name: GetOwnProductTokenGrantID :one
 SELECT grant_id FROM product_tokens WHERE id = $1 AND user_id = $2 AND NOT revoked
 `
@@ -455,6 +473,32 @@ func (q *Queries) GetOwnProductTokenGrantID(ctx context.Context, arg GetOwnProdu
 	var grant_id pgtype.UUID
 	err := row.Scan(&grant_id)
 	return grant_id, err
+}
+
+const getProductTokenForOAuthRevoke = `-- name: GetProductTokenForOAuthRevoke :one
+SELECT id, product_id, grant_id, revoked FROM product_tokens WHERE token_hash = $1
+`
+
+type GetProductTokenForOAuthRevokeRow struct {
+	ID        uuid.UUID   `json:"id"`
+	ProductID uuid.UUID   `json:"product_id"`
+	GrantID   pgtype.UUID `json:"grant_id"`
+	Revoked   bool        `json:"revoked"`
+}
+
+// The product token a client presents to POST /api/oauth/revoke, found by its sha256 WITHOUT a
+// lock (the handler locks the grant first when there is one, D8). Expired and revoked rows are
+// returned too, because both answer 200 like an unknown token. token_hash is never projected.
+func (q *Queries) GetProductTokenForOAuthRevoke(ctx context.Context, tokenHash []byte) (GetProductTokenForOAuthRevokeRow, error) {
+	row := q.db.QueryRow(ctx, getProductTokenForOAuthRevoke, tokenHash)
+	var i GetProductTokenForOAuthRevokeRow
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.GrantID,
+		&i.Revoked,
+	)
+	return i, err
 }
 
 const getProductTokenGrantID = `-- name: GetProductTokenGrantID :one
@@ -875,6 +919,26 @@ func (q *Queries) RedeemOAuthAuthorizeRequest(ctx context.Context, id uuid.UUID)
 	return i, err
 }
 
+const revokeOAuthGrantAccessToken = `-- name: RevokeOAuthGrantAccessToken :execrows
+UPDATE product_tokens SET revoked = true WHERE id = $1 AND grant_id = $2 AND NOT revoked
+`
+
+type RevokeOAuthGrantAccessTokenParams struct {
+	ID      uuid.UUID   `json:"id"`
+	GrantID pgtype.UUID `json:"grant_id"`
+}
+
+// Revoke ONE access token of a grant (RFC 7009 on an access token, which does not revoke the grant).
+// Run with the grant locked, before any product_tokens write of this transaction. Scoped to the
+// grant so a token that is not this grant's is never touched; idempotent.
+func (q *Queries) RevokeOAuthGrantAccessToken(ctx context.Context, arg RevokeOAuthGrantAccessTokenParams) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeOAuthGrantAccessToken, arg.ID, arg.GrantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const revokeOAuthGrantProductTokens = `-- name: RevokeOAuthGrantProductTokens :execrows
 UPDATE product_tokens SET revoked = true WHERE grant_id = $1 AND NOT revoked
 `
@@ -972,6 +1036,21 @@ UPDATE oauth_authorize_requests
 // them). Run with the grant already locked, after its product_tokens (lock order).
 func (q *Queries) SupersedeOAuthGrantCodes(ctx context.Context, grantID pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, supersedeOAuthGrantCodes, grantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const touchOAuthGrantRefreshUse = `-- name: TouchOAuthGrantRefreshUse :execrows
+UPDATE oauth_grants SET refresh_last_used_at = now() WHERE id = $1 AND revoked_at IS NULL
+`
+
+// Stamp a successful refresh: the 30-day idle clock counts from refresh_last_used_at (or from
+// refresh_issued_at before the first refresh). The refresh token itself is NOT rotated (D5). Run
+// with the grant locked; guarded on revoked_at IS NULL as a belt on the lock.
+func (q *Queries) TouchOAuthGrantRefreshUse(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, touchOAuthGrantRefreshUse, id)
 	if err != nil {
 		return 0, err
 	}

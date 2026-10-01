@@ -21,7 +21,7 @@ An external product that an admin registered as an [OAuth client](./oauth-client
 ## What a connection can do
 
 - It works only on [`/api/v1`](./product-tokens.md#what-it-can-and-cannot-reach), exactly like a product token with the approved scopes, and never with admin authority. Jobs it starts run as you and on your credential ([Jobs](./jobs.md)).
-- The product holds an **access token** that lasts one hour and a **refresh token**. A connection has at most 10 live access tokens at a time.
+- The product holds an **access token** that lasts one hour and a **refresh token** it uses to get new access tokens without asking you again, until the refresh token goes unused for 30 days or 90 days pass since you last approved (approving again starts a fresh 90 days). A connection has at most 10 live access tokens at a time.
 - Approving again replaces the scopes you approved before. If the new scopes drop one the earlier tokens held, those tokens stop working; reconnecting with the same or more scopes does not cancel running jobs.
 
 ## Disconnect
@@ -32,9 +32,10 @@ These actions revoke a connection: it stops working on its **next request**, and
 |---|---|
 | **Revoke all** in **Settings → Access**. Its button counts your live connections (not tokens), so it is offered even when the only thing live is a connection. | you |
 | Revoke **one** of its access tokens through the API by id (the same call as for any product token) | you, or an admin |
+| **Disconnect** from inside the product, which revokes its refresh token at uzi | the product |
 
 Revoking cancels the connection's non-terminal jobs, including jobs started by an access token that had already expired. A password change and logging out do not disconnect a product, as for any token. A connection's tokens are not listed with your own product tokens and do not count towards the 10-token limit on those.
 
 ## When the product or your account is switched off
 
-Disabling the product, or deactivating your account, does **not** revoke the connection. Its access tokens are refused on the next request, and nothing is deleted, so enabling the product again or reactivating your account restores the connection. Deleting a product is a soft delete that disables it for good: a deleted product cannot be enabled again, so its connections stay refused. The admin's delete confirm counts the manual tokens and the connections it stops.
+Disabling the product, or deactivating your account, does **not** revoke the connection. Its access tokens are refused on the next request, and nothing is deleted, so enabling the product again or reactivating your account restores the connection, unless its refresh token expired meanwhile (30 days idle, 90 days after you last approved). Deleting a product is a soft delete that disables it for good: a deleted product cannot be enabled again, so its connections stay refused. The admin's delete confirm counts the manual tokens and the connections it stops.

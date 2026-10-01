@@ -43,6 +43,18 @@ type OAuthTokenResponse struct {
 	Scope        string `json:"scope"`
 }
 
+// OAuthRefreshResponse is the 200 body of POST /api/oauth/token for grant_type=refresh_token (PRD
+// #1910 M4, RFC 6749 section 6): a new access token with its type, lifetime and scope (the grant's
+// scopes, or the narrower subset the request named). It deliberately carries NO refresh_token: the
+// refresh token is not rotated (D5), so the product keeps the one it holds, and RFC 6749 section
+// 6 lets the server omit it. Part of the external contract; no TypeScript twin.
+type OAuthRefreshResponse struct {
+	AccessToken string `json:"access_token"`
+	TokenType   string `json:"token_type"`
+	ExpiresIn   int64  `json:"expires_in"`
+	Scope       string `json:"scope"`
+}
+
 // OAuthErrorResponse is the error body of the OAuth token endpoint (RFC 6749 section 5.2):
 // an error code and, for some codes, a fixed human-readable description. Descriptions are fixed
 // strings, never an echo of a request value.

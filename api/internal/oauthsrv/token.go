@@ -60,6 +60,15 @@ type TokenForm struct {
 	CodeVerifier string
 	ClientID     string
 	ClientSecret string
+	// RefreshToken is the refresh_token grant's credential (PRD #1910 M4).
+	RefreshToken string
+	// Scope is the refresh grant's optional narrowing scope; HasScope separates an absent scope
+	// from an empty one, which is malformed rather than "no narrowing".
+	Scope    string
+	HasScope bool
+	// Token and TokenTypeHint are the RFC 7009 revoke request's parameters (PRD #1910 M4).
+	Token         string
+	TokenTypeHint string
 	// HasClientSecret separates an absent client_secret from an empty one: any client_secret in
 	// the body is a second authentication method next to Basic.
 	HasClientSecret bool
@@ -87,6 +96,11 @@ func ParseTokenForm(v url.Values) TokenForm {
 	f.CodeVerifier = one("code_verifier")
 	f.ClientID = one("client_id")
 	f.ClientSecret = one("client_secret")
+	f.RefreshToken = one("refresh_token")
+	f.Scope = one("scope")
+	_, f.HasScope = v["scope"]
+	f.Token = one("token")
+	f.TokenTypeHint = one("token_type_hint")
 	_, f.HasClientSecret = v["client_secret"]
 	return f
 }

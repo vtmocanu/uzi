@@ -411,6 +411,9 @@ var wantRouteMounts = []routeMount{
 	// fronted by oauthLimiter's PER-IP middleware, not guarded by this per-user table → noLimiter;
 	// TestOAuthTokenIsBehindThePerIPOAuthLimiter pins the mount.
 	{"POST", "/api/oauth/token", noLimiter},
+	// PRD #1910 M4: the RFC 7009 revoke endpoint is mounted exactly like the token endpoint.
+	// TestOAuthRevokeIsBehindThePerIPOAuthLimiter pins the mount.
+	{"POST", "/api/oauth/revoke", noLimiter},
 	{"GET", "/api/auth/config", noLimiter},
 	{"GET", "/api/auth/me", noLimiter},
 	{"GET", "/api/auth/oidc/callback", noLimiter},
@@ -1322,6 +1325,49 @@ func TestOAuthTokenIsBehindThePerIPOAuthLimiter(t *testing.T) {
 	}
 }
 
+// TestOAuthRevokeIsBehindThePerIPOAuthLimiter is the same pin for POST /api/oauth/revoke (PRD #1910 M4).
+func TestOAuthRevokeIsBehindThePerIPOAuthLimiter(t *testing.T) {
+	limiters := newProbeLimiters()
+	budget := len(limiterNames) // the oauth limiter is the last one: budget = its position + 1
+	if limiterNames[budget-1] != limOAuth {
+		t.Fatalf("limiterNames[%d] = %q, want %q", budget-1, limiterNames[budget-1], limOAuth)
+	}
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+
+	post := func(remote string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/oauth/revoke", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	for i := 0; i < budget; i++ {
+		if rec := post("192.0.2.10:4000"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_request") {
+			t.Fatalf("request %d = %d %q, want the handler's 400 invalid_request", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	rec := post("192.0.2.10:4001")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("request %d from the same address = %d, want 429 from oauthLimiter", budget+1, rec.Code)
+	}
+	// The refusal is OAuth-shaped (RFC 6749 section 5.2 JSON), not the generic limiter body, and tells
+	// the product when to retry.
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"temporarily_unavailable"}` {
+		t.Fatalf("the limiter's 429 body = %q, want the OAuth-shaped temporarily_unavailable", body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("the limiter's 429 has no Retry-After")
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("the limiter's 429 lacks the no-store headers: %v", rec.Header())
+	}
+	if rec := post("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+	}
+}
+
 // TestLimiterProbeTellsTheMountKindsApart is the positive control on the
 // instrument. Without it, the file above could go green for the wrong reason: a
 // probe that classified everything as noLimiter would still redden 24 rows, but a
@@ -1729,12 +1775,14 @@ func TestOAuthRoutesAreNoStoreOnEveryMethod(t *testing.T) {
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
 		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
 	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPost} {
-		req := httptest.NewRequest(method, "/api/oauth/token", nil)
-		req.RemoteAddr = "192.0.2.77:4000"
-		rec := httptest.NewRecorder()
-		router.ServeHTTP(rec, req)
-		if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
-			t.Errorf("%s /api/oauth/token = %d with headers %v, want no-store and no-cache", method, rec.Code, rec.Header())
+		for _, path := range []string{"/api/oauth/token", "/api/oauth/revoke"} {
+			req := httptest.NewRequest(method, path, nil)
+			req.RemoteAddr = "192.0.2.77:4000"
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req)
+			if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+				t.Errorf("%s %s = %d with headers %v, want no-store and no-cache", method, path, rec.Code, rec.Header())
+			}
 		}
 	}
 }
