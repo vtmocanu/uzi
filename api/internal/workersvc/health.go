@@ -994,6 +994,7 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			HeartbeatCutoff:     pgconv.Time(now.Add(-s.p.WorkerHeartbeatStale)),
 			DockerRepoAllowlist: allowlist,
 			CapabilityAware:     capAware,
+			EphemeralLease:      LeaseInterval(s.ephemeralLease),
 		}); cerr != nil {
 			slog.Error("health: count workers claimable for run", "run_id", r.ID, "error", cerr)
 		} else if claimable == 0 {

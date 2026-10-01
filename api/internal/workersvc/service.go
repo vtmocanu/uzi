@@ -2954,9 +2954,13 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// provisioner writes, never from anything the worker sent.
 		WorkerIsolatedLane: wkr.IsolatedLane,
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
-		IsEphemeral:           wkr.Ephemeral,
-		EphemeralRunID:        wkr.EphemeralRunID,
-		SpreadCutoff:          pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		IsEphemeral:    wkr.Ephemeral,
+		EphemeralRunID: wkr.EphemeralRunID,
+		SpreadCutoff:   pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		// PRD #2006: the configured lease for EVERY claimant, read by ClaimRun's spread-peer mirror so a
+		// leased ephemeral peer is a deferral target. A claimant's own lease identity (LeaseSince,
+		// LeaseRepoID, LeaseBranch, LeaseAt) stays confined to claimRunInTx. Lease 0 yields a NULL interval.
+		EphemeralLease:        LeaseInterval(s.ephemeralLease),
 		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
 		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
