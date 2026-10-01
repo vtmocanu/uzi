@@ -1772,8 +1772,8 @@ export class CodexHarness implements RunHarness {
     };
   }
 
-  /** True for an item/started or item/completed note of a model-issued tool item type on the
-   *  ACTIVE root thread. userMessage and unknown types are not model-issued. */
+  /** True for an item/started note (never item/completed) of a model-issued tool item type on
+   *  the ACTIVE root thread. userMessage and unknown types are not model-issued. */
   private isModelIssuedItem(note: Extract<CodexNotification, { kind: "activity" }>): boolean {
     // Issue #1800: only a tool START proves the model issued it this turn; a completion is a result
     // (possibly of an item started before this turn) and is never inclusion evidence.
