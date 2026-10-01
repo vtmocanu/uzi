@@ -74,20 +74,20 @@ import { makeFindingsToolHandlers, reportIncidentalIssueToolName, type FindingsT
 import { FORGE_SERVER_NAME, makeForgeToolHandlers, type ForgeToolHandlers } from "../forge-tools.js";
 import { provisionRunTools, removeProvisionDir } from "../provision-run.js";
 import { asText } from "../tool-evidence.js";
-import type {
-  BoundaryRequest,
-  BoundaryProcessRequest,
-  CodexExecutionSafety,
-  HarnessAgent,
-  HarnessContextHook,
-  HarnessEffort,
-  HarnessError,
-  ReducedTurnResult,
-  RunTurnRequest,
-  TurnStreamEnd,
+import {
+  evidencesModelProcessing,
+  type BoundaryRequest,
+  type BoundaryProcessRequest,
+  type CodexExecutionSafety,
+  type HarnessAgent,
+  type HarnessContextHook,
+  type HarnessEffort,
+  type HarnessError,
+  type ReducedTurnResult,
+  type RunTurnRequest,
+  type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { evidencesModelProcessing } from "../harness.js";
 import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";

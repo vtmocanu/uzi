@@ -404,6 +404,26 @@ describe("ChatExecutor lifecycle clocks (Decision 3)", () => {
     assert.deepStrictEqual(probe.included, [2], "init alone does not prove the model read the message");
   });
 
+  it("does not report a usage-limit-rejected turn (synthetic notice, is_error result with num_turns 1)", async () => {
+    const init = { type: "system", subtype: "init", session_id: "sess-1" } as unknown as SDKMessage;
+    const limit = { type: "rate_limit_event", session_id: "sess-1", rate_limit_info: { status: "rejected" } } as unknown as SDKMessage;
+    const synthetic = { type: "assistant", session_id: "sess-1", message: { model: "<synthetic>", content: [{ type: "text", text: "You've hit your limit" }] } } as unknown as SDKMessage;
+    const rejected = { type: "result", subtype: "success", is_error: true, num_turns: 1, session_id: "sess-1" } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([[init, limit, synthetic, rejected], [init, assistantText("a"), resultSuccess()]]);
+    const probe = makeCtx(["m1", "m2", undefined]);
+    await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
+    assert.deepStrictEqual(probe.included, [2], "only the turn the model answered is reported");
+  });
+
+  it("does not report a turn whose only assistant message is synthetic and whose result is an error", async () => {
+    const synthetic = { type: "assistant", session_id: "sess-1", message: { model: "<synthetic>", content: [{ type: "text", text: "notice" }] } } as unknown as SDKMessage;
+    const failed = { type: "result", subtype: "error_during_execution", is_error: true, num_turns: 1, session_id: "sess-1" } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([[synthetic, failed], [assistantText("a"), resultSuccess()]]);
+    const probe = makeCtx(["m1", "m2", undefined]);
+    await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
+    assert.deepStrictEqual(probe.included, [2]);
+  });
+
   it("does not report a turn aborted by the wall-clock before it streamed anything", async () => {
     const { queryFn } = fakeTurns([(signal) => hangUntilAbort(signal)]);
     const sched = new FakeScheduler();

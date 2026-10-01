@@ -64,6 +64,17 @@ function rateLimitEvent(status: string, sessionId = "sess-1"): SDKMessage {
     rate_limit_info: { status, resetsAt: 1_900_000_000, rateLimitType: "five_hour" },
   } as unknown as SDKMessage;
 }
+/** The SDK's worker-synthesized assistant notice (e.g. the usage-limit message): never model output. */
+function syntheticAssistant(text: string, sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: { model: "<synthetic>", content: [{ type: "text", text }] },
+  } as unknown as SDKMessage;
+}
+function resultErrorOneTurn(subtype: string, sessionId = "sess-1"): SDKMessage {
+  return { type: "result", subtype, is_error: true, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
+}
 function resultZeroTurns(sessionId = "sess-1"): SDKMessage {
   return { type: "result", subtype: "success", is_error: false, num_turns: 0, session_id: sessionId } as unknown as SDKMessage;
 }
@@ -284,7 +295,7 @@ describe("issue #1800: the Claude executor delivers and reports the owner follow
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.deepStrictEqual(includedAtPark, [], "nothing is reported while the park hands the follow-up over");
     assert.ok(prompts[2]!.includes(A), "the resumed turn carries the follow-up");
-    assert.deepStrictEqual(probe.included, [77], "reported with the park's input id once that turn started");
+    assert.deepStrictEqual(probe.included, [77], "reported with the park's input id once that turn reached the model");
   });
 });
 
@@ -362,5 +373,40 @@ describe("issue #1800: a follow-up is stamped only once the model processed its 
     await assert.rejects(exec(queryFn).run(probe.ctx), /spawn failed after init/);
     assert.ok(prompts[1]!.includes(A), "the throwing turn had the follow-up in its prompt");
     assert.deepStrictEqual(probe.included, [], "no model event, so nothing reported");
+  });
+
+  it("a usage-limit-rejected turn (synthetic notice, is_error result with num_turns 1) leaves the follow-up unreported", async () => {
+    // The real limit-rejected shape: the terminal reports a POSITIVE turn count even though the
+    // model never ran, and the executor consults the evidence before the reducer classifies it.
+    const queue = [A];
+    const { queryFn, prompts } = fakeTurns(
+      [
+        PLAN,
+        {
+          messages: [
+            initFrame(),
+            rateLimitEvent("rejected"),
+            syntheticAssistant("You've hit your limit"),
+            { type: "result", subtype: "success", is_error: true, num_turns: 1, session_id: "sess-1" } as unknown as SDKMessage,
+          ],
+        },
+      ],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    await assert.rejects(exec(queryFn, { emptyTurnMaxRetries: 0 }).run(probe.ctx));
+    assert.ok(prompts[1]!.includes(A), "the turn was started with the follow-up in its prompt");
+    assert.deepStrictEqual(probe.included, [], "the model never read it, so the next claim re-queues it");
+  });
+
+  it("a turn whose only assistant frame is a synthetic notice and whose terminal is an error leaves the follow-up unreported", async () => {
+    const queue = [A];
+    const { queryFn } = fakeTurns(
+      [PLAN, { messages: [initFrame(), syntheticAssistant("worker notice"), resultErrorOneTurn("error_during_execution")] }],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    await assert.rejects(exec(queryFn, { emptyTurnMaxRetries: 0 }).run(probe.ctx));
+    assert.deepStrictEqual(probe.included, []);
   });
 });

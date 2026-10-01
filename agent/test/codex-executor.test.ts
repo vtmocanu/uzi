@@ -9014,6 +9014,8 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
   const done = (id: number, th: string, tn: string): CodexNotification =>
     toolCall(id, "signal_done", {}, th, tn, `c-done-${id}`);
   const quiet: TurnScript = () => [];
+  /** A turn whose model produced an item, so a follow-up it carried counts as included. */
+  const spoke: TurnScript = (th) => [agentMessage("working", th)];
   const turnTexts = (t: FakeTransport): string[] =>
     t.requests
       .filter((r) => r.method === "turn/start")
@@ -9052,7 +9054,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.ok(/<follow_up_[0-9a-f]{16}>/.test(texts[1]!) && texts[1]!.includes("UNTRUSTED INPUT"), "inside the untrusted-input fence");
     assert.ok(texts[1]!.indexOf("the approved plan") < texts[1]!.indexOf("<follow_up_"), "after the base implement prompt");
     assert.ok(texts[1]!.trimEnd().endsWith(FOLLOW_UP_TRAILER), "a worker trailer, not the user's text, closes the prompt");
-    assert.deepEqual(seams.included, [1], "reported included once, when turn 2 started");
+    assert.deepEqual(seams.included, [1], "reported included once, when turn 2 reached the model");
   });
 
   it("(b) a follow-up queued before the implement loop (the plan gate) is in the FIRST implement prompt", async () => {
@@ -9067,7 +9069,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
   });
 
   it("delivers queued follow-ups one per ordinary turn, in FIFO order, without re-pulling a carried one", async () => {
-    const rig = makeMultiEpochRig([script("th-1", [quiet, quiet, (th, tn) => [done(31, th, tn)]])]);
+    const rig = makeMultiEpochRig([script("th-1", [spoke, spoke, (th, tn) => [done(31, th, tn)]])]);
     const seams = followUpSeams([A, B]);
     const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 FIFO run");
@@ -9105,12 +9107,12 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
   it("a turn that STARTS (turn/start sent) and is dropped before any model event keeps the follow-up; the re-drive stamps it once", async () => {
     const controller = new AbortController();
     let starts = 0;
+    // The dropped drive consumes a lifecycle notification (thread/started) BEFORE the owner's `now`
+    // lands (raised from ctx.onSessionId, which the executor calls after its evidence check on that
+    // same event), so a stamp-on-first-event rule would fire on it; only model output may stamp.
     const rig = makeMultiEpochRig([
       script("th-1", [quiet, (th, tn) => [done(11, th, tn)]], (n) => {
         starts = n;
-        // The owner's `now` lands while the first turn/start is being served: the turn started but
-        // no item/agent-message/tool event reached the executor.
-        if (n === 1) controller.abort(new PauseNowSignal());
       }),
     ]);
     const seams = followUpSeams([A]);
@@ -9120,6 +9122,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
       config: { max_iterations: 5 },
       pauseModeRequested: () => "now",
       parkForPause: async () => false,
+      onSessionId: () => { if (!controller.signal.aborted) controller.abort(new PauseNowSignal()); },
       pullFollowUp: seams.pullFollowUp,
       followUpIncluded: (id) => { startsAtStamp.push(starts); seams.followUpIncluded(id); },
     });

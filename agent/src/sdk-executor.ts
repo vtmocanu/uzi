@@ -2285,6 +2285,9 @@ export class SdkExecutor implements Executor {
       // stamped included then, exactly once).
       // A turn that throws, parks, walls, pauses or is restarted first keeps it for the next turn.
       let ownerFollowUp: { id: number; body: string } | undefined;
+      // Issue #1800: the held owner follow-up id the interactive-park branch already ran an extra
+      // turn for, so that branch is taken at most once per id.
+      let serviceTriedId: number | undefined;
       // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
       // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
       // framing, priorWork/deps notes, and the base-commit note) must be emitted on the
@@ -2881,11 +2884,17 @@ export class SdkExecutor implements Executor {
           if (ctx.interactive && ctx.awaitFollowUp) {
             // Issue #1800: defensive, not reachable through the public seams today: a turn that
             // reaches signal_done has model evidence, which empties the slot. If an owner follow-up
-            // is still held (pulled, never evidenced) it has not reached the model yet. Parking would consume a
-            // second follow-up from the server into an occupied slot, and one of the two would
-            // never be included. Service the held one first: run another turn instead of parking,
-            // with the same fresh budgets a received follow-up gets.
-            if (ownerFollowUp !== undefined) {
+            // is still held (pulled, never evidenced) it has not reached the model yet. Parking would
+            // consume a second follow-up from the server into an occupied slot, and one of the two
+            // would never be included. Service the held one first: run another turn instead of
+            // parking, with the same fresh budgets a received follow-up gets. Bounded: this is taken
+            // once per held id (`serviceTriedId`), and the system `followUp` text is cleared so the
+            // extra turn cannot replay a spent one. If the slot is STILL held after that turn, fall
+            // through to the normal park: the follow-up stays unincluded and is re-queued at the
+            // next claim.
+            if (ownerFollowUp !== undefined && serviceTriedId !== ownerFollowUp.id) {
+              serviceTriedId = ownerFollowUp.id;
+              followUp = undefined;
               iteration = 0;
               state.wallRemainingMs = initialWallMs;
               maxServedWallMs = initialWallMs;

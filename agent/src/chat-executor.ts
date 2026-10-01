@@ -187,23 +187,17 @@ export interface ChatContext {
   followUpIncluded?(id: number): void;
 }
 
-/** Issue #1800: does this raw SDK message evidence the model processing the turn? An assistant
- *  message not marked synthetic (the SDK's placeholder for worker-synthesized notices such as a
- *  usage-limit message), or a result reporting a positive turn count. Init, rate_limit_event and
- *  a zero-turn result do not. */
+/** Issue #1800: does this raw SDK message evidence the model processing the turn? Only an
+ *  assistant message not marked synthetic (the SDK's placeholder for worker-synthesized notices
+ *  such as a usage-limit message). A result never counts: a limit-rejected turn reports
+ *  num_turns 1 with is_error true, so only real model output proves the message was read. */
 function chatMsgEvidencesModel(msg: unknown): boolean {
   if (typeof msg !== "object" || msg === null) return false;
   const rec = msg as Record<string, unknown>;
-  if (rec["type"] === "assistant") {
-    const inner = rec["message"];
-    const model = typeof inner === "object" && inner !== null ? (inner as Record<string, unknown>)["model"] : undefined;
-    return model !== "<synthetic>";
-  }
-  if (rec["type"] === "result") {
-    const n = rec["num_turns"];
-    return typeof n === "number" && n > 0;
-  }
-  return false;
+  if (rec["type"] !== "assistant") return false;
+  const inner = rec["message"];
+  const model = typeof inner === "object" && inner !== null ? (inner as Record<string, unknown>)["model"] : undefined;
+  return model !== "<synthetic>";
 }
 
 /** One user message handed to the executor. `inputId` is the run_user_inputs id the message came
