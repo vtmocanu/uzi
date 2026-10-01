@@ -15,6 +15,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	chimw "github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -48,6 +49,11 @@ type Handler struct {
 	pool *pgxpool.Pool
 	q    *store.Queries
 	cfg  config.Config
+	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth
+	// token endpoint's code redemption, so a LiveDB test can hand it a transaction whose chosen
+	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
+	// (PRD #1910 D7). nil in production: New leaves it unset.
+	oauthBeginTx func(ctx context.Context) (pgx.Tx, error)
 	// tmplWriteStore, when non-nil, replaces h.q for the two builtin-definition/reset
 	// agent-template handlers so their DB touch can be faked in a unit test without a
 	// live database (issue #223). nil in production — New leaves it unset and the
@@ -861,8 +867,10 @@ const ChatCreateRoutePattern = "/api/chats/"
 // Decision 8) — hosted provision and worker delete; cliPollLimiter is a dedicated
 // per-(path,IP) budget on POST /api/auth/cli/poll (PRD #64 M5), sized to exceed the
 // server-returned poll cadence so uzi login cannot trip its own rate limit; v1Limiter is the
-// dedicated per-user budget on the whole /api/v1 subtree (PRD #1908 D-B).
-func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter *mw.Limiter) http.Handler {
+// dedicated per-user budget on the whole /api/v1 subtree (PRD #1908 D-B); oauthLimiter is the
+// per-IP budget on the OAuth token and revoke endpoints (PRD #1910 D7), which also keys a per-client
+// budget inside the handlers once the client has authenticated.
+func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter, oauthLimiter *mw.Limiter) http.Handler {
 	r := chi.NewRouter()
 	r.Use(chimw.Recoverer)
 	r.Use(chimw.RequestID)
@@ -881,7 +889,7 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 
 		h.mountAuthRoutes(r, authLimiter, cliPollLimiter)
 		// The OAuth authorization server's consent half (PRD #1910 M2): see mountOAuthRoutes.
-		h.mountOAuthRoutes(r, authLimiter)
+		h.mountOAuthRoutes(r, authLimiter, oauthLimiter)
 
 		// mountJudgeRoutes MUST precede mountMeRoutes: the /me/judge stats subrouter
 		// (r.Route("/me/judge"), in mountJudgeRoutes) and the /me/judge consent PUT

@@ -63,6 +63,7 @@ var limiterNames = [...]string{
 	limCLIPoll,
 	limBoardOrder,
 	limV1,
+	limOAuth,
 }
 
 // The limiter names, as constants so a typo in the 146-row table below is a compile
@@ -239,6 +240,9 @@ const (
 	// PRD #1908 D-B. The dedicated per-user budget of the whole /api/v1 subtree (job clients
 	// poll, which authLimiter's 10/min cannot carry), mounted by r.Use after RequireV1Caller.
 	limV1 = "v1Limiter"
+	// PRD #1910 D7. The OAuth token and revoke endpoints' budget: a PER-IP Middleware mount (so a
+	// noLimiter row here, like the authorize route) plus a per-client Allow inside the handler.
+	limOAuth = "oauthLimiter"
 	// POST /api/v1/jobs carries BOTH: the subtree's v1Limiter and, per route, authLimiter (a
 	// create is the spend action). A route with two per-user limiters is spelled with this
 	// constant; perUserLimiterOn joins the names in limiterNames order.
@@ -403,6 +407,10 @@ var wantRouteMounts = []routeMount{
 	// request read is a cookie-session DB read.
 	{"GET", "/api/oauth/authorize", noLimiter},
 	{"GET", "/api/oauth/requests/{id}", noLimiter},
+	// PRD #1910 M3: the token endpoint is unauthenticated (client-authenticated inside the handler) and
+	// fronted by oauthLimiter's PER-IP middleware, not guarded by this per-user table → noLimiter;
+	// TestOAuthTokenIsBehindThePerIPOAuthLimiter pins the mount.
+	{"POST", "/api/oauth/token", noLimiter},
 	{"GET", "/api/auth/config", noLimiter},
 	{"GET", "/api/auth/me", noLimiter},
 	{"GET", "/api/auth/oidc/callback", noLimiter},
@@ -1140,7 +1148,7 @@ func TestChatCreateRoutePatternMatchesMount(t *testing.T) {
 	limiters := newProbeLimiters()
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
 	routes := router.(chi.Routes)
 
 	p := &prober{}
@@ -1174,7 +1182,7 @@ func TestEveryRouteCarriesItsExpectedPerUserLimiter(t *testing.T) {
 	// routes exist and the table is unconditional.
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true, FetcherTokenSHA256: make([]byte, 32)}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
 
 	routes, ok := router.(chi.Routes)
 	if !ok {
@@ -1242,7 +1250,7 @@ func TestOAuthAuthorizeIsBehindThePerIPAuthLimiter(t *testing.T) {
 	limiters := newProbeLimiters()
 	h := &Handler{cfg: config.Config{}}
 	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
-		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9])
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
 
 	get := func(remote string) *httptest.ResponseRecorder {
 		req := httptest.NewRequest(http.MethodGet, "/api/oauth/authorize", nil)
@@ -1258,6 +1266,48 @@ func TestOAuthAuthorizeIsBehindThePerIPAuthLimiter(t *testing.T) {
 		t.Fatalf("second request from the same address = %d, want 429 from authLimiter", rec.Code)
 	}
 	if rec := get("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
+		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
+	}
+}
+
+// TestOAuthTokenIsBehindThePerIPOAuthLimiter pins PRD #1910 D7: the unauthenticated POST
+// /api/oauth/token is fronted by oauthLimiter's per-IP Middleware (wantRouteMounts reads per-USER
+// mounts only, so the route is a noLimiter row there). The request goes through the real h.Routes
+// with oauthLimiter's probe budget (newProbeLimiters gives the limiter at index len-1 a budget of
+// len): every request up to the budget reaches the handler (no Content-Type, so it dies with
+// invalid_request before any store, which this Handler does not have), the next one from the same
+// address is the limiter's 429, which still carries Cache-Control: no-store and Pragma: no-cache,
+// and another address has its own budget.
+func TestOAuthTokenIsBehindThePerIPOAuthLimiter(t *testing.T) {
+	limiters := newProbeLimiters()
+	budget := len(limiterNames) // the oauth limiter is the last one: budget = its position + 1
+	if limiterNames[budget-1] != limOAuth {
+		t.Fatalf("limiterNames[%d] = %q, want %q", budget-1, limiterNames[budget-1], limOAuth)
+	}
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+
+	post := func(remote string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/api/oauth/token", nil)
+		req.RemoteAddr = remote
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		return rec
+	}
+	for i := 0; i < budget; i++ {
+		if rec := post("192.0.2.10:4000"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "invalid_request") {
+			t.Fatalf("request %d = %d %q, want the handler's 400 invalid_request", i+1, rec.Code, rec.Body.String())
+		}
+	}
+	rec := post("192.0.2.10:4001")
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("request %d from the same address = %d, want 429 from oauthLimiter", budget+1, rec.Code)
+	}
+	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+		t.Fatalf("the limiter's 429 lacks the no-store headers: %v", rec.Header())
+	}
+	if rec := post("192.0.2.11:4000"); rec.Code != http.StatusBadRequest {
 		t.Fatalf("first request from another address = %d, want 400: the budget is per IP", rec.Code)
 	}
 }
@@ -1522,6 +1572,7 @@ var limiterConfigFields = map[string]string{
 	limCLIPoll:    "CLIPollRateLimitMax",
 	limBoardOrder: "BoardOrderRateLimitMax",
 	limV1:         "V1RateLimitMax",
+	limOAuth:      "OAuthRateLimitMax",
 }
 
 // limiterConstruction is one `x := mw.NewLimiter(cfg.Y, …)` found in main.

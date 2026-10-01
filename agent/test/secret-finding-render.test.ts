@@ -41,6 +41,14 @@ describe("renderSecretFinding", () => {
     }
   });
 
+  it("treats the uzi OAuth client-secret and refresh-token classes as secret-shaped (PRD #1910)", () => {
+    for (const prefix of ["uzs" + "_", "uzr" + "_"]) {
+      const p = `config/${prefix}Ab1-x.env`;
+      assert.equal(pathLooksSecretShaped(p), true, p);
+      assert.ok(!renderSecretFinding(finding(p)).includes(prefix), p);
+    }
+  });
+
   it("falls back for an invalid rule, commit and line", () => {
     const out = renderSecretFinding(finding("a.env", { ruleId: "bad rule\n!", commit: "zzz", startLine: -1 }));
     assert.equal(out, '[commit withheld] "a.env":? (rule [rule withheld])');

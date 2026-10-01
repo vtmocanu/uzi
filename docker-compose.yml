@@ -77,6 +77,9 @@ services:
       # Per-user budget on the whole /api/v1 external API (job clients poll).
       V1_RATE_LIMIT_MAX: ${V1_RATE_LIMIT_MAX:-120}
       V1_RATE_LIMIT_WINDOW: ${V1_RATE_LIMIT_WINDOW:-1m}
+      # Per-IP and per-client budget on the OAuth token endpoint (PRD #1910).
+      OAUTH_RATE_LIMIT_MAX: ${OAUTH_RATE_LIMIT_MAX:-60}
+      OAUTH_RATE_LIMIT_WINDOW: ${OAUTH_RATE_LIMIT_WINDOW:-1m}
       # Job files and product skill sets (PRD #1909). Empty => config.go's default
       # (docs/configuration.md). UZI_STORED_FILES_BUDGET_BYTES must fit the database volume (`pgdata`): job files are sealed chunks in Postgres.
       UZI_JOB_INPUT_FILE_MAX_BYTES: ${UZI_JOB_INPUT_FILE_MAX_BYTES:-}

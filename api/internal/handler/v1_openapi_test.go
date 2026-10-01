@@ -154,7 +154,7 @@ func v1RouterOperations(t *testing.T) map[string]bool {
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
 	// Hosting on, as in route_limiter_mounts_test.go, so the table is the full one.
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true}}
-	router := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
+	router := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
 	cr, ok := router.(chi.Routes)
 	if !ok {
 		t.Fatalf("Routes returned %T, not a chi.Routes", router)

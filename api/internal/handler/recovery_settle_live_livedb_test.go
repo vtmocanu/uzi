@@ -99,7 +99,7 @@ func (e *liveEnv) restart() {
 	wsvc.SetForges(settleForgeBuilder{f: e.lf})
 	h := &Handler{pool: e.pool, q: q, box: box, cfg: config.Config{JWTSecret: cliTestSecret, AuthTokenTTL: time.Hour}, wsvc: wsvc}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
-	e.router = h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
+	e.router = h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 	e.wsvc = wsvc
 }
 

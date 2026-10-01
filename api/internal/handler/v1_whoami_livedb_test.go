@@ -198,7 +198,7 @@ func TestV1RateLimitPerUserLiveDB(t *testing.T) {
 	// PRD #1908 D-B: the subtree rides the DEDICATED v1Limiter (the last Routes argument);
 	// authLimiter is generous here and only guards the create route.
 	v1Limiter := mw.NewLimiter(budget, time.Hour, nil)
-	routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), v1Limiter)
+	routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), v1Limiter, lim())
 
 	a := cliSeedUser(t, pool, false)
 	productA := v1SeedProduct(t, h.q, a)

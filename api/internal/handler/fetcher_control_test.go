@@ -27,7 +27,7 @@ func fetcherRouters(token string) (plain, tls http.Handler) {
 	}
 	h := &Handler{cfg: cfg}
 	lim := mw.NewLimiter(1000, time.Minute, nil)
-	return h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim), h.WorkerRoutes(lim)
+	return h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim), h.WorkerRoutes(lim)
 }
 
 func fetcherPost(r http.Handler, path, bearer, body string) int {
@@ -85,7 +85,7 @@ func TestFetcherAndControllerTokensAreNotInterchangeable(t *testing.T) {
 	fs, cs := sha256.Sum256([]byte(fetchTok)), sha256.Sum256([]byte(ctrlTok))
 	h := &Handler{cfg: config.Config{WorkerHostingEnabled: true, ControllerTokenSHA256: cs[:], FetcherTokenSHA256: fs[:]}}
 	lim := mw.NewLimiter(1000, time.Minute, nil)
-	for name, r := range map[string]http.Handler{"plain": h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim), "tls": h.WorkerRoutes(lim)} {
+	for name, r := range map[string]http.Handler{"plain": h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim), "tls": h.WorkerRoutes(lim)} {
 		for _, p := range []string{"/api/controller/status", "/api/controller/workers/" + uuid.NewString() + "/drain"} {
 			if code := fetcherPost(r, p, "Bearer "+fetchTok, `{}`); code != http.StatusUnauthorized {
 				t.Errorf("%s: fetcher token on %s = %d, want 401", name, p, code)

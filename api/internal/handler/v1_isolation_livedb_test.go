@@ -109,7 +109,7 @@ func v1LiveDBMax(t *testing.T, maxConns int32) (*Handler, *pgxpool.Pool) {
 func v1Routers(h *Handler) (routes, workerRoutes http.Handler) {
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
 	proposal := lim()
-	routes = h.Routes(lim(), lim(), lim(), lim(), proposal, lim(), lim(), lim(), lim(), lim())
+	routes = h.Routes(lim(), lim(), lim(), lim(), proposal, lim(), lim(), lim(), lim(), lim(), lim())
 	return routes, h.WorkerRoutes(proposal)
 }
 

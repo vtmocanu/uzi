@@ -85,6 +85,10 @@ func (l *Limiter) allow(key string) bool {
 // then the user id — to share a bucket with that route's mount.
 func (l *Limiter) Allow(key string) bool { return l.allow(key) }
 
+// Window is the fixed window every key's budget resets over: the longest a refused caller can
+// have to wait, which is what a Retry-After header advertises.
+func (l *Limiter) Window() time.Duration { return l.window }
+
 // Middleware limits by (route pattern, client IP). Apply it per-route so each
 // endpoint gets its own budget.
 func (l *Limiter) Middleware(next http.Handler) http.Handler {

@@ -59,8 +59,8 @@ func newV1JobsEnvMax(t *testing.T, jobCap int, maxConns int32) *v1JobsEnv {
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
 	return &v1JobsEnv{
 		t: t, h: h, pool: pool,
-		routes: h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim()),
-		tight:  h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), mw.NewLimiter(1, time.Hour, nil)),
+		routes: h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim()),
+		tight:  h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), mw.NewLimiter(1, time.Hour, nil), lim()),
 	}
 }
 
@@ -566,7 +566,7 @@ func TestV1JobsRateLimitsLiveDB(t *testing.T) {
 	const budget = 2
 
 	t.Run("the v1 budget is shared across endpoints and per user", func(t *testing.T) {
-		routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), mw.NewLimiter(budget, time.Hour, nil))
+		routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), mw.NewLimiter(budget, time.Hour, nil), lim())
 		a, b := cliSeedUser(t, pool, false), cliSeedUser(t, pool, false)
 		ta, tb := cliMintToken(t, pool, a, clitoken.ScopeUser), cliMintToken(t, pool, b, clitoken.ScopeUser)
 		// A missing-scope 403 is not reachable with a uzc_ token; a 401 spends nothing.
@@ -590,7 +590,7 @@ func TestV1JobsRateLimitsLiveDB(t *testing.T) {
 	})
 
 	t.Run("the create also rides authLimiter, keyed by its route", func(t *testing.T) {
-		routes := h.Routes(mw.NewLimiter(budget, time.Hour, nil), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
+		routes := h.Routes(mw.NewLimiter(budget, time.Hour, nil), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
 		owner := cliSeedUser(t, pool, false)
 		cliMustExec(t, pool, `INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
 		                      VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`, uuid.New(), owner, []byte("ct"))
@@ -611,7 +611,7 @@ func TestV1JobsRateLimitsLiveDB(t *testing.T) {
 	})
 
 	t.Run("a refused scope spends none of the create budget", func(t *testing.T) {
-		routes := h.Routes(mw.NewLimiter(budget, time.Hour, nil), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
+		routes := h.Routes(mw.NewLimiter(budget, time.Hour, nil), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
 		owner := cliSeedUser(t, pool, false)
 		cliMustExec(t, pool, `INSERT INTO user_secrets (id, user_id, kind, label, is_default, ciphertext, sealed_with)
 		                      VALUES ($1, $2, 'anthropic_token', 'anthropic-default', true, $3, 'master')`, uuid.New(), owner, []byte("ct"))

@@ -29,3 +29,24 @@ type OAuthAuthorizeRequestDTO struct {
 type OAuthRedirectResponse struct {
 	RedirectURL string `json:"redirect_url"`
 }
+
+// OAuthTokenResponse is the 200 body of POST /api/oauth/token (PRD #1910 D5, RFC 6749 section
+// 5.1): the product's access token (a uzp_ product token), its type and lifetime, the grant's
+// uzr_ refresh token and the granted scopes, space-joined. It is part of the external contract
+// (ADR-1907's compatibility promise extends to it) and the SPA never reads it, so it has no
+// TypeScript twin. The response also carries Cache-Control: no-store.
+type OAuthTokenResponse struct {
+	AccessToken  string `json:"access_token"`
+	TokenType    string `json:"token_type"`
+	ExpiresIn    int64  `json:"expires_in"`
+	RefreshToken string `json:"refresh_token"`
+	Scope        string `json:"scope"`
+}
+
+// OAuthErrorResponse is the error body of the OAuth token endpoint (RFC 6749 section 5.2):
+// an error code and, for some codes, a fixed human-readable description. Descriptions are fixed
+// strings, never an echo of a request value.
+type OAuthErrorResponse struct {
+	Error            string `json:"error"`
+	ErrorDescription string `json:"error_description,omitempty"`
+}

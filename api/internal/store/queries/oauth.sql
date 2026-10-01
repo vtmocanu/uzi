@@ -179,3 +179,89 @@ SELECT
 -- is_local = true): a lock held too long answers the authorize request temporarily_unavailable
 -- (SQLSTATE 55P03) instead of pinning an API pool connection.
 SELECT set_config('lock_timeout', sqlc.arg(timeout)::text, true);
+
+-- PRD #1910 M3: the token endpoint's authorization_code redemption. The handler runs it in ONE
+-- transaction in D8 lock order: the unlocked code lookup (no lock), the grant FOR UPDATE, the
+-- grant's token count, then the request row FOR UPDATE, the conditional redeem, the access-token
+-- insert and the refresh-token store. A failed check returns without writing, so nothing is
+-- consumed on failure.
+
+-- name: GetOAuthAuthorizeRequestByCodeHash :one
+-- The request an authorization code belongs to, found by the sha256 of the presented code. NO row
+-- lock: the handler needs the grant id to take the grant lock first (D8), then re-reads the request
+-- with LockOAuthAuthorizeRequest.
+SELECT * FROM oauth_authorize_requests WHERE code_hash = $1;
+
+-- name: LockOAuthGrant :one
+-- A grant by id, row-locked for the rest of the transaction (D8: every grant mutation serializes
+-- here first). No row means the grant is gone (its user was deleted).
+SELECT * FROM oauth_grants WHERE id = $1 FOR UPDATE;
+
+-- name: LockOAuthAuthorizeRequest :one
+-- The request row, locked AFTER its grant (D8) and re-read under that lock, so a redemption sees a
+-- supersession or a concurrent redemption that committed while it waited for the grant.
+SELECT * FROM oauth_authorize_requests WHERE id = $1 FOR UPDATE;
+
+-- name: CountLiveGrantTokens :one
+-- The ten-live-token bound (D5): the grant's unrevoked, unexpired access tokens and the earliest
+-- expiry among them (what Retry-After counts down to). Grant tokens always carry an expiry, so
+-- there is no NULL-expiry case here, unlike CountActiveProductTokensForUserProduct. Run with the
+-- grant locked, so no concurrent mint of this grant can change the count.
+SELECT count(*)::bigint AS live, min(expires_at)::timestamptz AS oldest_expires_at
+  FROM product_tokens
+ WHERE grant_id = $1
+   AND NOT revoked
+   AND expires_at > now();
+
+-- name: RedeemOAuthAuthorizeRequest :one
+-- approved -> redeemed in one conditional UPDATE, the code's single use. Zero rows (ErrNoRows)
+-- means it was no longer approved or its code expired: the handler answers invalid_grant. Run
+-- inside the redemption transaction after every check passed.
+UPDATE oauth_authorize_requests
+   SET status = 'redeemed'
+ WHERE id = $1 AND status = 'approved' AND code_expires_at > now()
+RETURNING *;
+
+-- name: CreateGrantProductToken :one
+-- Mint an access token for a grant: the CreateProductToken insert (guarded on the product being
+-- enabled and not soft-deleted) plus grant_id. token_hash is never projected.
+INSERT INTO product_tokens (user_id, product_id, name, token_hash, token_prefix, scopes, expires_at, grant_id)
+SELECT sqlc.arg(user_id)::uuid,
+       p.id,
+       sqlc.arg(name)::text,
+       sqlc.arg(token_hash)::bytea,
+       sqlc.arg(token_prefix)::text,
+       sqlc.arg(scopes)::text[],
+       sqlc.arg(expires_at)::timestamptz,
+       sqlc.arg(grant_id)::uuid
+  FROM products p
+ WHERE p.id = sqlc.arg(product_id)::uuid
+   AND p.enabled
+   AND p.deleted_at IS NULL
+RETURNING id, user_id, product_id, name, token_prefix, scopes, revoked,
+          created_at, last_used_at, last_used_ip, expires_at, grant_id;
+
+-- name: SetOAuthGrantRefreshToken :one
+-- Store the grant's refresh token (sha256 + display prefix), replacing any previous one: a code
+-- exchange on a grant that somehow still holds a refresh token replaces it, so at most one is ever
+-- live. refresh_last_used_at is reset; the idle clock then counts from refresh_issued_at. Guarded
+-- on revoked_at IS NULL as a belt on the grant lock.
+UPDATE oauth_grants
+   SET refresh_token_hash = sqlc.arg(refresh_token_hash)::bytea,
+       refresh_token_prefix = sqlc.arg(refresh_token_prefix)::text,
+       refresh_issued_at = now(),
+       refresh_last_used_at = NULL
+ WHERE id = sqlc.arg(id) AND revoked_at IS NULL
+RETURNING *;
+
+-- name: RevokeOAuthGrantRow :execrows
+-- The grant half of a revoke (D6): revoked_at, and the refresh token cleared so it can no longer be
+-- presented. Run with the grant locked, after RevokeOAuthGrantProductTokens and
+-- SupersedeOAuthGrantCodes (lock order); the row is kept as the audit trail. Idempotent.
+UPDATE oauth_grants
+   SET revoked_at = now(),
+       refresh_token_hash = NULL,
+       refresh_token_prefix = NULL,
+       refresh_issued_at = NULL,
+       refresh_last_used_at = NULL
+ WHERE id = $1 AND revoked_at IS NULL;

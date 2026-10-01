@@ -7,6 +7,7 @@ package store
 
 import (
 	"context"
+	"net/netip"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -51,6 +52,30 @@ func (q *Queries) ClaimOAuthAuthorizeRequest(ctx context.Context, arg ClaimOAuth
 		&i.CreatedAt,
 		&i.ExpiresAt,
 	)
+	return i, err
+}
+
+const countLiveGrantTokens = `-- name: CountLiveGrantTokens :one
+SELECT count(*)::bigint AS live, min(expires_at)::timestamptz AS oldest_expires_at
+  FROM product_tokens
+ WHERE grant_id = $1
+   AND NOT revoked
+   AND expires_at > now()
+`
+
+type CountLiveGrantTokensRow struct {
+	Live            int64              `json:"live"`
+	OldestExpiresAt pgtype.Timestamptz `json:"oldest_expires_at"`
+}
+
+// The ten-live-token bound (D5): the grant's unrevoked, unexpired access tokens and the earliest
+// expiry among them (what Retry-After counts down to). Grant tokens always carry an expiry, so
+// there is no NULL-expiry case here, unlike CountActiveProductTokensForUserProduct. Run with the
+// grant locked, so no concurrent mint of this grant can change the count.
+func (q *Queries) CountLiveGrantTokens(ctx context.Context, grantID pgtype.UUID) (CountLiveGrantTokensRow, error) {
+	row := q.db.QueryRow(ctx, countLiveGrantTokens, grantID)
+	var i CountLiveGrantTokensRow
+	err := row.Scan(&i.Live, &i.OldestExpiresAt)
 	return i, err
 }
 
@@ -136,6 +161,81 @@ func (q *Queries) CountLivePendingOAuthRequests(ctx context.Context, arg CountLi
 		&i.WidePending,
 		&i.ProductPending,
 		&i.GlobalPending,
+	)
+	return i, err
+}
+
+const createGrantProductToken = `-- name: CreateGrantProductToken :one
+INSERT INTO product_tokens (user_id, product_id, name, token_hash, token_prefix, scopes, expires_at, grant_id)
+SELECT $1::uuid,
+       p.id,
+       $2::text,
+       $3::bytea,
+       $4::text,
+       $5::text[],
+       $6::timestamptz,
+       $7::uuid
+  FROM products p
+ WHERE p.id = $8::uuid
+   AND p.enabled
+   AND p.deleted_at IS NULL
+RETURNING id, user_id, product_id, name, token_prefix, scopes, revoked,
+          created_at, last_used_at, last_used_ip, expires_at, grant_id
+`
+
+type CreateGrantProductTokenParams struct {
+	UserID      uuid.UUID          `json:"user_id"`
+	Name        string             `json:"name"`
+	TokenHash   []byte             `json:"token_hash"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scopes      []string           `json:"scopes"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	GrantID     uuid.UUID          `json:"grant_id"`
+	ProductID   uuid.UUID          `json:"product_id"`
+}
+
+type CreateGrantProductTokenRow struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	ProductID   uuid.UUID          `json:"product_id"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scopes      []string           `json:"scopes"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+	GrantID     pgtype.UUID        `json:"grant_id"`
+}
+
+// Mint an access token for a grant: the CreateProductToken insert (guarded on the product being
+// enabled and not soft-deleted) plus grant_id. token_hash is never projected.
+func (q *Queries) CreateGrantProductToken(ctx context.Context, arg CreateGrantProductTokenParams) (CreateGrantProductTokenRow, error) {
+	row := q.db.QueryRow(ctx, createGrantProductToken,
+		arg.UserID,
+		arg.Name,
+		arg.TokenHash,
+		arg.TokenPrefix,
+		arg.Scopes,
+		arg.ExpiresAt,
+		arg.GrantID,
+		arg.ProductID,
+	)
+	var i CreateGrantProductTokenRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ProductID,
+		&i.Name,
+		&i.TokenPrefix,
+		&i.Scopes,
+		&i.Revoked,
+		&i.CreatedAt,
+		&i.LastUsedAt,
+		&i.LastUsedIp,
+		&i.ExpiresAt,
+		&i.GrantID,
 	)
 	return i, err
 }
@@ -271,6 +371,44 @@ SELECT id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash
 // before exposing anything.
 func (q *Queries) GetOAuthAuthorizeRequest(ctx context.Context, id uuid.UUID) (OauthAuthorizeRequest, error) {
 	row := q.db.QueryRow(ctx, getOAuthAuthorizeRequest, id)
+	var i OauthAuthorizeRequest
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.RedirectUri,
+		&i.Scopes,
+		&i.State,
+		&i.CodeChallenge,
+		&i.BindingHash,
+		&i.SourcePrefix,
+		&i.SourceMid,
+		&i.SourceWide,
+		&i.Status,
+		&i.UserID,
+		&i.GrantID,
+		&i.CodeHash,
+		&i.CodeExpiresAt,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const getOAuthAuthorizeRequestByCodeHash = `-- name: GetOAuthAuthorizeRequestByCodeHash :one
+
+SELECT id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, source_mid, source_wide, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at FROM oauth_authorize_requests WHERE code_hash = $1
+`
+
+// PRD #1910 M3: the token endpoint's authorization_code redemption. The handler runs it in ONE
+// transaction in D8 lock order: the unlocked code lookup (no lock), the grant FOR UPDATE, the
+// grant's token count, then the request row FOR UPDATE, the conditional redeem, the access-token
+// insert and the refresh-token store. A failed check returns without writing, so nothing is
+// consumed on failure.
+// The request an authorization code belongs to, found by the sha256 of the presented code. NO row
+// lock: the handler needs the grant id to take the grant lock first (D8), then re-reads the request
+// with LockOAuthAuthorizeRequest.
+func (q *Queries) GetOAuthAuthorizeRequestByCodeHash(ctx context.Context, codeHash []byte) (OauthAuthorizeRequest, error) {
+	row := q.db.QueryRow(ctx, getOAuthAuthorizeRequestByCodeHash, codeHash)
 	var i OauthAuthorizeRequest
 	err := row.Scan(
 		&i.ID,
@@ -435,6 +573,62 @@ func (q *Queries) LockOAuthAuthorize(ctx context.Context, productID uuid.UUID) e
 	return err
 }
 
+const lockOAuthAuthorizeRequest = `-- name: LockOAuthAuthorizeRequest :one
+SELECT id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, source_mid, source_wide, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at FROM oauth_authorize_requests WHERE id = $1 FOR UPDATE
+`
+
+// The request row, locked AFTER its grant (D8) and re-read under that lock, so a redemption sees a
+// supersession or a concurrent redemption that committed while it waited for the grant.
+func (q *Queries) LockOAuthAuthorizeRequest(ctx context.Context, id uuid.UUID) (OauthAuthorizeRequest, error) {
+	row := q.db.QueryRow(ctx, lockOAuthAuthorizeRequest, id)
+	var i OauthAuthorizeRequest
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.RedirectUri,
+		&i.Scopes,
+		&i.State,
+		&i.CodeChallenge,
+		&i.BindingHash,
+		&i.SourcePrefix,
+		&i.SourceMid,
+		&i.SourceWide,
+		&i.Status,
+		&i.UserID,
+		&i.GrantID,
+		&i.CodeHash,
+		&i.CodeExpiresAt,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
+const lockOAuthGrant = `-- name: LockOAuthGrant :one
+SELECT id, user_id, product_id, scopes, refresh_token_hash, refresh_token_prefix, refresh_issued_at, refresh_last_used_at, created_at, consented_at, revoked_at FROM oauth_grants WHERE id = $1 FOR UPDATE
+`
+
+// A grant by id, row-locked for the rest of the transaction (D8: every grant mutation serializes
+// here first). No row means the grant is gone (its user was deleted).
+func (q *Queries) LockOAuthGrant(ctx context.Context, id uuid.UUID) (OauthGrant, error) {
+	row := q.db.QueryRow(ctx, lockOAuthGrant, id)
+	var i OauthGrant
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ProductID,
+		&i.Scopes,
+		&i.RefreshTokenHash,
+		&i.RefreshTokenPrefix,
+		&i.RefreshIssuedAt,
+		&i.RefreshLastUsedAt,
+		&i.CreatedAt,
+		&i.ConsentedAt,
+		&i.RevokedAt,
+	)
+	return i, err
+}
+
 const oAuthGrantHasTokenOutsideScopes = `-- name: OAuthGrantHasTokenOutsideScopes :one
 SELECT EXISTS (
     SELECT 1
@@ -501,6 +695,41 @@ func (q *Queries) ReconsentOAuthGrant(ctx context.Context, arg ReconsentOAuthGra
 	return i, err
 }
 
+const redeemOAuthAuthorizeRequest = `-- name: RedeemOAuthAuthorizeRequest :one
+UPDATE oauth_authorize_requests
+   SET status = 'redeemed'
+ WHERE id = $1 AND status = 'approved' AND code_expires_at > now()
+RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, source_mid, source_wide, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
+`
+
+// approved -> redeemed in one conditional UPDATE, the code's single use. Zero rows (ErrNoRows)
+// means it was no longer approved or its code expired: the handler answers invalid_grant. Run
+// inside the redemption transaction after every check passed.
+func (q *Queries) RedeemOAuthAuthorizeRequest(ctx context.Context, id uuid.UUID) (OauthAuthorizeRequest, error) {
+	row := q.db.QueryRow(ctx, redeemOAuthAuthorizeRequest, id)
+	var i OauthAuthorizeRequest
+	err := row.Scan(
+		&i.ID,
+		&i.ProductID,
+		&i.RedirectUri,
+		&i.Scopes,
+		&i.State,
+		&i.CodeChallenge,
+		&i.BindingHash,
+		&i.SourcePrefix,
+		&i.SourceMid,
+		&i.SourceWide,
+		&i.Status,
+		&i.UserID,
+		&i.GrantID,
+		&i.CodeHash,
+		&i.CodeExpiresAt,
+		&i.CreatedAt,
+		&i.ExpiresAt,
+	)
+	return i, err
+}
+
 const revokeOAuthGrantProductTokens = `-- name: RevokeOAuthGrantProductTokens :execrows
 UPDATE product_tokens SET revoked = true WHERE grant_id = $1 AND NOT revoked
 `
@@ -510,6 +739,27 @@ UPDATE product_tokens SET revoked = true WHERE grant_id = $1 AND NOT revoked
 // (lock order: grant, then product_tokens).
 func (q *Queries) RevokeOAuthGrantProductTokens(ctx context.Context, grantID pgtype.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, revokeOAuthGrantProductTokens, grantID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const revokeOAuthGrantRow = `-- name: RevokeOAuthGrantRow :execrows
+UPDATE oauth_grants
+   SET revoked_at = now(),
+       refresh_token_hash = NULL,
+       refresh_token_prefix = NULL,
+       refresh_issued_at = NULL,
+       refresh_last_used_at = NULL
+ WHERE id = $1 AND revoked_at IS NULL
+`
+
+// The grant half of a revoke (D6): revoked_at, and the refresh token cleared so it can no longer be
+// presented. Run with the grant locked, after RevokeOAuthGrantProductTokens and
+// SupersedeOAuthGrantCodes (lock order); the row is kept as the audit trail. Idempotent.
+func (q *Queries) RevokeOAuthGrantRow(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, revokeOAuthGrantRow, id)
 	if err != nil {
 		return 0, err
 	}
@@ -526,6 +776,45 @@ SELECT set_config('lock_timeout', $1::text, true)
 func (q *Queries) SetOAuthAuthorizeLockTimeout(ctx context.Context, timeout string) error {
 	_, err := q.db.Exec(ctx, setOAuthAuthorizeLockTimeout, timeout)
 	return err
+}
+
+const setOAuthGrantRefreshToken = `-- name: SetOAuthGrantRefreshToken :one
+UPDATE oauth_grants
+   SET refresh_token_hash = $1::bytea,
+       refresh_token_prefix = $2::text,
+       refresh_issued_at = now(),
+       refresh_last_used_at = NULL
+ WHERE id = $3 AND revoked_at IS NULL
+RETURNING id, user_id, product_id, scopes, refresh_token_hash, refresh_token_prefix, refresh_issued_at, refresh_last_used_at, created_at, consented_at, revoked_at
+`
+
+type SetOAuthGrantRefreshTokenParams struct {
+	RefreshTokenHash   []byte    `json:"refresh_token_hash"`
+	RefreshTokenPrefix string    `json:"refresh_token_prefix"`
+	ID                 uuid.UUID `json:"id"`
+}
+
+// Store the grant's refresh token (sha256 + display prefix), replacing any previous one: a code
+// exchange on a grant that somehow still holds a refresh token replaces it, so at most one is ever
+// live. refresh_last_used_at is reset; the idle clock then counts from refresh_issued_at. Guarded
+// on revoked_at IS NULL as a belt on the grant lock.
+func (q *Queries) SetOAuthGrantRefreshToken(ctx context.Context, arg SetOAuthGrantRefreshTokenParams) (OauthGrant, error) {
+	row := q.db.QueryRow(ctx, setOAuthGrantRefreshToken, arg.RefreshTokenHash, arg.RefreshTokenPrefix, arg.ID)
+	var i OauthGrant
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.ProductID,
+		&i.Scopes,
+		&i.RefreshTokenHash,
+		&i.RefreshTokenPrefix,
+		&i.RefreshIssuedAt,
+		&i.RefreshLastUsedAt,
+		&i.CreatedAt,
+		&i.ConsentedAt,
+		&i.RevokedAt,
+	)
+	return i, err
 }
 
 const supersedeOAuthGrantCodes = `-- name: SupersedeOAuthGrantCodes :execrows

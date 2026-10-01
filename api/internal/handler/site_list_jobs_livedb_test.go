@@ -67,7 +67,7 @@ func newSiteListEnv(t *testing.T) *siteListEnv {
 	h = New(pool, h.q, cfg, h.box, nil, svc, nil, hub.New(), settings.New(h.q, time.Minute))
 	h.SetHostedSvc(hostedsvc.New(h.q, h.box, time.Now, cfg.WorkerHeartbeatStale))
 	lim := func() *mw.Limiter { return mw.NewLimiter(1_000_000, time.Hour, nil) }
-	routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
+	routes := h.Routes(lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim(), lim())
 	return &siteListEnv{
 		t: t, h: h, pool: pool, routes: routes, svcTok: svcTok,
 		v1: &v1JobsEnv{t: t, h: h, pool: pool, routes: routes},

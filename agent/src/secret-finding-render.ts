@@ -54,6 +54,8 @@ const TOKEN_PREFIXES: string[] = [
   "xox" + "b-",
   "xox" + "p-",
   "uzp" + "_",
+  "uzs" + "_",
+  "uzr" + "_",
 ];
 const AWS_KEY_ID_RE = new RegExp("AK" + "IA[A-Z0-9]{16}");
 

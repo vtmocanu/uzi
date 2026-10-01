@@ -160,6 +160,10 @@ func contractCases() []contractCase {
 		// zero.json, never null on the wire) and the approve / deny redirect response.
 		newContractCase[OAuthAuthorizeRequestDTO]("oauth_authorize_request"),
 		newContractCase[OAuthRedirectResponse]("oauth_redirect_response"),
+		// PRD #1910 M3: the token endpoint bodies. Go-only (the SPA never calls /api/oauth/token), like
+		// the v1_* pairs.
+		newContractCase[OAuthTokenResponse]("oauth_token_response"),
+		newContractCase[OAuthErrorResponse]("oauth_error_response"),
 		newContractCase[ProductTokenDTO]("product_token"),
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),

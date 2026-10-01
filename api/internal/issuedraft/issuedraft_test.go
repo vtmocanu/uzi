@@ -250,7 +250,7 @@ func TestScrubSecretShapes(t *testing.T) {
 // TestMintedPrefixesScrubbedOnBothPaths binds the same prefixes across all three
 // copies; this is the in-package half.
 func TestScrubSecretShapesMintedUziPrefixes(t *testing.T) {
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix)
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix, oauthsrv.RefreshPrefix)
 	body := strings.Repeat("Ab1-_", 5) // 25 chars over the whole body class, assembled at runtime
 	for _, p := range prefixes {
 		tok := p + body

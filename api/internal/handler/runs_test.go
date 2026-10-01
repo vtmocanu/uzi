@@ -1300,7 +1300,7 @@ func TestListRunMessagesGzip(t *testing.T) {
 		hub:  hub.New(),
 	}
 	noLimit := mw.NewLimiter(100000, time.Minute, nil)
-	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
+	router := h.Routes(noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit, noLimit)
 
 	jwt, err := auth.IssueToken(secret, owner.ID.String(), 0, time.Hour)
 	if err != nil {

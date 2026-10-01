@@ -629,13 +629,20 @@ func (h *Handler) OAuthApprove(w http.ResponseWriter, r *http.Request) {
 // oauthRequestStillValid reports whether the product can still run this stored request: a
 // client, with the request's redirect URI still registered and its scopes still allowed.
 func oauthRequestStillValid(p store.Product, row store.OauthAuthorizeRequest) bool {
+	return oauthClientAllows(p, row.RedirectUri, row.Scopes)
+}
+
+// oauthClientAllows reports whether p is an enabled OAuth client that still registers
+// redirectURI and still allows every one of scopes. Approve and deny check it against the stored
+// request; the token endpoint re-checks it against the grant's current scopes at redemption.
+func oauthClientAllows(p store.Product, redirectURI string, scopes []string) bool {
 	c := oauthClientFromProduct(p)
 	if !c.IsClient() {
 		return false
 	}
 	registered := false
 	for _, u := range c.RedirectURIs {
-		if u == row.RedirectUri {
+		if u == redirectURI {
 			registered = true
 			break
 		}
@@ -643,7 +650,7 @@ func oauthRequestStillValid(p store.Product, row store.OauthAuthorizeRequest) bo
 	if !registered {
 		return false
 	}
-	for _, sc := range row.Scopes {
+	for _, sc := range scopes {
 		allowed := false
 		for _, a := range c.Scopes {
 			if a == sc {

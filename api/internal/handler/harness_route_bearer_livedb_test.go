@@ -99,7 +99,7 @@ func newHarnessRouteFixture(ctx context.Context, t *testing.T) harnessRouteFixtu
 		wsvc: wsvc,
 	}
 	lim := mw.NewLimiter(100000, time.Minute, nil)
-	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
+	router := h.Routes(lim, lim, lim, lim, lim, lim, lim, lim, lim, lim, lim)
 
 	cliMustExec(t, pool, `INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`,
 		owner, fmt.Sprintf("harness-route-%s@e2e", owner))

@@ -223,6 +223,14 @@ type Config struct {
 	// action, so it keeps the tighter credential-surface budget on top of this one).
 	V1RateLimitMax    int
 	V1RateLimitWindow time.Duration
+	// OAuthRateLimitMax/Window is the budget of the OAuth token and revoke endpoints (PRD #1910
+	// D7). It is applied twice: per client IP on every request (oauthLimiter.Middleware, so
+	// failed client authentication also spends it) and per client_id once the client has
+	// authenticated, so one product's retry storm cannot starve another's. The default (60/min)
+	// is far above an honest product's exchange and refresh rate (a refresh per access token, an
+	// hour apart) while bounding a guessing loop.
+	OAuthRateLimitMax    int
+	OAuthRateLimitWindow time.Duration
 	// PrivilegeCheckInterval is the cadence of the background PAT least-privilege
 	// re-check sweep (PRD #5). Default 24h; 0 disables the sweep entirely (no boot
 	// pass, no loop). A boot pass runs at start when enabled, so grandfathered
@@ -932,6 +940,8 @@ func Load() (Config, error) {
 	cfg.BoardOrderRateLimitWindow = parseDuration("BOARD_ORDER_RATE_LIMIT_WINDOW", time.Minute)
 	cfg.V1RateLimitMax = parseInt("V1_RATE_LIMIT_MAX", 120)
 	cfg.V1RateLimitWindow = parseDuration("V1_RATE_LIMIT_WINDOW", time.Minute)
+	cfg.OAuthRateLimitMax = parseInt("OAUTH_RATE_LIMIT_MAX", 60)
+	cfg.OAuthRateLimitWindow = parseDuration("OAUTH_RATE_LIMIT_WINDOW", time.Minute)
 	// parseNonNegDuration (not parseDuration): 0 is a legitimate value here —
 	// it disables the privilege sweep — and parseDuration rejects 0.
 	cfg.PrivilegeCheckInterval = parseNonNegDuration("UZI_PRIVILEGE_CHECK_INTERVAL", 24*time.Hour)

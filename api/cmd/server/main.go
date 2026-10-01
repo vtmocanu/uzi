@@ -1342,6 +1342,7 @@ func run() error {
 	// Dedicated per-user budget for the whole /api/v1 subtree (PRD #1908 D-B): job clients poll,
 	// which the 10/min authLimiter budget PRD #1907 used there cannot carry.
 	v1Limiter := mw.NewLimiter(cfg.V1RateLimitMax, cfg.V1RateLimitWindow, cfg.TrustedProxies)
+	oauthLimiter := mw.NewLimiter(cfg.OAuthRateLimitMax, cfg.OAuthRateLimitWindow, cfg.TrustedProxies)
 	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3), wired
 	// post-construction like the other optional forge collaborators.
@@ -1428,7 +1429,7 @@ func run() error {
 	// the SAME api on a second port, not a second surface. Building Routes twice
 	// would be two independent middleware chains — and two rate limiters, so a
 	// per-IP budget would silently double.
-	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter)
+	routes := h.Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter, proposalLimiter, judgeLimiter, hostedLimiter, cliPollLimiter, boardOrderLimiter, v1Limiter, oauthLimiter)
 
 	srv := &http.Server{
 		Addr:              cfg.Addr,

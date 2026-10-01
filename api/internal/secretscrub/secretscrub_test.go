@@ -75,9 +75,9 @@ func assertScrubbedIssueDraft(t *testing.T, token string) {
 // draft). The name predates the third path.
 func TestMintedPrefixesScrubbedOnBothPaths(t *testing.T) {
 	// clitoken.Prefixes = {uzc_, uza_}; jointoken.Prefix = uzw_; producttoken.Prefix =
-	// uzp_ (PRD #1907); oauthsrv.SecretPrefix = uzs_ (PRD #1910). The rest are consts, no
-	// slice needed. uzr_ (refresh tokens, PRD #1910 M3) joins this list when it is minted.
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix)
+	// uzp_ (PRD #1907); oauthsrv.SecretPrefix = uzs_ and oauthsrv.RefreshPrefix = uzr_ (PRD #1910).
+	// The rest are consts, no slice needed.
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix, oauthsrv.RefreshPrefix)
 	for _, p := range prefixes {
 		t.Run(p, func(t *testing.T) {
 			assertScrubbedBothPaths(t, p+body)

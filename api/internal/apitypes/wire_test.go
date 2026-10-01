@@ -957,6 +957,9 @@ func TestOAuthConsentDTOTags(t *testing.T) {
 	assertTags(t, "OAuthAuthorizeRequestDTO", OAuthAuthorizeRequestDTO{},
 		"product_name", "product_description", "redirect_host", "scopes", "status", "expires_at")
 	assertTags(t, "OAuthRedirectResponse", OAuthRedirectResponse{}, "redirect_url")
+	assertTags(t, "OAuthTokenResponse", OAuthTokenResponse{}, "access_token", "token_type", "expires_in", "refresh_token", "scope")
+	// error_description is omitempty, so tagSet leaves it out (the contract fixtures pin it).
+	assertTags(t, "OAuthErrorResponse", OAuthErrorResponse{}, "error")
 }
 
 // /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries

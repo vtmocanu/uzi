@@ -141,7 +141,7 @@ func TestVersionLatestRCRoute(t *testing.T) {
 		store.AppSetting{Key: settings.KeyReleaseRCBody, Value: "### Security\nprivate notes"},
 		store.AppSetting{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T10:00:00Z"},
 	)
-	route := h.Routes(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+	route := h.Routes(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
 	fetch := func() map[string]json.RawMessage {
 		rec := httptest.NewRecorder()
 		route.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api/version", nil))
