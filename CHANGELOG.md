@@ -22,9 +22,6 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-- **The GitLab bot helper can create a new bot ([#2016](https://github.com/vtmocanu/uzi/issues/2016)).**
-  The admin script uses jq to parse user IDs and tokens, sends the PAT request as JSON, and reports response errors without exposing tokens. It accepts `--gitlab <host>` (or `--gitlab=<host>`) ahead of `GITLAB_HOSTNAME`, normalizes host URLs, and supports help and option validation. jq is now required alongside glab. Credit to @alexp3200 for the report.
-
 ### Added
 
 - **A worker holding an undelivered run outcome is shown as such, and the run is flagged stalled after a minute ([#1994](https://github.com/vtmocanu/uzi/issues/1994)).**
@@ -34,6 +31,9 @@ through `[0.52.0]`.)
 
 - **Run durations span the whole run after a limit, recovery or pool resume ([#2004](https://github.com/vtmocanu/uzi/issues/2004)).**
   A resumed run gets a fresh timeout wall, which used to make every duration show only its last leg ("ran 4h 13m" for an ~18h run). Runs now record a never-reset first start (`first_started_at` on the run API), and the runs list, board card, run and issue views, `uzi run list` and the TUI measure from it, parks included; the timeout budget is still measured per leg. Finished board cards now show `ran <elapsed>`. `budget_used_seconds` on a finished run no longer keeps growing. For runs started before this release, the duration counts from their latest start before the upgrade, or, if `started_at` was NULL at the upgrade, from their first start after it, so their earlier legs are not counted.
+
+- **The GitLab bot helper can create a new bot ([#2016](https://github.com/vtmocanu/uzi/issues/2016)).**
+  The admin script uses jq to parse user IDs and tokens, sends the PAT request as JSON, and reports response errors without exposing tokens. It accepts `--gitlab <host>` (or `--gitlab=<host>`) ahead of `GITLAB_HOSTNAME`, normalizes host URLs, and supports help and option validation. jq is now required alongside glab. Credit to @alexp3200 for the report.
 
 ## [0.85.0] - 2026-09-26
 

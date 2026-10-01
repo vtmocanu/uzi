@@ -132,6 +132,8 @@ else
 fi
 
 info "minting a PAT (scope: $SCOPES, expires: $EXPIRES_AT)"
+# glab debug HTTP logging dumps response bodies to stderr, including the PAT.
+# Suppress that stream as well as keeping the captured response out of errors.
 pat_json="$(jq -n --arg scope "$SCOPES" --arg expires "$EXPIRES_AT" \
   '{name: "uzi-bot", scopes: [$scope], expires_at: $expires}' \
   | glab_api "users/${bot_id}/personal_access_tokens" -X POST \
@@ -157,9 +159,9 @@ else
 fi
 
 echo
-echo "Bot ready: ${BOT_USERNAME} (id ${bot_id}): Developer on ${PROJECT}"
+echo "Bot ready: ${BOT_USERNAME} (id ${bot_id}) is Developer on ${PROJECT}"
 echo
-printf '\033[33mSAVE THIS NOW: GitLab will not show it again:\033[0m\n'
+printf '\033[33mSAVE THIS NOW. GitLab will not show it again:\033[0m\n'
 printf '  %s\n' "$token"
 echo
 echo "Paste it into uzi: Settings -> Forge -> Base URL https://${GITLAB_HOSTNAME} -> Token."
