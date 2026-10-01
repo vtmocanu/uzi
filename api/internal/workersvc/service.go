@@ -5095,6 +5095,12 @@ type InputDTO struct {
 	// worker reading a legacy row see today's shape.
 	GateBinding  *string `json:"gate_binding,omitempty"`
 	GateRevision *int64  `json:"gate_revision,omitempty"`
+	// IncludedAt and InclusionReported are set only by GET /follow-ups (ConsumedFollowUps): when
+	// the worker reported the follow-up in an executor prompt, and whether the ACKing worker
+	// advertises input_inclusion_v1. InclusionReported is a pointer so /follow-ups always
+	// carries it (true or false) while GET /inputs omits it.
+	IncludedAt        *time.Time `json:"included_at,omitempty"`
+	InclusionReported *bool      `json:"inclusion_reported,omitempty"`
 }
 
 // inputDTO builds the worker-facing InputDTO from a run_user_inputs row's projected columns,
@@ -5207,7 +5213,13 @@ func (s *Service) ConsumedFollowUps(ctx context.Context, wkr store.Worker, runID
 	}
 	out := make([]InputDTO, 0, len(rows))
 	for _, row := range rows {
-		out = append(out, InputDTO{ID: row.ID, Kind: "follow_up", Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time})
+		reported := row.InclusionReported
+		dto := InputDTO{ID: row.ID, Kind: "follow_up", Body: textPtr(row.Body), CreatedAt: row.CreatedAt.Time, InclusionReported: &reported}
+		if row.IncludedAt.Valid {
+			t := row.IncludedAt.Time
+			dto.IncludedAt = &t
+		}
+		out = append(out, dto)
 	}
 	return out, nil
 }

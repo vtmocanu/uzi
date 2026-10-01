@@ -120,6 +120,10 @@ const WallParkV1 = "wall_park_v1"
 // InputReceiptsV1 advertises explicit ACK and applied receipts for steering inputs.
 const InputReceiptsV1 = "input_receipts_v1"
 
+// InputInclusionV1 advertises that the worker reports when a follow-up was actually included
+// in an executor prompt (POST /runs/{id}/inputs/included), so the server may trust included_at.
+const InputInclusionV1 = "input_inclusion_v1"
+
 // GateRevisionV1 is the PROTOCOL capability a worker self-reports (PRD #1795 M3) to declare it
 // matches plan-gate verdicts by the server-allocated gate revision: it mints a presentation id
 // per gate, reads the revision off the awaiting_approval ACK, and takes a bound verdict only on
@@ -197,6 +201,7 @@ var protocolVocabulary = map[string]struct{}{
 	CredentialSwitchV1:         {},
 	WallParkV1:                 {},
 	InputReceiptsV1:            {},
+	InputInclusionV1:           {},
 	GateRevisionV1:             {},
 	AdviceClaimFenceV1:         {},
 	JobRunnerV1:                {},
@@ -207,7 +212,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

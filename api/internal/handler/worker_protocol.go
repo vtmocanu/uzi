@@ -1376,6 +1376,13 @@ func (h *Handler) WorkerRunInputsApplied(w http.ResponseWriter, r *http.Request)
 	h.workerInputReceipt(w, r, h.wsvc.ApplyInputs)
 }
 
+// WorkerRunInputsIncluded records follow_up rows the worker put into an executor prompt. Same
+// body, auth and status mapping as the other receipts; fenced on the caller's claim only (see
+// workersvc.Service.IncludeInputs), and a worker without input_inclusion_v1 is a 400.
+func (h *Handler) WorkerRunInputsIncluded(w http.ResponseWriter, r *http.Request) {
+	h.workerInputReceipt(w, r, h.wsvc.IncludeInputs)
+}
+
 // WorkerRunInputsDiscarded settles approve_plan inputs the worker received and dropped as
 // stale (issue #1604): a discarded approve must leave the replay list, which is oldest-first
 // and capped, without counting as a human plan approval. Same body, auth, capability and

@@ -1132,6 +1132,8 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.Get("/runs/{id}/inputs", h.WorkerRunInputs)
 		r.Post("/runs/{id}/inputs/ack", h.WorkerRunInputsAck)
 		r.Post("/runs/{id}/inputs/applied", h.WorkerRunInputsApplied)
+		// Not lane-allowlisted: an isolated-lane run never includes follow-ups.
+		r.Post("/runs/{id}/inputs/included", h.WorkerRunInputsIncluded)
 		// Issue #1604: settles approve_plan rows the worker discarded as stale, so they leave
 		// the replay list without counting as approval (disposition 'superseded').
 		r.Post("/runs/{id}/inputs/discarded", h.WorkerRunInputsDiscarded)

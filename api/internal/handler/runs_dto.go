@@ -647,6 +647,11 @@ func steerInputToDTO(i store.RunUserInput) apitypes.SteerInputDTO {
 		CreatedAt:   i.CreatedAt.Time,
 		ConsumedAt:  timePtr(i.ConsumedAt.Valid, i.ConsumedAt.Time),
 		Disposition: textPtrValue(i.Disposition.Valid, i.Disposition.String),
+		AppliedAt:   timePtr(i.AppliedAt.Valid, i.AppliedAt.Time),
+		IncludedAt:  timePtr(i.IncludedAt.Valid, i.IncludedAt.Time),
+		// Unreported is not "not yet included": only a row ACKed by a worker that reports
+		// inclusion may be read as Routed-but-not-Included.
+		InclusionReported: i.InclusionReported,
 	}
 }
 
