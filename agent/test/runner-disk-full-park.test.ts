@@ -179,7 +179,7 @@ const pauseFailedFeed = (runId: string) =>
     .filter((m) => m.kind === "pause_failed")
     .map((m) => String(m.payload.text));
 const RECLAIM_WAIT_PAUSE_TEXT =
-  "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started its work, so there was no checkpoint to take. It has stopped on this worker and will start again when it is requeued.";
+  "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started work on this worker, so there was nothing new to checkpoint. It has stopped on this worker and will start again when it is requeued.";
 
 async function withHome(prefix: string, fn: (homeRoot: string) => Promise<void>): Promise<void> {
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));

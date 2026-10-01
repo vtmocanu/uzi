@@ -1474,8 +1474,10 @@ interface RunFlight {
    *  checkpoint, possibly a marker-only `wip(park):` one PRD #759 ignores). */
   landedCheckpoint?: boolean;
   /** Issue #1832: the PRD #1809 D6 operation ("preflight", "clone/fetch") whose data-volume
-   *  reclaim wait a pause interrupted. Set only pre-clone, by awaitDataVolumeReclaim; the pause
-   *  sink reads it to tell the owner what actually happened (nothing started, the run requeues). */
+   *  reclaim wait a PauseNowSignal interrupted (an owner `now` or a sweep `wall` pause; a `disk`
+   *  stop sets it too, but its arm never reads it). Set only pre-clone, by awaitDataVolumeReclaim;
+   *  handlePausePark reads it to say what actually happened (nothing started on this worker, the
+   *  run requeues). */
   reclaimWaitInterrupted?: string;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
    *  knows it — seeded from `claim.checkpoint_tip`, advanced to the declared overlay/real tip on
@@ -12227,7 +12229,7 @@ export class RunRunner {
         agent: "worker",
         payload: {
           text: reclaimWait !== undefined
-            ? "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started its work, so there was no checkpoint to take. It has stopped on this worker and will start again when it is requeued."
+            ? "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started work on this worker, so there was nothing new to checkpoint. It has stopped on this worker and will start again when it is requeued."
             : residueBlocked
             ? "Could not pause: a process this run started could not be stopped, so no checkpoint was taken. The run is still running and has restarted the interrupted step."
             : "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
