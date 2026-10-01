@@ -443,7 +443,7 @@ changelog_placement_guard() {
   if [ -n "$stray" ]; then
     log "the rebased CHANGELOG.md no longer holds bullet(s) the branch added under [Unreleased] there:"
     printf '%s\n' "$stray" | cut -c1-160
-    log "restore each under [Unreleased] (matching ### heading), or confirm an intentional removal by committing the file as wanted, then re-run with --skip-rebase"
+    log "restore each block under [Unreleased] with its matching ### heading, commit, and re-run with --skip-rebase; an intentional removal or reword needs a separate reviewed decision, and committing it alone does not clear this guard"
     echo "RESULT=changelog_misplaced WORKTREE=$WT"
     exit 11
   fi
