@@ -844,9 +844,10 @@ Tracked as GitHub issue vtmocanu/uzi#1907; PRD at `prds/1907-product-tokens-api-
 Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/1908-repo-less-jobs-api.md`.
 
 - A `uzc_` or `uzp_` caller can create a repo-less `research` job over `/api/v1/jobs` with a prompt and inline text inputs, and can follow, list, cancel and read its structured result (a report plus findings). The job runs as the token's user on that user's own Claude credential, with no plan gate. (AI-synced 2026-09-30)
-- A job never touches a repo, a branch, a forge or `main`. It has no web or network tool, and the api refuses forge, memory, publish and review worker routes for it. (AI-synced 2026-09-30)
+- A job never touches a repo, a branch, a forge or `main`. It has no web or network tool unless it is bound to a site list its caller may use; then its only network tool is the uzi fetch tool, on the isolated lane. The api refuses forge, memory, publish and review worker routes for it. (AI-synced 2026-10-01)
 - Docker-tier workers and worker images without the job runner never claim a job. (AI-synced 2026-09-30)
 - A `uzp_` token creates only the job types its product's admin-set allow-list names (empty allows none) and sees only its own product's jobs. A `uzc_` token may create any type and sees all of its user's jobs. (AI-synced 2026-09-30)
+- A `uzp_` token may bind a job only to the site lists an admin allowed its product (none by default; refused otherwise, with no job created); a `uzc_` token may name any existing list. Removing an allowance affects only jobs created afterwards. Admins grant and remove allowances in the web UI (cookie-only writes); the CLI only lists them. (AI-synced 2026-10-01)
 - Revoking the creating product token, disabling or deleting its product, or deactivating the owner cancels the job. Token expiry alone never does. (AI-synced 2026-09-30)
 - A job fails rather than waits: a usage limit, its time budget, a disabled credential or an ephemeral worker that cannot serve it ends it `failed`. (AI-synced 2026-09-30)
 - Each user has a cap on active jobs (default 10, admin-tunable) and a per-user `/api/v1` rate limit. (AI-synced 2026-09-30)
@@ -1063,7 +1064,7 @@ Tracked as GitHub issue vtmocanu/uzi#1864.
 Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources-web-research.md`.
 
 - A run bound to a site list may read web content only from hosts on that list, fetched through a uzi fetch service; it runs in a worker lane with no internet, and nothing (kill-switch, cleared requirements, self-reported capability, old agent) can place it outside that lane. (AI-synced 2026-09-29)
-- Site lists are named, admin-managed, and never supplied by a request; admins create and edit them in the web UI (cookie-only writes), the CLI can list and show them. (AI-synced 2026-09-29)
+- Site lists are named and admin-managed; a request may name a list (a job's `egress_profile`) but never supply hosts. Admins create and edit them in the web UI (cookie-only writes), the CLI can list and show them. (AI-synced 2026-10-01)
 - Every fetch attempt, allowed or refused, is in the run's source log, readable by the run owner (`uzi run fetches <run>`); a fetch that cannot be logged does not happen. (AI-synced 2026-09-29)
 - The lane is off by default; existing worker tiers are unchanged, and no new image or workflow change is needed. (AI-synced 2026-09-29)
 

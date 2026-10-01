@@ -2,6 +2,7 @@ import type {
   AdminProductToken,
   Product,
   ProductPatch,
+  ProductEgressProfile,
   ProductSkills,
   ProductToken,
   ProductTokenExpiry,
@@ -23,6 +24,7 @@ import {
   mockProductSkillsRepo,
   mockProductTokens,
 } from "../data";
+import { mockEgressProfileDescription } from "./egressProfiles";
 import { delay, requireAdmin, requireSession, users } from "./shared";
 
 // ── Product registry + product tokens (PRD #1907) ────────────────────────────
@@ -191,6 +193,24 @@ function findProduct(id: string): StoredProduct {
   return p;
 }
 
+// ── Product site lists (PRD #1976 M2) ────────────────────────────────────────
+// Per product, the lists its tokens may name on job create: name -> when it was allowed.
+// A list deleted from the admin page since drops out of the view, as the real api's
+// cascade does.
+const allowedLists = new Map<string, Map<string, string>>([
+  ["prod-helpdesk", new Map([["ml-model-cards", new Date(Date.now() - 3 * 86_400_000).toISOString()]])],
+]);
+
+function allowedListsView(id: string): { egress_profiles: ProductEgressProfile[] } {
+  const rows: ProductEgressProfile[] = [];
+  for (const [name, created_at] of allowedLists.get(id) ?? []) {
+    const description = mockEgressProfileDescription(name);
+    if (description === null) continue;
+    rows.push(description === "" ? { name, created_at } : { name, description, created_at });
+  }
+  return { egress_profiles: rows.sort((a, b) => a.name.localeCompare(b.name)) };
+}
+
 // Called by the mock revoke-all (cliTokens.ts): the real POST
 // /me/cli-tokens/revoke-all revokes the caller's product tokens in the same
 // transaction as its CLI tokens (D8).
@@ -337,6 +357,32 @@ export const productTokensApi = {
     p.enabled = false;
     p.deleted_at = new Date().toISOString();
     return delay({ product: withCount(p), stopped_token_count: wasEnabled ? active : 0 });
+  },
+  adminListProductEgressProfiles: async (id: string) => {
+    requireAdmin();
+    findProduct(id);
+    return delay(allowedListsView(id));
+  },
+  adminAllowProductEgressProfile: async (id: string, name: string) => {
+    requireAdmin();
+    const p = findProduct(id);
+    if (p.deleted_at !== null) throw new ApiError(409, "product is deleted");
+    if (mockEgressProfileDescription(name) === null) throw new ApiError(404, "egress profile not found");
+    const set = allowedLists.get(id) ?? new Map<string, string>();
+    if (!set.has(name)) set.set(name, new Date().toISOString());
+    allowedLists.set(id, set);
+    return delay(allowedListsView(id));
+  },
+  adminDisallowProductEgressProfile: async (id: string, name: string) => {
+    requireAdmin();
+    const p = findProduct(id);
+    if (p.deleted_at !== null) throw new ApiError(409, "product is deleted");
+    // The real handler resolves the list by name before it deletes the allowance.
+    if (mockEgressProfileDescription(name) === null) throw new ApiError(404, "egress profile not found");
+    if (!allowedLists.get(id)?.delete(name)) {
+      throw new ApiError(404, "this product is not allowed to use that egress profile");
+    }
+    return delay(null);
   },
   adminGetProductSkills: async (id: string) => {
     requireAdmin();

@@ -61,7 +61,14 @@ Product registration is an admin-only browser action under **Admin → Products*
 - **Delete:** soft. All its tokens stop working, but their rows, last-used data and revoked state stay listed for the audit trail. A deleted product cannot be edited or re-enabled, and its name can be registered again. The confirm says how many tokens the delete stops (0 if it was already disabled).
 - **Allowed job types:** each product card has a checkbox per job type (today `research`). A product with none ticked cannot create jobs: a create is refused 403 `job_type_not_allowed`. `uzi admin products` shows them in a `JOB_TYPES` column.
 - **Revoke one token:** each product card lists its tokens with owner, prefix, last used and IP; an admin can revoke a single compromised one. This does not change the rule that admins cannot revoke a user's personal CLI tokens.
+- **Allowed site lists:** each product card also lists the site lists its tokens may name on job create; see [Site lists for jobs](#site-lists-for-jobs).
 - **Read-only from the CLI:** `uzi admin products` (needs a `uza_` token). See [CLI](./cli.md#managing-tokens).
+
+## Site lists for jobs
+
+A job can name a [site list](./egress-profiles.md) in `egress_profile` so it can read official web sources ([Jobs](./jobs.md#site-lists)). A product token may name **only a list an admin has allowed for its product**: any other existing list is refused with 403 `egress_profile_not_allowed`, an unknown name is 404 `unknown_egress_profile`. Your own `uzc_` token may name any list. A product with no allowed lists cannot create a bound job.
+
+Admins allow a list on **Admin → Products**: each product card has a **Site lists** section where allowed lists are added and removed (a browser-session action; the equivalent `PUT`/`DELETE /api/admin/products/{id}/egress-profiles/{name}` refuse a Bearer token). Removing an allowance affects only jobs created afterwards. Deleting a site list removes its allowances. The CLI is read-only: `uzi admin products egress-profiles <product>` (needs a `uza_` token) lists a product's allowed lists.
 
 ## Compatibility promise
 

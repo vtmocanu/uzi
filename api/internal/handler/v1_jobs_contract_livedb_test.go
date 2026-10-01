@@ -92,7 +92,8 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "create 413", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"` + strings.Repeat("p", v1JobCreateMaxBodyBytes) + `"}`, want: 413},
 		{name: "create 422", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research"}`, want: 422},
 		{name: "create 422 unknown type", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"x","prompt":"p"}`, want: 422},
-		{name: "create 422 egress", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":"x"}`, want: 422},
+		{name: "create 422 egress", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":""}`, want: 422},
+		{name: "create 404 unknown egress profile", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":"no-such-list"}`, want: 404},
 		{name: "create 422 credential", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: cliMintToken(t, e.pool, cliSeedUser(t, e.pool, false), clitoken.ScopeUser), body: v1MinimalJob, want: 422},
 		{name: "create 429 over_cap", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: func() string {
 			_, tok := e.user()

@@ -172,6 +172,18 @@ const JobProtocolFiles int16 = 2
 // below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
 const IsolatedFetchV1 = "isolated_fetch_v1"
 
+// IsolatedJobV1 is the PROTOCOL capability a lane worker self-reports (PRD #1976 M1) to declare
+// its isolated runner can host a profile-bound JOB: it downloads the job's input files, offers
+// submit_job_result alongside the isolated tool set, uploads outputs and posts the result. It is
+// the ROLLOUT GATE for profile-bound jobs: ClaimRun's job clause (and each mirrored placement
+// query) lets a job with runs.egress_profile_id set be claimed only by a worker that advertises
+// this capability, because an isolated lane worker released before this PRD advertises
+// isolated_fetch_v1 and job_runner_v1 but cannot run a job on the lane. The gate is written into
+// the clause itself, OUTSIDE required_capabilities and the capability_aware kill-switch, exactly
+// like JobFilesV1 above. Like the other protocol capabilities it lives in the protocol vocabulary
+// below, NEVER in `vocabulary`, `required_capabilities` or the web capability picker.
+const IsolatedJobV1 = "isolated_job_v1"
+
 // protocolVocabulary is the closed set of legal PROTOCOL capability names — kept
 // entirely separate from `vocabulary` so a protocol string is never offered to users
 // through Vocabulary()/the web mirror. FilterProtocol drops anything not in here.
@@ -190,11 +202,12 @@ var protocolVocabulary = map[string]struct{}{
 	JobRunnerV1:                {},
 	JobFilesV1:                 {},
 	IsolatedFetchV1:            {},
+	IsolatedJobV1:              {},
 }
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

@@ -101,8 +101,8 @@ export interface IsolatedRunnerOptions {
   splitActive?: boolean;
 }
 
-/** A shape-valid isolated grant, or undefined. */
-function validGrant(v: unknown): IsolatedFetchClaim | undefined {
+/** A shape-valid isolated grant, or undefined. Shared with the JobRunner's lane mode. */
+export function validGrant(v: unknown): IsolatedFetchClaim | undefined {
   if (!v || typeof v !== "object") return undefined;
   const g = v as Record<string, unknown>;
   if (typeof g.credential !== "string" || !g.credential.trim()) return undefined;
@@ -113,9 +113,13 @@ function validGrant(v: unknown): IsolatedFetchClaim | undefined {
 
 /**
  * Why this isolated claim must not start, or undefined when it may. Pure: no I/O, so a
- * refused claim touches nothing on the worker.
+ * refused claim touches nothing on the worker. Shared with the JobRunner's lane mode, which
+ * passes its own fetcher config and uid-split knob.
  */
-function preflightReason(claim: ClaimResponse, opts: IsolatedRunnerOptions): string | undefined {
+export function preflightReason(
+  claim: ClaimResponse,
+  opts: Pick<IsolatedRunnerOptions, "fetcherUrl" | "fetcherCaFile" | "splitActive">,
+): string | undefined {
   if (!validGrant(claim.isolated_fetch)) return "profile-bound claim carried a malformed isolated_fetch grant";
   const secrets = claim.secrets as Partial<ClaimResponse["secrets"]> | undefined;
   if (secrets?.codex !== undefined && secrets.codex !== null) {

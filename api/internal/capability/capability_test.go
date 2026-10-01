@@ -369,3 +369,28 @@ func TestFilterProtocol_KeepsIsolatedFetchV1(t *testing.T) {
 		t.Errorf("Filter(%q) = %v, want empty (a protocol cap must not be a scheduler cap)", IsolatedFetchV1, got)
 	}
 }
+
+// TestFilterProtocol_KeepsIsolatedJobV1 pins PRD #1976 M1: isolated_job_v1 survives
+// FilterProtocol right after isolated_fetch_v1, is never a scheduler or self-reportable
+// capability, and never appears in the user-facing Vocabulary().
+func TestFilterProtocol_KeepsIsolatedJobV1(t *testing.T) {
+	if IsolatedJobV1 != "isolated_job_v1" {
+		t.Fatalf("IsolatedJobV1 = %q, want isolated_job_v1", IsolatedJobV1)
+	}
+	got := FilterProtocol([]string{IsolatedJobV1, IsolatedFetchV1, AdviceClaimFenceV1, "bogus"})
+	want := []string{AdviceClaimFenceV1, IsolatedFetchV1, IsolatedJobV1}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("FilterProtocol = %v, want %v", got, want)
+	}
+	if got := Filter([]string{IsolatedJobV1}); len(got) != 0 {
+		t.Errorf("Filter(%q) = %v, want empty", IsolatedJobV1, got)
+	}
+	if got := SelfReportable([]string{IsolatedJobV1}); len(got) != 0 {
+		t.Errorf("SelfReportable(%q) = %v, want empty", IsolatedJobV1, got)
+	}
+	for _, v := range Vocabulary() {
+		if v == IsolatedJobV1 {
+			t.Errorf("Vocabulary() contains %q, a protocol capability", v)
+		}
+	}
+}

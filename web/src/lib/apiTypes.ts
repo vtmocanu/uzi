@@ -1572,6 +1572,15 @@ export interface ProductPatch {
 }
 
 // ── Product skill sets (PRD #1909 M6, apitypes/product_skills.go) ──────────
+// ProductEgressProfile is one site list a product is allowed to name on job create (PRD
+// #1976), mirroring the handler's productEgressProfileDTO: GET/PUT
+// /api/admin/products/{id}/egress-profiles. `description` is omitted when empty.
+export interface ProductEgressProfile {
+  name: string;
+  description?: string;
+  created_at: string;
+}
+
 // ProductSkill is one skill of a product's set: name, description and the SKILL.md body.
 // Every field is UNTRUSTED text from the product's external repo: render as plain text.
 export interface ProductSkill {

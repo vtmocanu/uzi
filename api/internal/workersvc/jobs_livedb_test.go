@@ -190,16 +190,16 @@ func TestCreateJobRunRefusalsLiveDB(t *testing.T) {
 	if _, err := e2.svc.CreateJobRun(e2.ctx, big); !errors.Is(err, ErrJobInvalid) {
 		t.Errorf("oversize prompt err = %v", err)
 	}
-	// Unknown type, egress flag.
+	// Unknown type, unknown egress profile.
 	unk := jobReq(cliCaller(u2))
 	unk.JobType = "translate"
 	if _, err := e2.svc.CreateJobRun(e2.ctx, unk); !errors.Is(err, ErrJobTypeUnknown) {
 		t.Errorf("unknown type err = %v", err)
 	}
 	eg := jobReq(cliCaller(u2))
-	eg.EgressProfile = true
-	if _, err := e2.svc.CreateJobRun(e2.ctx, eg); !errors.Is(err, ErrJobNotSupported) {
-		t.Errorf("egress err = %v", err)
+	eg.EgressProfile = "no-such-list"
+	if _, err := e2.svc.CreateJobRun(e2.ctx, eg); !errors.Is(err, ErrJobProfileNotFound) {
+		t.Errorf("unknown egress profile err = %v, want ErrJobProfileNotFound", err)
 	}
 
 	// Product allow-list: a type outside it, and an empty list, both refuse.

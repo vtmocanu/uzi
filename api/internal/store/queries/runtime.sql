@@ -951,7 +951,12 @@ WITH target AS (
       -- (job_protocol NULL) stays claimable by any job_runner_v1 worker. Same OUTSIDE-the-bypasses rule.
       AND (r.kind <> 'job'
            OR (NOT @is_docker_worker::boolean AND 'job_runner_v1' = ANY(@worker_protocol_caps::text[])
-               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(@worker_protocol_caps::text[]))))
+               AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(@worker_protocol_caps::text[]))
+               -- PRD #1976 M1 (the isolated_job_v1 ROLLOUT GATE): a profile-bound job (runs.egress_profile_id)
+               -- additionally needs 'isolated_job_v1', so a lane worker released before profile-bound jobs
+               -- (isolated_fetch_v1 + job_runner_v1 only) never claims one. Same OUTSIDE-the-bypasses rule;
+               -- the lane clause below (isolated_lane + isolated_fetch_v1) is unchanged.
+               AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(@worker_protocol_caps::text[]))))
       -- PRD #1590 M2 (D2, amendment A1): keep a Codex subscription run queued while
       -- its SAME alias's account authority is on hold (D1's hold class):
       --   (1) quarantine: the linked account is quarantined and is still the run's
@@ -1117,7 +1122,9 @@ WITH target AS (
                 -- PRD #1909 M1: and the job_files_v1 arm for a stamped job (runs.job_protocol).
                 AND (r.kind <> 'job'
                      OR (NOT COALESCE(p.docker_enabled, false) AND 'job_runner_v1' = ANY(p.protocol_capabilities)
-                         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))))
+                         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(p.protocol_capabilities))
+                         -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
+                         AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(p.protocol_capabilities))))
                 -- PRD #1590 M2 (D2, A1): mirror the claimant's account gate so a
                 -- busy worker never defers this run to a peer that cannot claim it.
                 AND NOT (
@@ -6782,7 +6789,9 @@ WHERE run.id = @run_id
   -- PRD #1909 M1: and the job_files_v1 arm for a stamped job (runs.job_protocol).
   AND (run.kind <> 'job'
        OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
-           AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+           AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+           -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
+           AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
@@ -7092,6 +7101,8 @@ WHERE r.status = 'queued'
         AND 'job_runner_v1' = ANY(wj.protocol_capabilities)
         -- PRD #1909 M1: and 'job_files_v1' for a stamped job (runs.job_protocol).
         AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(wj.protocol_capabilities))
+        -- PRD #1976 M1: and 'isolated_job_v1' for a profile-bound job (runs.egress_profile_id).
+        AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(wj.protocol_capabilities))
   ))
   )
   AND NOT EXISTS (
@@ -7185,7 +7196,8 @@ WHERE r.status = 'queued'
         -- PRD #1908 (D-A): for a 'job' the capable set is the job-runner set (non-docker AND
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
-                                 AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+                                 AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
   )
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -7195,7 +7207,8 @@ WHERE r.status = 'queued'
         AND NOT w.ephemeral
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
-                                 AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+                                 AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                                 AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
         AND (w.max_concurrent_runs IS NULL
              OR (SELECT count(*) FROM runs r2
                   WHERE r2.worker_id = w.id

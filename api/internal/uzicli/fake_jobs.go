@@ -116,3 +116,13 @@ func (f *FakeClient) AdminProductSkills(_ context.Context, productID string) (ap
 	}
 	return apitypes.ProductSkillsDTO{}, Exitf(ExitNotFound, "product %s not found", productID)
 }
+
+func (f *FakeClient) AdminProductEgressProfiles(_ context.Context, productID string) ([]ProductEgressProfile, error) {
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	if d, ok := f.ProductEgress[productID]; ok {
+		return d, nil
+	}
+	return nil, Exitf(ExitNotFound, "product %s not found", productID)
+}

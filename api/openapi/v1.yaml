@@ -57,7 +57,10 @@ paths:
         Queues a job that runs as the token's user, on that user's own Anthropic
         credential. Needs the jobs:run scope. A product token may create only the job
         types its product allows. The job starts queued and runs to completion with no
-        approval step; poll GET /jobs/{id} for progress.
+        approval step; poll GET /jobs/{id} for progress. Naming a site list in
+        egress_profile runs the job on the isolated lane, where only that list's hosts
+        are reachable through the fetcher; a product token may name only a list its
+        product is allowed to use.
       requestBody:
         required: true
         content:
@@ -75,6 +78,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "403":
           $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
         "413":
           $ref: "#/components/responses/PayloadTooLarge"
         "422":
@@ -416,7 +421,9 @@ components:
       description: >-
         The token lacks the scope the endpoint needs (reason insufficient_scope), or, on
         POST /jobs, a product token asked for a job type its product does not allow
-        (reason job_type_not_allowed; a product with an empty allow-list allows none).
+        (reason job_type_not_allowed; a product with an empty allow-list allows none) or named a
+        site list in egress_profile that its product is not allowed to use (reason
+        egress_profile_not_allowed; a product with no allowed lists may use none).
       content:
         application/json:
           schema:
@@ -424,7 +431,8 @@ components:
     NotFound:
       description: >-
         No such job or file, or one the caller cannot see: another user's, another
-        product's and a malformed id all answer the same (reason not_found).
+        product's and a malformed id all answer the same (reason not_found). On POST
+        /jobs, egress_profile names no site list (reason unknown_egress_profile).
       content:
         application/json:
           schema:
@@ -510,9 +518,8 @@ components:
       description: >-
         The request is understood but refused. The reason says why: invalid_request (a
         malformed or invalid body or query parameter; the message names the field),
-        unknown_job_type, not_supported (egress_profile is reserved and refused for
-        now) or no_model_credential (the user has no usable Anthropic credential in
-        uzi). On POST /files, also empty_file, size_mismatch (the streamed size is not
+        unknown_job_type or no_model_credential (the user has no usable Anthropic
+        credential in uzi). On POST /files, also empty_file, size_mismatch (the streamed size is not
         X-Uzi-File-Size) and sha256_mismatch. On POST /jobs, also file_unavailable (an
         input_file_ids entry is unknown, belongs to another user or product, is already
         attached, has expired, or is listed twice).
@@ -670,7 +677,12 @@ components:
           type:
             - string
             - "null"
-          description: Reserved. Any value is refused with reason not_supported.
+          description: >-
+            The name of a site list. The job runs on the isolated lane and can reach only
+            that list's hosts, through the fetcher. A product token may name only a list
+            its product is allowed to use (403, reason egress_profile_not_allowed); an
+            unknown list is 404 (reason unknown_egress_profile); an empty string is 422.
+            Omit it, or send null, for a job with no site list.
     JobInput:
       type: object
       required:

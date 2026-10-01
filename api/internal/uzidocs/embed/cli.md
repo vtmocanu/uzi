@@ -600,7 +600,7 @@ A few worth knowing:
   `refused`), `REASON`, `HTTP` status, `BYTES`, `CONTENT TYPE`, `URL` and
   `FINAL URL` (after redirects). The command follows every page of the log; a read taken while the run is still fetching can miss a row that commits late.
   Owner-only: another user's run reads as not found (exit 4), and a run that
-  never fetched, which is every run until runs can be bound to a site list, shows
+  never fetched, which is every run not bound to a site list, shows
   no rows. URLs are cut in the table; `--json` prints them whole with each file's
   sha256. The text cells are site- or agent-controlled and are printed with
   control characters stripped. See [Isolated research
@@ -724,6 +724,12 @@ A few worth knowing:
   sync dropped and why. It works with a `uza_` token, like the rest of
   `uzi admin`; setting the source, syncing and approving stay browser-only. See
   [Product skills](./skills.md#product-skills).
+  `admin products egress-profiles <product>` lists, read-only, the [site
+  lists](egress-profiles.md) an admin has allowed that product's tokens to name
+  on job create (PRD #1976): `NAME`, `ALLOWED` (when) and `DESCRIPTION`. It
+  works with a `uza_` token; allowing and removing a list are browser-only
+  admin actions on **Admin → Products**. See [Product
+  tokens](product-tokens.md#site-lists-for-jobs).
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it

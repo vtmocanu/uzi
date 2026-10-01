@@ -8,15 +8,28 @@ audience: operator
 
 An egress profile is a named site list: the hosts an official-sources research
 run may read from ([PRD #1906](../prds/1906-official-sources-web-research.md)).
-Admins create and edit profiles; a run will name one profile, never a list of
+Admins create and edit profiles; a run names one profile, never a list of
 domains.
 
-**Not in use yet.** The fetch service and the no-internet worker lane that read
-these profiles exist and are described in [Isolated research
-lane](isolated-research-lane.md), but binding a run to a profile lands with job
-creation ([PRD #1908](../prds/1908-repo-less-jobs-api.md)). Until then no run
-is bound to a profile, and a profile changes nothing about how any run reaches
-the network.
+**Where a profile is used.** A [job](jobs.md#site-lists) names a profile in
+`egress_profile` when it is created ([PRD #1976](../prds/done/1976-site-list-jobs.md)),
+and runs on the no-internet worker lane described in [Isolated research
+lane](isolated-research-lane.md), reading only the hosts on the list. Your own
+`uzc_` token may name any profile. A product (`uzp_`) token may name only a
+profile an admin has allowed for its product (see below). Nothing else binds a
+run to a profile, and a run without one reaches the network as before.
+
+## Allowing a profile for a product
+
+An admin allows a product to use a profile on **Admin → Products**: each
+product card has a section listing its allowed site lists, where you add and
+remove one. The same actions exist as `PUT` and `DELETE`
+`/api/admin/products/<id>/egress-profiles/<name>`, which are browser-session
+only (a Bearer token gets `401`). `GET /api/admin/products/<id>/egress-profiles`
+and `uzi admin products egress-profiles <product>` read the set and work with a
+`uza_` token. Removing an allowance affects only jobs created afterwards.
+Deleting a profile removes its allowances; a profile that a run is bound to
+still can't be deleted (`409`).
 
 ## Managing profiles
 

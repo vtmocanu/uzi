@@ -58,11 +58,6 @@ func TestCreateJobRunRefusalsBeforeTheStore(t *testing.T) {
 	ctx := context.Background()
 	base := CreateJobParams{Caller: JobCaller{UserID: uuid.New()}, JobType: runkind.JobTypeResearch, Title: "t", Prompt: "p"}
 
-	egress := base
-	egress.EgressProfile = true
-	if _, err := svc.CreateJobRun(ctx, egress); !errors.Is(err, ErrJobNotSupported) {
-		t.Errorf("egress profile err = %v, want ErrJobNotSupported", err)
-	}
 	unknown := base
 	unknown.JobType = "nope"
 	if _, err := svc.CreateJobRun(ctx, unknown); !errors.Is(err, ErrJobTypeUnknown) {

@@ -900,7 +900,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	// job_runner_v1 is genuinely UNPLACEABLE (ClaimRun's non-bypassable job clause can never be
 	// satisfied). Same placement, guard and degrade rules as the Codex rungs above.
 	if r.Kind == runkind.Job {
-		// PRD #1909 M1: a job stamped with runs.job_protocol also needs 'job_files_v1'.
+		// PRD #1909 M1: a job stamped with runs.job_protocol also needs 'job_files_v1'. A profile-bound
+		// job (PRD #1976, runs.egress_profile_id) never reaches this rung: queuedReason returns
+		// isolatedLaneReason for it first, and this count excludes ephemeral (lane) workers.
 		c, cerr := s.q.CountOnlineWorkersSatisfyingJobRunner(ctx, store.CountOnlineWorkersSatisfyingJobRunnerParams{
 			UserID: r.UserID, RequiresJobFiles: r.JobProtocol.Valid,
 		})

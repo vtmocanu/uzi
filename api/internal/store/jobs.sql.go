@@ -93,8 +93,8 @@ func (q *Queries) CreateJobOrigin(ctx context.Context, arg CreateJobOriginParams
 }
 
 const createJobRun = `-- name: CreateJobRun :one
-INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness, job_protocol)
-VALUES ($1, $2, 'job', $3, $4, $5, true, '{}', $6, 'manual', $7, $8::smallint)
+INSERT INTO runs (id, user_id, kind, job_type, issue_title, issue_description, auto_approve, required_capabilities, budget_wall_seconds, trigger_source, harness, job_protocol, egress_profile_id)
+VALUES ($1, $2, 'job', $3, $4, $5, true, '{}', $6, 'manual', $7, $8::smallint, $9::uuid)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at
 `
 
@@ -107,6 +107,7 @@ type CreateJobRunParams struct {
 	BudgetWallSeconds pgtype.Int4 `json:"budget_wall_seconds"`
 	Harness           string      `json:"harness"`
 	JobProtocol       pgtype.Int2 `json:"job_protocol"`
+	EgressProfileID   pgtype.UUID `json:"egress_profile_id"`
 }
 
 // The dedicated insert for a kind='job' run (PRD #1908): repo-less, issue-less, branchless,
@@ -116,6 +117,8 @@ type CreateJobRunParams struct {
 // prompt/task runs use. harness is the @harness parameter from the atomic create seam.
 // job_protocol is the PRD #1909 M1 rollout stamp (capability.JobProtocolFiles): a stamped job is
 // claimable only by a worker that also advertises 'job_files_v1'.
+// egress_profile_id (PRD #1976 M1) binds the job to a site list: NULL = unbound, the unchanged path;
+// set = a profile-bound job that only an isolated-lane worker advertising 'isolated_job_v1' claims.
 func (q *Queries) CreateJobRun(ctx context.Context, arg CreateJobRunParams) (Run, error) {
 	row := q.db.QueryRow(ctx, createJobRun,
 		arg.RunID,
@@ -126,6 +129,7 @@ func (q *Queries) CreateJobRun(ctx context.Context, arg CreateJobRunParams) (Run
 		arg.BudgetWallSeconds,
 		arg.Harness,
 		arg.JobProtocol,
+		arg.EgressProfileID,
 	)
 	var i Run
 	err := row.Scan(
@@ -1078,7 +1082,9 @@ SELECT w.id AS worker_id, r.id AS run_id, r.user_id AS user_id,
          AND NOT (NOT COALESCE(w.docker_enabled, false)
                   AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                   -- PRD #1909 M1: a stamped job (runs.job_protocol) also needs 'job_files_v1'.
-                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
+                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
+                  -- PRD #1976 M1: and a profile-bound job needs 'isolated_job_v1' (the lane-job rollout gate).
+                  AND (r.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
         OR (w.last_heartbeat_at IS NULL AND w.created_at < $1)
    )
    AND NOT EXISTS (
@@ -1113,7 +1119,8 @@ type LockUnservableEphemeralJobWorkersRow struct {
 //	    protocol_capabilities lack 'job_runner_v1' (an old worker image). ClaimRun will never
 //	    let it claim, and the gap trigger would provision another one forever. The lacking
 //	    capability is job_runner_v1 or, for a job stamped with runs.job_protocol (created with
-//	    files support, PRD #1909 M1), job_files_v1.
+//	    files support, PRD #1909 M1), job_files_v1, or for a profile-bound job (runs.egress_profile_id,
+//	    PRD #1976 M1) isolated_job_v1 (a lane worker image that predates profile-bound jobs).
 //	    cause = 'no_job_capable_worker'.
 //	(b) the worker NEVER registered by the provision deadline (last_heartbeat_at IS NULL and
 //	    created_at older than @deadline_cutoff): the shape ReapEphemeralWorkers would delete

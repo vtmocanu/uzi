@@ -14,15 +14,16 @@ documentation and datasheets from hosts on an admin-approved [site
 list](egress-profiles.md) and nowhere else, with every attempt logged. The
 design rationale is in [ADR-1906](../adr/1906-isolated-fetch-lane.md).
 
-**Nothing uses the lane yet.** A run is placed in the lane only when it is bound
-to a site list, and no way to bind a run exists in this release: that arrives
-with job creation in [PRD #1908](../prds/1908-repo-less-jobs-api.md) (this PRD's
-milestone M8). Turning the lane on renders the namespace, the fetcher and the
-policies. The api provisions lane workers only for bound runs, so until then the
-lane is idle. Its lane trigger is gated on the ephemeral-worker switch, not on
-the chart value: with the lane off in the chart, a bound run would still get a
-lane worker row that the controller never renders, and the run would stay
-queued. Live acceptance on a real cluster (this PRD's
+**What uses the lane.** A run is placed in the lane only when it is bound to a
+site list. A [job](jobs.md#site-lists) binds itself by naming a site list in
+`egress_profile` on create ([PRD #1976](../prds/done/1976-site-list-jobs.md)); see
+[Jobs on the lane](#jobs-on-the-lane). Turning the lane on renders the
+namespace, the fetcher and the policies. The api provisions lane workers only
+for bound runs, so without bound runs the lane is idle. Its lane trigger is
+gated on the ephemeral-worker switch, not on the chart value: with the lane off
+in the chart, a bound run still gets a lane worker row that the controller never
+renders. A bound research run then stays queued; a bound job fails instead (see
+[Jobs on the lane](#jobs-on-the-lane)). Live acceptance on a real cluster (this PRD's
 milestone M9) has not been done: the network guarantees below are what the
 chart and code are built to enforce, not something a maintainer has yet
 measured on a running cluster.
@@ -49,8 +50,9 @@ measured on a running cluster.
   `WebFetch` or `WebSearch`, no subagents, no forge or memory tools. The agent
   checks the effective tool list the SDK reports at start and fails the run if
   it differs. The tool saves each download under `sources/<sha256>` in the run
-  workspace and returns its path, final URL, content type, size and hash. (The
-  result tool that PRD #1908 adds joins the set with M8; it is not offered yet.)
+  workspace and returns its path, final URL, content type, size and hash. A
+  lane worker running a job also gets the job's result tool, and a research
+  product's skills (see [Jobs on the lane](#jobs-on-the-lane)).
 - **Exclusive placement.** Only a lane worker can claim a bound run, and a lane
   worker claims only bound runs. The api provisions lane workers itself, one per
   bound run (they are run-bound and removed with the run), and marks them in the
@@ -61,6 +63,33 @@ measured on a running cluster.
   message-gap read, and the steering inputs). Every other worker route, agent
   memory and the forge routes included, answers `403` for it. The claim carries
   no forge credential, and the lane runs Claude only.
+
+## Jobs on the lane
+
+A job that names a site list ([Jobs](jobs.md#site-lists)) runs here with its
+inputs, uploaded files, output files and result, under the same isolation as any
+lane run. What differs from a job on a standard worker:
+
+- **Only a lane worker that advertises `isolated_job_v1` claims it.** A lane
+  worker running an older image never claims a bound job. The job is then
+  failed by the ephemeral-worker sweeper (`no_job_capable_worker`) rather than
+  waiting. **Rollout:** run the lane workers on a worker image that advertises
+  `isolated_job_v1` (the chart's `workers.image.tag`) before, or together with,
+  allowing products to name site lists. Until the fleet has rolled, a bound job
+  that gets a lane worker fails instead of running.
+- **Once a lane worker is provisioned for a bound job, a worker that cannot
+  serve it fails the job rather than leaving it waiting.** A lane worker that
+  never registers fails it (`ephemeral_worker_never_registered`) after the
+  provision deadline. If no lane worker is provisioned at all (ephemeral worker
+  provisioning off, or the user at the ephemeral worker limit), the bound job
+  stays queued, exactly like a bound research run.
+- **The fetch credential is redacted** from messages, failure reasons, logs and
+  the posted result. Output-file contents are outside that redaction coverage:
+  keeping the credential out of the model's prompt and environment does not
+  prove a credential the job echoes can never reach a file, so treat output
+  files as untrusted.
+- **Product skills are kept** on a bound job (they exist for this research use);
+  every other skill source stays stripped.
 
 ## Enabling the lane
 

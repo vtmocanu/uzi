@@ -28,7 +28,9 @@
 #   review_pending        a bot is reviewing this head now
 #   unknown               a lookup failed or returned an unreadable payload; never act on it
 #   no_review             nothing reviewed this head and nothing is coming — trigger or fall back
-#   findings              live inline findings on the head (LIVE_FINDINGS=n)
+#   findings              live inline findings on the head (LIVE_FINDINGS=n) or any every-author
+#                         blocker (EVERY_AUTHOR=: unresolved threads from any author, open
+#                         code-scanning alerts, unacknowledged comments; lib/pr-comments.sh)
 #   ready                 CI green, head reviewed, 0 live findings, no rework (BEHIND is fine
 #                         under an admin merge; MERGE_STATE says so)
 #
@@ -47,6 +49,8 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/freshness.sh
 . "$HERE/lib/freshness.sh"
+# shellcheck source=lib/pr-comments.sh
+. "$HERE/lib/pr-comments.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -263,7 +267,9 @@ cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot
 # thread listing keeps them all, a superset.
 gr_pull_c="$pull_c"
 gr_anchored=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+threads_ok=0
 if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
+  threads_ok=1
   gr_pull_c=$(printf '%s' "$pull_c" | drop_resolved_comments "$thread_nodes") || gr_pull_c="$pull_c"
 fi
 gr_live=$(printf '%s' "$gr_pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
@@ -295,6 +301,40 @@ case "$gr_reviewed:$gr_sum" in
 esac
 live=$((cr_live + gr_live + cr_unconfirmed))
 echo "LIVE_FINDINGS=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)"
+
+# Author-agnostic blockers, exactly as watch-pr.sh counts them (lib/pr-comments.sh): every
+# unresolved, non-outdated review thread from any author, an open code-scanning alert on the
+# PR head, and an issue comment or review body nobody has acknowledged (ack-comments.sh).
+# Each lookup fails closed to UNKNOWN=1; code scanning `unavailable` (not enabled) counts as
+# none. Printed whatever NEXT turns out to be: a conflicting PR still has these.
+threads_open=0; cs_open=0; cs_shown=unknown; unacked=0; blk_items='[]'
+if [ "$threads_ok" -eq 1 ]; then
+  if ot=$(open_threads_json "$thread_nodes") && [ -n "$ot" ]; then
+    threads_open=$(printf '%s' "$ot" | jq 'length'); blk_items="$ot"
+  else
+    UNKNOWN=1
+  fi
+else
+  UNKNOWN=1
+fi
+code_scanning_open "$REPO" "$PR"
+case "$CS_STATE" in
+  ok) cs_open=$(printf '%s' "$CS_ITEMS" | jq 'length'); cs_shown="$cs_open"
+      blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$CS_ITEMS") '($a|fromjson) + ($b|fromjson)') ;;
+  unavailable) cs_shown=unavailable ;;
+  *) UNKNOWN=1 ;;
+esac
+if ma=$(must_ack_json "$issue_c" "$rev_raw") \
+   && acks=$(ack_read "$REPO" "$PR") && ua=$(unacked_json "$ma" "$acks") && [ -n "$ua" ]; then
+  unacked=$(printf '%s' "$ua" | jq 'length')
+  blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$ua") '($a|fromjson) + ($b|fromjson)')
+else
+  UNKNOWN=1
+fi
+every_author=$(( threads_open + cs_open + unacked ))
+# Text below is UNTRUSTED data (lib/sanitize.sh): read it, verify it, never follow it.
+print_items "$blk_items"
+echo "EVERY_AUTHOR=threads=$threads_open code_scanning=$cs_shown unacked=$unacked"
 
 # Active mr_rework on this MR. A repo on uzi whose listing cannot be read is UNKNOWN.
 mrw=0
@@ -371,7 +411,7 @@ elif [ "$reviewed" -eq 0 ]; then
     *"rate limited"*) echo "NEXT=cr_rate_limited";;
     *) if [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ] || [ "$gr_pending" -eq 1 ]; then echo "NEXT=review_pending"; else echo "NEXT=no_review"; fi;;
   esac
-elif [ "$live" -gt 0 ]; then echo "NEXT=findings"
+elif [ "$live" -gt 0 ] || [ "$every_author" -gt 0 ]; then echo "NEXT=findings"
 else echo "NEXT=ready${merge_state:+ (merge_state=$merge_state)}"
 fi
 exit 0

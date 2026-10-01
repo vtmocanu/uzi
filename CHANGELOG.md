@@ -27,17 +27,6 @@ through `[0.52.0]`.)
 - **Renovate proposes grouped Codex runtime upgrades.**
   Stable native-runtime releases follow the existing seven-day release age and nightly update schedule. Each PR updates the source commit and both musl archive checksums together; installer consistency checks and runtime pin parity block partial upgrades until the required compatibility work is complete.
 
-- **A worker holding an undelivered run outcome is shown as such, and the run is flagged stalled after a minute ([#1994](https://github.com/vtmocanu/uzi/issues/1994)).**
-  The api now records when a worker's pending outcome (journaled on the worker, not yet delivered) was first seen, per worker, run and claim generation, surviving heartbeat renewals and a worker re-register. A running or awaiting-approval run whose outcome has been pending under an unexpired lease for 4 heartbeat intervals (60s by default) gets the existing stalled flag with the reason "the run's outcome is journaled on its worker but has not been delivered"; this is a warning only and never expires the lease or reclaims, fails or discards the run. `reported_runs` entries in the worker list API carry `terminal_pending` and `terminal_pending_since`, the `RUNS` column of `uzi worker list` and `uzi admin workers` shows "N pending outcome(s) (oldest <age>)" instead of counting them as running, and Settings > Workers and the admin Runs worker strip show a badge with a per-run tooltip. See [run health](docs/run-health.md#what-the-flags-mean).
-
-### Fixed
-
-- **Run durations span the whole run after a limit, recovery or pool resume ([#2004](https://github.com/vtmocanu/uzi/issues/2004)).**
-  A resumed run gets a fresh timeout wall, which used to make every duration show only its last leg ("ran 4h 13m" for an ~18h run). Runs now record a never-reset first start (`first_started_at` on the run API), and the runs list, board card, run and issue views, `uzi run list` and the TUI measure from it, parks included; the timeout budget is still measured per leg. Finished board cards now show `ran <elapsed>`. `budget_used_seconds` on a finished run no longer keeps growing. For runs started before this release, the duration counts from their latest start before the upgrade, or, if `started_at` was NULL at the upgrade, from their first start after it, so their earlier legs are not counted.
-
-- **The GitLab bot helper can create a new bot ([#2016](https://github.com/vtmocanu/uzi/issues/2016)).**
-  The admin script uses jq to parse user IDs and tokens, sends the PAT request as JSON, and reports response errors without exposing tokens. It accepts `--gitlab <host>` (or `--gitlab=<host>`) ahead of `GITLAB_HOSTNAME`, normalizes host URLs, and supports help and option validation. jq is now required alongside glab. Credit to @alexp3200 for the report.
-
 ## [0.85.0] - 2026-09-26
 
 ### Added
@@ -99,6 +88,11 @@ through `[0.52.0]`.)
   An admin can point a product at a skills repo (under `UZI_PRODUCT_SKILLS_ALLOWED_BASE_URLS`, https only; empty keeps the feature off) with an optional write-only clone token, sync it, review the staged diff and approve it under Admin > Products. Only that product's jobs receive its approved skills; they get no user, global or builtin skills, and no other run ever sees a product skill. `uzi admin products skills <product>` shows the state. See [Skills](docs/skills.md#product-skills).
 - **New jobs need workers advertising `job_files_v1`: roll the api and the worker image together ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
   A job created after this upgrade is claimed only by a worker that advertises `job_files_v1`, so an older worker never runs it without its files and skills; jobs created before the upgrade are still claimable by older workers.
+
+- **A worker holding an undelivered run outcome is shown as such, and the run is flagged stalled after a minute ([#1994](https://github.com/vtmocanu/uzi/issues/1994)).**
+  The api now records when a worker's pending outcome (journaled on the worker, not yet delivered) was first seen, per worker, run and claim generation, surviving heartbeat renewals and a worker re-register. A running or awaiting-approval run whose outcome has been pending under an unexpired lease for 4 heartbeat intervals (60s by default) gets the existing stalled flag with the reason "the run's outcome is journaled on its worker but has not been delivered"; this is a warning only and never expires the lease or reclaims, fails or discards the run. `reported_runs` entries in the worker list API carry `terminal_pending` and `terminal_pending_since`, the `RUNS` column of `uzi worker list` and `uzi admin workers` shows "N pending outcome(s) (oldest <age>)" instead of counting them as running, and Settings > Workers and the admin Runs worker strip show a badge with a per-run tooltip. See [run health](docs/run-health.md#what-the-flags-mean).
+- **A job can now name a site list, and runs on the no-internet research lane with only that list's hosts reachable ([#1976](https://github.com/vtmocanu/uzi/issues/1976)).**
+  `POST /api/v1/jobs` accepts `egress_profile`: a personal (`uzc_`) token may name any existing site list, while a product (`uzp_`) token may name only the lists an admin allowed its product (403 `egress_profile_not_allowed` otherwise, 404 `unknown_egress_profile` for an unknown name); the old 422 `not_supported` refusal is gone. Admins manage each product's allowed lists through `GET/PUT/DELETE /api/admin/products/{id}/egress-profiles[/{name}]` (writes are browser-session only). A bound job is claimed only by an isolated-lane worker that advertises the new `isolated_job_v1` protocol capability, gets a fetch grant for its list, keeps only its own product's approved skills, downloads its inputs, fetches through the uzi fetcher, uploads outputs and posts its result like any job; the fetch credential is redacted from the job's messages, failure reasons and result (the contents of output files are outside that redaction). Older lane workers never claim a bound job; the job is failed (`no_job_capable_worker`) instead of being run without a result. Removing an allowance affects only jobs created afterwards.
 
 ### Changed
 
@@ -288,6 +282,12 @@ through `[0.52.0]`.)
 
 - **`uzi run recovery` no longer suggests `uzi run export` for a hold that has no archive ([#1742](https://github.com/vtmocanu/uzi/issues/1742)).**
   A `source_only` hold now prints "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)", the export hint appears only when an open hold has an available archive, and a hold awaiting a decision gets a discard hint. The only-copy warning stays in the `source_only` line, the `uzi run discard --help` text and the interactive discard prompt, not in the hint. `--json` output is unchanged.
+
+- **Run durations span the whole run after a limit, recovery or pool resume ([#2004](https://github.com/vtmocanu/uzi/issues/2004)).**
+  A resumed run gets a fresh timeout wall, which used to make every duration show only its last leg ("ran 4h 13m" for an ~18h run). Runs now record a never-reset first start (`first_started_at` on the run API), and the runs list, board card, run and issue views, `uzi run list` and the TUI measure from it, parks included; the timeout budget is still measured per leg. Finished board cards now show `ran <elapsed>`. `budget_used_seconds` on a finished run no longer keeps growing. For runs started before this release, the duration counts from their latest start before the upgrade, or, if `started_at` was NULL at the upgrade, from their first start after it, so their earlier legs are not counted.
+
+- **The GitLab bot helper can create a new bot ([#2016](https://github.com/vtmocanu/uzi/issues/2016)).**
+  The admin script uses jq to parse user IDs and tokens, sends the PAT request as JSON, and reports response errors without exposing tokens. It accepts `--gitlab <host>` (or `--gitlab=<host>`) ahead of `GITLAB_HOSTNAME`, normalizes host URLs, and supports help and option validation. jq is now required alongside glab. Credit to @alexp3200 for the report.
 
 ## [0.84.0] - 2026-09-26
 

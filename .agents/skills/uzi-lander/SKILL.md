@@ -132,14 +132,14 @@ changes it); trust it over a handover's claim.
 | `unknown` | a lookup failed or returned garbage: re-run the snapshot; never act on it |
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
-| `migration_collision`, `conflict` | step 5 |
+| `migration_collision`, `conflict` | step 5; the `EVERY_AUTHOR=` line and its rows (threads, code-scanning alerts, unacked comments) print whatever `NEXT` is, so read them first |
 | `ci_red` | read the failing job; fix locally (step 4) or classify flake |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_pending`, `review_pending` | step 2 |
 | `cr_rate_limited` | step 2, choose the review requirement |
 | `no_review` | step 2, choose the review requirement |
-| `findings` | step 4 |
+| `findings` | step 4 (live bot findings or any `EVERY_AUTHOR` blocker) |
 | `ready` | step 6 |
 | `merged` | step 7 |
 

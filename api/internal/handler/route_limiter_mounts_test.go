@@ -308,6 +308,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #1907 M4: admin soft delete of a product (D9) — a cookie-only admin DB write,
 	// no forge call → noLimiter, like every sibling admin write.
 	{"DELETE", "/api/admin/products/{id}", noLimiter},
+	// PRD #1976 M1: revoke one site-list allowance — a cookie-only admin DB write → noLimiter.
+	{"DELETE", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
 	{"DELETE", "/api/agent-templates/{id}", noLimiter},
 	{"DELETE", "/api/forge/connections/{id}", noLimiter},
 	{"DELETE", "/api/me/cli-tokens/{id}", noLimiter},
@@ -347,6 +349,8 @@ var wantRouteMounts = []routeMount{
 	// (pattern, user) bucket.
 	{"GET", "/api/admin/products", limAuth},
 	{"GET", "/api/admin/products/{id}/skills", limAuth},
+	// PRD #1976 M1: a product's site-list allowance read, like its skills read beside it.
+	{"GET", "/api/admin/products/{id}/egress-profiles", limAuth},
 	{"GET", "/api/admin/product-tokens", limAuth},
 	// PRD #66 M9 (D8): the admin cross-user blocked-repos list reads the STORED
 	// privilege_report (no forge call) → noLimiter.
@@ -866,6 +870,8 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/admin/judge/recommendations/disposition", noLimiter},
 	{"PUT", "/api/admin/settings", noLimiter},
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
+	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
+	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
 	{"PUT", "/api/admin/users/{id}/judge", noLimiter},
 	{"PUT", "/api/agent-templates/allocations", noLimiter},
 	{"PUT", "/api/agent-templates/{id}", noLimiter},
