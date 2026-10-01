@@ -25,6 +25,7 @@ import {
   SECRET_FIXTURE_HYGIENE_APPEND,
   SUBAGENT_SAFETY_APPEND,
   CLAUDE_LONG_COMMAND_APPEND,
+  CODEX_LONG_COMMAND_APPEND,
   WORKER_RUNTIME_APPEND,
 } from "../src/prompt.js";
 
@@ -431,11 +432,11 @@ describe("renderCodexRun — prompts", () => {
     assert.deepEqual(lead, { systemPrompt: "SYS", prompt: "USR" });
   });
 
-  it("renders a subagent prompt as body + the four shared appends (agents.ts parity)", () => {
+  it("renders a subagent prompt with shared appends, Codex guidance, then safety", () => {
     const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
     assert.equal(
       run.perRolePrompts.get("a"),
-      `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
+      `BODY\n\n${FINDINGS_NUDGE_APPEND}\n\n${WORKER_RUNTIME_APPEND}\n\n${SECRET_FIXTURE_HYGIENE_APPEND}\n\n${CODEX_LONG_COMMAND_APPEND}\n\n${SUBAGENT_SAFETY_APPEND}`,
     );
   });
 
@@ -443,6 +444,8 @@ describe("renderCodexRun — prompts", () => {
     const run = renderCodexRun(runRequest({ agents: { a: agent({ prompt: "BODY" }) } }));
     const prompt = run.perRolePrompts.get("a") ?? "";
     assert.ok(prompt.includes("is stopped and its result is lost"));
+    assert.ok(prompt.includes(CODEX_LONG_COMMAND_APPEND));
+    assert.ok(prompt.indexOf(CODEX_LONG_COMMAND_APPEND) < prompt.indexOf(SUBAGENT_SAFETY_APPEND));
     assert.ok(!prompt.includes(CLAUDE_LONG_COMMAND_APPEND));
     assert.ok(!prompt.includes("run_in_background"));
   });

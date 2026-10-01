@@ -56,7 +56,7 @@ import { CodexTransportError, type CodexNotification, type CodexTransport } from
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
-import { FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
+import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
 import type { SpawnCommandOptions } from "../src/codex/broker.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
@@ -796,6 +796,21 @@ describe("CodexExecutor: run() control flow (run-lane precedence)", () => {
     assert.equal(result.branch, "agent/issue-42");
     const texts = emitted.flatMap((m) => (typeof m.payload.text === "string" ? [m.payload.text] : []));
     assert.ok(texts.some((t) => t.includes("working on it")), "the accumulated agent text was emitted");
+  });
+
+  it("passes the Codex lead command guidance through root thread/start developerInstructions", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "lead guidance run");
+    const start = rig.transport.requests.find((request) => request.method === "thread/start");
+    assert.ok(start, "root thread/start was sent");
+    const instructions = rec(start.params).developerInstructions;
+    assert.ok(typeof instructions === "string");
+    assert.ok(instructions.includes(CODEX_LONG_COMMAND_APPEND));
+    assert.match(instructions, /Run one long gate in the foreground:/);
+    assert.match(instructions, /mktemp \.uzi\/scratch\/gate-log\.XXXXXX/);
+    assert.ok(!instructions.includes(CLAUDE_LONG_COMMAND_APPEND));
+    assert.ok(!instructions.includes("run_in_background"));
   });
 
   it("issue #1783: recordedRootPids names the live provider supervisor while the run is in flight", async () => {

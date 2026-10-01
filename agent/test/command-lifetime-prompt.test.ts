@@ -8,13 +8,14 @@ import { assembleAgents } from "../src/agents.js";
 import {
   buildLeadSystemPrompt,
   CLAUDE_LONG_COMMAND_APPEND,
+  CODEX_LONG_COMMAND_APPEND,
 } from "../src/prompt.js";
 import type { AgentTemplate } from "../src/protocol.js";
 
 // Judge recommendations: gates backgrounded and then lost at the turn boundary, and
 // `gh` / bare `tsc` calls that cannot succeed on a worker. The harness-neutral rule must
 // reach the lead and every subagent on both harnesses; the Claude Bash recipe must reach
-// only the Claude lead and Claude subagents (the Codex Bash tool has no timeout argument).
+// only the Claude lead and Claude subagents; Codex gets its own foreground recipe.
 // The Codex subagent half lives in codex-render.test.ts beside its parity test.
 const LIFETIME = "is stopped and its result is lost";
 const TOOLBOX = "no forge CLI (`gh`, `glab`, `tea`)";
@@ -32,13 +33,30 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
     assert.ok(append.includes(LIFETIME));
     assert.ok(append.includes(TOOLBOX));
     assert.ok(append.includes(CLAUDE_LONG_COMMAND_APPEND));
+    assert.ok(!append.includes(CODEX_LONG_COMMAND_APPEND));
   });
 
-  it("a lead built without the Claude harness (the Codex executor) gets no Claude recipe", () => {
+  it("the Codex lead gets the neutral rules and the Codex foreground recipe only", () => {
+    const append = buildLeadSystemPrompt("LEAD BODY", { kind: "issue", harness: "codex" }).append;
+    assert.ok(append.includes(LIFETIME));
+    assert.ok(append.includes(TOOLBOX));
+    assert.ok(append.includes(CODEX_LONG_COMMAND_APPEND));
+    assert.match(append, /primary process to exit/);
+    assert.match(append, /terminating background descendants before returning/);
+    assert.match(append, /do not background a gate and expect to poll it later/);
+    assert.match(append, /Run one long gate in the foreground/);
+    assert.ok(append.includes('echo "EXIT=$rc"'));
+    assert.match(append, /After that command call exits, read the printed log path in a separate call/);
+    assert.ok(!append.includes(CLAUDE_LONG_COMMAND_APPEND));
+    assert.ok(!append.includes("run_in_background"));
+  });
+
+  it("an absent harness keeps the neutral rules without either recipe", () => {
     const append = buildLeadSystemPrompt("LEAD BODY", { kind: "issue" }).append;
     assert.ok(append.includes(LIFETIME));
     assert.ok(append.includes(TOOLBOX));
-    assert.ok(!append.includes("run_in_background"));
+    assert.ok(!append.includes(CODEX_LONG_COMMAND_APPEND));
+    assert.ok(!append.includes(CLAUDE_LONG_COMMAND_APPEND));
   });
 
   it("a Claude subagent gets the neutral rules and the Claude recipe", () => {
@@ -47,6 +65,7 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
     assert.ok(def.prompt.includes(LIFETIME));
     assert.ok(def.prompt.includes(TOOLBOX));
     assert.ok(def.prompt.includes(CLAUDE_LONG_COMMAND_APPEND));
+    assert.ok(!def.prompt.includes(CODEX_LONG_COMMAND_APPEND));
   });
 });
 

@@ -39,6 +39,11 @@ through `[0.52.0]`.)
 - **Codex runs now include owner follow-ups in the agent's prompt, and the steer queue says whether a follow-up reached a prompt ([#1800](https://github.com/vtmocanu/uzi/issues/1800)).**
   A follow-up sent to a Codex run was accepted and shown as delivered but never reached the agent; it now rides the next ordinary implementation prompt on both Claude and Codex, one per turn, and one sent at the plan gate is included in the first prompt after approval (on Claude it used to wait a turn). After a resume, a follow-up handled by a worker that reports inclusion but never included is re-sent to the lead (at-least-once, so it can appear twice). `uzi run inputs`, the TUI and the web steer queue no longer say "delivered": they show queued, received, routed, included in a prompt, or not confirmed (run finished), and rows handled by older workers read "no inclusion report". The follow-up text is fenced as untrusted input with a per-prompt tag. The steer-queue API (`/api/runs/{id}/inputs`, `uzi run inputs --json`) gains `applied_at`, `included_at` and `inclusion_reported`. See [run activity](docs/run-activity.md).
 
+### Changed
+
+- **Codex leads and subagents are told how a long gate command behaves ([#1926](https://github.com/vtmocanu/uzi/issues/1926)).**
+  A Codex command reaps its backgrounded descendants before it returns, so the agent is now told to run one long gate in the foreground to a log and read the recorded exit status, instead of backgrounding it and polling a result that no longer exists.
+
 ### Added
 
 - **Renovate proposes grouped Codex runtime upgrades.**
