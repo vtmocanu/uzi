@@ -510,6 +510,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := workerDTOFromWorker(updated, 0, false, "", h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayEphemeralLease(&dto, updated.LeaseSince, updated.DrainingSince)
 	h.overlayOutbox(&dto, updated.ID)
 	// Custody flag (issue #1759): whether this worker still holds an OPEN durable-recovery
 	// custody hold, i.e. keeps the only local copy of work a run could not publish. The

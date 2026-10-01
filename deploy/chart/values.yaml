@@ -249,7 +249,8 @@ api:
     # Ephemeral hosted workers (PRD #529, #747) — auto-provision a throwaway
     # hosted worker for a queued run that no online worker can serve — either
     # its capability is unmet (immediate) or the capable fleet is saturated at
-    # its per-worker cap (debounced) — torn down when the run finishes. OFF by
+    # its per-worker cap (debounced) — torn down once its run finishes and any idle
+    # lease (workers.ephemeralLease, PRD #2006) has ended. OFF by
     # default: requires hosted-worker hosting enabled (the controller must
     # run — uzi.apiHostingEnabled) AND the admin DB setting
     # `ephemeral_workers_enabled` turned on (PUT /settings) AND the per-user
@@ -694,7 +695,8 @@ workers:
   ephemeralRequest: 512Mi
   # The /data PVC size of a RUN-BOUND worker (issue #1815 → the controller's
   # UZI_WORKER_EPHEMERAL_DATA_SIZE). NAMING: "ephemeral" here means run-bound (the
-  # worker, PVCs included, is removed once its run is terminal), NOT ephemeral-storage;
+  # worker, PVCs included, is removed once its run is terminal and any idle lease
+  # (workers.ephemeralLease) has ended), NOT ephemeral-storage;
   # this key is unrelated to ephemeralRequest just above. The name spells out
   # "WorkerData" for exactly that reason.
   #
@@ -718,6 +720,18 @@ workers:
   # arrives with the next one provisioned. Empty falls back to the controller's
   # built-in 20Gi.
   ephemeralWorkerDataSize: 20Gi
+  # Ephemeral worker lease (PRD #2006 -> the api's UZI_EPHEMERAL_LEASE). When an ephemeral
+  # worker finishes its bound run it is NOT torn down at once: it stays idle for this long
+  # so a follow-up run from the same owner on the same repository and branch (a rework,
+  # a follow-up) can reuse its warm clone and caches instead of provisioning a new worker.
+  # The lease ends early on a cordon, roll or restart, and the oldest leased worker is
+  # evicted if the per-user ephemeral cap is hit. "0" DISABLES it (torn down at the run's
+  # end, as before). Maximum 2h: a larger value or a malformed duration refuses to boot
+  # the api. Unset or null renders the 2h default.
+  #
+  # This is a DIRECT env entry on the api Deployment, so it OVERRIDES a UZI_EPHEMERAL_LEASE
+  # set through api.config (envFrom): set it here, not there.
+  ephemeralLease: "2h"
   # Where the hosted worker's join-token Secret (worker_token + ca.crt) mounts (issue
   # #1761). Empty keeps the default /run/secrets, and then nothing about the worker pod
   # changes. OpenShift/OKD MUST set it (the render fails otherwise when

@@ -6,6 +6,7 @@
   "hosted_size": "x",
   "docker": true,
   "ephemeral": true,
+  "ephemeral_lease_expires_at": "2020-01-02T03:04:05Z",
   "capabilities": [
     "x"
   ],

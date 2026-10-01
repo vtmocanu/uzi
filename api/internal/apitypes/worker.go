@@ -27,6 +27,11 @@ type WorkerDTO struct {
 	// standing hosted worker. Display-only; the scheduler binds via workers.ephemeral_run_id,
 	// which stays server-internal like hosted_generation.
 	Ephemeral bool `json:"ephemeral"`
+	// EphemeralLeaseExpiresAt (PRD #2006) is when an ephemeral worker's idle lease ends: the
+	// worker finished its bound run and is being held for a same-owner/repo/branch follow-up
+	// until this instant. Set ONLY while the lease is live (lease_since plus the configured
+	// lease is in the future and the worker is not draining); absent otherwise.
+	EphemeralLeaseExpiresAt *time.Time `json:"ephemeral_lease_expires_at,omitempty"`
 	// Capabilities is the worker's server-authoritative capability set (PRD #84 M1):
 	// the Filter-ed union of its self-reported caps and its template-derived caps,
 	// v1 vocabulary {docker, jvm}. Read-only display for the workers UI. Serialized by

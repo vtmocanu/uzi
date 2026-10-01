@@ -2073,6 +2073,10 @@ export interface Worker {
   // reaps it when the run finishes. true marks such a worker; absent/false for a
   // normal hosted or an external worker. Optional so existing literals need no edit.
   ephemeral?: boolean;
+  // PRD #2006: when a finished ephemeral worker is held warm for same-branch follow-up
+  // work, the RFC3339 instant its lease ends. Present only while the lease is live; the
+  // worker is otherwise idle. Absent on every other worker.
+  ephemeral_lease_expires_at?: string;
   // Server-authoritative capability set (PRD #84 M1): the Filter-ed union of the
   // worker's self-reported caps and its template-derived caps, v1 vocabulary
   // {docker, jvm}. Read-only display. Optional so an older response (or a test

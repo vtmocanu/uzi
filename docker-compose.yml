@@ -43,6 +43,8 @@ services:
       # registration defaults on. Defaults match config.go.
       UZI_ALLOWED_EMAIL_DOMAINS: ${UZI_ALLOWED_EMAIL_DOMAINS:-}
       UZI_REGISTRATION_ENABLED: ${UZI_REGISTRATION_ENABLED:-true}
+      # Ephemeral worker lease (PRD #2006). Empty = the 2h default, 0 = disabled, max 2h.
+      UZI_EPHEMERAL_LEASE: ${UZI_EPHEMERAL_LEASE:-}
       # OIDC single sign-on (PRD #45). Without these lines every UZI_OIDC_*/
       # UZI_PASSWORD_LOGIN_ENABLED var in .env is inert — config.Load reads the api
       # container env, which compose must wire in from .env. Setting the issuer (plus
