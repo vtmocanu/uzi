@@ -18,13 +18,16 @@ import (
 // authLimiter.PerUserMiddleware like /api/auth/cli/approve; deny and the metadata read do not.
 func (h *Handler) mountOAuthRoutes(r chi.Router, authLimiter, oauthLimiter *mw.Limiter) {
 	r.Route("/oauth", func(r chi.Router) {
+		// Every /api/oauth response, the limiter's 429 and the router's 404/405 included, is
+		// no-store: nothing here may be cached (tokens, codes, consent state).
+		r.Use(oauthNoStore)
 		r.With(authLimiter.Middleware).Get("/authorize", h.OAuthAuthorize)
 		// POST /token is UNAUTHENTICATED at the router (the client authenticates inside the handler
 		// with HTTP Basic, PRD #1910 D2/D7): oauthLimiter's per-IP Middleware fronts it, so failed
 		// authentication spends the per-IP budget, and the handler draws the per-client budget only
-		// after the client authenticated. oauthTokenNoStore comes first so even the limiter's 429
-		// carries Cache-Control: no-store and Pragma: no-cache.
-		r.With(oauthTokenNoStore, oauthLimiter.Middleware).Post("/token", h.OAuthToken(oauthLimiter))
+		// after the client authenticated. The per-IP refusal is an OAuth-shaped 429
+		// {"error":"temporarily_unavailable"} with Retry-After, like the per-client one.
+		r.With(oauthLimiter.MiddlewareRejecting(oauthRateLimited)).Post("/token", h.OAuthToken(oauthLimiter))
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))
 			r.Get("/requests/{id}", h.OAuthGetRequest)

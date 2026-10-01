@@ -27,8 +27,14 @@ info:
     acts as the user who minted it and never with admin authority.
 servers:
   - url: /api/v1
+# Two alternative ways to authenticate (PRD #1910): a pasted Bearer token, or an OAuth 2.0
+# authorization-code access token, which is the same uzp_ Bearer credential obtained by a user
+# consenting in the browser. The oauth2 requirement is a NEW ALTERNATIVE entry beside
+# bearerAuth, never a scope added to bearerAuth and never a per-operation override (both are
+# breaking changes to oasdiff).
 security:
   - bearerAuth: []
+  - oauth2: []
 paths:
   /whoami:
     get:
@@ -407,6 +413,23 @@ components:
       description: >-
         A product token (uzp_) or a uzi CLI token (uzc_) with user scope. Admin
         read-only tokens (uza_) and browser session cookies are refused.
+    oauth2:
+      type: oauth2
+      description: >-
+        OAuth 2.0 authorization code with PKCE (S256), for a product an admin registered as
+        a confidential client (HTTP Basic client authentication at the token endpoint). The
+        user approves on the uzi consent page; the product receives a one-hour access token
+        (sent as a Bearer token, identical to a product token) and a refresh token. Revoking
+        the connection ends both. The authorization and token endpoints are on the uzi origin
+        under /api/oauth, outside this document's /api/v1 prefix.
+      flows:
+        authorizationCode:
+          authorizationUrl: /api/oauth/authorize
+          tokenUrl: /api/oauth/token
+          refreshUrl: /api/oauth/token
+          scopes:
+            "jobs:run": Create jobs as the user, cancel them and upload their input files.
+            "jobs:read": List and read the user's jobs, their messages, results and files.
   responses:
     Unauthorized:
       description: >-

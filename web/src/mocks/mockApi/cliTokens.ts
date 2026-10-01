@@ -2,6 +2,7 @@ import type { CliAuthRequestMeta, CliToken, CliTokenScope } from "../../lib/api"
 import { ApiError } from "../../lib/apiError";
 import { MOCK_CLI_AUTH_REQUEST_ID, mockCliAuthRequest, mockCliTokens } from "../data";
 import { delay, requireSession } from "./shared";
+import { revokeAllOAuthGrantsOf } from "./oauth";
 import { revokeAllProductTokensOf } from "./productTokens";
 
 // ── CLI tokens + browser-login requests (PRD #64 M6) ─────────────────────────
@@ -85,6 +86,8 @@ export const cliTokensApi = {
     cliTokens = cliTokens.map((t) => (t.user_id === me.id ? { ...t, revoked: true } : t));
     // D8 (PRD #1907): the same call revokes every product token of the caller.
     revokeAllProductTokensOf(me.id);
+    // PRD #1910 D6: and every live OAuth connection (grant) of the caller.
+    revokeAllOAuthGrantsOf(me.id);
     return delay(null);
   },
 

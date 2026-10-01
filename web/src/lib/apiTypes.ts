@@ -1756,6 +1756,23 @@ export interface OAuthRedirect {
   redirect_url: string;
 }
 
+// OAuthConnection is one live OAuth connection (grant) of the caller, from GET
+// /api/me/oauth-connections (apitypes.OAuthConnectionDTO). connected_at is the latest consent,
+// created_at the first one; last_used_at is the later of the refresh token's last use and the
+// latest use of any access token (null if never used); refresh_issued_at is null until the
+// authorization code is exchanged. A connection is listed while it is live, whatever the state of
+// its access tokens. Never carries a token or a hash.
+export interface OAuthConnection {
+  id: string;
+  product_id: string;
+  product_name: string;
+  scopes: ProductTokenScope[];
+  connected_at: string;
+  created_at: string;
+  last_used_at: string | null;
+  refresh_issued_at: string | null;
+}
+
 // ── Agent memory (PRD #90) ────────────────────────────────────────────────
 // A durable per-(user, repo) learning an agent saved on a prior run, read back
 // into a future run as inert, nonce-fenced, advisory context. The webui surfaces

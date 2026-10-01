@@ -74,6 +74,8 @@ type oaOperation struct {
 	OperationID string                `yaml:"operationId"`
 	RequestBody *oaRequestBody        `yaml:"requestBody"`
 	Responses   map[string]oaResponse `yaml:"responses"`
+	// Security is a per-operation override; the document must declare none (PRD #1910).
+	Security []map[string][]string `yaml:"security"`
 }
 
 type oaSpec struct {
@@ -214,8 +216,32 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 	if _, ok := spec.Comps.SecuritySchemes["bearerAuth"]; !ok {
 		t.Error("components.securitySchemes.bearerAuth is missing")
 	}
-	if len(spec.Security) != 1 || spec.Security[0]["bearerAuth"] == nil {
-		t.Errorf("top-level security = %v, want [{bearerAuth: []}]", spec.Security)
+	// PRD #1910: oauth2 is a NEW ALTERNATIVE entry beside bearerAuth (the access token is the
+	// same Bearer credential), never a scope on bearerAuth and never a per-operation override.
+	if len(spec.Security) != 2 || spec.Security[0]["bearerAuth"] == nil || spec.Security[1]["oauth2"] == nil {
+		t.Errorf("top-level security = %v, want [{bearerAuth: []}, {oauth2: []}]", spec.Security)
+	}
+	if scopes := spec.Security[0]["bearerAuth"]; len(scopes) != 0 {
+		t.Errorf("bearerAuth requirement carries scopes %v: that is a breaking change, put them on oauth2", scopes)
+	}
+	oauth2 := spec.Comps.SecuritySchemes["oauth2"]
+	flow, _ := oauth2["flows"].(map[string]any)["authorizationCode"].(map[string]any)
+	if oauth2["type"] != "oauth2" || flow == nil || len(oauth2["flows"].(map[string]any)) != 1 ||
+		flow["authorizationUrl"] != "/api/oauth/authorize" || flow["tokenUrl"] != "/api/oauth/token" || flow["refreshUrl"] != "/api/oauth/token" {
+		t.Errorf("components.securitySchemes.oauth2 = %v, want only the authorizationCode flow with the /api/oauth URLs", oauth2)
+	}
+	var oauthScopes []string
+	for sc := range flow["scopes"].(map[string]any) {
+		oauthScopes = append(oauthScopes, sc)
+	}
+	sort.Strings(oauthScopes)
+	if !slices.Equal(oauthScopes, []string{"jobs:read", "jobs:run"}) {
+		t.Errorf("oauth2 scopes = %v, want jobs:read and jobs:run", oauthScopes)
+	}
+	for key, op := range specOps {
+		if op.Security != nil {
+			t.Errorf("%s overrides security per operation: oasdiff rates that breaking; the global list covers it", key)
+		}
 	}
 	ids := map[string]string{}
 	for key, op := range specOps {

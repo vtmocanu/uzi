@@ -4,9 +4,11 @@
 // admins (a non-admin can mint only a 'user' token). See PRD #64 M6.
 //
 // Revoke all is the ONE panic button on Settings → Access: since PRD #1907 D8 the same
-// endpoint also revokes every product token, so its confirm counts both kinds
-// (productTokenActiveCount, reported by the sibling ProductTokens) and it tells the
-// parent (onRevokedAll) so that list refetches. A count that is unknown (null: a list
+// endpoint also revokes every product token, and since PRD #1910 D6 every live OAuth
+// connection, so its confirm counts all three kinds (productTokenActiveCount, reported by
+// the sibling ProductTokens, and oauthConnectionCount, the parent's count of live GRANTS,
+// not tokens: a connection whose access tokens all expired still counts) and it tells the
+// parent (onRevokedAll) so those lists refetch. A count that is unknown (null: a list
 // failed to load or was cut) keeps the button available and drops that number from the
 // confirm, since hiding the panic button on a load blip is the unsafe failure.
 
@@ -26,9 +28,11 @@ const scopeLabel = (scope: CliTokenScope) => (scope === "admin_ro" ? "admin (rea
 
 export function CliTokens({
   productTokenActiveCount = 0,
+  oauthConnectionCount = 0,
   onRevokedAll,
 }: {
   productTokenActiveCount?: number | null;
+  oauthConnectionCount?: number | null;
   onRevokedAll?: () => void;
 } = {}) {
   const { user } = useAuth();
@@ -141,7 +145,10 @@ export function CliTokens({
   // null when the CLI list could not be read (see the header on unknown counts).
   const activeCount = loadError ? null : tokens.filter((t) => !t.revoked).length;
   const canRevokeAll =
-    activeCount === null || productTokenActiveCount === null || activeCount + productTokenActiveCount > 0;
+    activeCount === null ||
+    productTokenActiveCount === null ||
+    oauthConnectionCount === null ||
+    activeCount + productTokenActiveCount + oauthConnectionCount > 0;
   const loadFailed = data === null && loadError !== "";
 
   return (
@@ -232,7 +239,7 @@ export function CliTokens({
             ref={confirmRef}
             tabIndex={-1}
             role="group"
-            aria-label="Confirm revoking all CLI and product tokens"
+            aria-label="Confirm revoking all CLI tokens, product tokens and connected products"
             aria-describedby="cli-revoke-all-warning"
             onKeyDown={(e) => {
               if (e.key === "Escape") setConfirmingAll(false);
@@ -240,7 +247,7 @@ export function CliTokens({
             className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-warn/40 bg-warn/10 px-3 py-2 outline-hidden"
           >
             <p id="cli-revoke-all-warning" className="text-xs text-warn">
-              Revoke {revokeAllSummary(activeCount, productTokenActiveCount)}? Every{" "}
+              Revoke {revokeAllSummary(activeCount, productTokenActiveCount, oauthConnectionCount)}? Every{" "}
               <code className="rounded bg-raised px-1 py-0.5">uzi</code> CLI, CI job and connected
               product using one stops working until you mint a new token. This cannot be undone.
             </p>
@@ -277,21 +284,24 @@ export function CliTokens({
   );
 }
 
-// "all 2 CLI tokens and 1 product token": both kinds counted, since the one endpoint
-// revokes both (D8). Only the kinds the user actually holds are named; a kind whose count
-// is unknown (null) is named without a number ("every product token").
-function revokeAllSummary(cli: number | null, product: number | null): string {
+// "all 2 CLI tokens, 1 product token and 1 connected product": every kind counted, since the one
+// endpoint revokes all of them (D8, PRD #1910 D6). Only the kinds the user actually holds are
+// named; a kind whose count is unknown (null) is named without a number ("every product token").
+function revokeAllSummary(cli: number | null, product: number | null, connections: number | null): string {
   const n = (count: number, noun: string) => `${count} ${noun}${count === 1 ? "" : "s"}`;
-  if (cli !== null && product !== null) {
-    const parts = [
-      cli > 0 ? n(cli, "CLI token") : "",
-      product > 0 ? n(product, "product token") : "",
-    ].filter(Boolean);
-    return `all ${parts.join(" and ")}`;
+  const join = (parts: string[]) =>
+    parts.length > 1 ? `${parts.slice(0, -1).join(", ")} and ${parts[parts.length - 1]}` : (parts[0] ?? "");
+  const kinds: [number | null, string][] = [
+    [cli, "CLI token"],
+    [product, "product token"],
+    [connections, "connected product"],
+  ];
+  if (kinds.every(([count]) => count !== null)) {
+    return `all ${join(kinds.flatMap(([count, noun]) => (count! > 0 ? [n(count!, noun)] : [])))}`;
   }
-  const part = (count: number | null, noun: string) =>
-    count === null ? `every ${noun}` : count > 0 ? `all ${n(count, noun)}` : "";
-  return [part(cli, "CLI token"), part(product, "product token")].filter(Boolean).join(" and ");
+  return join(
+    kinds.flatMap(([count, noun]) => (count === null ? [`every ${noun}`] : count > 0 ? [`all ${n(count, noun)}`] : [])),
+  );
 }
 
 function Skeletons() {

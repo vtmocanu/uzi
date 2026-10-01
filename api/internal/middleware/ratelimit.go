@@ -92,15 +92,28 @@ func (l *Limiter) Window() time.Duration { return l.window }
 // Middleware limits by (route pattern, client IP). Apply it per-route so each
 // endpoint gets its own budget.
 func (l *Limiter) Middleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.URL.Path + "|" + ClientIP(r, l.trustedProxies)
-		if !l.allow(key) {
-			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
-			httpx.Error(w, http.StatusTooManyRequests, "too many requests")
-			return
-		}
-		next.ServeHTTP(w, r)
-	})
+	return l.MiddlewareRejecting(func(w http.ResponseWriter, _ int) {
+		httpx.Error(w, http.StatusTooManyRequests, "too many requests")
+	})(next)
+}
+
+// MiddlewareRejecting is Middleware with the refusal body chosen by the caller, for routes whose
+// clients expect a protocol-shaped error (the OAuth token endpoint's RFC 6749 JSON). reject is
+// called after Retry-After (the window in seconds) is set; it writes the status and body, and the
+// request goes no further.
+func (l *Limiter) MiddlewareRejecting(reject func(w http.ResponseWriter, retryAfterSeconds int)) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			key := r.URL.Path + "|" + ClientIP(r, l.trustedProxies)
+			if !l.allow(key) {
+				secs := int(l.window.Seconds())
+				w.Header().Set("Retry-After", strconv.Itoa(secs))
+				reject(w, secs)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
 }
 
 // PerUserMiddleware limits by (route pattern, authenticated user id). It MUST

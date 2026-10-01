@@ -229,7 +229,7 @@ describe("CliTokens revoke", () => {
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
     // Does NOT revoke on the first click — it arms a confirmation.
     expect(mockApi.revokeAllCliTokens).not.toHaveBeenCalled();
-    expect(screen.getByRole("group", { name: "Confirm revoking all CLI and product tokens" })).toBeTruthy();
+    expect(screen.getByRole("group", { name: "Confirm revoking all CLI tokens, product tokens and connected products" })).toBeTruthy();
 
     fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
     await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
@@ -261,6 +261,35 @@ describe("CliTokens revoke", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
     expect(screen.getByText(/Revoke all 1 product token\?/)).toBeTruthy();
+  });
+
+  it("offers Revoke all when only a connection is live and names it (PRD #1910 D6)", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [] });
+    render(
+      <MemoryRouter>
+        <CliTokens oauthConnectionCount={1} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke all 1 connected product\?/)).toBeTruthy();
+  });
+
+  it("hides Revoke all with no CLI token, product token or connection", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [] });
+    renderPage();
+    await screen.findByText("No CLI tokens yet");
+    expect(screen.queryByRole("button", { name: "Revoke all" })).toBeNull();
+  });
+
+  it("keeps Revoke all when the connection count is unknown, naming no connection number", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "a" })] });
+    render(
+      <MemoryRouter>
+        <CliTokens oauthConnectionCount={null} />
+      </MemoryRouter>,
+    );
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke all 1 CLI token and every connected product\?/)).toBeTruthy();
   });
 
   it("keeps Revoke all when the product count is unknown, naming no product number", async () => {

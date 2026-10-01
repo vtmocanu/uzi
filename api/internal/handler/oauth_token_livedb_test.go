@@ -910,7 +910,7 @@ func TestOAuthTokenStorageErrorIsNeverACredentialErrorLiveDB(t *testing.T) {
 	for _, step := range []struct{ name, sql string }{
 		{"code lookup", "WHERE code_hash = $1"},
 		{"grant lock", "FROM oauth_grants WHERE id = $1 FOR UPDATE"},
-		{"request lock", "FROM oauth_authorize_requests WHERE id = $1 FOR UPDATE"},
+		{"request re-read", "FROM oauth_authorize_requests WHERE id = $1"},
 		{"product re-read", "FROM products WHERE id = $1"},
 		{"user re-read", "FROM users WHERE id = $1"},
 		{"live token count", "min(expires_at)"},
@@ -988,4 +988,138 @@ func TestOAuthTokenPerClientBudgetIgnoresFailedAuthenticationLiveDB(t *testing.T
 		t.Fatalf("fourth failed request from one address = %d, want 429 from the per-IP limiter", last.Code)
 	}
 	assertOAuthNoStore(t, last)
+}
+
+// TestOAuthTokenReplayAfterCodeExpiryStillRevokesLiveDB (D6): a fully bound replay of a redeemed
+// code revokes the grant even after the code's 60 s expired (the row is kept for ten more minutes
+// precisely so the replay stays detectable).
+func TestOAuthTokenReplayAfterCodeExpiryStillRevokesLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	code, reqID := e.approvedCode(t)
+	tok := decodeOAuthToken(t, e.exchange(t, code))
+	g := e.liveGrant(t)
+	cliMustExec(t, e.pool, `UPDATE oauth_authorize_requests SET code_expires_at = now() - interval '5 minutes' WHERE id = $1`, reqID)
+
+	requireOAuthError(t, e.exchange(t, code), http.StatusBadRequest, "invalid_grant")
+	if rg := e.grantByID(t, g.ID); !rg.RevokedAt.Valid || rg.RefreshTokenHash != nil {
+		t.Fatalf("grant after an expired-code replay = %+v, want revoked", rg)
+	}
+	e.wantWhoami(t, "the replayed grant's access token", tok.AccessToken, http.StatusUnauthorized)
+}
+
+// TestOAuthTokenReplayTakesNoRequestRowLockLiveDB (D8): the replay arm locks the grant and its
+// tokens and never takes a lock on the code's request row first. A foreign transaction holding that
+// row FOR UPDATE therefore does not stall the replay revoke.
+func TestOAuthTokenReplayTakesNoRequestRowLockLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	code, reqID := e.approvedCode(t)
+	decodeOAuthToken(t, e.exchange(t, code))
+	g := e.liveGrant(t)
+	ctx := context.Background()
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM oauth_authorize_requests WHERE id = $1 FOR UPDATE`, reqID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- e.exchange(t, code) }()
+	select {
+	case rec := <-done:
+		requireOAuthError(t, rec, http.StatusBadRequest, "invalid_grant")
+	case <-time.After(10 * time.Second):
+		t.Fatal("the replay blocked on the request row: it must take no lock on it before the grant's tokens")
+	}
+	if rg := e.grantByID(t, g.ID); !rg.RevokedAt.Valid {
+		t.Fatal("the replay did not revoke the grant")
+	}
+}
+
+// TestOAuthTokenReplayStorageErrorIsA503LiveDB (D7): a storage error on any step of the replay
+// revoke, or on its commit, answers 503 temporarily_unavailable (never invalid_grant), and rolls
+// the revoke back: the grant stays live. A healthy replay then revokes it.
+func TestOAuthTokenReplayStorageErrorIsA503LiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	code, _ := e.approvedCode(t)
+	tok := decodeOAuthToken(t, e.exchange(t, code))
+	g := e.liveGrant(t)
+	pool := e.pool
+	t.Cleanup(func() { e.h.oauthBeginTx = nil })
+
+	for _, step := range []struct {
+		name string
+		tx   func(pgx.Tx) pgx.Tx
+	}{
+		{"revoke the grant's tokens", func(tx pgx.Tx) pgx.Tx {
+			return oauthFailTx{Tx: tx, failOn: "UPDATE product_tokens SET revoked = true WHERE grant_id"}
+		}},
+		{"supersede the grant's codes", func(tx pgx.Tx) pgx.Tx { return oauthFailTx{Tx: tx, failOn: "SET status = 'superseded'"} }},
+		{"revoke the grant row", func(tx pgx.Tx) pgx.Tx { return oauthFailTx{Tx: tx, failOn: "SET revoked_at = now()"} }},
+		{"commit", func(tx pgx.Tx) pgx.Tx { return oauthFailTx{Tx: tx, failCommit: true} }},
+	} {
+		t.Run(step.name, func(t *testing.T) {
+			e.h.oauthBeginTx = func(ctx context.Context) (pgx.Tx, error) {
+				tx, err := pool.Begin(ctx)
+				return step.tx(tx), err
+			}
+			rec := e.exchange(t, code)
+			e.h.oauthBeginTx = nil
+			requireOAuthError(t, rec, http.StatusServiceUnavailable, "temporarily_unavailable")
+			if rec.Header().Get("Retry-After") == "" {
+				t.Fatal("503 without Retry-After")
+			}
+			if rg := e.grantByID(t, g.ID); rg.RevokedAt.Valid || rg.RefreshTokenHash == nil {
+				t.Fatalf("a failed replay revoke changed the grant: %+v", rg)
+			}
+			e.wantWhoami(t, "the access token after a failed replay revoke", tok.AccessToken, http.StatusOK)
+		})
+	}
+	requireOAuthError(t, e.exchange(t, code), http.StatusBadRequest, "invalid_grant")
+	if rg := e.grantByID(t, g.ID); !rg.RevokedAt.Valid {
+		t.Fatal("the healthy replay did not revoke the grant")
+	}
+}
+
+// TestOAuthTokenAccessTokenCarriesOnlyTheGrantsScopesLiveDB: a grant approved with only jobs:read
+// yields an access token (and a response) with only jobs:read.
+func TestOAuthTokenAccessTokenCarriesOnlyTheGrantsScopesLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	tok := e.connectAs(t, e.jwt, func(v url.Values) { v.Set("scope", "jobs:read") })
+	if tok.Scope != "jobs:read" {
+		t.Fatalf("response scope = %q, want jobs:read", tok.Scope)
+	}
+	w := v1DecodeWhoami(t, e.whoami(tok.AccessToken).body)
+	if !slices.Equal(w.Scopes, []string{"jobs:read"}) {
+		t.Fatalf("whoami scopes = %v, want [jobs:read]", w.Scopes)
+	}
+	var scopes []string
+	if err := e.pool.QueryRow(context.Background(), `SELECT scopes FROM product_tokens WHERE token_hash = $1`, producttoken.Hash(tok.AccessToken)).Scan(&scopes); err != nil || !slices.Equal(scopes, []string{"jobs:read"}) {
+		t.Fatalf("stored scopes = %v, %v; want [jobs:read]", scopes, err)
+	}
+}
+
+// TestOAuthTokenGrantOfAnotherProductIsInvalidGrantLiveDB: the belt check at redemption. A code
+// whose grant belongs to a different product than its request is refused and consumes nothing.
+func TestOAuthTokenGrantOfAnotherProductIsInvalidGrantLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	code, reqID := e.approvedCode(t)
+	other, _ := e.seedClient2(t)
+	cliMustExec(t, e.pool, `UPDATE oauth_grants SET product_id = $1 WHERE user_id = $2 AND revoked_at IS NULL`, other, e.user)
+	requireOAuthError(t, e.exchange(t, code), http.StatusBadRequest, "invalid_grant")
+	e.assertCodeUnconsumed(t, reqID)
+}
+
+// TestOAuthTokenNonClientProductIsInvalidClientLiveDB: a product without a secret (or not a
+// client) is the same 401 invalid_client as a wrong secret; the dummy hash stands in for the
+// missing one so the request does the same hashing work.
+func TestOAuthTokenNonClientProductIsInvalidClientLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	noSecret := v1SeedProduct(t, e.h.q, e.user) // a product with no OAuth client registration at all
+	rec := e.post(t, e.form("x"), func(r *http.Request) { r.SetBasicAuth(noSecret.String(), "anything") })
+	requireOAuthError(t, rec, http.StatusUnauthorized, "invalid_client")
+	if rec.Header().Get("WWW-Authenticate") == "" {
+		t.Fatal("401 without WWW-Authenticate")
+	}
 }

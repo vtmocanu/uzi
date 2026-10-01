@@ -17,6 +17,8 @@ A **product token** (`uzp_…`) lets an external product call uzi **as you**. Yo
 
 The `uzi` CLI cannot use a product token: it needs a CLI token (`uzc_` or `uza_`).
 
+A product an admin registered as an OAuth client can also be [connected](./connect-a-product.md) by approving on a uzi page instead of pasting a token. Its tokens are not listed here and do not count towards the limit below.
+
 ## Mint a token
 
 1. Open **Settings → Access → Product tokens**.
@@ -42,6 +44,7 @@ A token stops working on its **next request** when any of these happens:
 | Revoke one token in **Settings → Access** | you |
 | **Revoke all** in **Settings → Access** (revokes your CLI tokens **and** product tokens in one step) | you |
 | Revoke one product token on **Admin → Products** | an admin |
+| Revoke one access token of a [connected product](./connect-a-product.md) (this revokes that whole connection) | you or an admin |
 | The product is disabled or deleted | an admin |
 | Your account is deactivated | an admin |
 | The token expires | automatic |

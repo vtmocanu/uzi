@@ -4,7 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { MemoryRouter } from "react-router-dom";
 import { ProductTokens } from "./ProductTokens";
 import { AccessSettings } from "../pages/AccessSettings";
-import { api, type MintableProduct, type ProductToken, type User } from "../lib/api";
+import { api, type MintableProduct, type OAuthConnection, type ProductToken, type User } from "../lib/api";
 import { ApiError } from "../lib/apiError";
 import { useAuth } from "../auth/AuthContext";
 
@@ -17,6 +17,7 @@ vi.mock("../lib/api", async (importActual) => {
       listMintableProducts: vi.fn(),
       createProductToken: vi.fn(),
       revokeProductToken: vi.fn(),
+      listOAuthConnections: vi.fn(),
       listCliTokens: vi.fn(),
       createCliToken: vi.fn(),
       revokeCliToken: vi.fn(),
@@ -83,6 +84,7 @@ beforeEach(() => {
   mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [] });
   mockApi.listMintableProducts.mockResolvedValue({ products: PRODUCTS });
   mockApi.listCliTokens.mockResolvedValue({ tokens: [] });
+  mockApi.listOAuthConnections.mockResolvedValue({ connections: [] });
 });
 
 afterEach(() => {
@@ -444,8 +446,77 @@ describe("Settings → Access: Revoke all when the product count is unknown (rev
       </MemoryRouter>,
     );
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
-    const confirm = screen.getByRole("group", { name: "Confirm revoking all CLI and product tokens" });
+    const confirm = screen.getByRole("group", { name: "Confirm revoking all CLI tokens, product tokens and connected products" });
     expect(within(confirm).getByText(/^Revoke every product token\?/)).toBeTruthy();
     expect(within(confirm).queryByText(/\d+ product token/)).toBeNull();
+  });
+});
+
+function aConnection(over: Partial<OAuthConnection> = {}): OAuthConnection {
+  return {
+    id: "g1",
+    product_id: "prod-a",
+    product_name: "Helpdesk assistant",
+    scopes: ["jobs:run"],
+    connected_at: daysAgo(3),
+    created_at: daysAgo(30),
+    last_used_at: null,
+    refresh_issued_at: daysAgo(3),
+    ...over,
+  };
+}
+
+describe("Settings → Access: Revoke all counts live OAuth connections (PRD #1910 D6)", () => {
+  const renderPage = () =>
+    render(
+      <MemoryRouter>
+        <AccessSettings />
+      </MemoryRouter>,
+    );
+
+  it("offers Revoke all when only a connection is live (no CLI or product token)", async () => {
+    mockApi.listOAuthConnections.mockResolvedValue({ connections: [aConnection()] });
+    mockApi.revokeAllCliTokens.mockResolvedValue(null);
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke all 1 connected product\?/)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Revoke all anyway" }));
+    await waitFor(() => expect(mockApi.revokeAllCliTokens).toHaveBeenCalledTimes(1));
+    // The connection list is refetched after the panic button.
+    await waitFor(() => expect(mockApi.listOAuthConnections).toHaveBeenCalledTimes(2));
+  });
+
+  it("counts connections beside CLI and product tokens in the summary, from grants not tokens", async () => {
+    mockApi.listCliTokens.mockResolvedValue({
+      tokens: [{ id: "c1", name: "laptop", token_prefix: "uzc_a1b2", scope: "user", revoked: false, created_at: daysAgo(2), last_used_at: null, last_used_ip: null, expires_at: null }],
+    });
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken({ id: "p1" })] });
+    // Two live connections; neither has any access token left (the count comes from grants).
+    mockApi.listOAuthConnections.mockResolvedValue({
+      connections: [aConnection({ id: "g1" }), aConnection({ id: "g2", product_id: "prod-b", product_name: "Metrics export" })],
+    });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(
+      screen.getByText(/^Revoke all 1 CLI token, 1 product token and 2 connected products\?/),
+    ).toBeTruthy();
+  });
+
+  it("hides Revoke all when nothing at all is live", async () => {
+    renderPage();
+    await waitFor(() => expect(mockApi.listOAuthConnections).toHaveBeenCalled());
+    await waitFor(() => expect(mockApi.listCliTokens).toHaveBeenCalled());
+    expect(screen.queryByRole("button", { name: "Revoke all" })).toBeNull();
+  });
+
+  it("keeps Revoke all and names every connected product when the connection list fails to load", async () => {
+    mockApi.listOAuthConnections.mockRejectedValue(new ApiError(500, "database unavailable"));
+    mockApi.listProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken({ id: "p1" })] });
+    renderPage();
+
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/^Revoke all 1 product token and every connected product\?/)).toBeTruthy();
   });
 });

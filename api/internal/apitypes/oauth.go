@@ -50,3 +50,22 @@ type OAuthErrorResponse struct {
 	Error            string `json:"error"`
 	ErrorDescription string `json:"error_description,omitempty"`
 }
+
+// OAuthConnectionDTO is one live OAuth connection (grant) of the caller, from GET
+// /api/me/oauth-connections (PRD #1910 M3): the product, the approved scopes and the connection's
+// timestamps. It never carries a token, a hash or a refresh-token prefix. ConnectedAt is the
+// latest consent (the 90-day refresh expiry counts from it), CreatedAt the first consent.
+// LastUsedAt is the later of the refresh token's last use and the latest use of any of the
+// grant's access tokens, null when none was ever used; RefreshIssuedAt is null until the
+// authorization code is exchanged. A connection is listed while it is live, whatever the state of
+// its access tokens. Scopes is never null on the wire.
+type OAuthConnectionDTO struct {
+	ID              string     `json:"id"`
+	ProductID       string     `json:"product_id"`
+	ProductName     string     `json:"product_name"`
+	Scopes          []string   `json:"scopes"`
+	ConnectedAt     time.Time  `json:"connected_at"`
+	CreatedAt       time.Time  `json:"created_at"`
+	LastUsedAt      *time.Time `json:"last_used_at"`
+	RefreshIssuedAt *time.Time `json:"refresh_issued_at"`
+}

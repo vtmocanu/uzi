@@ -26,8 +26,9 @@ import (
 
 // The token half of uzi's OAuth authorization server (PRD #1910 M3, D5 to D8): POST
 // /api/oauth/token with grant_type=authorization_code. Every response, success or error, carries
-// Cache-Control: no-store and Pragma: no-cache (oauthTokenNoStore sets them in front of the rate
-// limiter, so its 429 has them too).
+// Cache-Control: no-store and Pragma: no-cache: oauthNoStore wraps the whole /api/oauth route group
+// (mountOAuthRoutes), in front of the rate limiter and of the router's own 404 and 405, so the
+// limiter's 429 and a GET on the token path have them too.
 
 const (
 	// oauthTokenBodyCap is the largest form body the endpoint reads (PRD #1910 D7).
@@ -45,12 +46,12 @@ const (
 	oauthGrantRowName = "OAuth access token"
 )
 
-// oauthDummySecretHash is compared against when the client is unknown, so an unknown client_id
-// costs the same constant-time compare as a wrong secret.
+// oauthDummySecretHash is compared against when the client is unknown or has no secret, so
+// neither costs less than a wrong secret: SecretMatches returns early on an empty stored hash.
 var oauthDummySecretHash = func() []byte { s := sha256.Sum256([]byte("uzi oauth unknown client")); return s[:] }()
 
-// oauthTokenNoStore sets the token endpoint's cache headers before anything else runs.
-func oauthTokenNoStore(next http.Handler) http.Handler {
+// oauthNoStore sets the OAuth endpoints' cache headers before anything else runs.
+func oauthNoStore(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("Pragma", "no-cache")
@@ -77,6 +78,13 @@ func writeOAuthTokenError(w http.ResponseWriter, f *oauthTokenFailure, descripti
 		w.Header().Set("WWW-Authenticate", `Basic realm="uzi"`)
 	}
 	httpx.JSON(w, f.status, apitypes.OAuthErrorResponse{Error: f.code, ErrorDescription: description})
+}
+
+// oauthRateLimited is the per-IP limiter's refusal on the token endpoint: the OAuth-shaped 429
+// (an extension, like the per-client and ten-token ones) instead of the generic JSON error, so a
+// product's client library sees a protocol error. Retry-After is already set by the limiter.
+func oauthRateLimited(w http.ResponseWriter, _ int) {
+	httpx.JSON(w, http.StatusTooManyRequests, apitypes.OAuthErrorResponse{Error: oauthsrv.ErrTemporarilyUnavailable})
 }
 
 func oauthInvalidRequest(w http.ResponseWriter, description string) {
@@ -172,14 +180,15 @@ func (h *Handler) OAuthToken(limiter *mw.Limiter) http.HandlerFunc {
 			oauthUnavailable(w)
 			return
 		}
-		storedHash := oauthDummySecretHash
-		if known {
-			storedHash = product.ClientSecretHash
+		// Always hash and compare in constant time, so an unknown client, a product without a
+		// secret and a wrong secret are the same answer at the same cost: the dummy hash stands in
+		// for a missing one, and its comparison result never authenticates anyone.
+		storedHash, hasSecret := oauthDummySecretHash, false
+		if known && len(product.ClientSecretHash) > 0 {
+			storedHash, hasSecret = product.ClientSecretHash, true
 		}
-		// Always run the constant-time compare, so an unknown client, a non-client product and a
-		// wrong secret are the same answer at the same cost.
 		secretOK := oauthsrv.SecretMatches(basicSecret, storedHash)
-		if !known || !secretOK || !oauthClientFromProduct(product).IsClient() {
+		if !known || !hasSecret || !secretOK || !oauthClientFromProduct(product).IsClient() {
 			oauthInvalidClient(w)
 			return
 		}
@@ -228,9 +237,13 @@ func (h *Handler) beginOAuthTx(ctx context.Context) (pgx.Tx, error) {
 	return h.pool.Begin(ctx)
 }
 
-// redeemOAuthCode redeems an authorization code in ONE transaction, in D8 lock order: the code's
-// request is found by its hash without a lock, then the grant is locked FOR UPDATE, then the
-// request row is locked and re-read under it. Every check runs BEFORE the conditional UPDATE that
+// redeemOAuthCode redeems an authorization code in ONE transaction, in D8 lock order (grant, then
+// its tokens, then its requests): the code's request is found by its hash without a lock, then the
+// grant is locked FOR UPDATE, then the request is re-read under that lock WITHOUT a row lock (the
+// grant lock serializes every writer of a grant's requests, and the redeem UPDATE below is itself
+// conditional on status). The request row is first locked by that UPDATE, after the access token
+// is inserted, and by revokeGrantLocked on the replay arm, after the grant's tokens. Every check
+// runs BEFORE the conditional UPDATE that
 // marks the code redeemed, so a wrong redirect URI, a wrong verifier, an expired or superseded
 // code, a revoked grant, a client or user that no longer qualifies, or a grant at its
 // ten-live-token bound consumes nothing: the transaction rolls back and the same code can be
@@ -270,7 +283,7 @@ func (h *Handler) redeemOAuthCode(ctx context.Context, clientID uuid.UUID, form 
 	if err != nil {
 		return nil, nil, err
 	}
-	row, err := q.LockOAuthAuthorizeRequest(ctx, found.ID)
+	row, err := q.GetOAuthAuthorizeRequest(ctx, found.ID)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, errOAuthInvalidGrant, nil
 	}
@@ -278,8 +291,9 @@ func (h *Handler) redeemOAuthCode(ctx context.Context, clientID uuid.UUID, form 
 		return nil, nil, err
 	}
 
-	// Bindings: the code belongs to this client, this exact redirect URI and this PKCE verifier.
-	if row.ProductID != clientID || form.RedirectURI == "" || form.RedirectURI != row.RedirectUri ||
+	// Bindings: the code belongs to this client, this exact redirect URI and this PKCE verifier,
+	// and its grant is the client's own (a belt: the grant is created for the request's product).
+	if row.ProductID != clientID || grant.ProductID != row.ProductID || form.RedirectURI == "" || form.RedirectURI != row.RedirectUri ||
 		!oauthsrv.VerifierMatchesS256(form.CodeVerifier, row.CodeChallenge) {
 		return nil, errOAuthInvalidGrant, nil
 	}
@@ -342,12 +356,9 @@ func (h *Handler) redeemOAuthCode(ctx context.Context, clientID uuid.UUID, form 
 		return nil, &oauthTokenFailure{status: http.StatusTooManyRequests, code: oauthsrv.ErrTemporarilyUnavailable, retryAfter: wait}, nil
 	}
 
-	// Every check passed: redeem, mint, issue the refresh token, commit.
-	if _, err := q.RedeemOAuthAuthorizeRequest(ctx, row.ID); errors.Is(err, pgx.ErrNoRows) {
-		return nil, errOAuthInvalidGrant, nil
-	} else if err != nil {
-		return nil, nil, err
-	}
+	// Every check passed: mint, issue the refresh token, redeem, commit. The redeem UPDATE comes
+	// last so the request row is locked after the grant and its tokens (D8); a lost race on it
+	// rolls the whole transaction back, minting nothing.
 	access, accessHash, accessPrefix, err := producttoken.Generate()
 	if err != nil {
 		return nil, nil, err
@@ -377,6 +388,11 @@ func (h *Handler) redeemOAuthCode(ctx context.Context, clientID uuid.UUID, form 
 	}); err != nil {
 		return nil, nil, err
 	}
+	if _, err := q.RedeemOAuthAuthorizeRequest(ctx, row.ID); errors.Is(err, pgx.ErrNoRows) {
+		return nil, errOAuthInvalidGrant, nil
+	} else if err != nil {
+		return nil, nil, err
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, nil, err
 	}
@@ -393,9 +409,11 @@ func (h *Handler) redeemOAuthCode(ctx context.Context, clientID uuid.UUID, form 
 // is set revoked (expired or not, so the ListRevokedProductJobs sweep cancels the jobs it created),
 // its unredeemed codes are superseded, and the grant itself gets revoked_at with its refresh token
 // cleared. It REQUIRES the grant row to be locked FOR UPDATE already by the caller's transaction
-// (D8): the lock order is grant, then its product_tokens, then its request rows, so every revoke
-// path (replay here; the user, admin, revoke-all and RFC 7009 paths of later milestones) calls
-// this and none takes a token or request lock before the grant's.
+// (D8), and takes the rest in the D8 order: the grant's product_tokens rows, then its
+// oauth_authorize_requests rows, then the grant row's own UPDATE (already locked). Every revoke
+// path calls this (the code replay here, the owner's and the admin's revoke of one grant token and
+// Revoke all, and RFC 7009 revoke in a later milestone), and none takes a token or request lock
+// before its grant's.
 func revokeGrantLocked(ctx context.Context, q *store.Queries, grantID uuid.UUID) error {
 	if _, err := q.RevokeOAuthGrantProductTokens(ctx, pgtype.UUID{Bytes: grantID, Valid: true}); err != nil {
 		return err
@@ -405,4 +423,20 @@ func revokeGrantLocked(ctx context.Context, q *store.Queries, grantID uuid.UUID)
 	}
 	_, err := q.RevokeOAuthGrantRow(ctx, grantID)
 	return err
+}
+
+// revokeGrantOfTokenTx is the D6 revoke of the grant behind one product token, for the owner's and
+// the admin's revoke-by-id routes: inside the caller's transaction it locks the grant FOR UPDATE
+// (D8), refuses with pgx.ErrNoRows when the grant is gone, already revoked (a concurrent revoke won,
+// so the token is revoked and the id is a 404, like any revoked id) or not the owner's when owner
+// is non-nil, then runs revokeGrantLocked.
+func revokeGrantOfTokenTx(ctx context.Context, q *store.Queries, grantID uuid.UUID, owner *uuid.UUID) error {
+	grant, err := q.LockOAuthGrant(ctx, grantID)
+	if err != nil {
+		return err
+	}
+	if grant.RevokedAt.Valid || (owner != nil && grant.UserID != *owner) {
+		return pgx.ErrNoRows
+	}
+	return revokeGrantLocked(ctx, q, grant.ID)
 }

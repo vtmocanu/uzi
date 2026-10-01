@@ -365,6 +365,11 @@ func (h *Handler) MintProductToken(w http.ResponseWriter, r *http.Request) {
 
 // RevokeMyProductToken revokes one of the caller's product tokens. Owner-scoped: a
 // foreign, unknown or already-revoked id is a 404, never a cross-user revoke.
+//
+// A MANUAL token (grant_id NULL) is revoked alone. An OAuth access token (grant_id set) belongs to
+// a connection: grant tokens are no longer listed on this route's page, but the id stays reachable,
+// and revoking one revokes its whole grant (PRD #1910 D6) in one transaction, taking the grant lock
+// first (D8), because revoking just that token would let the product refresh a new one.
 func (h *Handler) RevokeMyProductToken(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -373,6 +378,32 @@ func (h *Handler) RevokeMyProductToken(w http.ResponseWriter, r *http.Request) {
 	}
 	id, ok := httpx.PathUUID(w, r, "id", "token")
 	if !ok {
+		return
+	}
+	grantID, err := h.q.GetOwnProductTokenGrantID(r.Context(), store.GetOwnProductTokenGrantIDParams{ID: id, UserID: user.ID})
+	if errors.Is(err, pgx.ErrNoRows) {
+		httpx.Error(w, http.StatusNotFound, "token not found")
+		return
+	}
+	if err != nil {
+		slog.Error("revoke product token", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if grantID.Valid {
+		owner := user.ID
+		err := h.inTx(r.Context(), func(q *store.Queries) error {
+			return revokeGrantOfTokenTx(r.Context(), q, grantID.Bytes, &owner)
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			httpx.Error(w, http.StatusNotFound, "token not found")
+		case err != nil:
+			slog.Error("revoke product token's grant", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		default:
+			w.WriteHeader(http.StatusNoContent)
+		}
 		return
 	}
 	n, err := h.q.RevokeProductToken(r.Context(), store.RevokeProductTokenParams{ID: id, UserID: user.ID})

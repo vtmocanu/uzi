@@ -1,9 +1,10 @@
-import type { OAuthAuthorizeRequest, OAuthRedirect } from "../../lib/api";
+import type { OAuthAuthorizeRequest, OAuthConnection, OAuthRedirect } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import {
   MOCK_OAUTH_APPROVE_URL,
   MOCK_OAUTH_DENY_URL,
   MOCK_OAUTH_REQUEST_ID,
+  mockOAuthConnections,
   mockOAuthRequest,
 } from "../data";
 import { delay, requireSession } from "./shared";
@@ -23,7 +24,27 @@ function pendingRequest(id: string): OAuthAuthorizeRequest {
   return req;
 }
 
+// ── OAuth connections (PRD #1910 M3) ─────────────────────────────────────────
+// Live grants, owner-scoped like `WHERE user_id = $1 AND revoked_at IS NULL`; a revoked grant is
+// dropped from the list whatever the state of its tokens (the mock keeps no access tokens).
+let oauthConnections = mockOAuthConnections.map((c) => ({ ...c, scopes: [...c.scopes] }));
+
+// Revoke all (POST /me/cli-tokens/revoke-all) revokes every live grant of the caller in the
+// same transaction as their CLI and product tokens (D6); the mock mirrors that.
+export function revokeAllOAuthGrantsOf(userId: string): void {
+  oauthConnections = oauthConnections.filter((c) => c.user_id !== userId);
+}
+
+const stripOwner = ({ user_id: _user_id, ...c }: (typeof oauthConnections)[number]): OAuthConnection => ({
+  ...c,
+  scopes: [...c.scopes],
+});
+
 export const oauthApi = {
+  listOAuthConnections: async (): Promise<{ connections: OAuthConnection[] }> => {
+    const me = requireSession();
+    return delay({ connections: oauthConnections.filter((c) => c.user_id === me.id).map(stripOwner) });
+  },
   getOAuthRequest: async (id: string): Promise<OAuthAuthorizeRequest> => {
     const req = pendingRequest(id);
     return delay({ ...req, scopes: [...req.scopes] });

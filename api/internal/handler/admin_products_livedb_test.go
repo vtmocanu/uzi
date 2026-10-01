@@ -512,7 +512,7 @@ func TestAdminListProductTokensTruncatedLiveDB(t *testing.T) {
 		// The table is shared, so the expectation is derived from its size; -p 1 keeps
 		// other packages from writing between the count and the request.
 		var total int64
-		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM product_tokens`).Scan(&total); err != nil {
+		if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM product_tokens WHERE grant_id IS NULL`).Scan(&total); err != nil {
 			t.Fatalf("count: %v", err)
 		}
 		_, rows, truncated := apListProductTokens(t, routes, jwt)

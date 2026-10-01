@@ -100,6 +100,15 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.Delete("/{id}", h.RevokeMyProductToken)
 	})
 
+	// OAuth connections (PRD #1910 M3), the user's live grants to connected products. Cookie-only
+	// like /me/product-tokens above, for the same reason (never RequireUser: a stolen uzc_ must not
+	// read or later manage connections). The list is a plain read like the product-token list, so
+	// no limiter; the revoke write of M5 will join this group.
+	r.Route("/me/oauth-connections", func(r chi.Router) {
+		r.Use(mw.RequireAuth(h.q, h.cfg))
+		r.Get("/", h.ListMyOAuthConnections)
+	})
+
 	// Agent memory (PRD #90 M6): the owner's view + purge of their cross-run
 	// memory. RequireUser (session OR a user-scoped CLI token), so `uzi memory
 	// list/rm` works headlessly — the read/delete are the owner's own authority,

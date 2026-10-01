@@ -442,6 +442,8 @@ var wantRouteMounts = []routeMount{
 	// PRD #1907 M5: the caller's own product-token list and the mint picker, cookie-only
 	// metadata reads with no forge call → noLimiter, like the CLI-token list above.
 	{"GET", "/api/me/product-tokens/", noLimiter},
+	// PRD #1910 M3: the caller's live OAuth connections, a cookie-only plain read like the product-token list.
+	{"GET", "/api/me/oauth-connections/", noLimiter},
 	{"GET", "/api/me/product-tokens/products", noLimiter},
 	{"GET", "/api/me/judge/category-stats", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},
@@ -1304,6 +1306,14 @@ func TestOAuthTokenIsBehindThePerIPOAuthLimiter(t *testing.T) {
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("request %d from the same address = %d, want 429 from oauthLimiter", budget+1, rec.Code)
 	}
+	// The refusal is OAuth-shaped (RFC 6749 section 5.2 JSON), not the generic limiter body, and tells
+	// the product when to retry.
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"error":"temporarily_unavailable"}` {
+		t.Fatalf("the limiter's 429 body = %q, want the OAuth-shaped temporarily_unavailable", body)
+	}
+	if ra := rec.Header().Get("Retry-After"); ra == "" {
+		t.Fatal("the limiter's 429 has no Retry-After")
+	}
 	if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
 		t.Fatalf("the limiter's 429 lacks the no-store headers: %v", rec.Header())
 	}
@@ -1706,6 +1716,25 @@ func TestEachLimiterIsBuiltFromItsOwnConfigField(t *testing.T) {
 			t.Errorf("main builds %s from cfg.%s, but limiterConfigFields declares cfg.%s — "+
 				"the routes that mount %s would run on the wrong budget",
 				name, field, want, name)
+		}
+	}
+}
+
+// TestOAuthRoutesAreNoStoreOnEveryMethod pins PRD #1910 D7: Cache-Control: no-store and Pragma:
+// no-cache come from middleware on the whole /api/oauth route group, so a GET (405) or any other
+// method on the token path carries them as well as the POST.
+func TestOAuthRoutesAreNoStoreOnEveryMethod(t *testing.T) {
+	limiters := newProbeLimiters()
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+	for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete, http.MethodPost} {
+		req := httptest.NewRequest(method, "/api/oauth/token", nil)
+		req.RemoteAddr = "192.0.2.77:4000"
+		rec := httptest.NewRecorder()
+		router.ServeHTTP(rec, req)
+		if rec.Header().Get("Cache-Control") != "no-store" || rec.Header().Get("Pragma") != "no-cache" {
+			t.Errorf("%s /api/oauth/token = %d with headers %v, want no-store and no-cache", method, rec.Code, rec.Header())
 		}
 	}
 }

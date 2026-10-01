@@ -33,11 +33,13 @@ const countActiveProductTokensForProduct = `-- name: CountActiveProductTokensFor
 SELECT count(*)
   FROM product_tokens
  WHERE product_id = $1
+   AND grant_id IS NULL
    AND NOT revoked
    AND (expires_at IS NULL OR expires_at > now())
 `
 
-// Active (not revoked, not expired) tokens of one product, across all users.
+// Active (not revoked, not expired) MANUAL tokens of one product, across all users. OAuth grant
+// access tokens (grant_id set) are excluded: connections are counted from grants (PRD #1910 D5).
 func (q *Queries) CountActiveProductTokensForProduct(ctx context.Context, productID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveProductTokensForProduct, productID)
 	var count int64
@@ -50,6 +52,7 @@ SELECT count(*)
   FROM product_tokens
  WHERE user_id = $1
    AND product_id = $2
+   AND grant_id IS NULL
    AND NOT revoked
    AND (expires_at IS NULL OR expires_at > now())
 `
@@ -61,7 +64,9 @@ type CountActiveProductTokensForUserProductParams struct {
 
 // The D15 cap count: tokens of one user for one product that are not revoked and not
 // expired (the NULL trap again: a never-expiring token IS active). Run under
-// LockProductTokenMint, in the minting transaction.
+// LockProductTokenMint, in the minting transaction. Access tokens of an OAuth grant
+// (grant_id set) are not manual tokens and never count against the cap (PRD #1910 D5): their
+// own bound is ten live tokens per grant.
 func (q *Queries) CountActiveProductTokensForUserProduct(ctx context.Context, arg CountActiveProductTokensForUserProductParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countActiveProductTokensForUserProduct, arg.UserID, arg.ProductID)
 	var count int64
@@ -348,6 +353,7 @@ SELECT t.id,
   FROM product_tokens t
   JOIN users u ON u.id = t.user_id
   JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
@@ -370,6 +376,7 @@ type ListAllProductTokensForAdminRow struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+// Manual tokens only (grant_id IS NULL), as ListProductTokensForUser (PRD #1910 D5).
 // The factory-wide product-credential inventory (admin), sibling of
 // ListAllCLITokensForAdmin, and it carries that query's security rule verbatim:
 // COLUMNS ARE PROJECTED EXPLICITLY, AND THAT IS A SECURITY BOUNDARY, NOT A STYLE
@@ -491,6 +498,7 @@ SELECT t.id,
   FROM product_tokens t
   JOIN products p ON p.id = t.product_id
  WHERE t.user_id = $1
+   AND t.grant_id IS NULL
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
@@ -516,6 +524,8 @@ type ListProductTokensForUserRow struct {
 	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
 }
 
+// Manual tokens only (grant_id IS NULL): an OAuth connection's hourly access tokens would bury
+// them, and their lifecycle is the connection's (PRD #1910 D5).
 // The per-user product-token list (Settings > Access), metadata only: the value is never
 // stored and the hash is not projected. Joined for the product name. Includes tokens
 // of disabled or soft-deleted products (they still exist, and the user may want to
@@ -579,6 +589,7 @@ SELECT p.id,
        (SELECT count(*)
           FROM product_tokens t
          WHERE t.product_id = p.id
+           AND t.grant_id IS NULL
            AND NOT t.revoked
            AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count
   FROM products p
@@ -605,7 +616,7 @@ type ListProductsRow struct {
 
 // Every product, soft-deleted ones included (admin registry view), each with its count
 // of ACTIVE tokens (not revoked, not expired, the NULL trap spelled out) so the delete
-// confirm can say how many tokens it stops. Live products first, then by name.
+// confirm can say how many tokens it stops (manual tokens only: grant_id IS NULL, PRD #1910 D5). Live products first, then by name.
 func (q *Queries) ListProducts(ctx context.Context) ([]ListProductsRow, error) {
 	rows, err := q.db.Query(ctx, listProducts)
 	if err != nil {

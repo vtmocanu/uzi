@@ -202,12 +202,15 @@ func (h *Handler) RevokeCLIToken(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// RevokeAllCLITokens revokes every un-revoked CLI token AND every un-revoked product
-// token of the caller: the panic button for a lost laptop (PRD #64 Decision 19),
-// extended by PRD #1907 D8 so it leaves no uzp_ token live either. Both revokes run in
-// ONE transaction, so the call revokes both kinds or neither (a failure is a 500 with
-// nothing revoked). Idempotent: a second call is a no-op that still returns 204.
-// Scoped to the caller, so it never touches another user's tokens.
+// RevokeAllCLITokens is the panic button for a lost laptop (PRD #64 Decision 19), extended by PRD
+// #1907 D8 and PRD #1910 D6: it revokes the caller's un-revoked CLI tokens, every one of their live
+// OAuth grants (each with its access tokens, refresh token and unredeemed codes) and every
+// un-revoked product token, so it leaves nothing live. Everything runs in ONE transaction (a
+// failure is a 500 with nothing revoked), in D8 lock order: the user's live grants are locked FOR
+// UPDATE in ascending id order FIRST and revoked through revokeGrantLocked, and only then do the
+// plain token UPDATEs run. A code exchange racing this either committed before it (and its token
+// is revoked here) or waits on the grant lock and finds the grant revoked. Idempotent: a second
+// call is a no-op that still returns 204. Scoped to the caller.
 func (h *Handler) RevokeAllCLITokens(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -215,13 +218,22 @@ func (h *Handler) RevokeAllCLITokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
+		grants, err := q.LockLiveOAuthGrantsForUser(r.Context(), user.ID)
+		if err != nil {
+			return err
+		}
+		for _, g := range grants {
+			if err := revokeGrantLocked(r.Context(), q, g.ID); err != nil {
+				return err
+			}
+		}
 		if err := q.RevokeAllCLITokens(r.Context(), user.ID); err != nil {
 			return err
 		}
 		return q.RevokeAllProductTokens(r.Context(), user.ID)
 	})
 	if err != nil {
-		slog.Error("revoke all cli and product tokens", "error", err)
+		slog.Error("revoke all cli, product and oauth tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}

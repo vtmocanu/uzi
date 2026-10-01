@@ -691,3 +691,40 @@ func lockOrCreateOAuthGrant(ctx context.Context, q *store.Queries, userID, produ
 	}
 	return store.OauthGrant{}, false, errOAuthGrantContention
 }
+
+// ListMyOAuthConnections is GET /api/me/oauth-connections (PRD #1910 M3): the caller's LIVE OAuth
+// grants, whatever the state of their access tokens (a grant whose tokens all expired is still a
+// connection, and Revoke all must count it). Cookie-only like /api/me/product-tokens. At most one
+// row per product (the live-grant unique index), so the list needs no cut. Response:
+// {"connections": [...]}.
+func (h *Handler) ListMyOAuthConnections(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	rows, err := h.q.ListLiveOAuthGrantsForUser(r.Context(), user.ID)
+	if err != nil {
+		slog.Error("list oauth connections", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	out := make([]apitypes.OAuthConnectionDTO, 0, len(rows))
+	for _, g := range rows {
+		scopes := g.Scopes
+		if scopes == nil {
+			scopes = []string{}
+		}
+		out = append(out, apitypes.OAuthConnectionDTO{
+			ID:              g.ID.String(),
+			ProductID:       g.ProductID.String(),
+			ProductName:     g.ProductName,
+			Scopes:          scopes,
+			ConnectedAt:     g.ConsentedAt.Time,
+			CreatedAt:       g.CreatedAt.Time,
+			LastUsedAt:      timePtr(g.LastUsedAt.Valid, g.LastUsedAt.Time),
+			RefreshIssuedAt: timePtr(g.RefreshIssuedAt.Valid, g.RefreshIssuedAt.Time),
+		})
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"connections": out})
+}

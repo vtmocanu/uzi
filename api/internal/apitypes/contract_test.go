@@ -164,6 +164,10 @@ func contractCases() []contractCase {
 		// the v1_* pairs.
 		newContractCase[OAuthTokenResponse]("oauth_token_response"),
 		newContractCase[OAuthErrorResponse]("oauth_error_response"),
+		// PRD #1910 M3: one live OAuth connection of the caller (GET /api/me/oauth-connections;
+		// last_used_at and refresh_issued_at are present-as-null pointers; scopes is a nil-slice
+		// null in zero.json, never null on the wire).
+		newContractCase[OAuthConnectionDTO]("oauth_connection"),
 		newContractCase[ProductTokenDTO]("product_token"),
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),

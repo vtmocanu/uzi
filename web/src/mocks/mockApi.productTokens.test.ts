@@ -165,3 +165,18 @@ describe("mockApi — product site-list allowance (PRD #1976 M2)", () => {
     expect(first.egress_profiles.filter((p) => p.name === "vendor-x-docs")).toHaveLength(1);
   });
 });
+
+describe("mockApi — OAuth connections and Revoke all (PRD #1910 M3)", () => {
+  it("lists the caller's live connection and Revoke all revokes it with the tokens", async () => {
+    const api = await reload();
+    const { connections } = await api.listOAuthConnections();
+    expect(connections).toHaveLength(1);
+    expect(connections[0]).toMatchObject({ product_id: "prod-helpdesk", scopes: ["jobs:run", "jobs:read"] });
+    // The wire row carries no owner, token or hash.
+    expect(Object.keys(connections[0]).sort()).toEqual(
+      ["connected_at", "created_at", "id", "last_used_at", "product_id", "product_name", "refresh_issued_at", "scopes"],
+    );
+    await api.revokeAllCliTokens();
+    expect((await api.listOAuthConnections()).connections).toEqual([]);
+  });
+});

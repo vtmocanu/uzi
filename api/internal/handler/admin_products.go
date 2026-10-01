@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
@@ -480,6 +481,9 @@ func (h *Handler) AdminDeleteProduct(w http.ResponseWriter, r *http.Request) {
 // product credentials, so an admin may revoke one; PRD #64's rule that an admin never
 // revokes a user's CLI token is unchanged (this touches product_tokens only). An
 // unknown or already-revoked id is a 404, like the owner's own revoke.
+//
+// A token that belongs to an OAuth grant (grant_id set) revokes its whole grant (PRD #1910 D6),
+// in one transaction with the grant lock first (D8); otherwise the product would just refresh.
 func (h *Handler) AdminRevokeProductToken(w http.ResponseWriter, r *http.Request) {
 	actor, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -488,6 +492,32 @@ func (h *Handler) AdminRevokeProductToken(w http.ResponseWriter, r *http.Request
 	}
 	id, ok := httpx.PathUUID(w, r, "id", "token")
 	if !ok {
+		return
+	}
+	grantID, err := h.q.GetProductTokenGrantID(r.Context(), id)
+	if errors.Is(err, pgx.ErrNoRows) {
+		httpx.Error(w, http.StatusNotFound, "token not found")
+		return
+	}
+	if err != nil {
+		slog.Error("admin revoke product token", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if grantID.Valid {
+		err := h.inTx(r.Context(), func(q *store.Queries) error {
+			return revokeGrantOfTokenTx(r.Context(), q, grantID.Bytes, nil)
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			httpx.Error(w, http.StatusNotFound, "token not found")
+		case err != nil:
+			slog.Error("admin revoke product token's grant", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+		default:
+			slog.Info("admin revoked oauth grant of product token", "actor_id", actor.ID, "token_id", id, "grant_id", uuid.UUID(grantID.Bytes).String())
+			w.WriteHeader(http.StatusNoContent)
+		}
 		return
 	}
 	n, err := h.q.AdminRevokeProductToken(r.Context(), id)

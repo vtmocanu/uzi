@@ -44,6 +44,7 @@ import type {
   ChatListResponse,
   CliAuthRequestMeta,
   OAuthAuthorizeRequest,
+  OAuthConnection,
   OAuthRedirect,
   CliToken,
   CliTokenMint,
@@ -1927,6 +1928,13 @@ const realApi = {
     request<OAuthRedirect>("POST", `/oauth/requests/${encodeURIComponent(id)}/approve`),
   denyOAuthRequest: (id: string) =>
     request<OAuthRedirect>("POST", `/oauth/requests/${encodeURIComponent(id)}/deny`),
+
+  // ── OAuth connections (PRD #1910 M3) — cookie-only, owner-scoped ───────────
+  // The caller's LIVE grants to connected products, whatever the state of their access tokens
+  // (a grant whose tokens all expired is still a connection). Revoke all (revokeAllCliTokens
+  // above) revokes them too; the Connected products list and its revoke are M5.
+  listOAuthConnections: () =>
+    request<{ connections: OAuthConnection[] }>("GET", "/me/oauth-connections"),
 
   // ── Agent memory (PRD #90 M6) — cookie-only, owner-scoped ──────────────────
   // list is newest-first across all the caller's repos (the component groups by

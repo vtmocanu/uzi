@@ -330,8 +330,10 @@ RETURNING id, user_id, status;
 -- PRD #1908 D14 product-revoke sweep. The non-terminal kind='job' runs whose authorization
 -- has been withdrawn, oldest first, at most @batch per pass:
 --   * the creating product token was EXPLICITLY revoked (single revoke, "Revoke all" or admin
---     revoke, all of which set product_tokens.revoked; a future revoke path such as the PRD
---     #1910 OAuth grant revoke must set product_tokens.revoked too, or this sweep misses it);
+--     revoke, all of which set product_tokens.revoked; an OAuth grant revoke (PRD #1910 D6) sets
+--     it on every access token of the grant, expired or not, so a job created by an access token
+--     that has since expired is still cancelled; a future revoke path must set it too, or this
+--     sweep misses it);
 --   * the origin's product is disabled or soft-deleted (products_deleted_is_disabled makes a
 --     deleted product always disabled, so the deleted_at clause is belt-and-braces);
 --   * the owner is deactivated (any job, including one created with a uzc_ token).

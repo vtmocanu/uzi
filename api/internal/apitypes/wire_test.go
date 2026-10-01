@@ -958,6 +958,8 @@ func TestOAuthConsentDTOTags(t *testing.T) {
 		"product_name", "product_description", "redirect_host", "scopes", "status", "expires_at")
 	assertTags(t, "OAuthRedirectResponse", OAuthRedirectResponse{}, "redirect_url")
 	assertTags(t, "OAuthTokenResponse", OAuthTokenResponse{}, "access_token", "token_type", "expires_in", "refresh_token", "scope")
+	assertTags(t, "OAuthConnectionDTO", OAuthConnectionDTO{}, "id", "product_id", "product_name", "scopes",
+		"connected_at", "created_at", "last_used_at", "refresh_issued_at")
 	// error_description is omitempty, so tagSet leaves it out (the contract fixtures pin it).
 	assertTags(t, "OAuthErrorResponse", OAuthErrorResponse{}, "error")
 }

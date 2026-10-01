@@ -1,5 +1,6 @@
-import type { OAuthAuthorizeRequest } from "../../lib/api";
-import { minsAgo } from "./time";
+import type { OAuthAuthorizeRequest, OAuthConnection } from "../../lib/api";
+import { daysAgo, minsAgo } from "./time";
+import { mockAdmin } from "./users";
 
 // A seeded PENDING OAuth authorize request (PRD #1910 M2) so /connect?request=<id> renders the
 // consent page in the demo. Approve and deny flip its status in place and answer the redirect
@@ -20,3 +21,20 @@ export const MOCK_OAUTH_APPROVE_URL =
   "https://demo-product.example/callback?code=demo-code&iss=https%3A%2F%2Fuzi.example&state=demo-state";
 export const MOCK_OAUTH_DENY_URL =
   "https://demo-product.example/callback?error=access_denied&error_description=the+user+denied+the+request&iss=https%3A%2F%2Fuzi.example&state=demo-state";
+
+// A seeded LIVE OAuth connection (PRD #1910 M3) of the mock user to the seeded Helpdesk product, so the
+// demo's Revoke all counts a connection beside the tokens. user_id is mock-internal (the wire
+// OAuthConnection has none), like the owner on mockProductTokens; the mock strips it.
+export const mockOAuthConnections: (OAuthConnection & { user_id: string })[] = [
+  {
+    id: "grant-helpdesk",
+    user_id: mockAdmin.id,
+    product_id: "prod-helpdesk",
+    product_name: "Helpdesk assistant",
+    scopes: ["jobs:run", "jobs:read"],
+    connected_at: daysAgo(12),
+    created_at: daysAgo(40),
+    last_used_at: minsAgo(25),
+    refresh_issued_at: daysAgo(12),
+  },
+];

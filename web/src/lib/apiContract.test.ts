@@ -49,6 +49,7 @@ import type {
   Product,
   ProductOAuthClient,
   OAuthAuthorizeRequest,
+  OAuthConnection,
   OAuthRedirect,
   RotateProductClientSecretResponse,
   ProductToken,
@@ -157,6 +158,8 @@ import oauthAuthorizeRequestZero from "../../../fixtures/api-contract/oauth_auth
 import oauthAuthorizeRequestFull from "../../../fixtures/api-contract/oauth_authorize_request.full.json";
 import oauthRedirectResponseZero from "../../../fixtures/api-contract/oauth_redirect_response.zero.json";
 import oauthRedirectResponseFull from "../../../fixtures/api-contract/oauth_redirect_response.full.json";
+import oauthConnectionZero from "../../../fixtures/api-contract/oauth_connection.zero.json";
+import oauthConnectionFull from "../../../fixtures/api-contract/oauth_connection.full.json";
 import productTokenZero from "../../../fixtures/api-contract/product_token.zero.json";
 import runJobZero from "../../../fixtures/api-contract/run_job.zero.json";
 import runJobFull from "../../../fixtures/api-contract/run_job.full.json";
@@ -1124,6 +1127,18 @@ void _buildInfoFull;
   void _oauthRedirectExtra;
   void _oauthRedirectZero;
   void _oauthRedirectFull;
+}
+// PRD #1910 M3: one live OAuth connection. last_used_at and refresh_issued_at are present-as-null
+// pointers; scopes is the nil-slice null in the zero fixture that the handler normalizes to [].
+{
+  const _oauthConnectionMissing: never = null as unknown as Exclude<keyof OAuthConnection, keyof typeof oauthConnectionFull>;
+  const _oauthConnectionExtra: never = null as unknown as Exclude<keyof typeof oauthConnectionFull, keyof OAuthConnection>;
+  const _oauthConnectionZero: ZeroOf<OAuthConnection, "scopes"> = oauthConnectionZero;
+  const _oauthConnectionFull: Widen<OAuthConnection> = oauthConnectionFull;
+  void _oauthConnectionMissing;
+  void _oauthConnectionExtra;
+  void _oauthConnectionZero;
+  void _oauthConnectionFull;
 }
 // PRD #1907 M4/M5: the typed admin delete response (its nested product's deleted_at is
 // `string | null`, no exemption) and the user mint-picker entry (all strings).

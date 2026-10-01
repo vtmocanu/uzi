@@ -181,26 +181,24 @@ SELECT
 SELECT set_config('lock_timeout', sqlc.arg(timeout)::text, true);
 
 -- PRD #1910 M3: the token endpoint's authorization_code redemption. The handler runs it in ONE
--- transaction in D8 lock order: the unlocked code lookup (no lock), the grant FOR UPDATE, the
--- grant's token count, then the request row FOR UPDATE, the conditional redeem, the access-token
--- insert and the refresh-token store. A failed check returns without writing, so nothing is
--- consumed on failure.
+-- transaction in D8 lock order: the unlocked code lookup (no lock), the grant FOR UPDATE, an
+-- unlocked re-read of the request under that lock (the grant lock serializes every grant-keyed
+-- writer of the request, and the redeem UPDATE is itself conditional), the grant's token count,
+-- the access-token insert and the refresh-token store, and only LAST the conditional redeem
+-- UPDATE, which is the first lock on the request row. The replay arm revokes through
+-- revokeGrantLocked (grant, then its tokens, then its requests) and never locks the request row
+-- first. A failed check returns without writing, so nothing is consumed on failure.
 
 -- name: GetOAuthAuthorizeRequestByCodeHash :one
 -- The request an authorization code belongs to, found by the sha256 of the presented code. NO row
 -- lock: the handler needs the grant id to take the grant lock first (D8), then re-reads the request
--- with LockOAuthAuthorizeRequest.
+-- with GetOAuthAuthorizeRequest (still without a row lock).
 SELECT * FROM oauth_authorize_requests WHERE code_hash = $1;
 
 -- name: LockOAuthGrant :one
 -- A grant by id, row-locked for the rest of the transaction (D8: every grant mutation serializes
 -- here first). No row means the grant is gone (its user was deleted).
 SELECT * FROM oauth_grants WHERE id = $1 FOR UPDATE;
-
--- name: LockOAuthAuthorizeRequest :one
--- The request row, locked AFTER its grant (D8) and re-read under that lock, so a redemption sees a
--- supersession or a concurrent redemption that committed while it waited for the grant.
-SELECT * FROM oauth_authorize_requests WHERE id = $1 FOR UPDATE;
 
 -- name: CountLiveGrantTokens :one
 -- The ten-live-token bound (D5): the grant's unrevoked, unexpired access tokens and the earliest
@@ -216,7 +214,8 @@ SELECT count(*)::bigint AS live, min(expires_at)::timestamptz AS oldest_expires_
 -- name: RedeemOAuthAuthorizeRequest :one
 -- approved -> redeemed in one conditional UPDATE, the code's single use. Zero rows (ErrNoRows)
 -- means it was no longer approved or its code expired: the handler answers invalid_grant. Run
--- inside the redemption transaction after every check passed.
+-- inside the redemption transaction after every check passed, as its LAST write (D8: this is the
+-- first lock the transaction takes on the request row, after the grant and its tokens).
 UPDATE oauth_authorize_requests
    SET status = 'redeemed'
  WHERE id = $1 AND status = 'approved' AND code_expires_at > now()
@@ -265,3 +264,48 @@ UPDATE oauth_grants
        refresh_issued_at = NULL,
        refresh_last_used_at = NULL
  WHERE id = $1 AND revoked_at IS NULL;
+
+-- PRD #1910 M3: the D6 revoke paths and the connection list.
+
+-- name: LockLiveOAuthGrantsForUser :many
+-- Every live grant of one user, row-locked in ASCENDING id order for the rest of the transaction
+-- (D8: several grants are always locked in id order). Revoke all runs this FIRST, before any
+-- product_tokens UPDATE, so a code exchange or refresh of one of these grants either committed
+-- before (and its token is then revoked) or waits and finds the grant revoked.
+SELECT * FROM oauth_grants
+ WHERE user_id = $1 AND revoked_at IS NULL
+ ORDER BY id
+ FOR UPDATE;
+
+-- name: GetOwnProductTokenGrantID :one
+-- The grant of one of the CALLER'S unrevoked product tokens, read WITHOUT a lock so the handler can
+-- take the grant lock first (D8). grant_id is NULL for a manual token and never changes after
+-- insert. Owner-scoped like RevokeProductToken: a foreign, unknown or already-revoked id is
+-- pgx.ErrNoRows (the handler's 404).
+SELECT grant_id FROM product_tokens WHERE id = $1 AND user_id = $2 AND NOT revoked;
+
+-- name: GetProductTokenGrantID :one
+-- AdminRevokeProductToken's counterpart of GetOwnProductTokenGrantID: any user's unrevoked token.
+SELECT grant_id FROM product_tokens WHERE id = $1 AND NOT revoked;
+
+-- name: ListLiveOAuthGrantsForUser :many
+-- The caller's live grants (revoked_at IS NULL) whatever the state of their access tokens: a grant
+-- whose tokens all expired is still a live connection. last_used_at is the later of the refresh
+-- token's last use and the latest use of any of the grant's access tokens (GREATEST skips NULLs).
+-- Bounded by the one-live-grant-per-(user, product) index: at most one row per product.
+SELECT g.id,
+       g.product_id,
+       p.name AS product_name,
+       g.scopes,
+       g.consented_at,
+       g.created_at,
+       g.refresh_issued_at,
+       GREATEST(
+           g.refresh_last_used_at,
+           (SELECT max(t.last_used_at) FROM product_tokens t WHERE t.grant_id = g.id)
+       )::timestamptz AS last_used_at
+  FROM oauth_grants g
+  JOIN products p ON p.id = g.product_id
+ WHERE g.user_id = sqlc.arg(user_id)
+   AND g.revoked_at IS NULL
+ ORDER BY g.consented_at DESC, g.id ASC;

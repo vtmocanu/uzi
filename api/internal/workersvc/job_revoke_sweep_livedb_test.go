@@ -312,3 +312,60 @@ func TestCancelRevokedProductJobsRequeuedWithPendingCancelLiveDB(t *testing.T) {
 		t.Fatalf("requeued job with a pending cancel status = %q, want cancelled server-side", s)
 	}
 }
+
+// A grant revoke (PRD #1910 D6) cancels a job created by an access token of that grant that had
+// ALREADY EXPIRED: the revoke sets revoked on every grant token, expired or not, and the sweep keys
+// on revoked. Before the revoke the expired, unrevoked token cancels nothing (expiry alone never
+// does). The revoke here is the store-level sequence the handler's revokeGrantLocked runs, in its
+// lock order (grant, then tokens, then codes); the handler's own LiveDB tests pin that helper.
+func TestCancelRevokedProductJobsExpiredGrantTokenLiveDB(t *testing.T) {
+	e := setupJobLiveDB(t, 0)
+	owner := e.seedJobUser(t)
+	product, _ := e.seedProduct(t, owner, []string{"research"})
+	w := e.seedWorkerRow(t, owner, false, nil, jobCap, jobFilesCap)
+
+	grantID, tokenID := uuid.New(), uuid.New()
+	e.exec(`INSERT INTO oauth_grants (id, user_id, product_id, scopes) VALUES ($1, $2, $3, ARRAY['jobs:run'])`, grantID, owner, product)
+	e.exec(`INSERT INTO product_tokens (id, user_id, product_id, name, token_hash, token_prefix, scopes, expires_at, grant_id)
+	        VALUES ($1, $2, $3, 'OAuth access token', $4, 'uzp_test', ARRAY['jobs:run'], now() - interval '10 minutes', $5)`,
+		tokenID, owner, product, []byte(tokenID.String()), grantID)
+	queued := e.seedOriginJob(t, owner, "queued", nil, &product, &tokenID)
+	running := e.seedOriginJob(t, owner, "running", &w, &product, &tokenID)
+
+	if n, err := e.svc.CancelRevokedProductJobs(e.ctx); err != nil || n != 0 {
+		t.Fatalf("pass before the grant revoke = %d, %v; want 0 (an expired token alone cancels nothing)", n, err)
+	}
+
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(e.ctx) //nolint:errcheck // no-op after Commit
+	q := e.q.WithTx(tx)
+	if _, err := q.LockOAuthGrant(e.ctx, grantID); err != nil {
+		t.Fatal(err)
+	}
+	gid := pgtype.UUID{Bytes: grantID, Valid: true}
+	if _, err := q.RevokeOAuthGrantProductTokens(e.ctx, gid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.SupersedeOAuthGrantCodes(e.ctx, gid); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.RevokeOAuthGrantRow(e.ctx, grantID); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(e.ctx); err != nil {
+		t.Fatal(err)
+	}
+
+	if n, err := e.svc.CancelRevokedProductJobs(e.ctx); err != nil || n != 2 {
+		t.Fatalf("pass after the grant revoke = %d, %v; want 2 (the jobs of the expired grant token)", n, err)
+	}
+	if s := e.status(t, queued); s != "cancelled" {
+		t.Fatalf("queued job status = %q, want cancelled", s)
+	}
+	if n := e.pendingCancels(t, running); n != 1 {
+		t.Fatalf("running job pending cancel inputs = %d, want 1", n)
+	}
+}
