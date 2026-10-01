@@ -172,7 +172,7 @@ Files of a running job stay attached. When the job ends, each file becomes `avai
 | 404 | `unknown_egress_profile` | `egress_profile` names no existing site list |
 | 422 | `invalid_request`, `unknown_job_type`, `no_model_credential` | Bad request (an explicit empty `egress_profile` included), or you have no usable Anthropic credential |
 | 429 | `over_cap` | Active-job cap reached |
-| 503 | `isolated_lane_unavailable` | `egress_profile` names a site list but this instance has no isolated research lane enabled; checked before the list's allowance (403) and existence (404), and before 422 and `job_type_not_allowed` validation |
+| 503 | `isolated_lane_unavailable` | A non-empty `egress_profile` was supplied while this instance has no isolated research lane enabled; checked after body decoding and empty-profile validation (422), before the site list's allowance (403) and existence (404) and the remaining job validation |
 
 ## Site lists
 
