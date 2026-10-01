@@ -69,7 +69,7 @@ func TestAdminProductsEgressProfilesUnknownProduct(t *testing.T) {
 }
 
 func TestAdminProductsEgressProfilesHostileStringsEscaped(t *testing.T) {
-	hostile := func(s string) string { return s + esc2J + oscTitle + "‮" + "\nFORGED_ROW  x" }
+	hostile := func(s string) string { return s + esc2J + oscTitle + "\u202e" + "\nFORGED_ROW  x" }
 	fc := productEgressFixture()
 	fc.ProductEgress["p1"] = []uzicli.ProductEgressProfile{{Name: hostile("n"), Description: hostile("d"), CreatedAt: time.Now()}}
 	out, _, code := runCLI(t, fakeEnv(fc), "admin", "products", "egress-profiles", "p1")

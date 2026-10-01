@@ -77,10 +77,12 @@ lane run. What differs from a job on a standard worker:
   `isolated_job_v1` (the chart's `workers.image.tag`) before, or together with,
   allowing products to name site lists. Until the fleet has rolled, bound jobs
   fail instead of running.
-- **A bound job fails rather than waits when the lane is off or unavailable.**
-  The lane worker provisioned for it never registers, so the job fails
-  (`ephemeral_worker_never_registered`) after the provision deadline. A bound
-  research run with the lane off stays queued; a job never parks.
+- **Once a lane worker is provisioned for a bound job, a worker that cannot
+  serve it fails the job rather than leaving it waiting.** A lane worker that
+  never registers fails it (`ephemeral_worker_never_registered`) after the
+  provision deadline. If no lane worker is provisioned at all (ephemeral worker
+  provisioning off, or the user at the ephemeral worker limit), the bound job
+  stays queued, exactly like a bound research run.
 - **The fetch credential is redacted** from messages, failure reasons, logs and
   the posted result. Output-file contents are outside that redaction coverage:
   keeping the credential out of the model's prompt and environment does not
