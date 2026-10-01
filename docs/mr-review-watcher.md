@@ -133,7 +133,8 @@ out in Settings.
 A merge request can't be reworked forever. uzi tracks, per MR, how many
 automatic rework cycles it has spent and stops after a cap — **5 by
 default**, admin-configurable (`mr_rework_cap`). Past the cap, uzi sends a
-Slack DM ("MR rework stopped") linking the run page and, on an issue-run
+Slack DM ("MR rework stopped", retried for up to about a day if Slack
+doesn't take it the first time) linking the run page and, on an issue-run
 MR, also posts one comment on the issue naming the limit and pointing at
 the manual escape hatch below; a scheduled prompt MR has no backing issue,
 so it gets the Slack DM only. uzi then stops trying automatically. From there you can address the

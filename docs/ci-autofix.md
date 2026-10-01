@@ -120,7 +120,8 @@ comment posted when the fix starts is unchanged; landing itself never posted
 a forge comment.
 
 A halt is the one event that reaches you: a Slack DM (if you've linked your
-account, see [Slack](./slack.md)) plus, on an issue-run branch, the board's
+account, see [Slack](./slack.md); retried for up to about a day if Slack
+doesn't take it the first time) plus, on an issue-run branch, the board's
 **"Autofix stopped"** marker on the issue's card and a comment on the backing
 issue. A scheduled prompt MR has no backing issue card, so it gets the Slack
 DM only — see [The loop guard](#the-loop-guard) above.

@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **A CI auto-fix or MR rework halt DM that Slack failed to take is now retried until it reaches you, instead of being lost ([#1675](https://github.com/vtmocanu/uzi/issues/1675)).**
+  The "CI auto-fix stopped" and "MR rework stopped" DMs were sent once, best-effort, so a full Slack queue or a Slack error dropped them silently; this mattered most for a scheduled prompt MR with no backing issue, where the DM is the only signal. The notification now stores its rendered DM and is marked delivered on a successful post (or when you have no confirmed Slack link); an undelivered one is re-queued every 5 minutes for up to about 24 hours, after which uzi gives up. The forge halt comment is still posted at most once. A rare duplicate DM is possible, and a DM delayed by a Slack outage can arrive after the halt no longer applies. Other notification kinds are unchanged.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

@@ -991,6 +991,7 @@ Tracked as GitHub issue vtmocanu/uzi#1650; PRD at `prds/done/1650-retire-notific
 
 - The web Notifications inbox (tab, bell, unread badge) is retired; actionable signals reach users by Slack DM (when linked) plus the page that owns the thing. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
 - "Settings → Notifications" (Slack linking) is not the inbox and stays. [user 2026-09-25, #1650] (AI-synced 2026-09-25)
+- CI auto-fix / MR rework halt DMs are delivered at-least-once: retried until posted or the owner has no Slack link (capped at about 24h); the forge halt comment stays once-only. A rare duplicate DM is accepted. (AI-synced 2026-10-01, #1675)
 
 ## Feature #1695 — Review-bot control commands never trigger an MR rework
 

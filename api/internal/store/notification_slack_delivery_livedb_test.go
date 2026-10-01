@@ -113,7 +113,7 @@ func TestNotificationSlackDeliveryLiveDB(t *testing.T) {
 		if _, ok := got[plain.ID]; ok {
 			t.Errorf("non-durable row was claimed")
 		}
-		// The claim stamped attempted_at = now, so it is not stale against a past cutoff.
+		// The claim stamped attempted_at = now, so it is not stale against a one-hour retry window.
 		if _, ok := claim(notStale, 5, 100)[fresh.ID]; ok {
 			t.Errorf("row re-claimed immediately after a claim")
 		}

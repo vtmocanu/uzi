@@ -272,7 +272,10 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   rejects your [guardrail override
   request](./admin-settings.md#guardrail-override-per-repo), and links the
   Repos page. All three need Slack enabled and your account linked, like
-  every DM here.
+  every DM here. If Slack does not take one of the two halt DMs the first
+  time (a full queue, a Slack error), uzi retries it every few minutes for
+  up to about a day, so you may rarely see one twice or a while after the
+  halt; the override decision DM is not retried.
 
 ## Markdown rendering
 

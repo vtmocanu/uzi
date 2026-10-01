@@ -133,7 +133,7 @@ A `ci_fix` run rides PRD #4's run machinery as a second run **kind** (`runs.kind
 
 ### MR review watcher: auto-rework review comments (PRD #700)
 
-CI red is `ci_fix`'s job (above); a **green** pipeline with new review feedback is this one's. `poller/mr_review_watch.go` is a second detector on the same post-`SyncMRStates` poller hook (running after PRD #24's close-edge watcher, so a fresh close/merge is authoritative before this detector ever looks): for every opted-in user's completed run with an open MR, it gates in order on the watcher-owned `mr_state` being open, the head pipeline being green, the review having settled (a quiet-period debounce plus a same-head-SHA staleness check — reviews are open-ended and the worker's own push moves the head SHA, so "landed" has no forge primitive and had to be defined), a kept comment strictly past the per-(repo, ref) `mr_rework_ledger.high_water` mark, and the ledger's `attempt_count` under an admin-configurable cap (`mr_rework_cap`, default 5) — each gate a silent no-op on failure except the cap, which halts with one issue comment plus one Slack DM (latched via `halt_notified` so it never re-fires). The admin kill-switch (`settings.MrReworkEnabled`) is read **three-state**, not as a boolean: absent means on (the shipped default), a genuine store error means off — collapsing those two into one zero value would either lose the default or, worse, fail an error open into auto-reworking every MR.
+CI red is `ci_fix`'s job (above); a **green** pipeline with new review feedback is this one's. `poller/mr_review_watch.go` is a second detector on the same post-`SyncMRStates` poller hook (running after PRD #24's close-edge watcher, so a fresh close/merge is authoritative before this detector ever looks): for every opted-in user's completed run with an open MR, it gates in order on the watcher-owned `mr_state` being open, the head pipeline being green, the review having settled (a quiet-period debounce plus a same-head-SHA staleness check — reviews are open-ended and the worker's own push moves the head SHA, so "landed" has no forge primitive and had to be defined), a kept comment strictly past the per-(repo, ref) `mr_rework_ledger.high_water` mark, and the ledger's `attempt_count` under an admin-configurable cap (`mr_rework_cap`, default 5) — each gate a silent no-op on failure except the cap, which halts with one issue comment plus one Slack DM (the halt is latched via `halt_notified`, so the forge comment is posted at most once; the DM is durable and delivered at-least-once, #1675: the poller persists the notification before the latch, then latches, then comments). The admin kill-switch (`settings.MrReworkEnabled`) is read **three-state**, not as a boolean: absent means on (the shipped default), a genuine store error means off — collapsing those two into one zero value would either lose the default or, worse, fail an error open into auto-reworking every MR.
 
 **PRD #841** layers two more nullable overrides underneath the per-user default above: per-run (`runs.mr_rework_enabled`) and per-schedule (`run_schedules.mr_rework_enabled`, stamped onto the run at creation time unless the run's own create request overrides it). Both resolve live, not as a snapshot — `ListMRReworkCandidates`'s `COALESCE(run, owner) IS NOT FALSE` reads the run's own override first and only falls through to the owner default when it is NULL — and both bind to the newest issue run per branch, since the query's `per_branch` CTE is a `DISTINCT ON (r.branch)` keyed on `created_at DESC`, so a branch reused by a re-run is governed by that newest run's setting.
 
@@ -1008,8 +1008,17 @@ chain in the diagram above, with no intervening `running`.
   included, posts a ❌ Failed message with its reason. The DM is not gated on `stop_kind`.
   The `notifications` table itself is not gone (PRD #1650): it stays as a
   pruned (200 rows/user), write-only event log and the incidental-finding
-  Slack de-dup latch (`notifysvc.Notify`) — nothing in the product reads it
-  back any more.
+  Slack de-dup latch (`notifysvc.Notify`). One exception (#1675): the two halt
+  DMs ("CI auto-fix stopped", "MR rework stopped") store their DM render in
+  `notifications.slack_render` and are delivered at-least-once. The Slack drain
+  marks a row delivered on a successful post, or terminally when the owner has
+  no confirmed Slack link; the `notification_slack_redeliver` sweeper pass
+  (`notifysvc.Redeliverer`) re-enqueues undelivered rows every 5 minutes, up to
+  288 attempts (about 24h), then gives up; the per-user prune spares
+  undelivered rows under the cap. A rare duplicate DM is accepted (post
+  succeeded but the mark failed, or the latch write failed after the notify),
+  as is a late DM after a Slack outage; during a rolling deploy an old replica's
+  prune can still delete a pending row. Every other kind stays best-effort.
 - **Finalize, GitHub only: align a behind-on-workflows branch before that push**
   (PRD #456). GitHub rejects the bot's `repo`-only PAT push whenever the pushed
   tip's `.github/workflows/**` tree differs from the current default branch, even
