@@ -123,3 +123,45 @@ describe("mockApi — product skill sets (PRD #1909 M6)", () => {
     expect((await api.adminGetProductSkills("prod-helpdesk")).config.skills_token_set).toBe(true);
   });
 });
+
+describe("mockApi — product site-list allowance (PRD #1976 M2)", () => {
+  it("refuses a write on a deleted product with 409", async () => {
+    const api = await reload();
+    const { product } = await api.adminCreateProduct("Temp product", "", []);
+    await api.adminAllowProductEgressProfile(product.id, "ml-model-cards");
+    await api.adminDeleteProduct(product.id);
+    await expect(api.adminAllowProductEgressProfile(product.id, "ml-model-cards")).rejects.toMatchObject({
+      status: 409,
+    });
+    await expect(api.adminDisallowProductEgressProfile(product.id, "ml-model-cards")).rejects.toMatchObject({
+      status: 409,
+    });
+    // The audit trail still lists what was allowed.
+    await expect(api.adminListProductEgressProfiles(product.id)).resolves.toMatchObject({
+      egress_profiles: [{ name: "ml-model-cards" }],
+    });
+  });
+
+  it("answers 404 for an unknown list, with the real handler's message, on both verbs", async () => {
+    const api = await reload();
+    await expect(api.adminAllowProductEgressProfile("prod-helpdesk", "no-such-list")).rejects.toMatchObject({
+      status: 404,
+      message: "egress profile not found",
+    });
+    await expect(api.adminDisallowProductEgressProfile("prod-helpdesk", "no-such-list")).rejects.toMatchObject({
+      status: 404,
+      message: "egress profile not found",
+    });
+  });
+
+  it("answers 404 when a known list is not allowed, and allowing twice is idempotent", async () => {
+    const api = await reload();
+    await expect(api.adminDisallowProductEgressProfile("prod-helpdesk", "vendor-x-docs")).rejects.toMatchObject({
+      status: 404,
+    });
+    const first = await api.adminAllowProductEgressProfile("prod-helpdesk", "vendor-x-docs");
+    const second = await api.adminAllowProductEgressProfile("prod-helpdesk", "vendor-x-docs");
+    expect(second).toEqual(first);
+    expect(first.egress_profiles.filter((p) => p.name === "vendor-x-docs")).toHaveLength(1);
+  });
+});

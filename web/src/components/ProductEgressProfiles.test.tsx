@@ -4,6 +4,7 @@ import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-li
 import { ProductEgressProfilesPanel } from "./ProductEgressProfiles";
 import { api, type EgressProfile, type Product, type ProductEgressProfile } from "../lib/api";
 import { ApiError } from "../lib/apiError";
+import { MemoryRouter } from "react-router-dom";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -41,7 +42,11 @@ const profile = (name: string): EgressProfile =>
   ({ id: `id-${name}`, name, description: "", hosts: [], multi_publisher_override: [], warnings: [] }) as unknown as EgressProfile;
 
 async function openPanel(p: Product = product) {
-  const utils = render(<ProductEgressProfilesPanel product={p} />);
+  const utils = render(
+    <MemoryRouter>
+      <ProductEgressProfilesPanel product={p} />
+    </MemoryRouter>,
+  );
   const details = utils.container.querySelector("details") as HTMLDetailsElement;
   details.open = true;
   fireEvent(details, new Event("toggle"));
@@ -65,7 +70,11 @@ afterEach(() => {
 
 describe("ProductEgressProfilesPanel", () => {
   it("loads nothing until opened", () => {
-    render(<ProductEgressProfilesPanel product={product} />);
+    render(
+      <MemoryRouter>
+        <ProductEgressProfilesPanel product={product} />
+      </MemoryRouter>,
+    );
     expect(mockApi.adminListProductEgressProfiles).not.toHaveBeenCalled();
     expect(mockApi.adminListEgressProfiles).not.toHaveBeenCalled();
   });
@@ -132,6 +141,8 @@ describe("ProductEgressProfilesPanel", () => {
     await openPanel(deleted);
     expect(await screen.findByText("kernel-docs")).toBeTruthy();
     expect(screen.getByText(/This product is deleted/)).toBeTruthy();
+    expect(screen.getByText(/may only name these lists/)).toBeTruthy();
+    expect(screen.queryByText(/affects jobs created afterwards/)).toBeNull();
     expect(screen.queryByRole("button", { name: /^Remove/ })).toBeNull();
     expect(screen.queryByLabelText("Allow another site list")).toBeNull();
     expect(mockApi.adminListEgressProfiles).not.toHaveBeenCalled();
@@ -140,7 +151,91 @@ describe("ProductEgressProfilesPanel", () => {
   it("scopes the empty state to the section", async () => {
     mockApi.adminListProductEgressProfiles.mockResolvedValue({ egress_profiles: [] });
     const { container } = await openPanel();
-    const msg = await within(container).findByText(/No site lists allowed/);
+    const section = container.querySelector("details") as HTMLElement;
+    const msg = await within(section).findByText(/No site lists allowed/);
     expect(msg).toBeTruthy();
+    expect(within(section).getByLabelText("Allow a site list")).toBeTruthy();
+  });
+
+  it("keeps the post-write rows across a close and reopen whose refetch fails", async () => {
+    mockApi.adminDisallowProductEgressProfile.mockResolvedValue(null);
+    const { container } = await openPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Remove kernel-docs" }));
+    expect(await screen.findByText(/No site lists allowed/)).toBeTruthy();
+
+    const details = container.querySelector("details") as HTMLDetailsElement;
+    details.open = false;
+    fireEvent(details, new Event("toggle"));
+    mockApi.adminListProductEgressProfiles.mockRejectedValue(new ApiError(500, "refetch boom"));
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+
+    await waitFor(() => expect(mockApi.adminListProductEgressProfiles).toHaveBeenCalledTimes(2));
+    expect(await screen.findByText(/No site lists allowed/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Remove kernel-docs" })).toBeNull();
+  });
+
+  it("moves focus to the select after an add", async () => {
+    mockApi.adminAllowProductEgressProfile.mockResolvedValue({
+      egress_profiles: [row("kernel-docs"), row("vendor-x")],
+    });
+    await openPanel();
+    const select = (await screen.findByLabelText("Allow another site list")) as HTMLSelectElement;
+    await waitFor(() => expect(select.options.length).toBe(3));
+    fireEvent.change(select, { target: { value: "vendor-x" } });
+    fireEvent.click(screen.getByRole("button", { name: "Allow" }));
+    await screen.findByRole("button", { name: "Remove vendor-x" });
+    await waitFor(() => expect(document.activeElement).toBe(select));
+  });
+
+  it("moves focus to the next row's Remove button after a remove, then to the select when none remain", async () => {
+    mockApi.adminListProductEgressProfiles.mockResolvedValue({
+      egress_profiles: [row("kernel-docs"), row("vendor-x")],
+    });
+    mockApi.adminDisallowProductEgressProfile.mockResolvedValue(null);
+    await openPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Remove kernel-docs" }));
+    await waitFor(() =>
+      expect(document.activeElement).toBe(screen.getByRole("button", { name: "Remove vendor-x" })),
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove vendor-x" }));
+    const select = await screen.findByLabelText("Allow a site list");
+    await waitFor(() => expect(document.activeElement).toBe(select));
+  });
+
+  it("drops a row the api says is already gone and shows the error", async () => {
+    mockApi.adminDisallowProductEgressProfile.mockRejectedValue(
+      new ApiError(404, "this product is not allowed to use that egress profile"),
+    );
+    await openPanel();
+    fireEvent.click(await screen.findByRole("button", { name: "Remove kernel-docs" }));
+    const alert = await screen.findByRole("alert");
+    expect(alert.textContent).toContain("not allowed to use that egress profile");
+    expect(screen.queryByRole("button", { name: "Remove kernel-docs" })).toBeNull();
+    expect(screen.getByText(/No site lists allowed/)).toBeTruthy();
+  });
+
+  it("says no site lists exist yet, and links to the admin page, when the instance has none", async () => {
+    mockApi.adminListEgressProfiles.mockResolvedValue({ egress_profiles: [] });
+    await openPanel();
+    const select = (await screen.findByLabelText("Allow another site list")) as HTMLSelectElement;
+    await waitFor(() => expect(select.options[0].textContent).toBe("No site lists exist yet"));
+    expect(select.disabled).toBe(true);
+    expect(screen.getByRole("link", { name: "Site lists" }).getAttribute("href")).toBe("/admin/egress-profiles");
+  });
+
+  it("shows a loading placeholder, not the exhausted message, while the all-lists request is pending", async () => {
+    mockApi.adminListEgressProfiles.mockReturnValue(new Promise(() => {}));
+    await openPanel();
+    const select = (await screen.findByLabelText("Allow another site list")) as HTMLSelectElement;
+    expect(select.options[0].textContent).toBe("Loading site lists…");
+    expect(screen.queryByText("No lists left to allow")).toBeNull();
+  });
+
+  it("says no lists are left once every list is allowed", async () => {
+    mockApi.adminListEgressProfiles.mockResolvedValue({ egress_profiles: [profile("kernel-docs")] });
+    await openPanel();
+    const select = (await screen.findByLabelText("Allow another site list")) as HTMLSelectElement;
+    await waitFor(() => expect(select.options[0].textContent).toBe("No lists left to allow"));
   });
 });

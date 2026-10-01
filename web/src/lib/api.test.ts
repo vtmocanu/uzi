@@ -321,3 +321,24 @@ describe("egressProfileProblems (PRD #1906 M1w)", () => {
     expect(egressProfileProblems(new Error("boom"))).toBeNull();
   });
 });
+
+// PRD #1976 M2: a site-list name is free text, so the path segment must be percent-encoded.
+describe("product site-list allowance URLs", () => {
+  it.each([
+    ["PUT", () => api.adminAllowProductEgressProfile("prod-a", "model cards/v2")],
+    ["DELETE", () => api.adminDisallowProductEgressProfile("prod-a", "model cards/v2")],
+  ] as const)("%s encodes the list name into one path segment", async (method, call) => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(method === "PUT" ? 200 : 204, method === "PUT" ? { egress_profiles: [] } : null),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    // A write reads the CSRF cookie; this file runs in node, so give it an empty jar.
+    vi.stubGlobal("document", { cookie: "" });
+
+    await call();
+
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toContain("/admin/products/prod-a/egress-profiles/model%20cards%2Fv2");
+    expect((init as RequestInit).method).toBe(method);
+  });
+});

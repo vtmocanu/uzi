@@ -6,9 +6,10 @@
 // default and loaded on first open. A deleted product still lists its lists (the audit
 // trail) but the api refuses a write, so the panel is read-only for it.
 
-import { useId, useState } from "react";
+import { useEffect, useId, useRef, useState } from "react";
+import { Link } from "react-router-dom";
 import { api, type Product, type ProductEgressProfile } from "../lib/api";
-import { errorMessage } from "../lib/apiError";
+import { ApiError, errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Button, Select, Spinner, cx } from "./ui";
 
@@ -26,7 +27,10 @@ export function ProductEgressProfilesPanel({ product }: { product: Product }) {
     [product.id],
     { enabled: open && !deleted, fallback: "Failed to load the site lists" },
   );
-  // A write's own response is the freshest view, but only over the load it superseded.
+  // A write's own response is the freshest view, but only over the load it superseded: once a
+  // refetch lands, `data` is a new object and `fresh.over === data` stops holding. Closing the
+  // panel must not clear it, or a reopen would show the pre-write load until that refetch lands
+  // (and keep showing it if the refetch fails).
   const [fresh, setFresh] = useState<{ rows: ProductEgressProfile[]; over: typeof data } | null>(null);
   const rows = fresh && fresh.over === data ? fresh.rows : (data?.egress_profiles ?? null);
 
@@ -34,9 +38,7 @@ export function ProductEgressProfilesPanel({ product }: { product: Product }) {
     <details
       className="group/egress border-t border-edge pt-3"
       onToggle={(e) => {
-        const isOpen = (e.currentTarget as HTMLDetailsElement).open;
-        setOpen(isOpen);
-        if (!isOpen) setFresh(null);
+        setOpen((e.currentTarget as HTMLDetailsElement).open);
       }}
     >
       <summary className="flex cursor-pointer list-none flex-wrap items-center gap-x-2 gap-y-1 text-sm font-medium text-fg marker:content-none">
@@ -73,7 +75,7 @@ export function ProductEgressProfilesPanel({ product }: { product: Product }) {
               product={product}
               deleted={deleted}
               rows={rows}
-              available={all?.egress_profiles.map((p) => p.name) ?? []}
+              all={all?.egress_profiles.map((p) => p.name) ?? null}
               availableError={allError}
               onRows={(next) => setFresh({ rows: next, over: data })}
             />
@@ -88,14 +90,14 @@ function ListsBody({
   product,
   deleted,
   rows,
-  available,
+  all,
   availableError,
   onRows,
 }: {
   product: Product;
   deleted: boolean;
   rows: ProductEgressProfile[];
-  available: string[];
+  all: string[] | null;
   availableError: string;
   onRows: (rows: ProductEgressProfile[]) => void;
 }) {
@@ -105,8 +107,26 @@ function ListsBody({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
+  const addId = `${id}-add`;
+  const removeId = (name: string) => `${id}-rm-${name}`;
+  // Ids to try focusing once the write settles and the controls are enabled again; the first
+  // that exists and is enabled wins. Without this, focus lands on <body> when a button vanishes.
+  const pendingFocus = useRef<string[] | null>(null);
+  useEffect(() => {
+    if (busy || pendingFocus.current === null) return;
+    const ids = pendingFocus.current;
+    pendingFocus.current = null;
+    for (const target of ids) {
+      const el = document.getElementById(target) as HTMLButtonElement | HTMLSelectElement | null;
+      if (el && !el.disabled) {
+        el.focus();
+        return;
+      }
+    }
+  });
+
   const allowed = new Set(rows.map((r) => r.name));
-  const addable = available.filter((n) => !allowed.has(n));
+  const addable = (all ?? []).filter((n) => !allowed.has(n));
   // A selection another action made unavailable falls back to the empty choice.
   const selected = addable.includes(choice) ? choice : "";
 
@@ -117,6 +137,7 @@ function ListsBody({
     setNotice("");
     try {
       const next = await api.adminAllowProductEgressProfile(product.id, selected);
+      pendingFocus.current = [addId, removeId(selected)];
       onRows(next.egress_profiles);
       setNotice(`Allowed ${selected}. Tokens of this product can name it on job create.`);
       setChoice("");
@@ -127,6 +148,13 @@ function ListsBody({
     }
   };
 
+  const dropFromView = (name: string) => {
+    const i = rows.findIndex((r) => r.name === name);
+    const neighbour = rows[i + 1] ?? rows[i - 1];
+    pendingFocus.current = [...(neighbour ? [removeId(neighbour.name)] : []), addId];
+    onRows(rows.filter((r) => r.name !== name));
+  };
+
   const remove = async (name: string) => {
     if (busy) return;
     setBusy(true);
@@ -134,20 +162,34 @@ function ListsBody({
     setNotice("");
     try {
       await api.adminDisallowProductEgressProfile(product.id, name);
-      onRows(rows.filter((r) => r.name !== name));
+      dropFromView(name);
       setNotice(`Removed ${name}. Jobs created from now on can no longer name it.`);
     } catch (err) {
+      // A 404 means the allowance is already gone (removed elsewhere): the row is stale, so drop it.
+      if (err instanceof ApiError && err.status === 404) dropFromView(name);
       setError(errorMessage(err, "Failed to remove the site list"));
     } finally {
       setBusy(false);
     }
   };
 
+  // Say why the choice is empty: still loading, failed, no lists exist at all, or all are allowed.
+  const placeholder =
+    all === null
+      ? availableError
+        ? "Site lists unavailable"
+        : "Loading site lists…"
+      : all.length === 0
+        ? "No site lists exist yet"
+        : addable.length === 0
+          ? "No lists left to allow"
+          : "Choose a site list";
+
   return (
     <>
       <p className="text-xs text-muted">
-        A job created with this product’s token may only name these lists. Removing a list
-        affects jobs created afterwards; jobs already created keep the lists they were created with.
+        A job created with this product’s token may only name these lists.
+        {!deleted && " Removing a list affects jobs created afterwards; jobs already created keep the lists they were created with."}
       </p>
 
       {rows.length === 0 ? (
@@ -169,6 +211,7 @@ function ListsBody({
                   variant="ghost"
                   size="sm"
                   disabled={busy}
+                  id={removeId(r.name)}
                   aria-label={`Remove ${r.name}`}
                   onClick={() => remove(r.name)}
                 >
@@ -184,18 +227,18 @@ function ListsBody({
         <p className="text-xs text-faint">This product is deleted, so its site lists can no longer change.</p>
       ) : (
         <div className="space-y-1.5">
-          <label htmlFor={`${id}-add`} className="block text-xs font-medium text-muted">
-            Allow another site list
+          <label htmlFor={addId} className="block text-xs font-medium text-muted">
+            {rows.length === 0 ? "Allow a site list" : "Allow another site list"}
           </label>
           <div className="flex flex-wrap items-center gap-2">
             <Select
-              id={`${id}-add`}
+              id={addId}
               value={selected}
               disabled={busy || addable.length === 0}
               className="max-w-xs"
               onChange={(e) => setChoice(e.target.value)}
             >
-              <option value="">{addable.length === 0 ? "No lists left to allow" : "Choose a site list"}</option>
+              <option value="">{placeholder}</option>
               {addable.map((n) => (
                 <option key={n} value={n}>
                   {n}
@@ -206,6 +249,15 @@ function ListsBody({
               {busy ? "Saving…" : "Allow"}
             </Button>
           </div>
+          {all !== null && all.length === 0 && (
+            <p className="text-xs text-muted">
+              Create one under{" "}
+              <Link to="/admin/egress-profiles" className="text-brand hover:underline">
+                Site lists
+              </Link>{" "}
+              first.
+            </p>
+          )}
           {availableError && <p className="text-xs text-danger">{availableError}</p>}
         </div>
       )}

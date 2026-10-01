@@ -377,7 +377,11 @@ export const productTokensApi = {
     requireAdmin();
     const p = findProduct(id);
     if (p.deleted_at !== null) throw new ApiError(409, "product is deleted");
-    if (!allowedLists.get(id)?.delete(name)) throw new ApiError(404, "egress profile is not allowed for this product");
+    // The real handler resolves the list by name before it deletes the allowance.
+    if (mockEgressProfileDescription(name) === null) throw new ApiError(404, "egress profile not found");
+    if (!allowedLists.get(id)?.delete(name)) {
+      throw new ApiError(404, "this product is not allowed to use that egress profile");
+    }
     return delay(null);
   },
   adminGetProductSkills: async (id: string) => {
