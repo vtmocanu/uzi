@@ -76,7 +76,8 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
      large PR): take a concrete split (child outcomes, order, blockers) to the user as one
      yes/no, with the buddy's view, and do not dispatch that issue meanwhile. For these
      alarms only, if no split yields independently valuable pieces, record the reason in the
-     PRD's Decision Log and continue.
+     PRD's Decision Log, commit and push that PRD-only edit to `main` (as `/prd-create`
+     commits a PRD), and continue once the push lands: the run clones the remote.
 2. **Decide MR-rework, then create gated** (no `--plan-file`):
 
    ```
