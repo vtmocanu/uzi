@@ -573,6 +573,8 @@ func run() error {
 	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
 	// provisioner will never create.
 	wsvc.SetEphemeralSettings(settingsCache)
+	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
+	wsvc.SetEphemeralLease(cfg.EphemeralLease)
 
 	// Completion-interlock rollout switch (PRD #1226 M1, D1): createRun reads it from the
 	// same settings cache to decide whether to stamp completion_contract_version=1 on a new
@@ -751,6 +753,9 @@ func run() error {
 		DefaultSize:       cfg.EphemeralDefaultSize,
 		ProvisionDeadline: cfg.EphemeralProvisionDeadline,
 		SaturationDelay:   cfg.EphemeralSaturationDelay,
+		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
+		// live lease and provisioning evicts the oldest releasable one at the cap.
+		Lease: cfg.EphemeralLease,
 	})
 
 	sweep := sweeper.New(wsvc, cfg.SweepInterval,
