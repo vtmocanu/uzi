@@ -1027,6 +1027,8 @@ Tracked as GitHub issue vtmocanu/uzi#1798; PRD at `prds/1798-plain-english-pr-de
   line; a human can see what it does and how big it is from the description
   alone. (AI-synced 2026-09-28)
 - A Claude run and a Codex run produce the same layout. (AI-synced 2026-09-28)
+- The PR body shows the size as a file count plus a small table (one row per
+  category, a Total row); the web and CLI keep the one-line form. (AI-synced 2026-10-01, #2061)
 - Generated or lead-written text can never close an issue. (AI-synced 2026-09-28)
 - Text outside uzi's own blocks is preserved on an ordinary refresh; a few
   named cases (no uzi markers yet, malformed markers — the publisher skips

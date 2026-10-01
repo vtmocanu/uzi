@@ -75,7 +75,7 @@ import {
   renderRegion,
   type OwnedBlocks,
 } from "./pr-description.js";
-import type { ComputedSize } from "./pr-size.js";
+import { isCanonicalSizeTable, type ComputedSize } from "./pr-size.js";
 import type {
   PrDescriptionAckOutcome,
   PrDescriptionState,
@@ -357,7 +357,8 @@ const PROVENANCE_RE = /^Describes `[0-9a-f]{7}` against .+\.$/u;
 
 /**
  * Whether `region` is exactly uzi's deterministic region: the size line and/or the provenance line
- * and nothing else (renderRegion with no fields). Bodies created before this publisher carry a
+ * and nothing else (renderRegion with no fields). The size part is either the legacy one-line form
+ * or the canonical multi-line table (isCanonicalSizeTable). Bodies created before this publisher carry a
  * size-line-only region with no provenance and no version; that shape is uzi's own, so a region
  * with no published version and no matching version (lookup `none`) may be overwritten only when
  * it has this shape. Anything else is treated as a human edit.
@@ -368,7 +369,10 @@ export function isDeterministicRegion(region: string): boolean {
   const inner = lines.slice(1, -1);
   if (inner.length === 0) return true;
   if (inner.length === 1) return SIZE_LINE_RE.test(inner[0]!) || PROVENANCE_RE.test(inner[0]!);
-  return inner.length === 3 && SIZE_LINE_RE.test(inner[0]!) && inner[1] === "" && PROVENANCE_RE.test(inner[2]!);
+  if (inner.length === 3 && SIZE_LINE_RE.test(inner[0]!) && inner[1] === "" && PROVENANCE_RE.test(inner[2]!)) return true;
+  if (isCanonicalSizeTable(inner)) return true;
+  const n = inner.length;
+  return n >= 3 && inner[n - 2] === "" && PROVENANCE_RE.test(inner[n - 1]!) && isCanonicalSizeTable(inner.slice(0, n - 2));
 }
 
 /** The D12 staleness pair (inner markers included) exactly as renderCompletionBlock renders it,

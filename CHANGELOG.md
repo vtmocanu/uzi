@@ -44,6 +44,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **A uzi PR's size now reads as a small table instead of one dense line ([#2061](https://github.com/vtmocanu/uzi/issues/2061)).**
+  The PR body shows `**Size:** N files` followed by a Markdown table with one row per category (code, tests, docs, config, generated, vendored), right-aligned added and deleted counts, and a bold Total row; the numbers, bucket rules and `**Size:** unavailable` case are unchanged, and a PR whose description still carries the old one-line size is refreshed to the table. The run page's "Delivered" section and `uzi run get`'s `SIZE` row are unchanged.
+
 - **Codex leads and subagents are told how a long gate command behaves ([#1926](https://github.com/vtmocanu/uzi/issues/1926)).**
   A Codex command reaps its backgrounded descendants before it returns, so the agent is now told to run one long gate in the foreground to a log and read the recorded exit status, instead of backgrounding it and polling a result that no longer exists.
 

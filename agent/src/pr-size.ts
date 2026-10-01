@@ -1,4 +1,7 @@
-// PRD #1798 M1 (D3): the deterministic, repo-generic size line of a merge-request body.
+// PRD #1798 M1 (D3): the deterministic, repo-generic size of a merge-request body. The PR-body block
+// (`renderSizeTable`, issue #2061) is multi-line: a `**Size:** N files` header and a Markdown table.
+// `renderSizeLine` keeps the dense one-line form, pinned against the web and CLI renderers by
+// fixtures/pr-size-line/:
 //
 //   **Size:** code +A −D · tests +A −D · docs +A −D · config +A −D · generated +A −D · vendored +A −D · N files
 //
@@ -271,6 +274,93 @@ export function renderSizeLine(entries: readonly NumstatEntry[], attrs: Readonly
   return `**Size:** ${parts.join(SEPARATOR)}`;
 }
 
+/** One row of the size table: a bucket and its line counts. */
+export interface SizeTableRow {
+  bucket: SizeBucket;
+  added: number;
+  deleted: number;
+}
+
+const TABLE_HEADER_ROW = "| Category | Added | Deleted |";
+const TABLE_ALIGN_ROW = "|:---------|------:|--------:|";
+
+function bucketLabel(bucket: SizeBucket): string {
+  return bucket.charAt(0).toUpperCase() + bucket.slice(1);
+}
+
+function tableFileCount(n: number): string {
+  return `${NUMBER_FORMAT.format(n)} ${n === 1 ? "file" : "files"}`;
+}
+
+/**
+ * Issue #2061: the PR-body size block: a `**Size:** N files` header, a blank line, and a Markdown
+ * table with one row per given bucket plus a Total row summing them. Numbers use en-US grouping and
+ * deletions U+2212 MINUS SIGN, as in {@link renderSizeLine}.
+ */
+export function formatSizeTable(rows: readonly SizeTableRow[], files: number): string {
+  let added = 0;
+  let deleted = 0;
+  const body = rows.map((r) => {
+    added += r.added;
+    deleted += r.deleted;
+    return `| ${bucketLabel(r.bucket)} | +${NUMBER_FORMAT.format(r.added)} | ${MINUS}${NUMBER_FORMAT.format(r.deleted)} |`;
+  });
+  return [
+    `**Size:** ${tableFileCount(files)}`,
+    "",
+    TABLE_HEADER_ROW,
+    TABLE_ALIGN_ROW,
+    ...body,
+    `| **Total** | **+${NUMBER_FORMAT.format(added)}** | **${MINUS}${NUMBER_FORMAT.format(deleted)}** |`,
+  ].join("\n");
+}
+
+/** The table form of {@link renderSizeLine}, from the same bucketing; null for an empty diff. */
+export function renderSizeTable(entries: readonly NumstatEntry[], attrs: ReadonlyMap<string, PathAttributes>): string | null {
+  if (entries.length === 0) return null;
+  const totals = bucketTotals(entries, attrs);
+  const rows: SizeTableRow[] = [];
+  for (const bucket of SIZE_BUCKETS) {
+    const t = totals.get(bucket);
+    if (t) rows.push({ bucket, added: t.added, deleted: t.deleted });
+  }
+  return formatSizeTable(rows, entries.length);
+}
+
+const TABLE_HEAD_RE = /^\*\*Size:\*\* ([0-9][0-9,]*) files?$/u;
+const TABLE_ROW_RE = /^\| (Code|Tests|Docs|Config|Generated|Vendored) \| \+([0-9][0-9,]*) \| \u2212([0-9][0-9,]*) \|$/u;
+
+function parseGroupedCount(s: string): number {
+  return Number(s.replace(/,/gu, ""));
+}
+
+/**
+ * Whether `lines` are exactly a block {@link formatSizeTable} renders: the parsed numbers are
+ * re-rendered and must reproduce the input byte for byte, so non-canonical numbers, a wrong Total,
+ * reordered or duplicate buckets, an altered header or alignment row, and any extra text all fail.
+ */
+export function isCanonicalSizeTable(lines: readonly string[]): boolean {
+  if (lines.length < 6) return false;
+  const head = TABLE_HEAD_RE.exec(lines[0]!);
+  if (!head) return false;
+  if (lines[1] !== "" || lines[2] !== TABLE_HEADER_ROW || lines[3] !== TABLE_ALIGN_ROW) return false;
+  const rows: SizeTableRow[] = [];
+  let last = -1;
+  for (const line of lines.slice(4, -1)) {
+    const m = TABLE_ROW_RE.exec(line);
+    if (!m) return false;
+    const idx = SIZE_BUCKETS.findIndex((b) => bucketLabel(b) === m[1]);
+    if (idx <= last) return false;
+    last = idx;
+    rows.push({ bucket: SIZE_BUCKETS[idx]!, added: parseGroupedCount(m[2]!), deleted: parseGroupedCount(m[3]!) });
+  }
+  if (rows.length === 0) return false;
+  const files = parseGroupedCount(head[1]!);
+  if (!Number.isSafeInteger(files) || files < rows.length) return false;
+  if (rows.some((r) => !Number.isSafeInteger(r.added) || !Number.isSafeInteger(r.deleted))) return false;
+  return formatSizeTable(rows, files) === lines.join("\n");
+}
+
 /** A git invocation for the attribute lookup: `args` after `git -C <bare>`, optional NUL-joined stdin,
  *  and an optional `GIT_INDEX_FILE`. Resolves to stdout; rejects with an error carrying git's `stderr`
  *  (the `--source`-unsupported detection reads it). */
@@ -332,7 +422,7 @@ export interface SizeLineGit {
 
 /** The size line and the same numbers as the api's structured size (PRD #1798 D9). */
 export interface ComputedSize {
-  /** The rendered line; null only for an empty diff. */
+  /** The rendered PR-body size block (multi-line, {@link renderSizeTable}); null only for an empty diff. */
   line: string | null;
   /** The structured totals: `unavailable: true` with every count zero when `line` is
    *  {@link SIZE_UNAVAILABLE}, `files: 0` with every bucket zero for an empty diff. */
@@ -366,7 +456,7 @@ export async function computeSize(
     if (missing.length > 0) {
       throw new Error(`check-attr reported no attributes for ${missing.length} of ${paths.length} path(s), e.g. ${JSON.stringify(missing[0])}`);
     }
-    return { line: renderSizeLine(entries, attrs), size: sizeTotals(entries, attrs) };
+    return { line: renderSizeTable(entries, attrs), size: sizeTotals(entries, attrs) };
   } catch (err) {
     log?.warn("PR size line unavailable", { error: err instanceof Error ? err.message : String(err) });
     return { line: SIZE_UNAVAILABLE, size: zeroSize(true) };

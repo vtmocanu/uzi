@@ -46,6 +46,15 @@ const BASE = "b".repeat(40);
 const MR = 42;
 const IID = 7;
 const SIZE_LINE = "**Size:** code +3 −1 · 1 file";
+const SIZE_TABLE = [
+  "**Size:** 3 files",
+  "",
+  "| Category | Added | Deleted |",
+  "|:---------|------:|--------:|",
+  "| Code | +1,203 | −1 |",
+  "| Docs | +2 | −0 |",
+  "| **Total** | **+1,205** | **−1** |",
+].join("\n");
 const ZERO = { added: 0, deleted: 0 };
 const SIZE: PrDescriptionSize = { unavailable: false, files: 1, code: { added: 3, deleted: 1 }, tests: ZERO, docs: ZERO, config: ZERO, generated: ZERO, vendored: ZERO };
 const CTX: DeliveryContext = {
@@ -428,6 +437,35 @@ describe("publisher: preservation and human-edit protection (D10)", () => {
     await pub2.publish(MR);
     assert.match(r2.forge.pr.description, /Someone wrote this\./);
     assert.deepEqual(api.acks().slice(-1), ["skipped_human_edit"]);
+  });
+
+  it("a legacy one-line size region with no published version is refreshed to the table (issue #2061)", async () => {
+    const legacy = [REGION_START, SIZE_LINE, "", "Describes `aaaaaaa` against `main`.", REGION_END].join("\n");
+    const r = rig();
+    r.forge.pr.description = `${legacy}\n\n${completion(true)}`;
+    const pub = await r.publisher.prepare(
+      makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: SIZE_TABLE, size: SIZE } }) }),
+      { headSha: H1, targetBranch: "main" },
+    );
+    await pub.publish(MR);
+    assert.ok(pub.region.includes(SIZE_TABLE), "the new region carries the table");
+    assert.equal(r.forge.pr.description, renderBody(pub.region, completion(true)));
+    assert.deepEqual(api.acks(), ["published"]);
+  });
+
+  it("a versioned region whose table was edited is human: left alone (issue #2061)", async () => {
+    const table = renderRegion({ sizeLine: SIZE_TABLE, headSha: H1, targetBranch: "main" }).text;
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(table), headSha: H1 });
+    const edited = table.replace("| Docs | +2 |", "| Docs | +9 |");
+    assert.notEqual(edited, table);
+    r.forge.pr.description = `${edited}\n\n${completion(false)}`;
+    const pub = await r.publisher.prepare(makeSpec({ prior: await priorState() }), { headSha: H1, targetBranch: "main" });
+    const out = await pub.publish(MR);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.equal(parsed.kind === "ok" && parsed.region, edited, "the edited table is kept byte for byte");
+    assert.equal(out.ack, "skipped_human_edit");
+    assert.deepEqual(api.acks(), ["skipped_human_edit"]);
   });
 
   it("a region removed from a PR with a published version is not put back: skipped_no_region", async () => {
@@ -1209,6 +1247,42 @@ describe("publisher helpers", () => {
     assert.ok(isDeterministicRegion(renderRegion({ sizeLine: SIZE_LINE, headSha: H1, targetBranch: "main" }).text));
     assert.ok(!isDeterministicRegion(OLD_REGION));
     assert.ok(!isDeterministicRegion([REGION_START, SIZE_LINE, "Closes #7", REGION_END].join("\n")));
+  });
+
+  it("isDeterministicRegion: the size table, with and without provenance; legacy shapes still accepted (issue #2061)", () => {
+    const prov = "Describes `aaaaaaa` against `main`.";
+    const wrap = (...inner: string[]) => [REGION_START, ...inner, REGION_END].join("\n");
+    assert.ok(isDeterministicRegion(wrap(SIZE_TABLE)));
+    assert.ok(isDeterministicRegion(wrap(SIZE_TABLE, "", prov)));
+    assert.ok(isDeterministicRegion(renderRegion({ sizeLine: SIZE_TABLE, headSha: H1, targetBranch: "main" }).text));
+    assert.ok(isDeterministicRegion(wrap(SIZE_LINE)));
+    assert.ok(isDeterministicRegion(wrap(SIZE_LINE, "", prov)));
+    assert.ok(isDeterministicRegion(wrap(prov)));
+    assert.ok(isDeterministicRegion(wrap()));
+  });
+
+  it("isDeterministicRegion rejects a table that is not exactly canonical (issue #2061)", () => {
+    const prov = "Describes `aaaaaaa` against `main`.";
+    const wrap = (...inner: string[]) => [REGION_START, ...inner, REGION_END].join("\n");
+    const bad: [string, string][] = [
+      ["extra row", SIZE_TABLE.replace("| **Total**", "| Config | +1 | −0 |\n| **Total**")],
+      ["extra trailing text", `${SIZE_TABLE}\nSomething else`],
+      ["altered header", SIZE_TABLE.replace("| Category |", "| Kind |")],
+      ["altered alignment row", SIZE_TABLE.replace("|:---------|------:|--------:|", "|:---------|:-----:|--------:|")],
+      ["wrong total", SIZE_TABLE.replace("**+1,205**", "**+1,206**")],
+      ["reordered buckets", SIZE_TABLE.replace("| Code | +1,203 | −1 |\n| Docs | +2 | −0 |", "| Docs | +2 | −0 |\n| Code | +1,203 | −1 |")],
+      ["duplicate bucket", SIZE_TABLE.replace("| Docs | +2 | −0 |", "| Code | +2 | −0 |")],
+      ["ASCII hyphen", SIZE_TABLE.replaceAll("−", "-")],
+      ["missing comma", SIZE_TABLE.replace("+1,203", "+1203")],
+      ["leading zero", SIZE_TABLE.replace("+2 |", "+02 |")],
+    ];
+    for (const [name, table] of bad) {
+      assert.ok(table !== SIZE_TABLE, name);
+      assert.ok(!isDeterministicRegion(wrap(table)), name);
+      assert.ok(!isDeterministicRegion(wrap(table, "", prov)), name);
+    }
+    assert.ok(!isDeterministicRegion(wrap(SIZE_TABLE, "", "not provenance")));
+    assert.ok(!isDeterministicRegion(wrap(SIZE_TABLE, prov)));
   });
 
   it("repoPathFromUrl", () => {

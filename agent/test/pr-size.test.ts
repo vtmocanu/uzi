@@ -8,10 +8,13 @@ import { GitCache } from "../src/git.js";
 import {
   classifyPath,
   computeSize,
+  formatSizeTable,
+  isCanonicalSizeTable,
   isSourceUnsupported,
   lookupAttributes,
   parseNumstatZ,
   renderSizeLine,
+  renderSizeTable,
   sizeTotals,
   SIZE_UNAVAILABLE,
   type AttrGitRunner,
@@ -564,8 +567,23 @@ describe("computeSize: line plus structured size, same failure contract (PRD #17
 
   it("the line and the size carry the same numbers", async () => {
     const got = await computeSize(ok, "/bare", "main", head, nullLogger());
-    assert.strictEqual(got.line, `**Size:** code +1 ${MINUS}0 · docs +2 ${MINUS}5 · generated +4 ${MINUS}0 · 3 files`);
-    assertSizeMatchesLine(got.size, got.line);
+    assert.strictEqual(
+      got.line,
+      [
+        "**Size:** 3 files",
+        "",
+        "| Category | Added | Deleted |",
+        "|:---------|------:|--------:|",
+        `| Code | +1 | ${MINUS}0 |`,
+        `| Docs | +2 | ${MINUS}5 |`,
+        `| Generated | +4 | ${MINUS}0 |`,
+        `| **Total** | **+7** | **${MINUS}5** |`,
+      ].join("\n"),
+    );
+    // The one-line form of the same diff carries the same numbers as the structured size.
+    const entries = parseNumstatZ(await ok.diffNumstatZ("/bare", "b", head));
+    const attrs = await ok.checkAttrZ("/bare", head, entries.map((x) => x.path));
+    assertSizeMatchesLine(got.size, renderSizeLine(entries, attrs));
   });
 
   it("an empty diff: no line, a zero (available) size", async () => {
@@ -628,9 +646,22 @@ describe("computeSize end to end on a real bare clone (PRD #1798 M1)", () => {
       // code: src/keep.ts +2, src/helper.go (renamed from test/) +0 −0, img/logo.png binary.
       // docs: the deleted docs/gone.md (old path) −3. generated: store/runs.sql.go via .gitattributes.
       // config: .gitattributes itself is code (no rule matches it).
-      assert.strictEqual(line, `**Size:** code +3 ${MINUS}0 · docs +0 ${MINUS}3 · generated +2 ${MINUS}0 · 6 files`);
+      assert.strictEqual(
+        line,
+        [
+          "**Size:** 6 files",
+          "",
+          "| Category | Added | Deleted |",
+          "|:---------|------:|--------:|",
+          `| Code | +3 | ${MINUS}0 |`,
+          `| Docs | +0 | ${MINUS}3 |`,
+          `| Generated | +2 | ${MINUS}0 |`,
+          `| **Total** | **+5** | **${MINUS}3** |`,
+        ].join("\n"),
+      );
       const computed = await computeSize(gc, fx.bare, "main", fx.head, nullLogger());
-      assertSizeMatchesLine(computed.size, line!);
+      const entries = parseNumstatZ(raw);
+      assertSizeMatchesLine(computed.size, renderSizeLine(entries, await gc.checkAttrZ(fx.bare, fx.head, entries.map((x) => x.path))));
     } finally {
       fx.cleanup();
     }
@@ -654,7 +685,10 @@ describe("computeSize end to end on a real bare clone (PRD #1798 M1)", () => {
       diffNumstatZ: async () => "1\t0\tsrc/a.ts\0",
       checkAttrZ: async (_bare, _head, paths) => new Map(paths.map((p) => [p, { "linguist-generated": "unspecified" }])),
     };
-    assert.strictEqual(await sizeLine(ok, "/bare", "main", head, log), `**Size:** code +1 ${MINUS}0 · 1 file`);
+    assert.strictEqual(
+      await sizeLine(ok, "/bare", "main", head, log),
+      `**Size:** 1 file\n\n| Category | Added | Deleted |\n|:---------|------:|--------:|\n| Code | +1 | ${MINUS}0 |\n| **Total** | **+1** | **${MINUS}0** |`,
+    );
     const failures: SizeLineGit[] = [
       { ...ok, checkAttrZ: async () => { throw new Error("git check-attr failed: fatal: bad object"); } },
       { ...ok, diffNumstatZ: async () => { throw new Error("git diff failed"); } },
@@ -683,6 +717,58 @@ describe("computeSize end to end on a real bare clone (PRD #1798 M1)", () => {
     assert.match(JSON.stringify(warns[0]!.meta), /store\/q\.sql\.go/);
     // An entirely empty map (every path missing) is unavailable too.
     assert.strictEqual(await sizeLine({ ...partial, checkAttrZ: async () => new Map() }, "/bare", "main", head, log), SIZE_UNAVAILABLE);
+  });
+});
+
+describe("renderSizeTable (issue #2061)", () => {
+  const e = (p: string, added: number, deleted: number, binary = false): NumstatEntry => ({ path: p, added, deleted, binary });
+  const EXAMPLE = [
+    "**Size:** 8 files",
+    "",
+    "| Category | Added | Deleted |",
+    "|:---------|------:|--------:|",
+    `| Code | +330 | ${MINUS}27 |`,
+    `| Tests | +986 | ${MINUS}17 |`,
+    `| Docs | +3 | ${MINUS}0 |`,
+    `| **Total** | **+1,319** | **${MINUS}44** |`,
+  ].join("\n");
+
+  it("renders the issue example with grouped totals", () => {
+    const entries = [
+      e("src/a.ts", 300, 20),
+      e("src/b.ts", 30, 7),
+      e("src/a.test.ts", 900, 10),
+      e("test/b.test.ts", 86, 7),
+      e("test/c.test.ts", 0, 0),
+      e("docs/a.md", 2, 0),
+      e("docs/b.md", 1, 0),
+      e("docs/c.md", 0, 0),
+    ];
+    assert.strictEqual(renderSizeTable(entries, new Map()), EXAMPLE);
+  });
+
+  it("a binary-only bucket is a +0 row and the file count is singular for one file", () => {
+    assert.strictEqual(
+      renderSizeTable([e("logo.png", 0, 0, true)], new Map()),
+      `**Size:** 1 file\n\n| Category | Added | Deleted |\n|:---------|------:|--------:|\n| Code | +0 | ${MINUS}0 |\n| **Total** | **+0** | **${MINUS}0** |`,
+    );
+  });
+
+  it("orders rows by bucket and capitalises labels", () => {
+    const entries = [e("v/x.c", 1, 0), e("a.yml", 2, 0), e("a.ts", 3, 0)];
+    const out = renderSizeTable(entries, new Map([["v/x.c", { "linguist-vendored": "set" }]]))!;
+    assert.deepStrictEqual(
+      out.split("\n").slice(4, -1).map((l) => l.split(" | ")[0]),
+      ["| Code", "| Config", "| Vendored"],
+    );
+  });
+
+  it("an empty diff renders nothing", () => assert.strictEqual(renderSizeTable([], new Map()), null));
+
+  it("formatSizeTable output is canonical; renderSizeLine is unchanged", () => {
+    assert.ok(isCanonicalSizeTable(EXAMPLE.split("\n")));
+    assert.ok(isCanonicalSizeTable(formatSizeTable([{ bucket: "docs", added: 0, deleted: 0 }], 1).split("\n")));
+    assert.strictEqual(renderSizeLine([e("a.ts", 1, 0)], new Map()), `**Size:** code +1 ${MINUS}0 · 1 file`);
   });
 });
 
@@ -718,7 +804,7 @@ describe("RunRunner puts the size line in the opened MR body (PRD #1798 M1)", ()
     // PRD #1798 M6: the region also ends with the deterministic provenance line (D12).
     assert.match(
       body.description,
-      /^<!-- uzi:description:start v1 -->\n\*\*Size:\*\* docs \+\d+ −0 · 1 file\n\nDescribes `[0-9a-f]{7}` against `main`\.\n<!-- uzi:description:end -->\n\n<!-- uzi:completion:start v1 -->\n/,
+      /^<!-- uzi:description:start v1 -->\n\*\*Size:\*\* 1 file\n\n\| Category \| Added \| Deleted \|\n\|:---------\|------:\|--------:\|\n\| Docs \| \+\d+ \| −0 \|\n\| \*\*Total\*\* \| \*\*\+\d+\*\* \| \*\*−0\*\* \|\n\nDescribes `[0-9a-f]{7}` against `main`\.\n<!-- uzi:description:end -->\n\n<!-- uzi:completion:start v1 -->\n/,
     );
   });
 });
@@ -729,7 +815,15 @@ describe("RunRunner keeps the size line in the verified-head reconcile (PRD #179
     // The completion interlock (PRD #1226 M4) opens the MR, verifies head H, then REWRITES the body
     // via updateMergeRequestDescription to add Closes. That rewrite must keep the size line.
     const H = "1111111111111111111111111111111111111111";
-    const SIZE = `**Size:** code +3 ${MINUS}1 · tests +2 ${MINUS}0 · 2 files`;
+    const SIZE = [
+      "**Size:** 2 files",
+      "",
+      "| Category | Added | Deleted |",
+      "|:---------|------:|--------:|",
+      `| Code | +3 | ${MINUS}1 |`,
+      `| Tests | +2 | ${MINUS}0 |`,
+      `| **Total** | **+5** | **${MINUS}1** |`,
+    ].join("\n");
     const { gitlab, calls, all } = fakeGitlab({ head: H });
     const claim = gitlabClaim(1798, { config: { completion_contract_version: 1, contract_revision: 1 } });
     api.setCompletionPermitResponse(true);

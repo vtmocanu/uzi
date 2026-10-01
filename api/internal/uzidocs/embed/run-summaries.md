@@ -86,16 +86,26 @@ warnings, and a fixed footer: "Opened by uzi from `<branch>`. A human
 reviews and merges; uzi never merges." The summary and the size line are
 omitted, not left blank, when there's nothing to show.
 
-**The size line.** A line like:
+**The size block.** A file count and a small table, like:
 
 ```
-**Size:** code +896 −219 · tests +1,810 −84 · docs +101 −30 · generated +319 −44 · 52 files
+**Size:** 52 files
+
+| Category | Added | Deleted |
+|:---------|------:|--------:|
+| Code | +896 | −219 |
+| Tests | +1,810 | −84 |
+| Docs | +101 | −30 |
+| Generated | +319 | −44 |
+| **Total** | **+3,126** | **−377** |
 ```
 
 is always computed from the actual diff (`git diff --numstat`), never
 written by a model, and empty buckets are omitted; a bucket with a file in it
 but no added and no deleted lines (a binary file, say) still shows as
-`+0 −0`. Each changed file is
+`+0 −0`. When the size can't be computed faithfully the PR shows
+`**Size:** unavailable` instead, and a PR with no changed files has no size
+block at all. Each changed file is
 classified into one bucket, first by your repo's own `.gitattributes`
 (`linguist-generated`, `linguist-documentation`, `linguist-vendored`), then by
 generic path rules (test files, `docs/`, lockfiles and other generated
@@ -104,9 +114,9 @@ repo classifies something uzi's generic rules get wrong (generated code that
 doesn't match a common pattern, for example), add or adjust a
 `.gitattributes` entry for it; the size line has no repo-specific rules
 baked in. `uzi run get`'s own `SIZE` row and the run page's "Delivered"
-section both print a shorter cut of the same numbers: each omits a bucket
-that has a file but no added and no deleted lines, which the PR's own size
-line still shows.
+section both print the same numbers as one line (`Size: code +896 −219 ·
+… · 52 files`): each omits a bucket that has a file but no added and no
+deleted lines, which the PR's own size table still shows.
 
 **Verification is only what the agent reported.** The Verification section
 never claims the CI passed (that's on the PR itself, from the forge) and

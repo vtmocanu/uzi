@@ -92,6 +92,26 @@ const FULL: Partial<RawPrDescriptionFields> = {
 // ── renderRegion ────────────────────────────────────────────────────────────────────────────
 
 describe("renderRegion (D5, D8, D12)", () => {
+  it("carries a multi-line size table verbatim, with and without fields (issue #2061)", async () => {
+    const table = [
+      "**Size:** 2 files",
+      "",
+      "| Category | Added | Deleted |",
+      "|:---------|------:|--------:|",
+      "| Code | +3 | \u22121 |",
+      "| **Total** | **+3** | **\u22121** |",
+    ].join("\n");
+    const bare = renderRegion({ sizeLine: table, headSha: HEAD, targetBranch: "main" });
+    assert.equal(bare.withFields, false);
+    assert.ok(bare.text.includes(`\n${table}\n`), bare.text);
+    // CRLF input is normalised to LF, not flattened onto one line.
+    assert.equal(renderRegion({ sizeLine: table.replaceAll("\n", "\r\n") }).text, `${REGION_START}\n${table}\n${REGION_END}`);
+    const f = await mint(FULL);
+    const full = renderRegion({ sizeLine: table, headSha: HEAD, targetBranch: "main", source: "generated" }, f);
+    assert.equal(full.withFields, true);
+    assert.ok(full.text.includes(`\n\n${table}\n\n`), full.text);
+  });
+
   it("renders the full layout from a real instance, fields verbatim", async () => {
     const f = await mint(FULL);
     const r = renderRegion({ sizeLine: SIZE, headSha: HEAD, targetBranch: "main", source: "generated" }, f);

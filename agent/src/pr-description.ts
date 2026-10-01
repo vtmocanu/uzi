@@ -974,7 +974,8 @@ function sameSha(a: string, b: string): boolean {
 
 /** The deterministic inputs of a region: nothing here is model- or lead-authored. */
 export interface RegionInput {
-  /** The deterministic size line (`**Size:** …`, pr-size.ts); absent/empty ⇒ no size line. */
+  /** The deterministic size block (`**Size:** …`, pr-size.ts; one line or a multi-line table);
+   *  absent/empty ⇒ no size block. */
   sizeLine?: string | null;
   /** The head the region describes, for the provenance line and the Verification SHAs. */
   headSha?: string;
@@ -1007,7 +1008,7 @@ const SCOPE_LABEL: Record<SanitizedPrDescriptionFields["scope_notes"][number]["k
 };
 
 function sizeLineOf(input: RegionInput): string | undefined {
-  const t = input.sizeLine?.replace(/[\r\n]+/gu, " ").trim();
+  const t = input.sizeLine?.replace(/\r\n?/gu, "\n").trim();
   return t ? t : undefined;
 }
 
