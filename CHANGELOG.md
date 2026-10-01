@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A Codex command that hits its 60-minute deadline is stopped before the agent hears about it ([#2048](https://github.com/vtmocanu/uzi/issues/2048)).**
+  The command's process tree is reaped before the call returns, and the agent gets an explicit "stopped at its deadline" error instead of the generic broker failure; an unclean reap still fails closed.
+
 - **Run lists avoid scanning unrelated messages for plan revision state ([#2041](https://github.com/vtmocanu/uzi/issues/2041)).**
   A concurrently built partial index keeps the plan revision lookup scoped to plan and plan_revising frames as run histories grow, reducing board refresh delays without changing revision flags.
 

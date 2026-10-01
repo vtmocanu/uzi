@@ -115,6 +115,7 @@ import {
 } from "./codex-harness.js";
 import {
   CodexCallbackBroker,
+  CommandDeadlineError,
   type FileopClient,
   type ScreenPolicy,
   type SpawnCommandResult,
@@ -145,6 +146,7 @@ import {
   type CodexRootHandle,
   type CommandCacheHolder,
   type DisposeOutcome,
+  SupervisedChildExitTimeoutError,
 } from "./launcher.js";
 import { createCodexTransport } from "./transport.js";
 import type { CodexNotification } from "./transport.js";
@@ -3970,7 +3972,11 @@ function commandEffectSpec(
 
 /** Run a model-authorized shell effect as a registered command supervisor root.
  * The callback returns only after the primary child and every backgrounded
- * descendant have settled; abort/cap paths also reap before returning. */
+ * descendant have settled; abort/cap paths also reap before returning. At the wall
+ * deadline the root is reaped before {@link CommandDeadlineError} is thrown. Any other
+ * waitChild rejection also reaps first; with the real launcher that reap is unclean after
+ * the supervisor's fail(), so it surfaces as COMMAND_ROOT_UNREAPED with the registry
+ * poisoned (fail-closed). `wallMs` is a test seam; production uses the default. */
 export function makeDefaultSpawnCommand(
   registry: ExecutionRegistry,
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
@@ -3980,6 +3986,7 @@ export function makeDefaultSpawnCommand(
   mode: CommandSandboxMode,
   log?: Pick<Logger, "warn">,
   cache?: RunCommandCache,
+  wallMs: number = DEFAULT_WALL_MS,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
       const [cmd, ...rest] = argv;
@@ -4046,8 +4053,8 @@ export function makeDefaultSpawnCommand(
           opts.signal.addEventListener("abort", onAbort, { once: true });
         }
       });
-      const terminal = launched.handle.waitChild(DEFAULT_WALL_MS).then((result) => ({ kind: "exit" as const, code: result.code }));
-      void terminal.catch(() => undefined);
+      const terminal = launched.handle.waitChild(wallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
+        .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
       const first = await Promise.race([
         terminal,
         aborted.then(() => ({ kind: "aborted" as const })),
@@ -4058,6 +4065,8 @@ export function makeDefaultSpawnCommand(
       if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
       await outputEnded;
       if (first.kind === "aborted") throw new Error("command aborted");
+      if (first.kind === "deadline") throw new CommandDeadlineError(wallMs);
+      if (first.kind === "failed") throw first.error;
       return {
         code: first.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
         stdout,

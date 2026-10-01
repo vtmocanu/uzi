@@ -72,6 +72,8 @@ import type {
   DisposeEvidence,
   DisposeOutcome,
 } from "../src/codex/launcher.js";
+import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
+import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
 
@@ -2845,6 +2847,90 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
     assert.equal(reservedAtLaunch, true);
     assert.equal(disposes, 1, "abort awaited the supervisor's clean whole-root disposal");
     assert.equal(registry.hasLiveCommandRoot(), false);
+  });
+
+  describe("issue #2048: a command wall deadline reaps the root before the call returns", () => {
+  /** A fake command root whose waitChild rejects after a short fixed delay with the
+   *  supervisor's deadline error (whatever ms was asked for), so unfixed code fails fast. */
+  function deadlineFake(opts: { clean: boolean; waitError?: Error }): {
+    launch: () => Promise<CodexRootHandle>;
+    state: { disposes: number; waitMs: number | undefined };
+  } {
+    const state = { disposes: 0, waitMs: undefined as number | undefined };
+    const launch = async (): Promise<CodexRootHandle> => {
+      const stdin = new PassThrough();
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      return {
+        started: { event: "started", supervisorPid: 20, childPid: 21, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 20,
+        transport: { stdin, stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        waitChild: async (ms: number) => {
+          state.waitMs = ms;
+          await new Promise<void>((resolve) => setTimeout(resolve, 10));
+          throw opts.waitError ?? new SupervisedChildExitTimeoutError(ms);
+        },
+        dispose: async (): Promise<DisposeOutcome> => {
+          state.disposes += 1;
+          stdout.end(); stderr.end();
+          if (!opts.clean) return { clean: false, reason: "supervisor reported a surviving descendant" };
+          return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+        failed: undefined,
+        whenFailed: new Promise<Error>(() => undefined),
+      };
+    };
+    return { launch, state };
+  }
+
+    const WT = "/data/runner/repo/run-2048";
+    const build = (registry: ExecutionRegistry, launch: () => Promise<CodexRootHandle>) =>
+      makeDefaultSpawnCommand(registry, launch, 1000, WT, runEnv, "required", undefined, undefined, 20);
+
+    it("clean reap: rejects with CommandDeadlineError after exactly one dispose", async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2048));
+      const fake = deadlineFake({ clean: true });
+      const err = await withTimeout(
+        build(registry, fake.launch)(["/bin/sh", "-c", "sleep 9999"], { cwd: WT }).then(() => undefined, (e: unknown) => e),
+        5000,
+        "deadline command",
+      );
+      assert.ok(err instanceof CommandDeadlineError, `expected CommandDeadlineError, got ${String(err)}`);
+      assert.equal((err as CommandDeadlineError).name, "CommandDeadlineError");
+      assert.equal(fake.state.waitMs, 20, "the wall deadline is the injected wallMs");
+      assert.equal(fake.state.disposes, 1);
+      assert.equal(registry.hasLiveCommandRoot(), false);
+    });
+
+    it("unclean reap: fails closed with the unreaped error and a poisoned registry, never CommandDeadlineError", async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2049));
+      const fake = deadlineFake({ clean: false });
+      const err = await withTimeout(
+        build(registry, fake.launch)(["/bin/sh", "-c", "sleep 9999"], { cwd: WT }).then(() => undefined, (e: unknown) => e),
+        5000,
+        "unclean deadline command",
+      );
+      assert.ok(err instanceof Error);
+      assert.match((err as Error).message, /did not reap cleanly/);
+      assert.ok(!(err instanceof CommandDeadlineError));
+      assert.equal(registry.isPoisoned(), true);
+      assert.equal(fake.state.disposes, 1);
+    });
+
+    it("a non-deadline waitChild rejection reaps first, then rethrows that exact error", async () => {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2050));
+      const boom = new Error("supervisor boom");
+      // The clean-reap path here is fake-only: with the real launcher, fail() makes dispose unclean.
+      const fake = deadlineFake({ clean: true, waitError: boom });
+      const err = await withTimeout(
+        build(registry, fake.launch)(["/bin/sh", "-c", "true"], { cwd: WT }).then(() => undefined, (e: unknown) => e),
+        5000,
+        "failed waitChild command",
+      );
+      assert.equal(err, boom);
+      assert.equal(fake.state.disposes, 1);
+    });
   });
 
   it("builds the fixed Landlock wrapper argv for only the current worktree/private tmp, with the --mode token before --", () => {
