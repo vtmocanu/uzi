@@ -241,3 +241,44 @@ func TestWorkerJobInputFileUnavailableAfterFenceLiveDB(t *testing.T) {
 		t.Fatalf("holding worker: status = %d body %q, want 503 files_unavailable", rec.Code, rec.Body.String())
 	}
 }
+
+type workerDownloadDeadlineRecorder struct {
+	*httptest.ResponseRecorder
+	writeDeadline    time.Time
+	deadlineAtHeader time.Time
+}
+
+func (w *workerDownloadDeadlineRecorder) SetWriteDeadline(deadline time.Time) error {
+	w.writeDeadline = deadline
+	return nil
+}
+
+func (w *workerDownloadDeadlineRecorder) WriteHeader(status int) {
+	if status == http.StatusOK {
+		w.deadlineAtHeader = w.writeDeadline
+	}
+	w.ResponseRecorder.WriteHeader(status)
+}
+
+func TestWorkerJobInputDownloadExtendsWriteDeadlineLiveDB(t *testing.T) {
+	e := setupJobFileRouteLiveDB(t)
+	run := e.seedJob(t, e.user, e.worker)
+	body := bytes.Repeat([]byte("x"), 25<<20)
+	file := e.put(t, &run, workersvc.JobFileInput, body)
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/api/worker/runs/%s/files/%s?claim_generation=1", run, file), nil)
+	req.Header.Set("Authorization", "Bearer "+e.tokens[e.worker])
+	rec := &workerDownloadDeadlineRecorder{ResponseRecorder: httptest.NewRecorder()}
+	before := time.Now()
+	e.router.ServeHTTP(rec, req)
+	after := time.Now()
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), body) {
+		t.Fatalf("valid large download: status=%d, bytes=%d", rec.Code, rec.Body.Len())
+	}
+	duration := v1DownloadDeadlineFloor + time.Duration(int64(len(body))/v1DownloadMinBytesPerSec)*time.Second
+	if rec.deadlineAtHeader.Before(before.Add(duration)) || rec.deadlineAtHeader.After(after.Add(duration)) {
+		t.Fatalf("write deadline at header = %v, want between %v and %v", rec.deadlineAtHeader, before.Add(duration), after.Add(duration))
+	}
+	if rec.writeDeadline.After(after.Add(v1DownloadMaxDeadline)) {
+		t.Fatal("download deadline exceeds its cap")
+	}
+}

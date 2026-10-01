@@ -364,8 +364,8 @@ func (s *Service) recordGenerationRefusalsReason(job *genJob, reason string) {
 // markGenerationPending writes, inside the result transaction, the generation_pending marker of
 // each file the server will generate for sub, owned by the post id seq, after clearing the
 // generation-owned rows of both reserved names (an earlier post's marker, failure or refusal): a
-// re-post rewrites the markers and leaves no stale one, and the earlier post's generation, finding
-// its marker gone, knows it is superseded. Because the markers commit WITH the result, a crash or
+// re-post rewrites the markers and removes an omitted report. An earlier generation whose
+// marker is gone knows it is superseded. Because the markers commit WITH the result, a crash or
 // kill between the commit and the storage leaves them behind instead of silence. They are not
 // bounded by the per-run refusal cap (InsertGeneratedOutputMarker): there are at most two per run,
 // so prior refusals cannot crowd them out and they do not take a slot of the worker-reported drops.
@@ -387,6 +387,10 @@ func (j *JobFiles) markGenerationPending(ctx context.Context, q *store.Queries, 
 			// fence read it under FOR UPDATE, so this is not expected).
 			return ErrStaleClaim
 		}
+	}
+	if sub.ReportMD == "" {
+		_, err := q.DeleteOmittedGeneratedJobReport(ctx, store.DeleteOmittedGeneratedJobReportParams{RunID: runID, ClaimGeneration: gen, PostID: seq})
+		return err
 	}
 	return nil
 }
@@ -817,6 +821,13 @@ func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, r
 	}
 	if sub.ReportMD != "" {
 		record(JobOutputReportName, s.storeGeneratedOutput(ctx, wkr, run, gen, seq, JobOutputReportName, "text/markdown", []byte(sub.ReportMD)))
+	} else {
+		// A predecessor may have held its reservation while the empty post committed.
+		// Per-run generation ordering puts this repeat after that writer, before findings settle.
+		if err := s.removeOmittedGeneratedReport(ctx, wkr, run.ID, gen, seq); err != nil {
+			record(JobOutputFindingsName, err)
+			return // retain the failure marker; a successful findings write must not hide it
+		}
 	}
 	findings := make([]generatedFindingJSON, 0, len(sub.Findings))
 	for _, f := range sub.Findings {
@@ -833,6 +844,32 @@ func (s *Service) storeJobResultOutputs(ctx context.Context, wkr store.Worker, r
 	} else {
 		record(JobOutputFindingsName, s.storeGeneratedOutput(ctx, wkr, run, gen, seq, JobOutputFindingsName, "application/json", buf.Bytes()))
 	}
+}
+
+// removeOmittedGeneratedReport re-checks the post AFTER taking the run lock. The separate
+// statement gets a fresh READ COMMITTED snapshot: a post that committed while we waited on
+// the lock must supersede us. No stored-files advisory key is taken; this only frees bytes.
+func (s *Service) removeOmittedGeneratedReport(ctx context.Context, worker store.Worker, runID uuid.UUID, gen, seq int64) error {
+	tx, err := s.jobFiles.db.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	run, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(worker.ID)})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if run.Kind != runkind.Job || run.ClaimGeneration != gen || run.ClaimReleasedAt.Valid {
+		return nil
+	}
+	if _, err = q.DeleteOmittedGeneratedJobReport(ctx, store.DeleteOmittedGeneratedJobReportParams{RunID: runID, ClaimGeneration: gen, PostID: seq}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // storeGeneratedOutput stores one server-generated output of post seq (see startJobResultOutputs).

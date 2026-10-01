@@ -454,3 +454,24 @@ SELECT f.* FROM job_files f
                            AND r.user_id = @user_id
                            AND (sqlc.narg('product_id')::uuid IS NULL
                                 OR o.product_id = sqlc.narg('product_id')::uuid))));
+
+-- name: DeleteOmittedGeneratedJobReport :execrows
+-- An empty current result omits report.md. The caller already holds the runs row FOR UPDATE
+-- in this transaction; the owning findings post and current claim generation fence the delete.
+-- SKIP a row still being written. The empty post repeats this after its predecessor finishes,
+-- so a write that was in flight when the result committed cannot leave a stale report behind.
+DELETE FROM job_files
+ WHERE id IN (
+   SELECT f.id FROM job_files f
+    WHERE f.run_id = @run_id::uuid AND f.direction = 'output'
+      AND f.claim_generation = @claim_generation::bigint AND f.display_name = 'report.md'
+      AND EXISTS (
+        SELECT 1 FROM runs r
+        JOIN job_results j ON j.run_id = r.id
+        JOIN job_output_refusals m ON m.run_id = r.id
+         WHERE r.id = @run_id::uuid AND r.kind = 'job'
+           AND r.claim_generation = @claim_generation::bigint AND r.claim_released_at IS NULL
+           AND j.report_md = '' AND m.display_name = 'findings.json' AND m.post_id = @post_id::bigint
+      )
+    FOR UPDATE OF f SKIP LOCKED
+ );

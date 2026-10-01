@@ -51,6 +51,11 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Large job inputs keep their download allowance ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  Worker downloads use the same bounded size-based write deadline as caller downloads, instead of the server's 15-second default.
+- **An empty re-posted job report removes the earlier report file ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  The current result controls report.md; cleanup is fenced by its post and claim generation, including an earlier writer that finishes late.
+
 - **Job output uploads cannot follow swapped directory links ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
   The worker pins each directory and reads one file handle for hashing and upload; unsafe paths are refused and listed.
 

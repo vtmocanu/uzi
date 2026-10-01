@@ -189,6 +189,42 @@ func (q *Queries) DeleteJobOutputRefusalsForRun(ctx context.Context, runID uuid.
 	return result.RowsAffected(), nil
 }
 
+const deleteOmittedGeneratedJobReport = `-- name: DeleteOmittedGeneratedJobReport :execrows
+DELETE FROM job_files
+ WHERE id IN (
+   SELECT f.id FROM job_files f
+    WHERE f.run_id = $1::uuid AND f.direction = 'output'
+      AND f.claim_generation = $2::bigint AND f.display_name = 'report.md'
+      AND EXISTS (
+        SELECT 1 FROM runs r
+        JOIN job_results j ON j.run_id = r.id
+        JOIN job_output_refusals m ON m.run_id = r.id
+         WHERE r.id = $1::uuid AND r.kind = 'job'
+           AND r.claim_generation = $2::bigint AND r.claim_released_at IS NULL
+           AND j.report_md = '' AND m.display_name = 'findings.json' AND m.post_id = $3::bigint
+      )
+    FOR UPDATE OF f SKIP LOCKED
+ )
+`
+
+type DeleteOmittedGeneratedJobReportParams struct {
+	RunID           uuid.UUID `json:"run_id"`
+	ClaimGeneration int64     `json:"claim_generation"`
+	PostID          int64     `json:"post_id"`
+}
+
+// An empty current result omits report.md. The caller already holds the runs row FOR UPDATE
+// in this transaction; the owning findings post and current claim generation fence the delete.
+// SKIP a row still being written. The empty post repeats this after its predecessor finishes,
+// so a write that was in flight when the result committed cannot leave a stale report behind.
+func (q *Queries) DeleteOmittedGeneratedJobReport(ctx context.Context, arg DeleteOmittedGeneratedJobReportParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteOmittedGeneratedJobReport, arg.RunID, arg.ClaimGeneration, arg.PostID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const deleteStaleGeneratedJobOutput = `-- name: DeleteStaleGeneratedJobOutput :execrows
 DELETE FROM job_files
  WHERE id IN (SELECT f.id FROM job_files f

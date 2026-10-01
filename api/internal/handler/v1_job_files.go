@@ -32,6 +32,15 @@ const (
 	v1DownloadMaxDeadline    = 10 * time.Minute
 )
 
+// setJobFileDownloadDeadline gives both caller and worker downloads the same bounded
+// transfer allowance, including the fixed response/IO grace. Clamp seconds before converting
+// to time.Duration so even an oversized metadata value cannot overflow into a past deadline.
+func setJobFileDownloadDeadline(w http.ResponseWriter, byteSize int64) {
+	seconds := min(max(byteSize, 0)/v1DownloadMinBytesPerSec, int64((v1DownloadMaxDeadline-v1DownloadDeadlineFloor)/time.Second))
+	duration := v1DownloadDeadlineFloor + time.Duration(seconds)*time.Second
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(duration))
+}
+
 // V1JobFiles serves GET /api/v1/jobs/{id}/files: the job's inputs and outputs with metadata, and
 // the outputs that were refused. A job the caller cannot see is 404, exactly as for the result.
 func (h *Handler) V1JobFiles(w http.ResponseWriter, r *http.Request) {
@@ -95,11 +104,7 @@ func (h *Handler) V1FileDownload(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	d := v1DownloadDeadlineFloor + time.Duration(f.ByteSize/v1DownloadMinBytesPerSec)*time.Second
-	if d > v1DownloadMaxDeadline {
-		d = v1DownloadMaxDeadline
-	}
-	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(d))
+	setJobFileDownloadDeadline(w, f.ByteSize)
 
 	hd := w.Header()
 	hd.Set("Content-Type", "application/octet-stream")

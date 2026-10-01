@@ -75,6 +75,9 @@ func (h *Handler) WorkerJobInputFile(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
+	// The server-wide 15 s write timeout is too short for a valid large input.
+	// Extend it before headers using the same bounded allowance as caller downloads.
+	setJobFileDownloadDeadline(w, f.ByteSize)
 	hd := w.Header()
 	hd.Set("Content-Type", "application/octet-stream")
 	hd.Set("X-Content-Type-Options", "nosniff")
