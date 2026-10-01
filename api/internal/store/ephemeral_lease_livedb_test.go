@@ -1,12 +1,14 @@
 package store_test
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -114,7 +116,7 @@ type leasedWorker struct {
 	served uuid.UUID
 }
 
-// seedLeasedWorker creates the ephemeral worker bound to a freshly inserted liveBound run `spec`
+// seedLeasedWorker creates the ephemeral worker bound to a freshly inserted run `spec`
 // (status forced to completed), marks it online with a fresh heartbeat and a slot cap, and enters
 // the lease via EnterEphemeralLease (which must match one row). leaseAge backdates lease_since.
 func seedLeasedWorker(fx *fleetFixture, spec leaseRun, leaseAge time.Duration) leasedWorker {
@@ -321,6 +323,38 @@ func TestEphemeralLeaseNeverClaimedLiveDB(t *testing.T) {
 		})
 	}
 
+	t.Run("an issue run reporting another issue's branch is not admitted by that issue's lease", func(t *testing.T) {
+		// The worker's terminal report chooses runs.branch, so it must never choose a lease identity:
+		// issue 20 reporting agent/issue-21 must not ride the lease of the worker that served issue 21.
+		fx := newFleetFixture(t)
+		w := seedLeasedWorker(fx, leaseRun{iid: i64p(21)}, 0)
+		spoof := insertLeaseRun(fx, leaseRun{iid: i64p(20), branch: strp("agent/issue-21")})
+		got, err := claimLeased(fx, w, leaseInterval(leaseTwoHours), time.Now())
+		wantIdle(t, got, err)
+		control := insertLeaseRun(fx, leaseRun{iid: i64p(21)})
+		got, err = claimLeased(fx, w, leaseInterval(leaseTwoHours), time.Now())
+		wantClaimed(t, got, err, control)
+		var st string
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT status FROM runs WHERE id = $1`, spoof).Scan(&st); err != nil || st != "queued" {
+			t.Fatalf("spoofing run status = %q (%v), want queued", st, err)
+		}
+	})
+	t.Run("a served issue run that reported another issue's branch gets no lease and claims nothing", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		served := insertLeaseRun(fx, leaseRun{iid: i64p(20), status: "completed", branch: strp("agent/issue-21")})
+		w := seedEphemeralWorkerBound(fx, served)
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET worker_id = $2 WHERE id = $1`, served, w)
+		mustExec(fx.ctx, fx.t, fx.pool,
+			`UPDATE workers SET status = 'online', last_heartbeat_at = now(), online_since = now(), max_concurrent_runs = 2 WHERE id = $1`, w)
+		n, err := fx.q.EnterEphemeralLease(fx.ctx, store.EnterEphemeralLeaseParams{WorkerID: w, RunID: served})
+		if err != nil || n != 0 || hasLease(fx, w) {
+			t.Fatalf("EnterEphemeralLease = (%d, %v), lease=%v; a reported non-canonical branch must give no lease", n, err, hasLease(fx, w))
+		}
+		issue21 := insertLeaseRun(fx, leaseRun{iid: i64p(21)})
+		got, err := claimLeased(fx, leasedWorker{id: w, served: served}, leaseInterval(leaseTwoHours), time.Now())
+		wantIdle(t, got, err)
+		_ = issue21
+	})
 	t.Run("a claimant holding an open custody hold claims nothing through the lease", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(20)}, 0)
@@ -345,6 +379,8 @@ func TestEphemeralLeaseNeverClaimedLiveDB(t *testing.T) {
 			wantIdle(t, got, err)
 		}
 	})
+	// ClaimRun refuses a draining claimant by its own clause too, so this subtest does not isolate the
+	// draining check inside fn_ephemeral_lease_admits; TestEphemeralLeaseAdmitsFunctionLiveDB does.
 	t.Run("a draining claimant claims nothing through the lease", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(20)}, 0)
@@ -386,8 +422,10 @@ func TestEphemeralLeaseConstraintAndAdmitsFunctionLiveDB(t *testing.T) {
 		`UPDATE workers SET isolated_lane = true WHERE id = $1`,                       // lease on a lane worker
 		`UPDATE workers SET ephemeral = false, ephemeral_run_id = NULL WHERE id = $1`, // lease on a persistent worker
 	} {
-		if _, err := fx.pool.Exec(fx.ctx, set, w.id); err == nil {
-			t.Errorf("%q succeeded; ck_workers_ephemeral_lease must refuse it", set)
+		_, err := fx.pool.Exec(fx.ctx, set, w.id)
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != "ck_workers_ephemeral_lease" {
+			t.Errorf("%q: err = %v, want a violation of ck_workers_ephemeral_lease", set, err)
 		}
 	}
 
@@ -427,7 +465,7 @@ func TestEphemeralLeaseZeroEquivalenceLiveDB(t *testing.T) {
 			fx := newFleetFixture(t)
 			w := seedLeasedWorker(fx, leaseRun{iid: i64p(41)}, 0)
 			if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cutoff, iv); err != nil || workerExists(fx, w.id) {
-				t.Fatalf("reap err=%v, exists=%v; lease 0 must reap a liveBound-bound worker", err, workerExists(fx, w.id))
+				t.Fatalf("reap err=%v, exists=%v; lease 0 must reap a worker whose bound run is terminal", err, workerExists(fx, w.id))
 			}
 		})
 	}
@@ -456,6 +494,20 @@ func TestEphemeralLeaseZeroEquivalenceLiveDB(t *testing.T) {
 			t.Fatalf("delete = (%d, %v), want 1 row for an expired lease", rows, err)
 		}
 	})
+	t.Run("an unlinked leased worker (bound run deleted) is reaped despite a live lease", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		w := seedLeasedWorker(fx, leaseRun{iid: i64p(46)}, 0)
+		// Deleting the served run nulls workers.ephemeral_run_id (FK SET NULL): no claim can ever re-bind
+		// this worker, so the lease must not keep it alive.
+		mustExec(fx.ctx, fx.t, fx.pool, `DELETE FROM runs WHERE id = $1`, w.served)
+		row, err := fx.q.GetWorkerByID(fx.ctx, w.id)
+		if err != nil || row.EphemeralRunID.Valid || !hasLease(fx, w.id) {
+			t.Fatalf("harness: worker row = (%v, %v), lease=%v; want an unlinked worker still holding its lease", row.EphemeralRunID, err, hasLease(fx, w.id))
+		}
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cutoff, leaseInterval(leaseTwoHours)); err != nil || workerExists(fx, w.id) {
+			t.Fatalf("reap err=%v, exists=%v; an unlinked leased worker must be reaped at the next tick", err, workerExists(fx, w.id))
+		}
+	})
 	t.Run("a custody-held leased worker is never reaped, expired or not", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(45)}, 3*time.Hour)
@@ -467,7 +519,7 @@ func TestEphemeralLeaseZeroEquivalenceLiveDB(t *testing.T) {
 	t.Run("the reaper's selected rows are the pre-lease ones for the same unleased fixtures", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		runA := fx.queuedRun()
-		liveBound := seedEphemeralWorkerBound(fx, runA) // bound run still queued: kept
+		live := seedEphemeralWorkerBound(fx, runA) // bound run still queued: kept
 		runB := fx.queuedRun()
 		orphan := seedEphemeralWorkerBound(fx, runB)
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'cancelled' WHERE id = $1`, runB)
@@ -480,10 +532,10 @@ func TestEphemeralLeaseZeroEquivalenceLiveDB(t *testing.T) {
 			var sawOrphan, sawLive bool
 			for _, id := range ids {
 				sawOrphan = sawOrphan || id == orphan
-				sawLive = sawLive || id == liveBound
+				sawLive = sawLive || id == live
 			}
 			if !sawOrphan || sawLive {
-				t.Fatalf("selected %v: want the liveBound-bound %s and not the live-bound %s", ids, orphan, liveBound)
+				t.Fatalf("selected %v: want the terminal-bound %s and not the live-bound %s", ids, orphan, live)
 			}
 		}
 	})
@@ -541,15 +593,17 @@ func TestRebindLeasedEphemeralWorkerLiveDB(t *testing.T) {
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(53)}, 0)
 		next := insertLeaseRun(fx, leaseRun{iid: i64p(53)})
 		seedEphemeralWorkerBound(fx, next)
-		if _, err := fx.q.RebindLeasedEphemeralWorker(fx.ctx, store.RebindLeasedEphemeralWorkerParams{
-			NewRunID: next, WorkerID: w.id, OldRunID: w.served, EphemeralLease: leaseInterval(leaseTwoHours)}); err == nil {
-			t.Fatal("rebind onto an already-bound run succeeded; uq_workers_ephemeral_run must refuse it")
+		_, err := fx.q.RebindLeasedEphemeralWorker(fx.ctx, store.RebindLeasedEphemeralWorkerParams{
+			NewRunID: next, WorkerID: w.id, OldRunID: w.served, EphemeralLease: leaseInterval(leaseTwoHours)})
+		var pgErr *pgconn.PgError
+		if !errors.As(err, &pgErr) || pgErr.Code != "23505" || pgErr.ConstraintName != "uq_workers_ephemeral_run" {
+			t.Fatalf("rebind onto an already-bound run: err = %v, want SQLSTATE 23505 on uq_workers_ephemeral_run", err)
 		}
 	})
 }
 
 // TestEnterEphemeralLeaseGuardsLiveDB: lease entry matches exactly the worker that served its bound
-// liveBound run, and none of the guarded shapes.
+// terminal run, and none of the guarded shapes.
 func TestEnterEphemeralLeaseGuardsLiveDB(t *testing.T) {
 	enter := func(fx *fleetFixture, w, run uuid.UUID) int64 {
 		fx.t.Helper()
@@ -569,7 +623,7 @@ func TestEnterEphemeralLeaseGuardsLiveDB(t *testing.T) {
 		return w, run
 	}
 
-	t.Run("a liveBound repo-backed run leases with its repo and effective branch", func(t *testing.T) {
+	t.Run("a completed repo-backed run leases with its repo and effective branch", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		w, run := fresh(fx, leaseRun{iid: i64p(60), status: "completed"})
 		if enter(fx, w, run) != 1 {
@@ -596,7 +650,7 @@ func TestEnterEphemeralLeaseGuardsLiveDB(t *testing.T) {
 		name string
 		mk   func(fx *fleetFixture) (uuid.UUID, uuid.UUID)
 	}{
-		{"a non-liveBound bound run", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
+		{"a non-terminal bound run", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
 			return fresh(fx, leaseRun{iid: i64p(62), status: "running"})
 		}},
 		{"an open custody hold", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
@@ -604,7 +658,7 @@ func TestEnterEphemeralLeaseGuardsLiveDB(t *testing.T) {
 			insertCustodyHold(fx, run, pgtype.UUID{Bytes: fx.repoID, Valid: true}, pgtype.UUID{Bytes: w, Valid: true}, "open")
 			return w, run
 		}},
-		{"another non-liveBound run on the worker", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
+		{"another non-terminal run on the worker", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
 			w, run := fresh(fx, leaseRun{iid: i64p(64), status: "completed"})
 			insertLeaseRun(fx, leaseRun{iid: i64p(65), status: "running", workerID: &w})
 			return w, run
@@ -621,6 +675,12 @@ func TestEnterEphemeralLeaseGuardsLiveDB(t *testing.T) {
 		}},
 		{"a run with no derivable identity", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
 			return fresh(fx, leaseRun{iid: i64p(0), status: "completed"})
+		}},
+		{"an issue run that reported a non-canonical branch", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
+			return fresh(fx, leaseRun{iid: i64p(72), status: "completed", branch: strp("feature/x")})
+		}},
+		{"an issue run that reported another issue's branch", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
+			return fresh(fx, leaseRun{iid: i64p(73), status: "completed", branch: strp("agent/issue-74")})
 		}},
 		{"a repo-less run", func(fx *fleetFixture) (uuid.UUID, uuid.UUID) {
 			base := insertLeaseRun(fx, leaseRun{iid: i64p(68), status: "completed"})
@@ -778,7 +838,9 @@ func TestEphemeralLeasePlacementMirrorLiveDB(t *testing.T) {
 		if got[same] || !got[other] {
 			t.Fatalf("listed = %v; want the other-branch run %s only, not the same-branch run %s", got, other, same)
 		}
-		// Lease 0, an expired lease, a draining worker: today's behaviour, the run is listed again.
+		// Lease 0 and an expired lease: today's behaviour, the run is listed again. (The draining flag is
+		// pinned on fn_ephemeral_lease_admits itself in TestEphemeralLeaseAdmitsFunctionLiveDB: this query
+		// filters a draining worker out by its own predicate, so it cannot isolate that check.)
 		if got := listedUnplaceable(fx, 1000, pgtype.Interval{}); !got[same] {
 			t.Fatalf("at lease 0 the same-branch run must be provisioned for; listed %v", got)
 		}
@@ -854,32 +916,88 @@ func TestEphemeralLeasePlacementMirrorLiveDB(t *testing.T) {
 		wantClaimed(t, got, err, same)
 	})
 
-	t.Run("cap prefilter excludes releasable leased-idle workers only", func(t *testing.T) {
+	t.Run("cap prefilter excludes releasable leased-idle workers only (capability-gap trigger)", func(t *testing.T) {
 		fx := newFleetFixture(t)
 		optInEphemeral(fx)
 		w := seedLeasedWorker(fx, leaseRun{iid: i64p(97)}, 0) // one ephemeral worker: at a cap of 1
-		cap1 := int32(1)
 		unplaced := insertLeaseRun(fx, leaseRun{iid: i64p(98)})
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET required_capabilities = $2 WHERE id = $1`, unplaced, docker)
-		isolated := func() bool { return listedIsolated(fx, cap1)[unplaced] } // never matches: not profile-bound
-		_ = isolated
-
-		if !listedUnplaceable(fx, cap1, iv)[unplaced] {
-			t.Fatal("an owner at cap whose only worker is leased-idle must still reach provisioning")
-		}
-		insertCustodyHold(fx, w.served, pgtype.UUID{Bytes: fx.repoID, Valid: true}, pgtype.UUID{Bytes: w.id, Valid: true}, "open")
-		if listedUnplaceable(fx, cap1, iv)[unplaced] {
-			t.Fatal("a custody-held leased worker is not releasable: the at-cap owner must stay filtered")
-		}
-		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE recovery_custody_holds SET state = 'released', live_worker_id = NULL, live_run_id = NULL WHERE live_worker_id = $1`, w.id)
-		if !listedUnplaceable(fx, cap1, iv)[unplaced] {
-			t.Fatal("after the hold is released the worker is releasable again")
-		}
-		busyRun := insertLeaseRun(fx, leaseRun{iid: i64p(99), status: "running", workerID: &w.id})
-		if listedUnplaceable(fx, cap1, iv)[unplaced] {
-			t.Fatalf("a busy leased worker (run %s) is not releasable: the at-cap owner must stay filtered", busyRun)
-		}
+		assertLeasedIdleCapFilter(fx, w, unplaced, func(maxPerUser int32) map[uuid.UUID]bool {
+			return listedUnplaceable(fx, maxPerUser, iv)
+		})
 	})
+
+	t.Run("cap prefilter excludes releasable leased-idle workers only (saturation trigger)", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		optInEphemeral(fx)
+		busy := fx.worker("persistent", capOf(1), true)
+		fx.holdActive(busy, 1) // the only persistent worker is saturated, so a queued run is slot-blocked
+		w := seedLeasedWorker(fx, leaseRun{iid: i64p(114)}, 0)
+		unplaced := insertLeaseRun(fx, leaseRun{iid: i64p(115)})
+		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status_since = now() - interval '1 hour', required_capabilities = $2 WHERE id = $1`, unplaced, docker)
+		if !listedSaturation(fx, 1000, iv)[unplaced] {
+			t.Fatal("harness: the saturated run must be listed when the owner is far below the cap")
+		}
+		assertLeasedIdleCapFilter(fx, w, unplaced, func(maxPerUser int32) map[uuid.UUID]bool {
+			return listedSaturation(fx, maxPerUser, iv)
+		})
+	})
+
+	t.Run("cap prefilter excludes releasable leased-idle workers only (isolated-lane trigger)", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		w := seedLeasedWorker(fx, leaseRun{iid: i64p(116)}, 0)
+		profile := uuid.New()
+		mustExec(fx.ctx, fx.t, fx.pool, `INSERT INTO egress_profiles (id, name, hosts) VALUES ($1, $2, '{docs.example.com}')`,
+			profile, "lease-"+profile.String()[:20])
+		unplaced := uuid.New()
+		mustExec(fx.ctx, fx.t, fx.pool,
+			`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, egress_profile_id)
+			 VALUES ($1, $2, $3, 'issue', $4, 't', 'd', 'queued', $5)`, unplaced, fx.userID, fx.repoID, fx.nextIID(), profile)
+		t.Cleanup(func() {
+			// The profile is RESTRICTed while a run references it.
+			_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM runs WHERE id = $1`, unplaced)
+			_, _ = fx.pool.Exec(fx.ctx, `DELETE FROM egress_profiles WHERE id = $1`, profile)
+		})
+		if !listedIsolated(fx, 1000)[unplaced] {
+			t.Fatal("harness: the profile-bound run must be listed when the owner is far below the cap")
+		}
+		assertLeasedIdleCapFilter(fx, w, unplaced, func(maxPerUser int32) map[uuid.UUID]bool {
+			return listedIsolated(fx, maxPerUser)
+		})
+	})
+}
+
+// assertLeasedIdleCapFilter drives the at-cap fairness prefilter of one provisioning trigger: the
+// owner's only ephemeral worker is `w` (cap 1), so the run `unplaced` is listed only while `w` is a
+// RELEASABLE leased-idle worker (no non-terminal run, no open custody hold), which provisionOne would
+// evict. list runs the trigger at a given per-user cap.
+func assertLeasedIdleCapFilter(fx *fleetFixture, w leasedWorker, unplaced uuid.UUID, list func(maxPerUser int32) map[uuid.UUID]bool) {
+	fx.t.Helper()
+	const cap1 = int32(1)
+	if !list(cap1)[unplaced] {
+		fx.t.Fatal("an owner at cap whose only worker is leased-idle must still reach provisioning")
+	}
+	hold := insertCustodyHold(fx, w.served, pgtype.UUID{Bytes: fx.repoID, Valid: true}, pgtype.UUID{Bytes: w.id, Valid: true}, "open")
+	if list(cap1)[unplaced] {
+		fx.t.Fatal("a custody-held leased worker is not releasable: the at-cap owner must stay filtered")
+	}
+	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE recovery_custody_holds SET state = 'released', live_worker_id = NULL, live_run_id = NULL WHERE id = $1`, hold)
+	if !list(cap1)[unplaced] {
+		fx.t.Fatal("after the hold is released the worker is releasable again")
+	}
+	busyRun := insertLeaseRun(fx, leaseRun{iid: i64p(900 + fx.nextIID()), status: "running", workerID: &w.id})
+	if list(cap1)[unplaced] {
+		fx.t.Fatalf("a busy leased worker (run %s) is not releasable: the at-cap owner must stay filtered", busyRun)
+	}
+	// Control: the same worker without a lease is never releasable, so the owner stays filtered at cap.
+	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'completed' WHERE id = $1`, busyRun)
+	if !list(cap1)[unplaced] {
+		fx.t.Fatal("once the busy run is terminal the leased worker is releasable again")
+	}
+	mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL WHERE id = $1`, w.id)
+	if list(cap1)[unplaced] {
+		fx.t.Fatal("an unleased ephemeral worker counts toward the cap: the at-cap owner must stay filtered")
+	}
 }
 
 func errOf(_ store.Run, err error) error { return err }
@@ -1017,5 +1135,125 @@ func TestEphemeralLeaseReapSelectionLiveDB(t *testing.T) {
 	}
 	if !sawExpired || sawLive {
 		t.Fatalf("selected %v: want the expired %s and not the live %s", ids, expired.id, live.id)
+	}
+}
+
+// TestEphemeralLeaseReapDeleteHalfLiveDB pins the DELETE half of the reap on its own: the lock
+// statement selects the worker (its lease expired), then the lease is renewed inside the same
+// transaction before DeleteLockedEphemeralWorkers runs, so only the delete statement's own lease arm
+// can spare it. Removing the lease arm from DeleteLockedEphemeralWorkers alone reddens the first case.
+func TestEphemeralLeaseReapDeleteHalfLiveDB(t *testing.T) {
+	cutoff := pgtype.Timestamptz{Time: time.Now().Add(-30 * time.Minute), Valid: true}
+	iv := leaseInterval(leaseTwoHours)
+	run := func(t *testing.T, renew bool) (deleted int64, exists bool) {
+		fx := newFleetFixture(t)
+		w := seedLeasedWorker(fx, leaseRun{iid: i64p(112)}, 3*time.Hour) // expired
+		tx, err := fx.pool.Begin(fx.ctx)
+		if err != nil {
+			t.Fatalf("begin: %v", err)
+		}
+		defer func() { _ = tx.Rollback(fx.ctx) }()
+		q := store.New(tx)
+		ids, err := q.LockReapableEphemeralWorkers(fx.ctx, store.LockReapableEphemeralWorkersParams{EphemeralLease: iv, DeadlineCutoff: cutoff})
+		if err != nil {
+			t.Fatalf("LockReapableEphemeralWorkers: %v", err)
+		}
+		var sawW bool
+		for _, id := range ids {
+			sawW = sawW || id == w.id
+		}
+		if !sawW {
+			t.Fatalf("harness: the expired leased worker %s was not selected by the lock half (%v)", w.id, ids)
+		}
+		if renew {
+			// The lease is renewed after the lock half selected the worker and before the delete runs.
+			if _, err := tx.Exec(fx.ctx, `UPDATE workers SET lease_since = now() WHERE id = $1`, w.id); err != nil {
+				t.Fatalf("renew lease: %v", err)
+			}
+		}
+		// Only this fixture's worker is handed to the delete, so other fixtures' rows stay untouched.
+		n, err := q.DeleteLockedEphemeralWorkers(fx.ctx, store.DeleteLockedEphemeralWorkersParams{
+			Ids: []uuid.UUID{w.id}, EphemeralLease: iv, DeadlineCutoff: cutoff})
+		if err != nil {
+			t.Fatalf("DeleteLockedEphemeralWorkers: %v", err)
+		}
+		var cnt int
+		if err := tx.QueryRow(fx.ctx, `SELECT count(*) FROM workers WHERE id = $1`, w.id).Scan(&cnt); err != nil {
+			t.Fatalf("count: %v", err)
+		}
+		return n, cnt > 0
+	}
+	t.Run("a worker whose lease is renewed after the lock is spared by the delete", func(t *testing.T) {
+		if n, exists := run(t, true); n != 0 || !exists {
+			t.Fatalf("delete = %d rows, exists=%v; the delete half must re-check the live lease", n, exists)
+		}
+	})
+	t.Run("control: the same expired worker is deleted when nothing renewed it", func(t *testing.T) {
+		if n, exists := run(t, false); n != 1 || exists {
+			t.Fatalf("delete = %d rows, exists=%v; want the expired leased worker reaped", n, exists)
+		}
+	})
+}
+
+// TestEphemeralLeaseAdmitsFunctionLiveDB calls fn_ephemeral_lease_admits directly, one condition at a
+// time, so each guard (notably the draining flag, which no claim or placement query isolates because
+// each filters a draining worker out by its own predicate) is shown to refuse on its own.
+func TestEphemeralLeaseAdmitsFunctionLiveDB(t *testing.T) {
+	fx := newFleetFixture(t)
+	type in struct {
+		leaseSince  any // timestamptz, nil = no lease
+		leaseRepo   any
+		leaseBranch any
+		draining    any
+		lease       any // interval text, nil = unset
+		at          any
+		runRepo     any
+		runBranch   any
+		runIID      any
+		egress      any
+	}
+	base := func() in {
+		return in{
+			leaseSince: time.Now().Add(-10 * time.Minute), leaseRepo: fx.repoID, leaseBranch: "agent/issue-30",
+			draining: false, lease: "1 hour", at: time.Now(), runRepo: fx.repoID, runBranch: nil, runIID: int64(30), egress: nil,
+		}
+	}
+	admits := func(i in) bool {
+		var got bool
+		if err := fx.pool.QueryRow(fx.ctx,
+			`SELECT fn_ephemeral_lease_admits($1::timestamptz, $2::uuid, $3::text, $4::boolean, $5::interval, $6::timestamptz,
+			        $7::uuid, 'issue', $8::text, NULL, $9::bigint, NULL, $10::uuid)`,
+			i.leaseSince, i.leaseRepo, i.leaseBranch, i.draining, i.lease, i.at, i.runRepo, i.runBranch, i.runIID, i.egress).Scan(&got); err != nil {
+			t.Fatalf("fn_ephemeral_lease_admits: %v", err)
+		}
+		return got
+	}
+	cases := []struct {
+		name string
+		mut  func(*in)
+		want bool
+	}{
+		{"baseline: live lease, same repo and branch", func(*in) {}, true},
+		{"a draining worker is refused", func(i *in) { i.draining = true }, false},
+		{"a NULL draining flag is refused (never reads as admission)", func(i *in) { i.draining = nil }, false},
+		{"an expired lease is refused", func(i *in) { i.at = time.Now().Add(2 * time.Hour) }, false},
+		{"a zero interval is refused", func(i *in) { i.lease = "0 seconds" }, false},
+		{"an unset interval is refused", func(i *in) { i.lease = nil }, false},
+		{"no lease is refused", func(i *in) { i.leaseSince, i.leaseRepo, i.leaseBranch = nil, nil, nil }, false},
+		{"another repository is refused", func(i *in) { i.runRepo = uuid.New() }, false},
+		{"a repo-less run is refused", func(i *in) { i.runRepo = nil }, false},
+		{"another issue's branch is refused", func(i *in) { i.runIID = int64(31) }, false},
+		{"a profile-bound run is refused", func(i *in) { i.egress = uuid.New() }, false},
+		{"a reported canonical branch of the same issue is admitted", func(i *in) { i.runBranch = "agent/issue-30" }, true},
+		{"a reported branch of another issue is refused", func(i *in) { i.runBranch = "agent/issue-31" }, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			i := base()
+			c.mut(&i)
+			if got := admits(i); got != c.want {
+				t.Fatalf("fn_ephemeral_lease_admits = %v, want %v", got, c.want)
+			}
+		})
 	}
 }

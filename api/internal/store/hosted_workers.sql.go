@@ -395,8 +395,12 @@ WHERE w.id = ANY($1::uuid[])
        -- PRD #2006: ...unless the worker holds a LIVE ephemeral lease (it finished that run and
        -- stays warm for a same-branch follow-up). Evaluated at clock_timestamp(), so a statement
        -- that waited on a lock never reaps through, or spares, a lease on a stale instant. A NULL
-       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly.
-       AND NOT COALESCE(w.lease_since + $2::interval > clock_timestamp()
+       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly. The lease
+       -- spares only a worker still LINKED to its served run (ephemeral_run_id IS NOT NULL): a
+       -- worker whose run row was deleted (FK SET NULL) can never be re-bound by a claim, so it
+       -- is an orphan and reaps on the next tick even with a live lease.
+       AND NOT COALESCE(w.ephemeral_run_id IS NOT NULL
+                        AND w.lease_since + $2::interval > clock_timestamp()
                         AND w.draining_since IS NULL, false))
       OR (w.online_since IS NULL AND w.created_at < $3)
       OR (w.online_since IS NOT NULL AND w.online_since < $3
@@ -760,8 +764,12 @@ WHERE w.ephemeral
        -- PRD #2006: ...unless the worker holds a LIVE ephemeral lease (it finished that run and
        -- stays warm for a same-branch follow-up). Evaluated at clock_timestamp(), so a statement
        -- that waited on a lock never reaps through, or spares, a lease on a stale instant. A NULL
-       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly.
-       AND NOT COALESCE(w.lease_since + $1::interval > clock_timestamp()
+       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly. The lease
+       -- spares only a worker still LINKED to its served run (ephemeral_run_id IS NOT NULL): a
+       -- worker whose run row was deleted (FK SET NULL) can never be re-bound by a claim, so it
+       -- is an orphan and reaps on the next tick even with a live lease.
+       AND NOT COALESCE(w.ephemeral_run_id IS NOT NULL
+                        AND w.lease_since + $1::interval > clock_timestamp()
                         AND w.draining_since IS NULL, false))
       OR (w.online_since IS NULL AND w.created_at < $2)
       OR (w.online_since IS NOT NULL AND w.online_since < $2

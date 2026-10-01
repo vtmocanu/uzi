@@ -1961,6 +1961,13 @@ type CountOnlineWorkersClaimableForRunParams struct {
 // run), and NOT the run's released incarnation (D19: the exact worker+nonce a server park excluded,
 // with the leading IS NULL arm so an ordinary run counts every worker). Active count uses the SAME
 // run-lane definition as ClaimRun's fleet spread.
+//
+// PRD #2006: the lease arm of the ephemeral binding is an ADVISORY mirror, not the full claim
+// conjunction. fn_ephemeral_lease_admits covers the live lease, the draining flag, the repository
+// and effective branch identity and the no-egress-profile rule, evaluated at now(); it omits
+// ClaimRun's claimant-custody guard (an open custody hold on the claimant) and its already-bound
+// guard (a run another ephemeral worker is bound to), so this count can read one higher than the
+// claim would allow. That only softens a "restart worker" hint and never grants a claim.
 func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersClaimableForRun,
 		arg.RunID,

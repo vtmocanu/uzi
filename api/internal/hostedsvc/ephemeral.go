@@ -256,7 +256,10 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 // UNCONDITIONAL — deliberately NOT gated on the kill-switch (mirrors ExpirePendingTokens):
 // a stack that provisioned ephemeral workers and then turned the feature off is exactly
 // the one whose orphans would otherwise never be reaped. Its flag-off/no-ephemeral
-// footprint is one indexed DELETE that matches nothing.
+// footprint is one short transaction: a SELECT ... FOR UPDATE SKIP LOCKED that selects no
+// rows (so the delete statement is never issued and nothing is written), and a worker whose
+// ephemeral lease is live is spared (store.ReapEphemeralWorkers: lock, then delete re-checking
+// the same predicate).
 func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
 	cutoff := p.now().Add(-p.cfg.ProvisionDeadline)
 	return store.ReapEphemeralWorkers(ctx, p.pool, pgconv.Time(cutoff), leaseInterval(p.cfg.Lease))

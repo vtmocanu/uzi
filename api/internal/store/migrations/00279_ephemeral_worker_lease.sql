@@ -28,12 +28,16 @@ ALTER TABLE workers ADD CONSTRAINT ck_workers_ephemeral_lease CHECK (
     AND (lease_since IS NULL OR (ephemeral AND NOT isolated_lane))
 );
 
--- 2. The effective branch identity of a run: the server-derived, non-empty branch a lease binds to
--- and a follow-up must match. NULL means "no derivable identity", and NULL never equals NULL, so a
--- run with none is never lease-eligible (fail closed).
---   issue      runs.branch when non-empty, else the canonical 'agent/issue-<iid>' for a positive
---              issue_iid (a queued issue run normally has a NULL branch). Mirrors agentIssueBranch
---              in api/internal/workersvc/ci_fix.go.
+-- 2. The effective branch identity of a run: the non-empty branch a lease binds to and a follow-up
+-- must match. NULL means "no derivable identity", and NULL never equals NULL, so a run with none is
+-- never lease-eligible (fail closed).
+--   issue      always the canonical 'agent/issue-<iid>' for a positive issue_iid, DERIVED from the
+--              server-owned issue_iid and never read from runs.branch. runs.branch of an issue run
+--              is written from the worker's own terminal report (an untrusted field), so it is
+--              accepted only as a no-op: NULL or empty (a queued run) or exactly the canonical value.
+--              Any other recorded branch, or a non-positive issue_iid, gives NULL: a worker cannot
+--              choose its lease branch, so it cannot steer the lease onto another issue's run.
+--              Mirrors agentIssueBranch in api/internal/workersvc/ci_fix.go.
 --   mr_rework  pipeline_ref (its runs.branch is NULL), as claim_assembly.go sources the claim's
 --              Branch.
 --   ci_fix     the failure snapshot's string 'ref', the field claimPipelineFromSnapshot decodes.
@@ -51,9 +55,12 @@ CREATE FUNCTION fn_run_lease_branch(
 LANGUAGE sql IMMUTABLE
 AS $$
     SELECT CASE run_kind
-        WHEN 'issue' THEN COALESCE(
-            NULLIF(run_branch, ''),
-            CASE WHEN run_issue_iid > 0 THEN 'agent/issue-' || run_issue_iid::text END)
+        WHEN 'issue' THEN CASE
+            WHEN run_issue_iid > 0
+                 AND (NULLIF(run_branch, '') IS NULL
+                      OR run_branch = 'agent/issue-' || run_issue_iid::text)
+            THEN 'agent/issue-' || run_issue_iid::text
+        END
         WHEN 'mr_rework' THEN NULLIF(run_pipeline_ref, '')
         WHEN 'ci_fix' THEN CASE WHEN jsonb_typeof(run_failure_snapshot -> 'ref') = 'string'
                                 THEN NULLIF(run_failure_snapshot ->> 'ref', '') END

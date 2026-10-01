@@ -13,7 +13,10 @@ import (
 
 // goLeaseBranch is the effective branch identity the Go side derives for a run, written from the
 // SAME sources the claim path and the CI-fix create path use, never from fn_run_lease_branch:
-//   - issue: the run's branch when non-empty, else agentIssueBranch(issue_iid) for a positive iid;
+//   - issue: agentIssueBranch(issue_iid) for a positive iid, and only when the run's recorded branch
+//     is NULL, empty or already that exact value. runs.branch of an issue run is written from the
+//     worker's own terminal report, so any other value (a worker-chosen branch, another issue's
+//     branch) yields no identity rather than being trusted;
 //   - mr_rework: run.PipelineRef (claim_assembly.go sources the claim's Branch from it);
 //   - ci_fix: claimPipelineFromSnapshot(snapshot).Ref;
 //   - every other kind: none.
@@ -28,13 +31,14 @@ func goLeaseBranch(kind string, branch, pipelineRef *string, iid *int64, snapsho
 	}
 	switch kind {
 	case runkind.Issue:
-		if b := str(branch); b != "" {
-			return b
+		if iid == nil || *iid <= 0 {
+			return ""
 		}
-		if iid != nil && *iid > 0 {
-			return agentIssueBranch(*iid)
+		canonical := agentIssueBranch(*iid)
+		if b := str(branch); b != "" && b != canonical {
+			return ""
 		}
-		return ""
+		return canonical
 	case runkind.MRRework:
 		return str(pipelineRef)
 	case runkind.CIFix:
@@ -49,7 +53,8 @@ func goLeaseBranch(kind string, branch, pipelineRef *string, iid *int64, snapsho
 
 // TestLeaseBranchParityLiveDB pins fn_run_lease_branch (migration 00279, the single SQL identity
 // every lease claim and placement predicate shares) to the Go sources it mirrors, over valid,
-// malformed and empty inputs. Mutating either side (the SQL function's 'agent/issue-' prefix, a kind
+// malformed and empty inputs, including a worker-reported issue branch that must never become the
+// identity. Mutating either side (the SQL function's 'agent/issue-' prefix, a kind
 // arm, the ci_fix ref rule, or agentIssueBranch / claimPipelineFromSnapshot) reddens it.
 func TestLeaseBranchParityLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
@@ -82,10 +87,19 @@ func TestLeaseBranchParityLiveDB(t *testing.T) {
 		{name: "issue iid 7", kind: "issue", iid: ip(7)},
 		{name: "issue iid 2006", kind: "issue", iid: ip(2006)},
 		{name: "issue iid max int64", kind: "issue", iid: ip(math.MaxInt64)},
-		// issue: an explicit branch wins, even when iid is set or invalid.
-		{name: "issue explicit branch", kind: "issue", branch: sp("agent/issue-7"), iid: ip(8)},
-		{name: "issue explicit custom branch, no iid", kind: "issue", branch: sp("feature/x")},
-		{name: "issue explicit branch with unicode and spaces", kind: "issue", branch: sp("feat/ünï cödé x"), iid: ip(0)},
+		// issue: a recorded branch is accepted only when it is exactly the canonical one.
+		{name: "issue canonical explicit branch", kind: "issue", branch: sp("agent/issue-7"), iid: ip(7)},
+		{name: "issue canonical explicit branch, large iid", kind: "issue", branch: sp("agent/issue-2006"), iid: ip(2006)},
+		// issue: a worker-reported branch never becomes the identity (trust boundary), whatever the iid.
+		{name: "issue reported branch of another issue", kind: "issue", branch: sp("agent/issue-21"), iid: ip(20)},
+		{name: "issue reported branch of another issue, iid 8", kind: "issue", branch: sp("agent/issue-7"), iid: ip(8)},
+		{name: "issue reported custom branch", kind: "issue", branch: sp("feature/x"), iid: ip(5)},
+		{name: "issue reported custom branch, no iid", kind: "issue", branch: sp("feature/x")},
+		{name: "issue reported non-canonical spelling", kind: "issue", branch: sp("agent/issue-007"), iid: ip(7)},
+		{name: "issue reported branch with a trailing suffix", kind: "issue", branch: sp("agent/issue-7-x"), iid: ip(7)},
+		{name: "issue reported branch with unicode and spaces", kind: "issue", branch: sp("feat/ünï cödé x"), iid: ip(0)},
+		{name: "issue canonical-looking branch, iid 0", kind: "issue", branch: sp("agent/issue-0"), iid: ip(0)},
+		{name: "issue canonical-looking branch, NULL iid", kind: "issue", branch: sp("agent/issue-7")},
 		// issue: no identity.
 		{name: "issue NULL iid, NULL branch", kind: "issue"},
 		{name: "issue iid 0", kind: "issue", iid: ip(0)},
@@ -160,8 +174,8 @@ func TestLeaseBranchParityLiveDB(t *testing.T) {
 			if got != nil && *got == "" {
 				t.Fatalf("fn_run_lease_branch returned an empty string; no identity must be NULL")
 			}
-			// An issue run's canonical branch round-trips through the strict inverse.
-			if c.kind == runkind.Issue && got != nil && (c.branch == nil || *c.branch == "") {
+			// An issue run's identity is always the canonical branch of its own iid, whatever was recorded.
+			if c.kind == runkind.Issue && got != nil {
 				n, ok := issueIIDFromAgentBranch(*got)
 				if !ok || c.iid == nil || n != *c.iid {
 					t.Fatalf("issueIIDFromAgentBranch(%q) = (%d, %v), want (%v, true)", *got, n, ok, c.iid)

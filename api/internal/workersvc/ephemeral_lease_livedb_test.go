@@ -632,7 +632,8 @@ func (e leaseEnv) seedLeasedWorker(t *testing.T, leaseAge time.Duration) (worker
 }
 
 // seedFollowUp inserts a queued issue run on the same repo and owner. iid 0 allocates a fresh one;
-// branch non-empty sets runs.branch (the lease identity then comes from it).
+// branch non-empty sets runs.branch (it must be the canonical branch of that same iid, or the run has
+// no lease identity: the lease branch is derived from issue_iid, never taken from a reported branch).
 func (e leaseEnv) seedFollowUp(t *testing.T, iid int64, branch string) uuid.UUID {
 	t.Helper()
 	if iid == 0 {
@@ -698,7 +699,7 @@ func TestClaimThroughLeaseRebindsLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(2*time.Hour, e.pool)
 	w, served, iid := e.seedLeasedWorker(t, 0)
-	follow := e.seedFollowUp(t, 0, agentIssueBranch(iid))
+	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 	r := awaitClaim(t, e.claimAsync(svc, w, 1))
 	if r.err != nil || r.payload == nil || r.payload.RunID != follow.String() {
@@ -756,7 +757,7 @@ func TestClaimLeaseOffNeverClaimsForeignLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(0, e.pool)
 	w, _, iid := e.seedLeasedWorker(t, 0)
-	follow := e.seedFollowUp(t, 0, agentIssueBranch(iid))
+	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	r := awaitClaim(t, e.claimAsync(svc, w, 1))
 	if r.err != nil || r.payload != nil {
 		t.Fatalf("claim = (%+v, %v), want idle with the lease off", r.payload, r.err)
@@ -777,9 +778,14 @@ func TestClaimTwoFollowUpsForOneLeasedWorkerLiveDB(t *testing.T) {
 	svc := e.service(2*time.Hour, gate)
 	probe := &leaseProbe{}
 	svc.leaseClaimProbe = probe.hook
-	w, _, iid := e.seedLeasedWorker(t, 0)
-	r1 := e.seedFollowUp(t, 0, agentIssueBranch(iid))
-	r2 := e.seedFollowUp(t, 0, agentIssueBranch(iid))
+	w, served, iid := e.seedLeasedWorker(t, 0)
+	r1 := e.seedFollowUp(t, iid, agentIssueBranch(iid))
+	// uq_runs_one_active_per_issue allows one active issue run per issue, so the second lease-eligible
+	// follow-up is an mr_rework on the same branch (its identity is its pipeline_ref).
+	r2 := uuid.New()
+	e.exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_title, issue_description, status, pipeline_ref, target_run_id, mr_iid)
+	        VALUES ($1, $2, $3, 'mr_rework', 't', 'd', 'queued', $4, $5, $6)`,
+		r2, e.userID, e.repoID, agentIssueBranch(iid), served, nextLeaseIID()+2000)
 
 	gate.arm()
 	first := e.claimAsync(svc, w, 1)
@@ -824,7 +830,7 @@ func TestClaimVsCordonLiveDB(t *testing.T) {
 		probe := &leaseProbe{}
 		svc.leaseClaimProbe = probe.hook
 		w, _, iid := e.seedLeasedWorker(t, 0)
-		follow := e.seedFollowUp(t, 0, agentIssueBranch(iid))
+		follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 		cordon := e.sideTx(t, `UPDATE workers SET draining_since = COALESCE(draining_since, now()),
 		        lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL WHERE id = $1`, w)
@@ -849,7 +855,7 @@ func TestClaimVsCordonLiveDB(t *testing.T) {
 		gate := newGate(t, e.pool)
 		svc := e.service(2*time.Hour, gate)
 		w, _, iid := e.seedLeasedWorker(t, 0)
-		follow := e.seedFollowUp(t, 0, agentIssueBranch(iid))
+		follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 		gate.arm()
 		res := e.claimAsync(svc, w, 1)
@@ -887,7 +893,7 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 	gate := newGate(t, e.pool)
 	svc := e.service(2*time.Hour, gate)
 	w, served, iid := e.seedLeasedWorker(t, 0)
-	follow := e.seedFollowUp(t, 0, agentIssueBranch(iid))
+	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	del := func() int64 {
 		n, err := e.q.DeleteEphemeralWorkerForRun(e.ctx, store.DeleteEphemeralWorkerForRunParams{
 			RunID: served, EphemeralLease: svc.leaseInterval()})
@@ -926,7 +932,7 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 func (e leaseEnv) leaseClockCase(t *testing.T, lease, window time.Duration) (w, served uuid.UUID, follow uuid.UUID) {
 	t.Helper()
 	w, served, iid := e.seedLeasedWorker(t, lease-window)
-	return w, served, e.seedFollowUp(t, 0, agentIssueBranch(iid))
+	return w, served, e.seedFollowUp(t, iid, agentIssueBranch(iid))
 }
 
 // TestClaimStaleTxStartClockLiveDB (g): the lease has `window` left when the claim transaction
