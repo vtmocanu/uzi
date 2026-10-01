@@ -201,6 +201,22 @@ func TestRunGetHealthReason(t *testing.T) {
 	}
 }
 
+// TestRunGetLongToolCallHealth pins issue #2046 at the CLI: the long-tool-call flag is the
+// stalled enum with its fixed reason, rendered through the generic HEALTH rows.
+func TestRunGetLongToolCallHealth(t *testing.T) {
+	reason := "a tool call has been in progress longer than the configured threshold"
+	fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{
+		"r1": {ID: "r1", Status: "running", Health: "stalled", HealthReason: &reason},
+	}}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "stalled") || !strings.Contains(out, "HEALTH_REASON") || !strings.Contains(out, reason) {
+		t.Errorf("run get did not surface the stalled health and long-tool-call reason:\n%s", out)
+	}
+}
+
 // PRD #108 M9b. An auto-stopped run must be distinguishable from a user cancel at
 // the CLI, and the two are IDENTICAL on every other field: both end `failed`, and
 // on the live-poller half the worker's own SetRunFailed overwrites failure_reason

@@ -470,7 +470,7 @@ func Validate(key, value string) error {
 		return validateAgentSourceRef(value)
 	case KeyAgentSourceFolder:
 		return validateAgentSourceFolder(value)
-	case KeyHealthStallSeconds, KeyHealthQueuedSeconds,
+	case KeyHealthStallSeconds, KeyHealthToolCallSeconds, KeyHealthQueuedSeconds,
 		KeyHealthApprovalSeconds, KeyHealthNudgeCooldownSeconds:
 		return validateHealthSeconds(value)
 	case KeyHealthNearTimeoutPct:

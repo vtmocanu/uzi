@@ -6685,8 +6685,9 @@ LIMIT @lim;
 -- stop its scan at the start of the current claim/query leg and never count an
 -- orphaned call from an earlier leg as in flight. Loop detection keeps reading
 -- ListRunToolWindow unchanged. The Go side re-checks kind and payload event
--- itself rather than trusting this filter alone.
-SELECT seq, kind, payload
+-- itself rather than trusting this filter alone. created_at is the server receive
+-- time, used to age the oldest open call (issue #2046).
+SELECT seq, kind, payload, created_at
 FROM run_messages
 WHERE run_id = @run_id AND agent_instance IS NULL
   AND (kind IN ('tool_use', 'tool_result')
