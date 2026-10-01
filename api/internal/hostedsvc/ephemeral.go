@@ -152,6 +152,8 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		MaxRows:        ephemeralProvisionBatch,
 		MaxPerUser:     int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
+		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
+		CodexCuratedModels: workersvc.CodexCuratedModels(),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
@@ -161,6 +163,8 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		MaxRows:         ephemeralProvisionBatch,
 		MaxPerUser:      int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
 		EphemeralLease:  workersvc.LeaseInterval(p.cfg.Lease),
+		// PRD #2006: the lease arm mirrors ClaimRun's custom-Codex-model gate.
+		CodexCuratedModels: workersvc.CodexCuratedModels(),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list saturation queued runs: %w", err)
