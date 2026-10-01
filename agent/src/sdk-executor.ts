@@ -108,6 +108,7 @@ import type {
   RunTurnRequest,
   TurnStreamEnd,
 } from "./harness.js";
+import { evidencesModelProcessing } from "./harness.js";
 import { PlanRejectedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { clampToDirCharset, errMessage } from "./util.js";
@@ -2280,12 +2281,10 @@ export class SdkExecutor implements Executor {
       let followUp: string | undefined;
       // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
       // ordinary implement prompt is built, carried across loop iterations, and cleared only when
-      // the turn whose prompt held it yields its first event (stamped included then, exactly once).
+      // the turn whose prompt held it first yields a model-evidencing event (evidencesModelProcessing;
+      // stamped included then, exactly once).
       // A turn that throws, parks, walls, pauses or is restarted first keeps it for the next turn.
       let ownerFollowUp: { id: number; body: string } | undefined;
-      // Issue #1800: follow-ups an interactive park handed over while the slot was occupied
-      // (FIFO behind it), so none is overwritten.
-      const ownerBacklog: { id: number; body: string }[] = [];
       // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
       // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
       // framing, priorWork/deps notes, and the base-commit note) must be emitted on the
@@ -2542,7 +2541,7 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
-        if (followUp === undefined) ownerFollowUp ??= ownerBacklog.shift() ?? ctx.pullFollowUp?.();
+        if (followUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
         const ownerRides = followUp === undefined ? ownerFollowUp : undefined;
         const onFirstEvent = ownerRides
           ? () => {
@@ -2880,6 +2879,19 @@ export class SdkExecutor implements Executor {
           // awaitFollowUp, so a non-interactive run (and any executor that did not wire the
           // callback) breaks to the normal finalize below, byte-identical to today.
           if (ctx.interactive && ctx.awaitFollowUp) {
+            // Issue #1800: defensive, not reachable through the public seams today: a turn that
+            // reaches signal_done has model evidence, which empties the slot. If an owner follow-up
+            // is still held (pulled, never evidenced) it has not reached the model yet. Parking would consume a
+            // second follow-up from the server into an occupied slot, and one of the two would
+            // never be included. Service the held one first: run another turn instead of parking,
+            // with the same fresh budgets a received follow-up gets.
+            if (ownerFollowUp !== undefined) {
+              iteration = 0;
+              state.wallRemainingMs = initialWallMs;
+              maxServedWallMs = initialWallMs;
+              resetStallState();
+              continue;
+            }
             // Checkpoint-push at every park (Decision 4): the deliverable is commits the user
             // pulls, so try to get the turn's work onto origin before blocking. This is
             // BEST-EFFORT — checkpoint swallows push failures, so the run still PARKS even if
@@ -2922,11 +2934,11 @@ export class SdkExecutor implements Executor {
               // Fold the follow-up into the next turn EXACTLY as a mid-run follow-up is
               // (buildImplementPrompt renders `followUp` as UNTRUSTED user input); the
               // resumed session keeps full context, so nothing is replayed.
-              // Issue #1800: it enters the owner slot (queued behind one still held), so it is
-              // reported included when the turn carrying it yields its first event.
+              // Issue #1800: it enters the owner slot, so it is
+              // reported included when the turn carrying it reaches the model.
               followUp = undefined;
-              if (ownerFollowUp) ownerBacklog.push({ id: outcome.id, body: outcome.body });
-              else ownerFollowUp = { id: outcome.id, body: outcome.body };
+              // The slot is empty here: a held one makes the park above run a turn instead.
+              ownerFollowUp = { id: outcome.id, body: outcome.body };
               // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
               // interactive run spans many follow-ups over its lifetime and must NOT fail with
               // REASON_MAX_ITERATIONS after N turns SUMMED across them — the budget bounds one
@@ -3718,9 +3730,9 @@ export class SdkExecutor implements Executor {
     // `ctx.reportProgress`; the plan gate passes nothing (no progress is reported while
     // planning), keeping the streaming scope ignorant of milestones.
     onProgress?: (progress: MilestoneProgress) => void,
-    // Issue #1800: called when the turn yields its FIRST event, i.e. the prompt was really
-    // delivered. A re-drive of the same turn (driveTurnWithEmptyRecovery) calls it again, so the
-    // handler must be idempotent.
+    // Issue #1800: called when the turn first yields an event that evidences the model processing
+    // the prompt (evidencesModelProcessing), NOT on init or other lifecycle frames. A re-drive of
+    // the same turn (driveTurnWithEmptyRecovery) calls it again, so the handler must be idempotent.
     onFirstEvent?: () => void,
   ): Promise<TurnResult> {
     // A trip may already be pending (e.g. a cancel that landed during the gate).
@@ -3796,14 +3808,14 @@ export class SdkExecutor implements Executor {
         leadSkills: [],
       };
       const turn = this.harness.startTurn(request);
-      let sawFirstEvent = false;
+      let sawModelEvidence = false;
       for await (const event of turn.events) {
-        if (!sawFirstEvent) {
-          sawFirstEvent = true;
+        if (!sawModelEvidence && evidencesModelProcessing(event)) {
+          sawModelEvidence = true;
           try {
             onFirstEvent?.();
           } catch (err) {
-            this.log.warn("first-event handler threw", { run_id: ctx.runId, error: errMessage(err) });
+            this.log.warn("model-evidence handler threw", { run_id: ctx.runId, error: errMessage(err) });
           }
         }
         if (event.kind === "frame") {

@@ -394,6 +394,16 @@ describe("ChatExecutor lifecycle clocks (Decision 3)", () => {
     assert.deepStrictEqual(probe.included, [2], "only the turn that streamed is reported");
   });
 
+  it("does not report a message whose turn produced only init, a rate-limit event and a zero-turn result", async () => {
+    const init = { type: "system", subtype: "init", session_id: "sess-1" } as unknown as SDKMessage;
+    const limit = { type: "rate_limit_event", session_id: "sess-1", rate_limit_info: { status: "rejected" } } as unknown as SDKMessage;
+    const empty = { type: "result", subtype: "success", is_error: true, num_turns: 0, session_id: "sess-1" } as unknown as SDKMessage;
+    const { queryFn } = fakeTurns([[init, limit, empty], [init, assistantText("a"), resultSuccess()]]);
+    const probe = makeCtx(["m1", "m2", undefined]);
+    await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
+    assert.deepStrictEqual(probe.included, [2], "init alone does not prove the model read the message");
+  });
+
   it("does not report a turn aborted by the wall-clock before it streamed anything", async () => {
     const { queryFn } = fakeTurns([(signal) => hangUntilAbort(signal)]);
     const sched = new FakeScheduler();

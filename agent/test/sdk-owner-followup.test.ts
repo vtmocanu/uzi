@@ -13,7 +13,7 @@ import { nonexistentWorktreeFactory, nullLogger } from "./helpers.js";
 // Issue #1800: the Claude executor's OWNER follow-up slot. A queued owner follow-up is pulled
 // (ctx.pullFollowUp) only immediately before an ordinary implement prompt is built, rides that
 // prompt, and is reported included (ctx.followUpIncluded) exactly once, when the turn carrying
-// it yields its FIRST event. A system text (completion rework, clarification answer, secret
+// it first yields an event evidencing the model processed it (not init/lifecycle). A system text (completion rework, clarification answer, secret
 // remediation) owns its turn outright: the follow-up waits in its slot for the next ordinary
 // turn. A turn that is dropped before streaming (a declined `now` pause) keeps the follow-up.
 //
@@ -52,6 +52,20 @@ function askUser(questions: AskUserQuestion[], sessionId = "sess-1"): SDKMessage
 }
 function resultSuccess(sessionId = "sess-1"): SDKMessage {
   return { type: "result", subtype: "success", is_error: false, num_turns: 1, session_id: sessionId } as unknown as SDKMessage;
+}
+
+function initFrame(sessionId = "sess-1"): SDKMessage {
+  return { type: "system", subtype: "init", session_id: sessionId, model: "m" } as unknown as SDKMessage;
+}
+function rateLimitEvent(status: string, sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "rate_limit_event",
+    session_id: sessionId,
+    rate_limit_info: { status, resetsAt: 1_900_000_000, rateLimitType: "five_hour" },
+  } as unknown as SDKMessage;
+}
+function resultZeroTurns(sessionId = "sess-1"): SDKMessage {
+  return { type: "result", subtype: "success", is_error: false, num_turns: 0, session_id: sessionId } as unknown as SDKMessage;
 }
 
 interface ScriptedTurn {
@@ -151,7 +165,7 @@ describe("issue #1800: the Claude executor delivers and reports the owner follow
     const probe = makeCtx(queue);
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.ok(prompts[1]!.includes(A), "the first implement prompt carries the follow-up");
-    assert.ok(prompts[1]!.includes("<follow_up>"), "framed as untrusted input");
+    assert.ok(/<follow_up_[0-9a-f]{16}>/.test(prompts[1]!), "framed as untrusted input");
     assert.ok(!prompts[2]!.includes(A), "no replay on the next turn");
     assert.deepStrictEqual(probe.included, [1], "reported included exactly once");
   });
@@ -271,5 +285,82 @@ describe("issue #1800: the Claude executor delivers and reports the owner follow
     assert.deepStrictEqual(includedAtPark, [], "nothing is reported while the park hands the follow-up over");
     assert.ok(prompts[2]!.includes(A), "the resumed turn carries the follow-up");
     assert.deepStrictEqual(probe.included, [77], "reported with the park's input id once that turn started");
+  });
+});
+
+// The stamp boundary: "included" means the turn carrying the follow-up reached the MODEL, so a
+// turn that starts and dies before any model output (init, rate_limit_event, a zero-turn result,
+// a throw) must leave the follow-up unreported and held for the next turn.
+describe("issue #1800: a follow-up is stamped only once the model processed its turn", () => {
+  const exec = (queryFn: SdkQueryFn, extra: Record<string, number> = {}): SdkExecutor =>
+    new SdkExecutor(nullLogger(), homeDir, { queryFn, emptyTurnBackoffBaseMs: 0, ...extra });
+
+  it("an init-only empty turn is retried and the follow-up is stamped by the retry that streamed output", async () => {
+    const queue = [A];
+    const { queryFn, prompts } = fakeTurns(
+      [PLAN, { messages: [initFrame(), resultZeroTurns()] }, { messages: [initFrame(), ...DONE.messages] }],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    const invocationsAtStamp: number[] = [];
+    const base = probe.ctx.followUpIncluded!;
+    probe.ctx.followUpIncluded = (id) => {
+      invocationsAtStamp.push(prompts.length);
+      base(id);
+    };
+    await exec(queryFn, { emptyTurnMaxRetries: 2 }).run(probe.ctx);
+    assert.ok(prompts[1]!.includes(A) && prompts[2]!.includes(A), "the empty turn and its retry both carry it");
+    assert.deepStrictEqual(probe.included, [1], "stamped exactly once");
+    assert.deepStrictEqual(invocationsAtStamp, [3], "stamped by the third query (the retry), not the init-only second");
+    assert.deepStrictEqual(probe.pulls, [A], "pulled once");
+  });
+
+  it("an exhausted empty turn (init, rate_limit_event, zero turns) leaves the follow-up unreported", async () => {
+    const queue = [A];
+    const { queryFn, prompts } = fakeTurns(
+      [PLAN, { messages: [initFrame(), rateLimitEvent("allowed"), resultZeroTurns()] }],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    await assert.rejects(exec(queryFn, { emptyTurnMaxRetries: 0 }).run(probe.ctx));
+    assert.ok(prompts[1]!.includes(A), "the turn was started with the follow-up in its prompt");
+    assert.deepStrictEqual(probe.included, [], "never stamped: the next claim re-queues it");
+  });
+
+  it("a rate-limit-rejected empty turn leaves the follow-up unreported", async () => {
+    const queue = [A];
+    const { queryFn } = fakeTurns(
+      [PLAN, { messages: [initFrame(), rateLimitEvent("rejected"), resultZeroTurns()] }],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    await assert.rejects(exec(queryFn, { emptyTurnMaxRetries: 0 }).run(probe.ctx));
+    assert.deepStrictEqual(probe.included, []);
+  });
+
+  it("a turn that starts and then throws before any model event leaves the follow-up unreported", async () => {
+    const queue = [A];
+    const prompts: string[] = [];
+    let call = 0;
+    const queryFn: SdkQueryFn = (params) => {
+      const n = call++;
+      return (async function* () {
+        for await (const p of params.prompt) {
+          const content = (p as { message?: { content?: unknown } }).message?.content;
+          prompts[n] = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        if (n === 0) {
+          yield submitPlan("# Plan");
+          yield resultSuccess();
+          return;
+        }
+        yield initFrame();
+        throw new Error("spawn failed after init");
+      })();
+    };
+    const probe = makeCtx(queue);
+    await assert.rejects(exec(queryFn).run(probe.ctx), /spawn failed after init/);
+    assert.ok(prompts[1]!.includes(A), "the throwing turn had the follow-up in its prompt");
+    assert.deepStrictEqual(probe.included, [], "no model event, so nothing reported");
   });
 });

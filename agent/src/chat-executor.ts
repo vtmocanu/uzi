@@ -180,11 +180,30 @@ export interface ChatContext {
    * `ended` vs `idle` is distinguished by ctx.signal (aborted ⇒ ended).
    */
   nextUserMessage(): Promise<ChatUserMessage | undefined>;
-  /** Issue #1800: the user message carrying input `id` was delivered to a model turn (its first
-   *  message arrived). Called at most once per message, never for a message the turn cap refused
+  /** Issue #1800: the user message carrying input `id` was delivered to a model turn (the model
+   *  answered it). Called at most once per message, never for a message the turn cap refused
    *  and never for a turn that failed before the model answered. The ChatRunner reports it to the
    *  api (POST /inputs/included). Optional; absent (a stub or test) ⇒ nothing is reported. */
   followUpIncluded?(id: number): void;
+}
+
+/** Issue #1800: does this raw SDK message evidence the model processing the turn? An assistant
+ *  message not marked synthetic (the SDK's placeholder for worker-synthesized notices such as a
+ *  usage-limit message), or a result reporting a positive turn count. Init, rate_limit_event and
+ *  a zero-turn result do not. */
+function chatMsgEvidencesModel(msg: unknown): boolean {
+  if (typeof msg !== "object" || msg === null) return false;
+  const rec = msg as Record<string, unknown>;
+  if (rec["type"] === "assistant") {
+    const inner = rec["message"];
+    const model = typeof inner === "object" && inner !== null ? (inner as Record<string, unknown>)["model"] : undefined;
+    return model !== "<synthetic>";
+  }
+  if (rec["type"] === "result") {
+    const n = rec["num_turns"];
+    return typeof n === "number" && n > 0;
+  }
+  return false;
 }
 
 /** One user message handed to the executor. `inputId` is the run_user_inputs id the message came
@@ -475,11 +494,13 @@ export class ChatExecutor {
     let resultFrame: unknown;
     try {
       const queryInstance = this.queryFn({ prompt: promptStream(userMessage), options });
-      let sawFirstMessage = false;
+      let reportedIncluded = false;
       for await (const msg of queryInstance) {
-        // Issue #1800: the model's first message proves the turn started on this user message.
-        if (!sawFirstMessage) {
-          sawFirstMessage = true;
+        // Issue #1800: stamp the message included only once the model answered it (see
+        // chatMsgEvidencesModel): system/init and rate_limit_event frames precede a turn that may
+        // still die without the model ever reading the message.
+        if (!reportedIncluded && chatMsgEvidencesModel(msg)) {
+          reportedIncluded = true;
           if (inputId !== undefined) {
             try {
               ctx.followUpIncluded?.(inputId);

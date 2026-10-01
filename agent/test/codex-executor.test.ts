@@ -56,7 +56,7 @@ import { CodexTransportError, type CodexNotification, type CodexTransport } from
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
-import { PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
+import { FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
 import type { SpawnCommandOptions } from "../src/codex/broker.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
@@ -9049,8 +9049,9 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.equal(texts.length, 2);
     assert.ok(!texts[0]!.includes(A), "turn 1 predates the follow-up");
     assert.ok(texts[1]!.includes(A), "turn 2 carries it");
-    assert.ok(texts[1]!.includes("<follow_up>") && texts[1]!.includes("UNTRUSTED INPUT"), "inside the untrusted-input fence");
-    assert.ok(texts[1]!.indexOf("the approved plan") < texts[1]!.indexOf("<follow_up>"), "after the base implement prompt");
+    assert.ok(/<follow_up_[0-9a-f]{16}>/.test(texts[1]!) && texts[1]!.includes("UNTRUSTED INPUT"), "inside the untrusted-input fence");
+    assert.ok(texts[1]!.indexOf("the approved plan") < texts[1]!.indexOf("<follow_up_"), "after the base implement prompt");
+    assert.ok(texts[1]!.trimEnd().endsWith(FOLLOW_UP_TRAILER), "a worker trailer, not the user's text, closes the prompt");
     assert.deepEqual(seams.included, [1], "reported included once, when turn 2 started");
   });
 
@@ -9099,6 +9100,56 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.ok(texts[0]!.includes(A), "the re-driven turn carries the follow-up the dropped one held");
     assert.deepEqual(seams.pulls, [A], "pulled once, never re-pulled");
     assert.deepEqual(seams.included, [1], "reported exactly once, by the drive that streamed");
+  });
+
+  it("a turn that STARTS (turn/start sent) and is dropped before any model event keeps the follow-up; the re-drive stamps it once", async () => {
+    const controller = new AbortController();
+    let starts = 0;
+    const rig = makeMultiEpochRig([
+      script("th-1", [quiet, (th, tn) => [done(11, th, tn)]], (n) => {
+        starts = n;
+        // The owner's `now` lands while the first turn/start is being served: the turn started but
+        // no item/agent-message/tool event reached the executor.
+        if (n === 1) controller.abort(new PauseNowSignal());
+      }),
+    ]);
+    const seams = followUpSeams([A]);
+    const startsAtStamp: number[] = [];
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      config: { max_iterations: 5 },
+      pauseModeRequested: () => "now",
+      parkForPause: async () => false,
+      pullFollowUp: seams.pullFollowUp,
+      followUpIncluded: (id) => { startsAtStamp.push(starts); seams.followUpIncluded(id); },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 started-then-dropped run");
+    assert.deepEqual(seams.pulls.filter((p) => p !== undefined), [A], "pulled once, never re-pulled");
+    assert.deepEqual(seams.included, [1], "reported exactly once");
+    assert.ok(starts >= 2, "the dropped drive sent turn/start and a second drive followed");
+    assert.deepEqual(startsAtStamp, [2], "stamped by the turn/start that streamed model output, not the dropped one");
+  });
+
+  it("thread and turn lifecycle notifications alone do not stamp the follow-up", async () => {
+    // A turn whose only notifications are thread/started and a FAILED turn/completed: the model
+    // never produced an item, so the follow-up must stay unreported for the next claim.
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          const tn = `tn-th-1-${c.turnStartCount}`;
+          c.transport.push(threadStarted("th-1"));
+          c.transport.push(turnCompleted("failed", "th-1", tn));
+          return { turn: { id: tn } };
+        }
+        return {};
+      },
+    ]);
+    const seams = followUpSeams([A]);
+    const { ctx } = makeCtx({ pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#1800 lifecycle-only run");
+    assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A), "the turn carried it");
+    assert.deepEqual(seams.included, [], "but nothing evidenced the model processing it");
   });
 
   it("(e) a completion-rework turn does not carry the held follow-up; the next ordinary turn does", async () => {

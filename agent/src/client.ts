@@ -1484,8 +1484,10 @@ export class WorkerClient {
         throw new Error(`GET ${path}: malformed inputs row`);
       // Issue #1800: an api that predates inclusion reporting sends neither field; absent
       // inclusion_reported reads as false, so such a row is never re-queued as "unincluded".
+      // A raw `included_at: null` is dropped here (the spread would carry it past the type).
+      const { included_at: _rawIncludedAt, ...rest } = r as unknown as UserInput & { included_at?: unknown };
       out.push({
-        ...(r as unknown as UserInput),
+        ...rest,
         inclusion_reported: r.inclusion_reported === true,
         ...(typeof r.included_at === "string" && r.included_at !== "" ? { included_at: r.included_at } : {}),
       });

@@ -807,8 +807,8 @@ describe("SdkExecutor implement/review loop", () => {
 
     const p = turns[2]!.promptText ?? "";
     const steerIdx = p.indexOf("WORKER-SAFETY-STEER-BODY-777");
-    const openIdx = p.indexOf("<follow_up>");
-    const closeIdx = p.indexOf("</follow_up>");
+    const openIdx = p.search(/<follow_up_[0-9a-f]{16}>\n/);
+    const closeIdx = p.search(/\n<\/follow_up_[0-9a-f]{16}>/);
     assert.ok(steerIdx >= 0, "the drained safety steer reached the implement prompt");
     assert.match(p, /The worker detected a problem and is steering you/); // worker-guidance framing
     assert.ok(openIdx >= 0, "the follow-up is present on the same turn");

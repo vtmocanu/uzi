@@ -147,7 +147,7 @@ afterEach(() => {
   }
 });
 
-describe("issue #1152: queued follow-ups drain at a cooperative checkpoint", () => {
+describe("issue #1152 / #1800: a follow-up queued during a turn is pulled at the next loop top and rides the next ordinary turn", () => {
   it("delivers a follow-up queued during a checkpointing turn to the next turn", async () => {
     const queue: string[] = [];
     const { queryFn, prompts } = fakeTurns(

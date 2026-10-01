@@ -238,6 +238,36 @@ export type HarnessEvent = HarnessEventMeta &
     | { kind: "turn_finished"; terminal: HarnessTerminal }
   );
 
+/** The SDK's placeholder model name on a worker-synthesized assistant frame (e.g. the
+ *  "you've hit your limit" notice): such a frame was never produced by the model. */
+const SYNTHETIC_MODEL = "<synthetic>";
+
+/**
+ * Issue #1800: the ONE definition of "the model processed this turn", shared by both harnesses.
+ * An owner follow-up is stamped included only when the turn carrying it reaches this point, so a
+ * turn that starts and then dies before the model answered (provider-transient exhaustion, a
+ * rate-limit-rejected empty turn, a transport error) keeps the follow-up for the next claim.
+ *
+ * True for: a frame carrying model output (items), usage or a scanned signal (a signal-only tool
+ * call is still the model acting), except a synthetic frame; and a terminal that reports a
+ * positive turn count, or a successful terminal that does not report a zero count.
+ * False for lifecycle events: `initialized` (Claude system/init, Codex claim init), `activity`
+ * (rate_limit_event, thread/started, turn/started, token usage), and a zero-turn or failed
+ * terminal with no turn count.
+ */
+export function evidencesModelProcessing(event: HarnessEvent): boolean {
+  if (event.kind === "frame") {
+    if (event.model === SYNTHETIC_MODEL) return false;
+    return event.items.length > 0 || event.usage !== undefined || Object.keys(event.signals ?? {}).length > 0;
+  }
+  if (event.kind === "turn_finished") {
+    const n = event.terminal.metrics.wire?.num_turns;
+    if (typeof n === "number" && Number.isFinite(n)) return n > 0;
+    return event.terminal.outcome === "success" && event.terminal.apiErrorStatus == null;
+  }
+  return false;
+}
+
 // Tool inheritance is distinct from an explicitly empty allowlist. Conversion
 // of today's absent/null/empty template tools to inherit occurs upstream once.
 export type HarnessToolSet =

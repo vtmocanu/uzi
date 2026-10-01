@@ -742,6 +742,15 @@ describe("getConsumedFollowUps inclusion fields (issue #1800)", () => {
     );
   });
 
+  it("drops a raw included_at null instead of leaking it past the string|undefined type", async () => {
+    const client = newClient();
+    api.overrideFollowUps("run-fu-incl-null", 200, {
+      inputs: [{ id: 1, kind: "follow_up", body: "x", inclusion_reported: true, included_at: null }],
+    });
+    const [row] = await client.getConsumedFollowUps("run-fu-incl-null");
+    assert.ok(!("included_at" in row!), "the key is absent, not null");
+  });
+
   it("rejects a row whose inclusion fields have the wrong type", async () => {
     const client = newClient();
     for (const row of [

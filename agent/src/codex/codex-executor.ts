@@ -30,7 +30,8 @@
 // the plan phase by throwing a PauseNowSignal the runner parks.
 // Issue #1800: an owner follow-up (ctx.pullFollowUp) rides the base implement prompt of the next
 // ordinary turn in a <follow_up> fence and is reported included (ctx.followUpIncluded) when that
-// turn yields its first event; a completion-rework or secret-remediation turn leaves it waiting.
+// turn first yields an event evidencing the model processed it (evidencesModelProcessing; not
+// thread/turn lifecycle notifications); a completion-rework or secret-remediation turn leaves it waiting.
 // It reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
 // turns Codex-specific.
 //
@@ -86,7 +87,8 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock } from "../prompt.js";
+import { evidencesModelProcessing } from "../harness.js";
+import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -2248,7 +2250,7 @@ export class CodexExecutor implements Executor {
       // Issue #1800: the owner's follow-up. Pulled from steering only immediately before an ordinary
       // implement prompt is built (never while a system text owns the turn), carried across loop
       // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
-      // prompt held it yields its first event, which is when it is reported included. A turn that
+      // prompt held it first yields a model-evidencing event (evidencesModelProcessing), which is when it is reported included. A turn that
       // throws, parks, walls, pauses or whose epoch is recreated first keeps it for the next turn.
       let ownerFollowUp: { id: number; body: string } | undefined;
       // Issue #1674: the approved breakdown this loop reports against: the list approved at this
@@ -2370,7 +2372,7 @@ export class CodexExecutor implements Executor {
         }
         // PRD #1416 M2: drain the worker-authoritative safety steer at the loop top and, when
         // present, PREFIX it (framed as worker guidance, followed by a blank line) to THIS turn's
-        // implement prompt only. Codex has no <follow_up> fence; keep it a per-turn prefix so it
+        // implement prompt only. It is a per-turn prefix (outside the owner follow-up's fence) so it
         // is consumed at the next turn and NOT persisted. Absent ⇒ the base prompt is unchanged.
         const safetySteer = ctx.pullSafetySteer?.();
         // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
@@ -2387,7 +2389,7 @@ export class CodexExecutor implements Executor {
             }
           : undefined;
         const ownerBase = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
-        const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body)].join("\n") : ownerBase;
+        const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body), "", FOLLOW_UP_TRAILER].join("\n") : ownerBase;
         const implementBody = completionFollowUp !== undefined
           ? withMilestoneNote(completionFollowUp, milestoneNote())
           : basePrompt;
@@ -2903,7 +2905,8 @@ export class CodexExecutor implements Executor {
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
     pauseNow: CodexPauseNowState,
-    // Issue #1800: called once, when the turn yields its first event (the prompt was delivered).
+    // Issue #1800: called when the turn first yields an event evidencing the model processed the
+    // prompt (evidencesModelProcessing), not on lifecycle events such as the claim init.
     onFirstEvent?: () => void,
   ): Promise<ReducedTurnResult> {
     const callbackCursor = registry.callbackAdmissionCursor();
@@ -3018,15 +3021,17 @@ export class CodexExecutor implements Executor {
           return events.next();
         }
       })();
-      if (!first.done) {
-        try {
-          onFirstEvent?.();
-        } catch (err) {
-          this.log.warn("codex first-event handler threw", { run_id: ctx.runId, error: errMessage(err) });
-        }
-      }
+      let sawModelEvidence = false;
       for (; !first.done; first = await events.next()) {
         const event = first.value;
+        if (!sawModelEvidence && evidencesModelProcessing(event)) {
+          sawModelEvidence = true;
+          try {
+            onFirstEvent?.();
+          } catch (err) {
+            this.log.warn("codex model-evidence handler threw", { run_id: ctx.runId, error: errMessage(err) });
+          }
+        }
         armIdle(); // events re-arm idle only while no callback is in flight
         const reduction = await reducer.accept(event);
         if (reduction.firstSessionId !== undefined) {
