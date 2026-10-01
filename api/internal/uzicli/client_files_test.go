@@ -29,6 +29,11 @@ func TestHTTPFileRequests(t *testing.T) {
 	if d, err := c.AdminProductEgressProfiles(ctx, "p/1"); err != nil || len(d) != 1 || d[0].Name != "vendor-x" || *seen != [3]string{"GET", "/api/admin/products/p%2F1/egress-profiles", ""} {
 		t.Errorf("egress profiles = %+v %v, %v", d, *seen, err)
 	}
+
+	c, seen, _ = jobServer(t, 200, "application/json", `{"connections":[{"id":"g1","user_id":"u1","owner_email":"a@example.test","scopes":["jobs:run"],"connected_at":"2026-10-01T08:00:00Z","created_at":"2026-10-01T08:00:00Z","last_used_at":null}],"truncated":true}`)
+	if d, err := c.AdminProductConnections(ctx, "p/1"); err != nil || len(d.Connections) != 1 || d.Connections[0].OwnerEmail != "a@example.test" || !d.Truncated || *seen != [3]string{"GET", "/api/admin/products/p%2F1/connections", ""} {
+		t.Errorf("connections = %+v %v, %v", d, *seen, err)
+	}
 }
 
 func TestHTTPUploadFileHeadersAndStatuses(t *testing.T) {

@@ -74,8 +74,10 @@ type FakeClient struct {
 	ProductSkills map[string]apitypes.ProductSkillsDTO
 	// ProductEgress drives AdminProductEgressProfiles (PRD #1976), keyed by product id.
 	ProductEgress map[string][]ProductEgressProfile
-	AdminUsageV   apitypes.AdminUsageDTO
-	RateLimits    []apitypes.AdminRateLimitRowDTO
+	// ProductConns drives AdminProductConnections (PRD #1910 M5), keyed by product id.
+	ProductConns map[string]ProductConnections
+	AdminUsageV  apitypes.AdminUsageDTO
+	RateLimits   []apitypes.AdminRateLimitRowDTO
 	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide
 	// per-user Codex rows.
 	CodexRateLimits []apitypes.CodexAdminRateLimitRowDTO

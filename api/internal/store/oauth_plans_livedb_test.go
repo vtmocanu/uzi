@@ -185,12 +185,30 @@ func TestGrantTokenCountsUseIndexesLiveDB(t *testing.T) {
 	minted := plan(countGrantTokensMintedSince)
 	exec(`ROLLBACK`)
 
-	for _, c := range []struct{ name, got, index string }{
-		{"CountLiveGrantTokens", live, "idx_product_tokens_grant_live "},
-		{"CountGrantTokensMintedSince", minted, "idx_product_tokens_grant "},
+	// Naming the index is not enough: with (grant_id) alone as its key the same index is still
+	// chosen and the time predicate becomes a Filter that reads every row of the grant. The time
+	// column must sit in the Index Cond of the scan, and in no Filter line.
+	for _, c := range []struct{ name, got, index, column string }{
+		{"CountLiveGrantTokens", live, "idx_product_tokens_grant_live ", "expires_at"},
+		{"CountGrantTokensMintedSince", minted, "idx_product_tokens_grant ", "created_at"},
 	} {
 		if !strings.Contains(c.got, c.index) {
 			t.Errorf("%s does not use %s:\n%s", c.name, c.index, c.got)
+		}
+		var inIndexCond, inFilter bool
+		for _, line := range strings.Split(c.got, "\n") {
+			switch trimmed := strings.TrimSpace(line); {
+			case strings.HasPrefix(trimmed, "Index Cond:"):
+				inIndexCond = inIndexCond || strings.Contains(trimmed, c.column)
+			case strings.HasPrefix(trimmed, "Filter:"):
+				inFilter = inFilter || strings.Contains(trimmed, c.column)
+			}
+		}
+		if !inIndexCond {
+			t.Errorf("%s: %s is not in the Index Cond of the plan (the index key must carry it):\n%s", c.name, c.column, c.got)
+		}
+		if inFilter {
+			t.Errorf("%s: %s is applied as a Filter, so the scan reads rows it then discards:\n%s", c.name, c.column, c.got)
 		}
 		if strings.Contains(c.got, "Seq Scan") {
 			t.Errorf("%s seq-scans the table:\n%s", c.name, c.got)

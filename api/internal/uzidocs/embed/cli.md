@@ -732,6 +732,14 @@ A few worth knowing:
   works with a `uza_` token; allowing and removing a list are browser-only
   admin actions on **Admin → Products**. See [Product
   tokens](product-tokens.md#site-lists-for-jobs).
+  `admin products connections <product>` lists, read-only, the users who have
+  connected that product through OAuth (PRD #1910): `USER`, `SCOPES`,
+  `CONNECTED`, `LAST USED` and the connection `ID`. A connection is listed while
+  it is live, whatever the state of its access tokens. `--json` prints
+  `{"connections": [...], "truncated": bool}`; `truncated` is true when the
+  server cut the list at its 1000-row cap. It works with a `uza_` token;
+  revoking a connection is a browser-only admin action on **Admin → Products**.
+  See [Connect a product](connect-a-product.md).
 - **`admin guardrail-impact` is a live pre-flight count** (PRD #66) — how many
   enabled repos, factory-wide, the push/merge guardrail would refuse right now
   (the bot can push or merge to the default branch). It **persists nothing**: it

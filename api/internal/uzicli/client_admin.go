@@ -18,6 +18,24 @@ type ProductEgressProfile struct {
 	CreatedAt   time.Time `json:"created_at"`
 }
 
+// ProductConnections is the body of GET /api/admin/products/{id}/connections (PRD #1910 M5): one
+// product's live OAuth connections, newest consent first, and whether the server's row cap cut the
+// list.
+type ProductConnections struct {
+	Connections []apitypes.AdminOAuthConnectionDTO `json:"connections"`
+	Truncated   bool                               `json:"truncated"`
+}
+
+// AdminProductConnections reads a product's live OAuth connections. Read-only; an admin read
+// token works (the revoke route is cookie-only).
+func (c *HTTPClient) AdminProductConnections(ctx context.Context, productID string) (ProductConnections, error) {
+	var out ProductConnections
+	if err := c.get(ctx, "/api/admin/products/"+url.PathEscape(productID)+"/connections", &out); err != nil {
+		return ProductConnections{}, err
+	}
+	return out, nil
+}
+
 // AdminProductEgressProfiles reads a product's allowed site lists, ordered by name. Read-only; an
 // admin read token works (the write routes are cookie-only).
 func (c *HTTPClient) AdminProductEgressProfiles(ctx context.Context, productID string) ([]ProductEgressProfile, error) {

@@ -1781,6 +1781,21 @@ export interface OAuthConnection {
   refresh_issued_at: string | null;
 }
 
+// AdminOAuthConnection is one live OAuth connection of a product, from GET
+// /api/admin/products/{id}/connections (apitypes.AdminOAuthConnectionDTO): the connecting user
+// (id and email, as the admin token inventory shows an owner), the approved scopes and the
+// timestamps. connected_at is the latest consent, created_at the first one; last_used_at is null
+// if never used. Never carries a token or a hash.
+export interface AdminOAuthConnection {
+  id: string;
+  user_id: string;
+  owner_email: string;
+  scopes: ProductTokenScope[];
+  connected_at: string;
+  created_at: string;
+  last_used_at: string | null;
+}
+
 // ── Agent memory (PRD #90) ────────────────────────────────────────────────
 // A durable per-(user, repo) learning an agent saved on a prior run, read back
 // into a future run as inert, nonce-fenced, advisory context. The webui surfaces

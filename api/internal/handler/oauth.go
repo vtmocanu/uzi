@@ -740,3 +740,111 @@ func (h *Handler) ListMyOAuthConnections(w http.ResponseWriter, r *http.Request)
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"connections": out})
 }
+
+// RevokeMyOAuthConnection is POST /api/me/oauth-connections/{id}/revoke (PRD #1910 M5,
+// D6): the owner disconnects one product. Cookie-only with CSRF, like the list. In one
+// transaction the grant is locked FOR UPDATE (D8) and revoked with every token under it
+// (revokeGrantOfTokenTx with the caller as owner), so the next /api/v1 call with any of its access
+// tokens is 401, its refresh token is invalid_grant, and the revoke sweep cancels the jobs those
+// tokens created. A foreign, unknown or already-revoked id is a 404 and changes nothing (no
+// existence oracle). 204 on success, like DELETE /api/me/product-tokens/{id}.
+func (h *Handler) RevokeMyOAuthConnection(w http.ResponseWriter, r *http.Request) {
+	user, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
+		return
+	}
+	owner := user.ID
+	err := h.inTx(r.Context(), func(q *store.Queries) error {
+		return revokeGrantOfTokenTx(r.Context(), q, id, &owner)
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+	case err != nil:
+		slog.Error("revoke oauth connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	default:
+		w.WriteHeader(http.StatusNoContent)
+	}
+}
+
+// AdminListProductConnections is GET /api/admin/products/{id}/connections (PRD #1910 M5): one
+// product's LIVE grants whatever the state of their access tokens, with the connecting user's id
+// and email. A read a uza_ token may make, on authLimiter's per-user budget like the other admin
+// product reads. BOUNDED like the admin product-token inventory: at most maxAdminProductTokenRows
+// (1000) rows, newest consent first, with "truncated" when the extra row came back. Unknown
+// product is a 404. Response: {"connections": [...], "truncated": bool}.
+func (h *Handler) AdminListProductConnections(w http.ResponseWriter, r *http.Request) {
+	id, ok := httpx.PathUUID(w, r, "id", "product")
+	if !ok {
+		return
+	}
+	if _, err := h.q.GetProduct(r.Context(), id); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "product not found")
+			return
+		}
+		slog.Error("admin list product connections: get product", "product_id", id, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	bound := productTokenListBound(h.adminProductTokenRowsOverride, maxAdminProductTokenRows)
+	rows, err := h.q.ListLiveOAuthGrantsForProduct(r.Context(), store.ListLiveOAuthGrantsForProductParams{ProductID: id, MaxRows: bound + 1})
+	if err != nil {
+		slog.Error("admin list product connections", "product_id", id, "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	rows, truncated := cutProductTokenList(rows, bound)
+	out := make([]apitypes.AdminOAuthConnectionDTO, 0, len(rows))
+	for _, g := range rows {
+		scopes := g.Scopes
+		if scopes == nil {
+			scopes = []string{}
+		}
+		out = append(out, apitypes.AdminOAuthConnectionDTO{
+			ID:          g.ID.String(),
+			UserID:      g.UserID.String(),
+			OwnerEmail:  g.OwnerEmail,
+			Scopes:      scopes,
+			ConnectedAt: g.ConsentedAt.Time,
+			CreatedAt:   g.CreatedAt.Time,
+			LastUsedAt:  timePtr(g.LastUsedAt.Valid, g.LastUsedAt.Time),
+		})
+	}
+	httpx.JSON(w, http.StatusOK, map[string]any{"connections": out, "truncated": truncated})
+}
+
+// AdminRevokeOAuthConnection is POST /api/admin/oauth-connections/{id}/revoke (PRD #1910 M5, D6):
+// an admin disconnects any user's grant. Cookie-only admin write. Same transaction as the owner's
+// revoke (grant lock first, D8) without the owner scope; an unknown or already-revoked id is a
+// 404. 204 on success.
+func (h *Handler) AdminRevokeOAuthConnection(w http.ResponseWriter, r *http.Request) {
+	actor, ok := mw.UserFromContext(r.Context())
+	if !ok {
+		httpx.Error(w, http.StatusUnauthorized, "authentication required")
+		return
+	}
+	id, ok := httpx.PathUUID(w, r, "id", "connection")
+	if !ok {
+		return
+	}
+	err := h.inTx(r.Context(), func(q *store.Queries) error {
+		return revokeGrantOfTokenTx(r.Context(), q, id, nil)
+	})
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		httpx.Error(w, http.StatusNotFound, "connection not found")
+	case err != nil:
+		slog.Error("admin revoke oauth connection", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+	default:
+		slog.Info("admin revoked oauth connection", "actor_id", actor.ID, "grant_id", id)
+		w.WriteHeader(http.StatusNoContent)
+	}
+}

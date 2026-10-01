@@ -21,16 +21,10 @@ import { api, ApiError, type OAuthAuthorizeRequest } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { clearPendingReturn, setPendingReturn } from "../lib/pendingReturn";
+import { scopeText } from "../lib/oauthClient";
 import { Alert, Button, Card, Skeleton } from "../components/ui";
 import { useDemoMode } from "../lib/demoMode";
 import { maskEmail } from "../lib/demoMask";
-
-// What each scope lets the product do, in plain words. An unknown scope (a newer server) is
-// shown as its raw text rather than hidden: the user should see everything they are granting.
-const SCOPE_TEXT: Record<string, string> = {
-  "jobs:run": "Run jobs",
-  "jobs:read": "Read jobs and their results",
-};
 
 // The fixed disclosure of D4, shown on every consent exactly as written.
 const AUTOMATION_NOTICE =
@@ -177,7 +171,7 @@ export function Connect() {
                 <h2 className="text-sm font-medium text-fg">This product will be able to</h2>
                 <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-fg">
                   {meta.scopes.map((scope) => (
-                    <li key={scope}>{SCOPE_TEXT[scope] ?? scope}</li>
+                    <li key={scope}>{scopeText(scope)}</li>
                   ))}
                 </ul>
               </div>

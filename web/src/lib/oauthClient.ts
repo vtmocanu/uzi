@@ -81,3 +81,16 @@ export function redirectUrisError(uris: string[]): string | null {
   }
   return null;
 }
+
+// What each OAuth scope lets a connected product do, in plain words, shared by the consent page,
+// the user's Connected products list and the admin Connections panel so all three say it the same
+// way. An unknown scope (a newer server) is shown as its raw text by scopeText, never hidden: the
+// reader should see everything that was granted.
+const SCOPE_TEXT: Record<string, string> = {
+  "jobs:run": "Run jobs",
+  "jobs:read": "Read jobs and their results",
+};
+
+export function scopeText(scope: string): string {
+  return SCOPE_TEXT[scope] ?? scope;
+}

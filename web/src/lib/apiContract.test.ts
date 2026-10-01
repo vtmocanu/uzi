@@ -50,6 +50,7 @@ import type {
   ProductOAuthClient,
   OAuthAuthorizeRequest,
   OAuthConnection,
+  AdminOAuthConnection,
   OAuthRedirect,
   RotateProductClientSecretResponse,
   ProductToken,
@@ -160,6 +161,8 @@ import oauthRedirectResponseZero from "../../../fixtures/api-contract/oauth_redi
 import oauthRedirectResponseFull from "../../../fixtures/api-contract/oauth_redirect_response.full.json";
 import oauthConnectionZero from "../../../fixtures/api-contract/oauth_connection.zero.json";
 import oauthConnectionFull from "../../../fixtures/api-contract/oauth_connection.full.json";
+import adminOauthConnectionZero from "../../../fixtures/api-contract/admin_oauth_connection.zero.json";
+import adminOauthConnectionFull from "../../../fixtures/api-contract/admin_oauth_connection.full.json";
 import productTokenZero from "../../../fixtures/api-contract/product_token.zero.json";
 import runJobZero from "../../../fixtures/api-contract/run_job.zero.json";
 import runJobFull from "../../../fixtures/api-contract/run_job.full.json";
@@ -1139,6 +1142,18 @@ void _buildInfoFull;
   void _oauthConnectionExtra;
   void _oauthConnectionZero;
   void _oauthConnectionFull;
+}
+// PRD #1910 M5: one live connection in the admin product list. last_used_at is a present-as-null
+// pointer; scopes is the nil-slice null in the zero fixture that the handler normalizes to [].
+{
+  const _adminOauthConnectionMissing: never = null as unknown as Exclude<keyof AdminOAuthConnection, keyof typeof adminOauthConnectionFull>;
+  const _adminOauthConnectionExtra: never = null as unknown as Exclude<keyof typeof adminOauthConnectionFull, keyof AdminOAuthConnection>;
+  const _adminOauthConnectionZero: ZeroOf<AdminOAuthConnection, "scopes"> = adminOauthConnectionZero;
+  const _adminOauthConnectionFull: Widen<AdminOAuthConnection> = adminOauthConnectionFull;
+  void _adminOauthConnectionMissing;
+  void _adminOauthConnectionExtra;
+  void _adminOauthConnectionZero;
+  void _adminOauthConnectionFull;
 }
 // PRD #1907 M4/M5: the typed admin delete response (its nested product's deleted_at is
 // `string | null`, no exemption) and the user mint-picker entry (all strings).

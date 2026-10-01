@@ -447,6 +447,12 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/me/product-tokens/", noLimiter},
 	// PRD #1910 M3: the caller's live OAuth connections, a cookie-only plain read like the product-token list.
 	{"GET", "/api/me/oauth-connections/", noLimiter},
+	// PRD #1910 M5: the owner's revoke of one connection, a cookie-only local write → noLimiter.
+	{"POST", "/api/me/oauth-connections/{id}/revoke", noLimiter},
+	// PRD #1910 M5: a product's live connections, an admin read a uza_ token may make → limAuth.
+	{"GET", "/api/admin/products/{id}/connections", limAuth},
+	// PRD #1910 M5: the admin's revoke of one connection, a cookie-only admin DB write → noLimiter.
+	{"POST", "/api/admin/oauth-connections/{id}/revoke", noLimiter},
 	{"GET", "/api/me/product-tokens/products", noLimiter},
 	{"GET", "/api/me/judge/category-stats", noLimiter},
 	{"GET", "/api/me/judge/recommendations", noLimiter},

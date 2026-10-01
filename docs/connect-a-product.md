@@ -30,7 +30,9 @@ These actions revoke a connection: it stops working on its **next request**, and
 
 | Action | Who |
 |---|---|
+| **Revoke** one product in **Settings → Access → Connected products**, which lists every connection you have approved (product, what it may do, when you connected, when it was last used), including one whose access tokens have all expired. | you |
 | **Revoke all** in **Settings → Access**. Its button counts your live connections (not tokens), so it is offered even when the only thing live is a connection. | you |
+| **Revoke** in the **Connections** section of the product's card on **Admin → Products**, which lists everyone who connected it. `uzi admin products connections <product>` lists them read-only. | an admin |
 | Revoke **one** of its access tokens through the API by id (the same call as for any product token) | you, or an admin |
 | **Disconnect** from inside the product, which revokes its refresh token at uzi | the product |
 

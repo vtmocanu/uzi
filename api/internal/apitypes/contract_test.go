@@ -169,6 +169,9 @@ func contractCases() []contractCase {
 		// last_used_at and refresh_issued_at are present-as-null pointers; scopes is a nil-slice
 		// null in zero.json, never null on the wire).
 		newContractCase[OAuthConnectionDTO]("oauth_connection"),
+		// PRD #1910 M5: one live connection of a product in the admin list (last_used_at is a
+		// present-as-null pointer; scopes is a nil-slice null in zero.json, never null on the wire).
+		newContractCase[AdminOAuthConnectionDTO]("admin_oauth_connection"),
 		newContractCase[ProductTokenDTO]("product_token"),
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),

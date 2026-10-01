@@ -6,6 +6,9 @@
 // next to the product they unlock. Soft-deleted products (D9) stay listed, last, as the
 // audit trail; they have no controls, since a deleted product cannot change.
 //
+// Each product card also ends in its OAuth connections panel (PRD #1910 M5), collapsed and
+// loaded on open: who connected the product, with a revoke.
+//
 // Each live product card ends in its skill set (PRD #1909 M6, components/ProductSkills.tsx),
 // collapsed and loaded on open: the approve view for skills synced from the product's repo.
 //
@@ -43,6 +46,7 @@ import {
   productTokenExpiryText,
 } from "../components/ProductTokens";
 import { PackageIcon } from "../components/icons";
+import { ProductConnectionsPanel } from "../components/ProductConnections";
 import { ProductEgressProfilesPanel } from "../components/ProductEgressProfiles";
 import { ProductOAuthPanel } from "../components/ProductOAuthClient";
 import { ProductSkillsPanel } from "../components/ProductSkills";
@@ -598,6 +602,10 @@ function ProductCard({
         {/* PRD #1976 M2: the site lists the product's tokens may name on job create. A deleted
             product still lists them (read-only). */}
         <ProductEgressProfilesPanel product={product} />
+
+        {/* PRD #1910 M5: the users who connected the product through OAuth, with a revoke. A
+            deleted product still lists what it had (the audit trail). */}
+        <ProductConnectionsPanel product={product} />
       </Card>
     </section>
   );

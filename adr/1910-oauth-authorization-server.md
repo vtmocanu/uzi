@@ -1,6 +1,6 @@
 # ADR-1910: uzi is a minimal in-tree OAuth authorization server for registered products
 
-**Status**: Accepted (PRD #1910 M1-M4 implemented; M5 connection lists and M6 audit are not done)
+**Status**: Accepted (PRD #1910 M1-M5 implemented; the M6 audit is not done)
 **Date**: 2026-10-01
 **Issue**: [vtmocanu/uzi#1910](https://github.com/vtmocanu/uzi/issues/1910)
 **PRD**: [prds/1910-connect-uzi-oauth.md](../prds/1910-connect-uzi-oauth.md)
@@ -90,8 +90,9 @@ access token and a refresh token, until the connection is revoked.
    already expired token), clears the refresh token and supersedes unredeemed
    codes. Every path calls the one helper, `revokeGrantLocked`. Revoke all, the
    owner's or an admin's revoke of one grant token by id, a code replay and the
-   product's RFC 7009 revoke with its refresh token reach it; the user's and
-   admin's connection revoke follow in M5.
+   product's RFC 7009 revoke with its refresh token reach it, and so do the
+   user's and the admin's connection revoke (`revokeGrantOfTokenTx`, the same
+   transaction the revoke-by-token-id routes use).
 8. **Every grant mutation serializes on the grant row (D8).** The lock order is
    the grant row (several grants in ascending id order), then that grant's
    `product_tokens` rows, then its `oauth_authorize_requests` rows, on every
@@ -194,9 +195,9 @@ access token and a refresh token, until the connection is revoked.
 - A replay that is not fully bound is deliberately not punished: a stolen code
   injected into the honest client's callback cannot be used to disconnect the
   user.
-- A product can stay connected (refresh) and disconnect itself (RFC 7009), but a
-  user's and an admin's own connection lists and revoke buttons (M5) and the
-  audit (M6) are not built; their rows in the index below say so.
+- A product can stay connected (refresh) and disconnect itself (RFC 7009), and
+  users and admins can list and revoke connections (M5); only the audit (M6) is
+  not done, and its rows in the index below say so.
 - A refresh does not rotate, so a leaked refresh token is good until the user or
   product revokes the connection or the 30-day idle and 90-day absolute limits
   end it; the exposure is bounded by those limits and by revoke, not by reuse
@@ -206,7 +207,7 @@ access token and a refresh token, until the connection is revoked.
 
 Each row names the tests that pin a rule implemented so far. Tests whose names end
 in `LiveDB` need a database (`./e2e/run-store-it.sh`); the others run in
-`task test:api` and `task gate:web`. A row marked M5 or M6 is pending in that
+`task test:api` and `task gate:web`. A row marked M6 is pending in that
 milestone.
 
 | Rule | Pinned by |
@@ -220,6 +221,7 @@ milestone.
 | D5 code exchange mints an access token and the grant's refresh token; the token works on `/api/v1` and nowhere a pasted token is refused; the refresh token is no bearer | `TestOAuthTokenExchangeSuccessLiveDB`, `TestOAuthTokenAccessTokenIsRefusedWhereAPastedTokenIsLiveDB` |
 | D5 the access token carries only the grant's scopes; a code lives 60 seconds | `TestOAuthTokenAccessTokenCarriesOnlyTheGrantsScopesLiveDB`, `TestOAuthTokenCodeExpiresAfterSixtySecondsLiveDB` |
 | D5 one live grant per (user, product); re-consent rules | `TestOAuthConcurrentFirstConsentsShareOneGrantLiveDB`, `TestOAuthReconsentLiveDB`, `TestOAuthApproveAfterRevokedGrantCreatesNewGrantLiveDB` |
+| D5 the two per-mint counts read only the rows they count: the time column sits in the Index Cond of the plan, never in a Filter | `TestGrantTokenCountsUseIndexesLiveDB` (store; red when either index is reduced to `(grant_id)`) |
 | D5 ten live access tokens per grant, counted under the grant lock | `TestOAuthTokenLiveTokenCapLiveDB`, `TestOAuthTokenCapIsCountedUnderTheGrantLockLiveDB` |
 | D5 grant tokens are not manual tokens (lists, counts, mint cap) | `TestGrantTokensAreNotManualTokensLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx` |
 | D5 live connections are counted apart from manual tokens: `live_connection_count` on a product and `stopped_connection_count` on its delete, so the delete confirm names both | `TestProductConnectionCountsLiveDB`, `TestProductDTOTags` (the wire tags), the `product.*`, `admin_delete_product.*` and `rotate_product_client_secret.*` contract fixtures with `TestContractFixturesMatchMarshal`, `TestContractFullFixtureDecodesStrict` and `apiContract.test.ts`; `TestAdminProductsTable` (the `CONNECTIONS` column); web: the delete-confirm and toast wording in `AdminProducts.test.tsx`, the mock's counts in `mockApi.productTokens.test.ts` |
@@ -239,7 +241,13 @@ milestone.
 | D6 Revoke all leaves no live grant, and its button counts grants; its warning tells connected products to connect again | `TestRevokeAllRevokesGrantsLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB`, `TestRevokeAllVersusFirstConsentApproveLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx`, `CliTokens.test.tsx` (including the connect-again sentence), `mockApi.productTokens.test.ts` |
 | D6 revoke cancels jobs of an expired access token | `TestCancelRevokedProductJobsExpiredGrantTokenLiveDB` |
 | D6 the product revokes its own connection with its refresh token (grant, access tokens, refresh token), idempotently | `TestOAuthRevokeWithRefreshTokenKillsGrantLiveDB` |
-| D6 user revoke of a connection, admin revoke of a connection | M5 |
+| D6 the owner's revoke of a connection (`POST /api/me/oauth-connections/{id}/revoke`) is owner-scoped (a foreign, unknown or already-revoked id is 404 and changes nothing), needs the CSRF header, and is cookie-only | `TestUserRevokeConnectionIsOwnerScopedLiveDB`, `TestConnectionRevokeRoutesRefuseBearerLiveDB` (uzc_, uza_, uzp_ and uzr_ Bearers), `TestEveryRouteCarriesItsExpectedPerUserLimiter` (its row) |
+| D6 an admin's revoke of a connection (`POST /api/admin/oauth-connections/{id}/revoke`) is admin-only and cookie-only: a non-admin session is 403, a `uza_` Bearer is 401, an unknown id is 404 | `TestAdminConnectionRoutesAuthorizationLiveDB`, `TestConnectionRevokeRoutesRefuseBearerLiveDB`, `TestEveryRouteCarriesItsExpectedPerUserLimiter` (its row) |
+| D6 after a revoke from either list the next `/api/v1` call with the connection's access token is 401, the next refresh is `invalid_grant`, and a second revoke is 404 | `TestConnectionRevokeKillsApiAndRefreshLiveDB` (user and admin) |
+| D6 a connection whose access tokens have all expired is listed (for its owner and for the admin) and revocable from both; the revoke reaches the expired tokens, so the sweep cancels the jobs they created | `TestConnectionWithOnlyExpiredTokensIsListedAndRevocableLiveDB` (user and admin), `TestCancelRevokedProductJobsExpiredGrantTokenLiveDB` |
+| D6 the admin's per-product list (`GET /api/admin/products/{id}/connections`) shows only that product's live grants with the user's id and email and no token or hash, newest consent first, cut at the 1000-row bound with `truncated`; an unknown product is 404 | `TestAdminProductConnectionsListLiveDB`, `TestAdminConnectionRoutesAuthorizationLiveDB`, `TestEveryRouteCarriesItsExpectedPerUserLimiter` (its row); the `admin_oauth_connection.*` contract fixtures with `TestContractFixturesMatchMarshal`, `TestContractFullFixtureDecodesStrict`, `TestOAuthConsentDTOTags` and `apiContract.test.ts` |
+| D6 Settings, Access, Connected products lists every live grant whatever the state of its tokens, renders names as plain text, confirms before a revoke, drops the row and refreshes the Revoke all count; the admin Connections panel does the same per product | web: `OAuthConnections.test.tsx`, `ProductConnections.test.tsx`, the connection twins in `mockApi.productTokens.test.ts` and `mockApi.parity.test.ts` |
+| D6 `uzi admin products connections <product>` is read-only and prints a table or `{connections, truncated}` JSON | `TestAdminProductsConnectionsTable`, `TestAdminProductsConnectionsJSONEmptyAndTruncated`, `TestAdminProductsConnectionsUnknownProduct`, `TestAdminProductsConnectionsHostileStringsEscaped`, `TestHTTPFileRequests` (the client call), `TestSkillMatchesCommandTree` |
 | D7 token request rules: form only, no repeated parameter, one client-authentication method, 401 with `WWW-Authenticate` | `TestOAuthTokenRequestRulesLiveDB`, `TestOAuthTokenClientAuthenticationLiveDB` |
 | D7 a storage error is a 503, never a credential error, on every step including the replay revoke, a refresh and an RFC 7009 revoke | `TestOAuthTokenStorageErrorIsNeverACredentialErrorLiveDB`, `TestOAuthTokenReplayStorageErrorIsA503LiveDB`, `TestOAuthRefreshStorageErrorIsNeverACredentialErrorLiveDB`, `TestOAuthRevokeStorageErrorIsA503LiveDB` |
 | D7 limiter per IP and per client, per-client budget drawn only after authentication, OAuth-shaped 429, `no-store` on every method | `TestOAuthTokenPerClientBudgetIgnoresFailedAuthenticationLiveDB`, `TestOAuthRevokePerClientBudgetIgnoresFailedAuthenticationLiveDB`, `TestOAuthTokenIsBehindThePerIPOAuthLimiter`, `TestOAuthRevokeIsBehindThePerIPOAuthLimiter`, `TestOAuthRoutesAreNoStoreOnEveryMethod` (both paths) |

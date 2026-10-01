@@ -239,6 +239,10 @@ type Client interface {
 	// name on job create (GET /api/admin/products/{id}/egress-profiles, a uza_ token works; PRD
 	// #1976). Granting and revoking stay browser-session only.
 	AdminProductEgressProfiles(ctx context.Context, productID string) ([]ProductEgressProfile, error)
+	// AdminProductConnections lists a product's live OAuth connections (GET
+	// /api/admin/products/{id}/connections, a uza_ token works; PRD #1910 M5). Revoking one stays
+	// browser-session only.
+	AdminProductConnections(ctx context.Context, productID string) (ProductConnections, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows

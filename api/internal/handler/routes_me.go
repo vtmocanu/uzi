@@ -103,10 +103,13 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 	// OAuth connections (PRD #1910 M3), the user's live grants to connected products. Cookie-only
 	// like /me/product-tokens above, for the same reason (never RequireUser: a stolen uzc_ must not
 	// read or later manage connections). The list is a plain read like the product-token list, so
-	// no limiter; the revoke write of M5 will join this group.
+	// no limiter. The revoke write (PRD #1910 M5) is a POST in the same group: CSRF-protected
+	// by RequireAuth, owner-scoped in the handler, no limiter (a local write, like the DELETE
+	// of /me/product-tokens/{id}).
 	r.Route("/me/oauth-connections", func(r chi.Router) {
 		r.Use(mw.RequireAuth(h.q, h.cfg))
 		r.Get("/", h.ListMyOAuthConnections)
+		r.Post("/{id}/revoke", h.RevokeMyOAuthConnection)
 	})
 
 	// Agent memory (PRD #90 M6): the owner's view + purge of their cross-run

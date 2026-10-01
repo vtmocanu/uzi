@@ -634,6 +634,74 @@ func (q *Queries) IssueOAuthAuthorizationCode(ctx context.Context, arg IssueOAut
 	return i, err
 }
 
+const listLiveOAuthGrantsForProduct = `-- name: ListLiveOAuthGrantsForProduct :many
+SELECT g.id,
+       g.user_id,
+       u.email AS owner_email,
+       g.scopes,
+       g.consented_at,
+       g.created_at,
+       GREATEST(
+           g.refresh_last_used_at,
+           (SELECT max(t.last_used_at) FROM product_tokens t WHERE t.grant_id = g.id)
+       )::timestamptz AS last_used_at
+  FROM oauth_grants g
+  JOIN users u ON u.id = g.user_id
+ WHERE g.product_id = $1
+   AND g.revoked_at IS NULL
+ ORDER BY g.consented_at DESC, g.id ASC
+ LIMIT $2
+`
+
+type ListLiveOAuthGrantsForProductParams struct {
+	ProductID uuid.UUID `json:"product_id"`
+	MaxRows   int32     `json:"max_rows"`
+}
+
+type ListLiveOAuthGrantsForProductRow struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	OwnerEmail  string             `json:"owner_email"`
+	Scopes      []string           `json:"scopes"`
+	ConsentedAt pgtype.Timestamptz `json:"consented_at"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+}
+
+// One product's live grants (revoked_at IS NULL) for the admin connections list (PRD #1910 M5),
+// whatever the state of their access tokens, with the owner's id and email as the admin product-
+// token inventory shows them. Columns are projected explicitly: no refresh hash, no token column
+// of any kind. last_used_at is as in ListLiveOAuthGrantsForUser. BOUNDED: a product can have one
+// live grant per user, so the handler passes its named cap PLUS ONE and reports "truncated" when
+// the extra row came back; newest consent first, so the cut drops the oldest connections.
+func (q *Queries) ListLiveOAuthGrantsForProduct(ctx context.Context, arg ListLiveOAuthGrantsForProductParams) ([]ListLiveOAuthGrantsForProductRow, error) {
+	rows, err := q.db.Query(ctx, listLiveOAuthGrantsForProduct, arg.ProductID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListLiveOAuthGrantsForProductRow{}
+	for rows.Next() {
+		var i ListLiveOAuthGrantsForProductRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OwnerEmail,
+			&i.Scopes,
+			&i.ConsentedAt,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listLiveOAuthGrantsForUser = `-- name: ListLiveOAuthGrantsForUser :many
 SELECT g.id,
        g.product_id,

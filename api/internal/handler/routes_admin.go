@@ -130,6 +130,10 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// on job create. A read a uza_ token may make, on authLimiter's per-user budget like the
 			// product reads beside it; the PUT and DELETE writes are cookie-only, in the group below.
 			r.With(authLimiter.PerUserMiddleware).Get("/products/{id}/egress-profiles", h.AdminListProductEgressProfiles)
+			// A product's live OAuth connections (PRD #1910 M5): who has connected it, whatever the
+			// state of their access tokens. A read a uza_ token may make, on authLimiter's per-user
+			// budget like the product reads beside it; the revoke write is cookie-only, below.
+			r.With(authLimiter.PerUserMiddleware).Get("/products/{id}/connections", h.AdminListProductConnections)
 			r.With(authLimiter.PerUserMiddleware).Get("/product-tokens", h.AdminListProductTokens)
 			// Egress profiles (PRD #1906 M1): the named site lists an official-sources
 			// research run will be bound to. Reads only here, so a uza_ token can list and
@@ -239,6 +243,9 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Put("/products/{id}/egress-profiles/{name}", h.AdminAllowProductEgressProfile)
 			r.Delete("/products/{id}/egress-profiles/{name}", h.AdminRevokeProductEgressProfile)
 			r.Post("/product-tokens/{id}/revoke", h.AdminRevokeProductToken)
+			// Revoke one OAuth connection (PRD #1910 M5, D6): the grant and every token under it.
+			// Cookie-only, so a uza_ Bearer 401s before the handler; no limiter, a local write.
+			r.Post("/oauth-connections/{id}/revoke", h.AdminRevokeOAuthConnection)
 			// Product OAuth client registration (PRD #1910 M1, D2): set the redirect URIs and
 			// allowed scopes (PUT, both lists together), and rotate the client secret (POST,
 			// shown once). Cookie-only, so a uza_ Bearer 401s before the handler; no limiter,

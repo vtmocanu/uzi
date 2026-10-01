@@ -45,6 +45,7 @@ import type {
   CliAuthRequestMeta,
   OAuthAuthorizeRequest,
   OAuthConnection,
+  AdminOAuthConnection,
   OAuthRedirect,
   CliToken,
   CliTokenMint,
@@ -1901,6 +1902,15 @@ const realApi = {
     request<{ tokens: AdminProductToken[]; truncated: boolean }>("GET", "/admin/product-tokens"),
   adminRevokeProductToken: (id: string) =>
     request<null>("POST", `/admin/product-tokens/${id}/revoke`),
+  // A product's live OAuth connections (PRD #1910 M5), whatever the state of their access tokens;
+  // capped at 1000 rows, `truncated` says the cut happened. The revoke is a cookie-only admin write.
+  adminListProductConnections: (productId: string) =>
+    request<{ connections: AdminOAuthConnection[]; truncated: boolean }>(
+      "GET",
+      `/admin/products/${encodeURIComponent(productId)}/connections`,
+    ),
+  adminRevokeOAuthConnection: (id: string) =>
+    request<null>("POST", `/admin/oauth-connections/${encodeURIComponent(id)}/revoke`),
 
   // ── CLI browser-login consent flow (PRD #64) ───────────────────────────────
   // The `/cli-auth` page's three calls. getCliAuthRequest is a cookie-only read
@@ -1932,9 +1942,12 @@ const realApi = {
   // ── OAuth connections (PRD #1910 M3) — cookie-only, owner-scoped ───────────
   // The caller's LIVE grants to connected products, whatever the state of their access tokens
   // (a grant whose tokens all expired is still a connection). Revoke all (revokeAllCliTokens
-  // above) revokes them too; the Connected products list and its revoke are M5.
+  // above) revokes them too. revokeOAuthConnection (M5) is the owner's disconnect of one: the
+  // grant and every token under it, a CSRF write, 204.
   listOAuthConnections: () =>
     request<{ connections: OAuthConnection[] }>("GET", "/me/oauth-connections"),
+  revokeOAuthConnection: (id: string) =>
+    request<null>("POST", `/me/oauth-connections/${encodeURIComponent(id)}/revoke`),
 
   // ── Agent memory (PRD #90 M6) — cookie-only, owner-scoped ──────────────────
   // list is newest-first across all the caller's repos (the component groups by

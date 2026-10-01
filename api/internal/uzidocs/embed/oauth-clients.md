@@ -64,7 +64,7 @@ token=<the uzr_ or uzp_ token>&token_type_hint=refresh_token
 `token` is required. `token_type_hint` (`refresh_token` or `access_token`) is advisory: a wrong or unknown hint still finds the token.
 
 - Revoking the **refresh token** disconnects: the connection, every access token under it and the refresh token stop working at once, and jobs those tokens started are cancelled.
-- Revoking an **access token** that the connection issued revokes only that token; the connection and its refresh token keep working.
+- Revoking an **access token** that the connection issued revokes only that token; the connection and its refresh token keep working. Revoking an access token, expired or not, also cancels the still-running jobs that token created.
 - An unknown token answers **200** and revokes nothing. So does an access token that is already revoked, or expired and not yours, whichever product it belongs to; and so does a token a user pasted by hand into your own product, which was not issued through OAuth (the user revokes it). Your own expired access token answers 200 and is marked revoked.
 - A **live** (not revoked, not expired) token of another client's product is **400 `invalid_grant`** and revokes nothing.
 - 200 has an empty body. A database error is **503 `temporarily_unavailable`** with `Retry-After`: retry.

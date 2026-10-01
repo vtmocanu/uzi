@@ -81,3 +81,18 @@ type OAuthConnectionDTO struct {
 	LastUsedAt      *time.Time `json:"last_used_at"`
 	RefreshIssuedAt *time.Time `json:"refresh_issued_at"`
 }
+
+// AdminOAuthConnectionDTO is one live OAuth connection of a product, from GET
+// /api/admin/products/{id}/connections (PRD #1910 M5): the connecting user (id and email, as the
+// admin product-token inventory shows an owner), the approved scopes and the timestamps. It never
+// carries a token, a hash or a refresh-token prefix. ConnectedAt is the latest consent, CreatedAt
+// the first one; LastUsedAt is as in OAuthConnectionDTO. Scopes is never null on the wire.
+type AdminOAuthConnectionDTO struct {
+	ID          string     `json:"id"`
+	UserID      string     `json:"user_id"`
+	OwnerEmail  string     `json:"owner_email"`
+	Scopes      []string   `json:"scopes"`
+	ConnectedAt time.Time  `json:"connected_at"`
+	CreatedAt   time.Time  `json:"created_at"`
+	LastUsedAt  *time.Time `json:"last_used_at"`
+}

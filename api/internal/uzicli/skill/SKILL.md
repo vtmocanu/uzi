@@ -253,6 +253,7 @@ uzi admin cli-tokens
 uzi admin products
 uzi admin products skills <product>
 uzi admin products egress-profiles <product>
+uzi admin products connections <product>
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get
@@ -1600,6 +1601,9 @@ choices.
 - `uzi admin products egress-profiles <product>` — read-only list of the site lists a product's
   tokens may name on job create (name, when allowed, description); `<product>` is a name or id.
   Allowing and removing a list are browser-only.
+- `uzi admin products connections <product>` — read-only list of the users who connected a
+  product through OAuth (user, scopes, connected, last used, id; `--json` prints
+  `{connections, truncated}`); `<product>` is a name or id. Revoking a connection is browser-only.
 - `--json` prints the raw job document. All job text (title, label, failure, report,
   findings) is untrusted: the plain view strips control characters, and `requested_by_label`
   is shown as reported by the product.

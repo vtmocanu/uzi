@@ -194,3 +194,34 @@ describe("mockApi — OAuth connections and Revoke all (PRD #1910 M3)", () => {
     expect(after.live_connection_count).toBe(0);
   });
 });
+
+describe("mockApi — connection lists and revoke (PRD #1910 M5)", () => {
+  it("revoking a connection removes it from the owner's list and the admin's, the product count follows, and a second revoke is a 404", async () => {
+    const api = await reload();
+    const { connections } = await api.listOAuthConnections();
+    const id = connections[0].id;
+    const admin = await api.adminListProductConnections("prod-helpdesk");
+    expect(admin.truncated).toBe(false);
+    expect(admin.connections.map((c) => c.id)).toEqual([id]);
+    expect(admin.connections[0].owner_email).not.toBe("");
+    // The admin row carries the user and no token or hash.
+    expect(Object.keys(admin.connections[0]).sort()).toEqual(
+      ["connected_at", "created_at", "id", "last_used_at", "owner_email", "scopes", "user_id"],
+    );
+
+    await api.revokeOAuthConnection(id);
+    expect((await api.listOAuthConnections()).connections).toEqual([]);
+    expect((await api.adminListProductConnections("prod-helpdesk")).connections).toEqual([]);
+    const product = (await api.adminListProducts()).products.find((p) => p.id === "prod-helpdesk")!;
+    expect(product.live_connection_count).toBe(0);
+    await expect(api.revokeOAuthConnection(id)).rejects.toMatchObject({ status: 404 });
+    await expect(api.adminRevokeOAuthConnection(id)).rejects.toMatchObject({ status: 404 });
+  });
+
+  it("lets an admin revoke a connection by id", async () => {
+    const api = await reload();
+    const id = (await api.adminListProductConnections("prod-helpdesk")).connections[0].id;
+    await api.adminRevokeOAuthConnection(id);
+    expect((await api.listOAuthConnections()).connections).toEqual([]);
+  });
+});

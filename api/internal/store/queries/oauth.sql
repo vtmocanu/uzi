@@ -390,3 +390,27 @@ SELECT id, product_id, grant_id, revoked, (expires_at IS NOT NULL AND expires_at
 -- Run with the grant locked, before any product_tokens write of this transaction. Scoped to the
 -- grant so a token that is not this grant's is never touched; idempotent.
 UPDATE product_tokens SET revoked = true WHERE id = $1 AND grant_id = $2 AND NOT revoked;
+
+-- name: ListLiveOAuthGrantsForProduct :many
+-- One product's live grants (revoked_at IS NULL) for the admin connections list (PRD #1910 M5),
+-- whatever the state of their access tokens, with the owner's id and email as the admin product-
+-- token inventory shows them. Columns are projected explicitly: no refresh hash, no token column
+-- of any kind. last_used_at is as in ListLiveOAuthGrantsForUser. BOUNDED: a product can have one
+-- live grant per user, so the handler passes its named cap PLUS ONE and reports "truncated" when
+-- the extra row came back; newest consent first, so the cut drops the oldest connections.
+SELECT g.id,
+       g.user_id,
+       u.email AS owner_email,
+       g.scopes,
+       g.consented_at,
+       g.created_at,
+       GREATEST(
+           g.refresh_last_used_at,
+           (SELECT max(t.last_used_at) FROM product_tokens t WHERE t.grant_id = g.id)
+       )::timestamptz AS last_used_at
+  FROM oauth_grants g
+  JOIN users u ON u.id = g.user_id
+ WHERE g.product_id = sqlc.arg(product_id)
+   AND g.revoked_at IS NULL
+ ORDER BY g.consented_at DESC, g.id ASC
+ LIMIT sqlc.arg(max_rows);
