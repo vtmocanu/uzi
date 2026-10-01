@@ -219,7 +219,7 @@ func TestSubmitJobResultRecordsWorkerRefusedOutputsLiveDB(t *testing.T) {
 // still streaming, ErrJobFileUploadsBusy; a retry then finds the stored file. The unique output
 // index (not the lookup) is what holds this under concurrency.
 //
-// MUTATION CHECK: dropping uq_job_files_output_content from migration 00276 stores more than one.
+// MUTATION CHECK: dropping uq_job_files_output_content from migration 00277 stores more than one.
 func TestStoreJobOutputConcurrentDuplicateLiveDB(t *testing.T) {
 	e := newJFEnv(t, wide())
 	e.svc.SetJobFiles(e.jf)

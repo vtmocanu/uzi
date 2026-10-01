@@ -209,7 +209,7 @@ type UpdateProductSkillsSourceParams struct {
 	ID                uuid.UUID   `json:"id"`
 }
 
-// Product skill sets (PRD #1909 M6). Schema and rationale: migrations/00277_product_skills.sql.
+// Product skill sets (PRD #1909 M6). Schema and rationale: migrations/00278_product_skills.sql.
 //
 // skills_token_sealed is the sealed read-only clone token. The products queries use
 // `SELECT *` / `RETURNING *`, so it is IN store.Product: every DTO that renders a product is an

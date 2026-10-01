@@ -16,10 +16,10 @@ import (
 // UZI_TEST_DATABASE_URL points at a throwaway Postgres.
 
 // TestJobFileDisplayNameFormatCharsLiveDB: both display_name CHECKs (job_files and
-// job_output_refusals, migration 00276) refuse bidi overrides and isolates, zero-width characters,
+// job_output_refusals, migration 00277) refuse bidi overrides and isolates, zero-width characters,
 // the BOM and the line/paragraph separators, and still accept ordinary non-ASCII names.
 //
-// CALIBRATION: remove the last AND clause of either display_name CHECK in 00276; that table's
+// CALIBRATION: remove the last AND clause of either display_name CHECK in 00277; that table's
 // subtests then insert the name and go red.
 func TestJobFileDisplayNameFormatCharsLiveDB(t *testing.T) {
 	fx := newFleetFixture(t)

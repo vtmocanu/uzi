@@ -413,7 +413,7 @@ func (p ReserveParams) validate() error {
 		// Format (Cf: bidi overrides and isolates, zero-width and joiner characters, the BOM),
 		// line separator (Zl) and paragraph separator (Zp) characters let a name display as
 		// something it is not (a right-to-left override spoofing an extension) or break a line.
-		// The job_files and job_output_refusals display_name CHECKs (migration 00276) mirror the
+		// The job_files and job_output_refusals display_name CHECKs (migration 00277) mirror the
 		// ranges that matter; this is the complete test.
 		if unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp) {
 			return ErrJobFileInvalid
