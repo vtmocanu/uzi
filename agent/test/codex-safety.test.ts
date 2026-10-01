@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import * as codexLauncher from "../src/codex/launcher.js";
@@ -85,26 +85,50 @@ function spawnCounter(
 }
 
 describe("CodexExecutionSafety.withBoundary: gate ordering", () => {
-  it("uses one absolute deadline and passes a shrinking remaining budget across stages", async () => {
-    const reg = new ExecutionRegistry(newLocalExecutionEpoch(12));
+  // Issue #1516: the clock is mocked (Date only) and the wall-clock deadline timer is
+  // disarmed, so stage time is advanced explicitly and full-suite load cannot redden it.
+  const clockedSafety = (
+    t: TestContext,
+    epoch: number,
+    quiesce: () => void,
+  ): { safety: CodexExecutionSafetyImpl; seen: number[] } => {
+    t.mock.timers.enable({ apis: ["Date"], now: 0 });
     const seen: number[] = [];
-    const safety = new CodexExecutionSafetyImpl(reg, {
+    const safety = new CodexExecutionSafetyImpl(new ExecutionRegistry(newLocalExecutionEpoch(epoch)), {
       quiesce: async (request) => {
         seen.push(request.deadlineMs);
-        await new Promise<void>((resolve) => setTimeout(resolve, 20));
-        return { kind: "quiescent", epoch: 12 };
+        quiesce();
+        return { kind: "quiescent", epoch };
       },
       reap: async (request) => {
         seen.push(request.deadlineMs);
-        return { kind: "observed_empty", evidence: "supervisor_echild", epoch: 12 };
+        return { kind: "observed_empty", evidence: "supervisor_echild", epoch };
       },
       dispose: async () => ({ kind: "disposed" }),
       spawnRoot: spawnCounter().seam,
+      armDeadline: () => () => {},
     });
+    return { safety, seen };
+  };
+
+  it("uses one absolute deadline and passes a shrinking remaining budget across stages", async (t) => {
+    const { safety, seen } = clockedSafety(t, 12, () => t.mock.timers.tick(20));
     await safety.withBoundary({ boundary: "finalize", deadlineMs: 100 }, async () => undefined);
-    assert.equal(seen.length, 2);
-    assert.ok((seen[0] ?? 0) <= 100 && (seen[0] ?? 0) > 0);
-    assert.ok((seen[1] ?? 0) < (seen[0] ?? 0) - 10, `remaining budgets shrink: ${seen.join(" -> ")}`);
+    assert.deepEqual(seen, [100, 80], "reap gets what is left of the one absolute deadline after quiesce");
+  });
+
+  it("a stage that runs past the absolute deadline is refused before reap and the action", async (t) => {
+    const { safety, seen } = clockedSafety(t, 12, () => t.mock.timers.tick(101));
+    let actionCalls = 0;
+    await assert.rejects(
+      safety.withBoundary({ boundary: "finalize", deadlineMs: 100 }, async () => { actionCalls += 1; }),
+      (error: unknown) =>
+        error instanceof CodexBoundaryError &&
+        error.stage === "quiesce" &&
+        error.errors[0]?.message === "codex boundary deadline expired after quiesce",
+    );
+    assert.deepEqual(seen, [100], "reap never ran");
+    assert.equal(actionCalls, 0, "the action never ran");
   });
 
   it("propagates the same deadline AbortSignal into reconciliation", async () => {
