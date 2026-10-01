@@ -9,28 +9,32 @@ import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 // Issue #2044: the TMPDIR a Codex run gets, rebuilt from its parts.
 const CODEX_TMPDIR_BYTES = "/tmp/uzi-codex-command-".length + 36 + "/uzi-tmpdir-guard.XXXXXX".length;
 
-let root: string;
+// The base the helpers run under: os.tmpdir() itself when it is already Codex-length (a real
+// Codex run), else a fresh dir under it padded to exactly that length. Never a wrapper dir under a
+// Codex TMPDIR: that would add bytes a fixture under the same TMPDIR never pays.
 let base: string;
+let owned: string | undefined;
 
 before(() => {
-  root = fs.mkdtempSync(path.join(os.tmpdir(), "us-t-"));
-  base = root;
-  const pad = CODEX_TMPDIR_BYTES - Buffer.byteLength(root) - 1;
+  const tmp = os.tmpdir();
+  const pad = CODEX_TMPDIR_BYTES - Buffer.byteLength(tmp) - "/XXXXXX".length;
   if (pad >= 1) {
-    base = path.join(root, "p".repeat(pad));
-    fs.mkdirSync(base);
+    owned = fs.mkdtempSync(path.join(tmp, "c".repeat(pad)));
+    base = owned;
+  } else {
+    base = tmp;
   }
 });
 
 after(() => {
-  fs.rmSync(root, { recursive: true, force: true });
+  if (owned !== undefined) fs.rmSync(owned, { recursive: true, force: true });
 });
 
 const usDirs = (dir: string): string[] => fs.readdirSync(dir).filter((n) => n.startsWith("us-"));
 
 describe("unix-socket helpers under a Codex-length TMPDIR", () => {
-  it("the base is at least as long as a Codex TMPDIR", () => {
-    assert.ok(Buffer.byteLength(base) >= CODEX_TMPDIR_BYTES);
+  it("the base is as long as a Codex TMPDIR (or is os.tmpdir() itself)", () => {
+    assert.ok(Buffer.byteLength(base) >= Math.min(CODEX_TMPDIR_BYTES, Buffer.byteLength(os.tmpdir())));
   });
 
   it("listenUnix rejects an over-long path promptly, naming its byte length", async () => {
@@ -46,10 +50,13 @@ describe("unix-socket helpers under a Codex-length TMPDIR", () => {
   });
 
   it("shortUnixSocket throws for a base too long to fit and leaves no us- directory", () => {
-    const long = path.join(base, "q".repeat(120));
-    fs.mkdirSync(long);
-    assert.throws(() => shortUnixSocket(long), /bytes/);
-    assert.deepEqual(usDirs(long), []);
+    const long = fs.mkdtempSync(path.join(base, "q".repeat(120)));
+    try {
+      assert.throws(() => shortUnixSocket(long), /bytes/);
+      assert.deepEqual(usDirs(long), []);
+    } finally {
+      fs.rmSync(long, { recursive: true, force: true });
+    }
   });
 
   it("shortUnixSocket under a Codex-length base gives a bindable socket within the bound that round-trips a request", async () => {
