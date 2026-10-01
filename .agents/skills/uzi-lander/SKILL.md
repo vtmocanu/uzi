@@ -310,8 +310,12 @@ changes it); trust it over a handover's claim.
    A many-commit branch conflicting with `main` gets `origin/main` merged in by hand (one
    resolution pass; the PR is squash-merged), then `task migration:renumber`, sqlc regenerated
    (a renumber reorders generated columns) and the FULL gate: a clean merge can still break a
-   signature one side changed. After a release folds `[Unreleased]`, keep only the branch's
-   `CHANGELOG.md` bullets `main` lacks.
+   signature one side changed. Resolve a conflicted generated `*.sql.go` by regenerating it
+   after its `queries/*.sql`, never by hand. Run the gate with `UZI_TEST_DATABASE_URL` unset
+   (LiveDB tests self-skip); when either side adds a migration, also run
+   `./e2e/run-store-it.sh`, since a test pinned to an older schema can break on the other
+   side's new columns. After a release folds `[Unreleased]`,
+   keep only the branch's `CHANGELOG.md` bullets `main` lacks.
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
    fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
