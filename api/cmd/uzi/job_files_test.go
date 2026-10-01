@@ -70,7 +70,7 @@ func (fs *filesServer) handler(t *testing.T) http.Handler {
 			name: part.FileName(), body: string(b),
 		})
 		w.WriteHeader(http.StatusCreated)
-		_ = json.NewEncoder(w).Encode(apitypes.V1FileDTO{ID: "file-" + string(rune('0'+len(fs.uploads))), State: "unattached"})
+		_ = json.NewEncoder(w).Encode(apitypes.V1FileDTO{ID: "file-" + strconv.Itoa(len(fs.uploads)), State: "unattached"})
 	})
 	mux.HandleFunc("POST /api/v1/jobs", func(w http.ResponseWriter, r *http.Request) {
 		var m map[string]any
@@ -203,7 +203,7 @@ func TestJobFileGetWritesAndRefusesOverwrite(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit = %d\n%s", code, out)
 	}
-	got, err := os.ReadFile(filepath.Join(dir, fs.fileName))
+	got, err := os.ReadFile(filepath.Join(dir, fs.fileName)) //nolint:gosec // G304: test reads a file it wrote under t.TempDir()
 	if err != nil || string(got) != body {
 		t.Fatalf("file = %q, %v", got, err)
 	}
@@ -219,7 +219,7 @@ func TestJobFileGetWritesAndRefusesOverwrite(t *testing.T) {
 	if code != uzicli.ExitUsage || !strings.Contains(errOut, "refusing to overwrite") {
 		t.Errorf("exit = %d stderr = %q", code, errOut)
 	}
-	if b, _ := os.ReadFile(filepath.Join(dir, fs.fileName)); string(b) != "precious" {
+	if b, _ := os.ReadFile(filepath.Join(dir, fs.fileName)); string(b) != "precious" { //nolint:gosec // G304: test reads a file it wrote under t.TempDir()
 		t.Errorf("existing file was overwritten: %q", b)
 	}
 
@@ -228,7 +228,7 @@ func TestJobFileGetWritesAndRefusesOverwrite(t *testing.T) {
 	if _, _, code := runCLI(t, httpEnv(srv), "job", "file", "get", "f1", "-o", target); code != 0 {
 		t.Fatalf("-o exit = %d", code)
 	}
-	if b, _ := os.ReadFile(target); string(b) != body {
+	if b, _ := os.ReadFile(target); string(b) != body { //nolint:gosec // G304: test reads a file it wrote under t.TempDir()
 		t.Errorf("-o file = %q", b)
 	}
 	if _, _, code := runCLI(t, httpEnv(srv), "job", "file", "get", "f1", "-o", target); code != uzicli.ExitUsage {
@@ -489,7 +489,7 @@ func TestJobFileGetAbortedDownloadLeavesNothingAndNextGetSucceeds(t *testing.T) 
 	if out, _, code := runCLI(t, httpEnv(good), "job", "file", "get", "f1"); code != 0 {
 		t.Fatalf("the next get exit = %d\n%s", code, out)
 	}
-	if b, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(b) != body {
+	if b, err := os.ReadFile(filepath.Join(dir, name)); err != nil || string(b) != body { //nolint:gosec // G304: test reads a file it wrote under t.TempDir()
 		t.Errorf("file = %q, %v", b, err)
 	}
 }
@@ -527,7 +527,7 @@ func TestJobFileGetNeverReplacesFileAppearingMidDownload(t *testing.T) {
 	if code != uzicli.ExitUsage || !strings.Contains(errOut, "refusing to overwrite") {
 		t.Errorf("exit = %d stderr = %q", code, errOut)
 	}
-	if b, _ := os.ReadFile(target); string(b) != "precious" {
+	if b, _ := os.ReadFile(target); string(b) != "precious" { //nolint:gosec // G304: test reads a file it wrote under t.TempDir()
 		t.Errorf("a file that appeared mid-download was replaced: %q", b)
 	}
 	ents, _ := os.ReadDir(dir)
@@ -571,7 +571,7 @@ func TestJobFileGetInterruptedLeavesNothingAtTarget(t *testing.T) {
 	defer srv.Close()
 	defer close(release)
 	dir := t.TempDir()
-	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperJobFileGetStalled$")
+	cmd := exec.Command(os.Args[0], "-test.run=^TestHelperJobFileGetStalled$") //nolint:gosec // G204: re-runs this test binary with a fixed argument (helper-process pattern)
 	cmd.Env = append(os.Environ(), "UZI_TEST_HELPER_URL="+srv.URL, "UZI_TEST_HELPER_DIR="+dir)
 	if err := cmd.Start(); err != nil {
 		t.Fatal(err)
