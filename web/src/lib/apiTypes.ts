@@ -2036,6 +2036,14 @@ export interface WorkerReportedRun {
   run_id: string;
   phase: string;
   claim_generation: number;
+  /** Issue #1994: true when this entry is a PENDING OUTCOME, not a live execution: the run's
+   *  outcome is journaled on the worker but not yet delivered to the api. phase still reads
+   *  "running" for such an entry, so a consumer counting running work must exclude it.
+   *  Optional for api/web version skew: an older api omits it, which reads as false. */
+  terminal_pending?: boolean;
+  /** Issue #1994: RFC3339 instant the worker first reported this pending entry at this claim
+   *  generation; null (or absent on an older api) for a live entry. */
+  terminal_pending_since?: string | null;
 }
 
 /** One run's disk size on a worker (PRD #1809 M6, D8): the bytes under the run's HOME and, of
