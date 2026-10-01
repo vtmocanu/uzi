@@ -563,6 +563,9 @@ func TestSetStateEnterLeaseLiveDB(t *testing.T) {
 	nilGen := func(iid int64) StateRequest {
 		return StateRequest{State: "completed", Branch: strPtr(agentIssueBranch(iid))}
 	}
+	nilGenPermit := func(iid int64) StateRequest {
+		return StateRequest{State: "completed", Branch: strPtr(agentIssueBranch(iid)), Head: strPtr("0123abcd")}
+	}
 	cancelled := func(iid int64) StateRequest {
 		gen := int64(1)
 		return StateRequest{State: "cancelled", ClaimGeneration: &gen}
@@ -573,6 +576,7 @@ func TestSetStateEnterLeaseLiveDB(t *testing.T) {
 		{"legacy completed, lease off", 0, false, true, func(i int64) StateRequest { return completeReq(i, 1) }, false, false, "released"},
 		{"interlocked completed, lease off", 0, true, true, func(i int64) StateRequest { return completeReq(i, 1) }, false, false, "released"},
 		{"nil-generation completed gets no lease", 2 * time.Hour, false, true, nilGen, false, false, "released"},
+		{"interlocked nil-generation completed gets no lease", 2 * time.Hour, true, true, nilGenPermit, false, false, "released"},
 		{"failed with an open hold keeps the hold, no lease", 2 * time.Hour, false, true, failed, false, true, "open"},
 		{"failed without a hold leases", 2 * time.Hour, false, false, failed, true, true, ""},
 		{"worker-reported cancelled gets no lease", 2 * time.Hour, false, true, cancelled, false, true, "open"},
