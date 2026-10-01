@@ -121,6 +121,10 @@ this lander's second pair of eyes.
 S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<state>
 ```
 
+`MR_REWORK_ENABLED=true|false|unknown` reports the run's setting. On `true`, or `unknown` when
+you will fix locally, run `uzi run mr-rework RUN --enabled=false` first (the script never
+changes it); trust it over a handover's claim.
+
 `NEXT` is the branch point:
 
 | NEXT | Do |
@@ -147,6 +151,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
    `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
+   `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
+   a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
+   trace tail); do not assume dead or lost, change nothing until you know, then re-arm.
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (a completion question about a milestone
    the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate
