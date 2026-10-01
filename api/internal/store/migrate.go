@@ -104,6 +104,15 @@ const ProductTokenMintLockClass int32 = 0x757A7074 // "uzpt"
 // *LockClass. XACT-scoped.
 const JobCreateLockClass int32 = 0x757A6A62 // "uzjb"
 
+// OAuthAuthorizeLockClass is the class half of the two-int advisory lock that serializes one
+// product's OAuth authorize inserts, so the live-pending caps (per source, per product) cannot
+// be passed twice by concurrent unauthenticated requests under READ COMMITTED. Taken in SQL by
+// LockOAuthAuthorize (queries/oauth.sql), which carries this value as the literal 1970958177
+// with the objid derived there from the product id; TestOAuthAuthorizeLockClassMatchesSQL fails
+// if the two disagree and TestProductTokenMintLockClassMatchesSQL's source enumeration fails on
+// any collision with another *LockClass. XACT-scoped.
+const OAuthAuthorizeLockClass int32 = 0x757A6F61 // "uzoa"
+
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from
 // a user's uuid, exactly as the hosted-provision lock does: a uuid's leading bytes are
 // random, so two users can collide and serialize for a moment, a contention non-event,

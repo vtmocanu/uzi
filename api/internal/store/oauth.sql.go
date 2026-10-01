@@ -16,7 +16,7 @@ const claimOAuthAuthorizeRequest = `-- name: ClaimOAuthAuthorizeRequest :one
 UPDATE oauth_authorize_requests
    SET status = 'approved', user_id = $1
  WHERE id = $2 AND status = 'pending' AND expires_at > now()
-RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
+RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
 `
 
 type ClaimOAuthAuthorizeRequestParams struct {
@@ -40,6 +40,7 @@ func (q *Queries) ClaimOAuthAuthorizeRequest(ctx context.Context, arg ClaimOAuth
 		&i.State,
 		&i.CodeChallenge,
 		&i.BindingHash,
+		&i.SourcePrefix,
 		&i.Status,
 		&i.UserID,
 		&i.GrantID,
@@ -55,43 +56,60 @@ const countLivePendingOAuthRequests = `-- name: CountLivePendingOAuthRequests :o
 SELECT
     (SELECT count(*) FROM (
         SELECT 1 FROM oauth_authorize_requests
+         WHERE status = 'pending' AND expires_at > now()
+           AND oauth_authorize_requests.product_id = $1
+           AND oauth_authorize_requests.source_prefix = $2
+         LIMIT $3::int
+    ) s)::bigint AS source_pending,
+    (SELECT count(*) FROM (
+        SELECT 1 FROM oauth_authorize_requests
          WHERE status = 'pending' AND expires_at > now() AND oauth_authorize_requests.product_id = $1
-         LIMIT $2::int
+         LIMIT $4::int
     ) p)::bigint AS product_pending,
     (SELECT count(*) FROM (
         SELECT 1 FROM oauth_authorize_requests
          WHERE status = 'pending' AND expires_at > now()
-         LIMIT $3::int
+         LIMIT $5::int
     ) g)::bigint AS global_pending
 `
 
 type CountLivePendingOAuthRequestsParams struct {
 	ForProduct   uuid.UUID `json:"for_product"`
+	ForSource    string    `json:"for_source"`
+	SourceLimit  int32     `json:"source_limit"`
 	ProductLimit int32     `json:"product_limit"`
 	GlobalLimit  int32     `json:"global_limit"`
 }
 
 type CountLivePendingOAuthRequestsRow struct {
+	SourcePending  int64 `json:"source_pending"`
 	ProductPending int64 `json:"product_pending"`
 	GlobalPending  int64 `json:"global_pending"`
 }
 
-// How many live (pending, unexpired) authorize requests exist for the product and overall, each
-// counted up to its limit so the work is bounded however many rows an attacker piles up. The
-// unauthenticated authorize endpoint checks both against its caps BEFORE inserting.
-// idx_oauth_authorize_requests_pending serves both subqueries.
+// How many live (pending, unexpired) authorize requests exist for the (product, source), for the
+// product and overall, each counted up to its limit so the work is bounded however many rows an
+// attacker piles up. The unauthenticated authorize endpoint checks them against its caps (source
+// first, the fairness bound; the other two are storage backstops) BEFORE inserting, under
+// LockOAuthAuthorize. idx_oauth_authorize_requests_pending serves all three subqueries.
 func (q *Queries) CountLivePendingOAuthRequests(ctx context.Context, arg CountLivePendingOAuthRequestsParams) (CountLivePendingOAuthRequestsRow, error) {
-	row := q.db.QueryRow(ctx, countLivePendingOAuthRequests, arg.ForProduct, arg.ProductLimit, arg.GlobalLimit)
+	row := q.db.QueryRow(ctx, countLivePendingOAuthRequests,
+		arg.ForProduct,
+		arg.ForSource,
+		arg.SourceLimit,
+		arg.ProductLimit,
+		arg.GlobalLimit,
+	)
 	var i CountLivePendingOAuthRequestsRow
-	err := row.Scan(&i.ProductPending, &i.GlobalPending)
+	err := row.Scan(&i.SourcePending, &i.ProductPending, &i.GlobalPending)
 	return i, err
 }
 
 const createOAuthAuthorizeRequest = `-- name: CreateOAuthAuthorizeRequest :one
 
-INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, expires_at)
-VALUES ($1, $2, $3::text[], $4, $5, $6::bytea, $7)
-RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
+INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, expires_at)
+VALUES ($1, $2, $3::text[], $4, $5, $6::bytea, $7, $8)
+RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
 `
 
 type CreateOAuthAuthorizeRequestParams struct {
@@ -101,6 +119,7 @@ type CreateOAuthAuthorizeRequestParams struct {
 	State         string             `json:"state"`
 	CodeChallenge string             `json:"code_challenge"`
 	BindingHash   []byte             `json:"binding_hash"`
+	SourcePrefix  string             `json:"source_prefix"`
 	ExpiresAt     pgtype.Timestamptz `json:"expires_at"`
 }
 
@@ -121,6 +140,7 @@ func (q *Queries) CreateOAuthAuthorizeRequest(ctx context.Context, arg CreateOAu
 		arg.State,
 		arg.CodeChallenge,
 		arg.BindingHash,
+		arg.SourcePrefix,
 		arg.ExpiresAt,
 	)
 	var i OauthAuthorizeRequest
@@ -132,6 +152,7 @@ func (q *Queries) CreateOAuthAuthorizeRequest(ctx context.Context, arg CreateOAu
 		&i.State,
 		&i.CodeChallenge,
 		&i.BindingHash,
+		&i.SourcePrefix,
 		&i.Status,
 		&i.UserID,
 		&i.GrantID,
@@ -167,7 +188,7 @@ const denyOAuthAuthorizeRequest = `-- name: DenyOAuthAuthorizeRequest :one
 UPDATE oauth_authorize_requests
    SET status = 'denied', user_id = $1
  WHERE id = $2 AND status = 'pending' AND expires_at > now()
-RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
+RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
 `
 
 type DenyOAuthAuthorizeRequestParams struct {
@@ -187,6 +208,7 @@ func (q *Queries) DenyOAuthAuthorizeRequest(ctx context.Context, arg DenyOAuthAu
 		&i.State,
 		&i.CodeChallenge,
 		&i.BindingHash,
+		&i.SourcePrefix,
 		&i.Status,
 		&i.UserID,
 		&i.GrantID,
@@ -199,7 +221,7 @@ func (q *Queries) DenyOAuthAuthorizeRequest(ctx context.Context, arg DenyOAuthAu
 }
 
 const getOAuthAuthorizeRequest = `-- name: GetOAuthAuthorizeRequest :one
-SELECT id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at FROM oauth_authorize_requests WHERE id = $1
+SELECT id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at FROM oauth_authorize_requests WHERE id = $1
 `
 
 // The request by id (the URL-carried key). The handler compares binding_hash in constant time
@@ -215,6 +237,7 @@ func (q *Queries) GetOAuthAuthorizeRequest(ctx context.Context, id uuid.UUID) (O
 		&i.State,
 		&i.CodeChallenge,
 		&i.BindingHash,
+		&i.SourcePrefix,
 		&i.Status,
 		&i.UserID,
 		&i.GrantID,
@@ -268,7 +291,7 @@ UPDATE oauth_authorize_requests
        code_expires_at = $2,
        grant_id = $3
  WHERE id = $4 AND status = 'approved' AND user_id = $5
-RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
+RETURNING id, product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, status, user_id, grant_id, code_hash, code_expires_at, created_at, expires_at
 `
 
 type IssueOAuthAuthorizationCodeParams struct {
@@ -298,6 +321,7 @@ func (q *Queries) IssueOAuthAuthorizationCode(ctx context.Context, arg IssueOAut
 		&i.State,
 		&i.CodeChallenge,
 		&i.BindingHash,
+		&i.SourcePrefix,
 		&i.Status,
 		&i.UserID,
 		&i.GrantID,
@@ -339,6 +363,29 @@ func (q *Queries) LockLiveOAuthGrant(ctx context.Context, arg LockLiveOAuthGrant
 		&i.RevokedAt,
 	)
 	return i, err
+}
+
+const lockOAuthAuthorize = `-- name: LockOAuthAuthorize :exec
+SELECT pg_advisory_xact_lock(
+    1970958177,
+    hashtext($1::uuid::text)
+)
+`
+
+// Serializes one product's authorize inserts, so the pending caps cannot be passed by concurrent
+// requests under READ COMMITTED (each would count against its own snapshot): the authorize
+// handler runs, in ONE transaction, this lock, then CountLivePendingOAuthRequests, then
+// CreateOAuthAuthorizeRequest. The same reasoning as LockProductTokenMint.
+//
+// Two-int advisory lock: class 1970958177 = 0x757A6F61 ("uzoa"), the value of
+// store.OAuthAuthorizeLockClass in migrate.go, distinct from every other class constant there
+// (TestOAuthAuthorizeLockClassMatchesSQL pins this literal and TestProductTokenMintLockClassMatchesSQL
+// enumerates the collision check). The objid is hashtext of the product id, so two products can
+// collide: a moment of contention, never a correctness problem. XACT-scoped: released on commit
+// or rollback, so it must run on a transaction-bound Queries.
+func (q *Queries) LockOAuthAuthorize(ctx context.Context, productID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, lockOAuthAuthorize, productID)
+	return err
 }
 
 const oAuthGrantHasTokenOutsideScopes = `-- name: OAuthGrantHasTokenOutsideScopes :one

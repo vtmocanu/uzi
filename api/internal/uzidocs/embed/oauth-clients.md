@@ -10,6 +10,8 @@ An admin makes an [external product](./product-tokens.md) an **OAuth client** so
 
 > **Status.** This page covers registration (the redirect URIs, the allowed scopes and the client secret) and the consent step: a registered client can send a user to `/api/oauth/authorize`, the user approves or denies on uzi's `/connect` page, and the client receives an authorization code at its redirect URI together with its own `state` and uzi's `iss` (the instance's public origin). The token endpoint that exchanges the code ships in a later milestone of PRD #1910, so a client cannot finish a connection yet.
 
+When too many authorization requests are waiting (about 20 at once from one network address, or from one IPv6 /64), a new request is not stored and the user returns to your redirect URI with `error=temporarily_unavailable`; starting the connection again after a few minutes works, since a pending request lives 5 minutes.
+
 A product is an OAuth client only when it has all three of:
 
 - at least one **redirect URI**,

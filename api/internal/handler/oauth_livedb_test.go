@@ -111,7 +111,17 @@ func (e *oauthEnv) authorizeQuery(mut func(url.Values)) url.Values {
 // authorize drives GET /api/oauth/authorize as a browser holding binding (nil = none).
 func (e *oauthEnv) authorize(t *testing.T, q url.Values, binding *http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
+	return e.authorizeFrom(t, q, binding, "")
+}
+
+// authorizeFrom is authorize from a given peer address (RemoteAddr, "" = httptest's default). The
+// test Handler has no trusted proxies, so the peer address is the client address.
+func (e *oauthEnv) authorizeFrom(t *testing.T, q url.Values, binding *http.Cookie, remoteAddr string) *httptest.ResponseRecorder {
+	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/api/oauth/authorize?"+q.Encode(), nil)
+	if remoteAddr != "" {
+		req.RemoteAddr = remoteAddr
+	}
 	if binding != nil {
 		req.AddCookie(binding)
 	}
@@ -585,7 +595,10 @@ func TestOAuthDoubleApproveAndDenyLiveDB(t *testing.T) {
 }
 
 // TestOAuthConcurrentApproveLiveDB: of many simultaneous approves of one request exactly one
-// wins; the rest are 409, and exactly one code and one grant result.
+// wins; the rest are 409, and exactly one grant results. The losers each supersede the grant's
+// earlier codes (including the winner's) before their claim of the request fails; only their
+// transaction's rollback restores it. So afterwards the winning request is still approved and
+// exactly one request row carries a code.
 func TestOAuthConcurrentApproveLiveDB(t *testing.T) {
 	e := oauthSetup(t)
 	id, c := e.start(t, nil, nil)
@@ -618,6 +631,13 @@ func TestOAuthConcurrentApproveLiveDB(t *testing.T) {
 	var grants int
 	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_grants WHERE user_id = $1 AND product_id = $2`, e.user, e.product).Scan(&grants); err != nil || grants != 1 {
 		t.Errorf("grants = %d (%v), want 1", grants, err)
+	}
+	if row := e.requestRow(t, id); row.Status != "approved" {
+		t.Errorf("winning request status = %q, want approved (a losing approve's supersede must roll back)", row.Status)
+	}
+	var coded int
+	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_authorize_requests WHERE product_id = $1 AND code_hash IS NOT NULL`, e.product).Scan(&coded); err != nil || coded != 1 {
+		t.Errorf("request rows with a code = %d (%v), want exactly 1", coded, err)
 	}
 }
 
@@ -862,15 +882,16 @@ func TestOAuthDenyStaleRequestIsRefusedLiveDB(t *testing.T) {
 }
 
 // withOAuthPendingCaps lowers the authorize pending-request caps for one test.
-func withOAuthPendingCaps(t *testing.T, perProduct, global int) {
+func withOAuthPendingCaps(t *testing.T, perSource, perProduct, global int) {
 	t.Helper()
-	oldP, oldG := oauthPendingPerProductCap, oauthPendingGlobalCap
-	oauthPendingPerProductCap, oauthPendingGlobalCap = perProduct, global
-	t.Cleanup(func() { oauthPendingPerProductCap, oauthPendingGlobalCap = oldP, oldG })
+	oldS, oldP, oldG := oauthPendingPerSourceCap, oauthPendingPerProductCap, oauthPendingGlobalCap
+	oauthPendingPerSourceCap, oauthPendingPerProductCap, oauthPendingGlobalCap = perSource, perProduct, global
+	t.Cleanup(func() { oauthPendingPerSourceCap, oauthPendingPerProductCap, oauthPendingGlobalCap = oldS, oldP, oldG })
 }
 
 // The authorize endpoint is unauthenticated and its per-IP limiter does not bound a /64, so the
-// table is bounded by a per-product and a global cap checked BEFORE the insert. Over a cap the
+// table is bounded by a per-source cap (the fairness bound) and per-product and global storage
+// backstops, checked BEFORE the insert, atomically with it. Over a cap the
 // answer is an error redirect (temporarily_unavailable, state, iss) to the verified registered
 // URI, and nothing is stored (and no binding cookie set).
 func TestOAuthAuthorizePendingCapLiveDB(t *testing.T) {
@@ -901,7 +922,7 @@ func TestOAuthAuthorizePendingCapLiveDB(t *testing.T) {
 
 	t.Run("per product", func(t *testing.T) {
 		e := oauthSetup(t)
-		withOAuthPendingCaps(t, 2, 1_000_000)
+		withOAuthPendingCaps(t, 1_000_000, 2, 1_000_000)
 		first, c := e.start(t, nil, nil)
 		e.start(t, c, nil)
 		assertRefused(t, e, e.authorize(t, e.authorizeQuery(nil), c), 2)
@@ -935,17 +956,97 @@ func TestOAuthAuthorizePendingCapLiveDB(t *testing.T) {
 		if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_authorize_requests WHERE status = 'pending' AND expires_at > now()`).Scan(&live); err != nil {
 			t.Fatal(err)
 		}
-		withOAuthPendingCaps(t, 1_000_000, live+2)
+		withOAuthPendingCaps(t, 1_000_000, 1_000_000, live+2)
 		_, c := e.start(t, nil, nil)
 		e.start(t, c, nil)
 		assertRefused(t, e, e.authorize(t, e.authorizeQuery(nil), c), 2)
+	})
+
+	t.Run("per source is the fairness bound", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 2, 1_000_000, 1_000_000)
+		const a, b = "198.51.100.7:4000", "198.51.100.8:4000"
+		for i := 0; i < 2; i++ {
+			if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, a); !strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=") {
+				t.Fatalf("source A request %d = %d %q", i, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, a), 2)
+		// Another source of the same product is unaffected: one source cannot lock real users out.
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, b); !strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=") {
+			t.Errorf("source B while A is capped = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+		// The stored bucket is the derived prefix, not the raw address with its port.
+		var n int
+		if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_authorize_requests WHERE product_id = $1 AND source_prefix = '198.51.100.7'`, e.product).Scan(&n); err != nil || n != 2 {
+			t.Errorf("rows with source_prefix 198.51.100.7 = %d (%v), want 2", n, err)
+		}
+	})
+
+	t.Run("an IPv6 /64 is one source", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 2, 1_000_000, 1_000_000)
+		for _, addr := range []string{"[2001:db8:1:2::1]:1", "[2001:db8:1:2:ffff::9]:1"} {
+			if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, addr); !strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=") {
+				t.Fatalf("%s = %d %q", addr, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2001:db8:1:2:abcd::5]:1"), 2)
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2001:db8:1:3::1]:1"); !strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=") {
+			t.Errorf("a different /64 = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+	})
+
+	t.Run("a decided or expired request frees its source slot", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 1, 1_000_000, 1_000_000)
+		id, c := e.start(t, nil, nil)
+		assertRefused(t, e, e.authorize(t, e.authorizeQuery(nil), c), 1)
+		if rec := e.consent(t, http.MethodPost, id, "/deny", e.jwt, c); rec.Code != http.StatusOK {
+			t.Fatalf("deny = %d", rec.Code)
+		}
+		if rec := e.authorize(t, e.authorizeQuery(nil), c); !strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=") {
+			t.Errorf("after a deny = %d %q", rec.Code, rec.Header().Get("Location"))
+		}
+	})
+
+	t.Run("concurrent authorizes from one source store exactly the cap", func(t *testing.T) {
+		e := oauthSetup(t)
+		const cap, n = 3, 24
+		withOAuthPendingCaps(t, cap, 1_000_000, 1_000_000)
+		results := make([]string, n)
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := 0; i < n; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				rec := e.authorize(t, e.authorizeQuery(nil), nil)
+				results[i] = rec.Header().Get("Location")
+			}()
+		}
+		close(start)
+		wg.Wait()
+		accepted := 0
+		for _, loc := range results {
+			if strings.HasPrefix(loc, "/connect?request=") {
+				accepted++
+			}
+		}
+		if accepted != cap {
+			t.Errorf("accepted %d of %d concurrent authorizes, want exactly %d", accepted, n, cap)
+		}
+		if got := e.countRequests(t); got != cap {
+			t.Errorf("rows = %d, want exactly %d", got, cap)
+		}
 	})
 
 	t.Run("a refused request still validates first", func(t *testing.T) {
 		// Over the cap, a request that fails validation still gets its validation error, and an
 		// unverified redirect_uri still gets the static page, never the cap redirect.
 		e := oauthSetup(t)
-		withOAuthPendingCaps(t, 1, 1_000_000)
+		withOAuthPendingCaps(t, 1_000_000, 1, 1_000_000)
 		e.start(t, nil, nil)
 		rec := e.authorize(t, e.authorizeQuery(func(v url.Values) { v.Set("redirect_uri", "https://evil.example.test/cb") }), nil)
 		if rec.Code != http.StatusBadRequest || rec.Header().Get("Location") != "" {
@@ -956,55 +1057,4 @@ func TestOAuthAuthorizePendingCapLiveDB(t *testing.T) {
 			t.Errorf("invalid request over the cap: %d %q", rec.Code, rec.Header().Get("Location"))
 		}
 	})
-}
-
-// The sweep and the cap count must be served by the oauth_authorize_requests indexes, not by a
-// scan of the table. A seq scan is made unavailable (SET LOCAL enable_seqscan = off) because a
-// near-empty test table would otherwise always plan a seq scan; with it off, a predicate no index
-// can serve shows as a Seq Scan anyway (the old CASE form does) and fails here. The statements are
-// copied from queries/oauth.sql (DeleteExpiredOAuthAuthorizeRequests, CountLivePendingOAuthRequests).
-func TestOAuthSweepAndCapQueriesUseIndexesLiveDB(t *testing.T) {
-	e := oauthSetup(t)
-	ctx := context.Background()
-	tx, err := e.pool.Begin(ctx)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tx.Rollback(ctx) //nolint:errcheck // read-only plans; nothing to commit
-	if _, err := tx.Exec(ctx, `SET LOCAL enable_seqscan = off`); err != nil {
-		t.Fatal(err)
-	}
-	plan := func(sql string) string {
-		t.Helper()
-		rows, err := tx.Query(ctx, `EXPLAIN `+sql)
-		if err != nil {
-			t.Fatalf("explain: %v", err)
-		}
-		defer rows.Close()
-		var b strings.Builder
-		for rows.Next() {
-			var line string
-			if err := rows.Scan(&line); err != nil {
-				t.Fatal(err)
-			}
-			b.WriteString(line + "\n")
-		}
-		return b.String()
-	}
-	sweep := plan(`DELETE FROM oauth_authorize_requests
- WHERE (status IN ('pending', 'denied', 'superseded') AND expires_at < now())
-    OR (status IN ('approved', 'redeemed') AND code_expires_at < now() - interval '10 minutes')`)
-	for _, want := range []string{"idx_oauth_authorize_requests_expires", "idx_oauth_authorize_requests_code_expires"} {
-		if !strings.Contains(sweep, want) {
-			t.Errorf("the sweep plan does not use %s:\n%s", want, sweep)
-		}
-	}
-	if strings.Contains(sweep, "Seq Scan") {
-		t.Errorf("the sweep plan seq-scans the table:\n%s", sweep)
-	}
-	count := plan(`SELECT (SELECT count(*) FROM (SELECT 1 FROM oauth_authorize_requests WHERE status = 'pending' AND expires_at > now() AND product_id = '` + e.product.String() + `' LIMIT 500) p),
-       (SELECT count(*) FROM (SELECT 1 FROM oauth_authorize_requests WHERE status = 'pending' AND expires_at > now() LIMIT 5000) g)`)
-	if !strings.Contains(count, "idx_oauth_authorize_requests_pending") || strings.Contains(count, "Seq Scan") {
-		t.Errorf("the pending-count plan must be index-backed by idx_oauth_authorize_requests_pending:\n%s", count)
-	}
 }

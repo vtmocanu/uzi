@@ -9,8 +9,8 @@
 -- Store the pending request GET /api/oauth/authorize validated. The caller has already capped and
 -- validated every field (oauthsrv), so nothing here is attacker-sized. binding_hash is the sha256
 -- of the browser-binding cookie nonce; the plaintext nonce is never stored.
-INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, expires_at)
-VALUES (sqlc.arg(product_id), sqlc.arg(redirect_uri), sqlc.arg(scopes)::text[], sqlc.arg(state), sqlc.arg(code_challenge), sqlc.arg(binding_hash)::bytea, sqlc.arg(expires_at))
+INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, expires_at)
+VALUES (sqlc.arg(product_id), sqlc.arg(redirect_uri), sqlc.arg(scopes)::text[], sqlc.arg(state), sqlc.arg(code_challenge), sqlc.arg(binding_hash)::bytea, sqlc.arg(source_prefix), sqlc.arg(expires_at))
 RETURNING *;
 
 -- name: GetOAuthAuthorizeRequest :one
@@ -115,12 +115,37 @@ DELETE FROM oauth_authorize_requests
  WHERE (status IN ('pending', 'denied', 'superseded') AND expires_at < now())
     OR (status IN ('approved', 'redeemed') AND code_expires_at < now() - interval '10 minutes');
 
+-- name: LockOAuthAuthorize :exec
+-- Serializes one product's authorize inserts, so the pending caps cannot be passed by concurrent
+-- requests under READ COMMITTED (each would count against its own snapshot): the authorize
+-- handler runs, in ONE transaction, this lock, then CountLivePendingOAuthRequests, then
+-- CreateOAuthAuthorizeRequest. The same reasoning as LockProductTokenMint.
+--
+-- Two-int advisory lock: class 1970958177 = 0x757A6F61 ("uzoa"), the value of
+-- store.OAuthAuthorizeLockClass in migrate.go, distinct from every other class constant there
+-- (TestOAuthAuthorizeLockClassMatchesSQL pins this literal and TestProductTokenMintLockClassMatchesSQL
+-- enumerates the collision check). The objid is hashtext of the product id, so two products can
+-- collide: a moment of contention, never a correctness problem. XACT-scoped: released on commit
+-- or rollback, so it must run on a transaction-bound Queries.
+SELECT pg_advisory_xact_lock(
+    1970958177,
+    hashtext(sqlc.arg(product_id)::uuid::text)
+);
+
 -- name: CountLivePendingOAuthRequests :one
--- How many live (pending, unexpired) authorize requests exist for the product and overall, each
--- counted up to its limit so the work is bounded however many rows an attacker piles up. The
--- unauthenticated authorize endpoint checks both against its caps BEFORE inserting.
--- idx_oauth_authorize_requests_pending serves both subqueries.
+-- How many live (pending, unexpired) authorize requests exist for the (product, source), for the
+-- product and overall, each counted up to its limit so the work is bounded however many rows an
+-- attacker piles up. The unauthenticated authorize endpoint checks them against its caps (source
+-- first, the fairness bound; the other two are storage backstops) BEFORE inserting, under
+-- LockOAuthAuthorize. idx_oauth_authorize_requests_pending serves all three subqueries.
 SELECT
+    (SELECT count(*) FROM (
+        SELECT 1 FROM oauth_authorize_requests
+         WHERE status = 'pending' AND expires_at > now()
+           AND oauth_authorize_requests.product_id = sqlc.arg(for_product)
+           AND oauth_authorize_requests.source_prefix = sqlc.arg(for_source)
+         LIMIT sqlc.arg(source_limit)::int
+    ) s)::bigint AS source_pending,
     (SELECT count(*) FROM (
         SELECT 1 FROM oauth_authorize_requests
          WHERE status = 'pending' AND expires_at > now() AND oauth_authorize_requests.product_id = sqlc.arg(for_product)

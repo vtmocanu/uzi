@@ -9,6 +9,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strings"
 	"time"
@@ -64,17 +65,46 @@ const (
 	oauthGrantLockAttempts = 3
 )
 
-// oauthPendingPerProductCap and oauthPendingGlobalCap bound the live (pending, unexpired)
-// authorize requests GET /api/oauth/authorize will store, per product and overall. The endpoint
-// is unauthenticated and authLimiter keys on the full client address, so one IPv6 /64 has an
-// unbounded number of budgets: this cap, not the limiter, is what bounds the table. 500 per
-// product leaves a busy client orders of magnitude of headroom (a request lives 5 minutes and a
-// human decides each); 5000 overall keeps the per-product caps from adding up to a flood. They
-// are variables only so a LiveDB test can lower them; nothing else assigns them.
+// The live (pending, unexpired) authorize requests GET /api/oauth/authorize will store are
+// bounded three ways, checked in this order inside one transaction (see OAuthAuthorize):
+//
+//   - oauthPendingPerSourceCap per (product, source), where the source is the IPv4 address or
+//     the IPv6 /64 of the trusted client IP (oauthSourcePrefix). THIS is the fairness bound:
+//     authLimiter keys on the full address, so one /64 has unbounded budgets, and without a
+//     per-source bound one source could fill a product's table and lock every real user of that
+//     product out. A request lives 5 minutes and a human decides each, so a source needs a
+//     handful at once, never 20.
+//   - oauthPendingPerProductCap per product and oauthPendingGlobalCap overall are STORAGE
+//     BACKSTOPS only (a row is under 3 KB): they bound the table against an attacker with many
+//     sources and are deliberately far above any honest load, so they do not decide fairness.
+//     A distributed attacker with enough sources can still exhaust a product's backstop (PRD
+//     #1910 Decision Log). The global figure is checked under the per-product lock, so
+//     concurrent authorizes of different products can overshoot it by at most the number in
+//     flight, which a backstop tolerates.
+//
+// They are variables only so a LiveDB test can lower them; nothing else assigns them.
 var (
-	oauthPendingPerProductCap = 500
-	oauthPendingGlobalCap     = 5000
+	oauthPendingPerSourceCap  = 20
+	oauthPendingPerProductCap = 5000
+	oauthPendingGlobalCap     = 50000
 )
+
+// oauthSourcePrefix is the fairness bucket of a client address: the full address for IPv4 (an
+// IPv4-mapped IPv6 address counts as its IPv4), the /64 network in canonical CIDR form for
+// IPv6 (an end user's allocation is a /64 or larger, so one /64 is one source). An unparsable
+// address shares the empty bucket, which only ever makes the cap stricter. The input is
+// mw.ClientIP's answer, which honours X-Forwarded-For only from TRUSTED_PROXIES.
+func oauthSourcePrefix(clientIP string) string {
+	addr, err := netip.ParseAddr(clientIP)
+	if err != nil {
+		return ""
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is4() {
+		return addr.String()
+	}
+	return netip.PrefixFrom(addr, 64).Masked().String()
+}
 
 // oauthStaticErrorPage is the fixed page for a client_id / redirect_uri that cannot be trusted
 // (RFC 6749 section 4.1.2.1). It is a constant: it echoes no parameter, and the response carries
@@ -212,39 +242,58 @@ func (h *Handler) OAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	if _, err := h.q.DeleteExpiredOAuthAuthorizeRequests(ctx); err != nil {
 		slog.Warn("oauth authorize: sweep expired requests", "error", err)
 	}
-	// Bound the table before inserting (see oauthPendingPerProductCap). A product or an instance
-	// over its cap answers temporarily_unavailable (RFC 6749 section 4.1.2.1) on the already
-	// verified redirect URI and stores nothing.
-	pending, err := h.q.CountLivePendingOAuthRequests(ctx, store.CountLivePendingOAuthRequestsParams{
-		ForProduct:   product.ID,
-		ProductLimit: int32(oauthPendingPerProductCap), //nolint:gosec // G115: a small constant (or a test's lower value)
-		GlobalLimit:  int32(oauthPendingGlobalCap),     //nolint:gosec // G115: a small constant (or a test's lower value)
+	// Cap and insert atomically: the per-product advisory lock makes the count and the insert one
+	// step, so concurrent requests cannot each pass a check that was true when they looked. Over a
+	// cap the answer is temporarily_unavailable (RFC 6749 section 4.1.2.1) on the already
+	// verified redirect URI and nothing is stored.
+	source := oauthSourcePrefix(mw.ClientIP(r, h.cfg.TrustedProxies))
+	var (
+		row     store.OauthAuthorizeRequest
+		refused bool
+	)
+	err = h.inTx(ctx, func(q *store.Queries) error {
+		if err := q.LockOAuthAuthorize(ctx, product.ID); err != nil {
+			return err
+		}
+		pending, err := q.CountLivePendingOAuthRequests(ctx, store.CountLivePendingOAuthRequestsParams{
+			ForProduct:   product.ID,
+			ForSource:    source,
+			SourceLimit:  int32(oauthPendingPerSourceCap),  //nolint:gosec // G115: a small constant (or a test's lower value)
+			ProductLimit: int32(oauthPendingPerProductCap), //nolint:gosec // G115: a small constant (or a test's lower value)
+			GlobalLimit:  int32(oauthPendingGlobalCap),     //nolint:gosec // G115: a small constant (or a test's lower value)
+		})
+		if err != nil {
+			return err
+		}
+		if pending.SourcePending >= int64(oauthPendingPerSourceCap) ||
+			pending.ProductPending >= int64(oauthPendingPerProductCap) ||
+			pending.GlobalPending >= int64(oauthPendingGlobalCap) {
+			refused = true
+			return nil
+		}
+		row, err = q.CreateOAuthAuthorizeRequest(ctx, store.CreateOAuthAuthorizeRequestParams{
+			ProductID:     product.ID,
+			RedirectUri:   req.RedirectURI,
+			Scopes:        req.Scopes,
+			State:         req.State,
+			CodeChallenge: req.CodeChallenge,
+			BindingHash:   oauthBindingHash(nonce),
+			SourcePrefix:  source,
+			ExpiresAt:     pgtype.Timestamptz{Time: time.Now().Add(oauthAuthorizeTTL), Valid: true},
+		})
+		return err
 	})
 	if err != nil {
-		slog.Error("oauth authorize: count pending requests", "error", err)
+		slog.Error("oauth authorize: store request", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	if pending.ProductPending >= int64(oauthPendingPerProductCap) || pending.GlobalPending >= int64(oauthPendingGlobalCap) {
+	if refused {
 		oauthRedirect(w, oauthsrv.ErrorRedirectURL(req.RedirectURI, &oauthsrv.Error{
 			Code:        oauthsrv.ErrTemporarilyUnavailable,
 			Description: "too many authorization requests are pending; try again shortly",
 			State:       req.State,
 		}, h.oauthIssuer()))
-		return
-	}
-	row, err := h.q.CreateOAuthAuthorizeRequest(ctx, store.CreateOAuthAuthorizeRequestParams{
-		ProductID:     product.ID,
-		RedirectUri:   req.RedirectURI,
-		Scopes:        req.Scopes,
-		State:         req.State,
-		CodeChallenge: req.CodeChallenge,
-		BindingHash:   oauthBindingHash(nonce),
-		ExpiresAt:     pgtype.Timestamptz{Time: time.Now().Add(oauthAuthorizeTTL), Valid: true},
-	})
-	if err != nil {
-		slog.Error("oauth authorize: create request", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	h.setOAuthBindCookie(w, nonce)

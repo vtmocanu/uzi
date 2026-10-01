@@ -78,3 +78,32 @@ func TestWellFormedOAuthNonce(t *testing.T) {
 		}
 	}
 }
+
+// The fairness bucket of the authorize pending cap: the IPv4 address, or the IPv6 /64 in
+// canonical form; addresses of one /64 share it, different /64s and IPv4 addresses do not.
+func TestOAuthSourcePrefix(t *testing.T) {
+	tests := []struct{ in, want string }{
+		{"203.0.113.9", "203.0.113.9"},
+		{"203.0.113.10", "203.0.113.10"},
+		{"::ffff:203.0.113.9", "203.0.113.9"},
+		{"2001:db8:1:2::1", "2001:db8:1:2::/64"},
+		{"2001:db8:1:2:ffff:ffff:ffff:ffff", "2001:db8:1:2::/64"},
+		{"2001:DB8:1:2:0:0:0:7", "2001:db8:1:2::/64"},
+		{"2001:db8:1:3::1", "2001:db8:1:3::/64"},
+		{"fe80::1%eth0", "fe80::/64"},
+		{"::1", "::/64"},
+		{"", ""},
+		{"not-an-ip", ""},
+	}
+	for _, tt := range tests {
+		if got := oauthSourcePrefix(tt.in); got != tt.want {
+			t.Errorf("oauthSourcePrefix(%q) = %q, want %q", tt.in, got, tt.want)
+		}
+	}
+	if oauthSourcePrefix("2001:db8:1:2::1") != oauthSourcePrefix("2001:db8:1:2:aaaa::2") {
+		t.Error("two addresses of one /64 must share a bucket")
+	}
+	if oauthSourcePrefix("2001:db8:1:2::1") == oauthSourcePrefix("2001:db8:1:3::1") {
+		t.Error("different /64s must not share a bucket")
+	}
+}
