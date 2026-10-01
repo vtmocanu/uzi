@@ -27,7 +27,10 @@ type laneWorkerRoute struct {
 //     postMessages, and terminal-resolve.ts postTerminalState, which sends both);
 //   - the message-gap read terminal-resolve.ts fills a fenced terminal report from;
 //   - the steering input poll and its receipts (steering.ts ChatSteering: getInputs, ackInputs,
-//     applyInputs), which is how a cancel reaches a research run.
+//     applyInputs), which is how a cancel reaches a research run;
+//   - the three job routes a profile-bound job needs (PRD #1976): the result post, the input
+//     file download and the output file upload. Each handler fences itself to job runs held by
+//     the calling worker, so a lane worker reaches them only for its own job.
 //
 // Deliberately NOT listed: agent memory, every forge read and write, the judge trace and
 // review routes, the task review, the chat-agent reads of the owner's other runs, proposals,
@@ -46,6 +49,9 @@ var laneWorkerAllowlist = []laneWorkerRoute{
 	{http.MethodGet, "/runs/{id}/inputs"},
 	{http.MethodPost, "/runs/{id}/inputs/ack"},
 	{http.MethodPost, "/runs/{id}/inputs/applied"},
+	{http.MethodPost, "/runs/{id}/job-result"},
+	{http.MethodGet, "/runs/{id}/files/{fileID}"},
+	{http.MethodPost, "/runs/{id}/files"},
 }
 
 // laneAllowMux matches a request path against laneWorkerAllowlist with chi's own router, so

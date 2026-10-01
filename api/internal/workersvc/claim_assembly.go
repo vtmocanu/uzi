@@ -204,9 +204,21 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 
 	// Job lane (PRD #1908): a job is repo-less like a judge, so it forks here too, before
 	// GetRunClaimContext and any PAT decrypt. Its claim carries the model credential and the job
-	// block, and no repo, PAT, memory or skills.
+	// block, and no repo, PAT or memory (and no skills but a product's approved set). PRD #1976:
+	// a profile-bound job (isolated, checked above) then goes through the same isolation
+	// snapshot, fetch credential and strip as any profile-bound run, keeping only the product
+	// skills assembleJobClaim built; an unbound job's claim is returned untouched.
 	if run.Kind == runkind.Job {
-		return s.assembleJobClaim(ctx, wkr, run)
+		payload, err := s.assembleJobClaim(ctx, wkr, run)
+		if err != nil {
+			return nil, err
+		}
+		if isolated {
+			if err := s.isolateClaimKeeping(ctx, run, payload, true); err != nil {
+				return nil, err
+			}
+		}
+		return payload, nil
 	}
 
 	rc, err := s.q.GetRunClaimContext(ctx, run.ID)

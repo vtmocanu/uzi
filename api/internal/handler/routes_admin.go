@@ -126,6 +126,10 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// authLimiter's per-user budget like the registry read beside it. The sync and apply
 			// writes are cookie-only, in the group below.
 			r.With(authLimiter.PerUserMiddleware).Get("/products/{id}/skills", h.AdminGetProductSkills)
+			// A product's site-list allowance (PRD #1976 M1): the egress profiles its tokens may name
+			// on job create. A read a uza_ token may make, on authLimiter's per-user budget like the
+			// product reads beside it; the PUT and DELETE writes are cookie-only, in the group below.
+			r.With(authLimiter.PerUserMiddleware).Get("/products/{id}/egress-profiles", h.AdminListProductEgressProfiles)
 			r.With(authLimiter.PerUserMiddleware).Get("/product-tokens", h.AdminListProductTokens)
 			// Egress profiles (PRD #1906 M1): the named site lists an official-sources
 			// research run will be bound to. Reads only here, so a uza_ token can list and
@@ -229,6 +233,11 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			// handler; no per-user limiter, like the agent-source sync beside it.
 			r.Post("/products/{id}/skills/sync", h.AdminSyncProductSkills)
 			r.Post("/products/{id}/skills/apply", h.AdminApplyProductSkills)
+			// Product site-list allowance writes (PRD #1976 M1): allow (idempotent PUT) and revoke
+			// (DELETE) one list for a product. Cookie-only, so a uza_ Bearer 401s before the
+			// handler; no limiter, a local write. A revoke gates only later job creates.
+			r.Put("/products/{id}/egress-profiles/{name}", h.AdminAllowProductEgressProfile)
+			r.Delete("/products/{id}/egress-profiles/{name}", h.AdminRevokeProductEgressProfile)
 			r.Post("/product-tokens/{id}/revoke", h.AdminRevokeProductToken)
 			// Egress profile writes (PRD #1906 M1): create, full replace, delete. Cookie-only
 			// admin writes, so a uza_ Bearer 401s before the handler and the CLI stays

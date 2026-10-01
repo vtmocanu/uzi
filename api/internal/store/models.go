@@ -576,6 +576,13 @@ type Product struct {
 	SkillsAppliedAt   pgtype.Timestamptz `json:"skills_applied_at"`
 }
 
+type ProductEgressProfile struct {
+	ProductID       uuid.UUID          `json:"product_id"`
+	EgressProfileID uuid.UUID          `json:"egress_profile_id"`
+	CreatedBy       pgtype.UUID        `json:"created_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type ProductSkillStaged struct {
 	ProductID uuid.UUID          `json:"product_id"`
 	SourceSha string             `json:"source_sha"`

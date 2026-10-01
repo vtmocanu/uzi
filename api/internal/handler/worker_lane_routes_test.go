@@ -34,6 +34,10 @@ var wantLaneAllowed = map[string]bool{
 	"GET /runs/{id}/inputs":          true,
 	"POST /runs/{id}/inputs/ack":     true,
 	"POST /runs/{id}/inputs/applied": true,
+	// PRD #1976: the three job routes a profile-bound job needs on the lane.
+	"POST /runs/{id}/job-result":    true,
+	"GET /runs/{id}/files/{fileID}": true,
+	"POST /runs/{id}/files":         true,
 }
 
 var routeParam = regexp.MustCompile(`\{[^/}]+\}`)

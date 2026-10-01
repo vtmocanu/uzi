@@ -40,6 +40,15 @@ var errIsolatedLaneMismatch = fmt.Errorf("%w: run and worker are on different si
 // A mint that matches no row means the run left this claim (cancelled or reclaimed)
 // between ClaimRun and here: errRunVanished, and nothing is delivered.
 func (s *Service) isolateClaim(ctx context.Context, run store.Run, payload *ClaimPayload) error {
+	return s.isolateClaimKeeping(ctx, run, payload, false)
+}
+
+// isolateClaimKeeping is isolateClaim with one narrow exception (PRD #1976): keepProductSkills
+// re-attaches the Skills and SkillsDropped the payload carried on entry after the strip. Only
+// assembleJobClaim's product skill set may pass it (admin-approved, product-scoped, delivered
+// for exactly the official-sources research a profile-bound job exists for); every other skill
+// source is still cleared, because stripForIsolation is unchanged and runs first.
+func (s *Service) isolateClaimKeeping(ctx context.Context, run store.Run, payload *ClaimPayload, keepProductSkills bool) error {
 	if s.txBeginner == nil {
 		return fmt.Errorf("%w: no transaction source to mint the fetch credential", errIsolatedClaimRefused)
 	}
@@ -86,7 +95,11 @@ func (s *Service) isolateClaim(ctx context.Context, run store.Run, payload *Clai
 		return err
 	}
 
+	skills, dropped := payload.Skills, payload.SkillsDropped
 	stripForIsolation(payload)
+	if keepProductSkills {
+		payload.Skills, payload.SkillsDropped = skills, dropped
+	}
 	payload.IsolatedFetch = &ClaimIsolatedFetch{Credential: token, Profile: snap.Profile, Hosts: snap.Entries}
 	return nil
 }

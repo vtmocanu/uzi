@@ -1252,19 +1252,22 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// Job result ingest (PRD #1908): a kind='job' run posts its structured result (report +
 		// findings) before it reports `completed`. Fenced on the worker holding the run and the
 		// body's claim_generation; job runs only (any other kind is 403 not_for_job). Idempotent:
-		// one transaction upserts the result and replaces the run's findings.
+		// one transaction upserts the result and replaces the run's findings. On the isolated-lane
+		// allowlist (laneWorkerAllowlist): a profile-bound job (PRD #1976) posts its result from a
+		// lane worker, still fenced to job runs by the handler.
 		r.Post("/runs/{id}/job-result", h.WorkerJobResult)
 
 		// Job input download (PRD #1909 D8): the worker pulls each attached input file named in
 		// its claim. Fenced on the worker holding the run, the claim generation (query param) and
-		// the file being an attached input of THIS run. Deliberately NOT in laneWorkerAllowlist
-		// (a job is not a lane run yet; PRD #1906 M8 adds the route when jobs move to the lane).
+		// the file being an attached input of THIS run. On the isolated-lane allowlist
+		// (laneWorkerAllowlist) for a profile-bound job (PRD #1976); the handler still fences it to
+		// job runs.
 		r.Get("/runs/{id}/files/{fileID}", h.WorkerJobInputFile)
 
 		// Job output upload (PRD #1909 D4, M4): the worker stores the files it kept before it
 		// posts the result (the report and the findings JSON are the server's, stored from the
 		// result). Raw body + X-Uzi-Job-File metadata header; fenced exactly like the job-result
-		// route, BEFORE the body is read. Also NOT in laneWorkerAllowlist, for the same reason as
+		// route, BEFORE the body is read. Also on the isolated-lane allowlist, for the same reason as
 		// the download above.
 		r.Post("/runs/{id}/files", h.WorkerJobOutputFile)
 
