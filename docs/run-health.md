@@ -31,6 +31,22 @@ repo isn't on the Docker worker allowlist, so no Docker worker can run it"_ —
 distinct from "no worker online" or "all workers busy". The fix is to add the
 repo to the allowlist, not to start another worker.
 
+One **stalled** reason worth calling out is an undelivered outcome. When a
+worker has a running or awaiting-approval run's outcome journaled but not yet
+delivered to the api (a _pending outcome_; the worker keeps renewing the
+run's lease protection meanwhile), the api records when it first saw that
+entry. Once it has been pending on the run's current worker, at its current
+claim generation, under an unexpired lease, for 4 heartbeat intervals (60
+seconds with the default `WORKER_HEARTBEAT_INTERVAL` of 15s), the run is
+flagged ⚠ stalled and the owner's reason reads _"the run's outcome is
+journaled on its worker but has not been delivered"_. The clock survives
+heartbeat renewals and a worker re-register, and resets when the entry clears
+or the claim generation changes. This is a warning only: it never expires the
+lease or reclaims, fails or discards the run. The outcome is held on the
+worker, so check the worker — [`uzi worker list`](./cli.md#disk-usage-and-checkpoint-durability)
+shows its pending outcomes. A plain cancel is refused while the outcome is held;
+it must be confirmed as discarding that outcome.
+
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 

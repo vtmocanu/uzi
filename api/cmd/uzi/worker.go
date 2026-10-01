@@ -459,14 +459,29 @@ func compactBytes(n int64) string {
 // stability) rather than dropped, the same pass-through discipline upgradeCell uses, because
 // the CLI is versioned separately from the api.
 //
-// The raw reported_runs array also rides `--json` untouched (run_id/phase/claim_generation per
-// entry) for scripting, so an agent keys off the structured fields rather than parsing this cell.
+// An entry flagged terminal_pending is NOT a running execution: its outcome is journaled on the
+// worker but not yet delivered to the api (its phase still reads "running"). Those entries are
+// excluded from the phase tally and rendered as "N pending outcome(s)", with " (oldest <age>)"
+// from the oldest non-nil terminal_pending_since (omitted when every since is nil).
+//
+// The raw reported_runs array also rides `--json` untouched (run_id/phase/claim_generation/
+// terminal_pending/terminal_pending_since per entry) for scripting, so an agent keys off the
+// structured fields rather than parsing this cell.
 func reportedRunsCell(w apitypes.WorkerDTO) string {
 	if len(w.ReportedRuns) == 0 {
 		return "-"
 	}
 	counts := make(map[string]int, len(w.ReportedRuns))
+	pending := 0
+	var oldest *time.Time
 	for _, rr := range w.ReportedRuns {
+		if rr.TerminalPending {
+			pending++
+			if rr.TerminalPendingSince != nil && (oldest == nil || rr.TerminalPendingSince.Before(*oldest)) {
+				oldest = rr.TerminalPendingSince
+			}
+			continue
+		}
 		counts[rr.Phase]++
 	}
 	parts := make([]string, 0, len(counts))
@@ -487,8 +502,22 @@ func reportedRunsCell(w apitypes.WorkerDTO) string {
 	for _, ph := range extra {
 		parts = append(parts, fmt.Sprintf("%d %s", counts[ph], ph))
 	}
+	if pending > 0 {
+		noun := "pending outcomes"
+		if pending == 1 {
+			noun = "pending outcome"
+		}
+		part := fmt.Sprintf("%d %s", pending, noun)
+		if oldest != nil {
+			part += " (oldest " + formatUptimeDuration(reportedRunsNow().Sub(*oldest)) + ")"
+		}
+		parts = append(parts, part)
+	}
 	return strings.Join(parts, ", ")
 }
+
+// reportedRunsNow is reportedRunsCell's clock, a variable so tests pin the pending age.
+var reportedRunsNow = time.Now
 
 // bindModeCell renders HOW a worker chooses its Anthropic credential, for
 // `uzi worker list`'s TOKEN column (PRD #111 M5).
