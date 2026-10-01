@@ -915,7 +915,7 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
   });
 });
 
-describe("JobRunner output files (PRD #1909 M4)", () => {
+describe("JobRunner output files (PRD #1909 M4)", { skip: process.platform !== "linux" ? "requires Linux descriptor-relative output opens" : false }, () => {
   const sha = (b: string | Buffer): string => createHash("sha256").update(b).digest("hex");
   const refusal = (status: number, reason: string): RequestError =>
     new RequestError("POST", "/api/worker/runs/x/files", status, JSON.stringify({ error: "refused", reason }));
@@ -1156,7 +1156,7 @@ describe("JobRunner output files (PRD #1909 M4)", () => {
       "same file name twice": true,
       "invisible character": true,
       ok: false,
-      "symlink inside outputs": false,
+      "symlink inside outputs": true,
     });
   });
 

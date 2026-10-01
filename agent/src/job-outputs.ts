@@ -17,19 +17,21 @@
 // exhausted, out of time) leaves no trace at the api, so the summary lists it in `refused` and the
 // runner posts that list with the result (`refused_outputs`), where the api records it.
 //
-// Files are streamed from disk, never buffered whole. Each file is opened ONCE (O_NOFOLLOW): the
+// Files are streamed from disk, never buffered whole. Each file is opened ONCE through a
+// Linux descriptor-relative no-follow walk of every directory component: the
 // handle is fstat-ed (a regular file, one link, within the ceiling, all before any byte is read),
 // hashed by a bounded loop that checks the deadline and the abort signal, and then uploaded from the
 // SAME handle, so the path cannot be swapped between the hash pass and the upload.
 
 import { createHash } from "node:crypto";
-import { constants as fsc, lstatSync, realpathSync } from "node:fs";
-import { type FileHandle, open } from "node:fs/promises";
+import { lstatSync, realpathSync } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 import type { Readable } from "node:stream";
 
 import { isTransientStatus, RequestError, type WorkerClient } from "./client.js";
 import { screenToolPath } from "./guardrails.js";
+import { openJobOutputFile } from "./job-workspace.js";
 import type { Logger } from "./log.js";
 import type { JobFileUploadMeta, JobRefusedOutput } from "./protocol.js";
 import { errMessage, sleep } from "./util.js";
@@ -54,10 +56,6 @@ const JOB_OUTPUT_CEILINGS = {
 /** Longest display name (code points) sent; the api sanitises again and bounds it itself. */
 const DISPLAY_NAME_MAX = 100;
 const DISPLAY_EXT_MAX = 16;
-
-/** Open for reading without following a final symlink. O_NONBLOCK keeps the open of a FIFO from
- *  waiting for a writer: the handle is then refused by its fstat (not a regular file). */
-const READ_FLAGS = fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK;
 
 /** The basenames the api generates itself (report and findings); an `output_files` entry may not
  *  use them, in any case. Mirrors workersvc.IsReservedJobOutputName. */
@@ -137,8 +135,9 @@ export interface ResolvedOutputFile {
 
 /** Resolve one lexically valid `output_files` entry against the workspace: the path guard
  *  (screenToolPath: outside the workspace, /proc, the secret mount and .git are denied), then the
- *  REAL path (every symlink resolved) must lie inside `<work>/outputs` or `<work>/sources` and be a
- *  regular file. A symlink that points anywhere else, a directory, a FIFO or a device is refused.
+ *  REAL path must lie inside `<work>/outputs` or `<work>/sources` and be a
+ *  regular file. Every symlink component, a directory, a FIFO or a device is refused.
+ *  This preflight is not the read authority: openJobOutputFile pins each component at upload.
  *  Synchronous, so the submit tool can run it while the model is still there to fix a mistake, and
  *  the runner runs it again at upload time. */
 export function resolveOutputFile(
@@ -151,6 +150,13 @@ export function resolveOutputFile(
   let workReal: string;
   let real: string;
   try {
+    // Preflight policy only; openJobOutputFile is the race-free read authority.
+    let component = work;
+    if (lstatSync(component).isSymbolicLink()) return { ok: false, error: `${rel}: workspace is a symlink` };
+    for (const part of rel.split("/")) {
+      component = path.join(component, part);
+      if (lstatSync(component).isSymbolicLink()) return { ok: false, error: `${rel}: contains a symlink` };
+    }
     workReal = realpathSync(work);
     real = realpathSync(path.resolve(work, rel));
   } catch {
@@ -209,7 +215,7 @@ interface OpenedOutput {
   sha256: string;
 }
 
-/** Open `real` ONCE (O_NOFOLLOW, no blocking on a FIFO) and vet the handle before any byte is read:
+/** Open the workspace-relative output ONCE through openJobOutputFile (no blocking on a FIFO) and vet the handle before any byte is read:
  *  fstat must say a regular file with exactly one link (a hard link to a file outside outputs/ and
  *  sources/ passes the path checks, so it is refused), not empty, and within the per-file ceiling and
  *  what is left of the job's file and byte ceilings. Then hash it with a loop capped at size + 1
@@ -217,14 +223,15 @@ interface OpenedOutput {
  *  mtime moved while it was read is refused. The handle stays open for the upload; the caller closes
  *  it. Throws OutputRefusal (drop this file) or OutputPhaseStop (stop the phase). */
 async function openAndHash(
-  real: string,
+  work: string,
+  relative: string,
   ceilings: { files: number; totalBytes: number },
   deadlineAt: number,
   signal: AbortSignal | undefined,
 ): Promise<OpenedOutput> {
   let fh: FileHandle;
   try {
-    fh = await open(real, READ_FLAGS);
+    fh = await openJobOutputFile(work, relative);
   } catch (err) {
     throw new OutputRefusal("worker_unreadable", `could not be opened: ${errMessage(err)}`);
   }
@@ -341,7 +348,6 @@ export interface UploadJobOutputsSummary {
 interface Candidate {
   label: string;
   displayName: string;
-  real: string;
 }
 
 /** Upload the listed files. Never throws. */
@@ -357,14 +363,8 @@ export async function uploadJobOutputs(args: UploadJobOutputsArgs): Promise<Uplo
   };
   const candidates: Candidate[] = [];
   for (const rel of args.outputFiles) {
-    const r = resolveOutputFile(args.workDir, rel, args.secretPaths);
-    if (!r.ok) {
-      drop(outputDisplayName(rel), "worker_unreadable");
-      log.warn("job output file skipped", { error: logSafe(r.error) });
-      continue;
-    }
-    if (candidates.some((c) => c.real === r.value.real)) continue; // the same file by two paths
-    candidates.push({ label: rel, displayName: r.value.displayName, real: r.value.real });
+    if (candidates.some((c) => c.label === rel)) continue;
+    candidates.push({ label: rel, displayName: outputDisplayName(rel) });
   }
 
   let files = 0;
@@ -385,9 +385,17 @@ export async function uploadJobOutputs(args: UploadJobOutputsArgs): Promise<Uplo
       stopPhase("the upload phase's time is spent", true);
       break;
     }
+    // Validate and open THIS candidate now. A resolve-all-first pass leaves later
+    // candidates exposed to ancestor swaps while earlier uploads are in flight.
+    const resolved = resolveOutputFile(args.workDir, c.label, args.secretPaths);
+    if (!resolved.ok) {
+      drop(c.displayName, "worker_unreadable");
+      log.warn("job output file skipped", { error: logSafe(resolved.error) });
+      continue;
+    }
     let opened: OpenedOutput | undefined;
     try {
-      opened = await openAndHash(c.real, { files, totalBytes }, args.deadlineAt, args.signal);
+      opened = await openAndHash(args.workDir, c.label, { files, totalBytes }, args.deadlineAt, args.signal);
       const meta: JobFileUploadMeta = { claim_generation: args.generation, display_name: c.displayName, size: opened.size, sha256: opened.sha256 };
       const { fh, size } = opened;
       // The upload reads the handle the hash pass read: bounded to the hashed size, from offset 0

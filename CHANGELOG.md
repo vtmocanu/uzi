@@ -51,6 +51,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Job output uploads cannot follow swapped directory links ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
+  The worker pins each directory and reads one file handle for hashing and upload; unsafe paths are refused and listed.
+
 - **Queue generated job files while write slots are busy ([#1909](https://github.com/vtmocanu/uzi/issues/1909)).**
   Report and findings files wait in a bounded queue; shutdown cancels the first admitted write and marks waiting files explicitly.
 

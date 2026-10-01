@@ -140,6 +140,10 @@ a default deployment was sized for. Three further facts shaped the design:
   space is reused after vacuum rather than returned to the filesystem, so the
   quota, not the disk size, is the control.
 
+## Worker output read boundary
+
+The worker opens output files through `openJobOutputFile` in `agent/src/job-workspace.ts`: a Linux descriptor-relative walk pins every workspace ancestor and output directory with no-follow flags, then opens one regular, single-link file handle for both hashing and upload. Checking a pathname first is insufficient because another flight can replace a directory between validation and read. A symlink component or unavailable procfs anchoring refuses the file as `worker_unreadable`; there is no pathname fallback. The job still completes and reports the refusal.
+
 ## References
 
 - [PRD #1909](../prds/1909-job-files-product-skills.md): Decisions D1 to D4 and D8, Decision Log.

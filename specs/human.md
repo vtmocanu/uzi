@@ -860,6 +860,7 @@ Tracked as GitHub issue vtmocanu/uzi#1909; PRD at `prds/1909-job-files-product-s
 - File types are checked by content, not name; files are stored sealed and served only as downloads (attachment, `nosniff`, `application/octet-stream`). (AI-synced 2026-09-30)
 - Per-file, per-job, per-owner and instance caps apply, and job files and run recovery archives share one hard stored-file budget; recovery wins by reclaiming expired then oldest finished-job files, never those of a live job. (AI-synced 2026-09-30)
 - An output over a cap or quota is refused and listed; the job still completes. (AI-synced 2026-09-30)
+- Worker-produced output files are read through pinned no-follow directory descriptors and one regular, single-link file handle for hashing and upload. A symlink component or unavailable descriptor anchoring refuses the file visibly; it never redirects a read outside the workspace. (AI-synced 2026-10-01)
 - A result's `source_url` is set only when the file's hash matches a page the same job fetched; nothing the agent claims sets it. (AI-synced 2026-09-30)
 - An admin can give a product a skills repo (allowlisted base URLs, write-only clone token); synced skills reach that product's jobs only after the admin approves the exact commit, and no other run ever receives a product skill. (AI-synced 2026-09-30)
 - New jobs run only on workers that advertise `job_files_v1`. (AI-synced 2026-09-30)

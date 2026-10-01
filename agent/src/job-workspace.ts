@@ -28,6 +28,7 @@
 
 import { createHash, randomBytes } from "node:crypto";
 import { constants as fsc, promises as fs } from "node:fs";
+import type { FileHandle } from "node:fs/promises";
 import path from "node:path";
 
 import type { Logger } from "./log.js";
@@ -383,4 +384,59 @@ export async function reapStaleJobWorkspaces(jobsRoot: string, log: Logger): Pro
   }
   if (removed > 0) log.info("reaped stale job workspaces", { removed });
   return removed;
+}
+
+/** Open a job output through pinned directory descriptors, never through a checked pathname.
+ * The trusted worker creates work before the SDK starts; the pinned root must still be worker-owned.
+ * The workspace ancestor chain and every descendant are pinned through Linux procfs, with no-follow
+ * on each component. A parent renamed or replaced by a symlink therefore cannot redirect the
+ * next open. The final regular, single-link file handle is the authority for hashing/upload;
+ * the directory chain stays open through that open and fstat, then closes. There is no path
+ * fallback on another platform or without procfs. afterPin is a deterministic race-test seam. */
+export async function openJobOutputFile(
+  work: string,
+  relative: string,
+  opts: { afterPin?: (relativeDirectory: string) => Promise<void> } = {},
+): Promise<FileHandle> {
+  const parts = relative.split("/");
+  if (!path.isAbsolute(work) || relative.includes("\\") ||
+      (parts[0] !== "outputs" && parts[0] !== "sources") || parts.length < 2 ||
+      parts.some((p) => p === "" || p === "." || p === "..")) {
+    throw new Error("job output path is not a plain workspace-relative output path");
+  }
+  if (process.platform !== "linux" || (await fs.statfs("/proc/self/fd")).type !== 0x9fa0) {
+    throw new Error("job output descriptor anchoring is unavailable");
+  }
+  // O_PATH is Linux-only and absent from fs.constants. Like rmtree's pinned walk it
+  // needs directory traversal permission, without demanding directory listing permission.
+  const pinFlags = 0o10000000 | fsc.O_DIRECTORY | fsc.O_NOFOLLOW;
+  const directories: FileHandle[] = [];
+  let file: FileHandle | undefined;
+  try {
+    // Pin the absolute workspace chain too: a symlink at a run/workspace ancestor
+    // must not turn an otherwise safe descendant walk into an outside-file read.
+    let parent = await fs.open("/", pinFlags);
+    directories.push(parent);
+    for (const component of path.resolve(work).split("/").filter(Boolean)) {
+      parent = await fs.open(`/proc/self/fd/${parent.fd}/${component}`, pinFlags);
+      directories.push(parent);
+    }
+    const rootStat = await parent.stat();
+    const workerUid = process.getuid?.();
+    if (workerUid !== undefined && rootStat.uid !== workerUid) throw new Error("job workspace is not owned by this worker");
+    for (let i = 0; i < parts.length - 1; i++) {
+      parent = await fs.open(`/proc/self/fd/${parent.fd}/${parts[i]!}`, pinFlags);
+      directories.push(parent);
+      await opts.afterPin?.(parts.slice(0, i + 1).join("/"));
+    }
+    file = await fs.open(`/proc/self/fd/${parent.fd}/${parts.at(-1)!}`, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
+    const st = await file.stat();
+    if (!st.isFile() || st.nlink !== 1) throw new Error("job output is not a regular single-link file");
+    return file;
+  } catch (err) {
+    await file?.close().catch(() => undefined);
+    throw err;
+  } finally {
+    await Promise.allSettled(directories.map((directory) => directory.close()));
+  }
 }

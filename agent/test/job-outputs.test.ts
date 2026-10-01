@@ -105,7 +105,7 @@ describe("resolveOutputFile", () => {
     assert.strictEqual(r.value.displayName, "r.md");
   });
 
-  it("accepts a symlink that stays inside outputs/ or sources/, and refuses one that leaves them", async () => {
+  it("refuses symlinks inside outputs/ or sources/ as well as ones that leave them", async () => {
     const { work, outside } = await workspace();
     await fsp.writeFile(path.join(work, "outputs/a.txt"), "a");
     await fsp.writeFile(path.join(work, "sources/s"), "s");
@@ -116,8 +116,8 @@ describe("resolveOutputFile", () => {
     await fsp.symlink(path.join(work, "inputs/i.txt"), path.join(work, "outputs/to-inputs"));
     await fsp.symlink("../../outside.txt", path.join(work, "outputs/rel-out"));
     await fsp.symlink("/etc/hostname", path.join(work, "outputs/system"));
-    assert.ok(resolveOutputFile(work, "outputs/in-outputs").ok);
-    assert.ok(resolveOutputFile(work, "outputs/in-sources").ok);
+    assert.ok(!resolveOutputFile(work, "outputs/in-outputs").ok);
+    assert.ok(!resolveOutputFile(work, "outputs/in-sources").ok);
     for (const rel of ["outputs/out", "outputs/to-inputs", "outputs/rel-out", "outputs/system"]) {
       assert.strictEqual(resolveOutputFile(work, rel).ok, false, rel);
     }
@@ -170,7 +170,7 @@ describe("outputDisplayName", () => {
 });
 
 
-describe("uploadJobOutputs (PRD #1909 M4 rework)", () => {
+describe("uploadJobOutputs (PRD #1909 M4 rework)", { skip: process.platform !== "linux" ? "requires Linux descriptor-relative output opens" : false }, () => {
   const sha = (b: string | Buffer): string => createHash("sha256").update(b).digest("hex");
   type Upload = (meta: JobFileUploadMeta, body: Buffer | (() => Readable | Promise<Readable>), signal?: AbortSignal, timeoutMs?: number, attempt?: number) => Promise<{ status: number; file: never }>;
 
@@ -257,8 +257,8 @@ describe("uploadJobOutputs (PRD #1909 M4 rework)", () => {
     assert.deepStrictEqual(c.sent.map((u) => u.meta.display_name), ["ok.txt"]);
     assert.strictEqual(summary.stored, 1);
     assert.deepStrictEqual(summary.dropped, [
-      { display_name: "gone.txt", reason: "worker_unreadable" }, // resolved (and refused) first
       { display_name: "empty.csv", reason: "worker_empty" },
+      { display_name: "gone.txt", reason: "worker_unreadable" }, // checked in submitted order
     ]);
   });
 
@@ -360,6 +360,9 @@ describe("uploadJobOutputs (PRD #1909 M4 rework)", () => {
     assert.match(JSON.stringify(lines), /\\\\u202e/, "escaped, not dropped");
   });
 
+});
+
+describe("job output safe logging and time budget", () => {
   it("logSafe escapes format, control and separator characters and bounds the length", () => {
     assert.strictEqual(logSafe("a\u202eb\u0000c\u2028d"), "a\\u202eb\\u0000c\\u2028d");
     assert.strictEqual(logSafe("x".repeat(500), 10), "x".repeat(10));

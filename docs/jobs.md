@@ -89,6 +89,8 @@ While a generated report or findings file waits for storage, its `refused_files`
 
 Output types are the input allowlist plus HTML (a downloaded page). An output that is over a per-file or per-job cap, over a storage quota, or not an allowed type is **refused and listed, and the job still completes**: a refused file never fails a finished job and is never silently missing. Quotas are checked when a file is admitted, never by failing the job afterwards.
 
+Worker-produced files must be regular files under `outputs/` or `sources/`, with no symlink component or extra hard link. An unsafe path is refused as `worker_unreadable`.
+
 ### Read the files
 
 | Endpoint | Scope | Returns |
