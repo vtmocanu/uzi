@@ -629,6 +629,19 @@ it("carries the bounded unsplit stderr in rawDetail beside the one-line detail",
   } finally { restore(); }
 });
 
+it("trims leading padding before bounding rawDetail so a later token is not cut", { skip: linuxCloneSkip }, async () => {
+  const { bare } = await trackedClean();
+  const token = "tok-" + "z".repeat(40);
+  const err = Object.assign(new Error("subprocess exited 128"), {
+    code: 128, stdout: "", stderr: `${"\n".repeat(4080)}fatal: ${token}`,
+  });
+  const restore = failExec(["--is-shallow-repository"], err);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    assert.ok(e.rawDetail?.includes(token), e.rawDetail);
+  } finally { restore(); }
+});
+
 it("derives detail from a megabyte of stderr without scanning it all", { skip: linuxCloneSkip }, async () => {
   const { bare } = await trackedClean();
   const err = Object.assign(new Error("subprocess exited 128"), {

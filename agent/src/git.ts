@@ -187,9 +187,10 @@ export class ScratchPublicationError extends Error {
    *  failure text with leading whitespace trimmed. It can span several lines, so it can differ from
    *  the source line `detail` was cut from. A caller that redacts must redact this whole text first
    *  (the redactor matches across CR and LF, so a token split by a newline is only caught on unsplit
-   *  text) and only then pick a line, sanitize and cap: sanitizing or line-splitting first can leave
-   *  a token prefix or turn a control character inside a token into `?`. Untrusted text; never log
-   *  or report it unredacted. */
+   *  text; it does NOT match across U+2028/U+2029, so map those to LF before redacting) and only then
+   *  pick a line, sanitize and cap: sanitizing or line-splitting first can leave a token prefix or
+   *  turn a control character inside a token into `?`. Untrusted text; never log or report it
+   *  unredacted. */
   readonly rawDetail?: string;
   constructor(
     reason: string,
@@ -211,10 +212,11 @@ const DETAIL_MAX = 200;
 /** Bound on the unsanitized, unsplit text carried as ScratchPublicationError.rawDetail. */
 const RAW_DETAIL_MAX = 4096;
 
-/** The RAW_DETAIL_MAX prefix of `text` with leading whitespace trimmed: unsanitized and, on purpose,
- *  not split into lines (see ScratchPublicationError.rawDetail). */
+/** `text` with leading whitespace trimmed, then its RAW_DETAIL_MAX prefix: unsanitized and, on
+ *  purpose, not split into lines (see ScratchPublicationError.rawDetail). Trimming before the cut
+ *  keeps whitespace padding from pushing a token onto the cut, where only its prefix would remain. */
 function rawText(text: string): string {
-  return String(text).slice(0, RAW_DETAIL_MAX).trimStart();
+  return String(text).trimStart().slice(0, RAW_DETAIL_MAX);
 }
 
 /** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input

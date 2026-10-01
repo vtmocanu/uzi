@@ -1278,9 +1278,10 @@ const SCRATCH_REDACT_INPUT_MAX = 4096;
 
 /** Bound `text` for the redactor and turn U+2028/U+2029 into LF: the redactor matches a token across
  *  control characters such as LF but not across those two separators, which the first-line pick and
- *  sanitizeForLog would otherwise turn into a cut or a `?` inside an unredacted token. */
+ *  sanitizeForLog would otherwise turn into a cut or a `?` inside an unredacted token. Leading
+ *  whitespace is trimmed before the cut so padding cannot push a token onto it. */
 function redactorInput(text: string): string {
-  return text.slice(0, SCRATCH_REDACT_INPUT_MAX).replace(/[\u2028\u2029]/g, "\n");
+  return text.trimStart().slice(0, SCRATCH_REDACT_INPUT_MAX).replace(/[\u2028\u2029]/g, "\n");
 }
 
 /** Redact FIRST, then sanitize and cap: sanitizing first would turn a control character inside a
