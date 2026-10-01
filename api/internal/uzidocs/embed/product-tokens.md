@@ -66,7 +66,7 @@ Product registration is an admin-only browser action under **Admin → Products*
 
 ## Site lists for jobs
 
-A job can name a [site list](./egress-profiles.md) in `egress_profile` so it can read official web sources ([Jobs](./jobs.md#site-lists)). A product token may name **only a list an admin has allowed for its product**: any other existing list is refused with 403 `egress_profile_not_allowed`, an unknown name is 404 `unknown_egress_profile`. Your own `uzc_` token may name any list. A product with no allowed lists cannot create a bound job.
+A job can name a [site list](./egress-profiles.md) in `egress_profile` so it can read official web sources ([Jobs](./jobs.md#site-lists)). A product token may name **only a list an admin has allowed for its product**: any other existing list is refused with 403 `egress_profile_not_allowed`, an unknown name is 404 `unknown_egress_profile`. Your own `uzc_` token may name any list. A product with no allowed lists cannot create a bound job. On an instance with no isolated research lane enabled, naming a site list is refused first with 503 `isolated_lane_unavailable`, ahead of those 403/404 checks ([Jobs](./jobs.md#site-lists)).
 
 Admins allow a list on **Admin → Products**: each product card has a **Site lists** section where allowed lists are added and removed (a browser-session action; the equivalent `PUT`/`DELETE /api/admin/products/{id}/egress-profiles/{name}` refuse a Bearer token). Removing an allowance affects only jobs created afterwards. Deleting a site list removes its allowances. The CLI is read-only: `uzi admin products egress-profiles <product>` (needs a `uza_` token) lists a product's allowed lists.
 

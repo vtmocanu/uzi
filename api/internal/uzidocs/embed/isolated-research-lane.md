@@ -28,8 +28,10 @@ fetcher token Secret lacks that key reads as off (fail closed, and the fetcher
 control routes are unmounted too). With the lane off, creating a job that names
 a site list is refused with 503 `isolated_lane_unavailable` and no job is
 created. A run already bound (for example, created before the lane was turned
-off) stays queued, and its queued reason says an admin must enable the isolated
-research lane in the deployment (see [Jobs on the lane](#jobs-on-the-lane)).
+off) with no lane worker provisioned for it stays queued, and its queued reason
+says an admin must enable the isolated research lane in the deployment; a lane
+worker already provisioned or registered is not recalled (see
+[Jobs on the lane](#jobs-on-the-lane)).
 Live acceptance on a real cluster (this PRD's
 milestone M9) has not been done: the network guarantees below are what the
 chart and code are built to enforce, not something a maintainer has yet
@@ -91,7 +93,11 @@ lane run. What differs from a job on a standard worker:
   provisioning off, or the user at the ephemeral worker limit), the bound job
   stays queued, exactly like a bound research run. With the lane itself off, a
   job naming a site list is refused at create (503 `isolated_lane_unavailable`);
-  a job bound before the lane was turned off stays queued.
+  a bound job with no lane worker provisioned for it when the lane was turned
+  off stays queued. One whose lane worker was already provisioned is not
+  recalled: that worker still fails it at the provision deadline if it never
+  registers, and a lane worker that already registered (its objects are left in
+  place when the lane goes off) may still claim and run it.
 - **The fetch credential is redacted** from messages, failure reasons, logs and
   the posted result. Output-file contents are outside that redaction coverage:
   keeping the credential out of the model's prompt and environment does not
@@ -103,7 +109,8 @@ lane run. What differs from a job on a standard worker:
 ## Enabling the lane
 
 The lane is off by default and off renders nothing: no namespace, no fetcher, no
-policy, no controller setting, no api rule. Set `workers.isolatedLane.enabled:
+policy, no controller setting, and no api setting that detects the lane (the api
+then refuses jobs bound to a site list with 503 `isolated_lane_unavailable`). Set `workers.isolatedLane.enabled:
 true` in the Helm values. Every knob is documented in the comments of
 `deploy/chart/values.yaml` under `workers.isolatedLane`.
 
@@ -300,8 +307,11 @@ on a live cluster yet.
   lane namespace), and the chart no longer renders the namespace, policies or
   fetcher. The api provisions no new lane workers, and a job naming a site list
   is refused at create (503 `isolated_lane_unavailable`). Runs already bound to
-  a list stay bound and queued, with a reason telling an admin to enable the lane,
-  and cannot be claimed by any other kind of worker.
+  a list stay bound and cannot be claimed by any other kind of worker. One with
+  no lane worker provisioned stays queued, with a reason telling an admin to
+  enable the lane; one whose lane worker was already provisioned or registered is
+  not recalled, so that worker may still run it, or fail it at the provision
+  deadline if it never registers.
 - **Generated fetcher token under Argo CD.** The `generated` source keeps the
   same token across `helm upgrade` by looking up the existing Secret. Argo CD
   renders with `helm template`, where that lookup returns nothing, so every sync

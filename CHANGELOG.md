@@ -27,21 +27,19 @@ through `[0.52.0]`.)
 - **Run lists avoid scanning unrelated messages for plan revision state ([#2041](https://github.com/vtmocanu/uzi/issues/2041)).**
   A concurrently built partial index keeps the plan revision lookup scoped to plan and plan_revising frames as run histories grow, reducing board refresh delays without changing revision flags.
 
-### Added
+- **A Codex run that reached its time limit and parked, or entered the completion hold, is no longer reported failed afterwards ([#1784](https://github.com/vtmocanu/uzi/issues/1784)).**
+  The worker used to run the finalize step for such a run even though the server had already marked it paused, and the server refused that step's Codex credential refresh, so the run ended `failed`. A confirmed park or hold now skips that step and the run stays parked with its work kept, ready to extend or resume.
 
 - **Isolated lane: provisioning follows the chart's lane setting ([#1965](https://github.com/vtmocanu/uzi/issues/1965)).**
-  The api now provisions isolated-lane workers for site-list-bound runs only when the lane is enabled, detected from `UZI_FETCHER_TOKEN_SHA256`, which the chart renders into the api only when `workers.isolatedLane.enabled` and `workers.enabled` are on; a lane that is on with the fetcher token Secret key missing reads as off (fail closed). Creating a job that names a site list (`egress_profile`) on an instance without the lane is refused with 503 `isolated_lane_unavailable` and no job is created. A run already bound (for example, created before the lane was turned off) stays queued, and its queued reason now says an admin must enable the isolated research lane in the deployment; that reason takes precedence over the ephemeral-provisioning-off reason, while the requires-docker reason still comes first.
+  The api now provisions isolated-lane workers for site-list-bound runs only when the lane is enabled, detected from `UZI_FETCHER_TOKEN_SHA256`, which the chart renders into the api only when `workers.isolatedLane.enabled` and `workers.enabled` are on; a lane that is on with the fetcher token Secret key missing reads as off (fail closed). Creating a job that names a site list (`egress_profile`) on an instance without the lane is refused with 503 `isolated_lane_unavailable` and no job is created. A run already bound (for example, created before the lane was turned off) with no lane worker provisioned for it stays queued, and its queued reason now says an admin must enable the isolated research lane in the deployment; that reason takes precedence over the ephemeral-provisioning-off reason, while the requires-docker reason still comes first. A lane worker already provisioned or registered for a bound run is not recalled when the lane goes off: it can still run the job, or fail it at the provision deadline if it never registers. The 503 is checked before the site list's allowance (403) and existence (404) checks.
+
+### Added
 
 - **Renovate proposes grouped Codex runtime upgrades.**
   Stable native-runtime releases follow the existing seven-day release age and nightly update schedule. Each PR updates the source commit and both musl archive checksums together; installer consistency checks and runtime pin parity block partial upgrades until the required compatibility work is complete.
 
 - **An ephemeral worker is now held idle for up to 2 hours after its run, so a same-repo follow-up reuses it ([#2006](https://github.com/vtmocanu/uzi/issues/2006)).**
   When an ephemeral worker finishes its run it keeps its warm clone and caches for a lease (`UZI_EPHEMERAL_LEASE`, chart `workers.ephemeralLease`, default 2h, maximum 2h, `0` restores the old tear-down-at-finish behaviour), and a later run from the same owner on the same repository and branch (a rework or follow-up) claims it instead of provisioning a new one. The lease ends early on a cordon, roll or restart, and the oldest leased worker is evicted if you hit the per-user ephemeral cap. `uzi worker list` shows `(leased, 1h12m left)` and the worker JSON carries `ephemeral_lease_expires_at`. The Workers page shows a `leased · <time> left` badge, and its hosted-worker quota count no longer includes ephemeral workers, matching the server.
-
-### Fixed
-
-- **A Codex run that reached its time limit and parked, or entered the completion hold, is no longer reported failed afterwards ([#1784](https://github.com/vtmocanu/uzi/issues/1784)).**
-  The worker used to run the finalize step for such a run even though the server had already marked it paused, and the server refused that step's Codex credential refresh, so the run ended `failed`. A confirmed park or hold now skips that step and the run stays parked with its work kept, ready to extend or resume.
 
 ## [0.85.0] - 2026-09-26
 
