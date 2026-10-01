@@ -55,9 +55,11 @@ func LeaseInterval(d time.Duration) pgtype.Interval {
 // is nothing left to roll back to, the outer transaction is the server's to abort, and the caller's
 // own commit then fails and surfaces the error as it would for any failed terminal transaction.
 //
-// Only a run whose FINAL status is completed or failed enters a lease. A report of failed that
-// setState routed to cancelled (the stop and plan-reject routes) ends cancelled, and a
-// worker-reported cancelled gets no lease (PRD #2006). For a completed run it first releases the
+// Only a run whose FINAL status is completed or failed enters a lease (the plan decision: only
+// worker-reported completed/failed terminals with no open hold enter a lease). A report of failed
+// that setState routed to cancelled (the operator stop and cancel routes) ends cancelled and gets
+// no lease, as does a worker-reported cancelled. A plan-rejected run ends failed
+// (SetRunFailedPlanRejected), so it may lease. For a completed run it first releases the
 // completing generation's custody hold (the same ReleaseCustodyHoldExact call, with publication
 // evidence, SetState makes post-commit), then starts the worker's lease with EnterEphemeralLease.
 //
@@ -143,7 +145,13 @@ func (s *Service) probeLeaseClaim(admitted, rebound bool) {
 // so a lease that expired after the admission instant refuses. A refusal (any count other than 1, or
 // a unique violation because the provisioner bound the run to another ephemeral worker first) rolls
 // the claim (its run update and custody hold) back to the savepoint and reports idle, exactly the
-// no-candidate outcome. A lease-off service, a non-ephemeral worker or an unleased one passes the
+// no-candidate outcome. A rebind racing the provisioner has two outcomes, not one. When the
+// provisioner's insert lands first the rebind hits the unique violation above. When ClaimRun has
+// already locked the run FOR UPDATE and the provisioner's CreateEphemeralHostedWorker has inserted
+// its uq_workers_ephemeral_run entry, the provisioner's FK check blocks on the run while the rebind
+// waits on the uncommitted unique entry, and Postgres aborts one side with 40P01 (deadlock): the
+// claim then returns an error (a 500; the agent's next claim poll retries) or provisionOne errors
+// (the next provisioning pass retries). Neither corrupts state, and there is no retry here. A lease-off service, a non-ephemeral worker or an unleased one passes the
 // no-lease params (NULL columns), where ClaimRun's lease arm admits nothing.
 func (s *Service) claimRunInTx(ctx context.Context, tx pgx.Tx, qtx *store.Queries, workerID uuid.UUID, reread store.Worker, params store.ClaimRunParams) (store.Run, bool, error) {
 	leased := s.ephemeralLease > 0 && reread.Ephemeral && reread.LeaseSince.Valid &&
@@ -231,6 +239,9 @@ func (s *Service) claimRunLeasedNoSnapshot(ctx context.Context, wkr store.Worker
 	qtx := store.New(tx)
 	locked, err := qtx.GetWorkerForUpdate(ctx, wkr.ID)
 	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil // the worker row was deleted (reaper) since RequireWorker: idle
+		}
 		return nil, err
 	}
 	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, locked, params)

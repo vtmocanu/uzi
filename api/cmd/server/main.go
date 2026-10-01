@@ -584,7 +584,7 @@ func run() error {
 	wsvc.SetCompletionInterlockSettings(settingsCache)
 
 	// Completion-interlock permit transaction (PRD #1226 M2, D4): the permit-gated completion
-	// (completeRunWithPermit) consumes the permit and writes `completed` atomically through a pgx
+	// (completeRunWithPermitLease) consumes the permit and writes `completed` atomically through a pgx
 	// transaction opened on the shared pool. A nil beginner is fail-closed (an interlocked
 	// completion errors rather than completing non-atomically), so this wiring is what lets an
 	// interlocked run complete at all.

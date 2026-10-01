@@ -355,7 +355,7 @@ SELECT clock_timestamp()::timestamptz AS at;
 -- before the run's). lease_since is clock_timestamp(), so the lease starts at the commit-side
 -- instant, not the transaction-start one. Matches exactly one row, and only when ALL hold:
 --   * the worker is ephemeral, outside the isolated lane, not draining, and bound to @run_id;
---   * the run is terminal, was served by THIS worker, is repo-backed, carries no egress profile and
+--   * the run ended completed or failed (never cancelled), was served by THIS worker, is repo-backed, carries no egress profile and
 --     has a derivable effective branch identity (fn_run_lease_branch non-NULL) -- the identity the
 --     lease stores, so a follow-up must match it (a run with none never leases: fail closed);
 --   * the worker holds no other non-terminal run and no OPEN custody hold (the caller releases a
@@ -374,7 +374,7 @@ UPDATE workers w
    AND w.draining_since IS NULL
    AND r.id = @run_id::uuid
    AND r.worker_id = w.id
-   AND r.status IN ('completed', 'failed', 'cancelled')
+   AND r.status IN ('completed', 'failed')
    AND r.repo_id IS NOT NULL
    AND r.egress_profile_id IS NULL
    AND fn_run_lease_branch(r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot) IS NOT NULL

@@ -637,15 +637,20 @@ func TestEnterEphemeralLeaseGuardsLiveDB(t *testing.T) {
 			t.Fatalf("lease_since %v is not fresh", since.Time)
 		}
 	})
-	for _, st := range []string{"failed", "cancelled"} {
-		t.Run("a "+st+" run without a hold leases too (the caller decides which terminals may)", func(t *testing.T) {
-			fx := newFleetFixture(t)
-			w, run := fresh(fx, leaseRun{iid: i64p(61), status: st})
-			if enter(fx, w, run) != 1 {
-				t.Fatal("lease not entered")
-			}
-		})
-	}
+	t.Run("a failed run without a hold leases too", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		w, run := fresh(fx, leaseRun{iid: i64p(61), status: "failed"})
+		if enter(fx, w, run) != 1 {
+			t.Fatal("lease not entered")
+		}
+	})
+	t.Run("a cancelled run never leases", func(t *testing.T) {
+		fx := newFleetFixture(t)
+		w, run := fresh(fx, leaseRun{iid: i64p(61), status: "cancelled"})
+		if enter(fx, w, run) != 0 {
+			t.Fatal("a cancelled run entered a lease")
+		}
+	})
 	guards := []struct {
 		name string
 		mk   func(fx *fleetFixture) (uuid.UUID, uuid.UUID)

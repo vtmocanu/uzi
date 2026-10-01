@@ -4396,7 +4396,7 @@ type GetConsumedCompletionPermitParams struct {
 }
 
 // PRD #1226 M2 (D4): the retry-after-response-loss probe. When a completed report arrives for
-// an ALREADY-terminal run, completeRunWithPermit checks whether THIS worker's permit for the
+// an ALREADY-terminal run, completeRunWithPermitLease checks whether THIS worker's permit for the
 // identity was already consumed (i.e. we completed it once and the response was lost); if so it
 // returns idempotent success instead of a spurious denial. branch binds the probe to the
 // worker-reported source branch, the same identity component the unconsumed lookup uses. FOR
@@ -4692,7 +4692,7 @@ SELECT id, user_id, repo_id, issue_iid, issue_title, issue_description, status, 
 
 // PRD #1227 M1: the owner-decision transaction's row lock. DecideCompletion opens a pgx
 // transaction and SELECTs the run FOR UPDATE through this so a partial/accept decision
-// serializes against a racing decision (or a completeRunWithPermit consume) on the same run —
+// serializes against a racing decision (or a completeRunWithPermitLease consume) on the same run —
 // the FOR UPDATE row lock is the mutex, exactly as GetRunOwnedByWorkerForUpdate is for the
 // completion transaction. DecideCompletion is OWNER-SCOPED: it re-checks ownership against the
 // LOCKED row (locked.user_id == caller) after the lock, so a foreign caller — including an
@@ -5572,7 +5572,7 @@ type GetRunOwnedByWorkerForUpdateParams struct {
 	WorkerID pgtype.UUID `json:"worker_id"`
 }
 
-// PRD #1226 M2 (D4): the completion transaction's row lock. completeRunWithPermit opens a
+// PRD #1226 M2 (D4): the completion transaction's row lock. completeRunWithPermitLease opens a
 // pgx transaction and SELECTs the run FOR UPDATE through this so two concurrent completed
 // reports (a retry after response loss) serialize — the second blocks until the first
 // commits and then sees the terminal row. Worker-scoped like GetRunOwnedByWorker: a run the
@@ -5799,7 +5799,7 @@ type GetUnconsumedCompletionPermitParams struct {
 // fence). branch binds the permit to the worker-reported source branch so a permit issued for
 // branch A at head H cannot complete a report for branch B at the same head H. No row
 // (identity/head/revision/branch mismatch, already consumed, or a different worker) returns
-// pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
+// pgx.ErrNoRows, which completeRunWithPermitLease reads as "no matching permit -> the gated
 // completion stays non-terminal".
 func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnconsumedCompletionPermitParams) (RunCompletionPermit, error) {
 	row := q.db.QueryRow(ctx, getUnconsumedCompletionPermit,
@@ -13775,7 +13775,7 @@ WHERE id = $11 AND worker_id = $12
   -- generation-less legacy report is honoured by that nil-guarded fence and the best-effort Go
   -- status check in SetState is a TOCTOU — so the guard lives in SQL, mirroring SetRunRunning's
   -- own ` + "`" + `status <> 'paused'` + "`" + ` exclusion. A live legacy ` + "`" + `completed` + "`" + ` always runs on a running,
-  -- non-released row (the interlocked path is completeRunWithPermit, fenced on its own locked row),
+  -- non-released row (the interlocked path is completeRunWithPermitLease, fenced on its own locked row),
   -- so this never blocks a legitimate completion.
   AND status <> 'paused' AND claim_released_at IS NULL
   -- PRD #1908: a job is completed only from a live (claimed or running) status. In particular the
@@ -16122,7 +16122,7 @@ type UpsertCompletionPermitParams struct {
 // PRE-EXISTING row. The rebind matters on an A->B REQUEUE: worker A issued a permit for
 // (run, revision, head), the run requeued to worker B in a claimable state, and B re-requests
 // for the same identity. Without the rebind the row keeps A's issued_by_worker_id, so B's
-// completeRunWithPermit (which fences on B's id) can never find its permit -> the run is
+// completeRunWithPermitLease (which fences on B's id) can never find its permit -> the run is
 // PERMANENTLY non-terminal. Rebinding issued_by_worker_id to EXCLUDED (B) hands the permit to
 // whoever last requested it.
 //
@@ -16131,7 +16131,7 @@ type UpsertCompletionPermitParams struct {
 // issued_at untouched preserves the M2 idempotency contract (a re-request returns the SAME
 // permit rather than re-issuing one). Not touching consumed_at is provably correct: consumed_at
 // is NULL on every ON CONFLICT path here, because consume+complete are atomic in
-// completeRunWithPermit (so consumed ⇔ status='completed'), and a completed run's re-request is
+// completeRunWithPermitLease (so consumed ⇔ status='completed'), and a completed run's re-request is
 // rejected at loadClaimedInterlockedRun's status gate (completion_permit.go) BEFORE it ever
 // reaches this upsert. (EXCLUDED.<col>, not the target table by name, because sqlc's analyzer
 // treats a target-table self-reference in a DO UPDATE SET value as ambiguous — so do NOT

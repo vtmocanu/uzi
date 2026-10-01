@@ -119,8 +119,8 @@ and download everything again.
   the same branch. A run for any other repository, branch or owner never
   claims a leased worker. A leased worker does not count as a free slot for
   those runs.
-- **Which runs.** Issue runs, and `mr_rework` runs that continue the same
-  branch. Other kinds (chat, task, job, prompt, judge and self-improve runs), a
+- **Which runs.** Issue runs, `mr_rework` runs and `ci_fix` runs that continue
+  the same branch (a `ci_fix` run's branch is the ref of the failure it fixes). Other kinds (chat, task, job, prompt, judge and self-improve runs), a
   run without a repository, a run on an egress profile, and a worker on the
   isolated research lane never reuse a lease.
 - **How long.** 2 hours by default, which is also the maximum: the operator sets
@@ -129,8 +129,9 @@ and download everything again.
   finishes, as before. A value above 2h or a malformed one refuses to boot the
   api.
 - **At the cap.** A leased worker still counts toward your per-user ephemeral
-  cap. If a new run needs a slot and you are at the cap, the oldest leased
-  worker is evicted first.
+  cap. If a new run needs a slot and you are exactly at the cap, the oldest
+  releasable leased worker (one that is not busy and holds no custody hold) is
+  evicted first. An owner over the cap is refused instead.
 - **What ends it early.** A cordon, a roll to a new worker image, a restart of
   the worker, or the owner deleting it. A cordoned or restarted worker never
   keeps a lease. When the lease runs out the worker is removed by the normal

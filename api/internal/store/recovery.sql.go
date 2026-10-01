@@ -534,7 +534,7 @@ type GetSettleCompletionPermitHeadParams struct {
 
 // Issue #1582 M1 rework: the head of the completion permit an INTERLOCKED run's completion
 // consumed — the server-held fact the predecessor-settle request's pushed_sha (the SUCCESSOR
-// generation's acknowledged pushed head) must match. completeRunWithPermit consumes one permit
+// generation's acknowledged pushed head) must match. completeRunWithPermitLease consumes one permit
 // for (run, the LOCKED row's contract_revision, head) in the same transaction that writes
 // 'completed', fenced to the completing worker. InvalidatePriorCompletionPermits also stamps
 // consumed_at, but only on revisions BELOW the one a decision bumped to, so a consumed permit

@@ -52,6 +52,23 @@ func TestClaimNoSnapshotThroughLeaseRebindsLiveDB(t *testing.T) {
 	}
 }
 
+// TestClaimNoSnapshotWorkerDeletedIsIdleLiveDB: the worker row is deleted (reaper) after the
+// caller loaded it and before the claim locks it. The no-snapshot lease path reports idle, as the
+// old auto-commit ClaimRun path did, rather than a raw pgx.ErrNoRows (a 500 at the handler).
+func TestClaimNoSnapshotWorkerDeletedIsIdleLiveDB(t *testing.T) {
+	e := newLeaseEnv(t)
+	svc := e.service(2*time.Hour, e.pool)
+	w, _, _ := e.seedLeasedWorker(t, 0)
+	wkr := e.workerRow2(w)
+	if _, err := e.pool.Exec(e.ctx, `DELETE FROM workers WHERE id = $1`, w); err != nil {
+		t.Fatalf("delete worker: %v", err)
+	}
+	p, err := svc.Claim(e.ctx, wkr, nil)
+	if err != nil || p != nil {
+		t.Fatalf("claim = (%+v, %v), want idle (nil, nil)", p, err)
+	}
+}
+
 // TestClaimNoSnapshotLeaseClocksLiveDB: the clock discipline holds on the no-snapshot path. The lease
 // has `window` left when the claim starts and expires while it waits for the worker row.
 //   - admission clock: admission reads a fresh clock after the wait, so nothing is admitted; the
@@ -279,9 +296,10 @@ func TestEphemeralLeaseTerminalAtomicNoHoldLiveDB(t *testing.T) {
 }
 
 // TestEphemeralLeaseOnlyCompletedOrFailedFinalStatusLiveDB: a `failed` report that setState routes
-// to cancelled (an operator stop, cancel or plan reject pre-stamped on the run) ends the run
-// `cancelled`. The lease is keyed on the run's FINAL status, so a worker-reported-then-routed
-// cancel gets no lease even with no custody hold open.
+// to cancelled (an operator stop or cancel pre-stamped on the run) ends the run `cancelled`. The
+// lease is keyed on the run's FINAL status, so a worker-reported-then-routed cancel gets no lease
+// even with no custody hold open. A plan-rejected run is not in this set: it ends failed
+// (SetRunFailedPlanRejected) and may lease.
 func TestEphemeralLeaseOnlyCompletedOrFailedFinalStatusLiveDB(t *testing.T) {
 	for _, stopKind := range []string{"cancelled", "stopped"} {
 		t.Run(stopKind, func(t *testing.T) {

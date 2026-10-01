@@ -534,10 +534,10 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 //
 // A nil txBeginner is fail-closed (error): an interlocked run never completes non-atomically.
 //
-// lease is the PRD #2006 lease outcome: on an ephemeral worker with the lease on, the permit transaction locks the worker row BEFORE the run
-// row and, after the terminal write, releases the completed run's custody hold and enters the
-// worker's lease before it commits, so the completion, the release and the lease become visible
-// together. The outcome is zero on every other path (lease off, a non-ephemeral worker, a
+// lease is the PRD #2006 lease outcome: on an ephemeral worker with the lease on, the permit
+// transaction locks the worker row BEFORE the run row and, after the terminal write, releases the
+// completed run's custody hold and enters the worker's lease before it commits, so the completion,
+// the release and the lease become visible together. The outcome is zero on every other path (lease off, a non-ephemeral worker, a
 // non-applied completion), where SetState's post-commit steps run exactly as before.
 func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, completedParams store.SetRunCompletedParams) (rows int64, idempotent bool, lease terminalLeaseOutcome, err error) {
 	if s.txBeginner == nil {
