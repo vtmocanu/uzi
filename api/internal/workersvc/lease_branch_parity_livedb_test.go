@@ -51,7 +51,7 @@ func goLeaseBranch(kind string, branch, pipelineRef *string, iid *int64, snapsho
 	}
 }
 
-// TestLeaseBranchParityLiveDB pins fn_run_lease_branch (migration 00279, the single SQL identity
+// TestLeaseBranchParityLiveDB pins fn_run_lease_branch (migration 00282, the single SQL identity
 // every lease claim and placement predicate shares) to the Go sources it mirrors, over valid,
 // malformed and empty inputs, including a worker-reported issue branch that must never become the
 // identity. Mutating either side (the SQL function's 'agent/issue-' prefix, a kind
