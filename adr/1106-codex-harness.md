@@ -489,3 +489,64 @@ The source inventory is pinned to `bc5a0a8b11f5c98a7067c1fc4202d37a0f27f92e`:
   concurrency and supersedes the earlier run-long seat lock. Coordinated refresh
   and durable latest-state recovery remain production requirements; prior-token
   reuse remains unproven.
+
+## Amendment: runtime 0.159.3 and independent effort (2026-10-01)
+
+The pinned native package advances from 0.156.1 to 0.159.3 (source commit
+01fc69f4026735edfdf6789820549727a4867b11). `gpt-6.1-sol` joins the curated
+vocabulary and becomes the worker provider fallback. Explicit model defaults
+remain authoritative; task-review and PR-description built-ins stay at
+`gpt-6-sol`. The new model's catalog requires client 0.153.0 or newer, lists
+low through ultra, uses shell_command and declares no default service tier.
+Uzi exposes its existing five effort levels, deliberately excluding ultra.
+
+Both product effort defaults are medium. The existing nullable default_effort
+retains the Claude preference; nullable default_codex_effort retains Codex's.
+Backfill copies existing non-NULL values verbatim, including blanks. Each
+claim reads only the lane for its frozen harness, then resolves NULL/blank to
+medium. There is no scheduled/per-run freeze and no new claim payload field.
+The default is therefore picked at claim time for queued and resumed runs.
+Down retains the original preference and drops the independent Codex value.
+Storage stays unconstrained text, with current validation at write surfaces,
+so a future runtime-default choice need not reshape the column.
+
+The old Codex executor ignored the claim's effort, and run/advice transports
+used modelReasoningEffort instead of the upstream turn/start wire key effort.
+Both gaps are corrected with real-executor and wire-key regressions. Review
+and PR-description helpers keep their existing absence-of-effort behavior.
+
+The additive protocol capability codex_runtime_v2 proves the 0.159.3 runtime/
+catalog baseline and effort consumption. Every Codex claiming, placement and
+affinity predicate requires it independently of user requirements and their
+kill-switch. Older workers queue until an updated image is available; a new
+worker retains legacy capabilities for an older API to filter and use.
+
+### Upstream compatibility review
+
+Reviewed the stable release notes for 0.157.0, 0.157.1, 0.158.0 and
+0.159.0 through 0.159.3, plus the full source delta from 0.156.1.
+The sparse 0.157.1 notes were checked against its ten-file source delta:
+the executable changes are Windows spawn fixes; the Unix paths are unchanged.
+
+- App-server error enum: flexUnavailable and tooManyDenials are new scalar
+  tags, classified through the bounded allowlist. Core InvalidPrompt projects
+  to other; no arbitrary provider text or payload is echoed.
+- Token usage: consumed camel-case total/last breakdowns are unchanged and
+  still expose no service tier. Standard cost remains an estimate.
+- Initialization/auth: initialized remains a notification without params.
+  Explicit gateway OAuth is optional and unused by the fixed OpenAI provider.
+- Trust/config: explicit project trust_level=untrusted continues to prevent
+  automatic promotion. OpenAI still requires account authentication and enables
+  WebSockets; its built-in provider cannot be replaced by a same-name table.
+- Dynamic tools: consumed registration/call/response wire types are unchanged.
+  The new model's native shell shape is included in the real-binary deny proof.
+- Persistence: rollout compression remains opt-in and disabled by default;
+  uzi uses neither the compression feature nor rollout/compress.
+- New instant_interrupt is opt-in and disabled; thread-history pagination,
+  gateway OAuth, Windows launch fixes, TUI changes and Bedrock catalogs are not
+  used by uzi's fixed stdio/OpenAI composition.
+
+The GPT-6.1 Sol Standard row was verified against the official model page on
+2026-10-01: input/cached/cache-write/output are 2.00/0.10/2.50/10.00 per million
+tokens, and 4.00/0.20/5.00/15.00 above 272K input, applying to the full response.
+See https://developers.openai.com/api/docs/models/gpt-6.1-sol.

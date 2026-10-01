@@ -42,7 +42,7 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		placed bool
 	}{
 		{"without codex_harness_v1 is not a placement", []string{}, false},
-		{"with codex_harness_v1 is a placement", []string{"codex_harness_v1"}, true},
+		{"with codex_harness_v1 is a placement", []string{"codex_harness_v1", "codex_runtime_v2"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" for a Codex run", func(t *testing.T) {
 			fx, run := seed(t, 190, tc.protos, false)
@@ -94,8 +94,8 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		protos []string
 		placed bool
 	}{
-		{"without codex_custom_model_v1", []string{"codex_harness_v1"}, false},
-		{"with codex_custom_model_v1", []string{"codex_harness_v1", "codex_custom_model_v1"}, true},
+		{"without codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2"}, false},
+		{"with codex_custom_model_v1", []string{"codex_harness_v1", "codex_runtime_v2", "codex_custom_model_v1"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" and a Codex run on a custom-model lane", func(t *testing.T) {
 			fx, run := seed(t, 192, tc.protos, false)

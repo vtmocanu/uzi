@@ -51,7 +51,7 @@ func seedHoldCase(t *testing.T, env codexTestEnv, tc codexHoldCase) holdCaseFixt
 	t.Helper()
 	userID, workerID, repoID := env.seedCodexInfra(t)
 	env.exec(`UPDATE workers SET protocol_capabilities = $2, last_heartbeat_at = now() WHERE id = $1`,
-		workerID, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1})
+		workerID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
 	fx := holdCaseFixture{userID: userID, workerID: workerID}
 	if tc.alias == "static" {
 		aliasID := env.seedStaticAPIKey(t, userID, "codex-key-"+uuid.NewString(), codexToken("sk"))

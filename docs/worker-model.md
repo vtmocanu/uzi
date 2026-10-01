@@ -42,7 +42,7 @@ credential for), and only then reads that harness's model lane:
    harness.
 2. Your **worker model** for that harness, if set.
 3. The harness fallback: the `lead` template's `model` (`opus` by default)
-   for Claude, or `gpt-6-astra` for Codex.
+   for Claude, or `gpt-6.1-sol` for Codex.
 4. Whatever the underlying SDK/your account defaults to.
 
 An incompatible frozen schedule or legacy model (e.g. a Claude alias pinned
@@ -55,7 +55,7 @@ uses your Claude lane**, whichever harness is your default.
 ## Custom Codex model
 
 Codex's dropdown offers the curated `gpt-6-astra`, `gpt-5.6-sol` and
-`gpt-6-sol`, plus **Other (custom model ID)**, the same escape hatch
+`gpt-6-sol` and `gpt-6.1-sol`, plus **Other (custom model ID)**, the same escape hatch
 Claude has always had. uzi validates the string for length and unsafe
 characters but makes no provider call at save time; an unavailable or
 unsupported ID only fails visibly on your first run, exactly like an
@@ -123,3 +123,14 @@ detail page and by `uzi run get`.
 - **Separate from reasoning effort.** Your [reasoning
   effort](./worker-effort.md), which controls how hard the model thinks,
   is shared across both harnesses; see that page.
+
+## Current Codex worker baseline
+
+The current Codex worker uses runtime 0.159.3 and defaults to `gpt-6.1-sol`
+when no worker-model override is set. Explicit model preferences remain
+unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
+keep separate overrides. See [Reasoning effort](worker-effort.md).
+
+Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
+silently use the old model/catalog or ignore the requested effort. Codex runs
+queue until the worker image rolls, on hosted workers and compose alike.

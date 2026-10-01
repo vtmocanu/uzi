@@ -66,7 +66,7 @@ func (e codexTestEnv) seedCapableCodexWorker(t *testing.T, userID uuid.UUID) uui
 	id := uuid.New()
 	e.exec(`INSERT INTO workers (id, user_id, name, token_hash, status, protocol_capabilities)
 	        VALUES ($1, $2, $3, $4, 'online', $5)`,
-		id, userID, "codexw-"+id.String()[:8], id[:], []string{capability.CodexHarnessV1})
+		id, userID, "codexw-"+id.String()[:8], id[:], []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 	return id
 }
 
@@ -155,7 +155,7 @@ func (e codexTestEnv) claimInOwnTx(t *testing.T, userID, workerID uuid.UUID) (pg
 		_ = tx.Rollback(e.ctx)
 		t.Fatalf("set lock_timeout: %v", err)
 	}
-	run, err := e.q.WithTx(tx).ClaimRun(e.ctx, e.codexClaimParams(userID, workerID, []string{capability.CodexHarnessV1}))
+	run, err := e.q.WithTx(tx).ClaimRun(e.ctx, e.codexClaimParams(userID, workerID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}))
 	if err != nil {
 		_ = tx.Rollback(e.ctx)
 		t.Fatalf("claim run in tx (worker %s): %v", workerID, err)

@@ -59,7 +59,7 @@
     "plan_max_revisions": 3,
     "question_max": 5,
     "question_timeout_seconds": 86400,
-    "default_effort": "xhigh",
+    "default_effort": "medium",
     "attribution_enabled": true,
     "skill_max_bytes": 65536,
     "skills_max_per_run": 32,

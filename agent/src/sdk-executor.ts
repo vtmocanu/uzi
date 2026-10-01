@@ -1404,7 +1404,7 @@ export class SdkExecutor implements Executor {
     // and issue #916 attribution are set ONLY when present in the config (never an explicit
     // undefined); when a key is absent the adapter omits it and the SDK applies its own
     // fallback. The runtime adds no default of its own — the API is the policy source and
-    // now populates effort with the owner's choice or the uzi default `xhigh` for an
+    // now populates effort with the owner's choice or the uzi default `medium` for an
     // inheriting owner (issue #1157). Both reach the implement turn too, via the
     // `baseConfig` spread.
     const effort = ctx.config?.default_effort;

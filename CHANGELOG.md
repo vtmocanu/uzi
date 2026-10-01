@@ -22,6 +22,9 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+- **Codex uses the 0.159.3 runtime and defaults to GPT-6.1 Sol.**
+  GPT-6.1 Sol is available in the Codex model picker, with current Standard pricing estimates. Claude and Codex each inherit medium effort, with separate saved preferences; existing explicit shared preferences are copied to Codex during upgrade. Codex now honors claimed effort through the app-server turn parameter. Task-review and PR-description helpers keep their existing model and runtime effort behavior. Codex runs wait for a worker with the current runtime during the worker roll. See [worker effort](docs/worker-effort.md).
+
 ### Fixed
 
 - **Run lists avoid scanning unrelated messages for plan revision state ([#2041](https://github.com/vtmocanu/uzi/issues/2041)).**

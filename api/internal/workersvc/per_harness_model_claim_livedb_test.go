@@ -167,9 +167,9 @@ func TestClaimCustomCodexModelGateLiveDB(t *testing.T) {
 		e := setupInterlockLiveDB(t)
 		lane := customCodexModel
 		e.setUserCodexLane(t, &lane)
-		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1})
+		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 		runID := e.seedCodexIssueRunWithModel(t, nil) // NULL model ⇒ effective root = the custom lane
-		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1}, false)); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false)); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("custom-root Codex run claimed by a codex_harness_v1-only worker (err=%v); the D6 clause must block it", err)
 		}
 		if s := e.runStatus(t, runID); s != "queued" {
@@ -181,9 +181,9 @@ func TestClaimCustomCodexModelGateLiveDB(t *testing.T) {
 		e := setupInterlockLiveDB(t)
 		lane := customCodexModel
 		e.setUserCodexLane(t, &lane)
-		capable := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1})
+		capable := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
 		runID := e.seedCodexIssueRunWithModel(t, nil)
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}, false))
 		if err != nil {
 			t.Fatalf("codex_custom_model_v1 worker must claim the custom-root run: %v", err)
 		}
@@ -196,10 +196,10 @@ func TestClaimCustomCodexModelGateLiveDB(t *testing.T) {
 		e := setupInterlockLiveDB(t)
 		lane := customCodexModel
 		e.setUserCodexLane(t, &lane) // custom lane, but the frozen curated model overrides it
-		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1})
+		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 		curated := curatedCodexModel
 		runID := e.seedCodexIssueRunWithModel(t, &curated) // frozen curated model ⇒ effective root curated
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false))
 		if err != nil {
 			t.Fatalf("a curated frozen model must be claimable by a codex_harness_v1-only worker even with a custom lane: %v", err)
 		}
@@ -210,9 +210,9 @@ func TestClaimCustomCodexModelGateLiveDB(t *testing.T) {
 
 	t.Run("NULL lane ⇒ claimable by codex_harness_v1-only worker", func(t *testing.T) {
 		e := setupInterlockLiveDB(t) // no lane set ⇒ NULL
-		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1})
+		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 		runID := e.seedCodexIssueRunWithModel(t, nil) // NULL model, NULL lane ⇒ effective root NULL ⇒ curated
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false))
 		if err != nil {
 			t.Fatalf("a NULL-lane Codex run must be claimable by a codex_harness_v1-only worker: %v", err)
 		}
@@ -238,7 +238,7 @@ func TestClaimCustomCodexReviewExemptLiveDB(t *testing.T) {
 	e.setUserCodexLane(t, &lane)
 
 	t.Run("codex task-review run is claimable by a codex_harness_v1-only worker", func(t *testing.T) {
-		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1})
+		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 		target := e.seedCompletedTaskTarget(t)
 		reviewID := e.seedCodexTaskRun(t, &target)
 
@@ -246,10 +246,10 @@ func TestClaimCustomCodexReviewExemptLiveDB(t *testing.T) {
 		if e.healthRowFor(t, reviewID).CodexCustomRoot {
 			t.Fatal("a codex task-review run must NOT be flagged codex_custom_root (review_target_run_id exempt)")
 		}
-		if n := e.claimableForRun(t, e.withHeartbeatWorker(t, reviewID, []string{capability.CodexHarnessV1})); n == 0 {
+		if n := e.claimableForRun(t, e.withHeartbeatWorker(t, reviewID, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})); n == 0 {
 			t.Fatal("CountOnlineWorkersClaimableForRun must count a codex_harness_v1-only worker for a review run")
 		}
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false))
 		if err != nil {
 			t.Fatalf("a codex task-review run must be claimable by a codex_harness_v1-only worker despite a custom lane: %v", err)
 		}
@@ -259,21 +259,21 @@ func TestClaimCustomCodexReviewExemptLiveDB(t *testing.T) {
 	})
 
 	t.Run("ordinary codex task handoff with the same custom lane is NOT claimable by harness-only", func(t *testing.T) {
-		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1})
+		harnessOnly := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 		handoffID := e.seedCodexTaskRun(t, nil) // review_target_run_id NULL ⇒ NOT exempt
 
 		if !e.healthRowFor(t, handoffID).CodexCustomRoot {
 			t.Fatal("a custom-lane codex task HANDOFF (review_target_run_id NULL) must be flagged codex_custom_root")
 		}
-		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1}, false)); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(harnessOnly, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false)); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("a custom-lane codex task handoff must NOT be claimable by a codex_harness_v1-only worker (err=%v)", err)
 		}
 		if s := e.runStatus(t, handoffID); s != "queued" {
 			t.Fatalf("handoff must stay queued; status = %q", s)
 		}
 
-		capable := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1})
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}, false))
+		capable := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}, false))
 		if err != nil {
 			t.Fatalf("a codex_custom_model_v1 worker must claim the custom-lane handoff: %v", err)
 		}
@@ -311,17 +311,17 @@ func TestClaimCustomCodexPeerSpreadMirrorLiveDB(t *testing.T) {
 	// codex_custom_model_v1, so neither of the claimant's OWN D3/D6 clauses blocks it — isolating the
 	// PEER clause.
 	newBusyClaimant := func() uuid.UUID {
-		me := e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}, 2)
+		me := e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}, 2)
 		e.seedActiveRunOwnedBy(t, me)
 		return me
 	}
-	claimantCaps := []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}
+	claimantCaps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}
 
 	t.Run("harness-only idle peer is NOT a custom-root spread target; busy claimant claims", func(t *testing.T) {
 		me := newBusyClaimant()
 		// Idle, cap=2, advertises codex_harness_v1 but NOT codex_custom_model_v1: it clears the
 		// codex-harness peer mirror, so ONLY the custom-model peer mirror can exclude it.
-		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1}, 2)
+		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, 2)
 		runID := e.seedCodexQueuedRun(t) // NULL model + custom lane ⇒ custom-root
 
 		run, err := e.q.ClaimRun(e.ctx, e.claimParams(me, claimantCaps, false))
@@ -339,7 +339,7 @@ func TestClaimCustomCodexPeerSpreadMirrorLiveDB(t *testing.T) {
 	t.Run("custom-capable idle peer IS a custom-root spread target; busy claimant defers", func(t *testing.T) {
 		me := newBusyClaimant()
 		// Idle, cap=2, advertises BOTH capabilities: it can run a custom root, so it is a valid target.
-		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}, 2)
+		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}, 2)
 		runID := e.seedCodexQueuedRun(t)
 
 		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(me, claimantCaps, false)); !errors.Is(err, pgx.ErrNoRows) {
@@ -373,12 +373,12 @@ func TestCountAndProjectionCustomCodexLiveDB(t *testing.T) {
 	e.setUserCodexLane(t, &custom)
 
 	t.Run("custom-root run: harness-only excluded, custom-capable counted", func(t *testing.T) {
-		e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1}) // harness-only, must NOT count
+		e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}) // harness-only, must NOT count
 		runID := e.seedCodexIssueRunWithModel(t, nil)
 		if n := e.claimableForRun(t, runID); n != 0 {
 			t.Fatalf("custom-root run: claimable count with only a codex_harness_v1 worker = %d, want 0", n)
 		}
-		e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1})
+		e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
 		if n := e.claimableForRun(t, runID); n != 1 {
 			t.Fatalf("custom-root run: claimable count after adding a codex_custom_model_v1 worker = %d, want 1", n)
 		}
@@ -390,7 +390,7 @@ func TestCountAndProjectionCustomCodexLiveDB(t *testing.T) {
 	t.Run("curated lane run is not custom-root and stays claimable by harness-only", func(t *testing.T) {
 		curated := curatedCodexModel
 		e.setUserCodexLane(t, &curated)
-		e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1})
+		e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 		runID := e.seedCodexIssueRunWithModel(t, nil)
 		if e.healthRowFor(t, runID).CodexCustomRoot {
 			t.Fatal("a curated-lane run must NOT be flagged codex_custom_root")
@@ -427,7 +427,7 @@ func TestQueuedReasonNoCustomCodexCapableWorkerLiveDB(t *testing.T) {
 	}
 
 	t.Run("codex-harness worker but no custom-capable worker -> reasonNoCustomCodexCapableWorker", func(t *testing.T) {
-		e.seedWorker(t, []string{capability.CodexHarnessV1}) // online, harness-only
+		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}) // online, harness-only
 		runID := e.seedCodexIssueRunWithModel(t, nil)
 		got := svc.queuedReason(e.ctx, time.Now(), customRootRow(runID))
 		if got != reasonNoCustomCodexCapableWorker {
@@ -439,7 +439,7 @@ func TestQueuedReasonNoCustomCodexCapableWorkerLiveDB(t *testing.T) {
 	})
 
 	t.Run("custom-capable worker online -> falls through", func(t *testing.T) {
-		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1})
+		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
 		runID := e.seedCodexIssueRunWithModel(t, nil)
 		got := svc.queuedReason(e.ctx, time.Now(), customRootRow(runID))
 		if got == reasonNoCustomCodexCapableWorker {

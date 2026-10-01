@@ -16,7 +16,7 @@
 //
 // The ADR (`adr/1106-codex-harness.md:337-344`) requires the canonical project be
 // provisioned EXPLICITLY `untrusted` with `project_doc_max_bytes = 0`: pinned
-// 0.156.1 `thread_processor.rs` promotes trust when `trust_level.is_none()` (and, since 0.156, the
+// 0.159.3 `thread_processor.rs` promotes trust when `trust_level.is_none()` (and, since 0.156, the
 // config is not projectless), so an
 // unset value is unsafe. We emit an explicit `[projects."<cwd>"] trust_level =
 // "untrusted"` to avoid that branch.
@@ -174,10 +174,10 @@ function validateProductionConfigOptions(opts: CodexProductionConfigOptions): vo
 /**
  * Build the fixed production config used with `account/login/start` authentication.
  *
- * Pinned 0.156.1's built-in `openai` provider has `requires_openai_auth = true` and no
+ * Pinned 0.159.3's built-in `openai` provider has `requires_openai_auth = true` and no
  * configured base URL. That absence is load-bearing: API-key auth selects
  * `https://api.openai.com/v1`, while `chatgptAuthTokens` selects the ChatGPT Codex
- * backend. Pinned 0.156.1 merges configured providers with `or_insert`, so a caller cannot
+ * backend. Pinned 0.159.3 merges configured providers with `or_insert`, so a caller cannot
  * override the built-in `openai` provider with a partial table. Its production request and
  * stream retry defaults therefore remain active by design; the zero-retry custom-provider
  * settings belong only to deterministic fake-provider tests.
@@ -197,7 +197,7 @@ export function buildCodexProductionConfigToml(opts: CodexProductionConfigOption
  * is deliberately separate from {@link buildCodexProductionConfigToml}: production
  * keeps the built-in `openai` provider and emits no endpoint override.
  *
- * Pinned Codex 0.156.1's built-in provider has WebSockets enabled and cannot be
+ * Pinned Codex 0.159.3's built-in provider has WebSockets enabled and cannot be
  * overridden by a same-name provider table (`merge_configured_model_providers` uses
  * `or_insert`). Its app-server tests instead use a distinct custom provider with
  * `requires_openai_auth = true` and `supports_websockets = false`; this reproduces

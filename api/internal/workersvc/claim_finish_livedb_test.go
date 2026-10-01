@@ -66,7 +66,7 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 		last_heartbeat_at, snapshot_register_nonce, snapshot_epoch)
 		VALUES ($1, $2, $3, $4, 'online', $5, now(), 'nonce-B', 0)`,
 		fx.workerB, f.userID, "wb-"+fx.workerB.String(), fx.workerB[:],
-		[]string{capability.CodexHarnessV1, capability.RecoveryArchiveV1})
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1})
 	fx.svc = New(env.q, env.box, testParams())
 	fx.svc.SetTxBeginner(env.pool)
 	return fx
@@ -76,7 +76,7 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 func (fx *codexClaimFix) claimant(t *testing.T, capable bool) store.Worker {
 	t.Helper()
 	w := wkrRow(t, fx.env, fx.workerB)
-	w.ProtocolCapabilities = []string{capability.CodexHarnessV1}
+	w.ProtocolCapabilities = []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
 	if capable {
 		w.ProtocolCapabilities = append(w.ProtocolCapabilities, capability.RecoveryArchiveV1)
 	}

@@ -10,7 +10,7 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { JobRunner } from "../src/job-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { ClaimResponse, ChatClaimResponse, WorkerStats } from "../src/protocol.js";
-import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
+import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "../src/codex/codex-runtime-probe.js";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { StatsCollector } from "../src/stats.js";
 import { recordingLogger } from "./helpers.js";
@@ -924,7 +924,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", CODEX_HARNESS_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "credential_switch_v1", "wall_park_v1", "input_receipts_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -981,6 +981,13 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
   // build's renderer always carries the custom-root passthrough, so the two ride the same
   // advertise gate. Discriminating: mutating the worker.ts push to omit the custom cap
   // fails the advertising case; pushing it unconditionally fails the non-advertising case.
+  it("advertises the current runtime only with honest Codex availability", async () => {
+    for (const advertise of [true, false]) {
+      const caps = await advertisedCapabilities(fakeConfig({ codexHarness: { advertise, degraded: false, landlock: "available" } }));
+      assert.equal(caps?.includes(CODEX_RUNTIME_V2_CAPABILITY), advertise);
+    }
+  });
+
   it("advertises codex_custom_model_v1 exactly when codex_harness_v1 is advertised (PRD #1551 D6)", async () => {
     const advertising = await advertisedCapabilities(
       fakeConfig({ codexHarness: { advertise: true, degraded: false, landlock: "available" } }),

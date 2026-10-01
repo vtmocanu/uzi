@@ -6,65 +6,50 @@ audience: user
 
 # Reasoning effort
 
-Pick how hard the model reasons on your own runs: the lead orchestrator
-and the subagents that inherit it. This sets your own reasoning effort,
-overriding uzi's default just for you. Other users' runs are unaffected.
+Choose reasoning effort independently for your Claude and Codex runs in
+**Settings → Run defaults → Reasoning effort**. Both product defaults are
+**medium**. Leave a control on **Inherit** to use that product default, or
+choose `low`, `medium`, `high`, `xhigh` or `max` for that harness.
 
-**One setting, shared across harnesses.** Unlike [your worker
-model](./worker-model.md), which is a separate choice per harness, your
-reasoning effort is a single value that applies whichever harness (Claude
-or Codex) a run uses.
+Your explicit preference overrides the product default for the lead and its
+subagents. The setting is resolved when a worker claims the run, including a
+scheduled or already queued run and a resumed run; there is no per-schedule
+effort freeze. Other users and the shared lead template are unaffected.
 
-## Effort levels
+When upgrading from the shared setting, every existing explicit value is
+copied into the Codex setting and retained for Claude. An unset or blank
+preference inherits medium. Changing or clearing one harness's setting does
+not change the other. Schema rollback retains the original Claude/shared
+value but loses independently edited Codex preferences.
 
-- `low`
-- `medium`
-- `high`
-- `xhigh`
-- `max`
-- **Inherit** (uzi default: `xhigh`)
+## Set an override
 
-**Unset means the uzi default (`xhigh`).** When you leave it on Inherit, uzi
-applies its own default reasoning effort — `xhigh` — to your runs. (This is
-deeper reasoning than the Claude Agent SDK's own built-in fallback of
-`high`; uzi now sets the level explicitly for you rather than leaving it
-unset.)
+1. Open **Settings → Run defaults → Reasoning effort**.
+2. Pick the **Claude effort** or **Codex effort** level, or **Inherit**.
+3. Click **Save Claude effort** or **Save Codex effort**.
 
-## Good to know
+The controls currently offer five levels. Codex's additional `ultra` catalog
+level is deliberately not offered. Lower levels favor speed and lower cost;
+higher levels spend more reasoning time and can produce deeper answers.
 
-- **Per-model silent downgrade (Claude).** `xhigh` and `max` are only
-  honored on Claude models that support them. If the Claude model your run
-  uses doesn't support the level you picked, the SDK **silently
-  downgrades** it to that model's own highest supported level. uzi stores
-  your choice verbatim and does not second-guess it. You may pick `max`
-  and a given model quietly runs at its own highest supported effort
-  instead.
-- **Provider rejection (Codex).** Codex maps your chosen level directly to
-  its own reasoning-effort parameter; there's no uzi-side downgrade path.
-  A model, including a custom worker-root ID (see [worker
-  model](./worker-model.md#custom-codex-model)), may reject a particular
-  level. An unsupported level/model pair is rejected by the provider at
-  run time, surfaced in that run's messages like any other agent error,
-  not silently downgraded.
-- **Cost and latency tradeoff.** Lower levels (`low`/`medium`) are cheaper
-  and faster; higher levels (`xhigh`/`max`) reason more deeply at higher
-  cost.
-- **Yours alone.** This setting only changes runs you own; it never affects
-  other users or the shared `lead` template.
-- **Separate from the worker model.** It is independent of your [Worker
-  model](./worker-model.md) — see that page. There is no per-schedule
-  effort override and no CLI setter; the Settings control below is the
-  only place to change it.
-- **Also governs the [judge](./judge.md) lane.** The retrospective judge run
-  over your finished runs now uses this same setting (uzi default `xhigh`
-  when you haven't chosen a level), instead of the Claude Agent SDK's own
-  built-in default of `high`.
+Claude models that do not support a selected level can be silently
+downgraded by their SDK. Codex passes the selected level directly to its
+`turn/start` reasoning-effort parameter; an unsupported model/level pair is
+reported as a provider error rather than silently downgraded by uzi.
 
-## Set your reasoning effort
+The [judge](./judge.md) uses the preference for its own harness. Task-review
+and internal PR-description passes retain their existing SDK/catalog effort
+behavior; their built-in Codex model remains `gpt-6-sol`.
 
-1. Open **Settings → Reasoning effort**.
-2. Pick a level (`low`, `medium`, `high`, `xhigh`, `max`), or leave it on
-   **Inherit**.
-3. Click **Save effort**. It applies starting with your next run.
+There is no CLI settings command or effort setter today. Use the web controls;
+the CLI's settings decode mirrors still carry both fields. A separate runtime
+default choice and effective effort reporting are planned follow-up work.
 
-Leave it on **Inherit** to use the uzi default (`xhigh`).
+## Worker rollout
+
+Codex claims require a worker advertising `codex_runtime_v2`: the current
+runtime/catalog baseline and correct claimed-effort handling. Until the
+worker image is updated, Codex runs wait with the reason **no worker with the
+current Codex runtime is online; waiting for the worker roll**. This applies
+to hosted workers and local compose workers, including Codex judges and
+reviews. Claude runs are unaffected by that gate.

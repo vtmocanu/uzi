@@ -503,7 +503,8 @@ describe("CodexAdviceHarness: kind + a text advice pass", () => {
     const params = start.params as Record<string, unknown>;
     assert.deepEqual(params.input, [{ type: "text", text: "please review" }]);
     assert.equal(params.model, "gpt-6-astra");
-    assert.equal(params.modelReasoningEffort, "high");
+    assert.equal(params.effort, "high");
+    assert.equal(params.modelReasoningEffort, undefined, "only the actual app-server wire key is sent");
   });
 });
 

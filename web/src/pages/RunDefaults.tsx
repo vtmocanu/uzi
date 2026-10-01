@@ -239,13 +239,16 @@ export function RunDefaults() {
   const [summaryModelBusy, setSummaryModelBusy] = useState(false);
 
   // Per-user default reasoning effort (PRD #617 M5): "" = inherit (a NULL/inherit value
-  // resolves to the uzi default `xhigh` at claim assembly, issue #1157). Its own saved/busy pair,
+  // resolves to the uzi default `medium` at claim assembly, issue #1157). Its own saved/busy pair,
   // independent of the models above — same /me/settings endpoint, own field. Unlike
   // the model cards there is NO warning gate: the effort enum is closed, so the
   // dropdown can only ever emit a valid token or "".
   const [defaultEffort, setDefaultEffort] = useState("");
   const [savedEffort, setSavedEffort] = useState("");
   const [effortBusy, setEffortBusy] = useState(false);
+  const [defaultCodexEffort, setDefaultCodexEffort] = useState("");
+  const [savedCodexEffort, setSavedCodexEffort] = useState("");
+  const [codexEffortBusy, setCodexEffortBusy] = useState(false);
 
   // secrets feed the judge token picker; settings carry the saved worker model.
   // secrets is read-only display, set only here, so it rides in the hook's data
@@ -271,6 +274,9 @@ export function RunDefaults() {
       const sm = settings.summary_model ?? "";
       setSummaryModel(sm);
       setSavedSummaryModel(sm);
+      const codexEff = settings.default_codex_effort ?? "";
+      setDefaultCodexEffort(codexEff);
+      setSavedCodexEffort(codexEff);
       const eff = settings.default_effort ?? "";
       setDefaultEffort(eff);
       setSavedEffort(eff);
@@ -365,13 +371,33 @@ export function RunDefaults() {
       setSavedEffort(eff);
       setNotice(
         eff === ""
-          ? "Reasoning effort cleared. Your runs use the uzi default (xhigh)."
+          ? "Claude reasoning effort cleared. Your Claude runs use the uzi default (medium)."
           : `Reasoning effort set to ${eff}. It applies to your next run.`,
       );
     } catch (err) {
       setError(errorMessage(err, "Failed to save reasoning effort"));
     } finally {
       setEffortBusy(false);
+    }
+  };
+
+  const codexEffortDirty = defaultCodexEffort !== savedCodexEffort;
+  const saveCodexEffort = async () => {
+    setError("");
+    setNotice("");
+    setCodexEffortBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ default_codex_effort: defaultCodexEffort || null });
+      const eff = settings.default_codex_effort ?? "";
+      setDefaultCodexEffort(eff);
+      setSavedCodexEffort(eff);
+      setNotice(eff === ""
+        ? "Codex reasoning effort cleared. Your Codex runs use the uzi default (medium)."
+        : `Codex reasoning effort set to ${eff}. It applies at the next claim.`);
+    } catch (err) {
+      setError(errorMessage(err, "Failed to save Codex reasoning effort"));
+    } finally {
+      setCodexEffortBusy(false);
     }
   };
 
@@ -944,13 +970,13 @@ export function RunDefaults() {
       {/* Per-user default reasoning effort (PRD #617 M5). A CLOSED dropdown — the SDK
           reasoning-effort levels plus Inherit — with no custom mode and no warning
           surface, because the enum is closed and the control can only emit a valid
-          level or "" (inherit). Leave it on Inherit to use the uzi default (xhigh). */}
+          level or "" (inherit). Leave it on Inherit to use the uzi default (medium). */}
       <Card className="space-y-5">
         <div>
           <SectionTitle>Reasoning effort</SectionTitle>
           <p className="mt-2 text-sm text-muted">
-            The Agent SDK reasoning-effort level your runs use. Leave it on{" "}
-            <em>Inherit</em> to use the uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">xhigh</code>).
+            Choose reasoning effort independently for Claude and Codex runs. Leave it on{" "}
+            <em>Inherit</em> to use the uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>).
             Higher levels reason more deeply and cost more; a level a given model does not
             support is silently downgraded to the nearest one it does. It applies to your
             own runs only; other users are unaffected.
@@ -961,11 +987,17 @@ export function RunDefaults() {
           <Skeleton className="h-9 w-full max-w-sm" />
         ) : (
           <div className="space-y-3">
-            <Field label="Effort" htmlFor="worker-effort">
+            <Field label="Claude effort" htmlFor="worker-effort">
               <EffortSelect id="worker-effort" value={defaultEffort} onChange={setDefaultEffort} />
             </Field>
             <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
-              Save effort
+              Save Claude effort
+            </Button>
+            <Field label="Codex effort" htmlFor="codex-effort">
+              <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} />
+            </Field>
+            <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
+              Save Codex effort
             </Button>
           </div>
         )}

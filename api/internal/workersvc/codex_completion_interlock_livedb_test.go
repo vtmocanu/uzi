@@ -13,17 +13,17 @@ import (
 )
 
 func codexCompletionCaps() []string {
-	return []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexCompletionInterlockV1}
+	return []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCompletionInterlockV1}
 }
 
 func TestCodexCompletionClaimLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	old := e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1})
+	old := e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2})
 	capable := e.seedWorker(t, codexCompletionCaps())
 	runID := e.seedCodexQueuedRun(t)
 	e.exec(t, `UPDATE runs SET completion_contract_version = 1 WHERE id = $1`, runID)
 
-	if _, err := e.q.ClaimRun(e.ctx, e.claimParams(old, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1}, false)); !errors.Is(err, pgx.ErrNoRows) {
+	if _, err := e.q.ClaimRun(e.ctx, e.claimParams(old, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}, false)); !errors.Is(err, pgx.ErrNoRows) {
 		t.Fatalf("old Codex worker claimed interlocked run: %v", err)
 	}
 	got, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, codexCompletionCaps(), false))
@@ -34,9 +34,9 @@ func TestCodexCompletionClaimLiveDB(t *testing.T) {
 
 func TestLegacyCodexCompletionClaimLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	old := e.seedWorker(t, []string{capability.CodexHarnessV1})
+	old := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
 	runID := e.seedCodexQueuedRun(t)
-	got, err := e.q.ClaimRun(e.ctx, e.claimParams(old, []string{capability.CodexHarnessV1}, false))
+	got, err := e.q.ClaimRun(e.ctx, e.claimParams(old, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false))
 	if err != nil || got.ID != runID {
 		t.Fatalf("legacy Codex claim: run=%v err=%v", got.ID, err)
 	}
@@ -46,7 +46,7 @@ func TestCodexCompletionPeerMirrorLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	me := e.seedSpreadWorker(t, codexCompletionCaps(), 2)
 	e.seedActiveRunOwnedBy(t, me)
-	e.seedSpreadWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1}, 2)
+	e.seedSpreadWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2}, 2)
 	runID := e.seedCodexQueuedRun(t)
 	e.exec(t, `UPDATE runs SET completion_contract_version = 1 WHERE id = $1`, runID)
 	got, err := e.q.ClaimRun(e.ctx, e.claimParams(me, codexCompletionCaps(), false))
@@ -88,7 +88,7 @@ func TestCodexCompletionReleasedWorkerHealthLiveDB(t *testing.T) {
 
 func TestCodexCompletionClaimableCountLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
-	e.seedHeartbeatWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1})
+	e.seedHeartbeatWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2})
 	runID := e.seedCodexQueuedRun(t)
 	e.exec(t, `UPDATE runs SET completion_contract_version = 1 WHERE id = $1`, runID)
 
@@ -104,7 +104,7 @@ func TestCodexCompletionClaimableCountLiveDB(t *testing.T) {
 func TestCodexCompletionCustomRootProtocolIntersectionLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	e.seedWorker(t, codexCompletionCaps())
-	e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexCustomModelV1})
+	e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1})
 
 	count := func() int64 {
 		t.Helper()
@@ -128,7 +128,7 @@ func TestCodexCompletionCustomRootProtocolIntersectionLiveDB(t *testing.T) {
 func TestCodexCompletionHealthIntersectionLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
-	e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1})
+	e.seedWorker(t, []string{capability.CompletionInterlockV1, capability.CodexHarnessV1, capability.CodexRuntimeV2})
 	e.seedWorker(t, []string{capability.CodexCompletionInterlockV1})
 	runID := e.seedCodexQueuedRun(t)
 	row := e.codexIndicatingQueuedRow(runID)

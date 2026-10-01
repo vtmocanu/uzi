@@ -790,7 +790,8 @@ describe("CodexHarness: kind + thread configuration", () => {
     assert.ok(start);
     const params = rec(start.params);
     assert.equal(params.model, "gpt-6-astra");
-    assert.equal(params.modelReasoningEffort, "high");
+    assert.equal(params.effort, "high");
+    assert.equal(params.modelReasoningEffort, undefined, "only the actual app-server wire key is sent");
     assert.deepEqual(params.input, [{ type: "text", text: "do the thing" }]);
   });
 

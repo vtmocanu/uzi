@@ -62,6 +62,7 @@ var codexModels = map[string]bool{
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true,
 	"gpt-6-sol":   true,
+	"gpt-6.1-sol": true,
 }
 
 // codexCuratedModelsSlice returns the curated Codex model ids (codexModels) as a sorted slice,

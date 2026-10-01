@@ -8,12 +8,12 @@
 //
 // SERVICE TIER (D5): the >272K threshold, the four bucket rates and the whole table assume the
 // OpenAI **Standard** service tier as an ESTIMATION POLICY, not an observed fact. Uzi sets no
-// `service_tier`, and in pinned 0.156.1 a catalog `default_service_tier` (gpt-6-sol lists `priority`)
+// `service_tier`, and in pinned 0.159.3 a catalog `default_service_tier` (gpt-6-sol lists `priority`)
 // is applied only by the interactive TUI, never by app-server request building, so the request
 // carries none. OpenAI then processes it at the API PROJECT's configured tier, which uzi cannot
-// see: a project set to priority is billed above these rates. The pinned 0.156.1
+// see: a project set to priority is billed above these rates. The pinned 0.159.3
 // app-server `thread/tokenUsage/updated` notification (source commit
-// b412ff32c417f855c2b2d1581b77058eed87c84b, `codex-rs/app-server-protocol/src/protocol/v2/
+// 01fc69f4026735edfdf6789820549727a4867b11, `codex-rs/app-server-protocol/src/protocol/v2/
 // thread.rs`, unchanged since 0.153.2) carries NO service-tier field on either `total` or `last`, so the tier is NOT
 // observable here. Per D5's explicit fallback ("if the tier isn't observable in the pinned
 // protocol, price as Standard only for the two known models"), we price the known models as
@@ -25,10 +25,11 @@ import type { CodexUsageBreakdown } from "./transport.js";
 /**
  * The pinned price-table version. Recorded WITH the table (D5): the rates below were verified
  * against the official OpenAI API pricing table and model pages on 2026-09-13; the `gpt-6-sol` row was
- * added from its official model page on 2026-09-23. A re-verification
+ * added from its official model page on 2026-09-23. The GPT-6.1 Sol row was added
+ * from https://developers.openai.com/api/docs/models/gpt-6.1-sol on 2026-10-01. A re-verification
  * that changes any rate MUST bump this id and, for a promotional row, its review boundary.
  */
-export const CODEX_PRICE_TABLE_VERSION = "openai-standard-2026-09-23";
+export const CODEX_PRICE_TABLE_VERSION = "openai-standard-2026-10-01";
 
 /**
  * The per-response input-tier boundary (D5): the rates change for the WHOLE response when its
@@ -63,7 +64,7 @@ interface ModelRates {
 }
 
 /**
- * The `openai-standard-2026-09-23` table: PRD D5's `openai-standard-2026-09-13` rows plus `gpt-6-sol`
+ * The `openai-standard-2026-10-01` table: PRD D5's `openai-standard-2026-09-13` rows plus `gpt-6-sol`
  * (official model page, 2026-09-23: >272K input is 2x input and cache, 1.5x output). USD / 1,000,000 tokens:
  *
  *   gpt-6-astra   input <= 272K:  uncached 10.00  cached 1.00  cacheWrite 12.50  output 50.00
@@ -72,6 +73,8 @@ interface ModelRates {
  *   gpt-5.6-sol   input  > 272K:  uncached  8.00  cached 0.80  cacheWrite 10.00  output 30.00
  *   gpt-6-sol     input <= 272K:  uncached  2.00  cached 0.20  cacheWrite  2.50  output 10.00
  *   gpt-6-sol     input  > 272K:  uncached  4.00  cached 0.40  cacheWrite  5.00  output 15.00
+ *   gpt-6.1-sol   input <= 272K:  uncached  2.00  cached 0.10  cacheWrite  2.50  output 10.00
+ *   gpt-6.1-sol   input  > 272K:  uncached  4.00  cached 0.20  cacheWrite  5.00  output 15.00
  */
 const TABLE: Readonly<Record<string, ModelRates>> = {
   "gpt-6-astra": {
@@ -86,6 +89,10 @@ const TABLE: Readonly<Record<string, ModelRates>> = {
   "gpt-6-sol": {
     low: { uncachedInput: 2.0, cachedInput: 0.2, cacheWrite: 2.5, output: 10.0 },
     high: { uncachedInput: 4.0, cachedInput: 0.4, cacheWrite: 5.0, output: 15.0 },
+  },
+  "gpt-6.1-sol": {
+    low: { uncachedInput: 2.0, cachedInput: 0.1, cacheWrite: 2.5, output: 10.0 },
+    high: { uncachedInput: 4.0, cachedInput: 0.2, cacheWrite: 5.0, output: 15.0 },
   },
 };
 

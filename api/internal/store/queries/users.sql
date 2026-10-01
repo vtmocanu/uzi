@@ -180,6 +180,13 @@ RETURNING default_harness, default_claude_model, default_codex_model, default_mo
 -- and chat-run claim assembly, keyed on the run owner. Selects only the column.
 SELECT default_effort FROM users WHERE id = $1;
 
+-- name: GetUserDefaultCodexEffort :one
+SELECT default_codex_effort FROM users WHERE id = $1;
+
+-- name: SetUserDefaultCodexEffort :one
+UPDATE users SET default_codex_effort = @default_codex_effort WHERE id = @id
+RETURNING default_codex_effort;
+
 -- name: SetUserDefaultEffort :one
 -- Sets (or clears, when @default_effort is NULL) the current user's default
 -- reasoning effort. Own-user only; the caller passes the session user's id.
@@ -241,7 +248,7 @@ RETURNING summary_model;
 -- default_claude_model and default_codex_model (PRD #1551 M1 / D2) ride it too — the retained
 -- per-harness worker-model lanes; each NULL means "inherit". The settings surface exposes both
 -- lanes, and projects the deprecated default_model from the effective harness's lane.
-SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model FROM users WHERE id = $1;
+SELECT default_model, default_effort, judge_model, summary_model, theme, sidebar_token_ids, mr_rework_enabled, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort FROM users WHERE id = $1;
 
 -- name: GetUserSchedulePause :one
 -- The current user's pause-all-schedules state (PRD #1093), returned RAW: the switch

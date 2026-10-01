@@ -141,8 +141,9 @@ type fakeStore struct {
 	defaultModelErr   error
 	// defaultEffort is the run owner's per-user default reasoning effort (PRD #617);
 	// defaultEffortErr forces the lookup to fail for the error-path test.
-	defaultEffort    pgtype.Text
-	defaultEffortErr error
+	defaultEffort      pgtype.Text
+	defaultCodexEffort pgtype.Text
+	defaultEffortErr   error
 	// attributionEnabled is the run owner's AI-attribution opt-out (issue #916), read
 	// live at standard-claim assembly. The zero value is false; scheduleModelStore sets
 	// it to true so existing fixtures mirror a fresh user's default-on state, and a test
@@ -1000,6 +1001,9 @@ func (f *fakeStore) GetUserHarnessModelDefaults(context.Context, uuid.UUID) (sto
 }
 func (f *fakeStore) GetUserDefaultEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
 	return f.defaultEffort, f.defaultEffortErr
+}
+func (f *fakeStore) GetUserDefaultCodexEffort(context.Context, uuid.UUID) (pgtype.Text, error) {
+	return f.defaultCodexEffort, f.defaultEffortErr
 }
 func (f *fakeStore) GetUserAttributionEnabled(context.Context, uuid.UUID) (bool, error) {
 	return f.attributionEnabled, f.attributionEnabledErr
@@ -2465,10 +2469,10 @@ func TestClaimFailsOnDefaultModelLookupError(t *testing.T) {
 }
 
 // TestClaimDefaultsEffortToXhighWhenOwnerHasNone: with the owner's per-user default
-// effort left NULL (inherit), the claim resolves it to the uzi default `xhigh`
+// effort left NULL (inherit), the claim resolves it to the uzi default `medium`
 // (issue #1157) rather than omitting the field, so the worker applies xhigh instead
 // of the SDK's own `high` fallback.
-func TestClaimDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
+func TestClaimDefaultsEffortToMediumWhenOwnerHasNone(t *testing.T) {
 	box := newBox(t)
 	sealedPAT, _ := box.Seal([]byte("bot-pat-EFFOMIT-abcdef1234567890"))
 	sealedTok, _ := box.Seal([]byte("anthropic-EFFOMIT-abcdef1234567890"))
@@ -2488,16 +2492,16 @@ func TestClaimDefaultsEffortToXhighWhenOwnerHasNone(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Claim: %v", err)
 	}
-	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "xhigh" {
-		t.Fatalf("expected default effort xhigh for an inheriting owner, got %+v", payload.Config.DefaultEffort)
+	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "medium" {
+		t.Fatalf("expected default effort medium for an inheriting owner, got %+v", payload.Config.DefaultEffort)
 	}
 	// The uzi default now rides the wire for a NULL owner.
 	b, err := json.Marshal(payload.Config)
 	if err != nil {
 		t.Fatalf("marshal config: %v", err)
 	}
-	if !strings.Contains(string(b), `"default_effort":"xhigh"`) {
-		t.Fatalf("inheriting owner should carry default_effort xhigh on the wire; got %s", b)
+	if !strings.Contains(string(b), `"default_effort":"medium"`) {
+		t.Fatalf("inheriting owner should carry default_effort medium on the wire; got %s", b)
 	}
 }
 

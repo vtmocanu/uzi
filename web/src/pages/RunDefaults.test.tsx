@@ -333,6 +333,35 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 });
 
 describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
+  it("saves and clears Codex effort without sending or resetting the Claude choice", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "low",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    mockApi.putMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "medium",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    const codex = await screen.findByLabelText("Codex effort") as HTMLSelectElement;
+    const claude = screen.getByLabelText("Claude effort") as HTMLSelectElement;
+    fireEvent.change(claude, { target: { value: "max" } });
+    fireEvent.change(codex, { target: { value: "medium" } });
+    fireEvent.click(screen.getByText("Save Codex effort"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: "medium" }));
+    expect(claude.value).toBe("max");
+    mockApi.putMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: "high", default_codex_effort: null,
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    fireEvent.change(codex, { target: { value: "" } });
+    fireEvent.click(screen.getByText("Save Codex effort"));
+    await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_codex_effort: null }));
+    expect(claude.value).toBe("max");
+  });
   it("loads and shows the saved effort", async () => {
     mockApi.getMySettings.mockResolvedValue({
       settings: { default_harness: null, default_model: null, default_effort: "low", judge_model: null, summary_model: null, appearance_mode: null, light_theme: null, dark_theme: null, typeface: null, theme: null },
@@ -343,7 +372,7 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
     expect(select.value).toBe("low");
   });
 
@@ -360,8 +389,8 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
-    const save = screen.getByText("Save effort") as HTMLButtonElement;
+    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
+    const save = screen.getByText("Save Claude effort") as HTMLButtonElement;
     // Inherit is the saved value, so Save starts disabled (not dirty).
     expect(save.disabled).toBe(true);
     fireEvent.change(select, { target: { value: "low" } });
@@ -383,9 +412,9 @@ describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
       </MemoryRouter>,
     );
     await screen.findByText("Reasoning effort");
-    const select = (await screen.findByLabelText("Effort")) as HTMLSelectElement;
+    const select = (await screen.findByLabelText("Claude effort")) as HTMLSelectElement;
     fireEvent.change(select, { target: { value: "" } });
-    fireEvent.click(screen.getByText("Save effort"));
+    fireEvent.click(screen.getByText("Save Claude effort"));
     await waitFor(() => expect(mockApi.putMySettings).toHaveBeenCalledWith({ default_effort: null }));
   });
 });

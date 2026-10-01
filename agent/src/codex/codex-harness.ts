@@ -1287,7 +1287,7 @@ export class CodexHarness implements RunHarness {
       environments: [],
     };
     if (this.currentModel !== undefined) params.model = this.currentModel;
-    if (rendered.lead.modelReasoningEffort !== undefined) params.modelReasoningEffort = rendered.lead.modelReasoningEffort;
+    if (rendered.lead.modelReasoningEffort !== undefined) params.effort = rendered.lead.modelReasoningEffort;
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {

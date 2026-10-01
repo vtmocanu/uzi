@@ -12,8 +12,10 @@ type UserSettingsDTO struct {
 	// effort (PRD #617). Fidelity only — carried so a decode never drops it; there
 	// is no CLI setter (PRD #617 Decision 6).
 	DefaultEffort *string `json:"default_effort"`
-	JudgeModel    *string `json:"judge_model"`
-	SummaryModel  *string `json:"summary_model"`
+	// DefaultCodexEffort is the independently retained Codex effort; null inherits medium.
+	DefaultCodexEffort *string `json:"default_codex_effort"`
+	JudgeModel         *string `json:"judge_model"`
+	SummaryModel       *string `json:"summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override mirror (PRD #21); kept
 	// one release. The appearance override lives in the four fields below (PRD #1167).
 	Theme *string `json:"theme"`

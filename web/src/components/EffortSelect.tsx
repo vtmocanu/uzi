@@ -22,10 +22,10 @@ export function EffortSelect({
 }) {
   return (
     <Select id={id} value={value} onChange={(e) => onChange(e.target.value)}>
-      <option value="">Inherit (uzi default: xhigh)</option>
+      <option value="">Inherit (uzi default: medium)</option>
       {EFFORT_LEVELS.map((lvl) => (
         <option key={lvl} value={lvl}>
-          {lvl === "xhigh" ? "xhigh (uzi default)" : lvl}
+          {lvl === "medium" ? "medium (uzi default)" : lvl}
         </option>
       ))}
     </Select>

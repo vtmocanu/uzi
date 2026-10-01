@@ -1200,6 +1200,7 @@ type User struct {
 	SidebarCodexAccountIds  []uuid.UUID        `json:"sidebar_codex_account_ids"`
 	DefaultClaudeModel      pgtype.Text        `json:"default_claude_model"`
 	DefaultCodexModel       pgtype.Text        `json:"default_codex_model"`
+	DefaultCodexEffort      pgtype.Text        `json:"default_codex_effort"`
 }
 
 type UserSecret struct {

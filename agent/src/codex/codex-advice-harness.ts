@@ -542,7 +542,7 @@ export class CodexAdviceHarness implements AdviceHarness {
       input: [{ type: "text", text: rendered.prompt }],
     };
     if (model !== undefined) params.model = model;
-    if (rendered.modelReasoningEffort !== undefined) params.modelReasoningEffort = rendered.modelReasoningEffort;
+    if (rendered.modelReasoningEffort !== undefined) params.effort = rendered.modelReasoningEffort;
     const res = await transport.request<{ turn?: { id?: string } }>("turn/start", params, { signal });
     const id = res?.turn?.id;
     if (typeof id !== "string" || id.length === 0) {

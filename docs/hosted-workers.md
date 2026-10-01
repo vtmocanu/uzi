@@ -281,3 +281,14 @@ protocol against a container the cluster manages for you — provisioning and
 deleting from the UI stand in for starting and stopping it yourself. Both
 kinds work identically once online: same claim/run behavior, same resource
 gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
+
+## Current Codex worker baseline
+
+The current Codex worker uses runtime 0.159.3 and defaults to `gpt-6.1-sol`
+when no worker-model override is set. Explicit model preferences remain
+unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
+keep separate overrides. See [Reasoning effort](worker-effort.md).
+
+Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
+silently use the old model/catalog or ignore the requested effort. Codex runs
+queue until the worker image rolls, on hosted workers and compose alike.

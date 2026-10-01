@@ -92,7 +92,7 @@ interface CodexErrorInfoEntry {
   http?: boolean;
 }
 
-/** The CLOSED map of the pinned Codex 0.156.1 `codexErrorInfo` enum (13 scalar + 5 tagged, unchanged since 0.153.2)
+/** The CLOSED map of the pinned Codex 0.159.3 app-server `codexErrorInfo` enum (15 scalar + 5 tagged)
  *  from the exact lower-camel wire tag to its {@link CodexErrorInfoEntry}. A tag ABSENT from
  *  this map, or present with a shape that does not match the wire form, collapses to the
  *  fixed `"unknown"` classification — an arbitrary/attacker-shaped provider tag is NEVER
@@ -107,6 +107,8 @@ const CODEX_ERROR_INFO_MAP: ReadonlyMap<string, CodexErrorInfoEntry> = new Map<s
   ["sessionBudgetExceeded", { shape: "scalar", display: "sessionBudgetExceeded", category: "rate_limit" }],
   ["contextWindowExceeded", { shape: "scalar", display: "contextWindowExceeded", category: "model" }],
   ["serverOverloaded", { shape: "scalar", display: "serverOverloaded", category: "transport" }],
+  ["flexUnavailable", { shape: "scalar", display: "flexUnavailable", category: "transport" }],
+  ["tooManyDenials", { shape: "scalar", display: "tooManyDenials", category: "unknown" }],
   ["internalServerError", { shape: "scalar", display: "internalServerError", category: "transport" }],
   ["badRequest", { shape: "scalar", display: "badRequest", category: "unknown" }],
   ["sandboxError", { shape: "scalar", display: "sandboxError", category: "unknown" }],

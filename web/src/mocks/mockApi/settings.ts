@@ -32,7 +32,7 @@ import { secrets } from "./secrets";
 // id may not be saved into the Claude lane; a known Claude alias may not be saved into
 // the Codex lane (which otherwise accepts a custom id, D5). Kept module-local so knip
 // does not flag them.
-const CURATED_CODEX_IDS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol"];
+const CURATED_CODEX_IDS = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"];
 const KNOWN_CLAUDE_ALIASES = ["opus", "sonnet", "haiku", "fable"];
 
 // ── Settings persistence (demo build) ────────────────────────────────────────
@@ -73,6 +73,7 @@ const SEED_USER_SETTINGS: UserSettings = {
   default_claude_model: null,
   default_codex_model: null,
   default_effort: null,
+  default_codex_effort: null,
   judge_model: null,
   summary_model: null,
   theme: null,
@@ -189,6 +190,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#617 blob stays valid; absent reads as inherit, and the SEED
     // provides it going forward (like judge_model).
     (u.default_effort === undefined || u.default_effort === null || typeof u.default_effort === "string") &&
+    (u.default_codex_effort === undefined || u.default_codex_effort === null || typeof u.default_codex_effort === "string") &&
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
@@ -1087,6 +1089,15 @@ export const settingsApi = {
         throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
       }
       next = { ...next, default_effort: trimmed === "" ? null : trimmed };
+    }
+    if (patch.default_codex_effort !== undefined) {
+      // Closed enum (PRD #617 M5): blank clears to inherit; any other value must be one
+      // of the five SDK levels, mirroring the server's ValidateEffort.
+      const trimmed = patch.default_codex_effort?.trim() ?? "";
+      if (trimmed !== "" && !["low", "medium", "high", "xhigh", "max"].includes(trimmed)) {
+        throw new ApiError(400, "effort must be one of low, medium, high, xhigh, max");
+      }
+      next = { ...next, default_codex_effort: trimmed === "" ? null : trimmed };
     }
     if (patch.judge_model !== undefined) {
       // Same rules as default_model (PRD #69 M2): blank clears to inherit, a value with

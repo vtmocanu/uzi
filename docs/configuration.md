@@ -573,3 +573,14 @@ A per-connection alternative to the role-wide `ALTER ROLE`: a `plan_cache_mode=.
 in `DATABASE_URL` is kept by pgx as an unrecognized DSN parameter and passed to
 PostgreSQL as a connection runtime parameter, so it applies only to connections made
 with that DSN.
+
+## Current Codex worker baseline
+
+The current Codex worker uses runtime 0.159.3 and defaults to `gpt-6.1-sol`
+when no worker-model override is set. Explicit model preferences remain
+unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
+keep separate overrides. See [Reasoning effort](worker-effort.md).
+
+Every Codex claim requires `codex_runtime_v2`, so an older worker cannot
+silently use the old model/catalog or ignore the requested effort. Codex runs
+queue until the worker image rolls, on hosted workers and compose alike.

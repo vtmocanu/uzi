@@ -37,6 +37,8 @@ import path from "node:path";
  *  completion_interlock_v1 / recovery_archive_v1), NOT a user-selectable scheduler
  *  capability, and NOT a required_capability (PRD #1332 D3). */
 export const CODEX_HARNESS_CAPABILITY = "codex_harness_v1";
+/** This build has the current runtime/catalog and honors claimed Codex effort. */
+export const CODEX_RUNTIME_V2_CAPABILITY = "codex_runtime_v2";
 
 /** PRD #1551 (D6): the protocol capability advertised ONLY by a worker whose Codex
  *  renderer can pass a validated CUSTOM (non-curated) worker-root model through unchanged
@@ -68,10 +70,10 @@ export const CODEX_PROBE_EXPECTATION: {
   readonly version: string;
   readonly lockDigest: Readonly<Record<string, string>>;
 } = {
-  version: "0.156.1",
+  version: "0.159.3",
   lockDigest: {
-    amd64: "8b711520beddf385467b8da4d2c93736637c6ba1e46811cf0d8606b7c490b6f6",
-    arm64: "fdd47ed6aade0360796fd3f6f95a45096f327c15e19e8c7339f9dc5633041786",
+    amd64: "3930f31ac5fca861ea3e444e2683f261190d96b63fba58e0a40a879174369cdf",
+    arm64: "20b7d673cf2b64b6c6208fa4fda06feb9dac0572da9987294b48cde1dab9d001",
   },
 };
 

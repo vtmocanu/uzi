@@ -1,6 +1,7 @@
 {
   "default_model": null,
   "default_effort": null,
+  "default_codex_effort": null,
   "judge_model": null,
   "summary_model": null,
   "theme": null,

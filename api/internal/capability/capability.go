@@ -73,6 +73,11 @@ const RecoveryArchiveV2 = "recovery_archive_v2"
 // which is a calibrated failure case: the capable-worker claim test then fails.
 const CodexHarnessV1 = "codex_harness_v1"
 
+// CodexRuntimeV2 identifies a worker with the 0.159.3-or-newer runtime/catalog
+// baseline, GPT-6.1 Sol rendering and claimed effort consumption. It is a protocol
+// capability, not a user-selectable requirement; every Codex claim requires it.
+const CodexRuntimeV2 = "codex_runtime_v2"
+
 // CodexCustomModelV1 is the PROTOCOL capability a worker self-reports (PRD #1551 M4, D6) after its
 // Codex renderer can pass a validated CUSTOM (non-curated) worker-root model to the fixed OpenAI
 // provider WITHOUT substituting the curated Astra fallback. It is a strict addition on top of
@@ -192,6 +197,7 @@ var protocolVocabulary = map[string]struct{}{
 	RecoveryArchiveV1:          {},
 	RecoveryArchiveV2:          {},
 	CodexHarnessV1:             {},
+	CodexRuntimeV2:             {},
 	CodexCustomModelV1:         {},
 	CodexCompletionInterlockV1: {},
 	CredentialSwitchV1:         {},
@@ -207,7 +213,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
+var protocolOrder = []string{CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, CodexHarnessV1, CodexRuntimeV2, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

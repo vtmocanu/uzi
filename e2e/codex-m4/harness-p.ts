@@ -147,6 +147,8 @@ export interface ProtocolTurnOptions {
   readonly launcherEnv?: NodeJS.ProcessEnv;
   /** The model id (default gpt-6-astra, a contract model). */
   readonly model?: string;
+  /** Trusted reasoning effort for the real turn/start wire proof. */
+  readonly effort?: "medium";
   /** Optional per-callback origin (default "root"). */
   readonly origin?: "root" | "child" | "unknown";
   /** PRD #1533: thread `codeModeHost` onto the launch spec so the REAL `config.ts` loopback
@@ -381,6 +383,7 @@ export async function runProtocolTurn(mods: ProtocolModules, opts: ProtocolTurnO
       input: [{ type: "text", text: "M4 C3 P: run the scripted turn" }],
       environments: [],
       model,
+      ...(opts.effort === undefined ? {} : { effort: opts.effort }),
     });
     turnId = turnRes.turn?.id;
     if (turnId === undefined) throw new Error("turn/start returned no turn id");

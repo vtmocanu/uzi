@@ -50,7 +50,7 @@ func TestAssembleCodexClaimCustomLaneLiveDB(t *testing.T) {
 	run := mustRun(t, env, f.runID)
 
 	t.Run("capable worker: custom id shipped unchanged", func(t *testing.T) {
-		capable := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexCustomModelV1}}
+		capable := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1}}
 		payload, err := svc.assembleClaim(env.ctx, capable, run)
 		if err != nil {
 			t.Fatalf("assembleClaim (capable worker): %v", err)
@@ -64,7 +64,7 @@ func TestAssembleCodexClaimCustomLaneLiveDB(t *testing.T) {
 	})
 
 	t.Run("incapable worker: requeue, never fail, never Astra", func(t *testing.T) {
-		incapable := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1}}
+		incapable := store.Worker{ID: f.workerID, UserID: f.userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}}
 		payload, err := svc.assembleClaim(env.ctx, incapable, run)
 		if !errors.Is(err, errCustomModelCapabilityMissing) {
 			t.Fatalf("assembleClaim (incapable worker): err = %v, want errCustomModelCapabilityMissing", err)
@@ -133,7 +133,7 @@ func TestAssembleCodexReviewClaimShipsNoModelLiveDB(t *testing.T) {
 		t.Fatalf("fixture review run harness = %q, want codex", run.Harness)
 	}
 	// A codex_harness_v1-ONLY worker assembles it (no codex_custom_model_v1) and it ships no model.
-	harnessOnly := store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CodexHarnessV1}}
+	harnessOnly := store.Worker{ID: workerID, UserID: userID, ProtocolCapabilities: []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}}
 	payload, err := svc.assembleClaim(env.ctx, harnessOnly, run)
 	if err != nil {
 		t.Fatalf("assembleClaim on a Codex review run must succeed for a codex_harness_v1-only worker (review exempt): %v", err)

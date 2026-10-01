@@ -10,6 +10,22 @@ import {
   pickCodexClassification,
 } from "../src/codex/terminal-normalize.js";
 
+describe("Codex 0.159.3 error tags", () => {
+  it("recognizes new scalar tags while rejecting attacker-shaped objects", () => {
+    assert.deepEqual(normalizeCodexErrorInfo("flexUnavailable"), {
+      classification: "flexUnavailable", category: "transport",
+    });
+    assert.deepEqual(normalizeCodexErrorInfo("tooManyDenials"), {
+      classification: "tooManyDenials", category: "unknown",
+    });
+    for (const tag of ["flexUnavailable", "tooManyDenials"]) {
+      assert.deepEqual(normalizeCodexErrorInfo({ [tag]: { message: "untrusted", httpStatusCode: 401 } }), {
+        classification: "unknown", category: "unknown",
+      });
+    }
+  });
+});
+
 // PRD #1171 (M3, milestone 3) — the pure provider-terminal normalizers. These bound and
 // redact untrusted Codex terminal fields (status / turn.error / turn.usage) for BOTH the
 // run and advice decoders, so the two lanes cannot diverge. Every "secret-shaped" fixture

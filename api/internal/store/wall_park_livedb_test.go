@@ -864,7 +864,7 @@ func TestCountOnlineWorkersClaimableForRunLiveDB(t *testing.T) {
 		// codex_secret_id FK row is needed.
 		id := fx.run(wpRun{status: "queued", harness: "codex", requiredCaps: []string{"jvm"}})
 		fx.worker("hasCaps", wpWorker{caps: []string{"jvm"}, protocolCaps: []string{}})
-		fx.worker("hasCodex", wpWorker{caps: []string{}, protocolCaps: []string{"codex_harness_v1"}})
+		fx.worker("hasCodex", wpWorker{caps: []string{}, protocolCaps: []string{"codex_harness_v1", "codex_runtime_v2"}})
 		if n := claimable(id, true); n != 0 {
 			t.Fatalf("split-fleet claimable = %d, want 0 (no single worker satisfies capability AND codex protocol)", n)
 		}

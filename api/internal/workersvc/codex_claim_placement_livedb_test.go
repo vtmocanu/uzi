@@ -65,9 +65,9 @@ func (e interlockLiveDB) codexIndicatingQueuedRow(runID [16]byte) store.ListActi
 func TestClaimCodexHardClauseBlocksIncapableWorkerLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 
-	incapable := e.seedWorker(t, nil)                               // protocol_capabilities '{}'
-	capable := e.seedWorker(t, []string{capability.CodexHarnessV1}) // advertises codex_harness_v1
-	runID := e.seedCodexQueuedRun(t)                                // harness='codex', required_capabilities '{}'
+	incapable := e.seedWorker(t, nil)                                                          // protocol_capabilities '{}'
+	capable := e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}) // advertises codex_harness_v1
+	runID := e.seedCodexQueuedRun(t)                                                           // harness='codex', required_capabilities '{}'
 
 	// (1) capability_aware=false does NOT bypass: the incapable worker still cannot claim.
 	if _, err := e.q.ClaimRun(e.ctx, e.claimParams(incapable, []string{}, false)); !errors.Is(err, pgx.ErrNoRows) {
@@ -97,7 +97,7 @@ func TestClaimCodexHardClauseBlocksIncapableWorkerLiveDB(t *testing.T) {
 	}
 
 	// (3) a CAPABLE worker claims it — the clause admits a worker advertising codex_harness_v1.
-	run, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, []string{capability.CodexHarnessV1}, false))
+	run, err := e.q.ClaimRun(e.ctx, e.claimParams(capable, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false))
 	if err != nil {
 		t.Fatalf("capable worker must claim the codex-indicating run: %v", err)
 	}
@@ -148,7 +148,7 @@ func TestClaimCodexPeerSpreadMirrorLiveDB(t *testing.T) {
 	// CAN defer its claim to a strictly-better (idle) peer. It advertises codex_harness_v1, so the
 	// claimant's OWN D3 clause never blocks it — isolating the PEER clause.
 	newBusyClaimant := func() uuid.UUID {
-		me := e.seedSpreadWorker(t, []string{capability.CodexHarnessV1}, 2)
+		me := e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, 2)
 		e.seedActiveRunOwnedBy(t, me)
 		return me
 	}
@@ -158,7 +158,7 @@ func TestClaimCodexPeerSpreadMirrorLiveDB(t *testing.T) {
 		e.seedSpreadWorker(t, nil, 2) // idle, cap=2, but advertises no protocol capability
 		runID := e.seedCodexQueuedRun(t)
 
-		run, err := e.q.ClaimRun(e.ctx, e.claimParams(me, []string{capability.CodexHarnessV1}, false))
+		run, err := e.q.ClaimRun(e.ctx, e.claimParams(me, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false))
 		if err != nil {
 			t.Fatalf("busy claimant must claim the codex-indicating run — the incapable peer is not a valid deferral target (err=%v); the mirror clause must exclude it", err)
 		}
@@ -172,10 +172,10 @@ func TestClaimCodexPeerSpreadMirrorLiveDB(t *testing.T) {
 
 	t.Run("capable idle peer IS a spread target; busy claimant defers", func(t *testing.T) {
 		me := newBusyClaimant()
-		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1}, 2) // idle, cap=2, advertises codex_harness_v1
+		e.seedSpreadWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, 2) // idle, cap=2, advertises codex_harness_v1
 		runID := e.seedCodexQueuedRun(t)
 
-		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(me, []string{capability.CodexHarnessV1}, false)); !errors.Is(err, pgx.ErrNoRows) {
+		if _, err := e.q.ClaimRun(e.ctx, e.claimParams(me, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, false)); !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("busy claimant must DEFER the codex-indicating run to the capable idle peer (err=%v); the mirror clause admits a capable peer as a spread target", err)
 		}
 		if s := e.runStatus(t, runID); s != "queued" {
@@ -211,7 +211,7 @@ func TestQueuedReasonNoCodexCapableWorkerLiveDB(t *testing.T) {
 	})
 
 	t.Run("codex-capable worker online -> falls through", func(t *testing.T) {
-		e.seedWorker(t, []string{capability.CodexHarnessV1}) // an ONLINE codex-capable worker
+		e.seedWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}) // an ONLINE codex-capable worker
 		runID := e.seedCodexQueuedRun(t)
 		got := svc.queuedReason(e.ctx, time.Now(), e.codexIndicatingQueuedRow(runID))
 		if got != reasonWaitingWorker {
@@ -245,7 +245,7 @@ func TestClaimCodexVocabularyRemovalCalibrationLiveDB(t *testing.T) {
 
 	// A bare worker row Register can UPDATE (RegisterWorker is an UPDATE-by-id).
 	workerID := e.seedWorker(t, nil)
-	if _, _, err := svc.Register(e.ctx, store.Worker{ID: workerID, UserID: e.userID}, "v-test", "base", nil, nil, []string{capability.CodexHarnessV1}, nil); err != nil {
+	if _, _, err := svc.Register(e.ctx, store.Worker{ID: workerID, UserID: e.userID}, "v-test", "base", nil, nil, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}, nil); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
 

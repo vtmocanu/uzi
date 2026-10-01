@@ -595,11 +595,11 @@ type ClaimConfig struct {
 	DefaultModel                *string `json:"default_model,omitempty"`
 	// DefaultEffort is the SDK effort level the worker applies to the lead/main
 	// thread: the owner's explicit per-user reasoning effort (PRD #617), or the uzi
-	// default `xhigh` (issue #1157) when the owner has not chosen (NULL). It is
+	// default `medium` (issue #1157) when the owner has not chosen (NULL). It is
 	// populated for every issue-lane claim assembled through resolveEffortPtr; the
 	// judge lane (issue #1157) now ALSO populates it best-effort through the same
 	// resolveEffortPtr, inheriting the owner's per-user default_effort (uzi default
-	// `xhigh` when NULL) just like the run/chat lanes, so judge runs carry the owner's
+	// `medium` when NULL) just like the run/chat lanes, so judge runs carry the owner's
 	// effort rather than riding the SDK's own fallback. omitempty is retained. Unlike
 	// DefaultModel there is no per-run/per-schedule freeze; the owner's per-user value
 	// is the only source.

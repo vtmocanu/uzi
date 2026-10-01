@@ -156,7 +156,8 @@ const (
 	// D3-fixed user-visible text. In M5A only internal test-only Codex rows exist, so this rung is
 	// reachable only for them (no public origin can create a Codex run yet). Maps to the SAME
 	// healthWaitingWorker enum (no migration — runs.health_reason is free text).
-	reasonNoCodexCapableWorker = "no Codex-capable worker is online"
+	reasonNoCodexCapableWorker  = "no Codex-capable worker is online"
+	reasonNoCurrentCodexRuntime = "no worker with the current Codex runtime is online; waiting for the worker roll"
 	// reasonNoCustomCodexCapableWorker (PRD #1551 M4, D6) is emitted for a CUSTOM-Codex-root queued
 	// run (harness='codex', not task-review/judge/chat, whose effective worker-root model is a
 	// non-curated id) whose owner has NO online worker advertising BOTH 'codex_harness_v1' AND
@@ -881,6 +882,12 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying codex harness", "run_id", r.ID, "error", cerr)
 		} else if c == 0 {
 			return reasonNoCodexCapableWorker
+		}
+		current, currentErr := s.q.CountOnlineWorkersSatisfyingCodexRuntime(ctx, r.UserID)
+		if currentErr != nil {
+			slog.Error("health: count current Codex runtime workers", "run_id", r.ID, "error", currentErr)
+		} else if current == 0 {
+			return reasonNoCurrentCodexRuntime
 		}
 	}
 	// PRD #1551 M4 (D6): a CUSTOM-Codex-root run whose owner has NO online worker advertising BOTH

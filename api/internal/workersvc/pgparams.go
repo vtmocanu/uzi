@@ -114,8 +114,8 @@ func int64Ptr(v pgtype.Int8) *int64 {
 
 // resolveEffortPtr resolves the owner's per-user default reasoning effort to the
 // level the worker applies (PRD #617 + issue #1157): the owner's explicit choice,
-// or the uzi default (xhigh) when the column is NULL/blank. The wire field stays
-// *string+omitempty but is now ALWAYS populated — a NULL owner rides xhigh, not an
+// or the uzi default (medium) when the column is NULL/blank. The wire field stays
+// *string+omitempty but is now ALWAYS populated — a NULL owner rides medium, not an
 // omitted effort key.
 func resolveEffortPtr(t pgtype.Text) *string {
 	e := agenttmpl.ResolveDefaultEffort(textPtr(t))

@@ -62,11 +62,11 @@ function leadEffectGrants(): RunGrants {
   };
 }
 
-/** One contract model per catalog `shell_type` spelling. The 0.156.1 catalog gives gpt-6-astra (and
- *  gpt-5.6-sol) `shell_type: "unified_exec"` but gpt-6-sol `shell_type: "shell_command"` (a serde
+/** One contract model per catalog `shell_type` spelling. The 0.159.3 catalog gives gpt-6-astra (and
+ *  gpt-5.6-sol) `shell_type: "unified_exec"` but gpt-6-sol and gpt-6.1-sol `shell_type: "shell_command"` (a serde
  *  alias of the same internal type, gated by `shell_tool = false`), so the native-disabled template
  *  is proven for both catalog shapes, not only the default model. */
-const NATIVE_BYPASS_MODELS = ["gpt-6-astra", "gpt-6-sol"] as const;
+const NATIVE_BYPASS_MODELS = ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] as const;
 
 test(CODEX_P_NATIVE_ABSENT_TITLE, { skip: P_LAYER_SKIP }, async (t) => {
   for (const model of NATIVE_BYPASS_MODELS) {
@@ -103,6 +103,7 @@ async function nativeBypassFor(t: { diagnostic: (message: string) => void }, mod
       grants: leadEffectGrants(),
       credential,
       model,
+      effort: "medium",
       // Force every native surface, then the intended-model worker exec (positive control), then done.
       respond: scriptedStepsResponder([
         { kind: "call", callId: "n-shell", name: "shell", args: { command: ["/bin/sh", "-c", `touch ${marker("shell")}`] } },
@@ -125,6 +126,10 @@ async function nativeBypassFor(t: { diagnostic: (message: string) => void }, mod
     // The iteration really ran THIS model: every observed provider request names it, so a silent
     // fallback to the default model cannot make a later iteration pass on the default's shape.
     assert.ok(obs.providerRequests.length > 0, `[${model}] the fake provider observed real requests`);
+    for (const request of obs.providerRequests) {
+      assert.equal((request as { reasoning?: { effort?: unknown } }).reasoning?.effort, "medium",
+        `[${model}] the real runtime forwards medium reasoning effort to the provider`);
+    }
     assert.deepEqual(
       [...new Set(obs.providerRequests.map((body) => (body as { model?: unknown }).model))],
       [model],

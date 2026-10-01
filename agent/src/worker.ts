@@ -20,7 +20,7 @@ import type { RunDiskSampler } from "./run-disk.js";
 import { uidSplitActive } from "./runner-uid.js";
 import { errMessage, sleep } from "./util.js";
 import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.js";
-import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY } from "./codex/codex-runtime-probe.js";
+import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 
 /** PRD #1906 M4: the protocol capability proving this image runs the isolated research lane
  *  (the IsolatedRunner, the fetch tool and the fixed tool set). The api's dedicated claim
@@ -546,6 +546,7 @@ export class Worker {
         // clause admits a Codex-indicating run only for a worker that self-reported it).
         if (this.config.codexHarness?.advertise) {
           protocolCapabilities.push(CODEX_HARNESS_CAPABILITY);
+          protocolCapabilities.push(CODEX_RUNTIME_V2_CAPABILITY);
           protocolCapabilities.push(CODEX_COMPLETION_INTERLOCK_CAPABILITY);
           // PRD #1551 (D6): this build's renderer can pass a validated custom worker-root
           // model through unchanged, so advertise the custom-model capability under the same

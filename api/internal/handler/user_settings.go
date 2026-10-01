@@ -43,6 +43,7 @@ type userSettingsDTO struct {
 	DefaultClaudeModel *string `json:"default_claude_model"`
 	DefaultCodexModel  *string `json:"default_codex_model"`
 	DefaultEffort      *string `json:"default_effort"`
+	DefaultCodexEffort *string `json:"default_codex_effort"`
 	JudgeModel         *string `json:"judge_model"`
 	SummaryModel       *string `json:"summary_model"`
 	// Theme is the DEPRECATED legacy single-theme override (PRD #21); kept one
@@ -118,6 +119,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			DefaultClaudeModel:     textPtrValue(s.DefaultClaudeModel.Valid, s.DefaultClaudeModel.String),
 			DefaultCodexModel:      textPtrValue(s.DefaultCodexModel.Valid, s.DefaultCodexModel.String),
 			DefaultEffort:          textPtrValue(s.DefaultEffort.Valid, s.DefaultEffort.String),
+			DefaultCodexEffort:     textPtrValue(s.DefaultCodexEffort.Valid, s.DefaultCodexEffort.String),
 			JudgeModel:             textPtrValue(s.JudgeModel.Valid, s.JudgeModel.String),
 			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
 			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
@@ -194,6 +196,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		DefaultClaudeModel json.RawMessage `json:"default_claude_model"`
 		DefaultCodexModel  json.RawMessage `json:"default_codex_model"`
 		DefaultEffort      json.RawMessage `json:"default_effort"`
+		DefaultCodexEffort json.RawMessage `json:"default_codex_effort"`
 		JudgeModel         json.RawMessage `json:"judge_model"`
 		SummaryModel       json.RawMessage `json:"summary_model"`
 		Theme              json.RawMessage `json:"theme"`
@@ -256,7 +259,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Closed-list cross-vocabulary guard (D3): a curated Codex id must not sit in the
-		// Claude lane. No prefix guessing — only the three known Codex ids are rejected.
+		// Claude lane. No prefix guessing — only the curated Codex ids are rejected.
 		if err := rejectCodexIDInClaudeLane("default_claude_model", v); err != nil {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 			return
@@ -300,6 +303,22 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		effortVal = v
+	}
+
+	var codexEffortVal pgtype.Text
+	codexEffortPresent := req.DefaultCodexEffort != nil
+	if codexEffortPresent {
+		var raw *string
+		if err := json.Unmarshal(req.DefaultCodexEffort, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid default_codex_effort")
+			return
+		}
+		v, err := validateEffort(raw)
+		if err != nil {
+			httpx.Error(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		codexEffortVal = v
 	}
 
 	var judgeVal pgtype.Text
@@ -514,6 +533,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			DefaultEffort: effortVal,
 		}); err != nil {
 			slog.Error("set user default effort", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if codexEffortPresent {
+		if _, err := h.q.SetUserDefaultCodexEffort(r.Context(), store.SetUserDefaultCodexEffortParams{
+			ID:                 user.ID,
+			DefaultCodexEffort: codexEffortVal,
+		}); err != nil {
+			slog.Error("set user Codex default effort", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -853,6 +883,7 @@ var curatedCodexModels = map[string]bool{
 	"gpt-6-astra": true,
 	"gpt-5.6-sol": true,
 	"gpt-6-sol":   true,
+	"gpt-6.1-sol": true,
 }
 
 // knownClaudeAliases is the closed Claude alias set the web ModelSelect curates

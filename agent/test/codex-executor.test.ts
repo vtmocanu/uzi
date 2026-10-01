@@ -572,12 +572,13 @@ function makeExecutor(
   binding: CodexBinding,
   log: Logger = noopLog,
   dockerWiring?: DockerWiring,
+  providerConfig: CodexProviderConfig = provider,
 ): CodexExecutor {
   const seam = rig.deps.spawnCommand;
   return new CodexExecutor(
     log,
     "/data/agent-home/run-1",
-    { binding, client: rig.client as never, provider, dockerWiring },
+    { binding, client: rig.client as never, provider: providerConfig, dockerWiring },
     seam ? { ...rig.deps, spawnCommand: answerEnvProbe(seam, rig.probeCalls) } : rig.deps,
   );
 }
@@ -2417,6 +2418,19 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
 });
 
 describe("CodexExecutor: an api_key run meters the root model end-to-end (executor→harness authMode wiring)", () => {
+  it("forwards the claim's medium and explicit effort to the actual turn/start wire field", async () => {
+    for (const effort of ["medium", "xhigh"] as const) {
+      const rig = makeRig();
+      rig.transport.push(threadStarted()).push(signalDone()).push(turnCompleted("completed")).end();
+      const { ctx } = makeCtx({ config: { default_effort: effort } });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "claimed effort");
+      const turn = rig.transport.requests.find((request) => request.method === "turn/start");
+      assert.ok(turn, "a real executor turn is started");
+      assert.equal(rec(turn.params).effort, effort);
+      assert.equal(rec(turn.params).modelReasoningEffort, undefined);
+    }
+  });
+
   it("(C4b) an api_key binding drives a metered root modelUsage entry with the exact Standard costUSD", async () => {
     // The seam under test is codex-executor.ts's `authMode: binding.authMode` into new CodexHarness:
     // the RUN's credential mode selects the terminal cost semantics in the token accountant.
@@ -2426,7 +2440,7 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     // passes every other executor test; this pins it end-to-end: an api_key run's per-model entry
     // must be `metered` with a real costUSD, never `subscription`.
     const rig = makeRig();
-    // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6-astra")
+    // A single ROOT token-usage note on the configured root model (provider.model = "gpt-6.1-sol")
     // with priceable buckets: input 1000 (cached 600, cacheWrite 100 → uncached 300), output 200
     // (incl. 50 reasoning). last === total (a single-response leg), so it reconciles cleanly.
     const b = { inputTokens: 1000, cachedInputTokens: 600, cacheWriteInputTokens: 100, outputTokens: 200, reasoningOutputTokens: 50, totalTokens: 1200 };
@@ -2437,20 +2451,20 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
       .push(turnCompleted("completed"))
       .end();
     const { ctx, emitted } = makeCtx();
-    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "api_key metered run");
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, { ...provider, model: CODEX_PRODUCTION_PROVIDER.model }).run(ctx), 3000, "api_key metered run");
 
     const modelUsage = lastResultModelUsage(emitted);
     assert.ok(modelUsage, "the terminal carries per-model usage");
-    assert.deepEqual(Object.keys(modelUsage), ["gpt-6-astra"], "the root usage is charged to the configured root model");
-    const astra = rec(modelUsage["gpt-6-astra"]);
-    assert.equal(astra.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
-    assert.equal(astra.outputTokens, 200, "output rode through the accountant");
+    assert.deepEqual(Object.keys(modelUsage), ["gpt-6.1-sol"], "the root usage is charged to the configured root model");
+    const sol61 = rec(modelUsage["gpt-6.1-sol"]);
+    assert.equal(sol61.inputTokens, 300, "uncached input derived from the cumulative delta (1000 - 600 - 100)");
+    assert.equal(sol61.outputTokens, 200, "output rode through the accountant");
     // C4b: the api_key binding threads through `authMode: binding.authMode` so the entry is METERED
     // with the summed Standard price, NOT subscription. If line ~1413 is hardcoded to
     // "subscription", this becomes costStatus:'subscription' with no costUSD and both asserts fail.
-    assert.equal(astra.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
-    // 300*10 + 600*1 + 100*12.5 + 200*50 = 14850 µ$. Reasoning (50) is a subset of output, never re-added.
-    assert.equal(Math.round((astra.costUSD as number) * 1e6), 14850, "the exact summed Standard price in microdollars");
+    assert.equal(sol61.costStatus, "metered", "an api_key run's per-model entry is metered (never subscription)");
+    // 300*2 + 600*0.1 + 100*2.5 + 200*10 = 2910 µ$. Reasoning (50) is a subset of output, never re-added.
+    assert.equal(Math.round((sol61.costUSD as number) * 1e6), 2910, "the exact summed Standard price in microdollars");
   });
 
   it("(#1533) honors the server-resolved run/schedule model override on the root init + usage", async () => {
@@ -2458,8 +2472,8 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
     // so a claim carrying the api-resolved, harness-validated `default_model` drives the ROOT thread
     // (not just per-agent-template child overrides). Both the persisted init event AND the per-model
     // usage key derive from that one request.model, so both must reflect the override — NOT the
-    // hardcoded provider fallback "gpt-6-astra". The sibling C4b test (no default_model) pins the
-    // FALLBACK to "gpt-6-astra", so the two together prove `?? provider.model`.
+    // explicit fixture-provider fallback "gpt-6-astra". The production-provider test separately
+    // pins "gpt-6.1-sol"; together these prove `?? provider.model`.
     const rig = makeRig();
     rig.transport
       .push(threadStarted())
@@ -3419,7 +3433,7 @@ describe("CodexExecutor: production provider constant (mutation evidence)", () =
       name: "openai",
       baseUrl: "https://api.openai.com/v1",
       envKey: "OPENAI_API_KEY",
-      model: "gpt-6-astra",
+      model: "gpt-6.1-sol",
     });
   });
 
@@ -3428,9 +3442,9 @@ describe("CodexExecutor: production provider constant (mutation evidence)", () =
     assert.notEqual(
       CODEX_TASK_REVIEW_MODEL,
       CODEX_PRODUCTION_PROVIDER.model,
-      "the review model must not silently equal the shared provider default (which stays gpt-6-astra)",
+      "the review model must not silently equal the shared provider default (which is gpt-6.1-sol)",
     );
-    assert.equal(CODEX_PRODUCTION_PROVIDER.model, "gpt-6-astra", "the shared provider default is unchanged by #1551");
+    assert.equal(CODEX_PRODUCTION_PROVIDER.model, "gpt-6.1-sol", "the production fallback is GPT-6.1 Sol");
   });
 });
 

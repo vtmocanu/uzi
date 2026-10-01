@@ -1056,6 +1056,7 @@ type Store interface {
 	// above, and off the hot path for the same reason — it runs only for a Codex-indicating queued
 	// run already past its health threshold.
 	CountOnlineWorkersSatisfyingCodexHarness(ctx context.Context, userID uuid.UUID) (int64, error)
+	CountOnlineWorkersSatisfyingCodexRuntime(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexCompletion checks the protocol intersection
 	// required by an interlocked Codex run, including a custom root when requested.
 	CountOnlineWorkersSatisfyingCodexCompletion(ctx context.Context, arg store.CountOnlineWorkersSatisfyingCodexCompletionParams) (int64, error)
@@ -1293,8 +1294,9 @@ type Store interface {
 	GetUserHarnessModelDefaults(ctx context.Context, id uuid.UUID) (store.GetUserHarnessModelDefaultsRow, error)
 	// Per-user default reasoning effort (PRD #617): read at issue- and chat-run
 	// claim assembly, keyed on the run owner. NULL ⇒ inherit, resolved to the uzi
-	// default `xhigh` at claim assembly (issue #1157).
+	// default `medium` at claim assembly (issue #1157).
 	GetUserDefaultEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
+	GetUserDefaultCodexEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error)
 	// Per-user AI-attribution opt-out (issue #916): read LIVE at standard run-claim
 	// assembly, keyed on the run owner, so flipping the toggle takes effect on the
 	// next claim with no worker restart. NOT NULL column (default true) ⇒ a definite

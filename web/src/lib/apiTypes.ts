@@ -133,13 +133,15 @@ export interface UserSettings {
    *  default_model, and a curated Codex id is rejected here (D3 cross-vocabulary 400). */
   default_claude_model?: string | null;
   /** Per-user Codex worker-model default (PRD #1551 M1/D2); null = inherit the Codex
-   *  fallback (gpt-6-astra). Optional for the same back-compat reason. Unlike the other
+   *  fallback (gpt-6.1-sol). Optional for the same back-compat reason. Unlike the other
    *  lanes it accepts a custom id (D5), but a known Claude alias is rejected here (D3). */
   default_codex_model?: string | null;
   /** Per-user default reasoning effort (PRD #617); null means the user has not chosen
-   *  (inherit), which resolves to the uzi default (`xhigh`) at claim assembly (issue
+   *  (inherit), which resolves to the uzi default (`medium`) at claim assembly (issue
    *  #1157). One of low|medium|high|xhigh|max when set. */
   default_effort: string | null;
+  /** Independent Codex effort; null inherits medium. Optional for older servers. */
+  default_codex_effort?: string | null;
   /** Per-user judge model override (PRD #69 M2); null means inherit the instance
    *  judge_model (which itself falls back to opus). Written through PUT /me/settings
    *  alongside default_model, validated by the same model rules. */
@@ -195,6 +197,7 @@ export interface UserSettingsPatch {
   default_codex_model?: string | null;
   /** Per-user reasoning effort (PRD #617); present-null clears back to inherit. */
   default_effort?: string | null;
+  default_codex_effort?: string | null;
   /** Per-user judge model (PRD #69 M2); present-null clears back to inherit. */
   judge_model?: string | null;
   /** Per-user run-summary model (PRD #362 M2); present-null clears back to inherit. */

@@ -125,6 +125,7 @@ describe("ModelSelect — harness-scoped vocabulary (PRD #1429 D6)", () => {
     expect(screen.getByRole("option", { name: "gpt-6-astra" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "gpt-5.6-sol" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "gpt-6-sol" })).toBeTruthy();
+    expect(screen.getByRole("option", { name: "gpt-6.1-sol" })).toBeTruthy();
     expect(screen.getByRole("option", { name: "Inherit (account default)" })).toBeTruthy();
     expect(screen.queryByRole("option", { name: /Other/ })).toBeNull();
     // No Claude alias leaks into the Codex vocabulary.

@@ -116,12 +116,12 @@ func TestJudgeClaimUserModelReadErrorFallsBackToInstance(t *testing.T) {
 }
 
 // issue #1157: the judge lane now carries the run owner's per-user default reasoning
-// effort on the assembled claim, inheriting the uzi default `xhigh` when the owner has
+// effort on the assembled claim, inheriting the uzi default `medium` when the owner has
 // not chosen (NULL), mirroring the run/chat lanes. It is best-effort: a read error must
 // NOT fail the judge claim (audit H2's no-spurious-fail posture).
 
 // TestJudgeClaimNullDefaultEffortUsesUziDefault: a NULL per-user default_effort resolves
-// to the uzi default xhigh on the claim, and serializes as default_effort:"xhigh".
+// to the uzi default medium on the claim, and serializes as default_effort:"medium".
 func TestJudgeClaimNullDefaultEffortUsesUziDefault(t *testing.T) {
 	box := newBox(t)
 	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
@@ -129,7 +129,7 @@ func TestJudgeClaimNullDefaultEffortUsesUziDefault(t *testing.T) {
 	fs := &fakeStore{
 		claimRun:  judgeRun(uid, target),
 		anthropic: sealedTok,
-		// defaultEffort left zero (NULL) ⇒ the uzi default xhigh.
+		// defaultEffort left zero (NULL) ⇒ the uzi default medium.
 	}
 	svc := New(fs, box, testParams())
 	svc.SetSettings(fakeSettings{enabled: true, model: "haiku"})
@@ -138,15 +138,15 @@ func TestJudgeClaimNullDefaultEffortUsesUziDefault(t *testing.T) {
 	if err != nil || payload == nil {
 		t.Fatalf("Claim: payload=%v err=%v", payload, err)
 	}
-	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "xhigh" {
-		t.Errorf("Config.DefaultEffort = %v, want the uzi default xhigh", payload.Config.DefaultEffort)
+	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "medium" {
+		t.Errorf("Config.DefaultEffort = %v, want the uzi default medium", payload.Config.DefaultEffort)
 	}
 	b, err := json.Marshal(payload)
 	if err != nil {
 		t.Fatalf("json.Marshal(payload): %v", err)
 	}
-	if !strings.Contains(string(b), `"default_effort":"xhigh"`) {
-		t.Errorf("marshaled claim missing default_effort:xhigh: %s", b)
+	if !strings.Contains(string(b), `"default_effort":"medium"`) {
+		t.Errorf("marshaled claim missing default_effort:medium: %s", b)
 	}
 }
 
@@ -173,10 +173,10 @@ func TestJudgeClaimExplicitDefaultEffortIsCarried(t *testing.T) {
 	}
 }
 
-// TestJudgeClaimDefaultEffortReadErrorFallsBackToXhigh: a user-row read error must NOT
-// fail the judge claim and falls back to the uzi default xhigh best-effort, mirroring
+// TestJudgeClaimDefaultEffortReadErrorFallsBackToMedium: a user-row read error must NOT
+// fail the judge claim and falls back to the uzi default medium best-effort, mirroring
 // TestJudgeClaimUserModelReadErrorFallsBackToInstance.
-func TestJudgeClaimDefaultEffortReadErrorFallsBackToXhigh(t *testing.T) {
+func TestJudgeClaimDefaultEffortReadErrorFallsBackToMedium(t *testing.T) {
 	box := newBox(t)
 	sealedTok, _ := box.Seal([]byte("anthropic-judge-token-abcdef1234567890"))
 	uid, target := uuid.New(), uuid.New()
@@ -195,7 +195,7 @@ func TestJudgeClaimDefaultEffortReadErrorFallsBackToXhigh(t *testing.T) {
 	if payload == nil {
 		t.Fatal("expected a claim payload despite the user default-effort read error")
 	}
-	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "xhigh" {
-		t.Errorf("Config.DefaultEffort = %v, want the uzi default xhigh fallback", payload.Config.DefaultEffort)
+	if payload.Config.DefaultEffort == nil || *payload.Config.DefaultEffort != "medium" {
+		t.Errorf("Config.DefaultEffort = %v, want the uzi default medium fallback", payload.Config.DefaultEffort)
 	}
 }

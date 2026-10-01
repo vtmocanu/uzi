@@ -208,7 +208,7 @@ func TestCodexProfileBoundRunRefusedLiveDB(t *testing.T) {
 	f := newIsoFix(t)
 	run := f.queuedRun(t, 420, true)
 	lane := f.seedWorker(t, laneWorkerSpec{hosted: true, ephemeral: true, boundRun: run, isolated: true,
-		protoCaps: []string{capability.IsolatedFetchV1, capability.CodexHarnessV1, capability.CodexCustomModelV1,
+		protoCaps: []string{capability.IsolatedFetchV1, capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CodexCustomModelV1,
 			capability.CodexCompletionInterlockV1, capability.CompletionInterlockV1}})
 	withDroppedConstraint(t, f.env, "runs_egress_profile_not_codex", func(tx pgx.Tx) {
 		if _, err := tx.Exec(f.env.ctx, `UPDATE runs SET harness = 'codex' WHERE id = $1`, run); err != nil {

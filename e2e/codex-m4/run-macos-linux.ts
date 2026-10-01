@@ -32,6 +32,13 @@ try {
       "macOS Linux-container runner requires CODEX_M4_EVIDENCE (the per-invocation host evidence file); none was set",
     );
   }
+  const depsVolume = process.env.CODEX_M4_DEPS_VOLUME;
+  const codexVolume = process.env.CODEX_M4_CODEX_VOLUME;
+  for (const name of [depsVolume, codexVolume]) {
+    if (name !== undefined && !/^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$/.test(name)) {
+      throw new Error("Codex M4 cache overrides must be Docker volume names, not bind paths");
+    }
+  }
   executeMacosLinuxRun({
     whichDocker,
     nodeArch: process.arch,
@@ -39,6 +46,8 @@ try {
     agentDir,
     e2eDir,
     evidenceHostFile,
+    depsVolume,
+    codexVolume,
     runStage: (argv) => {
       const r = spawnSync(argv[0], argv.slice(1), { stdio: "inherit" });
       if (r.error) throw r.error;

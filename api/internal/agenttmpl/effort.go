@@ -18,7 +18,10 @@ var EffortLevels = []string{"low", "medium", "high", "xhigh", "max"}
 // default_effort column is NULL/blank). It replaces the Claude Agent SDK's own
 // built-in fallback (`high`) as the *effective* uzi default. It is a member of
 // EffortLevels; changing it must keep it inside that closed set.
-const UziDefaultEffort = "xhigh"
+const UziDefaultEffort = "medium"
+
+// UziDefaultCodexEffort is the independently overridable Codex product default.
+const UziDefaultCodexEffort = "medium"
 
 // ResolveDefaultEffort resolves the owner's per-user default effort to the level a
 // run actually uses (issue #1157): the owner's explicit choice when set, or
@@ -27,13 +30,22 @@ const UziDefaultEffort = "xhigh"
 // resolver never returns "" — an inheriting owner rides the uzi default, not an
 // omitted key.
 func ResolveDefaultEffort(userEffort *string) string {
-	if userEffort == nil {
-		return UziDefaultEffort
+	return resolveDefaultEffort(userEffort, UziDefaultEffort)
+}
+
+// ResolveDefaultCodexEffort uses only the owner's Codex preference, or the Codex
+// product default when NULL/blank. The shared preference is not consulted.
+func ResolveDefaultCodexEffort(userEffort *string) string {
+	return resolveDefaultEffort(userEffort, UziDefaultCodexEffort)
+}
+
+func resolveDefaultEffort(userEffort *string, fallback string) string {
+	if userEffort != nil {
+		if e := strings.TrimSpace(*userEffort); e != "" {
+			return e
+		}
 	}
-	if e := strings.TrimSpace(*userEffort); e != "" {
-		return e
-	}
-	return UziDefaultEffort
+	return fallback
 }
 
 // ValidateEffort is the single source of truth for the per-user default-effort
@@ -42,7 +54,7 @@ func ResolveDefaultEffort(userEffort *string) string {
 //
 // A blank (or whitespace-only) value means inherit and returns ("", nil): the
 // caller stores "inherit" as NULL, and inherit resolves to the uzi default
-// (UziDefaultEffort = `xhigh`) at claim assembly (see ResolveDefaultEffort). A
+// (UziDefaultEffort = `medium`) at claim assembly (see ResolveDefaultEffort). A
 // non-blank value is trimmed and must then EQUAL exactly one of EffortLevels
 // (case-sensitive): trimming only strips the ends, so an interior-whitespace value
 // ("hi gh"), an unknown token, or a differently-cased value ("HIGH") is rejected.

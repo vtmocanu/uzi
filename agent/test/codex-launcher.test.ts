@@ -23,7 +23,7 @@ import { WORKER_SPAWN_ENV, workerRunnerRootPids } from "../src/worker-spawn-mark
 // NO setpriv/root: the supervisor is a FAKE process, every privileged/uid-resolving
 // step is injected.
 
-const CODEX_BIN = "/opt/uzi-codex/0.156.1/bin/codex";
+const CODEX_BIN = "/opt/uzi-codex/0.159.3/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 const RUNNER_UID = 10002;
 const DATA_ROOT = "/data/run/root-1";

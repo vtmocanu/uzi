@@ -382,11 +382,11 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	}
 
 	// The run owner's per-user default reasoning effort (PRD #617). NULL now
-	// resolves to the uzi default `xhigh` at this sink (via resolveEffortPtr /
+	// resolves to the uzi default `medium` at this sink (via resolveEffortPtr /
 	// agenttmpl.ResolveDefaultEffort, issue #1157); an explicit choice is carried
 	// verbatim. Unlike DefaultModel there is no per-schedule freeze — the owner's
 	// per-user value is the only source.
-	defaultEffort, err := s.q.GetUserDefaultEffort(ctx, run.UserID)
+	defaultEffort, err := s.readUserDefaultEffort(ctx, run.UserID, Harness(run.Harness))
 	if err != nil {
 		return nil, fmt.Errorf("default effort lookup: %w", err)
 	}
@@ -747,7 +747,7 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 			// completion-blocked run. Configured server-side, shipped like the question bounds above.
 			CompletionHoldWindowSeconds: s.p.CompletionHoldWindowSeconds,
 			DefaultModel:                textPtr(defaultModel),
-			DefaultEffort:               resolveEffortPtr(defaultEffort),
+			DefaultEffort:               resolveHarnessEffortPtr(Harness(run.Harness), defaultEffort),
 			AttributionEnabled:          attributionEnabled,
 			// PRD #305 M3: deliver the flag frozen onto the run at fire time (M1). Read
 			// straight off the run row — not re-derived from the schedule. false for every

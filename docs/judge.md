@@ -118,7 +118,7 @@ works, but your own override only changes your runs, while the admin's is
 the fallback for everyone who hasn't set one.
 
 The judge's reasoning effort follows your own [reasoning effort](./worker-effort.md)
-setting (uzi default `xhigh` when you haven't chosen a level) — previously the
+setting (uzi default `medium` when you haven't chosen a level) — previously the
 judge call fell through to the Claude Agent SDK's own built-in default of
 `high` instead. The `judge_model` picker above is unaffected; this only
 changes how hard the judge model reasons.

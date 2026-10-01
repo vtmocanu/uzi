@@ -19,6 +19,7 @@ import type { CodexUsageBreakdown } from "../src/codex/transport.js";
 const ASTRA = "gpt-6-astra";
 const SOL = "gpt-5.6-sol";
 const SOL6 = "gpt-6-sol";
+const SOL61 = "gpt-6.1-sol";
 // A clock well before any promotional review boundary — the "priceable" default for these tests.
 const BEFORE_SOL_REVIEW = new Date("2026-01-01T00:00:00Z");
 
@@ -40,9 +41,25 @@ function micro(usd: number | undefined): number | undefined {
   return usd === undefined ? undefined : Math.round(usd * 1e6);
 }
 
+describe("GPT-6.1 Sol Standard pricing", () => {
+  it("prices every low-tier bucket and keeps its cheaper cache distinct from GPT-6 Sol", () => {
+    assert.equal(micro(priceCodexResponse(SOL61, bd({ inputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 200_000);
+    assert.equal(micro(priceCodexResponse(SOL61, bd({ inputTokens: 100_000, cachedInputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 10_000);
+    assert.equal(micro(priceCodexResponse(SOL6, bd({ inputTokens: 100_000, cachedInputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 20_000);
+    assert.equal(micro(priceCodexResponse(SOL61, bd({ inputTokens: 100_000, cacheWriteInputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 250_000);
+    assert.equal(micro(priceCodexResponse(SOL61, bd({ outputTokens: 100_000 }), BEFORE_SOL_REVIEW)), 1_000_000);
+  });
+  it("applies the strict input threshold to the whole response without a promotional expiry", () => {
+    const low = bd({ inputTokens: 272_000, cachedInputTokens: 100_000, cacheWriteInputTokens: 100_000, outputTokens: 100_000 });
+    const high = { ...low, inputTokens: 272_001 };
+    assert.equal(micro(priceCodexResponse(SOL61, low, new Date("2027-01-01"))), 1_404_000);
+    assert.equal(micro(priceCodexResponse(SOL61, high, new Date("2027-01-01"))), 2_308_004);
+  });
+});
+
 describe("codex-pricing: the version id and boundary constants are the pinned D5 values", () => {
   it("records the table version and the Sol review boundary with the table", () => {
-    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-09-23");
+    assert.equal(CODEX_PRICE_TABLE_VERSION, "openai-standard-2026-10-01");
     assert.equal(SOL_PROMO_REVIEW_DATE, "2026-11-21");
     assert.equal(CODEX_INPUT_TIER_THRESHOLD_TOKENS, 272_000);
   });

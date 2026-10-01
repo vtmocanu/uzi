@@ -37,6 +37,7 @@ import (
 type fakeSettingsDB struct {
 	model           pgtype.Text
 	effort          pgtype.Text
+	codexEffort     pgtype.Text
 	judge           pgtype.Text
 	summary         pgtype.Text
 	theme           pgtype.Text
@@ -104,6 +105,10 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 				f.model = v
 			}
 		}
+	case strings.Contains(sql, "UPDATE users SET default_codex_effort") && len(args) >= 1:
+		if e, ok := args[0].(pgtype.Text); ok {
+			f.codexEffort = e
+		}
 	case strings.Contains(sql, "UPDATE users SET default_effort") && len(args) >= 1:
 		if e, ok := args[0].(pgtype.Text); ok {
 			f.effort = e // SetUserDefaultEffort: $1 = default_effort
@@ -166,6 +171,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 	return fakeSettingsRow{
 		model:           f.model,
 		effort:          f.effort,
+		codexEffort:     f.codexEffort,
 		judge:           f.judge,
 		summary:         f.summary,
 		theme:           f.theme,
@@ -185,6 +191,7 @@ func (f *fakeSettingsDB) QueryRow(_ context.Context, sql string, args ...any) pg
 type fakeSettingsRow struct {
 	model           pgtype.Text
 	effort          pgtype.Text
+	codexEffort     pgtype.Text
 	judge           pgtype.Text
 	summary         pgtype.Text
 	theme           pgtype.Text
@@ -227,7 +234,7 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		if p, ok := dest[3].(*pgtype.Text); ok {
 			*p = r.typeface
 		}
-	case 15:
+	case 16:
 		// GetUserSettings: SELECT default_model, default_effort, judge_model,
 		// summary_model, theme, sidebar_token_ids, mr_rework_enabled,
 		// appearance_mode, light_theme, dark_theme, typeface, default_harness,
@@ -279,6 +286,9 @@ func (r fakeSettingsRow) Scan(dest ...any) error {
 		}
 		if p, ok := dest[14].(*pgtype.Text); ok {
 			*p = r.codexModel
+		}
+		if p, ok := dest[15].(*pgtype.Text); ok {
+			*p = r.codexEffort
 		}
 	}
 	return nil
