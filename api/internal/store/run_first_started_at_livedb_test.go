@@ -314,8 +314,8 @@ func TestRunResumedLegGetsFreshWallLiveDB(t *testing.T) {
 
 // TestRunFirstStartedAtBackfillLiveDB follows status_since_backfill_livedb_test.go: a throwaway
 // database migrated to 279 is seeded with legacy rows, 00280 is applied, and the backfill is
-// asserted. Started rows seed from started_at, never-started and parked rows stay NULL, and
-// created_at is never read.
+// asserted. Started rows, parked ones included, seed from started_at; rows with no started_at
+// (never started, or promoted and not yet running again) stay NULL; created_at is never read.
 func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
 	if dsn == "" {
@@ -387,6 +387,9 @@ func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
 		{"finished", "completed", time.Date(2021, 1, 1, 1, 0, 0, 0, time.UTC), ts(2), ts(4)},
 		{"running", "running", time.Date(2021, 1, 2, 1, 0, 0, 0, time.UTC), ts(6), nil},
 		{"parked", "limit_wait", time.Date(2021, 1, 3, 1, 0, 0, 0, time.UTC), nil, nil},
+		// A park keeps started_at (only promotion clears it), so a run parked at the upgrade
+		// with its anchor still set seeds from it like any other started row.
+		{"parked-started", "limit_wait", time.Date(2021, 1, 5, 1, 0, 0, 0, time.UTC), ts(8), nil},
 		{"never", "queued", time.Date(2021, 1, 4, 1, 0, 0, 0, time.UTC), nil, nil},
 	}
 	ids := map[string]uuid.UUID{}

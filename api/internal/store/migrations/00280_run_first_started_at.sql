@@ -8,7 +8,7 @@
 -- number is a draft: it is renumbered above the live head at landing.
 ALTER TABLE runs ADD COLUMN first_started_at timestamptz NULL;
 COMMENT ON COLUMN runs.first_started_at IS
-    'Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset on resume.';
+    'Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset by resume paths that grant a fresh wall.';
 
 -- Legacy backfill: a started row seeds from started_at (the best surviving signal, possibly the
 -- last leg only); a never-started or parked row (started_at NULL) stays NULL. created_at is
