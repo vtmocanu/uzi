@@ -107,7 +107,7 @@ func (m *sqlMirror) ClaimPendingSlackNotifications(_ context.Context, a store.Cl
 	defer m.mu.Unlock()
 	var out []store.ClaimPendingSlackNotificationsRow
 	for _, r := range m.rows {
-		if r.render == nil || r.delivered || r.attempts >= a.MaxAttempts || int32(len(out)) >= a.Lim {
+		if r.render == nil || r.delivered || r.attempts >= a.MaxAttempts || len(out) >= int(a.Lim) {
 			continue
 		}
 		r.attempts++

@@ -729,8 +729,8 @@ var queryInventory = []queryPin{
 			"were genuinely removed. Issue #1675: TestNotificationSlackDeliveryLiveDB also drives it " +
 			"with and without a slack_render"},
 	{"ClaimPendingSlackNotifications", "notifications.sql", "TestNotificationSlackDeliveryLiveDB",
-		"direct call across the 'claim' subtests: a row attempted just now is NOT claimed with " +
-			"stale_before in the past and IS claimed (attempts 1 -> 2) with it in the future; delivered, " +
+		"direct call across the 'claim' subtests: a row attempted just now is NOT claimed with a " +
+			"long retry_after_secs and IS claimed (attempts 1 -> 2) with retry_after_secs 0; delivered, " +
 			"at-max-attempts and non-durable rows are never claimed; lim=1 returns exactly one row"},
 	{"MarkNotificationSlackDelivered", "notifications.sql", "TestNotificationSlackDeliveryLiveDB",
 		"direct call in the 'delivered row' subtest: a second call does not move slack_delivered_at, " +

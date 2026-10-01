@@ -515,7 +515,7 @@ func TestMRReworkHaltNotifyFailureRetriesNextTick(t *testing.T) {
 	runs := &mrwRuns{ops: &ops}
 	notifier := &mrwNotifier{err: context.DeadlineExceeded, ops: &ops}
 	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
-	f.cfForge.ops = &ops
+	f.ops = &ops
 	d := newMRW(st, runs, notifier, mrwSettings{enabled: true, capVal: 5})
 
 	d.detect(context.Background(), mrwRepoRow(), f)

@@ -41,9 +41,11 @@ func NewRedeliverer(q RedeliveryStore, slack Slacker, logger *slog.Logger) *Rede
 }
 
 // Pass claims one batch of pending durable rows and re-enqueues each on the Slacker with
-// its row id as DeliveryID. It returns how many were published. A row whose stored render
-// cannot be decoded is logged and skipped; it keeps being claimed until it exhausts
-// MaxSlackAttempts and then stops. With no Slacker it claims nothing.
+// its row id as DeliveryID. It returns how many were handed to the Slacker: an enqueue
+// the notifier drops on a full queue still counts, and that row stays pending for a later
+// claim. A row whose stored render cannot be decoded is logged and skipped; it keeps being
+// claimed until it exhausts MaxSlackAttempts and then stops. With no Slacker it claims
+// nothing.
 func (r *Redeliverer) Pass(ctx context.Context) (int64, error) {
 	if r.slack == nil {
 		return 0, nil
