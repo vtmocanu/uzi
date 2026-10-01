@@ -11,8 +11,8 @@ import { makeFixture, type Fixture } from "./fixture-repo.js";
 import { nullLogger } from "./helpers.js";
 
 // An output stream that ended before execScoped attached without anything ever being read from it is a clean
-// empty EOF (the Codex supervisor closes its stdio copies at launch, so a fast silent git child's pipe has
-// already ended when the handle is returned). One that emitted data to nobody (child_process resumes unread
+// empty EOF (the Codex supervisor closes its stdio copies at launch, so a fast silent git child's pipe can
+// already have ended when the handle is returned). One that emitted data to nobody (child_process resumes unread
 // stdio at exit), or was destroyed without ending, may have lost output and is refused.
 type Seen = { destroyed: boolean; readableEnded: boolean; readableDidRead: boolean };
 const snap = (s: Readable): Seen => ({ destroyed: s.destroyed, readableEnded: s.readableEnded, readableDidRead: s.readableDidRead });
@@ -98,9 +98,10 @@ function execQuiet(bare: string, sha: string): Promise<{ stdout: string }> {
 const inBoundary = <T>(spawner: BoundaryProcessSpawner, fn: () => Promise<T>): Promise<T> =>
   cache.withBoundaryProcessSpawner(spawner, new AbortController().signal, fn);
 
-describe("execScoped boundary collect on already-ended streams fails closed", () => {
+describe("execScoped boundary collect tells a clean empty EOF from dropped output", () => {
   // child_process resumes unread stdio when the child exits, so an exited child's output is dropped
-  // while its streams read as destroyed+ended. That must never read as empty output.
+  // while its streams read as destroyed+ended. Output read before collect listened must never read as
+  // empty or complete; a stream that ended with nothing ever read is genuinely empty.
   it("refuses a real child that exited before handoff with stdout data", async () => {
     const { bare, sha } = await candidate();
     const seen: Seen[] = [];
@@ -138,6 +139,42 @@ describe("execScoped boundary collect on already-ended streams fails closed", ()
       return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
     };
     await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
+  });
+
+  it("refuses a stdout partly drained before handoff that ends later (no partial read as complete)", async () => {
+    const { bare, sha } = await candidate();
+    const spawner: BoundaryProcessSpawner = async () => {
+      const stdout = new PassThrough();
+      stdout.write("lost head\n");
+      stdout.resume();
+      await once(stdout, "data");
+      setImmediate(() => stdout.end("tail\n"));
+      const stderr = new PassThrough();
+      stderr.end();
+      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+    };
+    await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)), /subprocess output closed before end/);
+  });
+
+  it("refuses a stream that ended empty and then errored", async () => {
+    const { bare, sha } = await candidate();
+    let seen: (Seen & { errored: boolean }) | undefined;
+    const spawner: BoundaryProcessSpawner = async () => {
+      const stdout = new PassThrough({ autoDestroy: false });
+      stdout.end();
+      stdout.resume();
+      await once(stdout, "end");
+      stdout.on("error", () => undefined);
+      stdout.destroy(new Error("late failure"));
+      seen = { ...snap(stdout), errored: stdout.errored !== null };
+      const stderr = new PassThrough();
+      stderr.end();
+      return { stdin: null, stdout, stderr, completed: Promise.resolve({ code: 0 }) };
+    };
+    await assert.rejects(inBoundary(spawner, () => execQuiet(bare, sha)));
+    assert.equal(seen?.readableEnded, true);
+    assert.equal(seen?.readableDidRead, false);
+    assert.equal(seen?.errored, true);
   });
 
   it("refuses an ended but not destroyed stdout whose data was drained", async () => {

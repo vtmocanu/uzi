@@ -6814,12 +6814,13 @@ export class GitCache {
         stream.once("end", onEnd);
         stream.once("close", onClose);
         stream.once("error", onError);
-        // A stream already ended before we listened is a clean empty EOF only if nothing was ever read from
-        // it (the Codex supervisor closes its stdio copies at launch, so a fast, silent git child's pipe is
-        // ended before the handle is returned). Ended after emitting data to nobody (child_process resumes
-        // unread stdio at exit), or destroyed without ending, may have dropped output: refuse.
-        if (stream.readableEnded && !stream.readableDidRead && !stream.errored) onEnd();
-        else if (stream.readableEnded || stream.destroyed) onClose();
+        // Data read before we listened is lost (child_process resumes unread stdio at exit), ended or not:
+        // refuse, as for an errored stream or one destroyed without ending. A stream already ended with
+        // nothing ever read is a clean empty EOF (the Codex supervisor closes its stdio copies at launch, so
+        // a fast, silent git child's pipe can end before the handle is returned).
+        if (stream.readableDidRead || stream.errored) onClose();
+        else if (stream.readableEnded) onEnd();
+        else if (stream.destroyed) onClose();
         if (boundary.signal.aborted) onAbort();
         else boundary.signal.addEventListener("abort", onAbort, { once: true });
       });
