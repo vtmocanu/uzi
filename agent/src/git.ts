@@ -181,7 +181,7 @@ export class ScratchPublicationError extends Error {
   readonly code = "scratch_publication_refused";
   readonly kind: ScratchPublicationKind;
   readonly step?: ScratchPublicationStep;
-  /** One line, control characters stripped, capped at DETAIL_MAX; never carries env. */
+  /** One line, control characters replaced with `?` (sanitizeForLog), capped at DETAIL_MAX; never carries env. */
   readonly detail?: string;
   constructor(
     reason: string,
@@ -198,10 +198,12 @@ export class ScratchPublicationError extends Error {
 
 const DETAIL_MAX = 200;
 
-/** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input is
- *  scanned (forge stderr can be megabytes), lines split on CR, LF, U+2028 and U+2029, and the line
- *  goes through sanitizeForLog, which replaces control and bidi code points with `?` and cuts by
- *  code point. A truncated line ends in `...`; the whole result is at most DETAIL_MAX characters. */
+/** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input
+ *  (DETAIL_MAX*4 UTF-16 units) is scanned, because forge stderr can be megabytes; that prefix cut is
+ *  by UTF-16 unit and a line cut by it carries no `...` marker. Lines split on CR, LF, U+2028 and
+ *  U+2029, and the chosen line goes through sanitizeForLog, which replaces control and bidi code
+ *  points with `?`, cuts by code point at its own cap, and appends `...` when it cuts. The whole
+ *  result is at most DETAIL_MAX characters. */
 function oneLine(text: string): string {
   const prefix = String(text).slice(0, DETAIL_MAX * 4);
   for (const raw of prefix.split(/[\r\n\u2028\u2029]/)) {

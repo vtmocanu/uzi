@@ -1267,6 +1267,45 @@ interface ActiveRun {
   shuttingDown: boolean;
 }
 
+/** The failure_reason for a refused scratch publication. A floor_unverified detail can carry
+ *  forge or remote stderr (untrusted), so only its kind and step reach the reason; the structured
+ *  log line from {@link logScratchPublicationRefused} carries the redacted detail. */
+function scratchPublicationFailureReason(err: ScratchPublicationError): string {
+  const at = err.step === undefined ? "" : ` at ${err.step}`;
+  if (err.kind === "floor_unverified") {
+    return `scratch_publication_refused: cannot verify fresh remote floor (${err.kind}${at})`;
+  }
+  const detail = err.detail ? `: ${err.detail}` : "";
+  return `scratch_publication_refused: candidate history cannot be published (${err.kind}${at}${detail})`;
+}
+
+const SCRATCH_CAUSE_MAX_DEPTH = 4;
+const SCRATCH_CAUSE_PART_MAX = 200;
+const SCRATCH_CAUSE_TOTAL_MAX = 600;
+
+/** Log why a scratch publication was refused: kind, step, detail and the cause chain, each
+ *  redacted then sanitized. Without a redactor (a partial test flight) the free text is omitted
+ *  rather than logged unredacted. */
+function logScratchPublicationRefused(
+  runLog: Logger,
+  redactText: ((text: string) => string) | undefined,
+  err: ScratchPublicationError,
+): void {
+  const clean = (text: string): string => sanitizeForLog(redactText ? redactText(text) : "", SCRATCH_CAUSE_PART_MAX);
+  const parts: string[] = [];
+  let cur: unknown = err.cause;
+  for (let depth = 0; cur !== undefined && cur !== null && depth < SCRATCH_CAUSE_MAX_DEPTH; depth++) {
+    parts.push(clean(cur instanceof Error ? cur.message : String(cur)));
+    cur = cur instanceof Error ? cur.cause : undefined;
+  }
+  runLog.error("scratch publication refused", {
+    kind: err.kind,
+    step: err.step,
+    detail: err.detail === undefined ? undefined : clean(err.detail),
+    cause: parts.length === 0 ? undefined : parts.join(" <- ").slice(0, SCRATCH_CAUSE_TOTAL_MAX),
+  });
+}
+
 /**
  * PRD #949 M2 — the per-run state carrier for RunRunner.execute(). Holds the
  * cross-phase state the extracted phase methods, the (still-inline) back half, and
@@ -3600,9 +3639,7 @@ export class RunRunner {
         : err instanceof TerminalReportError
           ? err.reason
           : err instanceof ScratchPublicationError
-            ? err.message === "scratch_publication_refused: cannot verify fresh remote floor"
-              ? "scratch_publication_refused: cannot verify fresh remote floor"
-              : "scratch_publication_refused: candidate history cannot be published"
+            ? scratchPublicationFailureReason(err)
             : (codexBoundaryDiagnosticOf(err) ?? errMessage(err));
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
@@ -3620,6 +3657,7 @@ export class RunRunner {
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
+    if (err instanceof ScratchPublicationError) logScratchPublicationRefused(runLog, redactText, err);
     // Issue #1864: a Codex boundary failure also logs which stage, boundary and sink failed.
     const boundaryDiagnostic = codexBoundaryDiagnosticOf(err);
     if (boundaryDiagnostic !== undefined) {
@@ -9555,6 +9593,7 @@ export class RunRunner {
       }
     } catch (e) {
       if (e instanceof ScratchPublicationError) {
+        logScratchPublicationRefused(runLog, flight.redactText, e);
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
         return;
       }
@@ -10498,6 +10537,7 @@ export class RunRunner {
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
       if (e instanceof ScratchPublicationError) {
+        logScratchPublicationRefused(flight.runLog, flight.redactText, e);
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
         return { published: false, reason: "scratch_publication_refused" };
       }
