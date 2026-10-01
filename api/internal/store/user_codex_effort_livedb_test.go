@@ -12,7 +12,7 @@ import (
 
 func TestCodexEffortBackfillLiveDB(t *testing.T) {
 	ctx, dsn := standIsolatedDB(t, "codex_effort_")
-	if err := store.MigrateTo(ctx, dsn, 283); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 284); err != nil {
 		t.Fatal(err)
 	}
 	pool, err := store.OpenPool(ctx, dsn)
@@ -35,7 +35,7 @@ func TestCodexEffortBackfillLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := store.MigrateTo(ctx, dsn, 284); err != nil {
+	if err := store.MigrateTo(ctx, dsn, 285); err != nil {
 		t.Fatal(err)
 	}
 	for i, value := range cases {
@@ -54,7 +54,7 @@ func TestCodexEffortBackfillLiveDB(t *testing.T) {
 			t.Fatalf("backfill normalized %q to %+v", value, codex)
 		}
 	}
-	if err := store.MigrateDownTo(ctx, dsn, 283); err != nil {
+	if err := store.MigrateDownTo(ctx, dsn, 284); err != nil {
 		t.Fatal(err)
 	}
 	for i, value := range cases {
