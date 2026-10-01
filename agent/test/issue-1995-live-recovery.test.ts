@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
@@ -37,7 +37,6 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import type { RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import { nullLogger } from "./helpers.js";
-import { sleep } from "../src/util.js";
 
 // issue #1995 M2 — a recovery bundle whose upload fails while the worker is ALIVE is re-driven by
 // the heartbeat (no restart), and the capture/sweep/live/pin paths are race-safe: one producer, one
@@ -97,6 +96,10 @@ class FakeClient implements RecoveryArchiveClient {
   uploadEntered = new Counter();
   holdReserve: Promise<void> | undefined;
   holdUpload: Promise<void> | undefined;
+  /** When set, `holdUpload` only holds uploads of this run. */
+  holdUploadRun: string | undefined;
+  /** The run id of every upload attempt, in the order the streams opened. */
+  uploadRuns: string[] = [];
   /** One entry is consumed per upload attempt; an absent entry means the upload is accepted. */
   uploadFailures: Array<{ error: unknown; before?: () => void }> = [];
   active = 0;
@@ -113,16 +116,17 @@ class FakeClient implements RecoveryArchiveClient {
     return { capture_id: captureId, state: "preparing", manifest_bound: false };
   }
   async uploadRecoveryBundle(
-    _runId: string,
+    runId: string,
     captureId: string,
     manifest: RecoveryUploadManifest,
     bundle: Readable,
   ): Promise<RecoveryCaptureStatusResponse> {
     this.active++;
     this.maxActive = Math.max(this.maxActive, this.active);
+    this.uploadRuns.push(runId);
     this.uploadEntered.inc();
     try {
-      if (this.holdUpload) await this.holdUpload;
+      if (this.holdUpload && (!this.holdUploadRun || this.holdUploadRun === runId)) await this.holdUpload;
       const chunks: Buffer[] = [];
       for await (const c of bundle) chunks.push(Buffer.isBuffer(c) ? c : Buffer.from(c as string));
       this.uploadCalls.push({ captureId, manifest, bytes: Buffer.concat(chunks) });
@@ -268,10 +272,15 @@ describe("live recovery re-drive through the Worker heartbeat (issue #1995)", ()
       retentionMs: 7 * 86_400_000,
     });
     await outbox.init();
+    // Resolved by the worker's own heartbeat-driven pass once a pass finds the record journaled uploaded:
+    // an observed event, so the test is not bound to a polling interval.
+    const settled = deferred();
     const runner = {
       resumePendingRecoveries: async () => {},
-      resumeLiveRecoveries: (authenticatedAtMs: number, signal?: AbortSignal) =>
-        coord.resumeLive({ isExecuting: () => false, authenticatedAtMs, signal }),
+      resumeLiveRecoveries: async (authenticatedAtMs: number, signal?: AbortSignal) => {
+        await coord.resumeLive({ isExecuting: () => false, authenticatedAtMs, signal });
+        if ((await current(coord)).state === "uploaded") settled.resolve();
+      },
       execute: async () => {},
     } as unknown as RunRunner;
     const wclient = {
@@ -315,8 +324,15 @@ describe("live recovery re-drive through the Worker heartbeat (issue #1995)", ()
     const controller = new AbortController();
     const done = worker.run(controller.signal);
     try {
-      const deadline = Date.now() + 5000;
-      while ((await current(coord)).state !== "uploaded" && Date.now() < deadline) await sleep(5);
+      let timer: NodeJS.Timeout | undefined;
+      const timeout = new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("no live re-upload settled within 60s")), 60_000);
+      });
+      try {
+        await Promise.race([settled.promise, timeout]);
+      } finally {
+        clearTimeout(timer);
+      }
       assert.equal((await current(coord)).state, "uploaded", "the bundle settled uploaded with no restart");
       assert.equal(client.uploadCalls.length, 2, "the failed attempt, then one accepted re-upload");
       assert.equal(client.reserveCalls.length, 1, "the server capture reserved by the first attempt is reused");
@@ -714,6 +730,243 @@ describe("live pass scoping (issue #1995)", () => {
     await live(coord, { executing: true });
     assert.equal(client.uploadEntered.count, attempts);
     assert.deepEqual(await current(coord), rec);
+  });
+});
+
+// ── B1: an unreadable record never costs its bundle bytes ────────────────────────
+
+/** Make every read of a record `.json` fail with `code` from the `failFrom`-th read on. */
+function failJsonReads(failFrom: number, code = "EMFILE"): { restore(): void; reads(): number } {
+  const real = fsp.readFile.bind(fsp);
+  let n = 0;
+  const m = mock.method(fsp, "readFile", (async (...args: Parameters<typeof fsp.readFile>) => {
+    if (String(args[0]).endsWith(".json") && ++n >= failFrom) {
+      throw Object.assign(new Error(`${code}: simulated`), { code });
+    }
+    return real(...args);
+  }) as typeof fsp.readFile);
+  return { restore: () => m.mock.restore(), reads: () => n };
+}
+const jsonPath = (rec: RecoveryRecord): string => path.join(root, "recovery", RUN, `${rec.captureId}.json`);
+
+describe("a read error is not a removal (issue #1995)", () => {
+  afterEach(() => mock.restoreAll());
+
+  it("captureAndUpload: EMFILE on the mid-cycle re-read keeps the bundle and the record", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git);
+    const { pinned, rec } = await failedFirstUpload(client, coord);
+    const before = fs.readFileSync(jsonPath(rec), "utf8");
+    const attempts = client.uploadEntered.count;
+    // read 1 is the entry re-read; read 2 is the requirePresent before the reserve/stream.
+    const fault = failJsonReads(2);
+    let out: RecoveryOutcome;
+    try {
+      out = await cap(coord, pinned);
+    } finally {
+      fault.restore();
+    }
+    assert.deepEqual([out.state, out.reason], ["needs_action", "record_unauthenticated"]);
+    assert.ok(fs.existsSync(rec.bundlePath!), "the bundle bytes survive a read error");
+    assert.equal(fs.readFileSync(jsonPath(rec), "utf8"), before, "nothing is written");
+    assert.equal(client.uploadEntered.count, attempts, "nothing is uploaded on a record that cannot be read");
+    await live(coord);
+    assert.equal((await current(coord)).state, "uploaded", "a later pass still has the bytes to upload");
+  });
+
+  it("a live pass: EMFILE on the mid-step re-read keeps the bundle and leaves the record eligible", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git);
+    const { rec } = await failedFirstUpload(client, coord);
+    const before = fs.readFileSync(jsonPath(rec), "utf8");
+    const attempts = client.uploadEntered.count;
+    // read 1 is the pass's listing, 2 the step's re-read, 3 the requirePresent before the stream.
+    const fault = failJsonReads(3);
+    try {
+      await live(coord);
+    } finally {
+      fault.restore();
+    }
+    assert.ok(fs.existsSync(rec.bundlePath!), "the bundle bytes survive a read error");
+    assert.equal(fs.readFileSync(jsonPath(rec), "utf8"), before, "the record is unchanged");
+    assert.equal(client.uploadEntered.count, attempts);
+    clock.t += 1_000;
+    await live(coord);
+    assert.equal((await current(coord)).state, "uploaded", "the next pass uploads it");
+  });
+
+  it("a boot-sweep step: EMFILE on the mid-step re-read keeps the bundle", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git);
+    const { rec } = await failedFirstUpload(client, coord);
+    const before = fs.readFileSync(jsonPath(rec), "utf8");
+    // 1 is the boot listing, 2 the step's re-read, 3 the requirePresent before the reserve/stream.
+    const fault = failJsonReads(3);
+    try {
+      await coord.resumePending();
+    } finally {
+      fault.restore();
+    }
+    assert.ok(fs.existsSync(rec.bundlePath!));
+    assert.equal(fs.readFileSync(jsonPath(rec), "utf8"), before);
+  });
+
+  it("a confirmed removal still cleans up: only the record file deleted mid-stream drops the bundle", async () => {
+    for (const via of ["capture", "live"] as const) {
+      const client = new FakeClient();
+      const git = new FakeGit();
+      const coord = makeCoord(client, git);
+      const { pinned, rec } = await failedFirstUpload(client, coord);
+      const gate = deferred();
+      client.holdUpload = gate.promise;
+      const attempts = client.uploadEntered.count;
+      const run = via === "capture" ? cap(coord, pinned) : live(coord);
+      await client.uploadEntered.waitFor(attempts + 1);
+      await fsp.rm(jsonPath(rec)); // the record alone: the bundle is still on disk
+      assert.ok(fs.existsSync(rec.bundlePath!));
+      gate.resolve();
+      const out = await run;
+      if (via === "capture") assert.equal((out as RecoveryOutcome).reason, "record_removed");
+      assert.deepEqual(runFiles(), [], `${via}: the removed record's bundle is dropped, nothing recreated`);
+      await fsp.rm(path.join(root, "recovery"), { recursive: true, force: true });
+    }
+  });
+});
+
+// ── N1/N2: live pass selection ───────────────────────────────────────────────────
+
+/** Two runs each holding a journaled bundle whose first upload failed; returns run ids in the
+ *  order the pass will list them. */
+async function twoFailed(client: FakeClient, coord: RecoveryCoordinator): Promise<[string, string]> {
+  for (const runId of ["run-a", "run-b"]) {
+    client.uploadFailures.push({ error: typed(503, "busy") });
+    const pinned = await pinRec(coord, { runId });
+    assert.equal((await cap(coord, pinned)).state, "needs_action");
+  }
+  const order = fs.readdirSync(path.join(root, "recovery"));
+  assert.equal(order.length, 2);
+  return [order[0]!, order[1]!];
+}
+const stateOf = async (coord: RecoveryCoordinator, runId: string): Promise<string> =>
+  (await coord.inspect(runId))[0]!.state;
+
+describe("live pass selection (issue #1995)", () => {
+  it("liveMaxPerPass=1: an executing run does not hold the slot, the idle record uploads", async () => {
+    for (const executingIdx of [0, 1]) {
+      const client = new FakeClient();
+      const git = new FakeGit();
+      const coord = makeCoord(client, git, { liveMaxPerPass: 1 });
+      const order = await twoFailed(client, coord);
+      const executing = order[executingIdx]!;
+      const idle = order[1 - executingIdx]!;
+      await coord.resumeLive({
+        isExecuting: (runId) => runId === executing,
+        authenticatedAtMs: clock.t + 1_000_000,
+      });
+      assert.equal(await stateOf(coord, idle), "uploaded", `idle ${idle} uploads though ${executing} is listed first/last`);
+      assert.equal(await stateOf(coord, executing), "needs_action");
+      await fsp.rm(path.join(root, "recovery"), { recursive: true, force: true });
+    }
+  });
+
+  it("liveMaxPerPass=1: a record whose cycle is busy rotates behind its peers instead of holding the slot", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git, { liveMaxPerPass: 1 });
+    const [first, second] = await twoFailed(client, coord);
+    const gate = deferred();
+    client.holdUpload = gate.promise;
+    client.holdUploadRun = first;
+    const attempts = client.uploadEntered.count;
+    const fg = (async () => {
+      const rec = (await coord.inspect(first))[0]!;
+      return cap(coord, rec);
+    })();
+    await client.uploadEntered.waitFor(attempts + 1);
+    // first is listed first and its cycle is busy: pass 1 skips it (consuming the only slot)...
+    await live(coord);
+    clock.t += 1_000;
+    // ...but it is now the most recently attempted, so pass 2 reaches the other record.
+    await live(coord);
+    assert.equal(await stateOf(coord, second), "uploaded");
+    gate.resolve();
+    await fg;
+  });
+
+  it("the per-pass cap bounds the records a single pass attempts", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git, { liveMaxPerPass: 1 });
+    await twoFailed(client, coord);
+    const attempts = client.uploadEntered.count;
+    await live(coord);
+    assert.equal(client.uploadEntered.count, attempts + 1);
+  });
+
+  it("the least recently attempted record goes first, so a failing record cannot starve its peer", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git, { liveMaxPerPass: 1 });
+    await twoFailed(client, coord);
+    client.uploadFailures.push({ error: typed(503, "busy") }, { error: typed(503, "busy") });
+    const from = client.uploadRuns.length;
+    await live(coord);
+    clock.t += 1_000;
+    await live(coord);
+    const [a, b] = client.uploadRuns.slice(from);
+    assert.ok(a && b && a !== b, `two passes reached two different runs, got ${a} then ${b}`);
+  });
+
+  it("a credential rejection stops the pass: the next eligible record is not attempted", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git);
+    const [first, second] = await twoFailed(client, coord);
+    client.uploadFailures.push({ error: reqErr(401, "unauthorized") });
+    const attempts = client.uploadEntered.count;
+    await live(coord);
+    assert.equal(client.uploadEntered.count, attempts + 1, "only the rejected record was attempted");
+    assert.equal(await stateOf(coord, second), "needs_action");
+    assert.equal((await coord.inspect(first))[0]!.reason, "credential_rejected");
+  });
+
+  it("a run that becomes executing after selection is skipped under the lock", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git);
+    await twoFailed(client, coord);
+    const gate = deferred();
+    client.holdUpload = gate.promise;
+    const attempts = client.uploadEntered.count;
+    let flipped = false;
+    const pass = coord.resumeLive({
+      isExecuting: (runId) => flipped && runId !== client.uploadRuns[attempts],
+      authenticatedAtMs: clock.t + 1_000_000,
+    });
+    await client.uploadEntered.waitFor(attempts + 1);
+    // Both were selected as idle; the second now starts executing before its step takes the lock.
+    flipped = true;
+    gate.resolve();
+    await pass;
+    assert.equal(client.uploadEntered.count, attempts + 1, "the now-executing run was not uploaded");
+  });
+
+  it("forgets the attempt stamps of captures that left the journal", async () => {
+    const client = new FakeClient();
+    const git = new FakeGit();
+    const coord = makeCoord(client, git);
+    await failedFirstUpload(client, coord);
+    client.uploadFailures.push({ error: typed(503, "busy") });
+    await live(coord);
+    const stamps = (coord as unknown as { lastAttemptAt: Map<string, number> }).lastAttemptAt;
+    assert.equal(stamps.size, 1);
+    await coord.release(RUN, 1);
+    clock.t += 1_000_000;
+    await live(coord);
+    assert.equal(stamps.size, 0);
   });
 });
 

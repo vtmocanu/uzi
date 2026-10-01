@@ -448,7 +448,7 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
       }
       assert.deepEqual((await writer.inspect("r1")).map((r) => r.generation),
         cleanup === "legacy_release" ? [] : [8], "settled generation must stay deleted; siblings stay intact");
-      await assert.rejects(guardedWrite(writer, record, record), /was removed during the restart sweep/);
+      await assert.rejects(guardedWrite(writer, record, record), /was removed/);
     });
   }
 

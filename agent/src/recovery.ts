@@ -660,7 +660,12 @@ export class RecoveryCoordinator {
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
   private async captureCycle(input: CaptureInput): Promise<RecoveryOutcome> {
     let record = input.record;
-    const removed = async (): Promise<RecoveryOutcome> => {
+    // The bundle bytes are dropped only when the record's file is CONFIRMED absent; a record that is
+    // present but unreadable keeps them (they may be the only copy) and nothing is written.
+    const removed = async (err: RecordGoneError): Promise<RecoveryOutcome> => {
+      if (!err.absent) {
+        return { state: "needs_action", captureId: record.captureId, reason: "record_unauthenticated" };
+      }
       await this.dropBundleFiles(record);
       return { state: "needs_action", captureId: record.captureId, reason: "record_removed" };
     };
@@ -700,7 +705,7 @@ export class RecoveryCoordinator {
       }
       return await this.uploadJournaledBundle(record, input.signal, "capture");
     } catch (err) {
-      if (err instanceof RecordGoneError) return removed();
+      if (err instanceof RecordGoneError) return removed(err);
       this.log.warn("recovery: capture/upload failed; retaining source (needs_action)", {
         run_id: record.runId,
         capture_id: record.captureId,
@@ -709,7 +714,7 @@ export class RecoveryCoordinator {
       try {
         return await this.markFailure(record, "capture_error", true);
       } catch (markErr) {
-        if (markErr instanceof RecordGoneError) return removed();
+        if (markErr instanceof RecordGoneError) return removed(markErr);
         throw markErr;
       }
     }
@@ -811,8 +816,7 @@ export class RecoveryCoordinator {
     const finalPath = this.bundlePath(snapshot);
     try {
       return await this.withJournalLock(snapshot.runId, async () => {
-        const cur = await this.readRecord(this.recordPath(snapshot));
-        if (!cur) throw new RecordGoneError(snapshot);
+        const cur = await this.requireRecord(snapshot);
         if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
         await fs.rename(tmpPath, finalPath);
@@ -950,7 +954,7 @@ export class RecoveryCoordinator {
 
   /** Throw {@link RecordGoneError} unless the record still exists and authenticates. */
   private async requirePresent(record: RecoveryRecord): Promise<void> {
-    if (!(await this.readRecord(this.recordPath(record)))) throw new RecordGoneError(record);
+    await this.requireRecord(record);
   }
 
   /** The authenticated latest journaled version of `record`, telling a removed record from one
@@ -958,9 +962,9 @@ export class RecoveryCoordinator {
   private async readLatest(
     record: RecoveryRecord,
   ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "gone" } | { kind: "unauthenticated" }> {
-    const latest = await this.readRecord(this.recordPath(record));
-    if (latest) return { kind: "ok", record: latest };
-    return (await fileExists(this.recordPath(record))) ? { kind: "unauthenticated" } : { kind: "gone" };
+    const res = await this.readRecordResult(this.recordPath(record));
+    if (res.kind === "ok") return res;
+    return res.kind === "absent" ? { kind: "gone" } : { kind: "unauthenticated" };
   }
 
   /** Drop the bundle file(s) a removed record named (and its canonical path). */
@@ -1157,8 +1161,13 @@ export class RecoveryCoordinator {
         });
         return;
       }
-      // The live flight's cleanup removed this record while the sweep worked on it: stop, and
-      // drop the bundle bytes this sweep produced (the record that named them is gone).
+      // The record vanished or became unreadable while the sweep worked on it: stop. Only a
+      // confirmed-absent record (the live flight's cleanup) drops the bundle bytes; an unreadable
+      // one keeps them, since they may be the only copy.
+      if (!err.absent) {
+        done("needs_action", "record_unauthenticated");
+        return;
+      }
       await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
       done("record_removed");
     }
@@ -1247,7 +1256,7 @@ export class RecoveryCoordinator {
       return;
     }
     // Never write a bundle for a record the live flight's cleanup already removed.
-    if (await this.recordGone(record)) throw new RecordGoneError(record);
+    await this.requirePresent(record);
     try {
       // PAT-less and forge-free by design: no fetchDefaultTip, so the bundle is self-contained.
       // Written to a private temp and installed atomically only if the record still names the same
@@ -1313,15 +1322,24 @@ export class RecoveryCoordinator {
   private async livePass(opts: ResumeLiveOptions): Promise<void> {
     let transient = false;
     try {
-      const candidates = (await this.snapshotBootRecords())
-        .filter((r) => isLiveCandidate(r))
+      const all = await this.snapshotBootRecords();
+      // Forget the attempt stamps of captures no longer in the journal listing (bounded map).
+      const seen = new Set(all.map((r) => r.captureId));
+      for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
+      // Executing runs are filtered BEFORE the per-pass cap so they cannot hold its slots.
+      const candidates = all
+        .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
       for (const snap of candidates) {
         if (opts.signal?.aborted) break;
-        if (opts.isExecuting(snap.runId)) continue;
         const res = await runCaptureCycle(this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
-        if (!res.ran) continue;
+        if (!res.ran) {
+          // Cycle busy (a foreground capture or sweep step owns it): rotate it behind its peers so it
+          // does not hold a per-pass slot forever.
+          this.lastAttemptAt.set(snap.captureId, this.now());
+          continue;
+        }
         if (res.value === "transient") transient = true;
         if (res.value === "credential") break;
       }
@@ -1348,11 +1366,15 @@ export class RecoveryCoordinator {
         ...(reason ? { reason } : {}),
       });
     };
-    const record = await this.readRecord(this.recordPath(snap));
-    if (!record) {
-      log("record_removed");
+    const res = await this.readRecordResult(this.recordPath(snap));
+    if (res.kind !== "ok") {
+      // Nothing is deleted here: a removed record's bytes are already gone with its cleanup, and an
+      // unreadable one is retried by a later pass (rotated behind its peers).
+      this.lastAttemptAt.set(snap.captureId, this.now());
+      log(res.kind === "absent" ? "record_removed" : "record_unauthenticated");
       return "ok";
     }
+    const record = res.record;
     // Re-checked inside the lock: the record may have moved on, or the run started executing.
     if (!isLiveCandidate(record) || opts.isExecuting(record.runId)) return "ok";
     this.lastAttemptAt.set(record.captureId, this.now());
@@ -1364,8 +1386,9 @@ export class RecoveryCoordinator {
       return "ok";
     } catch (err) {
       if (err instanceof RecordGoneError) {
-        await this.dropBundleFiles(record);
-        log("record_removed");
+        // Drop the bytes only for a confirmed-absent record; an unreadable one stays eligible.
+        if (err.absent) await this.dropBundleFiles(record);
+        log(err.absent ? "record_removed" : "record_unauthenticated");
         return "ok";
       }
       this.log.warn("recovery: live re-upload failed; retaining source (needs_action)", {
@@ -1443,32 +1466,45 @@ export class RecoveryCoordinator {
     await fs.rename(tmp, dst);
   }
 
-  /** Read + AUTHENTICATE one record; null on a missing/tampered/unparseable file. */
+  /** Read + AUTHENTICATE one record; null on a missing/tampered/unparseable/unreadable file. */
   private async readRecord(filePath: string): Promise<RecoveryRecord | null> {
-    if (!this.key) return null;
+    const res = await this.readRecordResult(filePath);
+    return res.kind === "ok" ? res.record : null;
+  }
+
+  /**
+   * Read + authenticate one record, telling a record that is ABSENT (ENOENT: the only outcome that
+   * proves it was removed) from one that is present but could not be read or authenticated (EMFILE,
+   * EIO, a MAC mismatch, a malformed file). Only `absent` may drive deletion of the bundle bytes the
+   * record named: an unreadable record may still be the only pointer to the sole copy.
+   */
+  private async readRecordResult(
+    filePath: string,
+  ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "absent" } | { kind: "unreadable" }> {
+    if (!this.key) return { kind: "unreadable" };
     let raw: string;
     try {
       raw = await fs.readFile(filePath, "utf8");
-    } catch {
-      return null;
+    } catch (err) {
+      return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
     } catch {
       this.log.warn("recovery: unparseable journal record; refusing (needs_action)", { file: filePath });
-      return null;
+      return { kind: "unreadable" };
     }
-    if (typeof parsed !== "object" || parsed === null) return null;
+    if (typeof parsed !== "object" || parsed === null) return { kind: "unreadable" };
     const obj = parsed as Record<string, unknown>;
     const mac = obj.mac;
-    if (typeof mac !== "string") return null;
+    if (typeof mac !== "string") return { kind: "unreadable" };
     const rest = { ...obj };
     delete rest.mac;
     const record = coerceRecord(rest);
     if (!record) {
       this.log.warn("recovery: malformed journal record; refusing (needs_action)", { file: filePath });
-      return null;
+      return { kind: "unreadable" };
     }
     const expected = this.computeMac(record);
     if (!macEqual(mac, expected)) {
@@ -1476,9 +1512,17 @@ export class RecoveryCoordinator {
         file: filePath,
         run_id: record.runId,
       });
-      return null;
+      return { kind: "unreadable" };
     }
-    return record;
+    return { kind: "ok", record };
+  }
+
+  /** The authenticated record at `record`'s path, or a {@link RecordGoneError} carrying whether the
+   *  file is confirmed absent. */
+  private async requireRecord(record: Pick<RecoveryRecord, "runId" | "captureId">): Promise<RecoveryRecord> {
+    const res = await this.readRecordResult(this.recordPath(record));
+    if (res.kind !== "ok") throw new RecordGoneError(record, res.kind === "absent");
+    return res.record;
   }
 
   private computeMac(record: RecoveryRecord): string {
@@ -1527,8 +1571,7 @@ export class RecoveryCoordinator {
     mutate: (current: RecoveryRecord) => RecoveryRecord | undefined,
   ): Promise<RecoveryRecord> {
     return this.withJournalLock(record.runId, async () => {
-      const current = await this.readRecord(this.recordPath(record));
-      if (!current) throw new RecordGoneError(record);
+      const current = await this.requireRecord(record);
       const next = mutate(current);
       if (!next) return current;
       await this.writeRecordUnlocked(next);
@@ -1621,10 +1664,19 @@ export class RecoveryCoordinator {
   }
 }
 
-/** The restart sweep found the record it was working on already removed (issue #1742). */
+/** A capture, sweep or live step found its record gone (issue #1742) or unreadable (issue #1995).
+ *  `absent` is true only when the record file is CONFIRMED missing; when false the file exists but
+ *  could not be read or authenticated, and the bundle bytes it names must be kept. */
 class RecordGoneError extends Error {
-  constructor(record: Pick<RecoveryRecord, "runId" | "captureId">) {
-    super(`recovery record ${record.captureId} of run ${record.runId} was removed during the restart sweep`);
+  constructor(
+    record: Pick<RecoveryRecord, "runId" | "captureId">,
+    readonly absent: boolean = true,
+  ) {
+    super(
+      absent
+        ? `recovery record ${record.captureId} of run ${record.runId} was removed`
+        : `recovery record ${record.captureId} of run ${record.runId} could not be read or authenticated`,
+    );
     this.name = "RecordGoneError";
   }
 }
