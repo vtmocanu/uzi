@@ -966,6 +966,7 @@ Tracked as GitHub issue vtmocanu/uzi#1590; PRD at `prds/1590-codex-quarantine-cl
 Tracked as GitHub issue vtmocanu/uzi#1624.
 
 - (AI-synced 2026-09-24) An ephemeral (run-bound) worker reports `max_concurrent_runs` 1 and never counts as a free slot for another run; persistent workers report their advertised cap.
+- (AI-synced 2026-10-01) Qualifier: a leased-idle ephemeral worker (one that finished its run and is held for its lease) may take a same-owner, same-repo, same-branch follow-up run during the lease (PRD #2006); it still never counts as a free slot for any other run.
 
 ## Feature #1650 — Retire the Notifications inbox tab
 

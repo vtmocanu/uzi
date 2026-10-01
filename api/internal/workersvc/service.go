@@ -229,7 +229,7 @@ var (
 	// ErrMessagesPending rejects a TERMINAL transition whose messages_through_seq is not yet
 	// backed by a CONTIGUOUS [1..through] in run_messages (PRD #1391 Run B M3c, D3): the
 	// high-water last_seq has not reached `through`, or a hole exists below it (count < through).
-	// The fence returns it BEFORE the mutating SetRunCompleted/SetRunFailed/completeRunWithPermit
+	// The fence returns it BEFORE the mutating SetRunCompleted/SetRunFailed/completeRunWithPermitLease
 	// call, so nothing is written; the worker fills the missing seqs and re-reports. The handler
 	// maps it to a typed 409 with a {run, reason:"messages_pending"} body — the SAME {run, reason}
 	// shape as the forge-park refusals, NOT the disposition shape. It is a RECOVERABLE refusal:
@@ -457,7 +457,7 @@ type Store interface {
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
 	// DeleteEphemeralWorkerForRun tears down the ephemeral worker bound to a now-terminal
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
-	DeleteEphemeralWorkerForRun(ctx context.Context, arg uuid.UUID) (int64, error)
+	DeleteEphemeralWorkerForRun(ctx context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 
@@ -1323,7 +1323,7 @@ type Store interface {
 	// and UpsertCompletionPermit are called on the non-transactional permit/attempt endpoints
 	// through s.q; the completion-transaction queries (GetRunOwnedByWorkerForUpdate,
 	// GetUnconsumedCompletionPermit, GetConsumedCompletionPermit, ConsumeCompletionPermit) are
-	// invoked through a tx-bound *store.Queries inside completeRunWithPermit, and appear here so
+	// invoked through a tx-bound *store.Queries inside completeRunWithPermitLease, and appear here so
 	// the interface stays the complete list of queries this package uses (a new query changes
 	// the interface).
 	RecordCompletionAttempt(ctx context.Context, arg store.RecordCompletionAttemptParams) (int32, error)
@@ -1796,6 +1796,21 @@ type Service struct {
 	// ephemeralSettings reads the instance ephemeral-worker kill-switch for the queued reason
 	// of a profile-bound run (PRD #1906 M5). Optional (nil-safe); set via SetEphemeralSettings.
 	ephemeralSettings EphemeralSettingsReader
+	// ephemeralLease is the bounded interval a finished ephemeral worker keeps its row for a
+	// same-owner, same-repository, same-branch follow-up (PRD #2006). Zero (the default) turns the
+	// feature off: every path below is exactly the pre-lease one. Set via SetEphemeralLease.
+	ephemeralLease time.Duration
+	// leaseAtOverride pins Claim's @lease_at admission instant. TEST-ONLY: unexported, zero in
+	// production (Valid false), so Claim always reads LeaseClockNow. See claimLeaseAt.
+	leaseAtOverride pgtype.Timestamptz
+	// leaseClaimProbe, when set by a test, is told the outcome of every claim that ran through a
+	// lease: whether ClaimRun admitted a run through it and whether the rebind applied. TEST-ONLY:
+	// nil in production.
+	leaseClaimProbe func(admitted, rebound bool)
+	// leaseClaimWindow, when set by a test, runs between a lease claim's ClaimRun and its rebind,
+	// the window in which a concurrent provision can bind another ephemeral worker to the claimed
+	// run. TEST-ONLY: nil in production, where the call is skipped.
+	leaseClaimWindow func()
 	// completionInterlock reads the completion-interlock switch createRun consults to decide
 	// whether to stamp completion_contract_version=1 on a new unseeded issue
 	// run (PRD #1226 M1, D1; #1626). Optional (nil-safe); set via
@@ -1879,7 +1894,7 @@ type Service struct {
 	// claim backstop) remains the security net, so a wiring gap never fails all runs.
 	guard RepoGuard
 	// txBeginner opens the pgx transaction the permit-gated completion runs in (PRD #1226
-	// M2, D4): completeRunWithPermit locks the run, consumes the permit and writes
+	// M2, D4): completeRunWithPermitLease locks the run, consumes the permit and writes
 	// `completed` atomically through it. *pgxpool.Pool satisfies it; set via SetTxBeginner.
 	// Nil is FAIL-CLOSED — an interlocked completion errors rather than completing
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
@@ -2016,6 +2031,17 @@ func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabili
 // SetEphemeralSettings wires the instance ephemeral-worker kill-switch reader the health
 // detector consults for a profile-bound run's queued reason (PRD #1906 M5).
 func (s *Service) SetEphemeralSettings(r EphemeralSettingsReader) { s.ephemeralSettings = r }
+
+// SetEphemeralLease wires the ephemeral worker lease interval (PRD #2006). Call once at startup,
+// before serving. Zero (the default) disables the lease: no terminal report enters one and no claim
+// rebinds through one, so every path is exactly the pre-lease one. A negative value is treated as
+// zero.
+func (s *Service) SetEphemeralLease(d time.Duration) {
+	if d < 0 {
+		d = 0
+	}
+	s.ephemeralLease = d
+}
 
 // SetCompletionInterlockSettings wires the completion-interlock rollout-switch reader
 // createRun consults (PRD #1226 M1, D1). Call once at startup, before serving, with the
@@ -2928,9 +2954,13 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		// provisioner writes, never from anything the worker sent.
 		WorkerIsolatedLane: wkr.IsolatedLane,
 		// PRD #529 Decision 4: an ephemeral worker may claim only its bound run.
-		IsEphemeral:           wkr.Ephemeral,
-		EphemeralRunID:        wkr.EphemeralRunID,
-		SpreadCutoff:          pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		IsEphemeral:    wkr.Ephemeral,
+		EphemeralRunID: wkr.EphemeralRunID,
+		SpreadCutoff:   pgconv.Time(s.now().Add(-s.p.WorkerSpreadGrace)),
+		// PRD #2006: the configured lease for EVERY claimant, read by ClaimRun's spread-peer mirror so a
+		// leased ephemeral peer is a deferral target. A claimant's own lease identity (LeaseSince,
+		// LeaseRepoID, LeaseBranch, LeaseAt) stays confined to claimRunInTx. Lease 0 yields a NULL interval.
+		EphemeralLease:        LeaseInterval(s.ephemeralLease),
 		BackgroundGraceCutoff: pgconv.Time(s.now().Add(-s.p.WorkerBackgroundGrace)),
 		HeartbeatCutoff:       pgconv.Time(s.now().Add(-s.p.WorkerHeartbeatStale)),
 		// PRD #1030 M2: a draining claimant is scoped to its own promoted run (see the
@@ -2972,6 +3002,14 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 	// finishRunClaim's exact-claim transaction (PRD #1590 M1), which refuses with no payload
 	// when no tx beginner is wired, so a fake-store claim never delivers or mutates unfenced.
 	if snapshot == nil || s.txBeginner == nil {
+		// PRD #2006: a possibly-leased ephemeral claimant must claim under the lease discipline
+		// even with no snapshot (UZI_ACTIVE_SNAPSHOT_DISABLED, or an agent that has not negotiated
+		// active_run_snapshot), or its same-branch follow-up would sit queued for the whole lease.
+		// That takes a short transaction. Every other claimant (a non-ephemeral worker, lease 0, no
+		// tx beginner wired) keeps the single auto-commit ClaimRun below, byte for byte.
+		if s.txBeginner != nil && s.ephemeralLease > 0 && wkr.Ephemeral {
+			return s.claimRunLeasedNoSnapshot(ctx, wkr, params)
+		}
 		run, err := s.q.ClaimRun(ctx, params)
 		if err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
@@ -3036,19 +3074,20 @@ func (s *Service) Claim(ctx context.Context, wkr store.Worker, snapshot *ActiveS
 		committed = true
 		return nil, nil // idle: the worker is overflowed, no claim
 	}
-	// (e) Claim inside the tx. On no candidate, COMMIT (the snapshot replace must persist) and report
-	// idle; on success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
+	// (e) Claim inside the tx, through the lease discipline when the claimant holds a lease (see
+	// claimRunInTx). Not claimed: COMMIT (the snapshot replace must persist) and report idle. On
+	// success, COMMIT and then assemble OUTSIDE the tx (assembly opens credentials + builds
 	// snapshots and must not hold the DB tx), exactly as the no-snapshot path does.
-	run, err := qtx.ClaimRun(ctx, params)
+	run, claimed, err := s.claimRunInTx(ctx, tx, qtx, wkr.ID, reread, params)
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			if cerr := tx.Commit(ctx); cerr != nil {
-				return nil, cerr
-			}
-			committed = true
-			return nil, nil // idle
-		}
 		return nil, err
+	}
+	if !claimed {
+		if cerr := tx.Commit(ctx); cerr != nil {
+			return nil, cerr
+		}
+		committed = true
+		return nil, nil // idle
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
@@ -3466,7 +3505,7 @@ type StateRequest struct {
 	MrIID              *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
 	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
-	// such a completion through completeRunWithPermit, which consumes the permit issued for
+	// such a completion through completeRunWithPermitLease, which consumes the permit issued for
 	// (run, contract_revision, Head) and writes `completed` in one transaction. A completed
 	// report whose Head does not match an unconsumed permit leaves the run non-terminal
 	// (applied=false). Absent on a LEGACY run's completion (that path is byte-for-byte
@@ -3893,7 +3932,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// same 409/stale_claim ack as ErrStaleClaim). A LEGACY worker (no capability) is still honoured
 	// unfenced when it omits the field — back-compat by construction. INTERLOCKED completion is
 	// excluded here (stateUsesGenerationFence is false for it) and enforces the identical check
-	// inside completeRunWithPermit's permit transaction, where the rest of that arm's fence lives.
+	// inside completeRunWithPermitLease's permit transaction, where the rest of that arm's fence lives.
 	if req.ClaimGeneration == nil &&
 		stateUsesGenerationFence(req.State, owned) &&
 		slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1) {
@@ -3941,6 +3980,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			_ = fenceTx.Rollback(ctx)
 		}
 	}()
+	// PRD #2006: lease entry is atomic with the terminal transition. leaseOut records what the
+	// transaction that committed the terminal state did (hold released, lease entered) so the
+	// post-commit steps below skip the duplicate release and the teardown. leaseFence marks the
+	// generation fence tx below as the one that enters it (an ephemeral worker, lease on, a
+	// terminal fenced report).
+	var leaseOut terminalLeaseOutcome
+	var leaseFence bool
 	// PRD #1497 M1 (D16): close the released window for a generation-less (legacy) report too. A
 	// nil-generation report on a fenced state whose claim is RELEASED (a held-state switch, or a
 	// server-side wall park set claim_released_at) is rejected as stale — the released window closes
@@ -3961,6 +4007,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
+		// PRD #2006: an ephemeral worker's terminal report locks the WORKER row before the run
+		// row, the canonical order Claim, Register, Heartbeat and the sweepers use, so the lease
+		// entry below serializes against a claim, a cordon and the reaper. Only a terminal fenced
+		// report on an ephemeral worker with the lease on; every other report is unchanged.
+		if s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed") {
+			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
+				if errors.Is(werr, pgx.ErrNoRows) {
+					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
+				}
+				return store.Run{}, false, werr
+			}
+			leaseFence = true
+		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
 			if errors.Is(lerr, pgx.ErrNoRows) {
@@ -4285,7 +4344,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		})
 	case "completed":
 		// PRD #1391 Run B M3c (D3): the terminal fence, BEFORE any mutating write (the
-		// SetRunCompleted / completeRunWithPermit calls below). When the report carries
+		// SetRunCompleted / completeRunWithPermitLease calls below). When the report carries
 		// messages_through_seq it refuses a completion whose run_messages are not yet contiguous
 		// through that seq (ErrMessagesPending) or whose hole is too large to fill
 		// (ErrGapUnrecoverable). A legacy worker omits it and this is a no-op. Runs on q, which is
@@ -4358,7 +4417,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			ID:                  runID, WorkerID: pgconv.UUID(wkr.ID),
 		}
 		// PRD #1226 M2 (D4): an INTERLOCKED run's terminal completion is PERMIT-GATED and runs
-		// through a service transaction (completeRunWithPermit) that consumes the permit issued
+		// through a service transaction (completeRunWithPermitLease) that consumes the permit issued
 		// for the exact (run, contract_revision, head) and writes `completed` atomically, with a
 		// seam for later generation activation. A gated completion with no matching unconsumed
 		// permit updates nothing and stays non-terminal (rows==0 -> applied=false -> 409). A
@@ -4369,7 +4428,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// byte-for-byte.
 		if owned.CompletionContractVersion.Valid {
 			var idempotent bool
-			rows, idempotent, err = s.completeRunWithPermit(ctx, wkr, owned, req, completedParams)
+			rows, idempotent, leaseOut, err = s.completeRunWithPermitLease(ctx, wkr, owned, req, completedParams)
 			// PRD #1247 M5 (D3): the interlocked completion runs its OWN permit transaction, so
 			// it cannot nest under an outer FOR UPDATE fence (self-deadlock) — it is
 			// generation-fenced INSIDE that lock instead and returns ErrStaleClaim when a
@@ -4599,6 +4658,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// is a no-op once fenceTx is cleared. A legacy (nil-generation) report left fenceTx nil, so this
 	// is skipped.
 	if fenceTx != nil {
+		// PRD #2006: a genuinely applied terminal transition on an ephemeral worker (fence tx
+		// opened with the worker locked first) releases the completed run's custody hold and
+		// enters the lease in THIS transaction, so the terminal state, the release and the lease
+		// become visible together: the reaper sees either a non-terminal run or a live lease.
+		if leaseFence && rows > 0 {
+			leaseOut = s.enterEphemeralLeaseTx(ctx, fenceTx, wkr, runID, owned.ClaimGeneration)
+		}
 		if cerr := fenceTx.Commit(ctx); cerr != nil {
 			return store.Run{}, false, cerr
 		}
@@ -4702,7 +4768,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// completion report (D3) — the M4 custody-release reconciler is the backstop that settles
 		// a recorded successful publication later, after which reap proceeds. Deliberately NOT
 		// called on failed/cancelled: those retain custody for capture or explicit discard.
-		if run.Status == "completed" {
+		//
+		// PRD #2006: skipped when the terminal transaction already released it (leaseOut.released).
+		if run.Status == "completed" && !leaseOut.released {
 			if _, relErr := s.q.ReleaseCustodyHoldExact(ctx, store.ReleaseCustodyHoldExactParams{
 				RunID:      runID,
 				Generation: run.ClaimGeneration,
@@ -4726,7 +4794,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// worker-cancel / failed alike — is its cue to tear down. Fires on the SAME
 		// committed transition; guarded on wkr.Ephemeral and busy-checked in-query so a
 		// normal run's completion is a no-op. Best-effort — never fails the report.
-		s.maybeTeardownEphemeral(ctx, wkr, run)
+		// PRD #2006: skipped when the terminal transaction entered the worker's lease.
+		s.maybeTeardownEphemeral(ctx, wkr, run, leaseOut.leased)
 		// PRD #1030 M4 / PRD #1810 M1: on a COMMITTED terminal transition (completed, or a
 		// failed→cancelled/stopped/plan-reject/agent-failure route through the switch
 		// above), settle the run's checkpoint ref. While any custody hold of the run is open
@@ -4754,11 +4823,15 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 // (PRD #529 M4). Best-effort: a failure here must never fail the worker's terminal
 // report — M5's reaper is the backstop. Guarded on wkr.Ephemeral so a normal run's
 // completion does not issue a pointless DELETE.
-func (s *Service) maybeTeardownEphemeral(ctx context.Context, wkr store.Worker, run store.Run) {
-	if !wkr.Ephemeral || !terminalStatuses[run.Status] {
+//
+// PRD #2006: leased reports that the terminal transaction entered the worker's lease, so the worker
+// stays for a follow-up and no delete is issued. Otherwise the delete carries the real lease so its
+// own live-lease skip applies.
+func (s *Service) maybeTeardownEphemeral(ctx context.Context, wkr store.Worker, run store.Run, leased bool) {
+	if !wkr.Ephemeral || !terminalStatuses[run.Status] || leased {
 		return
 	}
-	if _, err := s.q.DeleteEphemeralWorkerForRun(ctx, run.ID); err != nil {
+	if _, err := s.q.DeleteEphemeralWorkerForRun(ctx, store.DeleteEphemeralWorkerForRunParams{RunID: run.ID, EphemeralLease: LeaseInterval(s.ephemeralLease)}); err != nil {
 		slog.Warn("ephemeral teardown on run completion", "run", run.ID, "worker", wkr.ID, "error", err)
 	}
 }
@@ -5325,7 +5398,7 @@ func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr sto
 // worker_id refuses it as not owned rather than acting on it: runOwnedByWorker, the input
 // receipts (inputReceipt), the PR-description fence (lockPrDescRun), and RunMessageGaps, whose
 // single-statement authorization carries the same predicate in SQL. The FOR UPDATE re-reads in
-// SetState, completeRunWithPermit, parkForgeUnreachable and parkDataVolumeFull run after
+// SetState, completeRunWithPermitLease, parkForgeUnreachable and parkDataVolumeFull run after
 // runOwnedByWorker on the same request, and both sides are immutable (runs.egress_profile_id by
 // trigger, workers.isolated_lane written only at provisioning), so they need no second check.
 // It logs the refusal, since a mismatched pair means the claim-side placement failed.

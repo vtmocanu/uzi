@@ -97,6 +97,14 @@ spec:
                   key: {{ $secretKey | quote }}
                   optional: true
             {{- end }}
+            # PRD #2006: how long an ephemeral worker is held idle after its run for a
+            # same-owner/repo/branch follow-up. Direct env, so it wins over api.config
+            # (envFrom). Null or unset renders the 2h default; any other value is quoted
+            # as a string so an explicit 0 (lease disabled) survives and is never read as
+            # unset. The api validates it (max 2h) and refuses to boot on a bad value.
+            {{- $ephemeralLease := .Values.workers.ephemeralLease }}
+            - name: UZI_EPHEMERAL_LEASE
+              value: {{ if kindIs "invalid" $ephemeralLease }}"2h"{{ else }}{{ toString $ephemeralLease | quote }}{{ end }}
             {{- if include "uzi.apiHostingEnabled" . }}
             # The controller's bearer credential, as a HASH (PRD #58 Decision 2). The
             # api only ever compares sha256(presented) against this, so the hash is not

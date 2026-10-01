@@ -336,6 +336,66 @@ describe("WorkersSettings hosted workers (PRD #58 M5)", () => {
     expect(screen.queryByText("ephemeral")).toBeNull();
   });
 
+  it("shows a leased badge with the remaining lease while it is live, and none when absent or past (PRD #2006 M2)", async () => {
+    // Pin the clock so the remaining time is exact. Fake only Date: the page's polls and
+    // findBy* waits still run on real timers.
+    vi.useFakeTimers({ toFake: ["Date"] });
+    vi.setSystemTime(new Date("2026-10-01T12:00:00Z"));
+    const leased = aWorker({
+      id: "w-el",
+      name: "ephemeral-leased",
+      kind: "hosted",
+      hosted_size: "m",
+      ephemeral: true,
+      ephemeral_lease_expires_at: "2026-10-01T13:12:30Z", // 1h 12m 30s ahead
+    });
+    const running = aWorker({ id: "w-er", name: "ephemeral-running", kind: "hosted", hosted_size: "m", ephemeral: true });
+    const expired = aWorker({
+      id: "w-ex",
+      name: "ephemeral-expired",
+      kind: "hosted",
+      hosted_size: "m",
+      ephemeral: true,
+      ephemeral_lease_expires_at: "2026-10-01T11:59:00Z", // a minute ago: stale poll / skew
+    });
+    mockApi.listWorkers.mockResolvedValue({ workers: [leased, running, expired] });
+    renderPage();
+
+    await screen.findByText("ephemeral-leased");
+    // Control: all three rows rendered (one ephemeral badge each), so the single leased
+    // badge below is a real count, not a page that rendered nothing.
+    expect(screen.getAllByText("ephemeral")).toHaveLength(3);
+    const badge = screen.getByText("leased · 1h 12m left");
+    // The badge sits in the LEASED worker's row, not merely somewhere on the page.
+    expect(badge.closest("li")?.textContent).toContain("ephemeral-leased");
+    expect(badge.getAttribute("title")).toMatch(/same repository and branch/);
+    // Absent (still running) and past (expired) render no leased badge at all, not "0m".
+    expect(screen.getAllByText(/^leased · /)).toHaveLength(1);
+    for (const name of ["ephemeral-running", "ephemeral-expired"]) {
+      expect(screen.getByText(name).closest("li")?.textContent).not.toMatch(/leased/);
+    }
+  });
+
+  it("does not count ephemeral (incl. leased) workers against the manual hosted quota", async () => {
+    // Mirrors the server's CountHostedWorkersForUser (`AND NOT ephemeral`): ephemeral
+    // workers have their own cap, so a leased worker idling for its lease must not make
+    // the manual form read "at quota" while the server would accept a provision.
+    const leased = aWorker({
+      id: "w-el",
+      name: "ephemeral-leased",
+      kind: "hosted",
+      hosted_size: "m",
+      ephemeral: true,
+      ephemeral_lease_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [hosted, leased] });
+    renderPage();
+    await screen.findByText("ephemeral-leased");
+    openAddTab();
+    expect(await screen.findByText(/1 of 2 used/)).toBeTruthy();
+  });
+
   it("badges a hosted row even when hosting is switched off (never leave a row lying)", async () => {
     // An admin can turn hosting off while a user still holds hosted workers. The rows
     // must stay listed and deletable — and stay honest about what they are, or they
@@ -589,6 +649,32 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     for (const b of screen.getAllByRole("button", { name: "Delete" })) {
       expect(document.activeElement).not.toBe(b);
     }
+  });
+
+  it("the at-quota link skips an ephemeral row listed first and focuses the first PERSISTENT hosted row (PRD #2006)", async () => {
+    // Ephemeral workers never count toward the manual hosted quota, so deleting one frees
+    // nothing here: the jump must land on a persistent hosted row even when a (leased)
+    // ephemeral row comes first in the fleet order.
+    const eph = aWorker({
+      id: "w-eph",
+      name: "auto (M)",
+      kind: "hosted",
+      hosted_size: "m",
+      ephemeral: true,
+      ephemeral_lease_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    const h1 = aWorker({ id: "w-h1", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    const h2 = aWorker({ id: "w-h2", name: "base (M)", kind: "hosted", hosted_size: "m" });
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [eph, h1, h2] });
+    renderPage();
+
+    await screen.findByText("base (M)");
+    openAddTab();
+    fireEvent.click(await screen.findByRole("button", { name: "delete one to provision another" }));
+
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1")));
+    expect(document.activeElement).not.toBe(document.getElementById("worker-row-w-eph"));
   });
 
   it("names each worker row via aria-labelledby pointing at the worker-name span (M4, a11y)", async () => {

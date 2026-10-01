@@ -954,6 +954,26 @@ func TestDriftBusyNotDrainingCordonsAndDefers(t *testing.T) {
 	}
 }
 
+// PRD #2006: an idle (Busy=false) ephemeral worker holding a lease is the same as any idle
+// worker to the controller. A drifted one is rolled (patched) at once, never deferred, and
+// no cordon is requested: the api clears the lease on its own side when it cordons or
+// re-registers the worker. The controller needs no lease awareness.
+func TestDriftIdleEphemeralWorkerIsPatchedImmediately(t *testing.T) {
+	c := &fakeCordoner{}
+	w, obs, dep := driftedWorker(t, false, nil)
+	w.Ephemeral = true
+	m, client := newMatWithCordoner(t, c, dep)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if !wasPatched(client) {
+		t.Fatal("an idle drifted ephemeral worker was not patched; it must roll at once")
+	}
+	if len(c.calls) != 0 {
+		t.Fatalf("RequestDrain calls = %v, want none for an idle worker", c.calls)
+	}
+}
+
 // drift + busy + already draining (recently, within the deadline) ⇒ no re-cordon, still
 // deferred (no patch).
 func TestDriftBusyAlreadyDrainingDefersWithoutRecordon(t *testing.T) {

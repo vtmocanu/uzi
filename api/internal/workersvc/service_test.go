@@ -1724,8 +1724,8 @@ func (f *fakeStore) DeleteWorkerForUser(_ context.Context, arg store.DeleteWorke
 	f.deleteWorkerParams = &arg
 	return f.deleteWorkerRows, nil
 }
-func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg uuid.UUID) (int64, error) {
-	f.delEphemeralArg = &arg
+func (f *fakeStore) DeleteEphemeralWorkerForRun(_ context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error) {
+	f.delEphemeralArg = &arg.RunID
 	return f.delEphemeralRuns, nil
 }
 

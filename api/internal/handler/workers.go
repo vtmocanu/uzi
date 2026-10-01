@@ -225,6 +225,27 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 	}
 }
 
+// ephemeralLeaseExpiry is the instant a worker's idle lease ends, or nil when no lease is
+// live: no lease_since, a draining worker (a cordon ends the lease), a disabled lease
+// (lease <= 0), or an expiry that is not after now (PRD #2006).
+func ephemeralLeaseExpiry(leaseSince, drainingSince pgtype.Timestamptz, lease time.Duration, now time.Time) *time.Time {
+	if !leaseSince.Valid || drainingSince.Valid || lease <= 0 {
+		return nil
+	}
+	exp := leaseSince.Time.Add(lease)
+	if !exp.After(now) {
+		return nil
+	}
+	return &exp
+}
+
+// overlayEphemeralLease sets the DTO's ephemeral_lease_expires_at from the worker's lease
+// columns and the configured lease. A post-step rather than a builder parameter because
+// the lease duration lives on the handler config, not on the row.
+func (h *Handler) overlayEphemeralLease(dto *apitypes.WorkerDTO, leaseSince, drainingSince pgtype.Timestamptz) {
+	dto.EphemeralLeaseExpiresAt = ephemeralLeaseExpiry(leaseSince, drainingSince, h.cfg.EphemeralLease, h.clock())
+}
+
 // rollSignalFromRow lifts the LEFT-JOINed roll-health columns into the classifier's
 // input, or nil when no report exists for this worker.
 //
@@ -570,6 +591,7 @@ func (h *Handler) ListWorkers(w http.ResponseWriter, r *http.Request) {
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		h.overlayEphemeralLease(&dto, row.LeaseSince, row.DrainingSince)
 		h.overlayOutbox(&dto, row.ID)
 		h.overlayReportedRuns(&dto, reported, row.ID)
 		overlayRunDisk(&dto, runDisk, row.ID)
@@ -596,6 +618,7 @@ func (h *Handler) AdminListWorkers(w http.ResponseWriter, r *http.Request) {
 	runDisk := h.runDiskByWorker(r.Context(), ids)
 	for _, row := range rows {
 		dto := workerDTOFromAdminRow(row, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+		h.overlayEphemeralLease(&dto, row.Worker.LeaseSince, row.Worker.DrainingSince)
 		h.overlayOutbox(&dto, row.Worker.ID)
 		h.overlayReportedRuns(&dto, reported, row.Worker.ID)
 		overlayRunDisk(&dto, runDisk, row.Worker.ID)
@@ -774,6 +797,7 @@ func (h *Handler) PatchWorker(w http.ResponseWriter, r *http.Request) {
 	// register/heartbeat/list surfaces: this worker may be active with a live backlog,
 	// and without the overlay its outbox_* fields would read null on this response.
 	dto := workerDTOFromWorker(wkr, 0, false, token.label, h.version, h.cfg.HostedWorkerVersion, h.clock(), h.startedAt)
+	h.overlayEphemeralLease(&dto, wkr.LeaseSince, wkr.DrainingSince)
 	h.overlayOutbox(&dto, wkr.ID)
 	// Reuse the batched query with a one-element id set (PRD #1390 M2c): this worker may hold a
 	// live snapshot, so without the overlay its reported_runs would read [] on this response.

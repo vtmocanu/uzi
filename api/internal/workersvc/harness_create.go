@@ -79,6 +79,10 @@ func codexCuratedModelsSlice() []string {
 	return out
 }
 
+// CodexCuratedModels is codexCuratedModelsSlice for the provisioning triggers in hostedsvc, whose lease
+// arm mirrors the same custom-Codex-model gate.
+func CodexCuratedModels() []string { return codexCuratedModelsSlice() }
+
 // harnessModelCompatible screens a FROZEN run.model value (a schedule/per-run pin) against harness
 // h's closed vocabulary (PRD #1429 D6, narrowed by PRD #1551 M4). Since M4 the per-harness user
 // lanes are read straight from GetUserHarnessModelDefaults and already carry their harness, so a

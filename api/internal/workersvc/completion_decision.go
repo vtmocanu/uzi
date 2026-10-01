@@ -231,7 +231,7 @@ func completionQuestionOpen(run store.Run) bool {
 //     transaction, no contract change.
 //   - "partial" / "accept": OWNER-SCOPED (GetRun authorizes the caller, exactly like continue and
 //     CreateRunInput), then ONE transaction that, under the run's FOR UPDATE row lock (the mutex,
-//     like completeRunWithPermit): re-checks ownership against the locked row, fences on the
+//     like completeRunWithPermitLease): re-checks ownership against the locked row, fences on the
 //     contract revision (fresh apply / idempotent no-op / conflict), validates the decision against
 //     the LOCKED contract, bumps the revision to N+1 with the revised contract, invalidates every
 //     prior unconsumed permit, records the audit input + resumes the run, and commits. Every write

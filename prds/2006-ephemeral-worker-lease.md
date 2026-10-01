@@ -1,6 +1,6 @@
 # PRD #2006: Ephemeral worker lease: keep a finished run's worker warm for same-branch follow-up work
 
-**Status**: Planned.
+**Status**: Implemented (M1, M2); hosted k8s acceptance pending.
 
 ## Problem
 
@@ -47,14 +47,14 @@ Acceptance examples:
 
 ## Milestones
 
-- [ ] **M1: A finished ephemeral worker is leased and takes a same-branch follow-up.** Lease setting (config, chart value, compose, boot validation), migration, effective branch identity, lease entry on terminal, lease-aware teardown and reaper, claim predicate with all placement mirrors and provisioning queries, atomic transitions, quota eviction, worker DTO plus `uzi worker list` display, `docs/hosted-workers.md` and the chart values docs, CHANGELOG. Tests per the Testing decisions. Blocked by: none. Correct the stale comment at `api/internal/hostedsvc/protocol.go` (the `Ephemeral` field says a disk-pressured ephemeral worker is torn down, while `controller/internal/kube/materializer.go` excludes ephemeral workers from pressure recycling). Gates: `task gate:api`, `task gate:controller`, relevant LiveDB tests via `./e2e/run-store-it.sh`, `task gate:repo`, `task render:ephemeral-lease-check`.
-- [ ] **M2: The web Workers page shows leased-idle workers.** Lease state and remaining time on the Workers page, counted in fleet totals; mock-mode fixture. Blocked by: M1. Gate: `task gate:web`.
+- [x] **M1: A finished ephemeral worker is leased and takes a same-branch follow-up.** Lease setting (config, chart value, compose, boot validation), migration, effective branch identity, lease entry on terminal, lease-aware teardown and reaper, claim predicate with all placement mirrors and provisioning queries, atomic transitions, quota eviction, worker DTO plus `uzi worker list` display, `docs/hosted-workers.md` and the chart values docs, CHANGELOG. Tests per the Testing decisions. Blocked by: none. Correct the stale comment at `api/internal/hostedsvc/protocol.go` (the `Ephemeral` field says a disk-pressured ephemeral worker is torn down, while `controller/internal/kube/materializer.go` excludes ephemeral workers from pressure recycling). Gates: `task gate:api`, `task gate:controller`, relevant LiveDB tests via `./e2e/run-store-it.sh`, `task gate:repo`, `task render:ephemeral-lease-check`.
+- [x] **M2: The web Workers page shows leased-idle workers.** Lease state and remaining time on the Workers page, counted in fleet totals; mock-mode fixture. Blocked by: M1. Gate: `task gate:web`.
 
 No `.github/workflows/**` change in implementation or validation.
 
 ## Acceptance (hosted k8s, maintainer-owned)
 
-Feature completion requires hosted k8s evidence, tracked in a linked `acceptance` issue: warm same-branch follow-up reuse, lease expiry teardown, quota eviction of a leased-idle worker, and drain/roll of a leased-idle worker. Implementation may merge before this acceptance completes; the PRD moves to `prds/done/` only after it.
+Feature completion requires hosted k8s evidence, tracked in the linked `acceptance` issue #2008: warm same-branch follow-up reuse, lease expiry teardown, quota eviction of a leased-idle worker, and drain/roll of a leased-idle worker. Implementation may merge before this acceptance completes; the PRD moves to `prds/done/` only after it.
 
 ## Decision Log
 
@@ -64,3 +64,10 @@ Feature completion requires hosted k8s evidence, tracked in a linked `acceptance
 - 2026-10-01: No disk-pressure lease ending: there is no signal that removes the worker row on kubelet eviction, and the controller already skips ephemeral workers in its disk-pressure roll.
 - 2026-10-01: Hosted acceptance is required for completion (not optional), because this changes scheduling and lifecycle on the primary runtime; merge does not wait for it.
 - 2026-10-01: Reviewed with a Codex buddy (four rounds on the issue draft; findings on branch identity (incl. issue re-runs via `agentIssueBranch`), chart render checks, lane exclusion, placement mirrors and quota prefilters, atomic transitions, and lifecycle wording folded in).
+- 2026-10-01: The effective branch identity is one SQL function, `fn_run_lease_branch` (migration `00282_ephemeral_worker_lease.sql`), not a Go function, because every consumer is a SQL predicate. A Go/SQL parity LiveDB test pins its issue and `ci_fix` arms to the Go sources (`agentIssueBranch`, `claimPipelineFromSnapshot`); the `mr_rework` arm mirrors `pipeline_ref`, the source `claim_assembly.go` uses. An issue run's identity is server-derived: `agent/issue-<iid>` only when its `branch` is NULL, empty or equal to that, otherwise no identity.
+- 2026-10-01: Drain and roll end a lease by clearing it in `CordonHostedWorker` and `RegisterWorker`; a rolled or restarted pod re-registers and the reaper releases the row. The controller is unchanged. A crash-restart also ends a lease (fail closed).
+- 2026-10-01: Deliberate narrowing of "any terminal": a lease starts only when a worker-reported `completed` or `failed` commits in a transaction holding the worker lock (the `setState` generation fence tx, or the `completeRunWithPermitLease` permit tx) and no custody hold is left open. A worker-reported `cancelled`, a failed report routed to cancelled, a nil-generation report (on both the fence and the permit path), and sweeper, cancel and server-side failures keep immediate teardown, because the worker's state is unknown. A plan-rejected run ends `failed` and may lease. Lease entry, the completed run's custody release and the terminal write commit together, so the reaper sees either a non-terminal run or a live lease.
+- 2026-10-01: Known limitation: the display-only health rungs (`CountOnlineWorkersWithFreeSlotForUser`, `CountOnlineWorkersSatisfying*`) are not lease-aware, so a run a leased-idle worker could take may briefly show "all workers busy".
+- 2026-10-01: Fresh clock: claim admission reads `clock_timestamp()` immediately before `ClaimRun` (after the worker lock, run locks, snapshot replace and claimant guards), the rebind re-checks the lease against its own `clock_timestamp()`, and a refused rebind rolls the claim back to a savepoint and reports idle. The same discipline applies on the no-snapshot claim path.
+- 2026-10-01: Deadlocks (40P01) are retried by the caller, not server-side: the agent's state report retries 5xx (`agent/src/client.ts` `reportStateOnce`), a claim error is retried on the next claim poll, a provision error on the next provisioner pass, and a repo delete is re-issued by the user. A claim racing a provision of another ephemeral worker for the same run ends in a unique violation (claim reports idle) or a 40P01 on one side; no state is corrupted.
+- 2026-10-01: At-cap eviction removes the oldest releasable (not busy, no custody hold) leased worker only for an owner exactly at the cap with the lease on; an owner over the cap (cap lowered across a restart) or with the lease at `0` is refused without eviction. The web Workers page's manual hosted quota count now excludes ephemeral workers, matching the server's `CountHostedWorkersForUser`.

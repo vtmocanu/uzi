@@ -1271,6 +1271,9 @@ type Worker struct {
 	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
 	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
 	IsolatedLane             bool               `json:"isolated_lane"`
+	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch              pgtype.Text        `json:"lease_branch"`
 }
 
 type WorkerActiveRun struct {

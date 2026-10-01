@@ -343,11 +343,11 @@ func TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB(t *testing.T) {
 	// A #1227 revision bump lands AFTER the snapshot but before the FOR UPDATE lock.
 	e.exec(t, `UPDATE runs SET contract_revision = 2 WHERE id = $1`, runID)
 
-	rows, idempotent, err := svc.completeRunWithPermit(e.ctx, wkr, owned,
+	rows, idempotent, _, err := svc.completeRunWithPermitLease(e.ctx, wkr, owned,
 		StateRequest{Head: strPtr(head)},
 		store.SetRunCompletedParams{ID: runID, WorkerID: owned.WorkerID})
 	if err != nil {
-		t.Fatalf("completeRunWithPermit: %v", err)
+		t.Fatalf("completeRunWithPermitLease: %v", err)
 	}
 	if rows != 0 || idempotent {
 		t.Fatalf("a completion racing a revision bump must stay non-terminal; rows=%d idempotent=%v", rows, idempotent)
@@ -365,7 +365,7 @@ func TestCompletionRevisionBumpUnderLockStaysNonTerminalLiveDB(t *testing.T) {
 	}
 }
 
-// TestCompletionGenerationFenceLiveDB drives completeRunWithPermit's generation fence (PRD #1247
+// TestCompletionGenerationFenceLiveDB drives completeRunWithPermitLease's generation fence (PRD #1247
 // M5, D3) end to end through a completed report carrying claim_generation, against an INTERLOCKED
 // run with a granted permit — coverage the interlocked completion arm lacked (tester BLOCKING gap):
 //   - (a) matching generation + not released -> completion proceeds (happy path);
@@ -641,7 +641,7 @@ func (e interlockLiveDB) permitBranchHead(t *testing.T, runID uuid.UUID) (branch
 // an attempt log, because that transaction can only consume a permit that was issued. It is the
 // same worker-field discipline every other worker-authored text field carries (stripNULParam /
 // persistCompletionAttempt). Mutation-sensitive: revert the strip in RequestCompletionPermit and
-// the issue 22021s (the permit-granted assertion reddens); revert it in completeRunWithPermit and
+// the issue 22021s (the permit-granted assertion reddens); revert it in completeRunWithPermitLease and
 // the consume 22021s (the SetState assertion reddens).
 func TestPermitNULStrippedEndToEndLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
@@ -879,7 +879,7 @@ func (e interlockLiveDB) permitIssuedByWorker(t *testing.T, runID uuid.UUID) uui
 // upsert's ON CONFLICT must REBIND issued_by_worker_id to the re-requesting worker. Worker A
 // issues a permit for (run, rev, H); the run requeues to worker B (still running, now owned by
 // B); B re-requests the SAME (rev, branch, H) and the row's issued_by_worker_id becomes B, so B's
-// completeRunWithPermit (which fences on B's id) can find and consume it and the run completes.
+// completeRunWithPermitLease (which fences on B's id) can find and consume it and the run completes.
 // Mutation-sensitive: revert the upsert SET to `branch = EXCLUDED.branch` only and the row keeps
 // A's id, so B's completion can never match its permit -> the "B completes" assertion reddens.
 func TestPermitRequeueRebindsWorkerLiveDB(t *testing.T) {

@@ -14,7 +14,8 @@ import (
 
 const cordonHostedWorker = `-- name: CordonHostedWorker :execrows
 UPDATE workers
-   SET draining_since = COALESCE(draining_since, now()), updated_at = now()
+   SET draining_since = COALESCE(draining_since, now()), updated_at = now(),
+       lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL
  WHERE id = $1 AND kind = 'hosted'
 `
 
@@ -24,6 +25,9 @@ UPDATE workers
 // and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
 // manages only hosted workers and must never cordon an external one. Rows affected = 0
 // means no such hosted worker exists (the handler answers 404).
+// PRD #2006: a cordon also ENDS any ephemeral lease (a draining worker claims nothing new, and a
+// leased-idle worker is idle, so it rolls or is released at once, never held for its lease). The
+// UPDATE takes the row lock, so it serializes against a claim that is rebinding the same worker.
 func (q *Queries) CordonHostedWorker(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, cordonHostedWorker, id)
 	if err != nil {
@@ -104,7 +108,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createEphemeralHostedWorker = `-- name: CreateEphemeralHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode, isolated_lane)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8, $9::boolean)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
 `
 
 type CreateEphemeralHostedWorkerParams struct {
@@ -199,6 +203,9 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
@@ -206,7 +213,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, $7)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
 `
 
 type CreateHostedWorkerParams struct {
@@ -299,6 +306,9 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
@@ -322,7 +332,18 @@ WHERE w.ephemeral
       SELECT 1 FROM recovery_custody_holds h
       WHERE h.live_worker_id = w.id AND h.state = 'open'
   )
+  -- PRD #2006: SKIP a worker whose ephemeral LEASE is live (it finished this run and stays warm
+  -- for a same-branch follow-up). Evaluated at clock_timestamp(), not the transaction-start now(),
+  -- so a delete that waited on a lock never skips through a lease that expired meanwhile. A NULL
+  -- or zero @ephemeral_lease, or a worker with no lease, reads false: today's behaviour exactly.
+  AND NOT COALESCE(w.lease_since + $2::interval > clock_timestamp()
+                   AND w.draining_since IS NULL, false)
 `
+
+type DeleteEphemeralWorkerForRunParams struct {
+	RunID          uuid.UUID       `json:"run_id"`
+	EphemeralLease pgtype.Interval `json:"ephemeral_lease"`
+}
 
 // Teardown primitive (PRD #529 M4): drop the ephemeral worker bound to a now-terminal
 // run, but ONLY when that worker holds no non-terminal run — the SAME busy definition as
@@ -339,8 +360,155 @@ WHERE w.ephemeral
 // @ephemeral_run_id::uuid) so the generated param is a plain uuid.UUID: the caller always
 // has a concrete run to tear down. A NULL ephemeral_run_id never equals it, so an
 // ephemeral worker whose bound run was already reaped (FK SET NULL) is left alone.
-func (q *Queries) DeleteEphemeralWorkerForRun(ctx context.Context, runID uuid.UUID) (int64, error) {
-	result, err := q.db.Exec(ctx, deleteEphemeralWorkerForRun, runID)
+func (q *Queries) DeleteEphemeralWorkerForRun(ctx context.Context, arg DeleteEphemeralWorkerForRunParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteEphemeralWorkerForRun, arg.RunID, arg.EphemeralLease)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteLockedEphemeralWorkers = `-- name: DeleteLockedEphemeralWorkers :execrows
+DELETE FROM workers w
+WHERE w.id = ANY($1::uuid[])
+  AND w.ephemeral
+  AND NOT EXISTS (
+      SELECT 1 FROM runs br
+      WHERE br.worker_id = w.id
+        AND br.status NOT IN ('completed', 'failed', 'cancelled')
+  )
+  -- PRD #1296 M4 (D3): the SAME custody skip as DeleteEphemeralWorkerForRun above — the
+  -- reaper must never drop the last local source of a custody-held worker. The hold's
+  -- live_worker_id FK is ON DELETE RESTRICT (a bypass fail-closes), and this predicate
+  -- turns that into a graceful skip: the custody-release reconciler releases the hold once
+  -- release is warranted, after which the next reap tick finds no open hold and proceeds.
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.live_worker_id = w.id AND h.state = 'open'
+  )
+  AND (
+      (NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')
+      )
+       -- PRD #2006: ...unless the worker holds a LIVE ephemeral lease (it finished that run and
+       -- stays warm for a same-branch follow-up). Evaluated at clock_timestamp(), so a statement
+       -- that waited on a lock never reaps through, or spares, a lease on a stale instant. A NULL
+       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly. The lease
+       -- spares only a worker still LINKED to its served run (ephemeral_run_id IS NOT NULL): a
+       -- worker whose run row was deleted (FK SET NULL) can never be re-bound by a claim, so it
+       -- is an orphan and reaps on the next tick even with a live lease.
+       AND NOT COALESCE(w.ephemeral_run_id IS NOT NULL
+                        AND w.lease_since + $2::interval > clock_timestamp()
+                        AND w.draining_since IS NULL, false))
+      OR (w.online_since IS NULL AND w.created_at < $3)
+      OR (w.online_since IS NOT NULL AND w.online_since < $3
+          AND EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.id = w.ephemeral_run_id
+                AND r.worker_id IS NOT NULL AND r.worker_id <> w.id
+          ))
+      OR EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
+      )
+      OR (w.isolated_lane AND w.online_since IS NOT NULL
+          AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
+  )
+`
+
+type DeleteLockedEphemeralWorkersParams struct {
+	Ids            []uuid.UUID        `json:"ids"`
+	EphemeralLease pgtype.Interval    `json:"ephemeral_lease"`
+	DeadlineCutoff pgtype.Timestamptz `json:"deadline_cutoff"`
+}
+
+// The delete half of the reap (see LockReapableEphemeralWorkers, whose header documents every arm):
+// delete the locked ids that STILL satisfy the reap predicate on this statement's fresh snapshot.
+// The predicate below is the SAME text as the lock statement's; keep them identical.
+func (q *Queries) DeleteLockedEphemeralWorkers(ctx context.Context, arg DeleteLockedEphemeralWorkersParams) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteLockedEphemeralWorkers, arg.Ids, arg.EphemeralLease, arg.DeadlineCutoff)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const deleteReleasableLeasedEphemeralWorker = `-- name: DeleteReleasableLeasedEphemeralWorker :execrows
+DELETE FROM workers w
+ WHERE w.id = $1
+   AND w.ephemeral
+   AND w.lease_since IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM runs r
+       WHERE r.worker_id = w.id
+         AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+       WHERE h.live_worker_id = w.id AND h.state = 'open')
+`
+
+// PRD #2006 quota eviction, step 2 of 2: delete the worker locked by
+// LockOldestReleasableLeasedEphemeralWorker, re-checking the lease, busy and custody guards on a
+// FRESH statement snapshot taken after the lock is held (the lock statement's snapshot may predate a
+// claim or a terminal report that committed while it ran). One row deleted: the slot is free. Zero:
+// the worker is no longer releasable; refuse as today.
+func (q *Queries) DeleteReleasableLeasedEphemeralWorker(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, deleteReleasableLeasedEphemeralWorker, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const enterEphemeralLease = `-- name: EnterEphemeralLease :execrows
+UPDATE workers w
+   SET lease_since   = clock_timestamp(),
+       lease_repo_id = r.repo_id,
+       lease_branch  = fn_run_lease_branch(r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot),
+       updated_at    = now()
+  FROM runs r
+ WHERE w.id = $1
+   AND w.ephemeral
+   AND NOT w.isolated_lane
+   AND w.ephemeral_run_id = $2::uuid
+   AND w.draining_since IS NULL
+   AND r.id = $2::uuid
+   AND r.worker_id = w.id
+   AND r.status IN ('completed', 'failed')
+   AND r.repo_id IS NOT NULL
+   AND r.egress_profile_id IS NULL
+   AND fn_run_lease_branch(r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot) IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM runs o
+       WHERE o.worker_id = w.id
+         AND o.status NOT IN ('completed', 'failed', 'cancelled'))
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+       WHERE h.live_worker_id = w.id AND h.state = 'open')
+`
+
+type EnterEphemeralLeaseParams struct {
+	WorkerID uuid.UUID `json:"worker_id"`
+	RunID    uuid.UUID `json:"run_id"`
+}
+
+// PRD #2006: start the ephemeral lease on the worker that just served its bound run, in the SAME
+// transaction that commits the run's terminal state (the caller holds the worker row lock, taken
+// before the run's). lease_since is clock_timestamp(), so the lease starts at the commit-side
+// instant, not the transaction-start one. Matches exactly one row, and only when ALL hold:
+//   - the worker is ephemeral, outside the isolated lane, not draining, and bound to @run_id;
+//   - the run ended completed or failed (never cancelled), was served by THIS worker, is repo-backed, carries no egress profile and
+//     has a derivable effective branch identity (fn_run_lease_branch non-NULL) -- the identity the
+//     lease stores, so a follow-up must match it (a run with none never leases: fail closed);
+//   - the worker holds no other non-terminal run and no OPEN custody hold (the caller releases a
+//     completed run's hold earlier in the same transaction, so the check reads that release).
+//
+// Zero rows means "do not lease": the caller falls back to today's immediate teardown.
+func (q *Queries) EnterEphemeralLease(ctx context.Context, arg EnterEphemeralLeaseParams) (int64, error) {
+	result, err := q.db.Exec(ctx, enterEphemeralLease, arg.WorkerID, arg.RunID)
 	if err != nil {
 		return 0, err
 	}
@@ -385,6 +553,21 @@ func (q *Queries) ExpirePendingHostedWorkerTokens(ctx context.Context, cutoff pg
 		return 0, err
 	}
 	return result.RowsAffected(), nil
+}
+
+const leaseClockNow = `-- name: LeaseClockNow :one
+SELECT clock_timestamp()::timestamptz AS at
+`
+
+// PRD #2006: a FRESH database instant for lease admission. now() is the transaction-start time, so
+// a claim transaction that waited on a lock would judge a lease against a stale instant; the claim
+// reads clock_timestamp() through this query IMMEDIATELY before ClaimRun, after every lock and guard
+// it waits on, and passes it as ClaimRun's @lease_at.
+func (q *Queries) LeaseClockNow(ctx context.Context) (pgtype.Timestamptz, error) {
+	row := q.db.QueryRow(ctx, leaseClockNow)
+	var at pgtype.Timestamptz
+	err := row.Scan(&at)
+	return at, err
 }
 
 const listHostedWorkersForController = `-- name: ListHostedWorkersForController :many
@@ -524,6 +707,151 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 	return items, nil
 }
 
+const lockOldestReleasableLeasedEphemeralWorker = `-- name: LockOldestReleasableLeasedEphemeralWorker :one
+SELECT w.id
+  FROM workers w
+ WHERE w.user_id = $1
+   AND w.kind = 'hosted'
+   AND w.ephemeral
+   AND w.lease_since IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM runs r
+       WHERE r.worker_id = w.id
+         AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+       WHERE h.live_worker_id = w.id AND h.state = 'open')
+ ORDER BY w.lease_since ASC, w.id ASC
+ LIMIT 1
+   FOR UPDATE OF w SKIP LOCKED
+`
+
+// PRD #2006 quota eviction, step 1 of 2 (the provisioner, under its per-user advisory lock, at the
+// ephemeral cap): lock the oldest leased worker of the owner that is RELEASABLE -- a lease set (live
+// or expired), no non-terminal run, no open custody hold. SKIP LOCKED so a worker a claim or the
+// reaper holds is passed over, not waited on. No row means nothing is releasable (provisioning is
+// refused as today).
+func (q *Queries) LockOldestReleasableLeasedEphemeralWorker(ctx context.Context, userID uuid.UUID) (uuid.UUID, error) {
+	row := q.db.QueryRow(ctx, lockOldestReleasableLeasedEphemeralWorker, userID)
+	var id uuid.UUID
+	err := row.Scan(&id)
+	return id, err
+}
+
+const lockReapableEphemeralWorkers = `-- name: LockReapableEphemeralWorkers :many
+SELECT w.id FROM workers w
+WHERE w.ephemeral
+  AND NOT EXISTS (
+      SELECT 1 FROM runs br
+      WHERE br.worker_id = w.id
+        AND br.status NOT IN ('completed', 'failed', 'cancelled')
+  )
+  -- PRD #1296 M4 (D3): the SAME custody skip as DeleteEphemeralWorkerForRun above — the
+  -- reaper must never drop the last local source of a custody-held worker. The hold's
+  -- live_worker_id FK is ON DELETE RESTRICT (a bypass fail-closes), and this predicate
+  -- turns that into a graceful skip: the custody-release reconciler releases the hold once
+  -- release is warranted, after which the next reap tick finds no open hold and proceeds.
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.live_worker_id = w.id AND h.state = 'open'
+  )
+  AND (
+      (NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')
+      )
+       -- PRD #2006: ...unless the worker holds a LIVE ephemeral lease (it finished that run and
+       -- stays warm for a same-branch follow-up). Evaluated at clock_timestamp(), so a statement
+       -- that waited on a lock never reaps through, or spares, a lease on a stale instant. A NULL
+       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly. The lease
+       -- spares only a worker still LINKED to its served run (ephemeral_run_id IS NOT NULL): a
+       -- worker whose run row was deleted (FK SET NULL) can never be re-bound by a claim, so it
+       -- is an orphan and reaps on the next tick even with a live lease.
+       AND NOT COALESCE(w.ephemeral_run_id IS NOT NULL
+                        AND w.lease_since + $1::interval > clock_timestamp()
+                        AND w.draining_since IS NULL, false))
+      OR (w.online_since IS NULL AND w.created_at < $2)
+      OR (w.online_since IS NOT NULL AND w.online_since < $2
+          AND EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.id = w.ephemeral_run_id
+                AND r.worker_id IS NOT NULL AND r.worker_id <> w.id
+          ))
+      OR EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
+      )
+      OR (w.isolated_lane AND w.online_since IS NOT NULL
+          AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
+  )
+FOR UPDATE OF w SKIP LOCKED
+`
+
+type LockReapableEphemeralWorkersParams struct {
+	EphemeralLease pgtype.Interval    `json:"ephemeral_lease"`
+	DeadlineCutoff pgtype.Timestamptz `json:"deadline_cutoff"`
+}
+
+// Orphan/failure GC backstop (PRD #529 M5, Decision 6). DELETE every ephemeral worker
+// that can no longer make progress. Busy-guarded so a worker holding ANY non-terminal
+// run is never reaped mid-flight (defense-in-depth; M3's claim restriction means only the
+// bound run ever points at it). The controller reaps the pod on its next poll (a hosted
+// row's absence => teardown); the token row goes via ON DELETE CASCADE.
+//
+//	(a) no live bound run: NOT EXISTS a non-terminal run at ephemeral_run_id — covers a
+//	    terminal owning run (the backstop for every terminal writer M4's SetState hook
+//	    misses), an absent run, and an unlinked ephemeral_run_id (FK SET NULL).
+//	(b) never booted past the provision deadline: online_since NULL and created_at old.
+//	(c) idle-stolen: online past the deadline and the bound run is claimed by a SIBLING
+//	    (worker_id set and != this worker), so this worker will never get work.
+//	(d) lane mismatch (PRD #1906 M5): the worker's isolated_lane differs from whether its bound
+//	    run is profile-bound, so ClaimRun's isolated-lane clause bars it from the run forever
+//	    (and it holds the run's one uq_workers_ephemeral_run slot, which would starve the right
+//	    trigger). No deadline: it can never make progress, so it goes on the next tick.
+//	(e) lane worker without the lane protocol (PRD #1906 M5): an isolated_lane worker that is
+//	    online (online_since set) but does not advertise 'isolated_fetch_v1' (an old image, or a
+//	    fetcher env it could not load). ClaimRun's lane clause requires that capability, so it
+//	    can never claim its bound run, yet it holds the run's uq_workers_ephemeral_run slot and
+//	    one per-user slot. No deadline, like (d); the busy and custody guards above still apply.
+//	    online_since stands in for "has registered" ONLY because the agent registers before it
+//	    heartbeats: RegisterWorker writes protocol_capabilities in the same UPDATE that stamps
+//	    online_since, but HeartbeatWorker also stamps online_since and never writes the
+//	    capabilities, so a worker that heartbeated first would be reaped here with the column
+//	    still at its '{}' default. agent/src/worker.ts awaits registerWithRetry before it starts
+//	    heartbeatLoop; keep that order, or key this arm on a column only register writes. (The
+//	    register nonce, snapshot_register_nonce, is not one: an older image sends none, and
+//	    that is the image this arm exists to reap.)
+//	(f) PRD #2006: arm (a) is spared while the worker's ephemeral lease is live at
+//	    clock_timestamp(); the lease ending (expiry, drain, re-register) makes (a) true again.
+//
+// The reap is TWO statements in ONE transaction (store.ReapEphemeralWorkers): THIS one locks the
+// selected rows FOR UPDATE SKIP LOCKED, then DeleteLockedEphemeralWorkers deletes them by id
+// re-checking the SAME predicate on a fresh snapshot taken after the locks are held. A single
+// DELETE is not enough: Postgres re-evaluates only the row's own columns after a lock wait, never
+// the NOT EXISTS subqueries over runs, so a worker a concurrent claim or terminal report just
+// changed could be deleted on a stale view. KEEP THE TWO PREDICATES BYTE-IDENTICAL.
+func (q *Queries) LockReapableEphemeralWorkers(ctx context.Context, arg LockReapableEphemeralWorkersParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockReapableEphemeralWorkers, arg.EphemeralLease, arg.DeadlineCutoff)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const markHostedWorkerTokenDelivered = `-- name: MarkHostedWorkerTokenDelivered :execrows
 UPDATE hosted_worker_tokens SET
     token_ciphertext = NULL,
@@ -598,77 +926,42 @@ func (q *Queries) MarkHostedWorkerTokenDelivered(ctx context.Context, arg MarkHo
 	return result.RowsAffected(), nil
 }
 
-const reapEphemeralWorkers = `-- name: ReapEphemeralWorkers :execrows
-DELETE FROM workers w
-WHERE w.ephemeral
-  AND NOT EXISTS (
-      SELECT 1 FROM runs br
-      WHERE br.worker_id = w.id
-        AND br.status NOT IN ('completed', 'failed', 'cancelled')
-  )
-  -- PRD #1296 M4 (D3): the SAME custody skip as DeleteEphemeralWorkerForRun above — the
-  -- reaper must never drop the last local source of a custody-held worker. The hold's
-  -- live_worker_id FK is ON DELETE RESTRICT (a bypass fail-closes), and this predicate
-  -- turns that into a graceful skip: the custody-release reconciler releases the hold once
-  -- release is warranted, after which the next reap tick finds no open hold and proceeds.
-  AND NOT EXISTS (
-      SELECT 1 FROM recovery_custody_holds h
-      WHERE h.live_worker_id = w.id AND h.state = 'open'
-  )
-  AND (
-      NOT EXISTS (
-          SELECT 1 FROM runs r
-          WHERE r.id = w.ephemeral_run_id
-            AND r.status NOT IN ('completed', 'failed', 'cancelled')
-      )
-      OR (w.online_since IS NULL AND w.created_at < $1)
-      OR (w.online_since IS NOT NULL AND w.online_since < $1
-          AND EXISTS (
-              SELECT 1 FROM runs r
-              WHERE r.id = w.ephemeral_run_id
-                AND r.worker_id IS NOT NULL AND r.worker_id <> w.id
-          ))
-      OR EXISTS (
-          SELECT 1 FROM runs r
-          WHERE r.id = w.ephemeral_run_id
-            AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
-      )
-      OR (w.isolated_lane AND w.online_since IS NOT NULL
-          AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
-  )
+const rebindLeasedEphemeralWorker = `-- name: RebindLeasedEphemeralWorker :execrows
+UPDATE workers
+   SET ephemeral_run_id = $1::uuid,
+       lease_since      = NULL,
+       lease_repo_id    = NULL,
+       lease_branch     = NULL,
+       updated_at       = now()
+ WHERE id = $2
+   AND ephemeral
+   AND ephemeral_run_id = $3::uuid
+   AND lease_since IS NOT NULL
+   AND draining_since IS NULL
+   AND lease_since + $4::interval > clock_timestamp()
 `
 
-// Orphan/failure GC backstop (PRD #529 M5, Decision 6). DELETE every ephemeral worker
-// that can no longer make progress. Busy-guarded so a worker holding ANY non-terminal
-// run is never reaped mid-flight (defense-in-depth; M3's claim restriction means only the
-// bound run ever points at it). The controller reaps the pod on its next poll (a hosted
-// row's absence => teardown); the token row goes via ON DELETE CASCADE.
-//
-//	(a) no live bound run: NOT EXISTS a non-terminal run at ephemeral_run_id — covers a
-//	    terminal owning run (the backstop for every terminal writer M4's SetState hook
-//	    misses), an absent run, and an unlinked ephemeral_run_id (FK SET NULL).
-//	(b) never booted past the provision deadline: online_since NULL and created_at old.
-//	(c) idle-stolen: online past the deadline and the bound run is claimed by a SIBLING
-//	    (worker_id set and != this worker), so this worker will never get work.
-//	(d) lane mismatch (PRD #1906 M5): the worker's isolated_lane differs from whether its bound
-//	    run is profile-bound, so ClaimRun's isolated-lane clause bars it from the run forever
-//	    (and it holds the run's one uq_workers_ephemeral_run slot, which would starve the right
-//	    trigger). No deadline: it can never make progress, so it goes on the next tick.
-//	(e) lane worker without the lane protocol (PRD #1906 M5): an isolated_lane worker that is
-//	    online (online_since set) but does not advertise 'isolated_fetch_v1' (an old image, or a
-//	    fetcher env it could not load). ClaimRun's lane clause requires that capability, so it
-//	    can never claim its bound run, yet it holds the run's uq_workers_ephemeral_run slot and
-//	    one per-user slot. No deadline, like (d); the busy and custody guards above still apply.
-//	    online_since stands in for "has registered" ONLY because the agent registers before it
-//	    heartbeats: RegisterWorker writes protocol_capabilities in the same UPDATE that stamps
-//	    online_since, but HeartbeatWorker also stamps online_since and never writes the
-//	    capabilities, so a worker that heartbeated first would be reaped here with the column
-//	    still at its '{}' default. agent/src/worker.ts awaits registerWithRetry before it starts
-//	    heartbeatLoop; keep that order, or key this arm on a column only register writes. (The
-//	    register nonce, snapshot_register_nonce, is not one: an older image sends none, and
-//	    that is the image this arm exists to reap.)
-func (q *Queries) ReapEphemeralWorkers(ctx context.Context, deadlineCutoff pgtype.Timestamptz) (int64, error) {
-	result, err := q.db.Exec(ctx, reapEphemeralWorkers, deadlineCutoff)
+type RebindLeasedEphemeralWorkerParams struct {
+	NewRunID       uuid.UUID       `json:"new_run_id"`
+	WorkerID       uuid.UUID       `json:"worker_id"`
+	OldRunID       uuid.UUID       `json:"old_run_id"`
+	EphemeralLease pgtype.Interval `json:"ephemeral_lease"`
+}
+
+// PRD #2006: rebind a leased ephemeral worker to the run it just claimed through its lease, and end
+// the lease (that run's own terminal starts a new one). Runs in the claim transaction, after
+// ClaimRun, with the worker row already locked. It re-checks the lease against ITS OWN
+// clock_timestamp(), never the admission instant the claim passed ClaimRun, so a lease that expired
+// while the claim waited cannot rebind; the caller treats any count other than 1 as a refusal and
+// rolls the claim back to its savepoint. Binding to a run another ephemeral worker already holds
+// raises a unique violation on uq_workers_ephemeral_run, which the caller handles the same way.
+func (q *Queries) RebindLeasedEphemeralWorker(ctx context.Context, arg RebindLeasedEphemeralWorkerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, rebindLeasedEphemeralWorker,
+		arg.NewRunID,
+		arg.WorkerID,
+		arg.OldRunID,
+		arg.EphemeralLease,
+	)
 	if err != nil {
 		return 0, err
 	}

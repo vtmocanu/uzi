@@ -2,7 +2,7 @@ import type {
   AdminWorker,
   Worker,
 } from "../../lib/api";
-import { daysAgo, minsAgo } from "./time";
+import { daysAgo, minsAgo, minsAhead } from "./time";
 import { mockAdmin } from "./users";
 
 // ── Workers ──────────────────────────────────────────────────────────────────
@@ -324,6 +324,58 @@ export const mockWorkers: Worker[] = [
     anthropic_secret_label: null,
     anthropic_bind_mode: "default",
     draining_since: minsAgo(20),
+  },
+  {
+    // PRD #2006 M2: a LEASED ephemeral worker. Its run finished 48 minutes ago, and the
+    // api keeps it online and idle for the rest of its 2h lease so a same-branch
+    // follow-up run can reuse it warm. Shows the `ephemeral` badge plus
+    // "leased · 1h 12m left" at page load (the demo clock is frozen at module load, so
+    // the countdown ages with the page and the badge drops once the lease runs out).
+    // Ephemeral rows are excluded from the manual hosted quota (server:
+    // CountHostedWorkersForUser `AND NOT ephemeral`), so this row leaves the at-quota
+    // journey's one slot of headroom intact. Named like the server's
+    // ephemeralWorkerName ("ephemeral-<run uuid>"); the uuid is fictional.
+    id: "w-eph-leased",
+    name: "ephemeral-5c1e0b7a-2d4f-4e8b-9a61-3f0c7d2e8b14",
+    status: "online",
+    kind: "hosted",
+    hosted_size: "m",
+    docker: true,
+    capabilities: ["docker"],
+    ephemeral: true,
+    ephemeral_lease_expires_at: minsAhead(72),
+    busy: false,
+    active_runs: 0,
+    max_concurrent_runs: null,
+    template_declared: "base",
+    template_reported: "base",
+    version: "0.4.2",
+    upgrade_status: "up_to_date",
+    upgrade_detail: null,
+    upgrade_target: "0.4.2",
+    upgrade_blocking_container: null,
+    upgrade_blocking_reason: null,
+    upgrade_last_exit_code: null,
+    last_heartbeat_at: minsAgo(0.2),
+    online_since: minsAgo(131),
+    created_at: minsAgo(134),
+    stats_cpu_pct: 1.2,
+    stats_mem_bytes: 429496730, // 0.4 GiB, idle
+    stats_mem_limit_bytes: 4294967296, // 4 GiB → ~10%
+    stats_source: "cgroup",
+    // Warm caches from the finished run: the reason the lease exists.
+    stats_disk_nix_bytes: 10737418240, // 10 GiB
+    stats_disk_nix_total_bytes: 21474836480, // 20 GiB → 50%
+    stats_disk_data_bytes: 1610612736, // 1.5 GiB
+    stats_disk_data_total_bytes: 10737418240, // 10 GiB → 15%
+    stats_disk_dind_bytes: 3221225472, // 3 GiB
+    stats_disk_dind_total_bytes: 21474836480, // 20 GiB → 15%
+    stats_disk_dind_inodes: 98000,
+    stats_disk_dind_total_inodes: 1310720,
+    anthropic_secret_id: null,
+    anthropic_secret_label: null,
+    anthropic_bind_mode: "default",
+    draining_since: null,
   },
 ];
 

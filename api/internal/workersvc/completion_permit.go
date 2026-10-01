@@ -18,7 +18,7 @@ import (
 )
 
 // TxBeginner is the narrow transaction seam the permit-gated completion runs in (PRD #1226 M2,
-// D4). *pgxpool.Pool satisfies it — completeRunWithPermit needs only Begin, because it opens
+// D4). *pgxpool.Pool satisfies it — completeRunWithPermitLease needs only Begin, because it opens
 // exactly one transaction and threads a tx-bound *store.Queries through the consume+complete
 // section. Kept its own interface (interface segregation, like CodexTxBeginner) so it is the
 // only pool surface this package depends on and a test can supply a fake.
@@ -248,10 +248,10 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 	// PRD #1247 M5 (D3): the released-generation fence, applied Go-side. A CAPABILITY worker stamps
 	// req.ClaimGeneration; if a held-state switch RELEASED this claim (claim_released_at set) or a
 	// reclaim SUPERSEDED it (claim_generation advanced), issuing a permit for the stale flight is
-	// wrong even though a stale permit is otherwise harmless (completeRunWithPermit re-fences at
+	// wrong even though a stale permit is otherwise harmless (completeRunWithPermitLease re-fences at
 	// consume). The Go check suffices here because the permit issue is not a single mutating
 	// statement. FAIL CLOSED for a capability worker that OMITS the generation, mirroring the
-	// completeRunWithPermit / SetState fence.
+	// completeRunWithPermitLease / SetState fence.
 	switch {
 	case req.ClaimGeneration != nil:
 		if run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid {
@@ -281,7 +281,7 @@ func (s *Service) RequestCompletionPermit(ctx context.Context, wkr store.Worker,
 		return CompletionPermitResult{Granted: false, DenyReason: CompletionDenyMissingMilestones, Unmet: unmet}, nil
 	}
 	// Normalize the worker-authored branch and head with the IDENTICAL two-step (NUL-strip THEN
-	// TrimSpace) the CONSUME side (completeRunWithPermit) and persistCompletionAttempt apply, so the
+	// TrimSpace) the CONSUME side (completeRunWithPermitLease) and persistCompletionAttempt apply, so the
 	// value stored at issue is byte-for-byte what the consume-side lookup keys on. NUL-strip first:
 	// a NUL reaching the permit's `text NOT NULL` columns (migration 00212) raises Postgres 22021,
 	// which 500s the issue so the permit is never written — and because the interlocked run's
@@ -515,12 +515,12 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 	return enc
 }
 
-// completeRunWithPermit runs an INTERLOCKED run's terminal completion through a single pgx
+// completeRunWithPermitLease runs an INTERLOCKED run's terminal completion through a single pgx
 // transaction (PRD #1226 M2, D4): lock the run FOR UPDATE, consume the permit issued for the
 // exact (run, contract_revision, head) identity, write `completed`, and (via the documented
 // seam below) leave room for later generation activation — all atomically.
 //
-// It returns (rows, idempotent, err):
+// It returns (rows, idempotent, lease, err):
 //   - rows==1, idempotent==false: a genuine new completion applied; SetState runs its terminal
 //     automation.
 //   - rows==0, idempotent==false: NON-TERMINAL — no matching unconsumed permit (missing, wrong
@@ -533,9 +533,15 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 //     WITHOUT re-running the terminal automation (it fired on the original completion).
 //
 // A nil txBeginner is fail-closed (error): an interlocked run never completes non-atomically.
-func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, completedParams store.SetRunCompletedParams) (rows int64, idempotent bool, err error) {
+//
+// lease is the PRD #2006 lease outcome: on an ephemeral worker with the lease on, the permit
+// transaction locks the worker row BEFORE the run row and, after the terminal write, releases the
+// completed run's custody hold and enters the worker's lease before it commits, so the completion,
+// the release and the lease become visible together. The outcome is zero on every other path (lease off, a non-ephemeral worker, a
+// non-applied completion), where SetState's post-commit steps run exactly as before.
+func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Worker, owned store.Run, req StateRequest, completedParams store.SetRunCompletedParams) (rows int64, idempotent bool, lease terminalLeaseOutcome, err error) {
 	if s.txBeginner == nil {
-		return 0, false, fmt.Errorf("completion transaction unavailable: no tx beginner wired for run %s", owned.ID)
+		return 0, false, lease, fmt.Errorf("completion transaction unavailable: no tx beginner wired for run %s", owned.ID)
 	}
 	head := ""
 	if req.Head != nil {
@@ -566,13 +572,13 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	// a cheap early-out on the pre-tx `owned` snapshot before we open a transaction; the
 	// AUTHORITATIVE revision is re-derived from the LOCKED row below.
 	if head == "" || !owned.ContractRevision.Valid {
-		return 0, false, nil
+		return 0, false, lease, nil
 	}
 	workerID := pgconv.UUID(wkr.ID)
 
 	tx, err := s.txBeginner.Begin(ctx)
 	if err != nil {
-		return 0, false, err
+		return 0, false, lease, err
 	}
 	// A no-op after a successful Commit; on any early return it undoes the FOR UPDATE lock and,
 	// on the failed-consume path, the permit consume — so a completion that does not apply never
@@ -580,12 +586,26 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	defer func() { _ = tx.Rollback(ctx) }()
 	qtx := store.New(tx)
 
+	// PRD #2006: with the lease on, an ephemeral worker's completion locks the WORKER row before
+	// the run row (the canonical order Claim, Register, Heartbeat and the sweepers use), so the
+	// lease entry below serializes against a claim, a cordon and the reaper. A nil-generation
+	// report (a worker without credential_switch_v1) never enters a lease, as on the fence path.
+	leaseTx := s.ephemeralLease > 0 && wkr.Ephemeral && req.ClaimGeneration != nil
+	if leaseTx {
+		if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
+			if errors.Is(werr, pgx.ErrNoRows) {
+				return 0, false, lease, nil // the worker row is gone: no longer this worker's run
+			}
+			return 0, false, lease, werr
+		}
+	}
+
 	run, err := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: owned.ID, WorkerID: workerID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, false, nil // no longer this worker's run → non-terminal
+			return 0, false, lease, nil // no longer this worker's run → non-terminal
 		}
-		return 0, false, err
+		return 0, false, lease, err
 	}
 
 	// PRD #1247 M5 (D3): the generation fence, evaluated INSIDE this permit transaction's FOR
@@ -606,17 +626,17 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	switch {
 	case req.ClaimGeneration != nil:
 		if run.ClaimGeneration != *req.ClaimGeneration || run.ClaimReleasedAt.Valid {
-			return 0, false, ErrStaleClaim
+			return 0, false, lease, ErrStaleClaim
 		}
 	case slices.Contains(wkr.ProtocolCapabilities, capability.CredentialSwitchV1):
-		return 0, false, ErrMissingClaimGeneration
+		return 0, false, lease, ErrMissingClaimGeneration
 	default:
 		// PRD #1497 M1 (D16): the released window closes for a generation-less (legacy) completion
 		// too — a completion on a RELEASED claim (a held-state switch or a server-side wall park set
 		// claim_released_at) is rejected even without a stamped generation, checked on the LOCKED row.
 		// A legacy completion on a LIVE claim stays honoured unfenced, byte-identical to before.
 		if run.ClaimReleasedAt.Valid {
-			return 0, false, ErrStaleClaim
+			return 0, false, lease, ErrStaleClaim
 		}
 	}
 
@@ -629,7 +649,7 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	// re-permit at the new revision. If the locked row is unfrozen (revision NULL — e.g. a
 	// split-state row), fail closed the same way the pre-tx no-head guard does.
 	if !run.ContractRevision.Valid {
-		return 0, false, nil
+		return 0, false, lease, nil
 	}
 	rev := run.ContractRevision.Int32
 
@@ -641,14 +661,14 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 			RunID: run.ID, ContractRevision: rev, Head: head, Branch: branch, IssuedByWorkerID: workerID,
 		}); cerr != nil {
 			if errors.Is(cerr, pgx.ErrNoRows) {
-				return 0, false, nil
+				return 0, false, lease, nil
 			}
-			return 0, false, cerr
+			return 0, false, lease, cerr
 		}
 		if cerr := tx.Commit(ctx); cerr != nil {
-			return 0, false, cerr
+			return 0, false, lease, cerr
 		}
-		return 0, true, nil
+		return 0, true, lease, nil
 	}
 
 	// Live run: fetch the unconsumed permit for the exact identity. None → non-terminal.
@@ -657,25 +677,25 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	})
 	if perr != nil {
 		if errors.Is(perr, pgx.ErrNoRows) {
-			return 0, false, nil
+			return 0, false, lease, nil
 		}
-		return 0, false, perr
+		return 0, false, lease, perr
 	}
 	consumed, cerr := qtx.ConsumeCompletionPermit(ctx, store.ConsumeCompletionPermitParams{ID: permit.ID, IssuedByWorkerID: workerID})
 	if cerr != nil {
-		return 0, false, cerr
+		return 0, false, lease, cerr
 	}
 	if consumed != 1 {
-		return 0, false, nil // raced consume → non-terminal, rolled back
+		return 0, false, lease, nil // raced consume → non-terminal, rolled back
 	}
 	rows, err = qtx.SetRunCompleted(ctx, completedParams)
 	if err != nil {
-		return 0, false, err
+		return 0, false, lease, err
 	}
 	if rows != 1 {
 		// The run left the completable state under the lock (e.g. a superseding terminal). Roll
 		// back so the permit is NOT consumed and the report stays non-terminal.
-		return 0, false, nil
+		return 0, false, lease, nil
 	}
 
 	// Generation-activation hook seam (PRD #1226 M2, D4). This is a DELIBERATE no-op today:
@@ -685,10 +705,17 @@ func (s *Service) completeRunWithPermit(ctx context.Context, wkr store.Worker, o
 	// all-or-nothing with the completion — do NOT replace this terminal seam with an isolated
 	// SQL update.
 
-	if cerr := tx.Commit(ctx); cerr != nil {
-		return 0, false, cerr
+	// PRD #2006: release the completed run's custody hold and enter the worker's lease in this same
+	// transaction (a SAVEPOINT inside the helper keeps a failure from poisoning the completion).
+	// run is the LOCKED row, so its claim generation is the completing generation.
+	if leaseTx {
+		lease = s.enterEphemeralLeaseTx(ctx, tx, wkr, run.ID, run.ClaimGeneration)
 	}
-	return rows, false, nil
+
+	if cerr := tx.Commit(ctx); cerr != nil {
+		return 0, false, terminalLeaseOutcome{}, cerr
+	}
+	return rows, false, lease, nil
 }
 
 // permitToDTO maps a stored permit to its coordinate-free wire shape.

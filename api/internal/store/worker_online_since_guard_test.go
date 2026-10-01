@@ -38,13 +38,15 @@ func TestOnlineSinceIsWriteOnlyAndNeverScheduled(t *testing.T) {
 		"RegisterWorker":          true, // stamps/preserves the anchor on coming online
 		"HeartbeatWorker":         true, // stamps/preserves the anchor on coming online
 		"MarkStaleWorkersOffline": true, // clears the anchor when the worker goes stale
-		// ReapEphemeralWorkers (PRD #529 M5, Decision 6) reads online_since in its WHERE to
+		// LockReapableEphemeralWorkers and DeleteLockedEphemeralWorkers (the two halves of the reap;
+		// PRD #529 M5, Decision 6; PRD #2006 split the one DELETE in two) read online_since in its WHERE to
 		// time out a stuck ephemeral worker: NULL-past-the-deadline == "never booted", and
 		// online-past-the-deadline gates the idle-stolen shape. This is GC teardown, not
 		// scheduling — it only DELETEs an ephemeral worker that can no longer make progress
 		// and never orders/selects/prefers a live worker for claiming, so online_since stays
 		// off the who-gets-scheduled path the rest of this guard protects.
-		"ReapEphemeralWorkers": true,
+		"LockReapableEphemeralWorkers": true,
+		"DeleteLockedEphemeralWorkers": true,
 	}
 
 	paths, err := filepath.Glob(filepath.Join("queries", "*.sql"))
@@ -60,7 +62,7 @@ func TestOnlineSinceIsWriteOnlyAndNeverScheduled(t *testing.T) {
 	var offenders []string
 	var sawAllowedRef int
 	for _, path := range paths {
-		b, err := os.ReadFile(path)
+		b, err := os.ReadFile(path) //nolint:gosec // G304: a glob of the fixed queries/ directory.
 		if err != nil {
 			t.Fatalf("read %s: %v", path, err)
 		}

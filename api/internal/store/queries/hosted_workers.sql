@@ -194,9 +194,15 @@ WHERE w.ephemeral
   AND NOT EXISTS (
       SELECT 1 FROM recovery_custody_holds h
       WHERE h.live_worker_id = w.id AND h.state = 'open'
-  );
+  )
+  -- PRD #2006: SKIP a worker whose ephemeral LEASE is live (it finished this run and stays warm
+  -- for a same-branch follow-up). Evaluated at clock_timestamp(), not the transaction-start now(),
+  -- so a delete that waited on a lock never skips through a lease that expired meanwhile. A NULL
+  -- or zero @ephemeral_lease, or a worker with no lease, reads false: today's behaviour exactly.
+  AND NOT COALESCE(w.lease_since + @ephemeral_lease::interval > clock_timestamp()
+                   AND w.draining_since IS NULL, false);
 
--- name: ReapEphemeralWorkers :execrows
+-- name: LockReapableEphemeralWorkers :many
 -- Orphan/failure GC backstop (PRD #529 M5, Decision 6). DELETE every ephemeral worker
 -- that can no longer make progress. Busy-guarded so a worker holding ANY non-terminal
 -- run is never reaped mid-flight (defense-in-depth; M3's claim restriction means only the
@@ -225,7 +231,16 @@ WHERE w.ephemeral
 --       heartbeatLoop; keep that order, or key this arm on a column only register writes. (The
 --       register nonce, snapshot_register_nonce, is not one: an older image sends none, and
 --       that is the image this arm exists to reap.)
-DELETE FROM workers w
+--   (f) PRD #2006: arm (a) is spared while the worker's ephemeral lease is live at
+--       clock_timestamp(); the lease ending (expiry, drain, re-register) makes (a) true again.
+--
+-- The reap is TWO statements in ONE transaction (store.ReapEphemeralWorkers): THIS one locks the
+-- selected rows FOR UPDATE SKIP LOCKED, then DeleteLockedEphemeralWorkers deletes them by id
+-- re-checking the SAME predicate on a fresh snapshot taken after the locks are held. A single
+-- DELETE is not enough: Postgres re-evaluates only the row's own columns after a lock wait, never
+-- the NOT EXISTS subqueries over runs, so a worker a concurrent claim or terminal report just
+-- changed could be deleted on a stale view. KEEP THE TWO PREDICATES BYTE-IDENTICAL.
+SELECT w.id FROM workers w
 WHERE w.ephemeral
   AND NOT EXISTS (
       SELECT 1 FROM runs br
@@ -242,11 +257,75 @@ WHERE w.ephemeral
       WHERE h.live_worker_id = w.id AND h.state = 'open'
   )
   AND (
-      NOT EXISTS (
+      (NOT EXISTS (
           SELECT 1 FROM runs r
           WHERE r.id = w.ephemeral_run_id
             AND r.status NOT IN ('completed', 'failed', 'cancelled')
       )
+       -- PRD #2006: ...unless the worker holds a LIVE ephemeral lease (it finished that run and
+       -- stays warm for a same-branch follow-up). Evaluated at clock_timestamp(), so a statement
+       -- that waited on a lock never reaps through, or spares, a lease on a stale instant. A NULL
+       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly. The lease
+       -- spares only a worker still LINKED to its served run (ephemeral_run_id IS NOT NULL): a
+       -- worker whose run row was deleted (FK SET NULL) can never be re-bound by a claim, so it
+       -- is an orphan and reaps on the next tick even with a live lease.
+       AND NOT COALESCE(w.ephemeral_run_id IS NOT NULL
+                        AND w.lease_since + @ephemeral_lease::interval > clock_timestamp()
+                        AND w.draining_since IS NULL, false))
+      OR (w.online_since IS NULL AND w.created_at < @deadline_cutoff)
+      OR (w.online_since IS NOT NULL AND w.online_since < @deadline_cutoff
+          AND EXISTS (
+              SELECT 1 FROM runs r
+              WHERE r.id = w.ephemeral_run_id
+                AND r.worker_id IS NOT NULL AND r.worker_id <> w.id
+          ))
+      OR EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND (r.egress_profile_id IS NOT NULL) <> w.isolated_lane
+      )
+      OR (w.isolated_lane AND w.online_since IS NOT NULL
+          AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
+  )
+FOR UPDATE OF w SKIP LOCKED;
+
+-- name: DeleteLockedEphemeralWorkers :execrows
+-- The delete half of the reap (see LockReapableEphemeralWorkers, whose header documents every arm):
+-- delete the locked ids that STILL satisfy the reap predicate on this statement's fresh snapshot.
+-- The predicate below is the SAME text as the lock statement's; keep them identical.
+DELETE FROM workers w
+WHERE w.id = ANY(@ids::uuid[])
+  AND w.ephemeral
+  AND NOT EXISTS (
+      SELECT 1 FROM runs br
+      WHERE br.worker_id = w.id
+        AND br.status NOT IN ('completed', 'failed', 'cancelled')
+  )
+  -- PRD #1296 M4 (D3): the SAME custody skip as DeleteEphemeralWorkerForRun above — the
+  -- reaper must never drop the last local source of a custody-held worker. The hold's
+  -- live_worker_id FK is ON DELETE RESTRICT (a bypass fail-closes), and this predicate
+  -- turns that into a graceful skip: the custody-release reconciler releases the hold once
+  -- release is warranted, after which the next reap tick finds no open hold and proceeds.
+  AND NOT EXISTS (
+      SELECT 1 FROM recovery_custody_holds h
+      WHERE h.live_worker_id = w.id AND h.state = 'open'
+  )
+  AND (
+      (NOT EXISTS (
+          SELECT 1 FROM runs r
+          WHERE r.id = w.ephemeral_run_id
+            AND r.status NOT IN ('completed', 'failed', 'cancelled')
+      )
+       -- PRD #2006: ...unless the worker holds a LIVE ephemeral lease (it finished that run and
+       -- stays warm for a same-branch follow-up). Evaluated at clock_timestamp(), so a statement
+       -- that waited on a lock never reaps through, or spares, a lease on a stale instant. A NULL
+       -- or zero @ephemeral_lease, or no lease, reads false: today's selection exactly. The lease
+       -- spares only a worker still LINKED to its served run (ephemeral_run_id IS NOT NULL): a
+       -- worker whose run row was deleted (FK SET NULL) can never be re-bound by a claim, so it
+       -- is an orphan and reaps on the next tick even with a live lease.
+       AND NOT COALESCE(w.ephemeral_run_id IS NOT NULL
+                        AND w.lease_since + @ephemeral_lease::interval > clock_timestamp()
+                        AND w.draining_since IS NULL, false))
       OR (w.online_since IS NULL AND w.created_at < @deadline_cutoff)
       OR (w.online_since IS NOT NULL AND w.online_since < @deadline_cutoff
           AND EXISTS (
@@ -262,6 +341,112 @@ WHERE w.ephemeral
       OR (w.isolated_lane AND w.online_since IS NOT NULL
           AND NOT ('isolated_fetch_v1' = ANY(w.protocol_capabilities)))
   );
+
+-- name: LeaseClockNow :one
+-- PRD #2006: a FRESH database instant for lease admission. now() is the transaction-start time, so
+-- a claim transaction that waited on a lock would judge a lease against a stale instant; the claim
+-- reads clock_timestamp() through this query IMMEDIATELY before ClaimRun, after every lock and guard
+-- it waits on, and passes it as ClaimRun's @lease_at.
+SELECT clock_timestamp()::timestamptz AS at;
+
+-- name: EnterEphemeralLease :execrows
+-- PRD #2006: start the ephemeral lease on the worker that just served its bound run, in the SAME
+-- transaction that commits the run's terminal state (the caller holds the worker row lock, taken
+-- before the run's). lease_since is clock_timestamp(), so the lease starts at the commit-side
+-- instant, not the transaction-start one. Matches exactly one row, and only when ALL hold:
+--   * the worker is ephemeral, outside the isolated lane, not draining, and bound to @run_id;
+--   * the run ended completed or failed (never cancelled), was served by THIS worker, is repo-backed, carries no egress profile and
+--     has a derivable effective branch identity (fn_run_lease_branch non-NULL) -- the identity the
+--     lease stores, so a follow-up must match it (a run with none never leases: fail closed);
+--   * the worker holds no other non-terminal run and no OPEN custody hold (the caller releases a
+--     completed run's hold earlier in the same transaction, so the check reads that release).
+-- Zero rows means "do not lease": the caller falls back to today's immediate teardown.
+UPDATE workers w
+   SET lease_since   = clock_timestamp(),
+       lease_repo_id = r.repo_id,
+       lease_branch  = fn_run_lease_branch(r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot),
+       updated_at    = now()
+  FROM runs r
+ WHERE w.id = @worker_id
+   AND w.ephemeral
+   AND NOT w.isolated_lane
+   AND w.ephemeral_run_id = @run_id::uuid
+   AND w.draining_since IS NULL
+   AND r.id = @run_id::uuid
+   AND r.worker_id = w.id
+   AND r.status IN ('completed', 'failed')
+   AND r.repo_id IS NOT NULL
+   AND r.egress_profile_id IS NULL
+   AND fn_run_lease_branch(r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot) IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM runs o
+       WHERE o.worker_id = w.id
+         AND o.status NOT IN ('completed', 'failed', 'cancelled'))
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+       WHERE h.live_worker_id = w.id AND h.state = 'open');
+
+-- name: RebindLeasedEphemeralWorker :execrows
+-- PRD #2006: rebind a leased ephemeral worker to the run it just claimed through its lease, and end
+-- the lease (that run's own terminal starts a new one). Runs in the claim transaction, after
+-- ClaimRun, with the worker row already locked. It re-checks the lease against ITS OWN
+-- clock_timestamp(), never the admission instant the claim passed ClaimRun, so a lease that expired
+-- while the claim waited cannot rebind; the caller treats any count other than 1 as a refusal and
+-- rolls the claim back to its savepoint. Binding to a run another ephemeral worker already holds
+-- raises a unique violation on uq_workers_ephemeral_run, which the caller handles the same way.
+UPDATE workers
+   SET ephemeral_run_id = @new_run_id::uuid,
+       lease_since      = NULL,
+       lease_repo_id    = NULL,
+       lease_branch     = NULL,
+       updated_at       = now()
+ WHERE id = @worker_id
+   AND ephemeral
+   AND ephemeral_run_id = @old_run_id::uuid
+   AND lease_since IS NOT NULL
+   AND draining_since IS NULL
+   AND lease_since + @ephemeral_lease::interval > clock_timestamp();
+
+-- name: LockOldestReleasableLeasedEphemeralWorker :one
+-- PRD #2006 quota eviction, step 1 of 2 (the provisioner, under its per-user advisory lock, at the
+-- ephemeral cap): lock the oldest leased worker of the owner that is RELEASABLE -- a lease set (live
+-- or expired), no non-terminal run, no open custody hold. SKIP LOCKED so a worker a claim or the
+-- reaper holds is passed over, not waited on. No row means nothing is releasable (provisioning is
+-- refused as today).
+SELECT w.id
+  FROM workers w
+ WHERE w.user_id = @user_id
+   AND w.kind = 'hosted'
+   AND w.ephemeral
+   AND w.lease_since IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM runs r
+       WHERE r.worker_id = w.id
+         AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+       WHERE h.live_worker_id = w.id AND h.state = 'open')
+ ORDER BY w.lease_since ASC, w.id ASC
+ LIMIT 1
+   FOR UPDATE OF w SKIP LOCKED;
+
+-- name: DeleteReleasableLeasedEphemeralWorker :execrows
+-- PRD #2006 quota eviction, step 2 of 2: delete the worker locked by
+-- LockOldestReleasableLeasedEphemeralWorker, re-checking the lease, busy and custody guards on a
+-- FRESH statement snapshot taken after the lock is held (the lock statement's snapshot may predate a
+-- claim or a terminal report that committed while it ran). One row deleted: the slot is free. Zero:
+-- the worker is no longer releasable; refuse as today.
+DELETE FROM workers w
+ WHERE w.id = @id
+   AND w.ephemeral
+   AND w.lease_since IS NOT NULL
+   AND NOT EXISTS (
+       SELECT 1 FROM runs r
+       WHERE r.worker_id = w.id
+         AND r.status NOT IN ('completed', 'failed', 'cancelled'))
+   AND NOT EXISTS (
+       SELECT 1 FROM recovery_custody_holds h
+       WHERE h.live_worker_id = w.id AND h.state = 'open');
 
 -- name: CreateHostedWorker :one
 -- Insert a hosted worker. Deliberately UNGUARDED: the quota decision belongs to the
@@ -407,8 +592,12 @@ WHERE token_ciphertext IS NOT NULL
 -- and does NOT reset the M5 drain-deadline clock. Scoped to kind='hosted': the controller
 -- manages only hosted workers and must never cordon an external one. Rows affected = 0
 -- means no such hosted worker exists (the handler answers 404).
+-- PRD #2006: a cordon also ENDS any ephemeral lease (a draining worker claims nothing new, and a
+-- leased-idle worker is idle, so it rolls or is released at once, never held for its lease). The
+-- UPDATE takes the row lock, so it serializes against a claim that is rebinding the same worker.
 UPDATE workers
-   SET draining_since = COALESCE(draining_since, now()), updated_at = now()
+   SET draining_since = COALESCE(draining_since, now()), updated_at = now(),
+       lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL
  WHERE id = @id AND kind = 'hosted';
 
 -- name: UncordonHostedWorker :execrows

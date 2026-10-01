@@ -733,6 +733,14 @@ type Config struct {
 	// so the path cannot be accidentally disabled via env.
 	EphemeralSaturationDelay time.Duration
 
+	// EphemeralLease (UZI_EPHEMERAL_LEASE, PRD #2006) is how long an ephemeral worker that
+	// just reported a terminal state stays alive to serve a follow-up run on the same
+	// repo/branch before the reaper releases it. Default 2h; 0 disables the lease (the
+	// worker is torn down at once, as before); values above MaxEphemeralLease are refused.
+	// Load returns an error for a malformed, negative or over-cap value so the api refuses
+	// to boot rather than silently running with a different lease.
+	EphemeralLease time.Duration
+
 	// Durable-recovery archive limits (PRD #1296 M2, D4/D6). Every knob is
 	// operator-configurable via env with the PRD default; byte ceilings are int64 so
 	// a 4 GiB instance quota is representable on every platform. They bound the
@@ -1270,6 +1278,11 @@ func Load() (Config, error) {
 	cfg.EphemeralMaxPerUser = parseInt("UZI_EPHEMERAL_MAX_PER_USER", 2)
 	cfg.EphemeralProvisionDeadline = parseDuration("UZI_EPHEMERAL_PROVISION_DEADLINE", 10*time.Minute)
 	cfg.EphemeralSaturationDelay = parseDuration("UZI_EPHEMERAL_SATURATION_DELAY", 90*time.Second)
+	lease, err := parseEphemeralLease(os.Getenv("UZI_EPHEMERAL_LEASE"))
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.EphemeralLease = lease
 	// The default size must be a preset the controller can resolve — an unknown value
 	// would provision a worker that never renders and sits pending until its token
 	// expires (workersize's own doc). Reject a bad value at load rather than at use, and
@@ -2049,6 +2062,36 @@ func getenv(key, def string) string {
 		return v
 	}
 	return def
+}
+
+// MaxEphemeralLease is the longest ephemeral worker lease Load accepts (PRD #2006).
+const MaxEphemeralLease = 2 * time.Hour
+
+// DefaultEphemeralLease is the lease used when UZI_EPHEMERAL_LEASE is unset or empty.
+const DefaultEphemeralLease = 2 * time.Hour
+
+// parseEphemeralLease is the strict parser of UZI_EPHEMERAL_LEASE: unset or empty is the
+// default, "0" disables the lease, and anything malformed, negative or above
+// MaxEphemeralLease is an error (unlike parseDuration, which silently falls back).
+func parseEphemeralLease(raw string) (time.Duration, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return DefaultEphemeralLease, nil
+	}
+	if raw == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("UZI_EPHEMERAL_LEASE: %q is not a valid duration (use e.g. 30m or 2h, or 0 to disable): %w", raw, err)
+	}
+	if d < 0 {
+		return 0, fmt.Errorf("UZI_EPHEMERAL_LEASE: %q is negative (use 0 to disable the lease)", raw)
+	}
+	if d > MaxEphemeralLease {
+		return 0, fmt.Errorf("UZI_EPHEMERAL_LEASE: %q exceeds the maximum of %s", raw, MaxEphemeralLease)
+	}
+	return d, nil
 }
 
 func parseDuration(key string, def time.Duration) time.Duration {

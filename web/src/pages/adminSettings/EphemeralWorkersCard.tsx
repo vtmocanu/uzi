@@ -47,7 +47,11 @@ export function EphemeralWorkersCard({
         <SectionTitle>Ephemeral workers</SectionTitle>
         <p className="mt-2 text-sm text-muted">
           When on, a queued run that needs a capability no online worker has can auto-provision a
-          run-bound, throwaway hosted worker on demand, reaped when the run finishes. This switch is the
+          throwaway hosted worker on demand. It is removed once the run finishes, or, when the
+          run qualifies for a lease, once that lease ends: during the lease it stays idle so a
+          follow-up run on the same repository and branch can reuse it. The lease length is
+          set by <code className="font-mono text-fg">UZI_EPHEMERAL_LEASE</code> (chart: <code className="font-mono text-fg">workers.ephemeralLease</code>),
+          default 2h; 0 disables leasing. This switch is the
           instance <strong className="text-fg">kill-switch</strong>: while it is off, no worker is ever
           auto-provisioned regardless of any per-user opt-in. With it on, users can still individually opt
           in per account on the Workers page. Off by default.

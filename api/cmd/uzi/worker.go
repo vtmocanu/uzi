@@ -285,6 +285,15 @@ func statusCell(w apitypes.WorkerDTO) string {
 	if w.Ephemeral {
 		s += " (ephemeral)"
 	}
+	// PRD #2006: an idle ephemeral worker held for a same-owner/repo/branch follow-up. The
+	// server sets the field only while the lease is live; a past value is skipped here too
+	// so a stale or skewed clock never prints a negative "left". Only the remaining time is
+	// shown, never the lease branch.
+	if w.EphemeralLeaseExpiresAt != nil {
+		if left := time.Until(*w.EphemeralLeaseExpiresAt); left > 0 {
+			s += " (leased, " + fmtUntil(left) + " left)"
+		}
+	}
 	return s
 }
 

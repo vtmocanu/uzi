@@ -426,6 +426,13 @@ func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
 		}
 	}
 
+	// The generated queries target the CURRENT schema (CreateWorker returns every column a later
+	// migration added), so finish migrating to head before using them; the 280 backfill assertions
+	// above already ran against the at-280 database.
+	if err := store.Migrate(ctx, newDSN); err != nil {
+		t.Fatalf("Migrate to head: %v", err)
+	}
+
 	// The seeded running row keeps its value across a heartbeat and a later reset + reclaim.
 	q := store.New(pool)
 	var userID uuid.UUID

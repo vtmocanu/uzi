@@ -44,7 +44,8 @@ regardless of size or type — the one number that doesn't change with your
 choice.
 
 An ephemeral (run-bound) worker, the kind uzi provisions for a single run and
-removes when that run finishes, is the exception on `/data`: its `/data` is
+removes once that run finishes and its idle lease ends (see [Ephemeral worker
+lease](#ephemeral-worker-lease)), is the exception on `/data`: its `/data` is
 its own setting, 20Gi by default and set by the operator, whatever size the
 worker runs at. Its CPU and memory still follow its size.
 
@@ -104,6 +105,42 @@ and shows a free run slot, but isn't picking up a run sitting in the queue.
 That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
 resumes claiming runs on its own once the roll finishes. There's no manual
 way to cordon a worker yourself; it's driven entirely by the cluster.
+
+## Ephemeral worker lease
+
+When an ephemeral worker finishes its run it is not removed at once. It stays
+idle for a **lease** so a follow-up run can reuse the clone, build caches and
+tools it already warmed up, instead of waiting for a new worker to provision
+and download everything again.
+
+- **What is reused.** The same worker, with its working clone and caches. Nothing
+  about the earlier run's result or credentials carries over.
+- **Who can take it.** Only a run with the same owner, the same repository and
+  the same branch. A run for any other repository, branch or owner never
+  claims a leased worker. A leased worker does not count as a free slot for
+  those runs.
+- **Which runs.** Issue runs, `mr_rework` runs and `ci_fix` runs that continue
+  the same branch (a `ci_fix` run's branch is the ref of the failure it fixes). Other kinds (chat, task, job, prompt, judge and self-improve runs), a
+  run without a repository, a run on an egress profile, and a worker on the
+  isolated research lane never reuse a lease.
+- **How long.** 2 hours by default, which is also the maximum: the operator sets
+  `UZI_EPHEMERAL_LEASE` (chart `workers.ephemeralLease`) to anything up to
+  `2h`. `0` turns the lease off, so an ephemeral worker is removed when its run
+  finishes, as before. A value above 2h or a malformed one refuses to boot the
+  api.
+- **At the cap.** A leased worker still counts toward your per-user ephemeral
+  cap. If a new run needs a slot and you are exactly at the cap, the oldest
+  releasable leased worker (one that is not busy and holds no custody hold) is
+  evicted first. An owner over the cap is refused instead.
+- **What ends it early.** A cordon, a roll to a new worker image, a restart of
+  the worker, or the owner deleting it. A cordoned or restarted worker never
+  keeps a lease. When the lease runs out the worker is removed by the normal
+  cleanup.
+
+`uzi worker list` shows a leased worker as `online (ephemeral) (leased, 1h12m
+left)`, with the time remaining. `uzi worker list --json` (and the admin
+fleet list) carries `ephemeral_lease_expires_at`, present only while the lease
+is live. The lease branch is not shown.
 
 ## My Codex run says "no Codex-capable worker is online"
 

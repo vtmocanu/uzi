@@ -216,6 +216,11 @@ WITH prev AS (
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
         draining_since      = NULL,
+        -- PRD #2006: a register is a FRESH pod incarnation, so it ends any ephemeral lease: the
+        -- row's warm state (the pod the lease kept) is gone. The reaper then releases the row.
+        lease_since         = NULL,
+        lease_repo_id       = NULL,
+        lease_branch        = NULL,
         -- Reset the disk-pressure debounce streak (PRD #837 M4): a register is a FRESH
         -- pod incarnation, so a prior incarnation's streak must never carry forward — a
         -- rolled/restarted worker starts clean and must re-earn its >=2-heartbeat streak
@@ -1034,7 +1039,34 @@ WITH target AS (
       -- ephemeral claimant (@is_ephemeral) matches ONLY its bound run
       -- (@ephemeral_run_id); a non-ephemeral worker short-circuits true and the
       -- (NULL) run id is never compared.
-      AND (NOT @is_ephemeral::boolean OR r.id = sqlc.narg('ephemeral_run_id')::uuid)
+      --
+      -- PRD #2006: the LEASE arm. A leased ephemeral worker (it finished its bound run and kept
+      -- its pod for a bounded lease) may ALSO claim a queued run of the same owner (the target's
+      -- own r.user_id = @user_id), the same repository and the same effective branch identity as
+      -- its last bound run: fn_ephemeral_lease_admits decides, on the claimant's OWN lease columns
+      -- (read under its row lock by the caller) at @lease_at, a clock reading the caller takes
+      -- AFTER every lock and guard it waits on (a stale transaction-start now() could admit
+      -- through a lease that expired while the claim waited). The arm is closed when another
+      -- ephemeral worker is already bound to r (one worker per bound run, uq_workers_ephemeral_run)
+      -- or when the claimant still holds an open custody hold. A NULL @ephemeral_lease or an
+      -- absent lease admits nothing, so lease 0 / a non-leased worker is exactly the bound-run-only
+      -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
+      AND (NOT @is_ephemeral::boolean
+           OR r.id = sqlc.narg('ephemeral_run_id')::uuid
+           OR (fn_ephemeral_lease_admits(
+                   sqlc.narg('lease_since')::timestamptz,
+                   sqlc.narg('lease_repo_id')::uuid,
+                   sqlc.narg('lease_branch')::text,
+                   @claimant_draining::boolean,
+                   @ephemeral_lease::interval,
+                   @lease_at::timestamptz,
+                   r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM workers bw
+                   WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM recovery_custody_holds ch
+                   WHERE ch.live_worker_id = @worker_id AND ch.state = 'open')))
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -1077,7 +1109,13 @@ WITH target AS (
                 -- ephemeral peer's own bound run, that peer is a valid deferral target,
                 -- so a busy claimant correctly defers to it — hence the full predicate,
                 -- not a bare AND NOT p.ephemeral.
-                AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id)
+                -- PRD #2006: ...or a LEASED ephemeral peer that may claim r through its lease
+                -- (the claimant clause's lease arm), advisory like this whole mirror, so now().
+                AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
+                     OR fn_ephemeral_lease_admits(
+                            p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
+                            @ephemeral_lease::interval, now(),
+                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), @docker_repo_allowlist::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, @capability_aware::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
@@ -3375,7 +3413,7 @@ WHERE id = @id AND worker_id = @worker_id
   -- generation-less legacy report is honoured by that nil-guarded fence and the best-effort Go
   -- status check in SetState is a TOCTOU — so the guard lives in SQL, mirroring SetRunRunning's
   -- own `status <> 'paused'` exclusion. A live legacy `completed` always runs on a running,
-  -- non-released row (the interlocked path is completeRunWithPermit, fenced on its own locked row),
+  -- non-released row (the interlocked path is completeRunWithPermitLease, fenced on its own locked row),
   -- so this never blocks a legitimate completion.
   AND status <> 'paused' AND claim_released_at IS NULL
   -- PRD #1908: a job is completed only from a live (claimed or running) status. In particular the
@@ -6734,6 +6772,13 @@ WHERE w.user_id = @user_id
 -- run), and NOT the run's released incarnation (D19: the exact worker+nonce a server park excluded,
 -- with the leading IS NULL arm so an ordinary run counts every worker). Active count uses the SAME
 -- run-lane definition as ClaimRun's fleet spread.
+--
+-- PRD #2006: the lease arm of the ephemeral binding is an ADVISORY mirror, not the full claim
+-- conjunction. fn_ephemeral_lease_admits covers the live lease, the draining flag, the repository
+-- and effective branch identity and the no-egress-profile rule, evaluated at now(); it omits
+-- ClaimRun's claimant-custody guard (an open custody hold on the claimant) and its already-bound
+-- guard (a run another ephemeral worker is bound to), so this count can read one higher than the
+-- claim would allow. That only softens a "restart worker" hint and never grants a claim.
 SELECT count(*)
 FROM runs run
 JOIN workers w ON w.user_id = run.user_id
@@ -6792,7 +6837,13 @@ WHERE run.id = @run_id
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
            -- PRD #1976 M1: and the isolated_job_v1 arm for a profile-bound job.
            AND (run.egress_profile_id IS NULL OR 'isolated_job_v1' = ANY(w.protocol_capabilities))))
-  AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
+  -- PRD #2006: a leased ephemeral worker also counts when it may claim THIS run through its lease
+  -- (advisory mirror of ClaimRun's lease arm, so now()).
+  AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id
+       OR fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              @ephemeral_lease::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id))
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce);
@@ -7085,7 +7136,39 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
-        AND NOT w.ephemeral
+        AND (NOT w.ephemeral
+             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
+             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
+             -- provisioned for.
+             OR (fn_ephemeral_lease_admits(
+                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    @ephemeral_lease::interval, now(),
+                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                 -- ...and only when the leased worker also meets the non-bypassable protocol clauses
+                 -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
+                 -- that cannot claim r must not read as a placement). The lane half is
+                 -- NOT w.isolated_lane: the lease only admits a run with no egress profile.
+                 AND NOT w.isolated_lane
+                 AND (r.completion_contract_version IS NULL
+                      OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                      OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+                 AND (r.completion_contract_version IS NULL
+                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                      OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+                 AND (
+                     NOT (
+                         r.harness = 'codex'
+                         AND r.kind NOT IN ('judge', 'chat')
+                         AND r.review_target_run_id IS NULL
+                         AND COALESCE(
+                             NOT ((CASE WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                        ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
+                                  = ANY(@codex_curated_models::text[])),
+                             false)
+                     )
+                     OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+                 )))
         AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
   -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
@@ -7110,7 +7193,19 @@ WHERE r.status = 'queued'
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
   )
   AND (SELECT count(*) FROM workers wc
-       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral
+         -- PRD #2006: a RELEASABLE leased-idle worker (lease set, no non-terminal run, no open
+         -- custody hold) does not count toward this fairness filter: provisionOne evicts the
+         -- oldest one under the advisory lock before it inserts, so an at-cap owner whose cap is
+         -- held only by such workers must still reach provisioning. Still a snapshot hint, never
+         -- the cap (the locked count in provisionOne is).
+         AND NOT (wc.lease_since IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runs lr
+                                  WHERE lr.worker_id = wc.id
+                                    AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
+                  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
+                                  WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
+      ) < @max_per_user::int
 ORDER BY r.created_at ASC
 LIMIT @max_rows;
 
@@ -7191,7 +7286,39 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
-        AND NOT w.ephemeral
+        AND (NOT w.ephemeral
+             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
+             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
+             -- provisioned for.
+             OR (fn_ephemeral_lease_admits(
+                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    @ephemeral_lease::interval, now(),
+                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                 -- ...and only when the leased worker also meets the non-bypassable protocol clauses
+                 -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
+                 -- that cannot claim r must not read as a placement). The lane half is
+                 -- NOT w.isolated_lane: the lease only admits a run with no egress profile.
+                 AND NOT w.isolated_lane
+                 AND (r.completion_contract_version IS NULL
+                      OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                      OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+                 AND (r.completion_contract_version IS NULL
+                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                      OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+                 AND (
+                     NOT (
+                         r.harness = 'codex'
+                         AND r.kind NOT IN ('judge', 'chat')
+                         AND r.review_target_run_id IS NULL
+                         AND COALESCE(
+                             NOT ((CASE WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                        ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
+                                  = ANY(@codex_curated_models::text[])),
+                             false)
+                     )
+                     OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+                 )))
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         -- PRD #1908 (D-A): for a 'job' the capable set is the job-runner set (non-docker AND
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
@@ -7204,7 +7331,39 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
-        AND NOT w.ephemeral
+        AND (NOT w.ephemeral
+             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
+             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
+             -- provisioned for.
+             OR (fn_ephemeral_lease_admits(
+                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    @ephemeral_lease::interval, now(),
+                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+                 -- ...and only when the leased worker also meets the non-bypassable protocol clauses
+                 -- ClaimRun enforces, written as in CountOnlineWorkersClaimableForRun (a leased worker
+                 -- that cannot claim r must not read as a placement). The lane half is
+                 -- NOT w.isolated_lane: the lease only admits a run with no egress profile.
+                 AND NOT w.isolated_lane
+                 AND (r.completion_contract_version IS NULL
+                      OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+                 AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                      OR 'codex_harness_v1' = ANY(w.protocol_capabilities))
+                 AND (r.completion_contract_version IS NULL
+                      OR NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
+                      OR 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities))
+                 AND (
+                     NOT (
+                         r.harness = 'codex'
+                         AND r.kind NOT IN ('judge', 'chat')
+                         AND r.review_target_run_id IS NULL
+                         AND COALESCE(
+                             NOT ((CASE WHEN r.model = ANY(@codex_curated_models::text[]) THEN r.model
+                                        ELSE (SELECT u2.default_codex_model FROM users u2 WHERE u2.id = r.user_id) END)
+                                  = ANY(@codex_curated_models::text[])),
+                             false)
+                     )
+                     OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
+                 )))
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))
@@ -7220,7 +7379,19 @@ WHERE r.status = 'queued'
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
   )
   AND (SELECT count(*) FROM workers wc
-       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral
+         -- PRD #2006: a RELEASABLE leased-idle worker (lease set, no non-terminal run, no open
+         -- custody hold) does not count toward this fairness filter: provisionOne evicts the
+         -- oldest one under the advisory lock before it inserts, so an at-cap owner whose cap is
+         -- held only by such workers must still reach provisioning. Still a snapshot hint, never
+         -- the cap (the locked count in provisionOne is).
+         AND NOT (wc.lease_since IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runs lr
+                                  WHERE lr.worker_id = wc.id
+                                    AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
+                  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
+                                  WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
+      ) < @max_per_user::int
 ORDER BY r.status_since ASC
 LIMIT @max_rows;
 
@@ -7258,7 +7429,19 @@ WHERE r.status = 'queued'
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
   )
   AND (SELECT count(*) FROM workers wc
-       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < @max_per_user::int
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral
+         -- PRD #2006: a RELEASABLE leased-idle worker (lease set, no non-terminal run, no open
+         -- custody hold) does not count toward this fairness filter: provisionOne evicts the
+         -- oldest one under the advisory lock before it inserts, so an at-cap owner whose cap is
+         -- held only by such workers must still reach provisioning. Still a snapshot hint, never
+         -- the cap (the locked count in provisionOne is).
+         AND NOT (wc.lease_since IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runs lr
+                                  WHERE lr.worker_id = wc.id
+                                    AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
+                  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
+                                  WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
+      ) < @max_per_user::int
 ORDER BY r.created_at ASC
 LIMIT @max_rows;
 
@@ -7410,7 +7593,7 @@ UPDATE runs SET priority = sqlc.narg('priority')::smallint
 WHERE id = @id AND user_id = @user_id AND status = 'queued';
 
 -- name: GetRunOwnedByWorkerForUpdate :one
--- PRD #1226 M2 (D4): the completion transaction's row lock. completeRunWithPermit opens a
+-- PRD #1226 M2 (D4): the completion transaction's row lock. completeRunWithPermitLease opens a
 -- pgx transaction and SELECTs the run FOR UPDATE through this so two concurrent completed
 -- reports (a retry after response loss) serialize — the second blocks until the first
 -- commits and then sees the terminal row. Worker-scoped like GetRunOwnedByWorker: a run the
@@ -7522,7 +7705,7 @@ RETURNING runs.completion_attempts;
 -- PRE-EXISTING row. The rebind matters on an A->B REQUEUE: worker A issued a permit for
 -- (run, revision, head), the run requeued to worker B in a claimable state, and B re-requests
 -- for the same identity. Without the rebind the row keeps A's issued_by_worker_id, so B's
--- completeRunWithPermit (which fences on B's id) can never find its permit -> the run is
+-- completeRunWithPermitLease (which fences on B's id) can never find its permit -> the run is
 -- PERMANENTLY non-terminal. Rebinding issued_by_worker_id to EXCLUDED (B) hands the permit to
 -- whoever last requested it.
 --
@@ -7531,7 +7714,7 @@ RETURNING runs.completion_attempts;
 -- issued_at untouched preserves the M2 idempotency contract (a re-request returns the SAME
 -- permit rather than re-issuing one). Not touching consumed_at is provably correct: consumed_at
 -- is NULL on every ON CONFLICT path here, because consume+complete are atomic in
--- completeRunWithPermit (so consumed ⇔ status='completed'), and a completed run's re-request is
+-- completeRunWithPermitLease (so consumed ⇔ status='completed'), and a completed run's re-request is
 -- rejected at loadClaimedInterlockedRun's status gate (completion_permit.go) BEFORE it ever
 -- reaches this upsert. (EXCLUDED.<col>, not the target table by name, because sqlc's analyzer
 -- treats a target-table self-reference in a DO UPDATE SET value as ambiguous — so do NOT
@@ -7556,7 +7739,7 @@ RETURNING *;
 -- fence). branch binds the permit to the worker-reported source branch so a permit issued for
 -- branch A at head H cannot complete a report for branch B at the same head H. No row
 -- (identity/head/revision/branch mismatch, already consumed, or a different worker) returns
--- pgx.ErrNoRows, which completeRunWithPermit reads as "no matching permit -> the gated
+-- pgx.ErrNoRows, which completeRunWithPermitLease reads as "no matching permit -> the gated
 -- completion stays non-terminal".
 SELECT * FROM run_completion_permits
 WHERE run_id = @run_id AND contract_revision = @contract_revision AND head = @head
@@ -7567,7 +7750,7 @@ FOR UPDATE;
 
 -- name: GetConsumedCompletionPermit :one
 -- PRD #1226 M2 (D4): the retry-after-response-loss probe. When a completed report arrives for
--- an ALREADY-terminal run, completeRunWithPermit checks whether THIS worker's permit for the
+-- an ALREADY-terminal run, completeRunWithPermitLease checks whether THIS worker's permit for the
 -- identity was already consumed (i.e. we completed it once and the response was lost); if so it
 -- returns idempotent success instead of a spurious denial. branch binds the probe to the
 -- worker-reported source branch, the same identity component the unconsumed lookup uses. FOR
@@ -7589,7 +7772,7 @@ WHERE id = @id AND issued_by_worker_id = @issued_by_worker_id AND consumed_at IS
 -- name: GetRunByIDForUpdate :one
 -- PRD #1227 M1: the owner-decision transaction's row lock. DecideCompletion opens a pgx
 -- transaction and SELECTs the run FOR UPDATE through this so a partial/accept decision
--- serializes against a racing decision (or a completeRunWithPermit consume) on the same run —
+-- serializes against a racing decision (or a completeRunWithPermitLease consume) on the same run —
 -- the FOR UPDATE row lock is the mutex, exactly as GetRunOwnedByWorkerForUpdate is for the
 -- completion transaction. DecideCompletion is OWNER-SCOPED: it re-checks ownership against the
 -- LOCKED row (locked.user_id == caller) after the lock, so a foreign caller — including an

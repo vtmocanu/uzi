@@ -24,8 +24,9 @@ export function HostedWorkers({
   onShowWorkers,
   onAvailability,
 }: {
-  /** How many hosted workers the user already holds, counted from the fleet list the
-   *  page polls. There is no count endpoint and none is wanted. */
+  /** How many PERSISTENT hosted workers the user already holds, counted from the fleet
+   *  list the page polls (ephemeral rows excluded, as the server's quota count excludes
+   *  them). There is no count endpoint and none is wanted. */
   hostedCount: number;
   /** Hand the new worker to the page: it owns the announcement slot (a delete has to
    *  be able to replace a provision's message, and deletes are the page's) and the
@@ -291,9 +292,12 @@ export function HostedWorkers({
             <span className="text-sm">Auto-provision on demand</span>
           </div>
           <p id="ephemeral-toggle-desc" className="text-xs text-muted">
-            When on, uzi spins up a run-bound throwaway hosted worker on demand when one of
-            your runs needs a capability no online worker has, and reaps it when the run
-            finishes. This is <em>experimental</em>, and each ephemeral worker pays a one-time
+            When on, uzi spins up a throwaway hosted worker on demand when one of your runs
+            needs a capability no online worker has. After the run finishes, the worker may be
+            kept warm, by default for up to 2 hours unless your admin turned that off, so a
+            follow-up run on the same repository and branch can reuse it; then it is removed.
+            While kept warm it still counts toward your ephemeral worker limit.
+            This is <em>experimental</em>, and each new ephemeral worker pays a one-time
             ~2.6&nbsp;GiB tool-cache cold start.
           </p>
           {/* The ephemeral write's own error slot, next to the toggle where the user

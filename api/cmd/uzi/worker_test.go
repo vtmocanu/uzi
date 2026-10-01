@@ -832,3 +832,25 @@ func TestWorkerListShowsLargestRunColumn(t *testing.T) {
 		}
 	}
 }
+
+// TestStatusCellLease pins the PRD #2006 lease annotation: shown with the remaining time
+// while the lease is in the future, absent when unset or already past.
+func TestStatusCellLease(t *testing.T) {
+	future := time.Now().Add(90*time.Minute + 30*time.Second)
+	past := time.Now().Add(-time.Minute)
+	for _, tc := range []struct {
+		name string
+		w    apitypes.WorkerDTO
+		want string
+	}{
+		{"leased", apitypes.WorkerDTO{Status: "online", Ephemeral: true, EphemeralLeaseExpiresAt: &future}, "online (ephemeral) (leased, 1h30m left)"},
+		{"no lease", apitypes.WorkerDTO{Status: "online", Ephemeral: true}, "online (ephemeral)"},
+		{"expired lease", apitypes.WorkerDTO{Status: "online", Ephemeral: true, EphemeralLeaseExpiresAt: &past}, "online (ephemeral)"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := statusCell(tc.w); got != tc.want {
+				t.Errorf("statusCell = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}

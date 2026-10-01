@@ -17,6 +17,7 @@ import { HostedWorkers } from "../components/HostedWorkers";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
 import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
+import { WorkerLeaseBadge } from "../components/WorkerLeaseBadge";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RecoveryHoldsSurface } from "../components/RecoveryHoldsSurface";
 import { WorkerStatGauges, formatBytes } from "../components/WorkerStats";
@@ -66,6 +67,11 @@ const TAB_BASE =
   "-mb-px shrink-0 whitespace-nowrap border-b-2 px-3 py-2 text-sm font-medium transition-colors";
 const TAB_ACTIVE = "border-brand text-fg";
 const TAB_INACTIVE = "border-transparent text-muted hover:border-edge-strong hover:text-fg";
+
+// A hosted worker that counts toward the manual hosted quota. Mirrors the server's
+// CountHostedWorkersForUser (`kind = 'hosted' AND NOT ephemeral`): ephemeral workers,
+// leased or not (PRD #529/#2006), sit under their own per-user cap instead.
+const isPersistentHosted = (w: Worker) => w.kind === "hosted" && w.ephemeral !== true;
 
 export function WorkersSettings() {
   const [workers, setWorkers] = useState<Worker[]>([]);
@@ -214,13 +220,14 @@ export function WorkersSettings() {
     document.getElementById(rowId(pendingRowFocus))?.focus();
     setPendingRowFocus(null);
   }, [pendingRowFocus]);
-  // Cross the tabs back to Your workers and focus the first HOSTED row's container so the
-  // user can delete one and free quota (D10). Never a Delete button — the focus rule below
+  // Cross the tabs back to Your workers and focus the first PERSISTENT hosted row's
+  // container so the user can delete one and free quota (D10). Ephemeral rows are skipped:
+  // they never count toward this quota, so deleting one frees nothing here. Never a Delete button — the focus rule below
   // stands. If there is no hosted worker (shouldn't happen at quota), just switch tabs and
   // let focus fall to <body>.
   const onShowWorkers = useCallback(() => {
     selectTab("workers");
-    const firstHosted = workers.find((w) => w.kind === "hosted");
+    const firstHosted = workers.find(isPersistentHosted);
     if (firstHosted) setPendingRowFocus(firstHosted.id);
   }, [selectTab, workers]);
   const onTabKeyDown = (e: React.KeyboardEvent) => {
@@ -657,8 +664,10 @@ export function WorkersSettings() {
                               worker without the sidecar renders nothing. */}
                           {w.docker === true && <Badge>docker</Badge>}
                           {/* Ephemeral (PRD #529/#649): an auto-provisioned, run-bound
-                              throwaway hosted worker the api spun up on demand and reaps
-                              when the run finishes. Like the docker badge above, it is a
+                              throwaway hosted worker the api spun up on demand. It is
+                              removed after its run finishes and any lease (PRD #2006)
+                              ends; the `leased` badge beside it shows that window. Like
+                              the docker badge above, it is a
                               WORD ("ephemeral"), not an icon or a letter — Badge is a bare
                               <span> (ARIA role `generic`, where naming is prohibited), so a
                               word is the only thing that reaches sighted, keyboard, and
@@ -670,11 +679,15 @@ export function WorkersSettings() {
                           {w.ephemeral === true && (
                             <Badge
                               tone="plan"
-                              title="Auto-provisioned on demand for a run that needed a capability no online worker had; reaped when that run finishes."
+                              title="Auto-provisioned on demand for a run that needed a capability no online worker had. Removed after that run finishes and any lease ends."
                             >
                               ephemeral
                             </Badge>
                           )}
+                          {/* Leased (PRD #2006): renders only while
+                              ephemeral_lease_expires_at is in the future; absent or past
+                              renders nothing. See WorkerLeaseBadge. */}
+                          <WorkerLeaseBadge worker={w} />
                         </>
                       )}
                       {hasTemplateDrift(w.template_declared, w.template_reported) && (
@@ -994,8 +1007,11 @@ export function WorkersSettings() {
                 on and self-service quota left. One list below, not two — a hosted worker is
                 an ordinary worker whose container the controller runs, so it keeps the same
                 status, gauges, run badge and delete rule, and only its origin differs. */}
+            {/* hostedCount excludes ephemeral rows (isPersistentHosted): an auto-provisioned
+                or leased worker must not make the manual form read "at quota" when the
+                server would accept a provision. */}
             <HostedWorkers
-              hostedCount={workers.filter((w) => w.kind === "hosted").length}
+              hostedCount={workers.filter(isPersistentHosted).length}
               onProvisioned={async (worker) => {
                 // Switch to Your workers AND announce in the SAME synchronous batch, both before
                 // any await (D "After a provision"). Both are plain state updates, so React
