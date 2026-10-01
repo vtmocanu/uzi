@@ -586,7 +586,7 @@ A few worth knowing:
   **scope directive** (PRD #634, `uzi run stop`/`run scope` on a
   milestone-structured issue run): a follow-up's `STATE` is a receipt state
   (`queued`, `received`, `routed`, `included in a prompt`, or `not delivered` /
-  `not included (run finished)` once the run ends); a scope directive's `STATE` is its
+  `not confirmed (run finished)` once the run ends); a scope directive's `STATE` is its
   **disposition** instead — `active (scope ceiling set)` while pending,
   `applied (finalized at the ceiling)`, `declined (not acted on)`, or
   `superseded (a later directive replaced it)` — because a scope row is

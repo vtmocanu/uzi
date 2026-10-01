@@ -566,7 +566,7 @@ uzi version
   at a clarification park, `(resumes the run)` on an interactive run awaiting a
   follow-up, or the usage-limit / token-pool / recovery park. On a finished run an
   unfetched input reads `not delivered (run finished)` and a fetched one no prompt
-  carried reads `not included (run finished)`. A worker that does not report prompt
+  carried reads `not confirmed (run finished)`. A worker that does not report prompt
   inclusion shows `received` or `routed` with `(no inclusion report)`. `included` is recorded once the turn carrying the follow-up
   reaches the model; on a resume the lead is re-sent a received, not-yet-included
   follow-up only when its worker reports inclusion (older workers' rows are not

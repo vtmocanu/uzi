@@ -283,7 +283,7 @@ through these delivery states:
 | Received / Routed — resumes the run | Fetched while an interactive run waits for its next follow-up; it becomes the next turn and resumes the run. |
 | Included in a prompt | The turn carrying it reached the model: it is in a prompt the agent was given. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
-| Not included — run finished | The worker fetched it, but the run finished before any turn carried it. |
+| Not confirmed — run finished | The worker fetched it, but no prompt carrying it was confirmed before the run finished. The receipt may have been lost at shutdown, so this is not proof it was never carried. |
 | Received / Routed — no inclusion report | The worker predates inclusion reporting, so uzi cannot say whether a prompt carried it. |
 
 **When a follow-up is included.** Claude and Codex runs behave identically.
@@ -316,7 +316,7 @@ included), from the steer queue if you can steer the run; on a finished run,
 in a new run.
 
 The queue stays visible, read-only, after the run finishes — so a
-"Not delivered — run finished" or "Not included — run finished" input doesn't just vanish.
+"Not delivered — run finished" or "Not confirmed — run finished" input doesn't just vanish.
 
 ### Scope directives
 

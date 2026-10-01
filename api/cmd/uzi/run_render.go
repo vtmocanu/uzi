@@ -1715,7 +1715,7 @@ func steerKindLabel(kind string) string {
 //     empty token pool / transient-recovery)
 //   - not consumed, otherwise      → "queued"
 //   - included_at set              → "included in a prompt" on any run status
-//   - consumed, not included, run terminal, inclusion reported → "not included (run finished)"
+//   - consumed, not included, run terminal, inclusion reported → "not confirmed (run finished)"
 //   - consumed, not included, run terminal, not reported → base + " (no inclusion report)"
 //   - consumed, not included, otherwise → base ("routed" when applied_at is set, else
 //     "received") plus one qualifier: awaiting_approval "(waits for approval)",
@@ -1822,7 +1822,7 @@ func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...st
 	const notReportedSuffix = " (no inclusion report)"
 	if terminalRunStatuses[runStatus] {
 		if in.InclusionReported {
-			return "not included (run finished)"
+			return "not confirmed (run finished)"
 		}
 		return base + notReportedSuffix
 	}

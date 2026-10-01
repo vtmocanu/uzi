@@ -10,7 +10,7 @@ import { FollowUpComposer } from "./FollowUpComposer";
 //
 // Critically, this card is rendered UNCONDITIONALLY by RunView — including for a terminal
 // run — and its `inputs` are lifted into useRunStream (Decision 7/B1). That is what lets
-// the queue survive the run completing and still show "Not delivered — run finished" or "Not included — run finished"; it
+// the queue survive the run completing and still show "Not delivered — run finished" or "Not confirmed — run finished"; it
 // could never do that from inside the !terminal-gated composer, which unmounts on
 // completion. The composer + Stop, by contrast, are only meaningful for a live run, so
 // they are gated on !terminal.
@@ -120,7 +120,7 @@ function deliveryFor(input: SteerInput, terminal: boolean, status: string | unde
   const base = input.applied_at != null ? "Routed" : "Received";
   if (!input.inclusion_reported) {
     // A worker that predates inclusion reporting cannot say whether a prompt carried it,
-    // so neither "included" nor "not included" is claimed.
+    // so neither "included" nor "not confirmed" is claimed.
     return {
       label: `${base} — no inclusion report`,
       tone: "neutral",
@@ -130,9 +130,9 @@ function deliveryFor(input: SteerInput, terminal: boolean, status: string | unde
   }
   if (terminal) {
     return {
-      label: "Not included — run finished",
+      label: "Not confirmed — run finished",
       tone: "neutral",
-      title: "The worker received this follow-up, but the run finished before a prompt carried it.",
+      title: "The worker received this follow-up, but no prompt carrying it was confirmed before the run finished.",
     };
   }
   const parked = status ? PARKED_COPY[status] : undefined;

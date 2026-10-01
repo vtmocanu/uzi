@@ -300,6 +300,32 @@ func TestSteerQueueIndicatorUsesTheSharedVocabulary(t *testing.T) {
 	}
 }
 
+// Issue #1800: a consumed row whose worker reports inclusion but never confirmed it,
+// on a terminal run, reads "not confirmed (run finished)" -- never "not included" -- and
+// the label fits the 30-column state cell untruncated.
+func TestSteerQueueTerminalUnconfirmedRowIsNotClaimedAsNotIncluded(t *testing.T) {
+	runID := "r-done"
+	run := ownedRun(runID)
+	run.Status = "completed"
+	body := "please also update the docs"
+	consumed := time.Now().Add(-time.Minute)
+	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
+	m = applyDetail(m, run, nil)
+	next, _ := m.Update(runInputsMsg{runID: runID, inputs: []apitypes.SteerInputDTO{
+		{ID: 1, Kind: "follow_up", Body: &body, CreatedAt: time.Now().Add(-2 * time.Minute),
+			ConsumedAt: &consumed, InclusionReported: true},
+	}})
+	m = next.(tuiModel)
+
+	block := stripANSI(m.renderSteerQueue())
+	if !strings.Contains(block, "not confirmed (run finished)") {
+		t.Errorf("terminal unconfirmed row does not read %q\n%s", "not confirmed (run finished)", block)
+	}
+	if strings.Contains(block, "not included") {
+		t.Errorf("a missing receipt must not be reported as not included\n%s", block)
+	}
+}
+
 // PRD #634 M3 P3c: the steer queue renders a KIND cell (reusing steerKindLabel) so a
 // kind='scope' operator directive is visually distinct from a follow_up. A scope row
 // shows "scope"; a follow_up (or an empty kind) shows "follow-up".

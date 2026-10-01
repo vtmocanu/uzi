@@ -445,7 +445,7 @@ export const mockCrewRuns: Run[] = [
 // Queued, consumed_at → Received, plus applied_at → Routed, plus included_at → Included in
 // a prompt; the run's status decides the gate/terminal copy client-side. The mock worker
 // reports prompt inclusion (inclusion_reported true), so a consumed row without included_at
-// reads as waiting or "Not included" rather than "no inclusion report".
+// reads as waiting or "Not confirmed" rather than "no inclusion report".
 const steerInput = (
   id: number,
   body: string,
@@ -504,7 +504,7 @@ export const mockRunInputs: Record<string, SteerInput[]> = {
   // this queue exhibits the three terminal scope dispositions (PRD #634) — an earlier
   // directive superseded by a later one, a declined one, and the applied one the run
   // finalized at — plus a follow-up that was never consumed → "Not delivered — run
-  // finished" and one the worker received that no prompt carried → "Not included — run
+  // finished" and one the worker received that no prompt carried → "Not confirmed — run
   // finished". With the live run's pending directive, all four disposition pills are
   // reachable in mock mode.
   "run-done": [

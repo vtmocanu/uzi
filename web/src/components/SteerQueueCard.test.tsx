@@ -4,7 +4,7 @@
 // client-side from the receipt timestamps (consumed_at, applied_at, included_at,
 // inclusion_reported) and run.status, and the queue must SURVIVE the run going terminal
 // (B1) — it lives in its own card lifted to useRunStream, not inside the !terminal-gated
-// composer, so "Not delivered — run finished" and "Not included — run finished" are
+// composer, so "Not delivered — run finished" and "Not confirmed — run finished" are
 // reachable. The harness (Claude or Codex) never changes a chip: SteerInput has no harness.
 
 import { afterEach, describe, it, expect, vi } from "vitest";
@@ -131,20 +131,25 @@ describe("SteerQueueCard delivery states (Decision 7, issue #1800)", () => {
       expect(chip.closest("[title]")?.getAttribute("title")).toBe(
         "Included in a prompt the agent was given; whether it acted on it shows in the agent's messages.",
       );
-      expect(screen.queryByText(/Delivered|Not included/)).toBeNull();
+      expect(screen.queryByText(/Delivered|Not confirmed/)).toBeNull();
     }
   });
 
-  it("consumed, never included, terminal → 'Not included — run finished'", () => {
+  it("consumed, inclusion unconfirmed, terminal → 'Not confirmed — run finished'", () => {
     renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "completed", true);
-    expect(screen.getByText("Not included — run finished")).toBeTruthy();
+    const chip = screen.getByText("Not confirmed — run finished");
+    expect(chip).toBeTruthy();
+    expect(chip.closest("[title]")?.getAttribute("title")).toBe(
+      "The worker received this follow-up, but no prompt carrying it was confirmed before the run finished.",
+    );
+    expect(screen.queryByText(/Not included/)).toBeNull();
     expect(screen.queryByText(/Delivered/)).toBeNull();
   });
 
-  it("received after a resume (non-terminal, not included) → still Received, not Not included", () => {
+  it("received after a resume (non-terminal, not included) → still Received, not Not confirmed", () => {
     renderCard(input({ consumed_at: RECEIVED }), "running");
     expect(screen.getByText("Received")).toBeTruthy();
-    expect(screen.queryByText(/Not included/)).toBeNull();
+    expect(screen.queryByText(/Not confirmed/)).toBeNull();
   });
 
   it("legacy (no inclusion report), live → 'Received/Routed — no inclusion report'", () => {
@@ -164,10 +169,10 @@ describe("SteerQueueCard delivery states (Decision 7, issue #1800)", () => {
     }
   });
 
-  it("legacy, terminal → never claims 'Not included' (the worker cannot say)", () => {
+  it("legacy, terminal → never claims 'Not confirmed' (the worker cannot say)", () => {
     renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED, inclusion_reported: false }), "completed", true);
     expect(screen.getByText("Routed — no inclusion report")).toBeTruthy();
-    expect(screen.queryByText(/Not included/)).toBeNull();
+    expect(screen.queryByText(/Not confirmed/)).toBeNull();
   });
 
   it("gate copy degrades to plain Received when status is not provided", () => {
