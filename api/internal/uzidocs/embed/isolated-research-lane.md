@@ -16,7 +16,7 @@ design rationale is in [ADR-1906](../adr/1906-isolated-fetch-lane.md).
 
 **What uses the lane.** A run is placed in the lane only when it is bound to a
 site list. A [job](jobs.md#site-lists) binds itself by naming a site list in
-`egress_profile` on create ([PRD #1976](../prds/1976-site-list-jobs.md)); see
+`egress_profile` on create ([PRD #1976](../prds/done/1976-site-list-jobs.md)); see
 [Jobs on the lane](#jobs-on-the-lane). Turning the lane on renders the
 namespace, the fetcher and the policies. The api provisions lane workers only
 for bound runs, so without bound runs the lane is idle. Its lane trigger is

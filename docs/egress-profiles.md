@@ -12,7 +12,7 @@ Admins create and edit profiles; a run names one profile, never a list of
 domains.
 
 **Where a profile is used.** A [job](jobs.md#site-lists) names a profile in
-`egress_profile` when it is created ([PRD #1976](../prds/1976-site-list-jobs.md)),
+`egress_profile` when it is created ([PRD #1976](../prds/done/1976-site-list-jobs.md)),
 and runs on the no-internet worker lane described in [Isolated research
 lane](isolated-research-lane.md), reading only the hosts on the list. Your own
 `uzc_` token may name any profile. A product (`uzp_`) token may name only a
