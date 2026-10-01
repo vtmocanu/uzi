@@ -81,11 +81,12 @@
 #  10  the branch is uzi-owned (agent/*, uzi/*) and changes .github/workflows files: pushing
 #      it would make every later uzi push there fail (worker PAT lacks workflow scope).
 #      Split the workflow edit into a separate PR, or --allow-workflow-edit
-#  11  a CLEAN rebase filed bullets the branch added under [Unreleased] into a released section
-#      (the base folded [Unreleased] into a new version; no conflict, so changelog-union.sh
-#      never ran): the bullets are named, nothing is relocated. Move them under [Unreleased],
-#      commit, re-run --skip-rebase. Runs right after the CHANGELOG guard (exit 9), also after a
-#      pre-push base-move rebase
+#  11  the rebased CHANGELOG.md no longer holds, under [Unreleased], a bullet block the branch
+#      added there. Each block is named as "misplaced" (a CLEAN rebase filed it in a released
+#      section after the base folded [Unreleased]; no conflict, so changelog-union.sh never ran)
+#      or "missing" (absent everywhere: an intentional removal or reword needs a human). Nothing
+#      is relocated: restore it under [Unreleased] and commit, re-run --skip-rebase. Runs right
+#      after the CHANGELOG guard (exit 9), also after a pre-push base-move rebase
 set -uo pipefail
 
 REPO=""; PR=""; WT=""; SKIP_REBASE=0; GATE="auto"; PUSH=1; ROOT=""; REWORK_CHECK=1; FRESH=0; ALLOW_CL_RM=0; ALLOW_WF=0
@@ -408,8 +409,8 @@ fi
 # new bullets under that RELEASED section without a conflict (measured 2026-10-01), so
 # changelog-union.sh never runs. The bullet blocks the branch ADDED under [Unreleased] (its
 # remote head $LEASE against that head's merge-base with origin/$BASE) must each still sit
-# under [Unreleased] in HEAD; one that HEAD holds only outside [Unreleased] stops here (exit
-# 11). No automatic relocation: move it by hand, commit, re-run --skip-rebase. A block is a
+# under [Unreleased] in HEAD; one that HEAD holds only outside [Unreleased] (misplaced) or nowhere (missing) stops
+# here (exit 11), each named with which it is. No automatic relocation: move it by hand, commit, re-run --skip-rebase. A block is a
 # `- ` line plus its indented continuation lines, compared verbatim.
 # Each file read gets a trailing blank line so awk sees a first record even when it is empty.
 changelog_placement_guard() {
@@ -432,14 +433,17 @@ changelog_placement_guard() {
       out()
       for (i = 1; i <= nb; i++) {
         b = B[i]
-        if (!((1, b) in U) && !((3, b) in U) && ((3, b) in R)) { t = b; sub(/\037.*/, "", t); print t }
+        if (!((1, b) in U) && !((3, b) in U)) {
+          t = b; sub(/\037.*/, "", t)
+          print (((3, b) in R) ? "misplaced (only in a released section): " : "missing (absent from the rebased file; a removal or reword needs a human): ") t
+        }
       }
     }' "$gd/1" "$gd/2" "$gd/3") || { rm -rf "$gd"; echo "cannot read CHANGELOG.md for the placement check" >&2; exit 3; }
   rm -rf "$gd"
   if [ -n "$stray" ]; then
-    log "the rebase placed CHANGELOG.md bullet(s) the branch added under [Unreleased] into a released section:"
+    log "the rebased CHANGELOG.md no longer holds bullet(s) the branch added under [Unreleased] there:"
     printf '%s\n' "$stray" | cut -c1-160
-    log "move them under [Unreleased] (matching ### heading), commit, re-run with --skip-rebase"
+    log "restore each under [Unreleased] (matching ### heading), or confirm an intentional removal by committing the file as wanted, then re-run with --skip-rebase"
     echo "RESULT=changelog_misplaced WORKTREE=$WT"
     exit 11
   fi

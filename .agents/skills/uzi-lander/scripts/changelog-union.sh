@@ -138,7 +138,8 @@ fold_resolve() {
           if (isu) uend[f] = i - 1
           isu = (s ~ /^## \[Unreleased\]/)
           if (isu) { nu[f]++; ustart[f] = i; uend[f] = N[f] }
-          h = ""; sec = trim(s); if (f == 1) ancsec[sec] = 1; continue
+          h = ""; sec = ""; if (match(s, /^## \[[^]]+\]/)) sec = substr(s, 4, RLENGTH - 3)   # the [version] identifier, never the date
+          if (f == 1 && sec != "") ancsec[sec] = 1; continue
         }
         if (s ~ /^### /) { flush(f); h = trim(s); continue }
         if (s ~ /^- /) { flush(f); cur = s; curu = isu; curh = h; cursec = sec; continue }
@@ -174,8 +175,8 @@ fold_resolve() {
         if (BU[2, k]) ou[BT[2, k]] = 1
         else {
           orl[BT[2, k]] = 1
-          # only a release section NEWLY introduced in the base can be the fold target
-          if (!(BS[2, k] in ancsec)) nrc[BH[2, k] K BT[2, k]]++
+          # only a release section whose [version] is NEWLY introduced in the base (a date edit of an existing one does not count) can be the fold target
+          if (BS[2, k] != "" && !(BS[2, k] in ancsec)) nrc[BH[2, k] K BT[2, k]]++
         }
       }
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {

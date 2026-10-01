@@ -3,7 +3,7 @@
 # [Unreleased] body into a `## [x.y.z]` section while the branch added bullets under
 # [Unreleased]. Each case builds a throwaway repo whose index is given the three conflict
 # stages directly (no real rebase: a real one of these shapes can merge cleanly, which
-# land-prep.sh's misplacement guard covers, tested in land-prep-misplaced.test.sh), plus a
+# land-prep.sh's misplacement guard covers, tested in land-prep-changelog-placement.test.sh), plus a
 # worktree file with diff3-style markers.
 set -eu
 
@@ -194,6 +194,14 @@ printf '%s## [Unreleased]\n\n### Added\n\n- **twin**\n  twin desc\n\n- **twin**\
 cp "$WORK/twin.base.md" "$WORK/twin2.base.md"; cp "$WORK/twin.main.md" "$WORK/twin2.main.md"
 printf '%s## [Unreleased]\n\n### Added\n\n- **new added**\n  new\n\n## [0.2.0] - 2026-02-01\n\n### Added\n\n- **twin**\n  twin desc\n\n- **twin**\n  twin desc\n' "$HEAD_" > "$WORK/twin2.want.md"
 mkconflict twin2; expect_ok twin2
+
+# 14b. Refusal (release identity is the VERSION): main only re-dated an existing release heading
+#      and deleted the Unreleased entry; no new release version exists.
+sed 's/## \[0.1.0\] - 2026-01-01/## [0.1.0] - 2026-01-02/' "$WORK/hist.main.md" > "$WORK/redate.main.md"
+cp "$WORK/hist.base.md" "$WORK/redate.base.md"
+cp "$WORK/hist.branch.md" "$WORK/redate.branch.md"
+printf '%s## [Unreleased]\n\n## [0.1.0] - 2026-01-02\n\n### Added\n\n- **old added**\n  old added desc\n' "$HEAD_" > "$WORK/redate.main.md"
+mkconflict redate; expect_refuse redate
 
 # 15. Refusal: markers in a plain file with no index stages stay the old refusal.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **a**\n||||||| b\n- **old**\n=======\n- **b**\n>>>>>>> x\n' > "$WORK/plain.md"

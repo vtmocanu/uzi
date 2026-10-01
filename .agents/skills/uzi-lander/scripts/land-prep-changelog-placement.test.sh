@@ -157,4 +157,22 @@ land keep
 [ "$RC" -eq 0 ] || fail "keep: expected exit 0, got $RC: $OUT"
 grep -Fq 'RESULT=prepared' <<<"$OUT" || fail "keep: not prepared: $OUT"
 
+# 3. A branch-added block that is MISSING everywhere (hand fix after exit 11 that dropped one
+#    bullet instead of moving it): re-entry stops again, naming it as missing, not as misplaced.
+printf '%s' "${FOLDED/## \[Unreleased\]/## [Unreleased]
+
+### Added
+
+- **new added**
+  new added line 1
+  new added line 2}" > "$WORK/fold/wt/CHANGELOG.md"
+git -C "$WORK/fold/wt" config user.name test
+git -C "$WORK/fold/wt" config user.email test@example.com
+git -C "$WORK/fold/wt" commit -qam 'hand fix that drops a bullet'
+RC=0
+OUT=$(PATH="$WORK/bin:$PATH" bash "$SCRIPT" test/uzi 77 --repo-root "$WORK/fold/root" --worktree "$WORK/fold/wt" --skip-rebase --no-push --gate none 2>&1) || RC=$?
+[ "$RC" -eq 11 ] || fail "missing: expected exit 11, got $RC: $OUT"
+grep -Fq 'missing' <<<"$OUT" && grep -Fq -- '- **new fixed**' <<<"$OUT" || fail "missing: the dropped bullet was not named as missing: $OUT"
+if grep -F 'misplaced (' <<<"$OUT" | grep -Fq 'new added'; then fail "missing: a correctly placed bullet was flagged: $OUT"; fi
+
 echo "PASS land-prep-changelog-placement: real conflict-free rebase after a release fold stops with exit 11 naming the misplaced bullets; a rebase keeping them under [Unreleased] passes"
