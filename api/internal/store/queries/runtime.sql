@@ -1638,6 +1638,10 @@ UPDATE runs SET
     -- running heartbeat re-clears an already-NULL column (a no-op). Display-only.
     checkpoint_contains_latest     = NULL,
     started_at       = COALESCE(started_at, now()),
+    -- Issue #2004: the display anchor. Stamped once and NEVER reset by any writer (the
+    -- promotion/requeue writers NULL started_at for a fresh wall but do not touch this column);
+    -- started_at stays the budget/timeout anchor.
+    first_started_at = COALESCE(first_started_at, now()),
     iteration_count  = GREATEST(iteration_count, @iteration_count),
     session_id       = COALESCE(sqlc.narg('session_id'), session_id),
     repo_agents      = COALESCE(sqlc.narg('repo_agents')::jsonb, repo_agents),

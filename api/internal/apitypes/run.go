@@ -545,9 +545,14 @@ type RunDTO struct {
 	PrdPatchSettledAt *time.Time `json:"prd_patch_settled_at"`
 	ClaimedAt         *time.Time `json:"claimed_at"`
 	StartedAt         *time.Time `json:"started_at"`
-	FinishedAt        *time.Time `json:"finished_at"`
-	CreatedAt         time.Time  `json:"created_at"`
-	UpdatedAt         time.Time  `json:"updated_at"`
+	// FirstStartedAt is when the run FIRST reached running (runs.first_started_at, issue
+	// #2004). Unlike started_at (the budget/timeout anchor, reset on every resume so a resumed
+	// leg gets a fresh wall) no writer ever resets it, so it is the display anchor for the
+	// whole-run duration. Null until the run first starts.
+	FirstStartedAt *time.Time `json:"first_started_at"`
+	FinishedAt     *time.Time `json:"finished_at"`
+	CreatedAt      time.Time  `json:"created_at"`
+	UpdatedAt      time.Time  `json:"updated_at"`
 	// StatusSince is when the run entered its CURRENT status (runs.status_since, stamped
 	// only by the statements that assign runs.status). The column is backfilled and NOT
 	// NULL (migration 00163_run_status_since.sql), so a current server always sends a

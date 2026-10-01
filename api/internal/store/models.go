@@ -880,6 +880,8 @@ type Run struct {
 	// Issue #1742: the exact claim generation at which Register's one-shot finalize-resume allowance re-queued this run over its budget. NULL = never used; once set the allowance never fires again for the run.
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 	JobProtocol              pgtype.Int2 `json:"job_protocol"`
+	// Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset on resume.
+	FirstStartedAt pgtype.Timestamptz `json:"first_started_at"`
 }
 
 type RunCompletionAttempt struct {

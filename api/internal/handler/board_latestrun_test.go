@@ -42,7 +42,7 @@ func TestMapLatestRun(t *testing.T) {
 
 	t.Run("owner's run maps all fields and is mine", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "completed", "issue", 2, true, i8(7), txt("https://gl.example/x/-/merge_requests/7"), txt("merged"), txt("boom"), nullTxt(), nullTxt(),
-			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			txt("Vlad"), txt("laptop"), 3, tstamp(created), tstamp(updated), viewer, 0)
 		if dto.IsPlanning {
 			t.Fatal("a completed run must not be is_planning")
@@ -83,7 +83,7 @@ func TestMapLatestRun(t *testing.T) {
 		// The committed cases thread a null hold_reason; this pins that a non-null one (a wall park)
 		// flows through so the board badge can render "Time limit reached".
 		dto := mapLatestRun(runID, viewer, "paused", "issue", 4, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
-			"ok", nullTxt(), pgtype.Timestamptz{}, txt("budget_exhausted"), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"ok", nullTxt(), pgtype.Timestamptz{}, txt("budget_exhausted"), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		if dto.HoldReason == nil || *dto.HoldReason != "budget_exhausted" {
 			t.Fatalf("hold_reason should flow to the board DTO, got %v", dto.HoldReason)
@@ -99,7 +99,7 @@ func TestMapLatestRun(t *testing.T) {
 		// visible so the badge can still classify the run as stopped.
 		dto := mapLatestRun(runID, otherOwner, "failed", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			txt("panic: raw agent internals"), txt("plan_rejected"), nullTxt(),
-			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		if dto.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
@@ -133,7 +133,7 @@ func TestMapLatestRun(t *testing.T) {
 		// (a) The owner sees the reason.
 		mine := mapLatestRun(runID, viewer, "cancelled", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			nullTxt(), txt("cancelled"), txt("wrong branch, my mistake"),
-			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		if mine.StopReason == nil || *mine.StopReason != "wrong branch, my mistake" {
 			t.Fatalf("owner must see stop_reason, got %v", mine.StopReason)
@@ -145,7 +145,7 @@ func TestMapLatestRun(t *testing.T) {
 		// (b) A non-owner viewer does NOT see the reason, but stop_kind stays exposed.
 		theirs := mapLatestRun(runID, otherOwner, "cancelled", "issue", 3, false, pgtype.Int8{}, nullTxt(), nullTxt(),
 			nullTxt(), txt("cancelled"), txt("wrong branch, my mistake"),
-			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		if theirs.IsMine {
 			t.Fatal("a run owned by someone else must not be is_mine")
@@ -160,7 +160,7 @@ func TestMapLatestRun(t *testing.T) {
 
 	t.Run("blank display name leaves owner name empty", func(t *testing.T) {
 		dto := mapLatestRun(runID, viewer, "queued", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
-			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"ok", nullTxt(), pgtype.Timestamptz{}, nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			txt(""), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		if dto.IsPlanning {
 			t.Fatal("a queued run is not running, so it must not be is_planning")
@@ -174,7 +174,7 @@ func TestMapLatestRun(t *testing.T) {
 		since := created.Add(2 * time.Minute)
 		// The owner of a flagged run sees the enum, the since, AND the reason.
 		mine := mapLatestRun(runID, viewer, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
-			"waiting_worker", txt("your vault is locked"), tstamp(since), nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"waiting_worker", txt("your vault is locked"), tstamp(since), nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			txt("Vlad"), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		// This owner's run is running at iteration 0 with no persisted plan: the board card
 		// carries the issue #321 planning flag (kind issue is planning-capable).
@@ -195,7 +195,7 @@ func TestMapLatestRun(t *testing.T) {
 		// but NOT the reason, which can name owner state (Decision 6).
 		other := uuid.New()
 		theirs := mapLatestRun(runID, other, "running", "issue", 0, false, pgtype.Int8{}, nullTxt(), nullTxt(), nullTxt(), nullTxt(), nullTxt(),
-			"waiting_worker", txt("your vault is locked"), tstamp(since), nullTxt(), pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
+			"waiting_worker", txt("your vault is locked"), tstamp(since), nullTxt(), pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Timestamptz{}, pgtype.Int4{}, 0, 0, 0, false,
 			nullTxt(), nullTxt(), 1, tstamp(created), tstamp(updated), viewer, 0)
 		if theirs.Health != "waiting_worker" {
 			t.Fatalf("non-owner health enum should still be exposed, got %q", theirs.Health)
