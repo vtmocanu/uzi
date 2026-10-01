@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
   A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
 
+- **A refused scratch publication now says which check failed and why ([#2054](https://github.com/vtmocanu/uzi/issues/2054)).**
+  At finalize or checkpoint, a refused scratch publication names the failed check (tip unavailable, shallow history, missing objects, object walk failure, timeout or exec failure, `.uzi/scratch` present, remote floor unverified, checkpoint range) and its cause in the run's failure reason and in a structured worker log line, with secrets redacted; the remote floor reason keeps forge error text out of the failure reason and logs it only. Inside a Codex boundary, git output that had already ended before the worker read it is refused rather than read as empty (it may have been dropped), so publication fails closed.
+
 - **A Codex command that hits its 60-minute deadline is stopped before the agent hears about it ([#2048](https://github.com/vtmocanu/uzi/issues/2048)).**
   The command's process tree is reaped before the call returns, and the agent gets an explicit "stopped at its deadline" error instead of the generic broker failure; an unclean reap still fails closed.
 

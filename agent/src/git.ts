@@ -183,9 +183,10 @@ export class ScratchPublicationError extends Error {
   readonly step?: ScratchPublicationStep;
   /** One line, control characters replaced with `?` (sanitizeForLog), capped at DETAIL_MAX; never carries env. */
   readonly detail?: string;
-  /** The bounded raw source text, NOT line-split: the first RAW_DETAIL_MAX UTF-16 units of the
-   *  failure text with leading whitespace trimmed. It can span several lines, so it can differ from
-   *  the source line `detail` was cut from. A caller that redacts must redact this whole text first
+  /** The bounded, unsplit, unsanitized failure text the runner redacts: the first RAW_DETAIL_MAX
+   *  UTF-16 units of the failure text with leading whitespace trimmed. It can span several lines and
+   *  can come from a different source than `detail` (e.g. with 800+ leading blank characters in
+   *  stderr, `detail` falls back to the message). A caller that redacts must redact this whole text first
    *  (the redactor matches across CR and LF, so a token split by a newline is only caught on unsplit
    *  text; it does NOT match across U+2028/U+2029, so map those to LF before redacting) and only then
    *  pick a line, sanitize and cap: sanitizing or line-splitting first can leave a token prefix or
@@ -6812,8 +6813,9 @@ export class GitCache {
         stream.once("end", onEnd);
         stream.once("close", onClose);
         stream.once("error", onError);
-        if (stream.destroyed) onClose();
-        else if (stream.readableEnded) onEnd();
+        // child_process resumes unread stdio at exit, so a stream that ended or was destroyed before we
+        // listened may have dropped output; refuse rather than read it as empty.
+        if (stream.readableEnded || stream.destroyed) onClose();
         if (boundary.signal.aborted) onAbort();
         else boundary.signal.addEventListener("abort", onAbort, { once: true });
       });
