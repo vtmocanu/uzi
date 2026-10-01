@@ -822,8 +822,9 @@ export interface RecoveryJournalEntry {
 // toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
 // attemptId (see compactAttemptLedger).
 // The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
-// this key and these field names: keep them byte-for-byte. (It never reads `state`, so a new state
-// value is invisible to it.)
+// this key and these field names: keep them byte-for-byte. It reads `state` only to report a BARE
+// backup's attempt as retired, which requires every entry for the run to be `retired` or
+// `abandoned`; any other value, including a new one, reads as "attempt state unknown".
 function attemptLedgerKey(branch: string): string {
   return `uzi-attempts.${branch}.entry`;
 }
