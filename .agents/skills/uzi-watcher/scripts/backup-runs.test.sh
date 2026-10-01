@@ -697,4 +697,30 @@ grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19D/backup.log" \
 if grep -q 'attempt retired' "$L19D/backup.log"; then fail "case19d: retirement claimed despite a runId-less row"; fi
 echo "PASS case19c/d: malformed ledger rows fail closed to attempt state unknown"
 
+# case 19e/19f: an EMPTY ledger value is a malformed row too. It must not be dropped before
+# validation (19e: empty row between a retired and an unrelated live entry) and must survive
+# the pod capture when it is the LAST value (19f: command substitution strips trailing newlines).
+reset_layout
+make_clone "$RB/seed" agent/issue-4242 seed
+git_q "$RB/seed" -c user.email=t@example.com -c user.name=tester commit -am committed-seed
+git --git-dir="$BARE" fetch -q "$RB/seed" agent/issue-4242:refs/uzi-runner/agent/issue-4242
+rm -rf "$RB/seed"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+git --git-dir="$BARE" config --add "$LKEY" ""
+ledger "$A3" other-run "$RB/issue-4242.attempt-$A3" live
+L19E="$(run_backup 19e)"
+[ -f "$L19E/issue-4242.tgz" ] || fail "case19e: BARE archive must still be kept"
+grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19E/backup.log" \
+  || fail "case19e: an empty ledger row must read unknown; got: $(cat "$WORK/out.19e/latest-attempt/backup.log")"
+if grep -q 'attempt retired' "$L19E/backup.log"; then fail "case19e: retirement claimed past an empty row"; fi
+git --git-dir="$BARE" config --unset-all "$LKEY"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+git --git-dir="$BARE" config --add "$LKEY" ""
+L19F="$(run_backup 19f)"
+[ -f "$L19F/issue-4242.tgz" ] || fail "case19f: BARE archive must still be kept"
+grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19F/backup.log" \
+  || fail "case19f: a trailing empty ledger row must read unknown; got: $(cat "$WORK/out.19f/latest-attempt/backup.log")"
+if grep -q 'attempt retired' "$L19F/backup.log"; then fail "case19f: retirement claimed past a trailing empty row"; fi
+echo "PASS case19e/f: empty ledger rows fail closed to attempt state unknown"
+
 echo "ALL PASS"
