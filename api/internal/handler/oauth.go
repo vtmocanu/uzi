@@ -86,8 +86,11 @@ const (
 //
 // Residual (PRD #1910 Decision Log): the tiers cap what a source can hold at 100 per /48 (IPv6)
 // or /24 (IPv4), so exhausting one product's 5000 backstop takes at least 50 IPv6 /48s or 50
-// IPv4 /24s (5000/100), and the 50000 global backstop at least 500. An attacker with that many
-// networks can still lock one product's users out. Also, behind a reverse proxy with
+// IPv4 /24s (5000/100). The tiers are per product, so one network holds up to 100 rows in EACH
+// client product: the 50000 global backstop takes about 500/P networks with P client products
+// (50 /48s once there are 10). An attacker with that many networks can still lock users out.
+// Teredo (2001::/32) addresses are not mapped to their embedded IPv4, so where the api can
+// reach a Teredo relay one IPv4 host can mint many /48 buckets. Also, behind a reverse proxy with
 // TRUSTED_PROXIES unset (the compose default) every browser shares the proxy's one bucket, so
 // 20 pending requests per product is all the instance's users can hold at once (the
 // shared-bucket trade-off of docs/auth-design.md).
