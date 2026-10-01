@@ -422,7 +422,8 @@ export interface SizeLineGit {
 
 /** The size line and the same numbers as the api's structured size (PRD #1798 D9). */
 export interface ComputedSize {
-  /** The rendered PR-body size block (multi-line, {@link renderSizeTable}); null only for an empty diff. */
+  /** The rendered PR-body size block: the multi-line {@link renderSizeTable}, or the one-line
+   *  {@link SIZE_UNAVAILABLE}; null only for an empty diff. */
   line: string | null;
   /** The structured totals: `unavailable: true` with every count zero when `line` is
    *  {@link SIZE_UNAVAILABLE}, `files: 0` with every bucket zero for an empty diff. */

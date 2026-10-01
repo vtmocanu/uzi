@@ -1275,6 +1275,9 @@ describe("publisher helpers", () => {
       ["ASCII hyphen", SIZE_TABLE.replaceAll("−", "-")],
       ["missing comma", SIZE_TABLE.replace("+1,203", "+1203")],
       ["leading zero", SIZE_TABLE.replace("+2 |", "+02 |")],
+      // Both round-trip through formatSizeTable, so only their own guards reject them.
+      ["no category rows", ["**Size:** 0 files", "", "| Category | Added | Deleted |", "|:---------|------:|--------:|", "| **Total** | **+0** | **−0** |"].join("\n")],
+      ["fewer files than rows", SIZE_TABLE.replace("**Size:** 3 files", "**Size:** 1 file")],
     ];
     for (const [name, table] of bad) {
       assert.ok(table !== SIZE_TABLE, name);

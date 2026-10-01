@@ -112,10 +112,9 @@ generic path rules (test files, `docs/`, lockfiles and other generated
 artifacts, config files) with anything left over counted as `code`. If your
 repo classifies something uzi's generic rules get wrong (generated code that
 doesn't match a common pattern, for example), add or adjust a
-`.gitattributes` entry for it; the size line has no repo-specific rules
+`.gitattributes` entry for it; the size block has no repo-specific rules
 baked in. `uzi run get`'s own `SIZE` row and the run page's "Delivered"
-section both print the same numbers as one line (`Size: code +896 −219 ·
-… · 52 files`): each omits a bucket that has a file but no added and no
+section both print the same numbers on one line: each omits a bucket that has a file but no added and no
 deleted lines, which the PR's own size table still shows.
 
 **Verification is only what the agent reported.** The Verification section
