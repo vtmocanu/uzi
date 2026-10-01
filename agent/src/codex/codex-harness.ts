@@ -1374,6 +1374,7 @@ export class CodexHarness implements RunHarness {
                 attribution: {},
                 items: [],
                 signals: routed.signals,
+                assistantAuthored: true,
                 model: this.currentModel,
                 sessionId: this.threadId,
               };
@@ -1555,6 +1556,7 @@ export class CodexHarness implements RunHarness {
       origin: { kind: "main" },
       attribution: { agent: "lead" },
       items: [item],
+      assistantAuthored: true,
       model: this.currentModel,
       sessionId: this.threadId,
     };
@@ -1762,6 +1764,7 @@ export class CodexHarness implements RunHarness {
       attribution: {},
       items,
       usage,
+      assistantAuthored: true,
       model: this.currentModel,
       sessionId: this.threadId,
     };

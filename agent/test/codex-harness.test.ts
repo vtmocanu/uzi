@@ -18,7 +18,7 @@ import {
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
-import type { HarnessEvent, HarnessItem, HarnessTerminal, RunTurnRequest } from "../src/harness.js";
+import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type HarnessTerminal, type RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
 import {
@@ -2011,6 +2011,35 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     const events = await withTimeout(eventsP, 2000, "ambiguous turn");
     assert.deepEqual(frames(events), [], "no dispatch, child or completion frame for an ambiguous key");
     assert.equal(events[events.length - 1]!.kind, "turn_finished");
+  });
+
+  it("issue #1800: a child-projected frame is not model-processing evidence; a root agentMessage frame is", async () => {
+    let harnessRef!: CodexHarness;
+    const broker = stubBroker(async (rt, name) => {
+      if (name !== "spawn_agent") return { ok: true, output: {} };
+      harnessRef.registerChildSink("th-c", { push: () => {} });
+      harnessRef.bindChildDispatch("th-c", rt, "coder");
+      harnessRef.emitChildFrame("th-c", [{ kind: "text", text: "child says hi" }]);
+      harnessRef.unregisterChildSink("th-c");
+      return { ok: true, output: { text: "done" } };
+    });
+    const { harness, transport } = makeHarness({ broker, idNonce: "abcdef012345" });
+    harnessRef = harness;
+    transport
+      .push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { subagent_type: "coder" }, "th-1", "tn-1", "c-1"))
+      .push(agentMessage("root answer"));
+    const eventsP = collect(harness.startTurn(makeRequest()).events);
+    await waitUntil(() => transport.responses.length === 1, "the parent reply");
+    transport.push(turnCompleted("completed")).end();
+    const events = await withTimeout(eventsP, 2000, "evidence turn");
+
+    const child = frames(events).filter((f) => f.origin.kind === "subagent");
+    assert.equal(child.length, 1, "one child frame");
+    assert.equal(evidencesModelProcessing(child[0]!), false, "a subagent frame never evidences the lead");
+    const root = frames(events).find((f) => f.origin.kind === "main" && f.items.some((i) => i.kind === "text" && i.text === "root answer"));
+    assert.ok(root, "the root agentMessage frame was projected");
+    assert.equal(evidencesModelProcessing(root), true);
   });
 
   it("emitChildFrame projects only for a registered AND bound thread, scrubbed, namespaced and signal-free", async () => {

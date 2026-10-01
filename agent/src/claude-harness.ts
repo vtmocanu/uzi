@@ -383,6 +383,7 @@ export class ClaudeHarness implements RunHarness {
         // Main-thread-gated raw signal envelope (scanSignals returns {} for a
         // subagent frame); the reducer additionally gates the fold on origin.
         signals: scanSignals(msg) as Readonly<Partial<TurnSignals>>,
+        assistantAuthored: true,
         sessionId,
         orphanInstanceFrameKind,
       };

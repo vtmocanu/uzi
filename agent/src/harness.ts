@@ -236,6 +236,9 @@ export type HarnessEvent = HarnessEventMeta &
         // the adapter. This is NOT an EmittedMessage transport — persisted output
         // travels through `items` — it is the reducer's signal-fold input.
         signals?: Readonly<Partial<TurnSignals>>;
+        // Issue #1800: model-authored output (an assistant message / root model item).
+        // Never set on a user, tool_result or replay frame. Read by evidencesModelProcessing.
+        assistantAuthored?: true;
       }
     | { kind: "turn_finished"; terminal: HarnessTerminal }
   );
@@ -250,8 +253,11 @@ const SYNTHETIC_MODEL = "<synthetic>";
  * turn that starts and then dies before the model answered (provider-transient exhaustion, a
  * rate-limit-rejected empty turn, a transport error) keeps the follow-up for the next claim.
  *
- * True only for a frame carrying model output (items), usage or a scanned signal (a signal-only
- * tool call is still the model acting), except a synthetic frame (a worker-written notice such as
+ * True only for a MAIN-thread, assistant-authored frame (`assistantAuthored`) carrying model
+ * output (items), usage or a scanned signal (a signal-only tool call is still the model acting).
+ * A subagent frame, a user/tool_result frame and a replayed user frame never count: they do not
+ * show the lead model read the follow-up, so a failing lead turn must keep it for retry. Also
+ * excluded: a synthetic frame (a worker-written notice such as
  * the usage-limit message). A terminal NEVER counts: its num_turns is positive even for a
  * limit-rejected turn ([rate_limit_event rejected, synthetic assistant, result is_error
  * num_turns 1]), and the executors run this before the reducer classifies the terminal, so
@@ -266,6 +272,7 @@ const SYNTHETIC_MODEL = "<synthetic>";
 export function evidencesModelProcessing(event: HarnessEvent): boolean {
   if (event.kind === "activity") return event.modelInitiated === true;
   if (event.kind === "frame") {
+    if (event.origin.kind !== "main" || event.assistantAuthored !== true) return false;
     if (event.model === SYNTHETIC_MODEL) return false;
     return event.items.length > 0 || event.usage !== undefined || Object.keys(event.signals ?? {}).length > 0;
   }

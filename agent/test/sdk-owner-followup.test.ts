@@ -409,4 +409,78 @@ describe("issue #1800: a follow-up is stamped only once the model processed its 
     await assert.rejects(exec(queryFn, { emptyTurnMaxRetries: 0 }).run(probe.ctx));
     assert.deepStrictEqual(probe.included, []);
   });
+
+  // Frames that are NOT the lead model answering: a subagent assistant message, a main-thread
+  // user tool_result and a replayed user message. None shows the lead read the follow-up.
+  const subagentAssistant = (): SDKMessage =>
+    ({
+      type: "assistant",
+      session_id: "sess-1",
+      parent_tool_use_id: "toolu_parent",
+      message: { content: [{ type: "text", text: "subagent chatter" }] },
+    }) as unknown as SDKMessage;
+  const mainToolResult = (): SDKMessage =>
+    ({
+      type: "user",
+      session_id: "sess-1",
+      parent_tool_use_id: null,
+      message: { content: [{ type: "tool_result", tool_use_id: "t9", content: "ok" }] },
+    }) as unknown as SDKMessage;
+  const replayUser = (): SDKMessage =>
+    ({
+      type: "user",
+      session_id: "sess-1",
+      isReplay: true,
+      message: { content: [{ type: "tool_result", tool_use_id: "t8", content: "replayed result" }] },
+    }) as unknown as SDKMessage;
+
+  const nonLeadFrames: Array<[string, () => SDKMessage]> = [
+    ["a subagent assistant frame", subagentAssistant],
+    ["a main-thread user tool_result frame", mainToolResult],
+    ["a replayed user frame", replayUser],
+  ];
+
+  for (const [label, frame] of nonLeadFrames) {
+    it(`${label} as the only evidence before the turn fails leaves the follow-up unreported`, async () => {
+      const queue = [A];
+      const { queryFn, prompts } = fakeTurns(
+        [PLAN, { messages: [initFrame(), frame(), resultZeroTurns()] }],
+        queue,
+      );
+      const probe = makeCtx(queue);
+      await assert.rejects(exec(queryFn, { emptyTurnMaxRetries: 0 }).run(probe.ctx));
+      assert.ok(prompts[1]!.includes(A), "the turn carried the follow-up");
+      assert.deepStrictEqual(probe.included, [], "never stamped: the lead model did not answer");
+    });
+
+    it(`${label} does not stamp; the retry carries the follow-up and is the one that stamps`, async () => {
+      const queue = [A];
+      const { queryFn, prompts } = fakeTurns(
+        [PLAN, { messages: [initFrame(), frame(), resultZeroTurns()] }, { messages: [initFrame(), ...DONE.messages] }],
+        queue,
+      );
+      const probe = makeCtx(queue);
+      const queriesAtStamp: number[] = [];
+      const base = probe.ctx.followUpIncluded!;
+      probe.ctx.followUpIncluded = (id) => {
+        queriesAtStamp.push(prompts.length);
+        base(id);
+      };
+      await exec(queryFn, { emptyTurnMaxRetries: 2 }).run(probe.ctx);
+      assert.ok(prompts[1]!.includes(A) && prompts[2]!.includes(A), "both attempts carry it");
+      assert.deepStrictEqual(probe.included, [1], "stamped exactly once");
+      assert.deepStrictEqual(queriesAtStamp, [3], "stamped by the retry's lead assistant frame, not the earlier frame");
+    });
+  }
+
+  it("a lead main-thread assistant frame stamps even after a non-lead frame", async () => {
+    const queue = [A];
+    const { queryFn } = fakeTurns(
+      [PLAN, { messages: [initFrame(), subagentAssistant(), assistantText("lead answer"), resultSuccess()] }, DONE],
+      queue,
+    );
+    const probe = makeCtx(queue);
+    await exec(queryFn).run(probe.ctx);
+    assert.deepStrictEqual(probe.included, [1]);
+  });
 });
