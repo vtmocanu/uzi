@@ -168,8 +168,8 @@ func TestPendingGenerationAfterDrainStartedIsRecordedNotRunLiveDB(t *testing.T) 
 	if len(got) != 1 || got[0] != "# A\n" {
 		t.Fatalf("generations that ran = %q, want only the first (the pending one is refused after the drain started)", got)
 	}
-	e.wantReasons(t, run, "report.md", RefusalGenerationFailed)
-	e.wantReasons(t, run, "findings.json", RefusalGenerationFailed)
+	e.wantReasons(t, run, "report.md", RefusalGenerationShutdown)
+	e.wantReasons(t, run, "findings.json", RefusalGenerationShutdown)
 }
 
 // TestSupersededPostReturnsPromptlyLiveDB: the caller of a post that a newer post replaced in the
@@ -232,11 +232,11 @@ func TestSupersededPostReturnsPromptlyLiveDB(t *testing.T) {
 }
 
 // TestGenerationPerOwnerShareLiveDB: one owner's runs cannot hold every slot of the process-wide
-// cap. With a share of 1, the owner's second run is recorded generation_failed while another
-// owner's run is still admitted under the same cap.
+// cap. With a share of 1, the owner's second run waits while another owner's run is still
+// admitted under the same active cap.
 //
-// MUTATION CHECK (run): removing the genOwners case in startJobResultOutputs admits the second run
-// of the first owner and turns the failed assertion red.
+// The second run of the first owner waits without taking its active share; the second owner
+// still runs. The separate queue-bound regression rejects overload past that waiting share.
 func TestGenerationPerOwnerShareLiveDB(t *testing.T) {
 	l := wide()
 	l.MaxConcurrentWritesPerOwner = 1
@@ -262,8 +262,8 @@ func TestGenerationPerOwnerShareLiveDB(t *testing.T) {
 		}
 	}
 	e.wantReasons(t, r1, "report.md", RefusalGenerationPending)
-	e.wantReasons(t, r2, "report.md", RefusalGenerationFailed)
-	e.wantReasons(t, r2, "findings.json", RefusalGenerationFailed)
+	e.wantReasons(t, r2, "report.md", RefusalGenerationPending)
+	e.wantReasons(t, r2, "findings.json", RefusalGenerationPending)
 	e.wantReasons(t, r3, "report.md", RefusalGenerationPending)
 	close(stall)
 	e.svc.WaitForGeneratedOutputs()

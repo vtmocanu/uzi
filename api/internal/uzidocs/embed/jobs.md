@@ -80,10 +80,12 @@ The worker downloads each attached file from uzi, checks its SHA-256 against the
 
 ### Output files
 
-Before the job reports, its worker uploads:
+Jobs return:
 
-- **`report.md` and `findings.json`**, which uzi stores itself from the result it received (the worker cannot upload or replace them);
-- **the files the job chose to keep**, listed in its result from its `outputs/` and `sources/` directories.
+- **`report.md` and `findings.json`**, which uzi stores from the scrubbed result it received. The worker cannot upload or replace them.
+- **The files the job chose to keep**, uploaded by the worker before it reports the result, from its `outputs/` and `sources/` directories.
+
+While a generated report or findings file waits for storage, its `refused_files` entry reads `generation_pending`. Waiting capacity overflow reads `generation_failed`; waiting work stopped by API shutdown reads `generation_shutdown`.
 
 Output types are the input allowlist plus HTML (a downloaded page). An output that is over a per-file or per-job cap, over a storage quota, or not an allowed type is **refused and listed, and the job still completes**: a refused file never fails a finished job and is never silently missing. Quotas are checked when a file is admitted, never by failing the job afterwards.
 

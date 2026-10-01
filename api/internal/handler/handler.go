@@ -107,7 +107,7 @@ type Handler struct {
 	// agentsource.FetchSkillFiles; a test injects a fake so the admin sync route is exercised
 	// without a network clone.
 	productSkillsFetch productSkillsFetcher
-	// productSkillsSyncing is the instance-wide single-flight of the product skills sync: one
+	// productSkillsSyncing is the per-process single-flight of the product skills sync: one
 	// clone of an untrusted repo at a time, so concurrent admin syncs cannot multiply the
 	// memory a clone decodes. A second sync while one runs is refused with a 429.
 	productSkillsSyncing atomic.Bool

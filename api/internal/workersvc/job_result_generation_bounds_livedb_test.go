@@ -81,8 +81,8 @@ func TestGenerationPerRunLatestWinsLiveDB(t *testing.T) {
 	}
 }
 
-// TestGenerationProcessWideCapLiveDB: with the process-wide cap full, a post for another run is
-// recorded generation_failed for every name it would have generated, and nothing is spawned.
+// TestGenerationProcessWideCapLiveDB: one running and one waiting slot fit exactly; a third
+// run exceeds the bounded waiting capacity and is explicitly generation_failed.
 func TestGenerationProcessWideCapLiveDB(t *testing.T) {
 	e := newJFEnv(t, wide())
 	e.svc.SetJobFiles(e.jf)
@@ -92,6 +92,7 @@ func TestGenerationProcessWideCapLiveDB(t *testing.T) {
 	u := e.seedJobUser(t)
 	w1, r1 := e.heldJob(t, u)
 	w2, r2 := e.heldJob(t, u)
+	w3, r3 := e.heldJob(t, u)
 	release := holdStoredFiles(t, e, u)
 	defer release()
 
@@ -102,8 +103,14 @@ func TestGenerationProcessWideCapLiveDB(t *testing.T) {
 	if err := e.svc.SubmitJobResult(e.ctx, w2, r2, 1, sub); err != nil {
 		t.Fatal(err)
 	}
+	for _, name := range generatedOutputNames {
+		e.wantReasons(t, r2, name, RefusalGenerationPending)
+	}
+	if err := e.svc.SubmitJobResult(e.ctx, w3, r3, 1, sub); err != nil {
+		t.Fatal(err)
+	}
 	for _, name := range []string{"report.md", "findings.json"} {
-		if got := e.refusalReasons(t, r2, name); len(got) != 1 || got[0] != RefusalGenerationFailed {
+		if got := e.refusalReasons(t, r3, name); len(got) != 1 || got[0] != RefusalGenerationFailed {
 			t.Fatalf("%s refusals of the capped run = %v, want [%s]", name, got, RefusalGenerationFailed)
 		}
 	}
@@ -115,7 +122,7 @@ func TestGenerationProcessWideCapLiveDB(t *testing.T) {
 }
 
 // TestDrainGeneratedOutputsOrderingLiveDB: DrainGeneratedOutputs returns only after the in-flight
-// generation finished (its files are stored), and after it a new post records generation_failed
+// generation finished (its files are stored), and after it a new post records generation_shutdown
 // instead of spawning anything. This is the ordering main.go relies on (drain after the HTTP
 // server, before the pool closes).
 //
@@ -148,8 +155,8 @@ func TestDrainGeneratedOutputsOrderingLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, name := range []string{"report.md", "findings.json"} {
-		if got := e.refusalReasons(t, run2, name); len(got) != 1 || got[0] != RefusalGenerationFailed {
-			t.Fatalf("%s refusals after shutdown = %v, want [%s]", name, got, RefusalGenerationFailed)
+		if got := e.refusalReasons(t, run2, name); len(got) != 1 || got[0] != RefusalGenerationShutdown {
+			t.Fatalf("%s refusals after shutdown = %v, want [%s]", name, got, RefusalGenerationShutdown)
 		}
 	}
 	if n := len(e.outputsNamed(t, run2, "report.md")); n != 0 {
@@ -230,7 +237,7 @@ func TestRefusedOutputsRecordedIndependentlyOfGenerationLiveDB(t *testing.T) {
 	if got := e.refusalReasons(t, run, "report.md"); len(got) != 0 {
 		t.Fatalf("report.md refusals = %v, want none for an empty report", got)
 	}
-	if got := e.refusalReasons(t, run, "findings.json"); len(got) != 1 || got[0] != RefusalGenerationFailed {
-		t.Fatalf("findings.json refusals = %v, want [%s]", got, RefusalGenerationFailed)
+	if got := e.refusalReasons(t, run, "findings.json"); len(got) != 1 || got[0] != RefusalGenerationShutdown {
+		t.Fatalf("findings.json refusals = %v, want [%s]", got, RefusalGenerationShutdown)
 	}
 }

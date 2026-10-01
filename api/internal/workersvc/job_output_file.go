@@ -293,9 +293,10 @@ var errGenShutdown = errors.New("workersvc: shutdown cancelled the generated-out
 // reserved_name refusal are the worker's, never the generation's: they carry no post_id, which is
 // what the queries tell them apart by, and they alone count against the per-run refusal cap.
 const (
-	RefusalGenerationPending = "generation_pending"
-	RefusalGenerationTimeout = "generation_timeout"
-	RefusalGenerationFailed  = "generation_failed"
+	RefusalGenerationPending  = "generation_pending"
+	RefusalGenerationTimeout  = "generation_timeout"
+	RefusalGenerationFailed   = "generation_failed"
+	RefusalGenerationShutdown = "generation_shutdown"
 )
 
 // generatedOutputNames are the two names the server generates. The markers of both are rewritten on
@@ -305,21 +306,25 @@ var generatedOutputNames = []string{JobOutputReportName, JobOutputFindingsName}
 // genJob is one result's generated-output storage: everything storeJobResultOutputs needs, and the
 // channel closed when the job is finished or superseded.
 type genJob struct {
-	wkr  store.Worker
-	run  store.Run
-	gen  int64
-	seq  int64 // the post id (job_output_refusals.post_id), ascending in commit order per run
-	sub  JobResultSubmission
-	done chan struct{}
+	wkr    store.Worker
+	run    store.Run
+	gen    int64
+	seq    int64 // the post id (job_output_refusals.post_id), ascending in commit order per run
+	sub    JobResultSubmission
+	reload bool // waiting jobs reload committed, scrubbed content instead of retaining it
+	report bool // names remain known without retaining a waiting report body
+	done   chan struct{}
 }
 
 // runGen is the per-run generation state. Its presence in Service.genRuns means one generation of
-// the run is running; pending is the single queued one behind it. owner is the run's user, whose
-// share of the process-wide cap the entry holds; running is the post id of the generation running.
+// the run is active or waiting for capacity; pending is the single latest post behind it.
+// owner is the run's user; running is the post id of the first unsettled generation.
 type runGen struct {
 	owner   uuid.UUID
 	running int64
 	pending *genJob
+	queued  bool
+	start   chan bool // buffered grant, or false when shutdown rejects the waiting job
 }
 
 // newest is the highest post id the run's entry holds (the running or the pending generation).
@@ -343,8 +348,16 @@ func generatedNames(sub JobResultSubmission) []string {
 // generated into generation_failed, for a job that never ran (or panicked). Best effort: it runs on
 // its own short detached context.
 func (s *Service) recordGenerationRefusals(job *genJob) {
-	for _, name := range generatedNames(job.sub) {
-		s.jobFiles.settleGenerated(context.Background(), job.run.ID, job.gen, job.seq, name, 0, RefusalGenerationFailed)
+	s.recordGenerationRefusalsReason(job, RefusalGenerationFailed)
+}
+
+func (s *Service) recordGenerationRefusalsReason(job *genJob, reason string) {
+	names := []string{JobOutputFindingsName}
+	if job.report {
+		names = generatedOutputNames
+	}
+	for _, name := range names {
+		s.jobFiles.settleGenerated(context.Background(), job.run.ID, job.gen, job.seq, name, 0, reason)
 	}
 }
 
@@ -426,8 +439,8 @@ func (s *Service) generatedOutputsMax() int {
 }
 
 // generatedOutputsPerOwnerMax is the share of the process-wide cap one owner's runs may hold: the
-// upload per-owner write slot bound, at least 1, so one owner's runs cannot fill every slot and
-// starve another owner's generations.
+// upload per-owner write slot bound, at least 1. Pool clamping can make this equal to the
+// global bound; otherwise another owner retains an active share.
 func (s *Service) generatedOutputsPerOwnerMax() int {
 	return max(1, s.jobFiles.limits.MaxConcurrentWritesPerOwner)
 }
@@ -449,10 +462,10 @@ func (s *Service) genBaseLocked() context.Context {
 }
 
 // DrainGeneratedOutputs is the shutdown half of startJobResultOutputs: it makes the service refuse
-// new generations (recorded as generation_failed) and waits for the ones already started, and
+// new generations (recorded as generation_shutdown) and waits for the ones already started, and
 // reports whether they all finished on their own. The caller MUST run it after the HTTP server has
 // drained (no request can start one any more) and BEFORE the database pool closes (a generation
-// stores through the pool). A pending generation behind a running one is recorded generation_failed
+// stores through the pool). Waiting and pending generations are recorded generation_shutdown
 // instead of started, so the wait is one storage long.
 //
 // The wait is bounded twice. After generatedOutputsDrainBound (far below generatedOutputsTimeout) it
@@ -467,6 +480,7 @@ func (s *Service) genBaseLocked() context.Context {
 func (s *Service) DrainGeneratedOutputs() bool {
 	s.genMu.Lock()
 	s.genClosed = true
+	s.activateWaitingGenerationsLocked()
 	cancel := s.genCancel
 	s.genMu.Unlock()
 	done := make(chan struct{})
@@ -514,13 +528,14 @@ func (s *Service) WaitForGeneratedOutputs() { s.genWG.Wait() }
 // post replaces the waiting one (latest wins; the replaced one is superseded, recorded nowhere,
 // because the newer post carries the content the result store now holds). "Newer" is the post id,
 // the COMMIT order, not the order the posts reach this function: an older post that arrives after a
-// newer one is itself the superseded one and is dropped here. Process-wide at most
-// generatedOutputsMax runs have a generation in flight, and at most generatedOutputsPerOwnerMax of
-// them belong to one owner; a post beyond either is recorded as generation_failed. So a worker
-// re-posting with varying content holds at most two submissions (about 4 MiB each) per run and one
-// goroutine per run, never a queue of them, and one owner cannot hold every slot. The per-run state
-// also serialises the replace-then-insert of a run's files, so two posts cannot leave two report.md
-// rows.
+// newer one is itself the superseded one and is dropped here. Active work is capped at
+// generatedOutputsMax globally and generatedOutputsPerOwnerMax per owner. A separate waiting
+// queue has those same bounds; beyond it, generation_failed is explicit. Waiting entries retain
+// only identities and reload scrubbed content from the database after verifying run, generation
+// and post. Each active run retains at most two submissions; each waiting run retains at most two
+// metadata entries. There is one goroutine per tracked run, at most twice the global active cap.
+// An owner's waiting work cannot block another owner's free active share. Per-run serialisation
+// also prevents two posts from leaving two report.md rows.
 //
 // Each generation runs in a goroutine tracked by the service (genWG) on a context derived from the
 // service's own base (genBaseCtx), DETACHED from the request, with its own timeout
@@ -531,7 +546,7 @@ func (s *Service) WaitForGeneratedOutputs() { s.genWG.Wait() }
 // would only make the worker treat a stored result as failed. An output it cannot store (a refusal,
 // the timeout, a panic, any other failure) is recorded in job_output_refusals
 // (RefusalGenerationTimeout / RefusalGenerationFailed for the last two), never dropped silently and
-// never failing the ingest. After DrainGeneratedOutputs, a post is refused with generation_failed
+// never failing the ingest. After DrainGeneratedOutputs, a post is refused with generation_shutdown
 // instead of started.
 //
 // Superseded posts. Every post deletes the earlier post's generation-owned rows and writes its own
@@ -557,47 +572,66 @@ func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, r
 	if s.jobFiles == nil {
 		return
 	}
-	job := &genJob{wkr: wkr, run: run, gen: gen, seq: seq, sub: sub, done: make(chan struct{})}
+	// Retain identities, not the run's prompt or the worker's complete row.
+	job := &genJob{wkr: store.Worker{ID: wkr.ID, UserID: wkr.UserID},
+		run: store.Run{ID: run.ID, UserID: run.UserID}, gen: gen, seq: seq,
+		sub: sub, report: sub.ReportMD != "", done: make(chan struct{})}
 	s.genMu.Lock()
-	switch st := s.genRuns[run.ID]; {
-	case s.genClosed:
+	if s.genClosed {
 		s.genMu.Unlock()
-		s.recordGenerationRefusals(job)
+		s.recordGenerationRefusalsReason(job, RefusalGenerationShutdown)
 		return
-	case st != nil:
+	}
+	if st := s.genRuns[run.ID]; st != nil {
 		if seq < st.newest() {
-			// A newer post (committed after this one) reached here first: it already owns the names and
-			// its generation, running or waiting, carries the newer content.
 			s.genMu.Unlock()
 			return
 		}
 		if st.pending != nil {
-			close(st.pending.done) // superseded by the newer post
+			close(st.pending.done)
+		}
+		if st.queued {
+			job.reload = true
+			job.sub = JobResultSubmission{}
 		}
 		st.pending = job
 		s.genMu.Unlock()
-	case len(s.genRuns) >= s.generatedOutputsMax():
-		s.genMu.Unlock()
-		slog.Warn("job files: too many generations in flight, output not stored", "run", run.ID.String())
-		s.recordGenerationRefusals(job)
-		return
-	case s.genOwners[run.UserID] >= s.generatedOutputsPerOwnerMax():
-		s.genMu.Unlock()
-		slog.Warn("job files: owner's share of the generations in flight is full, output not stored", "run", run.ID.String(), "owner", run.UserID.String())
-		s.recordGenerationRefusals(job)
-		return
-	default:
+	} else {
+		active := s.genActive < s.generatedOutputsMax() && s.genOwners[run.UserID] < s.generatedOutputsPerOwnerMax()
+		if !active && (len(s.genQueue) >= s.generatedOutputsMax() || s.genQueuedOwners[run.UserID] >= s.generatedOutputsPerOwnerMax()) {
+			s.genMu.Unlock()
+			slog.Warn("job files: generated-output waiting capacity full", "run", run.ID.String())
+			s.recordGenerationRefusals(job)
+			return
+		}
 		if s.genRuns == nil {
 			s.genRuns = map[uuid.UUID]*runGen{}
-		}
-		if s.genOwners == nil {
 			s.genOwners = map[uuid.UUID]int{}
+			s.genQueuedOwners = map[uuid.UUID]int{}
 		}
-		s.genRuns[run.ID] = &runGen{owner: run.UserID, running: seq}
-		s.genOwners[run.UserID]++
+		st := &runGen{owner: run.UserID, running: seq, queued: !active}
+		if active {
+			s.genActive++
+			s.genOwners[run.UserID]++
+		} else {
+			job.reload = true
+			job.sub = JobResultSubmission{}
+			st.start = make(chan bool, 1)
+			s.genQueue = append(s.genQueue, run.ID)
+			s.genQueuedOwners[run.UserID]++
+		}
+		s.genRuns[run.ID] = st
+		// Initialize before registration/launch: shutdown can never capture a nil cancel
+		// for an admitted generation whose goroutine has not started yet.
+		s.genBaseLocked()
 		s.genWG.Add(1)
 		s.genMu.Unlock()
-		go s.runGenerations(job)
+		go func() {
+			if s.genStartHook != nil {
+				s.genStartHook(job)
+			}
+			s.runGenerations(job)
+		}()
 	}
 	t := time.NewTimer(s.generatedOutputsReplyBound())
 	defer t.Stop()
@@ -608,16 +642,48 @@ func (s *Service) startJobResultOutputs(ctx context.Context, wkr store.Worker, r
 	}
 }
 
+// activateWaitingGenerationsLocked grants FIFO waiting work whose owner has a free share.
+// A saturated owner cannot prevent another owner using free process capacity. Shutdown grants
+// false instead, so every tracked waiting job visibly settles rather than silently disappearing.
+func (s *Service) activateWaitingGenerationsLocked() {
+	for i := 0; i < len(s.genQueue); {
+		id := s.genQueue[i]
+		st := s.genRuns[id]
+		if !s.genClosed && (s.genActive >= s.generatedOutputsMax() || s.genOwners[st.owner] >= s.generatedOutputsPerOwnerMax()) {
+			i++
+			continue
+		}
+		s.genQueue = append(s.genQueue[:i], s.genQueue[i+1:]...)
+		if s.genQueuedOwners[st.owner]--; s.genQueuedOwners[st.owner] == 0 {
+			delete(s.genQueuedOwners, st.owner)
+		}
+		if s.genClosed {
+			st.start <- false
+		} else {
+			st.queued = false
+			s.genActive++
+			s.genOwners[st.owner]++
+			st.start <- true
+		}
+	}
+}
+
 // runGenerations runs a run's generation and then the one pending behind it, until none is left;
 // it owns the run's entry in genRuns (and its owner's count in genOwners) and the genWG count taken
-// by startJobResultOutputs. A pending job met after shutdown began is recorded generation_failed
+// by startJobResultOutputs. A pending job met after shutdown began is recorded generation_shutdown
 // instead of run.
 func (s *Service) runGenerations(job *genJob) {
 	defer s.genWG.Done()
+	s.genMu.Lock()
+	permit := s.genRuns[job.run.ID].start
+	s.genMu.Unlock()
 	closed := false
+	if permit != nil {
+		closed = !<-permit
+	}
 	for {
 		if closed {
-			s.recordGenerationRefusals(job)
+			s.recordGenerationRefusalsReason(job, RefusalGenerationShutdown)
 			close(job.done)
 		} else {
 			s.runGeneration(job)
@@ -628,9 +694,13 @@ func (s *Service) runGenerations(job *genJob) {
 		st.pending = nil
 		if next == nil {
 			delete(s.genRuns, job.run.ID)
-			if s.genOwners[st.owner]--; s.genOwners[st.owner] <= 0 {
-				delete(s.genOwners, st.owner)
+			if !st.queued {
+				s.genActive--
+				if s.genOwners[st.owner]--; s.genOwners[st.owner] <= 0 {
+					delete(s.genOwners, st.owner)
+				}
 			}
+			s.activateWaitingGenerationsLocked()
 			s.genMu.Unlock()
 			return
 		}
@@ -655,10 +725,57 @@ func (s *Service) runGeneration(job *genJob) {
 			s.recordGenerationRefusals(job)
 		}
 	}()
+	if job.reload && !s.reloadWaitingGeneration(gctx, job) {
+		s.recordGenerationRefusals(job)
+		return
+	}
 	if s.genHook != nil {
 		s.genHook(job)
 	}
 	s.storeJobResultOutputs(gctx, job.wkr, job.run, job.gen, job.seq, job.sub)
+}
+
+// reloadWaitingGeneration uses committed scrubbed content, after validating the current run
+// and post identity. No database call runs under genMu; the per-file marker/fence checks remain.
+func (s *Service) reloadWaitingGeneration(ctx context.Context, job *genJob) bool {
+	run, err := s.q.GetRunOwnedByWorker(ctx, store.GetRunOwnedByWorkerParams{ID: job.run.ID, WorkerID: pgconv.UUID(job.wkr.ID)})
+	if err != nil || run.Kind != runkind.Job || run.UserID != job.run.UserID || run.ClaimGeneration != job.gen || run.ClaimReleasedAt.Valid ||
+		(run.Status != "claimed" && run.Status != "running" && run.Status != "completed" && run.Status != "failed") {
+		slog.Info("job files: stale waiting generation dropped", "run", job.run.ID.String())
+		return false
+	}
+	own, err := s.jobFiles.ownsGenerated(ctx, job.run.ID, job.seq, JobOutputFindingsName)
+	if err != nil || !own {
+		slog.Info("job files: superseded waiting post dropped", "run", job.run.ID.String(), "post", job.seq)
+		return false
+	}
+	q := store.New(s.jobFiles.db)
+	result, err := q.GetJobResultForRun(ctx, job.run.ID)
+	if err != nil {
+		return false
+	}
+	findings, err := q.ListJobFindingsForRun(ctx, job.run.ID)
+	if err != nil {
+		return false
+	}
+	job.sub = JobResultSubmission{Status: result.Status, ReportMD: result.ReportMd}
+	for _, f := range findings {
+		item := JobFindingSubmission{Severity: f.Severity, MessageMD: f.MessageMd}
+		if f.Url.Valid {
+			v := f.Url.String
+			item.URL = &v
+		}
+		if f.File.Valid {
+			v := f.File.String
+			item.File = &v
+		}
+		if f.Line.Valid {
+			v := f.Line.Int32
+			item.Line = &v
+		}
+		job.sub.Findings = append(job.sub.Findings, item)
+	}
+	return true
 }
 
 func (s *Service) generatedOutputsTimeout() time.Duration {

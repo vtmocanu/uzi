@@ -1532,7 +1532,7 @@ func run() error {
 	// Generated job outputs (report.md, findings.json) are stored by detached goroutines after the
 	// ingest reply. ORDER: after the HTTP drain above (no request can start one any more, so the
 	// service's WaitGroup sees no new Add) and BEFORE the deferred pool.Close (they store through
-	// the pool). The service refuses new ones from here on (recorded generation_failed) and this
+	// the pool). The service refuses new ones from here on (recorded generation_shutdown) and this
 	// waits for the running ones for 15 s; it then cancels their service-owned context, which ends
 	// the storage work they are blocked in (pool acquire, lock wait, queries), and waits 2 s more
 	// for them to return. So the worst case is 17 s, not the 60 s storage deadline: a generation

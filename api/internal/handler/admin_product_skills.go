@@ -115,14 +115,14 @@ func (h *Handler) validateProductSkillsURL(raw string) error {
 }
 
 // validateProductSkillsRef gates skills_ref: empty (the default branch), or one token of at most
-// maxProductSkillsRefLen characters with no whitespace or control characters (a branch, a tag or a
+// maxProductSkillsRefLen UTF-8 bytes with no whitespace or control characters (a branch, a tag or a
 // 40-hex SHA; agentsource validates it against git's ref rules again before any network call).
 func validateProductSkillsRef(raw string) error {
 	if raw == "" {
 		return nil
 	}
-	if utf8.RuneCountInString(raw) > maxProductSkillsRefLen {
-		return fmt.Errorf("skills_ref must be at most %d characters", maxProductSkillsRefLen)
+	if len(raw) > maxProductSkillsRefLen {
+		return fmt.Errorf("skills_ref must be at most %d bytes", maxProductSkillsRefLen)
 	}
 	for _, r := range raw {
 		if unicode.IsSpace(r) || unicode.IsControl(r) {
