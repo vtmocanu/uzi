@@ -333,7 +333,24 @@ describe("Run defaults — per-user summary model (PRD #362 M2)", () => {
 });
 
 describe("Run defaults — per-user reasoning effort (PRD #617 M5)", () => {
+  it("retains a stored Codex effort but hides its control when Codex is unavailable", async () => {
+    mockApi.getMySettings.mockResolvedValue({ settings: {
+      default_harness: null, default_model: null, default_effort: null, default_codex_effort: "max",
+      judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
+      dark_theme: null, typeface: null, theme: null,
+    } });
+    render(<MemoryRouter><RunDefaults /></MemoryRouter>);
+    await screen.findByLabelText("Claude effort");
+    expect(screen.queryByLabelText("Codex effort")).toBeNull();
+    expect(screen.queryByText("Save Codex effort")).toBeNull();
+    expect(mockApi.putMySettings).not.toHaveBeenCalled();
+  });
   it("saves and clears Codex effort without sending or resetting the Claude choice", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [{
+      id: "codex-effort-fixture", kind: "openai_api_key", label: "Codex fixture",
+      is_default: true, enabled: true, disabled_at: null, auto_eligible: false,
+      created_at: "2026-01-01T00:00:00Z", updated_at: "2026-01-01T00:00:00Z",
+    }] });
     mockApi.getMySettings.mockResolvedValue({ settings: {
       default_harness: null, default_model: null, default_effort: "high", default_codex_effort: "low",
       judge_model: null, summary_model: null, appearance_mode: null, light_theme: null,
@@ -990,6 +1007,8 @@ describe("Run defaults — harness and worker models card (PRD #1551 M3)", () =>
     // Both lanes present.
     expect(screen.getByLabelText("Claude model")).toBeTruthy();
     expect(screen.getByLabelText("Codex model")).toBeTruthy();
+    expect(within(laneOf("Codex")).getByText("gpt-6.1-sol", { selector: "code" })).toBeTruthy();
+    expect(screen.getByLabelText("Codex effort")).toBeTruthy();
     // Inherit with both usable resolves to Claude (D11), so the badge is on the
     // Anthropic lane and NOT on the Codex lane (paired positive/negative).
     expect(within(laneOf("Anthropic")).getByText("Default harness")).toBeTruthy();

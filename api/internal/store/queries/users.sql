@@ -176,14 +176,18 @@ RETURNING default_harness, default_claude_model, default_codex_model, default_mo
 
 -- name: GetUserDefaultEffort :one
 -- The current user's per-user default reasoning effort (PRD #617); NULL = inherit,
--- resolved to the uzi default `xhigh` at claim assembly (issue #1157). Read at issue-
+-- resolved to the uzi default `medium` at claim assembly (issue #1157). Read at issue-
 -- and chat-run claim assembly, keyed on the run owner. Selects only the column.
 SELECT default_effort FROM users WHERE id = $1;
 
 -- name: GetUserDefaultCodexEffort :one
+-- Read only the Codex preference for the frozen Codex harness at claim time.
+-- NULL/blank inherits the independently defined medium product default.
 SELECT default_codex_effort FROM users WHERE id = $1;
 
 -- name: SetUserDefaultCodexEffort :one
+-- Set or clear the session owner's Codex preference without changing Claude.
+-- Write surfaces validate the five supported levels before executing this query.
 UPDATE users SET default_codex_effort = @default_codex_effort WHERE id = @id
 RETURNING default_codex_effort;
 

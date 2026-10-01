@@ -7,6 +7,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func TestCodexCurrentRuntimePlacementLiveDB(t *testing.T) {
@@ -46,4 +47,50 @@ func TestCodexCurrentRuntimePlacementLiveDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestCodexRuntimePeerSpreadLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	caps := []string{capability.CodexHarnessV1, capability.CodexRuntimeV2}
+	me := e.seedSpreadWorker(t, caps, 2)
+	e.seedActiveRunOwnedBy(t, me)
+	e.seedSpreadWorker(t, []string{capability.CodexHarnessV1}, 2)
+	runID := e.seedCodexQueuedRun(t)
+	claimed, err := e.q.ClaimRun(e.ctx, e.claimParams(me, caps, false))
+	if err != nil || claimed.ID != runID {
+		t.Fatalf("current busy worker deferred to an old runtime peer: %v", err)
+	}
+}
+
+func TestCodexRuntimeClaimableCountLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1})
+	runID := e.seedCodexQueuedRun(t)
+	if n := e.claimableForRun(t, runID); n != 0 {
+		t.Fatalf("old runtime counted as claimable: %d", n)
+	}
+	e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2})
+	if n := e.claimableForRun(t, runID); n != 1 {
+		t.Fatalf("current runtime not counted: %d", n)
+	}
+}
+
+func TestCodexRuntimeMixedFleetHealthCountsLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	old := e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexCustomModelV1, capability.CompletionInterlockV1, capability.CodexCompletionInterlockV1})
+	e.seedHeartbeatWorker(t, []string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.CompletionInterlockV1})
+	assertCounts := func(want int64) {
+		t.Helper()
+		custom, err := e.q.CountOnlineWorkersSatisfyingCustomCodex(e.ctx, e.userID)
+		if err != nil || custom != want {
+			t.Errorf("custom-capable current runtime count=%d want=%d err=%v", custom, want, err)
+		}
+		completion, err := e.q.CountOnlineWorkersSatisfyingCodexCompletion(e.ctx, store.CountOnlineWorkersSatisfyingCodexCompletionParams{UserID: e.userID, CustomRoot: true})
+		if err != nil || completion != want {
+			t.Errorf("completion-capable current runtime count=%d want=%d err=%v", completion, want, err)
+		}
+	}
+	assertCounts(0)
+	e.exec(t, `UPDATE workers SET protocol_capabilities=array_append(protocol_capabilities,'codex_runtime_v2') WHERE id=$1`, old)
+	assertCounts(1)
 }

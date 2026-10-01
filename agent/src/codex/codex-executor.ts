@@ -189,7 +189,7 @@ export const CODEX_PRODUCTION_PROVIDER: CodexProviderConfig = {
 // PRD #1551 (M2, D5): the built-in Codex task-review model, re-exported here beside the
 // production provider for locality. It lives in the leaf module `task-review-model.ts` so
 // `review-runner.ts` reads it without a runtime import of this heavy module (it references
-// this module type-only). The shared provider default above stays `gpt-6-astra`; only
+// this module type-only). The shared provider default above stays `gpt-6.1-sol`; only
 // Codex task review uses `CODEX_TASK_REVIEW_MODEL`.
 export { CODEX_TASK_REVIEW_MODEL } from "./task-review-model.js";
 

@@ -362,6 +362,8 @@ const getUserDefaultCodexEffort = `-- name: GetUserDefaultCodexEffort :one
 SELECT default_codex_effort FROM users WHERE id = $1
 `
 
+// Read only the Codex preference for the frozen Codex harness at claim time.
+// NULL/blank inherits the independently defined medium product default.
 func (q *Queries) GetUserDefaultCodexEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error) {
 	row := q.db.QueryRow(ctx, getUserDefaultCodexEffort, id)
 	var default_codex_effort pgtype.Text
@@ -374,7 +376,7 @@ SELECT default_effort FROM users WHERE id = $1
 `
 
 // The current user's per-user default reasoning effort (PRD #617); NULL = inherit,
-// resolved to the uzi default `xhigh` at claim assembly (issue #1157). Read at issue-
+// resolved to the uzi default `medium` at claim assembly (issue #1157). Read at issue-
 // and chat-run claim assembly, keyed on the run owner. Selects only the column.
 func (q *Queries) GetUserDefaultEffort(ctx context.Context, id uuid.UUID) (pgtype.Text, error) {
 	row := q.db.QueryRow(ctx, getUserDefaultEffort, id)
@@ -1129,6 +1131,8 @@ type SetUserDefaultCodexEffortParams struct {
 	ID                 uuid.UUID   `json:"id"`
 }
 
+// Set or clear the session owner's Codex preference without changing Claude.
+// Write surfaces validate the five supported levels before executing this query.
 func (q *Queries) SetUserDefaultCodexEffort(ctx context.Context, arg SetUserDefaultCodexEffortParams) (pgtype.Text, error) {
 	row := q.db.QueryRow(ctx, setUserDefaultCodexEffort, arg.DefaultCodexEffort, arg.ID)
 	var default_codex_effort pgtype.Text

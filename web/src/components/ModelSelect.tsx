@@ -10,7 +10,9 @@ import { Input, Select } from "./ui";
 // picker is EXACTLY `gpt-6-astra`/`gpt-5.6-sol`/`gpt-6-sol`/`gpt-6.1-sol` — no custom option, no catalog
 // discovery — matching D6's "the product-owned Codex picker remains exactly" rule.
 const CLAUDE_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"] as const;
-const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"] as const;
+// Mirror agent/src/codex/codex-executor.ts CODEX_PRODUCTION_PROVIDER.model.
+export const DEFAULT_CODEX_MODEL = "gpt-6.1-sol";
+const CODEX_MODEL_ALIASES = ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", DEFAULT_CODEX_MODEL] as const;
 
 // aliasesForHarness is the single place this component resolves which curated list
 // applies. Defaults to Claude for an omitted/unrecognised harness — the safe,

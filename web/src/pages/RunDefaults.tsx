@@ -12,7 +12,7 @@ import type { BindMode } from "../lib/apiTypes";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { Alert, Badge, Button, Card, Field, SectionTitle, Select, Skeleton } from "../components/ui";
-import { ModelSelect } from "../components/ModelSelect";
+import { DEFAULT_CODEX_MODEL, ModelSelect } from "../components/ModelSelect";
 import { EffortSelect } from "../components/EffortSelect";
 import { HarnessPicker } from "../components/HarnessPicker";
 import { modelFieldWarning } from "../lib/agentTemplates";
@@ -947,7 +947,7 @@ export function RunDefaults() {
                   <p className="text-xs text-faint">
                     Curated Codex models plus a custom model ID. Leave on <em>Inherit</em>{" "}
                     to use the Codex default (currently{" "}
-                    <code className="rounded bg-raised px-1 py-0.5 text-fg">gpt-6-astra</code>
+                    <code className="rounded bg-raised px-1 py-0.5 text-fg">{DEFAULT_CODEX_MODEL}</code>
                     ); an unrecognized custom ID only fails on the first run.
                   </p>
                 </div>
@@ -977,8 +977,8 @@ export function RunDefaults() {
           <p className="mt-2 text-sm text-muted">
             Choose reasoning effort independently for Claude and Codex runs. Leave it on{" "}
             <em>Inherit</em> to use the uzi default (<code className="rounded bg-raised px-1 py-0.5 text-fg">medium</code>).
-            Higher levels reason more deeply and cost more; a level a given model does not
-            support is silently downgraded to the nearest one it does. It applies to your
+            Higher levels reason more deeply and cost more. Claude's SDK can downgrade a level
+            its model does not support; Codex receives the selected level directly. It applies to your
             own runs only; other users are unaffected.
           </p>
         </div>
@@ -993,12 +993,16 @@ export function RunDefaults() {
             <Button type="button" disabled={effortBusy || !effortDirty} onClick={saveEffort}>
               Save Claude effort
             </Button>
-            <Field label="Codex effort" htmlFor="codex-effort">
-              <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} />
-            </Field>
-            <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
-              Save Codex effort
-            </Button>
+            {showCodexLane && (
+              <>
+                <Field label="Codex effort" htmlFor="codex-effort">
+                  <EffortSelect id="codex-effort" value={defaultCodexEffort} onChange={setDefaultCodexEffort} />
+                </Field>
+                <Button type="button" disabled={codexEffortBusy || !codexEffortDirty} onClick={saveCodexEffort}>
+                  Save Codex effort
+                </Button>
+              </>
+            )}
           </div>
         )}
       </Card>

@@ -42,6 +42,7 @@ func TestEphemeralLeasePlacementProtocolMirrorLiveDB(t *testing.T) {
 		placed bool
 	}{
 		{"without codex_harness_v1 is not a placement", []string{}, false},
+		{"without codex_runtime_v2 is not a placement", []string{"codex_harness_v1"}, false},
 		{"with codex_harness_v1 is a placement", []string{"codex_harness_v1", "codex_runtime_v2"}, true},
 	} {
 		t.Run("a leased worker "+tc.name+" for a Codex run", func(t *testing.T) {

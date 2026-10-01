@@ -2076,6 +2076,7 @@ WHERE w.user_id = $1
   AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
   AND 'codex_completion_interlock_v1' = ANY(w.protocol_capabilities)
   AND (NOT $2::boolean OR 'codex_custom_model_v1' = ANY(w.protocol_capabilities))
 `
@@ -2164,11 +2165,12 @@ WHERE w.user_id = $1
   -- claims an unbound run, so it is never a satisfier here.
   AND NOT w.isolated_lane
   AND 'codex_harness_v1' = ANY(w.protocol_capabilities)
+  AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)
   AND 'codex_custom_model_v1' = ANY(w.protocol_capabilities)
 `
 
 // PRD #1551 M4 (D6): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
-// BOTH the 'codex_harness_v1' AND 'codex_custom_model_v1' PROTOCOL capabilities. This is the
+// the harness, current runtime and custom-model PROTOCOL capabilities. This is the
 // custom-Codex-model analogue of CountOnlineWorkersSatisfyingCodexHarness: it answers "does the
 // fleet have ANY worker that can execute a CUSTOM Codex root model?", NOT "can THIS run be claimed
 // right now?". It drives the queued-reason resolver's custom-Codex rung (reasonNoCustomCodexCapable
