@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
+  A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
+
 - **A Codex command that hits its 60-minute deadline is stopped before the agent hears about it ([#2048](https://github.com/vtmocanu/uzi/issues/2048)).**
   The command's process tree is reaped before the call returns, and the agent gets an explicit "stopped at its deadline" error instead of the generic broker failure; an unclean reap still fails closed.
 

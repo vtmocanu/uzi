@@ -798,3 +798,30 @@ func TestFetchCallerCancelIsNotTimeout(t *testing.T) {
 	r, ref = fetcherFor(publicResolver(), ca, port).Fetch(done, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
 	mustRefuse(t, r, ref, ReasonCancelled)
 }
+
+// A response whose headers arrive and whose context then ends must not come back as a
+// fetch result: the transport can race a finished response against the teardown, and the
+// body reads as a clean (possibly empty) success.
+func TestFetchCtxEndedAfterHeadersIsRefused(t *testing.T) {
+	ca := newTestCA(t)
+	_, port := upstream(t, ca.validLeaf(t, "docs.example.com"), http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", "5")
+		_, _ = w.Write([]byte("hello"))
+	}))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f, _ := testFetcher(publicResolver(), ca, port, func(o *Options) { o.testAfterHeaders = func(context.Context) { cancel() } })
+	r, ref := f.Fetch(ctx, "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonCancelled)
+	if ref.FinalURL != "https://docs.example.com/" {
+		t.Errorf("FinalURL = %q, want the hop that was in flight", ref.FinalURL)
+	}
+
+	f, _ = testFetcher(publicResolver(), ca, port, func(o *Options) {
+		o.Timeout = 50 * time.Millisecond
+		o.testAfterHeaders = func(ctx context.Context) { <-ctx.Done() }
+	})
+	r, ref = f.Fetch(context.Background(), "https://docs.example.com/", []string{"docs.example.com"}, 1<<20)
+	mustRefuse(t, r, ref, ReasonTimeout)
+}
