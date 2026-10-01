@@ -509,14 +509,18 @@ type MrReworkLedger struct {
 }
 
 type Notification struct {
-	ID        uuid.UUID          `json:"id"`
-	UserID    uuid.UUID          `json:"user_id"`
-	Kind      string             `json:"kind"`
-	Payload   []byte             `json:"payload"`
-	RunID     pgtype.UUID        `json:"run_id"`
-	ReviewID  pgtype.UUID        `json:"review_id"`
-	ReadAt    pgtype.Timestamptz `json:"read_at"`
-	CreatedAt pgtype.Timestamptz `json:"created_at"`
+	ID               uuid.UUID          `json:"id"`
+	UserID           uuid.UUID          `json:"user_id"`
+	Kind             string             `json:"kind"`
+	Payload          []byte             `json:"payload"`
+	RunID            pgtype.UUID        `json:"run_id"`
+	ReviewID         pgtype.UUID        `json:"review_id"`
+	ReadAt           pgtype.Timestamptz `json:"read_at"`
+	CreatedAt        pgtype.Timestamptz `json:"created_at"`
+	SlackRender      []byte             `json:"slack_render"`
+	SlackAttempts    int32              `json:"slack_attempts"`
+	SlackAttemptedAt pgtype.Timestamptz `json:"slack_attempted_at"`
+	SlackDeliveredAt pgtype.Timestamptz `json:"slack_delivered_at"`
 }
 
 type OauthAuthorizeRequest struct {

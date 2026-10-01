@@ -12,9 +12,72 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const claimPendingSlackNotifications = `-- name: ClaimPendingSlackNotifications :many
+
+UPDATE notifications
+SET slack_attempts = slack_attempts + 1,
+    slack_attempted_at = now()
+WHERE id IN (
+    SELECT c.id FROM notifications AS c
+    WHERE c.slack_render IS NOT NULL
+      AND c.slack_delivered_at IS NULL
+      AND (c.slack_attempted_at IS NULL OR c.slack_attempted_at < $1::timestamptz)
+      AND c.slack_attempts < $2::int4
+    ORDER BY c.created_at
+    LIMIT $3
+    FOR UPDATE SKIP LOCKED
+)
+RETURNING id, user_id, slack_render, slack_attempts
+`
+
+type ClaimPendingSlackNotificationsParams struct {
+	StaleBefore pgtype.Timestamptz `json:"stale_before"`
+	MaxAttempts int32              `json:"max_attempts"`
+	Lim         int32              `json:"lim"`
+}
+
+type ClaimPendingSlackNotificationsRow struct {
+	ID            uuid.UUID `json:"id"`
+	UserID        uuid.UUID `json:"user_id"`
+	SlackRender   []byte    `json:"slack_render"`
+	SlackAttempts int32     `json:"slack_attempts"`
+}
+
+// ── Issue #1675: durable Slack delivery for halt DMs ──
+// Atomically claim up to @lim undelivered durable rows for redelivery: bump the attempt
+// counter and stamp slack_attempted_at, so a concurrent sweeper (FOR UPDATE SKIP LOCKED)
+// or a later tick skips them until @stale_before passes again. A row is claimable when it
+// has a render, is not delivered, is under @max_attempts, and its last attempt is older
+// than @stale_before. A NULL slack_attempted_at is treated as claimable too (InsertNotification
+// always stamps it for a render, so this is only defensive). Oldest first.
+func (q *Queries) ClaimPendingSlackNotifications(ctx context.Context, arg ClaimPendingSlackNotificationsParams) ([]ClaimPendingSlackNotificationsRow, error) {
+	rows, err := q.db.Query(ctx, claimPendingSlackNotifications, arg.StaleBefore, arg.MaxAttempts, arg.Lim)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ClaimPendingSlackNotificationsRow{}
+	for rows.Next() {
+		var i ClaimPendingSlackNotificationsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.SlackRender,
+			&i.SlackAttempts,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const findNotificationForRunKind = `-- name: FindNotificationForRunKind :one
 
-SELECT id, user_id, kind, payload, run_id, review_id, read_at, created_at FROM notifications
+SELECT id, user_id, kind, payload, run_id, review_id, read_at, created_at, slack_render, slack_attempts, slack_attempted_at, slack_delivered_at FROM notifications
 WHERE user_id = $1
   AND run_id = $2::uuid
   AND kind = $3
@@ -51,23 +114,32 @@ func (q *Queries) FindNotificationForRunKind(ctx context.Context, arg FindNotifi
 		&i.ReviewID,
 		&i.ReadAt,
 		&i.CreatedAt,
+		&i.SlackRender,
+		&i.SlackAttempts,
+		&i.SlackAttemptedAt,
+		&i.SlackDeliveredAt,
 	)
 	return i, err
 }
 
 const insertNotification = `-- name: InsertNotification :one
 
-INSERT INTO notifications (user_id, kind, payload, run_id, review_id)
-VALUES ($1, $2, $3, $4, $5)
-RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at
+INSERT INTO notifications (user_id, kind, payload, run_id, review_id,
+                           slack_render, slack_attempts, slack_attempted_at)
+VALUES ($1, $2, $3, $4, $5,
+        $6::jsonb,
+        CASE WHEN $6::jsonb IS NULL THEN 0 ELSE 1 END,
+        CASE WHEN $6::jsonb IS NULL THEN NULL::timestamptz ELSE now() END)
+RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at, slack_render, slack_attempts, slack_attempted_at, slack_delivered_at
 `
 
 type InsertNotificationParams struct {
-	UserID   uuid.UUID   `json:"user_id"`
-	Kind     string      `json:"kind"`
-	Payload  []byte      `json:"payload"`
-	RunID    pgtype.UUID `json:"run_id"`
-	ReviewID pgtype.UUID `json:"review_id"`
+	UserID      uuid.UUID   `json:"user_id"`
+	Kind        string      `json:"kind"`
+	Payload     []byte      `json:"payload"`
+	RunID       pgtype.UUID `json:"run_id"`
+	ReviewID    pgtype.UUID `json:"review_id"`
+	SlackRender []byte      `json:"slack_render"`
 }
 
 // Notifications event log (PRD #46 Decision 6; read path retired by PRD #1650 D1/D4).
@@ -76,8 +148,15 @@ type InsertNotificationParams struct {
 // write-only event log (not a durable audit log; PruneNotificationsForUser caps it per
 // user) plus the per-run incidental-finding Slack DM latch (FindNotificationForRunKind).
 // The read_at column stays in the schema but nothing sets or reads it.
+// Exception (issue #1675): durable halt kinds carry a stored Slack render in slack_render
+// and are read back by the Slack redelivery sweep (ClaimPendingSlackNotifications), so
+// the table is no longer purely write-only for those rows.
 // The write seam (notifysvc.Notify): persist the row FIRST, then best-effort Slack.
 // payload defaults to '{}' at the column, but the caller always marshals a value.
+// slack_render is non-NULL only for opted-in durable kinds (issue #1675); then the
+// initial in-memory enqueue counts as attempt 1 (attempts = 1, attempted_at = now()).
+// A NULL render leaves attempts 0 and attempted_at NULL. The casts are explicit so the
+// NULL arm has a type (a bare NULL arm drew SQLSTATE 42P08 at prepare).
 func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotificationParams) (Notification, error) {
 	row := q.db.QueryRow(ctx, insertNotification,
 		arg.UserID,
@@ -85,6 +164,7 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		arg.Payload,
 		arg.RunID,
 		arg.ReviewID,
+		arg.SlackRender,
 	)
 	var i Notification
 	err := row.Scan(
@@ -96,26 +176,46 @@ func (q *Queries) InsertNotification(ctx context.Context, arg InsertNotification
 		&i.ReviewID,
 		&i.ReadAt,
 		&i.CreatedAt,
+		&i.SlackRender,
+		&i.SlackAttempts,
+		&i.SlackAttemptedAt,
+		&i.SlackDeliveredAt,
 	)
 	return i, err
+}
+
+const markNotificationSlackDelivered = `-- name: MarkNotificationSlackDelivered :exec
+UPDATE notifications
+SET slack_delivered_at = now()
+WHERE id = $1 AND slack_delivered_at IS NULL
+`
+
+// Settle delivery: the DM was posted, or the owner has no Slack link (terminal). Idempotent:
+// only the first call sets the timestamp.
+func (q *Queries) MarkNotificationSlackDelivered(ctx context.Context, id uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markNotificationSlackDelivered, id)
+	return err
 }
 
 const pruneNotificationsForUser = `-- name: PruneNotificationsForUser :execrows
 DELETE FROM notifications AS n
 WHERE n.user_id = $1
+  AND NOT (n.slack_render IS NOT NULL AND n.slack_delivered_at IS NULL
+           AND n.slack_attempts < $2::int4)
   AND n.created_at < (
       SELECT min(keep_row.created_at) FROM (
           SELECT created_at FROM notifications
           WHERE user_id = $1
           ORDER BY created_at DESC, id DESC
-          LIMIT $2
+          LIMIT $3
       ) AS keep_row
   )
 `
 
 type PruneNotificationsForUserParams struct {
-	UserID uuid.UUID `json:"user_id"`
-	Keep   int32     `json:"keep"`
+	UserID      uuid.UUID `json:"user_id"`
+	MaxAttempts int32     `json:"max_attempts"`
+	Keep        int32     `json:"keep"`
 }
 
 // Per-user retention cap (PRD #46 Decision 6: pruning ships with the table). Keeps
@@ -131,8 +231,12 @@ type PruneNotificationsForUserParams struct {
 // accepted for v1 (M6 pins exact semantics). Called best-effort by notifysvc after
 // each insert, so an active user's event log can never grow without bound while an
 // idle one is never touched.
+// Issue #1675: a durable row still awaiting Slack delivery (slack_render set, not
+// delivered, attempts below @max_attempts) is never deleted, so the redelivery sweep
+// can still find it. A delivered row, or one at/over @max_attempts (given up), prunes
+// normally. A zero @max_attempts spares nothing.
 func (q *Queries) PruneNotificationsForUser(ctx context.Context, arg PruneNotificationsForUserParams) (int64, error) {
-	result, err := q.db.Exec(ctx, pruneNotificationsForUser, arg.UserID, arg.Keep)
+	result, err := q.db.Exec(ctx, pruneNotificationsForUser, arg.UserID, arg.MaxAttempts, arg.Keep)
 	if err != nil {
 		return 0, err
 	}
@@ -143,7 +247,7 @@ const updateNotificationPayload = `-- name: UpdateNotificationPayload :one
 UPDATE notifications
 SET payload = $1
 WHERE id = $2 AND user_id = $3
-RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at
+RETURNING id, user_id, kind, payload, run_id, review_id, read_at, created_at, slack_render, slack_attempts, slack_attempted_at, slack_delivered_at
 `
 
 type UpdateNotificationPayloadParams struct {
@@ -171,6 +275,10 @@ func (q *Queries) UpdateNotificationPayload(ctx context.Context, arg UpdateNotif
 		&i.ReviewID,
 		&i.ReadAt,
 		&i.CreatedAt,
+		&i.SlackRender,
+		&i.SlackAttempts,
+		&i.SlackAttemptedAt,
+		&i.SlackDeliveredAt,
 	)
 	return i, err
 }

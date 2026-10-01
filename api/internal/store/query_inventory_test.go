@@ -714,7 +714,8 @@ var queryInventory = []queryPin{
 			"redden. The MECHANISM is the durable half. Also: " +
 			"revoked-sorts-last is asserted PAIRWISE WITHIN THE FIXTURE rather than table-wide, so the " +
 			"shared live database's other rows may interleave without touching it"},
-	// ── notifications.sql — the pruned, write-only event log (PRD #1650 D4) ───
+	// ── notifications.sql — the pruned event log (PRD #1650 D4); durable halt rows are ──
+	// read back by the Slack redelivery sweep (issue #1675) ──
 	// The inbox read path (list, counts, admin all-view, mark-read) was deleted by PRD #1650
 	// M2 along with its six queries. What remains is the write seam and the per-user prune,
 	// pinned here, and the incidental-finding coalescing pair further down.
@@ -725,7 +726,15 @@ var queryInventory = []queryPin{
 	{"InsertNotification", "notifications.sql", "TestNotificationsPruneLiveDB",
 		"direct call in the 'write-seam round-trip' subtest, NOT mere fixture setup: it " +
 			"inserts four, asserts a raw count(*) reads four, prunes to two, and asserts the rows " +
-			"were genuinely removed"},
+			"were genuinely removed. Issue #1675: TestNotificationSlackDeliveryLiveDB also drives it " +
+			"with and without a slack_render"},
+	{"ClaimPendingSlackNotifications", "notifications.sql", "TestNotificationSlackDeliveryLiveDB",
+		"direct call across the 'claim' subtests: a row attempted just now is NOT claimed with " +
+			"stale_before in the past and IS claimed (attempts 1 -> 2) with it in the future; delivered, " +
+			"at-max-attempts and non-durable rows are never claimed; lim=1 returns exactly one row"},
+	{"MarkNotificationSlackDelivered", "notifications.sql", "TestNotificationSlackDeliveryLiveDB",
+		"direct call in the 'delivered row' subtest: a second call does not move slack_delivered_at, " +
+			"and the delivered row is no longer claimable"},
 
 	// ── agent_memory.sql — pinned end to end, recorded because a table of gaps is not the ──
 	// point. One live test covers all six with discriminating assertions in both directions;
