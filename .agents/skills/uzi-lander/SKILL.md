@@ -366,10 +366,18 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    **The run's follow-up issue.** A run's findings (off-task bugs, and review notes the lead
    deferred) are uzi incidental findings, not forge issues. After the merge, list the ones
    still to triage: `uzi findings list --run RUN --bucket to_file`. None: nothing to do.
-   Otherwise dismiss what the merged code already fixed or what is only a nit
-   (`uzi findings dismiss ID --reason not-an-issue|wont-do`), get the buddy's `APPROVE` of
-   the remaining set, then file it as one issue with `uzi findings file ID ID...` (one id
-   files alone). Label it `reviewed` and name it in the trail.
+   - Verify each against the merged code. `uzi findings resolve ID` what the merge fixed;
+     `uzi findings dismiss ID --reason not-an-issue` a false positive, `--reason wont-do`
+     valid work deliberately declined.
+   - The rest becomes one issue. Get the buddy's `APPROVE` of its membership and its exact
+     title and body. `uzi findings file ID ID...` files the server-generated text (one id
+     files alone): preview it in the Findings page's file dialog (select the run's rows),
+     which is also where to edit it before filing.
+   - Filing is the human gate: file only with the user's go-ahead, given now or earlier in
+     the session for this follow-up. The buddy's approval never substitutes for it.
+   - A set over the grouped-filing limit (50) goes to the user for a decision; never split or
+     truncate it silently.
+   - Label the issue `reviewed` and name it in the trail.
 
 ## Always yours, whichever review lane applies
 
