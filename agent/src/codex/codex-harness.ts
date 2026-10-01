@@ -1549,14 +1549,16 @@ export class CodexHarness implements RunHarness {
     }
   }
 
-  /** One projected main-origin, lead-attributed frame carrying `item` (never `signals`). */
+  /** One projected main-origin, lead-attributed frame carrying `item` (never `signals`). Only a
+   *  tool START is marked `assistantAuthored` (the model issued that call); a finished frame is a
+   *  result, possibly worker-synthesized, and is never model-processing evidence. */
   private leadFrame(item: HarnessItem): HarnessEvent {
     return {
       kind: "frame",
       origin: { kind: "main" },
       attribution: { agent: "lead" },
       items: [item],
-      assistantAuthored: true,
+      ...(item.kind === "tool" && item.phase === "started" ? { assistantAuthored: true as const } : {}),
       model: this.currentModel,
       sessionId: this.threadId,
     };

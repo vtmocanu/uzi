@@ -30,7 +30,7 @@ describe("evidencesModelProcessing (issue #1800)", () => {
   it("rejects a subagent-origin frame even when assistant-authored", () => {
     assert.equal(evidencesModelProcessing(frame({ origin: { kind: "subagent" }, assistantAuthored: true })), false);
   });
-  it("rejects an unmarked main frame (user, tool_result, replay)", () => {
+  it("rejects an unmarked main frame", () => {
     assert.equal(evidencesModelProcessing(frame({})), false);
   });
   it("rejects an assistant-authored frame with no output", () => {

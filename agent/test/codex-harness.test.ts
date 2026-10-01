@@ -2040,6 +2040,12 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
     const root = frames(events).find((f) => f.origin.kind === "main" && f.items.some((i) => i.kind === "text" && i.text === "root answer"));
     assert.ok(root, "the root agentMessage frame was projected");
     assert.equal(evidencesModelProcessing(root), true);
+    const toolFrames = frames(events).filter((f) => f.origin.kind === "main" && f.items.some((i) => i.kind === "tool"));
+    const start = toolFrames.find((f) => f.items.some((i) => i.kind === "tool" && i.phase === "started"));
+    const finish = toolFrames.find((f) => f.items.some((i) => i.kind === "tool" && i.phase === "finished"));
+    assert.ok(start && finish, "the lead dispatch start and completion frames were projected");
+    assert.equal(evidencesModelProcessing(start), true, "the model-issued dispatch start counts");
+    assert.equal(evidencesModelProcessing(finish), false, "a completion (result) frame never counts");
   });
 
   it("emitChildFrame projects only for a registered AND bound thread, scrubbed, namespaced and signal-free", async () => {
@@ -2147,6 +2153,8 @@ describe("CodexHarness: delegation dispatch binding + child frames (issue #1583 
 
     const results = frames(seen).flatMap((f) => f.items).filter((i) => i.kind === "tool" && i.phase === "finished" && i.name === "Agent");
     assert.equal(results.length, 1, "exactly one completion");
+    const synthesized = frames(seen).find((f) => f.items.some((i) => i.kind === "tool" && i.phase === "finished" && i.name === "Agent"));
+    assert.equal(evidencesModelProcessing(synthesized!), false, "a worker-synthesized completion is not model evidence (issue #1800)");
     // Issue #1864: one warn names the open delegation, its role, age and open child tools only.
     const openWarns = warns.filter((w) => w.msg === "codex delegation open at turn end");
     assert.equal(openWarns.length, 1, "one open-at-turn-end warn");
