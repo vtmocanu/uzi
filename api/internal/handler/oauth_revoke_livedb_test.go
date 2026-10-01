@@ -219,6 +219,81 @@ func TestGrantTokensAreNotManualTokensLiveDB(t *testing.T) {
 	e.wantWhoami(t, "the grant token", tok.AccessToken, http.StatusOK)
 }
 
+// TestProductConnectionCountsLiveDB (D5): a product's live OAuth connections are counted apart
+// from its manual tokens. The registry list and the PATCH response carry live_connection_count
+// (revoked grants excluded, active_token_count untouched), and the delete response carries
+// stopped_connection_count: the live connections for a product that was enabled at deletion, 0
+// for one that was already disabled (its product still reports the live ones).
+func TestProductConnectionCountsLiveDB(t *testing.T) {
+	setup := func(t *testing.T) (e *tokenEnv, adminJWT string) {
+		e = tokenSetup(t)
+		e.connectAs(t, e.jwt, nil)
+		// A second user's connection that was revoked does not count.
+		other := cliSeedUser(t, e.pool, false)
+		otherJWT := cliMintJWT(t, e.pool, other)
+		e.connectAs(t, otherJWT, nil)
+		if rec := cookieReq(t, e.routes, http.MethodPost, "/api/me/cli-tokens/revoke-all", otherJWT, ""); rec.Code != http.StatusNoContent {
+			t.Fatalf("revoke-all = %d", rec.Code)
+		}
+		return e, cliMintJWT(t, e.pool, cliSeedUser(t, e.pool, true))
+	}
+	listed := func(t *testing.T, e *tokenEnv, jwt string) apitypes.ProductDTO {
+		t.Helper()
+		got, ok := apListProducts(t, e.routes, jwt)[e.product.String()]
+		if !ok {
+			t.Fatal("product missing from the admin list")
+		}
+		return got
+	}
+
+	t.Run("an enabled product", func(t *testing.T) {
+		e, jwt := setup(t)
+		if got := listed(t, e, jwt); got.LiveConnectionCount != 1 || got.ActiveTokenCount != 0 {
+			t.Fatalf("list: live_connection_count = %d, active_token_count = %d; want 1 and 0", got.LiveConnectionCount, got.ActiveTokenCount)
+		}
+		rec := cookieReq(t, e.routes, http.MethodPatch, "/api/admin/products/"+e.product.String(), jwt, `{"description":"edited"}`)
+		if got := apDecodeProduct(t, rec.Code, rec.Body.String()).Product; rec.Code != http.StatusOK || got.LiveConnectionCount != 1 {
+			t.Fatalf("PATCH = %d, live_connection_count = %d; want 200 and 1", rec.Code, got.LiveConnectionCount)
+		}
+		rec = cookieReq(t, e.routes, http.MethodDelete, "/api/admin/products/"+e.product.String(), jwt, "")
+		resp := apDecodeProduct(t, rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK || resp.StoppedConnectionCount == nil || *resp.StoppedConnectionCount != 1 ||
+			resp.StoppedTokenCount == nil || *resp.StoppedTokenCount != 0 || resp.Product.LiveConnectionCount != 1 {
+			t.Fatalf("DELETE = %d %q, want stopped_connection_count 1, stopped_token_count 0, product.live_connection_count 1", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("an already disabled product", func(t *testing.T) {
+		e, jwt := setup(t)
+		if rec := cookieReq(t, e.routes, http.MethodPatch, "/api/admin/products/"+e.product.String(), jwt, `{"enabled":false}`); rec.Code != http.StatusOK {
+			t.Fatalf("PATCH enabled=false = %d %q", rec.Code, rec.Body.String())
+		}
+		rec := cookieReq(t, e.routes, http.MethodDelete, "/api/admin/products/"+e.product.String(), jwt, "")
+		resp := apDecodeProduct(t, rec.Code, rec.Body.String())
+		if rec.Code != http.StatusOK || resp.StoppedConnectionCount == nil || *resp.StoppedConnectionCount != 0 || resp.Product.LiveConnectionCount != 1 {
+			t.Fatalf("DELETE = %d %q, want stopped_connection_count 0 and product.live_connection_count 1", rec.Code, rec.Body.String())
+		}
+	})
+}
+
+// TestRevokeAllProductTokensSkipsGrantTokensLiveDB (D8): the plain sweep revokes manual tokens only.
+// A grant's access token is revoked together with its grant under the grant lock; revoking it here
+// alone would leave a grant created concurrently with its access token dead and its grant and
+// refresh token live.
+func TestRevokeAllProductTokensSkipsGrantTokensLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	tok := e.connectAs(t, e.jwt, nil)
+	manual := mptMint(t, e.routes, e.jwt, e.product, "")
+	if err := e.h.q.RevokeAllProductTokens(context.Background(), e.user); err != nil {
+		t.Fatal(err)
+	}
+	e.wantWhoami(t, "the manual token", manual.Token, http.StatusUnauthorized)
+	e.wantWhoami(t, "the grant token the plain sweep must not touch", tok.AccessToken, http.StatusOK)
+	if n := e.liveGrantCount(t, e.user); n != 1 {
+		t.Fatalf("%d live grants, want 1", n)
+	}
+}
+
 // TestRevokeAllRevokesGrantsLiveDB (D6): Revoke all leaves no live grant for the caller, an approved
 // but unredeemed code can no longer be redeemed, and another user's connection is untouched.
 func TestRevokeAllRevokesGrantsLiveDB(t *testing.T) {
@@ -312,6 +387,129 @@ func TestRevokeAllRacingCodeExchangeLiveDB(t *testing.T) {
 		}
 	}
 	t.Logf("exchange won %d times, revoke-all won %d times", exchangedFirst, refusedAfter)
+}
+
+// pgWaitingCount counts the backends waiting on a lock whose current statement contains fragment.
+func pgWaitingCount(t *testing.T, e *tokenEnv, fragment string) int {
+	t.Helper()
+	var n int
+	if err := e.pool.QueryRow(context.Background(),
+		`SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%' || $1 || '%'`, fragment).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// waitForPgWaiting blocks until want backends wait on a lock inside a statement containing fragment.
+func waitForPgWaiting(t *testing.T, e *tokenEnv, fragment string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for pgWaitingCount(t, e, fragment) < want {
+		if time.Now().After(deadline) {
+			t.Fatalf("%d backends never waited on a lock in %q", want, fragment)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	time.Sleep(50 * time.Millisecond)
+}
+
+// TestRevokeAllVersusFirstConsentApproveLiveDB (D8): a first-consent approve that has inserted its
+// grant but not committed is invisible to every row lock, so Revoke all serializes with it on the
+// per-user lock (store.OAuthUserLockClass). Both orderings are pinned:
+//
+//   - the approve took the lock first: Revoke all waits for its commit and then revokes the new
+//     grant, so afterwards there is no live grant and its code cannot be redeemed;
+//   - Revoke all took the lock first: the approve runs after it and creates a live grant of its
+//     own, a consent given after the button was pressed, which works normally.
+func TestRevokeAllVersusFirstConsentApproveLiveDB(t *testing.T) {
+	ctx := context.Background()
+	revokeAll := func(e *tokenEnv, out **httptest.ResponseRecorder, wg *sync.WaitGroup) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			*out = cookieReq(t, e.routes, http.MethodPost, "/api/me/cli-tokens/revoke-all", e.jwt, "")
+		}()
+	}
+
+	t.Run("the approve holds the lock first", func(t *testing.T) {
+		e := tokenSetup(t)
+		id, binding := e.start(t, nil, nil)
+		// Hold the request row, so the approve blocks on its claim AFTER inserting the grant and
+		// while holding the per-user lock, with the grant uncommitted.
+		tx, err := e.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck // no-op after the commit below
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM oauth_authorize_requests WHERE id = $1 FOR UPDATE`, id); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var appr, rev *httptest.ResponseRecorder
+		wg.Add(1)
+		go func() { defer wg.Done(); appr = e.consent(t, http.MethodPost, id, "/approve", e.jwt, binding) }()
+		waitForPgWaiting(t, e, "name: ClaimOAuthAuthorizeRequest", 1)
+		revokeAll(e, &rev, &wg)
+		waitForPgWaiting(t, e, "name: LockOAuthUserGrants", 1)
+		if n := e.liveGrantCount(t, e.user); n != 0 {
+			t.Fatalf("the uncommitted grant is visible (%d live grants): the test no longer exercises the window", n)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		code := decodeRedirect(t, appr).Query().Get("code")
+		if code == "" || rev.Code != http.StatusNoContent {
+			t.Fatalf("approve = %d, revoke-all = %d %q", appr.Code, rev.Code, rev.Body.String())
+		}
+		if n := e.liveGrantCount(t, e.user); n != 0 {
+			t.Fatalf("%d live grants after revoke-all raced a first consent, want 0", n)
+		}
+		requireOAuthError(t, e.exchange(t, code), http.StatusBadRequest, "invalid_grant")
+		if n := e.grantTokenCount(t, e.grantOf(t, e.user).ID, `AND NOT revoked`); n != 0 {
+			t.Fatalf("%d unrevoked grant tokens", n)
+		}
+	})
+
+	t.Run("revoke-all holds the lock first", func(t *testing.T) {
+		e := tokenSetup(t)
+		before := e.connectAs(t, e.jwt, nil)
+		oldGrant := e.grantOf(t, e.user)
+		id, binding := e.start(t, nil, nil)
+		// Hold the per-user lock so both requests queue on it, revoke-all first.
+		tx, err := e.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback(ctx) //nolint:errcheck // no-op after the commit below
+		if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock($1, hashtext($2::uuid::text))`, store.OAuthUserLockClass, e.user); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var appr, rev *httptest.ResponseRecorder
+		revokeAll(e, &rev, &wg)
+		waitForPgWaiting(t, e, "name: LockOAuthUserGrants", 1)
+		wg.Add(1)
+		go func() { defer wg.Done(); appr = e.consent(t, http.MethodPost, id, "/approve", e.jwt, binding) }()
+		waitForPgWaiting(t, e, "name: LockOAuthUserGrants", 2)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		wg.Wait()
+		code := decodeRedirect(t, appr).Query().Get("code")
+		if code == "" || rev.Code != http.StatusNoContent {
+			t.Fatalf("approve = %d, revoke-all = %d %q", appr.Code, rev.Code, rev.Body.String())
+		}
+		e.wantWhoami(t, "the connection revoke-all revoked", before.AccessToken, http.StatusUnauthorized)
+		if n := e.liveGrantCount(t, e.user); n != 1 {
+			t.Fatalf("%d live grants, want exactly the one the later approve created", n)
+		}
+		if g := e.grantOf(t, e.user); g.ID == oldGrant.ID {
+			t.Fatal("the live grant is the one revoke-all revoked")
+		}
+		after := decodeOAuthToken(t, e.exchange(t, code))
+		e.wantWhoami(t, "the token of the later consent", after.AccessToken, http.StatusOK)
+	})
 }
 
 // TestAdminRevokeGrantTokenKillsGrantLiveDB (D6): an admin revoking one grant token by id kills the

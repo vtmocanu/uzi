@@ -7,6 +7,7 @@
     "deleted_at": null,
     "created_at": "0001-01-01T00:00:00Z",
     "active_token_count": 0,
+    "live_connection_count": 0,
     "allowed_job_types": null,
     "oauth_client": {
       "redirect_uris": null,
@@ -17,5 +18,6 @@
       "is_client": false
     }
   },
-  "stopped_token_count": 0
+  "stopped_token_count": 0,
+  "stopped_connection_count": 0
 }

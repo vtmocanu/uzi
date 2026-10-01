@@ -261,8 +261,10 @@ type CreateOAuthAuthorizeRequestParams struct {
 }
 
 // PRD #1910 M2: the consent half of the OAuth authorization server (oauth_grants and
-// oauth_authorize_requests, migration 00283). Lock order everywhere (D8): the grant row first, then
-// that grant's product_tokens rows, then its oauth_authorize_requests rows. The approve transaction
+// oauth_authorize_requests, migration 00283). Lock order everywhere (D8): the user's grant-creation
+// advisory lock first, on the two paths that create or sweep a user's grants (approve and Revoke
+// all; LockOAuthUserGrants), then the grant row (one user's grants in ascending id order), then that
+// grant's product_tokens rows, then its oauth_authorize_requests rows. The approve transaction
 // claims the request it decides LAST (after the grant lock, the narrowing revoke and the superseding
 // of the grant's earlier codes), so it never holds a request row while waiting for a grant. Only the
 // TTL sweep and deny lock request rows without a grant lock; neither ever waits for a grant.
@@ -649,17 +651,15 @@ func (q *Queries) LockLiveOAuthGrant(ctx context.Context, arg LockLiveOAuthGrant
 }
 
 const lockLiveOAuthGrantsForUser = `-- name: LockLiveOAuthGrantsForUser :many
-
 SELECT id, user_id, product_id, scopes, refresh_token_hash, refresh_token_prefix, refresh_issued_at, refresh_last_used_at, created_at, consented_at, revoked_at FROM oauth_grants
  WHERE user_id = $1 AND revoked_at IS NULL
  ORDER BY id
  FOR UPDATE
 `
 
-// PRD #1910 M3: the D6 revoke paths and the connection list.
 // Every live grant of one user, row-locked in ASCENDING id order for the rest of the transaction
-// (D8: several grants are always locked in id order). Revoke all runs this FIRST, before any
-// product_tokens UPDATE, so a code exchange or refresh of one of these grants either committed
+// (D8: several grants are always locked in id order). Revoke all runs this right after
+// LockOAuthUserGrants and before any product_tokens UPDATE, so a code exchange or refresh of one of these grants either committed
 // before (and its token is then revoked) or waits and finds the grant revoked.
 func (q *Queries) LockLiveOAuthGrantsForUser(ctx context.Context, userID uuid.UUID) ([]OauthGrant, error) {
 	rows, err := q.db.Query(ctx, lockLiveOAuthGrantsForUser, userID)
@@ -739,6 +739,40 @@ func (q *Queries) LockOAuthGrant(ctx context.Context, id uuid.UUID) (OauthGrant,
 		&i.RevokedAt,
 	)
 	return i, err
+}
+
+const lockOAuthUserGrants = `-- name: LockOAuthUserGrants :exec
+
+SELECT pg_advisory_xact_lock(
+    1970958197,
+    hashtext($1::uuid::text)
+)
+`
+
+// PRD #1910 M3: the D6 revoke paths and the connection list.
+// Serializes one user's grant CREATION against that user's Revoke all. A first-consent approve
+// inserts a grant row that no other transaction can see, or lock, until it commits, so
+// LockLiveOAuthGrantsForUser cannot wait for it: without this lock a Revoke all could finish
+// while an approve that already inserted its grant (and issued its code) commits afterwards,
+// leaving a live grant and a redeemable code after the panic button. The approve transaction
+// (handler.OAuthApprove) and the revoke-all transaction (handler.RevokeAllCLITokens) therefore
+// each take this lock FIRST, before any other lock. Lock order everywhere: this per-user lock,
+// then the user's grants in ascending id order, then each grant's product_tokens, then its
+// oauth_authorize_requests rows. Guaranteed: an approve that started first commits before the
+// revoke-all reads the grants, so the revoke covers its grant and code; an approve that waits
+// behind a revoke-all runs after it and creates a live grant of its own, which is a consent
+// given after the button was pressed. Paths that lock an EXISTING grant by id (token exchange,
+// refresh, per-token revoke) need only the grant lock and do not take this one.
+//
+// Two-int advisory lock: class 1970958197 = 0x757A6F75 ("uzou"), the value of
+// store.OAuthUserLockClass in migrate.go, distinct from every other class constant there
+// (TestOAuthUserLockClassMatchesSQL pins this literal and TestProductTokenMintLockClassMatchesSQL
+// enumerates the collision check). The objid is hashtext of the user id, so two users can
+// collide: a moment of contention, never a correctness problem. XACT-scoped: released on commit
+// or rollback, so it must run on a transaction-bound Queries.
+func (q *Queries) LockOAuthUserGrants(ctx context.Context, userID uuid.UUID) error {
+	_, err := q.db.Exec(ctx, lockOAuthUserGrants, userID)
+	return err
 }
 
 const oAuthGrantHasTokenOutsideScopes = `-- name: OAuthGrantHasTokenOutsideScopes :one

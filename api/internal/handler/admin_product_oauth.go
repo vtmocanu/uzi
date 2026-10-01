@@ -83,6 +83,7 @@ func (h *Handler) AdminSetProductOAuth(w http.ResponseWriter, r *http.Request) {
 	var (
 		updated store.Product
 		active  int64
+		conns   int64
 	)
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
 		var err error
@@ -101,7 +102,7 @@ func (h *Handler) AdminSetProductOAuth(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return err
 		}
-		active, err = q.CountActiveProductTokensForProduct(r.Context(), id)
+		active, conns, err = productUsageCounts(r.Context(), q, id)
 		return err
 	})
 	if writeProductOAuthError(w, err, "admin set product oauth") {
@@ -109,7 +110,7 @@ func (h *Handler) AdminSetProductOAuth(w http.ResponseWriter, r *http.Request) {
 	}
 	slog.Info("admin set product oauth client", "actor_id", actor.ID, "product_id", id,
 		"redirect_uris", len(uris), "scopes", len(scopes))
-	httpx.JSON(w, http.StatusOK, map[string]any{"product": productDTO(updated, active)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"product": productDTO(updated, active, conns)})
 }
 
 // AdminRotateProductClientSecret mints a new client secret (uzs_, 256 bits) for a live
@@ -138,6 +139,7 @@ func (h *Handler) AdminRotateProductClientSecret(w http.ResponseWriter, r *http.
 	var (
 		updated store.Product
 		active  int64
+		conns   int64
 	)
 	err = h.inTx(r.Context(), func(q *store.Queries) error {
 		var err error
@@ -155,7 +157,7 @@ func (h *Handler) AdminRotateProductClientSecret(w http.ResponseWriter, r *http.
 		if err != nil {
 			return err
 		}
-		active, err = q.CountActiveProductTokensForProduct(r.Context(), id)
+		active, conns, err = productUsageCounts(r.Context(), q, id)
 		return err
 	})
 	if writeProductOAuthError(w, err, "admin rotate product client secret") {
@@ -167,7 +169,7 @@ func (h *Handler) AdminRotateProductClientSecret(w http.ResponseWriter, r *http.
 	w.Header().Set("Cache-Control", "no-store")
 	httpx.JSON(w, http.StatusOK, apitypes.RotateProductClientSecretResponse{
 		ClientSecret: secret,
-		Product:      productDTO(updated, active),
+		Product:      productDTO(updated, active, conns),
 	})
 }
 

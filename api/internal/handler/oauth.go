@@ -565,6 +565,14 @@ func (h *Handler) OAuthApprove(w http.ResponseWriter, r *http.Request) {
 	qtx := h.q.WithTx(tx)
 	userID := pgtype.UUID{Bytes: user.ID, Valid: true}
 
+	// The user's grant-creation lock comes FIRST, before any grant lock (D8 lock order): it is
+	// what lets a concurrent Revoke all wait for a first-consent grant this transaction has
+	// inserted but not yet committed, which no row lock could do.
+	if err := qtx.LockOAuthUserGrants(ctx, user.ID); err != nil {
+		slog.Error("oauth approve: lock user grants", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
 	grant, existed, err := lockOrCreateOAuthGrant(ctx, qtx, user.ID, product.ID, row.Scopes)
 	if err != nil {
 		slog.Error("oauth approve: grant", "error", err)

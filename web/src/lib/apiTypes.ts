@@ -1545,7 +1545,9 @@ export type ProductTokenExpiry = "30d" | "90d" | "1y" | "never";
 
 // Product is one registered external product (apitypes.ProductDTO). deleted_at is
 // null for a live product; a soft-deleted product is always disabled and stays listed
-// for the audit trail. active_token_count counts tokens neither revoked nor expired.
+// for the audit trail. active_token_count counts MANUAL tokens neither revoked nor expired
+// (the access tokens of OAuth connections are not counted); live_connection_count counts the
+// product's live OAuth connections (PRD #1910 D5).
 export interface Product {
   id: string;
   name: string;
@@ -1554,6 +1556,10 @@ export interface Product {
   deleted_at: string | null;
   created_at: string;
   active_token_count: number;
+  /** Live OAuth connections of the product (apitypes.ProductDTO.LiveConnectionCount, PRD #1910).
+   *  OPTIONAL for the api/web rollout skew, like allowed_job_types: a mid-deploy api pod
+   *  predating it omits the key, so every read falls back (`?? 0`). */
+  live_connection_count?: number;
   /** Job types this product may create (apitypes.ProductDTO.AllowedJobTypes, PRD #1908);
    *  empty allows none (fail-closed). The mapper normalizes a nil slice to [], so it is
    *  never null on the wire. OPTIONAL for the api/web rollout skew (as Run.credential_override
@@ -1658,11 +1664,13 @@ export interface ProductSkills {
 
 // AdminDeleteProductResponse is DELETE /api/admin/products/{id}
 // (apitypes.AdminDeleteProductResponse): the soft-deleted product plus how many of its
-// tokens the delete stopped (0 when the product was already disabled, since those
-// tokens were already refused).
+// manual tokens and live OAuth connections the delete stopped (0 for each when the product
+// was already disabled, since those were already refused).
 export interface AdminDeleteProductResponse {
   product: Product;
   stopped_token_count: number;
+  /** OPTIONAL for the api/web rollout skew, like Product.live_connection_count. */
+  stopped_connection_count?: number;
 }
 
 // MintableProduct is one entry of the user mint picker, GET

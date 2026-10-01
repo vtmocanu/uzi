@@ -248,8 +248,10 @@ export function CliTokens({
           >
             <p id="cli-revoke-all-warning" className="text-xs text-warn">
               Revoke {revokeAllSummary(activeCount, productTokenActiveCount, oauthConnectionCount)}? Every{" "}
-              <code className="rounded bg-raised px-1 py-0.5">uzi</code> CLI, CI job and connected
-              product using one stops working until you mint a new token. This cannot be undone.
+              <code className="rounded bg-raised px-1 py-0.5">uzi</code> CLI, CI job and product
+              using a token stops working until you mint a new token
+              {oauthConnectionCount !== 0 && ", and every connected product must connect again"}. This
+              cannot be undone.
             </p>
             <div className="flex items-center gap-1.5">
               <Button variant="danger" size="sm" onClick={revokeAll}>

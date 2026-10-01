@@ -35,6 +35,11 @@ export function revokeAllOAuthGrantsOf(userId: string): void {
   oauthConnections = oauthConnections.filter((c) => c.user_id !== userId);
 }
 
+// Live connections of one product across all users, the mock of ListProducts' live_connection_count.
+export function liveOAuthConnectionCount(productId: string): number {
+  return oauthConnections.filter((c) => c.product_id === productId).length;
+}
+
 const stripOwner = ({ user_id: _user_id, ...c }: (typeof oauthConnections)[number]): OAuthConnection => ({
   ...c,
   scopes: [...c.scopes],

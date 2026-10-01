@@ -34,8 +34,9 @@ import (
 // ./e2e/run-store-it.sh provides one and sweeps this package for the LiveDB suffix.
 
 type apProductResp struct {
-	Product           apitypes.ProductDTO `json:"product"`
-	StoppedTokenCount *int64              `json:"stopped_token_count"`
+	Product                apitypes.ProductDTO `json:"product"`
+	StoppedTokenCount      *int64              `json:"stopped_token_count"`
+	StoppedConnectionCount *int64              `json:"stopped_connection_count"`
 }
 
 func apDecodeProduct(t *testing.T, code int, body string) apProductResp {

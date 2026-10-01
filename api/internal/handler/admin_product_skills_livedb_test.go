@@ -796,7 +796,7 @@ func TestProductSkillsNeverInSkillsListingsLiveDB(t *testing.T) {
 // TestProductDTOCarriesNoSkillsTokenMaterial pins the products list/patch DTOs: they are explicit
 // field lists, so the sealed token column never reaches them.
 func TestProductDTOCarriesNoSkillsTokenMaterial(t *testing.T) {
-	raw, err := json.Marshal(productDTO(storeProductWithSealedToken(), 0))
+	raw, err := json.Marshal(productDTO(storeProductWithSealedToken(), 0, 0))
 	if err != nil {
 		t.Fatal(err)
 	}

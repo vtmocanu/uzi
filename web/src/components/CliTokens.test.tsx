@@ -272,6 +272,16 @@ describe("CliTokens revoke", () => {
     );
     fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
     expect(screen.getByText(/^Revoke all 1 connected product\?/)).toBeTruthy();
+    // A connection has no token to mint: the product must connect again.
+    expect(screen.getByText(/until you mint a new token, and every connected product must connect again\./)).toBeTruthy();
+  });
+
+  it("says nothing of reconnecting when no connection is live", async () => {
+    mockApi.listCliTokens.mockResolvedValue({ tokens: [aToken({ id: "a" })] });
+    renderPage();
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke all" }));
+    expect(screen.getByText(/until you mint a new token\. This cannot be undone\./)).toBeTruthy();
+    expect(screen.queryByText(/connect again/)).toBeNull();
   });
 
   it("hides Revoke all with no CLI token, product token or connection", async () => {

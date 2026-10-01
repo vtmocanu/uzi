@@ -74,6 +74,24 @@ func (q *Queries) CountActiveProductTokensForUserProduct(ctx context.Context, ar
 	return count, err
 }
 
+const countLiveOAuthGrantsForProduct = `-- name: CountLiveOAuthGrantsForProduct :one
+SELECT count(*)
+  FROM oauth_grants
+ WHERE product_id = $1
+   AND revoked_at IS NULL
+`
+
+// Live connections (oauth_grants with revoked_at IS NULL) of one product, across all users: the
+// connection half of what disabling or deleting the product stops (PRD #1910 D5, D6). Counts
+// grants, not their hourly access tokens, and a grant whose access tokens all expired is still a
+// connection (it can refresh).
+func (q *Queries) CountLiveOAuthGrantsForProduct(ctx context.Context, productID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countLiveOAuthGrantsForProduct, productID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
 const createProduct = `-- name: CreateProduct :one
 INSERT INTO products (name, description, created_by, allowed_job_types)
 VALUES ($1, $2, $3, COALESCE($4::text[], '{}'))
@@ -591,7 +609,11 @@ SELECT p.id,
          WHERE t.product_id = p.id
            AND t.grant_id IS NULL
            AND NOT t.revoked
-           AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count
+           AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count,
+       (SELECT count(*)
+          FROM oauth_grants g
+         WHERE g.product_id = p.id
+           AND g.revoked_at IS NULL)::bigint AS live_connection_count
   FROM products p
  ORDER BY (p.deleted_at IS NOT NULL) ASC, lower(p.name) ASC, p.created_at ASC, p.id ASC
 `
@@ -612,11 +634,14 @@ type ListProductsRow struct {
 	ClientSecretPrefix    pgtype.Text        `json:"client_secret_prefix"`
 	ClientSecretRotatedAt pgtype.Timestamptz `json:"client_secret_rotated_at"`
 	ActiveTokenCount      int64              `json:"active_token_count"`
+	LiveConnectionCount   int64              `json:"live_connection_count"`
 }
 
 // Every product, soft-deleted ones included (admin registry view), each with its count
 // of ACTIVE tokens (not revoked, not expired, the NULL trap spelled out) so the delete
-// confirm can say how many tokens it stops (manual tokens only: grant_id IS NULL, PRD #1910 D5). Live products first, then by name.
+// confirm can say how many tokens it stops (manual tokens only: grant_id IS NULL, PRD #1910 D5),
+// plus its count of LIVE CONNECTIONS (oauth_grants with revoked_at IS NULL) so the same confirm
+// can say how many connections it stops. Live products first, then by name.
 func (q *Queries) ListProducts(ctx context.Context) ([]ListProductsRow, error) {
 	rows, err := q.db.Query(ctx, listProducts)
 	if err != nil {
@@ -642,6 +667,7 @@ func (q *Queries) ListProducts(ctx context.Context) ([]ListProductsRow, error) {
 			&i.ClientSecretPrefix,
 			&i.ClientSecretRotatedAt,
 			&i.ActiveTokenCount,
+			&i.LiveConnectionCount,
 		); err != nil {
 			return nil, err
 		}
@@ -686,13 +712,18 @@ func (q *Queries) LockProductTokenMint(ctx context.Context, arg LockProductToken
 }
 
 const revokeAllProductTokens = `-- name: RevokeAllProductTokens :exec
-UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked
+UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND grant_id IS NULL AND NOT revoked
 `
 
-// The panic button's product half (D8): revoke every un-revoked product token of one
-// user. Called by the existing revoke-all handler (POST /api/me/cli-tokens/revoke-all,
-// handler.RevokeAllCLITokens) in the SAME transaction as RevokeAllCLITokens, so the
-// button revokes both token kinds or neither. Idempotent, and scoped to $1.
+// The panic button's product half (D8): revoke every un-revoked MANUAL product token of one
+// user (grant_id IS NULL). Access tokens of an OAuth grant are not swept here: the revoke-all
+// handler revokes every live grant first through revokeGrantLocked (grant lock, then the grant's
+// tokens), and a plain sweep of grant tokens after that could meet a grant created concurrently
+// and revoke its access token without its grant lock, leaving the grant and its refresh token
+// live (PRD #1910 D8). Called by the existing revoke-all handler (POST
+// /api/me/cli-tokens/revoke-all, handler.RevokeAllCLITokens) in the SAME transaction as
+// RevokeAllCLITokens, so the button revokes both token kinds or neither. Idempotent, and scoped
+// to $1.
 func (q *Queries) RevokeAllProductTokens(ctx context.Context, userID uuid.UUID) error {
 	_, err := q.db.Exec(ctx, revokeAllProductTokens, userID)
 	return err

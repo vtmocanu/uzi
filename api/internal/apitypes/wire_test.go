@@ -940,7 +940,7 @@ func TestMintProductTokenResponseTags(t *testing.T) {
 
 func TestProductDTOTags(t *testing.T) {
 	assertTags(t, "ProductDTO", ProductDTO{},
-		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count",
+		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count", "live_connection_count",
 		// PRD #1908 D-C: the job types the product's tokens may create; never null on the wire.
 		"allowed_job_types",
 		// PRD #1910 D2: the OAuth client registration; never carries the secret or its hash.
@@ -949,6 +949,9 @@ func TestProductDTOTags(t *testing.T) {
 		"redirect_uris", "scopes", "has_secret", "secret_prefix", "rotated_at", "is_client")
 	assertTags(t, "RotateProductClientSecretResponse", RotateProductClientSecretResponse{},
 		"client_secret", "product")
+	// PRD #1910 D5: manual tokens and live connections are stopped and counted apart.
+	assertTags(t, "AdminDeleteProductResponse", AdminDeleteProductResponse{},
+		"product", "stopped_token_count", "stopped_connection_count")
 }
 
 // PRD #1910 M2: the consent page's metadata and the server-built redirect. Neither carries a

@@ -113,6 +113,17 @@ const JobCreateLockClass int32 = 0x757A6A62 // "uzjb"
 // any collision with another *LockClass. XACT-scoped.
 const OAuthAuthorizeLockClass int32 = 0x757A6F61 // "uzoa"
 
+// OAuthUserLockClass is the class half of the two-int advisory lock that serializes one user's
+// OAuth grant creation against that user's Revoke all (PRD #1910 D8). A first-consent approve
+// inserts a grant no other transaction can see or lock until it commits, so only an advisory
+// lock keyed on the user lets Revoke all wait for it. Taken in SQL by LockOAuthUserGrants
+// (queries/oauth.sql), which carries this value as the literal 1970958197 with the objid derived
+// there from the user id; TestOAuthUserLockClassMatchesSQL fails if the two disagree and
+// TestProductTokenMintLockClassMatchesSQL's source enumeration fails on any collision with another
+// *LockClass. It is the FIRST lock of both transactions that take it, before any grant lock.
+// XACT-scoped.
+const OAuthUserLockClass int32 = 0x757A6F75 // "uzou"
+
 // SecretMutationLockObjID derives the objid half of the per-user secret mutation lock from
 // a user's uuid, exactly as the hosted-provision lock does: a uuid's leading bytes are
 // random, so two users can collide and serialize for a moment, a contention non-event,

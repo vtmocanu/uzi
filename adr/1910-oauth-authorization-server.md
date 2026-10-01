@@ -75,7 +75,20 @@ access token and a refresh token, until the connection is revoked.
 8. **Every grant mutation serializes on the grant row (D8).** The lock order is
    the grant row (several grants in ascending id order), then that grant's
    `product_tokens` rows, then its `oauth_authorize_requests` rows, on every
-   path. After the lock the path re-checks and then acts: a redemption re-reads
+   path. The two paths that create or sweep a user's grants, approve and Revoke
+   all, take one more lock before all of those: a per-user transaction-scoped
+   advisory lock (`store.OAuthUserLockClass`, `LockOAuthUserGrants`). A
+   first-consent approve inserts a grant that no row lock can wait for until it
+   commits, so without it a Revoke all could finish while that approve commits
+   afterwards, leaving a live grant and a redeemable code. The full order is:
+   per-user lock, grants ascending, tokens, requests. What it guarantees: an
+   approve that took the lock first commits before Revoke all reads the grants,
+   so the revoke covers its grant and code; an approve that waits behind Revoke
+   all runs after it and creates a live grant of its own (a consent given after
+   the button was pressed). Revoke all's plain product-token sweep skips grant
+   tokens (`grant_id IS NULL`): grants are revoked only through
+   `revokeGrantLocked`, so a grant created concurrently is never left with its
+   access token revoked but its grant and refresh token live. After the lock the path re-checks and then acts: a redemption re-reads
    the request, the grant's `revoked_at`, the client and the user, and counts the
    live tokens, so a revoke cannot miss a token a concurrent exchange is inserting.
 9. **Contract extension (D7).** `POST /api/oauth/token` and
@@ -84,7 +97,10 @@ access token and a refresh token, until the connection is revoked.
    breaking) applies to their request and response shapes, and
    `api/openapi/v1.yaml` gains an `oauth2` security scheme (authorization-code
    flow URLs and the two scopes) as a new alternative entry beside `bearerAuth`,
-   which `check:api-v1-compat` rates as an additive change. Two extensions to RFC
+   which `check:api-v1-compat` rates as an additive change. The flow
+   declares `refreshUrl` (the token endpoint) ahead of the refresh grant itself:
+   the grant lands in M4 of the same PR, so no released document names a refresh
+   flow the server cannot serve. Two extensions to RFC
    6749 are deliberate and are part of that promise:
    - a **database or lookup error is a 503 `{"error":"temporarily_unavailable"}`
      with `Retry-After`**, never `invalid_grant` or `invalid_client`, because a
@@ -144,21 +160,23 @@ milestone.
 | D5 one live grant per (user, product); re-consent rules | `TestOAuthConcurrentFirstConsentsShareOneGrantLiveDB`, `TestOAuthReconsentLiveDB`, `TestOAuthApproveAfterRevokedGrantCreatesNewGrantLiveDB` |
 | D5 ten live access tokens per grant, counted under the grant lock | `TestOAuthTokenLiveTokenCapLiveDB`, `TestOAuthTokenCapIsCountedUnderTheGrantLockLiveDB` |
 | D5 grant tokens are not manual tokens (lists, counts, mint cap) | `TestGrantTokensAreNotManualTokensLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx` |
+| D5 live connections are counted apart from manual tokens: `live_connection_count` on a product and `stopped_connection_count` on its delete, so the delete confirm names both | `TestProductConnectionCountsLiveDB`, `TestProductDTOTags` (the wire tags), the `product.*`, `admin_delete_product.*` and `rotate_product_client_secret.*` contract fixtures with `TestContractFixturesMatchMarshal`, `TestContractFullFixtureDecodesStrict` and `apiContract.test.ts`; `TestAdminProductsTable` (the `CONNECTIONS` column); web: the delete-confirm and toast wording in `AdminProducts.test.tsx`, the mock's counts in `mockApi.productTokens.test.ts` |
 | D5 refresh grant: no rotation, idle and absolute expiry, narrowing `scope`, ten-token bound on refresh | M4 |
 | D6 code replay revokes the grant only after every binding check | `TestOAuthTokenReplayRevokesGrantLiveDB`, `TestOAuthTokenReplayWithBrokenBindingRevokesNothingLiveDB`, `TestOAuthTokenReplayAfterCodeExpiryStillRevokesLiveDB`, `TestOAuthTokenAnotherClientsCodeLiveDB` |
 | D6 a code approved before a revoke or a re-consent cannot be redeemed after it | `TestOAuthTokenCodeApprovedBeforeGrantRevokeIsDeadLiveDB`, `TestOAuthTokenCodeApprovedBeforeReconsentIsSupersededLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB` |
 | D6 the owner revoking a grant token by id kills the grant; a foreign id is 404; a manual token revokes alone | `TestRevokeMyProductTokenOnGrantTokenKillsGrantLiveDB`, `TestRevokeMyProductTokenForeignGrantAndManualTokenLiveDB` |
 | D6 an admin revoking a grant token by id kills the grant | `TestAdminRevokeGrantTokenKillsGrantLiveDB` |
-| D6 Revoke all leaves no live grant, and its button counts grants | `TestRevokeAllRevokesGrantsLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx`, `CliTokens.test.tsx`, `mockApi.productTokens.test.ts` |
+| D6 Revoke all leaves no live grant, and its button counts grants; its warning tells connected products to connect again | `TestRevokeAllRevokesGrantsLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB`, `TestRevokeAllVersusFirstConsentApproveLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx`, `CliTokens.test.tsx` (including the connect-again sentence), `mockApi.productTokens.test.ts` |
 | D6 revoke cancels jobs of an expired access token | `TestCancelRevokedProductJobsExpiredGrantTokenLiveDB` |
 | D6 user revoke of a connection, admin revoke of a connection, RFC 7009 revoke by the product | M5 (user and admin), M4 (RFC 7009) |
 | D7 token request rules: form only, no repeated parameter, one client-authentication method, 401 with `WWW-Authenticate` | `TestOAuthTokenRequestRulesLiveDB`, `TestOAuthTokenClientAuthenticationLiveDB` |
 | D7 a storage error is a 503, never a credential error, on every step including the replay revoke | `TestOAuthTokenStorageErrorIsNeverACredentialErrorLiveDB`, `TestOAuthTokenReplayStorageErrorIsA503LiveDB` |
 | D7 limiter per IP and per client, per-client budget drawn only after authentication, OAuth-shaped 429, `no-store` on every method | `TestOAuthTokenPerClientBudgetIgnoresFailedAuthenticationLiveDB`, `TestOAuthTokenIsBehindThePerIPOAuthLimiter`, `TestOAuthRoutesAreNoStoreOnEveryMethod` |
 | D7 `/api/me/oauth-connections` is cookie-only and lists live grants whatever their tokens' state | `TestOAuthConnectionsRouteRefusesBearerLiveDB`, `TestMyOAuthConnectionsLiveDB`, `TestEveryRouteCarriesItsExpectedPerUserLimiter` (its row) |
-| D7 the `oauth2` scheme is an additive alternative and nothing else in `v1.yaml` moved | `TestV1OpenAPIRouteParity`, the `check:api-v1-compat` gate |
+| D7 the `oauth2` scheme is an additive alternative and nothing else in `v1.yaml` moved; the test fails cleanly, never panics, on a spec without the scheme | `TestV1OpenAPIRouteParity`, the `check:api-v1-compat` gate |
 | D7 RFC 7009 revoke endpoint | M4 |
 | D8 lock order grant, tokens, requests on every path; replay takes no request-row lock | `TestOAuthTokenReplayTakesNoRequestRowLockLiveDB`, `TestOAuthTokenCapIsCountedUnderTheGrantLockLiveDB`, `TestOAuthTokenConcurrentSameCodeLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB` |
+| D8 per-user lock first on approve and Revoke all: both orderings of a first-consent approve against Revoke all leave no live grant or redeemable code the button missed | `TestRevokeAllVersusFirstConsentApproveLiveDB` (both orderings), `TestOAuthUserLockClassMatchesSQL`, `TestProductTokenMintLockClassMatchesSQL` (class collision enumeration) |
 | D8 approve and first consent under the grant lock | `TestOAuthConcurrentApproveLiveDB`, `TestOAuthConcurrentFirstConsentsShareOneGrantLiveDB`, `TestOAuthLosingApproveRollsBackSupersedeLiveDB` |
 | D8 refresh vs revoke and refresh vs re-consent races | M4 |
 

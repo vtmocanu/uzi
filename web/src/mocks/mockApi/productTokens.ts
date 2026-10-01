@@ -27,6 +27,7 @@ import {
   mockProductTokens,
 } from "../data";
 import { mockEgressProfileDescription } from "./egressProfiles";
+import { liveOAuthConnectionCount } from "./oauth";
 import { delay, requireAdmin, requireSession, users } from "./shared";
 
 // ── Product registry + product tokens (PRD #1907) ────────────────────────────
@@ -34,7 +35,7 @@ import { delay, requireAdmin, requireSession, users } from "./shared";
 // no value, the mint returns the plaintext once and enforces the D15 cap (10 active
 // per product per user), delete is soft (D9), and an admin may revoke one token (D8).
 type OwnedProductToken = ProductToken & { user_id: string };
-type StoredProduct = Omit<Product, "active_token_count">;
+type StoredProduct = Omit<Product, "active_token_count" | "live_connection_count">;
 
 const noOAuthClient = (): ProductOAuthClient => ({
   redirect_uris: [],
@@ -124,7 +125,9 @@ const isActive = (t: ProductToken) =>
 const stripOwner = ({ user_id: _user_id, ...t }: OwnedProductToken): ProductToken => t;
 const withCount = (p: StoredProduct): Product => ({
   ...p,
+  // Manual tokens only; the connections are counted apart from the OAuth mock's live grants.
   active_token_count: productTokens.filter((t) => t.product_id === p.id && isActive(t)).length,
+  live_connection_count: liveOAuthConnectionCount(p.id),
 });
 
 // ── Product skill sets (PRD #1909 M6) ────────────────────────────────────────
@@ -416,10 +419,14 @@ export const productTokensApi = {
     const p = findProduct(id);
     if (p.deleted_at !== null) throw new ApiError(409, "product is already deleted");
     const wasEnabled = p.enabled;
-    const active = withCount(p).active_token_count;
+    const { active_token_count: active, live_connection_count: conns = 0 } = withCount(p);
     p.enabled = false;
     p.deleted_at = new Date().toISOString();
-    return delay({ product: withCount(p), stopped_token_count: wasEnabled ? active : 0 });
+    return delay({
+      product: withCount(p),
+      stopped_token_count: wasEnabled ? active : 0,
+      stopped_connection_count: wasEnabled ? conns : 0,
+    });
   },
   adminListProductEgressProfiles: async (id: string) => {
     requireAdmin();

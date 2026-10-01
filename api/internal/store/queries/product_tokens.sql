@@ -154,11 +154,16 @@ UPDATE product_tokens SET revoked = true
  WHERE id = $1 AND user_id = $2 AND NOT revoked;
 
 -- name: RevokeAllProductTokens :exec
--- The panic button's product half (D8): revoke every un-revoked product token of one
--- user. Called by the existing revoke-all handler (POST /api/me/cli-tokens/revoke-all,
--- handler.RevokeAllCLITokens) in the SAME transaction as RevokeAllCLITokens, so the
--- button revokes both token kinds or neither. Idempotent, and scoped to $1.
-UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND NOT revoked;
+-- The panic button's product half (D8): revoke every un-revoked MANUAL product token of one
+-- user (grant_id IS NULL). Access tokens of an OAuth grant are not swept here: the revoke-all
+-- handler revokes every live grant first through revokeGrantLocked (grant lock, then the grant's
+-- tokens), and a plain sweep of grant tokens after that could meet a grant created concurrently
+-- and revoke its access token without its grant lock, leaving the grant and its refresh token
+-- live (PRD #1910 D8). Called by the existing revoke-all handler (POST
+-- /api/me/cli-tokens/revoke-all, handler.RevokeAllCLITokens) in the SAME transaction as
+-- RevokeAllCLITokens, so the button revokes both token kinds or neither. Idempotent, and scoped
+-- to $1.
+UPDATE product_tokens SET revoked = true WHERE user_id = $1 AND grant_id IS NULL AND NOT revoked;
 
 -- name: AdminRevokeProductToken :execrows
 -- An admin revokes one product token by id (D8). Product tokens are product
@@ -225,7 +230,9 @@ RETURNING *;
 -- name: ListProducts :many
 -- Every product, soft-deleted ones included (admin registry view), each with its count
 -- of ACTIVE tokens (not revoked, not expired, the NULL trap spelled out) so the delete
--- confirm can say how many tokens it stops (manual tokens only: grant_id IS NULL, PRD #1910 D5). Live products first, then by name.
+-- confirm can say how many tokens it stops (manual tokens only: grant_id IS NULL, PRD #1910 D5),
+-- plus its count of LIVE CONNECTIONS (oauth_grants with revoked_at IS NULL) so the same confirm
+-- can say how many connections it stops. Live products first, then by name.
 SELECT p.id,
        p.name,
        p.description,
@@ -245,7 +252,11 @@ SELECT p.id,
          WHERE t.product_id = p.id
            AND t.grant_id IS NULL
            AND NOT t.revoked
-           AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count
+           AND (t.expires_at IS NULL OR t.expires_at > now()))::bigint AS active_token_count,
+       (SELECT count(*)
+          FROM oauth_grants g
+         WHERE g.product_id = p.id
+           AND g.revoked_at IS NULL)::bigint AS live_connection_count
   FROM products p
  ORDER BY (p.deleted_at IS NOT NULL) ASC, lower(p.name) ASC, p.created_at ASC, p.id ASC;
 
@@ -279,6 +290,16 @@ SELECT count(*)
    AND grant_id IS NULL
    AND NOT revoked
    AND (expires_at IS NULL OR expires_at > now());
+
+-- name: CountLiveOAuthGrantsForProduct :one
+-- Live connections (oauth_grants with revoked_at IS NULL) of one product, across all users: the
+-- connection half of what disabling or deleting the product stops (PRD #1910 D5, D6). Counts
+-- grants, not their hourly access tokens, and a grant whose access tokens all expired is still a
+-- connection (it can refresh).
+SELECT count(*)
+  FROM oauth_grants
+ WHERE product_id = $1
+   AND revoked_at IS NULL;
 
 -- name: UpdateProduct :one
 -- Admin edit of the mutable fields (description, enabled, allowed_job_types). Each is a NULLABLE argument:

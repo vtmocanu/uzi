@@ -205,12 +205,20 @@ func (h *Handler) RevokeCLIToken(w http.ResponseWriter, r *http.Request) {
 // RevokeAllCLITokens is the panic button for a lost laptop (PRD #64 Decision 19), extended by PRD
 // #1907 D8 and PRD #1910 D6: it revokes the caller's un-revoked CLI tokens, every one of their live
 // OAuth grants (each with its access tokens, refresh token and unredeemed codes) and every
-// un-revoked product token, so it leaves nothing live. Everything runs in ONE transaction (a
-// failure is a 500 with nothing revoked), in D8 lock order: the user's live grants are locked FOR
-// UPDATE in ascending id order FIRST and revoked through revokeGrantLocked, and only then do the
-// plain token UPDATEs run. A code exchange racing this either committed before it (and its token
-// is revoked here) or waits on the grant lock and finds the grant revoked. Idempotent: a second
-// call is a no-op that still returns 204. Scoped to the caller.
+// un-revoked manual product token. Everything runs in ONE transaction (a failure is a 500 with
+// nothing revoked), in D8 lock order: the user's grant-creation advisory lock FIRST
+// (LockOAuthUserGrants, the lock OAuthApprove takes before it creates a grant), then the user's
+// live grants FOR UPDATE in ascending id order, revoked through revokeGrantLocked, and only then
+// the plain token UPDATEs (which skip grant tokens, as the grants already revoked them).
+//
+// What that guarantees: an approve that took the per-user lock before this call has committed
+// by the time the grants are read, so its grant and unredeemed code are revoked here; an approve
+// that waits behind this call runs after it and creates a live grant of its own (a consent given
+// after the button was pressed, not one the button missed). A code exchange racing this either
+// committed before it (and its token is revoked here) or waits on the grant lock and finds the
+// grant revoked. So no grant, access token, refresh token or redeemable code that existed
+// when the call took the lock survives it. Idempotent: a second call is a no-op that still
+// returns 204. Scoped to the caller.
 func (h *Handler) RevokeAllCLITokens(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -218,6 +226,9 @@ func (h *Handler) RevokeAllCLITokens(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
+		if err := q.LockOAuthUserGrants(r.Context(), user.ID); err != nil {
+			return err
+		}
 		grants, err := q.LockLiveOAuthGrantsForUser(r.Context(), user.ID)
 		if err != nil {
 			return err

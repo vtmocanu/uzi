@@ -44,7 +44,7 @@ A token stops working on its **next request** when any of these happens:
 | Revoke one token in **Settings → Access** | you |
 | **Revoke all** in **Settings → Access** (revokes your CLI tokens **and** product tokens in one step) | you |
 | Revoke one product token on **Admin → Products** | an admin |
-| Revoke one access token of a [connected product](./connect-a-product.md) (this revokes that whole connection) | you or an admin |
+| Revoke one access token of a [connected product](./connect-a-product.md) through the API by id (this revokes that whole connection) | you or an admin |
 | The product is disabled or deleted | an admin |
 | Your account is deactivated | an admin |
 | The token expires | automatic |
@@ -61,7 +61,7 @@ Product registration is an admin-only browser action under **Admin → Products*
 
 - **Register:** a name (unique among live products, case-insensitive, 200 bytes) and an optional one-line description (1000 bytes). Both are shown to every user, so control characters and invisible formatting are rejected.
 - **Disable / enable:** disabling refuses every token of the product on its next request; enabling restores them.
-- **Delete:** soft. All its tokens stop working, but their rows, last-used data and revoked state stay listed for the audit trail. A deleted product cannot be edited or re-enabled, and its name can be registered again. The confirm says how many tokens the delete stops (0 if it was already disabled).
+- **Delete:** soft. All its tokens stop working, but their rows, last-used data and revoked state stay listed for the audit trail. A deleted product cannot be edited or re-enabled, and its name can be registered again. The confirm says how many active manual tokens and how many OAuth connections the delete stops (none if it was already disabled; the product card's counts keep counting them).
 - **Allowed job types:** each product card has a checkbox per job type (today `research`). A product with none ticked cannot create jobs: a create is refused 403 `job_type_not_allowed`. `uzi admin products` shows them in a `JOB_TYPES` column.
 - **Revoke one token:** each product card lists its tokens with owner, prefix, last used and IP; an admin can revoke a single compromised one. This does not change the rule that admins cannot revoke a user's personal CLI tokens.
 - **Allowed site lists:** each product card also lists the site lists its tokens may name on job create; see [Site lists for jobs](#site-lists-for-jobs).

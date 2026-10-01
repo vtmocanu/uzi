@@ -1148,6 +1148,7 @@ void _buildInfoFull;
   const _adminDeleteProductZero: {
     product: ProductZero;
     stopped_token_count: number;
+    stopped_connection_count: number;
   } = adminDeleteProductZero;
   const _adminDeleteProductFull: Widen<AdminDeleteProductResponse> = adminDeleteProductFull;
   void _adminDeleteProductMissing;

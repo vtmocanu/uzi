@@ -712,9 +712,10 @@ A few worth knowing:
   split as every other `admin` verb.
 - **`admin products` lists the external products registered for product
   tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
-  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (tokens neither
-  revoked nor expired) and `DESCRIPTION`. A disabled or deleted product's
-  tokens are refused on `/api/v1`, and a deleted product can never be
+  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (manual product
+  tokens neither revoked nor expired; the access tokens of OAuth connections
+  are not counted), `CONNECTIONS` (live OAuth connections) and `DESCRIPTION`.
+  A disabled or deleted product's tokens and connections are refused on `/api/v1`, and a deleted product can never be
   re-enabled. Read-only: registering, editing, deleting a product and
   revoking one of its tokens are browser-only admin actions.
   `admin products skills <product>` (a product's name or id) shows one

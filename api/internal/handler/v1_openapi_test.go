@@ -219,19 +219,27 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 	// PRD #1910: oauth2 is a NEW ALTERNATIVE entry beside bearerAuth (the access token is the
 	// same Bearer credential), never a scope on bearerAuth and never a per-operation override.
 	if len(spec.Security) != 2 || spec.Security[0]["bearerAuth"] == nil || spec.Security[1]["oauth2"] == nil {
-		t.Errorf("top-level security = %v, want [{bearerAuth: []}, {oauth2: []}]", spec.Security)
+		t.Fatalf("top-level security = %v, want [{bearerAuth: []}, {oauth2: []}]", spec.Security)
 	}
 	if scopes := spec.Security[0]["bearerAuth"]; len(scopes) != 0 {
 		t.Errorf("bearerAuth requirement carries scopes %v: that is a breaking change, put them on oauth2", scopes)
 	}
 	oauth2 := spec.Comps.SecuritySchemes["oauth2"]
-	flow, _ := oauth2["flows"].(map[string]any)["authorizationCode"].(map[string]any)
-	if oauth2["type"] != "oauth2" || flow == nil || len(oauth2["flows"].(map[string]any)) != 1 ||
+	flows, _ := oauth2["flows"].(map[string]any)
+	if flows == nil {
+		t.Fatalf("components.securitySchemes.oauth2.flows is missing: %v", oauth2)
+	}
+	flow, _ := flows["authorizationCode"].(map[string]any)
+	if flow == nil {
+		t.Fatalf("components.securitySchemes.oauth2.flows has no authorizationCode flow: %v", flows)
+	}
+	if oauth2["type"] != "oauth2" || len(flows) != 1 ||
 		flow["authorizationUrl"] != "/api/oauth/authorize" || flow["tokenUrl"] != "/api/oauth/token" || flow["refreshUrl"] != "/api/oauth/token" {
 		t.Errorf("components.securitySchemes.oauth2 = %v, want only the authorizationCode flow with the /api/oauth URLs", oauth2)
 	}
+	scopeMap, _ := flow["scopes"].(map[string]any)
 	var oauthScopes []string
-	for sc := range flow["scopes"].(map[string]any) {
+	for sc := range scopeMap {
 		oauthScopes = append(oauthScopes, sc)
 	}
 	sort.Strings(oauthScopes)

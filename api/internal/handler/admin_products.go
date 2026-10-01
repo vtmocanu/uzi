@@ -98,16 +98,17 @@ func jobTypesOrEmpty(in []string) []string {
 	return slices.Clone(in)
 }
 
-func productDTO(p store.Product, activeTokens int64) apitypes.ProductDTO {
+func productDTO(p store.Product, activeTokens, liveConnections int64) apitypes.ProductDTO {
 	return apitypes.ProductDTO{
-		AllowedJobTypes:  jobTypesOrEmpty(p.AllowedJobTypes),
-		ID:               p.ID.String(),
-		Name:             p.Name,
-		Description:      p.Description,
-		Enabled:          p.Enabled,
-		DeletedAt:        timePtr(p.DeletedAt.Valid, p.DeletedAt.Time),
-		CreatedAt:        p.CreatedAt.Time,
-		ActiveTokenCount: activeTokens,
+		AllowedJobTypes:     jobTypesOrEmpty(p.AllowedJobTypes),
+		ID:                  p.ID.String(),
+		Name:                p.Name,
+		Description:         p.Description,
+		Enabled:             p.Enabled,
+		DeletedAt:           timePtr(p.DeletedAt.Valid, p.DeletedAt.Time),
+		CreatedAt:           p.CreatedAt.Time,
+		ActiveTokenCount:    activeTokens,
+		LiveConnectionCount: liveConnections,
 		OAuthClient: oauthClientDTO(p.RedirectUris, p.OauthScopes, p.ClientSecretHash != nil,
 			p.ClientSecretPrefix, p.ClientSecretRotatedAt),
 	}
@@ -143,15 +144,16 @@ func (h *Handler) AdminListProducts(w http.ResponseWriter, r *http.Request) {
 	out := make([]apitypes.ProductDTO, 0, len(rows))
 	for _, p := range rows {
 		out = append(out, apitypes.ProductDTO{
-			ID:               p.ID.String(),
-			Name:             p.Name,
-			Description:      p.Description,
-			Enabled:          p.Enabled,
-			DeletedAt:        timePtr(p.DeletedAt.Valid, p.DeletedAt.Time),
-			CreatedAt:        p.CreatedAt.Time,
-			ActiveTokenCount: p.ActiveTokenCount,
-			AllowedJobTypes:  jobTypesOrEmpty(p.AllowedJobTypes),
-			OAuthClient:      oauthClientDTO(p.RedirectUris, p.OauthScopes, p.HasClientSecret, p.ClientSecretPrefix, p.ClientSecretRotatedAt),
+			ID:                  p.ID.String(),
+			Name:                p.Name,
+			Description:         p.Description,
+			Enabled:             p.Enabled,
+			DeletedAt:           timePtr(p.DeletedAt.Valid, p.DeletedAt.Time),
+			CreatedAt:           p.CreatedAt.Time,
+			ActiveTokenCount:    p.ActiveTokenCount,
+			LiveConnectionCount: p.LiveConnectionCount,
+			AllowedJobTypes:     jobTypesOrEmpty(p.AllowedJobTypes),
+			OAuthClient:         oauthClientDTO(p.RedirectUris, p.OauthScopes, p.HasClientSecret, p.ClientSecretPrefix, p.ClientSecretRotatedAt),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"products": out})
@@ -265,7 +267,7 @@ func (h *Handler) AdminCreateProduct(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	httpx.JSON(w, http.StatusCreated, map[string]any{"product": productDTO(p, 0)})
+	httpx.JSON(w, http.StatusCreated, map[string]any{"product": productDTO(p, 0, 0)})
 }
 
 // errProductDeleted is the PATCH/DELETE refusal for a soft-deleted product.
@@ -358,6 +360,7 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 	var (
 		updated store.Product
 		active  int64
+		conns   int64
 	)
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
 		var err error
@@ -377,7 +380,7 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 				return err
 			}
 		}
-		active, err = q.CountActiveProductTokensForProduct(r.Context(), id)
+		active, conns, err = productUsageCounts(r.Context(), q, id)
 		return err
 	})
 	switch {
@@ -399,21 +402,37 @@ func (h *Handler) AdminPatchProduct(w http.ResponseWriter, r *http.Request) {
 		slog.Info("admin set product enabled", "actor_id", actor.ID, "product_id", id,
 			"enabled", updated.Enabled, "active_tokens", active)
 	}
-	httpx.JSON(w, http.StatusOK, map[string]any{"product": productDTO(updated, active)})
+	httpx.JSON(w, http.StatusOK, map[string]any{"product": productDTO(updated, active, conns)})
+}
+
+// productUsageCounts reads the two figures a ProductDTO carries beside the row: the product's
+// active MANUAL tokens and its live OAuth connections (PRD #1910 D5). Run on the caller's
+// transaction so both are read at the same point as the write they accompany.
+func productUsageCounts(ctx context.Context, q *store.Queries, id uuid.UUID) (tokens, conns int64, err error) {
+	if tokens, err = q.CountActiveProductTokensForProduct(ctx, id); err != nil {
+		return 0, 0, err
+	}
+	if conns, err = q.CountLiveOAuthGrantsForProduct(ctx, id); err != nil {
+		return 0, 0, err
+	}
+	return tokens, conns, nil
 }
 
 // AdminDeleteProduct soft-deletes a product (D9): deleted_at is set and the product is
 // disabled in one statement, so every one of its tokens is refused on its next
 // request, while the token rows stay for the audit trail.
 //
-// The response is apitypes.AdminDeleteProductResponse, {product, stopped_token_count}:
-// stopped_token_count is the number of tokens this delete made unusable. For a product
-// that was enabled at deletion that is its tokens neither revoked nor expired; for a
-// product that was ALREADY DISABLED it is 0, because the disable had already refused
-// those tokens. The pre-delete enabled flag is read under GetProductForUpdate's row lock
-// in the deleting transaction. product.active_token_count keeps its registry meaning (active tokens,
-// whatever the state), which is the figure the UI's delete confirm reads ahead of time
-// from GET /api/admin/products.
+// The response is apitypes.AdminDeleteProductResponse, {product, stopped_token_count,
+// stopped_connection_count}: stopped_token_count is the number of MANUAL tokens (not the
+// access tokens of OAuth connections, PRD #1910 D5) this delete made unusable and
+// stopped_connection_count the number of live OAuth connections it made unusable. For a
+// product that was enabled at deletion those are its manual tokens neither revoked nor
+// expired and its grants not revoked; for a product that was ALREADY DISABLED both are 0,
+// because the disable had already refused them. Nothing is revoked: the grants and tokens
+// stay as they are, only refused. The pre-delete enabled flag is read under
+// GetProductForUpdate's row lock in the deleting transaction. product.active_token_count and
+// product.live_connection_count keep their registry meaning (whatever the state), which are
+// the figures the UI's delete confirm reads ahead of time from GET /api/admin/products.
 //
 // An unknown id is a 404; an already-deleted product is a 409 (it exists and is
 // listed, see AdminPatchProduct).
@@ -428,9 +447,11 @@ func (h *Handler) AdminDeleteProduct(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var (
-		deleted store.Product
-		active  int64
-		stopped int64
+		deleted      store.Product
+		active       int64
+		conns        int64
+		stopped      int64
+		stoppedConns int64
 	)
 	err := h.inTx(r.Context(), func(q *store.Queries) error {
 		cur, err := q.GetProductForUpdate(r.Context(), id)
@@ -450,11 +471,11 @@ func (h *Handler) AdminDeleteProduct(w http.ResponseWriter, r *http.Request) {
 		if deleted, err = q.GetProduct(r.Context(), id); err != nil {
 			return err
 		}
-		if active, err = q.CountActiveProductTokensForProduct(r.Context(), id); err != nil {
+		if active, conns, err = productUsageCounts(r.Context(), q, id); err != nil {
 			return err
 		}
 		if cur.Enabled {
-			stopped = active
+			stopped, stoppedConns = active, conns
 		}
 		return nil
 	})
@@ -470,10 +491,12 @@ func (h *Handler) AdminDeleteProduct(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	slog.Info("admin deleted product", "actor_id", actor.ID, "product_id", id, "stopped_tokens", stopped)
+	slog.Info("admin deleted product", "actor_id", actor.ID, "product_id", id,
+		"stopped_tokens", stopped, "stopped_connections", stoppedConns)
 	httpx.JSON(w, http.StatusOK, apitypes.AdminDeleteProductResponse{
-		Product:           productDTO(deleted, active),
-		StoppedTokenCount: stopped,
+		Product:                productDTO(deleted, active, conns),
+		StoppedTokenCount:      stopped,
+		StoppedConnectionCount: stoppedConns,
 	})
 }
 

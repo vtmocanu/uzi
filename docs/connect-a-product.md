@@ -26,13 +26,15 @@ An external product that an admin registered as an [OAuth client](./oauth-client
 
 ## Disconnect
 
-A connection stops working on its **next request** when any of these happens, and every access token, the refresh token and any approved but unused code of that connection go with it:
+These actions revoke a connection: it stops working on its **next request**, and every access token, the refresh token and any approved but unused code of that connection are revoked with it.
 
 | Action | Who |
 |---|---|
 | **Revoke all** in **Settings → Access**. Its button counts your live connections (not tokens), so it is offered even when the only thing live is a connection. | you |
-| Revoke **one** of its access tokens by id (through the same call as any product token) | you, or an admin on **Admin → Products** |
-| The product, if it asks uzi to revoke its refresh token | the product |
-| The product is disabled or deleted, or your account is deactivated | an admin |
+| Revoke **one** of its access tokens through the API by id (the same call as for any product token) | you, or an admin |
 
 Revoking cancels the connection's non-terminal jobs, including jobs started by an access token that had already expired. A password change and logging out do not disconnect a product, as for any token. A connection's tokens are not listed with your own product tokens and do not count towards the 10-token limit on those.
+
+## When the product or your account is switched off
+
+Disabling the product, or deactivating your account, does **not** revoke the connection. Its access tokens are refused on the next request, and nothing is deleted, so enabling the product again or reactivating your account restores the connection until its access tokens expire. Deleting a product is a soft delete that disables it for good: a deleted product cannot be enabled again, so its connections stay refused. The admin's delete confirm counts the manual tokens and the connections it stops.

@@ -179,4 +179,18 @@ describe("mockApi — OAuth connections and Revoke all (PRD #1910 M3)", () => {
     await api.revokeAllCliTokens();
     expect((await api.listOAuthConnections()).connections).toEqual([]);
   });
+
+  it("counts connections apart from manual tokens, and Revoke all and a delete move the counts like the server", async () => {
+    const api = await reload();
+    const before = (await api.adminListProducts()).products.find((p) => p.id === "prod-helpdesk")!;
+    expect(before.live_connection_count).toBe(1);
+    // active_token_count is the product's manual tokens only; the connection is counted apart.
+    const deleted = await api.adminDeleteProduct("prod-helpdesk");
+    expect(deleted.stopped_connection_count).toBe(1);
+    expect(deleted.stopped_token_count).toBe(before.active_token_count);
+    expect(deleted.product.live_connection_count).toBe(1);
+    await api.revokeAllCliTokens();
+    const after = (await api.adminListProducts()).products.find((p) => p.id === "prod-helpdesk")!;
+    expect(after.live_connection_count).toBe(0);
+  });
 });
