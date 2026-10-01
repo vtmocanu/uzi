@@ -126,7 +126,7 @@ function isValidCustomModelId(model: string): boolean {
   return !UNSAFE_MODEL_CHAR_RE.test(model);
 }
 
-/** uzi's effort contract, mapped 1:1 to Codex `modelReasoningEffort` (ADR :267).
+/** uzi's effort contract, sent as Codex turn/start `effort` (ADR :267).
  *  Provider-only values (`ultra`, `persistent`) are NOT in the uzi contract. */
 const CONTRACT_EFFORTS: ReadonlySet<string> = new Set(["low", "medium", "high", "xhigh", "max"]);
 
@@ -156,8 +156,8 @@ export interface CodexRenderDiagnostic {
   readonly name: string;
 }
 
-/** A resolved model + reasoning effort. `modelReasoningEffort` is the uzi effort
- *  mapped 1:1 to the Codex field name; both are absent when dropped/unset. */
+/** A resolved model + reasoning effort. `modelReasoningEffort` is an internal
+ *  uzi field, sent as turn/start `effort`; both are absent when dropped/unset. */
 export interface ResolvedCodexModel {
   readonly model?: string;
   readonly modelReasoningEffort?: HarnessEffort;
@@ -330,7 +330,7 @@ function resolveModel(
   return undefined;
 }
 
-/** Validate an effort against the uzi contract (1:1 to Codex modelReasoningEffort);
+/** Validate an effort against the uzi contract (sent as Codex turn/start effort);
  *  an out-of-contract value is dropped (undefined) with an `unknown_effort`
  *  diagnostic. Absent ⇒ absent, no diagnostic. */
 function resolveEffort(

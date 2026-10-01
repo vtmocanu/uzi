@@ -499,6 +499,10 @@ remain authoritative; task-review and PR-description built-ins stay at
 `gpt-6-sol`. The new model's catalog requires client 0.153.0 or newer, lists
 low through ultra, uses shell_command and declares no default service tier.
 Uzi exposes its existing five effort levels, deliberately excluding ultra.
+The generated ReasoningEffort wire type is string. Its Rust parser rejects
+empty strings but accepts unknown non-empty values as Custom, so it does not
+enforce uzi's five-level vocabulary. API write validation and the renderer
+enforce that closed product vocabulary.
 
 Both product effort defaults are medium. The existing nullable default_effort
 retains the Claude preference; nullable default_codex_effort retains Codex's.
@@ -512,7 +516,8 @@ so a future runtime-default choice need not reshape the column.
 
 The old Codex executor ignored the claim's effort, and run/advice transports
 used modelReasoningEffort instead of the upstream turn/start wire key effort.
-Both gaps are corrected with real-executor and wire-key regressions. Review
+Root, advice and delegated child turns use the wire key effort. The gaps are
+corrected with real-executor and wire-key regressions. Review
 and PR-description helpers keep their existing absence-of-effort behavior.
 
 The additive protocol capability codex_runtime_v2 proves the 0.159.3 runtime/

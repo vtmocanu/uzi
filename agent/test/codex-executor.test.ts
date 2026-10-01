@@ -1773,7 +1773,7 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     // the root terminal.
     rig.transport.push(threadStarted()).push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
 
-    const { ctx } = makeCtx({ agents });
+    const { ctx } = makeCtx({ agents, config: { default_effort: "medium" } });
     const runP = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
 
     // The parent spawn_agent callback resolves ONLY after the child settles; once the
@@ -1787,6 +1787,10 @@ describe("CodexExecutor: child-thread delegation demux (part C)", () => {
     // A child thread + turn were started on the SAME transport (demuxed).
     assert.equal(rig.transport.threadStartCount, 2, "a child thread/start was issued");
     assert.equal(rig.transport.turnStartCount, 2, "a child turn/start was issued");
+    const childTurn = rig.transport.requests.filter((request) => request.method === "turn/start")[1];
+    assert.ok(childTurn);
+    assert.equal(rec(childTurn.params).effort, "medium", "the delegated child inherits the configured effort through the real wire key");
+    assert.equal(rec(childTurn.params).modelReasoningEffort, undefined, "the ignored internal field name never reaches the child wire");
     const childStart = rig.transport.requests.filter((request) => request.method === "thread/start")[1];
     assert.ok(childStart);
     const childParams = rec(childStart.params);

@@ -22,10 +22,10 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
-- **Codex uses the 0.159.3 runtime and defaults to GPT-6.1 Sol.**
-  GPT-6.1 Sol is available in the Codex model picker, with current Standard pricing estimates. Claude and Codex each inherit medium effort, with separate saved preferences; existing explicit shared preferences are copied to Codex during upgrade. Codex now honors claimed effort through the app-server turn parameter. Task-review and PR-description helpers keep their existing model and runtime effort behavior. Codex runs wait for a worker with the current runtime during the worker roll. See [worker effort](docs/worker-effort.md).
-
 ### Fixed
+
+- **Codex runs, delegated agents and the judge apply the configured reasoning effort.**
+  The executor consumes the claimed effort and sends the app-server turn parameter as `effort`; the previously used internal field name was ignored by Codex.
 
 - **Run lists avoid scanning unrelated messages for plan revision state ([#2041](https://github.com/vtmocanu/uzi/issues/2041)).**
   A concurrently built partial index keeps the plan revision lookup scoped to plan and plan_revising frames as run histories grow, reducing board refresh delays without changing revision flags.
@@ -112,6 +112,9 @@ through `[0.52.0]`.)
   `POST /api/v1/jobs` accepts `egress_profile`: a personal (`uzc_`) token may name any existing site list, while a product (`uzp_`) token may name only the lists an admin allowed its product (403 `egress_profile_not_allowed` otherwise, 404 `unknown_egress_profile` for an unknown name); the old 422 `not_supported` refusal is gone. Admins manage each product's allowed lists through `GET/PUT/DELETE /api/admin/products/{id}/egress-profiles[/{name}]` (writes are browser-session only). A bound job is claimed only by an isolated-lane worker that advertises the new `isolated_job_v1` protocol capability, gets a fetch grant for its list, keeps only its own product's approved skills, downloads its inputs, fetches through the uzi fetcher, uploads outputs and posts its result like any job; the fetch credential is redacted from the job's messages, failure reasons and result (the contents of output files are outside that redaction). Older lane workers never claim a bound job; the job is failed (`no_job_capable_worker`) instead of being run without a result. Removing an allowance affects only jobs created afterwards.
 
 ### Changed
+
+- **Codex uses the 0.159.3 runtime and defaults to GPT-6.1 Sol.**
+  GPT-6.1 Sol is available in the Codex model picker, with current Standard pricing estimates. For users who never chose an effort, both Claude and Codex product defaults move from xhigh to medium; an explicit preference is retained for Claude and seeds the independent Codex setting. Task-review and PR-description helpers keep their existing model and runtime effort behavior. Codex runs wait for a worker with the current runtime during the worker roll. See [worker effort](docs/worker-effort.md).
 
 - **The default sweeps no longer all start at 02:00 UTC, and bug triage picks up 4 issues ([#1738](https://github.com/vtmocanu/uzi/pull/1738)).**
   Bug triage now starts at 00:00, the Planned sweep stays at 02:00, and the assigned-to-uzi sweep moves to 06:00, giving bug runs a two-hour head start before Planned work is queued. Sweeps you already enabled keep their schedule: Reset on the row adopts the new defaults (it also restores UTC and clears other customizations), or set the cron and max issues explicitly with `uzi schedule edit`.

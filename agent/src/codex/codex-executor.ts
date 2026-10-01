@@ -3340,7 +3340,7 @@ export class CodexExecutor implements Executor {
           input: [{ type: "text", text: spec.taskInput }],
         };
         if (spec.model !== undefined) turnParams.model = spec.model;
-        if (spec.effort !== undefined) turnParams.modelReasoningEffort = spec.effort;
+        if (spec.effort !== undefined) turnParams.effort = spec.effort;
         const turnRes = await harness.requestOnTransport<{ turn?: { id?: string } }>("turn/start", turnParams, { signal: spec.signal });
         const id = turnRes?.turn?.id;
         if (typeof id !== "string" || id.length === 0) throw new Error("codex child turn/start returned no turn id");
