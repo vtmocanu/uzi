@@ -152,6 +152,34 @@ func TestHealthLongToolCallOutOfOrderCompletion(t *testing.T) {
 	wantHealth(t, "A completed, young B open", h, why, healthOK, "")
 }
 
+// TestHealthLongToolCallAgesTheOldestOfSeveralOpenCalls pins "oldest", not "newest" or
+// "first seen": two ordinary lead calls are open at once (concurrent Codex calls, see
+// leadInFlight), one past the threshold and one well under it.
+func TestHealthLongToolCallAgesTheOldestOfSeveralOpenCalls(t *testing.T) {
+	m := []fakeRunMessage{
+		lcUse(t, 1, "a", "Bash", 25*time.Minute),
+		lcUse(t, 2, "b", "Bash", 7*time.Minute),
+	}
+	h, why := lcDetect(t, lcRun(7*time.Minute), m, longCallSettings())
+	wantHealth(t, "old A and young B both open", h, why, healthStalled, reasonLongToolCall)
+}
+
+// TestHealthLongToolCallUnknownCreatedAtBesideAnAgedCall: a row with no created_at is
+// skipped, never treated as the zero time, so it cannot mask a genuinely old open call
+// beside it, in either row order.
+func TestHealthLongToolCallUnknownCreatedAtBesideAnAgedCall(t *testing.T) {
+	for _, unknownFirst := range []bool{true, false} {
+		old := lcUse(t, 1, "a", "Bash", 25*time.Minute)
+		unknown := lcUse(t, 2, "b", "Bash", 0)
+		unknown.createdAt = time.Time{}
+		if unknownFirst {
+			old.seq, unknown.seq = 2, 1
+		}
+		h, why := lcDetect(t, lcRun(7*time.Minute), []fakeRunMessage{old, unknown}, longCallSettings())
+		wantHealth(t, fmt.Sprintf("unknown created_at beside an aged call (unknownFirst=%v)", unknownFirst), h, why, healthStalled, reasonLongToolCall)
+	}
+}
+
 func TestHealthLongToolCallIgnoresCallsBeforeALifecycleBoundary(t *testing.T) {
 	for _, event := range []string{"init", "result"} {
 		m := []fakeRunMessage{

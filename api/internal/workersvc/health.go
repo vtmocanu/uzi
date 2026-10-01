@@ -554,9 +554,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 	// so Slack's "gone quiet" head and the amber lane dot stay truthful; with stall
 	// disabled (0) it falls back to the tool-call threshold itself. An ordinary call older
 	// than the tail is invisible, as in leadInFlight, and the run cannot hide behind it:
-	// with no open call in the tail stalled fires, with one in the tail this fires. The
-	// age comes from created_at (server receive time); an outbox-replayed frame only
-	// understates the age.
+	// with no open call in the tail stalled fires, with one in the tail this fires once
+	// that call itself reaches the threshold. The age comes from created_at (server
+	// receive time); an outbox-replayed frame only understates the age.
 	if th.toolCall > 0 && !stats.delegationOpen && !stats.oldestOpen.IsZero() && now.Sub(stats.oldestOpen) >= th.toolCall {
 		quiet := th.stall
 		if quiet == 0 {
