@@ -1480,7 +1480,8 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(calls.order, ["state:running", "result", "state:completed"]);
       assert.ok(sourcesIsDir);
       assert.deepStrictEqual(seen.options!.tools, LANE_TOOLS);
-      assert.ok(prompt.includes("vendor-docs") && prompt.includes("docs.example.com"), prompt);
+      assert.ok(prompt.includes("vendor-docs"), prompt);
+      assert.match(prompt, /docs\.example\.com/);
       assert.ok(!prompt.includes(CRED), "the fetch credential is never in the prompt");
       assert.ok(!JSON.stringify(seen.options!.env).includes(CRED), "nor in the SDK env");
       assert.ok(!String(seen.options!.systemPrompt).includes(CRED));
