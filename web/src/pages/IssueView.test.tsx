@@ -297,6 +297,31 @@ describe("IssueView run history — forge-aware MR/PR link when mr_web_url is nu
   });
 });
 
+// issue #2004: a resumed run's started_at is reset to the last leg, so the history row's
+// duration must span from first_started_at to finished_at.
+describe("IssueView run history — duration spans from first start (#2004)", () => {
+  it("shows the whole-run span for a resumed run", async () => {
+    setAuth();
+    mockApi.getIssue.mockResolvedValue({ issue: anIssue() });
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRunItem({
+          id: "run-1",
+          status: "completed",
+          first_started_at: "2026-07-05T10:00:00Z",
+          started_at: "2026-07-05T11:55:00Z",
+          finished_at: "2026-07-05T12:00:00Z",
+        }),
+      ],
+    });
+    const { container } = renderIssueView();
+    await screen.findByText("A small typo fix");
+    await waitFor(() => expect(container.textContent).toContain("2h"));
+    // The last leg alone (5m) must not be what the row reports.
+    expect(container.textContent).not.toMatch(/· 5m/);
+  });
+});
+
 describe("IssueView PRD presence badge (PRD #764)", () => {
   // A linked prds/*.md is optional but still detected: an issue that has one shows a
   // neutral "PRD" badge; one that does not shows no badge (and no "no PRD link" warning,

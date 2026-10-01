@@ -217,7 +217,8 @@ var (
 //     StatusSince, else UpdatedAt from an older server), i.e. how long it has been
 //     parked/held in that waiting state. UpdatedAt alone drifts on any row write (#1727).
 //   - completed / failed / cancelled → the STATIC span FinishedAt−(FirstStartedAt, else
-//     StartedAt), how long it actually ran, independent of now. StartedAt alone resets on
+//     StartedAt), how long the run spanned, first start to finish (parks
+//     included), independent of now. StartedAt alone resets on
 //     limit/recovery/pool resumes and would show only the last leg (#2004). A terminal run
 //     with neither (cancelled or failed before it ever started) never ran, so it renders "-".
 //   - any other/unknown status → "-".

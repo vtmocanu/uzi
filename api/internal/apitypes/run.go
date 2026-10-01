@@ -265,9 +265,9 @@ type RunDTO struct {
 	// is the ACTIVE time in the CURRENT budget leg (end - started_at - budget_paused_seconds,
 	// clamped at 0), the paused-aware "used" the header measures against the budget, NOT raw
 	// wall elapsed and NOT total working time: started_at resets on limit/recovery/pool
-	// resumes (see first_started_at for the never-reset start). end is now for a live run,
-	// status_since for a paused run, and finished_at for a terminal run, so the figure freezes
-	// once the run stops (issue #2004); null when the run never started. A new SPA against an
+	// resumes (see first_started_at for the never-reset start). end is
+	// status_since for a paused run, finished_at for a terminal run that has one (issue #2004:
+	// so a finished run's figure no longer drifts), else now; null when the run never started. A new SPA against an
 	// older api sees these undefined and falls back to plain elapsed (rollout-skew safe).
 	BudgetTotalSeconds *int `json:"budget_total_seconds"`
 	BudgetUsedSeconds  *int `json:"budget_used_seconds"`

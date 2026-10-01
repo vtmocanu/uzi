@@ -152,7 +152,7 @@ function RunBudgetElapsed({ run }: { run: Run }) {
   const now = useNow(1000);
   const view = extendBudgetView(run, now);
   if (!view) {
-    // Plain elapsed — today's behaviour, unchanged for a null-budget kind or an older api.
+    // Plain elapsed, spanning from the first start (firstStartIso) for a null-budget kind or an older api.
     const since = firstStartIso(run);
     return since ? <LiveElapsed since={since} /> : null;
   }
@@ -183,13 +183,14 @@ function RunBudgetElapsed({ run }: { run: Run }) {
 // PRD #1189/#1190: a paused run's elapsed. The clock is stopped, so it is a STATIC span, not a
 // ticker: the frozen used time over the budget, then how much of the budget remains when the run
 // resumes (the deadline itself is omitted — it moves with the pause). A run with no wall budget
-// keeps today's plain "· clock stopped" line, measured from started_at to when the pause landed
+// keeps today's plain "· clock stopped" line, measured from the first start to when the pause landed
 // (status_since, issue #1727, with the updated_at fallback; the same instant PausedPanel shows).
 function PausedElapsed({ run }: { run: Run }) {
   if (!run.started_at) return null;
   const view = extendBudgetView(run, Date.now());
   if (!view) {
     // Issue #2004: the no-budget line is a plain wall span, so it anchors on the first start.
+    // The `?? run.started_at` only narrows the type: firstStartIso already falls back to it.
     return (
       <span className="text-xs tabular-nums text-faint">
         {formatDuration(Date.parse(statusSinceIso(run)) - Date.parse(firstStartIso(run) ?? run.started_at))} · clock stopped
