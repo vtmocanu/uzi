@@ -190,6 +190,10 @@ const (
 	// source of lane workers and it provisions nothing with the switch off, so the run waits
 	// until an admin enables ephemeral workers.
 	reasonIsolatedLaneProvisioningOff = "this research run needs an isolated research-lane worker, but ephemeral worker provisioning is turned off on this instance; an admin must enable it"
+	// reasonIsolatedLaneNotEnabled (issue #1965) is the queued reason for a profile-bound run on
+	// a deployment that did not enable the isolated research lane: the provisioner creates no
+	// lane worker there, so the run can never be claimed whatever the kill-switch says.
+	reasonIsolatedLaneNotEnabled = "this research run needs an isolated research-lane worker, but the isolated research lane is not enabled on this instance; an admin must enable it in the deployment"
 	// reasonRepoNotDockerAllowed (PRD #361) is the queued reason for a repo-bearing run
 	// that no online worker is eligible to claim because every online worker is a Docker
 	// worker and the repo is not on the Docker-worker allowlist (fn_worker_can_claim,
@@ -1017,13 +1021,17 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 
 // isolatedLaneReason is queuedReason's rung for a profile-bound run, which only an
 // api-provisioned lane worker can claim. It names the two blocks no lane worker will ever
-// clear before the generic wait: a docker requirement (the lane has no DinD sidecar) and the
-// instance ephemeral-worker kill-switch being off (the provisioner is the lane's only source).
+// clear before the generic wait: a docker requirement (the lane has no DinD sidecar), the lane
+// not being enabled on this deployment (issue #1965), and the instance ephemeral-worker
+// kill-switch being off (the provisioner is the lane's only source).
 // A nil reader or a read error cannot tell, so it reports the generic wait rather than
 // inventing a block on a failed lookup.
 func (s *Service) isolatedLaneReason(ctx context.Context, r store.ListActiveRunsForHealthRow) string {
 	if slices.Contains(r.RequiredCapabilities, capability.Docker) {
 		return reasonIsolatedLaneNeedsDocker
+	}
+	if s.isolatedLaneDisabled {
+		return reasonIsolatedLaneNotEnabled
 	}
 	if s.ephemeralSettings != nil {
 		on, err := s.ephemeralSettings.EphemeralWorkersEnabled(ctx)

@@ -1796,6 +1796,10 @@ type Service struct {
 	// ephemeralSettings reads the instance ephemeral-worker kill-switch for the queued reason
 	// of a profile-bound run (PRD #1906 M5). Optional (nil-safe); set via SetEphemeralSettings.
 	ephemeralSettings EphemeralSettingsReader
+	// isolatedLaneDisabled is true when the deployment did not enable the isolated research
+	// lane (issue #1965); set via SetIsolatedLaneEnabled. Stored negated so a Service that never
+	// calls the setter (tests, other wiring) keeps the pre-#1965 queued reasons.
+	isolatedLaneDisabled bool
 	// ephemeralLease is the bounded interval a finished ephemeral worker keeps its row for a
 	// same-owner, same-repository, same-branch follow-up (PRD #2006). Zero (the default) turns the
 	// feature off: every path below is exactly the pre-lease one. Set via SetEphemeralLease.
@@ -2031,6 +2035,10 @@ func (s *Service) SetCapabilitySettings(r CapabilityScheduleReader) { s.capabili
 // SetEphemeralSettings wires the instance ephemeral-worker kill-switch reader the health
 // detector consults for a profile-bound run's queued reason (PRD #1906 M5).
 func (s *Service) SetEphemeralSettings(r EphemeralSettingsReader) { s.ephemeralSettings = r }
+
+// SetIsolatedLaneEnabled records whether the deployment enabled the isolated research lane
+// (issue #1965), so a queued profile-bound run reports reasonIsolatedLaneNotEnabled when it did not.
+func (s *Service) SetIsolatedLaneEnabled(on bool) { s.isolatedLaneDisabled = !on }
 
 // SetEphemeralLease wires the ephemeral worker lease interval (PRD #2006). Call once at startup,
 // before serving. Zero (the default) disables the lease: no terminal report enters one and no claim

@@ -91,6 +91,14 @@ func TestIsolatedLaneProvisionLiveDB(t *testing.T) {
 		t.Fatal("the kill-switch is off but a lane worker was provisioned")
 	}
 
+	// Issue #1965: kill-switch on but the deployment never enabled the lane, so no lane worker.
+	if _, err := fx.provisionerLaneOff(true, 2).ProvisionPass(fx.ctx); err != nil {
+		t.Fatalf("ProvisionPass (lane off): %v", err)
+	}
+	if _, _, found := fx.laneOf(bound); found {
+		t.Fatal("the isolated lane is not enabled but a lane worker was provisioned")
+	}
+
 	if _, err := fx.provisioner(true, 2).ProvisionPass(fx.ctx); err != nil {
 		t.Fatalf("ProvisionPass: %v", err)
 	}

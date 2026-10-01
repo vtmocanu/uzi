@@ -493,7 +493,9 @@ components:
     ServiceUnavailable:
       description: >-
         This deployment has no file store configured (reason files_unavailable, on
-        POST /files and on POST /jobs with input_file_ids), or, on POST /files, too many
+        POST /files and on POST /jobs with input_file_ids), or, on POST /jobs, this
+        deployment has no isolated research lane enabled and the request names an
+        egress_profile (reason isolated_lane_unavailable; no job is created), or, on POST /files, too many
         uploads are streaming at once, process-wide or for this user (reason
         uploads_busy; retry after the number of seconds in the Retry-After header).
       headers:
@@ -681,7 +683,9 @@ components:
             The name of a site list. The job runs on the isolated lane and can reach only
             that list's hosts, through the fetcher. A product token may name only a list
             its product is allowed to use (403, reason egress_profile_not_allowed); an
-            unknown list is 404 (reason unknown_egress_profile); an empty string is 422.
+            unknown list is 404 (reason unknown_egress_profile); an empty string is 422. A
+            deployment with no isolated research lane enabled refuses it with 503 (reason
+            isolated_lane_unavailable).
             Omit it, or send null, for a job with no site list.
     JobInput:
       type: object

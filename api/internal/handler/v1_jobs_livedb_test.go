@@ -64,6 +64,16 @@ func newV1JobsEnvMax(t *testing.T, jobCap int, maxConns int32) *v1JobsEnv {
 	}
 }
 
+// enableLane gives the handler's config a fetcher token hash, which is how the api reads the
+// isolated lane as enabled (issue #1965); an empty hash turns it back off.
+func (e *v1JobsEnv) enableLane(on bool) {
+	e.t.Helper()
+	e.h.cfg.FetcherTokenSHA256 = nil
+	if on {
+		e.h.cfg.FetcherTokenSHA256 = bytes.Repeat([]byte{7}, 32)
+	}
+}
+
 func (e *v1JobsEnv) exec(sql string, args ...any) {
 	e.t.Helper()
 	cliMustExec(e.t, e.pool, sql, args...)
@@ -276,6 +286,7 @@ func TestV1JobsCreateLiveDB(t *testing.T) {
 	t.Run("refusals", func(t *testing.T) {
 		other, otherTok := e.user()
 		_ = other
+		e.enableLane(true) // the egress_profile cases below need the lane to reach the 404 and 422
 		noCred := cliSeedUser(t, e.pool, false)
 		noCredTok := cliMintToken(t, e.pool, noCred, clitoken.ScopeUser)
 		for _, c := range []struct {
@@ -311,6 +322,19 @@ func TestV1JobsCreateLiveDB(t *testing.T) {
 				}
 			})
 		}
+	})
+
+	t.Run("a site list on a deployment without the isolated lane is 503 and creates nothing", func(t *testing.T) {
+		e.enableLane(false)
+		_, tok := e.user()
+		before := e.jobCount(tok)
+		r := e.call(http.MethodPost, "/api/v1/jobs", tok, `{"type":"research","prompt":"p","egress_profile":"open"}`)
+		e.want(r, http.StatusServiceUnavailable, "isolated_lane_unavailable")
+		if got := e.jobCount(tok); got != before {
+			t.Errorf("job rows = %d after the refused create, want %d", got, before)
+		}
+		// An unbound job on the same deployment is unaffected.
+		e.want(e.call(http.MethodPost, "/api/v1/jobs", tok, v1MinimalJob), http.StatusCreated, "")
 	})
 
 	t.Run("a decode error names the field, never a Go type", func(t *testing.T) {
