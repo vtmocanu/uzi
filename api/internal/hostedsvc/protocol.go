@@ -99,8 +99,8 @@ type DesiredWorker struct {
 	// Ephemeral is true for a run-bound throwaway worker (PRD #529). The controller's
 	// disk-pressure recycle skips ephemeral workers (materializer.go gates it on
 	// !w.Ephemeral): a disk-pressured ephemeral worker is not rolled for pressure, and it is
-	// removed by the api's reaper once its run is terminal and its lease and custody have
-	// ended, while a persistent one is rolled.
+	// removed by the api (teardown on the terminal report, or the reaper as backstop) once its
+	// run is terminal and its lease and custody have ended, while a persistent one is rolled.
 	// Always present on the wire (no omitempty) so a drop is a visible contract change,
 	// not a silent false.
 	Ephemeral bool `json:"ephemeral"`

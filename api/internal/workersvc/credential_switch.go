@@ -39,7 +39,7 @@ import (
 //
 // It is FALSE for:
 //
-//   - completed on an INTERLOCKED run: completeRunWithPermit runs its OWN permit transaction,
+//   - completed on an INTERLOCKED run: completeRunWithPermitLease runs its OWN permit transaction,
 //     which must NOT nest under a FOR UPDATE (self-deadlock on the run row); it is
 //     generation-fenced INSIDE that lock instead — including the fail-closed capability check —
 //     and service.go's completed arm surfaces its ErrStaleClaim / ErrMissingClaimGeneration.

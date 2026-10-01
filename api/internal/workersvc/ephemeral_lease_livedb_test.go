@@ -896,7 +896,7 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	del := func() int64 {
 		n, err := e.q.DeleteEphemeralWorkerForRun(e.ctx, store.DeleteEphemeralWorkerForRunParams{
-			RunID: served, EphemeralLease: svc.leaseInterval()})
+			RunID: served, EphemeralLease: LeaseInterval(svc.ephemeralLease)})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}

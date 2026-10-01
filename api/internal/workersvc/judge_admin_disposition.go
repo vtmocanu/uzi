@@ -93,7 +93,7 @@ func (s *Service) AdminMarkDone(ctx context.Context, adminUserID uuid.UUID, item
 
 	updated := int64(0)
 	if len(reviewIDs) > 0 {
-		// Fail-closed if the tx beginner was never wired (mirror completeRunWithPermit): the write
+		// Fail-closed if the tx beginner was never wired (mirror completeRunWithPermitLease): the write
 		// needs to take the per-coordinate advisory lock as the first statement of a real
 		// transaction, so it can never run non-atomically. This is INSIDE the write block, so the
 		// too-many-items and empty-resolve paths never reach it.

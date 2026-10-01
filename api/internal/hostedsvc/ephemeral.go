@@ -86,18 +86,9 @@ type EphemeralConfig struct {
 	// Lease (UZI_EPHEMERAL_LEASE, PRD #2006) is how long an ephemeral worker that finished a
 	// run stays alive for a same-repo/branch follow-up. Zero disables the lease. It is passed
 	// to the reaper and the trigger queries so a live lease is not reaped or counted as a
-	// slot, and provisionOne evicts the oldest releasable leased worker to stay under
-	// MaxPerUser.
+	// slot, and provisionOne evicts the oldest releasable leased worker when the owner is
+	// exactly at MaxPerUser (never when over it).
 	Lease time.Duration
-}
-
-// leaseInterval converts the configured lease to the interval param the lease-aware queries
-// take. Zero (disabled) is the invalid Interval, which the SQL reads as "no lease is live".
-func leaseInterval(d time.Duration) pgtype.Interval {
-	if d <= 0 {
-		return pgtype.Interval{}
-	}
-	return durationToInterval(d)
 }
 
 // EphemeralProvisioner is the background pass that auto-provisions run-bound ephemeral
@@ -160,7 +151,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	gapRuns, err := p.q.ListUnplaceableQueuedRunsForEphemeral(ctx, store.ListUnplaceableQueuedRunsForEphemeralParams{
 		MaxRows:        ephemeralProvisionBatch,
 		MaxPerUser:     int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-		EphemeralLease: leaseInterval(p.cfg.Lease),
+		EphemeralLease: workersvc.LeaseInterval(p.cfg.Lease),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list unplaceable queued runs: %w", err)
@@ -169,7 +160,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 		SaturationDelay: durationToInterval(p.cfg.SaturationDelay),
 		MaxRows:         ephemeralProvisionBatch,
 		MaxPerUser:      int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-		EphemeralLease:  leaseInterval(p.cfg.Lease),
+		EphemeralLease:  workersvc.LeaseInterval(p.cfg.Lease),
 	})
 	if err != nil {
 		return 0, fmt.Errorf("hostedsvc: list saturation queued runs: %w", err)
@@ -262,7 +253,7 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 // the same predicate).
 func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
 	cutoff := p.now().Add(-p.cfg.ProvisionDeadline)
-	return store.ReapEphemeralWorkers(ctx, p.pool, pgconv.Time(cutoff), leaseInterval(p.cfg.Lease))
+	return store.ReapEphemeralWorkers(ctx, p.pool, pgconv.Time(cutoff), workersvc.LeaseInterval(p.cfg.Lease))
 }
 
 // provisionOne runs the provision transaction for a single run, mirroring
@@ -298,12 +289,16 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 		return false, err
 	}
 	if n >= int64(p.cfg.MaxPerUser) {
-		// Over the concurrent-ephemeral cap. A leased-idle worker (PRD #2006) holds a slot only
-		// as a courtesy to a follow-up run, so evict the oldest releasable one in THIS tx to
-		// make room; with none releasable, refuse before minting anything, so there is no token
-		// to seal and nothing to roll back but the lock. Not an error: the cap working as
-		// intended.
-		if !p.evictOldestLeased(ctx, qtx, userID) {
+		// At or over the concurrent-ephemeral cap. With the lease on, a leased-idle worker (PRD
+		// #2006) holds a slot only as a courtesy to a follow-up run, so an owner EXACTLY at the cap
+		// gets the oldest releasable one evicted in THIS tx to make room: after the eviction the
+		// owner has cap-1 workers and the insert below brings it back to the cap. An owner OVER the
+		// cap (n > cap, e.g. the cap was lowered across a restart) would still be over it after
+		// one eviction plus the insert, so it is refused without evicting anything, as it is with
+		// no lease. Otherwise (nothing releasable, lease off) refuse before minting anything, so
+		// there is no token to seal and nothing to roll back but the lock. Not an error: the cap
+		// working as intended.
+		if p.cfg.Lease <= 0 || n > int64(p.cfg.MaxPerUser) || !p.evictOldestLeased(ctx, qtx, userID) {
 			return false, nil
 		}
 	}
@@ -366,7 +361,8 @@ func (p *EphemeralProvisioner) provisionOne(ctx context.Context, userID, runID u
 	return true, nil
 }
 
-// evictOldestLeased frees one slot under the per-user advisory lock the caller holds: it locks
+// evictOldestLeased frees one slot under the per-user advisory lock the caller holds (the caller
+// calls it only for an owner exactly at the cap, so one slot is all the provision needs): it locks
 // the owner's oldest releasable leased worker (FOR UPDATE SKIP LOCKED, so a worker a claim or
 // the reaper holds is passed over) and then deletes it by id in a fresh statement that re-checks
 // the lease, busy and custody guards. It reports true only when exactly one row was deleted.
@@ -389,7 +385,7 @@ func (p *EphemeralProvisioner) evictOldestLeased(ctx context.Context, qtx *store
 	if n != 1 {
 		return false
 	}
-	slog.Info("ephemeral provisioner: evicted oldest leased worker to stay under the per-user cap", "user_id", userID, "worker_id", id)
+	slog.Info("ephemeral provisioner: evicted oldest leased worker to make room for a provision at the per-user cap", "user_id", userID, "worker_id", id)
 	return true
 }
 

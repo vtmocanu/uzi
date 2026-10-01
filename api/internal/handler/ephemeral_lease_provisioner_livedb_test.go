@@ -171,6 +171,39 @@ func TestEphemeralLeaseProvisionEvictsOldestLiveDB(t *testing.T) {
 	}
 }
 
+// TestEphemeralLeaseProvisionOverCapRefusesLiveDB: an owner OVER the cap (the cap was lowered
+// across a restart: 3 leased-idle workers, cap 2) is refused outright. Evicting one lease and
+// inserting would leave the owner at 3 again, still over the cap, so nothing is evicted and
+// nothing is inserted.
+func TestEphemeralLeaseProvisionOverCapRefusesLiveDB(t *testing.T) {
+	fx := newEphemeralFixture(t, true)
+	a := fx.leasedWorker(30 * time.Minute)
+	b := fx.leasedWorker(60 * time.Minute)
+	c := fx.leasedWorker(90 * time.Minute)
+	x := fx.queuedRun([]string{"docker"})
+
+	created, err := fx.leaseProvisioner(2, 2*time.Hour).ProvisionPass(fx.ctx)
+	if err != nil {
+		t.Fatalf("ProvisionPass: %v", err)
+	}
+	if created != 0 {
+		t.Fatalf("created = %d, want 0: an over-cap owner must not be provisioned", created)
+	}
+	for name, w := range map[string]leasedIdle{"a": a, "b": b, "c": c} {
+		if !fx.workerExists(w.id) {
+			t.Fatalf("leased worker %s was evicted although the provision was refused", name)
+		}
+	}
+	for _, r := range fx.ephemeralRows() {
+		if r.runID == x {
+			t.Fatalf("an ephemeral worker was inserted for the queued run %s although the owner is over the cap", x)
+		}
+	}
+	if n := len(fx.ephemeralRows()); n != 3 {
+		t.Fatalf("ephemeral rows = %d, want 3", n)
+	}
+}
+
 // TestEphemeralLeaseProvisionNeverEvictsBusyOrHeldLiveDB: the eviction candidate is the oldest
 // RELEASABLE lease. A busy leased worker and a custody-held leased worker, both older than the
 // releasable one, are never evicted. With nothing releasable left the next run is refused.
