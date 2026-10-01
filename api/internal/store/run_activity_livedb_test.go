@@ -24,8 +24,8 @@ import (
 // idx_run_messages_tool_use_seq is available to the planner.
 //
 // It lives in the store package deliberately: e2e/run-store-it.sh and the CI
-// test-api-store-it job run `-run 'LiveDB$'` over ./internal/store/... only, so a
-// *LiveDB test placed elsewhere would never gate. Skipped unless UZI_TEST_DATABASE_URL
+// test-api-store-it job include ./internal/store/... in their six-package
+// `-run 'LiveDB$'` sweep. Skipped unless UZI_TEST_DATABASE_URL
 // points at a throwaway Postgres.
 func TestLatestToolUseForRunsLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")

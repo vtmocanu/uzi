@@ -19,7 +19,8 @@ type V1JobInputDTO struct {
 // derived from the prompt when omitted. EgressProfile names a site list (egress profile) that
 // binds the job to the isolated lane (PRD #1976): a product token may name only a list its
 // product is allowed (403 egress_profile_not_allowed), an unknown list is 404
-// unknown_egress_profile, and an empty string is 422 invalid_request. The optional fields
+// unknown_egress_profile, an empty string is 422 invalid_request, and an instance with no
+// isolated research lane enabled is 503 isolated_lane_unavailable. The optional fields
 // accept an explicit null as "omitted".
 type V1JobCreateRequest struct {
 	Type   string          `json:"type"`

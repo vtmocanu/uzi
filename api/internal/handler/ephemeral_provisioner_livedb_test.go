@@ -116,13 +116,26 @@ func (fx *ephemeralFixture) provisioner(instanceEnabled bool, maxPerUser int) *h
 // unchanged; the saturation tests flip this to gate the debounce deterministically without
 // any wall-clock sleep.
 func (fx *ephemeralFixture) provisionerWithDelay(instanceEnabled bool, maxPerUser int, saturationDelay time.Duration) *hostedsvc.EphemeralProvisioner {
+	return fx.provisionerWithLane(instanceEnabled, true, maxPerUser, saturationDelay)
+}
+
+// provisionerLaneOff is provisioner on a deployment that did not enable the isolated research
+// lane (issue #1965): the kill-switch follows instanceEnabled but the lane trigger is skipped.
+func (fx *ephemeralFixture) provisionerLaneOff(instanceEnabled bool, maxPerUser int) *hostedsvc.EphemeralProvisioner {
+	return fx.provisionerWithLane(instanceEnabled, false, maxPerUser, 0)
+}
+
+// provisionerWithLane is the one construction behind the helpers above. The lane defaults ON in
+// provisioner/provisionerWithDelay so the lane tests keep provisioning.
+func (fx *ephemeralFixture) provisionerWithLane(instanceEnabled, laneEnabled bool, maxPerUser int, saturationDelay time.Duration) *hostedsvc.EphemeralProvisioner {
 	sc := settings.New(&settingsStore{rows: []store.AppSetting{
 		{Key: settings.KeyEphemeralWorkersEnabled, Value: fmt.Sprintf("%t", instanceEnabled)},
 	}}, time.Minute)
 	return hostedsvc.NewEphemeralProvisioner(fx.pool, fx.q, fx.box, sc, hostedsvc.EphemeralConfig{
-		MaxPerUser:      maxPerUser,
-		DefaultSize:     "m",
-		SaturationDelay: saturationDelay,
+		MaxPerUser:          maxPerUser,
+		DefaultSize:         "m",
+		SaturationDelay:     saturationDelay,
+		IsolatedLaneEnabled: laneEnabled,
 	})
 }
 

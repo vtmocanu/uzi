@@ -573,6 +573,8 @@ func run() error {
 	// profile-bound run says provisioning is off, rather than waiting on a lane worker that the
 	// provisioner will never create.
 	wsvc.SetEphemeralSettings(settingsCache)
+	// Issue #1965: a profile-bound run on a deployment without the lane says so instead of waiting.
+	wsvc.SetIsolatedLaneEnabled(cfg.IsolatedLaneEnabled())
 	// PRD #2006: lease entry on a worker-reported terminal and lease-arm claims (0 disables).
 	wsvc.SetEphemeralLease(cfg.EphemeralLease)
 
@@ -749,10 +751,12 @@ func run() error {
 	// store, box and settings cache already in scope, plus the ephemeral cap + default
 	// size knobs.
 	ephemeralProv := hostedsvc.NewEphemeralProvisioner(pool, q, box, settingsCache, hostedsvc.EphemeralConfig{
-		MaxPerUser:        cfg.EphemeralMaxPerUser,
-		DefaultSize:       cfg.EphemeralDefaultSize,
-		ProvisionDeadline: cfg.EphemeralProvisionDeadline,
-		SaturationDelay:   cfg.EphemeralSaturationDelay,
+		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
+		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
+		MaxPerUser:          cfg.EphemeralMaxPerUser,
+		DefaultSize:         cfg.EphemeralDefaultSize,
+		ProvisionDeadline:   cfg.EphemeralProvisionDeadline,
+		SaturationDelay:     cfg.EphemeralSaturationDelay,
 		// PRD #2006: a finished ephemeral worker's lease (0 disables). The reaper spares a
 		// live lease and provisioning evicts the oldest releasable one at the cap.
 		Lease: cfg.EphemeralLease,

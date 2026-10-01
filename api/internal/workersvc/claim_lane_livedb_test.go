@@ -400,19 +400,26 @@ func TestIsolatedLaneQueuedReasonLiveDB(t *testing.T) {
 	for _, tc := range []struct {
 		name     string
 		settings EphemeralSettingsReader
+		laneOff  bool
 		run      uuid.UUID
 		want     string
 	}{
-		{"switch on", fakeEphemeralSettings{on: true}, plain, reasonWaitingIsolatedLane},
-		{"switch off", fakeEphemeralSettings{on: false}, plain, reasonIsolatedLaneProvisioningOff},
-		{"switch unreadable", fakeEphemeralSettings{err: errors.New("cold cache")}, plain, reasonWaitingIsolatedLane},
-		{"no reader", nil, plain, reasonWaitingIsolatedLane},
-		{"docker, switch on", fakeEphemeralSettings{on: true}, docker, reasonIsolatedLaneNeedsDocker},
-		{"docker, switch off", fakeEphemeralSettings{on: false}, docker, reasonIsolatedLaneNeedsDocker},
+		{"switch on", fakeEphemeralSettings{on: true}, false, plain, reasonWaitingIsolatedLane},
+		{"switch off", fakeEphemeralSettings{on: false}, false, plain, reasonIsolatedLaneProvisioningOff},
+		{"switch unreadable", fakeEphemeralSettings{err: errors.New("cold cache")}, false, plain, reasonWaitingIsolatedLane},
+		{"no reader", nil, false, plain, reasonWaitingIsolatedLane},
+		{"docker, switch on", fakeEphemeralSettings{on: true}, false, docker, reasonIsolatedLaneNeedsDocker},
+		{"docker, switch off", fakeEphemeralSettings{on: false}, false, docker, reasonIsolatedLaneNeedsDocker},
+		// Issue #1965: a deployment without the lane says so whatever the kill-switch reads.
+		{"lane off, switch on", fakeEphemeralSettings{on: true}, true, plain, reasonIsolatedLaneNotEnabled},
+		{"lane off, switch off", fakeEphemeralSettings{on: false}, true, plain, reasonIsolatedLaneNotEnabled},
+		{"docker, lane off", fakeEphemeralSettings{on: true}, true, docker, reasonIsolatedLaneNeedsDocker},
 	} {
 		f.svc.ephemeralSettings = tc.settings
+		f.svc.SetIsolatedLaneEnabled(!tc.laneOff)
 		if got := f.svc.queuedReason(f.env.ctx, time.Now(), byID[tc.run]); got != tc.want {
 			t.Errorf("%s: queuedReason = %q, want %q", tc.name, got, tc.want)
 		}
 	}
+	f.svc.SetIsolatedLaneEnabled(true)
 }

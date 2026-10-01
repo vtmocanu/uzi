@@ -1372,6 +1372,14 @@ func parseSalvageForges(raw string) ([]string, error) {
 // must stay visible (PRD #45, Decision 8/9).
 func (c Config) OIDCEnabled() bool { return c.OIDCIssuerURL != "" }
 
+// IsolatedLaneEnabled reports whether the isolated research lane is enabled on this
+// deployment (issue #1965). The chart renders UZI_FETCHER_TOKEN_SHA256 only inside
+// `{{- if include "uzi.isolatedLaneEnabled" . }}` (deploy/chart/templates/api-deployment.yaml),
+// so a set hash is the api's lane-enabled signal. A lane enabled with the optional key
+// missing also reads off, which fails closed: the fetcher routes are unmounted too
+// (fetcher_control.go), so nothing could serve a profile-bound run anyway.
+func (c Config) IsolatedLaneEnabled() bool { return len(c.FetcherTokenSHA256) != 0 }
+
 // AutoselectPolicy assembles the four UZI_AUTOSELECT_* knobs into the pure ranker's
 // Policy (PRD #111 D6).
 //

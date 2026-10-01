@@ -848,6 +848,7 @@ Tracked as GitHub issue vtmocanu/uzi#1908; PRD at `prds/1908-repo-less-jobs-api.
 - Docker-tier workers and worker images without the job runner never claim a job. (AI-synced 2026-09-30)
 - A `uzp_` token creates only the job types its product's admin-set allow-list names (empty allows none) and sees only its own product's jobs. A `uzc_` token may create any type and sees all of its user's jobs. (AI-synced 2026-09-30)
 - A `uzp_` token may bind a job only to the site lists an admin allowed its product (none by default; refused otherwise, with no job created); a `uzc_` token may name any existing list. Removing an allowance affects only jobs created afterwards. Admins grant and remove allowances in the web UI (cookie-only writes); the CLI only lists them. (AI-synced 2026-10-01)
+- A job naming a site list is refused at create (503 `isolated_lane_unavailable`) when the instance has no isolated lane enabled, rather than queued; no lane worker is provisioned while the lane is off. (AI-synced 2026-10-01)
 - Revoking the creating product token, disabling or deleting its product, or deactivating the owner cancels the job. Token expiry alone never does. (AI-synced 2026-09-30)
 - A job fails rather than waits: a usage limit, its time budget, a disabled credential or an ephemeral worker that cannot serve it ends it `failed`. (AI-synced 2026-09-30)
 - Each user has a cap on active jobs (default 10, admin-tunable) and a per-user `/api/v1` rate limit. (AI-synced 2026-09-30)

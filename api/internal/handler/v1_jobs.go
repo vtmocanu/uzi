@@ -49,6 +49,7 @@ import (
 //	413 too_many_files           more input_file_ids than UZI_JOB_INPUTS_MAX_FILES
 //	413 job_bytes_exceeded       the attached files total more than UZI_JOB_INPUTS_MAX_BYTES
 //	503 files_unavailable        input_file_ids was sent but this deployment has no file store
+//	503 isolated_lane_unavailable  egress_profile was sent but this deployment has no isolated lane
 //	429 over_cap                 the user's non-terminal job cap
 //	429 (no reason, Retry-After) the rate limiters
 const (
@@ -60,6 +61,7 @@ const (
 	v1ReasonNoModelAccount   = "no_model_credential"
 	v1ReasonTypeNotAllowed   = "job_type_not_allowed"
 	v1ReasonOverCap          = "over_cap"
+	v1ReasonLaneUnavailable  = "isolated_lane_unavailable"
 	v1ReasonJobTerminal      = "job_terminal"
 	v1ReasonPayloadTooLarge  = "payload_too_large"
 	v1JobCreateMaxBodyBytes  = 4 << 20 // prompt (256 KiB) + inputs (1 MiB) with JSON escaping headroom
@@ -253,6 +255,14 @@ func (h *Handler) V1JobCreate(w http.ResponseWriter, r *http.Request) {
 	if req.EgressProfile != nil {
 		if *req.EgressProfile == "" {
 			httpx.ErrorReason(w, http.StatusUnprocessableEntity, "egress_profile must not be empty; omit it for an unbound job", v1ReasonInvalidRequest)
+			return
+		}
+		// Issue #1965: a bound job can only run on an isolated-lane worker, so without the lane
+		// it would queue forever. Refuse it before anything is created. This intentionally
+		// precedes CreateJobRun's 422/403/404 validation (allowance, list existence): it reveals
+		// only deployment config, not whether a list exists.
+		if !h.cfg.IsolatedLaneEnabled() {
+			httpx.ErrorReason(w, http.StatusServiceUnavailable, "this deployment has no isolated research lane enabled, so a job cannot name a site list", v1ReasonLaneUnavailable)
 			return
 		}
 		params.EgressProfile = *req.EgressProfile

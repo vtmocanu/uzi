@@ -599,7 +599,8 @@ LIMIT 200;
 -- name: ListPlanRevisionStateForRuns :many
 -- The plan-ish message rows ({plan, plan_revising}) for a page of runs, so the
 -- "latest by seq is plan_revising ⇒ revising" fold happens in Go (planRevisingSet),
--- mirroring web derivePlanRevision. Backed by run_messages UNIQUE (run_id, seq).
+-- mirroring web derivePlanRevision. Backed by the partial index (issue #2041)
+-- idx_run_messages_plan_seq (run_id, seq) WHERE kind IN ('plan', 'plan_revising').
 SELECT run_id, seq, kind
 FROM run_messages
 WHERE run_id = ANY(@run_ids::uuid[])
@@ -639,7 +640,7 @@ WHERE run_id = @run_id::uuid
 -- its greatest-seq tool_use — which runactivity.FromFrame folds into the "now" line. A
 -- run with no tool_use frame returns no row (⇒ null current_activity). Backed by the
 -- partial index idx_run_messages_tool_use_seq (run_id, seq DESC) WHERE kind = 'tool_use'
--- (migration 00186), so the per-run first row is one index seek rather than a walk back
+-- (migration 00187), so the per-run first row is one index seek rather than a walk back
 -- over the trailing non-tool_use frames the UNIQUE (run_id, seq) index would force.
 SELECT DISTINCT ON (run_id) run_id, seq, kind, agent, agent_instance, agent_label, payload, created_at
 FROM run_messages

@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"os"
@@ -28,6 +29,7 @@ import (
 // The validator itself is pinned by TestV1SpecValidatorDetectsDrift.
 func TestV1SpecContractLiveDB(t *testing.T) {
 	e := newV1JobsEnv(t, 4)
+	e.enableLane(true) // the egress_profile cases need the isolated lane enabled (issue #1965)
 	doc := loadV1Doc(t)
 
 	// PRD #1909 M2: a small file store, so the upload's 413 and 507 are reachable.
@@ -73,7 +75,7 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		// A multipart upload case (POST /files): mpData is the file, mp its part and headers.
 		mp     *v1UploadOpts
 		mpData []byte
-		pre    func() // runs before the call (the 503 case unwires the file store).
+		pre    func() // runs before the call (the 503 cases unwire the file store or the isolated lane).
 		// binary: the 200 body is the file's raw bytes (GET /files/{id}); its headers are checked
 		// instead of a JSON schema.
 		binary bool
@@ -94,6 +96,8 @@ func TestV1SpecContractLiveDB(t *testing.T) {
 		{name: "create 422 unknown type", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"x","prompt":"p"}`, want: 422},
 		{name: "create 422 egress", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":""}`, want: 422},
 		{name: "create 404 unknown egress profile", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: `{"type":"research","prompt":"p","egress_profile":"no-such-list"}`, want: 404},
+		{name: "create 503 isolated lane unavailable", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: uzc, body: fmt.Sprintf(`{"type":"research","prompt":"p","egress_profile":%q}`, e.siteList()), want: 503,
+			pre: func() { e.enableLane(false) }},
 		{name: "create 422 credential", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: cliMintToken(t, e.pool, cliSeedUser(t, e.pool, false), clitoken.ScopeUser), body: v1MinimalJob, want: 422},
 		{name: "create 429 over_cap", method: "POST", specPath: "/jobs", url: "/api/v1/jobs", token: func() string {
 			_, tok := e.user()

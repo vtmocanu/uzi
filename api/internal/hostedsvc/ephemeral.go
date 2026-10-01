@@ -54,6 +54,11 @@ type EphemeralSettings interface {
 // EphemeralConfig carries the tuning knobs the provisioner needs (PRD #529 M2), lifted
 // out of config.Config so hostedsvc does not depend on the config package.
 type EphemeralConfig struct {
+	// IsolatedLaneEnabled reports whether the deployment enabled the isolated research lane
+	// (config.Config.IsolatedLaneEnabled). The zero value is off and fails closed: with it off
+	// ProvisionPass never lists or provisions isolated-lane workers (issue #1965), since the
+	// chart did not deploy the fetcher those workers depend on.
+	IsolatedLaneEnabled bool
 	// MaxPerUser is the per-user concurrent-ephemeral cap (UZI_EPHEMERAL_MAX_PER_USER).
 	MaxPerUser int
 	// DefaultSize is the workersize preset every ephemeral worker is provisioned at
@@ -121,7 +126,8 @@ func NewEphemeralProvisioner(pool *pgxpool.Pool, q *store.Queries, box *secretbo
 //
 // Flag-off footprint is exactly ONE settings read: with the instance kill-switch off it
 // returns (0, nil) before touching the database. When on, it unions the isolated-lane trigger
-// set (PRD #1906 M5: profile-bound runs, no opt-in needed) with the capability-gap and
+// set (PRD #1906 M5: profile-bound runs, no opt-in needed; skipped entirely unless
+// EphemeralConfig.IsolatedLaneEnabled, issue #1965) with the capability-gap and
 // saturation trigger sets for opted-in users and, for each, provisions one run-bound
 // ephemeral worker under the per-user cap. A hard error on one run is logged and does not
 // abort the whole pass — the sibling sweeper passes have the same resilience — so one bad
@@ -172,12 +178,17 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 	// PRD #1906 M5 (D-B): the isolated-lane trigger. It skips the per-user opt-in (the lane is
 	// the only placement a profile-bound run has) but not the kill-switch above or the per-user
 	// cap. The two ordinary triggers exclude profile-bound runs, so the sets are disjoint.
-	laneRuns, err := p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
-		MaxRows:    ephemeralProvisionBatch,
-		MaxPerUser: int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
-	})
-	if err != nil {
-		return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)
+	// Issue #1965: the whole trigger is skipped when the deployment did not enable the lane,
+	// so no worker is provisioned for a fetcher the chart never deployed (laneRuns stays empty).
+	var laneRuns []store.ListIsolatedQueuedRunsForEphemeralRow
+	if p.cfg.IsolatedLaneEnabled {
+		laneRuns, err = p.q.ListIsolatedQueuedRunsForEphemeral(ctx, store.ListIsolatedQueuedRunsForEphemeralParams{
+			MaxRows:    ephemeralProvisionBatch,
+			MaxPerUser: int32(p.cfg.MaxPerUser), //nolint:gosec // small configured cap, never near int32 range
+		})
+		if err != nil {
+			return 0, fmt.Errorf("hostedsvc: list isolated-lane queued runs: %w", err)
+		}
 	}
 
 	// Capability-gap first: it is permanent starvation (nothing can ever serve the run),
