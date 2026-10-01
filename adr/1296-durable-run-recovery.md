@@ -407,3 +407,53 @@ the hold becomes `archive_ready`. Three limits carry over from the rest of D5:
 - Release evidence is unchanged: the hold leaves `open` only on one of the five classes above.
 
 See [adr/1742-finalize-resume-allowance.md](1742-finalize-resume-allowance.md) (D4).
+
+## Amendment 2026-10-01 — issue #1995: a failed upload is re-driven while the worker is alive
+
+Refines D5 (the restart-safe re-upload). A journaled recovery bundle whose upload failed while the
+worker stayed up (an api outage, a timeout, a quota blip) was retried only by the boot sweep, so the
+hold stayed `needs_action` until the next worker restart even after the api was reachable again.
+
+**Live pass.** After each successful heartbeat the worker runs a bounded re-drive of journaled
+bundles (`resumeLive`). It is single-flight with the boot sweep (it returns at once while either is
+in flight), touches at most `liveMaxPerPass` records per pass (default 4), least recently attempted
+first, and spaces passes with a capped exponential backoff: defaults 30 s base and 15 min cap, with no
+lifetime cap on attempts. After the first transient pass the delay is 2x the base, doubling from
+there. A pass that fails nothing resets it to the base. Candidates are only authenticated records
+with a journaled bundle that are `bundled`, or `needs_action` for a transient reason, of runs this
+worker is not executing; the upload is the journaled-bytes upload (no forge PAT, never a re-bundle).
+
+**Typed dispositions.** The api's `mapRecoveryError` now writes a stable `reason` beside `error` on
+every recovery refusal (additive; the `{"error"}` envelope is unchanged). The worker classifies a
+failed reserve or upload by that `reason`, falling back to the HTTP status for an api without typed
+bodies:
+
+| Failure | Disposition |
+|---|---|
+| typed `not_authorized` | `stale_ownership` (permanent) |
+| untyped or unknown 403, and other 4xx refusals (400, 404, 409; typed `ambiguous_generation`, `capture_not_found`, `not_available`, `manifest_conflict`, `bad_request`) | `upload_rejected` (permanent) |
+| oversize (typed `oversize`, or 413) | `archive_constraint` (permanent) |
+| 422 / typed `integrity` | retried only while the local bytes still match the journaled manifest; otherwise `local_bundle_mismatch` (permanent), never re-bundled |
+| 401 | `credential_rejected`, retried only after a later successful heartbeat |
+| 429, 408, 5xx (including 507 quota), transport failures | transient |
+
+The disposition is stored in the record's existing `reason` string, not a new field: a new
+MAC-covered field would make a rolled-back worker recompute a different MAC and refuse the record.
+The permanent reasons are honoured at every entry point (capture, boot sweep, live pass): a record
+carrying one is never uploaded again. A permanent refusal leaves the hold `needs_action` with
+custody retained; release evidence is unchanged.
+
+**Immutability rules.** One per-capture cycle lock is the outer lock and the journal lock the inner
+one; a live step takes the cycle lock in skip mode, so a foreground capture or sweep step on the same
+record wins. A bundle is installed temp-then-atomic only if the record still exists with the same pin
+facts, else the step ends `source_advanced`. Guarded post-pin writes never resurrect a released
+record. Failure marking never downgrades `uploaded` and keeps `serverCaptureId`. A pin updates an
+existing record atomically under the journal lock, with per-state field rules. Journaled bundle bytes
+are dropped only when the record file is confirmed absent; an unreadable or unauthenticated record
+keeps its bytes and is not written.
+
+**Accepted residual.** A stream already in flight when cleanup releases the record cannot be recalled:
+the server refuses it and the record is not recreated.
+
+**Known gap, outside this change.** `release()`'s sibling count can treat a momentarily unreadable
+sibling record as absent; it is filed separately.

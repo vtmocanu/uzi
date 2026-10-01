@@ -30,7 +30,7 @@ const maxPrerequisiteShas = 64
 // refuses rather than guess a newest hold — the hold stays open and the worker must name its
 // generation (v2) or the owner disposes explicitly. Defined here beside the Reserve/Release
 // exact-generation logic that raises it (the shared sentinels live in recovery.go); the handler
-// maps it (a 409 Conflict is ideal, but mapRecoveryError's default 500 is acceptable).
+// maps it to 409 Conflict with reason `ambiguous_generation` (mapRecoveryError).
 var ErrAmbiguous = errors.New("recovery: ambiguous open custody generation")
 
 // ── Worker-facing operations (D2/D6/D7). Each enforces the ORIGINAL worker identity and

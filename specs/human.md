@@ -891,6 +891,15 @@ Tracked as GitHub issue vtmocanu/uzi#1742; ADR at `adr/1742-finalize-resume-allo
 - After such a restart, `uzi run recovery` is honest about the source. A finalization-pinned head that is verifiable in the worker's local repository and not yet on the default branch becomes an exportable archive (`archive_ready`, `uzi run export`); otherwise the hold is retained `source_only` custody, reported as "no recovery archive; custody of worker `<name>`'s local source is retained (export unavailable; it may be the only copy)", and export is not offered for it. (AI-synced 2026-09-30)
 - Early-cut limit: if the worker restarts before fetch-back and the finalization pin, generation G's own hold gets no archive. If the run resumes, the existing predecessor-capture path captures the work under the next generation (G+1); if the run is failed, G's hold reports retained `source_only` custody with no archive. On a Docker-lane worker the clone does not survive a pod loss. (AI-synced 2026-09-30)
 
+## Feature #1995 — A failed recovery upload is retried without a worker restart
+
+Tracked as GitHub issue vtmocanu/uzi#1995; ADR at `adr/1296-durable-run-recovery.md` (amendment 2026-10-01).
+
+- A recovery bundle whose upload failed is retried while the worker stays up, once the api is reachable again, with bounded exponential backoff; no worker restart is needed. (AI-synced 2026-10-01)
+- An upload the api permanently refuses (ownership lost, route refused, over the size cap) or whose local bytes no longer match what was journaled stays `needs_action` with custody retained and is not retried automatically. (AI-synced 2026-10-01)
+- A credential rejection is retried only after the worker authenticates again. (AI-synced 2026-10-01)
+- A run the worker is executing is never touched by the retry. (AI-synced 2026-10-01)
+
 ## Feature #1293 — Failed-run rate on the dashboard (global and per user)
 
 - The dashboard shows a failed-run percentage: global for admins, per user for everyone, and per user in the admin table. [user 2026-09-12]
