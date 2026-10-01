@@ -1267,6 +1267,9 @@ interface ActiveRun {
   shuttingDown: boolean;
 }
 
+/** Where a scratch publication refusal was caught, logged as `site`. */
+type ScratchPublicationSite = "finalize" | "park_bridge" | "checkpoint_publish";
+
 const SCRATCH_CAUSE_MAX_DEPTH = 4;
 const SCRATCH_CAUSE_PART_MAX = 200;
 const SCRATCH_CAUSE_TOTAL_MAX = 600;
@@ -1278,6 +1281,18 @@ const SCRATCH_REDACT_INPUT_MAX = 4096;
  *  input is bounded before redaction so a huge message costs a bounded redactor pass. */
 function redactThenSanitize(redactText: (text: string) => string, text: string): string {
   return sanitizeForLog(redactText(text.slice(0, SCRATCH_REDACT_INPUT_MAX)), SCRATCH_CAUSE_PART_MAX);
+}
+
+/** The DETAIL path: bound the unsplit raw text, redact it whole (the redactor matches across CR and
+ *  LF, so a token split by a newline is caught only before any line split), THEN pick the first
+ *  non-empty line (CR, LF, U+2028, U+2029) and sanitize and cap it. */
+function redactThenFirstLine(redactText: (text: string) => string, text: string): string {
+  const redacted = redactText(text.slice(0, SCRATCH_REDACT_INPUT_MAX));
+  for (const raw of redacted.split(/[\r\n\u2028\u2029]/)) {
+    const line = raw.trim();
+    if (line) return sanitizeForLog(line, SCRATCH_CAUSE_PART_MAX);
+  }
+  return "";
 }
 
 /** The failure_reason for a refused scratch publication. Only kind floor_unverified omits the
@@ -1297,7 +1312,7 @@ function scratchPublicationFailureReason(
   }
   const source = err.rawDetail ?? err.detail;
   // Without a redactor (a partial test flight) free text is omitted rather than reported unredacted.
-  const detail = source && redactText ? `: ${redactThenSanitize(redactText, source)}` : "";
+  const detail = source && redactText ? `: ${redactThenFirstLine(redactText, source)}` : "";
   return `scratch_publication_refused: candidate history cannot be published (${err.kind}${at}${detail})`;
 }
 
@@ -1308,12 +1323,13 @@ function logScratchPublicationRefused(
   runLog: Logger,
   redactText: ((text: string) => string) | undefined,
   err: ScratchPublicationError,
+  site: ScratchPublicationSite,
 ): void {
   let detail: string | undefined;
   let cause: string | undefined;
   if (redactText) {
     const source = err.rawDetail ?? err.detail;
-    if (source !== undefined) detail = redactThenSanitize(redactText, source);
+    if (source !== undefined) detail = redactThenFirstLine(redactText, source);
     const parts: string[] = [];
     let cur: unknown = err.cause;
     for (let depth = 0; cur !== undefined && cur !== null && depth < SCRATCH_CAUSE_MAX_DEPTH; depth++) {
@@ -1324,7 +1340,7 @@ function logScratchPublicationRefused(
     // `...` marker so the whole value is at most SCRATCH_CAUSE_TOTAL_MAX characters.
     if (parts.length > 0) cause = sanitizeForLog(parts.join(" <- "), SCRATCH_CAUSE_TOTAL_MAX - 3);
   }
-  runLog.error("scratch publication refused", { kind: err.kind, step: err.step, detail, cause });
+  runLog.error("scratch publication refused", { site, kind: err.kind, step: err.step, detail, cause });
 }
 
 /**
@@ -3678,7 +3694,7 @@ export class RunRunner {
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
-    if (err instanceof ScratchPublicationError) logScratchPublicationRefused(runLog, redactText, err);
+    if (err instanceof ScratchPublicationError) logScratchPublicationRefused(runLog, redactText, err, "finalize");
     // Issue #1864: a Codex boundary failure also logs which stage, boundary and sink failed.
     const boundaryDiagnostic = codexBoundaryDiagnosticOf(err);
     if (boundaryDiagnostic !== undefined) {
@@ -9614,7 +9630,7 @@ export class RunRunner {
       }
     } catch (e) {
       if (e instanceof ScratchPublicationError) {
-        logScratchPublicationRefused(runLog, flight.redactText, e);
+        logScratchPublicationRefused(runLog, flight.redactText, e, "park_bridge");
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
         return;
       }
@@ -10558,7 +10574,7 @@ export class RunRunner {
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
       if (e instanceof ScratchPublicationError) {
-        logScratchPublicationRefused(flight.runLog, flight.redactText, e);
+        logScratchPublicationRefused(flight.runLog, flight.redactText, e, "checkpoint_publish");
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
         return { published: false, reason: "scratch_publication_refused" };
       }

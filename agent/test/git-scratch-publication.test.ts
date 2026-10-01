@@ -612,6 +612,23 @@ it("splits detail lines on U+2028 and keeps only the first", { skip: linuxCloneS
   assert.doesNotMatch(detail, /second|third/);
 });
 
+it("carries the bounded unsplit stderr in rawDetail beside the one-line detail", { skip: linuxCloneSkip }, async () => {
+  const { bare } = await trackedClean();
+  const err = Object.assign(new Error("subprocess exited 128"), {
+    code: 128, stdout: "", stderr: "fatal: tok\tpart\nsecond line carries more",
+  });
+  const restore = failExec(["--is-shallow-repository"], err);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    assert.ok(e.rawDetail !== undefined);
+    assert.ok(e.rawDetail.includes("tok\tpart"), e.rawDetail);
+    assert.ok(e.rawDetail.includes("second line carries more"), e.rawDetail);
+    const detail = assertDetail(e);
+    assert.match(detail, /tok\?part/);
+    assert.doesNotMatch(detail, /second line/);
+  } finally { restore(); }
+});
+
 it("derives detail from a megabyte of stderr without scanning it all", { skip: linuxCloneSkip }, async () => {
   const { bare } = await trackedClean();
   const err = Object.assign(new Error("subprocess exited 128"), {

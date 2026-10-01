@@ -183,10 +183,13 @@ export class ScratchPublicationError extends Error {
   readonly step?: ScratchPublicationStep;
   /** One line, control characters replaced with `?` (sanitizeForLog), capped at DETAIL_MAX; never carries env. */
   readonly detail?: string;
-  /** The same first line WITHOUT sanitizing or the DETAIL_MAX cut, bounded to RAW_DETAIL_MAX UTF-16
-   *  units. A caller that redacts must redact this and only then sanitize+cap: sanitizing first turns
-   *  a control character inside a token into `?` and a cut can leave a token prefix, either of which
-   *  defeats the redactor. Untrusted text; never log or report it unredacted. */
+  /** The bounded raw source text, NOT line-split: the first RAW_DETAIL_MAX UTF-16 units of the
+   *  failure text with leading whitespace trimmed. It can span several lines, so it can differ from
+   *  the source line `detail` was cut from. A caller that redacts must redact this whole text first
+   *  (the redactor matches across CR and LF, so a token split by a newline is only caught on unsplit
+   *  text) and only then pick a line, sanitize and cap: sanitizing or line-splitting first can leave
+   *  a token prefix or turn a control character inside a token into `?`. Untrusted text; never log
+   *  or report it unredacted. */
   readonly rawDetail?: string;
   constructor(
     reason: string,
@@ -205,17 +208,13 @@ export class ScratchPublicationError extends Error {
 }
 
 const DETAIL_MAX = 200;
-/** Bound on the unsanitized first line carried as ScratchPublicationError.rawDetail. */
+/** Bound on the unsanitized, unsplit text carried as ScratchPublicationError.rawDetail. */
 const RAW_DETAIL_MAX = 4096;
 
-/** First non-empty line of `text` within a RAW_DETAIL_MAX prefix, unsanitized and uncut beyond it. */
-function rawLine(text: string): string {
-  const prefix = String(text).slice(0, RAW_DETAIL_MAX);
-  for (const raw of prefix.split(/[\r\n\u2028\u2029]/)) {
-    const line = raw.trim();
-    if (line) return line;
-  }
-  return "";
+/** The RAW_DETAIL_MAX prefix of `text` with leading whitespace trimmed: unsanitized and, on purpose,
+ *  not split into lines (see ScratchPublicationError.rawDetail). */
+function rawText(text: string): string {
+  return String(text).slice(0, RAW_DETAIL_MAX).trimStart();
 }
 
 /** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input
@@ -270,11 +269,11 @@ function classifyExecFailure(err: unknown): ExecFailure {
   const text = oneLine(stderr) || oneLine(message);
   if (text) parts.push(text);
   const rawParts = parts.slice(0, text ? -1 : undefined);
-  const rawText = rawLine(stderr) || rawLine(message);
-  if (rawText) rawParts.push(rawText);
+  const rawSource = rawText(stderr) || rawText(message);
+  if (rawSource) rawParts.push(rawSource);
   return {
     exitCode, timedOut, overflow, spawnError, stdout, stderr,
-    detail: oneLine(parts.join("; ")), rawDetail: rawLine(rawParts.join("; ")),
+    detail: oneLine(parts.join("; ")), rawDetail: rawText(rawParts.join("; ")),
   };
 }
 
@@ -1538,7 +1537,7 @@ export class GitCache {
     if (!SHA40_RE.test(sha)) {
       throw new ScratchPublicationError(PUBLICATION_UNPROVEN, undefined, {
         kind: "exec_failed", step: "resolve_tip", detail: oneLine(`unexpected rev-parse output: ${sha}`),
-        rawDetail: rawLine(`unexpected rev-parse output: ${sha}`),
+        rawDetail: rawText(`unexpected rev-parse output: ${sha}`),
       });
     }
     return sha;

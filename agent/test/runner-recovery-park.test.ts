@@ -378,13 +378,12 @@ describe("RunRunner — recovery-capture ancestry bridge (PRD #1416 M3, FIX 2)",
         gitlabClaim(iid, { run_id: "20000000-0000-4000-8000-000000002054" }),
       );
       // The capture bridge's own catch and the checkpoint publish that follows each log the refusal;
-      // the count pins the bridge site, which the publish site alone would otherwise mask.
+      // the site field pins the bridge, which the publish site alone would otherwise mask.
       const refused = lines.filter((l) => l.msg === "scratch publication refused");
-      assert.equal(refused.length, 2, JSON.stringify(lines.map((l) => l.msg)));
-      for (const line of refused) {
-        assert.equal(line.fields?.kind, "scratch_present");
-        assert.equal(line.fields?.step, "scratch_walk");
-      }
+      const bridge = refused.filter((l) => l.fields?.site === "park_bridge");
+      assert.equal(bridge.length, 1, JSON.stringify(refused.map((l) => l.fields?.site)));
+      assert.equal(bridge[0]?.fields?.kind, "scratch_present");
+      assert.equal(bridge[0]?.fields?.step, "scratch_walk");
       assert.ok(api.states.some((s) => s.body.status === "recovery_wait"), "a refused bridge never undoes the park");
     } finally {
       git.scratchPublicationPreflight = original;

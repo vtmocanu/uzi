@@ -336,6 +336,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       assert.equal(failed?.fail_origin, undefined);
       const line = lines.find((l) => l.msg === "scratch publication refused");
       assert.ok(line, JSON.stringify(lines.map((l) => l.msg)));
+      assert.equal(line.fields?.site, "finalize");
       assert.equal(line.fields?.kind, c.kind);
       assert.equal(line.fields?.step, c.step);
       assert.equal(line.fields?.detail, c.detail);
@@ -369,6 +370,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assert.ok(line);
     assert.match(String(failed?.failure_reason), /^scratch_publication_refused: candidate history cannot be published \(exec_failed at object_walk: /);
     assert.ok(!String(failed?.failure_reason).includes(PAT));
+    assert.equal(line.fields?.site, "finalize");
     assert.ok(!JSON.stringify(line.fields).includes(PAT));
     assert.ok(JSON.stringify(line.fields).includes("REDACTED"));
   });
@@ -421,6 +423,16 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assertNoPatPrefix(fields);
   });
 
+  for (const [label, sep] of [["CR", "\r"], ["LF", "\n"]] as const) {
+    it(`redacts a secret split by a ${label} in the multi-line rawDetail (failure_reason and log)`, async () => {
+      const raw = `fatal: ${PAT.slice(0, 16)}${sep}${PAT.slice(16)}\nhint: later line`;
+      const detail = "fatal: " + PAT.slice(0, 16);
+      const { reason, fields } = await finalizeRefusal(`redact-${label}`, undefined, detail, raw);
+      assertNoPatPrefix(reason);
+      assertNoPatPrefix(fields);
+    });
+  }
+
   it("redacts a secret that straddles the sanitized detail cap (failure_reason and log)", async () => {
     const raw = `${"x".repeat(185)}${PAT}`;
     const detail = sanitizeForLog(raw, 197);
@@ -430,7 +442,15 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assertNoPatPrefix(fields);
   });
 
-  it("bounds the cause chain at depth 4 and the joined cause at 600 characters", async () => {
+  it("bounds the cause chain at depth 4", async () => {
+    const chain = new Error("p1", {
+      cause: new Error("p2", { cause: new Error("p3", { cause: new Error("p4", { cause: new Error("p5") }) }) }),
+    });
+    const { fields } = await finalizeRefusal("cause-depth", chain, "exit 1", "exit 1");
+    assert.equal((JSON.parse(fields) as { cause: string }).cause, "p1 <- p2 <- p3 <- p4");
+  });
+
+  it("bounds the joined cause at 600 characters", async () => {
     const chain = new Error(`${"a".repeat(300)}1`, {
       cause: new Error(`${"b".repeat(300)}2`, {
         cause: new Error(`${"c".repeat(300)}3`, { cause: new Error(`${"d".repeat(300)}4`, { cause: new Error("fifth") }) }),
@@ -483,6 +503,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assert.deepEqual(feed, ["checkpoint publish failed: scratch_publication_refused"]);
     const line = lines.find((l) => l.msg === "scratch publication refused");
     assert.ok(line);
+    assert.equal(line.fields?.site, "checkpoint_publish");
     assert.equal(line.fields?.kind, "floor_unverified");
     assert.equal(line.fields?.step, "floor_refresh");
     assert.equal(line.fields?.detail, "remote text");
@@ -524,8 +545,9 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       git.checkpointPack = original;
     }
     assert.deepEqual(outcome, { published: false, reason: "scratch_publication_refused" });
-        const line = lines.find((l) => l.msg === "scratch publication refused");
+    const line = lines.find((l) => l.msg === "scratch publication refused");
     assert.ok(line);
+    assert.equal(line.fields?.site, "checkpoint_publish");
     assert.equal(line.fields?.kind, "exec_failed");
     assert.equal(line.fields?.step, "object_walk");
     assert.equal(line.fields?.detail, undefined);
