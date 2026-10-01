@@ -64,17 +64,18 @@ has been in progress longer than the configured threshold"_, when both hold:
   **Stalled after** is `0`).
 
 A call to a subagent (a delegation) is never aged, and while one is open
-among the run's recent tool calls this flag stays off, as before. A subagent
-that is still sending updates never trips it either. The one exception is a
+among the run's recent tool calls this flag stays off. A delegation whose
+subagent is still sending updates is never flagged. The one exception is a
 delegation old enough to have dropped out of those recent calls: if its
-subagent has also gone silent past the window while an ordinary call of the
-main agent has been open past the threshold, the run is flagged. The age is
+subagent has gone quiet past the window while an ordinary call of the main
+agent has been open past the threshold, the run is flagged. The age is
 measured from when uzi received the call. A run whose older calls all fall
 outside the recent window still trips the plain **stalled** flag once it
 goes quiet. During an api outage, when the run's worker reports its updates
 queued, the reason says so instead. The flag clears on the next check once
-no open call is past the threshold, or as soon as new activity arrives. Like
-every flag, it never stops the run.
+no open call is past the threshold or new activity has arrived. Setting
+**Long tool call after** to `0` turns this signal off. Like every flag, it
+never stops the run.
 
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
