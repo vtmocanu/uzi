@@ -71,7 +71,7 @@ describe("unix-socket helpers under a Codex-length TMPDIR", () => {
     const { socket, dispose } = shortUnixSocket(base);
     const server = http.createServer((req, res) => {
       res.writeHead(200);
-      res.end(`pong ${req.url}`);
+      res.end(req.url === "/ping" ? "pong /ping" : "unexpected path");
     });
     try {
       assert.ok(Buffer.byteLength(socket) <= 103);
