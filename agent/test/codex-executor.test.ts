@@ -6929,6 +6929,28 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     assert.ok(text!.includes("- [m1] Resume title — not started"));
   });
 
+  it("Issue #1514: a non-interlocked done that reaches the served scope ceiling with milestones left is scope-capped", async () => {
+    const ms = ["m1", "m2", "m3", "m4", "m5"].map((id) => ({ id, title: `t-${id}` }));
+    const doneAt = (declared: string[]) => makeMultiEpochRig([
+      script("th-1", [(th, tn) => [done(9, th, tn, { milestones_completed: declared })]]),
+    ]);
+    const run = async (declared: string[], total: typeof ms) => {
+      const { ctx, emitted: emits } = makeCtx({
+        frozenMilestones: total,
+        reportIteration: async () => ({ scopeCeiling: 3, completedCount: 2 }),
+      });
+      const result = await withTimeout(
+        makeExecutor(doneAt(declared), bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1514 run");
+      return { result, emits };
+    };
+    const capped = await run(["m1", "m2", "m3"], ms);
+    assert.deepEqual(capped.result.scopeCapped, { completedCount: 3, total: 5 });
+    assert.equal(capped.emits.filter((m) => m.kind === "steer_ack").length, 1);
+    // A genuinely full delivery (every frozen milestone declared) stays closing.
+    const full = await run(["m1", "m2", "m3"], ms.slice(0, 3));
+    assert.equal(full.result.scopeCapped, undefined);
+  });
+
   it("re-asks after a work turn with nothing in progress, resets once one is, and emits one bounded status", async () => {
     const rig = makeMultiEpochRig([script("th-1", [
       quiet,

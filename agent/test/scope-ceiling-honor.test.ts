@@ -59,6 +59,15 @@ function submitPlan(plan: string, sessionId = "sess-1"): SDKMessage {
     message: { content: [{ type: "tool_use", id: "t1", name: "mcp__uzi__submit_plan", input: { plan_md: plan } }] },
   } as unknown as SDKMessage;
 }
+function signalDoneDeclaring(ids: string[], sessionId = "sess-1"): SDKMessage {
+  return {
+    type: "assistant",
+    session_id: sessionId,
+    message: {
+      content: [{ type: "tool_use", id: "t2", name: "mcp__uzi__signal_done", input: { milestones_completed: ids } }],
+    },
+  } as unknown as SDKMessage;
+}
 function signalDone(sessionId = "sess-1"): SDKMessage {
   return {
     type: "assistant",
@@ -472,5 +481,61 @@ describe("PRD #634 M6 — worker scope-ceiling honor gate", () => {
     // 1 and scopeCapped would be set.
     assert.equal(turns.length, 2, "one planning turn + one implement turn drove (gate did not fire at loop top)");
     assert.deepEqual(probe.iterations, [1], "iteration 1 ran a real turn and signaled done; the gate did not cap it");
+  });
+
+  // Issue #1514: a lead that finishes its last permitted milestone and calls signal_done in the
+  // SAME turn never reaches the loop-top gate again; the done exit must latch the cap itself.
+  describe("Issue #1514 — scope cap at the signal_done exit", () => {
+    const SEVEN: Milestone[] = [1, 2, 3, 4, 5, 6, 7].map((n) => ({ id: `m${n}`, title: `milestone ${n}` }));
+    const served = { scopeCeiling: 3, completedCount: 2 };
+
+    it("latches scopeCapped when the done turn completes the ceiling with milestones remaining", async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlanWithMilestones("# Plan", SEVEN), resultSuccess()],
+        [assistantText("m3 done"), signalDoneDeclaring(["m1", "m2", "m3"]), resultSuccess()],
+      ]);
+      const probe = makeCtx({ reportIteration: async () => served });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.deepEqual(result.scopeCapped, { completedCount: 3, total: 7 });
+      const acks = probe.emits.filter((m) => m.kind === "steer_ack");
+      assert.equal(acks.length, 1);
+      assert.equal(acks[0]!.payload["directive"], "scope");
+      assert.equal(acks[0]!.payload["ceiling"], 3);
+      assert.equal(acks[0]!.payload["completed"], 3);
+    });
+
+    it("keeps a genuinely full delivery closing (all frozen milestones declared)", async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlanWithMilestones("# Plan", SEVEN), resultSuccess()],
+        [signalDoneDeclaring(SEVEN.map((m) => m.id)), resultSuccess()],
+      ]);
+      const probe = makeCtx({ reportIteration: async () => served });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(result.scopeCapped, undefined);
+      assert.ok(!probe.emits.some((m) => m.kind === "steer_ack"));
+    });
+
+    it("caps on a post-approval resume via ctx.frozenMilestones (no submit_plan in this run)", async () => {
+      const { queryFn } = fakeTurns([[signalDoneDeclaring(["m1", "m2", "m3"]), resultSuccess()]]);
+      const probe = makeCtx({
+        planApproved: true,
+        sessionId: "sess-parked",
+        approvedPlan: "# Approved plan",
+        frozenMilestones: SEVEN,
+        reportIteration: async () => served,
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.deepEqual(result.scopeCapped, { completedCount: 3, total: 7 });
+    });
+
+    it("does not cap a non-issue run", async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        [signalDoneDeclaring(["m1", "m2", "m3"]), resultSuccess()],
+      ]);
+      const probe = makeCtx({ kind: "prompt", frozenMilestones: SEVEN, reportIteration: async () => served });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.equal(result.scopeCapped, undefined);
+    });
   });
 });

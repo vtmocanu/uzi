@@ -180,6 +180,8 @@ export class FakeApi {
   // approval / the autopilot plan report); the worker reads it off the same body (readRunAck) and
   // binds its completion permit to it when the claim carried no contract_revision.
   private readonly stateAckCompletionRevision = new Map<string, unknown>();
+  // Issue #1514: the operator scope ceiling + completed ids the /state ACK's RunDTO carries.
+  private readonly stateAckScope = new Map<string, { scope_ceiling: number; milestones_completed: string[] }>();
   private readonly stateRawOverride = new Map<
     string,
     { status: number; body: string }
@@ -809,6 +811,12 @@ export class FakeApi {
    *  model a malformed one. */
   setStateAckCompletionRevision(runId: string, rev: unknown): void {
     this.stateAckCompletionRevision.set(runId, rev);
+  }
+
+  /** Issue #1514: make this run's 200 /state ACKs carry `run.scope_ceiling` and
+   *  `run.milestones_completed`, as the api serves them after a scope directive. */
+  setStateAckScope(runId: string, scope: { scope_ceiling: number; milestones_completed: string[] }): void {
+    this.stateAckScope.set(runId, scope);
   }
 
   /** PRD #1392 M2 (D7): set the raw `protocol_features` the register endpoint returns beside
@@ -1536,6 +1544,7 @@ export class FakeApi {
         // PRD #1190 M2: the server-decided pause boundary rides the RunDTO the ACK wraps. Only
         // present when a test armed it; otherwise absent (the worker reads it as "no pause").
         ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),
+        ...(this.stateAckScope.has(runId) ? this.stateAckScope.get(runId) : {}),
         // Issue #1626: the frozen completion-contract revision, only when a test armed it.
         ...(this.stateAckCompletionRevision.has(runId)
           ? { completion_revision: this.stateAckCompletionRevision.get(runId) }

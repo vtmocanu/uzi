@@ -49,6 +49,7 @@
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
 import fs from "node:fs/promises";
 import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
@@ -2268,6 +2269,11 @@ export class CodexExecutor implements Executor {
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
+      // Issue #1514: latched at the non-interlocked done exit when the operator's scope ceiling was
+      // reached with milestones remaining, so the run delivers non-closing (sdk-executor parity;
+      // Codex has no loop-top scope gate). Issue runs only.
+      let scopeCapped: { completedCount: number; total?: number } | undefined;
+      let lastServedScope: { scopeCeiling?: number; completedCount?: number } | undefined;
       const isIssueRun = resolveRunKind(ctx.kind) === "issue";
       const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
@@ -2288,6 +2294,7 @@ export class CodexExecutor implements Executor {
         branch: ctx.branch,
         ...(completionHeld ? { completionHeld } : {}),
         ...(pausedAt ? { pausedAt } : {}),
+        ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
@@ -2307,6 +2314,7 @@ export class CodexExecutor implements Executor {
         // budget never shortens the configured/default limit or an earlier lift.
         const served: IterationBudget | void = await ctx.reportIteration?.(iteration, latestProgress);
         if (served) {
+          lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount };
           if (typeof served.maxIterations === "number" && served.maxIterations > maxIterations) {
             maxIterations = served.maxIterations;
           }
@@ -2476,7 +2484,25 @@ export class CodexExecutor implements Executor {
             }
             if (secretDecision?.action === "fail") break;
           }
-          if (!interlockedIssue) break;
+          if (!interlockedIssue) {
+            // Issue #1514: same done-exit scope cap as sdk-executor's legacy done exit.
+            if (isIssueRun) {
+              const cap = scopeCapAtDone({
+                served: lastServedScope,
+                frozen: milestones,
+                completedIds: [...(declaredMilestonesCompleted ?? []), ...(latestProgress?.completed ?? [])],
+              });
+              if (cap) {
+                scopeCapped = cap;
+                ctx.emit({
+                  kind: "steer_ack",
+                  agent: "worker",
+                  payload: scopeSteerAckPayload(lastServedScope!.scopeCeiling!, cap.completedCount),
+                });
+              }
+            }
+            break;
+          }
           // Preserve the live thread before reaping the provider and reading Git state.
           await epoch.persistSession();
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still

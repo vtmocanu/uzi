@@ -23,6 +23,7 @@
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
+import { scopeCapAtDone, scopeSteerAckPayload } from "./scope-cap.js";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type {
@@ -2367,6 +2368,9 @@ export class SdkExecutor implements Executor {
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
+      // Issue #1514: the most recent served scope fields, kept so the done exit (which never
+      // reaches the loop-top gate again) can apply the same ceiling.
+      let lastServedScope: { scopeCeiling?: number; completedCount?: number } | undefined;
       // PRD #1190 M2: latched when an owner-requested pause parked the run (the loop-top pause
       // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
       // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
@@ -2408,6 +2412,7 @@ export class SdkExecutor implements Executor {
         // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
         const served = await ctx.reportIteration?.(iteration, latestProgress);
         if (served) {
+          lastServedScope = { scopeCeiling: served.scopeCeiling, completedCount: served.completedCount };
           if (
             typeof served.maxIterations === "number" &&
             served.maxIterations > maxIterations
@@ -2457,12 +2462,7 @@ export class SdkExecutor implements Executor {
           ctx.emit({
             kind: "steer_ack",
             agent: "worker",
-            payload: {
-              text: `finalizing at ${served.completedCount} completed milestone(s) (operator ceiling was ${served.scopeCeiling}); starting no further milestone`,
-              directive: "scope",
-              ceiling: served.scopeCeiling,
-              completed: served.completedCount,
-            },
+            payload: scopeSteerAckPayload(served.scopeCeiling, served.completedCount),
           });
           break;
         }
@@ -3166,6 +3166,25 @@ export class SdkExecutor implements Executor {
             resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
             turn.done = false;
             continue;
+          }
+          // Issue #1514: the loop-top scope gate only fires on a further iteration, so a lead that
+          // finishes its last permitted milestone and calls signal_done in the same turn exits
+          // here. Latch the cap now so the run delivers non-closing. Legacy exit only: the
+          // interlocked `unmet.length === 0` break means the server judged the run complete.
+          if (isIssueRun && !scopeCapped) {
+            const cap = scopeCapAtDone({
+              served: lastServedScope,
+              frozen: frozenMilestones ?? ctx.frozenMilestones,
+              completedIds: [...(declaredMilestonesCompleted ?? []), ...(latestProgress?.completed ?? [])],
+            });
+            if (cap) {
+              scopeCapped = cap;
+              ctx.emit({
+                kind: "steer_ack",
+                agent: "worker",
+                payload: scopeSteerAckPayload(lastServedScope!.scopeCeiling!, cap.completedCount),
+              });
+            }
           }
           break;
         }
