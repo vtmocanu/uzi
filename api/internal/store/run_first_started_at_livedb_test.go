@@ -313,7 +313,7 @@ func TestRunResumedLegGetsFreshWallLiveDB(t *testing.T) {
 }
 
 // TestRunFirstStartedAtBackfillLiveDB follows status_since_backfill_livedb_test.go: a throwaway
-// database migrated to 276 is seeded with legacy rows, 00277 is applied, and the backfill is
+// database migrated to 279 is seeded with legacy rows, 00280 is applied, and the backfill is
 // asserted. Started rows seed from started_at, never-started and parked rows stay NULL, and
 // created_at is never read.
 func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
@@ -357,8 +357,8 @@ func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
 	u.Path = "/" + name
 	newDSN := u.String()
 
-	if err := store.MigrateTo(ctx, newDSN, 276); err != nil {
-		t.Fatalf("MigrateTo(276): %v", err)
+	if err := store.MigrateTo(ctx, newDSN, 279); err != nil {
+		t.Fatalf("MigrateTo(279): %v", err)
 	}
 	pool, err = store.OpenPool(ctx, newDSN)
 	if err != nil {
@@ -370,7 +370,7 @@ func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
 		t.Fatalf("probe: %v", err)
 	}
 	if have != 0 {
-		t.Fatalf("runs.first_started_at exists at v276; the test would be vacuous")
+		t.Fatalf("runs.first_started_at exists at v279; the test would be vacuous")
 	}
 
 	// Distinct created_at per row, none equal to any started_at, so a created_at-seeded
@@ -397,8 +397,8 @@ func TestRunFirstStartedAtBackfillLiveDB(t *testing.T) {
 			id, s.status, s.created, s.started, s.fin)
 	}
 
-	if err := store.MigrateTo(ctx, newDSN, 277); err != nil {
-		t.Fatalf("MigrateTo(277): %v", err)
+	if err := store.MigrateTo(ctx, newDSN, 280); err != nil {
+		t.Fatalf("MigrateTo(280): %v", err)
 	}
 
 	read := func(tag string) (first, started, created pgtype.Timestamptz) {
