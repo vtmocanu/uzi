@@ -8573,7 +8573,7 @@ export class RunRunner {
           claim.config ?? null,
         ),
       pullFollowUp: () => steering.pullFollowUp(),
-      // Issue #1800: the executor reports a pulled follow-up once a prompt carrying it started.
+      // Issue #1800: the executor reports a pulled follow-up once the turn carrying it reached the model.
       followUpIncluded: (id) => steering.markFollowUpIncluded(id),
       // PRD #1416 M2: drain the worker-authoritative safety steer the divergence detection
       // (maybeSteerOnDivergence) armed on this same steering channel, in-process. Consumed by

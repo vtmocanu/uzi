@@ -4151,7 +4151,7 @@ export interface SteerInput {
   consumed_at: string | null;
   // When steering routed the input (Routed); null until then.
   applied_at: string | null;
-  // When the turn carrying the input started (Included in a prompt); null until then.
+  // When the turn carrying the input reached the model (Included in a prompt); null until then.
   // Only meaningful when inclusion_reported is true.
   included_at: string | null;
   // True when the receiving worker reports prompt inclusion. False for legacy rows and old

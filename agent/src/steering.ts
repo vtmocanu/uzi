@@ -1764,7 +1764,7 @@ export class SteeringChannel {
     return this.takeFollowUp();
   }
 
-  /** Issue #1800: the executor put follow-up `id` into a prompt that started. Queues an inclusion
+  /** Issue #1800: the executor put follow-up `id` into a prompt whose turn reached the model. Queues an inclusion
    *  receipt (POST /inputs/included), sent on the next poll tick and drained at stop. Idempotent
    *  per id; a failed send is retried, an api without the route is silently dropped. */
   markFollowUpIncluded(id: number): void {
@@ -2513,7 +2513,7 @@ export class ChatSteering implements ChatInputSource {
   private lost = false;
   private loop: Promise<void> | undefined;
   private readonly followUps: { id: number; text: string }[] = [];
-  /** Issue #1800: receipts for messages a turn really started on (a seeded first message included). */
+  /** Issue #1800: receipts for messages whose turn reached the model (a seeded first message included). */
   private readonly inclusions: InclusionReporter;
   /** Issue #1673: the one input batch in flight, as in SteeringChannel ("ack" retries the ACK,
    *  "applied" retries the applied receipt without rerouting). */

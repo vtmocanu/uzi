@@ -297,7 +297,7 @@ export class ChatRunner {
           batcher.emit({ kind: "user_message", payload: { text: input.text } });
           return { text: input.text, inputId: input.id };
         },
-        // Issue #1800: a message (the seeded first one included) a turn really started on.
+        // Issue #1800: a message (the seeded first one included) whose turn reached the model.
         followUpIncluded: (id) => source.markFollowUpIncluded?.(id),
       };
 

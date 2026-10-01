@@ -209,7 +209,9 @@ export interface HarnessEventMeta {
 
 export type HarnessEvent = HarnessEventMeta &
   (
-    | { kind: "activity" }
+    // `modelInitiated` (Codex only): the model itself issued a tool or item on the active root
+    // thread (command, file change, MCP/dynamic tool call). Absent on pure lifecycle liveness.
+    | { kind: "activity"; modelInitiated?: true }
     // issue #1562 (ADR-1562): `freshSession` marks that this SDK process did NOT
     // continue the requested session (no resume requested, or the init session_id
     // differed). Threaded to projectInit so the persisted init frame gains
@@ -254,10 +256,15 @@ const SYNTHETIC_MODEL = "<synthetic>";
  * limit-rejected turn ([rate_limit_event rejected, synthetic assistant, result is_error
  * num_turns 1]), and the executors run this before the reducer classifies the terminal, so
  * trusting it would stamp a follow-up the model never read.
- * False for lifecycle events: `initialized` (Claude system/init, Codex claim init), `activity`
- * (rate_limit_event, thread/started, turn/started, token usage) and `turn_finished`.
+ * Codex also counts an `activity` marked `modelInitiated`: a turn that acts only through
+ * commands, file changes or MCP/dynamic tool items (no agent message) still proves the model read
+ * the prompt, since the model issued them. Codex has no synthetic limit frame, so this is safe
+ * there; Claude never sets the marker, so its rule is unchanged.
+ * False for lifecycle events: `initialized` (Claude system/init, Codex claim init), unmarked
+ * `activity` (rate_limit_event, thread/started, turn/started, token usage) and `turn_finished`.
  */
 export function evidencesModelProcessing(event: HarnessEvent): boolean {
+  if (event.kind === "activity") return event.modelInitiated === true;
   if (event.kind === "frame") {
     if (event.model === SYNTHETIC_MODEL) return false;
     return event.items.length > 0 || event.usage !== undefined || Object.keys(event.signals ?? {}).length > 0;

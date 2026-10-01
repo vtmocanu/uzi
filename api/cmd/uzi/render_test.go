@@ -1505,6 +1505,10 @@ func TestSteerStateEveryFollowUpState(t *testing.T) {
 		" (run paused on a usage limit)",
 		" (run held on an empty token pool)",
 		" (run recovering from a transient interruption)",
+		" (run waiting for the forge)",
+		" (run held on its Codex account)",
+		" (run waiting for vault unlock)",
+		" (run waiting for disk space)",
 	}
 	hasAllowedParkSuffix := func(s string) bool {
 		for _, suf := range allowedParkSuffixes {

@@ -1390,7 +1390,9 @@ export class CodexHarness implements RunHarness {
         }
         const frame = this.decodeItemFrame(note);
         if (frame !== undefined) return frame;
-        // A Codex item update / unknown method: liveness only.
+        // A model-issued tool item on the root thread (issue #1800 inclusion evidence); any other
+        // item update / unknown method is liveness only.
+        if (this.isModelIssuedItem(note)) return { kind: "activity", sessionId: this.threadId, modelInitiated: true };
         return { kind: "activity", sessionId: this.threadId };
       }
     }
@@ -1763,6 +1765,16 @@ export class CodexHarness implements RunHarness {
       model: this.currentModel,
       sessionId: this.threadId,
     };
+  }
+
+  /** True for an item/started or item/completed note of a model-issued tool item type on the
+   *  ACTIVE root thread. userMessage and unknown types are not model-issued. */
+  private isModelIssuedItem(note: Extract<CodexNotification, { kind: "activity" }>): boolean {
+    if (note.method !== "item/started" && note.method !== "item/completed") return false;
+    const params = asObject(note.params);
+    if (params === undefined || params.threadId !== this.threadId) return false;
+    const type = asString(asObject(params.item)?.type);
+    return type === "commandExecution" || type === "fileChange" || type === "mcpToolCall" || type === "dynamicToolCall";
   }
 
   // VERIFIED 2026-09-10: the native both-image packaged proof drove pinned Codex

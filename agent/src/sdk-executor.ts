@@ -2288,6 +2288,11 @@ export class SdkExecutor implements Executor {
       // Issue #1800: the held owner follow-up id the interactive-park branch already ran an extra
       // turn for, so that branch is taken at most once per id.
       let serviceTriedId: number | undefined;
+      // Issue #1800: follow-ups the interactive park received while ownerFollowUp was still held,
+      // in arrival order. They are already consumed from the server, so they must never be
+      // dropped: they refill the slot at the loop top (ahead of a fresh pull) and the park below
+      // services them before it blocks again.
+      const queuedOwner: Array<{ id: number; body: string }> = [];
       // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
       // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
       // framing, priorWork/deps notes, and the base-commit note) must be emitted on the
@@ -2544,7 +2549,7 @@ export class SdkExecutor implements Executor {
         // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
         // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
         // in its slot for the next ordinary turn.
-        if (followUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
+        if (followUp === undefined) ownerFollowUp ??= queuedOwner.shift() ?? ctx.pullFollowUp?.();
         const ownerRides = followUp === undefined ? ownerFollowUp : undefined;
         const onFirstEvent = ownerRides
           ? () => {
@@ -2891,9 +2896,13 @@ export class SdkExecutor implements Executor {
             // once per held id (`serviceTriedId`), and the system `followUp` text is cleared so the
             // extra turn cannot replay a spent one. If the slot is STILL held after that turn, fall
             // through to the normal park: the follow-up stays unincluded and is re-queued at the
-            // next claim.
-            if (ownerFollowUp !== undefined && serviceTriedId !== ownerFollowUp.id) {
-              serviceTriedId = ownerFollowUp.id;
+            // next claim. A follow-up the park receives meanwhile queues BEHIND it (queuedOwner),
+            // and queued ones are serviced before any further park, so none is ever overwritten.
+            if (
+              (ownerFollowUp !== undefined && serviceTriedId !== ownerFollowUp.id)
+              || (ownerFollowUp === undefined && queuedOwner.length > 0)
+            ) {
+              if (ownerFollowUp !== undefined) serviceTriedId = ownerFollowUp.id;
               followUp = undefined;
               iteration = 0;
               state.wallRemainingMs = initialWallMs;
@@ -2946,8 +2955,10 @@ export class SdkExecutor implements Executor {
               // Issue #1800: it enters the owner slot, so it is
               // reported included when the turn carrying it reaches the model.
               followUp = undefined;
-              // The slot is empty here: a held one makes the park above run a turn instead.
-              ownerFollowUp = { id: outcome.id, body: outcome.body };
+              // The slot may still be held (the bounded extra turn above did not evidence it):
+              // keep the held one in front and queue this one behind it.
+              if (ownerFollowUp === undefined) ownerFollowUp = { id: outcome.id, body: outcome.body };
+              else queuedOwner.push({ id: outcome.id, body: outcome.body });
               // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
               // interactive run spans many follow-ups over its lifetime and must NOT fail with
               // REASON_MAX_ITERATIONS after N turns SUMMED across them — the budget bounds one
