@@ -18,7 +18,7 @@ left to the deadline (e.g. `1h 5m left`).
 | Flag | Shows up when | What to do |
 |---|---|---|
 | ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
-| ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
+| ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled) — or one tool call has been running far longer than a normal build or test suite would (see [Long tool calls](#long-tool-calls)). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
 | ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will park and wait for you at the timeout, not fail — see [Running out of time](#running-out-of-time). | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
 | ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
@@ -48,6 +48,30 @@ lease or reclaims, fails or discards the run. The outcome is held on the
 worker, so check the worker — [`uzi worker list`](./cli.md#disk-usage-and-checkpoint-durability)
 shows its pending outcomes. A plain cancel is refused while the outcome is held;
 it must be confirmed as discarding that outcome.
+
+### Long tool calls
+
+A long build or test suite sends one tool call and then nothing until it
+finishes, so ordinary **stalled** detection leaves a run alone while a call
+is in flight. That would let a hung command hide a run for hours. So a
+running run is also flagged ⚠ stalled, with the owner's reason _"a tool call
+has been in progress longer than the configured threshold"_, when both hold:
+
+- the oldest tool call the run's main agent still has open has been running
+  for at least **Long tool call after** (default 20 minutes), and
+- nothing at all has arrived from the run, on any agent, for at least the
+  **Stalled after** window (or for the long-tool-call threshold itself, if
+  **Stalled after** is `0`).
+
+A call to a subagent (a delegation) is never aged: while one is open the run
+reads as working, as before. A subagent that is still sending updates never
+trips this flag. Only one that has also gone silent past the window can, and
+then only while an ordinary call of the main agent has been open past the
+threshold. The age is measured from when uzi received the call, and it only
+looks at the run's recent tool calls; a run whose older calls all fall
+outside that window still trips the plain **stalled** flag once it goes
+quiet. The flag clears as soon as the call's result arrives. Like every
+flag, it never stops the run.
 
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
@@ -131,7 +155,8 @@ setting it to `0`, from **Admin → Instance → Run health** — see
 itself (how many repeats, over how large a window) isn't tunable; every other
 signal is — the plain seconds thresholds, and **near timeout**'s share of the
 run's wall-clock budget (a percent, not a duration, so it means the same
-thing regardless of the run's timeout or frozen budget). The undelivered-outcome
+thing regardless of the run's timeout or frozen budget). Setting **Long tool call after** to `0` turns off only the
+[long tool call](#long-tool-calls) reason. The undelivered-outcome
 **stalled** reason is the other exception: its threshold is fixed at 4 of the
 api's heartbeat intervals and setting **stalled** to `0` does not disable it;
 only turning run health off entirely does.
