@@ -205,8 +205,8 @@ deployment (see [Configuration](./configuration.md#hosted-k8s-workers-prd-58)).
 
 Five limits bound what one official-sources research run may download (see
 [Egress profiles](./egress-profiles.md)). The api reads them when it admits
-every fetch of a run in the [isolated research lane](./isolated-research-lane.md);
-no run is bound to a site list yet, so nothing exercises them today.
+every fetch of a run in the [isolated research lane](./isolated-research-lane.md),
+which is a job or run bound to a site list.
 
 | Setting | Default | Controls |
 |---|---|---|

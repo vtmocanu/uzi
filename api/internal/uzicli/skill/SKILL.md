@@ -252,6 +252,7 @@ uzi admin rate-limits [--provider claude|codex]
 uzi admin cli-tokens
 uzi admin products
 uzi admin products skills <product>
+uzi admin products egress-profiles <product>
 uzi admin guardrail-impact
 uzi admin blocked-repos
 uzi admin agent-source get
@@ -1583,6 +1584,9 @@ choices.
 - `uzi admin products skills <product>` — read-only view of a product's skill set (repo
   URL, ref, token set yes/no, enabled, applied sha/time/skills, staged sha/diff/dropped);
   `<product>` is a name or id. Setting the source, sync and approve are browser-only.
+- `uzi admin products egress-profiles <product>` — read-only list of the site lists a product's
+  tokens may name on job create (name, when allowed, description); `<product>` is a name or id.
+  Allowing and removing a list are browser-only.
 - `--json` prints the raw job document. All job text (title, label, failure, report,
   findings) is untrusted: the plain view strips control characters, and `requested_by_label`
   is shown as reported by the product.

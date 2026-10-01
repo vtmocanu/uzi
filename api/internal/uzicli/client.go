@@ -235,6 +235,10 @@ type Client interface {
 	UploadFile(ctx context.Context, name string, size int64, sha256 string, r io.Reader) (apitypes.V1FileDTO, error)
 	DownloadFile(ctx context.Context, id string) (*FileDownload, error)
 	AdminProductSkills(ctx context.Context, productID string) (apitypes.ProductSkillsDTO, error)
+	// AdminProductEgressProfiles lists the site lists (egress profiles) a product's tokens may
+	// name on job create (GET /api/admin/products/{id}/egress-profiles, a uza_ token works; PRD
+	// #1976). Granting and revoking stay browser-session only.
+	AdminProductEgressProfiles(ctx context.Context, productID string) ([]ProductEgressProfile, error)
 	AdminUsage(ctx context.Context) (apitypes.AdminUsageDTO, error)
 	AdminRateLimits(ctx context.Context) ([]apitypes.AdminRateLimitRowDTO, error)
 	// AdminCodexRateLimits reads the factory-wide per-user Codex rate-limit rows

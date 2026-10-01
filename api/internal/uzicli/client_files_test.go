@@ -24,6 +24,11 @@ func TestHTTPFileRequests(t *testing.T) {
 	if d, err := c.AdminProductSkills(ctx, "p/1"); err != nil || d.Staged != nil || *seen != [3]string{"GET", "/api/admin/products/p%2F1/skills", ""} {
 		t.Errorf("skills = %+v %v, %v", d, *seen, err)
 	}
+
+	c, seen, _ = jobServer(t, 200, "application/json", `{"egress_profiles":[{"name":"vendor-x","description":"d","created_at":"2026-10-01T08:00:00Z"}]}`)
+	if d, err := c.AdminProductEgressProfiles(ctx, "p/1"); err != nil || len(d) != 1 || d[0].Name != "vendor-x" || *seen != [3]string{"GET", "/api/admin/products/p%2F1/egress-profiles", ""} {
+		t.Errorf("egress profiles = %+v %v, %v", d, *seen, err)
+	}
 }
 
 func TestHTTPUploadFileHeadersAndStatuses(t *testing.T) {
