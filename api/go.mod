@@ -29,7 +29,7 @@ require (
 	github.com/slack-go/slack v0.29.0
 	github.com/spf13/cobra v1.10.2
 	github.com/yuin/goldmark v1.8.6
-	gitlab.com/gitlab-org/api/client-go/v3 v3.11.0
+	gitlab.com/gitlab-org/api/client-go/v3 v3.14.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/mod v0.41.0
 	golang.org/x/net v0.58.0
