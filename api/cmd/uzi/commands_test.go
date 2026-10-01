@@ -1048,7 +1048,7 @@ func TestRunLogsFollowStopsOnTerminal(t *testing.T) {
 }
 
 // The steer-queue table renders each follow-up's kind, body and its delivery state.
-// A non-consumed input on a live run is "queued"; a consumed one is "delivered". The
+// A non-consumed input on a live run is "queued"; a consumed one is "received". The
 // KIND column (PRD #634) labels a follow_up row "follow-up".
 func TestRunInputsTableStates(t *testing.T) {
 	consumed := time.Now().Add(-time.Minute)
@@ -1057,7 +1057,7 @@ func TestRunInputsTableStates(t *testing.T) {
 	fc := &uzicli.FakeClient{
 		RunByID: map[string]apitypes.RunDTO{"r1": {ID: "r1", Status: "running", Kind: "issue"}},
 		InputsByID: map[string][]apitypes.SteerInputDTO{"r1": {
-			{ID: 2, Kind: "follow_up", Body: &delivered, CreatedAt: time.Now().Add(-30 * time.Second), ConsumedAt: &consumed},
+			{ID: 2, Kind: "follow_up", Body: &delivered, CreatedAt: time.Now().Add(-30 * time.Second), ConsumedAt: &consumed, InclusionReported: true},
 			{ID: 1, Kind: "follow_up", Body: &queued, CreatedAt: time.Now().Add(-2 * time.Minute)},
 		}},
 	}
@@ -1065,7 +1065,7 @@ func TestRunInputsTableStates(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	for _, want := range []string{"KIND", "BODY", "STATE", "AGE", "follow-up", queued, "queued", delivered, "delivered"} {
+	for _, want := range []string{"KIND", "BODY", "STATE", "AGE", "follow-up", queued, "queued", delivered, "received"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("inputs table missing %q:\n%s", want, out)
 		}
@@ -1137,7 +1137,7 @@ func TestRunScopeSubmit(t *testing.T) {
 	}
 }
 
-// --json emits the raw DTO list (id/body/created_at/consumed_at); state is
+// --json emits the raw DTO list (id/body/created_at/consumed_at/applied_at/included_at/inclusion_reported); state is
 // derived by the agent from these fields, so the CLI does NOT fetch the run in
 // --json mode — proven here by the absence of any RunByID entry.
 func TestRunInputsJSON(t *testing.T) {
@@ -1171,21 +1171,21 @@ func TestRunInputsOwn200Foreign404(t *testing.T) {
 }
 
 // The gate and terminal nuances (Decision 7) render when the run's status is
-// known: a follow-up consumed at a plan gate reads "delivered (applies after
-// approval)"; an unconsumed one on a terminal run reads "not delivered".
+// known: a follow-up received at a plan gate reads "received (waits for approval)";
+// an unconsumed one on a terminal run reads "not delivered".
 func TestRunInputsGateAndTerminalStates(t *testing.T) {
 	consumed := time.Now().Add(-time.Minute)
 	atGate := "approve me"
 	stranded := "too late"
 	gate := &uzicli.FakeClient{
 		RunByID:    map[string]apitypes.RunDTO{"g": {ID: "g", Status: "awaiting_approval", Kind: "issue"}},
-		InputsByID: map[string][]apitypes.SteerInputDTO{"g": {{ID: 1, Body: &atGate, CreatedAt: time.Now(), ConsumedAt: &consumed}}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"g": {{ID: 1, Body: &atGate, CreatedAt: time.Now(), ConsumedAt: &consumed, InclusionReported: true}}},
 	}
 	out, _, code := runCLI(t, fakeEnv(gate), "run", "inputs", "g")
 	if code != uzicli.ExitOK {
 		t.Fatalf("gate: exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "applies after approval") {
+	if !strings.Contains(out, "received (waits for approval)") {
 		t.Errorf("gate state missing the approval nuance:\n%s", out)
 	}
 	term := &uzicli.FakeClient{
@@ -2047,5 +2047,32 @@ func TestRunReworkJSON(t *testing.T) {
 	}
 	if run.ID != "r2" || run.Kind != "mr_rework" {
 		t.Errorf("envelope run = %+v, want the created mr_rework run r2", run)
+	}
+}
+
+// TestRunInputsIncludedAndNotIncluded (issue #1800): the table reads "included in a prompt"
+// once the turn carrying a follow-up started, and a finished run whose received follow-up
+// never reached a prompt reads "not included (run finished)", never "delivered".
+func TestRunInputsIncludedAndNotIncluded(t *testing.T) {
+	at := time.Now().Add(-time.Minute)
+	inBody, outBody := "was in a prompt", "never in a prompt"
+	fc := &uzicli.FakeClient{
+		RunByID: map[string]apitypes.RunDTO{"d": {ID: "d", Status: "completed", Kind: "issue"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"d": {
+			{ID: 2, Kind: "follow_up", Body: &inBody, CreatedAt: at, ConsumedAt: &at, AppliedAt: &at, IncludedAt: &at, InclusionReported: true},
+			{ID: 1, Kind: "follow_up", Body: &outBody, CreatedAt: at, ConsumedAt: &at, AppliedAt: &at, InclusionReported: true},
+		}},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "d")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	for _, want := range []string{"included in a prompt", "not included (run finished)"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("inputs table missing %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "delivered") {
+		t.Errorf("inputs table says delivered for received follow-ups:\n%s", out)
 	}
 }

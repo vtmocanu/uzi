@@ -717,7 +717,7 @@ func detailSteerQueue(dark bool, now time.Time) string {
 		StartedAt:  tp(now.Add(-4 * time.Minute))} // header elapsed WORK time (`● running · 4m`)
 	m := detailBase(dark, run, now, false)
 	m = step(m, runInputsMsg{runID: detailRunID, err: nil, inputs: []apitypes.SteerInputDTO{
-		{ID: 1, Body: sp("prefer table-driven tests here"), CreatedAt: now.Add(-3 * time.Minute), ConsumedAt: tp(now.Add(-2 * time.Minute))},
+		{ID: 1, Body: sp("prefer table-driven tests here"), CreatedAt: now.Add(-3 * time.Minute), ConsumedAt: tp(now.Add(-2 * time.Minute)), AppliedAt: tp(now.Add(-2 * time.Minute)), IncludedAt: tp(now.Add(-100 * time.Second)), InclusionReported: true},
 		{ID: 2, Body: sp("also cover the seven-day window"), CreatedAt: now.Add(-30 * time.Second)},
 	}})
 	m = withLiveStream(m)

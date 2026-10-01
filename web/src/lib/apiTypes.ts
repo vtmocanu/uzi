@@ -4137,8 +4137,9 @@ export type RunInputKind =
 // SteerInput is one steer-queue entry (PRD #95, extended by PRD #634), from
 // GET /api/runs/{id}/inputs. `kind` is "follow_up" or "scope" (an operator
 // scope-ceiling directive). Delivery status is derived client-side per kind:
-//   - a follow_up derives its state from consumed_at (null ⇒ Queued; set ⇒
-//     Delivered) and its disposition is always null;
+//   - a follow_up derives its state from its receipt timestamps (consumed_at null ⇒
+//     Queued; set ⇒ Received; applied_at set ⇒ Routed; included_at set ⇒ Included in a
+//     prompt) and its disposition is always null;
 //   - a scope row is NEVER consumed (consumed_at always null); its state lives
 //     ENTIRELY in disposition ("applied" | "declined" | "superseded" | null pending).
 // body is nullable to match the wire, though every entry carries one in practice.
@@ -4146,9 +4147,18 @@ export interface SteerInput {
   id: number;
   body: string | null;
   created_at: string;
+  // When the worker received the input (Received). Null while it is still Queued.
   consumed_at: string | null;
+  // When steering routed the input (Routed); null until then.
+  applied_at: string | null;
+  // When the turn carrying the input started (Included in a prompt); null until then.
+  // Only meaningful when inclusion_reported is true.
+  included_at: string | null;
+  // True when the receiving worker reports prompt inclusion. False for legacy rows and old
+  // workers, where a null included_at means "cannot say", not "left out".
+  inclusion_reported: boolean;
   // "follow_up" | "scope" (PRD #634). Scope rows carry disposition; follow_up
-  // rows derive their state from consumed_at (disposition always null).
+  // rows derive their state from the receipt timestamps (disposition always null).
   kind: string;
   // For a scope row: "applied" | "declined" | "superseded" | null (pending).
   // Always null for a follow_up row.

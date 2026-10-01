@@ -290,8 +290,8 @@ func TestSteerQueueIndicatorUsesTheSharedVocabulary(t *testing.T) {
 	out := m.View().Content
 	// These strings come from steerState, not from this file — if the shared helper's
 	// wording changes, this test follows it rather than pinning a stale copy.
-	wantQueued := steerState(kindFollowUp, nil, nil, "running")
-	wantDelivered := steerState(kindFollowUp, &consumed, nil, "running")
+	wantQueued := steerState(queuedIn(), "running")
+	wantDelivered := steerState(receivedIn(consumed), "running")
 	if !strings.Contains(out, wantQueued) {
 		t.Errorf("the queue indicator does not show %q\n%s", wantQueued, out)
 	}
@@ -332,8 +332,8 @@ func TestSteerQueueLabelsTheScopeKind(t *testing.T) {
 	// Identify each row by a state-label substring unique to it (state labels come from
 	// the shared steerState helper and are rendered regardless of the KIND cell), so we
 	// assert on the RIGHT line rather than assuming row order.
-	scopeState := steerState("scope", nil, nil, m.detail.run.Status)
-	followState := steerState("follow_up", nil, nil, m.detail.run.Status)
+	scopeState := steerState(apitypes.SteerInputDTO{Kind: "scope"}, m.detail.run.Status)
+	followState := steerState(queuedIn(), m.detail.run.Status)
 	var scopeLine, followLine string
 	for _, line := range lines {
 		if strings.Contains(line, scopeState) {

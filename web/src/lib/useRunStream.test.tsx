@@ -204,11 +204,14 @@ describe("useRunStream steer queue (PRD #95 M3)", () => {
       body: "resume",
       created_at: "2026-07-20T10:00:00Z",
       consumed_at: "2026-07-20T10:02:00Z",
+      applied_at: null,
+      included_at: null,
+      inclusion_reported: true,
       kind: "follow_up",
       disposition: null,
     };
-    // Mount refetch returns Queued; every later refetch returns it Delivered — so a
-    // Delivered result can ONLY come from a post-mount refetch (open / input frame).
+    // Mount refetch returns Queued; every later refetch returns it Received — so a
+    // Received result can ONLY come from a post-mount refetch (open / input frame).
     const getInputs = vi
       .spyOn(api, "getRunInputs")
       .mockResolvedValueOnce({ inputs: [{ ...delivered, consumed_at: null }] })
@@ -288,6 +291,9 @@ describe("useRunStream stale fetch after run change (issue #1430)", () => {
     body,
     created_at: "",
     consumed_at: null,
+    applied_at: null,
+    included_at: null,
+    inclusion_reported: false,
     kind: "follow_up",
     disposition: null,
   });
