@@ -1850,7 +1850,9 @@ a run whose outcome the worker holds journaled but has not delivered to the api
 (a pending outcome) as running. Those show as `N pending outcome(s) (oldest
 <age>)` instead, so a worker stuck holding outcomes is visible at a glance.
 `--json` carries the raw `terminal_pending` and `terminal_pending_since` fields
-on each `reported_runs` entry. A run whose outcome stays pending for 60 seconds
+on each `reported_runs` entry. A worker over its pending-outcome cap lists
+only some of its pending outcomes per heartbeat, so the count is then a lower
+bound. A run whose outcome stays pending for 60 seconds
 (with the default heartbeat) is flagged stalled; see
 [run health](./run-health.md#what-the-flags-mean).
 

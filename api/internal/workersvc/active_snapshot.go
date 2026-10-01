@@ -308,9 +308,9 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	//
 	// KNOWN LIMIT: under pending_overflow the worker (agent/src/active-run-registry.ts,
 	// selectPendingForBuild) lists blocked-first fixed slots plus ONE slot that round-robins over
-	// the omitted pending entries. In heartbeat/claim mode an omitted entry's row is deleted
-	// above, so its since resets each time it rotates back in and those runs never reach the
-	// outcome-undelivered health threshold. The worker-level pending_overflow lease still
+	// the omitted pending entries. In heartbeat/claim mode an omitted entry's row is deleted by
+	// DeleteWorkerActiveRuns below, so its since resets each time it rotates back in and those
+	// runs never reach the outcome-undelivered health threshold. The worker-level pending_overflow lease still
 	// protects them from claim and reconcile.
 	type priorPending struct {
 		gen   int64
