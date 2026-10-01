@@ -18,7 +18,7 @@ import { FollowUpComposer } from "./FollowUpComposer";
 // Delivery state (Decision 7, issue #1800) is derived CLIENT-SIDE from the input's receipt
 // timestamps and run.status: consumed_at is the worker having received it (Received),
 // applied_at is steering having routed it (Routed), and included_at is the turn carrying it
-// having started (Included in a prompt). "Included" never claims the agent acted on the
+// having reached the model (Included in a prompt). "Included" never claims the agent acted on the
 // follow-up: whether it did shows in the agent's messages. The parked copy needs the run's
 // status (awaiting_approval, or awaiting_input since PRD #88); RunView passes it via
 // `status` (optional so the card still renders without it — those cases then degrade to

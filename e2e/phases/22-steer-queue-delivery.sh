@@ -170,5 +170,5 @@ wait_status "$RUN_S" cancelled
   || fail "a live-worker cancel must terminate the run as cancelled(stop_kind=cancelled), got status='$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')' stop_kind='$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')'"
 [ "$(apiget "/api/runs/$RUN_S/inputs" | jq -r '.inputs[0].consumed_at')" != null ] \
   || fail "the consumed follow_up must remain readable (consumed_at still set) after the run goes terminal (B1 survive-terminal)"
-pass "steer queue survives terminal: the consumed follow_up is still listed on the now-terminal (cancelled) run; the UI reads "Not included — run finished" (B1)"
+pass "steer queue survives terminal: the consumed follow_up is still listed on the now-terminal (cancelled) run; the consumed follow_up stays consumed after the run goes terminal (B1)"
 

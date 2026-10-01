@@ -560,7 +560,7 @@ uzi version
 - `uzi run inputs <run-id>` — the run's steer queue: the follow-ups sent to it
   (newest first) with a delivery state — `queued` (not yet fetched by the worker),
   `received` (the worker has it), `routed` (steering has acted on it), or `included in a
-  prompt` (the turn carrying it started; this never claims the agent acted on it). A
+  prompt` (the turn carrying it reached the model; this never claims the agent acted on it). A
   received or routed row names what it waits on: `(waits for approval)` at a plan gate
   (it reaches the first implementation prompt after approval), `(awaits your answer)`
   at a clarification park, `(resumes the run)` on an interactive run awaiting a

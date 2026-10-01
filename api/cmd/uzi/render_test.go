@@ -1500,13 +1500,27 @@ func TestSteerStateEveryFollowUpState(t *testing.T) {
 		{"legacy received awaiting answer", legacyRecv, "awaiting_input", "received (no inclusion report)"},
 		{"legacy routed usage limit", legacyRouted, statusLimitWait, "routed (no inclusion report)"},
 	}
+	// Pre-existing park suffixes that may overflow the 30-cell column.
+	allowedParkSuffixes := []string{
+		" (run paused on a usage limit)",
+		" (run held on an empty token pool)",
+		" (run recovering from a transient interruption)",
+	}
+	hasAllowedParkSuffix := func(s string) bool {
+		for _, suf := range allowedParkSuffixes {
+			if strings.HasSuffix(s, suf) {
+				return true
+			}
+		}
+		return false
+	}
 	for _, c := range cases {
 		got := steerState(c.in, c.status)
 		if got != c.want {
 			t.Errorf("%s: steerState = %q, want %q", c.name, got, c.want)
 		}
 		// The queue column is 30 cells wide (padCell); only the long park suffixes may overflow.
-		if len([]rune(got)) > 30 && !strings.Contains(got, "(run ") {
+		if len([]rune(got)) > 30 && !hasAllowedParkSuffix(got) {
 			t.Errorf("%s: %q is %d cells, wider than the 30-cell queue column", c.name, got, len([]rune(got)))
 		}
 		if strings.Contains(got, "delivered") && c.in.ConsumedAt != nil {

@@ -1722,7 +1722,7 @@ func steerKindLabel(kind string) string {
 //     awaiting_input "(awaits your answer)", awaiting_followup "(resumes the run)",
 //     a park's reason suffix, or "(no inclusion report)" for a legacy row.
 //
-// "Included" means the turn carrying the follow-up started; it never claims the model acted
+// "Included" means the turn carrying the follow-up reached the model; it never claims the model acted
 // on it. Nothing here says "delivered" for a consumed-but-not-included row: the worker having
 // received a follow-up is not the agent having been given it. The harness (Claude or Codex)
 // does not change a label; the DTO carries no harness.

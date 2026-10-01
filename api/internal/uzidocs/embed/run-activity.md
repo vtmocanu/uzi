@@ -281,7 +281,7 @@ through these delivery states:
 | Received / Routed — waits for approval | Fetched while the run sits at a plan-approval gate. It reaches a prompt in the first implementation prompt after you approve. |
 | Received / Routed — awaits your answer | Fetched while the run waits on a clarification question. It rides the next ordinary turn after you answer. |
 | Received / Routed — resumes the run | Fetched while an interactive run waits for its next follow-up; it becomes the next turn and resumes the run. |
-| Included in a prompt | The turn carrying it started: it is in a prompt the agent was given. |
+| Included in a prompt | The turn carrying it reached the model: it is in a prompt the agent was given. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
 | Not included — run finished | The worker fetched it, but the run finished before any turn carried it. |
 | Received / Routed — no inclusion report | The worker predates inclusion reporting, so uzi cannot say whether a prompt carried it. |

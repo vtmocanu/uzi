@@ -438,7 +438,7 @@ func newRunInputsCmd(env Env, gf *globalFlags) *cobra.Command {
 			"another user's run.\n\n" +
 			"The queue lists two kinds. A follow-up (kind='follow_up') carries a delivery state — " +
 			"queued (the worker has not received it yet), received (the worker has it), routed " +
-			"(steering has acted on it), included in a prompt (the turn carrying it started), " +
+			"(steering has acted on it), included in a prompt (the turn carrying it reached the model), " +
 			"not delivered (never received before the run finished), or not included (received but " +
 			"no turn carried it before the run finished). A received or routed row names what it is waiting on while " +
 			"the run waits for approval, your answer, or a follow-up. A worker that does not report " +
