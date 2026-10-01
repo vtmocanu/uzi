@@ -38,6 +38,10 @@ through `[0.52.0]`.)
 
 - **A milestone run that finishes at the operator's scope ceiling in the same turn as `signal_done` is now delivered as a partial ([#1514](https://github.com/vtmocanu/uzi/issues/1514)).**
   A non-interlocked milestone run that reached the operator's scope ceiling and signalled done in the same turn (Claude: before the next loop-top check; Codex: which has no loop-top check) opened a closing MR (`Closes #N`) and settled the scope input as declined; the done exit now applies the ceiling from the last served state, so the MR is `[partial]` and non-closing and the run reports `scope_capped`.
+
+- **The hard disk layer now relieves a run at its plan gate, waiting on a question, or otherwise not running, instead of only a run mid-implement ([#1830](https://github.com/vtmocanu/uzi/issues/1830)).**
+  At the hard disk threshold the worker used to consider only a Claude run inside its implement loop, so a run cloning, at its plan gate, in a revision turn, waiting on a question or follow-up, or finalizing could fill the volume untouched. It now considers every watched Claude run: a run whose executor is running and whose last server-acknowledged status is `running` is still stopped with a counted `data_volume_full` park, while any other run is not stopped (the api accepts a disk park only from `running`, and a park would swallow a pending approval) and instead has its rebuildable caches (`.cache/go-build`, `go/pkg/mod`, `.npm/_cacache`) dropped in place, keeping its gate and posting a status line to its feed. `.npm/_cacache` is kept while a JS-deps install may be running, and no process is killed. A stop pending when a run is about to report a wait parks it from `running` instead.
+
 - **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
   A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
 

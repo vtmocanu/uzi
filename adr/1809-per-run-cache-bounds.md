@@ -60,5 +60,5 @@ A disk-full write anywhere else after the clone (a build or test mid-turn, a com
 ## Consequences
 
 - A resumed or trimmed run rebuilds cold (minutes), accepted against a failed run.
-- The hard stop only picks runs inside their implement loop; a run cloning, planning, at its plan gate or finalizing is never a candidate.
+- The hard layer considers every watched Claude run in every phase (#1830). It stops (counted park) only a run whose executor is running and whose last server-acknowledged status is `running`, because the api accepts a disk park only from `running` and a park would swallow a pending approval. Any other run (cloning, at the plan gate, in a revision turn, waiting on a question or follow-up, between approval and its first progress report, finalizing) is not stopped: its rebuildable caches are dropped in place, `.npm/_cacache` kept while a JS-deps install may be running, and it keeps its gate. A stop pending when a run is about to report a wait parks it from `running` instead.
 - The PRD #837 recycle stays the last resort, unchanged.

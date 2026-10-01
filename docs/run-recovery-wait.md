@@ -241,7 +241,9 @@ counts toward the failure cap:
 - A **counted** park: everything else that reaches this park, including
   the hard, per-tick pressure stop — a background check on every stats
   tick that finds the volume at or over a hard threshold and stops
-  whichever running Claude run holds the largest caches — and an actual
+  whichever running Claude run holds the largest caches (a Claude run that
+  is not running, such as one at its plan gate or waiting on a question, is
+  not stopped; its rebuildable caches are dropped in place instead) — and an actual
   write that failed disk-full (a recognised `ENOSPC`/`EDQUOT` signal, or
   git's own disk-full diagnostics, confirmed against the volume's own free
   space and inodes) after uzi ran its background reclaim and retried once,

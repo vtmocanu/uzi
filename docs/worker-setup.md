@@ -183,7 +183,10 @@ last resort:
    run). A *hard* layer watches the data volume itself on every stats tick,
    independent of turn boundaries, and — only once the volume nears the
    api's disk-pressure threshold — stops the running Claude run with the
-   largest caches and parks it with a **counted** `data_volume_full` park.
+   largest caches and parks it with a **counted** `data_volume_full` park. A Claude run that
+   is not running (cloning, at its plan gate, in a revision turn, waiting
+   on a question or follow-up, finalizing) is not stopped: its rebuildable
+   caches are dropped in place instead and it keeps its gate.
    See [`UZI_RUN_CACHE_CAP_ENABLED`/`UZI_DISK_HARD_STOP_ENABLED` and the
    rest of this group](configuration.md#worker-disk-safety-prd-1809) for the
    exact thresholds and how to tune or disable either layer.
