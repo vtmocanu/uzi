@@ -1473,6 +1473,10 @@ interface RunFlight {
    *  `lastCheckpointRefTip`: that one is seeded from `claim.checkpoint_tip` (a prior/cross-worker
    *  checkpoint, possibly a marker-only `wip(park):` one PRD #759 ignores). */
   landedCheckpoint?: boolean;
+  /** Issue #1832: the PRD #1809 D6 operation ("preflight", "clone/fetch") whose data-volume
+   *  reclaim wait a pause interrupted. Set only pre-clone, by awaitDataVolumeReclaim; the pause
+   *  sink reads it to tell the owner what actually happened (nothing started, the run requeues). */
+  reclaimWaitInterrupted?: string;
   /** PRD #1062 M2 (#1036): the current tip of `refs/uzi-checkpoints/<branch>` as this run last
    *  knows it — seeded from `claim.checkpoint_tip`, advanced to the declared overlay/real tip on
    *  every CONFIRMED publish. Fed to `checkpointPack` as the overlay's `prevCheckpointTip` so a
@@ -4048,6 +4052,8 @@ export class RunRunner {
         throw new DataVolumeWaitShutdown(operation);
       case "aborted": {
         const reason: unknown = flight.cancel.signal.reason;
+        // Issue #1832: the pause sink then runs with nothing cloned; let it say so on the feed.
+        if (reason instanceof PauseNowSignal) flight.reclaimWaitInterrupted = operation;
         flight.runLog.warn("data volume reclaim wait interrupted; handing the run to the interrupt's own handling", {
           ...log,
           reason: reason instanceof Error ? reason.name : String(reason),
@@ -12197,7 +12203,16 @@ export class RunRunner {
       // issue #1783: a clone that is not provably quiescent reaches here with the fetch-back and the
       // publish skipped (and, when only the re-proof after the marker blocked, the marker undone
       // above); the log and the feed name that reason instead of a failed publish.
-      if (residueBlocked) {
+      // Issue #1832: a pause that interrupted the pre-clone data-volume reclaim wait reaches here
+      // with nothing cloned or started; executeClaim then leaves the run for requeue, so neither
+      // "restarted the interrupted step" text below would be true.
+      const reclaimWait = flight.reclaimWaitInterrupted;
+      if (reclaimWait !== undefined) {
+        runLog.warn("pause during the data-volume reclaim wait; nothing to checkpoint, the run is left for requeue", {
+          run_id: flight.runId,
+          operation: reclaimWait,
+        });
+      } else if (residueBlocked) {
         runLog.warn("pause park: clone not provably quiescent; no checkpoint taken, the run stays running", {
           run_id: flight.runId,
           state: residueState,
@@ -12211,7 +12226,9 @@ export class RunRunner {
         kind: "pause_failed",
         agent: "worker",
         payload: {
-          text: residueBlocked
+          text: reclaimWait !== undefined
+            ? "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started its work, so there was no checkpoint to take. It has stopped on this worker and will start again when it is requeued."
+            : residueBlocked
             ? "Could not pause: a process this run started could not be stopped, so no checkpoint was taken. The run is still running and has restarted the interrupted step."
             : "Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step.",
         },

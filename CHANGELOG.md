@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Codex sandbox: a substituted non-empty directory could pass the fresh-directory check ([#1842](https://github.com/vtmocanu/uzi/issues/1842)).**
   The supervisor's safetree Create trusted a single getdents batch to prove a directory empty, but a pending signal (Go's preemption sends SIGURG) can end a batch after only "." and "..", so a peer-substituted directory holding files was accepted; the check now reads to end of directory and rejects any entry.
 
+- **A pause requested while a run waited for disk space to be reclaimed no longer claims the run restarted its step ([#1832](https://github.com/vtmocanu/uzi/issues/1832)).**
+  When the owner's pause-now arrived while a run was still waiting on the worker's data-volume reclaim, before its work started, the feed said "The run is still running and has restarted the interrupted step"; it now says the run had not started, there was nothing to checkpoint, and it will start again when it is requeued.
+
 - **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
   A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
 

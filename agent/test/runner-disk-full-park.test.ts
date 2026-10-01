@@ -172,6 +172,15 @@ const feed = (runId: string) =>
     .filter((m) => m.kind === "status")
     .map((m) => String(m.payload.text));
 
+/** Issue #1832: the owner-facing `pause_failed` feed texts (the `feed` helper reads `status` only). */
+const pauseFailedFeed = (runId: string) =>
+  api
+    .messages(runId)
+    .filter((m) => m.kind === "pause_failed")
+    .map((m) => String(m.payload.text));
+const RECLAIM_WAIT_PAUSE_TEXT =
+  "Could not pause: the run was still waiting for disk space to be reclaimed on the worker and had not started its work, so there was no checkpoint to take. It has stopped on this worker and will start again when it is requeued.";
+
 async function withHome(prefix: string, fn: (homeRoot: string) => Promise<void>): Promise<void> {
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
   try {
@@ -617,6 +626,32 @@ describe("RunRunner — the data-volume reclaim wait is bounded and abortable (P
       assert.strictEqual(park(client), undefined, "no data_volume_full park");
       assert.strictEqual(client.releaseCalls.length, 0, "no disk-park custody release");
       assert.ok(!statuses(client).includes("failed"), "a pause never fails the run");
+      // Issue #1832: the feed says what happened, never the generic "restarted the interrupted step".
+      assert.deepStrictEqual(pauseFailedFeed(claim.run_id), [RECLAIM_WAIT_PAUSE_TEXT]);
+      assert.ok(!api.messages(claim.run_id).some((m) => /restarted the interrupted step/.test(String(m.payload.text))));
+    });
+  });
+
+  it("issue #1832: a pause-now during the preflight reclaim wait posts the reclaim-wait text and leaves the run for requeue", async () => {
+    await withHome("uzi-diskpark-wait-pause-pre-", async (homeRoot) => {
+      const claim = gitlabClaim(1835, { claim_generation: 35 });
+      const client = new DiskParkClient([FEATURE, FENCE, ECHO]);
+      const { factory } = homeFactory(homeRoot);
+      const calls = failingClone();
+      const probe = guardWith(() => FULL, {
+        onReclaim: () => api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]),
+        reclaimPass: stuckPass,
+      });
+      const started = Date.now();
+      await makeRunner(client, factory, probe.guard).execute(claim);
+
+      assert.ok(Date.now() - started < 60_000, "the pause ended the wait");
+      assert.strictEqual(calls(), 0, "the preflight stopped before any clone");
+      assert.strictEqual(park(client), undefined, "no data_volume_full park");
+      assert.strictEqual(client.releaseCalls.length, 0, "no disk-park custody release");
+      assert.ok(!statuses(client).includes("failed"), "a pause never fails the run");
+      assert.deepStrictEqual(pauseFailedFeed(claim.run_id), [RECLAIM_WAIT_PAUSE_TEXT]);
+      assert.ok(!api.messages(claim.run_id).some((m) => /restarted the interrupted step/.test(String(m.payload.text))));
     });
   });
 });
