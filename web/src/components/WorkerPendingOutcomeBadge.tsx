@@ -5,9 +5,10 @@ import { stripUnsafeChars } from "../lib/safeText";
 
 // WorkerPendingOutcomeBadge marks a worker holding run OUTCOMES it has journaled but not yet
 // delivered to the api (issue #1994): reported_runs entries flagged terminal_pending. Such an
-// entry still reads phase "running" on the wire, yet it is not an execution and holds no run
-// slot, so it gets its own pill rather than inflating WorkerRunBadge's "N runs" count. It
-// renders nothing when no entry is pending, including on an older api that omits the field.
+// entry still reads phase "running" on the wire, and its run row is still nonterminal, so the
+// worker's busy/active_runs (and so WorkerRunBadge beside this pill) keep counting it; this pill
+// marks which of that load is an undelivered outcome rather than an execution. It renders
+// nothing when no entry is pending, including on an older api that omits the field.
 //
 // The title lists each pending run with its claim generation and how long it has been pending
 // (formatUptimeSince, the same count-up buckets the uptime token uses; the age is omitted when

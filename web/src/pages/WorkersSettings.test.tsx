@@ -1590,17 +1590,17 @@ describe("WorkersSettings — header button + empty-state CTAs (PRD #1063 M2)", 
 
 // Issue #1994: a reported_runs entry flagged terminal_pending is an outcome journaled on the
 // worker and not yet delivered, NOT a running execution (its phase still reads "running").
-// The row shows the pending-outcome pill, and the run-load pill keeps counting only the
-// worker's live runs (active_runs), never the pending entry.
+// Its run row is still nonterminal, so the api's busy/active_runs keep counting it: the row
+// shows the existing run-load pill AND the pending-outcome pill side by side.
 describe("WorkersSettings pending outcomes (#1994)", () => {
-  it("shows the pending-outcome pill and does not count the pending entry as running", async () => {
+  it("shows the pending-outcome pill beside the run-load pill for one live plus one pending run", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [
         aWorker({
           id: "w-pend",
           name: "pending-box",
           busy: true,
-          active_runs: 1,
+          active_runs: 2,
           max_concurrent_runs: null,
           reported_runs: [
             { run_id: "live-run", phase: "running", claim_generation: 1, terminal_pending: false, terminal_pending_since: null },
@@ -1621,17 +1621,19 @@ describe("WorkersSettings pending outcomes (#1994)", () => {
     const pill = screen.getByText("1 pending outcome");
     expect(pill.getAttribute("title")).toContain("Outcome journaled on this worker but not yet delivered to the api");
     expect(pill.getAttribute("title")).toContain("run done-run (generation 4)");
-    // One live run reads as the legacy "busy" pill; the pending entry did not lift it to "2 runs".
-    expect(screen.getByText("busy")).toBeTruthy();
-    expect(screen.queryByText(/^\d+\/\d+ runs$/)).toBeNull();
+    // Both run rows are nonterminal, so the api counts both: the load pill reads "2/2 runs".
+    expect(screen.getByText("2/2 runs")).toBeTruthy();
   });
 
-  it("shows no run-load pill for a worker whose only reported entry is pending", async () => {
+  it("shows the busy pill and the pending-outcome pill for a worker whose only reported entry is pending", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [
         aWorker({
           id: "w-pend-only",
           name: "pending-only",
+          busy: true,
+          active_runs: 1,
+          max_concurrent_runs: null,
           reported_runs: [
             { run_id: "done-run", phase: "running", claim_generation: 2, terminal_pending: true, terminal_pending_since: null },
           ],
@@ -1641,8 +1643,7 @@ describe("WorkersSettings pending outcomes (#1994)", () => {
     renderPage();
     await screen.findByText("pending-only");
     expect(screen.getByText("1 pending outcome")).toBeTruthy();
-    expect(screen.queryByText("busy")).toBeNull();
-    expect(screen.queryByText(/ runs$/)).toBeNull();
+    expect(screen.getByText("busy")).toBeTruthy();
   });
 
   it("shows no pending-outcome pill when every reported entry is live", async () => {
