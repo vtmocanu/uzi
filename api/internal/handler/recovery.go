@@ -27,34 +27,36 @@ const recoveryManifestHeader = "X-Uzi-Recovery-Manifest"
 // queries.
 
 // mapRecoveryError writes the HTTP status for a recovery service sentinel that occurred
-// BEFORE any response body was written.
+// BEFORE any response body was written. Each body carries a stable machine-readable
+// "reason" beside "error" (issue #1995: the worker classifies upload failures by it); the
+// {"error"} envelope is a strict subset, so existing clients are unaffected.
 func mapRecoveryError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, recovery.ErrBadRequest):
-		httpx.Error(w, http.StatusBadRequest, "invalid recovery request")
+		httpx.ErrorReason(w, http.StatusBadRequest, "invalid recovery request", "bad_request")
 	case errors.Is(err, recovery.ErrNotAuthorized):
-		httpx.Error(w, http.StatusForbidden, "not authorized for this capture")
+		httpx.ErrorReason(w, http.StatusForbidden, "not authorized for this capture", "not_authorized")
 	case errors.Is(err, recovery.ErrAmbiguous):
 		// PRD #1349 M4: a v1/no-generation worker holds more than one open hold, so the
 		// server refuses to guess which generation the capture/release covers. The worker
 		// (or owner) must name the exact generation; the holds stay open (fail closed).
-		httpx.Error(w, http.StatusConflict, "ambiguous open custody generation; name the generation")
+		httpx.ErrorReason(w, http.StatusConflict, "ambiguous open custody generation; name the generation", "ambiguous_generation")
 	case errors.Is(err, recovery.ErrCaptureNotFound):
-		httpx.Error(w, http.StatusNotFound, "capture not found")
+		httpx.ErrorReason(w, http.StatusNotFound, "capture not found", "capture_not_found")
 	case errors.Is(err, recovery.ErrNotAvailable):
-		httpx.Error(w, http.StatusConflict, "capture is not available")
+		httpx.ErrorReason(w, http.StatusConflict, "capture is not available", "not_available")
 	case errors.Is(err, recovery.ErrOversize):
-		httpx.Error(w, http.StatusRequestEntityTooLarge, "bundle exceeds the maximum size")
+		httpx.ErrorReason(w, http.StatusRequestEntityTooLarge, "bundle exceeds the maximum size", "oversize")
 	case errors.Is(err, recovery.ErrManifestConflict):
-		httpx.Error(w, http.StatusConflict, "a different manifest is already bound for this capture")
+		httpx.ErrorReason(w, http.StatusConflict, "a different manifest is already bound for this capture", "manifest_conflict")
 	case errors.Is(err, recovery.ErrQuota):
-		httpx.Error(w, http.StatusInsufficientStorage, "storage quota exceeded")
+		httpx.ErrorReason(w, http.StatusInsufficientStorage, "storage quota exceeded", "quota")
 	case errors.Is(err, recovery.ErrIntegrity):
-		httpx.Error(w, http.StatusUnprocessableEntity, "archive integrity check failed")
+		httpx.ErrorReason(w, http.StatusUnprocessableEntity, "archive integrity check failed", "integrity")
 	case errors.Is(err, recovery.ErrBusy):
-		httpx.Error(w, http.StatusServiceUnavailable, "too many concurrent transfers; retry shortly")
+		httpx.ErrorReason(w, http.StatusServiceUnavailable, "too many concurrent transfers; retry shortly", "busy")
 	default:
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		httpx.ErrorReason(w, http.StatusInternalServerError, "internal error", "internal")
 	}
 }
 
