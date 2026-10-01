@@ -421,4 +421,5 @@ func TestIsolatedLaneQueuedReasonLiveDB(t *testing.T) {
 			t.Errorf("%s: queuedReason = %q, want %q", tc.name, got, tc.want)
 		}
 	}
+	f.svc.SetIsolatedLaneEnabled(true)
 }

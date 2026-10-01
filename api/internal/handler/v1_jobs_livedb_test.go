@@ -74,6 +74,21 @@ func (e *v1JobsEnv) enableLane(on bool) {
 	}
 }
 
+// siteList seeds a real site list (egress profile) and returns its name. Runs bound to it are
+// removed with it at cleanup. A uzc_ caller may name any list, so with the isolated-lane gate
+// removed a create naming it would succeed.
+func (e *v1JobsEnv) siteList() string {
+	e.t.Helper()
+	id := uuid.New()
+	name := "sl-" + strings.ReplaceAll(id.String(), "-", "")[:20]
+	e.exec(`INSERT INTO egress_profiles (id, name, hosts) VALUES ($1, $2, string_to_array($3, ','))`, id, name, "docs.example.com")
+	e.t.Cleanup(func() {
+		_, _ = e.pool.Exec(context.Background(), `DELETE FROM runs WHERE egress_profile_id = $1`, id)
+		_, _ = e.pool.Exec(context.Background(), `DELETE FROM egress_profiles WHERE id = $1`, id)
+	})
+	return name
+}
+
 func (e *v1JobsEnv) exec(sql string, args ...any) {
 	e.t.Helper()
 	cliMustExec(e.t, e.pool, sql, args...)
@@ -327,8 +342,9 @@ func TestV1JobsCreateLiveDB(t *testing.T) {
 	t.Run("a site list on a deployment without the isolated lane is 503 and creates nothing", func(t *testing.T) {
 		e.enableLane(false)
 		_, tok := e.user()
+		list := e.siteList() // exists, so only the lane gate can refuse this create
 		before := e.jobCount(tok)
-		r := e.call(http.MethodPost, "/api/v1/jobs", tok, `{"type":"research","prompt":"p","egress_profile":"open"}`)
+		r := e.call(http.MethodPost, "/api/v1/jobs", tok, fmt.Sprintf(`{"type":"research","prompt":"p","egress_profile":%q}`, list))
 		e.want(r, http.StatusServiceUnavailable, "isolated_lane_unavailable")
 		if got := e.jobCount(tok); got != before {
 			t.Errorf("job rows = %d after the refused create, want %d", got, before)

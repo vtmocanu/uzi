@@ -258,7 +258,9 @@ func (h *Handler) V1JobCreate(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Issue #1965: a bound job can only run on an isolated-lane worker, so without the lane
-		// it would queue forever. Refuse it before anything is created.
+		// it would queue forever. Refuse it before anything is created. This intentionally
+		// precedes CreateJobRun's 422/403/404 validation (allowance, list existence): it reveals
+		// only deployment config, not whether a list exists.
 		if !h.cfg.IsolatedLaneEnabled() {
 			httpx.ErrorReason(w, http.StatusServiceUnavailable, "this deployment has no isolated research lane enabled, so a job cannot name a site list", v1ReasonLaneUnavailable)
 			return
