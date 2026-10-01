@@ -673,4 +673,28 @@ grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19B/backup.log" \
 if grep -q 'attempt retired' "$L19B/backup.log"; then fail "case19b: retirement claimed with a live attempt"; fi
 echo "PASS case19: BARE line reports attempt retirement only on ledger proof"
 
+# case 19c/19d: damaged ledger rows fail closed. A truncated newest row for an attemptId (or a
+# newest row without runId) must not leave an older `retired` value as proof.
+reset_layout
+make_clone "$RB/seed" agent/issue-4242 seed
+git_q "$RB/seed" -c user.email=t@example.com -c user.name=tester commit -am committed-seed
+git --git-dir="$BARE" fetch -q "$RB/seed" agent/issue-4242:refs/uzi-runner/agent/issue-4242
+rm -rf "$RB/seed"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+git --git-dir="$BARE" config --add "$LKEY" "{\"attemptId\":\"$A1\",\"runId\":\"run-4242\",\"state\":\"li"
+L19C="$(run_backup 19c)"
+[ -f "$L19C/issue-4242.tgz" ] || fail "case19c: BARE archive must still be kept"
+grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19C/backup.log" \
+  || fail "case19c: truncated newest row must read unknown; got: $(cat "$WORK/out.19c/latest-attempt/backup.log")"
+if grep -q 'attempt retired' "$L19C/backup.log"; then fail "case19c: retirement claimed from an older row"; fi
+git --git-dir="$BARE" config --unset-all "$LKEY"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+git --git-dir="$BARE" config --add "$LKEY" "{\"attemptId\":\"$A1\",\"state\":\"live\"}"
+L19D="$(run_backup 19d)"
+[ -f "$L19D/issue-4242.tgz" ] || fail "case19d: BARE archive must still be kept"
+grep -q '^.*BARE .*run-4242.*attempt state unknown' "$L19D/backup.log" \
+  || fail "case19d: row without runId must read unknown; got: $(cat "$WORK/out.19d/latest-attempt/backup.log")"
+if grep -q 'attempt retired' "$L19D/backup.log"; then fail "case19d: retirement claimed despite a runId-less row"; fi
+echo "PASS case19c/d: malformed ledger rows fail closed to attempt state unknown"
+
 echo "ALL PASS"

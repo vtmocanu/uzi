@@ -35,7 +35,7 @@
 #     the near-timeout hint): stalled, looping, waiting_worker, approval_idle, ...
 #   - status is running/claimed, the run has a worker_id, and `uzi worker list --json`
 #     shows that worker's last_heartbeat_at older than WATCH_HEARTBEAT_STALE_SECS
-#     (default 180; the api marks a worker offline after 45s). An unreadable worker list
+#     (default 180; the api default WORKER_HEARTBEAT_STALE is 45s, configurable). An unreadable worker list
 #     or an absent worker row is no signal.
 # After WATCH_ATTENTION_POLLS consecutive attention polls (default 3, so a transient single
 # poll never fires; 0 disables the check) it prints STOP=needs_attention plus the evidence

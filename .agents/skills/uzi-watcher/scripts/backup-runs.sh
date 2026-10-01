@@ -502,7 +502,9 @@ pod_has_ref(){
 # LIVE run. "attempt retired (...)" only when the pod's attempt ledger (the last value per
 # attemptId wins) has at least one entry naming this run and EVERY such entry is `retired` or
 # `abandoned` (the owner disposed of the clone, or a verified capture released it). Anything
-# else (no ledger, an unreadable read, a `live` or `reclaimed` entry, no entry for this run)
+# else (no ledger, an unreadable read, a `live` or `reclaimed` entry, no entry for this run, or
+# ANY ledger row that is unparseable or lacks a string attemptId/runId, checked before the
+# last-value-wins reduction so a damaged newest row cannot leave an older one as proof)
 # prints "attempt state unknown": absence of evidence is never reported as retirement.
 attempt_retirement(){
   local ns="$1" pod="$2" branch="$3" rid="$4" ledger rc=0 states
@@ -512,12 +514,18 @@ attempt_retirement(){
   [ "$rc" -eq 0 ] || { printf 'attempt state unknown'; return 0; }
   # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
   states="$(printf '%s\n' "$ledger" | "$JQ" -rRn --arg rid "$rid" '
-    [inputs | fromjson? | select(type == "object"
-       and (.attemptId | type) == "string" and .attemptId != "")]
-    | reduce .[] as $e ({}; .[$e.attemptId] = $e)
-    | [.[] | select(.runId == $rid) | .state // "?"]
-    | if length > 0 and all(.[]; . == "retired" or . == "abandoned")
-      then "retired \(length)" else "unknown" end' 2>/dev/null)" || states="unknown"
+    [inputs | select(length > 0) | (try fromjson catch null)] as $rows
+    | if ($rows | any(.[];
+          type != "object"
+          or (.attemptId | type) != "string" or .attemptId == ""
+          or (.runId | type) != "string" or .runId == ""))
+      then "unknown"
+      else
+        reduce $rows[] as $e ({}; .[$e.attemptId] = $e)
+        | [.[] | select(.runId == $rid) | .state // "?"]
+        | if length > 0 and all(.[]; . == "retired" or . == "abandoned")
+          then "retired \(length)" else "unknown" end
+      end' 2>/dev/null)" || states="unknown"
   case "$states" in
     "retired "*) printf 'attempt retired (ledger: %s recorded attempt(s) for this run, all retired or abandoned)' "${states#retired }" ;;
     *) printf 'attempt state unknown' ;;
