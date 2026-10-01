@@ -4,10 +4,12 @@
  * be recovered on the next claim. Shared by SteeringChannel and ChatSteering.
  *
  * An id is stamped at most once per reporter (mark is idempotent). A flush is ONE request for
- * every queued id; it never throws. A transient failure keeps the ids queued for the next flush,
- * a definitive refusal or an inactive claim drops them (the claim ended, or the api will never
- * take them), and a 404/405 means the api cannot take receipts at all (a pod that predates the
- * route, or a run it does not own), so the reporter stops sending.
+ * every queued id; it never throws. A transient failure keeps the ids queued for the next flush.
+ * An UNTYPED 404/405 is ambiguous (an api pod that predates the route, mid rolling upgrade): the
+ * ids stay queued and flush backs off, skipping 1, 2, 4... (capped) poll ticks, and only
+ * INCLUSION_ROUTE_MISSING_LIMIT consecutive ones stop reporting. The reporter also stops, for
+ * good, on a typed not-owned 404 (reason "stale") or a receipt saying the claim is inactive (the
+ * next claim's requeue recovers what is left). Any other 4xx drops the batch.
  */
 import { RequestError, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
@@ -18,11 +20,31 @@ const MAX_INCLUDE_BATCH = 1000;
 /** Attempts a stopping channel makes to flush what is still queued, so a failing api never holds
  *  the shutdown. Whatever is left is recovered by the next claim's requeue. */
 const STOP_INCLUDE_ATTEMPTS = 3;
+/** Consecutive untyped 404/405 receipts (across flushes) after which reporting stops for the claim. */
+export const INCLUSION_ROUTE_MISSING_LIMIT = 5;
+/** Cap on the flush() calls skipped after an untyped 404/405: the k-th skips min(2^(k-1), cap). */
+const INCLUSION_ROUTE_MISSING_BACKOFF_MAX_TICKS = 8;
+
+/** The api's typed error reason (`{"error","reason"}`), or undefined for an untyped body. */
+function errorReason(err: RequestError): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(err.body);
+    if (typeof parsed === "object" && parsed !== null) {
+      const reason = (parsed as Record<string, unknown>).reason;
+      if (typeof reason === "string") return reason;
+    }
+  } catch {
+    // an untyped (or proxy) body: the status is the signal
+  }
+  return undefined;
+}
 
 export class InclusionReporter {
   private readonly seen = new Set<number>();
   private queue: number[] = [];
-  private unsupported = false;
+  private stopped = false;
+  private missingStreak = 0;
+  private skipTicks = 0;
 
   constructor(
     private readonly client: WorkerClient,
@@ -33,7 +55,7 @@ export class InclusionReporter {
 
   /** Queue `id` for a receipt; a no-op for an id already marked on this channel. */
   mark(id: number): void {
-    if (this.unsupported || this.seen.has(id)) return;
+    if (this.stopped || this.seen.has(id)) return;
     this.seen.add(id);
     this.queue.push(id);
   }
@@ -42,23 +64,40 @@ export class InclusionReporter {
     return this.queue.length > 0;
   }
 
-  /** One request for the queued ids (a no-op when none). Never throws. */
+  /** One request for the queued ids (a no-op when none, or while backing off). Never throws. */
   async flush(): Promise<void> {
+    if (this.skipTicks > 0) {
+      this.skipTicks--;
+      return;
+    }
+    await this.send();
+  }
+
+  private async send(): Promise<void> {
     const ids = this.queue.slice(0, MAX_INCLUDE_BATCH);
-    if (!ids.length) return;
+    if (this.stopped || !ids.length) return;
     try {
       const receipt = await this.client.includeInputs(this.runId, ids, this.claimGeneration);
       if (typeof receipt?.active !== "boolean") throw new Error("invalid input included response");
-      // Active or not, these ids are settled: an inactive claim was superseded or released, and
-      // its follow-ups are recovered by the claim that replaced it.
+      this.missingStreak = 0;
+      this.skipTicks = 0;
       this.drop(ids);
+      if (!receipt.active) {
+        // The claim was superseded or released; its follow-ups are recovered by the claim that
+        // replaced it, so nothing later on this reporter can be taken either.
+        this.stop("the claim is no longer active");
+      }
     } catch (err) {
-      if (err instanceof RequestError && (err.status === 404 || err.status === 405)) {
-        this.unsupported = true;
-        this.queue = [];
-        this.log.warn("steering: the api cannot take inclusion receipts (no /inputs/included, or run not owned); not reporting", {
-          run_id: this.runId,
-        });
+      if (err instanceof RequestError && errorReason(err) === "stale" && err.status === 404) {
+        this.stop("run not owned");
+      } else if (err instanceof RequestError && (err.status === 404 || err.status === 405)) {
+        this.missingStreak++;
+        if (this.missingStreak >= INCLUSION_ROUTE_MISSING_LIMIT) {
+          this.stop("no /inputs/included route");
+        } else {
+          this.skipTicks = Math.min(2 ** (this.missingStreak - 1), INCLUSION_ROUTE_MISSING_BACKOFF_MAX_TICKS);
+          this.log.warn("steering: inclusion receipt got an untyped 404/405; backing off", { run_id: this.runId, streak: this.missingStreak });
+        }
       } else if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 408 && err.status !== 429) {
         this.drop(ids);
         this.log.warn("steering: the api refused an inclusion receipt; dropping it", { run_id: this.runId, error: errMessage(err) });
@@ -68,9 +107,16 @@ export class InclusionReporter {
     }
   }
 
-  /** Flush at stop: bounded attempts, then give up (the next claim's requeue recovers the rest). */
+  /** Flush at stop: bounded attempts that ignore the tick backoff, then give up (the next claim's
+   *  requeue recovers the rest). */
   async drain(): Promise<void> {
-    for (let i = 0; i < STOP_INCLUDE_ATTEMPTS && this.pending; i++) await this.flush();
+    for (let i = 0; i < STOP_INCLUDE_ATTEMPTS && this.pending; i++) await this.send();
+  }
+
+  private stop(why: string): void {
+    this.stopped = true;
+    this.queue = [];
+    this.log.warn("steering: not reporting inclusion receipts", { run_id: this.runId, why });
   }
 
   private drop(ids: number[]): void {

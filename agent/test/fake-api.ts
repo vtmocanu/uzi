@@ -118,6 +118,9 @@ export class FakeApi {
   discardRouteMissing = false;
   /** Issue #1800: answer POST /inputs/included with an untyped 404, like an api that predates it. */
   inclusionRouteMissing = false;
+  /** Issue #1800: answer POST /inputs/included like an api that does not own the run: a TYPED 404
+   *  ({"error":"run not found","reason":"stale"}), unlike the untyped one of a missing route. */
+  inclusionNotOwned = false;
   /** Issue #1800: fail the next `times` POST /inputs/included with this HTTP status. */
   failingInclusions: { status: number; times: number } | undefined = undefined;
   /** Issue #1800: when set, GET /follow-ups rows carry `inclusion_reported: true` and, once a row is
@@ -1007,6 +1010,7 @@ export class FakeApi {
       const generation = json.claim_generation as number;
       this.inclusionCalls.push({ runId, ids: [...ids], generation });
       if (this.inclusionRouteMissing) return send(res, 404, { error: "not found" });
+      if (this.inclusionNotOwned) return send(res, 404, { error: "run not found", reason: "stale" });
       const failing = this.failingInclusions;
       if (failing && failing.times > 0) {
         failing.times--;
