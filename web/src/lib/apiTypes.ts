@@ -975,11 +975,13 @@ export interface AppSettings {
   // setting. Mirrors judge_model's admin machinery but delivers on the issue-run claim.
   summary_model: string;
   // Run-health detector keys (PRD #47, #1170). health_enabled is the text "true"/"false".
-  // The four *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
+  // The *_seconds keys are integer seconds as strings; health_near_timeout_pct is a
   // percent of the run's wall-clock budget (0 to disable, else [50, 99]). The API serves
   // every setting as a string. 0 disables that one signal.
   health_enabled: string;
   health_stall_seconds: string;
+  // Issue #2046: one lead tool call open this long on a quiet run flags it stalled; 0 disables.
+  health_tool_call_seconds: string;
   health_near_timeout_pct: string;
   health_queued_seconds: string;
   health_approval_seconds: string;

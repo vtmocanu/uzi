@@ -48,6 +48,7 @@ const settings = (over: Partial<AppSettings> = {}): AppSettings => ({
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
+  health_tool_call_seconds: "1200",
   health_near_timeout_pct: "85",
   health_queued_seconds: "600",
   health_approval_seconds: "3600",

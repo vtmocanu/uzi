@@ -640,6 +640,17 @@ describe("runBadge health warn variant (PRD #47)", () => {
     });
   });
 
+  it("a long-tool-call stall renders the stalled badge with its reason (issue #2046)", () => {
+    const reason = "a tool call has been in progress longer than the configured threshold";
+    expect(runBadge(flagged({ health_reason: reason }), NOW)).toEqual({
+      kind: "badge",
+      label: "⚠ stalled · 1m",
+      tone: "warning",
+      pulse: true,
+      title: reason,
+    });
+  });
+
   it("elapsed counts from health_since, not created_at", () => {
     // created_at 4m ago, health_since 1m ago → 1m, proving the source.
     const b = runBadge(flagged(), NOW);

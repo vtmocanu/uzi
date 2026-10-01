@@ -103,6 +103,8 @@ describe("mockApi settings persistence (demo survives reload)", () => {
     // The run-health keys round-trip too (PRD #47).
     expect(app.health_enabled).toBe("false");
     expect(app.health_stall_seconds).toBe("120");
+    // issue #2046: a blob that predates health_tool_call_seconds is filled from the seed.
+    expect(app.health_tool_call_seconds).toBe("1200");
   });
 
   it("migrates a legacy v3 blob (health_slow_seconds → health_near_timeout_pct) without discarding config", async () => {

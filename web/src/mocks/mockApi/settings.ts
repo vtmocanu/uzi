@@ -127,6 +127,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   summary_model: "haiku",
   health_enabled: "true",
   health_stall_seconds: "300",
+  // issue #2046: a single open lead tool call flags a quiet run stalled after 20 minutes.
+  health_tool_call_seconds: "1200",
   // PRD #1170: near-timeout at 85% of the run's wall-clock budget (replaces the old
   // wall-clock "slow after seconds" default of 2700).
   health_near_timeout_pct: "85",
@@ -242,6 +244,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
+    // issue #2046: accept a legacy blob that predates health_tool_call_seconds (undefined);
+    // the seed default ("1200") fills it on load. A malformed non-string is refused.
+    (a.health_tool_call_seconds === undefined || typeof a.health_tool_call_seconds === "string") &&
     // PRD #1170 replaced health_slow_seconds with this key WITHOUT bumping the v3
     // storage key, so accept a legacy blob that predates it (undefined) — a missing
     // value is filled from the seed default ("85") on load — but reject a malformed
@@ -831,6 +836,7 @@ export const settingsApi = {
       // inclusive range [60, 86400].
       if (
         key === "health_stall_seconds" ||
+        key === "health_tool_call_seconds" ||
         key === "health_queued_seconds" ||
         key === "health_approval_seconds" ||
         key === "health_nudge_cooldown_seconds"
