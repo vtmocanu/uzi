@@ -23,6 +23,7 @@ import { RunRunner } from "../src/runner.js";
 import { ScratchPublicationError, type ScratchPublicationKind, type ScratchPublicationStep } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import { makeTextRedactor } from "../src/redact.js";
+import { sanitizeForLog } from "../src/run-quiescence.js";
 
 installHarness();
 
@@ -263,7 +264,25 @@ interface RefusalCase {
 const REFUSAL_CASES: RefusalCase[] = [
   {
     name: "tip_unavailable", kind: "tip_unavailable", step: "resolve_tip", reason: "candidate commit is unavailable",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (tip_unavailable at resolve_tip)",
+    detail: "ref does not resolve to a commit",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (tip_unavailable at resolve_tip: ref does not resolve to a commit)",
+  },
+  {
+    name: "shallow_history", kind: "shallow_history", step: "shallow_check", reason: "cannot prove scratch-free candidate history",
+    detail: "history is shallow",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (shallow_history at shallow_check: history is shallow)",
+  },
+  {
+    name: "object_walk_failed", kind: "object_walk_failed", step: "object_walk", reason: "cannot prove scratch-free candidate history",
+    detail: "exit 128; fatal: bad tree",
+    cause: new Error("git rev-list failed"),
+    expectReason: "scratch_publication_refused: candidate history cannot be published (object_walk_failed at object_walk: exit 128; fatal: bad tree)",
+    expectCause: "git rev-list failed",
+  },
+  {
+    name: "checkpoint_range", kind: "checkpoint_range", step: "checkpoint_floor", reason: "checkpoint floor is unavailable or not an ancestor of candidate",
+    detail: "floor is unavailable or not an ancestor of candidate",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (checkpoint_range at checkpoint_floor: floor is unavailable or not an ancestor of candidate)",
   },
   {
     name: "missing_objects", kind: "missing_objects", step: "object_walk", reason: "cannot prove scratch-free candidate history",
@@ -279,7 +298,8 @@ const REFUSAL_CASES: RefusalCase[] = [
   },
   {
     name: "scratch_present", kind: "scratch_present", step: "scratch_walk", reason: "candidate history contains scratch",
-    expectReason: "scratch_publication_refused: candidate history cannot be published (scratch_present at scratch_walk)",
+    detail: ".uzi/scratch appears in candidate history",
+    expectReason: "scratch_publication_refused: candidate history cannot be published (scratch_present at scratch_walk: .uzi/scratch appears in candidate history)",
   },
   {
     name: "floor_unverified", kind: "floor_unverified", step: "floor_refresh", reason: "cannot verify fresh remote floor",
@@ -353,6 +373,77 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assert.ok(JSON.stringify(line.fields).includes("REDACTED"));
   });
 
+  /** Drive a finalize refusal whose error carries the given detail fields (as git.ts builds them: the
+   *  sanitized, capped `detail` beside the unsanitized `rawDetail`) and return the failure_reason and
+   *  the logged fields. */
+  async function finalizeRefusal(
+    name: string, cause: unknown, detail: string, rawDetail: string,
+  ): Promise<{ reason: string; fields: string }> {
+    const branch = `feature/refusal-${name}`;
+    publishBranch(branch);
+    const { gitlab } = fakeGitlab();
+    const obs: { H?: string } = {};
+    const original = git.scratchPublicationPreflight.bind(git);
+    git.scratchPublicationPreflight = (async (bare, n, candidate) => {
+      if (candidate && obs.H && candidate !== obs.H) {
+        throw new ScratchPublicationError("cannot prove scratch-free candidate history", cause, {
+          kind: "exec_failed", step: "object_walk", detail, rawDetail,
+        });
+      }
+      return original(bare, n, candidate);
+    }) as typeof git.scratchPublicationPreflight;
+    const { logger, lines } = recordingLogger();
+    const claim = taskClaim(branch);
+    try {
+      await runnerWith(() => ({ executor: rewritingExecutor(obs) }), gitlab, undefined, logger).execute(claim);
+    } finally {
+      git.scratchPublicationPreflight = original;
+    }
+    const failed = api.states.find((s) => s.runId === claim.run_id && s.body.status === "failed")?.body;
+    const line = lines.find((l) => l.msg === "scratch publication refused");
+    assert.ok(line);
+    return { reason: String(failed?.failure_reason), fields: JSON.stringify(line.fields) };
+  }
+
+  function assertNoPatPrefix(text: string): void {
+    for (let k = 8; k <= PAT.length; k++) {
+      assert.ok(!text.includes(PAT.slice(0, k)), `a ${k}-char PAT prefix survived: ${text}`);
+    }
+    assert.ok(text.includes("REDACTED"), text);
+  }
+
+  it("redacts a secret split by a control character before sanitizing (failure_reason and log)", async () => {
+    const raw = `exit 1; token ${PAT.slice(0, 10)}\t${PAT.slice(10)}`;
+    const detail = sanitizeForLog(raw, 197);
+    assert.ok(!detail.includes(PAT), "the sanitized copy alone no longer matches the redactor");
+    const { reason, fields } = await finalizeRefusal("redact-tab", undefined, detail, raw);
+    assertNoPatPrefix(reason);
+    assertNoPatPrefix(fields);
+  });
+
+  it("redacts a secret that straddles the sanitized detail cap (failure_reason and log)", async () => {
+    const raw = `${"x".repeat(185)}${PAT}`;
+    const detail = sanitizeForLog(raw, 197);
+    assert.ok(detail.endsWith("..."));
+    const { reason, fields } = await finalizeRefusal("redact-cap", undefined, detail, raw);
+    assertNoPatPrefix(reason);
+    assertNoPatPrefix(fields);
+  });
+
+  it("bounds the cause chain at depth 4 and the joined cause at 600 characters", async () => {
+    const chain = new Error(`${"a".repeat(300)}1`, {
+      cause: new Error(`${"b".repeat(300)}2`, {
+        cause: new Error(`${"c".repeat(300)}3`, { cause: new Error(`${"d".repeat(300)}4`, { cause: new Error("fifth") }) }),
+      }),
+    });
+    const { fields } = await finalizeRefusal("cause-bound", chain, "exit 1", "exit 1");
+    const cause = String((JSON.parse(fields) as { cause: string }).cause);
+    assert.ok(cause.length <= 600, String(cause.length));
+    assert.ok(cause.endsWith("..."));
+    assert.ok(!cause.includes("fifth"));
+    assert.ok(cause.startsWith("a".repeat(200)));
+  });
+
   it("checkpoint publish keeps the feed line byte-identical and logs the structured refusal", async () => {
     const { gitlab } = fakeGitlab();
     const branch = "feature/refusal-checkpoint";
@@ -396,6 +487,49 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assert.equal(line.fields?.step, "floor_refresh");
     assert.equal(line.fields?.detail, "remote text");
     assert.ok(!JSON.stringify(line.fields).includes(PAT));
+  });
+
+  it("checkpoint publish without a redactor logs kind and step but omits free text", async () => {
+    const { gitlab } = fakeGitlab();
+    const branch = "feature/refusal-noredactor";
+    const P = publishBranch(branch);
+    const bare = await git.ensureClone(fx.originPath);
+    await git.runnerCloneForBranch(bare, branch, "feature-rc", noProofReseed, "R1");
+    const { logger, lines } = recordingLogger();
+    const feed: string[] = [];
+    const flight = {
+      runId: "R1",
+      publishedTip: P,
+      checkpointFloor: P,
+      lastCheckpointRefTip: "CONFIRMED",
+      lastAttemptedCheckpointRefTip: "ATTEMPTED",
+      reportedPublishOutcomes: new Set<string>(),
+      runLog: logger,
+      batcher: { emit(message: { payload?: { text?: string } }) {
+        if (message.payload?.text) feed.push(message.payload.text);
+      } },
+    };
+    const original = git.checkpointPack.bind(git);
+    git.checkpointPack = (async () => {
+      throw new ScratchPublicationError("cannot verify fresh remote floor", new Error(`leak ${PAT}`), {
+        kind: "exec_failed", step: "object_walk", detail: "remote text",
+      });
+    }) as typeof git.checkpointPack;
+    let outcome: unknown;
+    try {
+      outcome = await (runner({ run: async (c) => ({ branch: c.branch }) }, gitlab) as unknown as {
+        publishCheckpointOutcome: (f: unknown, b: string, name: string) => Promise<unknown>;
+      }).publishCheckpointOutcome(flight, bare, branch);
+    } finally {
+      git.checkpointPack = original;
+    }
+    assert.deepEqual(outcome, { published: false, reason: "scratch_publication_refused" });
+        const line = lines.find((l) => l.msg === "scratch publication refused");
+    assert.ok(line);
+    assert.equal(line.fields?.kind, "exec_failed");
+    assert.equal(line.fields?.step, "object_walk");
+    assert.equal(line.fields?.detail, undefined);
+    assert.equal(line.fields?.cause, undefined);
   });
 });
 

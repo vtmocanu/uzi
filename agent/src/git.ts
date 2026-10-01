@@ -183,20 +183,40 @@ export class ScratchPublicationError extends Error {
   readonly step?: ScratchPublicationStep;
   /** One line, control characters replaced with `?` (sanitizeForLog), capped at DETAIL_MAX; never carries env. */
   readonly detail?: string;
+  /** The same first line WITHOUT sanitizing or the DETAIL_MAX cut, bounded to RAW_DETAIL_MAX UTF-16
+   *  units. A caller that redacts must redact this and only then sanitize+cap: sanitizing first turns
+   *  a control character inside a token into `?` and a cut can leave a token prefix, either of which
+   *  defeats the redactor. Untrusted text; never log or report it unredacted. */
+  readonly rawDetail?: string;
   constructor(
     reason: string,
     cause?: unknown,
-    opts?: { kind?: ScratchPublicationKind; step?: ScratchPublicationStep; detail?: string },
+    opts?: {
+      kind?: ScratchPublicationKind; step?: ScratchPublicationStep; detail?: string; rawDetail?: string;
+    },
   ) {
     super(`scratch_publication_refused: ${reason}`, { cause });
     this.name = "ScratchPublicationError";
     this.kind = opts?.kind ?? "exec_failed";
     if (opts?.step !== undefined) this.step = opts.step;
     if (opts?.detail !== undefined) this.detail = opts.detail;
+    if (opts?.rawDetail !== undefined) this.rawDetail = opts.rawDetail;
   }
 }
 
 const DETAIL_MAX = 200;
+/** Bound on the unsanitized first line carried as ScratchPublicationError.rawDetail. */
+const RAW_DETAIL_MAX = 4096;
+
+/** First non-empty line of `text` within a RAW_DETAIL_MAX prefix, unsanitized and uncut beyond it. */
+function rawLine(text: string): string {
+  const prefix = String(text).slice(0, RAW_DETAIL_MAX);
+  for (const raw of prefix.split(/[\r\n\u2028\u2029]/)) {
+    const line = raw.trim();
+    if (line) return line;
+  }
+  return "";
+}
 
 /** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input
  *  (DETAIL_MAX*4 UTF-16 units) is scanned, because forge stderr can be megabytes; that prefix cut is
@@ -222,6 +242,8 @@ interface ExecFailure {
   stdout: string;
   stderr: string;
   detail: string;
+  /** The unsanitized equivalent of `detail` (see ScratchPublicationError.rawDetail). */
+  rawDetail: string;
 }
 
 /** Classify an execScoped rejection (either the execFile or the boundary shape). */
@@ -244,9 +266,20 @@ function classifyExecFailure(err: unknown): ExecFailure {
   if (timedOut) parts.push("timed out");
   if (overflow) parts.push("output exceeded limit");
   if (spawnError) parts.push(`code ${String(e.code)}`);
-  const text = oneLine(stderr) || oneLine(typeof e.message === "string" ? e.message : String(err));
+  const message = typeof e.message === "string" ? e.message : String(err);
+  const text = oneLine(stderr) || oneLine(message);
   if (text) parts.push(text);
-  return { exitCode, timedOut, overflow, spawnError, stdout, stderr, detail: oneLine(parts.join("; ")) };
+  const rawParts = parts.slice(0, text ? -1 : undefined);
+  const rawText = rawLine(stderr) || rawLine(message);
+  if (rawText) rawParts.push(rawText);
+  return {
+    exitCode, timedOut, overflow, spawnError, stdout, stderr,
+    detail: oneLine(parts.join("; ")), rawDetail: rawLine(rawParts.join("; ")),
+  };
+}
+
+function execDetail(f: ExecFailure): { detail: string; rawDetail: string } {
+  return { detail: f.detail, rawDetail: f.rawDetail };
 }
 
 const PUBLICATION_UNPROVEN = "cannot prove scratch-free candidate history";
@@ -1498,13 +1531,14 @@ export class GitCache {
         });
       }
       throw new ScratchPublicationError(PUBLICATION_UNPROVEN, cause, {
-        kind: "exec_failed", step: "resolve_tip", detail: failure.detail,
+        kind: "exec_failed", step: "resolve_tip", detail: failure.detail, rawDetail: failure.rawDetail,
       });
     }
     const sha = stdout.trim();
     if (!SHA40_RE.test(sha)) {
       throw new ScratchPublicationError(PUBLICATION_UNPROVEN, undefined, {
         kind: "exec_failed", step: "resolve_tip", detail: oneLine(`unexpected rev-parse output: ${sha}`),
+        rawDetail: rawLine(`unexpected rev-parse output: ${sha}`),
       });
     }
     return sha;
@@ -1518,7 +1552,7 @@ export class GitCache {
     if (abort) return abort;
     if (cause instanceof ScratchPublicationError) return cause;
     return new ScratchPublicationError(PUBLICATION_UNPROVEN, cause, {
-      kind, step, detail: classifyExecFailure(cause).detail,
+      kind, step, ...execDetail(classifyExecFailure(cause)),
     });
   }
 
@@ -1587,7 +1621,7 @@ export class GitCache {
       if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError(PUBLICATION_UNPROVEN, cause, {
-        kind: "exec_failed", detail: classifyExecFailure(cause).detail,
+        kind: "exec_failed", ...execDetail(classifyExecFailure(cause)),
       });
     }
   }
@@ -1614,6 +1648,7 @@ export class GitCache {
           throw new ScratchPublicationError("cannot verify fresh remote floor", resolveErr.cause ?? resolveErr, {
             kind: "floor_unverified", step: "floor_refresh",
             ...(resolveErr.detail !== undefined ? { detail: resolveErr.detail } : {}),
+            ...(resolveErr.rawDetail !== undefined ? { rawDetail: resolveErr.rawDetail } : {}),
           });
         }
         throw resolveErr;
@@ -1647,7 +1682,7 @@ export class GitCache {
       if (abort) throw abort;
       if (cause instanceof ScratchPublicationError) throw cause;
       throw new ScratchPublicationError("cannot verify fresh remote floor", cause, {
-        kind: "floor_unverified", step: "floor_refresh", detail: classifyExecFailure(cause).detail,
+        kind: "floor_unverified", step: "floor_refresh", ...execDetail(classifyExecFailure(cause)),
       });
     } finally {
       await this.runGit(barePath, ["update-ref", "-d", scratchRef]).catch(() => undefined);
@@ -3946,7 +3981,7 @@ export class GitCache {
       const abort = this.boundaryAbortError(e);
       if (abort) throw abort;
       throw new ScratchPublicationError("checkpoint floor cannot be resolved", e, {
-        kind: "checkpoint_range", step: "checkpoint_floor", detail: classifyExecFailure(e).detail,
+        kind: "checkpoint_range", step: "checkpoint_floor", ...execDetail(classifyExecFailure(e)),
       });
     }
 

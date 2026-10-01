@@ -1267,43 +1267,64 @@ interface ActiveRun {
   shuttingDown: boolean;
 }
 
-/** The failure_reason for a refused scratch publication. A floor_unverified detail can carry
- *  forge or remote stderr (untrusted), so only its kind and step reach the reason; the structured
- *  log line from {@link logScratchPublicationRefused} carries the redacted detail. */
-function scratchPublicationFailureReason(err: ScratchPublicationError): string {
+const SCRATCH_CAUSE_MAX_DEPTH = 4;
+const SCRATCH_CAUSE_PART_MAX = 200;
+const SCRATCH_CAUSE_TOTAL_MAX = 600;
+/** Cap on the text handed to the redactor: a runGit cause message can carry up to 64 MiB of stderr. */
+const SCRATCH_REDACT_INPUT_MAX = 4096;
+
+/** Redact FIRST, then sanitize and cap: sanitizing first would turn a control character inside a
+ *  token into `?` (the redactor no longer matches it) and a cap could leave a token prefix. The
+ *  input is bounded before redaction so a huge message costs a bounded redactor pass. */
+function redactThenSanitize(redactText: (text: string) => string, text: string): string {
+  return sanitizeForLog(redactText(text.slice(0, SCRATCH_REDACT_INPUT_MAX)), SCRATCH_CAUSE_PART_MAX);
+}
+
+/** The failure_reason for a refused scratch publication. Only kind floor_unverified omits the
+ *  detail (it can carry forge or remote stderr, untrusted): its reason names only kind and step.
+ *  Every other kind, including a refusal from the forward-advance preflight of the fetched remote
+ *  tip (refreshScratchPublicationFloor rethrows its ScratchPublicationError unchanged), keeps its own
+ *  kind and its local-git detail, redacted with the claim's redactor before it is sanitized and
+ *  capped. The structured log line from {@link logScratchPublicationRefused} carries the detail for
+ *  every kind. */
+function scratchPublicationFailureReason(
+  err: ScratchPublicationError,
+  redactText: ((text: string) => string) | undefined,
+): string {
   const at = err.step === undefined ? "" : ` at ${err.step}`;
   if (err.kind === "floor_unverified") {
     return `scratch_publication_refused: cannot verify fresh remote floor (${err.kind}${at})`;
   }
-  const detail = err.detail ? `: ${err.detail}` : "";
+  const source = err.rawDetail ?? err.detail;
+  // Without a redactor (a partial test flight) free text is omitted rather than reported unredacted.
+  const detail = source && redactText ? `: ${redactThenSanitize(redactText, source)}` : "";
   return `scratch_publication_refused: candidate history cannot be published (${err.kind}${at}${detail})`;
 }
 
-const SCRATCH_CAUSE_MAX_DEPTH = 4;
-const SCRATCH_CAUSE_PART_MAX = 200;
-const SCRATCH_CAUSE_TOTAL_MAX = 600;
-
 /** Log why a scratch publication was refused: kind, step, detail and the cause chain, each
- *  redacted then sanitized. Without a redactor (a partial test flight) the free text is omitted
- *  rather than logged unredacted. */
+ *  redacted then sanitized. Without a redactor (a partial test flight) the free text (detail and
+ *  cause) is omitted rather than logged unredacted. */
 function logScratchPublicationRefused(
   runLog: Logger,
   redactText: ((text: string) => string) | undefined,
   err: ScratchPublicationError,
 ): void {
-  const clean = (text: string): string => sanitizeForLog(redactText ? redactText(text) : "", SCRATCH_CAUSE_PART_MAX);
-  const parts: string[] = [];
-  let cur: unknown = err.cause;
-  for (let depth = 0; cur !== undefined && cur !== null && depth < SCRATCH_CAUSE_MAX_DEPTH; depth++) {
-    parts.push(clean(cur instanceof Error ? cur.message : String(cur)));
-    cur = cur instanceof Error ? cur.cause : undefined;
+  let detail: string | undefined;
+  let cause: string | undefined;
+  if (redactText) {
+    const source = err.rawDetail ?? err.detail;
+    if (source !== undefined) detail = redactThenSanitize(redactText, source);
+    const parts: string[] = [];
+    let cur: unknown = err.cause;
+    for (let depth = 0; cur !== undefined && cur !== null && depth < SCRATCH_CAUSE_MAX_DEPTH; depth++) {
+      parts.push(redactThenSanitize(redactText, cur instanceof Error ? cur.message : String(cur)));
+      cur = cur instanceof Error ? cur.cause : undefined;
+    }
+    // Parts are already sanitized, so this only code-point-truncates; the cap leaves room for the
+    // `...` marker so the whole value is at most SCRATCH_CAUSE_TOTAL_MAX characters.
+    if (parts.length > 0) cause = sanitizeForLog(parts.join(" <- "), SCRATCH_CAUSE_TOTAL_MAX - 3);
   }
-  runLog.error("scratch publication refused", {
-    kind: err.kind,
-    step: err.step,
-    detail: err.detail === undefined ? undefined : clean(err.detail),
-    cause: parts.length === 0 ? undefined : parts.join(" <- ").slice(0, SCRATCH_CAUSE_TOTAL_MAX),
-  });
+  runLog.error("scratch publication refused", { kind: err.kind, step: err.step, detail, cause });
 }
 
 /**
@@ -3639,7 +3660,7 @@ export class RunRunner {
         : err instanceof TerminalReportError
           ? err.reason
           : err instanceof ScratchPublicationError
-            ? scratchPublicationFailureReason(err)
+            ? scratchPublicationFailureReason(err, redactText)
             : (codexBoundaryDiagnosticOf(err) ?? errMessage(err));
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
