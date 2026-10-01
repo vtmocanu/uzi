@@ -32,12 +32,24 @@ export function leaseRemaining(expiresAt: string | undefined, nowMs: number): st
  *
  * Its own 30s clock keeps the countdown ageing between the page's 10s fleet polls
  * (and when a poll is skipped), and drops the badge at expiry without a refetch.
+ *
+ * The clock lives in LeaseCountdown, mounted only while a lease exists and keyed on
+ * its expiry, so it starts from a fresh Date.now() the moment a lease appears (or is
+ * renewed). A single component with useNow(lease ? 30_000 : null) would freeze its
+ * clock at the row's MOUNT time: a row mounted mid-run that gains its lease hours
+ * later would count down from that stale instant and overstate the time left.
  */
 export function WorkerLeaseBadge({ worker }: { worker: Worker }) {
-  const now = useNow(worker.ephemeral_lease_expires_at ? 30_000 : null);
-  const left = leaseRemaining(worker.ephemeral_lease_expires_at, now);
+  const expiresAt = worker.ephemeral_lease_expires_at;
+  if (!expiresAt) return null;
+  return <LeaseCountdown key={expiresAt} expiresAt={expiresAt} />;
+}
+
+function LeaseCountdown({ expiresAt }: { expiresAt: string }) {
+  const now = useNow(30_000);
+  const left = leaseRemaining(expiresAt, now);
   if (left == null) return null;
-  const until = new Date(Date.parse(worker.ephemeral_lease_expires_at!)).toLocaleTimeString([], {
+  const until = new Date(Date.parse(expiresAt)).toLocaleTimeString([], {
     hour: "2-digit",
     minute: "2-digit",
   });

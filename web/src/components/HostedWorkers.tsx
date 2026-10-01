@@ -293,9 +293,10 @@ export function HostedWorkers({
           </div>
           <p id="ephemeral-toggle-desc" className="text-xs text-muted">
             When on, uzi spins up a throwaway hosted worker on demand when one of your runs
-            needs a capability no online worker has. After the run finishes, the worker is
-            kept warm for a short while so a follow-up run on the same branch can reuse it,
-            then removed; while kept warm it still counts toward your ephemeral worker limit.
+            needs a capability no online worker has. After the run finishes, the worker may be
+            kept warm, by default for up to 2 hours unless your admin turned that off, so a
+            follow-up run on the same repository and branch can reuse it; then it is removed.
+            While kept warm it still counts toward your ephemeral worker limit.
             This is <em>experimental</em>, and each new ephemeral worker pays a one-time
             ~2.6&nbsp;GiB tool-cache cold start.
           </p>

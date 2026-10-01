@@ -651,6 +651,32 @@ describe("WorkersSettings hosted quota is escapable (the primary journey)", () =
     }
   });
 
+  it("the at-quota link skips an ephemeral row listed first and focuses the first PERSISTENT hosted row (PRD #2006)", async () => {
+    // Ephemeral workers never count toward the manual hosted quota, so deleting one frees
+    // nothing here: the jump must land on a persistent hosted row even when a (leased)
+    // ephemeral row comes first in the fleet order.
+    const eph = aWorker({
+      id: "w-eph",
+      name: "auto (M)",
+      kind: "hosted",
+      hosted_size: "m",
+      ephemeral: true,
+      ephemeral_lease_expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+    });
+    const h1 = aWorker({ id: "w-h1", name: "base (S)", kind: "hosted", hosted_size: "s" });
+    const h2 = aWorker({ id: "w-h2", name: "base (M)", kind: "hosted", hosted_size: "m" });
+    mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
+    mockApi.listWorkers.mockResolvedValue({ workers: [eph, h1, h2] });
+    renderPage();
+
+    await screen.findByText("base (M)");
+    openAddTab();
+    fireEvent.click(await screen.findByRole("button", { name: "delete one to provision another" }));
+
+    await waitFor(() => expect(document.activeElement).toBe(document.getElementById("worker-row-w-h1")));
+    expect(document.activeElement).not.toBe(document.getElementById("worker-row-w-eph"));
+  });
+
   it("names each worker row via aria-labelledby pointing at the worker-name span (M4, a11y)", async () => {
     const h1 = aWorker({ id: "w-h1", name: "base (S)", kind: "hosted", hosted_size: "s" });
     mockApi.hostedConfig.mockResolvedValue({ enabled: true, quota: 2, ephemeral_enabled: false });
