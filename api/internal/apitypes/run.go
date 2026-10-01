@@ -262,10 +262,13 @@ type RunDTO struct {
 	// RUN_TIMEOUT) + budget_extension_seconds, computed server-side so a client never has to
 	// know RUN_TIMEOUT. Null for a kind/state that never times out (not running, chat/judge,
 	// interactive, or no started_at) — the same predicate RunDeadline uses. BudgetUsedSeconds
-	// is the ACTIVE time so far (now - started_at - budget_paused_seconds, clamped at 0), the
-	// paused-aware "used" the header measures against the budget, NOT raw wall elapsed; null
-	// when the run never started. A new SPA against an older api sees these undefined and falls
-	// back to plain elapsed (rollout-skew safe).
+	// is the ACTIVE time in the CURRENT budget leg (end - started_at - budget_paused_seconds,
+	// clamped at 0), the paused-aware "used" the header measures against the budget, NOT raw
+	// wall elapsed and NOT total working time: started_at resets on limit/recovery/pool
+	// resumes (see first_started_at for the never-reset start). end is now for a live run,
+	// status_since for a paused run, and finished_at for a terminal run, so the figure freezes
+	// once the run stops (issue #2004); null when the run never started. A new SPA against an
+	// older api sees these undefined and falls back to plain elapsed (rollout-skew safe).
 	BudgetTotalSeconds *int `json:"budget_total_seconds"`
 	BudgetUsedSeconds  *int `json:"budget_used_seconds"`
 	// ScopeCeiling is the operator scope ceiling (PRD #634 M2): the count of milestones the

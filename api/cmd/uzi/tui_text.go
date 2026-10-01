@@ -96,8 +96,10 @@ func padCell(s string, n int) string {
 }
 
 // runDuration is the run's elapsed WORK time for the header: a live run's time since it
-// started, or a terminal run's total from start to finish. Start is StartedAt, or ClaimedAt
-// during the brief claimed-but-not-started window; end is FinishedAt when set, else now.
+// started, or a terminal run's total from start to finish. Start is FirstStartedAt (the
+// never-reset first start, so a resumed run spans its whole life, #2004), else StartedAt (the
+// current budget leg, what an older server sends), else ClaimedAt during the brief
+// claimed-but-not-started window; end is FinishedAt when set, else now.
 //
 // CreatedAt is deliberately NOT a fallback: it would turn a queued run's header into its
 // queue-WAIT age dressed up as run-elapsed time (and a just-created run into a literal "0s"),
@@ -105,6 +107,8 @@ func padCell(s string, n int) string {
 func runDuration(run apitypes.RunDTO, now time.Time) string {
 	var start time.Time
 	switch {
+	case run.FirstStartedAt != nil && !run.FirstStartedAt.IsZero():
+		start = *run.FirstStartedAt
 	case run.StartedAt != nil && !run.StartedAt.IsZero():
 		start = *run.StartedAt
 	case run.ClaimedAt != nil && !run.ClaimedAt.IsZero():

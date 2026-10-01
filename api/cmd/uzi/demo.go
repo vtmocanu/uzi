@@ -220,6 +220,7 @@ func demoRuns(now time.Time) []apitypes.RunListItemDTO {
 		// has not begun implementing.
 		started := created
 		r.StartedAt = &started
+		r.FirstStartedAt = &started
 		if terminalRunStatuses[status] {
 			finished := now
 			r.FinishedAt = &finished
