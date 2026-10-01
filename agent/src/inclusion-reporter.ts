@@ -7,7 +7,7 @@
  * every queued id; it never throws. A transient failure keeps the ids queued for the next flush.
  * An UNTYPED 404/405 is ambiguous (an api pod that predates the route, mid rolling upgrade): the
  * ids stay queued and flush backs off, skipping 1, 2, 4... (capped) poll ticks, and only
- * INCLUSION_ROUTE_MISSING_LIMIT consecutive ones stop reporting. The reporter also stops, for
+ * INCLUSION_ROUTE_MISSING_LIMIT of them since the last accepted receipt stop reporting. The reporter also stops, for
  * good, on a typed not-owned 404 (reason "stale") or a receipt saying the claim is inactive (the
  * next claim's requeue recovers what is left). Any other 4xx drops the batch.
  */
@@ -20,10 +20,13 @@ const MAX_INCLUDE_BATCH = 1000;
 /** Attempts a stopping channel makes to flush what is still queued, so a failing api never holds
  *  the shutdown. Whatever is left is recovered by the next claim's requeue. */
 const STOP_INCLUDE_ATTEMPTS = 3;
-/** Consecutive untyped 404/405 receipts (across flushes) after which reporting stops for the claim. */
-export const INCLUSION_ROUTE_MISSING_LIMIT = 5;
+/** Untyped 404/405 answers since the last accepted receipt (across flushes) after which reporting
+ *  stops for the claim. With the backoff below the 8th answer lands after 1+2+4+8+16+16+16 = 63
+ *  skipped ticks, so the window before a permanent stop is about 70 poll ticks: roughly 70s for
+ *  chat (1s poll) and 3.5 minutes for steering, long enough for a rolling api upgrade. */
+export const INCLUSION_ROUTE_MISSING_LIMIT = 8;
 /** Cap on the flush() calls skipped after an untyped 404/405: the k-th skips min(2^(k-1), cap). */
-const INCLUSION_ROUTE_MISSING_BACKOFF_MAX_TICKS = 8;
+export const INCLUSION_ROUTE_MISSING_BACKOFF_MAX_TICKS = 16;
 
 /** The api's typed error reason (`{"error","reason"}`), or undefined for an untyped body. */
 function errorReason(err: RequestError): string | undefined {

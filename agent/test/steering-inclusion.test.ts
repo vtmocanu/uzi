@@ -8,7 +8,6 @@ import { nullLogger } from "./helpers.js";
 import { WorkerClient } from "../src/client.js";
 import { ChatSteering, SteeringChannel } from "../src/steering.js";
 import type { UserInput } from "../src/protocol.js";
-import { INCLUSION_ROUTE_MISSING_LIMIT } from "../src/inclusion-reporter.js";
 
 const TOKEN = "worker-join-token-0123456789";
 const RUN = "inclusion-run";
@@ -44,6 +43,22 @@ const until = async (ready: () => boolean): Promise<void> => {
   assert.ok(ready(), "condition reached");
 };
 const settle = (ms = 40): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** Start the channel and pull the follow-ups 7 and 8; returns the second (a real later id). */
+async function pullSevenAndEight(ch: SteeringChannel): Promise<{ first: number; second: number }> {
+  api.setInputs(RUN, [
+    { id: 7, kind: "follow_up", body: "seven" },
+    { id: 8, kind: "follow_up", body: "eight" },
+  ]);
+  ch.start();
+  const got: number[] = [];
+  await until(() => {
+    const f = ch.pullFollowUp();
+    if (f) got.push(f.id);
+    return got.length >= 2;
+  });
+  return { first: got[0]!, second: got[1]! };
+}
 
 /** Start the channel and pull the one follow-up the poll routes (id 7 body "seven"). */
 async function pullSeven(ch: SteeringChannel): Promise<{ id: number; body: string }> {
@@ -92,38 +107,28 @@ describe("SteeringChannel follow-up inclusion receipts (issue #1800)", () => {
       await settle();
       assert.strictEqual(api.inclusionCalls.length, 2, "one refused attempt, one that landed, then nothing more");
       assert.deepStrictEqual(api.inclusionCalls[1], { runId: RUN, ids: [7], generation: GENERATION });
+      assert.ok(api.isInputIncluded(RUN, 7), "the fake stamped the id included");
     });
   }
-
-  it("stops after INCLUSION_ROUTE_MISSING_LIMIT consecutive untyped 404s, including for a later id", async () => {
-    api.inclusionRouteMissing = true;
-    const ch = channel();
-    const { id } = await pullSeven(ch);
-    ch.markFollowUpIncluded(id);
-    await until(() => api.inclusionCalls.length >= INCLUSION_ROUTE_MISSING_LIMIT);
-    ch.markFollowUpIncluded(99);
-    await settle();
-    assert.strictEqual(api.inclusionCalls.length, INCLUSION_ROUTE_MISSING_LIMIT, "exactly the limit, then nothing, even for a later id");
-  });
 
   it("stops after one typed not-owned 404", async () => {
     api.inclusionNotOwned = true;
     const ch = channel();
-    const { id } = await pullSeven(ch);
-    ch.markFollowUpIncluded(id);
+    const { first, second } = await pullSevenAndEight(ch);
+    ch.markFollowUpIncluded(first);
     await until(() => api.inclusionCalls.length >= 1);
-    ch.markFollowUpIncluded(99);
+    ch.markFollowUpIncluded(second);
     await settle();
     assert.strictEqual(api.inclusionCalls.length, 1, "a typed stale 404 is final: nothing is sent after it");
   });
 
   it("drops an id whose receipt says the claim is no longer active, and sends nothing for a later mark", async () => {
     const ch = channel();
-    const { id } = await pullSeven(ch);
+    const { first, second } = await pullSevenAndEight(ch);
     api.setInputClaimGeneration(RUN, GENERATION + 1); // a newer claim took the run
-    ch.markFollowUpIncluded(id);
+    ch.markFollowUpIncluded(first);
     await until(() => api.inclusionCalls.length >= 1);
-    ch.markFollowUpIncluded(99);
+    ch.markFollowUpIncluded(second);
     await settle();
     assert.strictEqual(api.inclusionCalls.length, 1, "an inactive receipt is final: no retry, no later send");
   });

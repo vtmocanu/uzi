@@ -2052,7 +2052,7 @@ func TestRunReworkJSON(t *testing.T) {
 
 // TestRunInputsIncludedAndNotIncluded (issue #1800): the table reads "included in a prompt"
 // once the turn carrying a follow-up started, and a finished run whose received follow-up
-// never reached a prompt reads "not confirmed (run finished)", never "delivered".
+// has no confirmed prompt inclusion (a receipt can be lost at shutdown) reads "not confirmed (run finished)", never "delivered".
 func TestRunInputsIncludedAndNotIncluded(t *testing.T) {
 	at := time.Now().Add(-time.Minute)
 	inBody, outBody := "was in a prompt", "never in a prompt"

@@ -129,6 +129,10 @@ export class FakeApi {
   /** Issue #1800: every POST /inputs/included the api received, in arrival order. */
   readonly inclusionCalls: Array<{ runId: string; ids: number[]; generation: number }> = [];
   private readonly includedByRun = new Map<string, Set<number>>();
+  /** Issue #1800: whether POST /inputs/included stamped input `id` of `runId`. */
+  isInputIncluded(runId: string, id: number): boolean {
+    return this.includedByRun.get(runId)?.has(id) ?? false;
+  }
   /** Issue #1604: the approve_plan rows settled through /inputs/discarded, per run. */
   private readonly discardedByRun = new Map<string, Set<number>>();
   /** Issue #1604: the most rows one GET /inputs returns (the server's ListReplayRunInputs LIMIT);
