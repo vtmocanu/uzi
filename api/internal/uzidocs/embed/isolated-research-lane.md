@@ -75,8 +75,8 @@ lane run. What differs from a job on a standard worker:
   failed by the ephemeral-worker sweeper (`no_job_capable_worker`) rather than
   waiting. **Rollout:** run the lane workers on a worker image that advertises
   `isolated_job_v1` (the chart's `workers.image.tag`) before, or together with,
-  allowing products to name site lists. Until the fleet has rolled, bound jobs
-  fail instead of running.
+  allowing products to name site lists. Until the fleet has rolled, a bound job
+  that gets a lane worker fails instead of running.
 - **Once a lane worker is provisioned for a bound job, a worker that cannot
   serve it fails the job rather than leaving it waiting.** A lane worker that
   never registers fails it (`ephemeral_worker_never_registered`) after the

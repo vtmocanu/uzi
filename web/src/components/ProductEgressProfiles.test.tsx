@@ -120,13 +120,20 @@ describe("ProductEgressProfilesPanel", () => {
     expect(screen.queryByRole("button", { name: "Remove kernel-docs" })).toBeNull();
   });
 
-  it("surfaces a failed write and keeps the row", async () => {
-    mockApi.adminDisallowProductEgressProfile.mockRejectedValue(new ApiError(404, "egress profile is not allowed for this product"));
+  it("surfaces a failed (non-404) write and keeps the row", async () => {
+    mockApi.adminDisallowProductEgressProfile.mockRejectedValue(new ApiError(500, "remove failed"));
     await openPanel();
     fireEvent.click(await screen.findByRole("button", { name: "Remove kernel-docs" }));
     const alert = await screen.findByRole("alert");
-    expect(alert.textContent).toContain("not allowed for this product");
-    expect(screen.getByText("kernel-docs")).toBeTruthy();
+    expect(alert.textContent).toContain("remove failed");
+    expect(screen.getByRole("button", { name: "Remove kernel-docs" })).toBeTruthy();
+  });
+
+  it("says the site lists are unavailable when the list of all site lists fails to load", async () => {
+    mockApi.adminListEgressProfiles.mockRejectedValue(new ApiError(500, "lists down"));
+    await openPanel();
+    expect(await screen.findByText("Site lists unavailable")).toBeTruthy();
+    expect(screen.getByText("lists down")).toBeTruthy();
   });
 
   it("surfaces a failed load", async () => {

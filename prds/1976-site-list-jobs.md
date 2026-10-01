@@ -1,6 +1,6 @@
 # PRD #1976: Site-list jobs: per-product site-list allowance and profile-bound jobs on the isolated lane
 
-**Status**: Planned. Unblocked: PRD #1909 merged (PR #2002, `c4c94e2c`). Split out of PRD #1906 (its M8), which closed with this milestone open.
+**Status**: In progress. M1 is implemented and its `task gate:api` / `task gate:agent` gates pass, but its live-DB tests (`jobs_profile_livedb_test.go`, `site_list_jobs_livedb_test.go`) have not yet executed anywhere (the implementing run had no Postgres); tick M1 once the store-it lane (`./e2e/run-store-it.sh` or CI) runs them green. M2 is done. Unblocked: PRD #1909 merged (PR #2002, `c4c94e2c`). Split out of PRD #1906 (its M8), which closed with this milestone open.
 
 ## Problem
 
@@ -44,7 +44,7 @@ Acceptance examples:
 ## Milestones
 
 - [ ] **M1: A product job can use an allowed site list, end to end.** Allowance table and its cookie-only admin API; job create accepts `egress_profile` with the allowance check (user token: any list; product token: its product's allowed lists; fail closed), removing the 422 in the same change; a profile-bound job is placed on the lane and passes the job claim clause including `job_files_v1`; its claim carries the job block plus the fetch grant through the isolation strip; the lane worker runs it to completion (inputs, fetch, outputs, result) with PRD #1906's isolation intact; the two file routes and the job-result route join `laneWorkerAllowlist`. Tests per the Testing decisions. Blocked by: PRD #1909 merged. Gate: `task gate:api`, `task gate:agent`.
-- [ ] **M2: Admins manage allowances in the web and CLI.** Admin page section to add and remove a product's allowed lists (`task gate:web`), read-only CLI listing, docs and the #1906 operator page updated. Blocked by: M1. Gate: `task gate:web`, `task gate:api`, `task check-docs:web`.
+- [x] **M2: Admins manage allowances in the web and CLI.** Admin page section to add and remove a product's allowed lists (`task gate:web`), read-only CLI listing, docs and the #1906 operator page updated. Blocked by: M1. Gate: `task gate:web`, `task gate:api`, `task check-docs:web`.
 
 ## Decision Log
 
