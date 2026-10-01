@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **A worker holding an undelivered run outcome is shown as such, and the run is flagged stalled after a minute ([#1994](https://github.com/vtmocanu/uzi/issues/1994)).**
   The api now records when a worker's pending outcome (journaled on the worker, not yet delivered) was first seen, per worker, run and claim generation, surviving heartbeat renewals and a worker re-register. A running or awaiting-approval run whose outcome has been pending under an unexpired lease for 4 heartbeat intervals (60s by default) gets the existing stalled flag with the reason "the run's outcome is journaled on its worker but has not been delivered"; this is a warning only and never expires the lease or reclaims, fails or discards the run. `reported_runs` entries in the worker list API carry `terminal_pending` and `terminal_pending_since`, the `RUNS` column of `uzi worker list` and `uzi admin workers` shows "N pending outcome(s) (oldest <age>)" instead of counting them as running, and Settings > Workers and the admin Runs worker strip show a badge with a per-run tooltip. See [run health](docs/run-health.md#what-the-flags-mean).
 
+### Fixed
+
+- **Run durations span the whole run after a limit, recovery or pool resume ([#2004](https://github.com/vtmocanu/uzi/issues/2004)).**
+  A resumed run gets a fresh timeout wall, which used to make every duration show only its last leg ("ran 4h 13m" for an ~18h run). Runs now record a never-reset first start (`first_started_at` on the run API), and the runs list, board card, run and issue views, `uzi run list` and the TUI measure from it, parks included; the timeout budget is still measured per leg. Finished board cards now show `ran <elapsed>`. `budget_used_seconds` on a finished run no longer keeps growing. For runs started before this release, the duration counts from the leg that was active at upgrade, so a run that had already resumed shows only its later legs.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
