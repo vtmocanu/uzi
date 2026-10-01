@@ -9,8 +9,8 @@
 -- Store the pending request GET /api/oauth/authorize validated. The caller has already capped and
 -- validated every field (oauthsrv), so nothing here is attacker-sized. binding_hash is the sha256
 -- of the browser-binding cookie nonce; the plaintext nonce is never stored.
-INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, expires_at)
-VALUES (sqlc.arg(product_id), sqlc.arg(redirect_uri), sqlc.arg(scopes)::text[], sqlc.arg(state), sqlc.arg(code_challenge), sqlc.arg(binding_hash)::bytea, sqlc.arg(source_prefix), sqlc.arg(expires_at))
+INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, source_mid, source_wide, expires_at)
+VALUES (sqlc.arg(product_id), sqlc.arg(redirect_uri), sqlc.arg(scopes)::text[], sqlc.arg(state), sqlc.arg(code_challenge), sqlc.arg(binding_hash)::bytea, sqlc.arg(source_prefix), sqlc.arg(source_mid), sqlc.arg(source_wide), sqlc.arg(expires_at))
 RETURNING *;
 
 -- name: GetOAuthAuthorizeRequest :one
@@ -118,7 +118,7 @@ DELETE FROM oauth_authorize_requests
 -- name: LockOAuthAuthorize :exec
 -- Serializes one product's authorize inserts, so the pending caps cannot be passed by concurrent
 -- requests under READ COMMITTED (each would count against its own snapshot): the authorize
--- handler runs, in ONE transaction, this lock, then CountLivePendingOAuthRequests, then
+-- handler runs, in ONE transaction, SetOAuthAuthorizeLockTimeout, this lock, then a recount with CountLivePendingOAuthRequests, then
 -- CreateOAuthAuthorizeRequest. The same reasoning as LockProductTokenMint.
 --
 -- Two-int advisory lock: class 1970958177 = 0x757A6F61 ("uzoa"), the value of
@@ -133,19 +133,36 @@ SELECT pg_advisory_xact_lock(
 );
 
 -- name: CountLivePendingOAuthRequests :one
--- How many live (pending, unexpired) authorize requests exist for the (product, source), for the
--- product and overall, each counted up to its limit so the work is bounded however many rows an
--- attacker piles up. The unauthenticated authorize endpoint checks them against its caps (source
--- first, the fairness bound; the other two are storage backstops) BEFORE inserting, under
--- LockOAuthAuthorize. idx_oauth_authorize_requests_pending serves all three subqueries.
+-- How many live (pending, unexpired) authorize requests exist for the product's three source
+-- tiers (finest /64 or address, then /56 or /24, then /48 or /24), for the product and overall,
+-- each counted up to its limit so the work is bounded however many rows an attacker piles up.
+-- The unauthenticated authorize endpoint checks them against its caps (the source tiers are the
+-- fairness bounds; product and global are storage backstops) BEFORE inserting, first without
+-- the lock (a refusal never queues on it) and again under LockOAuthAuthorize. The subqueries
+-- are in this order: the three pending indexes serve the first four, and
+-- idx_oauth_authorize_requests_expires the global one (store test asserts each).
 SELECT
     (SELECT count(*) FROM (
         SELECT 1 FROM oauth_authorize_requests
          WHERE status = 'pending' AND expires_at > now()
            AND oauth_authorize_requests.product_id = sqlc.arg(for_product)
-           AND oauth_authorize_requests.source_prefix = sqlc.arg(for_source)
-         LIMIT sqlc.arg(source_limit)::int
-    ) s)::bigint AS source_pending,
+           AND oauth_authorize_requests.source_prefix = sqlc.arg(for_prefix)
+         LIMIT sqlc.arg(prefix_limit)::int
+    ) s)::bigint AS prefix_pending,
+    (SELECT count(*) FROM (
+        SELECT 1 FROM oauth_authorize_requests
+         WHERE status = 'pending' AND expires_at > now()
+           AND oauth_authorize_requests.product_id = sqlc.arg(for_product)
+           AND oauth_authorize_requests.source_mid = sqlc.arg(for_mid)
+         LIMIT sqlc.arg(mid_limit)::int
+    ) m)::bigint AS mid_pending,
+    (SELECT count(*) FROM (
+        SELECT 1 FROM oauth_authorize_requests
+         WHERE status = 'pending' AND expires_at > now()
+           AND oauth_authorize_requests.product_id = sqlc.arg(for_product)
+           AND oauth_authorize_requests.source_wide = sqlc.arg(for_wide)
+         LIMIT sqlc.arg(wide_limit)::int
+    ) w)::bigint AS wide_pending,
     (SELECT count(*) FROM (
         SELECT 1 FROM oauth_authorize_requests
          WHERE status = 'pending' AND expires_at > now() AND oauth_authorize_requests.product_id = sqlc.arg(for_product)
@@ -156,3 +173,9 @@ SELECT
          WHERE status = 'pending' AND expires_at > now()
          LIMIT sqlc.arg(global_limit)::int
     ) g)::bigint AS global_pending;
+
+-- name: SetOAuthAuthorizeLockTimeout :exec
+-- Bounds the wait of the LockOAuthAuthorize that follows, in this transaction only (set_config
+-- is_local = true): a lock held too long answers the authorize request temporarily_unavailable
+-- (SQLSTATE 55P03) instead of pinning an API pool connection.
+SELECT set_config('lock_timeout', sqlc.arg(timeout)::text, true);

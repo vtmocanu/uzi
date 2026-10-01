@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -595,10 +596,10 @@ func TestOAuthDoubleApproveAndDenyLiveDB(t *testing.T) {
 }
 
 // TestOAuthConcurrentApproveLiveDB: of many simultaneous approves of one request exactly one
-// wins; the rest are 409, and exactly one grant results. The losers each supersede the grant's
-// earlier codes (including the winner's) before their claim of the request fails; only their
-// transaction's rollback restores it. So afterwards the winning request is still approved and
-// exactly one request row carries a code.
+// wins; the rest are 409, and exactly one grant results. A loser may supersede the grant's
+// earlier codes (including the winner's) before its claim of the request fails; the rollback
+// that restores the winner is asserted deterministically by
+// TestOAuthLosingApproveRollsBackSupersedeLiveDB.
 func TestOAuthConcurrentApproveLiveDB(t *testing.T) {
 	e := oauthSetup(t)
 	id, c := e.start(t, nil, nil)
@@ -632,12 +633,77 @@ func TestOAuthConcurrentApproveLiveDB(t *testing.T) {
 	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_grants WHERE user_id = $1 AND product_id = $2`, e.user, e.product).Scan(&grants); err != nil || grants != 1 {
 		t.Errorf("grants = %d (%v), want 1", grants, err)
 	}
-	if row := e.requestRow(t, id); row.Status != "approved" {
-		t.Errorf("winning request status = %q, want approved (a losing approve's supersede must roll back)", row.Status)
+	if row := e.requestRow(t, id); row.Status != "approved" || row.CodeHash == nil {
+		t.Errorf("winning request = status %q, code present %t, want approved with a code", row.Status, row.CodeHash != nil)
 	}
-	var coded int
-	if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_authorize_requests WHERE product_id = $1 AND code_hash IS NOT NULL`, e.product).Scan(&coded); err != nil || coded != 1 {
-		t.Errorf("request rows with a code = %d (%v), want exactly 1", coded, err)
+}
+
+// TestOAuthLosingApproveRollsBackSupersedeLiveDB: an approve that reaches its claim AFTER another
+// decision committed answers 409 and leaves that decision intact. Deterministic: with a live grant
+// present, a test transaction holds the grant's row lock while the handler's approve of request R
+// loads R as pending and blocks on that lock; the test then approves R itself (claim, code) and
+// commits. The handler resumes, supersedes the grant's approved codes (R's, now) in its own
+// transaction, loses the claim (409), and only its rollback keeps R approved with its code.
+func TestOAuthLosingApproveRollsBackSupersedeLiveDB(t *testing.T) {
+	e := oauthSetup(t)
+	ctx := context.Background()
+	id0, c := e.start(t, nil, nil)
+	if rec := e.consent(t, http.MethodPost, id0, "/approve", e.jwt, c); rec.Code != http.StatusOK {
+		t.Fatalf("first approve = %d", rec.Code)
+	}
+	grant := e.liveGrant(t)
+	id, c := e.start(t, c, nil)
+	rid, _ := uuid.Parse(id)
+
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+	if _, err := tx.Exec(ctx, `SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE`, grant.ID); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- e.consent(t, http.MethodPost, id, "/approve", e.jwt, c) }()
+	// Wait until the handler is queued behind the grant lock.
+	var waiting int
+	for i := 0; i < 200 && waiting == 0; i++ {
+		if err := e.pool.QueryRow(ctx, `SELECT count(*) FROM pg_locks WHERE NOT granted`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		if waiting == 0 {
+			time.Sleep(25 * time.Millisecond)
+		}
+	}
+	if waiting == 0 {
+		t.Fatal("the handler's approve never blocked on the grant lock")
+	}
+	qtx := e.h.q.WithTx(tx)
+	userID := pgtype.UUID{Bytes: e.user, Valid: true}
+	if _, err := qtx.ClaimOAuthAuthorizeRequest(ctx, store.ClaimOAuthAuthorizeRequestParams{ID: rid, UserID: userID}); err != nil {
+		t.Fatal(err)
+	}
+	winnerHash := sha256.Sum256([]byte("winner code " + id))
+	if _, err := qtx.IssueOAuthAuthorizationCode(ctx, store.IssueOAuthAuthorizationCodeParams{
+		ID: rid, UserID: userID, GrantID: pgtype.UUID{Bytes: grant.ID, Valid: true},
+		CodeHash: winnerHash[:], CodeExpiresAt: pgtype.Timestamptz{Time: time.Now().Add(time.Minute), Valid: true},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("losing approve = %d %s, want 409", rec.Code, rec.Body.String())
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the losing approve never returned")
+	}
+	row := e.requestRow(t, id)
+	if row.Status != "approved" || !bytes.Equal(row.CodeHash, winnerHash[:]) {
+		t.Errorf("after the losing approve: status %q, code hash kept %t, want approved with the winner's hash", row.Status, bytes.Equal(row.CodeHash, winnerHash[:]))
 	}
 }
 
@@ -889,6 +955,14 @@ func withOAuthPendingCaps(t *testing.T, perSource, perProduct, global int) {
 	t.Cleanup(func() { oauthPendingPerSourceCap, oauthPendingPerProductCap, oauthPendingGlobalCap = oldS, oldP, oldG })
 }
 
+// withOAuthSourceTierCaps lowers the /56 and /48 (IPv6) and /24 (IPv4) tier caps for one test.
+func withOAuthSourceTierCaps(t *testing.T, v6Mid, v6Wide, v4Mid int) {
+	t.Helper()
+	oldM, oldW, old4 := oauthPendingV6MidCap, oauthPendingV6WideCap, oauthPendingV4MidCap
+	oauthPendingV6MidCap, oauthPendingV6WideCap, oauthPendingV4MidCap = v6Mid, v6Wide, v4Mid
+	t.Cleanup(func() { oauthPendingV6MidCap, oauthPendingV6WideCap, oauthPendingV4MidCap = oldM, oldW, old4 })
+}
+
 // The authorize endpoint is unauthenticated and its per-IP limiter does not bound a /64, so the
 // table is bounded by a per-source cap (the fairness bound) and per-product and global storage
 // backstops, checked BEFORE the insert, atomically with it. Over a cap the
@@ -997,7 +1071,7 @@ func TestOAuthAuthorizePendingCapLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("a decided or expired request frees its source slot", func(t *testing.T) {
+	t.Run("a decided request frees its source slot", func(t *testing.T) {
 		e := oauthSetup(t)
 		withOAuthPendingCaps(t, 1, 1_000_000, 1_000_000)
 		id, c := e.start(t, nil, nil)
@@ -1007,6 +1081,154 @@ func TestOAuthAuthorizePendingCapLiveDB(t *testing.T) {
 		}
 		if rec := e.authorize(t, e.authorizeQuery(nil), c); !strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=") {
 			t.Errorf("after a deny = %d %q", rec.Code, rec.Header().Get("Location"))
+		}
+	})
+
+	accepted := func(rec *httptest.ResponseRecorder) bool {
+		return strings.HasPrefix(rec.Header().Get("Location"), "/connect?request=")
+	}
+
+	t.Run("a flood from many /64s of one /56 is refused at the /56 tier", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 20, 1_000_000, 1_000_000)
+		withOAuthSourceTierCaps(t, 3, 1_000, 1_000)
+		// Three requests from three different /64s of 2001:db8:5::/56 fill its tier.
+		for i, addr := range []string{"[2001:db8:5:1::1]:1", "[2001:db8:5:2::1]:1", "[2001:db8:5:3::1]:1"} {
+			if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, addr); !accepted(rec) {
+				t.Fatalf("request %d from %s = %d %q", i, addr, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		// A fourth /64 of the same /56 is refused although its own /64 is empty.
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2001:db8:5:ee::1]:1"), 3)
+		// A user in another network still succeeds, so the flood did not lock the product.
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2001:db8:6:1::1]:1"); !accepted(rec) {
+			t.Errorf("a user of another /56 = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "198.51.100.9:1"); !accepted(rec) {
+			t.Errorf("an IPv4 user = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+	})
+
+	t.Run("many /56s of one /48 are refused at the /48 tier", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 20, 1_000_000, 1_000_000)
+		withOAuthSourceTierCaps(t, 1_000, 3, 1_000)
+		for i, addr := range []string{"[2001:db8:7:100::1]:1", "[2001:db8:7:200::1]:1", "[2001:db8:7:300::1]:1"} {
+			if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, addr); !accepted(rec) {
+				t.Fatalf("request %d from %s = %d %q", i, addr, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2001:db8:7:900::1]:1"), 3)
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2001:db8:8::1]:1"); !accepted(rec) {
+			t.Errorf("a user of another /48 = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+	})
+
+	t.Run("an IPv4 /24 is bounded and 6to4 counts as its embedded IPv4", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 20, 1_000_000, 1_000_000)
+		withOAuthSourceTierCaps(t, 1_000, 1_000, 3)
+		// 203.0.113.9 directly, then two 6to4 addresses embedding 203.0.113.x in different /64s,
+		// fill the /24: 2002:cb00:7109:: is 203.0.113.9, 2002:cb00:710a:: is 203.0.113.10.
+		for i, addr := range []string{"203.0.113.9:1", "[2002:cb00:710a:1::5]:1", "[2002:cb00:710b:ffff::5]:1"} {
+			if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, addr); !accepted(rec) {
+				t.Fatalf("request %d from %s = %d %q", i, addr, rec.Code, rec.Header().Get("Location"))
+			}
+		}
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, "203.0.113.200:1"), 3)
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "203.0.114.1:1"); !accepted(rec) {
+			t.Errorf("another /24 = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+		var n int
+		if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_authorize_requests WHERE product_id = $1 AND source_mid = '203.0.113.0/24'`, e.product).Scan(&n); err != nil || n != 3 {
+			t.Errorf("rows bucketed in 203.0.113.0/24 = %d (%v), want 3", n, err)
+		}
+	})
+
+	t.Run("the finest tier of 6to4 is the embedded IPv4 address, not the /64", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 1, 1_000_000, 1_000_000)
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2002:cb00:7109:1::1]:1"); !accepted(rec) {
+			t.Fatalf("first 6to4 request = %d", rec.Code)
+		}
+		// Another /64 of the same 6to4 prefix, and the plain IPv4 it embeds, are the same source.
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, "[2002:cb00:7109:2::1]:1"), 1)
+		assertRefused(t, e, e.authorizeFrom(t, e.authorizeQuery(nil), nil, "203.0.113.9:1"), 1)
+	})
+
+	t.Run("the source bucket honours TRUSTED_PROXIES", func(t *testing.T) {
+		e := oauthSetup(t)
+		withOAuthPendingCaps(t, 1, 1_000_000, 1_000_000)
+		_, trusted, _ := net.ParseCIDR("10.0.0.0/8")
+		e.h.cfg.TrustedProxies = []*net.IPNet{trusted}
+		t.Cleanup(func() { e.h.cfg.TrustedProxies = nil })
+		via := func(remote, xff string) *httptest.ResponseRecorder {
+			req := httptest.NewRequest(http.MethodGet, "/api/oauth/authorize?"+e.authorizeQuery(nil).Encode(), nil)
+			req.RemoteAddr = remote
+			req.Header.Set("X-Forwarded-For", xff)
+			rec := httptest.NewRecorder()
+			e.routes.ServeHTTP(rec, req)
+			return rec
+		}
+		// Behind a trusted proxy the client is the forwarded address: one capped client is
+		// refused while a different client behind the same proxy is accepted.
+		if rec := via("10.1.1.1:5000", "198.51.100.1"); !accepted(rec) {
+			t.Fatalf("client A = %d %q", rec.Code, rec.Header().Get("Location"))
+		}
+		assertRefused(t, e, via("10.1.1.1:5000", "198.51.100.1"), 1)
+		if rec := via("10.1.1.1:5000", "198.51.100.2"); !accepted(rec) {
+			t.Errorf("client B behind the same proxy = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
+		}
+		// An untrusted peer's X-Forwarded-For is forged input: the peer address is the bucket.
+		if rec := via("192.0.2.50:5000", "198.51.100.77"); !accepted(rec) {
+			t.Fatalf("untrusted peer = %d %q", rec.Code, rec.Header().Get("Location"))
+		}
+		assertRefused(t, e, via("192.0.2.50:5000", "198.51.100.78"), 3)
+		var n int
+		if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_authorize_requests WHERE product_id = $1 AND source_prefix = '192.0.2.50'`, e.product).Scan(&n); err != nil || n != 1 {
+			t.Errorf("rows bucketed by the untrusted peer = %d (%v), want 1", n, err)
+		}
+	})
+
+	t.Run("a held product lock refuses within the bound, an over-cap request never waits", func(t *testing.T) {
+		e := oauthSetup(t)
+		oldTO := oauthAuthorizeLockTimeout
+		oauthAuthorizeLockTimeout = 400 * time.Millisecond
+		t.Cleanup(func() { oauthAuthorizeLockTimeout = oldTO })
+		withOAuthPendingCaps(t, 1, 1_000_000, 1_000_000)
+
+		ctx := context.Background()
+		holder, err := e.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer holder.Rollback(ctx) //nolint:errcheck // released at the end of the test
+		if err := e.h.q.WithTx(holder).LockOAuthAuthorize(ctx, e.product); err != nil {
+			t.Fatal(err)
+		}
+
+		begin := time.Now()
+		rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "198.51.100.40:1")
+		elapsed := time.Since(begin)
+		if elapsed < 300*time.Millisecond || elapsed > 5*time.Second {
+			t.Errorf("authorize with the lock held took %s, want about the %s bound", elapsed, oauthAuthorizeLockTimeout)
+		}
+		assertRefused(t, e, rec, 0)
+
+		// An already over-cap source is refused by the lock-free pre-count, with the lock held.
+		cliMustExec(t, e.pool, `INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, source_mid, source_wide, expires_at)
+			VALUES ($1, $2, ARRAY['jobs:run'], 's', 'c', '\x00', '198.51.100.41', '198.51.100.0/24', '198.51.100.0/24', now() + interval '5 minutes')`, e.product, oauthTestRedirect)
+		begin = time.Now()
+		rec = e.authorizeFrom(t, e.authorizeQuery(nil), nil, "198.51.100.41:1")
+		if elapsed := time.Since(begin); elapsed > 250*time.Millisecond {
+			t.Errorf("an over-cap authorize took %s with the lock held, want no wait", elapsed)
+		}
+		assertRefused(t, e, rec, 1)
+		if err := holder.Rollback(ctx); err != nil {
+			t.Fatal(err)
+		}
+		if rec := e.authorizeFrom(t, e.authorizeQuery(nil), nil, "198.51.100.40:1"); !accepted(rec) {
+			t.Errorf("after the lock was released = %d %q, want the consent redirect", rec.Code, rec.Header().Get("Location"))
 		}
 	})
 

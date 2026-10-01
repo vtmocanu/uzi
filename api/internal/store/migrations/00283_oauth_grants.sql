@@ -52,10 +52,16 @@ CREATE TABLE oauth_authorize_requests (
     state            text NOT NULL,
     code_challenge   text NOT NULL,
     binding_hash     bytea NOT NULL,
-    -- The requester's network bucket: the full IPv4 address, or the IPv6 /64 in canonical CIDR
-    -- form, derived by the handler from the trusted client IP (TRUSTED_PROXIES). It is the
-    -- fairness key of the live-pending cap, so one source cannot fill a product's table.
+    -- The requester's network buckets, derived by the handler from the trusted client IP
+    -- (TRUSTED_PROXIES) and the fairness keys of the live-pending caps, finest first:
+    --   source_prefix  IPv6 /64 or IPv4 address (a 6to4 2002::/16 address counts as the IPv4 it embeds),
+    --   source_mid     IPv6 /56 or IPv4 /24,
+    --   source_wide    IPv6 /48 or IPv4 /24,
+    -- each in canonical CIDR (or dotted) form. Several tiers, so neither one /64 nor one delegated
+    -- /56 or /48 can fill a product's table and lock its real users out.
     source_prefix    text NOT NULL,
+    source_mid       text NOT NULL,
+    source_wide      text NOT NULL,
     status           text NOT NULL DEFAULT 'pending',
     user_id          uuid REFERENCES users ON DELETE CASCADE,
     grant_id         uuid REFERENCES oauth_grants,
@@ -84,12 +90,18 @@ CREATE INDEX idx_oauth_authorize_requests_expires ON oauth_authorize_requests (e
 CREATE INDEX idx_oauth_authorize_requests_code_expires ON oauth_authorize_requests (code_expires_at)
     WHERE code_expires_at IS NOT NULL;
 
--- GET /api/oauth/authorize caps the live pending requests per (product, source), per product and
--- overall in one transaction under a per-product advisory lock (CountLivePendingOAuthRequests).
--- One partial index serves all three counts: the per-source count is a range scan on all three
--- columns, the per-product count scans the product's prefix with expires_at checked inside the
--- index, and the global one is a bounded scan of the whole partial index.
+-- GET /api/oauth/authorize caps the live pending requests per (product, source) at three network
+-- tiers, per product and overall (CountLivePendingOAuthRequests), first lock-free and then again
+-- under a per-product advisory lock. Three partial indexes on status = 'pending', one per tier,
+-- serve the per-source counts as range scans; the per-product count scans the product_id prefix of
+-- whichever of them the planner picks (all three lead with it). The global count is NOT served by them: the planner reads it through
+-- idx_oauth_authorize_requests_expires (partial on pending/denied/superseded) with a status
+-- filter, and TestOAuthSweepAndCapQueriesUseIndexesLiveDB asserts the index of each subquery.
 CREATE INDEX idx_oauth_authorize_requests_pending ON oauth_authorize_requests (product_id, source_prefix, expires_at)
+    WHERE status = 'pending';
+CREATE INDEX idx_oauth_authorize_requests_pending_mid ON oauth_authorize_requests (product_id, source_mid, expires_at)
+    WHERE status = 'pending';
+CREATE INDEX idx_oauth_authorize_requests_pending_wide ON oauth_authorize_requests (product_id, source_wide, expires_at)
     WHERE status = 'pending';
 
 -- A grant's unredeemed codes are superseded by name (re-consent, a newer code).
@@ -106,6 +118,8 @@ CREATE INDEX idx_product_tokens_grant ON product_tokens (grant_id) WHERE grant_i
 DROP INDEX idx_product_tokens_grant;
 ALTER TABLE product_tokens DROP COLUMN grant_id;
 DROP INDEX idx_oauth_authorize_requests_grant;
+DROP INDEX idx_oauth_authorize_requests_pending_wide;
+DROP INDEX idx_oauth_authorize_requests_pending_mid;
 DROP INDEX idx_oauth_authorize_requests_pending;
 DROP INDEX idx_oauth_authorize_requests_code_expires;
 DROP INDEX idx_oauth_authorize_requests_expires;

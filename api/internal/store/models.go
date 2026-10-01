@@ -528,6 +528,8 @@ type OauthAuthorizeRequest struct {
 	CodeChallenge string             `json:"code_challenge"`
 	BindingHash   []byte             `json:"binding_hash"`
 	SourcePrefix  string             `json:"source_prefix"`
+	SourceMid     string             `json:"source_mid"`
+	SourceWide    string             `json:"source_wide"`
 	Status        string             `json:"status"`
 	UserID        pgtype.UUID        `json:"user_id"`
 	GrantID       pgtype.UUID        `json:"grant_id"`

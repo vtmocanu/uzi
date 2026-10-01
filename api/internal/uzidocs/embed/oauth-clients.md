@@ -10,7 +10,9 @@ An admin makes an [external product](./product-tokens.md) an **OAuth client** so
 
 > **Status.** This page covers registration (the redirect URIs, the allowed scopes and the client secret) and the consent step: a registered client can send a user to `/api/oauth/authorize`, the user approves or denies on uzi's `/connect` page, and the client receives an authorization code at its redirect URI together with its own `state` and uzi's `iss` (the instance's public origin). The token endpoint that exchanges the code ships in a later milestone of PRD #1910, so a client cannot finish a connection yet.
 
-When too many authorization requests are waiting (about 20 at once from one network address, or from one IPv6 /64), a new request is not stored and the user returns to your redirect URI with `error=temporarily_unavailable`; starting the connection again after a few minutes works, since a pending request lives 5 minutes.
+When too many authorization requests are waiting from one network, a new request is not stored and the user returns to your redirect URI with `error=temporarily_unavailable`; starting the connection again after a few minutes works, since a pending request lives 5 minutes. The limits are per application: 20 waiting requests per IPv4 address or IPv6 /64, 40 per IPv6 /56, and 100 per IPv4 /24 or IPv6 /48 (a 6to4 `2002::/16` address counts as the IPv4 address it embeds). Beyond those, an application can have at most 5000 requests waiting, and the instance 50000, to bound storage. A request that arrives while the application is busy with other requests can also be answered `temporarily_unavailable`; retrying works.
+
+The network is the client address uzi sees. Behind a reverse proxy, set `TRUSTED_PROXIES` so uzi reads the real client address from `X-Forwarded-For`. With it unset (the docker compose default), every browser behind the proxy shares one network and so one 20-request limit for each application, as with the other per-address limits described in [Auth design](auth-design.md).
 
 A product is an OAuth client only when it has all three of:
 

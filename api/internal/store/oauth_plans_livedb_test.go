@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
@@ -66,11 +67,48 @@ func TestOAuthSweepAndCapQueriesUseIndexesLiveDB(t *testing.T) {
 		t.Errorf("the sweep plan seq-scans the table:\n%s", sweep)
 	}
 
+	// The count statement is five scalar subqueries, in order: the three source tiers, the
+	// product, the whole table. Postgres renders each as an InitPlan section; assert per section
+	// which index serves it, so a regression of one subquery cannot hide behind another's index.
+	// An empty table has no statistics, so the planner would pick any of the equally priced
+	// indexes. Seed 20 products' worth of rows with realistic selectivity (600 finest buckets,
+	// 60 mid, 12 wide) and ANALYZE, all in one transaction that is rolled back, so the plan is the
+	// one a populated table gets and nothing is left behind.
+	const productID = `('00000000-0000-4000-8000-' || lpad(%s::text, 12, '0'))::uuid`
+	for _, stmt := range []string{
+		`BEGIN`,
+		`INSERT INTO products (id, name) SELECT ` + fmt.Sprintf(productID, "i") + `, 'plan-test-' || i FROM generate_series(1, 20) i`,
+		`INSERT INTO oauth_authorize_requests (product_id, redirect_uri, scopes, state, code_challenge, binding_hash, source_prefix, source_mid, source_wide, expires_at)
+		 SELECT ` + fmt.Sprintf(productID, "((i % 20) + 1)") + `, 'https://p.example.test/cb', ARRAY['jobs:run'], 's', 'c', '\x00', 'p' || (i % 600), 'm' || (i % 60), 'w' || (i % 12), now() + interval '1 hour'
+		   FROM generate_series(1, 6000) i`,
+		`ANALYZE oauth_authorize_requests`,
+	} {
+		if _, err := pg.Exec(ctx, stmt).ReadAll(); err != nil {
+			_, _ = pg.Exec(ctx, `ROLLBACK`).ReadAll()
+			t.Fatalf("seed %q: %v", stmt, err)
+		}
+	}
 	count := plan(countLivePendingOAuthRequests)
-	if !strings.Contains(count, "idx_oauth_authorize_requests_pending") {
-		t.Errorf("the pending-count plan does not use idx_oauth_authorize_requests_pending:\n%s", count)
+	if _, err := pg.Exec(ctx, `ROLLBACK`).ReadAll(); err != nil {
+		t.Fatal(err)
 	}
 	if strings.Contains(count, "Seq Scan") {
 		t.Errorf("the pending-count plan seq-scans the table:\n%s", count)
+	}
+	sections := strings.Split(count, "InitPlan")[1:]
+	wantIdx := []string{
+		"idx_oauth_authorize_requests_pending ",
+		"idx_oauth_authorize_requests_pending_mid ",
+		"idx_oauth_authorize_requests_pending_wide ",
+		"idx_oauth_authorize_requests_pending", // any of the three: each leads with product_id
+		"idx_oauth_authorize_requests_expires ",
+	}
+	if len(sections) != len(wantIdx) {
+		t.Fatalf("the pending-count plan has %d InitPlans, want %d:\n%s", len(sections), len(wantIdx), count)
+	}
+	for i, want := range wantIdx {
+		if !strings.Contains(sections[i], want) {
+			t.Errorf("pending-count subquery %d does not use %q:\n%s", i+1, strings.TrimSpace(want), sections[i])
+		}
 	}
 }
