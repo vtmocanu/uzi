@@ -58,7 +58,7 @@ func TestInputReceiptsMigrationDownLiveDB(t *testing.T) {
 	}
 }
 
-// Replays 00283's own Down/Up SQL over seeded rows: Down drops both inclusion columns and keeps
+// Replays 00284's own Down/Up SQL over seeded rows: Down drops both inclusion columns and keeps
 // the rows, and Up re-adds them with no backfill (included_at NULL, inclusion_reported false).
 func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
 	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
@@ -82,7 +82,7 @@ func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
 		VALUES ($1,'follow_up','x',now(),now(),now(),true) RETURNING id`, run).Scan(&id); err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range migrationDownStatements(t, "00283_input_included_at.sql") {
+	for _, stmt := range migrationDownStatements(t, "00284_input_included_at.sql") {
 		mustExec(ctx, t, pool, stmt)
 	}
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM information_schema.columns WHERE table_name='run_user_inputs' AND column_name IN ('included_at','inclusion_reported')`); n != 0 {
@@ -91,7 +91,7 @@ func TestInputIncludedAtMigrationReplayLiveDB(t *testing.T) {
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1`, id); n != 1 {
 		t.Fatal("Down lost the seeded row")
 	}
-	for _, stmt := range migrationUpStatements(t, "00283_input_included_at.sql") {
+	for _, stmt := range migrationUpStatements(t, "00284_input_included_at.sql") {
 		mustExec(ctx, t, pool, stmt)
 	}
 	if n := scalarInt(ctx, t, pool, `SELECT count(*) FROM run_user_inputs WHERE id=$1 AND included_at IS NULL AND inclusion_reported = false AND applied_at IS NOT NULL`, id); n != 1 {
