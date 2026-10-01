@@ -229,8 +229,10 @@ export class TransientRecoveryError extends Error {
  * outage, escalates to {@link TransientRecoveryError} → the `recovery_wait` park —
  * NEVER a work-destroying terminal `failed`. `status` and `sessionId` ride so the park
  * preserves the session lineage on the throw path (the clean path carries it via
- * `turn.sessionId`). The default message is composed like the materialize provider
- * message (readable, contains the status, never "success").
+ * `turn.sessionId`). `sessionId` is the session this turn actually ran (per-turn, never
+ * the once-per-run first-session latch; issue #1666); undefined = start fresh. The default
+ * message is composed like the materialize provider message (readable, contains the status,
+ * never "success").
  */
 export class ProviderTransientError extends Error {
   public readonly status?: number | null;
@@ -3791,11 +3793,6 @@ export class SdkExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: HarnessTerminal | undefined;
-    // issue #1088: the session id observed THIS turn (from the reducer's once-per-run
-    // first-session latch). On the clean path the reducer carries it via turn.sessionId;
-    // this is the throw-path analog, passed to a ProviderTransientError so the recovery
-    // park resumes the same session lineage.
-    let observedSessionId: string | undefined;
     // issue #1656: the session THIS turn actually runs, read off the turn's own events, and
     // whether an init reported a session other than the requested resume. Unlike the once-per-run
     // latch above, these see a later turn whose requested resume came back as a fresh session.
@@ -3804,6 +3801,11 @@ export class SdkExecutor implements Executor {
     let initSessionId: string | undefined;
     let turnSessionId: string | undefined;
     let freshInit = false;
+    // The session a retry/resume of THIS turn should continue: the one the turn ran; with none
+    // seen, the requested one, but only when no init reported a different (fresh) session.
+    // Shared by the signal-death and provider-transient throw paths (issue #1666).
+    const resumableSessionId = (): string | undefined =>
+      initSessionId ?? turnSessionId ?? (freshInit ? undefined : resumeId);
 
     this.armWall(state);
     // Budget already spent by earlier turns → fail now rather than run unbounded.
@@ -3861,8 +3863,6 @@ export class SdkExecutor implements Executor {
         // First-truthy session id once per run: the run callback, catch-and-warn
         // exactly as before (a handler throw must not fail the turn).
         if (reduction.firstSessionId !== undefined) {
-          // issue #1088: remember it for the ProviderTransientError throw-path resume.
-          observedSessionId = reduction.firstSessionId;
           try {
             ctx.onSessionId?.(reduction.firstSessionId);
           } catch (err) {
@@ -3928,7 +3928,7 @@ export class SdkExecutor implements Executor {
           throw new ProviderTransientError(
             providerErrorMessage(terminal.apiErrorStatus, terminal.resultText),
             terminal.apiErrorStatus,
-            observedSessionId,
+            resumableSessionId(),
           );
         }
         const thrown = terminal.failure
@@ -3949,10 +3949,8 @@ export class SdkExecutor implements Executor {
       // SIGTERM/SIGKILL death of the CLI foreign, and resumable by the recovery wrapper.
       const death = err instanceof Error ? foreignCliTermination(err) : undefined;
       if (err instanceof Error && death !== undefined) {
-        // Resume the session this turn ran; with none seen, the requested one, but only when no
-        // init reported a different (fresh) session. Otherwise no session: fail as before.
-        const resumable = initSessionId ?? turnSessionId ?? (freshInit ? undefined : resumeId);
-        throw new CliSignalDeathError(err, death, resumable, state.currentChild.pid);
+        // Resume the session this turn ran (see resumableSessionId); none: fail as before.
+        throw new CliSignalDeathError(err, death, resumableSessionId(), state.currentChild.pid);
       }
       throw err instanceof Error ? err : new Error(errMessage(err));
     } finally {
@@ -4099,9 +4097,11 @@ export class SdkExecutor implements Executor {
           if (!(err instanceof ProviderTransientError)) throw err;
           // A transient provider error: retry it like an empty turn, and preserve the
           // session lineage on this throw path (the clean path uses turn.sessionId).
+          // driveTurn already resolved the session this turn ran, falling back to the requested
+          // one when it saw none; undefined therefore means a fresh init with no id: start fresh.
           lastProviderErr = err;
           turn = undefined;
-          resumeId = err.sessionId ?? resumeId;
+          resumeId = err.sessionId;
           return;
         }
       }

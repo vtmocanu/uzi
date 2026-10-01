@@ -333,6 +333,37 @@ describe("SdkExecutor foreign CLI signal death (issue #1656)", () => {
     assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
   });
 
+  it("a transient provider error resumes the turn's own session, not the stale run-level one (issue #1666)", async () => {
+    // The plan turn latched sess-A. The implement turn asks to resume sess-A, the CLI starts
+    // sess-B, then the provider answers 529: the retry must continue sess-B.
+    const initB = { type: "system", subtype: "init", session_id: "sess-B" } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("# Plan", "sess-A"), resultSuccess("sess-A")],
+      [initB, assistantText("working", "sess-B"), resultApiError(529, "sess-B")],
+      [signalDone("sess-B"), resultSuccess("sess-B")],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.deepEqual(turns.map((t) => t.options.resume), [undefined, "sess-A", "sess-B"]);
+  });
+
+  it("a transient provider error after a fresh init that carried no session id retries without a resume (issue #1666)", async () => {
+    // Through the real harness a fresh init with an absent id only arises with no requested
+    // resume (claude-harness.ts init branch), so this pins the explicit semantics rather than
+    // regressing old code: undefined from driveTurn means start fresh, not "keep the old id".
+    const initNoId = { type: "system", subtype: "init" } as unknown as SDKMessage;
+    const errNoId = { ...(resultApiError(529) as object), session_id: undefined } as unknown as SDKMessage;
+    const { queryFn, turns } = fakeTurns([
+      [initNoId, errNoId],
+      [submitPlan("# Plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const result = await new SdkExecutor(nullLogger(), homeDir, opts(queryFn)).run(makeCtx().ctx);
+    assert.equal(result.branch, "agent/issue-5");
+    assert.equal(turns[0]!.options.resume, undefined);
+    assert.equal(turns[1]!.options.resume, undefined, "the retry starts fresh");
+  });
+
   it("the synchronous group kill's own time is charged to the wall budget", async () => {
     // Wall 1.5s. The first drive spends ~1s then dies; the group kill blocks ~700ms (the
     // setpriv spawnSync path can), which alone spends the rest of the wall.

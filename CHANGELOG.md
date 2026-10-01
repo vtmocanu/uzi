@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 - **A pause requested while a run waited for disk space to be reclaimed no longer claims the run restarted its step ([#1832](https://github.com/vtmocanu/uzi/issues/1832)).**
   When a pause-now (or a wall-clock pause) arrived while a run was still waiting on the worker's data-volume reclaim, before it started work on that worker, the feed said "The run is still running and has restarted the interrupted step"; it now says the run had not started work on this worker, there was nothing new to checkpoint, and it will start again when it is requeued.
 
+- **A transient provider error resumes the session the turn actually ran ([#1666](https://github.com/vtmocanu/uzi/issues/1666)).**
+  A later turn whose requested resume came back as a fresh session and then hit a transient provider error (429/5xx/529) no longer retries the stale session from an earlier turn; the retry now continues the session that turn actually ran, as the signal-death resume already did.
+
 - **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
   A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
 
