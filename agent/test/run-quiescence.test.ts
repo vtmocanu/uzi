@@ -24,6 +24,7 @@ import { SinkGate } from "../src/sink-gate.js";
 import { scopedRealView } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_ENV, RUN_CLONE_KEY_ENV, WORKER_SPAWN_ENV, recordRoot, workerSpawnEnv, workerSpawnNonce, type RecordedRoot } from "../src/worker-spawn-mark.js";
 
 // issue #1783 (R0/R3/R5 + Docker) — the run-quiescence reaper. Real processes where stated (single
@@ -134,9 +135,8 @@ interface FakeDaemon {
   close: () => Promise<void>;
 }
 
-async function startFakeDaemon(dir: string): Promise<FakeDaemon> {
-  fs.mkdirSync(dir, { recursive: true });
-  const socket = path.join(dir, "docker.sock");
+async function startFakeDaemon(): Promise<FakeDaemon> {
+  const { socket, dispose } = shortUnixSocket();
   let seq = 0;
   const daemon: FakeDaemon = { socket, containers: new Map(), hold: undefined, close: async () => {} };
   const server = http.createServer((req, res) => {
@@ -179,11 +179,19 @@ async function startFakeDaemon(dir: string): Promise<FakeDaemon> {
       })();
     });
   });
-  await new Promise<void>((r) => server.listen(socket, r));
+  try {
+    await listenUnix(server, socket);
+  } catch (err) {
+    dispose();
+    throw err;
+  }
   daemon.close = () =>
     new Promise<void>((r) => {
       server.closeAllConnections();
-      server.close(() => r());
+      server.close(() => {
+        dispose();
+        r();
+      });
     });
   return daemon;
 }
@@ -261,7 +269,7 @@ function killAgentTree(cli: ChildProcess): void {
 describe("A-core: a setsid'd agent tool survives killAgentTree; quiesce + retire removes it", { skip: realTableSkip("A-core") }, () => {
   it("reaps the attributed tool and its clone-bound containers, and never touches the issue-1769 sibling", async () => {
     const clones = makeClones("core", ["issue-17", "issue-1769"]);
-    const daemon = await startFakeDaemon(path.join(tmp, "core-docker"));
+    const daemon = await startFakeDaemon();
     try {
       const registry = new LiveAttemptRegistry();
       let ownRoots: RecordedRoot[] = [];
@@ -985,7 +993,7 @@ describe("A-unverified: every way the proof can fail is unverified", () => {
 describe("A-docker: the teardown never claims quiescence", () => {
   it("removes only clone-bound containers; a held create landing after the clean listings still reads docker_unconfirmed", async () => {
     const clones = makeClones("docker", ["issue-17", "issue-1769"]);
-    const daemon = await startFakeDaemon(path.join(tmp, "docker-daemon"));
+    const daemon = await startFakeDaemon();
     try {
       await createContainer(daemon.socket, path.join(clones["issue-17"]!, "a"));
       const sibling = await createContainer(daemon.socket, path.join(clones["issue-1769"]!, "a"));
@@ -1012,7 +1020,7 @@ describe("A-docker: the teardown never claims quiescence", () => {
     const clone = clones["issue-17"]!;
     const repoDir = path.dirname(clone); // /…/runner/<repo>
     const runnerRoot = path.dirname(repoDir); // /…/runner
-    const daemon = await startFakeDaemon(path.join(tmp, "docker-ancestor-daemon"));
+    const daemon = await startFakeDaemon();
     try {
       const parent = await createContainer(daemon.socket, repoDir);
       const ancestor = await createContainer(daemon.socket, runnerRoot);
