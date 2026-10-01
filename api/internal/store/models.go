@@ -1273,6 +1273,7 @@ type WorkerActiveRun struct {
 	TerminalPendingUntil pgtype.Timestamptz `json:"terminal_pending_until"`
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
+	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
 }
 
 type WorkerRunDisk struct {

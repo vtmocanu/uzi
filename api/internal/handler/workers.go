@@ -386,11 +386,17 @@ func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUI
 		return byWorker
 	}
 	for _, row := range rows {
-		byWorker[row.WorkerID] = append(byWorker[row.WorkerID], apitypes.WorkerReportedRunDTO{
+		dto := apitypes.WorkerReportedRunDTO{
 			RunID:           row.RunID.String(),
 			Phase:           row.Phase,
 			ClaimGeneration: row.ClaimGeneration,
-		})
+			TerminalPending: row.TerminalPending,
+		}
+		if row.TerminalPendingSince.Valid {
+			t := row.TerminalPendingSince.Time.UTC()
+			dto.TerminalPendingSince = &t
+		}
+		byWorker[row.WorkerID] = append(byWorker[row.WorkerID], dto)
 	}
 	return byWorker
 }

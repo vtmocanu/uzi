@@ -6668,6 +6668,10 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol,
+       (SELECT a.terminal_pending_since FROM worker_active_runs a
+         WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
+           AND a.claim_generation = runs.claim_generation
+           AND a.terminal_pending AND a.terminal_pending_until > now())::timestamptz AS terminal_pending_since,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
@@ -6742,6 +6746,7 @@ type ListActiveRunsForHealthRow struct {
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
 	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	JobProtocol               pgtype.Int2        `json:"job_protocol"`
+	TerminalPendingSince      pgtype.Timestamptz `json:"terminal_pending_since"`
 	CodexCustomRoot           bool               `json:"codex_custom_root"`
 	CodexAccountGated         bool               `json:"codex_account_gated"`
 }
@@ -6800,6 +6805,9 @@ type ListActiveRunsForHealthRow struct {
 // byte-identical), so the queued arm names the account hold instead of a worker reason for a
 // queued run the gate excludes in the window before the park_codex_account_unavailable pass
 // moves it to recovery_wait.
+// Issue #1994: terminal_pending_since is the first-seen time of the run's CURRENT-owner, CURRENT-
+// generation, unexpired terminal-pending snapshot row (NULL otherwise), so the health ladder can
+// flag an outcome journaled on its worker that has stayed undelivered across lease renewals.
 func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModels []string) ([]ListActiveRunsForHealthRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForHealth, codexCuratedModels)
 	if err != nil {
@@ -6839,6 +6847,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.ReleasedWorkerID,
 			&i.EgressProfileID,
 			&i.JobProtocol,
+			&i.TerminalPendingSince,
 			&i.CodexCustomRoot,
 			&i.CodexAccountGated,
 		); err != nil {
@@ -6853,23 +6862,27 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 }
 
 const listActiveRunsForWorkers = `-- name: ListActiveRunsForWorkers :many
-SELECT worker_id, run_id, phase, claim_generation
+SELECT worker_id, run_id, phase, claim_generation, terminal_pending, terminal_pending_since
 FROM worker_active_runs
 WHERE worker_id = ANY($1::uuid[])
 ORDER BY worker_id, run_id
 `
 
 type ListActiveRunsForWorkersRow struct {
-	WorkerID        uuid.UUID `json:"worker_id"`
-	RunID           uuid.UUID `json:"run_id"`
-	Phase           string    `json:"phase"`
-	ClaimGeneration int64     `json:"claim_generation"`
+	WorkerID             uuid.UUID          `json:"worker_id"`
+	RunID                uuid.UUID          `json:"run_id"`
+	Phase                string             `json:"phase"`
+	ClaimGeneration      int64              `json:"claim_generation"`
+	TerminalPending      bool               `json:"terminal_pending"`
+	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
 }
 
 // PRD #1390 M2c: the reported active runs (run_id, phase, generation) for a set of workers, for
 // the worker-list DTO overlay. Batched over a worker-id set so the two list endpoints read every
 // worker's rows in one round-trip (no N+1). Ordered by (worker_id, run_id) so the overlay can
 // group by worker in one pass and each worker's entries render in a stable order.
+// Issue #1994: terminal_pending and terminal_pending_since ride the read so the DTO can show how long
+// a journaled outcome has gone undelivered.
 func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid.UUID) ([]ListActiveRunsForWorkersRow, error) {
 	rows, err := q.db.Query(ctx, listActiveRunsForWorkers, workerIds)
 	if err != nil {
@@ -6884,6 +6897,8 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 			&i.RunID,
 			&i.Phase,
 			&i.ClaimGeneration,
+			&i.TerminalPending,
+			&i.TerminalPendingSince,
 		); err != nil {
 			return nil, err
 		}
@@ -9023,6 +9038,41 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 	for rows.Next() {
 		var i ListUnplaceableQueuedRunsForEphemeralRow
 		if err := rows.Scan(&i.ID, &i.UserID, &i.RequiredCapabilities); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listWorkerPendingSince = `-- name: ListWorkerPendingSince :many
+SELECT run_id, claim_generation, terminal_pending_since
+FROM worker_active_runs
+WHERE worker_id = $1 AND terminal_pending
+`
+
+type ListWorkerPendingSinceRow struct {
+	RunID                uuid.UUID          `json:"run_id"`
+	ClaimGeneration      int64              `json:"claim_generation"`
+	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
+}
+
+// Issue #1994: one worker's terminal-pending rows with their first-seen time, read by
+// ReplaceWorkerActiveRuns BEFORE it deletes the prior snapshot so the value can be carried across
+// renewals of the same (run, generation).
+func (q *Queries) ListWorkerPendingSince(ctx context.Context, workerID uuid.UUID) ([]ListWorkerPendingSinceRow, error) {
+	rows, err := q.db.Query(ctx, listWorkerPendingSince, workerID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListWorkerPendingSinceRow{}
+	for rows.Next() {
+		var i ListWorkerPendingSinceRow
+		if err := rows.Scan(&i.RunID, &i.ClaimGeneration, &i.TerminalPendingSince); err != nil {
 			return nil, err
 		}
 		items = append(items, i)
@@ -16137,32 +16187,39 @@ func (q *Queries) UpsertRunUsage(ctx context.Context, arg UpsertRunUsageParams) 
 const upsertWorkerActiveRun = `-- name: UpsertWorkerActiveRun :execrows
 INSERT INTO worker_active_runs (
     worker_id, run_id, claim_generation, phase,
-    terminal_pending, terminal_pending_until, snapshot_epoch, reported_at
+    terminal_pending, terminal_pending_until, terminal_pending_since, snapshot_epoch, reported_at
 )
 SELECT $1, $2, $3, $4,
        $5,
        CASE WHEN $5::boolean
             THEN now() + make_interval(secs => $6::int)
             ELSE NULL END,
-       $7, now()
+       -- Issue #1994: first-seen time of the pending entry. The caller passes the prior value only
+       -- when the same generation was already listed pending; otherwise now() (pending) or NULL.
+       CASE WHEN $5::boolean
+            THEN COALESCE($7::timestamptz, now())
+            ELSE NULL END,
+       $8, now()
 WHERE EXISTS (SELECT 1 FROM runs r WHERE r.id = $2 AND r.worker_id = $1 AND r.claim_released_at IS NULL)
 ON CONFLICT (worker_id, run_id) DO UPDATE SET
     claim_generation       = EXCLUDED.claim_generation,
     phase                  = EXCLUDED.phase,
     terminal_pending       = EXCLUDED.terminal_pending,
     terminal_pending_until = EXCLUDED.terminal_pending_until,
+    terminal_pending_since = EXCLUDED.terminal_pending_since,
     snapshot_epoch         = EXCLUDED.snapshot_epoch,
     reported_at            = EXCLUDED.reported_at
 `
 
 type UpsertWorkerActiveRunParams struct {
-	WorkerID        uuid.UUID `json:"worker_id"`
-	RunID           uuid.UUID `json:"run_id"`
-	ClaimGeneration int64     `json:"claim_generation"`
-	Phase           string    `json:"phase"`
-	TerminalPending bool      `json:"terminal_pending"`
-	LeaseSeconds    int32     `json:"lease_seconds"`
-	SnapshotEpoch   int64     `json:"snapshot_epoch"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	Phase           string             `json:"phase"`
+	TerminalPending bool               `json:"terminal_pending"`
+	LeaseSeconds    int32              `json:"lease_seconds"`
+	PendingSince    pgtype.Timestamptz `json:"pending_since"`
+	SnapshotEpoch   int64              `json:"snapshot_epoch"`
 }
 
 // Insert (or replace) one validated snapshot entry, OWNERSHIP-ENFORCED in SQL (D3): the row is
@@ -16183,6 +16240,7 @@ func (q *Queries) UpsertWorkerActiveRun(ctx context.Context, arg UpsertWorkerAct
 		arg.Phase,
 		arg.TerminalPending,
 		arg.LeaseSeconds,
+		arg.PendingSince,
 		arg.SnapshotEpoch,
 	)
 	if err != nil {

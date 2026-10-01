@@ -4714,12 +4714,17 @@ WHERE worker_id = @worker_id
 -- register path's preserved-then-re-listed rows refresh cleanly.
 INSERT INTO worker_active_runs (
     worker_id, run_id, claim_generation, phase,
-    terminal_pending, terminal_pending_until, snapshot_epoch, reported_at
+    terminal_pending, terminal_pending_until, terminal_pending_since, snapshot_epoch, reported_at
 )
 SELECT @worker_id, @run_id, @claim_generation, @phase,
        @terminal_pending,
        CASE WHEN @terminal_pending::boolean
             THEN now() + make_interval(secs => @lease_seconds::int)
+            ELSE NULL END,
+       -- Issue #1994: first-seen time of the pending entry. The caller passes the prior value only
+       -- when the same generation was already listed pending; otherwise now() (pending) or NULL.
+       CASE WHEN @terminal_pending::boolean
+            THEN COALESCE(sqlc.narg(pending_since)::timestamptz, now())
             ELSE NULL END,
        @snapshot_epoch, now()
 -- PRD #1497 M1 (D16): a RELEASED flight cannot refresh a snapshot row — otherwise a server-parked
@@ -4730,6 +4735,7 @@ ON CONFLICT (worker_id, run_id) DO UPDATE SET
     phase                  = EXCLUDED.phase,
     terminal_pending       = EXCLUDED.terminal_pending,
     terminal_pending_until = EXCLUDED.terminal_pending_until,
+    terminal_pending_since = EXCLUDED.terminal_pending_since,
     snapshot_epoch         = EXCLUDED.snapshot_epoch,
     reported_at            = EXCLUDED.reported_at;
 
@@ -4748,12 +4754,22 @@ UPDATE workers SET
     updated_at             = now()
 WHERE id = @id;
 
+-- name: ListWorkerPendingSince :many
+-- Issue #1994: one worker's terminal-pending rows with their first-seen time, read by
+-- ReplaceWorkerActiveRuns BEFORE it deletes the prior snapshot so the value can be carried across
+-- renewals of the same (run, generation).
+SELECT run_id, claim_generation, terminal_pending_since
+FROM worker_active_runs
+WHERE worker_id = @worker_id AND terminal_pending;
+
 -- name: ListActiveRunsForWorkers :many
 -- PRD #1390 M2c: the reported active runs (run_id, phase, generation) for a set of workers, for
 -- the worker-list DTO overlay. Batched over a worker-id set so the two list endpoints read every
 -- worker's rows in one round-trip (no N+1). Ordered by (worker_id, run_id) so the overlay can
 -- group by worker in one pass and each worker's entries render in a stable order.
-SELECT worker_id, run_id, phase, claim_generation
+-- Issue #1994: terminal_pending and terminal_pending_since ride the read so the DTO can show how long
+-- a journaled outcome has gone undelivered.
+SELECT worker_id, run_id, phase, claim_generation, terminal_pending, terminal_pending_since
 FROM worker_active_runs
 WHERE worker_id = ANY(@worker_ids::uuid[])
 ORDER BY worker_id, run_id;
@@ -6539,6 +6555,9 @@ UPDATE runs SET checkpoint_tip = @checkpoint_tip, checkpoint_tip_at = now() WHER
 -- byte-identical), so the queued arm names the account hold instead of a worker reason for a
 -- queued run the gate excludes in the window before the park_codex_account_unavailable pass
 -- moves it to recovery_wait.
+-- Issue #1994: terminal_pending_since is the first-seen time of the run's CURRENT-owner, CURRENT-
+-- generation, unexpired terminal-pending snapshot row (NULL otherwise), so the health ladder can
+-- flag an outcome journaled on its worker that has stayed undelivered across lease renewals.
 SELECT id, user_id, status, auto_approve,
        started_at, last_activity_at, updated_at, status_since,
        health, health_reason, health_since, health_notified_at,
@@ -6546,6 +6565,10 @@ SELECT id, user_id, status, auto_approve,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
        egress_profile_id, job_protocol,
+       (SELECT a.terminal_pending_since FROM worker_active_runs a
+         WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
+           AND a.claim_generation = runs.claim_generation
+           AND a.terminal_pending AND a.terminal_pending_until > now())::timestamptz AS terminal_pending_since,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL

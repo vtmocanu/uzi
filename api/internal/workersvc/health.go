@@ -232,7 +232,32 @@ const (
 	// clears, normal stalled detection resumes. Same fixed-string contract as its
 	// siblings — no tool name, no repo content, no live duration.
 	reasonOutboxQueued = "the agent's updates are queued on its worker and will replay when it can reach the api"
+	// reasonOutcomeUndelivered (issue #1994) flags a running / awaiting_approval run whose
+	// outcome is journaled on its worker but has stayed undelivered (the worker re-lists it as
+	// terminal_pending on every heartbeat, so its lease renews forever) for
+	// pendingOutcomeFlagHeartbeats heartbeat intervals. It maps to the SAME healthStalled enum as
+	// reasonOutboxQueued, is a warning only, and never touches the lease or authorizes a reclaim,
+	// fail or discard. Same fixed-string contract as its siblings.
+	reasonOutcomeUndelivered = "the run's outcome is journaled on its worker but has not been delivered"
 )
+
+// pendingOutcomeFlagHeartbeats (issue #1994) is how many worker heartbeat intervals a pending
+// outcome must stay listed before reasonOutcomeUndelivered fires. A code constant, like the loop
+// thresholds: it describes a mechanism, not an operator preference.
+const pendingOutcomeFlagHeartbeats = 4
+
+// pendingOutcomeFallbackInterval is the heartbeat interval assumed when the configured one is
+// unset or non-positive.
+const pendingOutcomeFallbackInterval = 15 * time.Second
+
+// pendingOutcomeThreshold returns how long a terminal-pending outcome may sit before it is flagged.
+func (s *Service) pendingOutcomeThreshold() time.Duration {
+	interval := s.p.WorkerHeartbeatInterval
+	if interval <= 0 {
+		interval = pendingOutcomeFallbackInterval
+	}
+	return pendingOutcomeFlagHeartbeats * interval
+}
 
 // Persistence-failure FLAG thresholds (PRD #108 M4), code constants for the same
 // reason loopWindow/loopThreshold are: they describe a mechanism, not an operator
@@ -384,6 +409,13 @@ func (s *Service) detectRunHealth(ctx context.Context, now time.Time) int64 {
 // self-clear. Exactly one flag per run; the running-run priority is inside
 // runningTarget.
 func (s *Service) healthTargetFor(ctx context.Context, now time.Time, r store.ListActiveRunsForHealthRow, th healthThresholds) (string, string) {
+	// Issue #1994: a journaled-but-undelivered outcome means the agent already stopped, so this rung
+	// outranks the approval guard and runningTarget's looping/stalled arms (those signals are stale).
+	// A NULL since (no current-owner, current-generation, unexpired pending row) never fires it.
+	if (r.Status == "running" || r.Status == "awaiting_approval") &&
+		r.TerminalPendingSince.Valid && now.Sub(r.TerminalPendingSince.Time) >= s.pendingOutcomeThreshold() {
+		return healthStalled, reasonOutcomeUndelivered
+	}
 	switch r.Status {
 	case "queued":
 		// A wedged 'claimed' checkout is handled by SweepClaimedNeverStarted, not

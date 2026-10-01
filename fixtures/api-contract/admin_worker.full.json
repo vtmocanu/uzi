@@ -16,7 +16,9 @@
     {
       "run_id": "x",
       "phase": "x",
-      "claim_generation": 1
+      "claim_generation": 1,
+      "terminal_pending": true,
+      "terminal_pending_since": "2020-01-02T03:04:05Z"
     }
   ],
   "retaining_unpublished_work": true,
