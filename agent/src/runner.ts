@@ -2000,6 +2000,18 @@ export class RunRunner {
     });
   }
 
+  /** issue #1995 — the live re-drive of a journaled recovery bundle whose upload failed while
+   *  the worker stayed alive. Called by the worker after each successful heartbeat
+   *  (`authenticatedAtMs` is that heartbeat's send time); the coordinator bounds, spaces and
+   *  single-flights the passes, and skips a run this runner is executing. Never throws. */
+  async resumeLiveRecoveries(authenticatedAtMs: number, signal?: AbortSignal): Promise<void> {
+    await this.recovery
+      .resumeLive({ isExecuting: (runId) => this.isExecuting(runId), authenticatedAtMs, signal })
+      .catch((err) => {
+        this.log.warn("recovery: live re-drive failed", { error: errMessage(err) });
+      });
+  }
+
   /**
    * issue #1582 M2 — the restart/retry sweep of the ancestry-settlement journal (called by the
    * worker after the boot pending-terminal gate, then on a timer). Settles every DUE

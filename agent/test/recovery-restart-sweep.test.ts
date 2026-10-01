@@ -129,6 +129,16 @@ function writeRaw(rec: RecoveryRecord): void {
   fs.writeFileSync(path.join(dir, `${rec.captureId}.json`), JSON.stringify({ ...rec, mac }));
 }
 
+/** issue #1995: the guarded post-pin journal write (the generalised restart-sweep write): refuses a
+ *  removed record, otherwise replaces the CURRENT record with `next`. */
+function guardedWrite(coord: RecoveryCoordinator, record: RecoveryRecord, next: RecoveryRecord): Promise<unknown> {
+  return (
+    coord as unknown as {
+      writeExistingRecord(r: RecoveryRecord, mutate: (cur: RecoveryRecord) => RecoveryRecord): Promise<unknown>;
+    }
+  ).writeExistingRecord(record, () => next);
+}
+
 const FIN = { bareDir: BARE_DIR, defaultBranch: "main", finalizationPin: true } as const;
 
 async function only(coord: RecoveryCoordinator, runId: string): Promise<RecoveryRecord> {
@@ -422,8 +432,7 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
         }
         return realRmdir(...args);
       });
-      const write = (writer as unknown as { writeSweepRecord(record: RecoveryRecord): Promise<void> })
-        .writeSweepRecord({ ...record, state: "needs_action", reason: "race_control" });
+      const write = guardedWrite(writer, record, { ...record, state: "needs_action", reason: "race_control" });
       let deletion: Promise<void> | undefined;
       try {
         await paused;
@@ -439,10 +448,7 @@ describe("RecoveryCoordinator.resumePending — retry, second restart, live-flig
       }
       assert.deepEqual((await writer.inspect("r1")).map((r) => r.generation),
         cleanup === "legacy_release" ? [] : [8], "settled generation must stay deleted; siblings stay intact");
-      await assert.rejects(
-        (writer as unknown as { writeSweepRecord(record: RecoveryRecord): Promise<void> }).writeSweepRecord(record),
-        /was removed during the restart sweep/,
-      );
+      await assert.rejects(guardedWrite(writer, record, record), /was removed during the restart sweep/);
     });
   }
 

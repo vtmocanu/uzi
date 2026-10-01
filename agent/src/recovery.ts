@@ -18,12 +18,13 @@
 // the runner clone (torn down) and from the unrelated issue #1187 git-config
 // recovery-capture journal. It survives runner-clone removal and worker restart.
 
-import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import fs from "node:fs/promises";
 import { createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 
+import { RequestError } from "./client.js";
 import type { Logger } from "./log.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
@@ -36,7 +37,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { RecoveryBundleTooLargeError, type RecoveryBundleResult } from "./git.js";
+import { RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult } from "./git.js";
 
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
@@ -221,6 +222,271 @@ export interface RecoveryCoordinatorOptions {
    *  unaffected. */
   workerToken?: string;
   now?: () => number;
+  /** issue #1995: the live re-drive's per-pass record cap (default {@link LIVE_MAX_PER_PASS}). */
+  liveMaxPerPass?: number;
+  /** issue #1995: the live re-drive's pass spacing, and the backoff base after a transient pass. */
+  liveBackoffBaseMs?: number;
+  /** issue #1995: the ceiling of the live re-drive's exponential backoff. */
+  liveBackoffCapMs?: number;
+  /** Test seams (never set in production). */
+  testHooks?: {
+    /** Awaited by {@link RecoveryCoordinator.pin} between its unlocked record observation and
+     *  its locked re-read, so a test can interleave a capture there. */
+    afterPinObserve?: () => Promise<void>;
+  };
+}
+
+/** issue #1995: what the worker hands the live re-drive. */
+export interface ResumeLiveOptions {
+  /** True while the runner is executing `runId` (its flight owns the run's records). */
+  isExecuting: (runId: string) => boolean;
+  /** The SEND time of the successful heartbeat that triggered this pass. */
+  authenticatedAtMs: number;
+  signal?: AbortSignal;
+}
+
+const LIVE_MAX_PER_PASS = 4;
+const LIVE_BACKOFF_BASE_MS = 30_000;
+const LIVE_BACKOFF_CAP_MS = 15 * 60_000;
+
+/** Dispositions of a journaled bundle's upload that no retry can change: the api refused the
+ *  capture for good, or the local bytes no longer match what was journaled. Written into the
+ *  existing `reason` string (never a new record field: an older worker recomputes the MAC from the
+ *  fields it knows). Checked at every entry point; a record carrying one is never uploaded again. */
+export const PERMANENT_UPLOAD_REASONS: ReadonlySet<string> = new Set([
+  "stale_ownership",
+  "upload_rejected",
+  "archive_constraint",
+  "local_bundle_mismatch",
+]);
+
+/** The `needs_action` reasons a live pass may retry (all need a journaled bundle). */
+const LIVE_RETRY_REASONS: ReadonlySet<string> = new Set([
+  "capture_error",
+  "restart_upload_failed",
+  "upload_transient",
+  "credential_rejected",
+]);
+
+/** Which entry point is uploading: picks the transient retry reason and the failure log. */
+type UploadMode = "capture" | "sweep" | "live";
+const TRANSIENT_UPLOAD_REASON: Readonly<Record<UploadMode, string>> = {
+  capture: "capture_error",
+  sweep: "restart_upload_failed",
+  live: "upload_transient",
+};
+
+/** A record that journaled a complete verified bundle (file path plus every manifest fact). */
+type JournaledBundleRecord = RecoveryRecord & {
+  bundlePath: string;
+  byteSize: number;
+  checksum: string;
+  chunkCount: number;
+};
+
+function hasJournaledBundle(record: RecoveryRecord): record is JournaledBundleRecord {
+  return (
+    !!record.bundlePath && typeof record.byteSize === "number" && !!record.checksum && typeof record.chunkCount === "number"
+  );
+}
+
+/** A record the live pass may re-drive: a journaled bundle that is `bundled`, or `needs_action`
+ *  for a transient reason. Never pinned, bundle-less, uploaded, or permanent. */
+function isLiveCandidate(record: RecoveryRecord): boolean {
+  if (!hasJournaledBundle(record)) return false;
+  if (record.state === "bundled") return true;
+  return record.state === "needs_action" && !!record.reason && LIVE_RETRY_REASONS.has(record.reason);
+}
+
+/** True when `current`'s pinned source differs from the one `snapshot`'s bytes were produced from. */
+function pinFactsDiffer(snapshot: RecoveryRecord, current: RecoveryRecord): boolean {
+  return (
+    snapshot.sourceSha !== current.sourceSha ||
+    snapshot.finalizationPin !== current.finalizationPin ||
+    snapshot.bareDir !== current.bareDir ||
+    snapshot.defaultBranch !== current.defaultBranch ||
+    snapshot.generation !== current.generation
+  );
+}
+
+/** Apply a pin to the CURRENT record under the journal lock; returns `current` itself when nothing
+ *  changes. Only a `pinned` record may re-point its source or take the finalization facts; any other
+ *  state may only fill an absent attempted head or generation (issue #1995). */
+function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
+  const next: RecoveryRecord = { ...current };
+  let changed = false;
+  // Advance the pinned source to the newest restore point for THIS generation (base →
+  // committed head), but NEVER re-point a record that already produced or uploaded a
+  // bundle: its source is bound to journaled bytes, so moving it would strand them.
+  if (current.state === "pinned" && current.sourceSha !== input.sourceSha) {
+    next.sourceSha = input.sourceSha;
+    changed = true;
+    // issue #1742: the finalization label describes the finalization head ONLY. A later
+    // non-finalization pin (shutdown / pause / restore-point transfer) that moves the source
+    // to a different head must not leave the old label (and its bare/default-branch facts) on it.
+    if (input.finalizationPin !== true) {
+      delete next.finalizationPin;
+      delete next.bareDir;
+      delete next.defaultBranch;
+    }
+  }
+  // issue #1742 D4(a): the finalization pin persists the restart-sweep facts on the
+  // generation's record. Only while `pinned` (a bundled/uploaded record is bound to
+  // journaled bytes and is never altered), and only when it is the finalization pin, so the
+  // early pin can never set the flag.
+  if (current.state === "pinned" && input.finalizationPin === true && input.bareDir && input.defaultBranch) {
+    if (
+      next.bareDir !== input.bareDir ||
+      next.defaultBranch !== input.defaultBranch ||
+      next.finalizationPin !== true
+    ) {
+      next.bareDir = input.bareDir;
+      next.defaultBranch = input.defaultBranch;
+      next.finalizationPin = true;
+      changed = true;
+    }
+  }
+  // Record the provenance H' once it is known and was not yet recorded.
+  if (input.attemptedHeadSha && !next.attemptedHeadSha) {
+    next.attemptedHeadSha = input.attemptedHeadSha;
+    changed = true;
+  }
+  // Fill the generation in if an earlier v1-shaped pin created the record without one.
+  if (next.generation === undefined && input.generation !== undefined) {
+    next.generation = input.generation;
+    changed = true;
+  }
+  return changed ? next : current;
+}
+
+// issue #1995: the per-capture cycle lock. A capture cycle (authenticated re-read → short-circuits
+// → production + install → reserve + upload → failure marking) is one critical section per record,
+// so two entry points can never produce twice or stream concurrently. It is OUTER to the per-run
+// journal lock (withJournalLock), which every inner helper takes only briefly. Process memory on
+// purpose, like recoveryJournalLocks: one worker process owns each data dir.
+const captureCycleTails = new Map<string, Promise<void>>();
+
+/** Run `fn` as the capture cycle of `key`. `wait` queues behind the current holder and returns
+ *  `fn`'s value; `skip` returns `{ ran: false }` at once when the cycle is busy. */
+function runCaptureCycle<T>(key: string, mode: "wait", fn: () => Promise<T>): Promise<T>;
+function runCaptureCycle<T>(
+  key: string,
+  mode: "skip",
+  fn: () => Promise<T>,
+): Promise<{ ran: true; value: T } | { ran: false }>;
+async function runCaptureCycle<T>(
+  key: string,
+  mode: "wait" | "skip",
+  fn: () => Promise<T>,
+): Promise<T | { ran: true; value: T } | { ran: false }> {
+  const previous = captureCycleTails.get(key);
+  if (mode === "skip" && previous) return { ran: false };
+  let release!: () => void;
+  const held = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  // Installed synchronously, so a later waiter queues behind this holder.
+  const tail = (previous ?? Promise.resolve()).then(() => held);
+  captureCycleTails.set(key, tail);
+  await previous;
+  try {
+    const value = await fn();
+    return mode === "skip" ? { ran: true, value } : value;
+  } finally {
+    release();
+    if (captureCycleTails.get(key) === tail) captureCycleTails.delete(key);
+  }
+}
+
+/** The typed disposition of a failed reserve/upload RPC (issue #1995). */
+export type UploadFailureClass =
+  | { kind: "transient" }
+  | { kind: "permanent"; reason: string }
+  | { kind: "credential"; reason: "credential_rejected" };
+
+/** Recompute the size, SHA-256 and chunk count of the journaled bundle file and compare them with
+ *  the journaled facts. False on a mismatch or an unreadable file. */
+async function verifyJournaledBytes(record: RecoveryRecord): Promise<boolean> {
+  if (!hasJournaledBundle(record)) return false;
+  try {
+    const hash = createHash("sha256");
+    let size = 0;
+    for await (const chunk of createReadStream(record.bundlePath)) {
+      const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk as string);
+      size += buf.length;
+      hash.update(buf);
+    }
+    return (
+      size === record.byteSize &&
+      hash.digest("hex") === record.checksum &&
+      Math.max(1, Math.ceil(size / RECOVERY_CHUNK_BYTES)) === record.chunkCount
+    );
+  } catch {
+    return false;
+  }
+}
+
+/** The api's typed error reason (`{"error","reason"}`, issue #1995 M1), or undefined. */
+function errorReason(err: RequestError): string | undefined {
+  try {
+    const parsed: unknown = JSON.parse(err.body);
+    if (typeof parsed === "object" && parsed !== null) {
+      const reason = (parsed as Record<string, unknown>).reason;
+      if (typeof reason === "string") return reason;
+    }
+  } catch {
+    // an untyped (or proxy) body: the status is the signal
+  }
+  return undefined;
+}
+
+/**
+ * Classify a failed reserve/upload RPC (issue #1995). The body's typed `reason` wins; the status is
+ * the fallback for an api without the typed bodies. Permanent: the api refused this capture for good
+ * (`stale_ownership`, `upload_rejected`, `archive_constraint`) or the local bytes no longer match the
+ * journaled facts (`local_bundle_mismatch`, an integrity rejection the bytes confirm). Credential: a
+ * 401. Everything else is transient, including any non-HTTP failure (network, timeout, fs). A 422
+ * integrity rejection is transient only when `record`'s journaled bytes still verify.
+ */
+export async function classifyUploadFailure(err: unknown, record?: RecoveryRecord): Promise<UploadFailureClass> {
+  if (!(err instanceof RequestError)) return { kind: "transient" };
+  const permanent = (reason: string): UploadFailureClass => ({ kind: "permanent", reason });
+  const integrity = async (): Promise<UploadFailureClass> =>
+    record && (await verifyJournaledBytes(record)) ? { kind: "transient" } : permanent("local_bundle_mismatch");
+  if (err.status === 401) return { kind: "credential", reason: "credential_rejected" };
+  switch (errorReason(err)) {
+    case "not_authorized":
+      return permanent("stale_ownership");
+    case "ambiguous_generation":
+    case "capture_not_found":
+    case "not_available":
+    case "manifest_conflict":
+    case "bad_request":
+      return permanent("upload_rejected");
+    case "oversize":
+      return permanent("archive_constraint");
+    case "integrity":
+      return integrity();
+    case "quota":
+    case "busy":
+    case "internal":
+      return { kind: "transient" };
+    default:
+      break;
+  }
+  switch (err.status) {
+    case 400:
+    case 403:
+    case 404:
+    case 409:
+      return permanent("upload_rejected");
+    case 413:
+      return permanent("archive_constraint");
+    case 422:
+      return integrity();
+    default:
+      return { kind: "transient" }; // 408, 429, 5xx (incl. 507), anything else
+  }
 }
 
 // Domain-separation label for the journal-key derivation (D1). Binding a distinct label
@@ -263,6 +529,19 @@ export class RecoveryCoordinator {
   private readonly now: () => number;
   private readonly key: Buffer | undefined;
   readonly enabled: boolean;
+  private readonly liveMaxPerPass: number;
+  private readonly liveBackoffBaseMs: number;
+  private readonly liveBackoffCapMs: number;
+  private readonly testHooks: RecoveryCoordinatorOptions["testHooks"];
+  /** In-flight passes (the boot sweep, a live pass): {@link resumeLive} is a no-op while non-empty. */
+  private readonly passes = new Set<Promise<void>>();
+  /** The earliest time the next live pass may run (the coordinator's `now()` clock). */
+  private nextPassAt = 0;
+  /** Consecutive live passes that ended with a transient failure (drives the backoff). */
+  private transientPasses = 0;
+  /** Set by any 401: a live pass runs only for a heartbeat sent after it. */
+  private credentialBlockedAt: number | undefined;
+  private readonly lastAttemptAt = new Map<string, number>();
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.client = opts.client;
@@ -270,6 +549,10 @@ export class RecoveryCoordinator {
     this.log = opts.log;
     this.recoveryRoot = opts.recoveryRoot;
     this.now = opts.now ?? (() => Date.now());
+    this.liveMaxPerPass = opts.liveMaxPerPass ?? LIVE_MAX_PER_PASS;
+    this.liveBackoffBaseMs = opts.liveBackoffBaseMs ?? LIVE_BACKOFF_BASE_MS;
+    this.liveBackoffCapMs = opts.liveBackoffCapMs ?? LIVE_BACKOFF_CAP_MS;
+    this.testHooks = opts.testHooks;
     // The MAC key is DERIVED from the (stable) worker join token, so it re-derives
     // identically on restart. A token-less coordinator is disabled.
     this.key = opts.workerToken
@@ -299,79 +582,53 @@ export class RecoveryCoordinator {
       // advances from the start tip to the committed head as the run progresses, so no orphan
       // base record is left behind for the restart sweep to flag needs_action. A v1 worker (no
       // generation) falls back to (runId, sourceSha) matching, exactly as before.
-      const existing = await this.findRecord(
-        input.runId,
+      const matches =
         input.generation !== undefined
-          ? (r) => r.generation === input.generation
-          : (r) => r.sourceSha === input.sourceSha,
-      );
-      if (existing) {
-        let changed = false;
-        // Advance the pinned source to the newest restore point for THIS generation (base →
-        // committed head), but NEVER re-point a record that already produced or uploaded a
-        // bundle: its source is bound to journaled bytes, so moving it would strand them.
-        if (existing.state === "pinned" && existing.sourceSha !== input.sourceSha) {
-          existing.sourceSha = input.sourceSha;
-          changed = true;
-          // issue #1742: the finalization label describes the finalization head ONLY. A later
-          // non-finalization pin (shutdown / pause / restore-point transfer) that moves the source
-          // to a different head must not leave the old label (and its bare/default-branch facts) on it.
-          if (input.finalizationPin !== true) {
-            delete existing.finalizationPin;
-            delete existing.bareDir;
-            delete existing.defaultBranch;
-          }
+          ? (r: RecoveryRecord): boolean => r.generation === input.generation
+          : (r: RecoveryRecord): boolean => r.sourceSha === input.sourceSha;
+      // The unlocked observation only identifies WHICH record this pin updates; every decision and
+      // write below is made on a re-read under the journal lock (issue #1995), so a concurrent
+      // capture that bundled or uploaded the record meanwhile is never overwritten with a stale view.
+      const observed = await this.findRecord(input.runId, matches);
+      await this.testHooks?.afterPinObserve?.();
+      return await this.withJournalLock(input.runId, async () => {
+        let current: RecoveryRecord | null | undefined;
+        if (observed) {
+          current = await this.readRecord(this.recordPath(observed));
+          // Removed (or no longer authenticating) since the observation: never recreate it.
+          if (!current) return undefined;
+        } else {
+          // Creation re-checks under the lock: a concurrent pin may have created the record already.
+          current = (await this.listRecords(input.runId)).find(matches);
         }
-        // issue #1742 D4(a): the finalization pin persists the restart-sweep facts on the
-        // generation's record. Only while `pinned` (a bundled/uploaded record is bound to
-        // journaled bytes and is never altered), and only when it is the finalization pin, so the
-        // early pin can never set the flag.
-        if (existing.state === "pinned" && input.finalizationPin === true && input.bareDir && input.defaultBranch) {
-          if (
-            existing.bareDir !== input.bareDir ||
-            existing.defaultBranch !== input.defaultBranch ||
-            existing.finalizationPin !== true
-          ) {
-            existing.bareDir = input.bareDir;
-            existing.defaultBranch = input.defaultBranch;
-            existing.finalizationPin = true;
-            changed = true;
-          }
+        if (current) {
+          const next = applyPin(current, input);
+          if (next === current) return current;
+          await this.writeRecordUnlocked(next);
+          return next;
         }
-        // Record the provenance H' once it is known and was not yet recorded.
-        if (input.attemptedHeadSha && !existing.attemptedHeadSha) {
-          existing.attemptedHeadSha = input.attemptedHeadSha;
-          changed = true;
-        }
-        // Fill the generation in if an earlier v1-shaped pin created the record without one.
-        if (existing.generation === undefined && input.generation !== undefined) {
-          existing.generation = input.generation;
-          changed = true;
-        }
-        if (changed) await this.writeRecord(existing);
-        return existing;
-      }
-      const record: RecoveryRecord = {
-        version: JOURNAL_VERSION,
-        runId: input.runId,
-        captureId: randomUUID(),
-        sourceSha: input.sourceSha,
-        attemptedHeadSha: input.attemptedHeadSha,
-        kind: input.kind,
-        branch: input.branch,
-        generation: input.generation,
-        createdAt: this.now(),
-        state: "pinned",
-        ...(input.finalizationPin === true && input.bareDir && input.defaultBranch
-          ? { bareDir: input.bareDir, defaultBranch: input.defaultBranch, finalizationPin: true }
-          : {}),
-      };
-      await this.writeRecord(record);
-      this.log.info("recovery: pinned source head at finalization boundary", {
-        run_id: input.runId,
-        capture_id: record.captureId,
+        const record: RecoveryRecord = {
+          version: JOURNAL_VERSION,
+          runId: input.runId,
+          captureId: randomUUID(),
+          sourceSha: input.sourceSha,
+          attemptedHeadSha: input.attemptedHeadSha,
+          kind: input.kind,
+          branch: input.branch,
+          generation: input.generation,
+          createdAt: this.now(),
+          state: "pinned",
+          ...(input.finalizationPin === true && input.bareDir && input.defaultBranch
+            ? { bareDir: input.bareDir, defaultBranch: input.defaultBranch, finalizationPin: true }
+            : {}),
+        };
+        await this.writeRecordUnlocked(record);
+        this.log.info("recovery: pinned source head at finalization boundary", {
+          run_id: input.runId,
+          capture_id: record.captureId,
+        });
+        return record;
       });
-      return record;
     } catch (err) {
       this.log.warn("recovery: failed to pin source head (source stays protected by the server hold)", {
         run_id: input.runId,
@@ -389,17 +646,45 @@ export class RecoveryCoordinator {
    * (2) journal the verified bundle FILE before binding its manifest (D5), then
    * (3) reserve → bind manifest → stream upload. On any failure the source stays pinned and
    * the record becomes needs_action; the caller reports the run's execution honestly.
+   *
+   * issue #1995: the whole cycle runs under the per-capture lock (a concurrent foreground
+   * capture, boot-sweep step or live pass on the same record waits or skips), starts from the
+   * authenticated LATEST journaled record rather than the caller's copy, and never re-produces
+   * bytes a record already journaled.
    */
   async captureAndUpload(input: CaptureInput): Promise<RecoveryOutcome> {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
+    return runCaptureCycle(this.cycleKey(input.record), "wait", () => this.captureCycle(input));
+  }
+
+  /** The capture cycle; the caller holds the record's capture-cycle lock. */
+  private async captureCycle(input: CaptureInput): Promise<RecoveryOutcome> {
     let record = input.record;
+    const removed = async (): Promise<RecoveryOutcome> => {
+      await this.dropBundleFiles(record);
+      return { state: "needs_action", captureId: record.captureId, reason: "record_removed" };
+    };
     try {
-      if (input.attemptedHeadSha && !record.attemptedHeadSha) {
-        record = { ...record, attemptedHeadSha: input.attemptedHeadSha };
-        await this.writeRecord(record);
+      // The authoritative state is the journal's, never the caller's (possibly stale) copy.
+      const latest = await this.readLatest(record);
+      if (latest.kind === "gone") {
+        return { state: "needs_action", captureId: record.captureId, reason: "record_removed" };
       }
+      if (latest.kind === "unauthenticated") {
+        return { state: "needs_action", captureId: record.captureId, reason: "record_unauthenticated" };
+      }
+      record = latest.record;
       if (record.state === "uploaded") return { state: "uploaded", captureId: record.captureId };
-      if (record.state !== "bundled") {
+      if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
+        return { state: "needs_action", captureId: record.captureId, reason: record.reason };
+      }
+      if (input.attemptedHeadSha && !record.attemptedHeadSha) {
+        const attempted = input.attemptedHeadSha;
+        record = await this.writeExistingRecord(record, (cur) =>
+          cur.attemptedHeadSha ? undefined : { ...cur, attemptedHeadSha: attempted },
+        );
+      }
+      if (!hasJournaledBundle(record)) {
         const produced = await this.produceBundle(record, input);
         if (produced.kind === "already_published") {
           // H is already on the fresh forge tip — verified no-unpublished-output (D2/D3).
@@ -413,19 +698,28 @@ export class RecoveryCoordinator {
         }
         record = produced.record;
       }
-      return await this.uploadJournaledBundle(record, input.signal);
+      return await this.uploadJournaledBundle(record, input.signal, "capture");
     } catch (err) {
+      if (err instanceof RecordGoneError) return removed();
       this.log.warn("recovery: capture/upload failed; retaining source (needs_action)", {
         run_id: record.runId,
         capture_id: record.captureId,
         error: errText(err),
       });
-      return this.markNeedsAction(record, "capture_error");
+      try {
+        return await this.markFailure(record, "capture_error", true);
+      } catch (markErr) {
+        if (markErr instanceof RecordGoneError) return removed();
+        throw markErr;
+      }
     }
   }
 
-  /** Produce + verify the bundle and journal its FILE before any manifest binding (D5).
-   *  Returns the bundled record, an already-published signal, or a needs_action reason. */
+  /** Produce + verify the bundle into a private temp and install it atomically (issue #1995),
+   *  journaling the FILE before any manifest binding (D5). Returns the bundled record, an
+   *  already-published signal, a needs_action reason, or `source_advanced` when the record's
+   *  pinned source moved while the bytes were produced (the bytes are discarded, nothing is
+   *  written). The caller holds the record's capture-cycle lock and has just read `record`. */
   private async produceBundle(
     record: RecoveryRecord,
     input: CaptureInput,
@@ -453,54 +747,97 @@ export class RecoveryCoordinator {
         error: errText(err),
       });
     }
-    const outPath = this.bundlePath(record);
-    await fs.mkdir(path.dirname(outPath), { recursive: true, mode: 0o700 });
+    const tmpPath = this.bundleTmpPath(record);
+    await fs.mkdir(path.dirname(tmpPath), { recursive: true, mode: 0o700 });
     let result: RecoveryBundleResult;
     try {
       result = await this.git.produceRecoveryBundle(input.barePath, {
         sourceSha: record.sourceSha,
-        outPath,
+        outPath: tmpPath,
         forgeTip,
       });
     } catch (err) {
+      await fs.rm(tmpPath, { force: true }).catch(() => undefined);
       if (err instanceof RecoveryBundleTooLargeError) {
         this.log.warn("recovery: bundle exceeds the size limit; retaining source (needs_action)", {
           run_id: record.runId,
           byte_size: err.byteSize,
           max_bytes: err.maxBytes,
         });
-        await this.markNeedsAction(record, "oversized");
+        await this.markFailure(record, "oversized", true);
         return { kind: "needs_action", reason: "oversized" };
       }
       this.log.warn("recovery: bundle production failed; retaining source (needs_action)", {
         run_id: record.runId,
         error: errText(err),
       });
-      await this.markNeedsAction(record, "bundle_failed");
+      await this.markFailure(record, "bundle_failed", true);
       return { kind: "needs_action", reason: "bundle_failed" };
     }
-    if (result.alreadyPublished) return { kind: "already_published" };
-    // Journal the verified bundle FILE before binding its manifest (D5), so a
-    // terminal/restart retry re-uploads exactly these bytes with no forge PAT.
-    const bundled: RecoveryRecord = {
-      ...record,
-      state: "bundled",
-      bundlePath: result.bundlePath,
-      byteSize: result.byteSize,
-      checksum: result.checksum,
-      chunkCount: result.chunkCount,
-      prerequisiteShas: result.prerequisiteShas,
-      selfContained: result.selfContained,
-      reason: undefined,
-    };
-    await this.writeRecord(bundled);
+    if (result.alreadyPublished) {
+      await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+      return { kind: "already_published" };
+    }
+    const installed = await this.installBundle(record, result, tmpPath);
+    if (installed.kind === "source_advanced") {
+      this.log.warn("recovery: pinned source advanced while the bundle was produced; bytes discarded", {
+        run_id: record.runId,
+        capture_id: record.captureId,
+      });
+      return { kind: "needs_action", reason: "source_advanced" };
+    }
     this.log.info("recovery: journaled verified bundle before upload", {
       run_id: record.runId,
       capture_id: record.captureId,
-      byte_size: result.byteSize,
-      self_contained: result.selfContained,
+      byte_size: installed.record.byteSize,
+      self_contained: installed.record.selfContained,
     });
-    return { kind: "bundled", record: bundled };
+    return { kind: "bundled", record: installed.record };
+  }
+
+  /**
+   * Install freshly produced bytes (issue #1995): under the per-run journal lock re-read the
+   * record, and only if it still names the source `snapshot` was produced from rename the private
+   * temp to the final `<captureId>.bundle` and journal the `bundled` record, built from the
+   * CURRENT record. A record that is gone or unauthenticated throws {@link RecordGoneError}; a
+   * pin that advanced the source discards the bytes (`source_advanced`, nothing written); a bundle
+   * journaled meanwhile wins and its facts are returned. The temp never outlives this call.
+   */
+  private async installBundle(
+    snapshot: RecoveryRecord,
+    result: RecoveryBundleResult,
+    tmpPath: string,
+  ): Promise<{ kind: "bundled"; record: RecoveryRecord } | { kind: "source_advanced" }> {
+    const finalPath = this.bundlePath(snapshot);
+    try {
+      return await this.withJournalLock(snapshot.runId, async () => {
+        const cur = await this.readRecord(this.recordPath(snapshot));
+        if (!cur) throw new RecordGoneError(snapshot);
+        if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
+        if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
+        await fs.rename(tmpPath, finalPath);
+        const bundled: RecoveryRecord = {
+          ...cur,
+          state: "bundled",
+          bundlePath: finalPath,
+          byteSize: result.byteSize,
+          checksum: result.checksum,
+          chunkCount: result.chunkCount,
+          prerequisiteShas: result.prerequisiteShas,
+          selfContained: result.selfContained,
+          reason: undefined,
+        };
+        try {
+          await this.writeRecordUnlocked(bundled);
+        } catch (err) {
+          await fs.rm(finalPath, { force: true }).catch(() => undefined);
+          throw err;
+        }
+        return { kind: "bundled" as const, record: bundled };
+      });
+    } finally {
+      await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+    }
   }
 
   /**
@@ -509,40 +846,47 @@ export class RecoveryCoordinator {
    * input (missing bundle file / manifest facts) → needs_action, never a fresh forge fetch.
    * Never silently swaps a rebuilt bundle's checksum under a bound capture id — the journaled
    * checksum is the one bound and streamed.
+   *
+   * issue #1995: every journal write is guarded (a removed record is never recreated, a newer
+   * state is never overwritten), the record's existence is re-checked before the reserve and
+   * right before the stream opens, and an RPC failure is classified ({@link classifyUploadFailure}):
+   * permanent and credential dispositions are journaled as such, a transient one under the mode's
+   * retry reason (`capture_error`, `restart_upload_failed`, `upload_transient`). The caller holds
+   * the record's capture-cycle lock.
    */
   private async uploadJournaledBundle(
     record: RecoveryRecord,
-    signal?: AbortSignal,
-    sweep = false,
+    signal: AbortSignal | undefined,
+    mode: UploadMode,
   ): Promise<RecoveryOutcome> {
-    const write = (r: RecoveryRecord): Promise<void> => (sweep ? this.writeSweepRecord(r) : this.writeRecord(r));
-    if (
-      !record.bundlePath ||
-      typeof record.byteSize !== "number" ||
-      !record.checksum ||
-      typeof record.chunkCount !== "number"
-    ) {
-      return this.markNeedsAction(record, "incomplete_local_inputs", sweep);
+    const swallow = mode === "capture";
+    if (!hasJournaledBundle(record)) {
+      return this.markFailure(record, "incomplete_local_inputs", swallow);
     }
     if (!(await fileExists(record.bundlePath))) {
       // The verified bundle is gone and we may not reproduce it without a forge PAT (D5).
-      return this.markNeedsAction(record, "bundle_file_missing", sweep);
+      return this.markFailure(record, "bundle_file_missing", swallow);
     }
-    // Reserve once; the local captureId is the idempotency_key so a lost ACK re-reserves the
-    // SAME server capture rather than duplicating it.
-    let current = record;
+    let current: RecoveryRecord = record;
+    await this.requirePresent(current);
     if (!current.serverCaptureId) {
-      const reserved = await this.client.reserveRecoveryCapture(current.runId, {
-        run_id: current.runId,
-        idempotency_key: current.captureId,
-        source_sha: current.sourceSha,
-        ...(current.attemptedHeadSha ? { attempted_head_sha: current.attemptedHeadSha } : {}),
-        // Bind the reserve to the EXACT generation's hold (PRD #1349 M2, D1); a v1 record with
-        // no generation omits it and the server falls back to the newest-hold reserve.
-        ...(current.generation !== undefined ? { generation: current.generation } : {}),
-      });
-      current = { ...current, serverCaptureId: reserved.capture_id };
-      await write(current);
+      // Reserve once; the local captureId is the idempotency_key so a lost ACK re-reserves the
+      // SAME server capture rather than duplicating it.
+      let reserved: RecoveryReserveResponse;
+      try {
+        reserved = await this.client.reserveRecoveryCapture(current.runId, {
+          run_id: current.runId,
+          idempotency_key: current.captureId,
+          source_sha: current.sourceSha,
+          ...(current.attemptedHeadSha ? { attempted_head_sha: current.attemptedHeadSha } : {}),
+          // Bind the reserve to the EXACT generation's hold (PRD #1349 M2, D1); a v1 record with
+          // no generation omits it and the server falls back to the newest-hold reserve.
+          ...(current.generation !== undefined ? { generation: current.generation } : {}),
+        });
+      } catch (err) {
+        return this.failUpload(current, err, signal, mode);
+      }
+      current = await this.writeExistingRecord(current, (cur) => ({ ...cur, serverCaptureId: reserved.capture_id }));
     }
     const manifest: RecoveryUploadManifest = {
       byte_size: current.byteSize!,
@@ -552,15 +896,23 @@ export class RecoveryCoordinator {
         ? { prerequisite_shas: current.prerequisiteShas }
         : {}),
     };
-    const status = await this.client.uploadRecoveryBundle(
-      current.runId,
-      current.serverCaptureId!,
-      manifest,
-      createReadStream(current.bundlePath!),
-      signal,
-    );
-    const uploaded: RecoveryRecord = { ...current, state: "uploaded", reason: undefined };
-    await write(uploaded);
+    // Last custody check before the stream opens: a record removed while the reserve ran is not uploaded.
+    await this.requirePresent(current);
+    let status: RecoveryCaptureStatusResponse;
+    try {
+      status = await this.client.uploadRecoveryBundle(
+        current.runId,
+        current.serverCaptureId!,
+        manifest,
+        createReadStream(current.bundlePath!),
+        signal,
+      );
+    } catch (err) {
+      return this.failUpload(current, err, signal, mode);
+    }
+    // A stream already in flight when cleanup ran cannot be recalled; this guarded write then
+    // throws RecordGoneError instead of recreating the removed record.
+    await this.writeExistingRecord(current, (cur) => ({ ...cur, state: "uploaded", reason: undefined }));
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
     await fs.rm(current.bundlePath!, { force: true }).catch(() => undefined);
@@ -571,6 +923,52 @@ export class RecoveryCoordinator {
       server_state: status.state,
     });
     return { state: "uploaded", captureId: current.captureId };
+  }
+
+  /** Classify a reserve/upload RPC failure and journal its disposition on the CURRENT record. */
+  private async failUpload(
+    record: RecoveryRecord,
+    err: unknown,
+    signal: AbortSignal | undefined,
+    mode: UploadMode,
+  ): Promise<RecoveryOutcome> {
+    // The worker's own abort stops a live pass; it says nothing about the capture or the api.
+    if (mode === "live" && signal?.aborted) {
+      return { state: record.state, captureId: record.captureId, reason: "aborted" };
+    }
+    const cls = await classifyUploadFailure(err, record);
+    this.log.warn(
+      mode === "sweep"
+        ? "recovery: restart re-upload failed; retaining source (needs_action)"
+        : "recovery: capture/upload failed; retaining source (needs_action)",
+      { run_id: record.runId, capture_id: record.captureId, disposition: cls.kind, error: errText(err) },
+    );
+    if (cls.kind === "credential") this.credentialBlockedAt = this.now();
+    const reason = cls.kind === "transient" ? TRANSIENT_UPLOAD_REASON[mode] : cls.reason;
+    return this.markFailure(record, reason, mode === "capture");
+  }
+
+  /** Throw {@link RecordGoneError} unless the record still exists and authenticates. */
+  private async requirePresent(record: RecoveryRecord): Promise<void> {
+    if (!(await this.readRecord(this.recordPath(record)))) throw new RecordGoneError(record);
+  }
+
+  /** The authenticated latest journaled version of `record`, telling a removed record from one
+   *  that fails authentication (both read as null). Never falls back to the caller's copy. */
+  private async readLatest(
+    record: RecoveryRecord,
+  ): Promise<{ kind: "ok"; record: RecoveryRecord } | { kind: "gone" } | { kind: "unauthenticated" }> {
+    const latest = await this.readRecord(this.recordPath(record));
+    if (latest) return { kind: "ok", record: latest };
+    return (await fileExists(this.recordPath(record))) ? { kind: "unauthenticated" } : { kind: "gone" };
+  }
+
+  /** Drop the bundle file(s) a removed record named (and its canonical path). */
+  private async dropBundleFiles(record: RecoveryRecord): Promise<void> {
+    await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+    if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
+      await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
+    }
   }
 
   // ── D3: release custody on successful full publication ──────────────────────────
@@ -681,7 +1079,7 @@ export class RecoveryCoordinator {
    * {@link snapshotBootRecords}; taken now when omitted). A record created after the snapshot is
    * never touched. Each record's MAC is verified again on re-read: a tampered/invalid record is
    * refused (left alone), never trusted. Every journal write here first re-checks the record still
-   * exists ({@link writeSweepRecord}); a record the live flight's cleanup removed meanwhile is
+   * exists ({@link writeExistingRecord}); a record the live flight's cleanup removed meanwhile is
    * dropped from the sweep, along with any bundle file this sweep produced for it.
    *   - `bundled`, or `needs_action` WITH a journaled bundle: re-upload the bundle BYTE-IDENTICALLY
    *     with NO forge PAT (D5), exactly as before.
@@ -702,39 +1100,67 @@ export class RecoveryCoordinator {
    *     bundled and never read as "no unpublished work".
    * One `recovery restart sweep` log line is written per processed record (ids and outcome only).
    */
-  async resumePending(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
-    if (!this.enabled) return;
+  resumePending(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
+    if (!this.enabled) return Promise.resolve();
+    // issue #1995: installed SYNCHRONOUSLY (before the first await) so a heartbeat-driven
+    // resumeLive can never overlap the boot sweep: it returns at once while any pass is in flight.
+    return this.trackPass(() => this.resumePendingPass(signal, snapshot));
+  }
+
+  /** Run `fn` as a coordinator pass: {@link resumeLive} is a no-op while any pass is in flight.
+   *  `fn` is invoked synchronously, so its in-flight marker exists before any caller can await. */
+  private trackPass(fn: () => Promise<void>): Promise<void> {
+    const pass = fn();
+    this.passes.add(pass);
+    return pass.finally(() => {
+      this.passes.delete(pass);
+    });
+  }
+
+  private async resumePendingPass(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
     const records = snapshot ?? (await this.snapshotBootRecords());
     for (const snap of records) {
       if (signal?.aborted) return;
-      // Re-read the current, authenticated state of exactly this snapshotted record.
-      const record = await this.readRecord(this.recordPath(snap));
-      if (!record || record.state === "uploaded") continue;
-      const done = (outcome: string, reason?: string): void => {
-        this.log.info("recovery restart sweep", {
+      // The whole record step runs under the per-capture cycle lock (issue #1995), so a foreground
+      // capture or a live pass on the same record cannot interleave with it.
+      await runCaptureCycle(this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal));
+    }
+  }
+
+  /** One boot-sweep record step; the caller holds the record's capture-cycle lock. */
+  private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal): Promise<void> {
+    // Re-read the current, authenticated state of exactly this snapshotted record.
+    const record = await this.readRecord(this.recordPath(snap));
+    if (!record || record.state === "uploaded") return;
+    const done = (outcome: string, reason?: string): void => {
+      this.log.info("recovery restart sweep", {
+        run_id: record.runId,
+        generation: record.generation,
+        outcome,
+        ...(reason ? { reason } : {}),
+      });
+    };
+    try {
+      if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
+        // A disposition the api or the local bytes made final: never retried (issue #1995).
+        done("needs_action", record.reason);
+        return;
+      }
+      await this.sweepRecord(record, done, signal);
+    } catch (err) {
+      if (!(err instanceof RecordGoneError)) {
+        // One record's failure (e.g. a journal write error) must not abort the rest of the sweep.
+        this.log.warn("recovery: restart sweep failed for a record; continuing", {
           run_id: record.runId,
           generation: record.generation,
-          outcome,
-          ...(reason ? { reason } : {}),
+          error: errText(err),
         });
-      };
-      try {
-        await this.sweepRecord(record, done, signal);
-      } catch (err) {
-        if (!(err instanceof RecordGoneError)) {
-          // One record's failure (e.g. a journal write error) must not abort the rest of the sweep.
-          this.log.warn("recovery: restart sweep failed for a record; continuing", {
-            run_id: record.runId,
-            generation: record.generation,
-            error: errText(err),
-          });
-          continue;
-        }
-        // The live flight's cleanup removed this record while the sweep worked on it: stop, and
-        // drop the bundle bytes this sweep produced (the record that named them is gone).
-        await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
-        done("record_removed");
+        return;
       }
+      // The live flight's cleanup removed this record while the sweep worked on it: stop, and
+      // drop the bundle bytes this sweep produced (the record that named them is gone).
+      await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+      done("record_removed");
     }
   }
 
@@ -743,7 +1169,10 @@ export class RecoveryCoordinator {
     done: (outcome: string, reason?: string) => void,
     signal?: AbortSignal,
   ): Promise<void> {
-    if (record.state === "pinned" || (record.state === "needs_action" && !record.bundlePath)) {
+    if (
+      !hasJournaledBundle(record) &&
+      (record.state === "pinned" || (record.state === "needs_action" && !record.bundlePath))
+    ) {
       // Only the transient `source_not_verifiable_after_restart` is re-evaluated on a later boot;
       // every other bundle-less needs_action reason (oversized, bundle_failed, capture_error,
       // no_unpublished_work_after_restart, ...) is final, so a boot does not retry it forever.
@@ -757,8 +1186,9 @@ export class RecoveryCoordinator {
       await this.resumePinned(record, done, signal);
       return;
     }
+    // A journaled bundle in ANY state is uploaded as journaled, never re-produced (issue #1995).
     try {
-      const out = await this.uploadJournaledBundle(record, signal, true);
+      const out = await this.uploadJournaledBundle(record, signal, "sweep");
       done(out.state, out.reason);
     } catch (err) {
       if (err instanceof RecordGoneError) throw err;
@@ -767,16 +1197,9 @@ export class RecoveryCoordinator {
         capture_id: record.captureId,
         error: errText(err),
       });
-      await this.markNeedsAction(await this.latestOf(record), "restart_upload_failed", true);
-      done("needs_action", "restart_upload_failed");
+      const out = await this.markFailure(record, "restart_upload_failed");
+      done(out.state, out.reason);
     }
-  }
-
-  /** The newest authenticated journaled version of `record` (falls back to `record` itself), so a
-   *  needs_action mark after a partial step keeps the bundle facts and server capture id the step
-   *  already journaled instead of overwriting them with the older in-memory copy. */
-  private async latestOf(record: RecoveryRecord): Promise<RecoveryRecord> {
-    return (await this.readRecord(this.recordPath(record))) ?? record;
   }
 
   /** Mark a needs_action reason in the sweep; a record that already carries it is left untouched. */
@@ -789,8 +1212,8 @@ export class RecoveryCoordinator {
       done("needs_action", reason);
       return;
     }
-    await this.markNeedsAction(record, reason, true);
-    done("needs_action", reason);
+    const out = await this.markFailure(record, reason);
+    done(out.state, out.state === "uploaded" ? undefined : reason);
   }
 
   private async recordGone(record: RecoveryRecord): Promise<boolean> {
@@ -825,37 +1248,31 @@ export class RecoveryCoordinator {
     }
     // Never write a bundle for a record the live flight's cleanup already removed.
     if (await this.recordGone(record)) throw new RecordGoneError(record);
-    let latest = record;
     try {
       // PAT-less and forge-free by design: no fetchDefaultTip, so the bundle is self-contained.
-      const outPath = this.bundlePath(record);
-      await fs.mkdir(path.dirname(outPath), { recursive: true, mode: 0o700 });
+      // Written to a private temp and installed atomically only if the record still names the same
+      // source (issue #1995).
+      const tmpPath = this.bundleTmpPath(record);
+      await fs.mkdir(path.dirname(tmpPath), { recursive: true, mode: 0o700 });
       let result: RecoveryBundleResult;
       try {
         result = await this.git.produceRecoveryBundle(resolved.barePath, {
           sourceSha: record.sourceSha,
-          outPath,
+          outPath: tmpPath,
           forgeTip: undefined,
         });
       } catch (err) {
+        await fs.rm(tmpPath, { force: true }).catch(() => undefined);
         const reason = err instanceof RecoveryBundleTooLargeError ? "oversized" : "bundle_failed";
         await this.sweepMark(record, reason, done);
         return;
       }
-      const bundled: RecoveryRecord = {
-        ...record,
-        state: "bundled",
-        bundlePath: result.bundlePath,
-        byteSize: result.byteSize,
-        checksum: result.checksum,
-        chunkCount: result.chunkCount,
-        prerequisiteShas: result.prerequisiteShas,
-        selfContained: result.selfContained,
-        reason: undefined,
-      };
-      await this.writeSweepRecord(bundled);
-      latest = bundled;
-      const out = await this.uploadJournaledBundle(bundled, signal, true);
+      const installed = await this.installBundle(record, result, tmpPath);
+      if (installed.kind === "source_advanced") {
+        done("needs_action", "source_advanced");
+        return;
+      }
+      const out = await this.uploadJournaledBundle(installed.record, signal, "sweep");
       done(out.state, out.reason);
     } catch (err) {
       if (err instanceof RecordGoneError) throw err;
@@ -864,10 +1281,101 @@ export class RecoveryCoordinator {
         capture_id: record.captureId,
         error: errText(err),
       });
-      // Mark the LATEST journaled record (the bundle facts and any reserved server capture id
-      // included), so the next boot re-uploads the bundle instead of finding a bundle-less record.
-      await this.markNeedsAction(await this.latestOf(latest), "restart_upload_failed", true);
-      done("needs_action", "restart_upload_failed");
+      // markFailure marks the CURRENT journaled record (the bundle facts and any reserved server
+      // capture id included), so the next boot re-uploads the bundle instead of finding a
+      // bundle-less record.
+      const out = await this.markFailure(record, "restart_upload_failed");
+      done(out.state, out.reason);
+    }
+  }
+
+  // ── issue #1995: live re-drive of a failed upload (no restart) ──────────────────
+
+  /**
+   * Re-drive journaled bundles whose upload failed while the worker stayed alive. Called by the
+   * worker after each successful heartbeat (`authenticatedAtMs` is that heartbeat's SEND time).
+   * Bounded and cheap to call: it returns at once while any pass (this or the boot sweep) is in
+   * flight, before `nextPassAt`, or while a credential rejection is newer than the heartbeat; a
+   * pass touches at most `liveMaxPerPass` records, least recently attempted first, and backs off
+   * exponentially (capped) after a pass with a transient failure. Only records with a journaled
+   * bundle that are `bundled`, or `needs_action` for a transient reason, are candidates; the
+   * upload is the journaled-bytes upload (no forge PAT, never a re-bundle). A run that is
+   * executing is skipped, and each record step takes the capture-cycle lock in skip mode so a
+   * foreground capture or sweep step on the same record wins.
+   */
+  async resumeLive(opts: ResumeLiveOptions): Promise<void> {
+    if (!this.enabled || this.passes.size > 0) return;
+    if (this.now() < this.nextPassAt) return;
+    if (this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt) return;
+    await this.trackPass(() => this.livePass(opts));
+  }
+
+  private async livePass(opts: ResumeLiveOptions): Promise<void> {
+    let transient = false;
+    try {
+      const candidates = (await this.snapshotBootRecords())
+        .filter((r) => isLiveCandidate(r))
+        .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
+        .slice(0, this.liveMaxPerPass);
+      for (const snap of candidates) {
+        if (opts.signal?.aborted) break;
+        if (opts.isExecuting(snap.runId)) continue;
+        const res = await runCaptureCycle(this.cycleKey(snap), "skip", () => this.liveStep(snap, opts));
+        if (!res.ran) continue;
+        if (res.value === "transient") transient = true;
+        if (res.value === "credential") break;
+      }
+    } catch (err) {
+      this.log.warn("recovery: live re-drive pass failed", { error: errText(err) });
+      transient = true;
+    }
+    if (transient) {
+      this.transientPasses++;
+      this.nextPassAt = this.now() + Math.min(this.liveBackoffBaseMs * 2 ** this.transientPasses, this.liveBackoffCapMs);
+    } else {
+      this.transientPasses = 0;
+      this.nextPassAt = this.now() + this.liveBackoffBaseMs;
+    }
+  }
+
+  /** One live record step; the caller holds the record's capture-cycle lock. */
+  private async liveStep(snap: RecoveryRecord, opts: ResumeLiveOptions): Promise<"ok" | "transient" | "credential"> {
+    const log = (outcome: string, reason?: string): void => {
+      this.log.info("recovery live re-drive", {
+        run_id: snap.runId,
+        generation: snap.generation,
+        outcome,
+        ...(reason ? { reason } : {}),
+      });
+    };
+    const record = await this.readRecord(this.recordPath(snap));
+    if (!record) {
+      log("record_removed");
+      return "ok";
+    }
+    // Re-checked inside the lock: the record may have moved on, or the run started executing.
+    if (!isLiveCandidate(record) || opts.isExecuting(record.runId)) return "ok";
+    this.lastAttemptAt.set(record.captureId, this.now());
+    try {
+      const out = await this.uploadJournaledBundle(record, opts.signal, "live");
+      log(out.state, out.reason);
+      if (out.state === "needs_action" && out.reason === "upload_transient") return "transient";
+      if (out.state === "needs_action" && out.reason === "credential_rejected") return "credential";
+      return "ok";
+    } catch (err) {
+      if (err instanceof RecordGoneError) {
+        await this.dropBundleFiles(record);
+        log("record_removed");
+        return "ok";
+      }
+      this.log.warn("recovery: live re-upload failed; retaining source (needs_action)", {
+        run_id: record.runId,
+        capture_id: record.captureId,
+        error: errText(err),
+      });
+      await this.markFailure(record, "upload_transient").catch(() => undefined);
+      log("needs_action", "upload_transient");
+      return "transient";
     }
   }
 
@@ -908,16 +1416,22 @@ export class RecoveryCoordinator {
     return path.join(this.runDir(record.runId), `${record.captureId}.bundle`);
   }
 
+  /** A private, unique production target (never the final path): bytes are installed over the
+   *  final `<captureId>.bundle` only by {@link installBundle}, after a source compare. */
+  private bundleTmpPath(record: Pick<RecoveryRecord, "runId" | "captureId">): string {
+    return path.join(this.runDir(record.runId), `${record.captureId}.${randomUUID()}.bundle.tmp`);
+  }
+
+  /** The per-capture cycle lock key. */
+  private cycleKey(record: Pick<RecoveryRecord, "runId" | "captureId">): string {
+    return path.resolve(this.recordPath(record));
+  }
+
   private withJournalLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
     return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn);
   }
 
-  /** Serialize local writes with cleanup (0600 file, 0700 dir). */
-  private async writeRecord(record: RecoveryRecord): Promise<void> {
-    await this.withJournalLock(record.runId, () => this.writeRecordUnlocked(record));
-  }
-
-  /** Atomic rename with a fresh MAC. The caller holds this run's journal lock. */
+  /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
   private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
     if (!this.key) return;
     const mac = this.computeMac(record);
@@ -998,29 +1512,57 @@ export class RecoveryCoordinator {
     return records.find(predicate);
   }
 
-  private async markNeedsAction(record: RecoveryRecord, reason: string, sweep = false): Promise<RecoveryOutcome> {
-    const updated: RecoveryRecord = { ...record, state: "needs_action", reason };
-    if (sweep) {
-      await this.writeSweepRecord(updated);
-    } else {
-      await this.writeRecord(updated).catch(() => undefined);
-    }
-    return { state: "needs_action", captureId: record.captureId, reason };
+  /**
+   * The guarded post-pin journal write (issue #1995): under the per-run journal lock, re-read
+   * the record by path, require it to still authenticate (else {@link RecordGoneError}), apply
+   * `mutate` to the CURRENT record (never to an older in-memory copy), and write the result.
+   * `mutate` returning undefined writes nothing. Check and rename share the in-process lock
+   * cleanup ({@link forgetGeneration} / {@link release}) takes, so a write either lands before
+   * the cleanup or refuses the missing record: a removed record is never resurrected, and a
+   * newer state (a journaled bundle, `uploaded`) is never overwritten with a stale snapshot.
+   * Generalises the restart sweep's #1742 write. Bundling and RPCs stay outside the lock.
+   */
+  private async writeExistingRecord(
+    record: Pick<RecoveryRecord, "runId" | "captureId">,
+    mutate: (current: RecoveryRecord) => RecoveryRecord | undefined,
+  ): Promise<RecoveryRecord> {
+    return this.withJournalLock(record.runId, async () => {
+      const current = await this.readRecord(this.recordPath(record));
+      if (!current) throw new RecordGoneError(record);
+      const next = mutate(current);
+      if (!next) return current;
+      await this.writeRecordUnlocked(next);
+      return next;
+    });
   }
 
   /**
-   * The restart sweep's journal write (issue #1742): re-check that the record still exists and
-   * authenticates, and throw {@link RecordGoneError} when it does not, so a sweep that is
-   * bundling/uploading while the live successor flight's cleanup ({@link forgetGeneration} /
-   * {@link release}) deletes the record never resurrects it. Check and rename share the same
-   * per-run in-process lock as cleanup: either this write completes before cleanup removes it,
-   * or cleanup wins and this write refuses the missing record. Bundling and RPCs stay outside.
+   * Mark `reason` on the CURRENT journaled record (keeping its bundle facts and server capture
+   * id). A record that is gone or fails authentication writes nothing and throws
+   * {@link RecordGoneError}; a record the latest journal read shows `uploaded` is never
+   * downgraded and surfaces as `uploaded`. `swallow` (the foreground capture) tolerates a
+   * journal IO error, as it always has; the record's removal still propagates.
    */
-  private async writeSweepRecord(record: RecoveryRecord): Promise<void> {
-    await this.withJournalLock(record.runId, async () => {
-      if (!(await this.readRecord(this.recordPath(record)))) throw new RecordGoneError(record);
-      await this.writeRecordUnlocked(record);
-    });
+  private async markFailure(
+    record: Pick<RecoveryRecord, "runId" | "captureId">,
+    reason: string,
+    swallow = false,
+  ): Promise<RecoveryOutcome> {
+    try {
+      let alreadyUploaded = false;
+      await this.writeExistingRecord(record, (cur) => {
+        if (cur.state === "uploaded") {
+          alreadyUploaded = true;
+          return undefined;
+        }
+        return { ...cur, state: "needs_action", reason };
+      });
+      if (alreadyUploaded) return { state: "uploaded", captureId: record.captureId };
+      return { state: "needs_action", captureId: record.captureId, reason };
+    } catch (err) {
+      if (err instanceof RecordGoneError || !swallow) throw err;
+      return { state: "needs_action", captureId: record.captureId, reason };
+    }
   }
 
   /** The caller holds this run's journal lock, including for legacy whole-run release. */

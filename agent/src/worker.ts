@@ -665,6 +665,17 @@ export class Worker {
         void this.sweepPendingTerminals(signal).catch((err) => {
           this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
         });
+        // Issue #1995: re-drive a journaled recovery bundle whose upload failed while this worker
+        // stayed alive (it was retried only at the next boot before). Fire-and-forget like the
+        // drain above: a pass uploads bundles and must never delay the next heartbeat. The
+        // coordinator single-flights, spaces and bounds the passes; `sampledAtMs` is this
+        // heartbeat's send time, so a credential rejection newer than it keeps the pass closed. A
+        // runner double without the method has nothing to re-drive.
+        if (sampledAtMs !== undefined && typeof this.runner.resumeLiveRecoveries === "function") {
+          void this.runner.resumeLiveRecoveries(sampledAtMs, signal).catch((err) => {
+            this.log.warn("recovery: live re-drive failed", { error: errMessage(err) });
+          });
+        }
       }
       await sleep(this.config.heartbeatIntervalMs, signal);
     }

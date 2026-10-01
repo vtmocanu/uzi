@@ -522,10 +522,14 @@ describe("RecoveryCoordinator — byte-identical restart re-upload with NO forge
     assert.ok(uploaded.bytes.equals(journaledBytes), "re-uploaded bytes are BYTE-IDENTICAL");
     // The manifest checksum is the journaled one (never swapped under a bound capture id).
     assert.equal(uploaded.manifest.checksum, createHash("sha256").update(journaledBytes).digest("hex"));
-    // The reserve idempotency key is the SAME durable capture id, so a lost ACK re-reserves
-    // the same server capture rather than duplicating it.
-    assert.equal(client2.reserveCalls.length, 1);
-    assert.equal(client2.reserveCalls[0]!.req.idempotency_key, rec!.captureId);
+    // The first attempt already reserved and journaled the server capture id (issue #1995: a
+    // failure mark keeps it instead of overwriting the record with a stale copy), so the restart
+    // streams to that same server capture without reserving again. The reserve idempotency key
+    // remains the durable capture id, so a lost ACK would still re-reserve the same capture.
+    assert.equal(client1.reserveCalls.length, 1);
+    assert.equal(client1.reserveCalls[0]!.req.idempotency_key, rec!.captureId);
+    assert.equal(client2.reserveCalls.length, 0);
+    assert.equal(uploaded.captureId, client1.serverCaptureId);
     // After a successful re-upload the record is uploaded and the local bundle is freed.
     const after = await coord2.inspect("run-real");
     assert.equal(after[0]!.state, "uploaded");
