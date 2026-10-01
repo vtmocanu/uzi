@@ -48,10 +48,10 @@ func TestValidateEffort(t *testing.T) {
 }
 
 // TestUziDefaultEffort pins uzi's effective default reasoning effort (issue #1157)
-// to xhigh — the level an inheriting owner rides in place of the SDK's own `high`.
+// to medium for an inheriting owner.
 func TestUziDefaultEffort(t *testing.T) {
-	if UziDefaultEffort != "xhigh" {
-		t.Errorf("UziDefaultEffort = %q, want \"xhigh\"", UziDefaultEffort)
+	if got := ResolveDefaultEffort(nil); got != "medium" {
+		t.Errorf("ResolveDefaultEffort(nil) = %q, want \"medium\"", got)
 	}
 }
 
