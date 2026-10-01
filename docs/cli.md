@@ -2416,4 +2416,4 @@ error saying so. Like CLI tokens, product tokens are **not** revoked by a
 password change or logout; Revoke all, revoking one token, an admin, disabling
 or deleting the product, or deactivating the account does revoke them. Minting
 and admin product management are browser-only; the CLI has just the read-only
-`uzi admin products` (with a `JOB_TYPES` column showing the job types each product may start). See [Product tokens](./product-tokens.md).
+`uzi admin products` (with a `JOB_TYPES` column showing the job types each product may start, and `CLIENT` and `SCOPES` columns for its [OAuth client](./oauth-clients.md) registration). See [Product tokens](./product-tokens.md).

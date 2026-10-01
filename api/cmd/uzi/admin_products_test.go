@@ -17,7 +17,11 @@ func adminProductsFixture() []apitypes.ProductDTO {
 	created := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
 	deleted := created.Add(48 * time.Hour)
 	return []apitypes.ProductDTO{
-		{ID: "p1", Name: "Acme CRM", Description: "Syncs tickets", Enabled: true, CreatedAt: created, ActiveTokenCount: 3},
+		{ID: "p1", Name: "Acme CRM", Description: "Syncs tickets", Enabled: true, CreatedAt: created, ActiveTokenCount: 3,
+			OAuthClient: apitypes.ProductOAuthClientDTO{
+				RedirectURIs: []string{"https://acme.example.com/cb"}, Scopes: []string{"jobs:run", "jobs:read"},
+				HasSecret: true, SecretPrefix: "uzs_Ab12", IsClient: true,
+			}},
 		{ID: "p2", Name: "Paused", Enabled: false, CreatedAt: created},
 		{ID: "p3", Name: "Gone", Enabled: false, DeletedAt: &deleted, CreatedAt: created, ActiveTokenCount: 2},
 	}
@@ -33,7 +37,7 @@ func TestAdminProductsTable(t *testing.T) {
 	if len(lines) != 4 {
 		t.Fatalf("rendered %d lines, want header + 3 rows:\n%s", len(lines), out)
 	}
-	for _, h := range []string{"NAME", "STATE", "ACTIVE_TOKENS", "CREATED", "DESCRIPTION"} {
+	for _, h := range []string{"NAME", "STATE", "ACTIVE_TOKENS", "CLIENT", "SCOPES", "CREATED", "DESCRIPTION"} {
 		if !strings.Contains(lines[0], h) {
 			t.Errorf("header %q lacks %s", lines[0], h)
 		}
@@ -42,8 +46,8 @@ func TestAdminProductsTable(t *testing.T) {
 		row    int
 		fields []string
 	}{
-		{1, []string{"Acme CRM", "enabled", "3", "2026-09-01T10:00:00Z", "Syncs tickets"}},
-		{2, []string{"Paused", "disabled", "0"}},
+		{1, []string{"Acme CRM", "enabled", "3", "yes", "jobs:run,jobs:read", "2026-09-01T10:00:00Z", "Syncs tickets"}},
+		{2, []string{"Paused", "disabled", "0", "no"}},
 		// deleted wins over the (always false) enabled flag.
 		{3, []string{"Gone", "deleted", "2"}},
 	}
@@ -80,5 +84,37 @@ func TestAdminProductsServerError(t *testing.T) {
 	_, _, code := runCLI(t, fakeEnv(fc), "admin", "products")
 	if code != uzicli.ExitAuth {
 		t.Fatalf("exit = %d, want %d", code, uzicli.ExitAuth)
+	}
+}
+
+// `--json` carries oauth_client (the DTO) and never a client secret or its hash: the DTO has
+// no such field, and the table prints only yes/no and the scopes.
+func TestAdminProductsJSONCarriesOAuthClientButNoSecret(t *testing.T) {
+	fc := &uzicli.FakeClient{AdminProducts: adminProductsFixture()}
+	out, _, code := runCLI(t, fakeEnv(fc), "admin", "products", "--json")
+	if code != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", code, out)
+	}
+	var raw []map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(out), &raw); err != nil {
+		t.Fatalf("decode %q: %v", out, err)
+	}
+	var oc map[string]json.RawMessage
+	if err := json.Unmarshal(raw[0]["oauth_client"], &oc); err != nil {
+		t.Fatalf("product 0 has no oauth_client object: %v", err)
+	}
+	for _, k := range []string{"redirect_uris", "scopes", "has_secret", "secret_prefix", "rotated_at", "is_client"} {
+		if _, ok := oc[k]; !ok {
+			t.Errorf("oauth_client lacks %q: %s", k, out)
+		}
+	}
+	for _, banned := range []string{"client_secret", "secret_hash", "hash"} {
+		if strings.Contains(out, banned) {
+			t.Errorf("--json output contains %q: %s", banned, out)
+		}
+	}
+	tbl, _, _ := runCLI(t, fakeEnv(fc), "admin", "products")
+	if strings.Contains(tbl, "uzs_") {
+		t.Errorf("the table printed a secret-class value: %s", tbl)
 	}
 }

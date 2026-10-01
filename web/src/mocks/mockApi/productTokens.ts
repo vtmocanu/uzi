@@ -1,6 +1,7 @@
 import type {
   AdminProductToken,
   Product,
+  ProductOAuthClient,
   ProductPatch,
   ProductEgressProfile,
   ProductSkills,
@@ -15,6 +16,7 @@ import {
   PRODUCT_NAME_MAX_BYTES,
 } from "../../lib/productText";
 import { JOB_TYPES } from "../../lib/jobTypes";
+import { redirectUrisError } from "../../lib/oauthClient";
 import {
   MOCK_SKILLS_APPLIED_SHA,
   MOCK_SKILLS_REPO_SHA,
@@ -34,7 +36,27 @@ import { delay, requireAdmin, requireSession, users } from "./shared";
 type OwnedProductToken = ProductToken & { user_id: string };
 type StoredProduct = Omit<Product, "active_token_count">;
 
-let products: StoredProduct[] = mockProducts.map((p) => ({ ...p, allowed_job_types: [...(p.allowed_job_types ?? [])] }));
+const noOAuthClient = (): ProductOAuthClient => ({
+  redirect_uris: [],
+  scopes: [],
+  has_secret: false,
+  secret_prefix: "",
+  rotated_at: null,
+  is_client: false,
+});
+// is_client is derived exactly as the server does: a URI, a scope and a secret.
+const withIsClient = (c: ProductOAuthClient): ProductOAuthClient => ({
+  ...c,
+  is_client: c.redirect_uris.length > 0 && c.scopes.length > 0 && c.has_secret,
+});
+
+let products: StoredProduct[] = mockProducts.map((p) => ({
+  ...p,
+  allowed_job_types: [...(p.allowed_job_types ?? [])],
+  oauth_client: p.oauth_client
+    ? { ...p.oauth_client, redirect_uris: [...p.oauth_client.redirect_uris], scopes: [...p.oauth_client.scopes] }
+    : noOAuthClient(),
+}));
 let productTokens: OwnedProductToken[] = mockProductTokens.map((t) => ({ ...t, scopes: [...t.scopes] }));
 let productCounter = 0;
 let productTokenCounter = 0;
@@ -319,6 +341,7 @@ export const productTokensApi = {
       deleted_at: null,
       created_at: new Date().toISOString(),
       allowed_job_types: allowed,
+      oauth_client: noOAuthClient(),
     };
     products = [p, ...products];
     return delay({ product: withCount(p) }, 200);
@@ -347,6 +370,46 @@ export const productTokensApi = {
     if (allowed !== undefined) p.allowed_job_types = allowed;
     if (touchesSkills) applySkillsPatch(id, patch);
     return delay({ product: withCount(p) });
+  },
+  // PRD #1910 M1: the OAuth client registration. Same validation order and refusals as
+  // handler/admin_product_oauth.go: both lists required, the URIs checked first, scopes a
+  // non-empty known subset when URIs are set and empty when they are not; unknown 404, deleted 409.
+  adminSetProductOAuth: async (id: string, redirectUris: string[], scopes: string[]) => {
+    requireAdmin();
+    const p = findProduct(id);
+    const uriErr = redirectUrisError(redirectUris);
+    if (uriErr !== null) throw new ApiError(400, uriErr);
+    if (redirectUris.length > 0) {
+      if (scopes.length === 0) throw new ApiError(400, "scope must name at least one scope");
+      if (new Set(scopes).size !== scopes.length) throw new ApiError(400, "duplicate scope");
+      const unknown = scopes.find((s) => s !== "jobs:run" && s !== "jobs:read");
+      if (unknown !== undefined) throw new ApiError(400, "unknown scope (known: jobs:run, jobs:read)");
+    } else if (scopes.length > 0) {
+      throw new ApiError(400, "scopes must be empty when redirect_uris is empty: clear both to stop being an OAuth client");
+    }
+    if (p.deleted_at !== null) throw new ApiError(409, "product is deleted; a deleted product cannot be changed");
+    p.oauth_client = withIsClient({
+      ...(p.oauth_client ?? noOAuthClient()),
+      redirect_uris: [...redirectUris],
+      scopes: scopes as ProductOAuthClient["scopes"],
+    });
+    return delay({ product: withCount(p) });
+  },
+  adminRotateProductClientSecret: async (id: string) => {
+    requireAdmin();
+    const p = findProduct(id);
+    if (p.deleted_at !== null) throw new ApiError(409, "product is deleted; a deleted product cannot be changed");
+    // Assembled at runtime from a class prefix and a random body: the real secret is 256 bits.
+    const bytes = crypto.getRandomValues(new Uint8Array(32));
+    const body = btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+    const secret = "uzs_" + body;
+    p.oauth_client = withIsClient({
+      ...(p.oauth_client ?? noOAuthClient()),
+      has_secret: true,
+      secret_prefix: secret.slice(0, 8),
+      rotated_at: new Date().toISOString(),
+    });
+    return delay({ client_secret: secret, product: withCount(p) }, 200);
   },
   adminDeleteProduct: async (id: string) => {
     requireAdmin();

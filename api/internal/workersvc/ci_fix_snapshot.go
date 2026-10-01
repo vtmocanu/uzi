@@ -39,7 +39,7 @@ var snapshotSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`),
 	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{16,}`),
 	regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{16,}`),
-	regexp.MustCompile(`uz[capw]_[A-Za-z0-9_\-]{16,}`),
+	regexp.MustCompile(`uz[caprsw]_[A-Za-z0-9_\-]{16,}`),
 	// Header lines a `curl -v` / `set -x` echoes — redact the WHOLE value to EOL
 	// (`.` excludes newline, so `.*` stops at the line end), never just the first word.
 	regexp.MustCompile(`(?i)(private-token|authorization)\s*[:=].*`),

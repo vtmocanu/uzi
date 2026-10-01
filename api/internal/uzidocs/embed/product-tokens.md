@@ -62,6 +62,7 @@ Product registration is an admin-only browser action under **Admin → Products*
 - **Allowed job types:** each product card has a checkbox per job type (today `research`). A product with none ticked cannot create jobs: a create is refused 403 `job_type_not_allowed`. `uzi admin products` shows them in a `JOB_TYPES` column.
 - **Revoke one token:** each product card lists its tokens with owner, prefix, last used and IP; an admin can revoke a single compromised one. This does not change the rule that admins cannot revoke a user's personal CLI tokens.
 - **Allowed site lists:** each product card also lists the site lists its tokens may name on job create; see [Site lists for jobs](#site-lists-for-jobs).
+- **OAuth client:** each product card also has an **OAuth client** section for redirect URIs, scopes and a client secret; see [Registering an OAuth client](./oauth-clients.md).
 - **Read-only from the CLI:** `uzi admin products` (needs a `uza_` token). See [CLI](./cli.md#managing-tokens).
 
 ## Site lists for jobs

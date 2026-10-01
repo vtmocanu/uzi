@@ -198,7 +198,7 @@ UPDATE products
        updated_at = now()
  WHERE id = $5
    AND deleted_at IS NULL
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at
 `
 
 type UpdateProductSkillsSourceParams struct {
@@ -247,6 +247,11 @@ func (q *Queries) UpdateProductSkillsSource(ctx context.Context, arg UpdateProdu
 		&i.SkillsAppliedSha,
 		&i.SkillsAppliedBy,
 		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
 	)
 	return i, err
 }

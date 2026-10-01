@@ -44,6 +44,7 @@ import {
 } from "../components/ProductTokens";
 import { PackageIcon } from "../components/icons";
 import { ProductEgressProfilesPanel } from "../components/ProductEgressProfiles";
+import { ProductOAuthPanel } from "../components/ProductOAuthClient";
 import { ProductSkillsPanel } from "../components/ProductSkills";
 import { JOB_TYPES, jobTypeLabel } from "../lib/jobTypes";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -168,6 +169,7 @@ export function AdminProducts() {
                   return `Revoked “${t.name}” (${t.token_prefix}…).`;
                 }, "Failed to revoke token")
               }
+              onOAuthChanged={reload}
             />
           ))}
         </div>
@@ -396,6 +398,7 @@ function ProductCard({
   onJobTypes,
   onDelete,
   onRevoke,
+  onOAuthChanged,
 }: {
   product: Product;
   tokens: AdminProductToken[];
@@ -409,6 +412,8 @@ function ProductCard({
   onJobTypes: (allowed: string[]) => Promise<{ error: string } | { error: null; saved: string[] }>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
+  // Reloads the registry after an OAuth client write (the panel owns its own banners).
+  onOAuthChanged: () => Promise<unknown> | void;
 }) {
   const deleted = product.deleted_at !== null;
   const [busy, setBusy] = useState(false);
@@ -570,6 +575,9 @@ function ProductCard({
         ) : (
           <ProductTokenTable tokens={tokens} onRevoke={onRevoke} />
         )}
+
+        {/* PRD #1910 M1: the OAuth client registration (redirect URIs, scopes, client secret). */}
+        <ProductOAuthPanel product={product} onChanged={onOAuthChanged} />
 
         {/* PRD #1909 M6: the product's skill set (source, staged review, approved set).
             A deleted product cannot change, so it gets no panel. */}

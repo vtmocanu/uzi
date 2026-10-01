@@ -8,5 +8,17 @@
   "active_token_count": 1,
   "allowed_job_types": [
     "x"
-  ]
+  ],
+  "oauth_client": {
+    "redirect_uris": [
+      "x"
+    ],
+    "scopes": [
+      "x"
+    ],
+    "has_secret": true,
+    "secret_prefix": "x",
+    "rotated_at": "2020-01-02T03:04:05Z",
+    "is_client": true
+  }
 }

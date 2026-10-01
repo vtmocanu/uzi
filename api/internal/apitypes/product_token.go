@@ -27,6 +27,34 @@ type ProductDTO struct {
 	CreatedAt        time.Time  `json:"created_at"`
 	ActiveTokenCount int64      `json:"active_token_count"`
 	AllowedJobTypes  []string   `json:"allowed_job_types"`
+	// OAuthClient is the product's OAuth client registration (PRD #1910 D2): its redirect
+	// URIs, allowed scopes and secret metadata. Always present; a product that is not a
+	// client carries empty lists and is_client false.
+	OAuthClient ProductOAuthClientDTO `json:"oauth_client"`
+}
+
+// ProductOAuthClientDTO is the OAuth-client half of a registered product (PRD #1910 D2).
+// THE CLIENT SECRET AND ITS HASH APPEAR IN NO FIELD: the hash is projected into no DTO, and
+// the plaintext appears exactly once, in RotateProductClientSecretResponse.ClientSecret.
+// HasSecret says a secret exists; SecretPrefix is its short display prefix ("" when there is
+// none) and RotatedAt when it was last replaced (null when never). IsClient is the derived
+// "this product can run the consent flow": at least one redirect URI, a non-empty scope
+// list and a secret. RedirectURIs and Scopes are never null on the wire.
+type ProductOAuthClientDTO struct {
+	RedirectURIs []string   `json:"redirect_uris"`
+	Scopes       []string   `json:"scopes"`
+	HasSecret    bool       `json:"has_secret"`
+	SecretPrefix string     `json:"secret_prefix"`
+	RotatedAt    *time.Time `json:"rotated_at"`
+	IsClient     bool       `json:"is_client"`
+}
+
+// RotateProductClientSecretResponse is the POST /api/admin/products/{id}/oauth/secret
+// response: the new plaintext client secret, shown exactly once (only its sha256 is
+// stored), plus the updated product. Mirrors MintProductTokenResponse.
+type RotateProductClientSecretResponse struct {
+	ClientSecret string     `json:"client_secret"`
+	Product      ProductDTO `json:"product"`
 }
 
 // AdminDeleteProductResponse is the DELETE /api/admin/products/{id} response (PRD #1907

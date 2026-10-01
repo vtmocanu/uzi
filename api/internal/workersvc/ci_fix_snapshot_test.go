@@ -8,6 +8,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/oauthsrv"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -63,11 +64,11 @@ func TestScrubKnownTokensRedactsTokenFamilies(t *testing.T) {
 }
 
 // TestScrubKnownTokensMintedUziPrefixes ranges over the EXPORTED minted uzi class
-// prefixes (clitoken.Prefixes, jointoken.Prefix, producttoken.Prefix), so the
-// snapshot scrubber's copy of the uz[capw]_ pattern is bound to every credential
+// prefixes (clitoken.Prefixes, jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix), so the
+// snapshot scrubber's copy of the uz[caprsw]_ pattern is bound to every credential
 // class uzi mints rather than to string copies of the prefixes.
 func TestScrubKnownTokensMintedUziPrefixes(t *testing.T) {
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix)
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix)
 	body := strings.Repeat("Ab1-_", 5) // 25 chars over the whole body class, assembled at runtime
 	for _, p := range prefixes {
 		out := ScrubKnownTokens("step printed " + p + body + " and exited")

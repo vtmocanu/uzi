@@ -239,6 +239,12 @@ func (h *Handler) mountAdminRoutes(r chi.Router, forgeLimiter, authLimiter *mw.L
 			r.Put("/products/{id}/egress-profiles/{name}", h.AdminAllowProductEgressProfile)
 			r.Delete("/products/{id}/egress-profiles/{name}", h.AdminRevokeProductEgressProfile)
 			r.Post("/product-tokens/{id}/revoke", h.AdminRevokeProductToken)
+			// Product OAuth client registration (PRD #1910 M1, D2): set the redirect URIs and
+			// allowed scopes (PUT, both lists together), and rotate the client secret (POST,
+			// shown once). Cookie-only, so a uza_ Bearer 401s before the handler; no limiter,
+			// local DB writes by an authenticated admin session.
+			r.Put("/products/{id}/oauth", h.AdminSetProductOAuth)
+			r.Post("/products/{id}/oauth/secret", h.AdminRotateProductClientSecret)
 			// Egress profile writes (PRD #1906 M1): create, full replace, delete. Cookie-only
 			// admin writes, so a uza_ Bearer 401s before the handler and the CLI stays
 			// read-only; the web Admin page is the editor. The name is immutable (a run will

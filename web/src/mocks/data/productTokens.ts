@@ -16,6 +16,15 @@ export const mockProducts: Omit<Product, "active_token_count">[] = [
     deleted_at: null,
     created_at: daysAgo(45),
     allowed_job_types: ["research"],
+    // A fully registered OAuth client (PRD #1910): URIs, scopes and a secret.
+    oauth_client: {
+      redirect_uris: ["https://helpdesk.example.com/uzi/callback", "http://127.0.0.1:8123/callback"],
+      scopes: ["jobs:run", "jobs:read"],
+      has_secret: true,
+      secret_prefix: "uzs_Qm4x",
+      rotated_at: daysAgo(10),
+      is_client: true,
+    },
   },
   {
     id: "prod-metrics",

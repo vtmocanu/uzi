@@ -89,7 +89,7 @@ func validateAllowedJobTypes(in []string) ([]string, error) {
 	return out, nil
 }
 
-// jobTypesOrEmpty is the wire form of a products.allowed_job_types value: never nil.
+// jobTypesOrEmpty is the wire form of a products text[] column (allowed_job_types, redirect_uris, oauth_scopes): never nil.
 func jobTypesOrEmpty(in []string) []string {
 	if in == nil {
 		return []string{}
@@ -107,7 +107,27 @@ func productDTO(p store.Product, activeTokens int64) apitypes.ProductDTO {
 		DeletedAt:        timePtr(p.DeletedAt.Valid, p.DeletedAt.Time),
 		CreatedAt:        p.CreatedAt.Time,
 		ActiveTokenCount: activeTokens,
+		OAuthClient: oauthClientDTO(p.RedirectUris, p.OauthScopes, p.ClientSecretHash != nil,
+			p.ClientSecretPrefix, p.ClientSecretRotatedAt),
 	}
+}
+
+// oauthClientDTO builds the nested oauth_client view (PRD #1910 D2) from a product's client
+// columns. It takes the secret as a bool plus the display prefix and rotation time, never the
+// hash itself, so the hash cannot reach a DTO through this path. IsClient is derived here, in
+// the one place both the single-product and list builders share.
+func oauthClientDTO(uris, scopes []string, hasSecret bool, prefix pgtype.Text, rotatedAt pgtype.Timestamptz) apitypes.ProductOAuthClientDTO {
+	dto := apitypes.ProductOAuthClientDTO{
+		RedirectURIs: jobTypesOrEmpty(uris),
+		Scopes:       jobTypesOrEmpty(scopes),
+		HasSecret:    hasSecret,
+		RotatedAt:    timePtr(rotatedAt.Valid, rotatedAt.Time),
+	}
+	if prefix.Valid {
+		dto.SecretPrefix = prefix.String
+	}
+	dto.IsClient = len(dto.RedirectURIs) > 0 && len(dto.Scopes) > 0 && hasSecret
+	return dto
 }
 
 // AdminListProducts returns every registered product, soft-deleted ones included (they
@@ -130,6 +150,7 @@ func (h *Handler) AdminListProducts(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:        p.CreatedAt.Time,
 			ActiveTokenCount: p.ActiveTokenCount,
 			AllowedJobTypes:  jobTypesOrEmpty(p.AllowedJobTypes),
+			OAuthClient:      oauthClientDTO(p.RedirectUris, p.OauthScopes, p.HasClientSecret, p.ClientSecretPrefix, p.ClientSecretRotatedAt),
 		})
 	}
 	httpx.JSON(w, http.StatusOK, map[string]any{"products": out})

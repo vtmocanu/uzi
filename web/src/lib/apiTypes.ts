@@ -1560,6 +1560,32 @@ export interface Product {
    *  and outcome_pending): a mid-deploy api pod predating #1908 omits the key, so every read
    *  falls back (`?? []`, or hides the editor) instead of crashing the Products page. */
   allowed_job_types?: string[];
+  /** The product's OAuth client registration (apitypes.ProductDTO.OAuthClient, PRD #1910).
+   *  OPTIONAL for the api/web rollout skew, like allowed_job_types: a mid-deploy api pod
+   *  predating #1910 omits it, so every read treats a missing value as "not a client". */
+  oauth_client?: ProductOAuthClient;
+}
+
+// ProductOAuthClient is the OAuth-client half of a product (apitypes.ProductOAuthClientDTO,
+// PRD #1910 D2). The client secret and its hash are never fields: has_secret says one exists,
+// secret_prefix is its short display prefix ("" when none) and rotated_at when it last changed
+// (null when never). is_client is the server's derived "can run the consent flow": a redirect
+// URI, a scope list and a secret. redirect_uris and scopes are never null on the wire.
+export interface ProductOAuthClient {
+  redirect_uris: string[];
+  scopes: ProductTokenScope[];
+  has_secret: boolean;
+  secret_prefix: string;
+  rotated_at: string | null;
+  is_client: boolean;
+}
+
+// RotateProductClientSecretResponse is POST /api/admin/products/{id}/oauth/secret
+// (apitypes.RotateProductClientSecretResponse): the new plaintext client secret, shown exactly
+// once (only its sha256 is stored), plus the updated product.
+export interface RotateProductClientSecretResponse {
+  client_secret: string;
+  product: Product;
 }
 
 // ProductPatch is the PATCH /api/admin/products/{id} body: every field optional, an omitted

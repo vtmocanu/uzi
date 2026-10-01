@@ -6,5 +6,13 @@
   "deleted_at": null,
   "created_at": "0001-01-01T00:00:00Z",
   "active_token_count": 0,
-  "allowed_job_types": null
+  "allowed_job_types": null,
+  "oauth_client": {
+    "redirect_uris": null,
+    "scopes": null,
+    "has_secret": false,
+    "secret_prefix": "",
+    "rotated_at": null,
+    "is_client": false
+  }
 }

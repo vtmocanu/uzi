@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
+	"github.com/vtmocanu/uzi/api/internal/oauthsrv"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
 	"github.com/vtmocanu/uzi/api/internal/secretscrub"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
@@ -52,7 +53,7 @@ func assertScrubbedBothPaths(t *testing.T, token string) {
 }
 
 // assertScrubbedIssueDraft is the third path for the minted uzi prefixes only:
-// issuedraft.ScrubSecretShapes carries its own copy of the uz[capw]_ pattern. It is
+// issuedraft.ScrubSecretShapes carries its own copy of the uz[caprsw]_ pattern. It is
 // not folded into assertScrubbedBothPaths because issuedraft's forge families are
 // deliberately different (its GitHub pattern needs a 36+ char body), so the forge
 // test below could not share it.
@@ -74,8 +75,9 @@ func assertScrubbedIssueDraft(t *testing.T, token string) {
 // draft). The name predates the third path.
 func TestMintedPrefixesScrubbedOnBothPaths(t *testing.T) {
 	// clitoken.Prefixes = {uzc_, uza_}; jointoken.Prefix = uzw_; producttoken.Prefix =
-	// uzp_ (PRD #1907). The last two are consts, no slice needed.
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix)
+	// uzp_ (PRD #1907); oauthsrv.SecretPrefix = uzs_ (PRD #1910). The rest are consts, no
+	// slice needed. uzr_ (refresh tokens, PRD #1910 M3) joins this list when it is minted.
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix)
 	for _, p := range prefixes {
 		t.Run(p, func(t *testing.T) {
 			assertScrubbedBothPaths(t, p+body)

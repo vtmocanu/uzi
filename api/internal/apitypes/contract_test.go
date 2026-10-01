@@ -151,6 +151,11 @@ func contractCases() []contractCase {
 		// NOT NULL and non-empty). AdminProductTokenDTO embeds ProductTokenDTO, so its
 		// fixture carries the row's keys inline; MintProductTokenResponse nests it.
 		newContractCase[ProductDTO]("product"),
+		// PRD #1910 M1: the product's nested oauth_client (rotated_at is a present-as-null
+		// pointer; the redirect_uris/scopes slices are non-omitempty, null in zero.json and
+		// never null on the real wire) and the rotate-secret response that carries the
+		// one-time plaintext beside the updated product.
+		newContractCase[RotateProductClientSecretResponse]("rotate_product_client_secret"),
 		newContractCase[ProductTokenDTO]("product_token"),
 		newContractCase[AdminProductTokenDTO]("admin_product_token"),
 		newContractCase[MintProductTokenResponse]("mint_product_token"),

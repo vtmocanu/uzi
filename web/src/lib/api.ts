@@ -51,6 +51,7 @@ import type {
   MintableProduct,
   Product,
   ProductPatch,
+  RotateProductClientSecretResponse,
   ProductSkills,
   ProductEgressProfile,
   ProductToken,
@@ -1880,6 +1881,16 @@ const realApi = {
     ),
   adminDisallowProductEgressProfile: (id: string, name: string) =>
     request<null>("DELETE", `/admin/products/${id}/egress-profiles/${encodeURIComponent(name)}`),
+  // PRD #1910 M1: make a product an OAuth client. PUT replaces the redirect URIs and scopes
+  // together (both empty clears the registration; non-empty URIs need non-empty scopes) and
+  // answers {product}; the POST rotates the client secret and returns the plaintext ONCE.
+  adminSetProductOAuth: (id: string, redirectUris: string[], scopes: ProductTokenScope[]) =>
+    request<{ product: Product }>("PUT", `/admin/products/${id}/oauth`, {
+      redirect_uris: redirectUris,
+      scopes,
+    }),
+  adminRotateProductClientSecret: (id: string) =>
+    request<RotateProductClientSecretResponse>("POST", `/admin/products/${id}/oauth/secret`),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
   // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.

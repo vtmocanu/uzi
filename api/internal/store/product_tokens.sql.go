@@ -72,7 +72,7 @@ func (q *Queries) CountActiveProductTokensForUserProduct(ctx context.Context, ar
 const createProduct = `-- name: CreateProduct :one
 INSERT INTO products (name, description, created_by, allowed_job_types)
 VALUES ($1, $2, $3, COALESCE($4::text[], '{}'))
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at
 `
 
 type CreateProductParams struct {
@@ -110,6 +110,11 @@ func (q *Queries) CreateProduct(ctx context.Context, arg CreateProductParams) (P
 		&i.SkillsAppliedSha,
 		&i.SkillsAppliedBy,
 		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
 	)
 	return i, err
 }
@@ -192,7 +197,7 @@ func (q *Queries) CreateProductToken(ctx context.Context, arg CreateProductToken
 }
 
 const getProduct = `-- name: GetProduct :one
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at FROM products WHERE id = $1
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at FROM products WHERE id = $1
 `
 
 // One product by id, soft-deleted included (callers check enabled / deleted_at).
@@ -215,12 +220,17 @@ func (q *Queries) GetProduct(ctx context.Context, id uuid.UUID) (Product, error)
 		&i.SkillsAppliedSha,
 		&i.SkillsAppliedBy,
 		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
 	)
 	return i, err
 }
 
 const getProductForUpdate = `-- name: GetProductForUpdate :one
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at FROM products WHERE id = $1 FOR UPDATE
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at FROM products WHERE id = $1 FOR UPDATE
 `
 
 // One product by id, soft-deleted included, ROW-LOCKED for the rest of the transaction.
@@ -248,6 +258,11 @@ func (q *Queries) GetProductForUpdate(ctx context.Context, id uuid.UUID) (Produc
 		&i.SkillsAppliedSha,
 		&i.SkillsAppliedBy,
 		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
 	)
 	return i, err
 }
@@ -412,7 +427,7 @@ func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int3
 }
 
 const listEnabledProducts = `-- name: ListEnabledProducts :many
-SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at
   FROM products
  WHERE enabled
    AND deleted_at IS NULL
@@ -445,6 +460,11 @@ func (q *Queries) ListEnabledProducts(ctx context.Context) ([]Product, error) {
 			&i.SkillsAppliedSha,
 			&i.SkillsAppliedBy,
 			&i.SkillsAppliedAt,
+			&i.RedirectUris,
+			&i.OauthScopes,
+			&i.ClientSecretHash,
+			&i.ClientSecretPrefix,
+			&i.ClientSecretRotatedAt,
 		); err != nil {
 			return nil, err
 		}
@@ -551,6 +571,11 @@ SELECT p.id,
        p.created_at,
        p.updated_at,
        p.allowed_job_types,
+       p.redirect_uris,
+       p.oauth_scopes,
+       (p.client_secret_hash IS NOT NULL)::boolean AS has_client_secret,
+       p.client_secret_prefix,
+       p.client_secret_rotated_at,
        (SELECT count(*)
           FROM product_tokens t
          WHERE t.product_id = p.id
@@ -561,16 +586,21 @@ SELECT p.id,
 `
 
 type ListProductsRow struct {
-	ID               uuid.UUID          `json:"id"`
-	Name             string             `json:"name"`
-	Description      string             `json:"description"`
-	Enabled          bool               `json:"enabled"`
-	DeletedAt        pgtype.Timestamptz `json:"deleted_at"`
-	CreatedBy        pgtype.UUID        `json:"created_by"`
-	CreatedAt        pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt        pgtype.Timestamptz `json:"updated_at"`
-	AllowedJobTypes  []string           `json:"allowed_job_types"`
-	ActiveTokenCount int64              `json:"active_token_count"`
+	ID                    uuid.UUID          `json:"id"`
+	Name                  string             `json:"name"`
+	Description           string             `json:"description"`
+	Enabled               bool               `json:"enabled"`
+	DeletedAt             pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy             pgtype.UUID        `json:"created_by"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes       []string           `json:"allowed_job_types"`
+	RedirectUris          []string           `json:"redirect_uris"`
+	OauthScopes           []string           `json:"oauth_scopes"`
+	HasClientSecret       bool               `json:"has_client_secret"`
+	ClientSecretPrefix    pgtype.Text        `json:"client_secret_prefix"`
+	ClientSecretRotatedAt pgtype.Timestamptz `json:"client_secret_rotated_at"`
+	ActiveTokenCount      int64              `json:"active_token_count"`
 }
 
 // Every product, soft-deleted ones included (admin registry view), each with its count
@@ -595,6 +625,11 @@ func (q *Queries) ListProducts(ctx context.Context) ([]ListProductsRow, error) {
 			&i.CreatedAt,
 			&i.UpdatedAt,
 			&i.AllowedJobTypes,
+			&i.RedirectUris,
+			&i.OauthScopes,
+			&i.HasClientSecret,
+			&i.ClientSecretPrefix,
+			&i.ClientSecretRotatedAt,
 			&i.ActiveTokenCount,
 		); err != nil {
 			return nil, err
@@ -673,6 +708,105 @@ func (q *Queries) RevokeProductToken(ctx context.Context, arg RevokeProductToken
 	return result.RowsAffected(), nil
 }
 
+const rotateProductClientSecret = `-- name: RotateProductClientSecret :one
+UPDATE products
+   SET client_secret_hash = $1::bytea,
+       client_secret_prefix = $2::text,
+       client_secret_rotated_at = now(),
+       updated_at = now()
+ WHERE id = $3
+   AND deleted_at IS NULL
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at
+`
+
+type RotateProductClientSecretParams struct {
+	ClientSecretHash   []byte    `json:"client_secret_hash"`
+	ClientSecretPrefix string    `json:"client_secret_prefix"`
+	ID                 uuid.UUID `json:"id"`
+}
+
+// Admin write (PRD #1910 M1): replace the product's client secret with a new one, effective
+// immediately (the previous secret stops authenticating). Stores only the sha256 and the display
+// prefix; the plaintext exists only in the handler's response. Same live-product guard as
+// SetProductOAuthClient. The returned row carries client_secret_hash (products queries may use
+// RETURNING *); no DTO ever projects it.
+func (q *Queries) RotateProductClientSecret(ctx context.Context, arg RotateProductClientSecretParams) (Product, error) {
+	row := q.db.QueryRow(ctx, rotateProductClientSecret, arg.ClientSecretHash, arg.ClientSecretPrefix, arg.ID)
+	var i Product
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Enabled,
+		&i.DeletedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
+	)
+	return i, err
+}
+
+const setProductOAuthClient = `-- name: SetProductOAuthClient :one
+UPDATE products
+   SET redirect_uris = $1::text[],
+       oauth_scopes = $2::text[],
+       updated_at = now()
+ WHERE id = $3
+   AND deleted_at IS NULL
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at
+`
+
+type SetProductOAuthClientParams struct {
+	RedirectUris []string  `json:"redirect_uris"`
+	OauthScopes  []string  `json:"oauth_scopes"`
+	ID           uuid.UUID `json:"id"`
+}
+
+// Admin write (PRD #1910 M1): set a product's OAuth redirect URIs and allowed scopes. Both are
+// always written together (the handler validates the pair with oauthsrv), and clearing both
+// stops the product being a client; the secret is untouched. Guarded by deleted_at IS NULL like
+// UpdateProduct: no row for an unknown id (404) or a soft-deleted product (409, the handler
+// reads which). The CHECKs on redirect_uris and oauth_scopes back the handler's validation up.
+func (q *Queries) SetProductOAuthClient(ctx context.Context, arg SetProductOAuthClientParams) (Product, error) {
+	row := q.db.QueryRow(ctx, setProductOAuthClient, arg.RedirectUris, arg.OauthScopes, arg.ID)
+	var i Product
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Enabled,
+		&i.DeletedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
+	)
+	return i, err
+}
+
 const softDeleteProduct = `-- name: SoftDeleteProduct :execrows
 UPDATE products
    SET deleted_at = now(),
@@ -723,7 +857,7 @@ UPDATE products
        updated_at = now()
  WHERE id = $4
    AND deleted_at IS NULL
-RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at
+RETURNING id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at
 `
 
 type UpdateProductParams struct {
@@ -766,6 +900,11 @@ func (q *Queries) UpdateProduct(ctx context.Context, arg UpdateProductParams) (P
 		&i.SkillsAppliedSha,
 		&i.SkillsAppliedBy,
 		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
 	)
 	return i, err
 }

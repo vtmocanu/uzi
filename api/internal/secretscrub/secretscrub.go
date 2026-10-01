@@ -32,7 +32,9 @@ import "regexp"
 //     been live since 2026-08-08 and both lists previously missed it;
 //   - uziToken covers uzi's own Bearer credentials — uzw_ (worker join token), uzc_
 //     (user CLI token), uza_ (admin_ro CLI token) (PRD #64 Risk 14) and uzp_ (product
-//     token, PRD #1907).
+//     token, PRD #1907) and uzs_ (OAuth client secret, PRD #1910). The class letter r is
+//     reserved for uzr_ OAuth refresh tokens (PRD #1910 M3), scrubbed from the start so a
+//     token minted later is never briefly unscrubbed.
 //
 // The {16,} body on the anchored families avoids matching the short "uzc_a1b2" /
 // "ghp_a1b2" display prefixes, which are not secrets.
@@ -43,7 +45,7 @@ var (
 	gitlabPATPattern       = regexp.MustCompile(`gl(pat|oas|rt|cbt|ptt|soat|imt|agent|dt)-[A-Za-z0-9_-]{16,}`)
 	githubClassicPattern   = regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`)
 	githubFineGrainPattern = regexp.MustCompile(`github_pat_[A-Za-z0-9_]{16,}`)
-	uziTokenPattern        = regexp.MustCompile(`uz[capw]_[A-Za-z0-9_-]{16,}`)
+	uziTokenPattern        = regexp.MustCompile(`uz[caprsw]_[A-Za-z0-9_-]{16,}`)
 )
 
 // Scrub replaces every recognised secret family with a placeholder.

@@ -227,6 +227,11 @@ SELECT p.id,
        p.created_at,
        p.updated_at,
        p.allowed_job_types,
+       p.redirect_uris,
+       p.oauth_scopes,
+       (p.client_secret_hash IS NOT NULL)::boolean AS has_client_secret,
+       p.client_secret_prefix,
+       p.client_secret_rotated_at,
        (SELECT count(*)
           FROM product_tokens t
          WHERE t.product_id = p.id
@@ -293,3 +298,32 @@ UPDATE products
        updated_at = now()
  WHERE id = $1
    AND deleted_at IS NULL;
+
+-- name: SetProductOAuthClient :one
+-- Admin write (PRD #1910 M1): set a product's OAuth redirect URIs and allowed scopes. Both are
+-- always written together (the handler validates the pair with oauthsrv), and clearing both
+-- stops the product being a client; the secret is untouched. Guarded by deleted_at IS NULL like
+-- UpdateProduct: no row for an unknown id (404) or a soft-deleted product (409, the handler
+-- reads which). The CHECKs on redirect_uris and oauth_scopes back the handler's validation up.
+UPDATE products
+   SET redirect_uris = sqlc.arg(redirect_uris)::text[],
+       oauth_scopes = sqlc.arg(oauth_scopes)::text[],
+       updated_at = now()
+ WHERE id = sqlc.arg(id)
+   AND deleted_at IS NULL
+RETURNING *;
+
+-- name: RotateProductClientSecret :one
+-- Admin write (PRD #1910 M1): replace the product's client secret with a new one, effective
+-- immediately (the previous secret stops authenticating). Stores only the sha256 and the display
+-- prefix; the plaintext exists only in the handler's response. Same live-product guard as
+-- SetProductOAuthClient. The returned row carries client_secret_hash (products queries may use
+-- RETURNING *); no DTO ever projects it.
+UPDATE products
+   SET client_secret_hash = sqlc.arg(client_secret_hash)::bytea,
+       client_secret_prefix = sqlc.arg(client_secret_prefix)::text,
+       client_secret_rotated_at = now(),
+       updated_at = now()
+ WHERE id = sqlc.arg(id)
+   AND deleted_at IS NULL
+RETURNING *;

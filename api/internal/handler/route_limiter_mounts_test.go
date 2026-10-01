@@ -618,6 +618,8 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/admin/products/{id}/skills/apply", noLimiter},
 	{"POST", "/api/admin/products/{id}/skills/sync", noLimiter},
 	{"POST", "/api/admin/product-tokens/{id}/revoke", noLimiter},
+	// PRD #1910 M1: rotate a product's OAuth client secret — a cookie-only admin DB write → noLimiter.
+	{"POST", "/api/admin/products/{id}/oauth/secret", noLimiter},
 	// PRD #1184 M3: the admin "All users" FILE issue write — files a coordinate's newest open
 	// occurrence through the owner filer's forge path (claim-first → CreateIssue → settle). A
 	// forge WRITE, so it carries forgeLimiter.PerUserMiddleware like the owner
@@ -873,6 +875,8 @@ var wantRouteMounts = []routeMount{
 	{"PUT", "/api/admin/users/{id}/ci-autofix", noLimiter},
 	// PRD #1976 M1: allow one site list for a product — a cookie-only admin DB write → noLimiter.
 	{"PUT", "/api/admin/products/{id}/egress-profiles/{name}", noLimiter},
+	// PRD #1910 M1: set a product's OAuth redirect URIs and scopes — a cookie-only admin DB write → noLimiter.
+	{"PUT", "/api/admin/products/{id}/oauth", noLimiter},
 	{"PUT", "/api/admin/users/{id}/judge", noLimiter},
 	{"PUT", "/api/agent-templates/allocations", noLimiter},
 	{"PUT", "/api/agent-templates/{id}", noLimiter},

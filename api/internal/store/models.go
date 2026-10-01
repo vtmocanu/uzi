@@ -559,21 +559,26 @@ type PrDescriptionVersion struct {
 }
 
 type Product struct {
-	ID                uuid.UUID          `json:"id"`
-	Name              string             `json:"name"`
-	Description       string             `json:"description"`
-	Enabled           bool               `json:"enabled"`
-	DeletedAt         pgtype.Timestamptz `json:"deleted_at"`
-	CreatedBy         pgtype.UUID        `json:"created_by"`
-	CreatedAt         pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
-	AllowedJobTypes   []string           `json:"allowed_job_types"`
-	SkillsRepoUrl     string             `json:"skills_repo_url"`
-	SkillsRef         string             `json:"skills_ref"`
-	SkillsTokenSealed []byte             `json:"skills_token_sealed"`
-	SkillsAppliedSha  string             `json:"skills_applied_sha"`
-	SkillsAppliedBy   pgtype.UUID        `json:"skills_applied_by"`
-	SkillsAppliedAt   pgtype.Timestamptz `json:"skills_applied_at"`
+	ID                    uuid.UUID          `json:"id"`
+	Name                  string             `json:"name"`
+	Description           string             `json:"description"`
+	Enabled               bool               `json:"enabled"`
+	DeletedAt             pgtype.Timestamptz `json:"deleted_at"`
+	CreatedBy             pgtype.UUID        `json:"created_by"`
+	CreatedAt             pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt             pgtype.Timestamptz `json:"updated_at"`
+	AllowedJobTypes       []string           `json:"allowed_job_types"`
+	SkillsRepoUrl         string             `json:"skills_repo_url"`
+	SkillsRef             string             `json:"skills_ref"`
+	SkillsTokenSealed     []byte             `json:"skills_token_sealed"`
+	SkillsAppliedSha      string             `json:"skills_applied_sha"`
+	SkillsAppliedBy       pgtype.UUID        `json:"skills_applied_by"`
+	SkillsAppliedAt       pgtype.Timestamptz `json:"skills_applied_at"`
+	RedirectUris          []string           `json:"redirect_uris"`
+	OauthScopes           []string           `json:"oauth_scopes"`
+	ClientSecretHash      []byte             `json:"client_secret_hash"`
+	ClientSecretPrefix    pgtype.Text        `json:"client_secret_prefix"`
+	ClientSecretRotatedAt pgtype.Timestamptz `json:"client_secret_rotated_at"`
 }
 
 type ProductEgressProfile struct {

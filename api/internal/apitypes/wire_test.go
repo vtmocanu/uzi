@@ -942,7 +942,13 @@ func TestProductDTOTags(t *testing.T) {
 	assertTags(t, "ProductDTO", ProductDTO{},
 		"id", "name", "description", "enabled", "deleted_at", "created_at", "active_token_count",
 		// PRD #1908 D-C: the job types the product's tokens may create; never null on the wire.
-		"allowed_job_types")
+		"allowed_job_types",
+		// PRD #1910 D2: the OAuth client registration; never carries the secret or its hash.
+		"oauth_client")
+	assertTags(t, "ProductOAuthClientDTO", ProductOAuthClientDTO{},
+		"redirect_uris", "scopes", "has_secret", "secret_prefix", "rotated_at", "is_client")
+	assertTags(t, "RotateProductClientSecretResponse", RotateProductClientSecretResponse{},
+		"client_secret", "product")
 }
 
 // /api/v1 is the stable external contract (PRD #1907 D12): the whoami user carries

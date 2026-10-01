@@ -70,6 +70,9 @@ through `[0.52.0]`.)
 - **An ephemeral worker is now held idle for up to 2 hours after its run, so a same-repo follow-up reuses it ([#2006](https://github.com/vtmocanu/uzi/issues/2006)).**
   When an ephemeral worker finishes its run it keeps its warm clone and caches for a lease (`UZI_EPHEMERAL_LEASE`, chart `workers.ephemeralLease`, default 2h, maximum 2h, `0` restores the old tear-down-at-finish behaviour), and a later run from the same owner on the same repository and branch (a rework or follow-up) claims it instead of provisioning a new one. The lease ends early on a cordon, roll or restart, and the oldest leased worker is evicted if you hit the per-user ephemeral cap. `uzi worker list` shows `(leased, 1h12m left)` and the worker JSON carries `ephemeral_lease_expires_at`. The Workers page shows a `leased · <time> left` badge, and its hosted-worker quota count no longer includes ephemeral workers, matching the server.
 
+- **An admin can register a product as an OAuth client ([#1910](https://github.com/vtmocanu/uzi/issues/1910)).**
+  Each product card under Admin, Products gains an OAuth client section: set up to five exact-match redirect URIs (https, or http for 127.0.0.1 and [::1] with a port), pick the scopes the product may request, and create or rotate a `uzs_` client secret that is shown once and stored only as a hash. `uzi admin products` shows a CLIENT and SCOPES column and `--json` carries `oauth_client` without the secret. Registration only for now: the authorize and token endpoints follow in later milestones. See [Registering an OAuth client](docs/oauth-clients.md).
+
 ## [0.85.0] - 2026-09-26
 
 ### Added
