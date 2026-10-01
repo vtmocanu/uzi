@@ -1257,7 +1257,10 @@ export const mockRuns: Run[] = [
     forge_park_count: 0,
     forge_park_max: 0,
     claimed_at: minsAgo(515),
-    started_at: minsAgo(514),
+    // A resumed run: started_at was reset by a limit resume, first_started_at never is, so
+    // the duration displays read the whole run (44m), not just the last leg (10m).
+    first_started_at: minsAgo(514),
+    started_at: minsAgo(480),
     finished_at: minsAgo(470),
     created_at: minsAgo(520),
     updated_at: minsAgo(470),

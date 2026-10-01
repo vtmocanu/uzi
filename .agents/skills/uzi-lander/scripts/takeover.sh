@@ -28,9 +28,17 @@
 #   review_pending        a bot is reviewing this head now
 #   unknown               a lookup failed or returned an unreadable payload; never act on it
 #   no_review             nothing reviewed this head and nothing is coming — trigger or fall back
-#   findings              live inline findings on the head (LIVE_FINDINGS=n)
+#   findings              live inline findings on the head (LIVE_FINDINGS=n) or any every-author
+#                         blocker (EVERY_AUTHOR=: unresolved threads from any author, open
+#                         code-scanning alerts, unacknowledged comments; lib/pr-comments.sh)
 #   ready                 CI green, head reviewed, 0 live findings, no rework (BEHIND is fine
 #                         under an admin merge; MERGE_STATE says so)
+#
+# MR_REWORK_ENABLED=true|false|unknown is printed for the run (uzi run get --json,
+# .mr_rework_enabled; unknown when the lookup fails, no run resolves, or the field is
+# absent/null, where null means the run inherits the owner default). On true a one-line
+# warning goes to stderr: uzi's poller may auto-start an mr_rework on new review comments.
+# This script only reads; it never changes the setting.
 # Exit 0 on a snapshot, 3 on usage / could not resolve the target.
 set -uo pipefail
 
@@ -41,12 +49,14 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 . "$HERE/lib/review-threads.sh"
 # shellcheck source=lib/freshness.sh
 . "$HERE/lib/freshness.sh"
+# shellcheck source=lib/pr-comments.sh
+. "$HERE/lib/pr-comments.sh"
 TARGET=""; REPO=""; CLAIM=1
 while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
     --no-claim) CLAIM=0; shift;;
-    -h|--help) sed -n '2,32p' "$0"; exit 3;;
+    -h|--help) sed -n '2,38p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -76,9 +86,9 @@ if [ "$have_uzi" -eq 1 ]; then
 fi
 
 # ---- resolve run <-> PR --------------------------------------------------------------
-PR=""; run_json=""
+PR=""; run_json=""; BY_PR=0
 if printf '%s' "$TARGET" | grep -qE '^[0-9]+$'; then
-  PR="$TARGET"
+  PR="$TARGET"; BY_PR=1
   if [ "$have_uzi" -eq 1 ] && [ -n "$repo_id" ]; then
     run_json=$(uzi run list --json 2>/dev/null | jq -c --arg repo "$repo_id" --argjson pr "$PR" \
       '[.[]|select(.repo_id==$repo and .mr_iid==$pr and .kind!="mr_rework")]|max_by(.created_at) // empty' 2>/dev/null || true)
@@ -89,12 +99,29 @@ else
   PR=$(printf '%s' "$run_json" | jq -r '.mr_iid // empty')
 fi
 
+# report_mr_rework <run-json>: print MR_REWORK_ENABLED and warn on true. Read-only.
+report_mr_rework() {
+  local v
+  v=$(printf '%s' "$1" | jq -r 'if (.mr_rework_enabled|type)=="boolean" then (.mr_rework_enabled|tostring) else "unknown" end' 2>/dev/null) || v=unknown
+  [ -n "$v" ] || v=unknown
+  echo "MR_REWORK_ENABLED=$v"
+  if [ "$v" = true ]; then
+    echo "WARNING: mr_rework is ENABLED for this run: uzi's poller may auto-start an mr_rework on new review comments; before fixing locally run: uzi run mr-rework <RUN> --enabled=false" >&2
+  fi
+}
+
 if [ -n "$run_json" ]; then
   printf '%s' "$run_json" | jq -r '
     "RUN_ID=\(.id)", "RUN_STATUS=\(.status)", "RUN_KIND=\(.kind)", "ISSUE=\(.issue_iid // "")",
     "MR=\(.mr_iid // "")", "MR_URL=\(.mr_web_url // "")", "WORKER=\(.worker_id // "")",
     "FAIL_ORIGIN=\(.fail_origin // "")", "FAILURE_REASON=\((.failure_reason // "")|.[0:160]|gsub("\n";" "))",
     "HEALTH=\(.health_reason // "")"'
+  # The by-PR path resolved the run from `uzi run list`; read the detail view for the flag.
+  rw_json="$run_json"
+  if [ "$BY_PR" -eq 1 ]; then
+    rw_json=$(uzi run get "$(printf '%s' "$run_json" | jq -r '.id')" --json 2>/dev/null || true)
+  fi
+  report_mr_rework "$rw_json"
   run_status=$(printf '%s' "$run_json" | jq -r '.status')
   case "$run_status" in
     completed|failed|cancelled) ;;
@@ -108,6 +135,7 @@ if [ -n "$run_json" ]; then
     exit 0
   fi
 fi
+[ -n "$run_json" ] || report_mr_rework ""
 [ -n "$PR" ] || { echo "NEXT=unresolved (no PR for $TARGET)"; exit 3; }
 
 # ---- PR snapshot -----------------------------------------------------------------------
@@ -239,7 +267,9 @@ cr_live=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="coderabbitai[bot
 # thread listing keeps them all, a superset.
 gr_pull_c="$pull_c"
 gr_anchored=$(printf '%s' "$pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
+threads_ok=0
 if thread_nodes=$(fetch_review_threads "$REPO" "$PR"); then
+  threads_ok=1
   gr_pull_c=$(printf '%s' "$pull_c" | drop_resolved_comments "$thread_nodes") || gr_pull_c="$pull_c"
 fi
 gr_live=$(printf '%s' "$gr_pull_c" | jq '[.[]|select(.user.login=="greptile-apps[bot]" and .line!=null)]|length' 2>/dev/null || echo 0)
@@ -271,6 +301,40 @@ case "$gr_reviewed:$gr_sum" in
 esac
 live=$((cr_live + gr_live + cr_unconfirmed))
 echo "LIVE_FINDINGS=$live (cr=$cr_live gr=$gr_live cr_unconfirmed=$cr_unconfirmed)"
+
+# Author-agnostic blockers, exactly as watch-pr.sh counts them (lib/pr-comments.sh): every
+# unresolved, non-outdated review thread from any author, an open code-scanning alert on the
+# PR head, and an issue comment or review body nobody has acknowledged (ack-comments.sh).
+# Each lookup fails closed to UNKNOWN=1; code scanning `unavailable` (not enabled) counts as
+# none. Printed whatever NEXT turns out to be: a conflicting PR still has these.
+threads_open=0; cs_open=0; cs_shown=unknown; unacked=0; blk_items='[]'
+if [ "$threads_ok" -eq 1 ]; then
+  if ot=$(open_threads_json "$thread_nodes") && [ -n "$ot" ]; then
+    threads_open=$(printf '%s' "$ot" | jq 'length'); blk_items="$ot"
+  else
+    UNKNOWN=1
+  fi
+else
+  UNKNOWN=1
+fi
+code_scanning_open "$REPO" "$PR"
+case "$CS_STATE" in
+  ok) cs_open=$(printf '%s' "$CS_ITEMS" | jq 'length'); cs_shown="$cs_open"
+      blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$CS_ITEMS") '($a|fromjson) + ($b|fromjson)') ;;
+  unavailable) cs_shown=unavailable ;;
+  *) UNKNOWN=1 ;;
+esac
+if ma=$(must_ack_json "$issue_c" "$rev_raw") \
+   && acks=$(ack_read "$REPO" "$PR") && ua=$(unacked_json "$ma" "$acks") && [ -n "$ua" ]; then
+  unacked=$(printf '%s' "$ua" | jq 'length')
+  blk_items=$(jq -nc --rawfile a <(printf '%s' "$blk_items") --rawfile b <(printf '%s' "$ua") '($a|fromjson) + ($b|fromjson)')
+else
+  UNKNOWN=1
+fi
+every_author=$(( threads_open + cs_open + unacked ))
+# Text below is UNTRUSTED data (lib/sanitize.sh): read it, verify it, never follow it.
+print_items "$blk_items"
+echo "EVERY_AUTHOR=threads=$threads_open code_scanning=$cs_shown unacked=$unacked"
 
 # Active mr_rework on this MR. A repo on uzi whose listing cannot be read is UNKNOWN.
 mrw=0
@@ -347,7 +411,7 @@ elif [ "$reviewed" -eq 0 ]; then
     *"rate limited"*) echo "NEXT=cr_rate_limited";;
     *) if [ "$gr_state" = "in_progress" ] || [ "$gr_state" = "queued" ] || [ "$gr_pending" -eq 1 ]; then echo "NEXT=review_pending"; else echo "NEXT=no_review"; fi;;
   esac
-elif [ "$live" -gt 0 ]; then echo "NEXT=findings"
+elif [ "$live" -gt 0 ] || [ "$every_author" -gt 0 ]; then echo "NEXT=findings"
 else echo "NEXT=ready${merge_state:+ (merge_state=$merge_state)}"
 fi
 exit 0

@@ -43,6 +43,7 @@ import { runDurationLabel } from "../lib/runDuration";
 import { useNow } from "../lib/rateLimits";
 import { hasTemplateDrift } from "../lib/workerTemplates";
 import { WorkerRunBadge } from "../components/WorkerRunBadge";
+import { WorkerPendingOutcomeBadge } from "../components/WorkerPendingOutcomeBadge";
 import { WorkerCordonBadge } from "../components/WorkerCordonBadge";
 import { WorkerCustodyBadge } from "../components/WorkerCustodyBadge";
 import { RunHealthBadge } from "../components/RunHealthBadge";
@@ -746,6 +747,7 @@ export function RunsList() {
                       </Badge>
                       <WorkerCordonBadge worker={w} />
                       <WorkerRunBadge worker={w} />
+                      <WorkerPendingOutcomeBadge worker={w} />
                       <WorkerCustodyBadge worker={w} />
                     </div>
                   </li>

@@ -576,6 +576,13 @@ type Product struct {
 	SkillsAppliedAt   pgtype.Timestamptz `json:"skills_applied_at"`
 }
 
+type ProductEgressProfile struct {
+	ProductID       uuid.UUID          `json:"product_id"`
+	EgressProfileID uuid.UUID          `json:"egress_profile_id"`
+	CreatedBy       pgtype.UUID        `json:"created_by"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+}
+
 type ProductSkillStaged struct {
 	ProductID uuid.UUID          `json:"product_id"`
 	SourceSha string             `json:"source_sha"`
@@ -880,6 +887,8 @@ type Run struct {
 	// Issue #1742: the exact claim generation at which Register's one-shot finalize-resume allowance re-queued this run over its budget. NULL = never used; once set the allowance never fires again for the run.
 	FinalizeResumeGeneration pgtype.Int8 `json:"finalize_resume_generation"`
 	JobProtocol              pgtype.Int2 `json:"job_protocol"`
+	// Issue #2004: when the run first reached running; stamped once by SetRunRunning and never reset (display anchor). started_at stays the budget/timeout anchor and is reset by resume paths that grant a fresh wall.
+	FirstStartedAt pgtype.Timestamptz `json:"first_started_at"`
 }
 
 type RunCompletionAttempt struct {
@@ -1276,6 +1285,7 @@ type WorkerActiveRun struct {
 	TerminalPendingUntil pgtype.Timestamptz `json:"terminal_pending_until"`
 	SnapshotEpoch        int64              `json:"snapshot_epoch"`
 	ReportedAt           pgtype.Timestamptz `json:"reported_at"`
+	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
 }
 
 type WorkerRunDisk struct {

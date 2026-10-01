@@ -285,7 +285,8 @@ func TestV1JobsCreateLiveDB(t *testing.T) {
 		}{
 			{"unknown type", otherTok, `{"type":"translate","prompt":"p"}`, 422, "unknown_job_type"},
 			{"missing type", otherTok, `{"prompt":"p"}`, 422, "unknown_job_type"},
-			{"egress profile", otherTok, `{"type":"research","prompt":"p","egress_profile":"open"}`, 422, "not_supported"},
+			{"unknown egress profile", otherTok, `{"type":"research","prompt":"p","egress_profile":"open"}`, 404, "unknown_egress_profile"},
+			{"empty egress profile", otherTok, `{"type":"research","prompt":"p","egress_profile":""}`, 422, "invalid_request"},
 			{"missing prompt", otherTok, `{"type":"research"}`, 422, "invalid_request"},
 			{"bad input name", otherTok, `{"type":"research","prompt":"p","inputs":[{"name":"../x","content":"c"}]}`, 422, "invalid_request"},
 			{"duplicate input name", otherTok, `{"type":"research","prompt":"p","inputs":[{"name":"a","content":"c"},{"name":"a","content":"d"}]}`, 422, "invalid_request"},

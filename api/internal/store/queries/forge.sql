@@ -512,7 +512,8 @@ SELECT DISTINCT ON (r.issue_iid)
        -- null unless running & not chat/judge/interactive.
        -- PRD #1189: budget_extension_seconds is the extra term RunDeadline adds so the card's
        -- deadline_at reflects a granted extension.
-       r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       -- Issue #2004: first_started_at + finished_at feed the card's whole-run duration.
+       r.started_at, r.first_started_at, r.finished_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.budget_extension_seconds,
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.
@@ -543,7 +544,8 @@ SELECT r.id, r.user_id, r.status, r.mr_iid, r.mr_web_url, r.mr_state, r.failure_
        -- PRD #1170: the near-timeout inputs the card's deadline_at needs (RunDeadline).
        -- PRD #1189: budget_extension_seconds is the extra term RunDeadline adds so the card's
        -- deadline_at reflects a granted extension.
-       r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
+       -- Issue #2004: first_started_at + finished_at feed the card's whole-run duration.
+       r.started_at, r.first_started_at, r.finished_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
        r.budget_extension_seconds,
        -- PRD #1497 M1: budget_finalize_seconds is the third RunDeadline term; hold_reason lets the
        -- board badge render a wall park ('budget_exhausted') as needing the owner.

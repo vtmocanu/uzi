@@ -52,6 +52,7 @@ import type {
   Product,
   ProductPatch,
   ProductSkills,
+  ProductEgressProfile,
   ProductToken,
   ProductTokenMint,
   ProductTokenExpiry,
@@ -1867,6 +1868,18 @@ const realApi = {
     request<ProductSkills>("POST", `/admin/products/${id}/skills/apply`, {
       expected_sha: expectedSha,
     }),
+  // PRD #1976 M2: the site lists a product's tokens may name on job create. PUT allows one
+  // (the response is the whole list); DELETE removes it (204) and only affects jobs created
+  // afterwards. A deleted product lists but answers 409 to a write.
+  adminListProductEgressProfiles: (id: string) =>
+    request<{ egress_profiles: ProductEgressProfile[] }>("GET", `/admin/products/${id}/egress-profiles`),
+  adminAllowProductEgressProfile: (id: string, name: string) =>
+    request<{ egress_profiles: ProductEgressProfile[] }>(
+      "PUT",
+      `/admin/products/${id}/egress-profiles/${encodeURIComponent(name)}`,
+    ),
+  adminDisallowProductEgressProfile: (id: string, name: string) =>
+    request<null>("DELETE", `/admin/products/${id}/egress-profiles/${encodeURIComponent(name)}`),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
   // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.

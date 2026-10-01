@@ -38,8 +38,19 @@ fi
 case "$MODE" in pushrace*) . "$RACE_FIXTURE"; shift; race_api "$@"; exit $? ;; esac
 case "$*" in
   *"/commits/$HEAD/status"*) echo '{"statuses":[]}' ;;
+  *'/code-scanning/alerts'*)
+    # CS_MODE: unset = none; alert = one open alert; unavailable = 404 no analysis; broken = 502.
+    case "${CS_MODE:-}" in
+      alert) echo '[{"number":55,"tool":{"name":"CodeQL"},"rule":{"id":"js/bad-code-sanitization","severity":"warning"},"most_recent_instance":{"location":{"path":"agent/q.ts","start_line":9},"message":{"text":"Code construction depends on an improperly sanitized value."}}}]' ;;
+      unavailable) echo '{"message":"no analysis found","status":"404"}'; echo 'gh: no analysis found (HTTP 404)' >&2; exit 1 ;;
+      broken) echo 'HTTP 502: Bad Gateway' >&2; exit 1 ;;
+      *) echo '[]' ;;
+    esac ;;
   *'graphql'*)
-    case "$MODE" in prior_resolved|prior_pending_resolved) ;; *) echo "unexpected gh api: $*" >&2; exit 1 ;; esac
+    case "$MODE" in
+      prior_resolved|prior_pending_resolved) ;;
+      *) echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[],"pageInfo":{"hasNextPage":false}}}}}}'; exit 0 ;;
+    esac
     echo '{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[{"isResolved":true,"isOutdated":false,"comments":{"nodes":[{"databaseId":991,"author":{"login":"greptile-apps"},"body":"P1 finding","path":"x.go","line":8,"originalLine":8}],"pageInfo":{"hasNextPage":false}}}],"pageInfo":{"hasNextPage":false}}}}}}' ;;
   *'/pulls/42/reviews'*)
     case "$MODE" in
@@ -85,11 +96,13 @@ STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/uzi"
 export PATH="$WORK/bin:$PATH"
 export RACE_FIXTURE="$HERE/lib/greptile-race.fixture.sh"
+export UZI_LANDER_STATE_DIR="$WORK/state"
 
 # snap MODE — one snapshot; never claims (that writes shared state). A snapshot always exits 0.
 snap() {
   MODE="$1"; export MODE
-  bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/$1.out" 2>&1 || fail "$1: takeover.sh exited $?: $(cat "$WORK/$1.out")"
+  local out="${2:-$1}"
+  bash "$SCRIPT" 42 --repo test/repo --no-claim > "$WORK/$out.out" 2>&1 || fail "$out: takeover.sh exited $?: $(cat "$WORK/$out.out")"
 }
 has() { grep -qF -- "$2" "$WORK/$1.out" || fail "$1: missing '$2': $(cat "$WORK/$1.out")"; }
 hasnt() { if grep -qF -- "$2" "$WORK/$1.out"; then fail "$1: unexpected '$2': $(cat "$WORK/$1.out")"; fi; }
@@ -226,5 +239,33 @@ snap head_clean_computing
 has head_clean_computing 'NEXT=unknown'
 hasnt head_clean_computing 'NEXT=conflict'
 unset MERGEABLE MERGE_STATE CHECKS_NONE
+
+# ---- every-author blockers (lib/pr-comments.sh), as watch-pr.sh counts them ---------------
+# PR #2029: an open code-scanning alert on a CONFLICTING PR was invisible to the snapshot.
+export CS_MODE=alert MERGEABLE=CONFLICTING MERGE_STATE=DIRTY CHECKS_NONE=1
+snap head_clean head_clean_ea_conflict
+has head_clean_ea_conflict 'EVERY_AUTHOR=threads=0 code_scanning=1 unacked=0'
+has head_clean_ea_conflict '[alert a55] author=CodeQL at=agent/q.ts:9 | js/bad-code-sanitization'
+has head_clean_ea_conflict 'NEXT=conflict'
+unset MERGEABLE MERGE_STATE CHECKS_NONE
+# On an otherwise ready PR the alert makes it findings, never ready.
+snap head_clean head_clean_ea_alert
+has head_clean_ea_alert 'LIVE_FINDINGS=0 (cr=0 gr=0 '
+has head_clean_ea_alert 'EVERY_AUTHOR=threads=0 code_scanning=1 unacked=0'
+has head_clean_ea_alert 'NEXT=findings'
+hasnt head_clean_ea_alert 'NEXT=ready'
+# Unreadable code scanning (5xx) is unknown, never ready.
+export CS_MODE=broken
+snap head_clean head_clean_ea_broken
+has head_clean_ea_broken 'UNKNOWN=1'
+has head_clean_ea_broken 'code_scanning=unknown'
+has head_clean_ea_broken 'NEXT=unknown'
+# Code scanning not enabled counts as none.
+export CS_MODE=unavailable
+snap head_clean head_clean_ea_unavail
+has head_clean_ea_unavail 'EVERY_AUTHOR=threads=0 code_scanning=unavailable unacked=0'
+has head_clean_ea_unavail 'UNKNOWN=0'
+has head_clean_ea_unavail 'NEXT=ready'
+unset CS_MODE
 
 echo "PASS takeover: Greptile liveness agrees with watch-pr and pr-findings, including a run on an older commit; a conflicting PR is NEXT=conflict"

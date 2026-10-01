@@ -72,6 +72,8 @@ type FakeClient struct {
 	DownloadName  string
 	DownloadIDs   []string
 	ProductSkills map[string]apitypes.ProductSkillsDTO
+	// ProductEgress drives AdminProductEgressProfiles (PRD #1976), keyed by product id.
+	ProductEgress map[string][]ProductEgressProfile
 	AdminUsageV   apitypes.AdminUsageDTO
 	RateLimits    []apitypes.AdminRateLimitRowDTO
 	// CodexRateLimits drives AdminCodexRateLimits (PRD #1209 M3): the factory-wide

@@ -35,13 +35,14 @@ import (
 //	401 (no reason)              RequireV1Caller, one body whatever the cause
 //	403 insufficient_scope       RequireScope
 //	403 job_type_not_allowed     a product token whose product does not allow the type
+//	403 egress_profile_not_allowed  a product token naming a site list its product is not allowed
+//	404 unknown_egress_profile   egress_profile names no site list
 //	404 not_found                no such job, another user's job, another product's job, or a
 //	                             malformed id; the four are indistinguishable by design
 //	409 job_terminal             cancel of a finished job
 //	413 payload_too_large        create body over v1JobCreateMaxBodyBytes
 //	422 invalid_request          malformed or invalid body or query (the message names the field)
 //	422 unknown_job_type         type is not a known job type
-//	422 not_supported            egress_profile (no egress control exists yet)
 //	422 no_model_credential      the user has no usable Anthropic credential
 //	422 file_unavailable         an input_file_ids entry cannot be attached (unknown, another
 //	                             owner's or product's, already attached, expired, or listed twice)
@@ -54,7 +55,8 @@ const (
 	v1ReasonNotFound         = "not_found"
 	v1ReasonInvalidRequest   = "invalid_request"
 	v1ReasonUnknownJobType   = "unknown_job_type"
-	v1ReasonNotSupported     = "not_supported"
+	v1ReasonProfileUnknown   = "unknown_egress_profile"
+	v1ReasonProfileDenied    = "egress_profile_not_allowed"
 	v1ReasonNoModelAccount   = "no_model_credential"
 	v1ReasonTypeNotAllowed   = "job_type_not_allowed"
 	v1ReasonOverCap          = "over_cap"
@@ -111,8 +113,10 @@ func writeV1JobError(w http.ResponseWriter, op string, err error) {
 		httpx.ErrorReason(w, http.StatusUnprocessableEntity, "the request is invalid", v1ReasonInvalidRequest)
 	case errors.Is(err, workersvc.ErrJobTypeUnknown):
 		httpx.ErrorReason(w, http.StatusUnprocessableEntity, "unknown job type", v1ReasonUnknownJobType)
-	case errors.Is(err, workersvc.ErrJobNotSupported):
-		httpx.ErrorReason(w, http.StatusUnprocessableEntity, "egress_profile is not supported yet", v1ReasonNotSupported)
+	case errors.Is(err, workersvc.ErrJobProfileNotFound):
+		httpx.ErrorReason(w, http.StatusNotFound, "no such egress profile", v1ReasonProfileUnknown)
+	case errors.Is(err, workersvc.ErrJobProfileNotAllowed):
+		httpx.ErrorReason(w, http.StatusForbidden, "this token may not use this egress profile", v1ReasonProfileDenied)
 	case workersvc.IsNoModelCredential(err):
 		httpx.ErrorReason(w, http.StatusUnprocessableEntity, "the account has no usable model credential; add an Anthropic credential in uzi", v1ReasonNoModelAccount)
 	case errors.Is(err, workersvc.ErrJobTypeNotAllowed):
@@ -245,7 +249,13 @@ func (h *Handler) V1JobCreate(w http.ResponseWriter, r *http.Request) {
 		Prompt:           req.Prompt,
 		RequestedByLabel: req.RequestedByLabel,
 		WallSeconds:      req.WallSeconds,
-		EgressProfile:    req.EgressProfile != nil,
+	}
+	if req.EgressProfile != nil {
+		if *req.EgressProfile == "" {
+			httpx.ErrorReason(w, http.StatusUnprocessableEntity, "egress_profile must not be empty; omit it for an unbound job", v1ReasonInvalidRequest)
+			return
+		}
+		params.EgressProfile = *req.EgressProfile
 	}
 	if req.Title != nil {
 		params.Title = *req.Title

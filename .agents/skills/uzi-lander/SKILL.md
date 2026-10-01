@@ -121,6 +121,10 @@ this lander's second pair of eyes.
 S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<state>
 ```
 
+`MR_REWORK_ENABLED=true|false|unknown` reports the run's setting. On `true`, or `unknown` when
+you will fix locally, run `uzi run mr-rework RUN --enabled=false` first (the script never
+changes it); trust it over a handover's claim.
+
 `NEXT` is the branch point:
 
 | NEXT | Do |
@@ -128,14 +132,14 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
 | `unknown` | a lookup failed or returned garbage: re-run the snapshot; never act on it |
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
-| `migration_collision`, `conflict` | step 5 |
+| `migration_collision`, `conflict` | step 5; the `EVERY_AUTHOR=` line and its rows (threads, code-scanning alerts, unacked comments) print whatever `NEXT` is, so read them first |
 | `ci_red` | read the failing job; fix locally (step 4) or classify flake |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_pending`, `review_pending` | step 2 |
 | `cr_rate_limited` | step 2, choose the review requirement |
 | `no_review` | step 2, choose the review requirement |
-| `findings` | step 4 |
+| `findings` | step 4 (live bot findings or any `EVERY_AUTHOR` blocker) |
 | `ready` | step 6 |
 | `merged` | step 7 |
 
@@ -147,6 +151,9 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
    `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
+   `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
+   a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
+   trace tail); do not assume dead or lost, change nothing until you know, then re-arm.
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
    surface it, answer with `uzi run answer` if you can (a completion question about a milestone
    the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate
@@ -308,7 +315,10 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    A conflict on `CHANGELOG.md` alone is auto-resolved as a union (`changelog-union.sh`),
    unless a bullet appears on both sides of a hunk (a shared `### X` under `[Unreleased]` is
    fine), a hunk holds a `## ` heading, or a side rewords a line: then it refuses and the
-   stop is exit 5. Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
+   stop is exit 5. When the base cut a release that folded `[Unreleased]` (the fold is proven from the
+   three index stages), it instead keeps the base and inserts only the branch's new bullet blocks under
+   their `###` headings; an edited or deleted ancestor bullet, an unproven fold or a duplicate refuses.
+   Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
    Union and collapse keep every existing blank line; only their own joins follow `[Unreleased]`'s convention.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git -c merge.conflictStyle=diff3 rebase --continue` (a later
@@ -330,6 +340,8 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    them; `--allow-changelog-removals` only for a deliberate reword. Exit 10 = a uzi-owned
    branch changes workflow files: split the edit out (*Always yours*);
    `--allow-workflow-edit` only when no uzi push to the branch can follow.
+   Exit 11 = the branch's new `CHANGELOG.md` bullets are misplaced (a conflict-free rebase filed them
+   under a released section after a fold) or missing after the rebase: restore under `[Unreleased]`, `--skip-rebase`.
    A push re-enters the chosen review lane in step 2. Trail `rebase+renumber → pushed`.
    Say what you resolved in the merge note; do not ask first.
 6. **Merge.** When the readiness poll says ready and the *Always yours* checks below have
@@ -361,9 +373,23 @@ S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<
    (`git worktree list`, then `git worktree remove` / `git branch -D`), purge the completed
    trail with `S/claims.sh release '#PR' --purge`, then run
    `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
-   sessions), and hand any still-open item on. A run's off-task findings ("a finding was
-   filed" in its plan or log) are uzi incidental findings, not forge issues: list them with
-   `uzi findings list --run RUN --bucket all` before reporting them anywhere.
+   sessions), and hand any still-open item on.
+
+   **The run's follow-up issue.** A run's findings (off-task bugs, and review notes the lead
+   deferred) are uzi incidental findings, not forge issues. After the merge, list the ones
+   still to triage: `uzi findings list --run RUN --bucket to_file`. None: nothing to do.
+   - Verify each against the merged code. `uzi findings resolve ID` what the merge fixed;
+     `uzi findings dismiss ID --reason not-an-issue` a false positive, `--reason wont-do`
+     valid work deliberately declined.
+   - The rest becomes one issue. Get the buddy's `APPROVE` of its membership and its exact
+     title and body. `uzi findings file ID ID...` files the server-generated text (one id
+     files alone): preview it in the Findings page's file dialog (select the run's rows),
+     which is also where to edit it before filing.
+   - Filing is the human gate: file only with the user's go-ahead, given now or earlier in
+     the session for this follow-up. The buddy's approval never substitutes for it.
+   - A set over the grouped-filing limit (50) goes to the user for a decision; never split or
+     truncate it silently.
+   - Label the issue `reviewed` and name it in the trail.
 
 ## Always yours, whichever review lane applies
 

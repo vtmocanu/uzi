@@ -208,16 +208,19 @@ var (
 // of the web's runDurationLabel. AGE means different things per state, so the anchor is
 // chosen by status (Decision 2), not by a single "created" reading:
 //
-//   - running   → time since StartedAt (when the agent began), or CreatedAt if unstamped.
+//   - running   → time since FirstStartedAt (when the run FIRST reached running, never reset),
+//     else StartedAt (the current budget leg; what an older server sends), else CreatedAt.
 //   - claimed   → time since ClaimedAt (when a worker took it), or CreatedAt if unstamped.
 //   - queued    → time since CreatedAt (how long it has waited to be claimed).
 //   - awaiting_approval / awaiting_input / awaiting_followup / limit_wait / pool_wait /
 //     recovery_wait → time since the run entered that status (statusEnteredAt:
 //     StatusSince, else UpdatedAt from an older server), i.e. how long it has been
 //     parked/held in that waiting state. UpdatedAt alone drifts on any row write (#1727).
-//   - completed / failed / cancelled → the STATIC span FinishedAt−StartedAt, how long it
-//     actually ran, independent of now. A terminal run with no StartedAt (cancelled or
-//     failed before it ever started) never ran, so it renders "-".
+//   - completed / failed / cancelled → the STATIC span FinishedAt−(FirstStartedAt, else
+//     StartedAt), how long the run spanned, first start to finish (parks
+//     included), independent of now. StartedAt alone resets on
+//     limit/recovery/pool resumes and would show only the last leg (#2004). A terminal run
+//     with neither (cancelled or failed before it ever started) never ran, so it renders "-".
 //   - any other/unknown status → "-".
 //
 // The live (non-terminal) buckets pass now.Sub(anchor) through formatUptimeDuration, which
@@ -228,9 +231,12 @@ func runAgeCell(r apitypes.RunDTO, now time.Time) string {
 	var anchor *time.Time
 	switch r.Status {
 	case "running":
-		if r.StartedAt != nil {
+		switch {
+		case r.FirstStartedAt != nil:
+			anchor = r.FirstStartedAt
+		case r.StartedAt != nil:
 			anchor = r.StartedAt
-		} else {
+		default:
 			anchor = &r.CreatedAt
 		}
 	case "claimed":
@@ -247,10 +253,14 @@ func runAgeCell(r apitypes.RunDTO, now time.Time) string {
 	case "completed", "failed", "cancelled":
 		// A static ran-span, not a live age: only meaningful when the run both started
 		// and finished. Missing either end (never started) → "-".
-		if r.StartedAt == nil || r.FinishedAt == nil {
+		start := r.FirstStartedAt
+		if start == nil {
+			start = r.StartedAt
+		}
+		if start == nil || r.FinishedAt == nil {
 			return "-"
 		}
-		return formatUptimeDuration(r.FinishedAt.Sub(*r.StartedAt))
+		return formatUptimeDuration(r.FinishedAt.Sub(*start))
 	default:
 		return "-"
 	}

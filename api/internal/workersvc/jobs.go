@@ -35,9 +35,10 @@ import (
 //
 //	ErrJobInvalid          422 invalid_request (JobInvalidError names the field)
 //	ErrJobTypeUnknown      422 unknown_job_type
-//	ErrJobNotSupported     422 not_supported
+//	ErrJobProfileNotFound  404 unknown_egress_profile
 //	IsNoModelCredential    422 no_model_credential
 //	ErrJobTypeNotAllowed   403 job_type_not_allowed
+//	ErrJobProfileNotAllowed 403 egress_profile_not_allowed
 //	ErrJobOverCap          429 over_cap
 //	ErrJobNotFound         404 not_found
 //	ErrJobTerminal         409 job_terminal
@@ -47,11 +48,16 @@ import (
 var (
 	ErrJobInvalid        = errors.New("job request is invalid")
 	ErrJobTypeUnknown    = errors.New("unknown job type")
-	ErrJobNotSupported   = errors.New("job option is not supported")
 	ErrJobTypeNotAllowed = errors.New("this product token may not create jobs of this type")
-	ErrJobOverCap        = errors.New("too many active jobs")
-	ErrJobNotFound       = errors.New("job not found")
-	ErrJobTerminal       = errors.New("job is already finished")
+	// ErrJobProfileNotFound: the named egress profile (site list) does not exist (PRD #1976).
+	ErrJobProfileNotFound = errors.New("egress profile not found")
+	// ErrJobProfileNotAllowed: a product-token caller named a site list its product is not allowed
+	// to use (no allowance row, or the product is disabled or deleted). A user token is never
+	// refused with this.
+	ErrJobProfileNotAllowed = errors.New("this product token may not use this egress profile")
+	ErrJobOverCap           = errors.New("too many active jobs")
+	ErrJobNotFound          = errors.New("job not found")
+	ErrJobTerminal          = errors.New("job is already finished")
 	// ErrJobFileUnavailable: an input file id cannot be attached: it is unknown, another owner's,
 	// another product's, already attached, expired, not an input, or listed twice. The causes read
 	// the same by design (422 file_unavailable).
@@ -126,9 +132,11 @@ type CreateJobParams struct {
 	// WallSeconds is the optional wall-clock limit; nil uses the instance default. Values above
 	// the 8h ceiling are clamped to it.
 	WallSeconds *int
-	// EgressProfile is a presence flag: a request that names an egress profile is refused with
-	// ErrJobNotSupported (no egress control exists yet).
-	EgressProfile bool
+	// EgressProfile is the name of the site list (egress profile) the job is bound to; empty means
+	// an unbound job. A named profile must exist (ErrJobProfileNotFound) and, for a product-token
+	// caller, be allowed for the caller's product (ErrJobProfileNotAllowed); a user-token caller may
+	// name any existing profile. A bound job runs on the isolated lane (PRD #1976).
+	EgressProfile string
 }
 
 // JobView is the public projection of a job run. Status is the public vocabulary
@@ -356,9 +364,6 @@ var errJobNoTransaction = errors.New("workersvc: job create needs a transaction 
 // Codex), the per-user advisory lock, the active-job cap, the product allow-list, the run INSERT,
 // its inputs and its origin all commit in ONE transaction, so the cap cannot be raced past.
 func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView, error) {
-	if p.EgressProfile {
-		return JobView{}, fmt.Errorf("%w: egress_profile", ErrJobNotSupported)
-	}
 	if !knownJobType(p.JobType) {
 		return JobView{}, ErrJobTypeUnknown
 	}
@@ -409,6 +414,31 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 				return store.Run{}, ErrJobTypeNotAllowed
 			}
 		}
+		// PRD #1976: the site-list decision, after the job-type policy and before anything is
+		// created. Empty = unbound (the unchanged path). A user token may name any existing list; a
+		// product token only a list its product is allowed (fail closed: no row = refused).
+		var profileID pgtype.UUID
+		if p.EgressProfile != "" {
+			prof, perr := qq.GetEgressProfileByName(ctx, p.EgressProfile)
+			if perr != nil {
+				if errors.Is(perr, pgx.ErrNoRows) {
+					return store.Run{}, ErrJobProfileNotFound
+				}
+				return store.Run{}, perr
+			}
+			if p.Caller.ProductID != nil {
+				ok, aerr := qq.ProductEgressProfileAllowed(ctx, store.ProductEgressProfileAllowedParams{
+					ProductID: *p.Caller.ProductID, EgressProfileID: prof.ID,
+				})
+				if aerr != nil {
+					return store.Run{}, aerr
+				}
+				if !ok {
+					return store.Run{}, ErrJobProfileNotAllowed
+				}
+			}
+			profileID = pgtype.UUID{Bytes: prof.ID, Valid: true}
+		}
 		if err := qq.LockJobCreate(ctx, p.Caller.UserID); err != nil {
 			return store.Run{}, err
 		}
@@ -439,7 +469,8 @@ func (s *Service) CreateJobRun(ctx context.Context, p CreateJobParams) (JobView,
 			BudgetWallSeconds: v.wall,
 			Harness:           string(resolved.Harness),
 			// The rollout stamp: only a worker advertising capability.JobFilesV1 may claim this job.
-			JobProtocol: pgtype.Int2{Int16: capability.JobProtocolFiles, Valid: true},
+			JobProtocol:     pgtype.Int2{Int16: capability.JobProtocolFiles, Valid: true},
+			EgressProfileID: profileID,
 		})
 		if err != nil {
 			return store.Run{}, err

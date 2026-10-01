@@ -3,10 +3,32 @@ package uzicli
 import (
 	"context"
 	"net/url"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/egressprofile"
 )
+
+// ProductEgressProfile is one site list a product is allowed to name on job create (PRD #1976):
+// the element of GET /api/admin/products/{id}/egress-profiles. The strings are server-supplied and
+// untrusted at the render boundary.
+type ProductEgressProfile struct {
+	Name        string    `json:"name"`
+	Description string    `json:"description,omitempty"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// AdminProductEgressProfiles reads a product's allowed site lists, ordered by name. Read-only; an
+// admin read token works (the write routes are cookie-only).
+func (c *HTTPClient) AdminProductEgressProfiles(ctx context.Context, productID string) ([]ProductEgressProfile, error) {
+	var env struct {
+		EgressProfiles []ProductEgressProfile `json:"egress_profiles"`
+	}
+	if err := c.get(ctx, "/api/admin/products/"+url.PathEscape(productID)+"/egress-profiles", &env); err != nil {
+		return nil, err
+	}
+	return env.EgressProfiles, nil
+}
 
 // client_admin.go holds the admin verbs (uzi admin) of the
 // Client/HTTPClient split out of client.go (PRD #1017).

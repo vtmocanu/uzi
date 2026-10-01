@@ -66,6 +66,18 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
    cross-issue blocker** (the target depends on another run's code landing first, or a
    sharp same-file overlap). Independent issues parallelize fine — do not gate on ordinary
    parallelism; a file conflict that slips through is resolved at merge.
+
+   **Scope gate (PRD issues).** Before creating the run, apply `/prd-create`'s scope gate
+   (Step 1.2) to the issue's `prds/` file, as `/prd-start` does. A PRD written before that
+   gate existed is the usual case.
+   - **A milestone needing an unfinished PRD is a hard stop**: propose moving it or redrawing
+     the boundary; do not dispatch.
+   - **A scope-review alarm** (more than one independently valuable outcome, or an expected
+     large PR): take a concrete split (child outcomes, order, blockers) to the user as one
+     yes/no, with the buddy's view, and do not dispatch that issue meanwhile. For these
+     alarms only, if no split yields independently valuable pieces, record the reason in the
+     PRD's Decision Log, commit and push that PRD-only edit to `main` (as `/prd-create`
+     commits a PRD), and continue once the push lands: the run clones the remote.
 2. **Decide MR-rework, then create gated** (no `--plan-file`):
 
    ```
@@ -126,6 +138,10 @@ re-invokes you when it exits:
 <this skill's directory>/scripts/watch-run.sh RUN               # stops at gate/park/terminal
 <this skill's directory>/scripts/watch-run.sh RUN completed,failed,cancelled 60   # to the end only
 ```
+
+It also exits 4 with `STOP=needs_attention` plus evidence when a non-terminal run keeps a
+non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
+consecutive polls; `0` disables. It means investigate, not dead.
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
@@ -330,7 +346,9 @@ and namespace from your own kubeconfig; they are deployment-specific, do not har
    safe.directory=CLONE -C CLONE bundle create /tmp/r.bundle BRANCH --not
    origin/main`. `backup-runs.sh` emits a `BARE` capture automatically when the current
    worker has no clone (cold-reassignment) or the clone is gone. Such a capture preserves
-   committed checkpoints only and states that uncommitted WIP is unavailable. By hand, use:
+   committed checkpoints only and states that uncommitted WIP is unavailable; for a live run its
+   log line ends `attempt retired (...)` only on attempt-ledger proof, else `attempt state
+   unknown` (the backup is kept either way). By hand, use:
    `git --git-dir=BARE bundle create /tmp/r.bundle
    refs/uzi-runner/agent/issue-N ^MERGEBASE` (`MERGEBASE` = `git --git-dir=BARE merge-base
    refs/uzi-runner/agent/issue-N refs/remotes/origin/main`). Then `kubectl cp` it out.

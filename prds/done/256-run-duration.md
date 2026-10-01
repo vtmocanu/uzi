@@ -168,6 +168,10 @@ Crucially this needs **no board-specific code**: the same `runDurationLabel` fed
 "ran 42m" on closed board cards is later wanted, the follow-up is widening `latestRunDTO`
 + `ListLatestRunsForRepoRow` + web `LatestRun` (+ `board_latestrun_test.go`).
 
+> **Superseded by #2004 (owner-approved, 2026-10-01).** The board projection now carries
+> `first_started_at` and `finished_at`, so a running card counts from the run's first start and a
+> terminal card shows `ran <elapsed>`; only an older api without those keys still degrades as above.
+
 ## Milestones
 
 **Phase 1 — parallel (separate files/modules, no shared edits):**

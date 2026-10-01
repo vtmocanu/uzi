@@ -241,6 +241,62 @@ describe("runDurationLabel", () => {
     expect(runDurationLabel(board, NOW)).toBe("running 12m");
   });
 
+  it("terminal run renders ran from first_started_at, not the reset started_at (#2004)", () => {
+    // A resumed run: started_at was reset to the last leg (1h before finish); the run
+    // really started 18h before finish.
+    expect(
+      runDurationLabel(
+        {
+          status: "completed",
+          created_at: isoBefore(1100),
+          updated_at: isoBefore(1),
+          first_started_at: isoBefore(1080),
+          started_at: isoBefore(61),
+          finished_at: isoBefore(1),
+        },
+        NOW,
+      ),
+    ).toBe("ran 17h 59m");
+  });
+
+  it("running token anchors on first_started_at (#2004)", () => {
+    expect(
+      runDurationLabel(
+        {
+          status: "running",
+          created_at: isoBefore(500),
+          updated_at: isoBefore(1),
+          first_started_at: isoBefore(300),
+          started_at: isoBefore(10),
+        },
+        NOW,
+      ),
+    ).toBe("running 5h 0m");
+  });
+
+  it("falls back to started_at when first_started_at is absent or null (#2004)", () => {
+    const base = {
+      status: "completed",
+      created_at: isoBefore(100),
+      updated_at: isoBefore(1),
+      started_at: isoBefore(90),
+      finished_at: isoBefore(30),
+    };
+    expect(runDurationLabel(base, NOW)).toBe("ran 1h 0m");
+    expect(runDurationLabel({ ...base, first_started_at: null }, NOW)).toBe("ran 1h 0m");
+  });
+
+  it("board-shaped LatestRun with first_started_at and finished_at renders ran (#2004)", () => {
+    const card = {
+      status: "completed",
+      created_at: isoBefore(200),
+      updated_at: isoBefore(5),
+      first_started_at: isoBefore(150),
+      finished_at: isoBefore(30),
+    };
+    expect(runDurationLabel(card, NOW)).toBe("ran 2h 0m");
+  });
+
   it("type-checks against both Run and LatestRun (compile-time assertion)", () => {
     // These assignments only need to COMPILE; the runtime body is trivial. They pin
     // Decision 6: the optional-and-nullable fields accept Run (string | null) and

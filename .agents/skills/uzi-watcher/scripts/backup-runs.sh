@@ -36,6 +36,9 @@
 #   issue-N.log-tail.ndjson   last 80 transcript messages
 # A clone capture fully reconstructs the working tree. A bare-ref fallback preserves
 # committed checkpoints only and logs BARE loudly because uncommitted WIP is unavailable.
+# For a LIVE (non-failed) run the BARE line ends with "attempt retired (...)" only when the
+# pod's attempt ledger shows every attempt recorded for the run as retired/abandoned, else
+# "attempt state unknown". The backup is kept either way.
 # See this skill's "Recovering a failed run's work from the worker PVC" section.
 #
 # Usage:  bash backup-runs.sh <RUN_ID> [RUN_ID ...]
@@ -495,6 +498,45 @@ pod_has_ref(){
   [ "$owner" = "$rid" ]
 }
 
+# attempt_retirement <ns> <pod> <branch> <rid>: print a short phrase for the BARE log line of a
+# LIVE run. "attempt retired (...)" only when the pod's attempt ledger (the last value per
+# attemptId wins) has at least one entry naming this run and EVERY such entry is `retired` or
+# `abandoned` (the owner disposed of the clone, or a verified capture released it). Anything
+# else (no ledger, an unreadable read, a `live` or `reclaimed` entry, no entry for this run, or
+# ANY ledger row (an empty one included) that is unparseable or lacks a string attemptId/runId, checked before the
+# last-value-wins reduction so a damaged newest row cannot leave an older one as proof)
+# prints "attempt state unknown": absence of evidence is never reported as retirement.
+attempt_retirement(){
+  local ns="$1" pod="$2" branch="$3" rid="$4" ledger rc=0 states
+  [ -n "$branch" ] || { printf 'attempt state unknown'; return 0; }
+  # The pod prints a sentinel line after the values: command substitution strips trailing
+  # newlines, which would silently drop trailing EMPTY values (malformed rows) otherwise.
+  # shellcheck disable=SC2016  # expanded by the pod's shell, not here.
+  ledger="$(kexec_probe "$ns" "$pod" sh -c \
+    'git --git-dir="$1" config --get-all "$2"; rc=$?; printf "__LEDGER_END__\n"; exit "$rc"' _ \
+    "$REPOS_BASE/$REPO_SLUG.git" "uzi-attempts.$branch.entry")" || rc=$?
+  [ "$rc" -eq 0 ] || { printf 'attempt state unknown'; return 0; }
+  case "$ledger" in *__LEDGER_END__*) ledger="${ledger%__LEDGER_END__*}" ;; *) printf 'attempt state unknown'; return 0 ;; esac
+  # shellcheck disable=SC2016  # $rid/$e are jq variables, not host expansions.
+  states="$(printf '%s' "$ledger" | "$JQ" -rRn --arg rid "$rid" '
+    [inputs | (try fromjson catch null)] as $rows
+    | if ($rows | any(.[];
+          type != "object"
+          or (.attemptId | type) != "string" or .attemptId == ""
+          or (.runId | type) != "string" or .runId == ""))
+      then "unknown"
+      else
+        reduce $rows[] as $e ({}; .[$e.attemptId] = $e)
+        | [.[] | select(.runId == $rid) | .state // "?"]
+        | if length > 0 and all(.[]; . == "retired" or . == "abandoned")
+          then "retired \(length)" else "unknown" end
+      end' 2>/dev/null)" || states="unknown"
+  case "$states" in
+    "retired "*) printf 'attempt retired (ledger: %s recorded attempt(s) for this run, all retired or abandoned)' "${states#retired }" ;;
+    *) printf 'attempt state unknown' ;;
+  esac
+}
+
 PROBE_ERR_FILE="$DEST/.probe-inconclusive"
 for RID in "${RUNS[@]}"; do
   rm -f "$PROBE_ERR_FILE"
@@ -709,7 +751,9 @@ for RID in "${RUNS[@]}"; do
     # still useful, but there are no committed commits to restore.
     if tar tzf "$f" 2>/dev/null | grep -qF "$STEM.bundle"; then
       if [ "$capture_kind" = "bare" ]; then
-        log "BARE $RID ($LBL) status=$st pod=$pod ref=$TRACK_REF -> $f ($(du -h "$f" | cut -f1)); committed history only, uncommitted WIP unavailable"
+        att=""
+        [ "$terminal_capture" -eq 1 ] || att="; $(attempt_retirement "$ns" "$pod" "$RUN_BRANCH" "$RID")"
+        log "BARE $RID ($LBL) status=$st pod=$pod ref=$TRACK_REF -> $f ($(du -h "$f" | cut -f1)); committed history only, uncommitted WIP unavailable$att"
       else
         log "OK   $RID ($LBL) status=$st worker=$wid pod=$pod clone=$CLONE_PATH -> $f ($(du -h "$f" | cut -f1))"
       fi

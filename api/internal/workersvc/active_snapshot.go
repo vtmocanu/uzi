@@ -11,6 +11,7 @@ import (
 	"log/slog"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -296,6 +297,34 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	// TerminalPendingLease is a small bounded config duration (env TERMINAL_PENDING_LEASE); its
 	// whole seconds never come near the int32 range, so the truncation is safe.
 	leaseSeconds := int32(s.p.TerminalPendingLease.Seconds())
+
+	// Issue #1994: terminal_pending_since is the first-seen time of a pending entry. Read the
+	// prior pending rows BEFORE any delete so the value can be carried forward. The rule: an
+	// entry keeps the prior since only when it is pending now AND the prior row was pending at
+	// the SAME claim generation with a non-NULL since; otherwise it is stamped fresh (now() when
+	// pending, NULL when live). So since is preserved across heartbeat renewals and a register,
+	// and reset when the entry clears, is omitted, or the generation changes. All three callers
+	// lock the worker row first, so this read-then-write cannot race a sibling snapshot.
+	//
+	// KNOWN LIMIT: under pending_overflow the worker (agent/src/active-run-registry.ts,
+	// selectPendingForBuild) lists blocked-first fixed slots plus ONE slot that round-robins over
+	// the omitted pending entries. In heartbeat/claim mode an omitted entry's row is deleted by
+	// DeleteWorkerActiveRuns below, so its since resets each time it rotates back in and those
+	// runs never reach the outcome-undelivered health threshold. The worker-level pending_overflow lease still
+	// protects them from claim and reconcile.
+	type priorPending struct {
+		gen   int64
+		since pgtype.Timestamptz
+	}
+	priorRows, err := qtx.ListWorkerPendingSince(ctx, wkr.ID)
+	if err != nil {
+		return false, err
+	}
+	prior := make(map[uuid.UUID]priorPending, len(priorRows))
+	for _, r := range priorRows {
+		prior[r.RunID] = priorPending{gen: r.ClaimGeneration, since: r.TerminalPendingSince}
+	}
+
 	if mode == snapshotModeRegister {
 		// Preserve leased rows; drop only ordinary rows the snapshot no longer lists.
 		keep := make([]uuid.UUID, 0, len(entries))
@@ -313,6 +342,10 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	}
 
 	for _, e := range entries {
+		var pendingSince pgtype.Timestamptz
+		if p, ok := prior[e.runID]; ok && e.terminalPending && p.gen == e.claimGeneration && p.since.Valid {
+			pendingSince = p.since
+		}
 		rows, err := qtx.UpsertWorkerActiveRun(ctx, store.UpsertWorkerActiveRunParams{
 			WorkerID:        wkr.ID,
 			RunID:           e.runID,
@@ -320,6 +353,7 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 			Phase:           e.phase,
 			TerminalPending: e.terminalPending,
 			LeaseSeconds:    leaseSeconds,
+			PendingSince:    pendingSince,
 			SnapshotEpoch:   snap.SnapshotEpoch,
 		})
 		if err != nil {

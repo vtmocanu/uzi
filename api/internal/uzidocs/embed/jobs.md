@@ -22,7 +22,7 @@ A job never touches a forge. It has no repo, issue or branch, opens no merge req
  "requested_by_label": "Acme dashboard"}
 ```
 
-`title` is optional (derived from the first line of the prompt). Inputs are inline text (for a document, upload a file instead: see [Job files](#job-files)): at most 20, 1 MiB in total, names of 1 to 100 characters (letters, digits, `.`, `_`, `-`, starting with a letter or digit, no `..`). `wall_seconds` sets the wall-clock limit; it is clamped to 8 hours. `egress_profile` is refused (`not_supported`): there is no egress control yet.
+`title` is optional (derived from the first line of the prompt). Inputs are inline text (for a document, upload a file instead: see [Job files](#job-files)): at most 20, 1 MiB in total, names of 1 to 100 characters (letters, digits, `.`, `_`, `-`, starting with a letter or digit, no `..`). `wall_seconds` sets the wall-clock limit; it is clamped to 8 hours. `egress_profile` names a [site list](./egress-profiles.md) (see [Site lists](#site-lists)); leave it out for an ordinary job.
 
 The response is 201 with the queued job. Poll `GET /api/v1/jobs/{id}`, then read `GET /api/v1/jobs/{id}/result`. The full contract, including every field, is `api/openapi/v1.yaml`.
 
@@ -110,7 +110,7 @@ The result (`GET /api/v1/jobs/{id}/result`) carries the same `files` and `refuse
 
 An output file carries `source_url` **only when its SHA-256 equals the SHA-256 of an allowed fetch recorded in the same run**; the URL is taken from that record (the final URL when one was recorded). Any origin the job claims for a file is ignored, and a file never matches a fetch from another job. Otherwise `source_url` is null, always for an input.
 
-> **Not shipped yet:** jobs do not yet run on the no-internet worker lane that uses the fetch service ([Isolated research lane](./isolated-research-lane.md)). Until PRD #1906 M8 wires jobs to that lane, `sources` is empty and no output has a `source_url`.
+A job that names a site list runs on the no-internet worker lane that uses the fetch service ([Isolated research lane](./isolated-research-lane.md)), so its `sources` and `source_url` are filled. A job without a site list never fetches, so its `sources` is empty and no output has a `source_url`.
 
 ### Limits
 
@@ -168,17 +168,34 @@ Files of a running job stay attached. When the job ends, each file becomes `avai
 | 404 | `not_found` | No such job for this caller |
 | 409 | `job_terminal` | Cancel of a finished job |
 | 413 | `payload_too_large` | The create body is over 4 MiB |
-| 422 | `invalid_request`, `unknown_job_type`, `not_supported`, `no_model_credential` | Bad request, or you have no usable Anthropic credential |
+| 403 | `egress_profile_not_allowed` | A product token named a site list its product is not allowed to use |
+| 404 | `unknown_egress_profile` | `egress_profile` names no existing site list |
+| 422 | `invalid_request`, `unknown_job_type`, `no_model_credential` | Bad request (an explicit empty `egress_profile` included), or you have no usable Anthropic credential |
 | 429 | `over_cap` | Active-job cap reached |
+
+## Site lists
+
+A job can read official web sources from an admin-approved [site list](./egress-profiles.md) (an egress profile). Name one in `egress_profile` on create:
+
+```json
+{"type": "research", "prompt": "Summarize the datasheet at the vendor site.",
+ "egress_profile": "vendor-x-docs"}
+```
+
+- **Who may name what.** Your own `uzc_` token may name any existing list. A product (`uzp_`) token may name only a list an admin has allowed for its product ([Product tokens](./product-tokens.md#site-lists-for-jobs)); any other existing list is 403 `egress_profile_not_allowed`, an unknown name is 404 `unknown_egress_profile`, and an explicit empty string is 422 `invalid_request`. The check runs when the job is created.
+- **Removing an allowance affects only jobs created afterwards.** A job already created keeps its list.
+- **Where it runs.** A job with a site list is placed on the [isolated research lane](./isolated-research-lane.md): a worker with no internet that reads the web only through the fetch service, limited to the list's hosts, with every attempt in the result's `sources`. Inputs, uploaded files, output files and the result work as for any job.
+- **The fetch credential is redacted** from messages, failure reasons, logs and the posted result. **Output-file contents are not covered by that redaction**: the job writes them, so treat them as untrusted and do not assume an echoed credential can never reach one.
+- **Once a lane worker is provisioned for a bound job, a worker that cannot serve it fails the job rather than leaving it waiting.** If that lane worker never registers, the job fails (`ephemeral_worker_never_registered`); a lane worker that registers without the `isolated_job_v1` capability fails it too (`no_job_capable_worker`). If no lane worker is provisioned at all (ephemeral worker provisioning is turned off on the instance, or you are at your ephemeral worker limit), the bound job stays `queued`, like a bound research run, and counts toward your active jobs; cancel it if it should not wait. A job without a site list is unaffected. See [Isolated research lane](./isolated-research-lane.md#jobs-on-the-lane).
 
 ## Trust model
 
-- **Inputs and the prompt are untrusted.** The product supplies them, not you. The job runs with only `Read`, `Write`, `Glob`, `Grep` and the result-submitting tool, confined to a per-run workspace on the worker; it has no shell, network or forge access. Worker routes for publishing, memory, forge reads, merge-request threads and reviews refuse job runs (403 `not_for_job`).
+- **Inputs and the prompt are untrusted.** The product supplies them, not you. The job runs with only `Read`, `Write`, `Glob`, `Grep` and the result-submitting tool (plus `Skill` when its product has approved skills), confined to a per-run workspace on the worker; it has no shell, network or forge access. A job with a site list runs on the isolated lane with `Read`, `Write`, `Edit`, `Glob`, `Grep`, a fetch tool limited to that list and the result-submitting tool (plus `Skill` when its product has approved skills); it still has no shell or forge access. Worker routes for publishing, memory, forge reads, merge-request threads and reviews refuse job runs (403 `not_for_job`).
 - **`requested_by_label` is reported by the product.** It is shown as text the product supplied, never as a verified identity. Treat the report and findings as untrusted text too: render them inert.
 - **Revoking cuts jobs off.** Revoking a product token, disabling or deleting the product, or deactivating you cancels that product's non-terminal jobs. Token expiry alone does not. Jobs made with a `uzc_` token are cancelled only when you are deactivated.
 
 ## Worker requirement and rollout
 
-Only a non-Docker worker that advertises the `job_runner_v1` capability claims jobs, and a job created since job files shipped also needs the `job_files_v1` capability. If you opted in to ephemeral workers, an ephemeral worker is provisioned for a queued job when needed. Without that opt-in the job waits `queued` for a capable worker of yours and counts toward the active-job cap. If a job's bound ephemeral worker registers without `job_runner_v1` (or, for a job needing files, `job_files_v1`), or never registers, the job fails (`no_job_capable_worker` or `ephemeral_worker_never_registered`) rather than waiting. **Deploy the api and the chart's worker image tag together:** an older worker image never claims jobs, so a job queued against a fleet that has not rolled will sit `queued` or fail as above. Each new job is stamped as needing `job_files_v1`, and the claim refuses it for any worker that does not advertise it, so an api rolled ahead of the workers never hands a job that needs files to a worker that cannot deliver them; it waits `queued` (health reason: `no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker`) until a current worker is online. A job created before the upgrade carries no such stamp and any `job_runner_v1` worker may still claim it.
+Only a non-Docker worker that advertises the `job_runner_v1` capability claims jobs, and a job created since job files shipped also needs the `job_files_v1` capability. If you opted in to ephemeral workers, an ephemeral worker is provisioned for a queued job when needed. Without that opt-in the job waits `queued` for a capable worker of yours and counts toward the active-job cap. If a job's bound ephemeral worker registers without `job_runner_v1` (or, for a job needing files, `job_files_v1`), or never registers, the job fails (`no_job_capable_worker` or `ephemeral_worker_never_registered`) rather than waiting. **Deploy the api and the chart's worker image tag together:** an older worker image never claims jobs, so a job queued against a fleet that has not rolled will sit `queued` or fail as above. Each new job is stamped as needing `job_files_v1`, and the claim refuses it for any worker that does not advertise it, so an api rolled ahead of the workers never hands a job that needs files to a worker that cannot deliver them; it waits `queued` (health reason: `no online worker supports jobs (job_runner_v1, job_files_v1); update or provision a non-Docker worker`) until a current worker is online. A job created before the upgrade carries no such stamp and any `job_runner_v1` worker may still claim it. A job with a site list needs an isolated-lane worker that advertises `isolated_job_v1`; see [Isolated research lane](./isolated-research-lane.md#jobs-on-the-lane).
 
 Design rationale: the job run kind ADR, adr/1908-job-run-kind.md in the repo, and the job-file storage budget ADR, adr/1909-stored-file-budget.md.

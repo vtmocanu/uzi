@@ -672,6 +672,10 @@ async function main(): Promise<void> {
     gapFillMax: config.gapFillMax,
     outboxSpillBufferBytes: config.outboxSpillBufferBytes,
     transientTripMs: config.transientTripMs,
+    // PRD #1976 lane mode: the same fetcher config the IsolatedRunner gets. Without it a
+    // profile-bound job fails closed.
+    fetcherUrl: config.fetcherUrl,
+    fetcherCaFile: config.fetcherCaFile,
     ...(config.executor === "stub" ? { queryFn: stubJobQueryFn } : {}),
   });
 

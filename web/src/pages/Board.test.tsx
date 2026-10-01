@@ -459,10 +459,11 @@ describe("IssueCard \u2014 PRD presence badge + runnable marker (PRD #764)", () 
 
 // Issue #256 M4 (Decision 4/6): every card wears a uniform per-state duration token
 // beside its status badge, and the running elapsed no longer lives INSIDE the badge —
-// the badge reads a bare "running" while the token carries "running <elapsed>". The
-// board's LatestRun has no started_at, so running counts from created_at (the DEGRADED
-// variant, Decision 6): no board-specific code, and the helper returns "" for terminal
-// runs so those cards carry no token.
+// the badge reads a bare "running" while the token carries "running <elapsed>". Issue #2004
+// superseded Decision 6's degraded board: LatestRun now carries first_started_at and
+// finished_at, so a running card counts from the first start and a terminal card shows
+// `ran <elapsed>`. Only an older api (or a never-stamped run) degrades: running falls back to
+// created_at and a terminal card carries no token. No board-specific code either way.
 describe("IssueCard duration token (issue #256 M4)", () => {
   // Anchor Date.now() so the elapsed is deterministic — the card reads Date.now()
   // inline (Decision 3, riding the existing poll).
@@ -509,11 +510,25 @@ describe("IssueCard duration token (issue #256 M4)", () => {
     expect(screen.getByText("queued 4m")).toBeTruthy();
   });
 
-  it("renders no duration token for a terminal run (Decision 6)", () => {
-    // The board's LatestRun carries no started_at/finished_at, so runDurationLabel's
-    // static ran-span cannot be computed and it returns "" — no mono token renders.
+  it("renders no duration token for a terminal run from an older api without the stamps", () => {
+    // A LatestRun lacking first_started_at/finished_at (older api): the static ran-span
+    // cannot be computed, runDurationLabel returns "" and no mono token renders.
     renderCard({ latest_run: aRun({ status: "completed" }) });
     expect(screen.queryByText(/^ran /)).toBeNull();
+  });
+
+  it("renders 'ran <span from first start>' for a terminal run carrying both stamps (#2004)", () => {
+    // first_started_at is 2h before finished_at; a later (reset) started_at would give
+    // only the last 5m leg. The token must span from the first start.
+    renderCard({
+      latest_run: aRun({
+        status: "completed",
+        first_started_at: "2026-07-04T10:00:00Z",
+        started_at: "2026-07-04T11:55:00Z",
+        finished_at: "2026-07-04T12:00:00Z",
+      } as Partial<LatestRun>),
+    });
+    expect(screen.getByText("ran 2h 0m")).toBeTruthy();
   });
 
   it("renders no token at all when the card has no run", () => {

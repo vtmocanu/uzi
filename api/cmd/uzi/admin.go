@@ -340,6 +340,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 
 	products.AddCommand(newAdminProductSkillsCmd(env, gf))
+	products.AddCommand(newAdminProductEgressProfilesCmd(env, gf))
 
 	guardrailImpact := &cobra.Command{
 		Use:   "guardrail-impact",

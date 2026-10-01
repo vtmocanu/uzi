@@ -16,9 +16,11 @@ type V1JobInputDTO struct {
 }
 
 // V1JobCreateRequest is the POST /api/v1/jobs body. Type and Prompt are required. Title is
-// derived from the prompt when omitted. EgressProfile is reserved: any value is refused
-// with 422 not_supported until PRD #1906 lands site-list egress. The optional fields accept
-// an explicit null as "omitted".
+// derived from the prompt when omitted. EgressProfile names a site list (egress profile) that
+// binds the job to the isolated lane (PRD #1976): a product token may name only a list its
+// product is allowed (403 egress_profile_not_allowed), an unknown list is 404
+// unknown_egress_profile, and an empty string is 422 invalid_request. The optional fields
+// accept an explicit null as "omitted".
 type V1JobCreateRequest struct {
 	Type   string          `json:"type"`
 	Title  *string         `json:"title,omitempty"`

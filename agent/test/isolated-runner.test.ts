@@ -17,7 +17,8 @@ import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ChatClaimResponse, ClaimResponse, StateRequest } from "../src/protocol.js";
 import type { ReviewRunner } from "../src/review-runner.js";
 import type { RunRunner } from "../src/runner.js";
-import { ISOLATED_FETCH_CAPABILITY, Worker } from "../src/worker.js";
+import { JobRunner } from "../src/job-runner.js";
+import { ISOLATED_FETCH_CAPABILITY, ISOLATED_JOB_CAPABILITY, Worker } from "../src/worker.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
 const CRED = "iso-cred-" + "test-only-abcdef";
@@ -330,12 +331,17 @@ function fakeConfig(over: Partial<Config> = {}): Config {
   } as unknown as Config;
 }
 
-async function routeOne(claim: ClaimResponse, wire: "fake" | "none" = "fake"): Promise<{ routed: string[]; states: StateRequest[] }> {
+async function routeOne(
+  claim: ClaimResponse,
+  wire: "fake" | "none" = "fake",
+  jobRunner?: Pick<JobRunner, "execute">,
+  makeClient?: (base: Record<string, unknown>) => WorkerClient,
+): Promise<{ routed: string[]; states: StateRequest[] }> {
   const controller = new AbortController();
   const routed: string[] = [];
   const states: StateRequest[] = [];
   let gave = false;
-  const client = {
+  const base = {
     register: async () => ({}),
     heartbeat: async () => {},
     claimRun: async (): Promise<ClaimResponse | null> => {
@@ -349,7 +355,8 @@ async function routeOne(claim: ClaimResponse, wire: "fake" | "none" = "fake"): P
       routed.push(`report:${body.status}`);
       return { applied: true };
     },
-  } as unknown as WorkerClient;
+  };
+  const client = (makeClient ? makeClient(base) : base) as unknown as WorkerClient;
   const runRunner = {
     ...noResumeRecoveries,
     execute: async () => {
@@ -364,6 +371,7 @@ async function routeOne(claim: ClaimResponse, wire: "fake" | "none" = "fake"): P
     fakeConfig(), client, runRunner, {} as unknown as ChatRunner, judge, review, recordingLogger().logger, okPreflight,
     undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
     isolatedRunner,
+    ...(jobRunner ? [jobRunner] : []),
   );
   const done = worker.run(controller.signal);
   for (let i = 0; i < 500 && routed.length === 0; i++) await tick();
@@ -384,6 +392,54 @@ describe("Worker: isolated claim dispatch (PRD #1906 M4)", () => {
     const { routed, states } = await routeOne(isolatedClaim(), "none");
     assert.ok(!routed.includes("runner"));
     assert.equal(states[0]?.status, "failed");
+  });
+
+  it("routes a JOB claim carrying isolated_fetch to the JobRunner (lane mode), never the IsolatedRunner or the RunRunner", async () => {
+    let jobSeen = 0;
+    const { routed } = await routeOne(isolatedClaim({ kind: "job" }), "fake", {
+      execute: async (c) => {
+        jobSeen++;
+        assert.ok(c.isolated_fetch, "the grant rides the claim into the JobRunner");
+      },
+    });
+    assert.equal(jobSeen, 1);
+    assert.ok(!routed.includes("isolated") && !routed.includes("runner"), JSON.stringify(routed));
+  });
+
+  it("a job claim carrying isolated_fetch on a worker without lane config fails closed in the JobRunner (reported failed, no session)", async () => {
+    let ran = false;
+    // The JobRunner reports through the same client the Worker holds (routeOne's), so its
+    // state reports land in routeOne's `states`.
+    let workerClient: WorkerClient | undefined;
+    const lateClient = new Proxy({} as WorkerClient, { get: (_t, k) => (workerClient as unknown as Record<string | symbol, unknown>)[k] });
+    const jobRunner = new JobRunner(lateClient, nullLogger(), {
+      jobsRoot: path.join(dataDir, "jobs"),
+      batchMs: 5,
+      splitActive: false,
+      queryFn: (() => {
+        ran = true;
+        throw new Error("a session must not start");
+      }) as never,
+    });
+    const claim = isolatedClaim({
+      kind: "job",
+      job: { type: "research", title: "t", prompt: "p", inputs: [] },
+      budget_wall_seconds: 30,
+    } as Partial<ClaimResponse>);
+    const { routed, states } = await routeOne(claim, "fake", jobRunner, (base) => {
+      workerClient = { ...base, postMessages: async () => ({}), getInputs: async () => ({ inputs: [], receipts: false }) } as unknown as WorkerClient;
+      return workerClient;
+    });
+    assert.ok(!routed.includes("isolated") && !routed.includes("runner"));
+    assert.equal(ran, false);
+    assert.deepEqual(states.map((s) => s.status), ["failed"]);
+    assert.match(states[0]!.failure_reason ?? "", /UZI_FETCHER_URL/);
+    assert.ok(!fs.existsSync(path.join(dataDir, "jobs")), "no workspace was created");
+  });
+
+  it("a research claim (not a job) still goes to the IsolatedRunner even when a JobRunner is wired", async () => {
+    const { routed } = await routeOne(isolatedClaim(), "fake", { execute: async () => void 0 });
+    assert.deepEqual(routed, ["isolated"]);
   });
 
   it("a claim without isolated_fetch still goes to the RunRunner", async () => {
@@ -429,16 +485,18 @@ describe("Worker: isolated_fetch_v1 advertisement", () => {
   it("is not advertised under the UZI_UID_SPLIT uid split, whose preflight refuses every isolated claim", async () => {
     process.env.UZI_UID_SPLIT = "1";
     const caps = await advertised(fakeConfig({ fetcherUrl: "https://f:8443", fetcherCaFile: "/run/ca.pem" }));
-    assert.ok(caps && !caps.includes("isolated_fetch_v1"), JSON.stringify(caps));
+    assert.ok(caps && !caps.includes("isolated_fetch_v1") && !caps.includes("isolated_job_v1"), JSON.stringify(caps));
   });
 
   it("is advertised only when both UZI_FETCHER_URL and UZI_FETCHER_CA_FILE are configured", async () => {
     assert.equal(ISOLATED_FETCH_CAPABILITY, "isolated_fetch_v1");
     const both = await advertised(fakeConfig({ fetcherUrl: "https://f:8443", fetcherCaFile: "/run/ca.pem" }));
     assert.ok(both?.includes("isolated_fetch_v1"));
+    assert.equal(ISOLATED_JOB_CAPABILITY, "isolated_job_v1");
+    assert.ok(both?.includes("isolated_job_v1"), "isolated_job_v1 rides with isolated_fetch_v1");
     for (const partial of [{}, { fetcherUrl: "https://f:8443" }, { fetcherCaFile: "/run/ca.pem" }]) {
       const caps = await advertised(fakeConfig(partial));
-      assert.ok(caps && !caps.includes("isolated_fetch_v1"), JSON.stringify(partial));
+      assert.ok(caps && !caps.includes("isolated_fetch_v1") && !caps.includes("isolated_job_v1"), JSON.stringify(partial));
     }
   });
 });

@@ -222,8 +222,9 @@ export function IssueCard({
   const shadow = shadowSignal(run);
   const badge = run ? runBadge(run, Date.now()) : null;
   // Uniform per-card duration token (issue #256 M4, Decision 4): a faint mono span
-  // beside the badge carrying `running 1h 30m` / `queued 4m` / `ran 42m`, "" for
-  // terminal (Decision 6). Rides the existing 10s poll via the same Date.now() the
+  // beside the badge carrying `running 1h 30m` / `queued 4m` / `ran 42m`. A terminal card
+  // shows `ran …` from first start to finish (issue #2004); "" only for an older api whose
+  // LatestRun lacks the stamps. Rides the existing 10s poll via the same Date.now() the
   // badge reads — no new timer (Decision 3).
   const duration = run ? runDurationLabel(run, Date.now()) : "";
   const hint = run ? retryHint(run.run_count) : null;

@@ -254,6 +254,52 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
     expect(screen.getByText("draining")).toBeTruthy();
     expect(screen.queryByText("cordoned")).toBeNull();
   });
+
+  // Issue #1994: a pending outcome is journaled-not-delivered, so the admin strip flags it
+  // with its own pill beside the run badge, as the Workers settings page does.
+  it("shows the pending outcome pill for a worker holding an undelivered outcome", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [
+        adminWorker({
+          reported_runs: [
+            {
+              run_id: "11111111-1111-1111-1111-111111111111",
+              phase: "running",
+              claim_generation: 3,
+              terminal_pending: true,
+              terminal_pending_since: "2026-01-02T00:00:00Z",
+            },
+          ],
+        }),
+      ],
+    } as never);
+
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(screen.getByText("1 pending outcome")).toBeTruthy();
+  });
+
+  it("shows no pending outcome pill when no reported run is pending", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({
+      workers: [
+        adminWorker({
+          reported_runs: [
+            { run_id: "22222222-2222-2222-2222-222222222222", phase: "running", claim_generation: 1, terminal_pending: false, terminal_pending_since: null },
+          ],
+        }),
+      ],
+    } as never);
+
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
+    expect(screen.queryByText(/pending outcome/)).toBeNull();
+  });
 });
 
 describe("RunsList — the run title carries no format characters (#124)", () => {

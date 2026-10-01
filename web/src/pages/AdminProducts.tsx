@@ -43,6 +43,7 @@ import {
   productTokenExpiryText,
 } from "../components/ProductTokens";
 import { PackageIcon } from "../components/icons";
+import { ProductEgressProfilesPanel } from "../components/ProductEgressProfiles";
 import { ProductSkillsPanel } from "../components/ProductSkills";
 import { JOB_TYPES, jobTypeLabel } from "../lib/jobTypes";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -573,6 +574,10 @@ function ProductCard({
         {/* PRD #1909 M6: the product's skill set (source, staged review, approved set).
             A deleted product cannot change, so it gets no panel. */}
         {!deleted && <ProductSkillsPanel product={product} />}
+
+        {/* PRD #1976 M2: the site lists the product's tokens may name on job create. A deleted
+            product still lists them (read-only). */}
+        <ProductEgressProfilesPanel product={product} />
       </Card>
     </section>
   );

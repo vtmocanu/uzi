@@ -31,6 +31,24 @@ repo isn't on the Docker worker allowlist, so no Docker worker can run it"_ —
 distinct from "no worker online" or "all workers busy". The fix is to add the
 repo to the allowlist, not to start another worker.
 
+One **stalled** reason worth calling out is an undelivered outcome. When a
+worker has a running or awaiting-approval run's outcome journaled but not yet
+delivered to the api (a _pending outcome_; the worker keeps renewing the
+run's lease protection meanwhile), the api records when it first saw that
+entry. Once it has been pending on the run's current worker, at its current
+claim generation, under an unexpired lease, for 4 heartbeat intervals (60
+seconds with the api's default `WORKER_HEARTBEAT_INTERVAL` of 15s), the run is
+flagged ⚠ stalled and the owner's reason reads _"the run's outcome is
+journaled on its worker but has not been delivered"_. The clock survives
+heartbeat renewals and a worker re-register, and resets when the entry clears
+or the claim generation changes. A worker holding more pending outcomes than
+its cap lists only some of them on each heartbeat; the ones it rotates in and
+out restart their clock each time, so they are not flagged. This is a warning only: it never expires the
+lease or reclaims, fails or discards the run. The outcome is held on the
+worker, so check the worker — [`uzi worker list`](./cli.md#disk-usage-and-checkpoint-durability)
+shows its pending outcomes. A plain cancel is refused while the outcome is held;
+it must be confirmed as discarding that outcome.
+
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 
@@ -113,6 +131,9 @@ setting it to `0`, from **Admin → Instance → Run health** — see
 itself (how many repeats, over how large a window) isn't tunable; every other
 signal is — the plain seconds thresholds, and **near timeout**'s share of the
 run's wall-clock budget (a percent, not a duration, so it means the same
-thing regardless of the run's timeout or frozen budget).
+thing regardless of the run's timeout or frozen budget). The undelivered-outcome
+**stalled** reason is the other exception: its threshold is fixed at 4 of the
+api's heartbeat intervals and setting **stalled** to `0` does not disable it;
+only turning run health off entirely does.
 
 Related: [Paused on a usage limit](run-limit-wait.md) · [Why was my run stopped automatically?](run-auto-stopped.md) · [Configuration](configuration.md)

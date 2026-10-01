@@ -90,7 +90,7 @@ func TestCommandTree(t *testing.T) {
 	}
 
 	// PRD #1909 M7: the nested verbs `job file get` and `admin products skills`.
-	for _, path := range [][]string{{"job", "file", "get"}, {"admin", "products", "skills"}} {
+	for _, path := range [][]string{{"job", "file", "get"}, {"admin", "products", "skills"}, {"admin", "products", "egress-profiles"}} {
 		c := root
 		for _, name := range path {
 			if c = findCmd(c, name); c == nil {

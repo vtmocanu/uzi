@@ -18,8 +18,11 @@ import {
   buildJobSdkOptions,
   disallowedEffectiveTools,
   JobRunner,
+  laneJobSurface,
   validateJobResult,
 } from "../src/job-runner.js";
+import { createLogger } from "../src/log.js";
+import { ISOLATED_TOOLS } from "../src/isolated-executor.js";
 import { JobInputError } from "../src/job-workspace.js";
 import type { ClaimResponse, JobResultRequest, OutgoingMessage, StateRequest, UserInput } from "../src/protocol.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -1299,5 +1302,468 @@ describe("JobRunner product skills (PRD #1909 M6)", () => {
     );
     assert.deepStrictEqual(seen.options!.tools, ["Read", "Write", "Glob", "Grep", "mcp__job__submit_job_result"]);
     assert.deepStrictEqual(seen.options!.skills, []);
+  });
+});
+
+// --- lane mode (PRD #1976): a profile-bound job on the isolated lane ----------------------------
+
+describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
+  // Assembled at runtime so no complete token-shaped literal sits in the source.
+  const CRED = "lane-fetch-cred-" + "0123456789abcdef";
+  const SKILL = { name: "brand-voice", description: "How this product writes", body: "# Brand voice\nBe brief." };
+  const SUBMIT = "mcp__job__submit_job_result";
+  const LANE_TOOLS = [...ISOLATED_TOOLS, SUBMIT];
+  const LANE_INIT = {
+    type: "system",
+    subtype: "init",
+    tools: LANE_TOOLS,
+    mcp_servers: [{ name: "uzi_fetch" }, { name: "job" }],
+    plugins: [],
+    agents: ["claude", "general-purpose", "statusline-setup"],
+    skills: ["doctor"],
+  };
+
+  function laneClaim(over: Partial<ClaimResponse> = {}, jobOver: Partial<NonNullable<ClaimResponse["job"]>> = {}): ClaimResponse {
+    return jobClaim({ isolated_fetch: { credential: CRED, profile: "vendor-docs", hosts: ["docs.example.com"] }, ...over }, jobOver);
+  }
+  async function caFile(): Promise<string> {
+    const jobsRoot = await tmpJobsRoot();
+    const f = path.join(path.dirname(jobsRoot), "ca.pem");
+    await fsp.writeFile(f, "not parsed unless a fetch happens\n");
+    return f;
+  }
+  async function laneRunner(client: WorkerClient, jobsRoot: string, qf: SdkQueryFn, extra: Record<string, unknown> = {}): Promise<JobRunner> {
+    return newRunner(client, jobsRoot, qf, {
+      fetcherUrl: "https://uzi-fetcher.test:8443",
+      fetcherCaFile: await caFile(),
+      splitActive: false,
+      ...extra,
+    });
+  }
+  const rawIn = (v: unknown): boolean => JSON.stringify(v).includes(CRED);
+
+  describe("the options", () => {
+    const build = (skills?: { pluginPath: string; names: string[] }): SdkOptions => {
+      const rs = buildJobResultServer({});
+      return buildJobSdkOptions({
+        env: {},
+        systemPrompt: "s",
+        workDir: "/data/jobs/run/work",
+        log: nullLogger(),
+        secretPaths: [],
+        resultServer: rs.server,
+        toolNames: rs.toolNames,
+        ...(skills ? { productSkills: skills } : {}),
+        lane: { surface: laneJobSurface(skills?.names), gate: { passed: false }, fetchServer: {} as never },
+      });
+    };
+
+    it("offers exactly the isolated tools plus submit_job_result, two MCP servers, no plugin, no agents", () => {
+      const o = build();
+      assert.deepStrictEqual(o.tools, LANE_TOOLS);
+      assert.deepStrictEqual(Object.keys(o.mcpServers ?? {}).sort(), ["job", "uzi_fetch"]);
+      assert.deepStrictEqual(o.plugins, []);
+      assert.deepStrictEqual(o.agents, {});
+      assert.deepStrictEqual(o.skills, []);
+      assert.deepStrictEqual(o.settingSources, []);
+      assert.strictEqual(o.strictMcpConfig, true);
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false }, disableSkillShellExecution: true });
+      for (const banned of ["Bash", "WebFetch", "WebSearch", "Agent", "Task", "Skill", "MultiEdit", "NotebookEdit"]) {
+        assert.ok((o.disallowedTools ?? []).includes(banned), `${banned} is disallowed`);
+        assert.ok(!(o.tools as string[]).includes(banned));
+      }
+      for (const offered of LANE_TOOLS) assert.ok(!(o.disallowedTools ?? []).includes(offered), `${offered} is offered, so not disallowed`);
+    });
+
+    it("adds Skill and the single local plugin (MCP discovery off) only when the job carries skills", () => {
+      const o = build({ pluginPath: "/data/jobs/run/.uzi-skills-work", names: ["uzi:brand-voice"] });
+      assert.deepStrictEqual(o.tools, [...LANE_TOOLS, "Skill"]);
+      assert.deepStrictEqual(o.skills, ["uzi:brand-voice"]);
+      assert.deepStrictEqual(o.plugins, [{ type: "local", path: "/data/jobs/run/.uzi-skills-work", skipMcpDiscovery: true }]);
+      assert.ok(!(o.disallowedTools ?? []).includes("Skill"));
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false }, disableSkillShellExecution: true });
+    });
+
+    it("keeps the Glob/Grep escape guard and the sources/ write guard on", async () => {
+      const o = build();
+      const run = async (tool: string, input: Record<string, unknown>): Promise<string | undefined> => {
+        for (const m of o.hooks?.PreToolUse ?? []) {
+          if (m.matcher !== undefined && !new RegExp(`^(?:${m.matcher})$`).test(tool)) continue;
+          for (const h of m.hooks) {
+            const out = (await h(
+              { hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, session_id: "s", transcript_path: "", cwd: "/data/jobs/run/work" } as unknown as HookInput,
+              undefined,
+              { signal: new AbortController().signal },
+            )) as { hookSpecificOutput?: { permissionDecision?: string } };
+            if (out.hookSpecificOutput?.permissionDecision === "deny") return "deny";
+          }
+        }
+        return undefined;
+      };
+      assert.strictEqual(await run("Glob", { pattern: "../../etc/*" }), "deny");
+      assert.strictEqual(await run("Write", { file_path: "/data/jobs/run/work/sources/abc", content: "x" }), "deny");
+      assert.strictEqual(await run("Bash", { command: "ls" }), "deny");
+    });
+  });
+
+  describe("fails closed", () => {
+    const cases: Array<[string, Partial<ClaimResponse>, Record<string, unknown>, RegExp]> = [
+      ["no fetcher URL", {}, { fetcherUrl: undefined }, /UZI_FETCHER_URL/],
+      ["no fetcher CA", {}, { fetcherCaFile: undefined }, /UZI_FETCHER_CA_FILE/],
+      ["the uid split", {}, { splitActive: true }, /UZI_UID_SPLIT/],
+      ["a malformed grant", { isolated_fetch: { credential: "", profile: "p", hosts: [] } }, {}, /malformed isolated_fetch/],
+      ["a forge credential", { secrets: { forge_pat: "glpat-x", anthropic_oauth_token: "sk-fixture-model-credential" } }, {}, /forge credential/],
+    ];
+    for (const [name, claimOver, optsOver, want] of cases) {
+      it(`refuses a profile-bound job with ${name}: failed, no session, no workspace`, async () => {
+        const jobsRoot = await tmpJobsRoot();
+        const { client, calls } = fakeClient();
+        let ran = false;
+        const qf = scripted(async function* () {
+          ran = true;
+          yield RESULT_OK;
+        });
+        await (await laneRunner(client, jobsRoot, qf, optsOver)).execute(laneClaim(claimOver));
+        assert.strictEqual(ran, false);
+        assert.deepStrictEqual(calls.order, ["state:failed"], "never `running`");
+        assert.match(calls.states[0]!.body.failure_reason!, want);
+        assert.strictEqual(calls.states[0]!.body.claim_generation, GEN);
+        await assert.rejects(() => fsp.stat(jobsRoot), { code: "ENOENT" }, "no workspace was created");
+      });
+    }
+
+    it("fails when the CA file cannot be read, with no session", async () => {
+      const { client, calls } = fakeClient();
+      let ran = false;
+      const qf = scripted(async function* () {
+        ran = true;
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf, { fetcherCaFile: "/nonexistent/ca.pem" })).execute(laneClaim());
+      assert.strictEqual(ran, false);
+      assert.strictEqual(calls.states.at(-1)!.body.status, "failed");
+      assert.match(calls.states.at(-1)!.body.failure_reason!, /fetcher CA bundle/);
+    });
+
+    it("an unbound job is unchanged by the lane config being absent (no isolated_fetch: plain job path)", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options }) {
+        yield INIT_OK;
+        await callSubmit(options, GOOD_RESULT);
+        yield RESULT_OK;
+      });
+      await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+      assert.deepStrictEqual(calls.order, ["state:running", "result", "state:completed"]);
+    });
+  });
+
+  describe("the session", () => {
+    it("runs a lane job: sources/ exists, both servers wired, the credential only in the fetch server, completed after the result", async () => {
+      const { client, calls } = fakeClient();
+      const seen: { options?: SdkOptions } = {};
+      let sourcesIsDir = false;
+      let prompt = "";
+      const qf = (({ prompt: pr, options }: { prompt: unknown; options: SdkOptions }) => {
+        seen.options = options;
+        return (async function* () {
+          sourcesIsDir = (await fsp.stat(path.join(options.cwd!, "sources"))).isDirectory();
+          for await (const m of pr as AsyncIterable<{ message: { content: unknown } }>) {
+            prompt = JSON.stringify(m.message.content);
+            break;
+          }
+          yield LANE_INIT;
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        })();
+      }) as unknown as SdkQueryFn;
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      assert.deepStrictEqual(calls.order, ["state:running", "result", "state:completed"]);
+      assert.ok(sourcesIsDir);
+      assert.deepStrictEqual(seen.options!.tools, LANE_TOOLS);
+      assert.ok(prompt.includes("vendor-docs"), prompt);
+      assert.match(prompt, /docs\.example\.com/);
+      assert.ok(!prompt.includes(CRED), "the fetch credential is never in the prompt");
+      assert.ok(!JSON.stringify(seen.options!.env).includes(CRED), "nor in the SDK env");
+      assert.ok(!String(seen.options!.systemPrompt).includes(CRED));
+      assert.match(String(seen.options!.systemPrompt), /fetch_url/);
+      assert.ok(!/no web access/.test(String(seen.options!.systemPrompt)), "the lane prompt does not claim there is no web access");
+      assert.strictEqual((seen.options!.env as Record<string, string>).CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC, "1");
+    });
+
+    it("a lane job with skills passes with Skill, the plugin and the product skill in the init frame", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options }) {
+        const plugin = options.plugins?.[0] as { path: string };
+        yield { ...LANE_INIT, tools: [...LANE_TOOLS, "Skill"], plugins: [{ name: "uzi", path: plugin.path }], skills: ["doctor", "uzi:brand-voice"] };
+        await callSubmit(options, GOOD_RESULT);
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim({ skills: [SKILL], skills_dropped: [] }));
+      assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
+    });
+
+    it("the lane tool gate allows submit_job_result (and Skill with skills) only after a verified init, and denies Bash and WebFetch always", async () => {
+      const decide = async (options: SdkOptions, tool: string, input: Record<string, unknown>): Promise<"deny" | "allow"> => {
+        for (const m of options.hooks?.PreToolUse ?? []) {
+          if (m.matcher !== undefined && !new RegExp(`^(?:${m.matcher})$`).test(tool)) continue;
+          for (const h of m.hooks) {
+            const out = (await h(
+              { hook_event_name: "PreToolUse", tool_name: tool, tool_input: input, session_id: "s", transcript_path: "", cwd: options.cwd } as unknown as HookInput,
+              undefined,
+              { signal: new AbortController().signal },
+            )) as { hookSpecificOutput?: { permissionDecision?: string } };
+            if (out.hookSpecificOutput?.permissionDecision === "deny") return "deny";
+          }
+        }
+        return "allow";
+      };
+      for (const withSkills of [false, true]) {
+        const { client, calls } = fakeClient();
+        const seen: Record<string, string> = {};
+        const qf = scripted(async function* ({ options }) {
+          const probe = async (phase: string): Promise<void> => {
+            seen[`${phase}:submit`] = await decide(options, SUBMIT, {});
+            seen[`${phase}:skill`] = await decide(options, "Skill", { skill: "uzi:brand-voice" });
+            seen[`${phase}:fetch`] = await decide(options, "mcp__uzi_fetch__fetch_url", { url: "https://docs.example.com/" });
+            seen[`${phase}:bash`] = await decide(options, "Bash", { command: "ls" });
+            seen[`${phase}:webfetch`] = await decide(options, "WebFetch", { url: "https://example.com" });
+          };
+          await probe("before");
+          const plugin = options.plugins?.[0] as { path: string } | undefined;
+          yield withSkills
+            ? { ...LANE_INIT, tools: [...LANE_TOOLS, "Skill"], plugins: [{ name: "uzi", path: plugin!.path }], skills: ["doctor", "uzi:brand-voice"] }
+            : LANE_INIT;
+          await probe("after");
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        });
+        await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim(withSkills ? { skills: [SKILL], skills_dropped: [] } : {}));
+        assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
+        for (const k of ["submit", "skill", "fetch", "bash", "webfetch"]) assert.strictEqual(seen[`before:${k}`], "deny", `before init: ${k} (skills=${withSkills})`);
+        assert.strictEqual(seen["after:submit"], "allow", "submit_job_result after init");
+        assert.strictEqual(seen["after:fetch"], "allow", "the fetch tool after init");
+        assert.strictEqual(seen["after:skill"], withSkills ? "allow" : "deny", `Skill after init (skills=${withSkills})`);
+        assert.strictEqual(seen["after:bash"], "deny");
+        assert.strictEqual(seen["after:webfetch"], "deny");
+      }
+    });
+
+    for (const [name, mutate] of [
+      ["an extra tool", (f: Record<string, unknown>) => (f.tools = [...LANE_TOOLS, "Bash"])],
+      ["a missing result tool", (f: Record<string, unknown>) => (f.tools = ISOLATED_TOOLS)],
+      ["Skill on a job without skills", (f: Record<string, unknown>) => (f.tools = [...LANE_TOOLS, "Skill"])],
+      ["a third MCP server", (f: Record<string, unknown>) => (f.mcp_servers = [{ name: "uzi_fetch" }, { name: "job" }, { name: "forge" }])],
+      ["a plugin", (f: Record<string, unknown>) => (f.plugins = [{ name: "uzi", path: "/x" }])],
+      ["a stray skill", (f: Record<string, unknown>) => (f.skills = ["doctor", "pdf"])],
+    ] as Array<[string, (f: Record<string, unknown>) => void]>) {
+      it(`aborts the job when the init frame has ${name}`, async () => {
+        const { client, calls } = fakeClient();
+        const qf = scripted(async function* ({ options }) {
+          const f = { ...LANE_INIT };
+          mutate(f);
+          yield f;
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        });
+        await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+        assert.strictEqual(calls.states.at(-1)!.body.status, "failed");
+        assert.match(calls.states.at(-1)!.body.failure_reason!, /refused/);
+        assert.strictEqual(calls.results.length, 0);
+      });
+    }
+
+    it("a session that never reports its tool set fails the job", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* () {
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      assert.strictEqual(calls.states.at(-1)!.body.status, "failed");
+      assert.match(calls.states.at(-1)!.body.failure_reason!, /no init frame/);
+    });
+  });
+
+  describe("fetch-credential redaction: the raw credential reaches no recorded call and no log line", () => {
+    const assistant = (text: string) => ({ type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } });
+
+    it("(a) an assistant message and a tool-result message are redacted in the posted batches", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options }) {
+        yield LANE_INIT;
+        yield assistant(`the key is ${CRED}`);
+        yield { type: "user", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: `echo ${CRED}` }] } };
+        await callSubmit(options, GOOD_RESULT);
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      const posted = JSON.stringify(calls.messages);
+      assert.ok(posted.includes("the key is"), "the assistant text was streamed");
+      assert.ok(posted.includes("***REDACTED***"));
+      assert.ok(!rawIn(calls), "no recorded call body carries the credential");
+    });
+
+    it("(b) a session error carrying the credential gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* () {
+        yield LANE_INIT;
+        throw new Error(`upstream said ${CRED}`);
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /\*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(c) report_md and a finding in the posted result are redacted", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options }) {
+        yield LANE_INIT;
+        const res = await callSubmit(options, {
+          status: "completed",
+          report_md: `# Report\nthe credential was ${CRED}`,
+          findings: [{ severity: "warning", message_md: `leaked ${CRED}`, url: `https://docs.example.com/?k=${CRED}` }, { severity: "info", message_md: "x", file: `notes-${CRED}.md` }],
+        });
+        assert.strictEqual(res.isError, undefined);
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      assert.strictEqual(calls.results.length, 1);
+      const body = calls.results[0]!.body;
+      assert.match(body.report_md, /the credential was \*\*\*REDACTED\*\*\*/);
+      assert.match(body.findings[0]!.message_md, /leaked \*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+      assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
+    });
+
+    it("(d) a run-logger line is redacted, and so is the failed reason of a result post that errors with it", async () => {
+      const { client, calls } = fakeClient({
+        postJobResult: async () => {
+          throw new Error(`boom ${CRED}`);
+        },
+      });
+      // The real logger writes its JSON lines to stdout/stderr. Only those lines are captured; every
+      // other write (the test runner reports results over the same stream) is passed straight through.
+      const lines: string[] = [];
+      const origOut = process.stdout.write;
+      const origErr = process.stderr.write;
+      const tee = (stream: NodeJS.WriteStream, orig: typeof process.stdout.write) =>
+        ((chunk: unknown, ...rest: unknown[]): boolean => {
+          if (typeof chunk === "string" && chunk.startsWith('{"ts"')) {
+            lines.push(chunk);
+            return true;
+          }
+          return (orig as unknown as (...a: unknown[]) => boolean).call(stream, chunk, ...rest);
+        }) as unknown as typeof process.stdout.write;
+      process.stdout.write = tee(process.stdout, origOut);
+      process.stderr.write = tee(process.stderr, origErr);
+      try {
+        const qf = scripted(async function* ({ options }) {
+          yield LANE_INIT;
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        });
+        const runner = new JobRunner(client, createLogger("debug"), {
+          queryFn: qf,
+          jobsRoot: await tmpJobsRoot(),
+          batchMs: 5,
+          cancelPollMs: 10,
+          fetcherUrl: "https://uzi-fetcher.test:8443",
+          fetcherCaFile: await caFile(),
+          splitActive: false,
+        });
+        await runner.execute(laneClaim());
+      } finally {
+        process.stdout.write = origOut;
+        process.stderr.write = origErr;
+      }
+      const logged = lines.join("");
+      assert.match(logged, /job result post failed/, "the line that carried the error was logged");
+      assert.ok(!logged.includes(CRED), "no log line carries the credential");
+      assert.ok(logged.includes("***REDACTED***"));
+      assert.match(calls.states.at(-1)!.body.failure_reason!, /could not store the job result/);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("an output file whose own name carries the credential is not uploaded and is reported under a scrubbed name", { skip: process.platform !== "linux" }, async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options }) {
+        await fsp.writeFile(path.join(options.cwd!, "outputs", `${CRED}.txt`), "data");
+        await fsp.writeFile(path.join(options.cwd!, "outputs", "ok.txt"), "fine");
+        yield LANE_INIT;
+        const res = await callSubmit(options, { ...GOOD_RESULT, output_files: [`outputs/${CRED}.txt`, "outputs/ok.txt"] });
+        assert.strictEqual(res.isError, undefined, JSON.stringify(res));
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      assert.deepStrictEqual(calls.uploads.map((u) => u.meta.display_name), ["ok.txt"]);
+      assert.strictEqual(calls.results[0]!.body.refused_outputs?.length, 1);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(e) a workspace-setup failure carrying the credential gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* () {
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf, { fetcherCaFile: `/nonexistent/${CRED}/ca.pem` })).execute(laneClaim());
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /fetcher CA bundle/);
+      assert.match(failed.failure_reason!, /\*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(f) a failing completed report carrying the credential gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient({
+        reportState: (_id, b) => {
+          if (b.status === "completed") throw new Error(`report refused ${CRED}`);
+          return { applied: true, status: b.status };
+        },
+      });
+      const qf = scripted(async function* ({ options }) {
+        yield LANE_INIT;
+        await callSubmit(options, GOOD_RESULT);
+        yield RESULT_OK;
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(laneClaim());
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /report refused \*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+    });
+
+    it("(g) an unexpected throw out of the run (prompt assembly) gives a redacted failed reason", async () => {
+      const { client, calls } = fakeClient();
+      let ran = false;
+      const qf = scripted(async function* () {
+        ran = true;
+        yield RESULT_OK;
+      });
+      const claim = laneClaim();
+      Object.defineProperty(claim.job!, "prompt", {
+        get() {
+          throw new Error(`prompt assembly exploded ${CRED}`);
+        },
+      });
+      await (await laneRunner(client, await tmpJobsRoot(), qf)).execute(claim);
+      assert.strictEqual(ran, false);
+      const failed = calls.states.at(-1)!.body;
+      assert.strictEqual(failed.status, "failed");
+      assert.match(failed.failure_reason!, /prompt assembly exploded \*\*\*REDACTED\*\*\*/);
+      assert.ok(!rawIn(calls));
+    });
+  });
+
+  it("every job's posted result is redacted, lane or not (the model credential in report_md)", async () => {
+    const { client, calls } = fakeClient();
+    const qf = scripted(async function* ({ options }) {
+      yield INIT_OK;
+      await callSubmit(options, { ...GOOD_RESULT, report_md: "leak sk-fixture-model-credential here" });
+      yield RESULT_OK;
+    });
+    await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim());
+    assert.ok(!JSON.stringify(calls).includes("sk-fixture-model-credential"));
+    assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
   });
 });
