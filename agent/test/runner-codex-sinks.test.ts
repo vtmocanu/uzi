@@ -179,6 +179,16 @@ const VAULT_BODY_SENTINEL = "vault-body-sentinel-XXXXXXXX";
 
 /** Issue #1766: the api's real reply to a Codex refresh/release that passed authorization but hit
  *  a locked owner vault: HTTP 409 with a typed `reason`. */
+/** Issue #1784: the server's 409 for a reconcile against a run that is no longer actively claimed. */
+function notAvailableError(op: "refresh" | "release"): RequestError {
+  return new RequestError(
+    "POST",
+    `/api/worker/runs/run-codex-sink/codex/${op}`,
+    409,
+    JSON.stringify({ error: "codex credential is not available" }),
+  );
+}
+
 function vaultLockedError(op: "refresh" | "release"): RequestError {
   return new RequestError(
     "POST",
@@ -239,6 +249,9 @@ function codexRig(
     /** Issue #1766: while this answers true, refreshCodex/releaseCodex throw the api's real typed
      *  409 `vault_locked` RequestError (a locked owner vault after authorization). */
     vaultLocked?: () => boolean;
+    /** Issue #1784: while this answers true, refreshCodex/releaseCodex throw the api's 409 "codex
+     *  credential is not available" (the server refuses a reconcile for a `paused` run). */
+    refuseReconcile?: () => boolean;
   } = {},
 ): CodexRig {
   const authMode = opts.authMode ?? "subscription";
@@ -252,6 +265,7 @@ function codexRig(
   const fakeClient = {
     releaseCodex: async (_runId: string, _req: { capability: string }) => {
       releaseCalls += 1;
+      if (opts.refuseReconcile?.()) throw notAvailableError("release");
       if (opts.vaultLocked?.()) throw vaultLockedError("release");
       if (opts.blockReconcile) throw new Error("release contended");
       return { access_token: RELEASE_TOK };
@@ -261,6 +275,7 @@ function codexRig(
       _req: { capability: string; operation_id: string; observed_generation: number },
     ) => {
       refreshCalls += 1;
+      if (opts.refuseReconcile?.()) throw notAvailableError("refresh");
       if (opts.vaultLocked?.()) throw vaultLockedError("refresh");
       if (opts.blockReconcile) throw new Error("refresh contended");
       return { access_token: REFRESH_TOK, generation: 7, outcome: "advanced" };
@@ -1129,6 +1144,136 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
     // ...and finalize still runs afterwards (the ONLY boundary of this run).
     assert.deepEqual(rig.boundaries, ["finalize"], "the only permit this run minted was the finalize sink");
   });
+});
+
+// ================================================================================
+// Issue #1784: a Codex run the server CONFIRMED as wall-parked or completion-held (`paused`) must
+// bypass the finalize boundary like an owner pause (#1764): the server refuses the boundary's
+// credential reconcile for a `paused` run. An UNDELIVERABLE wall park (the claim is still owned)
+// keeps going through the boundary. captureHoldContext opens its own "shutdown" boundary, so these
+// assert no "finalize" entry and unchanged reconcile counts AFTER the park, not zero totals.
+describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park", () => {
+  const HOLD_REASON = "test completion hold reason";
+  const WALL_REASON = "run exceeded its wall-clock timeout";
+  const HELD_HEAD = "cafef00dcafef00dcafef00dcafef00dcafef00d";
+
+  interface Probe { refresh: number; release: number; outcome?: unknown }
+
+  const wallExecutor = (rig: CodexRig, runHome: string, probe: Probe, refuse: { on: boolean }): FakeCodexExecutor =>
+    new FakeCodexExecutor(rig.safety, async (ctx) => {
+      fs.mkdirSync(runHome, { recursive: true });
+      fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
+      commitInTree(ctx.worktreePath, "WORK.txt", "work before the wall\n");
+      await ctx.checkpoint?.({ reap: false });
+      probe.outcome = await ctx.parkForWall?.({ completedCount: 1, total: 2 });
+      if (probe.outcome === "parked") refuse.on = true;
+      probe.refresh = rig.refreshCalls();
+      probe.release = rig.releaseCalls();
+      return { branch: ctx.branch, walled: { reason: WALL_REASON } };
+    });
+
+  const assertKept = (iid: number, runId: string, runHome: string, rig: CodexRig): void => {
+    const st = statuses(runId);
+    assert.ok(!st.includes("failed") && !st.includes("completed"), `non-terminal; got ${JSON.stringify(st)}`);
+    assert.ok(fs.existsSync(path.join(runHome, "session.marker")), "HOME retained for the resume");
+    assert.ok(fs.existsSync(worktreeDirFor(iid)), "clone retained for the resume");
+    assert.deepEqual(rig.disposeBoundaries, ["terminal"], "the registry was disposed once, at terminal");
+  };
+
+  it("(R1) a confirmed wall park bypasses the finalize boundary: no finalize permit, no reconcile after the park, not reported failed", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const restore = spyPublishLands();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-wall-"));
+    try {
+      api.setWallParkResponse("paused");
+      const refuse = { on: false };
+      const rig = codexRig({ authMode: "subscription", refuseReconcile: () => refuse.on });
+      const runHome = path.join(homeRoot, "h");
+      const probe: Probe = { refresh: -1, release: -1 };
+      const claim = gitlabClaim(1784);
+      await runnerWith(() => ({ executor: wallExecutor(rig, runHome, probe, refuse), homeDir: runHome }), gitlab).execute(claim);
+      assert.equal(probe.outcome, "parked");
+      assert.ok(!rig.boundaries.includes("finalize"), `no finalize boundary; got ${JSON.stringify(rig.boundaries)}`);
+      assert.equal(rig.refreshCalls(), probe.refresh, "no refresh reconcile after the confirmed park");
+      assert.equal(rig.releaseCalls(), probe.release, "no release reconcile after the confirmed park");
+      assert.equal(api.wallParkRequests.length, 1, "one wall_park report was sent");
+      assert.equal(calls.length, 0, "no push/MR");
+      assertKept(1784, claim.run_id, runHome, rig);
+    } finally {
+      restore();
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("(R2) a confirmed completion hold bypasses the finalize boundary: no finalize permit, no reconcile after the hold, not reported failed", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-hold-"));
+    try {
+      api.setCompletionHoldResponse("paused");
+      const refuse = { on: false };
+      const rig = codexRig({ authMode: "subscription", refuseReconcile: () => refuse.on });
+      const runHome = path.join(homeRoot, "h");
+      const probe: Probe = { refresh: -1, release: -1 };
+      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        fs.mkdirSync(runHome, { recursive: true });
+        fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
+        commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
+        // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
+        git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+        git.fetchAgentBranch = (async () => `refs/uzi-runner/${ctx.branch}`) as typeof git.fetchAgentBranch;
+        git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+        git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
+        git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+        const entered = await ctx.enterCompletionHold?.(HOLD_REASON);
+        probe.outcome = entered;
+        if (entered) refuse.on = true;
+        probe.refresh = rig.refreshCalls();
+        probe.release = rig.releaseCalls();
+        return { branch: ctx.branch, completionHeld: { reason: HOLD_REASON } };
+      });
+      const claim = gitlabClaim(1785);
+      await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
+      assert.equal(probe.outcome, true, "the hold was entered");
+      assert.ok(!rig.boundaries.includes("finalize"), `no finalize boundary; got ${JSON.stringify(rig.boundaries)}`);
+      assert.equal(rig.refreshCalls(), probe.refresh, "no refresh reconcile after the confirmed hold");
+      assert.equal(rig.releaseCalls(), probe.release, "no release reconcile after the confirmed hold");
+      assert.equal(api.completionHoldRequests.length, 1, "one completion-hold request was sent");
+      assert.equal(calls.length, 0, "no push/MR");
+      assertKept(1785, claim.run_id, runHome, rig);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  for (const [name, httpStatus, iid] of [
+    ["(C1) an UNDELIVERABLE wall park (503) still passes through the finalize boundary", 503, 1786],
+    ["(C1b) a reclaimed wall park (404) still passes through the finalize boundary", 404, 1787],
+  ] as const) {
+    it(`${name}: reconcile still runs, non-terminal, work kept`, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const restore = spyPublishLands();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-undeliverable-"));
+      try {
+        api.setWallParkResponse("paused", httpStatus);
+        const rig = codexRig({ authMode: "subscription" });
+        const runHome = path.join(homeRoot, "h");
+        const probe: Probe = { refresh: -1, release: -1 };
+        const claim = gitlabClaim(iid);
+        await runnerWith(() => ({ executor: wallExecutor(rig, runHome, probe, { on: false }), homeDir: runHome }), gitlab).execute(claim);
+        assert.equal(probe.outcome, "undeliverable");
+        assert.ok(rig.boundaries.includes("finalize"), `the finalize boundary was entered; got ${JSON.stringify(rig.boundaries)}`);
+        if (httpStatus === 503) {
+          assert.ok(rig.refreshCalls() + rig.releaseCalls() > probe.refresh + probe.release, "the finalize reconcile ran");
+        }
+        assert.equal(api.wallParkRequests.length, 1, "one wall_park report was attempted");
+        assert.equal(calls.length, 0, "no push/MR");
+        assertKept(iid, claim.run_id, runHome, rig);
+      } finally {
+        restore();
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
 });
 
 // ================================================================================

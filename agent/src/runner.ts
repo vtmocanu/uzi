@@ -1315,6 +1315,11 @@ interface RunFlight {
   branch: string | undefined;
   active: ActiveRun | undefined;
   parked: boolean;
+  /** Issue #1784: true only once the server answered `paused` to a completion hold or a wall park on
+   *  THIS flight (enterCompletionHold / enterWallPark). Drives the Codex finalize-boundary bypass in
+   *  executeClaim: a confirmed-`paused` run's credential reconcile is refused by the server. An
+   *  undeliverable wall park leaves it false. */
+  holdOrWallParkConfirmed: boolean;
   /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
    *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
    *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
@@ -1509,7 +1514,9 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
  * early returns (an owner pause park, the completion hold, the wall-clock park, the in-place
  * credential-switch release) each already reported their own non-terminal state and finalize
  * nothing. Both the finalize-pending write and phasePublish use this predicate: a non-terminal
- * result never writes a finalize record or reaches the finalize boundary.
+ * result never writes a finalize record or finalizes. Only an owner pause or a server-confirmed
+ * hold/wall park (#1784) bypasses the Codex finalize boundary; an undeliverable wall park and a
+ * credential-switch release still pass through it and take phasePublish's early return inside it.
  */
 export function isFinalizeBoundResult(
   result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased">,
@@ -2346,8 +2353,9 @@ export class RunRunner {
       // PRD #1171 m4: the finalize sink. phasePreflightHandoff already ran the
       // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
       // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
-      // (push/base-align/MR, or the pause/not_code/report-only early returns) runs under the
-      // held permit — its per-sink reconcile + quiesce+reap close admission and tear down the
+      // (push/base-align/MR, or the not_code/report-only/undeliverable-park/switch-release early
+      // returns) runs under the held permit (an owner pause or a server-confirmed hold/wall park,
+      // #1764/#1784, bypasses it) — its per-sink reconcile + quiesce+reap close admission and tear down the
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
       // a committed publish still propagates to the failed-run report below, unless it carries a
@@ -2355,13 +2363,17 @@ export class RunRunner {
       // registers the committed terminal callback, however, the pushed branch/open MR is the
       // authoritative outcome and must be reported after the boundary releases.
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
-      if (flight.result?.pausedAt) {
-        // Issue #1764: an owner-pause PARKED the run (handlePausePark reported `paused`), so
-        // phasePublish takes its pausedAt early return and finalizes nothing. Call it OUTSIDE the
-        // Codex finalize boundary: that boundary's per-sink credential reconcile
-        // (refreshCodex/releaseCodex) is refused by the server once the run is `paused` (not an
-        // actively-claimed status), which would fail a durably parked run. The finally's terminal
-        // safety.dispose still tears the Codex registry down. For Claude/stub the boundary wrapper
+      if (
+        flight.result?.pausedAt ||
+        ((flight.result?.walled || flight.result?.completionHeld) && flight.holdOrWallParkConfirmed)
+      ) {
+        // Issues #1764/#1784: an owner-pause, or a completion hold / wall park the server CONFIRMED
+        // (`paused`), PARKED the run, so phasePublish takes its non-terminal early return and
+        // finalizes nothing. Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
+        // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
+        // `paused` (not an actively-claimed status), which would fail a durably parked run. An
+        // undeliverable wall park and a credential-switch release keep going through the boundary.
+        // The finally's terminal safety.dispose still tears the Codex registry down. For Claude/stub the boundary wrapper
         // is a plain call, so this path is unchanged for them.
         await this.phasePublish(claim, flight, undefined, undefined);
       } else {
@@ -4477,7 +4489,8 @@ export class RunRunner {
       if (result.pausedAt) {
         // PRD #1171 m4: needs NO own permit. Issue #1764: a Codex executor now sets pausedAt, and
         // executeClaim then calls phasePublish directly, BYPASSING the finalize withBoundary (its
-        // credential reconcile is refused once the run is `paused`); the runner's terminal
+        // credential reconcile is refused once the run is `paused`; same for #1784's confirmed
+        // hold/wall park below); the runner's terminal
         // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
         // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
         executor.killAgentTree?.();
@@ -4492,8 +4505,9 @@ export class RunRunner {
       // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
       // non-terminal and the hold seam already handled the transition, so there is nothing to
       // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
-      // finally preserves its HOME for resume. In M3 this branch is dead (the seam is unwired, so
-      // completionHeld is never set) — M4 wires the seam and this becomes live.
+      // finally preserves its HOME for resume. Issue #1784: a Codex run whose hold the server
+      // confirmed (`paused`) reaches here via the finalize-boundary bypass in executeClaim. In M3
+      // this branch was dead (the seam was unwired, so completionHeld was never set); M4 wired it.
       if (result.completionHeld) {
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
@@ -4508,7 +4522,9 @@ export class RunRunner {
       // the completion hold above, the run is non-terminal and the wall seam already handled it (a
       // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
       // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
-      // clone + HOME (enterWallPark set the flags) for a resume. Keyed on the executor's result so no
+      // clone + HOME (enterWallPark set the flags) for a resume. Issue #1784: a Codex run whose park
+      // the server confirmed (`paused`) reaches here via the finalize-boundary bypass in executeClaim;
+      // an undeliverable park still arrives inside the boundary. Keyed on the executor's result so no
       // non-wall path can reach this branch.
       if (result.walled) {
         executor.killAgentTree?.();
@@ -6950,6 +6966,7 @@ export class RunRunner {
       // rather than in the catch so the finally can see it; false is the safe default,
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
+      holdOrWallParkConfirmed: false,
       // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
       // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
       // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
@@ -12430,6 +12447,7 @@ export class RunRunner {
     //    plugin dir for the same-worker resume (the clone stays via preserveRecoveryClone, set
     //    above). phasePublish's completionHeld branch reaps again (idempotent) and skips finalize.
     flight.parked = true;
+    flight.holdOrWallParkConfirmed = true;
     runLog.info("run entered the recoverable completion hold; preserving its clone and HOME for resume", {
       run_id: flight.runId,
       reason,
@@ -12565,6 +12583,7 @@ export class RunRunner {
       //    plugin dir; preserveRecoveryClone (set above) keeps the clone. phasePublish's walled branch
       //    reaps again (idempotent) and skips finalize.
       flight.parked = true;
+      flight.holdOrWallParkConfirmed = true;
       runLog.info("run parked at its wall-clock limit; preserving clone + HOME for resume", {
         run_id: flight.runId,
         published,

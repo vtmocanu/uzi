@@ -21,7 +21,7 @@ import (
 // park, so "an old flight's stamped-generation report is rejected, before AND after the resume" is a
 // wall-park pin rather than a credential-switch proxy. Skipped unless UZI_TEST_DATABASE_URL is set.
 
-// TestWallParkFenceOldFlightRejectedLiveDB drives a stamped-generation running/completed report from
+// TestWallParkFenceOldFlightRejectedLiveDB drives a stamped-generation running/completed/failed report from
 // the OLD flight through SetState against a SERVER-parked (ParkRunsAtWall) row, and asserts it is
 // rejected with no mutation in both windows:
 //
@@ -104,6 +104,7 @@ func TestWallParkFenceOldFlightRejectedLiveDB(t *testing.T) {
 	// BEFORE the resume: the claim_released_at fence rejects the matching-generation report as stale.
 	report("before-resume", "running", ErrStaleClaim, "paused")
 	report("before-resume", "completed", ErrStaleClaim, "paused")
+	report("before-resume", "failed", ErrStaleClaim, "paused")
 
 	// The owner extends-and-resumes: paused -> queued, worker_id NULL (server-parked, D19).
 	if _, err := env.q.ExtendAndResumeWallPark(env.ctx, store.ExtendAndResumeWallParkParams{
@@ -121,4 +122,5 @@ func TestWallParkFenceOldFlightRejectedLiveDB(t *testing.T) {
 	// before the fence runs — still a no-op, still leaving the run untouched at queued.
 	report("after-resume", "running", ErrRunNotOwned, "queued")
 	report("after-resume", "completed", ErrRunNotOwned, "queued")
+	report("after-resume", "failed", ErrRunNotOwned, "queued")
 }
