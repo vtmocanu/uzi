@@ -41,6 +41,11 @@ through `[0.52.0]`.)
 - **An ephemeral worker is now held idle for up to 2 hours after its run, so a same-repo follow-up reuses it ([#2006](https://github.com/vtmocanu/uzi/issues/2006)).**
   When an ephemeral worker finishes its run it keeps its warm clone and caches for a lease (`UZI_EPHEMERAL_LEASE`, chart `workers.ephemeralLease`, default 2h, maximum 2h, `0` restores the old tear-down-at-finish behaviour), and a later run from the same owner on the same repository and branch (a rework or follow-up) claims it instead of provisioning a new one. The lease ends early on a cordon, roll or restart, and the oldest leased worker is evicted if you hit the per-user ephemeral cap. `uzi worker list` shows `(leased, 1h12m left)` and the worker JSON carries `ephemeral_lease_expires_at`. The Workers page shows a `leased · <time> left` badge, and its hosted-worker quota count no longer includes ephemeral workers, matching the server.
 
+### Fixed
+
+- **Codex runs now apply owner follow-ups, and the steer queue says whether a follow-up reached a prompt ([#1800](https://github.com/vtmocanu/uzi/issues/1800)).**
+  A follow-up sent to a Codex run was accepted and shown as delivered but never reached the agent; it now rides the next ordinary implementation prompt on both Claude and Codex, one per turn, and one sent at the plan gate is included in the first prompt after approval (on Claude it used to wait a turn). A follow-up received but never included is re-sent to the lead after a resume. `uzi run inputs`, the TUI and the web steer queue no longer say "delivered": they show queued, received, routed, included in a prompt, or not included (run finished), and rows handled by older workers read "no inclusion report". The follow-up text is fenced as untrusted input with a per-prompt tag. Worker inputs gain `applied_at`, `included_at` and `inclusion_reported`. See [run activity](docs/run-activity.md).
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

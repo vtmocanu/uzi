@@ -562,12 +562,15 @@ uzi version
   `received` (the worker has it), `routed` (steering has acted on it), or `included in a
   prompt` (the turn carrying it started; this never claims the agent acted on it). A
   received or routed row names what it waits on: `(waits for approval)` at a plan gate
-  (it reaches the first implementation prompt after approval), `(waits for your answer)`
+  (it reaches the first implementation prompt after approval), `(awaits your answer)`
   at a clarification park, `(resumes the run)` on an interactive run awaiting a
   follow-up, or the usage-limit / token-pool / recovery park. On a finished run an
   unfetched input reads `not delivered (run finished)` and a fetched one no prompt
   carried reads `not included (run finished)`. A worker that does not report prompt
-  inclusion shows `received` or `routed` with `(prompt inclusion not reported)`. The
+  inclusion shows `received` or `routed` with `(no inclusion report)`. `included` is recorded once the turn carrying the follow-up
+  reaches the model; on a resume the lead is re-sent a received, not-yet-included
+  follow-up only when its worker reports inclusion (older workers' rows are not
+  re-sent), so delivery is at-least-once and a follow-up can be included again. The
   table's `KIND` column labels each row
   `follow-up` or `scope`. A `scope` row is an operator scope directive (PRD #634): it is
   never consumed, so its state is its **disposition** — `applied (finalized at the

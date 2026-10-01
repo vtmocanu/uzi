@@ -39,7 +39,7 @@ const PARKED_COPY: Record<string, { suffix: string; title: string }> = {
     title: "The worker has it, but it reaches a prompt only after you approve the plan.",
   },
   awaiting_input: {
-    suffix: "waits for your answer",
+    suffix: "awaits your answer",
     title: "The worker has it, but it reaches a prompt only after you answer the agent's question.",
   },
   // PRD #517: an interactive run parked awaiting the owner's next follow-up. Sending
@@ -122,7 +122,7 @@ function deliveryFor(input: SteerInput, terminal: boolean, status: string | unde
     // A worker that predates inclusion reporting cannot say whether a prompt carried it,
     // so neither "included" nor "not included" is claimed.
     return {
-      label: `${base} — inclusion not reported`,
+      label: `${base} — no inclusion report`,
       tone: "neutral",
       title:
         "The worker has this follow-up but does not report which prompt carried it, so whether it was included is unknown.",
@@ -272,7 +272,7 @@ export function SteerQueueCard({
   inputs: SteerInput[];
   terminal: boolean;
   // The run status, used only to render the parked copy ("Received — waits for approval" /
-  // "…waits for your answer"). Optional: absent degrades those to a plain "Received".
+  // "…awaits your answer"). Optional: absent degrades those to a plain "Received".
   status?: string;
   // canSteer is false for a NON-OWNER viewer (a non-owner admin can open the owner-or-
   // admin run view, but the owner-only /inputs 404s — useRunStream reports that here).
@@ -331,7 +331,7 @@ export function SteerQueueCard({
                   {/* Scope-disposition labels are sentence-length (the longest is
                       "Superseded — a later directive replaced it"), so opt into Badge's
                       `wrap` (ui.tsx) to wrap the pill on a narrow viewport instead of
-                      crushing the body text. Follow-up chips such as "Routed — waits for your
+                      crushing the body text. Follow-up chips such as "Routed — awaits your
                       answer" are nearly as long, so they wrap too. */}
                   <Badge tone={d.tone} wrap>
                     {d.label}

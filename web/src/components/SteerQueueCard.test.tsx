@@ -85,6 +85,12 @@ describe("SteerQueueCard delivery states (Decision 7, issue #1800)", () => {
     expect(screen.getByText("Routed")).toBeTruthy();
   });
 
+  it("received + awaiting_approval → 'Received — waits for approval'", () => {
+    renderCard(input({ consumed_at: RECEIVED }), "awaiting_approval");
+    expect(screen.getByText("Received — waits for approval")).toBeTruthy();
+    expect(screen.queryByText(/^Received$/)).toBeNull();
+  });
+
   it("routed + awaiting_approval → 'Routed — waits for approval'", () => {
     renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "awaiting_approval");
     expect(screen.getByText("Routed — waits for approval")).toBeTruthy();
@@ -98,13 +104,13 @@ describe("SteerQueueCard delivery states (Decision 7, issue #1800)", () => {
     // a prompt only on the next turn, which does not come until the human answers. Reusing
     // the gate's copy would send the user hunting for a plan gate that is not there.
     renderCard(input({ consumed_at: RECEIVED }), "awaiting_input");
-    expect(screen.getByText("Received — waits for your answer")).toBeTruthy();
+    expect(screen.getByText("Received — awaits your answer")).toBeTruthy();
     expect(screen.queryByText(/waits for approval/)).toBeNull();
   });
 
-  it("routed + awaiting_input → 'Routed — waits for your answer'", () => {
+  it("routed + awaiting_input → 'Routed — awaits your answer'", () => {
     renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED }), "awaiting_input");
-    expect(screen.getByText("Routed — waits for your answer")).toBeTruthy();
+    expect(screen.getByText("Routed — awaits your answer")).toBeTruthy();
   });
 
   it("routed + awaiting_followup → 'Routed — resumes the run' (PRD #517)", () => {
@@ -141,17 +147,26 @@ describe("SteerQueueCard delivery states (Decision 7, issue #1800)", () => {
     expect(screen.queryByText(/Not included/)).toBeNull();
   });
 
-  it("legacy (inclusion not reported), live → 'Received/Routed — inclusion not reported'", () => {
+  it("legacy (no inclusion report), live → 'Received/Routed — no inclusion report'", () => {
     renderCard(input({ consumed_at: RECEIVED, inclusion_reported: false }), "running");
-    expect(screen.getByText("Received — inclusion not reported")).toBeTruthy();
+    expect(screen.getByText("Received — no inclusion report")).toBeTruthy();
     cleanup();
     renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED, inclusion_reported: false }), "running");
-    expect(screen.getByText("Routed — inclusion not reported")).toBeTruthy();
+    expect(screen.getByText("Routed — no inclusion report")).toBeTruthy();
+  });
+
+  it("legacy at a park → the no-inclusion-report chip wins over the park qualifier", () => {
+    for (const status of ["awaiting_approval", "awaiting_input", "awaiting_followup"]) {
+      cleanup();
+      renderCard(input({ consumed_at: RECEIVED, inclusion_reported: false }), status);
+      expect(screen.getByText("Received — no inclusion report")).toBeTruthy();
+      expect(screen.queryByText(/waits for approval|awaits your answer|resumes the run/)).toBeNull();
+    }
   });
 
   it("legacy, terminal → never claims 'Not included' (the worker cannot say)", () => {
     renderCard(input({ consumed_at: RECEIVED, applied_at: ROUTED, inclusion_reported: false }), "completed", true);
-    expect(screen.getByText("Routed — inclusion not reported")).toBeTruthy();
+    expect(screen.getByText("Routed — no inclusion report")).toBeTruthy();
     expect(screen.queryByText(/Not included/)).toBeNull();
   });
 

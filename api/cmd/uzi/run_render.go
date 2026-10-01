@@ -1716,11 +1716,11 @@ func steerKindLabel(kind string) string {
 //   - not consumed, otherwise      → "queued"
 //   - included_at set              → "included in a prompt" on any run status
 //   - consumed, not included, run terminal, inclusion reported → "not included (run finished)"
-//   - consumed, not included, run terminal, not reported → base + " (prompt inclusion not reported)"
+//   - consumed, not included, run terminal, not reported → base + " (no inclusion report)"
 //   - consumed, not included, otherwise → base ("routed" when applied_at is set, else
 //     "received") plus one qualifier: awaiting_approval "(waits for approval)",
-//     awaiting_input "(waits for your answer)", awaiting_followup "(resumes the run)",
-//     a park's reason suffix, or "(prompt inclusion not reported)" for a legacy row.
+//     awaiting_input "(awaits your answer)", awaiting_followup "(resumes the run)",
+//     a park's reason suffix, or "(no inclusion report)" for a legacy row.
 //
 // "Included" means the turn carrying the follow-up started; it never claims the model acted
 // on it. Nothing here says "delivered" for a consumed-but-not-included row: the worker having
@@ -1819,7 +1819,7 @@ func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...st
 	if in.AppliedAt != nil {
 		base = "routed"
 	}
-	const notReportedSuffix = " (prompt inclusion not reported)"
+	const notReportedSuffix = " (no inclusion report)"
 	if terminalRunStatuses[runStatus] {
 		if in.InclusionReported {
 			return "not included (run finished)"
@@ -1837,7 +1837,7 @@ func steerState(in apitypes.SteerInputDTO, runStatus string, recoveryCause ...st
 		// answer rather than behind an approval. Distinct wording because the action
 		// the user owes is different, and telling them to approve something would be
 		// simply wrong.
-		return base + " (waits for your answer)"
+		return base + " (awaits your answer)"
 	case "awaiting_followup":
 		// PRD #517: the interactive task is parked awaiting the user's next follow-up;
 		// a follow-up here is what wakes the parked run.

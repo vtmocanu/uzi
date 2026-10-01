@@ -273,8 +273,8 @@ func TestSteerApproveOnlyAtThePlanGate(t *testing.T) {
 	}
 }
 
-// The queued/delivered indicator uses the SHARED steerState + relAge helpers, so the
-// TUI and `uzi run inputs` cannot disagree about what "delivered" means.
+// The queue indicator uses the SHARED steerState + relAge helpers, so the TUI and
+// `uzi run inputs` cannot disagree about what "queued" and "received" mean.
 func TestSteerQueueIndicatorUsesTheSharedVocabulary(t *testing.T) {
 	runID := "r-own"
 	body := "please also update the docs"
@@ -291,12 +291,12 @@ func TestSteerQueueIndicatorUsesTheSharedVocabulary(t *testing.T) {
 	// These strings come from steerState, not from this file — if the shared helper's
 	// wording changes, this test follows it rather than pinning a stale copy.
 	wantQueued := steerState(queuedIn(), "running")
-	wantDelivered := steerState(receivedIn(consumed), "running")
+	wantReceived := steerState(receivedIn(consumed), "running")
 	if !strings.Contains(out, wantQueued) {
 		t.Errorf("the queue indicator does not show %q\n%s", wantQueued, out)
 	}
-	if !strings.Contains(out, wantDelivered) {
-		t.Errorf("the queue indicator does not show %q\n%s", wantDelivered, out)
+	if !strings.Contains(out, wantReceived) {
+		t.Errorf("the queue indicator does not show %q\n%s", wantReceived, out)
 	}
 }
 

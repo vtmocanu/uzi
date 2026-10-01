@@ -1479,8 +1479,8 @@ func TestSteerStateEveryFollowUpState(t *testing.T) {
 		{"routed live", routed, "running", "routed"},
 		{"received at plan gate", recv, "awaiting_approval", "received (waits for approval)"},
 		{"routed at plan gate", routed, "awaiting_approval", "routed (waits for approval)"},
-		{"received awaiting answer", recv, "awaiting_input", "received (waits for your answer)"},
-		{"routed awaiting answer", routed, "awaiting_input", "routed (waits for your answer)"},
+		{"received awaiting answer", recv, "awaiting_input", "received (awaits your answer)"},
+		{"routed awaiting answer", routed, "awaiting_input", "routed (awaits your answer)"},
 		{"routed awaiting follow-up", routed, "awaiting_followup", "routed (resumes the run)"},
 		{"routed usage limit", routed, statusLimitWait, "routed (run paused on a usage limit)"},
 		{"routed pool wait", routed, statusPoolWait, "routed (run held on an empty token pool)"},
@@ -1492,16 +1492,22 @@ func TestSteerStateEveryFollowUpState(t *testing.T) {
 		{"routed then run finished", routed, "failed", "not included (run finished)"},
 		{"received after a resume (non-terminal, not included)", recv, "running", "received"},
 		{"routed after a resume (non-terminal, not included)", routed, "running", "routed"},
-		{"legacy received live", legacyRecv, "running", "received (prompt inclusion not reported)"},
-		{"legacy routed live", legacyRouted, "running", "routed (prompt inclusion not reported)"},
-		{"legacy routed at gate", legacyRouted, "awaiting_approval", "routed (prompt inclusion not reported)"},
-		{"legacy received terminal", legacyRecv, "completed", "received (prompt inclusion not reported)"},
-		{"legacy routed terminal", legacyRouted, "completed", "routed (prompt inclusion not reported)"},
+		{"legacy received live", legacyRecv, "running", "received (no inclusion report)"},
+		{"legacy routed live", legacyRouted, "running", "routed (no inclusion report)"},
+		{"legacy routed at gate", legacyRouted, "awaiting_approval", "routed (no inclusion report)"},
+		{"legacy received terminal", legacyRecv, "completed", "received (no inclusion report)"},
+		{"legacy routed terminal", legacyRouted, "completed", "routed (no inclusion report)"},
+		{"legacy received awaiting answer", legacyRecv, "awaiting_input", "received (no inclusion report)"},
+		{"legacy routed usage limit", legacyRouted, statusLimitWait, "routed (no inclusion report)"},
 	}
 	for _, c := range cases {
 		got := steerState(c.in, c.status)
 		if got != c.want {
 			t.Errorf("%s: steerState = %q, want %q", c.name, got, c.want)
+		}
+		// The queue column is 30 cells wide (padCell); only the long park suffixes may overflow.
+		if len([]rune(got)) > 30 && !strings.Contains(got, "(run ") {
+			t.Errorf("%s: %q is %d cells, wider than the 30-cell queue column", c.name, got, len([]rune(got)))
 		}
 		if strings.Contains(got, "delivered") && c.in.ConsumedAt != nil {
 			t.Errorf("%s: %q says delivered for a received row", c.name, got)

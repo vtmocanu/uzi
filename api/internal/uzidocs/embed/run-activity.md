@@ -279,12 +279,12 @@ through these delivery states:
 | Received | The worker has fetched it. It is not in a prompt yet. |
 | Routed | The run's steering has acted on it: it is lined up for the next turn. |
 | Received / Routed — waits for approval | Fetched while the run sits at a plan-approval gate. It reaches a prompt in the first implementation prompt after you approve. |
-| Received / Routed — waits for your answer | Fetched while the run waits on a clarification question. It rides the next ordinary turn after you answer. |
+| Received / Routed — awaits your answer | Fetched while the run waits on a clarification question. It rides the next ordinary turn after you answer. |
 | Received / Routed — resumes the run | Fetched while an interactive run waits for its next follow-up; it becomes the next turn and resumes the run. |
 | Included in a prompt | The turn carrying it started: it is in a prompt the agent was given. |
 | Not delivered — run finished | The run went terminal before the worker ever fetched it. |
 | Not included — run finished | The worker fetched it, but the run finished before any turn carried it. |
-| Received / Routed — inclusion not reported | The worker predates inclusion reporting, so uzi cannot say whether a prompt carried it. |
+| Received / Routed — no inclusion report | The worker predates inclusion reporting, so uzi cannot say whether a prompt carried it. |
 
 **When a follow-up is included.** Claude and Codex runs behave identically.
 Each owner follow-up is included in the next ordinary implementation prompt,
@@ -292,9 +292,14 @@ one per turn, oldest first, so with several queued a later one stays Received
 or Routed until its turn starts. A follow-up sent at the plan gate is included
 in the first implementation prompt after you approve. Completion-rework,
 clarification and secret-gate turns carry only their own text; a follow-up
-that is waiting rides the next ordinary turn. "Included" is recorded when the
-turn carrying it starts. After a resume, a follow-up that was received but
-never included is sent to the lead again. Chat messages are included when
+that is waiting rides the next ordinary turn. "Included" is recorded once the
+turn carrying it reaches the model (the agent's first model activity in that
+turn). The follow-up is fenced as untrusted input in the prompt. After a
+resume, a follow-up that a worker received, and that the worker reports
+inclusion for, but that was never included is sent to the lead again at every
+re-claim; rows received by an older worker that does not report inclusion are
+not re-sent. Delivery is therefore at-least-once: a follow-up can be included
+again after a resume if the worker could not report the first inclusion. Chat messages are included when
 their chat turn starts. Diff-review, judge, job and isolated research runs
 never include follow-ups.
 
@@ -330,8 +335,8 @@ whether the directive changed anything:
 | Declined — not acted on | The run completed normally despite the directive — it finished its milestones (or the ceiling was never reached), so the directive changed nothing. |
 
 This closes the gap the note above names for a plain follow-up: where
-"Delivered" only tells you the worker *saw* it, a scope directive's chip
-tells you whether it *fired*.
+"Received" only tells you the worker *has* a follow-up, a scope directive's
+chip tells you whether it *fired*.
 
 ## Milestones and the now line
 

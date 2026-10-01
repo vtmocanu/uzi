@@ -445,7 +445,7 @@ export const mockCrewRuns: Run[] = [
 // Queued, consumed_at → Received, plus applied_at → Routed, plus included_at → Included in
 // a prompt; the run's status decides the gate/terminal copy client-side. The mock worker
 // reports prompt inclusion (inclusion_reported true), so a consumed row without included_at
-// reads as waiting or "Not included" rather than "inclusion not reported".
+// reads as waiting or "Not included" rather than "no inclusion report".
 const steerInput = (
   id: number,
   body: string,

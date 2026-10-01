@@ -2076,3 +2076,23 @@ func TestRunInputsIncludedAndNotIncluded(t *testing.T) {
 		t.Errorf("inputs table says delivered for received follow-ups:\n%s", out)
 	}
 }
+
+// TestRunInputsReceivedAtFollowUpPark (issue #1800): a follow-up the worker received while an
+// interactive run waits for the owner's next follow-up reads "received (resumes the run)".
+func TestRunInputsReceivedAtFollowUpPark(t *testing.T) {
+	at := time.Now().Add(-time.Minute)
+	body := "keep going"
+	fc := &uzicli.FakeClient{
+		RunByID: map[string]apitypes.RunDTO{"p": {ID: "p", Status: "awaiting_followup", Kind: "task"}},
+		InputsByID: map[string][]apitypes.SteerInputDTO{"p": {
+			{ID: 1, Kind: "follow_up", Body: &body, CreatedAt: at, ConsumedAt: &at, InclusionReported: true},
+		}},
+	}
+	out, _, code := runCLI(t, fakeEnv(fc), "run", "inputs", "p")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0", code)
+	}
+	if !strings.Contains(out, "received (resumes the run)") {
+		t.Errorf("inputs table missing %q:\n%s", "received (resumes the run)", out)
+	}
+}

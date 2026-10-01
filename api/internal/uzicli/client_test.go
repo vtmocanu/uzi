@@ -411,7 +411,7 @@ func TestHTTPClientReview404(t *testing.T) {
 }
 
 // RunInputs decodes the {"inputs": [...]} envelope into the DTO list, carrying
-// consumed_at through as a pointer (null → nil = Queued, set → Delivered).
+// consumed_at through as a pointer (null → nil = not yet received, set → received by the worker).
 func TestHTTPClientRunInputs(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"inputs":[{"id":2,"body":"b2","created_at":"2026-07-20T10:00:00Z","consumed_at":"2026-07-20T10:01:00Z"},{"id":1,"body":"b1","created_at":"2026-07-20T09:00:00Z","consumed_at":null}]}`))
@@ -422,10 +422,10 @@ func TestHTTPClientRunInputs(t *testing.T) {
 		t.Fatalf("RunInputs: in=%+v err=%v", in, err)
 	}
 	if in[0].ID != 2 || in[0].ConsumedAt == nil {
-		t.Errorf("first row should be consumed (Delivered): %+v", in[0])
+		t.Errorf("first row should be consumed (received): %+v", in[0])
 	}
 	if in[1].ID != 1 || in[1].ConsumedAt != nil {
-		t.Errorf("second row should be unconsumed (Queued): %+v", in[1])
+		t.Errorf("second row should be unconsumed (not yet received): %+v", in[1])
 	}
 }
 

@@ -22,7 +22,9 @@
 # agent's next turn. We submit the follow-up in the queued/claiming window BEFORE the
 # run is owned and its steering poll has run, then read it back as Queued; the gate's
 # poll then flips it to Received while the run sits at awaiting_approval — the S3
-# "Received — waits for approval" (consumed_at set; not yet in a prompt) case, driven end to end by the real worker poll.
+# S3 case (consumed_at set; not yet in a prompt; the UI reads "Received — waits for approval",
+# or "Routed — waits for approval" once steering has acted on it), driven end to end by the real
+# worker poll. The assertions here key on consumed_at only.
 # (The dropped-frame reconnect self-heal, S1, is proven in
 # web/src/lib/useRunStream.test.tsx — e2e has no browser WS, so it is not re-tested here.)
 #
@@ -145,7 +147,7 @@ apiget "/api/runs/$RUN_S" | jq -e '((.run.usage.input_tokens // 0) == 0) and ((.
 pass "no forge write + no token spend for the follow_up path (MR count unchanged, no branch, run.usage zero)"
 
 # The queue survives the run going terminal (B1): cancel to clean up, then the same
-# Received follow_up is still readable on the now-terminal run (it lives in
+# consumed follow_up is still readable on the now-terminal run (it lives in
 # run_user_inputs, not the composer's unmounted component state).
 #
 # Terminal status is `cancelled`, NOT `failed` (PRD #503 M1, landed in #521): a cancel
@@ -167,6 +169,6 @@ wait_status "$RUN_S" cancelled
 [ "$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')" = "cancelled" ] \
   || fail "a live-worker cancel must terminate the run as cancelled(stop_kind=cancelled), got status='$(apiget "/api/runs/$RUN_S" | jq -r '.run.status')' stop_kind='$(apiget "/api/runs/$RUN_S" | jq -r '.run.stop_kind // empty')'"
 [ "$(apiget "/api/runs/$RUN_S/inputs" | jq -r '.inputs[0].consumed_at')" != null ] \
-  || fail "the received follow_up must remain readable (and Received) after the run goes terminal (B1 survive-terminal)"
-pass "steer queue survives terminal: the Received follow_up is still listed on the now-terminal (cancelled) run (B1)"
+  || fail "the consumed follow_up must remain readable (consumed_at still set) after the run goes terminal (B1 survive-terminal)"
+pass "steer queue survives terminal: the consumed follow_up is still listed on the now-terminal (cancelled) run; the UI reads "Not included — run finished" (B1)"
 
