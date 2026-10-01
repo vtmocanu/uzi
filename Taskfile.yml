@@ -1026,7 +1026,7 @@ tasks:
       - ./.agents/skills/uzi-watcher/scripts/create-run.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance and CHANGELOG union
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance and CHANGELOG union and release fold
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
@@ -1038,6 +1038,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-basemove.test.sh
       - ./.agents/skills/uzi-lander/scripts/changelog-union.test.sh
+      - ./.agents/skills/uzi-lander/scripts/changelog-union-fold.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-pr.test.sh
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
       - ./.agents/skills/uzi-lander/scripts/merge.test.sh
