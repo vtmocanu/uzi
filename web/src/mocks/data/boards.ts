@@ -32,6 +32,10 @@ function latestRun(fields: Partial<LatestRun> & Pick<LatestRun, "id" | "status">
     worker_name: null,
     is_mine: true,
     run_count: 1,
+    // Issue #2004: the whole-run anchors the card now carries (null until first start /
+    // finish). A card that needs a terminal `ran …` token overrides both.
+    first_started_at: null,
+    finished_at: null,
     created_at: minsAgo(30),
     updated_at: minsAgo(30),
     ...fields,

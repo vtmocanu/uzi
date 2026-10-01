@@ -488,7 +488,13 @@ export function startNewRun(runId: string) {
     {
       delay: 900,
       step: () => {
-        patchRun(runId, { status: "running", started_at: new Date().toISOString() });
+        const startedAt = new Date().toISOString();
+        // Mirrors the DB COALESCE: first_started_at is stamped once and never reset.
+        patchRun(runId, {
+          status: "running",
+          started_at: startedAt,
+          ...(getRun(runId)?.first_started_at ? {} : { first_started_at: startedAt }),
+        });
         schedule(runId, planningScript(runId));
       },
     },

@@ -6,11 +6,13 @@
 import { formatElapsed } from "./runBadge";
 import { statusSinceIso } from "./statusSince";
 
-// RunDurationInput is the minimal run shape runDurationLabel reads. The three lifecycle
+// RunDurationInput is the minimal run shape runDurationLabel reads. The lifecycle
 // timestamps are BOTH optional and nullable (Decision 6) so a single type accepts the
-// full Run (where claimed/started/finished are `string | null`) AND the board's narrow
-// LatestRun (which carries only created_at/updated_at — the keys are simply absent) by
-// structural typing. status_since (issue #1727) is optional for the same reason: the full
+// full Run (where claimed/started/finished are `string | null`) AND an older api or a
+// narrower shape whose keys are simply absent, by structural typing. Issue #2004: the
+// board's LatestRun now carries first_started_at and finished_at too (superseding PRD
+// #256 Decision 6, which had the board degrade), so a terminal board card shows `ran …`.
+// first_started_at is optional for rollout skew. status_since (issue #1727) is optional for the same reason: the full
 // Run carries it, LatestRun does not, and an older server omits it.
 export interface RunDurationInput {
   status: string;
@@ -18,8 +20,23 @@ export interface RunDurationInput {
   updated_at: string;
   status_since?: string | null;
   claimed_at?: string | null;
+  first_started_at?: string | null;
   started_at?: string | null;
   finished_at?: string | null;
+}
+
+/**
+ * firstStartIso is the anchor every whole-run duration display reads (issue #2004):
+ * first_started_at, which is never reset, falling back to started_at for an older api that
+ * omits the key. started_at is the timeout/budget anchor and is cleared on limit, recovery
+ * and pool resumes, so on its own it covers only the last leg. Returns null when the run
+ * never started.
+ */
+export function firstStartIso(run: {
+  first_started_at?: string | null;
+  started_at?: string | null;
+}): string | null {
+  return run.first_started_at ?? run.started_at ?? null;
 }
 
 // parseTs parses an RFC3339 timestamp to epoch ms, or null when the value is
@@ -37,7 +54,7 @@ function parseTs(iso: string | null | undefined): number | null {
  *
  *   - queued              → `queued <elapsed>`  since created_at (time waiting to be claimed)
  *   - claimed             → `claimed <elapsed>` since claimed_at ?? created_at
- *   - running             → `running <elapsed>` since started_at ?? created_at
+ *   - running             → `running <elapsed>` since first_started_at ?? started_at ?? created_at
  *   - awaiting_approval /
  *     awaiting_input /
  *     awaiting_followup /
@@ -48,7 +65,7 @@ function parseTs(iso: string | null | undefined): number | null {
  *   - paused               → `paused <elapsed>`  since status_since ?? updated_at (PRD #1190,
  *                            its own verb)
  *   - completed / failed /
- *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − started_at, i.e.
+ *     cancelled (terminal) → `ran <elapsed>`, the STATIC span finished_at − (first_started_at ?? started_at), i.e.
  *                            how long it actually ran, independent of nowMs
  *   - anything else        → ""
  *
@@ -70,7 +87,7 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
     case "claimed":
       return liveToken("claimed", run.claimed_at ?? run.created_at, nowMs);
     case "running":
-      return liveToken("running", run.started_at ?? run.created_at, nowMs);
+      return liveToken("running", firstStartIso(run) ?? run.created_at, nowMs);
     case "awaiting_approval":
     case "awaiting_input":
     case "awaiting_followup":
@@ -96,7 +113,7 @@ export function runDurationLabel(run: RunDurationInput, nowMs: number): string {
     case "cancelled": {
       // Static ran-span, not a live age: only meaningful when the run both started and
       // finished. Missing either end (never started) → "".
-      const started = parseTs(run.started_at);
+      const started = parseTs(firstStartIso(run));
       const finished = parseTs(run.finished_at);
       if (started == null || finished == null) return "";
       return `ran ${formatElapsed(finished - started)}`;

@@ -58,6 +58,7 @@ import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage } from "../lib/runUsage";
 import { statusSinceIso } from "../lib/statusSince";
+import { firstStartIso } from "../lib/runDuration";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
 import { SalvagePanel } from "../components/SalvagePanel";
@@ -152,7 +153,8 @@ function RunBudgetElapsed({ run }: { run: Run }) {
   const view = extendBudgetView(run, now);
   if (!view) {
     // Plain elapsed — today's behaviour, unchanged for a null-budget kind or an older api.
-    return run.started_at ? <LiveElapsed since={run.started_at} /> : null;
+    const since = firstStartIso(run);
+    return since ? <LiveElapsed since={since} /> : null;
   }
   const deadline = formatLocalTime(view.deadlineIso);
   const tip =
@@ -187,9 +189,10 @@ function PausedElapsed({ run }: { run: Run }) {
   if (!run.started_at) return null;
   const view = extendBudgetView(run, Date.now());
   if (!view) {
+    // Issue #2004: the no-budget line is a plain wall span, so it anchors on the first start.
     return (
       <span className="text-xs tabular-nums text-faint">
-        {formatDuration(Date.parse(statusSinceIso(run)) - Date.parse(run.started_at))} · clock stopped
+        {formatDuration(Date.parse(statusSinceIso(run)) - Date.parse(firstStartIso(run) ?? run.started_at))} · clock stopped
       </span>
     );
   }
@@ -2188,9 +2191,10 @@ export function RunView() {
     run.mr_web_url,
     run.mr_iid != null ? mergeRequestUrl(repoWebUrl, run.mr_iid, run.forge_type) : null,
   );
+  const firstStart = firstStartIso(run);
   const duration =
-    run.started_at && run.finished_at
-      ? formatDuration(new Date(run.finished_at).getTime() - new Date(run.started_at).getTime())
+    firstStart && run.finished_at
+      ? formatDuration(new Date(run.finished_at).getTime() - new Date(firstStart).getTime())
       : null;
   // PRD #1167 M4: Shadow's per-run surface signal, rendered as data-live/data-attention
   // on the run header block (the titleNode wrapping the breadcrumb, title and status).

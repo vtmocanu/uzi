@@ -733,6 +733,10 @@ export interface LatestRun {
   id: string;
   status: RunStatus;
   mr_iid: number | null;
+  // Issue #2004: the whole-run duration anchors (see Run.first_started_at). Optional for
+  // rollout skew: an older api omits both keys.
+  first_started_at?: string | null;
+  finished_at?: string | null;
   // Forge-supplied MR/PR web URL persisted by the worker at creation (PRD #65 D8),
   // null on runs created before it landed. Rendered directly through isHttpsUrl; a
   // null falls back to a forge-aware URL reconstruction (forgeUrls.ts) that picks the
@@ -2821,6 +2825,11 @@ export interface Run {
   budget_used_seconds?: number | null;
   claimed_at: string | null;
   started_at: string | null;
+  /** Issue #2004: when the run FIRST started; never reset. started_at is the timeout/budget
+   *  anchor and is cleared on limit/recovery/pool resumes, so it covers only the last leg.
+   *  Whole-run duration displays read this, falling back to started_at. Optional for rollout
+   *  skew: an older api omits the key; null before the run first starts. */
+  first_started_at?: string | null;
   finished_at: string | null;
   created_at: string;
   updated_at: string;
