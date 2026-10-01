@@ -879,7 +879,8 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
     const origPub = client.publishCheckpoint.bind(client);
     (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => ({
       tipOid: r.published,
-      pack: { resume() {} },
+      pack: { readableEnded: true },
+      exited: Promise.resolve(0),
     });
     (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async () => {
       if (result instanceof Error) throw result;

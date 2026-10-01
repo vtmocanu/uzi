@@ -109,7 +109,9 @@ A few things worth knowing:
   (`RUN_MAX_REQUEUES`, default 1) — 48h, not 24, on the defaults. The
   question cap (`QUESTION_MAX`, default 5 per attempt) resets the same way,
   for the same reason, so its honest lifetime bound is likewise **× (requeue
-  limit + 1)** — 10 questions, not 5.
+  limit + 1)** — 10 questions, not 5. A run that a restarted worker resumed
+  through the one-shot finalize-resume allowance (issue #1742) gets one more
+  attempt, so both bounds become **× (requeue limit + 2)** for that run.
 - **Autopilot runs never park on a question.** With nobody in the loop, the
   agent auto-resolves with "proceed on your best judgment," notes the
   assumption it made in the run feed, and keeps going — see

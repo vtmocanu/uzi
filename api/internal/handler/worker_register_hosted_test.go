@@ -32,6 +32,12 @@ type registerStore struct {
 func (r *registerStore) FailWorkerRunsOverCap(context.Context, store.FailWorkerRunsOverCapParams) ([]uuid.UUID, error) {
 	return nil, nil
 }
+func (r *registerStore) FailAttestedFinalizeRunsOverCap(context.Context, store.FailAttestedFinalizeRunsOverCapParams) ([]uuid.UUID, error) {
+	return nil, nil
+}
+func (r *registerStore) RequeueAttestedFinalizeRuns(context.Context, store.RequeueAttestedFinalizeRunsParams) ([]store.RequeueAttestedFinalizeRunsRow, error) {
+	return nil, nil
+}
 func (r *registerStore) RequeueWorkerRuns(context.Context, store.RequeueWorkerRunsParams) ([]uuid.UUID, error) {
 	return nil, nil
 }

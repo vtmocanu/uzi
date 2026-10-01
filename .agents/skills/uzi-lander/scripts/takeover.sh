@@ -58,7 +58,7 @@ fi
 echo "REPO=$REPO"
 stale=$(skill_scripts_stale "$HERE")
 echo "SKILL_SCRIPTS_STALE=$stale"
-[ "$stale" = 1 ] && echo "WARNING: these uzi-lander scripts differ from origin/main; run them from a fresh detached origin/main worktree (git fetch origin main && git worktree add --detach ../uzi-lander-tools origin/main)" >&2
+[ "$stale" = 1 ] && echo "WARNING: these uzi-lander scripts differ from origin/main; run them from a fresh detached origin/main worktree (git fetch origin main && T=\$(mktemp -d ../uzi-lander-tools.XXXXXX) && git worktree add --detach \"\$T\" origin/main)" >&2
 
 have_uzi=0; command -v uzi >/dev/null 2>&1 && have_uzi=1
 # UNKNOWN is set by any lookup that fails or returns an unreadable payload; a snapshot with

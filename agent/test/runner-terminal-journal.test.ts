@@ -10,6 +10,9 @@ import { nullLogger } from "./helpers.js";
 import { StubExecutor, type Executor, type ExecutorResult, type RunContext } from "../src/executor.js";
 import { Outbox, type RawWriteSeam } from "../src/outbox.js";
 import { api, fakeGitlab, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import { pollUntil, startSweepWorker, sweepClient } from "./worker-sweep-rig.js";
+import type { StateRequest } from "../src/protocol.js";
 import { commitInTree, fixture, makeRecoveryCoordinator, FakeRecoveryClient, FakeRecoveryGit } from "./codex-reap-fixture.js";
 
 // PRD #1391 Run B M3b — the run-lane WRITE-AHEAD terminal send path, end to end through RunRunner.
@@ -557,6 +560,126 @@ describe("RunRunner terminal journaling (PRD #1391 Run B M3b)", () => {
       "the hold is RELEASED after the hook returns (delete releaseTerminalResolve → RED)",
     );
     assert.equal(outbox.hasPendingTerminal(runId, gen), true, "the 409 running kept the durable journal");
+  });
+
+  // Issue #1512: the fatal-401 permanent-failure hook journals `failed`, its own send fails, and the
+  // run has NO message-outbox records (nothing spilled), so the drainer never visits it. Before the
+  // heartbeat terminal sweep the journal stranded until a restart or re-claim. A Worker over the same
+  // Outbox now delivers it on the next successful heartbeat. Boot cannot be the deliverer, by
+  // construction: the heartbeat fails until reportState has been ATTEMPTED once, and with no
+  // successful heartbeat no sweep runs, so that first attempt is the boot resolve's and it fails. On
+  // the base (no sweep) nothing retries after it, so this test is red there on every run.
+  it("#1512: a fatal-401 `failed` journal with no message records is delivered by the next successful heartbeat", async () => {
+    const { gitlab } = fakeGitlab();
+    const outbox = await mkOutbox();
+    const coord = mkRecoveryCoordinator();
+    const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+      recovery: coord,
+    });
+    const runId = "run-1512-fatal-401";
+    const gen = 6;
+    const events: string[] = [];
+    const flight = minimalFailFlight({
+      runId,
+      gen,
+      events,
+      reportState: async () => {
+        throw new Error("api unreachable");
+      },
+    });
+    await callHandle(run, failClaim(runId, gen), flight, "message persistence failed permanently: 401");
+    assert.equal(outbox.hasPendingTerminal(runId, gen), true, "precondition: the failed terminal is journaled and unsent");
+    assert.deepEqual(outbox.runsWithPending(), [], "precondition: the run has no message records for the drainer to visit");
+
+    let bootAttempted = false;
+    const delivered: Array<{ runId: string; body: StateRequest }> = [];
+    const client = sweepClient({
+      heartbeat: async () => {
+        if (!bootAttempted) throw new Error("api still down");
+      },
+      reportState: async (id, body) => {
+        if (!bootAttempted) {
+          bootAttempted = true;
+          throw new Error("api still down");
+        }
+        delivered.push({ runId: id, body });
+        return { applied: true, status: "failed" };
+      },
+    });
+    const w = startSweepWorker({ outbox, client });
+    try {
+      await pollUntil(() => bootAttempted, 3000, "the boot resolve attempted (and failed) the send");
+      await pollUntil(() => delivered.length > 0, 3000, "the next successful heartbeat delivers the failed terminal");
+      await pollUntil(() => !outbox.hasPendingTerminal(runId, gen), 3000, "the journal retires");
+    } finally {
+      await w.stop();
+    }
+    assert.equal(delivered.length, 1);
+    assert.equal(delivered[0]!.runId, runId);
+    assert.equal(delivered[0]!.body.status, "failed");
+    assert.equal(delivered[0]!.body.claim_generation, gen, "stamped with the journal's claim generation");
+  });
+
+  // Issue #1512 (check order): the live permanent-failure hook holds the resolve AND its run is live
+  // in this process. The heartbeat sweep must check the HOLD before liveness so its skip is RECORDED;
+  // the hook's `finally` then re-drives exactly one resolve through flight.reportState (the lane's own
+  // choke point), never client.reportState. Swapping the sweep's checks (liveness first) returns
+  // without recording, so the re-drive never happens and the hook's send count stays 1.
+  it("#1512: hold+live — the sweep records the held skip, and the hook re-drives once through flight.reportState", async () => {
+    const { gitlab } = fakeGitlab();
+    const outbox = await mkOutbox();
+    const coord = mkRecoveryCoordinator();
+    const run = runner(new StubExecutor(nullLogger()), gitlab, undefined, {
+      outbox,
+      outboxTerminalMaxBytes: 1 << 20,
+      gapFillMax: 100,
+      recovery: coord,
+    });
+    const runId = "run-1512-hold-live";
+    const gen = 8;
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
+    registry.add(runId, gen); // the run is live in this process while its hook runs
+    let beats = 0;
+    let clientSends = 0;
+    const client = sweepClient({
+      heartbeat: async () => {
+        beats += 1;
+      },
+      reportState: async () => {
+        clientSends += 1;
+        return { applied: true, status: "failed" };
+      },
+    });
+    const w = startSweepWorker({ outbox, client, activeRuns: registry });
+    const events: string[] = [];
+    let flightSends = 0;
+    try {
+      await pollUntil(() => beats > 0, 2000, "worker booted");
+      const flight = minimalFailFlight({
+        runId,
+        gen,
+        events,
+        reportState: async () => {
+          flightSends += 1;
+          if (flightSends === 1) {
+            // The hook's own send: let several heartbeat sweeps run while the hold is taken, then fail.
+            const seen = beats;
+            await pollUntil(() => beats >= seen + 5, 2000, "sweeps while the hook holds the resolve");
+            throw new Error("api unreachable");
+          }
+          return { applied: true, status: "failed" }; // the release-driven re-drive lands
+        },
+      });
+      await callHandle(run, failClaim(runId, gen), flight, "message persistence failed permanently: 401");
+    } finally {
+      await w.stop();
+    }
+    assert.equal(clientSends, 0, "the sweep never sent over client.reportState (held, and the run is live)");
+    assert.equal(flightSends, 2, "the hook sent once, then re-drove exactly one resolve through flight.reportState");
+    assert.equal(outbox.hasPendingTerminal(runId, gen), false, "the re-drive retired the journal");
   });
 
   // PRD #1391 Run B M3 (N1): a report_only COMPLETED must be journalled WRITE-AHEAD, so an outage at

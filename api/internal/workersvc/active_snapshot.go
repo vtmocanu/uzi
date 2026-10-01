@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -36,6 +38,58 @@ type ActiveSnapshot struct {
 	// its server-side closure is unexpired every run it owns is closed to every claimant and the
 	// worker itself is refused any claim (#1391, D11).
 	PendingOverflow bool `json:"pending_overflow"`
+	// FinalizeResume (issue #1742) is carried ONLY on a register snapshot: the attempts whose
+	// executor finished and whose worker holds an authenticated finalize-pending record, but no
+	// journaled terminal outcome, at the named exact claim generation. It is never an outcome and
+	// never a lease; Register uses it to re-queue (never complete) the run through the ordinary
+	// claim path. Omitted by an older worker, ignored by an older api (the snapshot is parsed
+	// leniently).
+	FinalizeResume []FinalizeResumeEntry `json:"finalize_resume,omitempty"`
+
+	// finalizeResumeMalformed is set by UnmarshalJSON when finalize_resume had a wrong wire type
+	// and was dropped. Only the register path (validateFinalizeResume) logs it, with the worker id;
+	// heartbeat and claim snapshots stay silent about the field.
+	finalizeResumeMalformed bool
+}
+
+// UnmarshalJSON decodes an ActiveSnapshot with FinalizeResume decoded as a SEPARATE lenient step
+// (issue #1742): a finalize_resume value of the wrong wire type (a string claim_generation, a
+// float, a non-string run_id, a non-array) drops only the finalize list, with a warning, and never
+// fails the decode of the rest of the snapshot, so a malformed attestation cannot discard valid
+// Active terminal_pending leases or pending_overflow (#1391). Every other field keeps the strict
+// typed decode it had before the finalize list existed.
+func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
+	// json.Unmarshaler convention: a JSON null is a no-op.
+	if string(bytes.TrimSpace(data)) == "null" {
+		return nil
+	}
+	type plain ActiveSnapshot
+	aux := struct {
+		*plain
+		FinalizeResume json.RawMessage `json:"finalize_resume"`
+	}{plain: (*plain)(s)}
+	if err := json.Unmarshal(data, &aux); err != nil {
+		return err
+	}
+	s.FinalizeResume = nil
+	s.finalizeResumeMalformed = false
+	if len(aux.FinalizeResume) == 0 || string(aux.FinalizeResume) == "null" {
+		return nil
+	}
+	var list []FinalizeResumeEntry
+	if err := json.Unmarshal(aux.FinalizeResume, &list); err != nil {
+		s.finalizeResumeMalformed = true
+		return nil
+	}
+	s.FinalizeResume = list
+	return nil
+}
+
+// FinalizeResumeEntry is one finalize-pending attempt a restarting worker attests on its register
+// snapshot (issue #1742): the run and the exact claim generation whose executor finished.
+type FinalizeResumeEntry struct {
+	RunID           string `json:"run_id"`
+	ClaimGeneration int64  `json:"claim_generation"`
 }
 
 // ActiveRunEntry is one attempt in an ActiveSnapshot. run_id is a uuid string; claim_generation
@@ -98,6 +152,57 @@ type validatedEntry struct {
 	claimGeneration int64
 	phase           string
 	terminalPending bool
+}
+
+// validatedFinalizeResume is the shape-validated form of ActiveSnapshot.FinalizeResume: two
+// parallel slices (the attested pair i is ids[i], generations[i]) ready to pass to the attested
+// finalize queries. Run ids are unique.
+type validatedFinalizeResume struct {
+	ids         []uuid.UUID
+	generations []int64
+}
+
+// validateFinalizeResume validates ActiveSnapshot.FinalizeResume INDEPENDENTLY of Active (issue
+// #1742): a bad finalize list never drops a valid Active list and vice versa. It returns ok=false
+// for an absent list, and for an invalid one (a non-uuid run_id, a negative generation, a
+// duplicate run_id, or more than ActiveSnapshotMaxEntries entries) after a warning: the list is
+// then ignored and Register carries on, never failing. Only the register path calls it; the
+// heartbeat and claim snapshots never read the field. A wrongly TYPED list never reaches here:
+// ActiveSnapshot.UnmarshalJSON already dropped it without failing the rest of the snapshot.
+func (s *Service) validateFinalizeResume(wkr store.Worker, snap *ActiveSnapshot) (validatedFinalizeResume, bool) {
+	var out validatedFinalizeResume
+	if snap != nil && snap.finalizeResumeMalformed {
+		slog.Warn("finalize_resume has an invalid wire shape; ignoring the list and keeping the rest of the snapshot",
+			"worker_id", wkr.ID.String())
+		return out, false
+	}
+	if snap == nil || len(snap.FinalizeResume) == 0 {
+		return out, false
+	}
+	reject := func(reason string) (validatedFinalizeResume, bool) {
+		slog.Warn("finalize resume list rejected; ignoring it", "worker_id", wkr.ID.String(), "reason", reason)
+		return validatedFinalizeResume{}, false
+	}
+	if len(snap.FinalizeResume) > s.p.ActiveSnapshotMaxEntries {
+		return reject("list exceeds the absolute entry ceiling")
+	}
+	seen := make(map[uuid.UUID]bool, len(snap.FinalizeResume))
+	for _, e := range snap.FinalizeResume {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil {
+			return reject("entry run_id is not a uuid")
+		}
+		if e.ClaimGeneration < 0 {
+			return reject("entry claim_generation is negative")
+		}
+		if seen[id] {
+			return reject("duplicate run_id in list")
+		}
+		seen[id] = true
+		out.ids = append(out.ids, id)
+		out.generations = append(out.generations, e.ClaimGeneration)
+	}
+	return out, true
 }
 
 // ReplaceWorkerActiveRuns validates a worker's active-run snapshot and, when valid, applies it

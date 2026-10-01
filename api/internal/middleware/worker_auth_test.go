@@ -4,8 +4,11 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/google/uuid"
@@ -88,17 +91,85 @@ func TestRequireWorkerRejectsMissingAndBadTokens(t *testing.T) {
 	}
 }
 
-// The lookup must not leak whether a token exists via a different error type.
-func TestRequireWorkerTreatsAllLookupFailuresAsUnauthorized(t *testing.T) {
-	st := errWorkerStore{err: errors.New("db exploded")}
-	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
-	req := httptest.NewRequest(http.MethodPost, "/api/worker/heartbeat", nil)
-	req.Header.Set("Authorization", "Bearer uzw_whatever")
-	rec := httptest.NewRecorder()
-	RequireWorker(st)(next).ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("status = %d, want 401", rec.Code)
+// Issue #1989: only a missing token row is a credential rejection. A store failure
+// (a database outage behind a live api) is a retryable 503, so the worker rides it out
+// instead of failing its run; an unknown token and a hash mismatch stay 401.
+func TestRequireWorkerLookupFailureStatus(t *testing.T) {
+	_, otherHash, err := jointoken.Generate()
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
 	}
+	cases := []struct {
+		name string
+		st   WorkerStore
+		want int
+	}{
+		{"store failure is retryable", errWorkerStore{err: errors.New("dial tcp: connect: connection refused")}, http.StatusServiceUnavailable},
+		{"context.Canceled lookup error on a live request returns 503", errWorkerStore{err: fmt.Errorf("lookup: %w", context.Canceled)}, http.StatusServiceUnavailable},
+		{"wrapped no-rows is unauthorized", errWorkerStore{err: fmt.Errorf("lookup: %w", pgx.ErrNoRows)}, http.StatusUnauthorized},
+		{"hash mismatch is unauthorized", rowWorkerStore{worker: store.Worker{ID: uuid.New(), TokenHash: otherHash}}, http.StatusUnauthorized},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				t.Error("next handler reached on a failed worker lookup")
+				w.WriteHeader(http.StatusOK)
+			})
+			req := httptest.NewRequest(http.MethodPost, "/api/worker/heartbeat", nil)
+			req.Header.Set("Authorization", "Bearer uzw_whatever")
+			rec := httptest.NewRecorder()
+			RequireWorker(tc.st)(next).ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("status = %d, want %d", rec.Code, tc.want)
+			}
+		})
+	}
+}
+
+// A store failure on a live request is an outage and is logged, even when the error
+// itself unwraps to context.DeadlineExceeded (a database dial or pool timeout). A
+// request whose own context is already done is the client going away: still a 503,
+// but not logged.
+func TestRequireWorkerLogsStoreFailureOnlyForLiveRequests(t *testing.T) {
+	var buf bytes.Buffer
+	prev := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&buf, nil)))
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	dialTimeout := errWorkerStore{err: fmt.Errorf("dial tcp: i/o timeout: %w", context.DeadlineExceeded)}
+	next := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusOK) })
+	serve := func(ctx context.Context) int {
+		req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/api/worker/heartbeat", nil)
+		req.Header.Set("Authorization", "Bearer uzw_whatever")
+		rec := httptest.NewRecorder()
+		RequireWorker(dialTimeout)(next).ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	if code := serve(context.Background()); code != http.StatusServiceUnavailable {
+		t.Fatalf("live request: status = %d, want 503", code)
+	}
+	if !strings.Contains(buf.String(), "worker auth: token lookup failed") {
+		t.Fatalf("live request: store failure not logged; log = %q", buf.String())
+	}
+
+	buf.Reset()
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if code := serve(cancelled); code != http.StatusServiceUnavailable {
+		t.Fatalf("cancelled request: status = %d, want 503", code)
+	}
+	if buf.Len() != 0 {
+		t.Fatalf("cancelled request: logged %q, want nothing", buf.String())
+	}
+}
+
+// rowWorkerStore returns its row for any hash, so the middleware's constant-time
+// re-check is the only thing standing between a mismatched row and the handler.
+type rowWorkerStore struct{ worker store.Worker }
+
+func (r rowWorkerStore) GetWorkerByTokenHash(context.Context, []byte) (store.Worker, error) {
+	return r.worker, nil
 }
 
 type errWorkerStore struct{ err error }

@@ -18,7 +18,9 @@ has nothing to do with it.
 
 Grep the file for unchecked boxes (`- [ ]`) and go through **all** of them. The item
 you did not think about is exactly the one that gets wrongly ticked or wrongly left.
-Categorise each: implementation, documentation, validation, or launch.
+Categorise each: implementation, documentation, validation, launch, or
+**maintainer live acceptance** (a check only the maintainer can run in a live
+environment: a cluster, a hosted instance, an external service; no run can tick it).
 
 ## 2. Tick only on direct evidence
 
@@ -44,7 +46,13 @@ Check first, then move. A PRD routinely outlives its first merge request: severa
 runs against one PRD is the expected shape, not the exception.
 
 - **Every checkbox ticked** — update the status header, then move the file.
-- **Any item still open** — update the checkboxes and **leave the file where it is**.
+- **Any item still open outside maintainer live acceptance** — update the checkboxes
+  and **leave the file where it is**.
+- **Only live-acceptance items open** — every open item is in the maintainer live
+  acceptance category. They do not hold the move: leave them unticked, list them in
+  the merge request description as open acceptance for the maintainer, then update
+  the status header and move the file. If even one open item falls in any other
+  category, this exception does not apply.
 - **Already under `prds/done/`** — a no-op. Do not move it again, do not "tidy" the
   path. Update the checkboxes if there is anything to update, and stop.
 
@@ -111,7 +119,10 @@ when you did not move anything.
 
 Check the PRD diff against what the branch actually changed, the same way you check
 the code. Specifically: does every newly-ticked box have something in this diff that
-supports it, and does the move (if there is one) match a PRD with no open items left?
+supports it, and does the move (if there is one) match a PRD whose only open items,
+if any, are maintainer live acceptance listed in the merge request? A move with any
+other item open, or an item labelled live acceptance that a run could have checked,
+is a finding.
 An unsupported completion claim is a review finding; send it back.
 
 Be aware of what this control is and is not. It is a prompt-level instruction, so it

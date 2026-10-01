@@ -1,14 +1,14 @@
 # shellcheck shell=bash
 # phase:    api-outage-outbox
-# title:    PRD #1391: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay)
+# title:    PRD #1391 + #1742: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay; finalize-resume across an agent SIGKILL)
 # critical: no
 # lane:     gitlab
 # executor: stub
-# requires: REPO_ID UZI_WORKER_TOKEN
+# requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
-# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stop/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case); six stub runs created; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
-# restores: api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs cancelled best-effort
+# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stop/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the api already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# restores: api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
 # =============================================================================
 # PRD #1391 M5 (Run A) — the worker message OUTBOX survives an api outage. When the api
@@ -212,13 +212,17 @@ wait_spilled() {
 # it by construction. We key on the per-attempt retry rather than the full retry-exhaustion event on
 # purpose: the terminal retry schedule is [1,2,4,8,16]s over 6 attempts, and on the CI lane where each
 # failed connect black-holes ~10s, exhaustion alone is ~90s. Including run work and api restart
-# could exceed the 120s heartbeat-stale window below and swap this into a stale-requeue failure.
+# could exceed the heartbeat-stale window below (300s) and swap this into a stale-requeue failure.
 # The FIRST failed attempt is the same
 # proof and fires ~one connect timeout after the terminal, keeping the whole outage well under the
 # window. TIMEOUT bounds it likewise. Returns 0 once observed and 1 on timeout; it never calls `fail`
 # itself (it runs with the api STOPPED) — the caller restores the api and judges after.
+# TIMEOUT defaults to 180s. The old 80s under-shot on the gitlab CI lane (nightly run 36680011794,
+# 2026-09-30): with the api down, finalize itself takes ~60s, because PR-description staging waits
+# ~10s on a failed fetch and MR creation spends ~32s in transient forge retries, so the terminal
+# was journaled ~70s after the cut and its first send failed ~80s after it.
 wait_terminal_lost() {
-  local run="$1" timeout="${2:-80}" f="$RUNROOT/.outbox-terminal.log"
+  local run="$1" timeout="${2:-180}" f="$RUNROOT/.outbox-terminal.log"
   local start=$SECONDS deadline=$((SECONDS + timeout))
   while [ "$SECONDS" -lt "$deadline" ]; do
     "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
@@ -275,7 +279,7 @@ api_back() {
 # outage SECS longer so a real backlog accumulates, bring the api back, re-login (the
 # bounce drops the session), then assert the barrier. Spill-gated rather than
 # fixed-length: see wait_spilled for why a bare `sleep` cannot bound the spill. The
-# total stays well under the 120s heartbeat-stale window raised below (~21s worst-case
+# total stays well under the 300s heartbeat-stale window raised below (~21s worst-case
 # spill + 25s the longest hold). No `docker compose start` (no phase uses it): stop,
 # then api_back, which waits for the existing web proxy to recover.
 outage() {
@@ -295,11 +299,11 @@ outage() {
 # --- raise the api heartbeat-stale window so the outage never requeues the run --------
 # Exported so it out-ranks the env-file's E2E_WORKER_HEARTBEAT_STALE=15s (compose ranks
 # shell env above --env-file), exactly as phase 46 exports UZI_E2E_MAX_CONCURRENT_RUNS.
-export E2E_WORKER_HEARTBEAT_STALE=120s
+export E2E_WORKER_HEARTBEAT_STALE=300s
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login
-pass "api recreated with a 120s heartbeat-stale window so the outage cannot requeue the running run"
+pass "api recreated with a 300s heartbeat-stale window so the outage cannot requeue the running run"
 
 # Clear the admin owner's accumulated cross-phase recovery custody holds so the claim
 # admission gate (workersvc/budget.go: custodyHoldLimit=8) does not wedge our claims in
@@ -396,7 +400,7 @@ fi
 # while the api is down replays its messages first and its outcome only once the trace is
 # contiguous. These cases reuse the UZI_STUB_OUTBOX sentinel but with the SHORT e2e-only stream
 # (UZI_STUB_OUTBOX_TICKS) so the run reaches its terminal INSIDE a bounded outage that still stays
-# under the 120s heartbeat-stale window raised above — the worker stays leased across the outage.
+# under the 300s heartbeat-stale window raised above — the worker stays leased across the outage.
 say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked permit wait)"
 unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
 export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
@@ -413,8 +417,9 @@ rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 # first send fail while the api is unreachable, so recovery is forced through the persisted journal.
 # How long the short stream takes to get there depends on the runner's speed, not this phase (a fixed
 # 30s under-shot it on the slow gitlab CI lane — the #1391 M6 regression this replaces). The gate's
-# timeout stays under the 120s heartbeat-stale window, so the worker is never swept stale
-# mid-outage and the run is never requeued.
+# timeout stays under the 300s heartbeat-stale window, so the worker is never swept stale
+# mid-outage and the run is never requeued. Budget: the gate (180s) plus, for case 4, a container
+# restart and the api start, well inside 300s.
 
 # Cases 3-5 exercise the terminal journal, so their runs are created un-interlocked (set_interlock).
 # The trap restores the default even if a case fails.
@@ -579,6 +584,285 @@ RB4_FR="$(apiget "/api/runs/$RUN_B4" | jq -r '.run.failure_reason // ""')"
 pass "case 6: the interlocked run waited out the outage for its permit -> completed at gen $GEN_B4, no false failed"
 
 # =============================================================================
+# Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart
+# that lands while the api is DOWN, and the one-shot finalize-resume allowance keeps that run from
+# being failed as worker_lost by the orphan pass, exactly once. The cut is DETERMINISTIC: the api is
+# stopped while the stub stream is still running (executor not returned), so no terminal can land, and
+# the agent is restarted only once the finalize record is PROVEN durable, by BOTH the agent's own
+# `finalize record durable` line (logged after the directory fsync) AND the file being on disk.
+say "ISSUE #1742: finalize-resume allowance across an agent restart during an api outage (A completes, B is one-shot)"
+
+# f42_max_requeues — the api's RUN_MAX_REQUEUES as the e2e stack renders it (docker-compose.e2e.yml
+# sets it). Prints the integer and returns 0; returns 1 (message on stderr) when the config cannot be
+# rendered or carries no integer value: a guessed budget would make the "budget spent" premise false.
+# The caller judges, with the api up.
+f42_max_requeues() {
+  local v
+  v="$("${COMPOSE[@]}" config --format json 2>/dev/null | jq -r '.services.api.environment.RUN_MAX_REQUEUES // empty' 2>/dev/null)" || v=""
+  case "$v" in
+    ''|*[!0-9]*) echo "compose config did not render a numeric services.api.environment.RUN_MAX_REQUEUES (got '${v}')" >&2; return 1;;
+  esac
+  printf '%s' "$v"
+}
+# f42_durable_logged RUN GEN — 0 when the agent's log carries `finalize record durable` for RUN at claim
+# generation GEN. The agent logs JSON, so run_id and claim_generation are matched as fields of the SAME
+# line as the message; the generation is matched exactly (a line for G must not satisfy G+1). awk, not
+# `grep … | grep -q` (CLAUDE.md): it reads to EOF, so no SIGPIPE.
+f42_durable_logged() {
+  local run="$1" gen="$2" f="$RUNROOT/.outbox-finalize.log"
+  "${COMPOSE[@]}" logs --no-color agent > "$f" 2>/dev/null || true
+  awk -v r="$run" -v g="$gen" '
+    index($0, "finalize record durable") && index($0, r) && ($0 ~ ("\"claim_generation\":" g "([^0-9]|$)")) { hit = 1 }
+    END { exit(hit ? 0 : 1) }' "$f"
+}
+# f42_cut RUN GEN — the deterministic cut for run RUN at claim generation GEN: stop the api (the run's
+# stream is still running, so no terminal can land), assert there is NO durable finalize line yet, then
+# wait (bounded) for BOTH proofs of the durable point. Returns 0 once both hold, 1 on timeout, 2 when the
+# hand-off beat the outage (inconclusive). Like the other wait_* it never calls `fail` itself: it runs
+# with the api STOPPED, and a `fail` there would wedge every later phase. The caller restores the api
+# first and judges after.
+f42_cut() {
+  local run="$1" gen="$2" start deadline
+  "${COMPOSE[@]}" stop api >/dev/null 2>&1
+  if f42_durable_logged "$run" "$gen"; then
+    return 2
+  fi
+  start=$SECONDS; deadline=$((SECONDS + 90))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    if f42_durable_logged "$run" "$gen" \
+      && "${COMPOSE[@]}" exec -T agent test -f "/data/outbox/$run/finalize-$gen.json" >/dev/null 2>&1; then
+      pass "run $run: finalize record durable at generation $gen (log line + on-disk file) $((SECONDS - start))s after the api was cut"
+      return 0
+    fi
+    sleep 1
+  done
+  return 1
+}
+# f42_cut_judge RC RUN GEN — judge f42_cut's status AFTER the api is back.
+f42_cut_judge() {
+  case "$1" in
+    0) return 0;;
+    2) fail "issue 1742: inconclusive: run $2 handed off to finalize (finalize record durable already logged at generation $3) before the api outage took hold — the cut was not before the hand-off";;
+    *) fail "issue 1742: run $2 never showed both the 'finalize record durable' log line and finalize-$3.json on disk within 90s of the outage";;
+  esac
+}
+# f42_restart_cycle RUN GEN MAX SET_MAX — from a cut api: check the cut is still the state the case
+# needs (finalize-GEN.json present, NO terminal-GEN.json journaled), optionally (SET_MAX=1, the FIRST cut
+# of a run only) raise requeue_count to the budget ceiling so ONLY the one-shot finalize allowance can
+# save the run, then SIGKILL the agent (abrupt, no graceful-shutdown path, as the ADR specifies) and start
+# it on the same /data volume, bring the api back and wait for the worker. The api is down for the whole
+# function until api_back, so no `fail` and no set -e abort may happen before it: every step records its
+# error, the api is restored, and only then is the error judged. A precondition or UPDATE error skips
+# the kill (the attempt is inconclusive) but still restores the api.
+f42_restart_cycle() {
+  local run="$1" gen="$2" max="$3" set_max="${4:-0}" err="" rc=0 st="" regs_before=0 regs_now=0 deadline
+  # One exec prints a state token, so an exec/container error (no token) is told apart from a
+  # journaled terminal.
+  rc=0; st="$("${COMPOSE[@]}" exec -T agent sh -c \
+    "if [ ! -f '/data/outbox/$run/finalize-$gen.json' ]; then echo NO_FINALIZE; elif [ -e '/data/outbox/$run/terminal-$gen.json' ]; then echo TERMINAL_JOURNALED; else echo READY; fi" 2>/dev/null)" || rc=$?
+  st="$(printf '%s' "$st" | tr -d '[:space:]')"
+  case "$rc:$st" in
+    0:READY) ;;
+    0:NO_FINALIZE) err="inconclusive: /data/outbox/$run/finalize-$gen.json is not present before the restart";;
+    0:TERMINAL_JOURNALED) err="inconclusive: a terminal was already journaled (terminal-$gen.json exists) for run $run before the restart, so the restart would not interrupt finalize";;
+    *) err="could not inspect /data/outbox/$run in the agent container (exec exit $rc, output '$st')";;
+  esac
+  if [ -z "$err" ] && [ "$set_max" = 1 ]; then
+    rc=0; db_psql "UPDATE runs SET requeue_count = $max WHERE id = '$run'" >/dev/null || rc=$?
+    [ "$rc" = 0 ] || err="could not set requeue_count=$max on run $run (psql exit $rc)"
+    if [ -z "$err" ]; then
+      [ "$(rb_run_field "$run" requeue_count || true)" = "$max" ] || err="requeue_count on run $run is not $max after the UPDATE"
+    fi
+  fi
+  if [ -z "$err" ]; then
+    # Baseline of the agent's "registered" log lines, so the post-restart wait can prove a NEW register.
+    # A failed log read must not yield a 0 baseline (the agent's earlier register would then pass the wait).
+    rc=0; regs_before="$("${COMPOSE[@]}" logs agent 2>/dev/null)" || rc=$?
+    if [ "$rc" = 0 ]; then
+      regs_before="$(printf '%s\n' "$regs_before" | grep -c '"msg":"registered"' || true)"
+    else
+      err="could not read the agent logs for the register baseline (exit $rc)"
+    fi
+  fi
+  if [ -z "$err" ]; then
+    say "SIGKILLing the agent container with the api still down (run $run generation $gen)"
+    rc=0; "${COMPOSE[@]}" kill -s SIGKILL agent >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 0 ] || err="could not SIGKILL the agent container (exit $rc)"
+    rc=0; "${COMPOSE[@]}" start agent >/dev/null 2>&1 || rc=$?
+    [ "$rc" = 0 ] || err="${err:+$err; }could not start the agent container again (exit $rc)"
+  fi
+  api_back
+  [ -z "$err" ] || fail "issue 1742: $err"
+  # wait_worker_online alone proves nothing here (the raised heartbeat-stale window keeps the row
+  # online across the kill), so require a fresh "registered" line from the restarted agent (worker.ts
+  # registerWithRetry). f42_wait_reclaim / the fail waits remain the judges of the run outcome.
+  deadline=$((SECONDS + 90))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    regs_now="$("${COMPOSE[@]}" logs agent 2>/dev/null | grep -c '"msg":"registered"' || true)"
+    [ "${regs_now:-0}" -gt "${regs_before:-0}" ] && break
+    sleep 1
+  done
+  [ "${regs_now:-0}" -gt "${regs_before:-0}" ] \
+    || fail "issue 1742: the restarted agent never logged a new 'registered' line within 90s (before=$regs_before now=${regs_now:-0}) for run $run"
+  wait_worker_online
+}
+# f42_wait_reclaim RUN GEN TIMEOUT — poll until RUN is running at claim generation GEN. A run that goes
+# failed while waiting is a failure with its origin named.
+f42_wait_reclaim() {
+  local run="$1" gen="$2" timeout="${3:-120}" deadline s g
+  deadline=$((SECONDS + timeout))
+  while [ "$SECONDS" -lt "$deadline" ]; do
+    s="$(rb_run_field "$run" status)"; g="$(rb_run_field "$run" claim_generation)"
+    if [ "$s" = running ] && [ "$g" = "$gen" ]; then return 0; fi
+    case "$s" in
+      failed|cancelled) fail "issue 1742: run $run went '$s' (fail_origin=$(rb_run_field "$run" fail_origin)) while waiting to be re-claimed at generation $gen";;
+    esac
+    sleep 0.5
+  done
+  fail "issue 1742: run $run was never re-claimed and running at generation $gen (status=${s:-none} generation=${g:-none})"
+}
+
+# This single-worker harness retains the predecessor clone across the container restart.
+# The exact G+1 claim MUST capture it and park before G+2 executes. A direct G+1 completion
+# is a failure here, not an acceptable alternate path. Pin the extra claim to ordered log
+# evidence and an available capture at EXACT G+1, never accept an arbitrary later generation.
+f42_assert_capture_park() {
+  local run="$1" gen="$2" log_file="$RUNROOT/.f42-capture.log" recovery_file="$RUNROOT/.f42-capture.json"
+  "${COMPOSE[@]}" logs --no-color agent > "$log_file" 2>/dev/null \
+    || fail "issue 1742: could not read predecessor-capture evidence for $run"
+  jq -Rse --arg run "$run" --argjson gen "$gen" '
+    [split("\n")[] | sub("^[^{]*"; "") | fromjson? | select(.run_id == $run)] as $events |
+    [$events | to_entries[] | select(.value.msg == "run claimed") | .key] as $claims |
+    [$events | to_entries[] | select(.value.msg == "run parked for transient recovery"
+      and .value.detail == "recovering retained work before reseeding") | .key] as $parks |
+    [$events | to_entries[] | select(.value.msg == "recovery: park/early-terminal disposition outcome"
+      and .value.claim_generation == $gen and .value.state == "uploaded") | .key] as $captures |
+    ($claims | length) == 3 and ($parks | length) == 1 and ($captures | length) == 1
+    and $claims[1] < $parks[0] and $parks[0] < $captures[0] and $captures[0] < $claims[2]
+  ' "$log_file" >/dev/null \
+    || fail "issue 1742: run $run lacks the exact G+1 capture/park then G+2 claim sequence"
+  uzi_cli run recovery "$run" --json > "$recovery_file" \
+    || fail "issue 1742: could not read recovery captures for $run"
+  jq -e --argjson gen "$gen" '
+    [.[] | select(.generation == $gen) | .captures[]? | select(.state == "available")] | length == 1
+  ' "$recovery_file" >/dev/null \
+    || fail "issue 1742: run $run has no unique available capture at generation $gen"
+  pass "run $run: exact generation $gen captured retained work and parked before the next claim"
+}
+
+# The api is up here, so a failure to resolve the budget can fail at once.
+F42_MAX="$(f42_max_requeues)" || fail "issue 1742: cannot resolve RUN_MAX_REQUEUES from the rendered compose config: $(f42_max_requeues 2>&1 >/dev/null || true)"
+
+# -----------------------------------------------------------------------------
+# CASE 7 (A, completion control): the durable finalize record lets the run resume at G+1 even with the
+# requeue budget spent. G+1 captures the retained predecessor clone and parks; G+2 completes.
+say "CASE 7: finalize restart on spent budget -> G+1 capture park -> G+2 completes (never worker_lost)"
+make_outbox_run
+RUN_F1="$OUTBOX_RUN"
+GEN_F1="$(rb_run_field "$RUN_F1" claim_generation)"
+say "cutting the api while run $RUN_F1's stub stream is still running (generation $GEN_F1)"
+rc=0; f42_cut "$RUN_F1" "$GEN_F1" || rc=$?
+if [ "$rc" = 0 ]; then
+  f42_restart_cycle "$RUN_F1" "$GEN_F1" "$F42_MAX" 1
+else
+  api_back
+  f42_cut_judge "$rc" "$RUN_F1" "$GEN_F1"
+fi
+wait_status "$RUN_F1" completed "${UZI_E2E_COMPLETE_TIMEOUT:-$COMPLETE_TIMEOUT_DEFAULT}"
+[ "$(rb_run_field "$RUN_F1" fail_origin)" = "" ] \
+  || fail "case 7: run $RUN_F1 carries fail_origin=$(rb_run_field "$RUN_F1" fail_origin) — the orphan pass failed a run the finalize allowance should have resumed"
+[ "$(rb_run_field "$RUN_F1" finalize_resume_generation)" = "$GEN_F1" ] \
+  || fail "case 7: finalize_resume_generation is '$(rb_run_field "$RUN_F1" finalize_resume_generation)', want $GEN_F1 — the allowance was not consumed for the durable finalize generation"
+f42_assert_capture_park "$RUN_F1" "$((GEN_F1 + 1))"
+[ "$(rb_run_field "$RUN_F1" claim_generation)" = "$((GEN_F1 + 2))" ] \
+  || fail "case 7: run $RUN_F1 completed at generation $(rb_run_field "$RUN_F1" claim_generation), want $((GEN_F1 + 2)) after the proved G+1 capture park"
+pass "case 7: run $RUN_F1 captured at generation $((GEN_F1 + 1)) and completed at $((GEN_F1 + 2)); finalize_resume_generation=$GEN_F1, never worker_lost"
+
+# -----------------------------------------------------------------------------
+# CASE 8 (B, one-shot control): the allowance is used ONCE. After the G+1 capture park, a second
+# interruption of the EXECUTING generation G+2 leaves the
+# spent budget to fail the run as worker_lost, and the failed run's recovery hold is never a silent empty one.
+say "CASE 8: allowance is one-shot: G+1 capture park, G+2 finalize interrupted -> worker_lost, mark stays G"
+make_outbox_run
+RUN_F2="$OUTBOX_RUN"
+GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
+say "first cut: run $RUN_F2 at generation $GEN_F2"
+rc=0; f42_cut "$RUN_F2" "$GEN_F2" || rc=$?
+if [ "$rc" = 0 ]; then
+  f42_restart_cycle "$RUN_F2" "$GEN_F2" "$F42_MAX" 1
+else
+  api_back
+  f42_cut_judge "$rc" "$RUN_F2" "$GEN_F2"
+fi
+f42_wait_reclaim "$RUN_F2" "$((GEN_F2 + 2))" 120
+f42_assert_capture_park "$RUN_F2" "$((GEN_F2 + 1))"
+[ "$(rb_run_field "$RUN_F2" finalize_resume_generation)" = "$GEN_F2" ] \
+  || fail "case 8: after the first interruption finalize_resume_generation is '$(rb_run_field "$RUN_F2" finalize_resume_generation)', want $GEN_F2"
+# The allowance is charged as a requeue, and the second cut below must NOT reset the counter downward.
+[ "$(rb_run_field "$RUN_F2" requeue_count)" = "$((F42_MAX + 1))" ] \
+  || fail "case 8: after the allowance requeue requeue_count is '$(rb_run_field "$RUN_F2" requeue_count)', want $((F42_MAX + 1)) (RUN_MAX_REQUEUES $F42_MAX + the one charged requeue)"
+pass "case 8: run $RUN_F2 used the allowance, captured at G+1, and is executing at generation $((GEN_F2 + 2)) (finalize_resume_generation=$GEN_F2, requeue_count=$((F42_MAX + 1)))"
+# Second cut at the proved EXECUTING G+2: G+1 was the retained-clone capture, not an executor turn.
+GEN_F2B=$((GEN_F2 + 2))
+say "second cut: run $RUN_F2 at generation $GEN_F2B"
+rc=0; f42_cut "$RUN_F2" "$GEN_F2B" || rc=$?
+if [ "$rc" = 0 ]; then
+  f42_restart_cycle "$RUN_F2" "$GEN_F2B" "$F42_MAX" 0
+else
+  api_back
+  f42_cut_judge "$rc" "$RUN_F2" "$GEN_F2B"
+fi
+# The allowance is spent: the orphan pass now fails the run as worker_lost. Bounded wait, it must not complete.
+F42_DEADLINE=$((SECONDS + 120)); F42_ST=""
+while [ "$SECONDS" -lt "$F42_DEADLINE" ]; do
+  F42_ST="$(rb_run_field "$RUN_F2" status)"
+  case "$F42_ST" in failed|completed|cancelled) break;; esac
+  sleep 0.5
+done
+[ "$F42_ST" = failed ] \
+  || fail "case 8: run $RUN_F2 ended '$F42_ST' after the second interruption, want failed (worker_lost) — the allowance must not be reusable"
+[ "$(rb_run_field "$RUN_F2" fail_origin)" = worker_lost ] \
+  || fail "case 8: run $RUN_F2 failed with fail_origin='$(rb_run_field "$RUN_F2" fail_origin)', want worker_lost"
+[ "$(rb_run_field "$RUN_F2" finalize_resume_generation)" = "$GEN_F2" ] \
+  || fail "case 8: finalize_resume_generation moved to '$(rb_run_field "$RUN_F2" finalize_resume_generation)' — the one-shot allowance was reused (want $GEN_F2)"
+pass "case 8: run $RUN_F2 failed worker_lost at generation $GEN_F2B with finalize_resume_generation still $GEN_F2 (allowance not reused)"
+
+# Recovery custody for the failed run: `uzi run recovery` must never show a silent empty hold, i.e. an
+# OPEN hold with neither an available capture nor a source_only/needs_action attention.
+# Wait (bounded) until no hold is still `capturing`, so the judgment is on the settled custody state.
+F42_DEADLINE=$((SECONDS + 60)); F42_REC=""; F42_CAPTURING=1
+while [ "$SECONDS" -lt "$F42_DEADLINE" ]; do
+  F42_REC="$(uzi_cli run recovery "$RUN_F2" --json)" || fail "case 8: uzi run recovery --json failed (exit $?)"
+  F42_CAPTURING="$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open" and .attention == "capturing")] | length')"
+  [ "$F42_CAPTURING" = 0 ] && break
+  sleep 2
+done
+[ "$F42_CAPTURING" = 0 ] \
+  || fail "case 8: a custody hold on run $RUN_F2 was still capturing after 60s: $F42_REC"
+[ "$(printf '%s' "$F42_REC" | jq -r 'length')" -gt 0 ] \
+  || fail "case 8: uzi run recovery lists no custody hold at all for the failed run $RUN_F2"
+# Every OPEN hold is either an archive_ready one (with an available capture) or a source_only/needs_action one.
+F42_SILENT="$(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open" and (((.attention == "archive_ready") and (.has_available_capture // false)) or (.attention | IN("source_only", "needs_action")) | not)) | .id] | join(",")')"
+[ -z "$F42_SILENT" ] \
+  || fail "case 8: uzi run recovery shows hold(s) on run $RUN_F2 that are neither archive_ready with a capture nor source_only/needs_action: $F42_SILENT"
+F42_REC_TXT="$(uzi_cli run recovery "$RUN_F2" 2>&1)" || fail "case 8: uzi run recovery failed (exit $?): $F42_REC_TXT"
+# Per open hold, the human output must carry the text matching its attention: archive_ready ->
+# export hint, source_only -> custody line, needs_action -> discard hint.
+for F42_ATT in $(printf '%s' "$F42_REC" | jq -r '[.[] | select(.state == "open") | .attention] | unique | .[]'); do
+  case "$F42_ATT" in
+    archive_ready) F42_WANT='uzi run export';;
+    source_only) F42_WANT='no recovery archive; custody';;
+    needs_action) F42_WANT='uzi run discard';;
+    *) continue;;
+  esac
+  case "$F42_REC_TXT" in
+    *"$F42_WANT"*) ;;
+    *) fail "case 8: the human recovery output for run $RUN_F2 has an open $F42_ATT hold but lacks '$F42_WANT': $F42_REC_TXT";;
+  esac
+done
+pass "case 8: uzi run recovery on run $RUN_F2 shows no silent empty hold ($(printf '%s' "$F42_REC" | jq -r 'length') hold(s) listed)"
+
+# =============================================================================
 # RESTORE — return the api stale window and the agent outbox knobs to their defaults so
 # later phases (59-restart-agent, 60-62) are unaffected. Mirrors phase 46's restore.
 say "restore: recreate api + agent back to their defaults"
@@ -590,9 +874,9 @@ login
 wait_worker_online
 pass "api + agent recreated back to their defaults"
 
-# Best-effort cleanup: every run completed (terminal), so a cancel is a no-op, but never let a
-# cleanup blip redden a passed phase.
-for r in "$RUN1" "$RUN2" "$RUN_B1" "$RUN_B2" "$RUN_B3" "$RUN_B4"; do
+# Best-effort cleanup: every run is terminal (completed, or failed for the case 8 run), so a cancel is a
+# no-op, but never let a cleanup blip redden a passed phase.
+for r in "$RUN1" "$RUN2" "$RUN_B1" "$RUN_B2" "$RUN_B3" "$RUN_B4" "$RUN_F1" "$RUN_F2"; do
   [ -n "${r:-}" ] && apipost "/api/runs/$r/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true
 done
 

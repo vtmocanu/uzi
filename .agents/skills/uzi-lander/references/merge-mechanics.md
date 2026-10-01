@@ -28,8 +28,8 @@ stop rather than forcing.
   bump), `git merge origin/main`, take the union of the bumps, regenerate (`go mod tidy`, or
   `npm install --package-lock-only` in the package dir), `go build ./...`, push, merge. CI
   runs `npm ci`, so a lockfile regenerated under a newer local npm is fine while consistent
-  with `package.json`. A Renovate branch you never push to: Renovate rebases it itself
-  (references/renovate.md). Right after a resolution push, a stale `merge conflicts` is
+  with `package.json`. A Renovate branch you never push to: Renovate rebases it only at
+  night; by day see references/renovate.md. Right after a resolution push, a stale `merge conflicts` is
   GitHub's async mergeability lag: re-check `mergeable` after a few seconds and retry.
 - **`gh pr merge` is intermittently blocked by the harness auto-mode classifier.** It is
   not deterministic; a retry often succeeds. When the user has authorized admin merges,

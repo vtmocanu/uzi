@@ -1,7 +1,7 @@
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import { replaySegment } from "./batcher.js";
-import type { Outbox } from "./outbox.js";
+import type { Outbox, PendingFinalize } from "./outbox.js";
 import type { RunRunner } from "./runner.js";
 import type { ChatRunner } from "./chat-runner.js";
 import type { JudgeRunner } from "./judge-runner.js";
@@ -125,6 +125,9 @@ export class Worker {
    *  still running). */
   private draining = false;
 
+  /** Issue #1512: single-flight guard for {@link sweepPendingTerminals}, like `draining`. */
+  private sweepingTerminals = false;
+
   async run(signal: AbortSignal): Promise<void> {
     // PRD #92 M3 — fail-loud boot toolchain preflight, BEFORE the register retry loop.
     // A worker whose `/nix` store is missing the baked go/python3/gcc/pip/openssl (a stale seed
@@ -143,6 +146,11 @@ export class Worker {
         `toolchain preflight failed: missing ${pf.missing.join(", ")} — baked worker toolchain not on the runner PATH (likely a stale /nix seed after an image roll; see PRD #92)`,
       );
     }
+    // issue #1742 D4(a): snapshot the previous process's recovery records BEFORE register, so the
+    // restart sweep below provably excludes any record a live flight of this process writes later.
+    // A runner stub without the method (older test doubles) simply has nothing to snapshot.
+    const bootRecoveries =
+      typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
     await this.registerWithRetry(signal);
     if (signal.aborted) return;
     // PRD #1296 M3 (D3/D5) — after registering (so the worker is authenticated), re-drive
@@ -150,7 +158,7 @@ export class Worker {
     // journaled bundle bytes with NO forge PAT. Fire-and-forget and fully swallowed — a
     // resume failure must never block the claim loops, and the source stays protected by
     // the journal + the server custody hold regardless.
-    void this.runner.resumePendingRecoveries(signal).catch((err) => {
+    void this.runner.resumePendingRecoveries(signal, bootRecoveries).catch((err) => {
       this.log.warn("recovery: restart resume sweep failed", { error: errMessage(err) });
     });
     // PRD #1391 M2: admit any spill tail a crash may have lost, then drain the outbox
@@ -241,6 +249,14 @@ export class Worker {
           send: this.replaySend(entry.run_id, gen),
           signal,
         });
+        // Issue #1742: a crash between installing G's terminal journal and retiring G's finalize
+        // record leaves both files. Once the journal is settled (no longer pending), the finalize
+        // record for the run at generation <= G is obsolete, so retire it or it blocks the retention
+        // sweep. A journal left listed (blocked, transient blip) keeps its finalize record.
+        const stillPending = outbox
+          .listPendingTerminals()
+          .some((p) => p.run_id === entry.run_id && p.claim_generation === gen);
+        if (!stillPending) await outbox.retireFinalizesThrough(entry.run_id, gen);
       } catch (err) {
         this.log.warn("outbox: boot terminal resolve failed for a run; leaving it listed for a later resolve", {
           run_id: entry.run_id,
@@ -282,7 +298,7 @@ export class Worker {
    * be false-timeouted. Now the drain's own retire is that "later resolve": the segments are gone, so
    * the N3 guard passes and the fenced terminal lands. Mirrors resolveBootTerminals, scoped to runId;
    * a no-op when the run has no pending terminal. Never throws on an expected failure — a still-failing
-   * send is left listed for the next drain / boot, exactly as the boot resolve leaves it.
+   * send is left listed for the next heartbeat sweep / drain / boot, exactly as the boot resolve leaves it.
    */
   private async resolveRunTerminal(runId: string, signal?: AbortSignal): Promise<void> {
     const outbox = this.outbox;
@@ -296,35 +312,109 @@ export class Worker {
     for (const entry of outbox.listPendingTerminals()) {
       if (entry.run_id !== runId) continue;
       if (signal?.aborted) return;
-      const gen = entry.claim_generation;
-      // #1539 (B2/N4): the live run's permanent-failure hook holds this terminal's resolve while it
-      // aborts + reaps between its durable install and its own send. Sending here would race the hook's
-      // resolve, so SKIP and record the skip — the hook's `finally` release reads it and re-drives one
-      // resolve if its own send failed, so the terminal is never stranded until boot.
-      if (outbox.isTerminalResolveHeld(runId, gen)) {
-        outbox.noteHeldSkip(runId, gen);
-        this.log.info("outbox: terminal resolve held by the live run's permanent-failure hook; skipping the drain resolve", {
-          run_id: runId,
-          claim_generation: gen,
-        });
-        continue;
-      }
-      try {
-        await resolvePendingTerminal(deps, {
-          runId,
-          claimGeneration: gen,
-          // State-only send stamped with the journal's generation (mirrors resolveBootTerminals): a
-          // superseded generation is refused stale_claim and local-retired (D11), never mis-applied.
-          send: this.replaySend(runId, gen),
-          signal,
-        });
-      } catch (err) {
-        this.log.warn("outbox: post-drain terminal resolve failed for a run; leaving it listed for a later resolve", {
-          run_id: runId,
-          error: errMessage(err),
-        });
-      }
+      await this.resolveLiveTerminal(outbox, deps, entry, "drain", signal);
     }
+  }
+
+  /**
+   * Issue #1512: the live re-resolve the drain-retire hook could not give a run with NO message
+   * records. A journaled terminal whose send failed (an api outage, a fatal 401, a non-terminal 409)
+   * used to wait for the next boot or re-claim unless the run also had spilled messages to drain,
+   * because the only live re-resolve was {@link resolveRunTerminal}, fired from the drainer, and the
+   * drainer iterates `runsWithPending()` (message records only). This sweep is fired, fire-and-forget,
+   * after each successful heartbeat and walks every pending terminal journal. Single-flight (a tick
+   * during a sweep is a no-op), aborts with the signal, and never throws: a failing entry is logged
+   * and the rest continue. A journal the api answers with a non-terminal 409 is re-sent on each
+   * heartbeat (no backoff; the single-flight and the heartbeat cadence bound the rate, and the
+   * "state report not applied server-side" log makes it visible).
+   */
+  private async sweepPendingTerminals(signal?: AbortSignal): Promise<void> {
+    const outbox = this.outbox;
+    if (!outbox) return;
+    if (this.sweepingTerminals) return; // single-flight
+    this.sweepingTerminals = true;
+    try {
+      const deps = makeTerminalOutboxDeps(outbox, this.client, {
+        gapFillMax: this.config.gapFillMax,
+        terminalMaxBytes: this.config.outboxTerminalMaxBytes,
+        log: this.log,
+      });
+      if (!deps) return; // no usable outbox (failed closed) — nothing durable to resolve
+      for (const entry of outbox.listPendingTerminals()) {
+        if (signal?.aborted) return;
+        await this.resolveLiveTerminal(outbox, deps, entry, "sweep", signal);
+      }
+    } finally {
+      this.sweepingTerminals = false;
+    }
+  }
+
+  /**
+   * The ONE per-journal step shared by the heartbeat sweep and the drain-retire resolve. The checks
+   * run in this ORDER, and the order is load-bearing:
+   *  1. a blocked journal is owner-resolved, never auto-retried;
+   *  2. (sweep only) a run with undrained message segments belongs to the drainer, whose retire hook
+   *     resolves the terminal once the segments are gone;
+   *  3. the #1539 HOLD comes BEFORE liveness: the live run's permanent-failure hook holds the resolve
+   *     while it aborts and reaps, and its `finally` release re-drives one resolve only if a skip was
+   *     RECORDED here. A live-run check first would return without recording and strand the terminal;
+   *  4. only then skip a run that is live in this process: its own lane sends through
+   *     `flight.reportState` plus the recovery-terminal driver, which {@link replaySend} would bypass
+   *     (receipt gate, credential switch, recovery-hold release);
+   *  5. resolve (single-flight, "skip" when busy) and, once the journal is settled, retire the #1742
+   *     finalize record the way the boot resolve does.
+   * Never throws; a failing entry is logged and left listed for the next heartbeat / drain / boot.
+   */
+  private async resolveLiveTerminal(
+    outbox: Outbox,
+    deps: NonNullable<ReturnType<typeof makeTerminalOutboxDeps>>,
+    entry: { run_id: string; claim_generation: number; blocked: boolean },
+    via: "sweep" | "drain",
+    signal?: AbortSignal,
+  ): Promise<void> {
+    const runId = entry.run_id;
+    const gen = entry.claim_generation;
+    if (entry.blocked) return;
+    if (via === "sweep" && outbox.hasUndrainedMessages(runId)) return;
+    if (outbox.isTerminalResolveHeld(runId, gen)) {
+      outbox.noteHeldSkip(runId, gen);
+      this.log.info("outbox: terminal resolve held by the live run's permanent-failure hook; skipping the resolve", {
+        run_id: runId,
+        claim_generation: gen,
+        via,
+      });
+      return;
+    }
+    if (this.isRunLiveHere(runId)) return;
+    try {
+      await resolvePendingTerminal(deps, {
+        runId,
+        claimGeneration: gen,
+        // State-only send stamped with the journal's generation (mirrors resolveBootTerminals): a
+        // superseded generation is refused stale_claim and local-retired (D11), never mis-applied.
+        send: this.replaySend(runId, gen),
+        signal,
+        ifBusy: "skip",
+      });
+      const stillPending = outbox
+        .listPendingTerminals()
+        .some((p) => p.run_id === runId && p.claim_generation === gen);
+      if (!stillPending) await outbox.retireFinalizesThrough(runId, gen);
+    } catch (err) {
+      this.log.warn("outbox: live terminal resolve failed for a run; leaving it listed for a later resolve", {
+        run_id: runId,
+        via,
+        error: errMessage(err),
+      });
+    }
+  }
+
+  /** Whether this process is executing `runId` (the registry when wired, else the runner's own
+   *  execution tracking; the typeof guard covers test fakes that lack `isExecuting`). */
+  private isRunLiveHere(runId: string): boolean {
+    if (this.activeRuns) return this.activeRuns.has(runId);
+    const runner = this.runner as { isExecuting?: (id: string) => boolean };
+    return typeof runner.isExecuting === "function" ? runner.isExecuting(runId) : false;
   }
 
   private async registerWithRetry(signal: AbortSignal): Promise<void> {
@@ -332,11 +422,26 @@ export class Worker {
     // initial snapshot with an EMPTY pending subset + `pending_overflow: true` ON the register
     // request, so those outcomes are LEASED before the api's register-time orphan pass can re-claim
     // them. Cap-independent: the empty subset + overflow protects every pending run regardless of the
-    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Built ONCE
-    // before the retry loop so a re-register re-sends the same snapshot. Undefined for an ordinary
-    // worker with no pending journals (or no registry) ⇒ the register wire stays byte-identical.
+    // cap (even cap 0, where a non-empty subset would be rejected whole when cap < count). Issue
+    // #1742: a worker with only finalize-pending records also sends a snapshot (`pending_overflow`
+    // false, `finalize_resume` set). Built ONCE before the retry loop so a re-register re-sends the
+    // same snapshot. Undefined for an ordinary worker with neither (or no registry) ⇒ the register
+    // wire stays byte-identical.
     const pending = this.outbox?.listPendingTerminals() ?? [];
-    const initialSnapshot = this.buildRegisterSnapshot();
+    // Issue #1742: the finalize-pending records offered on this register, captured ONCE with the
+    // snapshot. After an accepted register the offered records (and any lower-generation records of
+    // the same offered runs) are retired, never a re-listing, so a record a live flight writes later
+    // survives.
+    const offeredFinalizes = this.outbox?.listPendingFinalizes() ?? [];
+    const initialSnapshot = this.buildRegisterSnapshot(offeredFinalizes);
+    const sentFinalizes = initialSnapshot?.finalize_resume ?? [];
+    if (sentFinalizes.length > 0) {
+      this.log.info("register finalize snapshot", {
+        count: sentFinalizes.length,
+        claim_generations_sample: sentFinalizes.slice(0, 8).map((entry) => entry.claim_generation),
+        claim_generations_omitted: Math.max(0, sentFinalizes.length - 8),
+      });
+    }
     this.log.info("register terminal snapshot", {
       authenticated_pending: pending.length,
       claim_generations_sample: pending.slice(0, 8).map((entry) => entry.claim_generation),
@@ -457,6 +562,19 @@ export class Worker {
           worker_id: res.worker_id ?? null,
         });
         this.dindPrune?.setWorkerId(res.worker_id);
+        // Issue #1742: the api accepted this register, so retire the offered finalize records
+        // (`sentFinalizes`, what the snapshot carried) and any lower-generation records of the same
+        // offered runs. A failed register never reaches here. A
+        // retire failure must not turn an accepted register into a retry loop.
+        if (sentFinalizes.length > 0) {
+          try {
+            await this.outbox?.retireFinalizes(sentFinalizes);
+          } catch (err) {
+            this.log.warn("register finalize snapshot: retiring the offered records failed", {
+              error: errMessage(err),
+            });
+          }
+        }
         return;
       } catch (err) {
         // A 401/403 is a PERMANENT auth rejection of the worker join token (rotated or
@@ -542,6 +660,11 @@ export class Worker {
         void this.drainOutbox(signal).catch((err) => {
           this.log.warn("outbox drain failed", { error: errMessage(err) });
         });
+        // Issue #1512: also re-resolve journaled terminals that have no message records (the
+        // drainer never visits those). Fire-and-forget for the same reason as the drain above.
+        void this.sweepPendingTerminals(signal).catch((err) => {
+          this.log.warn("outbox terminal sweep failed", { error: errMessage(err) });
+        });
       }
       await sleep(this.config.heartbeatIntervalMs, signal);
     }
@@ -549,12 +672,15 @@ export class Worker {
 
   /** PRD #1391 M5: assemble the per-run outbox depth for the heartbeat, mapping every
    *  run with pending outbox depth to the wire {@link OutboxHeartbeatEntry} shape
-   *  (`pending_terminal` is always 0 in Run A). Undefined when there is no outbox or
+   *  (`pending_terminal` counts the run's journaled terminals; a terminal-only run, with no message
+   *  records, is listed too, issue #1512). Undefined when there is no outbox or
    *  nothing pending, so the heartbeat wire stays byte-identical. */
   private outboxEntries(): OutboxHeartbeatEntry[] | undefined {
     if (!this.outbox) return undefined;
     const entries: OutboxHeartbeatEntry[] = [];
-    for (const runId of this.outbox.runsWithPending()) {
+    const runIds = new Set(this.outbox.runsWithPending());
+    for (const t of this.outbox.listPendingTerminals()) runIds.add(t.run_id);
+    for (const runId of runIds) {
       const d = this.outbox.depthFor(runId);
       if (!d) continue;
       entries.push({
@@ -584,18 +710,24 @@ export class Worker {
   }
 
   /**
-   * PRD #1391 Run B M4 (D7): build the BOOT register snapshot, or undefined for an ordinary worker.
-   * Returned only when the worker holds at least one pending terminal journal — then it is an EMPTY
-   * pending subset + `pending_overflow: true`, which leases every pending run BEFORE the api's
-   * register-time orphan pass, cap-independently. Unlike the heartbeat/claim snapshot this is NOT
-   * gated on the `active_run_snapshot` FEATURE (the feature is only known AFTER register, and #1390's
-   * register handler accepts the field unconditionally): the gate is purely "do we hold a pending
-   * outcome to protect". Undefined when there is no registry or nothing pending.
+   * PRD #1391 Run B M4 (D7) and issue #1742: build the BOOT register snapshot, or undefined for an
+   * ordinary worker. Returned when the worker holds a pending terminal journal OR an offered
+   * finalize-pending record. With pending terminals it is an EMPTY pending subset +
+   * `pending_overflow: true`, which leases every pending run BEFORE the api's register-time orphan
+   * pass, cap-independently. With only finalize records there is nothing to lease, so
+   * `pending_overflow` is false and the snapshot carries just `finalize_resume`. Unlike the
+   * heartbeat/claim snapshot this is NOT gated on the `active_run_snapshot` FEATURE (the feature is
+   * only known AFTER register, and #1390's register handler accepts the field unconditionally): the
+   * gate is purely "do we hold a pending outcome or finalize record to protect". Undefined when there
+   * is no registry or nothing pending.
    */
-  private buildRegisterSnapshot(): ActiveSnapshot | undefined {
+  private buildRegisterSnapshot(finalizes: readonly PendingFinalize[]): ActiveSnapshot | undefined {
     if (!this.activeRuns) return undefined;
-    if (!this.outbox || this.outbox.listPendingTerminals().length === 0) return undefined;
-    return this.activeRuns.buildRegisterSnapshot();
+    if (!this.outbox) return undefined;
+    // Issue #1742: a pending finalize record also warrants the register snapshot (it carries
+    // finalize_resume), even with no pending terminal journal.
+    if (this.outbox.listPendingTerminals().length === 0 && finalizes.length === 0) return undefined;
+    return this.activeRuns.buildRegisterSnapshot(finalizes);
   }
 
   /**

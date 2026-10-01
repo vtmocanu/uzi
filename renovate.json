@@ -13,6 +13,7 @@
   },
   "timezone": "Europe/Bucharest",
   "schedule": ["* 0-6 * * *"],
+  "updateNotScheduled": false,
   "prHourlyLimit": 5,
   "minimumReleaseAge": "7 days",
   "internalChecksFilter": "strict",

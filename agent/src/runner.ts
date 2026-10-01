@@ -2,7 +2,7 @@ import { AsyncResource } from "node:async_hooks";
 import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import os from "node:os";
-import { join, resolve as resolvePath } from "node:path";
+import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError } from "./client.js";
 import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange } from "./git.js";
@@ -1503,6 +1503,20 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
   "awaiting_followup",
 ]);
 
+/**
+ * Issue #1742: is this executor result FINALIZE-BOUND, i.e. does phasePublish go on to finalize it
+ * (push, MR, terminal report) rather than take one of its non-terminal early returns? The four
+ * early returns (an owner pause park, the completion hold, the wall-clock park, the in-place
+ * credential-switch release) each already reported their own non-terminal state and finalize
+ * nothing. Both the finalize-pending write and phasePublish use this predicate: a non-terminal
+ * result never writes a finalize record or reaches the finalize boundary.
+ */
+export function isFinalizeBoundResult(
+  result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased">,
+): boolean {
+  return !result.pausedAt && !result.completionHeld && !result.walled && !result.switchReleased;
+}
+
 function snapshotPhaseOf(status: StateRequest["status"]): ActiveSnapshotPhase | undefined {
   return SNAPSHOT_PHASES.has(status as ActiveSnapshotPhase) ? (status as ActiveSnapshotPhase) : undefined;
 }
@@ -1788,7 +1802,8 @@ export class RunRunner {
    *
    *  Not durable, and that is worth stating rather than implying: the map is worker
    *  memory, so a worker death re-queues the run and the resuming worker starts a
-   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1). */
+   *  fresh budget. The honest worst case is QUESTION_TIMEOUT x (RUN_MAX_REQUEUES + 1); a run that
+   *  used the issue #1742 one-shot finalize-resume allowance gets one more attempt, so x (RUN_MAX_REQUEUES + 2). */
   private readonly questionDeadlines = new Map<string, number>();
   /** PRD #88: the question id a run is currently parked on. Seeded from the claim on a
    *  resume so a re-park re-uses the SAME id rather than minting a new one — which is
@@ -1970,11 +1985,17 @@ export class RunRunner {
     return this.deliverySummary;
   }
 
+  /** issue #1742 D4(a) — the previous process's recovery records, snapshotted by the worker BEFORE
+   *  register and handed to {@link resumePendingRecoveries}. Best-effort: [] on any failure. */
+  async snapshotBootRecoveries(): Promise<RecoveryRecord[]> {
+    return this.recovery.snapshotBootRecords().catch(() => []);
+  }
+
   /** PRD #1296 M3 — restart-safe recovery resume (called once by the worker after
    *  registration). Re-uploads any journaled bundle BYTE-IDENTICALLY with no forge PAT.
    *  Best-effort; never throws to the caller. */
-  async resumePendingRecoveries(signal?: AbortSignal): Promise<void> {
-    await this.recovery.resumePending(signal).catch((err) => {
+  async resumePendingRecoveries(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
+    await this.recovery.resumePending(signal, snapshot).catch((err) => {
       this.log.warn("recovery: resume sweep failed", { error: errMessage(err) });
     });
   }
@@ -2505,6 +2526,8 @@ export class RunRunner {
           runLog,
           parkSink,
         );
+        // Issue #1742 retirement site (c): the api accepted the limit park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "limit_park_accepted");
         // parked === true is the ONLY thing that preserves on-disk state; see the
         // carve-out in the finally.
         //
@@ -2590,6 +2613,8 @@ export class RunRunner {
             preventive: err instanceof DiskParkSignal && err.preventive && steering.getPauseMode() !== "disk",
           },
         );
+        // Issue #1742 retirement site (c): the api accepted the disk park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "disk_park_accepted");
       } else if (err instanceof TransientRecoveryError) {
         // Retry capture without abandoning the live claim. Only verified local
         // durability permits automatic promotion; shutdown retains uncaptured work
@@ -2603,6 +2628,8 @@ export class RunRunner {
           reportState,
           runLog,
         );
+        // Issue #1742 retirement site (c): the api accepted the recovery_wait park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "recovery_park_accepted");
       } else if (flight.active?.shuttingDown) {
         // PRD #218 M1 — the worker is shutting down (SIGTERM/SIGINT) and aborted this
         // run mid-flight. The DISCRIMINATOR is the flag, never the error: a user
@@ -2809,6 +2836,8 @@ export class RunRunner {
         // pause_failed and left the run running), preserve the session and leave it for the
         // sweeper to requeue rather than failing a run the owner asked to pause.
         flight.parked = await this.handlePausePark(claim, flight, { completedCount: 0 });
+        // Issue #1742 retirement site (c): the api accepted the owner pause park for this generation.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "pause_park_accepted");
         if (!flight.parked) {
           flight.preserveSession = true;
           runLog.info(
@@ -2871,6 +2900,8 @@ export class RunRunner {
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
         flight.parked = true;
+        // Issue #1742 retirement site (c): the api itself parked this generation at its wall limit.
+        await this.retireFinalizeRecord(flight, "server_wall_park");
         runLog.info(
           "run parked server-side at its wall-clock limit; retaining clone + HOME and leaving it non-terminal for a resume",
           { run_id: flight.runId },
@@ -2894,6 +2925,10 @@ export class RunRunner {
         // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
         // terminal state — a `failed` here would fight the owning claim — and set NO preserve flag
         // (normal teardown: the new claim has its own clone). The finally then runs ordinary cleanup.
+        // Issue #1742: deliberately NO retireFinalizeRecord here (nor in the claim-fence,
+        // RunningAckTerminalError and CredentialSwitchSignal "released" arms): none of them is an
+        // accepted park/hold for this generation, and the api only acts on a finalize record for a
+        // run still running at that exact generation, so the record stays until a register offers it.
         runLog.info("run claim superseded server-side (stale_claim); stopping this flight");
         await batcher.close().catch(() => undefined);
       } else if (err instanceof RunningAckTerminalError) {
@@ -2966,6 +3001,8 @@ export class RunRunner {
         // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
         // superseded claim is never parked.
         await this.handleVaultLockDeferral(err as Error, claim, flight, executor, runLog);
+        // Issue #1742 retirement site (c): the api accepted the vault_locked recovery park.
+        if (flight.parked) await this.retireFinalizeRecord(flight, "vault_lock_park_accepted");
       } else {
         await this.reportGenericFailure(claim, flight, err);
       }
@@ -3258,6 +3295,47 @@ export class RunRunner {
     }
   }
 
+  /**
+   * Issue #1742: write the finalize-pending record for this flight's generation when `result` is
+   * finalize-bound ({@link isFinalizeBoundResult}) and a usable outbox is wired. Never throws.
+   */
+  private async journalFinalizeRecord(flight: RunFlight, result: ExecutorResult): Promise<void> {
+    if (!this.outbox || this.outbox.isDisabled()) return;
+    if (!isFinalizeBoundResult(result)) return;
+    try {
+      await this.outbox.journalFinalize(flight.runId, flight.claimGeneration);
+    } catch (err) {
+      this.log.warn("finalize record not written", {
+        run_id: flight.runId,
+        claim_generation: flight.claimGeneration,
+        reason: `unexpected: ${errMessage(err)}`,
+      });
+    }
+  }
+
+  /**
+   * Issue #1742: retire this flight's finalize-pending record once the generation's fate is durably
+   * recorded elsewhere. The retirement sites are: journalAndSendTerminal after the terminal journal
+   * is installed; journalAndSendTerminal after an unjournaled terminal send resolved; the
+   * executeClaim catch after the api accepted a limit, disk, recovery, pause or server-wall park;
+   * the accepted vault-lock park; and the accepted completion hold in phasePublish.
+   * The graceful-shutdown branch deliberately never calls this, so the record survives a SIGTERM.
+   * Never throws.
+   */
+  private async retireFinalizeRecord(flight: RunFlight, site: string): Promise<void> {
+    if (!this.outbox) return;
+    try {
+      await this.outbox.retireFinalize(flight.runId, flight.claimGeneration);
+    } catch (err) {
+      this.log.warn("finalize record retire failed", {
+        run_id: flight.runId,
+        claim_generation: flight.claimGeneration,
+        site,
+        error: errMessage(err),
+      });
+    }
+  }
+
   /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
    *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
    *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
@@ -3335,6 +3413,9 @@ export class RunRunner {
       messagesThroughSeq: fence,
       body,
     });
+    // Issue #1742 retirement site (a): G's terminal journal is installed, so the #1391 lease takes
+    // over and the finalize-pending record is no longer needed (independent of the send below).
+    if (installed.journaled) await this.retireFinalizeRecord(flight, "terminal_journal_installed");
     // #1539: the durable install is now on disk. Run the hook (abort + reap for the permanent
     // failure hook) BEFORE the resolve/send.
     await beforeResolve?.();
@@ -3342,6 +3423,9 @@ export class RunRunner {
       // reserve_exhausted: send unjournaled. A throw here propagates (skipping the latch below), so the
       // executor catch finds NO journal and takes today's fallback — unchanged from journalAndResolveTerminal.
       await sendUnjournaledTerminal(deps, installed.canonical, fence, wrappedSend);
+      // Issue #1742 retirement site (b): no journal could be installed and the unjournaled terminal
+      // send resolved, so the api holds G's outcome.
+      await this.retireFinalizeRecord(flight, "unjournaled_terminal_sent");
     } else {
       await resolvePendingTerminal(deps, {
         runId: flight.runId,
@@ -4370,72 +4454,76 @@ export class RunRunner {
     };
     const runId = claim.run_id;
     const result = flight.result!;
-    // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
-    // `paused` and set flight.parked). The run is non-terminal and already reported — there is
-    // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
-    // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
-    // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
-    // never reach this branch.
-    if (result.pausedAt) {
-      // PRD #1171 m4: needs NO own permit. Issue #1764: a Codex executor now sets pausedAt, and
-      // executeClaim then calls phasePublish directly, BYPASSING the finalize withBoundary (its
-      // credential reconcile is refused once the run is `paused`); the runner's terminal
-      // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
-      // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run parked on an owner-requested pause; skipping finalization", {
-        run_id: runId,
-      });
-      return;
-    }
-    // PRD #1226 M3 (D3/D6): the run entered the recoverable COMPLETION HOLD — a repeated
-    // no-progress completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed
-    // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
-    // non-terminal and the hold seam already handled the transition, so there is nothing to
-    // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
-    // finally preserves its HOME for resume. In M3 this branch is dead (the seam is unwired, so
-    // completionHeld is never set) — M4 wires the seam and this becomes live.
-    if (result.completionHeld) {
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run entered the completion hold; skipping finalization", {
-        run_id: runId,
-        reason: result.completionHeld.reason,
-      });
-      return;
-    }
-    // PRD #1497 M2: the run PARKED at its WALL-CLOCK limit (ctx.parkForWall → "parked", or
-    // "undeliverable" so the flight ends non-terminal keeping the work, D17). Like the pause park and
-    // the completion hold above, the run is non-terminal and the wall seam already handled it (a
-    // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
-    // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
-    // clone + HOME (enterWallPark set the flags) for a resume. Keyed on the executor's result so no
-    // non-wall path can reach this branch.
-    if (result.walled) {
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run parked at its wall-clock limit; skipping finalization", {
-        run_id: runId,
-        reason: result.walled.reason,
-      });
-      return;
-    }
-    // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
-    // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
-    // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
-    // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
-    // park and the completion hold above, the run is non-terminal and already handled, so there is
-    // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
-    // (idempotent — the release already drained it) and return; the finally retires the clone
-    // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
-    // Keyed on the executor's result so no non-release path can reach this branch.
-    if (result.switchReleased) {
-      executor.killAgentTree?.();
-      await closeBatcher().catch(() => undefined);
-      runLog.info("run released for a credential switch in place; skipping finalization", {
-        run_id: runId,
-      });
+    // The same predicate gates the write-ahead record and entry into finalization.
+    if (!isFinalizeBoundResult(result)) {
+      // PRD #1190 M2: an owner-requested pause PARKED the run mid-loop (handlePausePark reported
+      // `paused` and set flight.parked). The run is non-terminal and already reported — there is
+      // nothing to finalize (no push, no MR, no completion report), and the finally preserves its
+      // HOME for resume exactly as a limit park does. Close the batcher (handlePausePark only
+      // flushed it) and return. Keyed on the result the executor returned so a non-pause path can
+      // never reach this branch.
+      if (result.pausedAt) {
+        // PRD #1171 m4: needs NO own permit. Issue #1764: a Codex executor now sets pausedAt, and
+        // executeClaim then calls phasePublish directly, BYPASSING the finalize withBoundary (its
+        // credential reconcile is refused once the run is `paused`); the runner's terminal
+        // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
+        // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run parked on an owner-requested pause; skipping finalization", {
+          run_id: runId,
+        });
+        return;
+      }
+      // PRD #1226 M3 (D3/D6): the run entered the recoverable COMPLETION HOLD — a repeated
+      // no-progress completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed
+      // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
+      // non-terminal and the hold seam already handled the transition, so there is nothing to
+      // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
+      // finally preserves its HOME for resume. In M3 this branch is dead (the seam is unwired, so
+      // completionHeld is never set) — M4 wires the seam and this becomes live.
+      if (result.completionHeld) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run entered the completion hold; skipping finalization", {
+          run_id: runId,
+          reason: result.completionHeld.reason,
+        });
+        return;
+      }
+      // PRD #1497 M2: the run PARKED at its WALL-CLOCK limit (ctx.parkForWall → "parked", or
+      // "undeliverable" so the flight ends non-terminal keeping the work, D17). Like the pause park and
+      // the completion hold above, the run is non-terminal and the wall seam already handled it (a
+      // `paused` report on "parked", NOTHING on "undeliverable"), so there is nothing to finalize (no
+      // push, no MR, no terminal report). Reap + close the batcher and return; the finally preserves
+      // clone + HOME (enterWallPark set the flags) for a resume. Keyed on the executor's result so no
+      // non-wall path can reach this branch.
+      if (result.walled) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run parked at its wall-clock limit; skipping finalization", {
+          run_id: runId,
+          reason: result.walled.reason,
+        });
+        return;
+      }
+      // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
+      // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
+      // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+      // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
+      // park and the completion hold above, the run is non-terminal and already handled, so there is
+      // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
+      // (idempotent — the release already drained it) and return; the finally retires the clone
+      // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+      // Keyed on the executor's result so no non-release path can reach this branch.
+      if (result.switchReleased) {
+        executor.killAgentTree?.();
+        await closeBatcher().catch(() => undefined);
+        runLog.info("run released for a credential switch in place; skipping finalization", {
+          run_id: runId,
+        });
+        return;
+      }
       return;
     }
     // issue #1783: the finalize boundary. It sits BELOW the park/hold/wall/switch early returns
@@ -4594,6 +4682,13 @@ export class RunRunner {
           // this generation's record after clone; matching by generation UPDATES it to the
           // committed head H here rather than minting a duplicate.
           generation: claim.claim_generation,
+          // issue #1742 D4(a): the restart-sweep facts. The finalization pin (the committed head H,
+          // NOT the early start-tip pin) records where H lives so a restart can re-verify and
+          // capture it without a forge fetch.
+          bareDir: pathBasename(barePath),
+          defaultBranch:
+            claim.repo.default_branch?.trim() || (await this.git.defaultBranchName(barePath)) || "main",
+          finalizationPin: true,
         });
       } else {
         runLog.warn("recovery: could not resolve the original committed head to pin", {
@@ -6058,6 +6153,8 @@ export class RunRunner {
     const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
       const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
       if (held) {
+        // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
+        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run entered the completion hold; skipping finalization", {
@@ -8792,6 +8889,13 @@ export class RunRunner {
     let diskParked = false;
     try {
       result = await executor.run(ctx);
+      // Issue #1742: the executor returned. If the result is finalize-bound, journal a durable
+      // finalize-pending record NOW, before the finally's ticker stop and report-chain drain and
+      // before every later finalize await, so a worker restart anywhere in finalize leaves proof
+      // the executor of this generation succeeded. Awaited; never throws (a failure is logged by
+      // the outbox as `finalize record not written` and the run continues exactly as before).
+      // Only this run lane writes it, and a rejected executor.run never reaches this line.
+      await this.journalFinalizeRecord(flight, result);
     } catch (err) {
       diskParked = err instanceof DiskParkSignal || (err instanceof PauseNowSignal && steering.getPauseMode() === "disk");
       throw err;
@@ -10310,6 +10414,11 @@ export class RunRunner {
       onStep?.("checkpoint_upload");
       const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
       if (res.ok && res.body.published === true) {
+        // An early HTTP success does not prove the streamed git pack completed. spawnGit's
+        // exit promise never rejects and, inside a boundary, settles only after root reap.
+        // Abandon an unread tail so the producer cannot stay blocked on pipe backpressure.
+        if (!packed.pack.readableEnded) packed.pack.destroy();
+        if (await packed.exited !== 0) throw new Error("checkpoint pack producer failed");
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.

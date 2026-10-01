@@ -1,0 +1,11 @@
+{
+  "snapshot_epoch": 1,
+  "active": [],
+  "pending_overflow": false,
+  "finalize_resume": [
+    {
+      "run_id": "11111111-1742-4000-8000-000000000001",
+      "claim_generation": 3
+    }
+  ]
+}

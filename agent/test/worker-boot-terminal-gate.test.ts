@@ -163,6 +163,73 @@ describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
     await done;
   });
 
+  it("issue #1742: a boot-resolved terminal also retires the run's finalize records at generation <= G", async () => {
+    // A crash between installing G's terminal journal and retiring G's finalize record leaves both
+    // files. The lister excludes the run while the journal is pending; once the boot resolve settles
+    // the journal the finalize record must go too, or it blocks the retention sweep.
+    const outbox = await mkOutbox();
+    await outbox.journalFinalize(RUN, 3); // older generation, superseded by G
+    await outbox.journalFinalize(RUN, 4);
+    await outbox.journalFinalize(RUN, 6); // a higher generation is not G's to retire
+    await outbox.journalFinalize(RUN2, 1); // another run is untouched
+    await outbox.journalTerminal(RUN, 4, "running", 0, { status: "completed" });
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN2, claim_generation: 1 }], "precondition: RUN is excluded");
+
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
+    const controller = new AbortController();
+    const worker = new Worker(
+      fakeConfig(), fakeClient(), idleRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight,
+      outbox, new Map(), registry,
+    );
+    const done = worker.run(controller.signal);
+    try {
+      await pollUntil(() => !outbox.hasPendingTerminal(RUN, 4), 2000, "the boot resolve retired the terminal");
+      const runDir = path.join(tmpRoots[tmpRoots.length - 1]!, "outbox", RUN);
+      const finalizeNames = async (): Promise<string[]> =>
+        (await fsp.readdir(runDir)).filter((n) => n.startsWith("finalize-")).sort();
+      // Wait on the files themselves: the per-run deduped list shows gen 6 before gens 3 and 4 are unlinked.
+      let names: string[] = await finalizeNames();
+      for (let i = 0; i < 200 && names.join() !== "finalize-6.json"; i++) {
+        await sleep(10);
+        names = await finalizeNames();
+      }
+      // RUN2's record was offered on the accepted register and retired there; RUN keeps only gen 6.
+      assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN, claim_generation: 6 }]);
+      // The list dedupes by run (highest generation), so assert the files themselves.
+      const files = (await fsp.readdir(path.join(tmpRoots[tmpRoots.length - 1]!, "outbox", RUN)))
+        .filter((n) => n.startsWith("finalize-"))
+        .sort();
+      assert.deepEqual(files, ["finalize-6.json"], "gens 3 and 4 were retired, the higher gen 6 kept");
+    } finally {
+      controller.abort();
+      await done;
+    }
+  });
+
+  it("issue #1742: a terminal the boot resolve leaves listed keeps its finalize record", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalFinalize(RUN, 4);
+    await outbox.journalTerminal(RUN, 4, "running", 0, { status: "completed" });
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 32);
+    let reports = 0;
+    const controller = new AbortController();
+    const worker = new Worker(
+      fakeConfig(),
+      // A benign non-terminal 409: the boot resolve KEEPS the journal pending.
+      fakeClient({ reportState: async () => { reports += 1; return { applied: false, status: "running" } as StateAck; } }),
+      idleRunner, idleChat, noJudge, noReview, nullLogger(), okPreflight, outbox, new Map(), registry,
+    );
+    const done = worker.run(controller.signal);
+    await pollUntil(() => reports >= 1, 2000, "the boot resolve ran");
+    await sleep(40);
+    assert.equal(outbox.hasPendingTerminal(RUN, 4), true, "the journal stays pending");
+    controller.abort();
+    await done;
+    // Retire the journal by hand: the finalize record must still be there to list.
+    await outbox.retireTerminal(RUN, 4);
+    assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: RUN, claim_generation: 4 }]);
+  });
+
   it("a strict-decode rollback does NOT reopen the claim loops while a journal is still unresolved (D9)", async () => {
     // Two pending terminals with a cap of 0 (undefined getter) ⇒ pending_overflow, so the claim loop
     // gate stays CLOSED. The boot resolve keeps the journals (the api answers a benign non-terminal

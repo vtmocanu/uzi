@@ -25,6 +25,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 
 import type { Logger } from "./log.js";
+import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
   RecoveryCaptureStatusResponse,
   RecoveryHold,
@@ -111,6 +112,20 @@ export interface RecoveryRecord {
   serverCaptureId?: string;
   /** A bounded reason on `needs_action`. */
   reason?: string;
+  /** issue #1742 D4(a): the BASENAME of the private bare (`bareDirName`) the finalization pin's
+   *  `sourceSha` lives in, so the restart sweep can re-resolve it through the git cache. Set only
+   *  by the finalization pin. MAC-covered; absent on older records. Never a path. */
+  bareDir?: string;
+  /** issue #1742 D4(a): the repo default branch the finalization pin was taken against, so the
+   *  restart sweep can prove "already published" without a forge fetch. */
+  defaultBranch?: string;
+  /** issue #1742 D4(a): true ONLY while `sourceSha` is the finalization pin's committed head H.
+   *  Every unflagged `pinned` record (the early start-tip pin, and the shutdown / pause /
+   *  restore-point pins of `pinRecoveryGeneration`) is never read by a restart as proof of "no
+   *  unpublished work" and is never bundled by it. A later non-finalization pin that re-points
+   *  `sourceSha` in the same generation CLEARS this flag and `bareDir`/`defaultBranch`, since the
+   *  label is only true for the finalization head. */
+  finalizationPin?: boolean;
 }
 
 /** The outcome of a capture attempt, surfaced to the runner for logging. */
@@ -159,6 +174,14 @@ export interface RecoveryBundleProducer {
     cloneUrl?: string,
     username?: string,
   ): Promise<string>;
+  /** issue #1742 D4(a): resolve a journaled bare-dir basename under the private repos root and
+   *  classify `sourceSha` against it (see `GitCache.resolveRestartSource`). Optional: a producer
+   *  without it makes every finalization-pinned record `source_not_verifiable_after_restart`. */
+  resolveRestartSource?(
+    bareDir: string,
+    sourceSha: string,
+    defaultBranch: string,
+  ): Promise<{ status: "missing_bare" | "missing_sha" | "on_default" | "unpublished"; barePath?: string }>;
 }
 
 export interface PinInput {
@@ -168,6 +191,10 @@ export interface PinInput {
   branch: string;
   attemptedHeadSha?: string;
   generation?: number;
+  /** issue #1742 D4(a): set ONLY by the finalization pin (see RecoveryRecord). */
+  bareDir?: string;
+  defaultBranch?: string;
+  finalizationPin?: boolean;
 }
 
 export interface CaptureInput {
@@ -215,6 +242,10 @@ export function canonicalJson(value: unknown): string {
   }
   return `{${parts.join(",")}}`;
 }
+
+// All coordinators in this worker process share the configured recovery directory. Reuse the
+// keyed FIFO mutex for local journal IO only; one worker process owns each data directory.
+const recoveryJournalLocks = new RunDiskLocks();
 
 /**
  * The persistent, authenticated durable-recovery coordinator (PRD #1296 M3).
@@ -282,6 +313,30 @@ export class RecoveryCoordinator {
         if (existing.state === "pinned" && existing.sourceSha !== input.sourceSha) {
           existing.sourceSha = input.sourceSha;
           changed = true;
+          // issue #1742: the finalization label describes the finalization head ONLY. A later
+          // non-finalization pin (shutdown / pause / restore-point transfer) that moves the source
+          // to a different head must not leave the old label (and its bare/default-branch facts) on it.
+          if (input.finalizationPin !== true) {
+            delete existing.finalizationPin;
+            delete existing.bareDir;
+            delete existing.defaultBranch;
+          }
+        }
+        // issue #1742 D4(a): the finalization pin persists the restart-sweep facts on the
+        // generation's record. Only while `pinned` (a bundled/uploaded record is bound to
+        // journaled bytes and is never altered), and only when it is the finalization pin, so the
+        // early pin can never set the flag.
+        if (existing.state === "pinned" && input.finalizationPin === true && input.bareDir && input.defaultBranch) {
+          if (
+            existing.bareDir !== input.bareDir ||
+            existing.defaultBranch !== input.defaultBranch ||
+            existing.finalizationPin !== true
+          ) {
+            existing.bareDir = input.bareDir;
+            existing.defaultBranch = input.defaultBranch;
+            existing.finalizationPin = true;
+            changed = true;
+          }
         }
         // Record the provenance H' once it is known and was not yet recorded.
         if (input.attemptedHeadSha && !existing.attemptedHeadSha) {
@@ -307,6 +362,9 @@ export class RecoveryCoordinator {
         generation: input.generation,
         createdAt: this.now(),
         state: "pinned",
+        ...(input.finalizationPin === true && input.bareDir && input.defaultBranch
+          ? { bareDir: input.bareDir, defaultBranch: input.defaultBranch, finalizationPin: true }
+          : {}),
       };
       await this.writeRecord(record);
       this.log.info("recovery: pinned source head at finalization boundary", {
@@ -455,18 +513,20 @@ export class RecoveryCoordinator {
   private async uploadJournaledBundle(
     record: RecoveryRecord,
     signal?: AbortSignal,
+    sweep = false,
   ): Promise<RecoveryOutcome> {
+    const write = (r: RecoveryRecord): Promise<void> => (sweep ? this.writeSweepRecord(r) : this.writeRecord(r));
     if (
       !record.bundlePath ||
       typeof record.byteSize !== "number" ||
       !record.checksum ||
       typeof record.chunkCount !== "number"
     ) {
-      return this.markNeedsAction(record, "incomplete_local_inputs");
+      return this.markNeedsAction(record, "incomplete_local_inputs", sweep);
     }
     if (!(await fileExists(record.bundlePath))) {
       // The verified bundle is gone and we may not reproduce it without a forge PAT (D5).
-      return this.markNeedsAction(record, "bundle_file_missing");
+      return this.markNeedsAction(record, "bundle_file_missing", sweep);
     }
     // Reserve once; the local captureId is the idempotency_key so a lost ACK re-reserves the
     // SAME server capture rather than duplicating it.
@@ -482,7 +542,7 @@ export class RecoveryCoordinator {
         ...(current.generation !== undefined ? { generation: current.generation } : {}),
       });
       current = { ...current, serverCaptureId: reserved.capture_id };
-      await this.writeRecord(current);
+      await write(current);
     }
     const manifest: RecoveryUploadManifest = {
       byte_size: current.byteSize!,
@@ -500,7 +560,7 @@ export class RecoveryCoordinator {
       signal,
     );
     const uploaded: RecoveryRecord = { ...current, state: "uploaded", reason: undefined };
-    await this.writeRecord(uploaded);
+    await write(uploaded);
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
     await fs.rm(current.bundlePath!, { force: true }).catch(() => undefined);
@@ -555,7 +615,7 @@ export class RecoveryCoordinator {
         if (generation !== undefined) {
           await this.removeGenerationRecords(runId, generation, "sweep_if_last");
         } else {
-          await this.removeRunDir(runId);
+          await this.withJournalLock(runId, () => this.removeRunDir(runId));
         }
       }
     } catch (err) {
@@ -594,41 +654,220 @@ export class RecoveryCoordinator {
   // ── D3/D5: restart-safe sweep ───────────────────────────────────────────────────
 
   /**
-   * On worker restart, re-upload any journaled bundle BYTE-IDENTICALLY with NO forge PAT
-   * (D5). Verifies each record's MAC first: a tampered/invalid record is refused (left for
-   * needs_action), never trusted. A `pinned` record with no bundle, or one whose bundle file
-   * is gone, is incomplete and cannot be reproduced without a PAT → needs_action.
+   * issue #1742 D4(a) — snapshot the records the PREVIOUS process left behind. Taken by the worker
+   * BEFORE register, so it provably excludes any record a live flight of this process writes
+   * later; {@link resumePending} then processes only this snapshot. Authenticated records only
+   * (a tampered record is never trusted), `uploaded` ones omitted (nothing to do).
    */
-  async resumePending(signal?: AbortSignal): Promise<void> {
-    if (!this.enabled) return;
+  async snapshotBootRecords(): Promise<RecoveryRecord[]> {
+    if (!this.enabled) return [];
     let runDirs: string[];
     try {
       runDirs = await fs.readdir(this.recoveryRoot);
     } catch {
-      return; // no journal dir yet — nothing to resume
+      return [];
     }
+    const out: RecoveryRecord[] = [];
     for (const runId of runDirs) {
+      for (const record of await this.listRecords(runId)) {
+        if (record.state !== "uploaded") out.push(record);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * On worker restart, dispose of the previous process's journaled records (`snapshot`, from
+   * {@link snapshotBootRecords}; taken now when omitted). A record created after the snapshot is
+   * never touched. Each record's MAC is verified again on re-read: a tampered/invalid record is
+   * refused (left alone), never trusted. Every journal write here first re-checks the record still
+   * exists ({@link writeSweepRecord}); a record the live flight's cleanup removed meanwhile is
+   * dropped from the sweep, along with any bundle file this sweep produced for it.
+   *   - `bundled`, or `needs_action` WITH a journaled bundle: re-upload the bundle BYTE-IDENTICALLY
+   *     with NO forge PAT (D5), exactly as before.
+   *   - `needs_action` WITHOUT a bundle (a reason a previous sweep or capture recorded, e.g.
+   *     `early_pin_only_after_restart`, `source_not_verifiable_after_restart`, `oversized`): never
+   *     sent to the upload path (that would rewrite the reason to `incomplete_local_inputs`). Only a
+   *     finalization-pinned `source_not_verifiable_after_restart` (transient) is re-evaluated like
+   *     `pinned`; any other keeps its reason unchanged (no retry on every boot).
+   *   - `pinned` + `finalizationPin` (the committed head H, issue #1742 D4a): resolve the bare from
+   *     the journaled basename; a missing bare/commit is `source_not_verifiable_after_restart`; H
+   *     already on the default branch is `no_unpublished_work_after_restart` (held untouched, no
+   *     bundle); otherwise produce a PAT-less, self-contained bundle of H (no forge tip fetch,
+   *     size-capped while it is written), journal it, and upload it at the record's exact
+   *     generation.
+   *   - `pinned` without the flag: the early start-tip pin, a shutdown / pause / restore-point pin
+   *     that moved the source off the finalization head, or an older record that cannot say. All map
+   *     to `early_pin_only_after_restart` (the reason name is part of the ADR/spec vocabulary): never
+   *     bundled and never read as "no unpublished work".
+   * One `recovery restart sweep` log line is written per processed record (ids and outcome only).
+   */
+  async resumePending(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
+    if (!this.enabled) return;
+    const records = snapshot ?? (await this.snapshotBootRecords());
+    for (const snap of records) {
       if (signal?.aborted) return;
-      const records = await this.listRecords(runId);
-      for (const record of records) {
-        if (signal?.aborted) return;
-        if (record.state === "uploaded") continue;
-        if (record.state !== "bundled" && record.state !== "needs_action") {
-          // `pinned` with no verified bundle: cannot reproduce without a forge PAT (D5).
-          await this.markNeedsAction(record, "no_local_bundle_after_restart");
-          continue;
-        }
-        try {
-          await this.uploadJournaledBundle(record, signal);
-        } catch (err) {
-          this.log.warn("recovery: restart re-upload failed; retaining source (needs_action)", {
+      // Re-read the current, authenticated state of exactly this snapshotted record.
+      const record = await this.readRecord(this.recordPath(snap));
+      if (!record || record.state === "uploaded") continue;
+      const done = (outcome: string, reason?: string): void => {
+        this.log.info("recovery restart sweep", {
+          run_id: record.runId,
+          generation: record.generation,
+          outcome,
+          ...(reason ? { reason } : {}),
+        });
+      };
+      try {
+        await this.sweepRecord(record, done, signal);
+      } catch (err) {
+        if (!(err instanceof RecordGoneError)) {
+          // One record's failure (e.g. a journal write error) must not abort the rest of the sweep.
+          this.log.warn("recovery: restart sweep failed for a record; continuing", {
             run_id: record.runId,
-            capture_id: record.captureId,
+            generation: record.generation,
             error: errText(err),
           });
-          await this.markNeedsAction(record, "restart_upload_failed");
+          continue;
         }
+        // The live flight's cleanup removed this record while the sweep worked on it: stop, and
+        // drop the bundle bytes this sweep produced (the record that named them is gone).
+        await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+        done("record_removed");
       }
+    }
+  }
+
+  private async sweepRecord(
+    record: RecoveryRecord,
+    done: (outcome: string, reason?: string) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (record.state === "pinned" || (record.state === "needs_action" && !record.bundlePath)) {
+      // Only the transient `source_not_verifiable_after_restart` is re-evaluated on a later boot;
+      // every other bundle-less needs_action reason (oversized, bundle_failed, capture_error,
+      // no_unpublished_work_after_restart, ...) is final, so a boot does not retry it forever.
+      if (
+        record.state === "needs_action" &&
+        !(record.finalizationPin && record.reason === "source_not_verifiable_after_restart")
+      ) {
+        done("needs_action", record.reason); // keep the recorded reason; no rewrite
+        return;
+      }
+      await this.resumePinned(record, done, signal);
+      return;
+    }
+    try {
+      const out = await this.uploadJournaledBundle(record, signal, true);
+      done(out.state, out.reason);
+    } catch (err) {
+      if (err instanceof RecordGoneError) throw err;
+      this.log.warn("recovery: restart re-upload failed; retaining source (needs_action)", {
+        run_id: record.runId,
+        capture_id: record.captureId,
+        error: errText(err),
+      });
+      await this.markNeedsAction(await this.latestOf(record), "restart_upload_failed", true);
+      done("needs_action", "restart_upload_failed");
+    }
+  }
+
+  /** The newest authenticated journaled version of `record` (falls back to `record` itself), so a
+   *  needs_action mark after a partial step keeps the bundle facts and server capture id the step
+   *  already journaled instead of overwriting them with the older in-memory copy. */
+  private async latestOf(record: RecoveryRecord): Promise<RecoveryRecord> {
+    return (await this.readRecord(this.recordPath(record))) ?? record;
+  }
+
+  /** Mark a needs_action reason in the sweep; a record that already carries it is left untouched. */
+  private async sweepMark(
+    record: RecoveryRecord,
+    reason: string,
+    done: (outcome: string, reason?: string) => void,
+  ): Promise<void> {
+    if (record.state === "needs_action" && record.reason === reason && !(await this.recordGone(record))) {
+      done("needs_action", reason);
+      return;
+    }
+    await this.markNeedsAction(record, reason, true);
+    done("needs_action", reason);
+  }
+
+  private async recordGone(record: RecoveryRecord): Promise<boolean> {
+    return (await this.readRecord(this.recordPath(record))) === null;
+  }
+
+  /** The `pinned` (and bundle-less finalization `needs_action`) arm of {@link resumePending}. */
+  private async resumePinned(
+    record: RecoveryRecord,
+    done: (outcome: string, reason?: string) => void,
+    signal?: AbortSignal,
+  ): Promise<void> {
+    if (!record.finalizationPin) {
+      await this.sweepMark(record, "early_pin_only_after_restart", done);
+      return;
+    }
+    let resolved: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["resolveRestartSource"]>>> | undefined;
+    if (record.bareDir && record.defaultBranch && this.git.resolveRestartSource) {
+      try {
+        resolved = await this.git.resolveRestartSource(record.bareDir, record.sourceSha, record.defaultBranch);
+      } catch (err) {
+        this.log.warn("recovery: restart source resolution failed", { run_id: record.runId, error: errText(err) });
+      }
+    }
+    if (!resolved || resolved.status === "missing_bare" || resolved.status === "missing_sha" || !resolved.barePath) {
+      await this.sweepMark(record, "source_not_verifiable_after_restart", done);
+      return;
+    }
+    if (resolved.status === "on_default") {
+      await this.sweepMark(record, "no_unpublished_work_after_restart", done);
+      return;
+    }
+    // Never write a bundle for a record the live flight's cleanup already removed.
+    if (await this.recordGone(record)) throw new RecordGoneError(record);
+    let latest = record;
+    try {
+      // PAT-less and forge-free by design: no fetchDefaultTip, so the bundle is self-contained.
+      const outPath = this.bundlePath(record);
+      await fs.mkdir(path.dirname(outPath), { recursive: true, mode: 0o700 });
+      let result: RecoveryBundleResult;
+      try {
+        result = await this.git.produceRecoveryBundle(resolved.barePath, {
+          sourceSha: record.sourceSha,
+          outPath,
+          forgeTip: undefined,
+        });
+      } catch (err) {
+        const reason = err instanceof RecoveryBundleTooLargeError ? "oversized" : "bundle_failed";
+        await this.sweepMark(record, reason, done);
+        return;
+      }
+      const bundled: RecoveryRecord = {
+        ...record,
+        state: "bundled",
+        bundlePath: result.bundlePath,
+        byteSize: result.byteSize,
+        checksum: result.checksum,
+        chunkCount: result.chunkCount,
+        prerequisiteShas: result.prerequisiteShas,
+        selfContained: result.selfContained,
+        reason: undefined,
+      };
+      await this.writeSweepRecord(bundled);
+      latest = bundled;
+      const out = await this.uploadJournaledBundle(bundled, signal, true);
+      done(out.state, out.reason);
+    } catch (err) {
+      if (err instanceof RecordGoneError) throw err;
+      this.log.warn("recovery: restart capture failed; retaining source (needs_action)", {
+        run_id: record.runId,
+        capture_id: record.captureId,
+        error: errText(err),
+      });
+      // Mark the LATEST journaled record (the bundle facts and any reserved server capture id
+      // included), so the next boot re-uploads the bundle instead of finding a bundle-less record.
+      await this.markNeedsAction(await this.latestOf(latest), "restart_upload_failed", true);
+      done("needs_action", "restart_upload_failed");
     }
   }
 
@@ -669,8 +908,17 @@ export class RecoveryCoordinator {
     return path.join(this.runDir(record.runId), `${record.captureId}.bundle`);
   }
 
-  /** Atomically write the record with a fresh MAC (0600 file, 0700 dir). */
+  private withJournalLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
+    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn);
+  }
+
+  /** Serialize local writes with cleanup (0600 file, 0700 dir). */
   private async writeRecord(record: RecoveryRecord): Promise<void> {
+    await this.withJournalLock(record.runId, () => this.writeRecordUnlocked(record));
+  }
+
+  /** Atomic rename with a fresh MAC. The caller holds this run's journal lock. */
+  private async writeRecordUnlocked(record: RecoveryRecord): Promise<void> {
     if (!this.key) return;
     const mac = this.computeMac(record);
     const dir = this.runDir(record.runId);
@@ -750,12 +998,32 @@ export class RecoveryCoordinator {
     return records.find(predicate);
   }
 
-  private async markNeedsAction(record: RecoveryRecord, reason: string): Promise<RecoveryOutcome> {
+  private async markNeedsAction(record: RecoveryRecord, reason: string, sweep = false): Promise<RecoveryOutcome> {
     const updated: RecoveryRecord = { ...record, state: "needs_action", reason };
-    await this.writeRecord(updated).catch(() => undefined);
+    if (sweep) {
+      await this.writeSweepRecord(updated);
+    } else {
+      await this.writeRecord(updated).catch(() => undefined);
+    }
     return { state: "needs_action", captureId: record.captureId, reason };
   }
 
+  /**
+   * The restart sweep's journal write (issue #1742): re-check that the record still exists and
+   * authenticates, and throw {@link RecordGoneError} when it does not, so a sweep that is
+   * bundling/uploading while the live successor flight's cleanup ({@link forgetGeneration} /
+   * {@link release}) deletes the record never resurrects it. Check and rename share the same
+   * per-run in-process lock as cleanup: either this write completes before cleanup removes it,
+   * or cleanup wins and this write refuses the missing record. Bundling and RPCs stay outside.
+   */
+  private async writeSweepRecord(record: RecoveryRecord): Promise<void> {
+    await this.withJournalLock(record.runId, async () => {
+      if (!(await this.readRecord(this.recordPath(record)))) throw new RecordGoneError(record);
+      await this.writeRecordUnlocked(record);
+    });
+  }
+
+  /** The caller holds this run's journal lock, including for legacy whole-run release. */
   private async removeRunDir(runId: string): Promise<void> {
     await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
   }
@@ -774,6 +1042,15 @@ export class RecoveryCoordinator {
    *   attempted, and a non-empty (or already gone) dir is left as is.
    */
   private async removeGenerationRecords(
+    runId: string,
+    generation: number,
+    dirMode: "sweep_if_last" | "rmdir_if_empty",
+  ): Promise<void> {
+    await this.withJournalLock(runId, () => this.removeGenerationRecordsUnlocked(runId, generation, dirMode));
+  }
+
+  /** Generation selection and cleanup run under the same lock as every journal write. */
+  private async removeGenerationRecordsUnlocked(
     runId: string,
     generation: number,
     dirMode: "sweep_if_last" | "rmdir_if_empty",
@@ -802,6 +1079,14 @@ export class RecoveryCoordinator {
   }
 }
 
+/** The restart sweep found the record it was working on already removed (issue #1742). */
+class RecordGoneError extends Error {
+  constructor(record: Pick<RecoveryRecord, "runId" | "captureId">) {
+    super(`recovery record ${record.captureId} of run ${record.runId} was removed during the restart sweep`);
+    this.name = "RecordGoneError";
+  }
+}
+
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
@@ -822,6 +1107,19 @@ function macEqual(a: string, b: string): boolean {
   const bb = Buffer.from(b, "hex");
   if (ba.length !== bb.length || ba.length === 0) return false;
   return timingSafeEqual(ba, bb);
+}
+
+/** A bare-dir name is a plain basename: non-empty, no path separator, not `.`/`..`, no NUL. The
+ *  git cache re-checks this before joining it under its private repos root. */
+function isSafeBareDirName(name: string): boolean {
+  return (
+    name.length > 0 &&
+    name !== "." &&
+    name !== ".." &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes("\0")
+  );
 }
 
 /** Validate the untrusted parsed object into a RecoveryRecord (shape only; the MAC is the
@@ -860,5 +1158,19 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
   if (typeof obj.selfContained === "boolean") record.selfContained = obj.selfContained;
   if (str(obj.serverCaptureId)) record.serverCaptureId = obj.serverCaptureId;
   if (str(obj.reason)) record.reason = obj.reason;
+  // issue #1742 D4(a): the restart-sweep facts. A wrongly-typed value refuses the record (like
+  // any other shape error); an unsafe bareDir is refused HERE, before it can reach a path join.
+  if (obj.bareDir !== undefined) {
+    if (!str(obj.bareDir) || !isSafeBareDirName(obj.bareDir)) return null;
+    record.bareDir = obj.bareDir;
+  }
+  if (obj.defaultBranch !== undefined) {
+    if (!str(obj.defaultBranch)) return null;
+    record.defaultBranch = obj.defaultBranch;
+  }
+  if (obj.finalizationPin !== undefined) {
+    if (typeof obj.finalizationPin !== "boolean") return null;
+    record.finalizationPin = obj.finalizationPin;
+  }
   return record;
 }

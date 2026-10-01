@@ -234,6 +234,8 @@ confirming you want to discard what's held. See
 mechanics and the same-uid caveat, which applies to a journaled outcome
 exactly as it does to the message feed.
 
+A restart in the narrower window before that journal exists is also covered, once (issue #1742). Right after the agent's final result, and before the worker starts finalizing (fetching the branch back, pushing, opening the MR), the worker writes a small authenticated finalize-pending record; it is not an outcome. If the worker container restarts while finalizing, it reports that record on register, and the api re-queues the run once even when its re-queue budget is already spent, instead of failing it `worker_lost`. The run resumes through the ordinary claim path and completes only through the normal completion path at a later claim generation (the next claim, or the one after it when that claim first captures retained work and parks) (the claim-generation fences, plus the completion permit where the run is interlocked). A crash before that record is durable behaves as before, the extra resume is once per run and off at `RUN_MAX_REQUEUES=0`, and `uzi run recovery` reports a source it could not archive as retained `source_only` custody rather than offering an export. See [ADR-1742](../adr/1742-finalize-resume-allowance.md).
+
 ## How this differs from running your own worker
 
 A worker you run yourself is a container on hardware you control: you copy a

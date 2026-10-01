@@ -2,12 +2,12 @@ import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
-import { constants as fsConstants, createReadStream, type Stats } from "node:fs";
+import { constants as fsConstants, createReadStream, createWriteStream, type Stats } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { pipeline } from "node:stream/promises";
-import { PassThrough, Writable, type Readable } from "node:stream";
+import { PassThrough, Transform, Writable, type Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import type { Logger } from "./log.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest, BoundaryStep } from "./harness.js";
@@ -1267,6 +1267,82 @@ export class GitCache {
 
   barePathFor(repoUrl: string): string {
     return path.join(this.reposRoot, bareDirName(repoUrl));
+  }
+
+  /**
+   * issue #1742 D4(a) — resolve a journaled bare-dir BASENAME (the `bareDirName` recorded on a
+   * finalization-pinned recovery record) to the private bare under this cache's repos root and
+   * classify the record's pinned `sourceSha` against it, for the restart sweep. `reposRoot` is
+   * private, so the sweep cannot build the path itself; this is the only door, and it refuses a
+   * name that is not a plain basename (no separator, not `.`/`..`) so a tampered-but-re-MACed
+   * record can never point outside the repos root. The bare must ALSO be a real directory (not a
+   * symlink) whose realpath sits DIRECTLY under `realpath(reposRoot)`, so a symlinked
+   * `<name>.git` that points elsewhere is `missing_bare` too. `defaultBranch` is only used as a
+   * ref name after a strict character check plus `git check-ref-format`.
+   *   - `missing_bare`: the name is unsafe or no bare with that name exists;
+   *   - `missing_sha`: the bare lacks `sourceSha` as a commit (not verifiable);
+   *   - `on_default`: `sourceSha` is an ancestor of the bare's `<defaultBranch>` ref
+   *     (`refs/remotes/origin/<defaultBranch>`, which every fetch updates, or the mirror-layout
+   *     `refs/heads/<defaultBranch>`), so it is already published there;
+   *   - `unpublished`: present in the bare and reachable from neither default ref (a missing
+   *     default ref counts as not reachable).
+   * Read-only; runs under the bare lock so it never observes a half-written object set.
+   */
+  async resolveRestartSource(
+    bareDir: string,
+    sourceSha: string,
+    defaultBranch: string,
+  ): Promise<{ status: "missing_bare" | "missing_sha" | "on_default" | "unpublished"; barePath?: string }> {
+    if (
+      !bareDir ||
+      bareDir === "." ||
+      bareDir === ".." ||
+      bareDir !== path.basename(bareDir) ||
+      bareDir.includes("\\") ||
+      bareDir.includes("\0")
+    ) {
+      return { status: "missing_bare" };
+    }
+    const barePath = path.join(this.reposRoot, bareDir);
+    if (path.dirname(barePath) !== this.reposRoot) return { status: "missing_bare" };
+    try {
+      const st = await fs.lstat(barePath);
+      if (st.isSymbolicLink() || !st.isDirectory()) return { status: "missing_bare" };
+      const [realBare, realRoot] = await Promise.all([fs.realpath(barePath), fs.realpath(this.reposRoot)]);
+      if (path.dirname(realBare) !== realRoot) return { status: "missing_bare" };
+    } catch {
+      return { status: "missing_bare" };
+    }
+    if (!(await isBareRepo(barePath))) return { status: "missing_bare" };
+    if (!/^[0-9a-f]{40}$/.test(sourceSha)) return { status: "missing_sha", barePath };
+    return this.withLock(barePath, async () => {
+      if ((await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${sourceSha}^{commit}`])) !== 0) {
+        return { status: "missing_sha" as const, barePath };
+      }
+      const db = defaultBranch.trim();
+      if (await this.isPlainBranchName(barePath, db)) {
+        for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
+          if (!(await this.refExists(barePath, ref))) continue;
+          if ((await this.tryGit(barePath, ["merge-base", "--is-ancestor", sourceSha, ref])) === 0) {
+            return { status: "on_default" as const, barePath };
+          }
+        }
+      }
+      return { status: "unpublished" as const, barePath };
+    });
+  }
+
+  /** A journaled default-branch name safe to splice into a ref: printable ASCII only, no leading
+   *  `-`, no `@{`, none of the ref-format metacharacters, and accepted by
+   *  `git check-ref-format refs/heads/<name>` (which does no `@{-N}` expansion). */
+  private async isPlainBranchName(barePath: string, name: string): Promise<boolean> {
+    if (!name || name.startsWith("-") || name.includes("@{")) return false;
+    if (/[\s~^:?*[\\]|\.\./.test(name)) return false;
+    for (const ch of name) {
+      const c = ch.charCodeAt(0);
+      if (c < 0x21 || c > 0x7e) return false;
+    }
+    return (await this.tryGit(barePath, ["check-ref-format", `refs/heads/${name}`])) === 0;
   }
 
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
@@ -3637,9 +3713,10 @@ export class GitCache {
 
   /**
    * PRD #122 M8 — the delta packfile of `<exclude>..refs/uzi-runner/<branch>`, for a
-   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack }` where `tipOid`
-   * is the tracking-ref tip (the same the checkpoint fetched back) and `pack` STREAMS the
-   * packfile bytes; null when there is no tracking ref yet (nothing to publish).
+   * brokered origin publish at a checkpoint. Returns `{ tipOid, pack, exited }` where
+   * `tipOid` is the tracking-ref tip (the same the checkpoint fetched back), `pack`
+   * STREAMS the packfile bytes, and `exited` settles with the producer's exit code;
+   * null when there is no tracking ref yet (nothing to publish).
    *
    * The exclude boundary mirrors the reseed's floor: `refs/remotes/origin/<branch>` when
    * origin carries the branch, else the default branch — so the pack carries only what the
@@ -3658,7 +3735,7 @@ export class GitCache {
     overlay?: CheckpointOverlayContext,
     pinned?: CheckpointRange,
     onStep?: (step: BoundaryStep) => void,
-  ): Promise<{ tipOid: string; pack: Readable } | null> {
+  ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
@@ -3676,12 +3753,12 @@ export class GitCache {
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
       onStep?.("checkpoint_pack");
-      const { stdout } = await this.spawnGit(
+      const { stdout, exited } = await this.spawnGit(
         barePath,
         ["pack-objects", "--revs", "--stdout"],
         `${wanted}\n^${pinned.excludeSha}\n`,
       );
-      return { tipOid: wanted, pack: stdout };
+      return { tipOid: wanted, pack: stdout, exited };
     }
     const realTip = await this.trackingTip(barePath, branch);
     if (!realTip) return null;
@@ -3724,12 +3801,12 @@ export class GitCache {
     const wanted = wantRev;
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
     onStep?.("checkpoint_pack");
-    const { stdout } = await this.spawnGit(
+    const { stdout, exited } = await this.spawnGit(
       barePath,
       ["pack-objects", "--revs", "--stdout"],
       `${wanted}\n^${excludeSha}\n`,
     );
-    return { tipOid: wantRev, pack: stdout };
+    return { tipOid: wantRev, pack: stdout, exited };
   }
 
   private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {
@@ -5388,7 +5465,9 @@ export class GitCache {
    * nothing else. When no forge-reachable prerequisite exists (unrelated histories, or H is
    * already fully on the forge), it falls back to a SELF-CONTAINED bundle within the size
    * limit; if that exceeds RECOVERY_MAX_BUNDLE_BYTES it throws RecoveryBundleTooLargeError
-   * so the caller retains custody and surfaces needs_action rather than truncating.
+   * so the caller retains custody and surfaces needs_action rather than truncating. The size
+   * limit is enforced WHILE writing ({@link streamBundleWithCap}): the git child is killed and the
+   * partial file removed as soon as the bytes written pass the limit.
    *
    * The bundle is `git bundle verify`d against the bare (a producer self-check that its
    * prerequisites resolve) before the size/checksum are recorded. The transient named ref
@@ -5441,9 +5520,10 @@ export class GitCache {
       // it, then delete the ref in a finally so the bare's namespace is left untouched.
       await this.runGit(barePath, ["update-ref", RECOVERY_BUNDLE_REF, h]);
       try {
-        const args = ["bundle", "create", opts.outPath, RECOVERY_BUNDLE_REF];
+        // `-` writes the bundle to stdout so the bytes actually written are counted and capped.
+        const args = ["bundle", "create", "-", RECOVERY_BUNDLE_REF];
         for (const p of prereqs) args.push(`^${p}`);
-        await this.runGit(barePath, args);
+        await this.streamBundleWithCap(barePath, args, opts.outPath, maxBytes);
         // Producer self-check: the bundle's prerequisites resolve against the bare. The
         // authoritative proof is the clean-clone import in the conformance tests.
         await this.runGit(barePath, ["bundle", "verify", opts.outPath]);
@@ -5481,6 +5561,44 @@ export class GitCache {
         alreadyPublished: false,
       };
     });
+  }
+
+  /**
+   * issue #1742 — run `git bundle create - ...` (bundle on stdout) and write it to `outPath`
+   * through a byte counter that is a HARD bound on the bytes written: the moment the count passes
+   * `maxBytes` the git child is killed, the partial file is removed and
+   * {@link RecoveryBundleTooLargeError} (with the count seen so far) is thrown. No chunk that
+   * would push the file past `maxBytes` is ever written. Same worker-uid credential-free git env
+   * as {@link runGit} (via {@link spawnGit}), no shell, and the same GIT_TIMEOUT_MS bound.
+   */
+  private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
+    const { child, stdout, exited } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS });
+    let seen = 0;
+    const counter = new Transform({
+      transform(chunk: Buffer, _enc, cb) {
+        seen += chunk.length;
+        if (seen > maxBytes) cb(new RecoveryBundleTooLargeError(seen, maxBytes));
+        else cb(null, chunk);
+      },
+    });
+    const killChild = (): void => {
+      if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    };
+    const timer = setTimeout(() => {
+      killChild();
+      counter.destroy(new Error(`git ${args.join(" ")} exceeded ${GIT_TIMEOUT_MS}ms`));
+    }, GIT_TIMEOUT_MS);
+    try {
+      await pipeline(stdout, counter, createWriteStream(outPath, { mode: 0o600 }));
+    } catch (err) {
+      killChild();
+      stdout.destroy();
+      await exited;
+      await fs.rm(outPath, { force: true });
+      throw err;
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   /**

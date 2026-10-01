@@ -4570,6 +4570,79 @@ WHERE runs.worker_id = @worker_id
                            WHERE w.id = runs.worker_id AND w.pending_overflow_until > now())))
 RETURNING id;
 
+-- Attested finalize-resume passes (issue #1742) -----------------------------
+--
+-- A restarting worker attests, on its register snapshot, the (run, claim_generation) pairs whose
+-- executor finished and whose finalize-pending record survived the restart. An ATTESTED run is
+-- one owned by the registering worker, still running at exactly the attested generation, not
+-- chat, and with no live exact-generation terminal_pending lease. Both queries below take the
+-- same attested predicate and are disjoint: requeue takes (under budget) OR (over budget with the
+-- one-shot allowance available); fail takes over budget with the allowance unavailable.
+--
+-- Both DELIBERATELY do not apply the worker-level pending_overflow closure that
+-- FailWorkerRunsOverCap / RequeueWorkerRuns honour (ADR-1390, #1742): the closure protects
+-- UNLISTED outcomes, and an attested run has none (the worker lists no run that has a pending
+-- terminal journal). The exact-generation lease predicate still applies, and ClaimRun still
+-- excludes every run of a worker with pending_overflow_until > now(), so a run re-queued here
+-- cannot be claimed while the closure lasts.
+
+-- name: RequeueAttestedFinalizeRuns :many
+-- Under budget: an ordinary requeue (the allowance mark is NOT set). Over budget: the one-shot
+-- allowance (@max_requeues > 0 and finalize_resume_generation still NULL) requeues once more and
+-- stamps finalize_resume_generation = claim_generation. Never decrements requeue_count.
+-- RETURNING allowance_used tells the caller which case fired (the mark equals the generation the
+-- run held when re-queued; claim_generation is unchanged until the next ClaimRun).
+UPDATE runs SET status = 'queued', status_since = now(), requeue_count = requeue_count + 1,
+    finalize_resume_generation = CASE WHEN requeue_count >= @max_requeues
+                                      THEN claim_generation
+                                      ELSE finalize_resume_generation END,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    codex_cap_hash = NULL, codex_claim_epoch = codex_claim_epoch + 1,
+    updated_at = now()
+WHERE runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND (requeue_count < @max_requeues
+       OR (requeue_count >= @max_requeues AND @max_requeues > 0 AND finalize_resume_generation IS NULL))
+RETURNING id, (finalize_resume_generation IS NOT NULL AND finalize_resume_generation = claim_generation)::boolean AS allowance_used;
+
+-- name: FailAttestedFinalizeRunsOverCap :many
+-- An attested run that is over budget and not eligible for the one-shot allowance (allowance
+-- already used, or RUN_MAX_REQUEUES = 0) fails exactly as FailWorkerRunsOverCap fails it.
+UPDATE runs SET status = 'failed', status_since = now(), failure_reason = @failure_reason,
+    fail_origin = 'worker_lost',
+    move_pending_since = CASE WHEN issue_iid IS NOT NULL THEN now() END, finished_at = now(),
+    milestones_in_progress = NULL,
+    milestones_agents = NULL,
+    pause_requested_at = NULL, pause_mode = NULL, pause_after_count = NULL,
+    credential_switch_requested_at = NULL, credential_switch_generation = NULL,
+    health = 'ok', health_reason = NULL, health_since = NULL,
+    updated_at = now()
+WHERE runs.worker_id = @worker_id
+  AND runs.claim_released_at IS NULL
+  AND runs.status = 'running'
+  AND runs.kind <> 'chat'
+  -- Positional pairing of the two parallel arrays (run ids are unique: Register validates the
+  -- list). array_position is NULL for an unlisted run, so the equality is then never true.
+  AND runs.id = ANY(@run_ids::uuid[])
+  AND runs.claim_generation = (@claim_generations::bigint[])[array_position(@run_ids::uuid[], runs.id)]
+  AND NOT EXISTS (SELECT 1 FROM worker_active_runs a
+                  WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id AND a.terminal_pending
+                    AND a.terminal_pending_until > now()
+                    AND a.claim_generation = runs.claim_generation)
+  AND requeue_count >= @max_requeues
+  AND NOT (@max_requeues > 0 AND finalize_resume_generation IS NULL)
+RETURNING id;
+
 -- name: RequeueWorkerRuns :many
 -- Within budget → re-queued to this same worker (affinity), which then re-claims
 -- and resumes from the persisted session (handles docker compose down && up).

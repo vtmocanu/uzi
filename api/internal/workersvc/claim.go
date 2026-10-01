@@ -581,7 +581,9 @@ type ClaimConfig struct {
 	//
 	// The deadline is therefore NOT durable: a worker death re-queues the run and the
 	// resumed worker starts a fresh clock, so the honest worst case is
-	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1).
+	// QuestionTimeoutSeconds × (RUN_MAX_REQUEUES + 1) — or × (RUN_MAX_REQUEUES + 2) for a run that
+	// used the one-shot finalize-resume allowance (#1742, runs.finalize_resume_generation), which
+	// gets exactly one more attempt.
 	QuestionMax            int `json:"question_max"`
 	QuestionTimeoutSeconds int `json:"question_timeout_seconds"`
 	// CompletionHoldWindowSeconds is the PRD #1226 M5 (D6) live owner-continue window before a

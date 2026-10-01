@@ -239,7 +239,7 @@ An MR review found that `SetRunCodexClaimCapability` matched only on the run id,
 ## Out of scope (separate issues)
 
 - Every durability boundary does a full provider refresh-token rotation, with no "access token still fresh" skip (`buildRunLaneReconcile` → `coordinatedRefresh`). This multiplies ambiguous-exchange exposure.
-- `worker_auth.go:46-49` returns 401 "invalid worker token" on any DB lookup error, and the agent treats 401 as fatal (`batcher.ts:106`, `worker.ts:324`).
+- Before #1989, worker auth returned 401 "invalid worker token" on any lookup error, which the agent treated as fatal. #1989 changed non-not-found lookup errors to a retryable 503. (AI-synced 2026-09-30)
 - The Docker worker's `/data/runner` emptyDir exceeded its ephemeral-storage request (26.8 GiB used against 4 GiB), causing the eviction.
 - The graceful shutdown did not advance the bare tracking ref in the observed case (PR #1592's body records the evidence).
 - `budget_used_seconds` keeps growing on terminal runs (`runs_dto.go`).

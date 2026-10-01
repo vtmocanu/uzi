@@ -1,6 +1,6 @@
 ---
 name: tester
-version: 16
+version: 17
 description: "Runs the repo's quality gate (format, lint, typecheck, dead code, coverage, tests) scoped to what the change touched, and validates behavior against representative real-world inputs. Adapts to whatever testing surface the repo actually has: unit-test framework (jest, pytest, go test, cargo test), scenario simulation for repos without one (CI workflows, infra, KCL/IaC libs), live-API dry-runs, or end-to-end runs with a consumer."
 tools: Bash, Read, Grep, Glob, WebFetch, Edit, Write, SendMessage, TaskUpdate, TaskList, TaskGet
 model: sonnet
@@ -175,6 +175,16 @@ the three testing flavors below fit the repo and the change.
    - Assert on the observable end-state (output, rendered result,
      behavior), not internal routing or state, so tests survive
      refactors.
+   - Test through the seams the PRD or task names, else through the
+     existing public interface. Never assert through a side channel
+     (querying storage the interface already exposes, calling private
+     helpers) or mock a collaborator inside the module under test.
+   - Take expected values from an independent source (a known-good
+     literal, a worked example, the spec), never by recomputing them the
+     way the code does: such a test passes by construction.
+   - For a feature slice, prefer writing the behaviour test first and
+     watching it fail; this is a preference, not a gate, since the fold
+     check (folding the production expression until the suite reddens) proves the test bites either way.
    - A bugfix is not done until a regression test pins the defect: it
      must fail on the unfixed code and pass with the fix before you call
      the task complete. The only exemption is a defect with no observable

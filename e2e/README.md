@@ -48,7 +48,9 @@ Phase registry knobs (PRD #966 M2 — the driver reads these):
 - `E2E_ONLY=<glob[,glob]>` — run only the phases whose slug matches one of these
   comma-separated globs (e.g. `E2E_ONLY='mr-*,happy-*'`). `critical: yes` phases
   (boot seed, worker-online, happy path) always run regardless, so a subset still
-  boots a usable stack.
+  boots a usable stack. Selection does not add non-critical prerequisites. Phase 52's
+  recovery assertions use the CLI binary and token from `cli-smoke`, so run its focused
+  acceptance with `E2E_ONLY=cli-smoke,api-outage-outbox ./e2e/run-e2e.sh`.
 - `E2E_SKIP=<glob[,glob]>` — the inverse: skip the phases whose slug matches. As
   with `E2E_ONLY`, critical phases are never skipped.
 - `E2E_STRICT_LEAKS=1` — make an end-of-phase quarantine **LEAK** (a non-terminal
@@ -172,7 +174,7 @@ headers, not the rows.
 | 49 | docker-sidecar | gitlab | no | PRD #83 M2: rootless DinD sidecar + Decision-3 efficacy |
 | 50 | worker-token-binding | gitlab | no | PRD #104: a worker's Anthropic binding reaches the claim payload; a rebind lands on the next claim |
 | 51 | auto-stop-poison | gitlab | no | PRD #108 M5: auto-stop kills a run whose messages can't be saved (direct-to-API poison) |
-| 52 | api-outage-outbox | gitlab | no | PRD #1391: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay) |
+| 52 | api-outage-outbox | gitlab | no | PRD #1391 + #1742: worker outbox survives an api outage (M5 spill+drain/tombstones, M6 write-ahead terminal replay; finalize-resume across an agent SIGKILL) |
 | 59 | restart-agent | gitlab | no | PRD #966: restart the agent worker before schedule phases 60-62 |
 | 60 | schedules-sweep | gitlab | no | PRD #966 M4: scheduled Planned-sweep (catalog enable, run-now tallies, uzi-gate filter, open-MR skip) |
 | 61 | schedules-prompt | gitlab | no | PRD #966 M4: scheduled prompt run (issue-less repo->MR run via run-now) |

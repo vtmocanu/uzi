@@ -11,6 +11,13 @@ around it. `S` is `.agents/skills/uzi-lander/scripts/`.
   be met: merge with `--admin` directly (references/merge-mechanics.md).
 - **Never push to a `renovate/*` branch.** Renovate rebases and force-pushes it, clobbering
   your commit; `S/land-prep.sh` refuses one. A needed fix goes on your own branch (below).
+- **Renovate rebases only at night** (`renovate.json` `schedule` plus `updateNotScheduled:
+  false`). By day a conflicting Renovate PR stays conflicting: tick its rebase checkbox
+  (honoured outside the schedule, on Renovate's next run, up to 4 h away), or re-apply
+  the same bump on your own branch off `main` and let Renovate close its PR.
+- **A pending `renovate/stability-days` is not a required check** and can stay pending for
+  good (a digest update with no release timestamp). Judge the target's provenance and age
+  yourself (e.g. an action digest is an upstream release-tag commit), not the status.
 
 ## A major and its minor sibling: prefer the major when safe
 
