@@ -4,11 +4,12 @@ import os from "node:os";
 import path from "node:path";
 
 // Issue #2044: a unix socket path is capped by sockaddr_un.sun_path (108 bytes on Linux, 104 on
-// macOS, both including the NUL). A Codex run's TMPDIR is already 83 bytes
-// (/tmp/uzi-codex-command-<uuid>/uzi-tmpdir-guard.XXXXXX), so a fake-Docker socket built under
-// os.tmpdir() overflows it: listen() emits EINVAL, and a bare `server.listen(socket, resolve)` has
-// no error handler, so the test hangs to the runner timeout. Fixtures take a short socket path
-// from shortUnixSocket and bind through listenUnix, which fails fast and names the path.
+// macOS, both including the NUL). In a Codex run the test TMPDIR is already 83 bytes: the
+// command's /tmp/uzi-codex-command-<uuid> plus tmpdir-leak-guard's /uzi-tmpdir-guard.XXXXXX.
+// So a fake-Docker socket built under os.tmpdir() overflows it: listen() emits EINVAL, and a bare
+// `server.listen(socket, resolve)` has no error handler, so the test hangs to the runner timeout.
+// Fixtures take a short socket path from shortUnixSocket and bind through listenUnix, which fails
+// fast and names the path.
 const UNIX_SOCKET_PATH_MAX_BYTES = 103;
 
 function assertSocketPathFits(socket: string): void {

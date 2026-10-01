@@ -19,6 +19,7 @@ import {
   runnerWith,
   worktreeDirFor,
 } from "./runner-harness.js";
+import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 
 // issue #1315 — atomic runner-clone RELEASE (retireRunnerClone). The terminal cleanup
 // bug was non-atomic: a recursive `fs.rm` racing a `git maintenance`/`fsmonitor` daemon
@@ -752,14 +753,17 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
     // which is exactly what tolerates the git fsmonitor socket on a real docker-lane clone).
     // Bind at a short path first, then move the live socket node into the clone: macOS caps UNIX
     // socket addresses at 104 bytes, while this fixture's intentionally nested clone path is longer.
+    // Issue #2044: under a Codex run's TMPDIR even fx.dataDir is too long, so the short path comes
+    // from shortUnixSocket.
     execFileSync("mkfifo", [path.join(clonePath, "worktree.fifo")]);
     const server = net.createServer();
-    const shortSocket = path.join(fx.dataDir, "t1354-a.sock");
-    await new Promise<void>((resolve, reject) => {
-      server.once("error", reject);
-      server.listen(shortSocket, () => resolve());
-    });
-    fs.renameSync(shortSocket, path.join(clonePath, ".sock"));
+    const short = shortUnixSocket();
+    try {
+      await listenUnix(server, short.socket);
+      fs.renameSync(short.socket, path.join(clonePath, ".sock"));
+    } finally {
+      short.dispose();
+    }
 
     const restore = stubDockerLaneRename();
     try {

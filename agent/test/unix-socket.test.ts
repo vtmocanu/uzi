@@ -9,8 +9,8 @@ import { listenUnix, shortUnixSocket } from "./unix-socket.js";
 // Issue #2044: the TMPDIR a Codex run gets, rebuilt from its parts.
 const CODEX_TMPDIR_BYTES = "/tmp/uzi-codex-command-".length + 36 + "/uzi-tmpdir-guard.XXXXXX".length;
 
-// The base the helpers run under: os.tmpdir() itself when it is already Codex-length (a real
-// Codex run), else a fresh dir under it padded to exactly that length. Never a wrapper dir under a
+// The base the helpers run under: os.tmpdir() itself when it is too long to pad (a real Codex
+// run, where it is already Codex-length), else a fresh dir under it padded to exactly that length. Never a wrapper dir under a
 // Codex TMPDIR: that would add bytes a fixture under the same TMPDIR never pays.
 let base: string;
 let owned: string | undefined;
@@ -33,8 +33,16 @@ after(() => {
 const usDirs = (dir: string): string[] => fs.readdirSync(dir).filter((n) => n.startsWith("us-"));
 
 describe("unix-socket helpers under a Codex-length TMPDIR", () => {
-  it("the base is as long as a Codex TMPDIR (or is os.tmpdir() itself)", () => {
-    assert.ok(Buffer.byteLength(base) >= Math.min(CODEX_TMPDIR_BYTES, Buffer.byteLength(os.tmpdir())));
+  it("the base is exactly Codex-length, or is os.tmpdir() itself when that is too long to pad", () => {
+    assert.ok(Buffer.byteLength(base) === CODEX_TMPDIR_BYTES || base === os.tmpdir(), `base is ${Buffer.byteLength(base)} bytes`);
+  });
+
+  it("listenUnix rejects a listen error the length bound does not catch, instead of hanging", async () => {
+    const socket = path.join(base, "us-missing", "d.sock");
+    const server = http.createServer();
+    // ENOENT on a plain host; EACCES inside the Landlock command sandbox. Either is a listen error.
+    await assert.rejects(listenUnix(server, socket), (err: NodeJS.ErrnoException) => err.syscall === "listen" && typeof err.code === "string");
+    assert.equal(server.listening, false);
   });
 
   it("listenUnix rejects an over-long path promptly, naming its byte length", async () => {
