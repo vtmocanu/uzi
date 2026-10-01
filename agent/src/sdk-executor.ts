@@ -2292,7 +2292,8 @@ export class SdkExecutor implements Executor {
       // in arrival order. They are already consumed from the server; the queue is in-memory only.
       // They refill the slot at the loop top (ahead of a fresh pull) and are serviced once the
       // held follow-up reaches the model. A follow-up stranded by a run end stays
-      // consumed-but-not-included and is re-queued at the next claim (server-side).
+      // consumed-but-not-included; the worker re-queues it at its next claim (from the claim-time
+      // GET of consumed follow-ups), not the server.
       const queuedOwner: Array<{ id: number; body: string }> = [];
       // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
       // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
