@@ -36,7 +36,13 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     // RELEASES. A component test asserting "disabled at quota" passes either way.
     const api = await fresh();
     await api.login("vlad@uzi.local", "x");
-    const seeded = (await api.listWorkers()).workers.filter((w) => w.kind === "hosted");
+    // PERSISTENT hosted rows only: the quota (server CountHostedWorkersForUser) excludes
+    // ephemeral workers, and so does the page's hostedCount. The seeded leased ephemeral
+    // worker (PRD #2006 M2) is hosted but must not eat the one slot of headroom.
+    const persistent = (w: { kind: string; ephemeral?: boolean }) => w.kind === "hosted" && w.ephemeral !== true;
+    const all = (await api.listWorkers()).workers;
+    expect(all.filter((w) => w.kind === "hosted" && w.ephemeral === true)).toHaveLength(1);
+    const seeded = all.filter(persistent);
     // FOUR seeded hosted workers against a quota of FIVE: PRD #113 M5 added the failed
     // roller, and PRD #496 added two cordoned demo workers. The numbers moved together
     // deliberately: what this test exists to prove is that the gate RELEASES, which
@@ -45,12 +51,12 @@ describe("mockApi hosted workers (PRD #58 M5)", () => {
     expect(seeded[0].hosted_size).toBe("m");
 
     const { worker } = await api.provisionHostedWorker("base", "l");
-    const after = (await api.listWorkers()).workers.filter((w) => w.kind === "hosted");
+    const after = (await api.listWorkers()).workers.filter(persistent);
     expect(after).toHaveLength(5); // at quota
 
     // Delete is kind-blind, exactly as the real DELETE /api/workers/{id} is.
     await api.deleteWorker(worker.id);
-    expect((await api.listWorkers()).workers.filter((w) => w.kind === "hosted")).toHaveLength(4);
+    expect((await api.listWorkers()).workers.filter(persistent)).toHaveLength(4);
   });
 
   it("provisions offline, unreported, with the chosen size — the controller has not started it yet", async () => {

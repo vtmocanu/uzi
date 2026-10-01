@@ -2070,7 +2070,8 @@ export interface Worker {
   docker?: boolean | null;
   // Auto-provisioned, run-bound throwaway hosted worker (PRD #529/#649): the api
   // provisions it on demand for a run needing a capability no online worker has and
-  // reaps it when the run finishes. true marks such a worker; absent/false for a
+  // removes it after that run finishes and any lease (PRD #2006,
+  // ephemeral_lease_expires_at below) ends. true marks such a worker; absent/false for a
   // normal hosted or an external worker. Optional so existing literals need no edit.
   ephemeral?: boolean;
   // PRD #2006: when a finished ephemeral worker is held warm for same-branch follow-up
