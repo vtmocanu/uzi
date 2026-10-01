@@ -198,14 +198,17 @@ export class ScratchPublicationError extends Error {
 
 const DETAIL_MAX = 200;
 
-/** First non-empty line of `text`, control characters stripped, capped at DETAIL_MAX. */
+/** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input is
+ *  scanned (forge stderr can be megabytes), lines split on CR, LF, U+2028 and U+2029, and the line
+ *  goes through sanitizeForLog, which replaces control and bidi code points with `?` and cuts by
+ *  code point. A truncated line ends in `...`; the whole result is at most DETAIL_MAX characters. */
 function oneLine(text: string): string {
-  const strip = (l: string): string => Array.from(l, (c) => {
-    const n = c.charCodeAt(0);
-    return n < 0x20 || (n >= 0x7f && n <= 0x9f) ? " " : c;
-  }).join("").trim();
-  const first = text.split(/[\r\n]+/).map(strip).find((l) => l) ?? "";
-  return first.slice(0, DETAIL_MAX);
+  const prefix = String(text).slice(0, DETAIL_MAX * 4);
+  for (const raw of prefix.split(/[\r\n\u2028\u2029]/)) {
+    const line = raw.trim();
+    if (line) return sanitizeForLog(line, DETAIL_MAX - 3);
+  }
+  return "";
 }
 
 interface ExecFailure {
@@ -226,9 +229,11 @@ function classifyExecFailure(err: unknown): ExecFailure {
     stdout?: unknown; stderr?: unknown; message?: unknown;
   };
   const overflow = e.outputExceeded === true || e.code === "ERR_CHILD_PROCESS_STDIO_MAXBUFFER";
-  const timedOut = !overflow && (e.killed === true || (typeof e.signal === "string" && e.signal !== ""));
-  const exitCode = !overflow && !timedOut && typeof e.code === "number" ? e.code : undefined;
-  const spawnError = !overflow && !timedOut && typeof e.code === "string";
+  const signalled = typeof e.signal === "string" && e.signal !== "";
+  // Only our own timeout kill (execFile `killed`) is a timeout; a bare signal is reported as such.
+  const timedOut = !overflow && e.killed === true;
+  const exitCode = !overflow && !timedOut && !signalled && typeof e.code === "number" ? e.code : undefined;
+  const spawnError = !overflow && !timedOut && !signalled && typeof e.code === "string";
   const stderr = typeof e.stderr === "string" ? e.stderr : "";
   const stdout = typeof e.stdout === "string" ? e.stdout : "";
   const parts: string[] = [];
@@ -1600,7 +1605,17 @@ export class GitCache {
       const match = /^([0-9a-f]{40})\trefs\/heads\/.+$/.exec(listed);
       if (!match || listed !== `${match[1]}\t${remoteRef}`) throw new Error("remote branch response is ambiguous");
       await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
-      const fresh = await this.revParse(barePath, `${scratchRef}^{commit}`);
+      // Strict read: an exec failure must not look like "the branch changed". Re-wrap a refusal
+      // from the resolver as this step's floor_unverified, keeping its detail.
+      const fresh = await this.resolveCommitStrict(barePath, scratchRef).catch((resolveErr: unknown) => {
+        if (resolveErr instanceof ScratchPublicationError) {
+          throw new ScratchPublicationError("cannot verify fresh remote floor", resolveErr.cause ?? resolveErr, {
+            kind: "floor_unverified", step: "floor_refresh",
+            ...(resolveErr.detail !== undefined ? { detail: resolveErr.detail } : {}),
+          });
+        }
+        throw resolveErr;
+      });
       if (fresh !== match[1]) throw new Error("remote branch changed during refresh");
       const priorRef = `refs/remotes/origin/${branch}`;
       const prior = await this.revParse(barePath, `${priorRef}^{commit}`);

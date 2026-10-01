@@ -578,13 +578,105 @@ it("classifies checkpoint floor refusals as checkpoint_range at checkpoint_floor
 
 it("keeps detail to one capped line without control characters", { skip: linuxCloneSkip }, async () => {
   const { bare } = await trackedClean();
-  const noisy = new Error(`bad\u0007thing\n${"x".repeat(500)}`);
-  const restore = failExec(["--is-shallow-repository"], noisy);
+  const long = `bad\u0007thing ${"x".repeat(500)}\nsecond line`;
+  const restore = failExec(["--is-shallow-repository"], new Error(long));
   try {
     const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
     const detail = assertDetail(e);
-    assert.doesNotMatch(detail, /\n/);
-    assert.match(detail, /^bad thing/);
+    assert.equal(detail.length, 200);
+    assert.doesNotMatch(detail, /\n|second line/);
+    assert.match(detail, /^bad\?thing x+/);
+  } finally { restore(); }
+});
+
+async function detailFor(message: string): Promise<string> {
+  const { bare } = await trackedClean();
+  const restore = failExec(["--is-shallow-repository"], new Error(message));
+  try {
+    return assertDetail(await refusal(cache.scratchPublicationPreflight(bare, branch)));
+  } finally { restore(); }
+}
+
+it("does not let bidi, mark or line-separator code points survive in detail", { skip: linuxCloneSkip }, async () => {
+  const cp = String.fromCodePoint;
+  const detail = await detailFor(`evil${cp(0x202e)}gnp${cp(0x2066)}x${cp(0x200f)}y`);
+  for (const c of [0x202e, 0x2066, 0x200f]) assert.ok(!detail.includes(cp(c)), `U+${c.toString(16)} survived`);
+  assert.match(detail, /evil.gnp.x.y/);
+});
+
+it("splits detail lines on U+2028 and keeps only the first", { skip: linuxCloneSkip }, async () => {
+  const cp = String.fromCodePoint;
+  const detail = await detailFor(`first${cp(0x2028)}second${cp(0x2029)}third`);
+  assert.ok(!detail.includes(cp(0x2028)) && !detail.includes(cp(0x2029)));
+  assert.match(detail, /first/);
+  assert.doesNotMatch(detail, /second|third/);
+});
+
+it("derives detail from a megabyte of stderr without scanning it all", { skip: linuxCloneSkip }, async () => {
+  const { bare } = await trackedClean();
+  const err = Object.assign(new Error("subprocess exited 128"), {
+    code: 128, stdout: "", stderr: `fatal: first\n${"y".repeat(1024 * 1024)}\n`,
+  });
+  const restore = failExec(["--is-shallow-repository"], err);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    const detail = assertDetail(e);
+    assert.match(detail, /exit 128; fatal: first/);
+    assert.doesNotMatch(detail, /y{10}/);
+  } finally { restore(); }
+});
+
+it("reports output overflow even when git also exited non-zero with a missing-object message", { skip: linuxCloneSkip }, async () => {
+  const { bare } = await trackedClean();
+  const err = Object.assign(new Error("subprocess output exceeded limit"), {
+    code: 128, outputExceeded: true, stdout: "", stderr: "fatal: missing blob deadbeef\n",
+  });
+  const restore = failExec(["rev-list", "--objects"], err);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    assert.equal(e.kind, "exec_failed");
+    assert.equal(e.step, "object_walk");
+    assert.match(assertDetail(e), /output exceeded limit/);
+  } finally { restore(); }
+});
+
+it("says timed out only for our timeout kill, not for a bare signal", { skip: linuxCloneSkip }, async () => {
+  const { bare } = await trackedClean();
+  const killed = Object.assign(new Error("Command failed"), { killed: true, signal: "SIGTERM", code: null });
+  let restore = failExec(["rev-list", "--objects"], killed);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    assert.equal(e.kind, "exec_failed");
+    assert.match(assertDetail(e), /timed out/);
+  } finally { restore(); }
+  const signalled = Object.assign(new Error("Command failed"), { killed: false, signal: "SIGKILL", code: null });
+  restore = failExec(["rev-list", "--objects"], signalled);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    assert.equal(e.kind, "exec_failed");
+    const detail = assertDetail(e);
+    assert.match(detail, /signal SIGKILL/);
+    assert.doesNotMatch(detail, /timed out/);
+  } finally { restore(); }
+});
+
+it("a fresh floor read that fails to execute is floor_unverified at floor_refresh, not a changed branch", { skip: linuxCloneSkip }, async () => {
+  const { bare, clone } = await setup();
+  fs.writeFileSync(path.join(clone, "one"), "one");
+  const base = commit(clone, "one");
+  seedRemoteBranch(clone, base);
+  fs.writeFileSync(path.join(clone, "two"), "two");
+  commit(clone, "two");
+  await track(bare, clone);
+  const restore = failExec(["rev-parse", `refs/uzi-publication-floor/${branch}^{commit}`], new Error("spawn git EAGAIN"));
+  try {
+    const e = await refusal(cache.pushBranch(bare, branch, "", fx.originPath));
+    assert.equal(e.kind, "floor_unverified");
+    assert.equal(e.step, "floor_refresh");
+    assert.match(e.message, /cannot verify fresh remote floor/);
+    const detail = assertDetail(e);
+    assert.match(detail, /EAGAIN/);
+    assert.doesNotMatch(detail, /changed during refresh/);
   } finally { restore(); }
 });
 
