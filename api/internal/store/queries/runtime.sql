@@ -6361,20 +6361,22 @@ ORDER BY id ASC;
 -- name: AckRunInputRows :many
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = @claim_generation,
     consumed_worker_id = @worker_id,
-    -- The row now belongs to this claim: a re-ACK after a resume replaces the previous
-    -- claim's value with whether THIS claim's worker reports inclusion (input_inclusion_v1).
-    inclusion_reported = @inclusion_reported
+    -- The row now belongs to this claim: a re-ACK after a resume takes whether THIS claim's worker
+    -- reports inclusion (input_inclusion_v1), but never downgrades a row already stamped included.
+    inclusion_reported = (included_at IS NOT NULL OR @inclusion_reported::boolean)
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND applied_at IS NULL
 RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: IncludeRunInputRows :many
 -- The worker reports follow_up rows it actually included in an executor prompt. Stamps
--- included_at once (idempotent). No per-row claim fence: a follow-up recovered after a
--- resume was consumed by an earlier claim; the service fences the CALLER's claim instead.
-UPDATE run_user_inputs SET included_at = now()
+-- included_at once (idempotent) and sets inclusion_reported: the receipt itself proves the
+-- reporting worker supports inclusion, even for a row a legacy worker ACKed before a resume.
+-- No per-row claim fence: a follow-up recovered after a resume was consumed by an earlier
+-- claim; the service fences the CALLER's claim instead. run_id scopes the ids to this run.
+UPDATE run_user_inputs SET included_at = now(), inclusion_reported = true
 WHERE run_id = @run_id AND id = ANY(@ids::bigint[]) AND kind = 'follow_up'
   AND consumed_at IS NOT NULL AND included_at IS NULL
-RETURNING id;
+RETURNING id, kind, body, created_at, gate_binding, gate_revision;
 
 -- name: ApplyRunInputRows :execrows
 UPDATE run_user_inputs SET applied_at = now()
@@ -6420,8 +6422,9 @@ ORDER BY id ASC;
 -- web + CLI steer queue reads BOTH follow_up rows and operator scope directives
 -- (kind IN ('follow_up','scope')). A follow_up's state is derived client-side from
 -- consumed_at / applied_at / included_at (consumed_at NULL → Queued; consumed_at set → Received;
--- applied_at set → Routed; included_at set → Included in an executor prompt, trusted only when
--- inclusion_reported says the ACKing worker reports inclusion); a scope row is never consumed, so its
+-- applied_at set → Routed; included_at set → Included in an executor prompt. A NULL included_at
+-- means "not yet included" only when inclusion_reported is true, i.e. the worker that ACKed the
+-- row (or a later inclusion receipt) shows it reports inclusion; otherwise it means unknown); a scope row is never consumed, so its
 -- state is its disposition (applied/declined/superseded, NULL → pending). Deliberately
 -- NOT the judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that
 -- would drop the newest entries behind its cap on a busy/chat run. Owner-scoping is

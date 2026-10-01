@@ -271,4 +271,66 @@ func TestInputInclusionLiveDB(t *testing.T) {
 			t.Fatal("a retried applied receipt published again")
 		}
 	})
+
+	reportedOf := func(id int64) bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(ctx, `SELECT inclusion_reported FROM run_user_inputs WHERE id=$1`, id).Scan(&ok); err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+
+	t.Run("legacy ACK then capable claim stamps: inclusion_reported becomes true", func(t *testing.T) {
+		run := newRun(legacy, 1)
+		id := addInput(run, "follow_up", false, 0, legacy)
+		if _, err := svc.AckInputs(ctx, legacy, run, 1, []int64{id}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.ApplyInputs(ctx, legacy, run, 1, []int64{id}); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE runs SET worker_id=$2, claim_generation=2 WHERE id=$1`, run, capable.ID)
+		if res, err := svc.IncludeInputs(ctx, capable, run, 2, []int64{id}); err != nil || !res.Active {
+			t.Fatalf("res=%+v err=%v", res, err)
+		}
+		if !included(id) || !reportedOf(id) {
+			t.Fatalf("included=%v reported=%v, want both true", included(id), reportedOf(id))
+		}
+	})
+
+	t.Run("legacy re-ACK of an already-stamped unapplied row keeps inclusion_reported", func(t *testing.T) {
+		run := newRun(capable, 1)
+		id := addInput(run, "follow_up", false, 0, capable)
+		if _, err := svc.AckInputs(ctx, capable, run, 1, []int64{id}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := svc.IncludeInputs(ctx, capable, run, 1, []int64{id}); err != nil {
+			t.Fatal(err)
+		}
+		exec(`UPDATE runs SET worker_id=$2, claim_generation=2 WHERE id=$1`, run, legacy.ID)
+		if _, err := svc.AckInputs(ctx, legacy, run, 2, []int64{id}); err != nil {
+			t.Fatal(err)
+		}
+		if !included(id) || !reportedOf(id) {
+			t.Fatalf("included=%v reported=%v after legacy re-ACK, want both true", included(id), reportedOf(id))
+		}
+	})
+
+	t.Run("a foreign run's row is not stamped through this run's claim", func(t *testing.T) {
+		runA := newRun(capable, 1)
+		runB := newRun(capable, 1)
+		foreign := addInput(runB, "follow_up", true, 1, capable)
+		own := addInput(runA, "follow_up", true, 1, capable)
+		res, err := svc.IncludeInputs(ctx, capable, runA, 1, []int64{foreign, own})
+		if err != nil || !res.Active {
+			t.Fatalf("res=%+v err=%v", res, err)
+		}
+		if included(foreign) || !included(own) {
+			t.Fatalf("foreign=%v own=%v, want foreign unstamped and own stamped", included(foreign), included(own))
+		}
+		if len(res.Inputs) != 1 || res.Inputs[0].ID != own || res.Inputs[0].Kind != "follow_up" {
+			t.Fatalf("Inputs = %+v, want only the newly stamped own row", res.Inputs)
+		}
+	})
 }

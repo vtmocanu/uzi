@@ -15,9 +15,9 @@ import (
 const ackRunInputRows = `-- name: AckRunInputRows :many
 UPDATE run_user_inputs SET consumed_at = COALESCE(consumed_at, now()), consumed_claim_generation = $1,
     consumed_worker_id = $2,
-    -- The row now belongs to this claim: a re-ACK after a resume replaces the previous
-    -- claim's value with whether THIS claim's worker reports inclusion (input_inclusion_v1).
-    inclusion_reported = $3
+    -- The row now belongs to this claim: a re-ACK after a resume takes whether THIS claim's worker
+    -- reports inclusion (input_inclusion_v1), but never downgrades a row already stamped included.
+    inclusion_reported = (included_at IS NOT NULL OR $3::boolean)
 WHERE run_id = $4 AND id = ANY($5::bigint[]) AND applied_at IS NULL
 RETURNING id, kind, body, created_at, gate_binding, gate_revision
 `
@@ -6259,10 +6259,10 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 }
 
 const includeRunInputRows = `-- name: IncludeRunInputRows :many
-UPDATE run_user_inputs SET included_at = now()
+UPDATE run_user_inputs SET included_at = now(), inclusion_reported = true
 WHERE run_id = $1 AND id = ANY($2::bigint[]) AND kind = 'follow_up'
   AND consumed_at IS NOT NULL AND included_at IS NULL
-RETURNING id
+RETURNING id, kind, body, created_at, gate_binding, gate_revision
 `
 
 type IncludeRunInputRowsParams struct {
@@ -6270,22 +6270,40 @@ type IncludeRunInputRowsParams struct {
 	Ids   []int64   `json:"ids"`
 }
 
+type IncludeRunInputRowsRow struct {
+	ID           int64              `json:"id"`
+	Kind         string             `json:"kind"`
+	Body         pgtype.Text        `json:"body"`
+	CreatedAt    pgtype.Timestamptz `json:"created_at"`
+	GateBinding  pgtype.Text        `json:"gate_binding"`
+	GateRevision pgtype.Int8        `json:"gate_revision"`
+}
+
 // The worker reports follow_up rows it actually included in an executor prompt. Stamps
-// included_at once (idempotent). No per-row claim fence: a follow-up recovered after a
-// resume was consumed by an earlier claim; the service fences the CALLER's claim instead.
-func (q *Queries) IncludeRunInputRows(ctx context.Context, arg IncludeRunInputRowsParams) ([]int64, error) {
+// included_at once (idempotent) and sets inclusion_reported: the receipt itself proves the
+// reporting worker supports inclusion, even for a row a legacy worker ACKed before a resume.
+// No per-row claim fence: a follow-up recovered after a resume was consumed by an earlier
+// claim; the service fences the CALLER's claim instead. run_id scopes the ids to this run.
+func (q *Queries) IncludeRunInputRows(ctx context.Context, arg IncludeRunInputRowsParams) ([]IncludeRunInputRowsRow, error) {
 	rows, err := q.db.Query(ctx, includeRunInputRows, arg.RunID, arg.Ids)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	items := []int64{}
+	items := []IncludeRunInputRowsRow{}
 	for rows.Next() {
-		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var i IncludeRunInputRowsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.Kind,
+			&i.Body,
+			&i.CreatedAt,
+			&i.GateBinding,
+			&i.GateRevision,
+		); err != nil {
 			return nil, err
 		}
-		items = append(items, id)
+		items = append(items, i)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -7371,8 +7389,9 @@ ORDER BY id DESC
 // web + CLI steer queue reads BOTH follow_up rows and operator scope directives
 // (kind IN ('follow_up','scope')). A follow_up's state is derived client-side from
 // consumed_at / applied_at / included_at (consumed_at NULL → Queued; consumed_at set → Received;
-// applied_at set → Routed; included_at set → Included in an executor prompt, trusted only when
-// inclusion_reported says the ACKing worker reports inclusion); a scope row is never consumed, so its
+// applied_at set → Routed; included_at set → Included in an executor prompt. A NULL included_at
+// means "not yet included" only when inclusion_reported is true, i.e. the worker that ACKed the
+// row (or a later inclusion receipt) shows it reports inclusion; otherwise it means unknown); a scope row is never consumed, so its
 // state is its disposition (applied/declined/superseded, NULL → pending). Deliberately
 // NOT the judge's ListRunInputsForRun (oldest-first, @lim-capped, all kinds) — that
 // would drop the newest entries behind its cap on a busy/chat run. Owner-scoping is

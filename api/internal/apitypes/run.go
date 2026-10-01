@@ -1047,9 +1047,10 @@ type RunInputResponse struct {
 // The queue spans two kinds. For a Kind=="follow_up" row the state is derived from
 // the receipt timestamps: ConsumedAt NULL is Queued; ConsumedAt set is Received (the worker
 // ACKed it); AppliedAt set is Routed (steering acted on it); IncludedAt set is Included (the
-// worker reported it in an executor prompt). IncludedAt is only meaningful when
-// InclusionReported is true, i.e. the ACKing worker advertises input_inclusion_v1; otherwise a
-// nil IncludedAt means the worker cannot say, not that it was left out. For a Kind=="scope"
+// worker reported it in an executor prompt). A nil IncludedAt means "not yet included" only when
+// InclusionReported is true: the worker that ACKed the row advertises input_inclusion_v1, or an
+// inclusion receipt set it. Otherwise a nil IncludedAt means the worker cannot say, not that the
+// follow-up was left out. For a Kind=="scope"
 // operator scope directive (PRD #634), state is the Disposition (applied/declined/superseded)
 // because a scope row is never consumed; a nil Disposition means the ceiling is still pending
 // on a live run. Body is a pointer for the JSON-null vs value convention. This is a DISTINCT

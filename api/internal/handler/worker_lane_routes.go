@@ -36,8 +36,9 @@ type laneWorkerRoute struct {
 // review routes, the task review, the chat-agent reads of the owner's other runs, proposals,
 // findings, summaries, PR descriptions, checkpoint publish, the recovery archive and hold
 // routes, the Codex bridge, the completion interlock, the wall park, the follow-up history,
-// the orphan classification and the ownership probe, and the discarded-input receipt (only
-// the plan-gate SteeringChannel sends it). A profile-bound run needs none of them, and several
+// the orphan classification and the ownership probe, the discarded-input receipt (only
+// the plan-gate SteeringChannel sends it), and the inclusion receipt (only a follow-up reaches an
+// executor prompt, and a lane run takes none). A profile-bound run needs none of them, and several
 // return third-party content (Decision 5).
 var laneWorkerAllowlist = []laneWorkerRoute{
 	{http.MethodPost, "/register"},

@@ -262,11 +262,13 @@ func (s *Service) DiscardInputs(ctx context.Context, wkr store.Worker, runID uui
 // prompt. The fence is the caller's claim only: the run's current worker_id must be wkr and its
 // claim_generation must equal generation, whatever the run's status. A terminal or
 // switch_pending run keeps both, so the final turn's receipt still lands after the terminal
-// report. A failed fence answers Active=false with ReceiptStale and stamps nothing. There is no
+// report. Terminal, switch_pending and released or requeued-at-the-same-generation runs are
+// accepted on purpose: a re-claim bumps claim_generation, which is what fences an old flight. A failed fence answers Active=false with ReceiptStale and stamps nothing. There is no
 // per-row consumed_claim_generation or consumed_worker_id check: a follow-up recovered after a
 // resume was consumed by an earlier claim. Rows that are not follow_up, not yet ACKed or
-// already included are skipped silently, which makes a retry idempotent. Inputs is always an
-// empty list; the stamp has no per-row answer the worker needs.
+// already included are skipped silently, which makes a retry idempotent. Inputs lists only the
+// rows this call newly stamped (id and kind), so the worker can tell stamped from skipped; ids
+// belonging to another run are skipped like any other non-matching id, not rejected.
 func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uuid.UUID, generation int64, ids []int64) (InputReceiptResult, error) {
 	if !slices.Contains(wkr.ProtocolCapabilities, capability.InputInclusionV1) || !validInputIDs(ids) {
 		return InputReceiptResult{}, ErrInputReceiptInvalid
@@ -303,5 +305,9 @@ func (s *Service) IncludeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if len(stamped) > 0 && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return InputReceiptResult{Inputs: []InputDTO{}, Active: true}, nil
+	out := make([]InputDTO, 0, len(stamped))
+	for _, row := range stamped {
+		out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
+	}
+	return InputReceiptResult{Inputs: out, Active: true}, nil
 }
