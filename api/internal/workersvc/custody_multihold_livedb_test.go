@@ -122,7 +122,7 @@ func TestReconcileMultiHoldReadyCaptureReleasesOnlyCurrentLiveDB(t *testing.T) {
 
 	// W1 is NOT reapable while its generation-1 hold is open; W2 (gen-2 released) is reaped.
 	cutoff := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
-	if _, err := e.q.ReapEphemeralWorkers(e.ctx, cutoff); err != nil {
+	if _, err := store.ReapEphemeralWorkers(e.ctx, e.pool, cutoff, pgtype.Interval{}); err != nil {
 		t.Fatalf("ReapEphemeralWorkers: %v", err)
 	}
 	if !mhWorkerExists(t, e, w1) {

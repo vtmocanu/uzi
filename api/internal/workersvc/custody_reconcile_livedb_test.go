@@ -103,7 +103,7 @@ func TestReconcileCustodyReleasesLiveDB(t *testing.T) {
 	// (3) A failed run's hold, seeded up front so one reconcile pass covers both cases.
 	failWorker, _, failHold := seedWorkerRun("failed")
 
-	if _, err := q.ReapEphemeralWorkers(ctx, cutoff); err != nil {
+	if _, err := store.ReapEphemeralWorkers(ctx, pool, cutoff, pgtype.Interval{}); err != nil {
 		t.Fatalf("ReapEphemeralWorkers(pre-reconcile): %v", err)
 	}
 	if !workerExists(compWorker) {
@@ -128,7 +128,7 @@ func TestReconcileCustodyReleasesLiveDB(t *testing.T) {
 	}
 
 	// release-then-reap: the completed-run worker is now reapable; the failed-run worker stays.
-	if _, err := q.ReapEphemeralWorkers(ctx, cutoff); err != nil {
+	if _, err := store.ReapEphemeralWorkers(ctx, pool, cutoff, pgtype.Interval{}); err != nil {
 		t.Fatalf("ReapEphemeralWorkers(post-reconcile): %v", err)
 	}
 	if workerExists(compWorker) {

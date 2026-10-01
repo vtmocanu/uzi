@@ -241,7 +241,9 @@ func (p *EphemeralProvisioner) ProvisionPass(ctx context.Context) (int64, error)
 // footprint is one indexed DELETE that matches nothing.
 func (p *EphemeralProvisioner) ReapPass(ctx context.Context) (int64, error) {
 	cutoff := p.now().Add(-p.cfg.ProvisionDeadline)
-	return p.q.ReapEphemeralWorkers(ctx, pgconv.Time(cutoff))
+	// No lease interval is passed yet (the zero Interval is invalid, so no lease is live): the
+	// selection is the pre-lease one until the service wiring supplies UZI_EPHEMERAL_LEASE.
+	return store.ReapEphemeralWorkers(ctx, p.pool, pgconv.Time(cutoff), pgtype.Interval{})
 }
 
 // provisionOne runs the provision transaction for a single run, mirroring

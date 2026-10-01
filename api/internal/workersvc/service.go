@@ -457,7 +457,7 @@ type Store interface {
 	DeleteWorkerForUser(ctx context.Context, arg store.DeleteWorkerForUserParams) (int64, error)
 	// DeleteEphemeralWorkerForRun tears down the ephemeral worker bound to a now-terminal
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
-	DeleteEphemeralWorkerForRun(ctx context.Context, arg uuid.UUID) (int64, error)
+	DeleteEphemeralWorkerForRun(ctx context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 
@@ -4758,7 +4758,7 @@ func (s *Service) maybeTeardownEphemeral(ctx context.Context, wkr store.Worker, 
 	if !wkr.Ephemeral || !terminalStatuses[run.Status] {
 		return
 	}
-	if _, err := s.q.DeleteEphemeralWorkerForRun(ctx, run.ID); err != nil {
+	if _, err := s.q.DeleteEphemeralWorkerForRun(ctx, store.DeleteEphemeralWorkerForRunParams{RunID: run.ID}); err != nil {
 		slog.Warn("ephemeral teardown on run completion", "run", run.ID, "worker", wkr.ID, "error", err)
 	}
 }

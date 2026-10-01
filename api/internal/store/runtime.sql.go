@@ -916,7 +916,34 @@ WITH target AS (
       -- ephemeral claimant (@is_ephemeral) matches ONLY its bound run
       -- (@ephemeral_run_id); a non-ephemeral worker short-circuits true and the
       -- (NULL) run id is never compared.
-      AND (NOT $14::boolean OR r.id = $15::uuid)
+      --
+      -- PRD #2006: the LEASE arm. A leased ephemeral worker (it finished its bound run and kept
+      -- its pod for a bounded lease) may ALSO claim a queued run of the same owner (the target's
+      -- own r.user_id = @user_id), the same repository and the same effective branch identity as
+      -- its last bound run: fn_ephemeral_lease_admits decides, on the claimant's OWN lease columns
+      -- (read under its row lock by the caller) at @lease_at, a clock reading the caller takes
+      -- AFTER every lock and guard it waits on (a stale transaction-start now() could admit
+      -- through a lease that expired while the claim waited). The arm is closed when another
+      -- ephemeral worker is already bound to r (one worker per bound run, uq_workers_ephemeral_run)
+      -- or when the claimant still holds an open custody hold. A NULL @ephemeral_lease or an
+      -- absent lease admits nothing, so lease 0 / a non-leased worker is exactly the bound-run-only
+      -- clause above. The caller rebinds the worker to the claimed run in the same transaction.
+      AND (NOT $14::boolean
+           OR r.id = $15::uuid
+           OR (fn_ephemeral_lease_admits(
+                   $16::timestamptz,
+                   $17::uuid,
+                   $18::text,
+                   $5::boolean,
+                   $19::interval,
+                   $20::timestamptz,
+                   r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM workers bw
+                   WHERE bw.ephemeral AND bw.ephemeral_run_id = r.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM recovery_custody_holds ch
+                   WHERE ch.live_worker_id = $1 AND ch.state = 'open')))
       -- PRD #216 fleet-aware spread (D3/D4/D7/D8/R3). Defer this run to a peer
       -- ONLY when a strictly-better peer exists. Resume affinity (worker_id = me)
       -- and a run older than @spread_cutoff both BYPASS the spread, so the spread
@@ -934,7 +961,7 @@ WITH target AS (
       -- claim (a minimum-loaded worker never defers, guaranteeing claimability).
       AND (
           r.worker_id = $1
-          OR r.updated_at < $16
+          OR r.updated_at < $21
           OR NOT EXISTS (
               SELECT 1
               FROM workers p
@@ -959,7 +986,13 @@ WITH target AS (
                 -- ephemeral peer's own bound run, that peer is a valid deferral target,
                 -- so a busy claimant correctly defers to it — hence the full predicate,
                 -- not a bare AND NOT p.ephemeral.
-                AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id)
+                -- PRD #2006: ...or a LEASED ephemeral peer that may claim r through its lease
+                -- (the claimant clause's lease arm), advisory like this whole mirror, so now().
+                AND (NOT p.ephemeral OR p.ephemeral_run_id = r.id
+                     OR fn_ephemeral_lease_admits(
+                            p.lease_since, p.lease_repo_id, p.lease_branch, p.draining_since IS NOT NULL,
+                            $19::interval, now(),
+                            r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
                 AND p.max_concurrent_runs IS NOT NULL
                 AND fn_worker_can_claim(COALESCE(p.docker_enabled, false), $7::uuid[], r.repo_id, r.kind, p.capabilities, r.required_capabilities, $9::boolean)
                 -- PRD #1226 M1 (D2): MIRROR the non-bypassable completion-protocol clause for
@@ -1070,7 +1103,7 @@ WITH target AS (
             -- PRD #1497 M1 (D16): a RELEASED flight's fresh snapshot must NOT block the reclaim of a
             -- server-parked run — the release is exactly the signal the old flight is over.
             AND r.claim_released_at IS NULL
-            AND (a.reported_at >= $17
+            AND (a.reported_at >= $22
                  OR (a.terminal_pending AND a.terminal_pending_until > now())))
       -- (2) Request-array exclusion (fact 7): the claimant's OWN request snapshot excludes its
       -- listed runs at the CURRENT generation, so the exclusion holds BEFORE the first heartbeat
@@ -1080,8 +1113,8 @@ WITH target AS (
       -- Empty arrays (no request snapshot, or the no-snapshot path) match nothing → no exclusion.
       AND NOT EXISTS (
           SELECT 1
-          FROM unnest($18::uuid[]) WITH ORDINALITY AS req_id(id, ord)
-          JOIN unnest($19::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
+          FROM unnest($23::uuid[]) WITH ORDINALITY AS req_id(id, ord)
+          JOIN unnest($24::bigint[]) WITH ORDINALITY AS req_gen(gen, ord)
                ON req_gen.ord = req_id.ord
           WHERE req_id.id = r.id AND req_gen.gen = r.claim_generation)
       -- (3) Overflow closure (D11): never claim a run whose OWNER is under an unexpired
@@ -1112,7 +1145,7 @@ WITH target AS (
     -- fail-open: a demoted run created before it reads as stale, so
     -- fn_run_priority returns normal and background work never starves.
     ORDER BY COALESCE(r.worker_id = $1, false) DESC,
-             fn_run_priority(r.kind, r.priority, r.created_at < $20) DESC,
+             fn_run_priority(r.kind, r.priority, r.created_at < $25) DESC,
              r.created_at ASC
     FOR UPDATE SKIP LOCKED
     LIMIT 1
@@ -1132,9 +1165,9 @@ hold AS (
          original_worker_id, original_worker_identity, live_worker_id, live_run_id,
          created_at, updated_at)
     SELECT gen_random_uuid(), t.user_id, t.repo_id, t.id, t.claim_generation + 1, 'open',
-           $1, $21::text, $1, t.id, now(), now()
+           $1, $26::text, $1, t.id, now(), now()
     FROM target t
-    WHERE $22::boolean
+    WHERE $27::boolean
       AND t.kind IN ('issue', 'ci_fix', 'self_improve', 'prompt', 'task', 'mr_rework')
       -- PRD #1906 M5: a profile-bound run publishes no code (no repo, no forge credential, no
       -- push), so it never opens a custody hold, whatever the claiming worker advertises.
@@ -1197,6 +1230,11 @@ type ClaimRunParams struct {
 	WorkerIsolatedLane    bool               `json:"worker_isolated_lane"`
 	IsEphemeral           bool               `json:"is_ephemeral"`
 	EphemeralRunID        pgtype.UUID        `json:"ephemeral_run_id"`
+	LeaseSince            pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID           pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch           pgtype.Text        `json:"lease_branch"`
+	EphemeralLease        pgtype.Interval    `json:"ephemeral_lease"`
+	LeaseAt               pgtype.Timestamptz `json:"lease_at"`
 	SpreadCutoff          pgtype.Timestamptz `json:"spread_cutoff"`
 	SnapshotFreshCutoff   pgtype.Timestamptz `json:"snapshot_fresh_cutoff"`
 	RequestActiveIds      []uuid.UUID        `json:"request_active_ids"`
@@ -1258,6 +1296,11 @@ func (q *Queries) ClaimRun(ctx context.Context, arg ClaimRunParams) (Run, error)
 		arg.WorkerIsolatedLane,
 		arg.IsEphemeral,
 		arg.EphemeralRunID,
+		arg.LeaseSince,
+		arg.LeaseRepoID,
+		arg.LeaseBranch,
+		arg.EphemeralLease,
+		arg.LeaseAt,
 		arg.SpreadCutoff,
 		arg.SnapshotFreshCutoff,
 		arg.RequestActiveIds,
@@ -1883,7 +1926,13 @@ WHERE run.id = $1
   AND (run.kind <> 'job'
        OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
            AND (run.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
-  AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id)
+  -- PRD #2006: a leased ephemeral worker also counts when it may claim THIS run through its lease
+  -- (advisory mirror of ClaimRun's lease arm, so now()).
+  AND (NOT w.ephemeral OR w.ephemeral_run_id = run.id
+       OR fn_ephemeral_lease_admits(
+              w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+              $6::interval, now(),
+              run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id))
   AND (run.released_worker_id IS NULL
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
@@ -1895,6 +1944,7 @@ type CountOnlineWorkersClaimableForRunParams struct {
 	DockerRepoAllowlist []uuid.UUID        `json:"docker_repo_allowlist"`
 	CapabilityAware     bool               `json:"capability_aware"`
 	CodexCuratedModels  []string           `json:"codex_curated_models"`
+	EphemeralLease      pgtype.Interval    `json:"ephemeral_lease"`
 }
 
 // PRD #1497 M1 (D19): how many of the run's owner's workers could ACTUALLY claim THIS ONE run right
@@ -1918,6 +1968,7 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		arg.DockerRepoAllowlist,
 		arg.CapabilityAware,
 		arg.CodexCuratedModels,
+		arg.EphemeralLease,
 	)
 	var count int64
 	err := row.Scan(&count)
@@ -3397,7 +3448,7 @@ const createWorker = `-- name: CreateWorker :one
 
 INSERT INTO workers (user_id, name, token_hash, template_declared, anthropic_secret_id, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, $5, $6)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
 `
 
 type CreateWorkerParams struct {
@@ -3485,6 +3536,9 @@ func (q *Queries) CreateWorker(ctx context.Context, arg CreateWorkerParams) (Wor
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
@@ -5765,7 +5819,7 @@ func (q *Queries) GetUnconsumedCompletionPermit(ctx context.Context, arg GetUnco
 }
 
 const getWorkerByID = `-- name: GetWorkerByID :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE id = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1
 `
 
 func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, error) {
@@ -5816,12 +5870,15 @@ func (q *Queries) GetWorkerByID(ctx context.Context, id uuid.UUID) (Worker, erro
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
 
 const getWorkerByIDForUser = `-- name: GetWorkerByIDForUser :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE id = $1 AND user_id = $2
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1 AND user_id = $2
 `
 
 type GetWorkerByIDForUserParams struct {
@@ -5877,12 +5934,15 @@ func (q *Queries) GetWorkerByIDForUser(ctx context.Context, arg GetWorkerByIDFor
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
 
 const getWorkerByTokenHash = `-- name: GetWorkerByTokenHash :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE token_hash = $1
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE token_hash = $1
 `
 
 // Worker auth: Bearer join token → sha256 → this lookup.
@@ -5934,12 +5994,15 @@ func (q *Queries) GetWorkerByTokenHash(ctx context.Context, tokenHash []byte) (W
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
 
 const getWorkerForUpdate = `-- name: GetWorkerForUpdate :one
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM workers WHERE id = $1 FOR UPDATE
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM workers WHERE id = $1 FOR UPDATE
 `
 
 // PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
@@ -5995,6 +6058,9 @@ func (q *Queries) GetWorkerForUpdate(ctx context.Context, id uuid.UUID) (Worker,
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
@@ -6044,7 +6110,7 @@ UPDATE workers SET
     END,
     updated_at            = now()
 WHERE id = $16
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
 `
 
 type HeartbeatWorkerParams struct {
@@ -6138,6 +6204,9 @@ func (q *Queries) HeartbeatWorker(ctx context.Context, arg HeartbeatWorkerParams
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
@@ -6896,7 +6965,7 @@ func (q *Queries) ListActiveRunsForWorkers(ctx context.Context, workerIds []uuid
 }
 
 const listAllWorkers = `-- name: ListAllWorkers :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch,
        EXISTS (
            SELECT 1 FROM runs r
            WHERE r.worker_id = w.id
@@ -7015,6 +7084,9 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.Worker.StatsDiskDataInodes,
 			&i.Worker.StatsDiskDataTotalInodes,
 			&i.Worker.IsolatedLane,
+			&i.Worker.LeaseSince,
+			&i.Worker.LeaseRepoID,
+			&i.Worker.LeaseBranch,
 			&i.Busy,
 			&i.ActiveRuns,
 			&i.OwnerEmail,
@@ -7360,7 +7432,19 @@ WHERE r.status = 'queued'
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
   )
   AND (SELECT count(*) FROM workers wc
-       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < $1::int
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral
+         -- PRD #2006: a RELEASABLE leased-idle worker (lease set, no non-terminal run, no open
+         -- custody hold) does not count toward this fairness filter: provisionOne evicts the
+         -- oldest one under the advisory lock before it inserts, so an at-cap owner whose cap is
+         -- held only by such workers must still reach provisioning. Still a snapshot hint, never
+         -- the cap (the locked count in provisionOne is).
+         AND NOT (wc.lease_since IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runs lr
+                                  WHERE lr.worker_id = wc.id
+                                    AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
+                  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
+                                  WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
+      ) < $1::int
 ORDER BY r.created_at ASC
 LIMIT $2
 `
@@ -8767,7 +8851,14 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
-        AND NOT w.ephemeral
+        AND (NOT w.ephemeral
+             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
+             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
+             -- provisioned for.
+             OR fn_ephemeral_lease_admits(
+                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    $2::interval, now(),
+                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         -- PRD #1908 (D-A): for a 'job' the capable set is the job-runner set (non-docker AND
         -- 'job_runner_v1'), ClaimRun's non-bypassable clause; the same arm sits in the free-slot test.
@@ -8779,7 +8870,14 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
-        AND NOT w.ephemeral
+        AND (NOT w.ephemeral
+             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
+             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
+             -- provisioned for.
+             OR fn_ephemeral_lease_admits(
+                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    $2::interval, now(),
+                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
         AND r.required_capabilities <@ fn_effective_worker_caps(w.capabilities, COALESCE(w.docker_enabled, false))
         AND (r.kind <> 'job' OR (NOT COALESCE(w.docker_enabled, false) AND 'job_runner_v1' = ANY(w.protocol_capabilities)
                                  AND (r.job_protocol IS NULL OR 'job_files_v1' = ANY(w.protocol_capabilities))))
@@ -8794,13 +8892,26 @@ WHERE r.status = 'queued'
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
   )
   AND (SELECT count(*) FROM workers wc
-       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < $2::int
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral
+         -- PRD #2006: a RELEASABLE leased-idle worker (lease set, no non-terminal run, no open
+         -- custody hold) does not count toward this fairness filter: provisionOne evicts the
+         -- oldest one under the advisory lock before it inserts, so an at-cap owner whose cap is
+         -- held only by such workers must still reach provisioning. Still a snapshot hint, never
+         -- the cap (the locked count in provisionOne is).
+         AND NOT (wc.lease_since IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runs lr
+                                  WHERE lr.worker_id = wc.id
+                                    AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
+                  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
+                                  WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
+      ) < $3::int
 ORDER BY r.status_since ASC
-LIMIT $3
+LIMIT $4
 `
 
 type ListSaturationQueuedRunsForEphemeralParams struct {
 	SaturationDelay pgtype.Interval `json:"saturation_delay"`
+	EphemeralLease  pgtype.Interval `json:"ephemeral_lease"`
 	MaxPerUser      int32           `json:"max_per_user"`
 	MaxRows         int32           `json:"max_rows"`
 }
@@ -8880,7 +8991,12 @@ type ListSaturationQueuedRunsForEphemeralRow struct {
 // debounce gates on), so we order by it for consistency. LIMIT @max_rows bounds the work
 // per tick.
 func (q *Queries) ListSaturationQueuedRunsForEphemeral(ctx context.Context, arg ListSaturationQueuedRunsForEphemeralParams) ([]ListSaturationQueuedRunsForEphemeralRow, error) {
-	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral, arg.SaturationDelay, arg.MaxPerUser, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listSaturationQueuedRunsForEphemeral,
+		arg.SaturationDelay,
+		arg.EphemeralLease,
+		arg.MaxPerUser,
+		arg.MaxRows,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -8923,7 +9039,14 @@ WHERE r.status = 'queued'
       WHERE w.user_id = r.user_id
         AND w.status = 'online'
         AND w.draining_since IS NULL
-        AND NOT w.ephemeral
+        AND (NOT w.ephemeral
+             -- PRD #2006: a LEASED ephemeral worker that may claim r through its lease is capable
+             -- and placeable too (advisory mirror of ClaimRun's lease arm, so now()), so r is not
+             -- provisioned for.
+             OR fn_ephemeral_lease_admits(
+                    w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
+                    $1::interval, now(),
+                    r.repo_id, r.kind, r.branch, r.pipeline_ref, r.issue_iid, r.failure_snapshot, r.egress_profile_id))
         AND r.required_capabilities <@ (COALESCE(w.capabilities, '{}') || CASE WHEN COALESCE(w.docker_enabled, false) THEN ARRAY['docker'] ELSE ARRAY[]::text[] END)
   )
   -- The job arm: a job is placeable ONLY on an online, non-draining, non-ephemeral, NON-docker
@@ -8946,14 +9069,27 @@ WHERE r.status = 'queued'
       WHERE w2.ephemeral AND w2.ephemeral_run_id = r.id
   )
   AND (SELECT count(*) FROM workers wc
-       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral) < $1::int
+       WHERE wc.user_id = r.user_id AND wc.kind = 'hosted' AND wc.ephemeral
+         -- PRD #2006: a RELEASABLE leased-idle worker (lease set, no non-terminal run, no open
+         -- custody hold) does not count toward this fairness filter: provisionOne evicts the
+         -- oldest one under the advisory lock before it inserts, so an at-cap owner whose cap is
+         -- held only by such workers must still reach provisioning. Still a snapshot hint, never
+         -- the cap (the locked count in provisionOne is).
+         AND NOT (wc.lease_since IS NOT NULL
+                  AND NOT EXISTS (SELECT 1 FROM runs lr
+                                  WHERE lr.worker_id = wc.id
+                                    AND lr.status NOT IN ('completed', 'failed', 'cancelled'))
+                  AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds lh
+                                  WHERE lh.live_worker_id = wc.id AND lh.state = 'open'))
+      ) < $2::int
 ORDER BY r.created_at ASC
-LIMIT $2
+LIMIT $3
 `
 
 type ListUnplaceableQueuedRunsForEphemeralParams struct {
-	MaxPerUser int32 `json:"max_per_user"`
-	MaxRows    int32 `json:"max_rows"`
+	EphemeralLease pgtype.Interval `json:"ephemeral_lease"`
+	MaxPerUser     int32           `json:"max_per_user"`
+	MaxRows        int32           `json:"max_rows"`
 }
 
 type ListUnplaceableQueuedRunsForEphemeralRow struct {
@@ -9014,7 +9150,7 @@ type ListUnplaceableQueuedRunsForEphemeralRow struct {
 // ORDER BY r.created_at ASC so the oldest waiting run is provisioned first; LIMIT
 // @max_rows bounds the work per tick.
 func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg ListUnplaceableQueuedRunsForEphemeralParams) ([]ListUnplaceableQueuedRunsForEphemeralRow, error) {
-	rows, err := q.db.Query(ctx, listUnplaceableQueuedRunsForEphemeral, arg.MaxPerUser, arg.MaxRows)
+	rows, err := q.db.Query(ctx, listUnplaceableQueuedRunsForEphemeral, arg.EphemeralLease, arg.MaxPerUser, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -9034,7 +9170,7 @@ func (q *Queries) ListUnplaceableQueuedRunsForEphemeral(ctx context.Context, arg
 }
 
 const listWorkersByUser = `-- name: ListWorkersByUser :many
-SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane,
+SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.version, w.created_at, w.updated_at, w.template_declared, w.template_reported, w.max_concurrent_runs, w.stats_cpu_pct, w.stats_mem_bytes, w.stats_mem_limit_bytes, w.stats_source, w.kind, w.hosted_size, w.hosted_generation, w.docker_enabled, w.anthropic_secret_id, w.anthropic_bind_mode, w.online_since, w.draining_since, w.capabilities, w.ephemeral, w.ephemeral_run_id, w.stats_disk_nix_bytes, w.stats_disk_nix_total_bytes, w.stats_disk_data_bytes, w.stats_disk_data_total_bytes, w.stats_disk_pressure_streak, w.protocol_capabilities, w.snapshot_epoch, w.snapshot_register_nonce, w.pending_overflow, w.pending_overflow_until, w.stats_disk_dind_bytes, w.stats_disk_dind_total_bytes, w.stats_disk_dind_inodes, w.stats_disk_dind_total_inodes, w.stats_disk_data_inodes, w.stats_disk_data_total_inodes, w.isolated_lane, w.lease_since, w.lease_repo_id, w.lease_branch,
        s.label AS anthropic_secret_label,
        EXISTS (
            SELECT 1 FROM runs r
@@ -9126,6 +9262,9 @@ type ListWorkersByUserRow struct {
 	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
 	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
 	IsolatedLane             bool               `json:"isolated_lane"`
+	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch              pgtype.Text        `json:"lease_branch"`
 	AnthropicSecretLabel     pgtype.Text        `json:"anthropic_secret_label"`
 	Busy                     bool               `json:"busy"`
 	ActiveRuns               int64              `json:"active_runs"`
@@ -9215,6 +9354,9 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.StatsDiskDataInodes,
 			&i.StatsDiskDataTotalInodes,
 			&i.IsolatedLane,
+			&i.LeaseSince,
+			&i.LeaseRepoID,
+			&i.LeaseBranch,
 			&i.AnthropicSecretLabel,
 			&i.Busy,
 			&i.ActiveRuns,
@@ -11514,6 +11656,11 @@ WITH prev AS (
         -- does NOT touch draining_since: a draining worker heartbeats and must STAY draining
         -- until it actually rolls.
         draining_since      = NULL,
+        -- PRD #2006: a register is a FRESH pod incarnation, so it ends any ephemeral lease: the
+        -- row's warm state (the pod the lease kept) is gone. The reaper then releases the row.
+        lease_since         = NULL,
+        lease_repo_id       = NULL,
+        lease_branch        = NULL,
         -- Reset the disk-pressure debounce streak (PRD #837 M4): a register is a FRESH
         -- pod incarnation, so a prior incarnation's streak must never carry forward — a
         -- rolled/restarted worker starts clean and must re-earn its >=2-heartbeat streak
@@ -11531,7 +11678,7 @@ WITH prev AS (
         last_heartbeat_at   = now(),
         updated_at          = now()
     WHERE workers.id = $1
-    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
+    RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
 ), cleared AS (
     UPDATE worker_upgrade_reports r
        SET upgrading_since    = NULL,
@@ -11583,7 +11730,7 @@ WITH prev AS (
        -- preserves that.
        AND split_part($2::text, '+', 1) IS DISTINCT FROM split_part(prev.old_version, '+', 1)
 )
-SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane FROM upd
+SELECT id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch FROM upd
 `
 
 type RegisterWorkerParams struct {
@@ -11641,6 +11788,9 @@ type RegisterWorkerRow struct {
 	StatsDiskDataInodes      pgtype.Int8        `json:"stats_disk_data_inodes"`
 	StatsDiskDataTotalInodes pgtype.Int8        `json:"stats_disk_data_total_inodes"`
 	IsolatedLane             bool               `json:"isolated_lane"`
+	LeaseSince               pgtype.Timestamptz `json:"lease_since"`
+	LeaseRepoID              pgtype.UUID        `json:"lease_repo_id"`
+	LeaseBranch              pgtype.Text        `json:"lease_branch"`
 }
 
 // Worker announces version + its self-reported template and comes online;
@@ -11746,6 +11896,9 @@ func (q *Queries) RegisterWorker(ctx context.Context, arg RegisterWorkerParams) 
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }
@@ -15368,7 +15521,7 @@ SET anthropic_secret_id = $1,
     anthropic_bind_mode = $2,
     updated_at = now()
 WHERE id = $3 AND user_id = $4
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch
 `
 
 type SetWorkerAnthropicSecretParams struct {
@@ -15453,6 +15606,9 @@ func (q *Queries) SetWorkerAnthropicSecret(ctx context.Context, arg SetWorkerAnt
 		&i.StatsDiskDataInodes,
 		&i.StatsDiskDataTotalInodes,
 		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
 	)
 	return i, err
 }

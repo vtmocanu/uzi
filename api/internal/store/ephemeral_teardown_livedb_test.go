@@ -107,7 +107,7 @@ func TestDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 			t.Fatalf("precondition: expected one parked token row for the worker")
 		}
 
-		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}
@@ -132,7 +132,7 @@ func TestDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 		// runA owned by the worker and NON-terminal.
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'running', worker_id = $2 WHERE id = $1`, runA, wID)
 
-		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}
@@ -154,7 +154,7 @@ func TestDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 		runB := uuid.New()
 		pointRunAtWorker(fx, runB, wID, "running")
 
-		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}
@@ -180,7 +180,7 @@ func TestDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 		pointRunAtWorker(fx, runA, persistentID, "completed")
 
 		// runA is not bound to any ephemeral worker (ephemeral_run_id), so the delete matches nothing.
-		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}
@@ -191,7 +191,7 @@ func TestDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 			t.Errorf("persistent worker %s was deleted by the ephemeral teardown query", persistentID)
 		}
 		// A second call for the same run is a harmless no-op (idempotent).
-		rows2, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows2, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun (2nd): %v", err)
 		}
@@ -201,7 +201,7 @@ func TestDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 
 		// A run id that exists but has no worker at all: also 0 rows.
 		orphan := fx.queuedRun()
-		rows3, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, orphan)
+		rows3, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: orphan})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun (orphan run): %v", err)
 		}

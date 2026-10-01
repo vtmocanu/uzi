@@ -6,6 +6,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // The store-query half of PRD #529 M5 (ephemeral orphan/failure GC reaper, Decision 6)
@@ -52,7 +54,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 			t.Fatalf("precondition: expected one parked token row for the worker")
 		}
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if workerExists(fx, wID) {
@@ -73,7 +75,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		// Unlink the bound run (what the FK ON DELETE SET NULL leaves behind).
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE workers SET ephemeral_run_id = NULL WHERE id = $1`, wID)
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if workerExists(fx, wID) {
@@ -87,7 +89,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		wID := seedEphemeralWorkerBound(fx, runA)
 		setWorkerClock(fx, wID, old, time.Time{}) // created_at old, online_since NULL
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if workerExists(fx, wID) {
@@ -101,7 +103,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		wID := seedEphemeralWorkerBound(fx, runA)
 		setWorkerClock(fx, wID, recent, time.Time{}) // created_at within grace, online_since NULL
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if !workerExists(fx, wID) {
@@ -118,7 +120,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		// The bound run is non-terminal but claimed by the SIBLING, not this worker.
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'running', worker_id = $2 WHERE id = $1`, runA, sibling)
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if workerExists(fx, wID) {
@@ -137,7 +139,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		sibling := fx.worker("sibling", nil, false)
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'running', worker_id = $2 WHERE id = $1`, runA, sibling)
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if !workerExists(fx, wID) {
@@ -153,7 +155,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		// But the bound run is non-terminal and owned by THIS worker: the busy guard protects it.
 		mustExec(fx.ctx, fx.t, fx.pool, `UPDATE runs SET status = 'running', worker_id = $2 WHERE id = $1`, runA, wID)
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if !workerExists(fx, wID) {
@@ -167,7 +169,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		wID := seedEphemeralWorkerBound(fx, runA)
 		setWorkerClock(fx, wID, recent, time.Time{}) // fresh, not yet online
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if !workerExists(fx, wID) {
@@ -187,7 +189,7 @@ func TestReapEphemeralWorkersLiveDB(t *testing.T) {
 		runA := uuid.New()
 		pointRunAtWorker(fx, runA, persistentID, "completed")
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cut); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cut, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if !workerExists(fx, persistentID) {

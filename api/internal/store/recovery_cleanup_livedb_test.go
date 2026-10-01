@@ -80,7 +80,7 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 			pgtype.UUID{Bytes: wID, Valid: true}, "open")
 
 		// The teardown DELETE must SKIP it (0 rows), leaving the last local source alive.
-		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows, err := fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun: %v", err)
 		}
@@ -100,7 +100,7 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 		}
 
 		// Now the SAME teardown deletes it.
-		rows, err = fx.q.DeleteEphemeralWorkerForRun(fx.ctx, runA)
+		rows, err = fx.q.DeleteEphemeralWorkerForRun(fx.ctx, store.DeleteEphemeralWorkerForRunParams{RunID: runA})
 		if err != nil {
 			t.Fatalf("DeleteEphemeralWorkerForRun(after release): %v", err)
 		}
@@ -123,7 +123,7 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 		// cutoff: any value works — a completed bound run satisfies the "no live bound run"
 		// disjunct regardless of the deadline.
 		cutoff := pgtype.Timestamptz{Time: time.Now().Add(time.Hour), Valid: true}
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cutoff); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cutoff, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers: %v", err)
 		}
 		if !workerExists(fx, wID) {
@@ -137,7 +137,7 @@ func TestTeardownDeletesSkipCustodyHeldWorkerLiveDB(t *testing.T) {
 			t.Fatalf("hold %s still open after release", holdID)
 		}
 
-		if _, err := fx.q.ReapEphemeralWorkers(fx.ctx, cutoff); err != nil {
+		if _, err := store.ReapEphemeralWorkers(fx.ctx, fx.pool, cutoff, pgtype.Interval{}); err != nil {
 			t.Fatalf("ReapEphemeralWorkers(after release): %v", err)
 		}
 		if workerExists(fx, wID) {
