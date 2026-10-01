@@ -75,7 +75,7 @@ function fakeSource(script: ChatInput[]): ChatInputSource {
     },
   };
 }
-const msg = (text: string): ChatInput => ({ kind: "message", text });
+const msg = (text: string, id = 1): ChatInput => ({ kind: "message", text, id });
 
 function runner(client: WorkerClient, executor: ChatExecutor, source: ChatInputSource, defaults = DEFAULTS): ChatRunner {
   // Wrap the single executor as a per-session factory (PRD #42): each execute()
@@ -130,6 +130,16 @@ describe("ChatRunner — claim → session loop → complete (no clone, no MR)",
     assert.strictEqual(userMsg!.agent, undefined, "user_message carries no agent (rendered as a user bubble)");
     const answer = messages.find((m) => m.kind === "text");
     assert.ok(answer && userMsg!.seq < answer.seq, "user_message precedes the model reply");
+  });
+
+  it("reports a delivered message (the seeded first one included) to the source by its input id once the model answers (issue #1800)", async () => {
+    const { client } = fakeClient();
+    const { queryFn } = fakeQuery();
+    const marked: number[] = [];
+    const inner = fakeSource([msg("first, seeded", 41), msg("second", 42), { kind: "idle" }]);
+    const source: ChatInputSource = { ...inner, markFollowUpIncluded: (id) => { marked.push(id); } };
+    await runner(client, new ChatExecutor(nullLogger(), homeDir, { queryFn }), source).execute(baseClaim());
+    assert.deepStrictEqual(marked, [41, 42]);
   });
 
   it("passes claim generation and drains the source before reporting completion", async () => {

@@ -13,6 +13,7 @@ import {
   type ChatContext,
   type ChatScheduler,
   type ChatTimerHandle,
+  type ChatUserMessage,
   type SdkQueryFn,
 } from "../src/chat-executor.js";
 import type { EmittedMessage } from "../src/executor.js";
@@ -136,6 +137,8 @@ interface CtxProbe {
   ctx: ChatContext;
   emits: EmittedMessage[];
   sessionIds: string[];
+  /** Issue #1800: ids passed to ctx.followUpIncluded, in call order. */
+  included: number[];
 }
 
 /**
@@ -150,7 +153,10 @@ interface CtxProbe {
 function makeCtx(queue: (string | undefined | null)[], overrides: Partial<ChatContext> = {}): CtxProbe {
   const emits: EmittedMessage[] = [];
   const sessionIds: string[] = [];
+  const included: number[] = [];
   const pending = [...queue];
+  // Issue #1800: each delivered message carries an input id, its 1-based position in `queue`.
+  let delivered = 0;
   const ctx: ChatContext = {
     runId: "chat-1",
     oauthToken: OAUTH,
@@ -160,14 +166,16 @@ function makeCtx(queue: (string | undefined | null)[], overrides: Partial<ChatCo
     maxTurns: 50,
     turnTimeoutMs: 5000,
     nextUserMessage: () => {
-      if (pending.length === 0) return Promise.resolve<string | undefined>(undefined);
+      if (pending.length === 0) return Promise.resolve<ChatUserMessage | undefined>(undefined);
       const v = pending.shift();
-      if (v === null) return new Promise<string | undefined>(() => {});
-      return Promise.resolve<string | undefined>(v);
+      if (v === null) return new Promise<ChatUserMessage | undefined>(() => {});
+      delivered++;
+      return Promise.resolve<ChatUserMessage | undefined>(v === undefined ? undefined : { text: v, inputId: delivered });
     },
+    followUpIncluded: (id) => included.push(id),
     ...overrides,
   };
-  return { ctx, emits, sessionIds };
+  return { ctx, emits, sessionIds, included };
 }
 
 describe("buildChatSdkOptions confinement (PRD #39 Decision 6)", () => {
@@ -357,6 +365,44 @@ describe("ChatExecutor lifecycle clocks (Decision 3)", () => {
     assert.strictEqual(result.endReason, "turn_cap");
     assert.strictEqual(turns.length, 2, "exactly maxTurns turns are driven");
     assert.ok(probe.emits.some((m) => m.kind === "status" && /turn limit/.test(String(m.payload["text"]))));
+  });
+
+  // Issue #1800: a message is reported included only once the turn answering it produced its
+  // first model message; a message the cap refused, or a turn that failed first, is not.
+  it("reports each answered message included, by its input id", async () => {
+    const { queryFn } = fakeTurns([[assistantText("a"), resultSuccess()]]);
+    const probe = makeCtx(["m1", "m2", undefined]);
+    await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
+    assert.deepStrictEqual(probe.included, [1, 2]);
+  });
+
+  it("does not report the message the turn cap refused", async () => {
+    const { queryFn } = fakeTurns([[assistantText("a"), resultSuccess()]]);
+    const probe = makeCtx(["m1", "m2", "m3"], { maxTurns: 1 });
+    const result = await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
+    assert.strictEqual(result.endReason, "turn_cap");
+    assert.deepStrictEqual(probe.included, [1], "m2 was fetched but never answered, so it stays unreported");
+  });
+
+  it("does not report a message whose turn failed before the model's first message", async () => {
+    const failing = (): AsyncIterable<unknown> => ({
+      [Symbol.asyncIterator]: () => ({ next: async () => { throw new Error("spawn failed"); } }),
+    });
+    const { queryFn } = fakeTurns([failing, [assistantText("a"), resultSuccess()]]);
+    const probe = makeCtx(["m1", "m2", undefined]);
+    await new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: new FakeScheduler() }).run(probe.ctx);
+    assert.deepStrictEqual(probe.included, [2], "only the turn that streamed is reported");
+  });
+
+  it("does not report a turn aborted by the wall-clock before it streamed anything", async () => {
+    const { queryFn } = fakeTurns([(signal) => hangUntilAbort(signal)]);
+    const sched = new FakeScheduler();
+    const probe = makeCtx(["long question", undefined], { turnTimeoutMs: 5000 });
+    const run = new ChatExecutor(nullLogger(), homeDir, { queryFn, scheduler: sched }).run(probe.ctx);
+    await waitForTimer(sched, 5000);
+    sched.fire(5000);
+    await run;
+    assert.deepStrictEqual(probe.included, []);
   });
 
   it("completes with idle when the input source has no more input (source owns the idle clock)", async () => {

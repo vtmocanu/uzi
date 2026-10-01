@@ -8989,3 +8989,154 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
     });
   }
 });
+
+// ================================================================================
+// Issue #1800: the Codex executor delivers the owner's follow-up. Before the fix the loop drained
+// only ctx.pullSafetySteer, so a follow-up (queued during implementation or at the plan gate) never
+// reached the model. Now it is pulled into a dedicated owner slot immediately before an ordinary
+// implement prompt, rendered in a <follow_up> fence on the base prompt, and reported included
+// (ctx.followUpIncluded) when the turn carrying it yields its first event. A system text (the
+// completion-rework prompt) owns its turn and leaves the follow-up waiting for the next ordinary one.
+describe("CodexExecutor owner follow-up (issue #1800)", () => {
+  type TurnScript = (th: string, tn: string, n: number) => CodexNotification[];
+  const script = (th: string, turns: TurnScript[], onTurnStart: (n: number) => void = () => {}): Responder => (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+    if (c.method === "turn/start") {
+      const tn = `tn-${th}-${c.turnStartCount}`;
+      if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+      onTurnStart(c.turnStartCount);
+      for (const note of turns[c.turnStartCount - 1]?.(th, tn, c.turnStartCount) ?? []) c.transport.push(note);
+      c.transport.push(turnCompleted("completed", th, tn));
+      return { turn: { id: tn } };
+    }
+    return {};
+  };
+  const done = (id: number, th: string, tn: string): CodexNotification =>
+    toolCall(id, "signal_done", {}, th, tn, `c-done-${id}`);
+  const quiet: TurnScript = () => [];
+  const turnTexts = (t: FakeTransport): string[] =>
+    t.requests
+      .filter((r) => r.method === "turn/start")
+      .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+
+  const A = "FOLLOWUP-MARKER-ALPHA-CODEX-7f3a";
+  const B = "FOLLOWUP-MARKER-BRAVO-CODEX-2c9e";
+
+  /** A pullFollowUp over `queue` (ids 1, 2, ... in pull order) plus a followUpIncluded recorder. */
+  function followUpSeams(queue: string[]): { pullFollowUp: () => { id: number; body: string } | undefined; followUpIncluded: (id: number) => void; pulls: Array<string | undefined>; included: number[] } {
+    const pulls: Array<string | undefined> = [];
+    const included: number[] = [];
+    let nextId = 1;
+    return {
+      pulls,
+      included,
+      pullFollowUp: () => {
+        const body = queue.shift();
+        pulls.push(body);
+        return body === undefined ? undefined : { id: nextId++, body };
+      },
+      followUpIncluded: (id) => { included.push(id); },
+    };
+  }
+
+  it("(a) a follow-up queued during implementation rides the NEXT turn's prompt in a <follow_up> fence", async () => {
+    const queue: string[] = [];
+    const rig = makeMultiEpochRig([script("th-1", [quiet, (th, tn) => [done(21, th, tn)]], (n) => { if (n === 1) queue.push(A); })]);
+    const seams = followUpSeams(queue);
+    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 during-implementation run");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 2);
+    assert.ok(!texts[0]!.includes(A), "turn 1 predates the follow-up");
+    assert.ok(texts[1]!.includes(A), "turn 2 carries it");
+    assert.ok(texts[1]!.includes("<follow_up>") && texts[1]!.includes("UNTRUSTED INPUT"), "inside the untrusted-input fence");
+    assert.ok(texts[1]!.indexOf("the approved plan") < texts[1]!.indexOf("<follow_up>"), "after the base implement prompt");
+    assert.deepEqual(seams.included, [1], "reported included once, when turn 2 started");
+  });
+
+  it("(b) a follow-up queued before the implement loop (the plan gate) is in the FIRST implement prompt", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+    const seams = followUpSeams([A]);
+    const { ctx } = makeCtx({ pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 gate run");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 1, "the run finished in that one turn");
+    assert.ok(texts[0]!.includes(A));
+    assert.deepEqual(seams.included, [1], "a one-turn run still reports it");
+  });
+
+  it("delivers queued follow-ups one per ordinary turn, in FIFO order, without re-pulling a carried one", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [quiet, quiet, (th, tn) => [done(31, th, tn)]])]);
+    const seams = followUpSeams([A, B]);
+    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 FIFO run");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.ok(texts[0]!.includes(A) && !texts[0]!.includes(B));
+    assert.ok(texts[1]!.includes(B) && !texts[1]!.includes(A));
+    assert.ok(!texts[2]!.includes(A) && !texts[2]!.includes(B), "nothing replays");
+    assert.deepEqual(seams.pulls, [A, B, undefined], "one pull per ordinary turn");
+    assert.deepEqual(seams.included, [1, 2]);
+  });
+
+  it("(d) a turn dropped before its first event (declined now pause) keeps the follow-up; it is reported once", async () => {
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+    const seams = followUpSeams([A]);
+    let parks = 0;
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => "now",
+      parkForPause: async () => { parks++; return false; }, // declined: the dropped turn is re-driven
+      pullFollowUp: seams.pullFollowUp,
+      followUpIncluded: seams.followUpIncluded,
+    });
+    // The owner's `now` is already pending when the turn starts, so it is dropped before streaming.
+    controller.abort(new PauseNowSignal());
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 dropped-turn run");
+    assert.equal(parks, 1, "the pause was offered a park and declined");
+    const texts = turnTexts(rig.epochs[0]!.transport);
+    assert.equal(texts.length, 1, "the dropped drive sent nothing; the re-drive sent the prompt");
+    assert.ok(texts[0]!.includes(A), "the re-driven turn carries the follow-up the dropped one held");
+    assert.deepEqual(seams.pulls, [A], "pulled once, never re-pulled");
+    assert.deepEqual(seams.included, [1], "reported exactly once, by the drive that streamed");
+  });
+
+  it("(e) a completion-rework turn does not carry the held follow-up; the next ordinary turn does", async () => {
+    const queue: string[] = [];
+    const rig = makeMultiEpochRig([
+      script("th-1", [(th, tn) => [done(11, th, tn)]], (n) => { if (n === 1) queue.push(A); }),
+      // The rework turn ends quietly, so the SAME recreated epoch drives the next ordinary turn.
+      script("th-1", [quiet, (th, tn) => [done(31, th, tn)]]),
+    ]);
+    const seams = followUpSeams(queue);
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      kind: "issue",
+      completionInterlock: true,
+      config: { max_iterations: 6 },
+      frozenMilestones: [{ id: "m1", title: "Alpha" }],
+      checkpoint: async () => {},
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m1"] : [], attemptCount: attempts }),
+      pullFollowUp: seams.pullFollowUp,
+      followUpIncluded: seams.followUpIncluded,
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 rework run");
+    const [first] = turnTexts(rig.epochs[0]!.transport);
+    const [rework, next] = turnTexts(rig.epochs[1]!.transport);
+    assert.ok(!first!.includes(A), "the follow-up arrived during turn 1");
+    assert.ok(rework!.startsWith("Completion check (structural interlock)"), "the second turn is the rework");
+    assert.ok(!rework!.includes(A), "the rework turn does not carry the follow-up");
+    assert.ok(next!.includes(A), "the next ordinary turn does");
+    assert.deepEqual(seams.pulls, [undefined, A], "no pull while the rework text owned the turn");
+    assert.deepEqual(seams.included, [1]);
+  });
+
+  it("(f) a non-issue run kind (task) delivers the follow-up too", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+    const seams = followUpSeams([A]);
+    const { ctx } = makeCtx({ kind: "task", pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 task run");
+    assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A));
+    assert.deepEqual(seams.included, [1]);
+  });
+});

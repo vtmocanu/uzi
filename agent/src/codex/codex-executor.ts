@@ -28,6 +28,9 @@
 // live turn (a PauseNowSignal abort, or the re-armable ctx.onPauseNow interrupt) is honoured
 // too: in the implement phase through ctx.parkForPause (a declined park re-drives the turn), in
 // the plan phase by throwing a PauseNowSignal the runner parks.
+// Issue #1800: an owner follow-up (ctx.pullFollowUp) rides the base implement prompt of the next
+// ordinary turn in a <follow_up> fence and is reported included (ctx.followUpIncluded) when that
+// turn yields its first event; a completion-rework or secret-remediation turn leaves it waiting.
 // It reuses `ctx.gatePlan` for the plan→approval gate exactly like SdkExecutor, but drives
 // turns Codex-specific.
 //
@@ -83,7 +86,7 @@ import type {
   TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote } from "../prompt.js";
+import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -2242,6 +2245,12 @@ export class CodexExecutor implements Executor {
       let lastCompletionFingerprint: string | undefined;
       let completionStallStreak = 0;
       let completionFollowUp: string | undefined;
+      // Issue #1800: the owner's follow-up. Pulled from steering only immediately before an ordinary
+      // implement prompt is built (never while a system text owns the turn), carried across loop
+      // iterations (the base prompt is rebuilt each time), and cleared only when the turn whose
+      // prompt held it yields its first event, which is when it is reported included. A turn that
+      // throws, parks, walls, pauses or whose epoch is recreated first keeps it for the next turn.
+      let ownerFollowUp: { id: number; body: string } | undefined;
       // Issue #1674: the approved breakdown this loop reports against: the list approved at this
       // run's gate, else (a pre-approved resume) the claim's frozen list.
       const milestones = approvedMilestones ?? ctx.frozenMilestones ?? undefined;
@@ -2366,7 +2375,19 @@ export class CodexExecutor implements Executor {
         const safetySteer = ctx.pullSafetySteer?.();
         // Issue #1674: every implement-phase prompt (the base, the completion-rework follow-up and
         // the clarification continuation below) carries the shared milestone tracker guidance.
-        const basePrompt = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
+        // Issue #1800: a system text (the completion-rework or secret-remediation follow-up) owns
+        // the turn outright, so the owner follow-up is neither pulled nor rendered on it.
+        if (completionFollowUp === undefined) ownerFollowUp ??= ctx.pullFollowUp?.();
+        const ownerRides = completionFollowUp === undefined ? ownerFollowUp : undefined;
+        const onOwnerFirstEvent = ownerRides
+          ? () => {
+              if (ownerFollowUp?.id !== ownerRides.id) return;
+              ownerFollowUp = undefined;
+              ctx.followUpIncluded?.(ownerRides.id);
+            }
+          : undefined;
+        const ownerBase = this.implementPrompt(ctx, gatedPlan, milestoneNote(), environmentFacts);
+        const basePrompt = ownerRides ? [ownerBase, ...renderFollowUpBlock(ownerRides.body)].join("\n") : ownerBase;
         const implementBody = completionFollowUp !== undefined
           ? withMilestoneNote(completionFollowUp, milestoneNote())
           : basePrompt;
@@ -2385,7 +2406,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, completionAttempted, onProgress);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
           if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -2882,6 +2903,8 @@ export class CodexExecutor implements Executor {
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
     pauseNow: CodexPauseNowState,
+    // Issue #1800: called once, when the turn yields its first event (the prompt was delivered).
+    onFirstEvent?: () => void,
   ): Promise<ReducedTurnResult> {
     const callbackCursor = registry.callbackAdmissionCursor();
     const turnAbort = new AbortController();
@@ -2995,6 +3018,13 @@ export class CodexExecutor implements Executor {
           return events.next();
         }
       })();
+      if (!first.done) {
+        try {
+          onFirstEvent?.();
+        } catch (err) {
+          this.log.warn("codex first-event handler threw", { run_id: ctx.runId, error: errMessage(err) });
+        }
+      }
       for (; !first.done; first = await events.next()) {
         const event = first.value;
         armIdle(); // events re-arm idle only while no callback is in flight
@@ -3092,6 +3122,7 @@ export class CodexExecutor implements Executor {
     pauseNow: CodexPauseNowState,
     completionAttempted = false,
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
+    onFirstEvent?: () => void,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -3101,7 +3132,7 @@ export class CodexExecutor implements Executor {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress, pauseNow,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress, pauseNow, onFirstEvent,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared

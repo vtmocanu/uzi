@@ -332,7 +332,7 @@ describe("SdkExecutor served wall extension (PRD #1189 M1)", () => {
       [0, 50, 450],
     );
     const outcomes: FollowUpOutcome[] = [
-      { kind: "followup", body: "the resumed task" },
+      { kind: "followup", id: 101, body: "the resumed task" },
       { kind: "ended", reason: "idle" },
     ];
     let call = 0;

@@ -179,7 +179,20 @@ export interface ChatContext {
    * user message arrives the same way — a seeded follow_up input (M1 CreateChatRun).
    * `ended` vs `idle` is distinguished by ctx.signal (aborted ⇒ ended).
    */
-  nextUserMessage(): Promise<string | undefined>;
+  nextUserMessage(): Promise<ChatUserMessage | undefined>;
+  /** Issue #1800: the user message carrying input `id` was delivered to a model turn (its first
+   *  message arrived). Called at most once per message, never for a message the turn cap refused
+   *  and never for a turn that failed before the model answered. The ChatRunner reports it to the
+   *  api (POST /inputs/included). Optional; absent (a stub or test) ⇒ nothing is reported. */
+  followUpIncluded?(id: number): void;
+}
+
+/** One user message handed to the executor. `inputId` is the run_user_inputs id the message came
+ *  from (every message a steering channel delivers has one), reported back through
+ *  {@link ChatContext.followUpIncluded}. */
+export interface ChatUserMessage {
+  text: string;
+  inputId?: number;
 }
 
 /** The outcome of a whole chat conversation. */
@@ -364,7 +377,7 @@ export class ChatExecutor {
         break;
       }
       turns++;
-      const turn = await this.driveChatTurn(ctx, baseOptions, resumeId, next.message!);
+      const turn = await this.driveChatTurn(ctx, baseOptions, resumeId, next.message!.text, next.message!.inputId);
       if (turn.sessionId) {
         resumeId = turn.sessionId;
         if (!reportedSessionId) {
@@ -396,11 +409,11 @@ export class ChatExecutor {
    * racing the idle tick is never dropped (team task #8). `ended` vs `idle` is read
    * from ctx.signal (an aborted signal is an explicit End chat / shutdown).
    */
-  private awaitNext(ctx: ChatContext): Promise<{ message?: string; reason?: ChatEndReason }> {
+  private awaitNext(ctx: ChatContext): Promise<{ message?: ChatUserMessage; reason?: ChatEndReason }> {
     if (ctx.signal?.aborted) return Promise.resolve({ reason: "ended" });
     return new Promise((resolve) => {
       let settled = false;
-      const finish = (r: { message?: string; reason?: ChatEndReason }): void => {
+      const finish = (r: { message?: ChatUserMessage; reason?: ChatEndReason }): void => {
         if (settled) return;
         settled = true;
         ctx.signal?.removeEventListener("abort", onAbort);
@@ -426,6 +439,7 @@ export class ChatExecutor {
     baseOptions: SdkOptions,
     resumeId: string | undefined,
     userMessage: string,
+    inputId?: number,
   ): Promise<ChatTurnResult> {
     const abort = new AbortController();
     let timedOut = false;
@@ -461,7 +475,19 @@ export class ChatExecutor {
     let resultFrame: unknown;
     try {
       const queryInstance = this.queryFn({ prompt: promptStream(userMessage), options });
+      let sawFirstMessage = false;
       for await (const msg of queryInstance) {
+        // Issue #1800: the model's first message proves the turn started on this user message.
+        if (!sawFirstMessage) {
+          sawFirstMessage = true;
+          if (inputId !== undefined) {
+            try {
+              ctx.followUpIncluded?.(inputId);
+            } catch (err) {
+              this.log.warn("chat: followUpIncluded handler threw", { run_id: ctx.runId, error: errMessage(err) });
+            }
+          }
+        }
         const sid = sessionIdOf(msg);
         if (sid) turnSessionId = sid;
         rateLimits.observe(msg);

@@ -13,6 +13,13 @@ import { buildAgentGuardHook, NESTED_AGENT_TOOL } from "../src/guardrails.js";
 import type { HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { nullLogger, stopStartedChannels, withReceipts } from "./helpers.js";
 
+/** Issue #1800: follow-up outcomes and chat messages now carry the input id; most tests here
+ *  assert only the kind and text, so they compare it with the id stripped. */
+function noId<T extends object>(o: T): Omit<T, "id"> {
+  const { id: _id, ...rest } = o as T & { id?: unknown };
+  return rest;
+}
+
 // The steering channel is the single /inputs poller; it routes verdicts,
 // follow-ups, and cancel. Driven with a scripted getInputs — no live server.
 
@@ -87,9 +94,9 @@ describe("SteeringChannel", () => {
     const { ch } = makeChannel([[inp("follow_up", "first"), inp("follow_up", "second")]]);
     ch.start();
     await tick();
-    assert.strictEqual(ch.pullFollowUp(), "first");
-    assert.strictEqual(ch.pullFollowUp(), "second");
-    assert.strictEqual(ch.pullFollowUp(), undefined);
+    assert.strictEqual(ch.pullFollowUp()?.body, "first");
+    assert.strictEqual(ch.pullFollowUp()?.body, "second");
+    assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     await ch.stop();
   });
 
@@ -542,11 +549,11 @@ describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", 
     ch.start();
     await tick(); // poll consumes + buffers both — buffering must NOT advance the watermark
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0, "buffered, not delivered");
-    assert.strictEqual(ch.pullFollowUp(), "a");
+    assert.strictEqual(ch.pullFollowUp()?.body, "a");
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 3, "advanced to the first delivered id");
-    assert.strictEqual(ch.pullFollowUp(), "b");
+    assert.strictEqual(ch.pullFollowUp()?.body, "b");
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 7, "advanced to the second delivered id");
-    assert.strictEqual(ch.pullFollowUp(), undefined);
+    assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 7, "an empty pull leaves it unchanged");
     await ch.stop();
   });
@@ -562,7 +569,7 @@ describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", 
     await tick(); // buffered, no waiter armed yet
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 0, "a buffered follow-up does not advance it");
     const outcome = await ch.awaitFollowUp(60_000); // immediate-return branch drains the buffer
-    assert.deepStrictEqual(outcome, { kind: "followup", body: "task" });
+    assert.deepStrictEqual(noId(outcome), { kind: "followup", body: "task" });
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 12, "delivery advanced it");
     await ch.stop();
   });
@@ -575,7 +582,7 @@ describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", 
     ch.start();
     const parked = ch.awaitFollowUp(60_000); // arm before the first poll routes anything
     const outcome = await parked;
-    assert.deepStrictEqual(outcome, { kind: "followup", body: "y" });
+    assert.deepStrictEqual(noId(outcome), { kind: "followup", body: "y" });
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 9, "serviceFollowUp advanced it");
     await ch.stop();
   });
@@ -587,10 +594,10 @@ describe("SteeringChannel — last-delivered follow-up watermark (issue #559)", 
     const { ch } = makeChannel([[inpId("follow_up", 10, "hi")], [inpId("follow_up", 4, "lo")]]);
     ch.start();
     await tick();
-    assert.strictEqual(ch.pullFollowUp(), "hi");
+    assert.strictEqual(ch.pullFollowUp()?.body, "hi");
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10);
     await tick(30);
-    assert.strictEqual(ch.pullFollowUp(), "lo");
+    assert.strictEqual(ch.pullFollowUp()?.body, "lo");
     assert.strictEqual(ch.getLastDeliveredFollowUpId(), 10, "a lower delivered id never regresses it");
     await ch.stop();
   });
@@ -823,7 +830,7 @@ describe("ChatSteering", () => {
   it("delivers a follow_up as a message", async () => {
     const ch = new ChatSteering(fakeClient([[inp("follow_up", "how does X work?")]]), "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
-    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "how does X work?" });
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "message", text: "how does X work?" });
     await ch.stop();
   });
 
@@ -831,7 +838,7 @@ describe("ChatSteering", () => {
     const ch = new ChatSteering(fakeClient([[inp("follow_up", "buffered")]]), "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
     await tick(); // the poll consumes + buffers it while nobody is parked
-    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "buffered" });
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "message", text: "buffered" });
     await ch.stop();
   });
 
@@ -865,7 +872,7 @@ describe("ChatSteering", () => {
     } as unknown as WorkerClient;
     const ch = new ChatSteering(withReceipts(client), "chat-1", 1, nullLogger(), new AbortController(), { now: () => clock });
     ch.start();
-    assert.deepStrictEqual(await ch.awaitFollowUp(50), { kind: "message", text: "raced-in" });
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(50)), { kind: "message", text: "raced-in" });
     await ch.stop();
   });
 
@@ -896,7 +903,7 @@ describe("ChatSteering", () => {
     } } as unknown as WorkerClient);
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
-    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "after GET retry" });
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "message", text: "after GET retry" });
     await ch.stop();
     assert.ok(gets >= 2);
   });
@@ -928,10 +935,10 @@ describe("ChatSteering", () => {
     } as unknown as WorkerClient;
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController(), {}, 4);
     ch.start();
-    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "seven" });
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "message", text: "seven" });
     assert.strictEqual(gets, 1);
     assert.strictEqual(applies, 0, "waiter was serviced before applied began");
-    assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "eight" });
+    assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "message", text: "eight" });
     await ch.stop();
     assert.strictEqual(acks, 2);
     assert.strictEqual(applies, 1);
@@ -955,7 +962,7 @@ describe("ChatSteering", () => {
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "message", text: "delivered once" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "message", text: "delivered once" });
       assert.strictEqual(applies, 0);
       const stopped = ch.stop();
       release();
@@ -1008,7 +1015,7 @@ describe("ChatSteering", () => {
       await tick(2);
       assert.strictEqual(settled, false);
       release();
-      assert.deepStrictEqual(await outcome, { kind: "message", text: "raced" });
+      assert.deepStrictEqual(noId(await outcome), { kind: "message", text: "raced" });
     } finally {
       release();
       await ch.stop();
@@ -1026,7 +1033,7 @@ describe("ChatSteering", () => {
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "unapplied" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "message", text: "unapplied" });
       await ch.stop();
       assert.ok(applies >= 1);
       assert.strictEqual(ch.unconfirmedInput(), "could not confirm your message was applied; please resend it");
@@ -1047,7 +1054,7 @@ describe("ChatSteering", () => {
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "never confirmed" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "message", text: "never confirmed" });
       for (let i = 0; i < 500 && !ch.unconfirmedInput(); i++) await tick(2);
       assert.strictEqual(ch.unconfirmedInput(), "could not confirm your message was applied; please resend it");
       assert.strictEqual(ch.claimLost(), false);
@@ -1072,7 +1079,7 @@ describe("ChatSteering", () => {
     const ch = new ChatSteering(client, "chat-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "message", text: "applied then released" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "message", text: "applied then released" });
       for (let i = 0; i < 200 && applies < 2; i++) await tick(2);
       await ch.stop();
       assert.strictEqual(ch.claimLost(), true);
@@ -1113,8 +1120,8 @@ describe("SteeringChannel operator constraints (issue #1660)", () => {
       await tick();
       assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"], "trimmed, blanks and other kinds skipped");
       // The lead's delivery is unchanged and does not consume the constraint record.
-      assert.strictEqual(ch.pullFollowUp(), "first");
-      assert.strictEqual(ch.pullFollowUp(), "second");
+      assert.strictEqual(ch.pullFollowUp()?.body, "first");
+      assert.strictEqual(ch.pullFollowUp()?.body, "second");
       assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"]);
     } finally {
       await ch.stop();
@@ -1164,7 +1171,7 @@ describe("SteeringChannel operator constraints (issue #1660)", () => {
       assert.ok(late.startsWith("auditor task\n\n"));
       assert.ok(late.includes(rule), "dispatch after the follow-up carries it");
       // A later dispatch still carries it after the lead consumed its own copy.
-      assert.strictEqual(ch.pullFollowUp(), rule);
+      assert.strictEqual(ch.pullFollowUp()?.body, rule);
       assert.ok((await dispatch("reviewer")).includes(rule), "persistent for the rest of the run");
     } finally {
       await ch.stop();
@@ -1192,8 +1199,8 @@ describe("SteeringChannel.seedOperatorConstraints (issue #1660)", () => {
       await tick();
       assert.deepStrictEqual(ch.operatorConstraints(), ["earlier", "later", "live"]);
       // Seeded constraints are NOT re-delivered to the lead: its FIFO holds only the live one.
-      assert.strictEqual(ch.pullFollowUp(), "live");
-      assert.strictEqual(ch.pullFollowUp(), undefined);
+      assert.strictEqual(ch.pullFollowUp()?.body, "live");
+      assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     } finally {
       await ch.stop();
     }
@@ -1206,7 +1213,7 @@ describe("SteeringChannel.seedOperatorConstraints (issue #1660)", () => {
     try {
       await tick();
       assert.deepStrictEqual(ch.operatorConstraints(), ["same row"]);
-      assert.strictEqual(ch.pullFollowUp(), "same row", "the lead still gets the live delivery");
+      assert.strictEqual(ch.pullFollowUp()?.body, "same row", "the lead still gets the live delivery");
     } finally {
       await ch.stop();
     }
@@ -1224,7 +1231,7 @@ describe("SteeringChannel.markOperatorConstraintsUnavailable (issue #1660)", () 
     try {
       await tick();
       assert.strictEqual(ch.operatorConstraints(), null);
-      assert.strictEqual(ch.pullFollowUp(), "live", "the lead's delivery is unaffected");
+      assert.strictEqual(ch.pullFollowUp()?.body, "live", "the lead's delivery is unaffected");
     } finally {
       await ch.stop();
     }
@@ -1258,9 +1265,9 @@ describe("input receipts", () => {
     ch.start();
     try {
       await until(() => applied > 0);
-      assert.strictEqual(ch.pullFollowUp(), "seven");
-      assert.strictEqual(ch.pullFollowUp(), "eight");
-      assert.strictEqual(ch.pullFollowUp(), undefined);
+      assert.strictEqual(ch.pullFollowUp()?.body, "seven");
+      assert.strictEqual(ch.pullFollowUp()?.body, "eight");
+      assert.strictEqual(ch.pullFollowUp()?.body, undefined);
       assert.ok(acks >= 2);
       assert.ok(applied >= 1);
       assert.ok(gets >= 1);
@@ -1307,10 +1314,10 @@ describe("input receipts", () => {
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "followup", body: "seven" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "followup", body: "seven" });
       assert.strictEqual(applyCalls, 0, "the waiter is serviced before apply begins");
-      assert.strictEqual(ch.pullFollowUp(), "eight");
-      assert.strictEqual(ch.pullFollowUp(), undefined);
+      assert.strictEqual(ch.pullFollowUp()?.body, "eight");
+      assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     } finally {
       releaseApply();
       await ch.stop();
@@ -1339,8 +1346,8 @@ describe("input receipts", () => {
       assert.deepStrictEqual(appliedIds, [[7], [7]]);
       assert.strictEqual(acks, 1);
       assert.strictEqual(gets, 1, "no GET precedes settlement");
-      assert.strictEqual(ch.pullFollowUp(), "seven");
-      assert.strictEqual(ch.pullFollowUp(), undefined);
+      assert.strictEqual(ch.pullFollowUp()?.body, "seven");
+      assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     } finally {
       await ch.stop();
     }
@@ -1370,7 +1377,7 @@ describe("input receipts", () => {
       void outcome.then(() => { settled = true; });
       assert.strictEqual(settled, false);
       releaseAck();
-      assert.deepStrictEqual(await outcome, { kind: "followup", body: "seven" });
+      assert.deepStrictEqual(noId(await outcome), { kind: "followup", body: "seven" });
     } finally {
       releaseAck();
       await ch.stop();
@@ -1426,8 +1433,8 @@ describe("input receipts", () => {
       await until(() => acks === 2);
       assert.strictEqual(getsAtRetry, 1, "the retry reused the held ids without a newer GET");
       await tick();
-      assert.strictEqual(ch.pullFollowUp(), "seven", "routed once, from the well-formed receipt");
-      assert.strictEqual(ch.pullFollowUp(), undefined);
+      assert.strictEqual(ch.pullFollowUp()?.body, "seven", "routed once, from the well-formed receipt");
+      assert.strictEqual(ch.pullFollowUp()?.body, undefined);
     } finally {
       await ch.stop();
     }
@@ -1535,7 +1542,7 @@ describe("input receipts", () => {
       try {
         // The routed input reaches the executor, which then reports the resume.
         if (kind === "approve_plan") assert.strictEqual((await ch.awaitVerdict()).kind, "approve");
-        else assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        else assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
         await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError",
           "the guarded report never goes out as if the input were applied");
         assert.strictEqual(applies, 30, "bounded on the active claim");
@@ -1597,7 +1604,7 @@ describe("input receipts", () => {
       const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController(), { receiptDeadlineMs: 100 });
       ch.start();
       try {
-        assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
         const started = Date.now();
         await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError", mode);
         assert.ok(Date.now() - started < 2_000, `${mode}: bounded by the deadline, not the attempt count`);
@@ -1718,7 +1725,7 @@ describe("input receipts", () => {
     ch.start();
     try {
       await until(() => cancel.signal.aborted);
-      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "eight" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "eight" });
       await ch.awaitReceiptSettlement();
       assert.strictEqual(appliedFollowUp, true, "the running report waited for the follow-up's APPLIED");
     } finally {
@@ -1748,7 +1755,7 @@ describe("input receipts", () => {
       await until(() => cancel.signal.aborted);
       assert.strictEqual((cancel.signal.reason as Error).name, "CredentialSwitchSignal");
       ch.rearmCredentialSwitch(); // the give-up's stamp-clear was confirmed; the flight continues
-      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "eight" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "eight" });
       await ch.awaitReceiptSettlement();
       assert.strictEqual(appliedFollowUp, true, "the running report waited for the follow-up's APPLIED");
     } finally {
@@ -1772,7 +1779,7 @@ describe("input receipts", () => {
       const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
       ch.start();
       try {
-        assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+        assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
         await tick();
         const waiting = ch.awaitReceiptSettlement();
         release();
@@ -1796,7 +1803,7 @@ describe("input receipts", () => {
     ch.start();
     try {
       assert.deepStrictEqual(await ch.awaitVerdict(), { kind: "approve", selection: { status: "absent" } });
-      assert.strictEqual(ch.pullFollowUp(), "eight");
+      assert.strictEqual(ch.pullFollowUp()?.body, "eight");
       await ch.awaitReceiptSettlement();
     } finally {
       await ch.stop();
@@ -1820,7 +1827,7 @@ describe("input receipts", () => {
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), cancel, { claimGeneration: 4 });
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100_000), { kind: "followup", body: "seven" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100_000)), { kind: "followup", body: "seven" });
       await tick();
       const waiting = ch.awaitReceiptSettlement();
       release();
@@ -1871,7 +1878,7 @@ describe("input receipts", () => {
     const ch = new SteeringChannel(client, "run-1", 1, nullLogger(), new AbortController());
     ch.start();
     try {
-      assert.deepStrictEqual(await ch.awaitFollowUp(100000), { kind: "followup", body: "seven" });
+      assert.deepStrictEqual(noId(await ch.awaitFollowUp(100000)), { kind: "followup", body: "seven" });
       let reported = false;
       const report = ch.awaitReceiptSettlement().then(() => { reported = true; });
       await tick();

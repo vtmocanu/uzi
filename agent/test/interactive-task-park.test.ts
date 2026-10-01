@@ -234,7 +234,7 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
       [assistantText("t2"), signalDone(), resultSuccess()], // loop 2 (after follow-up) → done → park (idle)
     ]);
     const outcomes: FollowUpOutcome[] = [
-      { kind: "followup", body: "now add tests" },
+      { kind: "followup", id: 101, body: "now add tests" },
       { kind: "ended", reason: "idle" },
     ];
     const events: string[] = [];
@@ -298,7 +298,7 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
       [assistantText("f done"), signalDone(), resultSuccess()], // follow-up loop 2 → done → park (idle)
     ]);
     const outcomes: FollowUpOutcome[] = [
-      { kind: "followup", body: "a bigger task" },
+      { kind: "followup", id: 102, body: "a bigger task" },
       { kind: "ended", reason: "idle" },
     ];
     const { ctx } = makeCtx({
@@ -397,12 +397,12 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
     );
     // park #1 (loop1) … #6 return a follow-up; park #7 ends the session idle.
     const outcomes: FollowUpOutcome[] = [
-      { kind: "followup", body: "task 2" },
-      { kind: "followup", body: "task 3" },
-      { kind: "followup", body: "task 4" },
-      { kind: "followup", body: "task 5" },
-      { kind: "followup", body: "task 6" },
-      { kind: "followup", body: "task 7" },
+      { kind: "followup", id: 103, body: "task 2" },
+      { kind: "followup", id: 104, body: "task 3" },
+      { kind: "followup", id: 105, body: "task 4" },
+      { kind: "followup", id: 106, body: "task 5" },
+      { kind: "followup", id: 107, body: "task 6" },
+      { kind: "followup", id: 108, body: "task 7" },
       { kind: "ended", reason: "idle" },
     ];
     const { ctx } = makeCtx({
@@ -446,7 +446,7 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
       [0, 50, 450],
     );
     const outcomes: FollowUpOutcome[] = [
-      { kind: "followup", body: "the resumed task" },
+      { kind: "followup", id: 109, body: "the resumed task" },
       { kind: "ended", reason: "idle" },
     ];
     const { ctx } = makeCtx({
@@ -483,7 +483,7 @@ describe("SdkExecutor interactive task park (PRD #517 M3)", () => {
       [assistantText("t2"), signalDone(), resultSuccess()], // loop 2 (resumed follow-up) → park idle
     ]);
     const outcomes: FollowUpOutcome[] = [
-      { kind: "followup", body: "please also update the docs" },
+      { kind: "followup", id: 110, body: "please also update the docs" },
       { kind: "ended", reason: "idle" },
     ];
     const { ctx } = makeCtx({
@@ -622,7 +622,7 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     ch.start();
     await tick(); // let the poll consume + buffer the follow-up before we park
     const outcome = await ch.awaitFollowUp(60_000);
-    assert.deepStrictEqual(outcome, { kind: "followup", body: "next task" });
+    assert.deepStrictEqual(outcome, { kind: "followup", id: 1, body: "next task" });
     await ch.stop();
   });
 
@@ -647,7 +647,7 @@ describe("SteeringChannel.awaitFollowUp (PRD #517 M3)", () => {
     );
     // Non-consuming: awaitFollowUp still returns the same buffered follow-up afterwards.
     const outcome = await ch.awaitFollowUp(60_000);
-    assert.deepStrictEqual(outcome, { kind: "followup", body: "next task" });
+    assert.deepStrictEqual(outcome, { kind: "followup", id: 2, body: "next task" });
     assert.strictEqual(
       ch.hasPendingFollowUpOutcome(),
       false,
@@ -976,7 +976,7 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     assert.strictEqual(log.checkpointed, true, "the executor checkpoint-pushed at the park");
     assert.deepStrictEqual(
       log.outcomes,
-      [{ kind: "followup", body: "keep going" }],
+      [{ kind: "followup", id: 1, body: "keep going" }],
       "the callback delivered the injected follow-up, consumed via the poll loop",
     );
     assert.strictEqual(
@@ -1013,7 +1013,7 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     );
     assert.deepStrictEqual(
       log.outcomes,
-      [{ kind: "followup", body: "keep going" }],
+      [{ kind: "followup", id: 1, body: "keep going" }],
       "the buffered follow-up was serviced directly, without parking",
     );
     assert.strictEqual(
@@ -1127,8 +1127,8 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
       `each park must report the pre-round-trip last-delivered id; got ${JSON.stringify(watermarks)}`,
     );
     assert.deepStrictEqual(log.outcomes, [
-      { kind: "followup", body: "turn 2" },
-      { kind: "followup", body: "turn 3" },
+      { kind: "followup", id: 5, body: "turn 2" },
+      { kind: "followup", id: 8, body: "turn 3" },
       { kind: "ended", reason: "stopped" },
     ]);
   });
@@ -1203,7 +1203,7 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     );
     assert.deepStrictEqual(
       log.outcomes,
-      [{ kind: "followup", body: "keep going" }],
+      [{ kind: "followup", id: 1, body: "keep going" }],
       "the buffered follow-up was serviced despite the transient probe error",
     );
     assert.strictEqual(statuses.at(-1), "completed", "the run proceeded past the probe and finalized");
@@ -1229,7 +1229,7 @@ describe("RunRunner interactive follow-up park (PRD #517 M3)", () => {
     );
     assert.deepStrictEqual(
       log.outcomes,
-      [{ kind: "followup", body: "keep going" }],
+      [{ kind: "followup", id: 1, body: "keep going" }],
       "the buffered follow-up was serviced directly after the owned+running probe",
     );
     assert.strictEqual(statuses.at(-1), "completed", "the run resumed past the skipped park and finalized");

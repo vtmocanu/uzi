@@ -2564,6 +2564,13 @@ export interface UserInput {
    *  `own`, never the untrusted repo source. */
   body?: string | null;
   created_at?: string;
+  /** Issue #1800: when a follow_up was reported as included in a prompt (GET /follow-ups only;
+   *  absent until then). */
+  included_at?: string;
+  /** Issue #1800: GET /follow-ups only. True when the api tracks inclusion for this row, so an
+   *  absent `included_at` means "consumed but never put into a prompt". Absent/false from an api
+   *  that predates inclusion reporting. */
+  inclusion_reported?: boolean;
   /** PRD #1795 M1 (D3): the verdict row's persisted gate binding: "bound" (with `gate_revision`,
    *  the revision the verdict was stamped against) or "unbound" (sent while no gate was visible).
    *  Both ABSENT for a legacy row (before the migration, an older api, or a non-verdict kind), which

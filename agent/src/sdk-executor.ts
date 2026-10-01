@@ -2274,7 +2274,18 @@ export class SdkExecutor implements Executor {
         ? approvedPlan
         : undefined;
       let iteration = 0;
+      // Issue #1800: SYSTEM texts only (completion rework, clarification answer, secret
+      // remediation): worker-authored turn prompts that own the next implement turn outright.
+      // Owner follow-ups never ride this variable; they live in ownerFollowUp below.
       let followUp: string | undefined;
+      // Issue #1800: the owner's follow-up, pulled from steering ONLY immediately before an
+      // ordinary implement prompt is built, carried across loop iterations, and cleared only when
+      // the turn whose prompt held it yields its first event (stamped included then, exactly once).
+      // A turn that throws, parks, walls, pauses or is restarted first keeps it for the next turn.
+      let ownerFollowUp: { id: number; body: string } | undefined;
+      // Issue #1800: follow-ups an interactive park handed over while the slot was occupied
+      // (FIFO behind it), so none is overwritten.
+      const ownerBacklog: { id: number; body: string }[] = [];
       // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
       // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
       // framing, priorWork/deps notes, and the base-commit note) must be emitted on the
@@ -2524,11 +2535,22 @@ export class SdkExecutor implements Executor {
         });
         // PRD #1416 M2: drain the worker-authoritative safety steer BEFORE building the implement
         // prompt, so an M2-armed steer reaches the next turn and an M5-armed steer reaches
-        // iteration 1. Every iteration (including the first), and AHEAD of the follow-up drains
-        // (end of iteration and cooperative checkpoint) — it survives the park paths that `continue`
-        // before those drains, and is rendered as worker guidance OUTSIDE the <follow_up> fence (see
+        // iteration 1. Every iteration (including the first), and AHEAD of the owner follow-up
+        // pull just below — it is rendered as worker guidance OUTSIDE the <follow_up> fence (see
         // buildImplementPrompt).
         const safetySteer = ctx.pullSafetySteer?.();
+        // Issue #1800: fill the owner slot (only when empty) and decide who owns this turn. A system
+        // text owns it outright: the owner follow-up is neither pulled nor rendered then and waits
+        // in its slot for the next ordinary turn.
+        if (followUp === undefined) ownerFollowUp ??= ownerBacklog.shift() ?? ctx.pullFollowUp?.();
+        const ownerRides = followUp === undefined ? ownerFollowUp : undefined;
+        const onFirstEvent = ownerRides
+          ? () => {
+              if (ownerFollowUp?.id !== ownerRides.id) return;
+              ownerFollowUp = undefined;
+              ctx.followUpIncluded?.(ownerRides.id);
+            }
+          : undefined;
         // PRD #1064 M1 (Decisions 1/2): a per-turn progress observer. It owns the diff base
         // (seeded from the loop-scope latestProgress, the previous turn's final snapshot, so
         // a transition already seen does not re-emit) and the frozen titles, emits the
@@ -2580,7 +2602,7 @@ export class SdkExecutor implements Executor {
             // Undefined for every path except the session-less seeded cold start (see
             // seededPlanBody above), so resume/gated implement prompts are unchanged.
             seededPlan: seededPlanBody,
-            followUp,
+            followUp: followUp ?? ownerRides?.body,
             // #157: the join above populated these, so the first implement turn can be told
             // which dirs are ready and which genuinely are not — the facts the plan turn
             // could not have. Correct on the revise path too: the join runs after the LAST
@@ -2626,6 +2648,7 @@ export class SdkExecutor implements Executor {
           state,
           idleMs,
           onProgress,
+          onFirstEvent,
         );
         // PRD #1190 M2: await the turn through a catch for a `now` pause abort. driveTurn is an
         // async function, so even a synchronous trip check surfaces as a REJECTED promise here
@@ -2844,10 +2867,10 @@ export class SdkExecutor implements Executor {
             latestProgress = undefined;
           }
           resetStallState(); // a cooperative checkpoint is progress → breaks any refusal streak
-          // Issue #1152: drain the follow-up queue at the checkpoint boundary too (FIFO, one per
-          // turn, like the end-of-iteration drain below). Assigning also clears the follow-up this
-          // turn already carried, so it is not replayed into the next prompt.
-          followUp = ctx.pullFollowUp?.();
+          // Issue #1800: the system text this turn carried is spent. An owner follow-up is pulled
+          // at the next loop top (immediately before its prompt is built), never here, so it
+          // cannot be lost to a loop that exits before sending it.
+          followUp = undefined;
           continue;
         }
         if (turn.done) {
@@ -2899,7 +2922,11 @@ export class SdkExecutor implements Executor {
               // Fold the follow-up into the next turn EXACTLY as a mid-run follow-up is
               // (buildImplementPrompt renders `followUp` as UNTRUSTED user input); the
               // resumed session keeps full context, so nothing is replayed.
-              followUp = outcome.body;
+              // Issue #1800: it enters the owner slot (queued behind one still held), so it is
+              // reported included when the turn carrying it yields its first event.
+              followUp = undefined;
+              if (ownerFollowUp) ownerBacklog.push({ id: outcome.id, body: outcome.body });
+              else ownerFollowUp = { id: outcome.id, body: outcome.body };
               // RESET the iteration budget: each follow-up gets a fresh maxIterations. An
               // interactive run spans many follow-ups over its lifetime and must NOT fail with
               // REASON_MAX_ITERATIONS after N turns SUMMED across them — the budget bounds one
@@ -3087,7 +3114,7 @@ export class SdkExecutor implements Executor {
               throw new Error(REASON_COMPLETION_NO_PROGRESS);
             }
             // Progress is still possible: inject the unmet ids as an AUTONOMOUS same-session
-            // follow-up (like the mid-loop pullFollowUp injection, NOT the interactive owner
+            // follow-up (like a queued owner follow-up, NOT the interactive owner
             // park) and continue, resuming the SAME SDK session. The iteration/wall budgets are
             // NOT reset — the loop is bounded by those budgets plus the completion STALL_LIMIT
             // (exhausting iterations routes to the hold below via completionAttempted). No
@@ -3179,12 +3206,14 @@ export class SdkExecutor implements Executor {
           continue;
         }
 
-        // Fold any queued correction into the next turn (FIFO, one per turn).
-        followUp = ctx.pullFollowUp?.();
+        // Issue #1800: the system text this turn carried is spent. Queued owner follow-ups are
+        // pulled at the next loop top (FIFO, one per turn), immediately before the prompt that
+        // carries them is built.
+        followUp = undefined;
 
         // PRD #390 M3 (D2/D4): enforcement evaluation. Only normal work turns reach here — the
-        // checkpoint and park paths `continue` above (the checkpoint path drains its own follow-up
-        // first, #1152), and done/max-iter exit above. On a
+        // checkpoint and park paths `continue` above (the checkpoint path `continue`s too; an owner follow-up
+        // is pulled at the next loop top, #1152/#1800), and done/max-iter exit above. On a
         // milestone-bearing run (≥1 frozen milestone) where the tracker shows NO milestone in
         // progress, escalate the next turn's prompt and count the miss; after K consecutive misses
         // emit a feed-only status so a silently-non-reporting lead is observable. A lead that
@@ -3689,6 +3718,10 @@ export class SdkExecutor implements Executor {
     // `ctx.reportProgress`; the plan gate passes nothing (no progress is reported while
     // planning), keeping the streaming scope ignorant of milestones.
     onProgress?: (progress: MilestoneProgress) => void,
+    // Issue #1800: called when the turn yields its FIRST event, i.e. the prompt was really
+    // delivered. A re-drive of the same turn (driveTurnWithEmptyRecovery) calls it again, so the
+    // handler must be idempotent.
+    onFirstEvent?: () => void,
   ): Promise<TurnResult> {
     // A trip may already be pending (e.g. a cancel that landed during the gate).
     if (state.tripReason) throw this.tripError(state);
@@ -3763,7 +3796,16 @@ export class SdkExecutor implements Executor {
         leadSkills: [],
       };
       const turn = this.harness.startTurn(request);
+      let sawFirstEvent = false;
       for await (const event of turn.events) {
+        if (!sawFirstEvent) {
+          sawFirstEvent = true;
+          try {
+            onFirstEvent?.();
+          } catch (err) {
+            this.log.warn("first-event handler threw", { run_id: ctx.runId, error: errMessage(err) });
+          }
+        }
         if (event.kind === "frame") {
           for (const item of event.items) {
             if (item.kind !== "tool" || item.id === undefined) continue;
@@ -3931,6 +3973,7 @@ export class SdkExecutor implements Executor {
     state: RunDrive,
     idleMs: number,
     onProgress?: (progress: MilestoneProgress) => void,
+    onFirstEvent?: () => void,
   ): Promise<TurnResult> {
     // issue #1088: a driveTurn either RETURNS a result (possibly positively-empty) or
     // THROWS. A ProviderTransientError throw is captured (retry it, like an empty turn);
@@ -3954,6 +3997,7 @@ export class SdkExecutor implements Executor {
             state,
             idleMs,
             onProgress,
+            onFirstEvent,
           );
           lastProviderErr = undefined;
           return;
