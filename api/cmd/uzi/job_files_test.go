@@ -364,18 +364,18 @@ func productSkillsFixture() (apitypes.ProductSkillsDTO, []apitypes.ProductDTO) {
 	by := "admin@example.com"
 	staged := time.Date(2026, 9, 11, 9, 0, 0, 0, time.UTC)
 	return apitypes.ProductSkillsDTO{
-			Config:  apitypes.ProductSkillsConfigDTO{SkillsRepoURL: "https://git.example/acme/skills.git", SkillsRef: "main", SkillsTokenSet: true, Enabled: true},
-			Applied: apitypes.ProductSkillsAppliedDTO{SHA: "aaaa1111", AppliedAt: &applied, AppliedBy: &by, Skills: []apitypes.ProductSkillDTO{{Name: "triage", Body: "SECRET BODY"}, {Name: "summarize"}}},
-			Staged: &apitypes.ProductSkillsStagedDTO{
-				SHA: "bbbb2222", StagedAt: staged, StagedBy: &by,
-				Skills:  []apitypes.ProductSkillDTO{{Name: "triage"}, {Name: "translate"}},
-				Dropped: []apitypes.ProductSkillDropDTO{{Name: "evil", Reason: "secret"}, {Reason: "over_limit", Count: 7}},
-				Diff:    apitypes.ProductSkillsDiffDTO{Added: []string{"translate"}, Changed: []string{"triage"}, Removed: []string{"summarize"}, Unchanged: []string{}},
-			},
-		}, []apitypes.ProductDTO{
-			{ID: "p1", Name: "Acme CRM", Enabled: true},
-			{ID: "p2", Name: "Other"},
-		}
+		Config:  apitypes.ProductSkillsConfigDTO{SkillsRepoURL: "https://git.example/acme/skills.git", SkillsRef: "main", SkillsTokenSet: true, Enabled: true},
+		Applied: apitypes.ProductSkillsAppliedDTO{SHA: "aaaa1111", AppliedAt: &applied, AppliedBy: &by, Skills: []apitypes.ProductSkillDTO{{Name: "triage", Body: "SECRET BODY"}, {Name: "summarize"}}},
+		Staged: &apitypes.ProductSkillsStagedDTO{
+			SHA: "bbbb2222", StagedAt: staged, StagedBy: &by,
+			Skills:  []apitypes.ProductSkillDTO{{Name: "triage"}, {Name: "translate"}},
+			Dropped: []apitypes.ProductSkillDropDTO{{Name: "evil", Reason: "secret"}, {Reason: "over_limit", Count: 7}},
+			Diff:    apitypes.ProductSkillsDiffDTO{Added: []string{"translate"}, Changed: []string{"triage"}, Removed: []string{"summarize"}, Unchanged: []string{}},
+		},
+	}, []apitypes.ProductDTO{
+		{ID: "p1", Name: "Acme CRM", Enabled: true},
+		{ID: "p2", Name: "Other"},
+	}
 }
 
 func TestAdminProductsSkillsRender(t *testing.T) {
