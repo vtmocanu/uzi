@@ -1279,19 +1279,25 @@ const SCRATCH_REDACT_INPUT_MAX = 4096;
 /** Bound `text` for the redactor and turn U+2028/U+2029 into LF: the redactor matches a token across
  *  control characters such as LF but not across those two separators, which the first-line pick and
  *  sanitizeForLog would otherwise turn into a cut or a `?` inside an unredacted token. Leading
- *  whitespace is trimmed before the cut so padding cannot push a token onto it. */
+ *  whitespace is trimmed first; text still longer than SCRATCH_REDACT_INPUT_MAX is replaced by a
+ *  marker naming its length, never cut, because a cut can separate a padding-split token from its
+ *  suffix and leave the redactor a bare prefix. */
 function redactorInput(text: string): string {
-  return text.trimStart().slice(0, SCRATCH_REDACT_INPUT_MAX).replace(/[\u2028\u2029]/g, "\n");
+  const trimmed = text.trimStart();
+  if (trimmed.length > SCRATCH_REDACT_INPUT_MAX) {
+    return `[${trimmed.length} characters omitted: over the redaction bound]`;
+  }
+  return trimmed.replace(/[\u2028\u2029]/g, "\n");
 }
 
 /** Redact FIRST, then sanitize and cap: sanitizing first would turn a control character inside a
- *  token into `?` (the redactor no longer matches it) and a cap could leave a token prefix. The
- *  input is bounded before redaction so a huge message costs a bounded redactor pass. */
+ *  token into `?` (the redactor no longer matches it) and a cap could leave a token prefix. An
+ *  oversized message is omitted before redaction (redactorInput), so the redactor pass stays bounded. */
 function redactThenSanitize(redactText: (text: string) => string, text: string): string {
   return sanitizeForLog(redactText(redactorInput(text)), SCRATCH_CAUSE_PART_MAX);
 }
 
-/** The DETAIL path: bound the unsplit raw text, redact it whole (the redactor matches across CR and
+/** The DETAIL path: bound the unsplit raw text (omitting it when oversized), redact it whole (the redactor matches across CR and
  *  LF, so a token split by a newline is caught only before any line split), THEN pick the first
  *  non-empty line and sanitize and cap it. U+2028/U+2029 become LF before redaction (redactorInput). */
 function redactThenFirstLine(redactText: (text: string) => string, text: string): string {

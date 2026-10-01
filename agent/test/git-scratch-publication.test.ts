@@ -642,6 +642,21 @@ it("trims leading padding before bounding rawDetail so a later token is not cut"
   } finally { restore(); }
 });
 
+it("omits an oversized rawDetail rather than cutting a padding-split token to its prefix", { skip: linuxCloneSkip }, async () => {
+  const { bare } = await trackedClean();
+  const token = "tok-" + "z".repeat(40);
+  const err = Object.assign(new Error("subprocess exited 128"), {
+    code: 128, stdout: "", stderr: `fatal: ${token.slice(0, 16)}${"\n".repeat(5000)}${token.slice(16)}`,
+  });
+  const restore = failExec(["--is-shallow-repository"], err);
+  try {
+    const e = await refusal(cache.scratchPublicationPreflight(bare, branch));
+    assert.ok(e.rawDetail !== undefined);
+    assert.ok(!e.rawDetail.includes(token.slice(0, 8)), e.rawDetail);
+    assert.match(e.rawDetail, /characters omitted: over the redaction bound/);
+  } finally { restore(); }
+});
+
 it("derives detail from a megabyte of stderr without scanning it all", { skip: linuxCloneSkip }, async () => {
   const { bare } = await trackedClean();
   const err = Object.assign(new Error("subprocess exited 128"), {

@@ -450,6 +450,26 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     });
   }
 
+  function assertOmittedNoPatPrefix(text: string): void {
+    for (let k = 8; k <= PAT.length; k++) {
+      assert.ok(!text.includes(PAT.slice(0, k)), `a ${k}-char PAT prefix survived: ${text}`);
+    }
+    assert.match(text, /characters omitted: over the redaction bound/);
+  }
+
+  it("omits an oversized rawDetail whose secret is split by interior padding (failure_reason and log)", async () => {
+    const raw = `fatal: ${PAT.slice(0, 16)}${"\n".repeat(5000)}${PAT.slice(16)}`;
+    const { reason, fields } = await finalizeRefusal("redact-interior-pad", undefined, "exit 1", raw);
+    assertOmittedNoPatPrefix(reason);
+    assertOmittedNoPatPrefix(fields);
+  });
+
+  it("omits an oversized logged cause whose secret is split by interior padding", async () => {
+    const cause = new Error(`fatal: ${PAT.slice(0, 16)}${"\n".repeat(5000)}${PAT.slice(16)}`);
+    const { fields } = await finalizeRefusal("redact-cause-interior-pad", cause, "exit 1", "exit 1");
+    assertOmittedNoPatPrefix(fields);
+  });
+
   it("redacts a secret that straddles the sanitized detail cap (failure_reason and log)", async () => {
     const raw = `${"x".repeat(185)}${PAT}`;
     const detail = sanitizeForLog(raw, 197);

@@ -183,8 +183,9 @@ export class ScratchPublicationError extends Error {
   readonly step?: ScratchPublicationStep;
   /** One line, control characters replaced with `?` (sanitizeForLog), capped at DETAIL_MAX; never carries env. */
   readonly detail?: string;
-  /** The bounded, unsplit, unsanitized failure text the runner redacts: the first RAW_DETAIL_MAX
-   *  UTF-16 units of the failure text with leading whitespace trimmed. It can span several lines and
+  /** The bounded, unsplit, unsanitized failure text the runner redacts: the failure text with leading
+   *  whitespace trimmed, or, when that is longer than RAW_DETAIL_MAX UTF-16 units, only a marker naming
+   *  its length (never a cut prefix, see rawText). It can span several lines and
    *  can come from a different source than `detail` (e.g. with 800+ leading blank characters in
    *  stderr, `detail` falls back to the message). A caller that redacts must redact this whole text first
    *  (the redactor matches across CR and LF, so a token split by a newline is only caught on unsplit
@@ -213,11 +214,13 @@ const DETAIL_MAX = 200;
 /** Bound on the unsanitized, unsplit text carried as ScratchPublicationError.rawDetail. */
 const RAW_DETAIL_MAX = 4096;
 
-/** `text` with leading whitespace trimmed, then its RAW_DETAIL_MAX prefix: unsanitized and, on
- *  purpose, not split into lines (see ScratchPublicationError.rawDetail). Trimming before the cut
- *  keeps whitespace padding from pushing a token onto the cut, where only its prefix would remain. */
+/** `text` with leading whitespace trimmed: unsanitized and, on purpose, not split into lines (see
+ *  ScratchPublicationError.rawDetail). Text still longer than RAW_DETAIL_MAX is replaced by a marker
+ *  naming its length, never cut: the redactor matches a token across line breaks, so a token split
+ *  by padding that a cut separates from its suffix would reach the redactor as a bare prefix. */
 function rawText(text: string): string {
-  return String(text).trimStart().slice(0, RAW_DETAIL_MAX);
+  const trimmed = String(text).trimStart();
+  return trimmed.length > RAW_DETAIL_MAX ? `[${trimmed.length} characters omitted: over the redaction bound]` : trimmed;
 }
 
 /** First non-empty line of `text` as a bounded, log-safe detail. Only a prefix of the input
