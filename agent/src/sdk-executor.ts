@@ -4098,7 +4098,8 @@ export class SdkExecutor implements Executor {
           // A transient provider error: retry it like an empty turn, and preserve the
           // session lineage on this throw path (the clean path uses turn.sessionId).
           // driveTurn already resolved the session this turn ran, falling back to the requested
-          // one when it saw none; undefined therefore means a fresh init with no id: start fresh.
+          // one when it saw none; undefined therefore means no session seen and none requested (or a
+          // fresh init with no id): start fresh.
           lastProviderErr = err;
           turn = undefined;
           resumeId = err.sessionId;
