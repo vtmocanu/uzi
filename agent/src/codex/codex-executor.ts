@@ -3437,7 +3437,7 @@ export class CodexExecutor implements Executor {
       }
       agents[t.name] = toHarnessAgent(t);
     }
-    const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind }).append;
+    const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex" }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
     const request: RunTurnRequest = {
@@ -4007,12 +4007,13 @@ function commandEffectSpec(
 }
 
 /** Run a model-authorized shell effect as a registered command supervisor root.
- * The callback returns only after the primary child and every backgrounded
- * descendant have settled; abort/cap paths also reap before returning. At the wall
- * deadline the root is reaped before {@link CommandDeadlineError} is thrown. Any other
- * waitChild rejection also reaps first; with the real launcher that reap is unclean after
- * the supervisor's fail(), so it surfaces as COMMAND_ROOT_UNREAPED with the registry
- * poisoned (fail-closed). `wallMs` is a test seam; production uses the default. */
+ * On the normal path, waitChild observes the primary child's exit, then reapRoot
+ * terminates remaining backgrounded descendants before the callback returns; abort/cap
+ * paths also reap before returning. At the wall deadline the root is reaped before
+ * {@link CommandDeadlineError} is thrown. Any other waitChild rejection also reaps first;
+ * with the real launcher that reap is unclean after the supervisor's fail(), so it surfaces
+ * as COMMAND_ROOT_UNREAPED with the registry poisoned (fail-closed). `wallMs` is a test
+ * seam; production uses the default. */
 export function makeDefaultSpawnCommand(
   registry: ExecutionRegistry,
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,

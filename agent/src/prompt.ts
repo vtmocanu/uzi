@@ -281,9 +281,21 @@ export const WORKER_RUNTIME_APPEND = [
   WORKER_TOOLBOX_RULE,
 ].join("\n");
 
+/** Codex command-root lifetime guidance for the lead and Codex subagents. */
+export const CODEX_LONG_COMMAND_APPEND = [
+  "On the Codex harness, a command waits for its primary process to exit,",
+  "then reaps the command root, terminating background descendants before returning; abort,",
+  "output-cap and wall-deadline paths reap it too.",
+  "So do not background a gate and expect to poll it later or rely on its result.",
+  "Run one long gate in the foreground:",
+  "`log=$(mktemp .uzi/scratch/gate-log.XXXXXX); rc=0; <gate command> > \"$log\" 2>&1 || rc=$?; echo \"EXIT=$rc\" >> \"$log\"; printf 'LOG=%s\\n' \"$log\"; test \"$rc\" -eq 0`",
+  "After that command call exits, read the printed log path in a separate call and report",
+  "its recorded exit status.",
+].join("\n");
+
 /**
- * The Claude harness's HOW for COMMAND_LIFETIME_RULE (the Codex Bash tool has no timeout
- * argument and already waits for background descendants, so it never gets this). Verified
+ * The Claude harness's HOW for COMMAND_LIFETIME_RULE. Codex has its own command-root
+ * lifetime guidance in CODEX_LONG_COMMAND_APPEND. Verified
  * against the CLI bundled with the Agent SDK: a Bash call past its timeout is
  * auto-backgrounded (`timedOutAfterMs`), only a standalone `sleep N` is blocked, and each
  * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. The
@@ -412,9 +424,9 @@ export interface LeadSystemPromptOptions {
    *  LAST — after every guardrail/lifecycle/untrusted-subagent append, so nothing
    *  in the untrusted block precedes the guardrail text. Lead-only. */
   repoInstructions?: string;
-  /** The harness running this lead. "claude" appends CLAUDE_LONG_COMMAND_APPEND, the
-   *  Claude Bash tool's long-command recipe; absent (the Codex executor) appends nothing. */
-  harness?: "claude";
+  /** The harness running this lead. Explicit "claude" and "codex" select their
+   *  command-lifetime guidance; absent appends neither recipe. */
+  harness?: "claude" | "codex";
 }
 
 // isMrReworkKind reports whether the run kind is the PRD #700 mr_rework kind (the
@@ -454,6 +466,7 @@ export function buildLeadSystemPrompt(
   // inside the untrusted-repo fence (repoInstructions is pushed last).
   parts.push(SECRET_FIXTURE_HYGIENE_APPEND);
   if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
+  if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
   // PRD #700 M4: the mr_rework run-lifecycle note. Gated on the kind so an issue/
   // ci_fix/self_improve run's prompt is byte-identical to before.
