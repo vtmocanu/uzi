@@ -459,11 +459,11 @@ describe("IssueCard \u2014 PRD presence badge + runnable marker (PRD #764)", () 
 
 // Issue #256 M4 (Decision 4/6): every card wears a uniform per-state duration token
 // beside its status badge, and the running elapsed no longer lives INSIDE the badge —
-// the badge reads a bare "running" while the token carries "running <elapsed>". The
-// board's LatestRun has no started_at, so running counts from created_at (the DEGRADED
-// variant, Decision 6): no board-specific code. Issue #2004 superseded the terminal half of
-// Decision 6: LatestRun now carries first_started_at and finished_at, so a terminal card
-// shows `ran <elapsed>`; only an older api without the stamps yields no token.
+// the badge reads a bare "running" while the token carries "running <elapsed>". Issue #2004
+// superseded Decision 6's degraded board: LatestRun now carries first_started_at and
+// finished_at, so a running card counts from the first start and a terminal card shows
+// `ran <elapsed>`. Only an older api (or a never-stamped run) degrades: running falls back to
+// created_at and a terminal card carries no token. No board-specific code either way.
 describe("IssueCard duration token (issue #256 M4)", () => {
   // Anchor Date.now() so the elapsed is deterministic — the card reads Date.now()
   // inline (Decision 3, riding the existing poll).
