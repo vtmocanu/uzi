@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Run lists avoid scanning unrelated messages for plan revision state ([#2041](https://github.com/vtmocanu/uzi/issues/2041)).**
+  A concurrently built partial index keeps the plan revision lookup scoped to plan and plan_revising frames as run histories grow, reducing board refresh delays without changing revision flags.
+
 ### Added
 
 - **Renovate proposes grouped Codex runtime upgrades.**
