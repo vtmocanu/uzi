@@ -1690,7 +1690,7 @@ describe("CodexHarness: modelInitiated inclusion evidence (issue #1800)", () => 
     params: { threadId, item: { type } },
   });
 
-  it("a root-thread item/started and item/completed of a tool item type is marked modelInitiated", async () => {
+  it("a root-thread item/started of a tool item type is marked modelInitiated; its item/completed is not", async () => {
     const { harness, transport } = makeHarness();
     transport
       .push(threadStarted())
@@ -1698,7 +1698,18 @@ describe("CodexHarness: modelInitiated inclusion evidence (issue #1800)", () => 
       .push(itemNote("item/completed", "commandExecution", "th-1"))
       .push(turnCompleted("completed"))
       .end();
-    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 2);
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 1);
+  });
+
+  it("a root-thread item/completed alone (no start this turn) is not marked modelInitiated", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(itemNote("item/completed", "commandExecution", "th-1"))
+      .push(itemNote("item/completed", "mcpToolCall", "th-1"))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 0);
   });
 
   it("a child/foreign-thread commandExecution item is not marked modelInitiated", async () => {

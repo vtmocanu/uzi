@@ -9173,6 +9173,29 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.deepEqual(seams.included, [], "but nothing evidenced the model processing it");
   });
 
+  it("a root tool item/completed with no start this turn does not stamp the follow-up when the turn fails", async () => {
+    // A completion is a result, possibly of an item started before this turn: it must not prove the
+    // model read the follow-up, so a failing turn keeps it unreported for the next claim's requeue.
+    const rig = makeMultiEpochRig([
+      (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          const tn = `tn-th-1-${c.turnStartCount}`;
+          c.transport.push(threadStarted("th-1"));
+          c.transport.push({ kind: "activity", method: "item/completed", params: { threadId: "th-1", item: { type: "commandExecution" } } });
+          c.transport.push(turnCompleted("failed", "th-1", tn));
+          return { turn: { id: tn } };
+        }
+        return {};
+      },
+    ]);
+    const seams = followUpSeams([A]);
+    const { ctx } = makeCtx({ pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx).catch(() => undefined), 5000, "#1800 completion-only run");
+    assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A), "the turn carried it");
+    assert.deepEqual(seams.included, [], "a tool completion alone is not inclusion evidence");
+  });
+
   it("(e) a completion-rework turn does not carry the held follow-up; the next ordinary turn does", async () => {
     const queue: string[] = [];
     const rig = makeMultiEpochRig([
