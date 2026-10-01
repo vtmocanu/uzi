@@ -2289,9 +2289,10 @@ export class SdkExecutor implements Executor {
       // turn for, so that branch is taken at most once per id.
       let serviceTriedId: number | undefined;
       // Issue #1800: follow-ups the interactive park received while ownerFollowUp was still held,
-      // in arrival order. They are already consumed from the server, so they must never be
-      // dropped: they refill the slot at the loop top (ahead of a fresh pull) and the park below
-      // services them before it blocks again.
+      // in arrival order. They are already consumed from the server; the queue is in-memory only.
+      // They refill the slot at the loop top (ahead of a fresh pull) and are serviced once the
+      // held follow-up reaches the model. A follow-up stranded by a run end stays
+      // consumed-but-not-included and is re-queued at the next claim (server-side).
       const queuedOwner: Array<{ id: number; body: string }> = [];
       // PRD #517 M3 (Fix 3): latches TRUE the first time this run parks at an interactive
       // follow-up. The first-turn-only prompt scaffolding (the "your plan was approved"
@@ -2896,8 +2897,8 @@ export class SdkExecutor implements Executor {
             // once per held id (`serviceTriedId`), and the system `followUp` text is cleared so the
             // extra turn cannot replay a spent one. If the slot is STILL held after that turn, fall
             // through to the normal park: the follow-up stays unincluded and is re-queued at the
-            // next claim. A follow-up the park receives meanwhile queues BEHIND it (queuedOwner),
-            // and queued ones are serviced before any further park, so none is ever overwritten.
+            // next claim (server-side). A follow-up the park receives meanwhile queues BEHIND it
+            // (queuedOwner); queued ones are serviced once the held one reaches the model.
             if (
               (ownerFollowUp !== undefined && serviceTriedId !== ownerFollowUp.id)
               || (ownerFollowUp === undefined && queuedOwner.length > 0)

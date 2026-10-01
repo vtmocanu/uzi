@@ -9133,22 +9133,23 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.deepEqual(startsAtStamp, [2], "stamped by the turn/start that streamed model output, not the dropped one");
   });
 
-  it("a turn whose only model output is a command and a dynamic tool call stamps once and the follow-up is not re-rendered", async () => {
-    const acts: TurnScript = (th, tn) => [
-      { kind: "activity", method: "item/started", params: { threadId: th, item: { type: "commandExecution", command: "ls" } } },
-      { kind: "activity", method: "item/completed", params: { threadId: th, item: { type: "commandExecution", command: "ls" } } },
-      toolCall(41, "some_dynamic_tool", {}, th, tn, "c-dyn-41"),
-    ];
-    const rig = makeMultiEpochRig([script("th-1", [acts, (th, tn) => [done(42, th, tn)]])]);
-    const seams = followUpSeams([A]);
-    const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
-    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 tool-only run");
-    const texts = turnTexts(rig.epochs[0]!.transport);
-    assert.equal(texts.length, 2);
-    assert.ok(texts[0]!.includes(A), "turn 1 carried it");
-    assert.ok(!texts[1]!.includes(A), "turn 2 must not re-render it");
-    assert.deepEqual(seams.included, [1], "stamped exactly once");
-  });
+  for (const type of ["commandExecution", "fileChange"] as const) {
+    it(`a turn whose only model output is a ${type} item stamps once and the follow-up is not re-rendered`, async () => {
+      const acts: TurnScript = (th) => [
+        { kind: "activity", method: "item/started", params: { threadId: th, item: { type } } },
+        { kind: "activity", method: "item/completed", params: { threadId: th, item: { type } } },
+      ];
+      const rig = makeMultiEpochRig([script("th-1", [acts, (th, tn) => [done(42, th, tn)]])]);
+      const seams = followUpSeams([A]);
+      const { ctx } = makeCtx({ config: { max_iterations: 5 }, pullFollowUp: seams.pullFollowUp, followUpIncluded: seams.followUpIncluded });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, `#1800 ${type}-only run`);
+      const texts = turnTexts(rig.epochs[0]!.transport);
+      assert.equal(texts.length, 2);
+      assert.ok(texts[0]!.includes(A), "turn 1 carried it");
+      assert.ok(!texts[1]!.includes(A), "turn 2 must not re-render it");
+      assert.deepEqual(seams.included, [1], "stamped exactly once");
+    });
+  }
 
   it("thread and turn lifecycle notifications alone do not stamp the follow-up", async () => {
     // A turn whose only notifications are thread/started and a FAILED turn/completed: the model

@@ -1681,6 +1681,51 @@ describe("CodexHarness: item content decode", () => {
   });
 });
 
+describe("CodexHarness: modelInitiated inclusion evidence (issue #1800)", () => {
+  const modelInitiated = (events: HarnessEvent[]): number =>
+    events.filter((e) => e.kind === "activity" && e.modelInitiated === true).length;
+  const itemNote = (method: string, type: string, threadId: string): CodexNotification => ({
+    kind: "activity",
+    method,
+    params: { threadId, item: { type } },
+  });
+
+  it("a root-thread item/started and item/completed of a tool item type is marked modelInitiated", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(itemNote("item/started", "commandExecution", "th-1"))
+      .push(itemNote("item/completed", "commandExecution", "th-1"))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 2);
+  });
+
+  it("a child/foreign-thread commandExecution item is not marked modelInitiated", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(itemNote("item/started", "commandExecution", "child-thread"))
+      .push(itemNote("item/completed", "commandExecution", "child-thread"))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 0);
+  });
+
+  it("userMessage items and lifecycle / token-usage notifications stay unmarked", async () => {
+    const { harness, transport } = makeHarness();
+    transport
+      .push(threadStarted())
+      .push(turnStarted())
+      .push(itemNote("item/started", "userMessage", "th-1"))
+      .push(itemNote("item/completed", "userMessage", "th-1"))
+      .push(tokenUsage({}, {}))
+      .push(turnCompleted("completed"))
+      .end();
+    assert.equal(modelInitiated(await collect(harness.startTurn(makeRequest()).events)), 0);
+  });
+});
+
 describe("CodexHarness: owner abort cancels a turn wedged in a broker callback", () => {
   it("an owner abort ENDS a turn wedged in a never-settling broker callback (no hang)", async () => {
     const ac = new AbortController();
