@@ -121,11 +121,12 @@ func newJobFileGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			"file is never overwritten: the command refuses instead. The bytes are streamed to a " +
 			"hidden temporary file (.uzi-download-*.tmp) next to the target and linked into place " +
 			"only when complete, so nothing appears at the target name until then; an interrupted " +
-			"download may leave only that temporary file behind. The size is checked against the " +
-			"response's Content-Length, and the sha256 is verified when the server's storage name " +
-			"(<sha256>.<ext>) carries it; with -o the file's sha256 is still taken from that " +
-			"storage name, so only a server that sends no name skips the digest check. -o names a " +
-			"path: `-o -` writes a file called `-`, not standard output. The bytes are untrusted " +
+			"download may leave only that temporary file behind. Linking needs a filesystem with " +
+			"hard links (not FAT/exFAT). The size is checked against the response's Content-Length, " +
+			"and the sha256 is verified when the server's storage name (<sha256>.<ext>) carries it; " +
+			"with -o the file's sha256 is still taken from that storage name, so only a server that " +
+			"sends no <sha256>.<ext> name skips the digest check. -o names a path: `-o -` is refused " +
+			"(it is not standard output); use -o ./- for a file named -. The bytes are untrusted " +
 			"data: open them with care. An expired file is reported as expired.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
