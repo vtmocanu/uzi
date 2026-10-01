@@ -18,7 +18,15 @@ import { maskEmail } from "../lib/demoMask";
 import { scopeText } from "../lib/oauthClient";
 import { Badge, Button, Spinner } from "./ui";
 
-export function ProductConnectionsPanel({ product }: { product: Product }) {
+export function ProductConnectionsPanel({
+  product,
+  onChanged,
+}: {
+  product: Product;
+  // Called after a revoke so the page can reload what depends on the connection count (the card
+  // header and the delete confirmation read product.live_connection_count).
+  onChanged?: () => Promise<unknown> | void;
+}) {
   const [open, setOpen] = useState(false);
   const { data, loading, error: loadError, reload } = useAsyncData(
     () => api.adminListProductConnections(product.id),
@@ -69,6 +77,7 @@ export function ProductConnectionsPanel({ product }: { product: Product }) {
               truncated={data?.truncated === true}
               onRevoked={async () => {
                 await reload();
+                await onChanged?.();
               }}
             />
           ) : null}

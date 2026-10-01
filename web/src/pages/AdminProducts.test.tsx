@@ -18,6 +18,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminUpdateProduct: vi.fn(),
       adminDeleteProduct: vi.fn(),
       adminRevokeProductToken: vi.fn(),
+      adminListProductConnections: vi.fn(),
+      adminRevokeOAuthConnection: vi.fn(),
       // AdminShell's health pip self-fetches; it never settles here, so the pip stays off.
       getAdminHealth: vi.fn(() => new Promise(() => {})),
     },
@@ -170,6 +172,44 @@ describe("AdminProducts writes", () => {
     renderPage();
     fireEvent.click(await screen.findByRole("switch", { name: "Disable Helpdesk assistant" }));
     await waitFor(() => expect(mockApi.adminUpdateProduct).toHaveBeenCalledWith("prod-a", { enabled: false }));
+  });
+
+  it("updates the card's connection count after a revoke in the Connections panel", async () => {
+    mockApi.adminListProducts
+      .mockResolvedValueOnce({ products: [aProduct({ active_token_count: 3, live_connection_count: 1 })] })
+      .mockResolvedValue({ products: [aProduct({ active_token_count: 3, live_connection_count: 0 })] });
+    mockApi.adminListProductConnections
+      .mockResolvedValueOnce({
+        connections: [
+          {
+            id: "g1",
+            user_id: "u1",
+            owner_email: "ann@example.test",
+            scopes: ["jobs:run"],
+            connected_at: daysAgo(3),
+            created_at: daysAgo(30),
+            last_used_at: null,
+          },
+        ],
+        truncated: false,
+      })
+      .mockResolvedValue({ connections: [], truncated: false });
+    mockApi.adminRevokeOAuthConnection.mockResolvedValue(null);
+    const { container } = renderPage();
+
+    expect(await screen.findByText("3 active manual tokens, 1 connection")).toBeTruthy();
+    const details = Array.from(container.querySelectorAll("details")).find((d) =>
+      d.textContent?.includes("The users who connected this product"),
+    ) as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke the connection of ann@example.test" }));
+    fireEvent.click(await screen.findByRole("button", { name: "Revoke connection" }));
+
+    await waitFor(() => expect(mockApi.adminRevokeOAuthConnection).toHaveBeenCalledWith("g1"));
+    // The page reloaded the registry: the card header no longer counts the connection.
+    expect(await screen.findByText("3 active manual tokens")).toBeTruthy();
+    expect(screen.queryByText("3 active manual tokens, 1 connection")).toBeNull();
   });
 
   it("confirms delete with the manual tokens and connections it stops, then reports both stopped counts", async () => {

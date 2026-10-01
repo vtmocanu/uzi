@@ -119,11 +119,16 @@ ALTER TABLE product_tokens
 --   * (grant_id, created_at) serves the mint-rate bound (CountGrantTokensMintedSince, revoked rows
 --     included) and, as a grant_id prefix, the grant's revoke sweeps and the NO ACTION FK check;
 --   * (grant_id, expires_at) WHERE NOT revoked serves the ten-live-token count
---     (CountLiveGrantTokens), which reads only unrevoked rows past now().
+--     (CountLiveGrantTokens), which reads only unrevoked rows past now();
+--   * (grant_id, last_used_at DESC) WHERE last_used_at IS NOT NULL serves the connections lists'
+--     last-used column as a top-1 probe per grant (ListLiveOAuthGrantsForUser/ForProduct), so a
+--     grant's never-pruned token history is not read to find its latest use.
 CREATE INDEX idx_product_tokens_grant ON product_tokens (grant_id, created_at) WHERE grant_id IS NOT NULL;
 CREATE INDEX idx_product_tokens_grant_live ON product_tokens (grant_id, expires_at) WHERE grant_id IS NOT NULL AND NOT revoked;
+CREATE INDEX idx_product_tokens_grant_last_used ON product_tokens (grant_id, last_used_at DESC) WHERE grant_id IS NOT NULL AND last_used_at IS NOT NULL;
 
 -- +goose Down
+DROP INDEX idx_product_tokens_grant_last_used;
 DROP INDEX idx_product_tokens_grant_live;
 DROP INDEX idx_product_tokens_grant;
 ALTER TABLE product_tokens DROP COLUMN grant_id;

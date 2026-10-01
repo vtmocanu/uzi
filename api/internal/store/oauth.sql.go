@@ -643,7 +643,9 @@ SELECT g.id,
        g.created_at,
        GREATEST(
            g.refresh_last_used_at,
-           (SELECT max(t.last_used_at) FROM product_tokens t WHERE t.grant_id = g.id)
+           (SELECT t.last_used_at FROM product_tokens t
+             WHERE t.grant_id = g.id AND t.last_used_at IS NOT NULL
+             ORDER BY t.last_used_at DESC LIMIT 1)
        )::timestamptz AS last_used_at
   FROM oauth_grants g
   JOIN users u ON u.id = g.user_id
@@ -712,7 +714,9 @@ SELECT g.id,
        g.refresh_issued_at,
        GREATEST(
            g.refresh_last_used_at,
-           (SELECT max(t.last_used_at) FROM product_tokens t WHERE t.grant_id = g.id)
+           (SELECT t.last_used_at FROM product_tokens t
+             WHERE t.grant_id = g.id AND t.last_used_at IS NOT NULL
+             ORDER BY t.last_used_at DESC LIMIT 1)
        )::timestamptz AS last_used_at
   FROM oauth_grants g
   JOIN products p ON p.id = g.product_id
@@ -734,7 +738,9 @@ type ListLiveOAuthGrantsForUserRow struct {
 
 // The caller's live grants (revoked_at IS NULL) whatever the state of their access tokens: a grant
 // whose tokens all expired is still a live connection. last_used_at is the later of the refresh
-// token's last use and the latest use of any of the grant's access tokens (GREATEST skips NULLs).
+// token's last use and the latest use of any of the grant's access tokens (GREATEST skips NULLs). The access-token half is a
+// top-1 probe of idx_product_tokens_grant_last_used per grant, never a read of the grant's whole
+// never-pruned token history.
 // Bounded by the one-live-grant-per-(user, product) index: at most one row per product.
 func (q *Queries) ListLiveOAuthGrantsForUser(ctx context.Context, userID uuid.UUID) ([]ListLiveOAuthGrantsForUserRow, error) {
 	rows, err := q.db.Query(ctx, listLiveOAuthGrantsForUser, userID)

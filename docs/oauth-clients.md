@@ -91,7 +91,7 @@ All steps are browser actions under **Admin → Products**, on the product's car
 
 The section then shows **Client** once all three parts exist, and says what is still missing until then.
 
-To stop a product being a client, clear every URI and every scope and save. The secret is kept, so registering it again later does not need a new one; rotate it if you want it gone.
+To stop a product being a client, clear every URI and every scope and save. The secret is kept, so registering it again later does not need a new one; rotate it if you want it gone. Narrowing or clearing the registration does not cut access at once: existing access tokens keep their scopes until they expire (at most one hour); only refresh is refused. Disable the product to cut access immediately.
 
 ## Redirect URI rules
 

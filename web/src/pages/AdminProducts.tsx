@@ -426,7 +426,8 @@ function ProductCard({
   onJobTypes: (allowed: string[]) => Promise<{ error: string } | { error: null; saved: string[] }>;
   onDelete: () => Promise<boolean>;
   onRevoke: (t: AdminProductToken) => Promise<boolean>;
-  // Reloads the registry after an OAuth client write (the panel owns its own banners).
+  // Reloads the registry after an OAuth client write or a connection revoke (the panels own their
+  // own banners).
   onOAuthChanged: () => Promise<unknown> | void;
 }) {
   const deleted = product.deleted_at !== null;
@@ -605,7 +606,7 @@ function ProductCard({
 
         {/* PRD #1910 M5: the users who connected the product through OAuth, with a revoke. A
             deleted product still lists what it had (the audit trail). */}
-        <ProductConnectionsPanel product={product} />
+        <ProductConnectionsPanel product={product} onChanged={onOAuthChanged} />
       </Card>
     </section>
   );

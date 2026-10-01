@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -212,6 +214,125 @@ func TestGrantTokenCountsUseIndexesLiveDB(t *testing.T) {
 		}
 		if strings.Contains(c.got, "Seq Scan") {
 			t.Errorf("%s seq-scans the table:\n%s", c.name, c.got)
+		}
+	}
+}
+
+// TestGrantListLastUsedIsATopOneIndexProbeLiveDB: the two connections lists (ListLiveOAuthGrantsForUser
+// and, reachable with a uza_ token, ListLiveOAuthGrantsForProduct) show each grant's last use. A
+// grant's product_tokens history is never pruned (about 64,800 rows for one 90-day grant at the
+// 30/h mint cap), so the last-use subquery must be a top-1 probe of idx_product_tokens_grant_last_used
+// (grant_id, last_used_at DESC) per grant and never an aggregate over the whole history. It runs
+// EXPLAIN (ANALYZE) on the statements the generated code really executes (the unexported
+// listLiveOAuthGrantsForUser and listLiveOAuthGrantsForProduct constants), with the parameters
+// inlined as literals, over three live grants of 5000 tokens each seeded in a transaction that is
+// rolled back, and asserts the subplan is an index scan under a Limit that returns one row per
+// probe. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestGrantListLastUsedIsATopOneIndexProbeLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	pg := conn.Conn().PgConn()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sql).ReadAll(); err != nil {
+			_, _ = pg.Exec(ctx, `ROLLBACK`).ReadAll()
+			t.Fatalf("%q: %v", sql, err)
+		}
+	}
+	exec(`SET enable_seqscan = off`)
+	defer func() { _, _ = pg.Exec(ctx, `RESET enable_seqscan`).ReadAll() }()
+
+	const (
+		productID = "00000000-0000-4000-8000-0000000000b2"
+		userID    = "00000000-0000-4000-8000-000000000001"
+	)
+	exec(`BEGIN`)
+	exec(`INSERT INTO users (id, email, password_hash)
+	      SELECT ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, 'grant-last-used-' || i || '@example.test', 'x'
+	        FROM generate_series(1, 3) i`)
+	exec(`INSERT INTO products (id, name) VALUES ('` + productID + `', 'grant-last-used')`)
+	exec(`INSERT INTO oauth_grants (id, user_id, product_id, scopes)
+	      SELECT ('00000000-0000-4000-8000-' || lpad((100 + i)::text, 12, '0'))::uuid,
+	             ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid,
+	             '` + productID + `', ARRAY['jobs:read']
+	        FROM generate_series(1, 3) i`)
+	exec(`INSERT INTO product_tokens (user_id, product_id, name, token_hash, token_prefix, scopes, revoked, created_at, expires_at, last_used_at, grant_id)
+	      SELECT ('00000000-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid, '` + productID + `', 'plan', sha256((g || '-' || i)::text::bytea), 'uzp_plan', ARRAY['jobs:read'],
+	             i > 3, now() - (i || ' minutes')::interval, now() - (i || ' minutes')::interval + interval '1 hour',
+	             CASE WHEN i % 2 = 0 THEN now() - (i || ' seconds')::interval END,
+	             ('00000000-0000-4000-8000-' || lpad((100 + g)::text, 12, '0'))::uuid
+	        FROM generate_series(1, 3) g, generate_series(1, 5000) i`)
+	exec(`ANALYZE product_tokens`)
+	analyze := func(sql string) string {
+		t.Helper()
+		sql = strings.ReplaceAll(sql, "$2", "1000")
+		sql = strings.ReplaceAll(sql, "$1", "'"+productID+"'::uuid")
+		results, err := pg.Exec(ctx, `EXPLAIN (ANALYZE, COSTS OFF, TIMING OFF) `+sql).ReadAll()
+		if err != nil {
+			_, _ = pg.Exec(ctx, `ROLLBACK`).ReadAll()
+			t.Fatalf("explain: %v", err)
+		}
+		var b strings.Builder
+		for _, res := range results {
+			for _, row := range res.Rows {
+				b.WriteString(string(row[0]) + "\n")
+			}
+		}
+		return b.String()
+	}
+	// The user list takes the user id as $1; the product list takes the product id as $1.
+	forUser := analyze(strings.Replace(listLiveOAuthGrantsForUser, "$1", "'"+userID+"'::uuid", 1))
+	forProduct := analyze(listLiveOAuthGrantsForProduct)
+	exec(`ROLLBACK`)
+
+	oneRow := regexp.MustCompile(`rows=1(\.00)? loops=\d+`)
+	for _, c := range []struct {
+		name, got string
+		probes    int
+	}{
+		{"ListLiveOAuthGrantsForUser", forUser, 1},
+		{"ListLiveOAuthGrantsForProduct", forProduct, 3},
+	} {
+		if !strings.Contains(c.got, "idx_product_tokens_grant_last_used") {
+			t.Errorf("%s does not use idx_product_tokens_grant_last_used:\n%s", c.name, c.got)
+		}
+		if !strings.Contains(c.got, "Limit") {
+			t.Errorf("%s has no Limit over the last-use probe:\n%s", c.name, c.got)
+		}
+		if strings.Contains(c.got, "Seq Scan on product_tokens") || strings.Contains(c.got, "Aggregate") {
+			t.Errorf("%s scans or aggregates the token history:\n%s", c.name, c.got)
+		}
+		var scanned bool
+		for _, line := range strings.Split(c.got, "\n") {
+			if !strings.Contains(line, "idx_product_tokens_grant_last_used") {
+				continue
+			}
+			scanned = true
+			if !oneRow.MatchString(line) {
+				t.Errorf("%s: the index probe does not return one row per grant: %s\n%s", c.name, strings.TrimSpace(line), c.got)
+			}
+			if !strings.Contains(line, "loops="+strconv.Itoa(c.probes)) {
+				t.Errorf("%s: want %d probes (one per live grant): %s", c.name, c.probes, strings.TrimSpace(line))
+			}
+		}
+		if !scanned {
+			t.Errorf("%s: no index scan line in the plan:\n%s", c.name, c.got)
 		}
 	}
 }

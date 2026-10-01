@@ -35,7 +35,7 @@ Tracked as GitLab issue vtmocanu/uzi#1; PRD at `prds/done/1-simple-webui-user-re
 - Simple web UI with user support and registration.
 - Plain user/password registration stored in the DB.
 - No email (no OTP, no verification, no reset for now).
-- No SSO/OAuth.
+- No SSO/OAuth. (This concerns logging in to uzi and was superseded by #45; since #1910 uzi acts as an OAuth server for registered products. (AI-synced 2026-10-01))
 - Auth flow: password + revocation.
 - Stack: Go API + React/Vite SPA.
 - Minimal-shell scope: landing, register/login, protected dashboard, admin user list.
@@ -841,7 +841,7 @@ Tracked as GitHub issue vtmocanu/uzi#1867; PRD at `prds/1867-failed-run-salvage-
 
 Tracked as GitHub issue vtmocanu/uzi#1907; PRD at `prds/1907-product-tokens-api-v1.md`.
 
-- An admin registers an external product; a user then mints a `uzp_` product token for it in Settings → Access, which acts as that user (once job endpoints exist, on the user's own worker and model credential) but only on the stable, versioned `/api/v1` and never with admin authority, and is refused on every other route exactly like an unknown token. A user holds at most 10 active tokens per product, chooses an expiry (30 days, 90 days by default, 1 year or never), and can revoke one token or use the existing Revoke all, which now covers product tokens too; an admin can revoke one product token or disable or delete a product, which cuts off all its tokens on their next request. A password change and logout do not revoke them. `/api/v1` changes are additive only, with a deprecation window of at least two minor releases and 90 days. Only `GET /api/v1/whoami` exists so far; job endpoints come later. (AI-synced 2026-09-29)
+- An admin registers an external product; a user then mints a `uzp_` product token for it in Settings → Access, which acts as that user (once job endpoints exist, on the user's own worker and model credential) but only on the stable, versioned `/api/v1` and never with admin authority, and is refused on every other route exactly like an unknown token. A user holds at most 10 active manually created tokens per product (connections made through OAuth, #1910, are counted apart), chooses an expiry (30 days, 90 days by default, 1 year or never), and can revoke one token or use the existing Revoke all, which now covers product tokens too; an admin can revoke one product token or disable or delete a product, which cuts off all its tokens on their next request. A password change and logout do not revoke them. `/api/v1` changes are additive only, with a deprecation window of at least two minor releases and 90 days. Only `GET /api/v1/whoami` exists so far; job endpoints come later. (AI-synced 2026-09-29)
 - `/api/v1` now serves `whoami` and the jobs endpoints of Feature #1908. (AI-synced 2026-09-30)
 
 ## Feature #1908 — Repo-less jobs over `/api/v1`
@@ -872,6 +872,17 @@ Tracked as GitHub issue vtmocanu/uzi#1909; PRD at `prds/1909-job-files-product-s
 - A result's `source_url` is set only when the file's hash matches a page the same job fetched; nothing the agent claims sets it. (AI-synced 2026-09-30)
 - An admin can give a product a skills repo (allowlisted base URLs, write-only clone token); synced skills reach that product's jobs only after the admin approves the exact commit, and no other run ever receives a product skill. (AI-synced 2026-09-30)
 - New jobs run only on workers that advertise `job_files_v1`. (AI-synced 2026-09-30)
+
+## Feature #1910 — Connect uzi (OAuth for external products)
+
+Tracked as GitHub issue vtmocanu/uzi#1910; PRD at `prds/done/1910-connect-uzi-oauth.md`.
+
+- An admin registers a product as a confidential OAuth client: exact redirect URIs, the scopes it may request and a `uzs_` client secret that is shown once. A product with none of these is not a client; pasted `uzp_` tokens keep working for every product. (AI-synced 2026-10-01)
+- A product sends the user to uzi (authorization code with PKCE S256); uzi always shows an explicit consent page, and the user approves or denies. No public clients, no implicit or password grant, no OpenID Connect provider features. (AI-synced 2026-10-01)
+- The product gets a one-hour access token that goes through the same `/api/v1` enforcement as a pasted token, and a non-rotating refresh token valid 30 days idle and 90 days from the user's latest consent. (AI-synced 2026-10-01)
+- Users see and revoke their connections in Settings → Access → Connected products; admins see and revoke a product's connections on its card; the CLI lists them read-only. Revoke all includes connections. (AI-synced 2026-10-01)
+- Revoking a connection or one of its tokens cancels the jobs it created. A password change and logout do not revoke a connection. Disabling a product or deactivating a user refuses its access until re-enabled. (AI-synced 2026-10-01)
+- Narrowing or clearing a product's registration leaves existing access tokens with their scopes until they expire (at most one hour); disable the product to cut access at once. (AI-synced 2026-10-01)
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker
 

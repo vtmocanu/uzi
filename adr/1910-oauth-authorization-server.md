@@ -1,9 +1,9 @@
 # ADR-1910: uzi is a minimal in-tree OAuth authorization server for registered products
 
-**Status**: Accepted (PRD #1910 M1-M5 implemented; the M6 audit is not done)
+**Status**: Accepted (PRD #1910 M1-M6 implemented and audited; the M6 audit found one High, fixed with `TestGrantListLastUsedIsATopOneIndexProbeLiveDB`, and two Lows, addressed in the docs and this record)
 **Date**: 2026-10-01
 **Issue**: [vtmocanu/uzi#1910](https://github.com/vtmocanu/uzi/issues/1910)
-**PRD**: [prds/1910-connect-uzi-oauth.md](../prds/1910-connect-uzi-oauth.md)
+**PRD**: [prds/done/1910-connect-uzi-oauth.md](../prds/done/1910-connect-uzi-oauth.md)
 
 ## Decision (summary)
 
@@ -80,6 +80,20 @@ access token and a refresh token, until the connection is revoked.
    WHERE NOT revoked` the live count, and `TestGrantTokenCountsUseIndexesLiveDB`
    EXPLAINs both. A product refreshes about once an hour, so the bound is far
    above honest use.
+
+   Resource-bound note. The connections lists show each grant's last use. A
+   grant's token history is never pruned (about 64,800 rows for one 90-day grant
+   at the 30-an-hour cap), so both lists read it through
+   `idx_product_tokens_grant_last_used (grant_id, last_used_at DESC)` as a top-1
+   probe per grant (`ORDER BY last_used_at DESC LIMIT 1`), never an aggregate,
+   pinned by `TestGrantListLastUsedIsATopOneIndexProbeLiveDB`. Two statements
+   still read every UNREVOKED row of one grant: the scope check on approve
+   (`OAuthGrantHasTokenOutsideScopes`) and the token sweep on revoke
+   (`RevokeOAuthGrantProductTokens`). They run only on a user, admin or product
+   revoke or approve action, are served by `idx_product_tokens_grant_live`, and
+   read at most the grant's unrevoked rows, which are bounded by the mint rate
+   times the grant's lifetime since its last revoke (expired tokens are not
+   revoked, because that would cancel their jobs). Pruning stays out of scope.
 6. **Grant tokens are not manual tokens (D5).** Rows with a `grant_id` are
    excluded from the user and admin token lists, from the per-product active
    counts and from the 10-token manual mint cap. Their lifecycle is the
@@ -196,8 +210,12 @@ access token and a refresh token, until the connection is revoked.
   injected into the honest client's callback cannot be used to disconnect the
   user.
 - A product can stay connected (refresh) and disconnect itself (RFC 7009), and
-  users and admins can list and revoke connections (M5); only the audit (M6) is
-  not done, and its rows in the index below say so.
+  users and admins can list and revoke connections (M5). The M6 audit is done;
+  every rule in the index below has a named test.
+- Narrowing or clearing a product's OAuth registration refuses refresh at once
+  but leaves live access tokens with their old scopes until they expire (at most
+  one hour). Disabling the product cuts access immediately. This is documented in
+  [Registering an OAuth client](../docs/oauth-clients.md).
 - A refresh does not rotate, so a leaked refresh token is good until the user or
   product revokes the connection or the 30-day idle and 90-day absolute limits
   end it; the exposure is bounded by those limits and by revoke, not by reuse
@@ -207,17 +225,20 @@ access token and a refresh token, until the connection is revoked.
 
 Each row names the tests that pin a rule implemented so far. Tests whose names end
 in `LiveDB` need a database (`./e2e/run-store-it.sh`); the others run in
-`task test:api` and `task gate:web`. A row marked M6 is pending in that
-milestone.
+`task test:api` and `task gate:web`.
 
 | Rule | Pinned by |
 |---|---|
 | D1 only the listed surface exists: no public client, no other grant, Basic only, PKCE S256 and `code` only | `TestValidateAuthorizeRejects`, `TestOAuthTokenRequestRulesLiveDB` (unsupported grant type), `TestOAuthTokenClientAuthenticationLiveDB` (a body secret alone, a bearer, a non-client) |
+| D1 no discovery or OpenID Connect provider routes: the `/api/oauth` surface is exactly the six listed routes and nothing is served under `/.well-known` | `TestOAuthServerHasNoOIDCProviderRoutes` |
 | D1 protocol logic in one package, RFC verifier and PKCE rules | `TestValidVerifier`, `TestVerifierMatchesS256`, `TestParseTokenForm`, `TestParseScopes`, `TestValidateScopes`, `TestRedirectURLs` |
 | D2 redirect-URI format and exact match, client secret class and constant-time check | `TestValidateRedirectURI`, `TestValidateRedirectURIs`, `TestValidateRedirectURIsErrorDoesNotEchoTheURI`, `TestGenerateSecret`, `TestSecretMatches`, `TestAdminProductOAuthClientLiveDB`, `TestAdminProductOAuthValidationLiveDB`, `TestAdminProductOAuthUnknownAndDeletedLiveDB`, `TestAdminProductOAuthRoutesAuthLiveDB`, `TestOAuthTokenRotatedSecretCutsOffTheOldOneLiveDB` |
+| D2 pasted `uzp_` tokens keep working for every product, client or not, beside a connection's access token | `TestManualTokenWorksForAClientProductLiveDB` |
 | D2 `uzs_` and `uzr_` are registered and scrubbed | `TestMintedPrefixesScrubbedOnBothPaths`, `TestScrubSecretShapesMintedUziPrefixes`, `TestScrubKnownTokensMintedUziPrefixes`, `TestGenerateRefreshToken` |
 | D3 authorize is unauthenticated, validated before any redirect, caps, binding cookie, bounded storage | `TestCheckClientRejectsBeforeAnyRedirect`, `TestOAuthAuthorizeStaticErrorWithoutDB`, `TestOAuthAuthorizeStaticErrorLiveDB`, `TestOAuthAuthorizeRejectsRedirectToRegisteredURILiveDB`, `TestOAuthAuthorizeSuccessStoresHashAndSetsCookieLiveDB`, `TestOAuthAuthorizePendingCapLiveDB`, `TestOAuthSourceBucketsFor`, `TestWellFormedOAuthNonce`, `TestOAuthSweepAndCapQueriesUseIndexesLiveDB`, `TestOAuthAuthorizeLockClassMatchesSQL` |
-| D4 consent is explicit, bound to the browser, single use | `TestOAuthRequestMetadataLiveDB`, `TestOAuthConsentFixationLiveDB`, `TestOAuthApproveRedirectCarriesCodeStateIssLiveDB`, `TestOAuthApproveRedirectKeepsRegisteredQueryLiveDB`, `TestOAuthDoubleApproveAndDenyLiveDB`, `TestOAuthConcurrentApproveLiveDB`, `TestOAuthLosingApproveRollsBackSupersedeLiveDB`, `TestOAuthDenyStaleRequestIsRefusedLiveDB`, `TestOAuthSweepKeepsRecentCodesLiveDB`; web: `Connect.test.tsx`, `pendingReturn.test.ts`, `AppShell.pendingReturn.test.tsx` |
+| D3 authorize is behind `authLimiter`'s per-IP middleware, and approve carries the per-user limiter | `TestOAuthAuthorizeIsBehindThePerIPAuthLimiter`, `TestEveryRouteCarriesItsExpectedPerUserLimiter` (the approve row) |
+| D3 returning after login: a signed-out user on `/connect` is sent to `/login?next=`, the path is kept in `sessionStorage` for an OIDC login, and the consent page resumes the request | web: `pendingReturn.test.ts`, `AppShell.pendingReturn.test.tsx`, `Connect.test.tsx` |
+| D4 consent is explicit, bound to the browser, single use | `TestOAuthRequestMetadataLiveDB`, `TestOAuthConsentFixationLiveDB`, `TestOAuthApproveRedirectCarriesCodeStateIssLiveDB`, `TestOAuthApproveRedirectKeepsRegisteredQueryLiveDB`, `TestOAuthDoubleApproveAndDenyLiveDB`, `TestOAuthConcurrentApproveLiveDB`, `TestOAuthLosingApproveRollsBackSupersedeLiveDB`, `TestOAuthDenyStaleRequestIsRefusedLiveDB`, `TestOAuthSweepKeepsRecentCodesLiveDB`; web: `Connect.test.tsx` |
 | D5 code exchange mints an access token and the grant's refresh token; the token works on `/api/v1` and nowhere a pasted token is refused; the refresh token is no bearer | `TestOAuthTokenExchangeSuccessLiveDB`, `TestOAuthTokenAccessTokenIsRefusedWhereAPastedTokenIsLiveDB` |
 | D5 the access token carries only the grant's scopes; a code lives 60 seconds | `TestOAuthTokenAccessTokenCarriesOnlyTheGrantsScopesLiveDB`, `TestOAuthTokenCodeExpiresAfterSixtySecondsLiveDB` |
 | D5 one live grant per (user, product); re-consent rules | `TestOAuthConcurrentFirstConsentsShareOneGrantLiveDB`, `TestOAuthReconsentLiveDB`, `TestOAuthApproveAfterRevokedGrantCreatesNewGrantLiveDB` |
@@ -239,6 +260,8 @@ milestone.
 | D6 the owner revoking a grant token by id kills the grant; a foreign id is 404; a manual token revokes alone | `TestRevokeMyProductTokenOnGrantTokenKillsGrantLiveDB`, `TestRevokeMyProductTokenForeignGrantAndManualTokenLiveDB` |
 | D6 an admin revoking a grant token by id kills the grant | `TestAdminRevokeGrantTokenKillsGrantLiveDB` |
 | D6 Revoke all leaves no live grant, and its button counts grants; its warning tells connected products to connect again | `TestRevokeAllRevokesGrantsLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB`, `TestRevokeAllVersusFirstConsentApproveLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx`, `CliTokens.test.tsx` (including the connect-again sentence), `mockApi.productTokens.test.ts` |
+| D6 password change and logout do not revoke a connection: both bump `token_version`, and the access token and the refresh token still work afterwards | `TestPasswordChangeAndLogoutDoNotRevokeAConnectionLiveDB` |
+| D6 the connections lists read each grant's last use as a top-1 index probe, not the grant's whole token history | `TestGrantListLastUsedIsATopOneIndexProbeLiveDB` (store) |
 | D6 revoke cancels jobs of an expired access token | `TestCancelRevokedProductJobsExpiredGrantTokenLiveDB` |
 | D6 the product revokes its own connection with its refresh token (grant, access tokens, refresh token), idempotently | `TestOAuthRevokeWithRefreshTokenKillsGrantLiveDB` |
 | D6 the owner's revoke of a connection (`POST /api/me/oauth-connections/{id}/revoke`) is owner-scoped (a foreign, unknown or already-revoked id is 404 and changes nothing), needs the CSRF header, and is cookie-only | `TestUserRevokeConnectionIsOwnerScopedLiveDB`, `TestConnectionRevokeRoutesRefuseBearerLiveDB` (uzc_, uza_, uzp_ and uzr_ Bearers), `TestEveryRouteCarriesItsExpectedPerUserLimiter` (its row) |
@@ -265,7 +288,7 @@ milestone.
 
 ## References
 
-- [PRD #1910](../prds/1910-connect-uzi-oauth.md): D1-D8, M1-M6.
+- [PRD #1910](../prds/done/1910-connect-uzi-oauth.md): D1-D8, M1-M6.
 - [ADR-1907](1907-product-api-v1-contract.md): the `/api/v1` contract and `RequireV1Caller`.
 - `api/internal/oauthsrv`, `api/internal/handler/oauth.go`, `api/internal/handler/oauth_token.go`, `api/internal/handler/oauth_revoke.go`, `api/internal/store/queries/oauth.sql`, `api/openapi/v1.yaml`.
 - [Connecting a product](../docs/connect-a-product.md) (users) and [Registering an OAuth client](../docs/oauth-clients.md) (admins).

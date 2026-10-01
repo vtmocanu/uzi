@@ -224,3 +224,54 @@ func TestWorkerControllerRoutesAreBearerOnly(t *testing.T) {
 		t.Fatal("no /api/controller/ routes were walked — the test is vacuous; check WorkerHostingEnabled and the pattern prefix")
 	}
 }
+
+// TestOAuthServerHasNoOIDCProviderRoutes pins ADR-1910 D1: uzi is an OAuth authorization server for
+// registered products and not an OpenID Connect provider, so the router carries no discovery,
+// JWKS, userinfo, introspection, registration or device route. The route set is derived from the
+// real h.Routes via chi.Walk. The /api/oauth surface must be exactly the listed routes (so an
+// added route fails here and reopens the decision), and no route of any kind may live under
+// /.well-known.
+func TestOAuthServerHasNoOIDCProviderRoutes(t *testing.T) {
+	limiters := newProbeLimiters()
+	h := &Handler{cfg: config.Config{}}
+	router := h.Routes(limiters[0], limiters[1], limiters[2], limiters[3],
+		limiters[4], limiters[5], limiters[6], limiters[7], limiters[8], limiters[9], limiters[10])
+	routes, ok := router.(chi.Routes)
+	if !ok {
+		t.Fatal("router is not a chi.Routes")
+	}
+	want := map[string]bool{
+		"GET /api/oauth/authorize":              true,
+		"POST /api/oauth/token":                 true,
+		"POST /api/oauth/revoke":                true,
+		"GET /api/oauth/requests/{id}":          true,
+		"POST /api/oauth/requests/{id}/approve": true,
+		"POST /api/oauth/requests/{id}/deny":    true,
+	}
+	got := map[string]bool{}
+	err := chi.Walk(routes, func(method, pattern string, _ http.Handler, _ ...func(http.Handler) http.Handler) error {
+		route := method + " " + strings.ReplaceAll(pattern, "/*/", "/")
+		switch {
+		case strings.Contains(pattern, "/.well-known"):
+			t.Errorf("route %s: discovery documents are not served (ADR-1910 D1)", route)
+		case strings.HasPrefix(pattern, "/api/oauth/") || pattern == "/api/oauth":
+			got[route] = true
+		case strings.Contains(strings.ToLower(pattern), "userinfo"), strings.Contains(strings.ToLower(pattern), "jwks"):
+			t.Errorf("route %s: OIDC provider routes are not served (ADR-1910 D1)", route)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for route := range got {
+		if !want[route] {
+			t.Errorf("unexpected OAuth route %s: widening the surface reopens ADR-1910 D1", route)
+		}
+	}
+	for route := range want {
+		if !got[route] {
+			t.Errorf("OAuth route %s is missing from the router", route)
+		}
+	}
+}
