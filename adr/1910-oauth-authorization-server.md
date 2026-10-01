@@ -68,6 +68,18 @@ access token and a refresh token, until the connection is revoked.
    already holds 10 unexpired, unrevoked access tokens, counted under the grant
    lock. The refusal is a 429 with `Retry-After` (seconds until the oldest live
    token expires) and `{"error":"temporarily_unavailable"}`.
+
+   The live count alone is no bound on stored rows: a product that refreshes and
+   then RFC 7009-revokes each new access token keeps its live count at zero and
+   adds a row per round. So every mint, a code exchange and a refresh alike, is
+   also refused once 30 access tokens were minted for the grant in the last hour,
+   revoked ones included, again under the grant lock and again a 429 with
+   `Retry-After` (seconds until the oldest of them leaves the hour). Both counts
+   read only their own rows: `idx_product_tokens_grant (grant_id, created_at)`
+   serves the rate count and `idx_product_tokens_grant_live (grant_id, expires_at)
+   WHERE NOT revoked` the live count, and `TestGrantTokenCountsUseIndexesLiveDB`
+   EXPLAINs both. A product refreshes about once an hour, so the bound is far
+   above honest use.
 6. **Grant tokens are not manual tokens (D5).** Rows with a `grant_id` are
    excluded from the user and admin token lists, from the per-product active
    counts and from the 10-token manual mint cap. Their lifecycle is the
@@ -116,7 +128,7 @@ access token and a refresh token, until the connection is revoked.
      #1992 applied here from day one); `temporarily_unavailable` is an
      authorization-endpoint code in RFC 6749 section 4.1.2.1, not a section 5.2
      token error;
-   - a **429 `temporarily_unavailable` with `Retry-After`** for the 10-token bound
+   - a **429 `temporarily_unavailable` with `Retry-After`** for the 10-token and hourly mint bounds
      and for the per-IP and per-client limiters: the request is not malformed, the
      product should reuse its token or wait.
 
@@ -127,14 +139,36 @@ access token and a refresh token, until the connection is revoked.
     and a product that drops one access token must be able to refresh. A **manual
     (pasted) `uzp_` token** has no grant, so it was not issued to the client by
     OAuth: it answers 200 and is **not** revoked there; its owner revokes it. A
-    token that belongs to another client (any product token of another product,
-    or another product's grant) is 400 `invalid_grant` and revokes nothing; an
-    unknown, expired or already revoked token is 200. `token_type_hint` is
+    LIVE token that belongs to another client (any product token of another
+    product, or another product's grant) is 400 `invalid_grant` and revokes
+    nothing; an unknown token, or an access token that is already revoked or
+    expired and not the client's own, is 200 (see the exact rule below). `token_type_hint` is
     advisory: refresh is tried first unless the hint is `access_token`, and the
     other type is always tried next. A product that is disabled or deleted, or
     whose client registration was cleared, no longer authenticates as a client,
     so its refresh and revoke requests are 401 `invalid_client`; the grant itself
     is untouched and works again when the product does.
+
+    **Whose state is wrong decides the refresh error.** `invalid_grant` is "stop
+    using this refresh token": revoked, idle or absolute expiry, superseded by a
+    new consent, another client's, or the user is deactivated (nothing is revoked
+    and reactivation restores the grant, but a product may discard the connection
+    meanwhile, which is the price of RFC 6749 section 5.2 having no better code for
+    an account problem). `invalid_client` (401 with `WWW-Authenticate`) is "your
+    registration is the problem, keep the refresh token": the product is disabled,
+    deleted, no longer a client, or its allowed scopes no longer cover what the
+    token would carry. It is the same answer whether the state is seen at
+    authentication or under the grant lock, so a product that stopped being a
+    client while its request waited for the lock gets the 401 its authentication
+    would have got a moment earlier, and a product must never discard a connection
+    on it. The scopes checked are the REQUESTED ones when `scope` is sent, so a
+    product narrowed below the grant can still refresh with the scopes it keeps.
+    The revoke endpoint's dead-token rule is exact: an access token that is
+    already revoked, or expired and not the client's own, answers 200 before the
+    other-client check (as a revoked refresh token, whose hash is cleared, is
+    simply unknown); only a **live** token of another product is 400
+    `invalid_grant`; the client's own expired access token answers 200 and is
+    marked revoked so the revoked-jobs sweep covers it.
 10. **A replay after an ambiguous commit revokes (D6).** A second redemption of an
     already redeemed code revokes the grant only when it passes every binding
     check (client authentication, the code's client, the exact redirect URI and the
@@ -193,9 +227,11 @@ milestone.
 | D5 refresh lifetimes: 30 days idle (from the last refresh, else issue), 90 days absolute from `consented_at`, a re-consent restarts the absolute clock | `TestOAuthRefreshLifetimesLiveDB`, `TestOAuthRefreshAfterReconsentRestartsTheAbsoluteClockLiveDB` |
 | D5 refresh `scope` narrows to a subset of the grant's current scopes, never widens; the grant is unchanged | `TestOAuthRefreshScopeLiveDB`, `TestOAuthRefreshScopeCannotWidenLiveDB` |
 | D5 the ten-live-token bound on refresh, counted under the grant lock | `TestOAuthRefreshLiveTokenCapLiveDB`, `TestOAuthRefreshCapIsCountedUnderTheGrantLockLiveDB` |
+| D5 the per-grant mint-rate bound (30 an hour, revoked included): a refresh-then-revoke loop is refused with a 429 and a Retry-After that counts down to the oldest mint leaving the hour; both per-mint counts are index-served | `TestOAuthRefreshThenRevokeLoopIsRateBoundedLiveDB`, `TestGrantTokenCountsUseIndexesLiveDB` (store) |
 | D5 a refresh token is never a bearer | `TestOAuthTokenAccessTokenIsRefusedWhereAPastedTokenIsLiveDB` (every route), `TestOAuthRefreshTokenIsNotABearerLiveDB` |
 | D7 refresh authenticates the client like the code exchange; another client's refresh is `invalid_grant` and changes nothing; the token request rules apply | `TestOAuthRefreshClientAuthenticationLiveDB`, `TestOAuthRefreshRequestRulesLiveDB` |
-| D8 refresh re-checks the hash, client, product, user and scopes under the grant lock | `TestOAuthRefreshRechecksClientAndUserLiveDB`, `TestOAuthRefreshProductDisabledWhileWaitingForTheLockLiveDB` |
+| D7 whose state is wrong decides the refresh error: a disabled, deleted, non-client or scope-narrowed product is 401 `invalid_client` with `WWW-Authenticate` and nothing is revoked, an inactive user or dead grant is `invalid_grant`; a narrowing `scope` the product still allows is served | `TestOAuthRefreshRechecksClientAndUserLiveDB` |
+| D8 refresh re-checks the hash, client, product, user and scopes under the grant lock: a product that stops being a client while the request waits for the lock gets `invalid_client`, mints nothing, and the same refresh token works once restored | `TestOAuthRefreshRechecksClientAndUserLiveDB`, `TestOAuthRefreshProductDisabledWhileWaitingForTheLockLiveDB` (disabled, deleted, redirect URIs cleared, scopes narrowed, scopes narrowed with a narrowing request) |
 | D6 code replay revokes the grant only after every binding check | `TestOAuthTokenReplayRevokesGrantLiveDB`, `TestOAuthTokenReplayWithBrokenBindingRevokesNothingLiveDB`, `TestOAuthTokenReplayAfterCodeExpiryStillRevokesLiveDB`, `TestOAuthTokenAnotherClientsCodeLiveDB` |
 | D6 a code approved before a revoke or a re-consent cannot be redeemed after it | `TestOAuthTokenCodeApprovedBeforeGrantRevokeIsDeadLiveDB`, `TestOAuthTokenCodeApprovedBeforeReconsentIsSupersededLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB` |
 | D6 the owner revoking a grant token by id kills the grant; a foreign id is 404; a manual token revokes alone | `TestRevokeMyProductTokenOnGrantTokenKillsGrantLiveDB`, `TestRevokeMyProductTokenForeignGrantAndManualTokenLiveDB` |
@@ -209,12 +245,15 @@ milestone.
 | D7 limiter per IP and per client, per-client budget drawn only after authentication, OAuth-shaped 429, `no-store` on every method | `TestOAuthTokenPerClientBudgetIgnoresFailedAuthenticationLiveDB`, `TestOAuthRevokePerClientBudgetIgnoresFailedAuthenticationLiveDB`, `TestOAuthTokenIsBehindThePerIPOAuthLimiter`, `TestOAuthRevokeIsBehindThePerIPOAuthLimiter`, `TestOAuthRoutesAreNoStoreOnEveryMethod` (both paths) |
 | D7 `/api/me/oauth-connections` is cookie-only and lists live grants whatever their tokens' state | `TestOAuthConnectionsRouteRefusesBearerLiveDB`, `TestMyOAuthConnectionsLiveDB`, `TestEveryRouteCarriesItsExpectedPerUserLimiter` (its row) |
 | D7 the `oauth2` scheme is an additive alternative and nothing else in `v1.yaml` moved; the test fails cleanly, never panics, on a spec without the scheme | `TestV1OpenAPIRouteParity`, the `check:api-v1-compat` gate |
-| D7 RFC 7009 revoke: client-authenticated like the token endpoint, a token of another client is `invalid_grant` and revokes nothing, unknown, expired and revoked tokens are 200, the hint is advisory | `TestOAuthRevokeRequestRulesLiveDB`, `TestOAuthRevokeAnotherClientsTokenIsInvalidGrantLiveDB`, `TestOAuthRevokeUnknownTokensAreOKLiveDB`, `TestOAuthRevokeHintIsAdvisoryLiveDB` |
+| D7 RFC 7009 revoke: client-authenticated like the token endpoint, a live token of another client is `invalid_grant` and revokes nothing, unknown, expired and revoked tokens are 200, the hint is advisory | `TestOAuthRevokeRequestRulesLiveDB`, `TestOAuthRevokeAnotherClientsTokenIsInvalidGrantLiveDB`, `TestOAuthRevokeUnknownTokensAreOKLiveDB`, `TestOAuthRevokeHintIsAdvisoryLiveDB` |
+| D7 a dead (revoked, or expired and another client's) access token is 200 before the other-client check, a revoked refresh token is 200 for anyone, a live token of another client stays `invalid_grant` with nothing revoked, the client's own expired token is marked revoked | `TestOAuthRevokeDeadTokenIsOKBeforeTheOtherClientCheckLiveDB` |
 | D7 revoking an access token revokes that token only; a manual token is not revoked there | `TestOAuthRevokeAccessTokenRevokesOnlyThatTokenLiveDB`, `TestOAuthRevokeHintIsAdvisoryLiveDB` (access token cases) |
 | D8 lock order grant, tokens, requests on every path; replay takes no request-row lock | `TestOAuthTokenReplayTakesNoRequestRowLockLiveDB`, `TestOAuthTokenCapIsCountedUnderTheGrantLockLiveDB`, `TestOAuthTokenConcurrentSameCodeLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB` |
 | D8 per-user lock first on approve and Revoke all: both orderings of a first-consent approve against Revoke all leave no live grant or redeemable code the button missed | `TestRevokeAllVersusFirstConsentApproveLiveDB` (both orderings), `TestOAuthUserLockClassMatchesSQL`, `TestProductTokenMintLockClassMatchesSQL` (class collision enumeration) |
 | D8 approve and first consent under the grant lock | `TestOAuthConcurrentApproveLiveDB`, `TestOAuthConcurrentFirstConsentsShareOneGrantLiveDB`, `TestOAuthLosingApproveRollsBackSupersedeLiveDB` |
 | D8 refresh vs revoke and refresh vs re-consent races: a refresh blocked on the grant lock while a revoke or re-consent commits mints nothing, and no live token survives Revoke all | `TestOAuthRefreshVersusGrantMutationLiveDB` (owner revoke, `revokeGrantLocked`, re-consent), `TestOAuthRefreshVersusRevokeAllLiveDB` |
+| D8 refresh vs `POST /api/oauth/revoke` with the refresh token, both queued on the grant lock in either order: the losing refresh mints nothing that survives (revoke first: no token is minted; refresh first: the minted token is revoked with the grant), no live grant or unrevoked token remains | `TestOAuthRefreshVersusOAuthRevokeLiveDB` (both orders) |
+| D8 access-token revoke vs refresh on the same grant: both complete without a deadlock, the revoked token stays revoked, the refreshed one works, the grant stays live | `TestOAuthAccessTokenRevokeVersusRefreshLiveDB` |
 
 ## References
 

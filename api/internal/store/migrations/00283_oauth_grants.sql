@@ -112,9 +112,19 @@ CREATE INDEX idx_oauth_authorize_requests_grant ON oauth_authorize_requests (gra
 ALTER TABLE product_tokens
     ADD COLUMN grant_id uuid REFERENCES oauth_grants ON DELETE NO ACTION;
 
-CREATE INDEX idx_product_tokens_grant ON product_tokens (grant_id) WHERE grant_id IS NOT NULL;
+-- Two partial indexes bound what a grant's refresh loop can make the mint checks cost. A product
+-- that refreshes and then RFC 7009 revokes the new access token repeatedly keeps its live count at
+-- zero and still adds one row per round, so the grant's full row history grows without bound; both
+-- per-mint counts (run under the grant lock) must therefore read only the rows they count:
+--   * (grant_id, created_at) serves the mint-rate bound (CountGrantTokensMintedSince, revoked rows
+--     included) and, as a grant_id prefix, the grant's revoke sweeps and the NO ACTION FK check;
+--   * (grant_id, expires_at) WHERE NOT revoked serves the ten-live-token count
+--     (CountLiveGrantTokens), which reads only unrevoked rows past now().
+CREATE INDEX idx_product_tokens_grant ON product_tokens (grant_id, created_at) WHERE grant_id IS NOT NULL;
+CREATE INDEX idx_product_tokens_grant_live ON product_tokens (grant_id, expires_at) WHERE grant_id IS NOT NULL AND NOT revoked;
 
 -- +goose Down
+DROP INDEX idx_product_tokens_grant_live;
 DROP INDEX idx_product_tokens_grant;
 ALTER TABLE product_tokens DROP COLUMN grant_id;
 DROP INDEX idx_oauth_authorize_requests_grant;

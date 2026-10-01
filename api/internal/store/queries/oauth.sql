@@ -213,6 +213,31 @@ SELECT count(*)::bigint AS live, min(expires_at)::timestamptz AS oldest_expires_
    AND NOT revoked
    AND expires_at > now();
 
+-- name: CountGrantTokensMintedSince :one
+-- The per-grant mint-rate bound: how many access tokens were minted for the grant in the last
+-- window_seconds (revoked and expired rows included, so revoking a fresh token buys no extra
+-- mint), and the seconds until the oldest of them leaves the window (what Retry-After counts down
+-- to). Run with the grant locked, so no concurrent mint of this grant can change the count. Served
+-- by idx_product_tokens_grant (grant_id, created_at): it reads only the window's rows, never the
+-- grant's whole history. The window is measured on the database clock.
+SELECT count(*)::bigint AS minted,
+       GREATEST(1, COALESCE(ceil(extract(epoch FROM (min(created_at) + sqlc.arg(window_seconds)::bigint * interval '1 second' - now()))), 1))::int AS retry_after_seconds
+  FROM product_tokens
+ WHERE grant_id = sqlc.arg(grant_id)
+   AND created_at > now() - sqlc.arg(window_seconds)::bigint * interval '1 second';
+
+-- name: OAuthGrantRefreshWithinLifetimes :one
+-- Whether the grant's refresh token is inside both lifetimes (PRD #1910 D5), evaluated on the
+-- DATABASE clock so application and database clock skew cannot shift either bound: idle (from the
+-- last refresh, else from issue) at most idle_seconds ago, and the user's latest consent at most
+-- absolute_seconds ago. A grant with no refresh issue time is outside. Run with the grant locked.
+SELECT COALESCE(
+         COALESCE(refresh_last_used_at, refresh_issued_at) >= now() - sqlc.arg(idle_seconds)::bigint * interval '1 second'
+         AND consented_at >= now() - sqlc.arg(absolute_seconds)::bigint * interval '1 second',
+         false)::boolean AS within
+  FROM oauth_grants
+ WHERE id = sqlc.arg(id);
+
 -- name: RedeemOAuthAuthorizeRequest :one
 -- approved -> redeemed in one conditional UPDATE, the code's single use. Zero rows (ErrNoRows)
 -- means it was no longer approved or its code expired: the handler answers invalid_grant. Run
@@ -355,8 +380,10 @@ UPDATE oauth_grants SET refresh_last_used_at = now() WHERE id = $1 AND revoked_a
 -- name: GetProductTokenForOAuthRevoke :one
 -- The product token a client presents to POST /api/oauth/revoke, found by its sha256 WITHOUT a
 -- lock (the handler locks the grant first when there is one, D8). Expired and revoked rows are
--- returned too, because both answer 200 like an unknown token. token_hash is never projected.
-SELECT id, product_id, grant_id, revoked FROM product_tokens WHERE token_hash = $1;
+-- returned too (expired is judged on the database clock), because a revoked or expired token
+-- answers 200 like an unknown one, before any other-client check. token_hash is never projected.
+SELECT id, product_id, grant_id, revoked, (expires_at IS NOT NULL AND expires_at <= now())::boolean AS expired
+  FROM product_tokens WHERE token_hash = $1;
 
 -- name: RevokeOAuthGrantAccessToken :execrows
 -- Revoke ONE access token of a grant (RFC 7009 on an access token, which does not revoke the grant).

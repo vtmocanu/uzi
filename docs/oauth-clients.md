@@ -19,7 +19,7 @@ The 200 response is `access_token` (a `uzp_` token valid for one hour, used as a
 - A code lives 60 seconds and works once. Presenting it again with the right client, redirect URI and verifier revokes the whole connection (RFC 6749 section 4.1.2); a replay with a wrong binding revokes nothing. A refused exchange never uses the code up.
 - Failed or missing client authentication is **401 `invalid_client`** with `WWW-Authenticate: Basic`. Any other credential problem (unknown, used, expired or wrongly bound code) is 400 `invalid_grant`.
 - A database error is **503 `temporarily_unavailable`** with `Retry-After`, never `invalid_grant`, so a client must treat a 503 as "try again", not "the connection is gone". If a 503 followed a commit that did land, the retry presents a used code and, being fully bound, counts as a replay and revokes the connection: start a new connection then.
-- A connection already holding 10 live access tokens answers **429 `temporarily_unavailable`** with `Retry-After` (seconds until the oldest expires): reuse your current token. Rate limits answer 429 with the same body.
+- A connection already holding 10 live access tokens, or one for which 30 access tokens were minted in the last hour (revoked ones count, so refreshing and then revoking each new token does not get around it), answers **429 `temporarily_unavailable`** with `Retry-After` (seconds until a slot frees or the oldest mint leaves the hour): reuse your current token. Rate limits answer 429 with the same body.
 - Limits are per client IP (every request) and per product (after authentication): `OAUTH_RATE_LIMIT_MAX` requests per `OAUTH_RATE_LIMIT_WINDOW`, 60 per minute by default. The per-product budget is one bucket shared by all of that product's users, so raise `OAUTH_RATE_LIMIT_MAX` for a busy multi-user product.
 
 ## Refresh an access token
@@ -39,14 +39,19 @@ Cache-Control: no-store
 {"access_token":"<a uzp_ token>","token_type":"Bearer","expires_in":3600,"scope":"jobs:run jobs:read"}
 ```
 
-A refresh token stops working, with 400 `invalid_grant`, when:
+A refresh token is refused with 400 `invalid_grant` when it should no longer be used:
 
 - it has not been used for 30 days;
 - 90 days have passed since the user last approved the connection (approving again, through the normal consent page, starts a fresh 90 days and issues a new refresh token);
 - the user or an admin revoked the connection, or the user approved again, which replaces the previous refresh token;
-- it belongs to another client, or the product's registration no longer allows the connection's scopes, or the user's account is inactive.
+- it belongs to another client;
+- the user's account is deactivated. Nothing is revoked, and reactivating the account makes the same refresh token work again, but a product may discard the connection meanwhile and ask the user to connect again.
 
-`invalid_grant` means the connection is gone: send the user through consent again. A product that is disabled or deleted cannot authenticate at all (401 `invalid_client`); the connection itself survives and works again when the product is enabled. A 503 or a 429 (a connection already holding 10 live access tokens, with `Retry-After`) means try again later, not that the connection is gone.
+On `invalid_grant`, stop using this refresh token and send the user through consent again.
+
+A request is refused with **401 `invalid_client`** (with `WWW-Authenticate: Basic`) when your own client registration is the problem: the product is disabled or deleted, it is no longer registered as an OAuth client, or its allowed scopes no longer cover the connection's scopes. The connection is untouched, so **keep the refresh token** and retry after an admin fixes the registration. While the allowed scopes are narrowed, a refresh whose `scope` names only scopes you are still allowed (and the connection holds) succeeds with those; a refresh without `scope`, or naming a scope you are no longer allowed, is `invalid_client`.
+
+A 503 or a 429 (a connection already holding 10 live access tokens or at its 30 mints an hour, with `Retry-After`) means try again later, not that the connection is gone.
 
 ## Revoke from the product
 
@@ -60,8 +65,8 @@ token=<the uzr_ or uzp_ token>&token_type_hint=refresh_token
 
 - Revoking the **refresh token** disconnects: the connection, every access token under it and the refresh token stop working at once, and jobs those tokens started are cancelled.
 - Revoking an **access token** that the connection issued revokes only that token; the connection and its refresh token keep working.
-- A token you were not issued (an unknown, expired or already revoked token, or a token a user pasted by hand rather than one issued through OAuth) answers **200** and revokes nothing.
-- A token issued to another client is **400 `invalid_grant`** and revokes nothing.
+- An unknown token answers **200** and revokes nothing. So does an access token that is already revoked, or expired and not yours, whichever product it belongs to; and so does a token a user pasted by hand into your own product, which was not issued through OAuth (the user revokes it). Your own expired access token answers 200 and is marked revoked.
+- A **live** (not revoked, not expired) token of another client's product is **400 `invalid_grant`** and revokes nothing.
 - 200 has an empty body. A database error is **503 `temporarily_unavailable`** with `Retry-After`: retry.
 
 These endpoints are part of the `/api/v1` compatibility promise in [Product tokens](./product-tokens.md#compatibility-promise); `api/openapi/v1.yaml` declares an `oauth2` security scheme beside `bearerAuth`.

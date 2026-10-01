@@ -292,77 +292,154 @@ func TestOAuthRefreshAfterReconsentRestartsTheAbsoluteClockLiveDB(t *testing.T) 
 	e.requireRefreshRefused(t, "refresh token of the previous consent", tok.RefreshToken, http.StatusBadRequest, "invalid_grant")
 }
 
-// TestOAuthRefreshRechecksClientAndUserLiveDB (D8): the product and user are re-read under the
-// grant lock on every refresh.
+// requireInvalidClient asserts the 401 invalid_client (with WWW-Authenticate) that a client
+// registration which stopped qualifying gets: the product must keep its refresh token.
+func requireInvalidClient(t *testing.T, name string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("%s: status = %d %q, want 401 invalid_client", name, rec.Code, rec.Body.String())
+	}
+	requireOAuthError(t, rec, http.StatusUnauthorized, "invalid_client")
+	if got := rec.Header().Get("WWW-Authenticate"); !strings.HasPrefix(got, "Basic") {
+		t.Fatalf("%s: WWW-Authenticate = %q, want a Basic challenge", name, got)
+	}
+}
+
+// TestOAuthRefreshRechecksClientAndUserLiveDB (D7, D8): the product and user are re-read under the
+// grant lock on every refresh, and the answer says WHOSE state is wrong. The client's own
+// registration (disabled, deleted, scopes narrowed below the grant) is 401 invalid_client, so a
+// product keeps its refresh token; an inactive user or a dead grant is invalid_grant. Nothing is
+// revoked by any of them: restoring the state makes the same refresh token work again.
 func TestOAuthRefreshRechecksClientAndUserLiveDB(t *testing.T) {
 	e := tokenSetup(t)
 	tok := e.connect(t)
 	ctx := context.Background()
 	exec := func(sql string, args ...any) { t.Helper(); cliMustExec(t, e.pool, sql, args...) }
-	restoreClient := func() {
+	setClientScopes := func(scopes ...string) {
+		t.Helper()
 		if _, err := e.h.q.SetProductOAuthClient(ctx, store.SetProductOAuthClientParams{
-			ID: e.product, RedirectUris: []string{oauthTestRedirect}, OauthScopes: []string{"jobs:run", "jobs:read"},
+			ID: e.product, RedirectUris: []string{oauthTestRedirect}, OauthScopes: scopes,
 		}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	refused := func(name string) {
+	noMint := func(name string, rec *httptest.ResponseRecorder, before int) {
+		t.Helper()
+		if after := e.countAllGrantTokens(t); after != before {
+			t.Fatalf("%s: a refused refresh minted %d token(s)", name, after-before)
+		}
+		if g := e.liveGrant(t); g.RevokedAt.Valid || len(g.RefreshTokenHash) == 0 {
+			t.Fatalf("%s: the refusal revoked the grant or cleared its refresh token", name)
+		}
+	}
+	clientRefused := func(name string) {
+		t.Helper()
+		before := e.countAllGrantTokens(t)
+		rec := e.refresh(t, tok.RefreshToken)
+		requireInvalidClient(t, name, rec)
+		noMint(name, rec, before)
+	}
+	grantRefused := func(name string) {
 		t.Helper()
 		e.requireRefreshRefused(t, name, tok.RefreshToken, http.StatusBadRequest, "invalid_grant")
 	}
 
 	exec(`UPDATE products SET enabled = false WHERE id = $1`, e.product)
 	// A disabled product cannot authenticate as a client at all: the refresh is a 401 before the grant.
-	requireOAuthError(t, e.refresh(t, tok.RefreshToken), http.StatusUnauthorized, "invalid_client")
+	clientRefused("product disabled")
 	exec(`UPDATE products SET enabled = true WHERE id = $1`, e.product)
 
 	exec(`UPDATE products SET enabled = false, deleted_at = now() WHERE id = $1`, e.product)
-	requireOAuthError(t, e.refresh(t, tok.RefreshToken), http.StatusUnauthorized, "invalid_client")
+	clientRefused("product deleted")
 	exec(`UPDATE products SET enabled = true, deleted_at = NULL WHERE id = $1`, e.product)
 
-	// The allowed scopes no longer cover the grant's (the client still authenticates).
-	if _, err := e.h.q.SetProductOAuthClient(ctx, store.SetProductOAuthClientParams{
-		ID: e.product, RedirectUris: []string{oauthTestRedirect}, OauthScopes: []string{"jobs:read"},
-	}); err != nil {
-		t.Fatal(err)
+	// The allowed scopes no longer cover the grant's (the client still authenticates): the whole
+	// grant cannot be refreshed, and that is the registration's fault, not the connection's.
+	setClientScopes("jobs:read")
+	clientRefused("scope no longer allowed")
+	// A request that narrows to what the product still allows is served, with exactly those scopes;
+	// one that asks for a scope the product lost is refused the same way, and one outside the
+	// grant is invalid_scope whatever the product allows.
+	narrowed := decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken, "jobs:read"))
+	if narrowed.Scope != "jobs:read" {
+		t.Fatalf("narrowed refresh scope = %q, want jobs:read", narrowed.Scope)
 	}
-	refused("scope no longer allowed")
-	restoreClient()
+	e.wantWhoami(t, "the token narrowed to the product's remaining scope", narrowed.AccessToken, http.StatusOK)
+	before := e.countAllGrantTokens(t)
+	requireInvalidClient(t, "requested scope the product lost", e.refresh(t, tok.RefreshToken, "jobs:run"))
+	requireInvalidClient(t, "requested set including a lost scope", e.refresh(t, tok.RefreshToken, "jobs:run jobs:read"))
+	requireOAuthError(t, e.refresh(t, tok.RefreshToken, "jobs:admin"), http.StatusBadRequest, "invalid_scope")
+	if e.countAllGrantTokens(t) != before {
+		t.Fatal("a refused scoped refresh minted a token")
+	}
+	setClientScopes("jobs:run", "jobs:read")
 
 	exec(`UPDATE users SET is_active = false WHERE id = $1`, e.user)
-	refused("user inactive")
+	grantRefused("user inactive")
 	exec(`UPDATE users SET is_active = true WHERE id = $1`, e.user)
 
 	g := e.liveGrant(t)
 	exec(`UPDATE oauth_grants SET revoked_at = now() WHERE id = $1`, g.ID)
-	refused("grant revoked")
+	grantRefused("grant revoked")
 	exec(`UPDATE oauth_grants SET revoked_at = NULL WHERE id = $1`, g.ID)
 
-	decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken)) // everything restored
+	if r := decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken)); r.Scope != "jobs:run jobs:read" { // everything restored
+		t.Fatalf("restored refresh scope = %q", r.Scope)
+	}
 }
 
 // TestOAuthRefreshProductDisabledWhileWaitingForTheLockLiveDB: the in-transaction product check
-// (not only client authentication) refuses a product that stopped being an enabled client between the
-// authentication and the lock. The product row is flipped inside a held transaction.
+// (not only client authentication) refuses a product that stopped being an enabled client, or whose
+// allowed scopes stopped covering what the token would carry, between the authentication and the
+// lock. The product row is flipped inside the transaction that holds the lock. The refusal is the
+// 401 invalid_client of the auth-time check, mints nothing, and the same refresh token works once
+// the registration is restored.
 func TestOAuthRefreshProductDisabledWhileWaitingForTheLockLiveDB(t *testing.T) {
-	e := tokenSetup(t)
-	tok := e.connect(t)
-	g := e.liveGrant(t)
-	rec := e.refreshBlockedBy(t, g.ID, tok.RefreshToken, func(ctx context.Context, tx pgx.Tx) {
-		if _, err := tx.Exec(ctx, `UPDATE products SET enabled = false WHERE id = $1`, e.product); err != nil {
-			t.Fatal(err)
-		}
-	})
-	requireOAuthError(t, rec, http.StatusBadRequest, "invalid_grant")
-	cliMustExec(t, e.pool, `UPDATE products SET enabled = true WHERE id = $1`, e.product)
-	if n := e.countAllGrantTokens(t); n != 1 {
-		t.Fatalf("grant tokens = %d, want only the exchange's", n)
+	for _, tc := range []struct {
+		name      string
+		mutate    string
+		restore   string
+		scope     []string
+		wantScope string // "" = refused with 401
+	}{
+		{"product disabled", `UPDATE products SET enabled = false WHERE id = $1`, `UPDATE products SET enabled = true WHERE id = $1`, nil, ""},
+		{"product deleted", `UPDATE products SET enabled = false, deleted_at = now() WHERE id = $1`, `UPDATE products SET enabled = true, deleted_at = NULL WHERE id = $1`, nil, ""},
+		{"no longer a client (redirect URIs cleared)", `UPDATE products SET redirect_uris = '{}' WHERE id = $1`, `UPDATE products SET redirect_uris = ARRAY['` + oauthTestRedirect + `'] WHERE id = $1`, nil, ""},
+		{"allowed scopes narrowed below the grant", `UPDATE products SET oauth_scopes = ARRAY['jobs:read'] WHERE id = $1`, `UPDATE products SET oauth_scopes = ARRAY['jobs:run','jobs:read'] WHERE id = $1`, nil, ""},
+		{"allowed scopes narrowed, request narrows to what remains", `UPDATE products SET oauth_scopes = ARRAY['jobs:read'] WHERE id = $1`, `UPDATE products SET oauth_scopes = ARRAY['jobs:run','jobs:read'] WHERE id = $1`, []string{"jobs:read"}, "jobs:read"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tokenSetup(t)
+			tok := e.connect(t)
+			g := e.liveGrant(t)
+			rec := e.refreshBlockedBy(t, g.ID, tok.RefreshToken, func(ctx context.Context, tx pgx.Tx) {
+				if _, err := tx.Exec(ctx, tc.mutate, e.product); err != nil {
+					t.Fatal(err)
+				}
+			}, tc.scope...)
+			if tc.wantScope != "" {
+				if got := decodeOAuthRefresh(t, rec); got.Scope != tc.wantScope {
+					t.Fatalf("scope = %q, want %q", got.Scope, tc.wantScope)
+				}
+				return
+			}
+			requireInvalidClient(t, tc.name, rec)
+			if n := e.countAllGrantTokens(t); n != 1 {
+				t.Fatalf("grant tokens = %d, want only the exchange's", n)
+			}
+			if got := e.liveGrant(t); got.RevokedAt.Valid || len(got.RefreshTokenHash) == 0 {
+				t.Fatal("the refusal revoked the grant or cleared its refresh token")
+			}
+			cliMustExec(t, e.pool, tc.restore, e.product)
+			decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken))
+		})
 	}
 }
 
 // refreshBlockedBy holds the grant row lock in a transaction, starts a refresh that must block on
-// it, runs mutate inside the holding transaction, commits, and returns the refresh's response.
-func (e *tokenEnv) refreshBlockedBy(t *testing.T, grantID uuid.UUID, refresh string, mutate func(context.Context, pgx.Tx)) *httptest.ResponseRecorder {
+// it (with the optional scope parameter), runs mutate inside the holding transaction, commits, and
+// returns the refresh's response.
+func (e *tokenEnv) refreshBlockedBy(t *testing.T, grantID uuid.UUID, refresh string, mutate func(context.Context, pgx.Tx), scope ...string) *httptest.ResponseRecorder {
 	t.Helper()
 	ctx := context.Background()
 	tx, err := e.pool.Begin(ctx)
@@ -376,7 +453,7 @@ func (e *tokenEnv) refreshBlockedBy(t *testing.T, grantID uuid.UUID, refresh str
 	var wg sync.WaitGroup
 	var rec *httptest.ResponseRecorder
 	wg.Add(1)
-	go func() { defer wg.Done(); rec = e.refresh(t, refresh) }()
+	go func() { defer wg.Done(); rec = e.refresh(t, refresh, scope...) }()
 	waitForPgWaiting(t, e, "FROM oauth_grants WHERE id = $1 FOR UPDATE", 1)
 	mutate(ctx, tx)
 	if err := tx.Commit(ctx); err != nil {
@@ -675,4 +752,49 @@ func TestOAuthRefreshTokenIsNotABearerLiveDB(t *testing.T) {
 			t.Errorf("GET %s with a refresh token = %d %q, want 401", path, got.status, got.body)
 		}
 	}
+}
+
+// TestOAuthRefreshThenRevokeLoopIsRateBoundedLiveDB (D5, Resource bounds): refreshing and then
+// revoking each new access token (RFC 7009) keeps the live count at zero, so the ten-live-token
+// bound never fires; the per-grant mint-rate bound does. The grant's thirtieth mint of the hour
+// (the exchange's plus twenty-nine refreshes) is the last: the next refresh is a 429
+// temporarily_unavailable with a Retry-After, mints and stamps nothing, and a mint that has left
+// the hour no longer counts.
+func TestOAuthRefreshThenRevokeLoopIsRateBoundedLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	tok := e.connect(t)
+	g := e.liveGrant(t)
+	for i := 1; i < oauthMaxGrantMintsPerWindow; i++ {
+		r := decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken))
+		e.requireRevoked200(t, e.revoke(t, r.AccessToken, "access_token"))
+	}
+	if n := e.grantTokenCount(t, g.ID, ``); n != oauthMaxGrantMintsPerWindow {
+		t.Fatalf("grant tokens = %d, want %d after the loop", n, oauthMaxGrantMintsPerWindow)
+	}
+	stamp := e.liveGrant(t).RefreshLastUsedAt
+
+	rec := e.refresh(t, tok.RefreshToken)
+	requireOAuthError(t, rec, http.StatusTooManyRequests, "temporarily_unavailable")
+	ra, err := strconv.Atoi(rec.Header().Get("Retry-After"))
+	if err != nil || ra < 1 || ra > 3600 {
+		t.Fatalf("Retry-After = %q, want 1..3600 seconds", rec.Header().Get("Retry-After"))
+	}
+	if n := e.grantTokenCount(t, g.ID, ``); n != oauthMaxGrantMintsPerWindow {
+		t.Fatalf("a refused refresh minted a token: %d rows", n)
+	}
+	if got := e.liveGrant(t); got.RevokedAt.Valid || !got.RefreshLastUsedAt.Time.Equal(stamp.Time) {
+		t.Fatal("a rate-refused refresh revoked the grant or stamped refresh_last_used_at")
+	}
+
+	// Retry-After counts down to when the oldest mint leaves the hour: age it to 59 minutes.
+	cliMustExec(t, e.pool, `UPDATE product_tokens SET created_at = now() - interval '59 minutes'
+	                           WHERE id = (SELECT id FROM product_tokens WHERE grant_id = $1 ORDER BY created_at LIMIT 1)`, g.ID)
+	rec = e.refresh(t, tok.RefreshToken)
+	requireOAuthError(t, rec, http.StatusTooManyRequests, "temporarily_unavailable")
+	if ra, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || ra < 55 || ra > 65 {
+		t.Fatalf("Retry-After = %q, want about 60", rec.Header().Get("Retry-After"))
+	}
+	cliMustExec(t, e.pool, `UPDATE product_tokens SET created_at = now() - interval '61 minutes'
+	                           WHERE id = (SELECT id FROM product_tokens WHERE grant_id = $1 ORDER BY created_at LIMIT 1)`, g.ID)
+	decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken))
 }

@@ -55,6 +55,37 @@ func (q *Queries) ClaimOAuthAuthorizeRequest(ctx context.Context, arg ClaimOAuth
 	return i, err
 }
 
+const countGrantTokensMintedSince = `-- name: CountGrantTokensMintedSince :one
+SELECT count(*)::bigint AS minted,
+       GREATEST(1, COALESCE(ceil(extract(epoch FROM (min(created_at) + $1::bigint * interval '1 second' - now()))), 1))::int AS retry_after_seconds
+  FROM product_tokens
+ WHERE grant_id = $2
+   AND created_at > now() - $1::bigint * interval '1 second'
+`
+
+type CountGrantTokensMintedSinceParams struct {
+	WindowSeconds int64       `json:"window_seconds"`
+	GrantID       pgtype.UUID `json:"grant_id"`
+}
+
+type CountGrantTokensMintedSinceRow struct {
+	Minted            int64 `json:"minted"`
+	RetryAfterSeconds int32 `json:"retry_after_seconds"`
+}
+
+// The per-grant mint-rate bound: how many access tokens were minted for the grant in the last
+// window_seconds (revoked and expired rows included, so revoking a fresh token buys no extra
+// mint), and the seconds until the oldest of them leaves the window (what Retry-After counts down
+// to). Run with the grant locked, so no concurrent mint of this grant can change the count. Served
+// by idx_product_tokens_grant (grant_id, created_at): it reads only the window's rows, never the
+// grant's whole history. The window is measured on the database clock.
+func (q *Queries) CountGrantTokensMintedSince(ctx context.Context, arg CountGrantTokensMintedSinceParams) (CountGrantTokensMintedSinceRow, error) {
+	row := q.db.QueryRow(ctx, countGrantTokensMintedSince, arg.WindowSeconds, arg.GrantID)
+	var i CountGrantTokensMintedSinceRow
+	err := row.Scan(&i.Minted, &i.RetryAfterSeconds)
+	return i, err
+}
+
 const countLiveGrantTokens = `-- name: CountLiveGrantTokens :one
 SELECT count(*)::bigint AS live, min(expires_at)::timestamptz AS oldest_expires_at
   FROM product_tokens
@@ -476,7 +507,8 @@ func (q *Queries) GetOwnProductTokenGrantID(ctx context.Context, arg GetOwnProdu
 }
 
 const getProductTokenForOAuthRevoke = `-- name: GetProductTokenForOAuthRevoke :one
-SELECT id, product_id, grant_id, revoked FROM product_tokens WHERE token_hash = $1
+SELECT id, product_id, grant_id, revoked, (expires_at IS NOT NULL AND expires_at <= now())::boolean AS expired
+  FROM product_tokens WHERE token_hash = $1
 `
 
 type GetProductTokenForOAuthRevokeRow struct {
@@ -484,11 +516,13 @@ type GetProductTokenForOAuthRevokeRow struct {
 	ProductID uuid.UUID   `json:"product_id"`
 	GrantID   pgtype.UUID `json:"grant_id"`
 	Revoked   bool        `json:"revoked"`
+	Expired   bool        `json:"expired"`
 }
 
 // The product token a client presents to POST /api/oauth/revoke, found by its sha256 WITHOUT a
 // lock (the handler locks the grant first when there is one, D8). Expired and revoked rows are
-// returned too, because both answer 200 like an unknown token. token_hash is never projected.
+// returned too (expired is judged on the database clock), because a revoked or expired token
+// answers 200 like an unknown one, before any other-client check. token_hash is never projected.
 func (q *Queries) GetProductTokenForOAuthRevoke(ctx context.Context, tokenHash []byte) (GetProductTokenForOAuthRevokeRow, error) {
 	row := q.db.QueryRow(ctx, getProductTokenForOAuthRevoke, tokenHash)
 	var i GetProductTokenForOAuthRevokeRow
@@ -497,6 +531,7 @@ func (q *Queries) GetProductTokenForOAuthRevoke(ctx context.Context, tokenHash [
 		&i.ProductID,
 		&i.GrantID,
 		&i.Revoked,
+		&i.Expired,
 	)
 	return i, err
 }
@@ -842,6 +877,32 @@ func (q *Queries) OAuthGrantHasTokenOutsideScopes(ctx context.Context, arg OAuth
 	var drops_scope bool
 	err := row.Scan(&drops_scope)
 	return drops_scope, err
+}
+
+const oAuthGrantRefreshWithinLifetimes = `-- name: OAuthGrantRefreshWithinLifetimes :one
+SELECT COALESCE(
+         COALESCE(refresh_last_used_at, refresh_issued_at) >= now() - $1::bigint * interval '1 second'
+         AND consented_at >= now() - $2::bigint * interval '1 second',
+         false)::boolean AS within
+  FROM oauth_grants
+ WHERE id = $3
+`
+
+type OAuthGrantRefreshWithinLifetimesParams struct {
+	IdleSeconds     int64     `json:"idle_seconds"`
+	AbsoluteSeconds int64     `json:"absolute_seconds"`
+	ID              uuid.UUID `json:"id"`
+}
+
+// Whether the grant's refresh token is inside both lifetimes (PRD #1910 D5), evaluated on the
+// DATABASE clock so application and database clock skew cannot shift either bound: idle (from the
+// last refresh, else from issue) at most idle_seconds ago, and the user's latest consent at most
+// absolute_seconds ago. A grant with no refresh issue time is outside. Run with the grant locked.
+func (q *Queries) OAuthGrantRefreshWithinLifetimes(ctx context.Context, arg OAuthGrantRefreshWithinLifetimesParams) (bool, error) {
+	row := q.db.QueryRow(ctx, oAuthGrantRefreshWithinLifetimes, arg.IdleSeconds, arg.AbsoluteSeconds, arg.ID)
+	var within bool
+	err := row.Scan(&within)
+	return within, err
 }
 
 const reconsentOAuthGrant = `-- name: ReconsentOAuthGrant :one

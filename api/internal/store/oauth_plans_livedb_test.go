@@ -112,3 +112,88 @@ func TestOAuthSweepAndCapQueriesUseIndexesLiveDB(t *testing.T) {
 		}
 	}
 }
+
+// TestGrantTokenCountsUseIndexesLiveDB: the two per-mint counts run under a grant's lock on every
+// token mint, so they must read only the rows they count and never the grant's whole history,
+// which a refresh-then-revoke loop can grow without bound. CountLiveGrantTokens must be served by
+// idx_product_tokens_grant_live (partial on NOT revoked) and CountGrantTokensMintedSince by
+// idx_product_tokens_grant (grant_id, created_at). It EXPLAINs the statements the generated code
+// really executes (the unexported countLiveGrantTokens and countGrantTokensMintedSince
+// constants) as generic plans, over a populated, analyzed table seeded in a transaction that is
+// rolled back: five grants of 2000 rows each, almost all revoked and expired, which is the
+// shape a loop leaves. A seq scan is made unavailable, as in the test above, so a predicate no
+// index can serve fails here. Skipped unless UZI_TEST_DATABASE_URL points at a throwaway Postgres.
+func TestGrantTokenCountsUseIndexesLiveDB(t *testing.T) {
+	dsn := os.Getenv("UZI_TEST_DATABASE_URL")
+	if dsn == "" {
+		t.Skip("UZI_TEST_DATABASE_URL not set; run via e2e/run-store-it.sh for live-DB coverage")
+	}
+	ctx := context.Background()
+	if err := Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	pool, err := OpenPool(ctx, dsn)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	defer pool.Close()
+	conn, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Release()
+	pg := conn.Conn().PgConn()
+	exec := func(sql string) {
+		t.Helper()
+		if _, err := pg.Exec(ctx, sql).ReadAll(); err != nil {
+			_, _ = pg.Exec(ctx, `ROLLBACK`).ReadAll()
+			t.Fatalf("%q: %v", sql, err)
+		}
+	}
+	exec(`SET enable_seqscan = off`)
+	defer func() { _, _ = pg.Exec(ctx, `RESET enable_seqscan`).ReadAll() }()
+
+	exec(`BEGIN`)
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ('00000000-0000-4000-8000-0000000000a1', 'plan-grant-tokens@example.test', 'x')`)
+	exec(`INSERT INTO products (id, name) VALUES ('00000000-0000-4000-8000-0000000000b1', 'plan-grant-tokens')`)
+	exec(`INSERT INTO oauth_grants (id, user_id, product_id, scopes, revoked_at)
+	      SELECT ('00000000-0000-4000-8000-' || lpad(i::text, 12, '0'))::uuid, '00000000-0000-4000-8000-0000000000a1',
+	             '00000000-0000-4000-8000-0000000000b1', ARRAY['jobs:read'], now()
+	        FROM generate_series(1, 5) i`)
+	exec(`INSERT INTO product_tokens (user_id, product_id, name, token_hash, token_prefix, scopes, revoked, created_at, expires_at, grant_id)
+	      SELECT '00000000-0000-4000-8000-0000000000a1', '00000000-0000-4000-8000-0000000000b1', 'plan', sha256((g || '-' || i)::text::bytea), 'uzp_plan', ARRAY['jobs:read'],
+	             i > 3, now() - (i || ' minutes')::interval, now() - (i || ' minutes')::interval + interval '1 hour',
+	             ('00000000-0000-4000-8000-' || lpad(g::text, 12, '0'))::uuid
+	        FROM generate_series(1, 5) g, generate_series(1, 2000) i`)
+	exec(`ANALYZE product_tokens`)
+	plan := func(sql string) string {
+		t.Helper()
+		results, err := pg.Exec(ctx, `EXPLAIN (GENERIC_PLAN) `+sql).ReadAll()
+		if err != nil {
+			_, _ = pg.Exec(ctx, `ROLLBACK`).ReadAll()
+			t.Fatalf("explain: %v", err)
+		}
+		var b strings.Builder
+		for _, res := range results {
+			for _, row := range res.Rows {
+				b.WriteString(string(row[0]) + "\n")
+			}
+		}
+		return b.String()
+	}
+	live := plan(countLiveGrantTokens)
+	minted := plan(countGrantTokensMintedSince)
+	exec(`ROLLBACK`)
+
+	for _, c := range []struct{ name, got, index string }{
+		{"CountLiveGrantTokens", live, "idx_product_tokens_grant_live "},
+		{"CountGrantTokensMintedSince", minted, "idx_product_tokens_grant "},
+	} {
+		if !strings.Contains(c.got, c.index) {
+			t.Errorf("%s does not use %s:\n%s", c.name, c.index, c.got)
+		}
+		if strings.Contains(c.got, "Seq Scan") {
+			t.Errorf("%s seq-scans the table:\n%s", c.name, c.got)
+		}
+	}
+}

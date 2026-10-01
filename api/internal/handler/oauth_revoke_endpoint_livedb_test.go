@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -332,5 +333,183 @@ func TestOAuthRevokePerClientBudgetIgnoresFailedAuthenticationLiveDB(t *testing.
 	requireOAuthError(t, rec, http.StatusTooManyRequests, "temporarily_unavailable")
 	if ra, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || ra < 1 {
 		t.Fatalf("Retry-After = %q", rec.Header().Get("Retry-After"))
+	}
+}
+
+// TestOAuthRevokeDeadTokenIsOKBeforeTheOtherClientCheckLiveDB (RFC 7009 sections 2.1 and 2.2): an
+// access token that is already revoked or expired is answered 200 BEFORE the other-client check,
+// whoever asks, like a revoked refresh token (whose hash is cleared, so the lookup misses). A LIVE
+// token of another client stays 400 invalid_grant, and nothing is revoked by any of these.
+func TestOAuthRevokeDeadTokenIsOKBeforeTheOtherClientCheckLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	tok := e.connect(t)
+	other, otherSecret := e.seedClient2(t)
+	asOther := func(r *http.Request) { r.SetBasicAuth(other.String(), otherSecret) }
+	revokeAsOther := func(token, hint string) *httptest.ResponseRecorder {
+		return e.postTo(t, "/api/oauth/revoke", revokeForm(token, hint), asOther)
+	}
+	hints := []string{"", "refresh_token", "access_token"}
+
+	expired := decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken)).AccessToken
+	expiredID := e.tokenID(t, expired)
+	cliMustExec(t, e.pool, `UPDATE product_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1`, expiredID)
+	revoked := decodeOAuthRefresh(t, e.refresh(t, tok.RefreshToken)).AccessToken
+	revokedID := e.tokenID(t, revoked)
+	e.requireRevoked200(t, e.revoke(t, revoked, "access_token"))
+	deadManual := e.seedManualToken(t, e.product)
+	cliMustExec(t, e.pool, `UPDATE product_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1`, e.tokenID(t, deadManual))
+	liveManual := e.seedManualToken(t, e.product)
+
+	for name, token := range map[string]string{"expired access token": expired, "revoked access token": revoked, "expired manual token": deadManual} {
+		for _, hint := range hints {
+			if rec := revokeAsOther(token, hint); rec.Code != http.StatusOK {
+				t.Fatalf("another client revoking the %s with hint %q = %d %q, want 200", name, hint, rec.Code, rec.Body.String())
+			}
+		}
+	}
+	if e.tokenRevoked(t, expiredID) {
+		t.Fatal("another client's request revoked an expired token")
+	}
+	if !e.tokenRevoked(t, revokedID) {
+		t.Fatal("a revoked token became unrevoked")
+	}
+
+	// A live token of the other client's product is still refused, and nothing is revoked.
+	for name, token := range map[string]string{"live access token": tok.AccessToken, "live manual token": liveManual} {
+		for _, hint := range hints {
+			requireOAuthError(t, revokeAsOther(token, hint), http.StatusBadRequest, "invalid_grant")
+		}
+		t.Log(name, "refused for the other client")
+	}
+	e.requireConnectionIntact(t, tok.AccessToken)
+	e.wantWhoami(t, "the live manual token", liveManual, http.StatusOK)
+
+	// A revoked refresh token is unknown to its grant's former client's peers: 200 for anyone.
+	e.requireRevoked200(t, e.revoke(t, tok.RefreshToken))
+	for _, hint := range hints {
+		if rec := revokeAsOther(tok.RefreshToken, hint); rec.Code != http.StatusOK {
+			t.Fatalf("another client revoking a revoked refresh token with hint %q = %d, want 200", hint, rec.Code)
+		}
+	}
+
+	// The client's own expired token is 200 and is marked revoked, so the revoked-jobs sweep
+	// covers what it created.
+	tok2 := e.connect(t)
+	own := decodeOAuthRefresh(t, e.refresh(t, tok2.RefreshToken)).AccessToken
+	ownID := e.tokenID(t, own)
+	cliMustExec(t, e.pool, `UPDATE product_tokens SET expires_at = now() - interval '1 minute' WHERE id = $1`, ownID)
+	e.requireRevoked200(t, e.revoke(t, own, "access_token"))
+	if !e.tokenRevoked(t, ownID) {
+		t.Fatal("the client's own expired access token was not marked revoked")
+	}
+}
+
+// TestOAuthRefreshVersusOAuthRevokeLiveDB (D8): a refresh and POST /api/oauth/revoke with the refresh
+// token, both blocked on the grant lock, run in the order they queued and the loser leaves nothing
+// that survives. The revoke first: the refresh re-checks under the lock, finds the refresh token
+// gone and mints nothing. The refresh first: it mints, and the revoke then revokes that token with
+// the rest of the grant. Either way no unrevoked grant token and no live grant remains.
+func TestOAuthRefreshVersusOAuthRevokeLiveDB(t *testing.T) {
+	for _, revokeFirst := range []bool{true, false} {
+		name := "refresh queued first"
+		if revokeFirst {
+			name = "revoke queued first"
+		}
+		t.Run(name, func(t *testing.T) {
+			e := tokenSetup(t)
+			tok := e.connect(t)
+			g := e.liveGrant(t)
+			ctx := context.Background()
+			tx, err := e.pool.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer tx.Rollback(ctx) //nolint:errcheck // no-op after Commit
+			if _, err := tx.Exec(ctx, `SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE`, g.ID); err != nil {
+				t.Fatal(err)
+			}
+			var wg sync.WaitGroup
+			var ref, rev *httptest.ResponseRecorder
+			doRefresh := func() { wg.Add(1); go func() { defer wg.Done(); ref = e.refresh(t, tok.RefreshToken) }() }
+			doRevoke := func() { wg.Add(1); go func() { defer wg.Done(); rev = e.revoke(t, tok.RefreshToken) }() }
+			if revokeFirst {
+				doRevoke()
+			} else {
+				doRefresh()
+			}
+			waitForPgWaiting(t, e, "FROM oauth_grants WHERE id = $1 FOR UPDATE", 1)
+			if revokeFirst {
+				doRefresh()
+			} else {
+				doRevoke()
+			}
+			waitForPgWaiting(t, e, "FROM oauth_grants WHERE id = $1 FOR UPDATE", 2)
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			wg.Wait()
+
+			e.requireRevoked200(t, rev)
+			if revokeFirst {
+				requireOAuthError(t, ref, http.StatusBadRequest, "invalid_grant")
+				if n := e.countAllGrantTokens(t); n != 1 {
+					t.Fatalf("grant tokens = %d, want only the exchange's: the losing refresh minted one", n)
+				}
+			} else {
+				e.wantWhoami(t, "the token the winning refresh minted", decodeOAuthRefresh(t, ref).AccessToken, http.StatusUnauthorized)
+			}
+			if n := e.grantTokenCount(t, g.ID, `AND NOT revoked`); n != 0 {
+				t.Fatalf("%d unrevoked grant tokens survive the revoke", n)
+			}
+			if n := e.liveGrantCount(t, e.user); n != 0 {
+				t.Fatalf("%d live grants survive the revoke", n)
+			}
+			e.requireRefreshRefused(t, "refresh after the race", tok.RefreshToken, http.StatusBadRequest, "invalid_grant")
+		})
+	}
+}
+
+// TestOAuthAccessTokenRevokeVersusRefreshLiveDB (D8): revoking an access token and refreshing the
+// same grant concurrently, both on the grant lock, neither deadlocks nor undoes the other: both
+// answer 200, the revoked token stays revoked, the refreshed one works, and the grant stays live.
+// Repeated, so both lock orders occur.
+func TestOAuthAccessTokenRevokeVersusRefreshLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	tok := e.connect(t)
+	g := e.liveGrant(t)
+	ctx := context.Background()
+	victim := tok.AccessToken
+	for i := 0; i < 6; i++ {
+		tx, err := e.pool.Begin(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := tx.Exec(ctx, `SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE`, g.ID); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		var ref, rev *httptest.ResponseRecorder
+		wg.Add(2)
+		go func() { defer wg.Done(); ref = e.refresh(t, tok.RefreshToken) }()
+		go func() { defer wg.Done(); rev = e.revoke(t, victim, "access_token") }()
+		waitForPgWaiting(t, e, "FROM oauth_grants WHERE id = $1 FOR UPDATE", 2)
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan struct{})
+		go func() { wg.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(20 * time.Second):
+			t.Fatalf("iteration %d: refresh and access-token revoke deadlocked", i)
+		}
+		e.requireRevoked200(t, rev)
+		next := decodeOAuthRefresh(t, ref).AccessToken
+		e.wantWhoami(t, "the revoked access token", victim, http.StatusUnauthorized)
+		e.wantWhoami(t, "the refreshed access token", next, http.StatusOK)
+		if got := e.liveGrant(t); got.ID != g.ID || len(got.RefreshTokenHash) == 0 {
+			t.Fatal("an access-token revoke ended the grant")
+		}
+		victim = next
 	}
 }
