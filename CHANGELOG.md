@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Codex runs, delegated agents and the judge apply the configured reasoning effort.**
   The executor consumes the claimed effort and sends the app-server turn parameter as `effort`; the previously used internal field name was ignored by Codex.
 
+- **Codex sandbox: a substituted non-empty directory could pass the fresh-directory check ([#1842](https://github.com/vtmocanu/uzi/issues/1842)).**
+  The supervisor's safetree Create trusted a single getdents batch to prove a directory empty, but a pending signal (Go's preemption sends SIGURG) can end a batch after only "." and "..", so a peer-substituted directory holding files was accepted; the check now reads to end of directory and rejects any entry.
+
 - **A fetch that timed out or was cancelled as the site responded is no longer logged as a success ([#1977](https://github.com/vtmocanu/uzi/issues/1977)).**
   A fetcher attempt whose fetch timeout or caller cancellation ended as the site's response arrived is now refused and logged as `timeout`/`cancelled` instead of being returned and recorded as a successful (possibly 0-byte) fetch.
 

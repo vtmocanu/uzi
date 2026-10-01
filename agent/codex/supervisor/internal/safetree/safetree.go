@@ -93,19 +93,19 @@
 // foreign owner (ErrOwner), an I/O error (ErrIO), an invalid name (ErrName), or
 // the caller's deadline expiring (ErrDeadline).
 //
-// Create never chmods a directory before it has proven it made it. It opens
-// the name it just mkdirat'ed with the same two steps but restores no bits: a
+// Create never chmods a directory before it has proven it made it. It opens the
+// name it just mkdirat'ed with the same two steps but restores no bits: a
 // directory that is not owned by uid, lacks any owner rwx bit (mkdirat asked
-// for 0700), or is not empty (getdents shows more than "." and "..") is
-// rejected, so a peer that exchanged a NON-EMPTY directory, or one lacking
-// owner rwx, into the name between the mkdirat and the open gets neither a pin
-// nor a chmod on it (ErrMismatch, or ErrOwner for a foreign owner). An EMPTY
-// same-uid directory with owner rwx is indistinguishable from the one Create
-// made and is accepted (pinned, then fchmod'ed to 0700): the peer gains nothing
-// it could not do by opening the real directory after Create returns. Only
-// after those checks pass does Create fchmod the directory to exactly 0700. A
-// umask that strips owner bits from the mkdirat therefore also makes Create
-// fail.
+// for 0700), or is not empty (a getdents read to end of directory finds an
+// entry besides "." and "..") is rejected, so a peer that exchanged a NON-EMPTY
+// directory, or one lacking owner rwx, into the name between the mkdirat and
+// the open gets neither a pin nor a chmod on it (ErrMismatch, or ErrOwner for a
+// foreign owner). An EMPTY same-uid directory with owner rwx is
+// indistinguishable from the one Create made and is accepted (pinned, then
+// fchmod'ed to 0700): the peer gains nothing it could not do by opening the
+// real directory after Create returns. Only after those checks pass does Create
+// fchmod the directory to exactly 0700. A umask that strips owner bits from the
+// mkdirat therefore also makes Create fail.
 //
 // # Documented residual
 //
@@ -164,8 +164,8 @@ var (
 )
 
 const (
-	// getdentsBufSize is Create's emptiness-check buffer and the default
-	// direntBufSize.
+	// getdentsBufSize is the buffer for each getdents call of Create's
+	// emptiness check (read to end of directory) and the default direntBufSize.
 	getdentsBufSize = 8192
 	// minDirentBufSize fits one linux_dirent64 with a 255-byte name
 	// (19-byte header + 256, 8-aligned), so getdents never fails EINVAL.
@@ -188,8 +188,8 @@ const (
 // renameat2 and before its identity check. fstatat is the lstat used for every entry
 // and for the root re-check; fstat is used on every opened fd. procFdPrefix is
 // the magic-link directory the owner-bit restore chmods through. now is the
-// clock RemoveBy's deadline is checked against; getdents is the Remove walk's
-// directory read.
+// clock RemoveBy's deadline is checked against; getdents is the directory
+// read of both the Remove walk and Create's emptiness check.
 var (
 	hookBetweenStatAndOpen        func(dirfd int, name string)
 	hookBeforeRootRecheck         func(parentFd int, name string)
@@ -428,24 +428,29 @@ func Create(parentFd int, name string, uid int) (int, Pin, error) {
 	return fd, pinOf(&st), nil
 }
 
-// requireFresh verifies the directory fd is empty: one getdents shows only "."
-// and "..". st_nlink is not checked: btrfs reports 1 for every directory.
+// requireFresh verifies the directory fd is empty: getdents is read to end of
+// directory and any entry besides "." and ".." fails. One call is not enough: a
+// pending signal (Go's SIGURG preemption) ends a getdents batch early, so a
+// batch holding only "." and ".." can precede real entries. st_nlink is not
+// checked: btrfs reports 1 for every directory.
 func requireFresh(fd int) error {
 	buf := make([]byte, getdentsBufSize)
-	n, err := unix.Getdents(fd, buf)
-	for errors.Is(err, unix.EINTR) {
-		n, err = unix.Getdents(fd, buf)
-	}
-	if err != nil {
-		return ioErr("create getdents", err)
-	}
-	_, _, names := unix.ParseDirent(buf[:max(n, 0)], -1, nil)
-	for _, name := range names {
-		if name != "." && name != ".." {
+	for {
+		n, err := getdents(fd, buf)
+		if err != nil {
+			if errors.Is(err, unix.EINTR) {
+				continue
+			}
+			return ioErr("create getdents", err)
+		}
+		if n <= 0 {
+			return nil
+		}
+		// ParseDirent already drops "." and "..".
+		if _, count, _ := unix.ParseDirent(buf[:n], 1, nil); count > 0 {
 			return fmt.Errorf("%w: create: not empty", ErrMismatch)
 		}
 	}
-	return nil
 }
 
 // Remove is RemoveBy with no deadline.

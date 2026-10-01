@@ -1,6 +1,8 @@
 package safetree
 
 import (
+	"bytes"
+	"encoding/binary"
 	"errors"
 	"io/fs"
 	"os"
@@ -992,25 +994,13 @@ func TestCreateRejectsSubstitutedNonEmptyDir(t *testing.T) {
 	if !requireNonRootCommandUID(t) {
 		return
 	}
-	for _, tc := range []struct {
-		name  string
-		plant func(t *testing.T, dir string) string
-	}{
-		{"file", func(t *testing.T, dir string) string {
-			p := filepath.Join(dir, "planted")
-			mustWrite(t, p, "x")
-			return p
-		}},
-		{"subdir", func(t *testing.T, dir string) string {
-			p := filepath.Join(dir, "planted")
-			mustMkdir(t, p)
-			return p
-		}},
-	} {
+	for _, tc := range plantCases {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
 			var planted string
+			hookRan := false
 			setCreateHook(t, func(parentFd int, name string) {
+				hookRan = true
 				// Stand-in for a peer's renameat2(RENAME_EXCHANGE): the fresh dir
 				// leaves, a pre-filled one takes its name.
 				if err := unix.Renameat(parentFd, name, parentFd, name+".fresh"); err != nil {
@@ -1023,6 +1013,97 @@ func TestCreateRejectsSubstitutedNonEmptyDir(t *testing.T) {
 			fd, _, err := Create(f.parentFd, treeName, os.Geteuid())
 			if err == nil {
 				_ = unix.Close(fd)
+			}
+			if !hookRan {
+				t.Fatal("create hook did not run")
+			}
+			if !errors.Is(err, ErrMismatch) || fd != -1 {
+				t.Fatalf("Create = %d, %v; want -1, ErrMismatch", fd, err)
+			}
+			assertExists(t, planted)
+		})
+	}
+}
+
+// plantCases are the entries a peer pre-fills a substituted directory with.
+var plantCases = []struct {
+	name  string
+	plant func(t *testing.T, dir string) string
+}{
+	{"file", func(t *testing.T, dir string) string {
+		p := filepath.Join(dir, "planted")
+		mustWrite(t, p, "x")
+		return p
+	}},
+	{"subdir", func(t *testing.T, dir string) string {
+		p := filepath.Join(dir, "planted")
+		mustMkdir(t, p)
+		return p
+	}},
+}
+
+// A signal pending after the first entry ends a getdents batch early, so a
+// batch can hold only "." and ".." on a non-empty directory. The fake wraps the
+// getdents seam and returns only the first linux_dirent64 of each batch,
+// seeking the fd to the next record, to model that. Create must read to end of
+// directory instead of accepting the first batch. Dot entries come first on
+// ext4, xfs and tmpfs; on a filesystem that lists a real name first the batch
+// is not dot-only and the test would prove nothing, so it skips there.
+func TestCreateRejectsNonEmptyDirAcrossShortGetdentsBatches(t *testing.T) {
+	if !requireNonRootCommandUID(t) {
+		return
+	}
+	for _, tc := range plantCases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			var planted string
+			hookRan := false
+			setCreateHook(t, func(parentFd int, name string) {
+				hookRan = true
+				if err := unix.Renameat(parentFd, name, parentFd, name+".fresh"); err != nil {
+					t.Errorf("rename: %v", err)
+					return
+				}
+				mustMkdir(t, f.root())
+				planted = tc.plant(t, f.root())
+			})
+			prev := getdents
+			calls := 0
+			first := ""
+			getdents = func(fd int, buf []byte) (int, error) {
+				n, err := prev(fd, buf)
+				if err != nil || n <= 0 {
+					return n, err
+				}
+				calls++
+				reclen := int(binary.NativeEndian.Uint16(buf[16:18]))
+				off := int64(binary.NativeEndian.Uint64(buf[8:16]))
+				if first == "" {
+					name := buf[19:reclen]
+					if z := bytes.IndexByte(name, 0); z >= 0 {
+						name = name[:z]
+					}
+					first = string(name)
+				}
+				if _, err := unix.Seek(fd, off, unix.SEEK_SET); err != nil {
+					return 0, err
+				}
+				return reclen, nil
+			}
+			t.Cleanup(func() { getdents = prev })
+
+			fd, _, err := Create(f.parentFd, treeName, os.Geteuid())
+			if err == nil {
+				_ = unix.Close(fd)
+			}
+			if !hookRan {
+				t.Fatal("create hook did not run")
+			}
+			if calls == 0 {
+				t.Fatal("getdents seam never called: Create bypassed it")
+			}
+			if first != "." && first != ".." {
+				t.Skipf("filesystem lists %q before the dot entries; batch is not dot-only", first)
 			}
 			if !errors.Is(err, ErrMismatch) || fd != -1 {
 				t.Fatalf("Create = %d, %v; want -1, ErrMismatch", fd, err)
