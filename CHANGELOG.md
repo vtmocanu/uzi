@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Isolated lane: provisioning follows the chart's lane setting ([#1965](https://github.com/vtmocanu/uzi/issues/1965)).**
+  The api now provisions isolated-lane workers for site-list-bound runs only when the lane is enabled, detected from `UZI_FETCHER_TOKEN_SHA256`, which the chart renders into the api only when `workers.isolatedLane.enabled` and `workers.enabled` are on; a lane that is on with the fetcher token Secret key missing reads as off (fail closed). Creating a job that names a site list (`egress_profile`) on an instance without the lane is refused with 503 `isolated_lane_unavailable` and no job is created. A run already bound (for example, created before the lane was turned off) stays queued, and its queued reason now says an admin must enable the isolated research lane in the deployment; that reason takes precedence over the ephemeral-provisioning-off reason, while the requires-docker reason still comes first.
+
 - **Renovate proposes grouped Codex runtime upgrades.**
   Stable native-runtime releases follow the existing seven-day release age and nightly update schedule. Each PR updates the source commit and both musl archive checksums together; installer consistency checks and runtime pin parity block partial upgrades until the required compatibility work is complete.
 

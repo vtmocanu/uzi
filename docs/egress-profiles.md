@@ -17,7 +17,9 @@ and runs on the no-internet worker lane described in [Isolated research
 lane](isolated-research-lane.md), reading only the hosts on the list. Your own
 `uzc_` token may name any profile. A product (`uzp_`) token may name only a
 profile an admin has allowed for its product (see below). Nothing else binds a
-run to a profile, and a run without one reaches the network as before.
+run to a profile, and a run without one reaches the network as before. On an
+instance without the isolated lane enabled, a job naming a profile is refused
+with 503 `isolated_lane_unavailable`.
 
 ## Allowing a profile for a product
 

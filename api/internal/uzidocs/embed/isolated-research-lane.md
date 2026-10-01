@@ -19,11 +19,18 @@ site list. A [job](jobs.md#site-lists) binds itself by naming a site list in
 `egress_profile` on create ([PRD #1976](../prds/done/1976-site-list-jobs.md)); see
 [Jobs on the lane](#jobs-on-the-lane). Turning the lane on renders the
 namespace, the fetcher and the policies. The api provisions lane workers only
-for bound runs, so without bound runs the lane is idle. Its lane trigger is
-gated on the ephemeral-worker switch, not on the chart value: with the lane off
-in the chart, a bound run still gets a lane worker row that the controller never
-renders. A bound research run then stays queued; a bound job fails instead (see
-[Jobs on the lane](#jobs-on-the-lane)). Live acceptance on a real cluster (this PRD's
+for bound runs, so without bound runs the lane is idle. Lane workers are
+provisioned only when the lane is enabled in the chart
+(`workers.isolatedLane.enabled`) and ephemeral workers are on. The api detects
+the lane from `UZI_FETCHER_TOKEN_SHA256`, which the chart renders into the api
+only when the lane and `workers.enabled` are on; a lane that is on while the
+fetcher token Secret lacks that key reads as off (fail closed, and the fetcher
+control routes are unmounted too). With the lane off, creating a job that names
+a site list is refused with 503 `isolated_lane_unavailable` and no job is
+created. A run already bound (for example, created before the lane was turned
+off) stays queued, and its queued reason says an admin must enable the isolated
+research lane in the deployment (see [Jobs on the lane](#jobs-on-the-lane)).
+Live acceptance on a real cluster (this PRD's
 milestone M9) has not been done: the network guarantees below are what the
 chart and code are built to enforce, not something a maintainer has yet
 measured on a running cluster.
@@ -82,7 +89,9 @@ lane run. What differs from a job on a standard worker:
   never registers fails it (`ephemeral_worker_never_registered`) after the
   provision deadline. If no lane worker is provisioned at all (ephemeral worker
   provisioning off, or the user at the ephemeral worker limit), the bound job
-  stays queued, exactly like a bound research run.
+  stays queued, exactly like a bound research run. With the lane itself off, a
+  job naming a site list is refused at create (503 `isolated_lane_unavailable`);
+  a job bound before the lane was turned off stays queued.
 - **The fetch credential is redacted** from messages, failure reasons, logs and
   the posted result. Output-file contents are outside that redaction coverage:
   keeping the credential out of the model's prompt and environment does not
@@ -115,8 +124,8 @@ fails the render); the rest it does not check:
 - **Ephemeral (run-bound) workers must be enabled** on the instance (the
   `ephemeral_workers_enabled` admin setting; see [Hosted
   workers](hosted-workers.md)). Lane workers are provisioned by the same
-  provisioner. The lane trigger skips a user's opt-in, but not this switch or the
-  per-user ephemeral cap.
+  provisioner. The lane trigger skips a user's opt-in, but not this switch, the
+  per-user ephemeral cap, or the requirement that the lane is enabled.
 - **`workers.isolatedLane.modelHost`** is one exact host name, `api.anthropic.com`
   by default; a `*` fails the render. No OpenAI host is admitted in the lane.
   Change it only from a real failure.
@@ -289,8 +298,10 @@ on a live cluster yet.
   lane namespace: existing lane workers, Secrets and PVCs are left untouched, not
   torn down. Clean them up by hand (delete the leftover `uzi-hw-*` objects in the
   lane namespace), and the chart no longer renders the namespace, policies or
-  fetcher. Runs already bound to a list stay bound and cannot be claimed by any
-  other kind of worker.
+  fetcher. The api provisions no new lane workers, and a job naming a site list
+  is refused at create (503 `isolated_lane_unavailable`). Runs already bound to
+  a list stay bound and queued, with a reason telling an admin to enable the lane,
+  and cannot be claimed by any other kind of worker.
 - **Generated fetcher token under Argo CD.** The `generated` source keeps the
   same token across `helm upgrade` by looking up the existing Secret. Argo CD
   renders with `helm template`, where that lookup returns nothing, so every sync

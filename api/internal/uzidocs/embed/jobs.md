@@ -172,6 +172,7 @@ Files of a running job stay attached. When the job ends, each file becomes `avai
 | 404 | `unknown_egress_profile` | `egress_profile` names no existing site list |
 | 422 | `invalid_request`, `unknown_job_type`, `no_model_credential` | Bad request (an explicit empty `egress_profile` included), or you have no usable Anthropic credential |
 | 429 | `over_cap` | Active-job cap reached |
+| 503 | `isolated_lane_unavailable` | `egress_profile` was sent but this instance has no isolated research lane enabled |
 
 ## Site lists
 
@@ -186,7 +187,7 @@ A job can read official web sources from an admin-approved [site list](./egress-
 - **Removing an allowance affects only jobs created afterwards.** A job already created keeps its list.
 - **Where it runs.** A job with a site list is placed on the [isolated research lane](./isolated-research-lane.md): a worker with no internet that reads the web only through the fetch service, limited to the list's hosts, with every attempt in the result's `sources`. Inputs, uploaded files, output files and the result work as for any job.
 - **The fetch credential is redacted** from messages, failure reasons, logs and the posted result. **Output-file contents are not covered by that redaction**: the job writes them, so treat them as untrusted and do not assume an echoed credential can never reach one.
-- **Once a lane worker is provisioned for a bound job, a worker that cannot serve it fails the job rather than leaving it waiting.** If that lane worker never registers, the job fails (`ephemeral_worker_never_registered`); a lane worker that registers without the `isolated_job_v1` capability fails it too (`no_job_capable_worker`). If no lane worker is provisioned at all (ephemeral worker provisioning is turned off on the instance, or you are at your ephemeral worker limit), the bound job stays `queued`, like a bound research run, and counts toward your active jobs; cancel it if it should not wait. A job without a site list is unaffected. See [Isolated research lane](./isolated-research-lane.md#jobs-on-the-lane).
+- **Once a lane worker is provisioned for a bound job, a worker that cannot serve it fails the job rather than leaving it waiting.** If that lane worker never registers, the job fails (`ephemeral_worker_never_registered`); a lane worker that registers without the `isolated_job_v1` capability fails it too (`no_job_capable_worker`). If no lane worker is provisioned at all (ephemeral worker provisioning is turned off on the instance, or you are at your ephemeral worker limit), the bound job stays `queued`, like a bound research run, and counts toward your active jobs; cancel it if it should not wait. If the instance has no isolated research lane enabled, naming a site list is refused at create with 503 `isolated_lane_unavailable` and no job is created (the check runs after the empty-string 422); a job bound before the lane was turned off stays `queued`, and its queued reason says an admin must enable the lane. A job without a site list is unaffected. See [Isolated research lane](./isolated-research-lane.md#jobs-on-the-lane).
 
 ## Trust model
 
