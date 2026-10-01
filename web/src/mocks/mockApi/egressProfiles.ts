@@ -281,6 +281,11 @@ function validate(
   return { hosts, overrides };
 }
 
+// mockEgressProfileDescription is the description of the named list, or null when it does
+// not exist (the per-product allowed lists in productTokens.ts resolve names through it).
+export const mockEgressProfileDescription = (name: string): string | null =>
+  profiles.find((p) => p.name === name)?.description ?? null;
+
 export const egressProfilesApi = {
   adminListEgressProfiles: async () => {
     requireAdmin();
