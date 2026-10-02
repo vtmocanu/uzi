@@ -19,6 +19,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       adminUpdateProduct: vi.fn(),
       adminDeleteProduct: vi.fn(),
       adminRevokeProductToken: vi.fn(),
+      adminRotateProductClientSecret: vi.fn(),
       adminListProductConnections: vi.fn(),
       adminRevokeOAuthConnection: vi.fn(),
       // AdminShell's health pip self-fetches; it never settles here, so the pip stays off.
@@ -639,8 +640,61 @@ describe("AdminProducts owner and product filters (issue #1935)", () => {
     mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "boom"));
     fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
     expect(await screen.findByText("boom")).toBeTruthy();
-    expect(screen.queryByRole("region", { name: "Metrics export" })).toBeNull();
+    // The card stays, but with neither the old rows nor a claim about the new filter.
+    const metrics = await productCard("Metrics export");
+    expect(within(metrics).queryByText("ancient")).toBeNull();
+    expect(within(metrics).queryByText("No tokens match the current filters.")).toBeNull();
     expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+  });
+
+  // Opens a card's OAuth disclosure the way ProductOAuthClient's own tests do.
+  function openOAuth(card: HTMLElement) {
+    const details = Array.from(card.querySelectorAll("details")).find((d) =>
+      d.textContent?.includes("OAuth client"),
+    ) as HTMLDetailsElement;
+    details.open = true;
+    fireEvent(details, new Event("toggle"));
+  }
+
+  it("keeps a card's unsaved redirect-URI draft across an owner filter change", async () => {
+    await pickFilters();
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    const helpdesk = await productCard("Helpdesk assistant");
+    await within(helpdesk).findByText("support-prod");
+    openOAuth(helpdesk);
+    const uris = within(helpdesk).getByLabelText(/Redirect URIs/) as HTMLTextAreaElement;
+    fireEvent.change(uris, { target: { value: "https://draft.example.com/cb" } });
+
+    mockApi.adminListProductTokens.mockClear();
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenCalledWith({ ownerId: "u-mira", productId: "" }));
+    expect(await within(helpdesk).findByText("No tokens match the current filters.")).toBeTruthy();
+    expect((within(helpdesk).getByLabelText(/Redirect URIs/) as HTMLTextAreaElement).value).toBe(
+      "https://draft.example.com/cb",
+    );
+  });
+
+  it("keeps a one-time client secret on screen across owner and product filter changes", async () => {
+    const secret = "uzs_" + "A".repeat(43);
+    mockApi.adminRotateProductClientSecret.mockResolvedValue({ client_secret: secret, product: aProduct() });
+    await pickFilters();
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    const helpdesk = await productCard("Helpdesk assistant");
+    await within(helpdesk).findByText("support-prod");
+    openOAuth(helpdesk);
+    fireEvent.click(within(helpdesk).getByRole("button", { name: "Create client secret" }));
+    expect(await within(helpdesk).findByText(secret)).toBeTruthy();
+
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenLastCalledWith({ ownerId: "u-mira", productId: "" }));
+    // Another product's filter hides this card without unmounting it ...
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "prod-b" } });
+    expect(screen.queryByRole("region", { name: "Helpdesk assistant" })).toBeNull();
+    // ... and clearing it brings the card back with the secret still shown.
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    expect(await screen.findByText(secret)).toBeTruthy();
   });
 
   it("shows an error beside the filters when the users list fails to load", async () => {

@@ -77,8 +77,22 @@ export function AdminProducts() {
   const { data: usersData, error: usersError } = useAsyncData<User[]>(async () => (await api.listUsers()).users, [], {
     fallback: "Failed to load users",
   });
-  const { data, loading, error: loadError, reload } = useAsyncData<{
-    products: Product[];
+  // Products load once, apart from the tokens: a filter change refetches only the tokens, so the
+  // cards stay mounted and keep their local state (an unsaved redirect-URI draft, a one-time
+  // client secret that cannot be shown again).
+  const {
+    data: productsData,
+    loading,
+    error: productsError,
+    reload: reloadProducts,
+  } = useAsyncData<Product[]>(async () => (await api.adminListProducts()).products, [], {
+    fallback: "Failed to load products",
+  });
+  const {
+    data,
+    error: tokensError,
+    reload: reloadTokens,
+  } = useAsyncData<{
     tokens: AdminProductToken[];
     truncated: boolean;
     // The filters this result was fetched with, so rows are only shown under the same filters.
@@ -86,37 +100,35 @@ export function AdminProducts() {
     productId: string;
   }>(
     async () => {
-      const [{ products }, { tokens, truncated }] = await Promise.all([
-        api.adminListProducts(),
-        api.adminListProductTokens({ ownerId: ownerFilter, productId: productFilter }),
-      ]);
-      return { products, tokens, truncated: truncated === true, ownerId: ownerFilter, productId: productFilter };
+      const { tokens, truncated } = await api.adminListProductTokens({
+        ownerId: ownerFilter,
+        productId: productFilter,
+      });
+      return { tokens, truncated: truncated === true, ownerId: ownerFilter, productId: productFilter };
     },
     [ownerFilter, productFilter],
-    // "deps": a filter change shows the skeleton instead of the previous filter's rows.
-    { fallback: "Failed to load products", skeleton: "deps" },
+    { fallback: "Failed to load tokens" },
   );
-  // The hook keeps the last data when a refetch fails, so a failed fetch after a filter change
-  // leaves the previous filter's result in `data`. `shown` is that result only while it matches
-  // the displayed filters; otherwise nothing from it (rows, narrowing, notices) is rendered.
+  const reload = () => Promise.all([reloadProducts(), reloadTokens()]);
+  // The hook keeps the last data when a refetch fails, and while a new filter's fetch is pending
+  // `data` is still the previous filter's result. `shown` is that result only while it matches
+  // the displayed filters; otherwise nothing from it (rows, revoke actions, narrowing, notices)
+  // is rendered, and the cards say their tokens are loading (or, on a failure, only the banner).
   const shown = data && data.ownerId === ownerFilter && data.productId === productFilter ? data : null;
+  const tokensFailed = shown === null && tokensError !== "";
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   // When the server cut the inventory, how many tokens it did list (the notices name
   // this number rather than a hard-coded cap that could drift from the server's).
   const truncatedAt = shown?.truncated ? shown.tokens.length : null;
-  // No result for the current filters (the first load, or a filter change's refetch,
-  // failed): show only the error, never a "No products registered"
+  // The first products load failed: show only the error, never a "No products registered"
   // empty state the page cannot know to be true.
-  const loadFailed = shown === null && loadError !== "";
+  const loadFailed = productsData === null && productsError !== "";
 
   // Live products first, soft-deleted ones last (the audit trail), server order within.
-  // (The product list itself does not depend on the filters, so it feeds the select from `data`.)
-  const allProducts = [...(data?.products ?? [])].sort(
+  const allProducts = [...(productsData ?? [])].sort(
     (a, b) => Number(a.deleted_at !== null) - Number(b.deleted_at !== null),
   );
-  // A product filter shows only that product's card: the rest would all read "no tokens match".
-  const products = productFilter ? allProducts.filter((p) => p.id === productFilter) : allProducts;
   const tokensByProduct = new Map<string, AdminProductToken[]>();
   for (const t of shown?.tokens ?? []) {
     const list = tokensByProduct.get(t.product_id) ?? [];
@@ -142,7 +154,7 @@ export function AdminProducts() {
 
   return (
     <AdminShell description="External products your users can connect to uzi’s /api/v1. Disabling or deleting a product stops every token and connection for it on its next request.">
-      {(error || loadError) && <Alert message={error || loadError} />}
+      {(error || productsError || tokensError) && <Alert message={error || productsError || tokensError} />}
       {notice && <Alert tone="success" message={notice} />}
 
       <CreateProduct
@@ -199,7 +211,7 @@ export function AdminProducts() {
 
       {loading ? (
         <ListSkeleton rows={3} />
-      ) : loadFailed || shown === null ? null : products.length === 0 ? (
+      ) : loadFailed || productsData === null ? null : allProducts.length === 0 ? (
         <EmptyState
           icon={<PackageIcon />}
           title="No products registered"
@@ -207,10 +219,15 @@ export function AdminProducts() {
         />
       ) : (
         <div className="space-y-4">
-          {products.map((p) => (
+          {allProducts.map((p) => (
             <ProductCard
               key={p.id}
+              // A product filter shows only that product's card; the rest are hidden, not unmounted,
+              // so their local state survives a change of filter.
+              hidden={productFilter !== "" && p.id !== productFilter}
               product={p}
+              tokensReady={shown !== null}
+              tokensFailed={tokensFailed}
               tokens={tokensByProduct.get(p.id) ?? []}
               truncatedAt={truncatedAt}
               filtered={filtered}
@@ -466,7 +483,10 @@ function DeletedBadge({ deletedAt }: { deletedAt: string }) {
 }
 
 function ProductCard({
+  hidden,
   product,
+  tokensReady,
+  tokensFailed,
   tokens,
   truncatedAt,
   filtered,
@@ -476,7 +496,13 @@ function ProductCard({
   onRevoke,
   onOAuthChanged,
 }: {
+  // A product filter excludes this card: kept mounted (so its state survives) but not shown.
+  hidden: boolean;
   product: Product;
+  // The tokens for the current filters have arrived; until then (or after a failed fetch) the
+  // token section shows neither rows nor an empty-list message.
+  tokensReady: boolean;
+  tokensFailed: boolean;
   tokens: AdminProductToken[];
   // Non-null when the inventory was cut server-side (the number listed), so an empty
   // `tokens` does not mean none exist.
@@ -548,7 +574,7 @@ function ProductCard({
   const headingId = `product-${product.id}`;
 
   return (
-    <section aria-labelledby={headingId}>
+    <section aria-labelledby={headingId} hidden={hidden}>
       <Card className={deleted ? "space-y-4 opacity-75" : "space-y-4"}>
         <div className="flex flex-wrap items-start justify-between gap-3">
           <div className="min-w-0 space-y-1">
@@ -647,7 +673,9 @@ function ProductCard({
           />
         )}
 
-        {tokens.length === 0 ? (
+        {!tokensReady ? (
+          tokensFailed ? null : <p className="text-sm text-faint">Loading tokens…</p>
+        ) : tokens.length === 0 ? (
           <p className="text-sm text-faint">
             {truncatedAt !== null
               ? `None of this product’s tokens${filtered ? " matching the current filters" : ""} are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
