@@ -9578,14 +9578,17 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
   it("plan/own: the override replaces a pinned child model", async () => {
     for (const override of [false, true]) {
       const rig = makeRig({ responder: spawnResponder("th-plan", false) });
+      // gatePlan routes run() through the PLAN turn, so the child spawns on the plan transport.
+      // That turn submits no plan, so run() fails closed and the approver is never reached.
       const { ctx } = makeCtx({
         planApproved: false, approvedPlan: undefined,
+        gatePlan: async () => ({ kind: "cancel" }),
         agents: [ownAgents[0]!, pinnedOwn],
         config: { default_model: "gpt-6-astra", override_subagent_model: override },
       });
       const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan model run");
       const admitted = await probeSpawns(rig.transport, "th-plan", ["pinned-own"]);
-      await run;
+      await assert.rejects(run, /produced no plan/);
       assert.deepEqual(admitted, { "pinned-own": true });
       assert.equal(rec(rig.transport.requests.find((r) => r.method === "thread/start")?.params).model, "gpt-6-astra");
       const expected = override ? "gpt-6-astra" : "gpt-5.6-sol";
