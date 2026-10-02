@@ -41,7 +41,7 @@
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
 #      superseded it) and nothing failed. A run not yet concluded whose jobs are all
 #      terminal with at least one cancelled counts as superseded too, never green; a run
-#      GitHub already concluded success keeps that verdict. `git fetch origin main` and re-watch the CURRENT
+#      GitHub already concluded keeps its own verdict (success green, failure exit 1). `git fetch origin main` and re-watch the CURRENT
 #      head, whose run exercises this change plus the newer one. Not a failure.
 #
 # Design notes:
@@ -261,11 +261,16 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           ;;
         PENDING) pending=1 ;;
         CANCELLED)
-          # Inferred only for a run not yet concluded: a run GitHub already concluded
-          # success (a cancelled job inside a green run) keeps its own verdict.
-          if [ "$rstatus" = "completed" ] && [ "$rconcl" = "success" ]; then :
+          # Supersession is inferred only for a run not yet concluded. A concluded run
+          # keeps GitHub's own verdict: success/skipped/neutral is green, anything else
+          # (failure, timed_out, ...) is a failure. A cancelled RUN was handled above.
+          if [ "$rstatus" != "completed" ]; then
+            superseded=$((superseded+1)); echo "[tick $tick] run $rid jobs cancelled before the run concluded (superseded)"
           else
-            superseded=$((superseded+1)); echo "[tick $tick] $wname run $rid jobs cancelled before the run concluded (superseded)"
+            case "$rconcl" in
+              success|skipped|neutral) : ;;
+              *) echo "=== sha ${SHA:0:8}: run $rid concluded $(printf '%s' "$rconcl" | tr -cd 'a-z_') with a cancelled job (exit 1) ==="; failed=1; break ;;
+            esac
           fi ;;
         GREEN) : ;;
       esac
@@ -340,13 +345,17 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       exit 0
       ;;
     CANCELLED)
-      # Inferred only for a run not yet concluded (concl is read above in branch mode):
-      # a run GitHub already concluded success keeps its own verdict.
-      if [ "${concl:-}" = "success" ]; then
-        echo "=== run $cur: concluded success (a cancelled job inside it), none failed after $((tick*INTERVAL))s ==="
-        exit 0
-      fi
-      echo "[tick $tick] run $cur jobs cancelled before the run concluded (superseded); re-resolving next tick"
+      # Supersession is inferred only for a run not yet concluded (concl is read above in
+      # branch mode). A concluded run keeps GitHub's own verdict.
+      case "${concl:-}" in
+        "") echo "[tick $tick] run $cur jobs cancelled before the run concluded (superseded); re-resolving next tick" ;;
+        success|skipped|neutral)
+          echo "=== run $cur: concluded ${concl} (a cancelled job inside it), none failed after $((tick*INTERVAL))s ==="
+          exit 0 ;;
+        *)
+          echo "=== run $cur: concluded $(printf '%s' "$concl" | tr -cd 'a-z_') with a cancelled job (exit 1) ==="
+          exit 1 ;;
+      esac
       ;;
     PENDING)
       open_jobs="$(printf '%s\n' "$out" | awk -F'\t' '$1!="completed"{n++} END{print n+0}')"

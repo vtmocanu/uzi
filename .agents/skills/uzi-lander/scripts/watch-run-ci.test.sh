@@ -84,6 +84,13 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
         *) printf '107\n' ;;
       esac
       ;;
+    jobs-cancelled-failure)
+      # GitHub concluded the run failure; the job rows show only success and cancelled.
+      case " $* " in
+        *" --commit "*) printf '108\tcompleted\tfailure\tCI\n' ;;
+        *) printf '108\n' ;;
+      esac
+      ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
   exit 0
@@ -99,9 +106,14 @@ if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
     else printf 'completed\tsuccess\tCI\thttps://example.invalid/job/103\t103\n'; fi
   elif [ "$MODE" = stuck ]; then
     printf 'in_progress\t\tCI\thttps://example.invalid/job/105\t105\n'
-  elif [ "$MODE" = jobs-cancelled ] || [ "$MODE" = jobs-cancelled-success ]; then
+  elif [ "$MODE" = jobs-cancelled ] || [ "$MODE" = jobs-cancelled-success ] || [ "$MODE" = jobs-cancelled-failure ]; then
     case " $* " in
-      *" --json conclusion "*) if [ "$MODE" = jobs-cancelled-success ]; then printf 'success\n'; else printf '\n'; fi ;;
+      *" --json conclusion "*)
+        case "$MODE" in
+          jobs-cancelled-success) printf 'success\n' ;;
+          jobs-cancelled-failure) printf 'failure\n' ;;
+          *) printf '\n' ;;
+        esac ;;
       *) printf 'completed\tsuccess\tlint\thttps://example.invalid/job/1061\t1061\n'
          printf 'completed\tcancelled\ttest\thttps://example.invalid/job/1062\t1062\n' ;;
     esac
@@ -299,5 +311,19 @@ bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 2 > "$WOR
 rc=$?
 set -e
 [ "$rc" -eq 0 ] || fail "--branch concluded-success run with a cancelled job was not green, rc=$rc: $(cat "$WORK/jobs-cancelled-success-branch.out")"
+
+# A run GitHub already concluded failure stays a failure even when its job rows show only
+# success and cancelled.
+MODE=jobs-cancelled-failure; export MODE
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-failure-sha.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "--sha concluded-failure run with a cancelled job was not a failure, rc=$rc: $(cat "$WORK/jobs-cancelled-failure-sha.out")"
+set +e
+bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 2 > "$WORK/jobs-cancelled-failure-branch.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "--branch concluded-failure run with a cancelled job was not a failure, rc=$rc: $(cat "$WORK/jobs-cancelled-failure-branch.out")"
 
 echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green"
