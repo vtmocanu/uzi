@@ -56,6 +56,9 @@ through `[0.52.0]`.)
 - **Fetch credentials are now scrubbed from API text and CI failure log tails ([#2035](https://github.com/vtmocanu/uzi/issues/2035)).**
   The outbound text and issue draft scrubbers replace recognized `uzf_` credentials, and the CI failure snapshot scrubber replaces them in log tails.
 
+- **A lost wall-park response no longer fails or discards a resumable Codex run ([#2042](https://github.com/vtmocanu/uzi/issues/2042)).**
+  The worker retries an uncertain park and checks claim ownership before finalizing; late failure reports cannot end a wall or completion hold, and an abandoned timed run remains eligible for server wall parking even at the requeue cap.
+
 - **Admin Health no longer expects a controller when chart hosting is disabled ([#1982](https://github.com/vtmocanu/uzi/issues/1982)).**
   The chart emits HOSTED_WORKER_VERSION only when workers.enabled is true, so an installation with no hosted workers does not show a false controller-report Danger banner after startup. External worker upgrade targets are unaffected.
 
