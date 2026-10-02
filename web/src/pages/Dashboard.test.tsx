@@ -190,6 +190,8 @@ beforeEach(() => {
     login: vi.fn(),
     logout: vi.fn(),
     refresh: vi.fn(),
+    serverUnreachable: false,
+    retry: vi.fn(),
   });
   // Deterministic visibility so usePollWhileVisible ticks.
   Object.defineProperty(document, "hidden", { configurable: true, get: () => false });

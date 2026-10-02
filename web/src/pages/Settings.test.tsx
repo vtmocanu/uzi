@@ -101,6 +101,8 @@ function mockAuth(user: User, appearance = baseAppearance()) {
     login: vi.fn(),
     logout: vi.fn(),
     refresh,
+    serverUnreachable: false,
+    retry: vi.fn(),
   });
 }
 

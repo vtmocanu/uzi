@@ -190,6 +190,8 @@ beforeEach(() => {
     login: vi.fn(),
     logout: vi.fn(),
     refresh: vi.fn(),
+    serverUnreachable: false,
+    retry: vi.fn(),
   });
   mockApi.listRepos.mockResolvedValue({ repos });
   mockApi.listConnections.mockResolvedValue({ connections: [gitlabConnection] });

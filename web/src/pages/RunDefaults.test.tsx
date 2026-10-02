@@ -98,6 +98,8 @@ function mockAuth(user: User, over: Partial<ReturnType<typeof useAuth>> = {}) {
     login: vi.fn(),
     logout: vi.fn(),
     refresh,
+    serverUnreachable: false,
+    retry: vi.fn(),
     ...over,
   });
 }

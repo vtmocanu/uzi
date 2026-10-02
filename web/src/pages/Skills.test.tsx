@@ -86,6 +86,8 @@ function setAuth(u: User) {
     login: vi.fn(),
     logout: vi.fn(),
     refresh: vi.fn(),
+    serverUnreachable: false,
+    retry: vi.fn(),
   });
 }
 

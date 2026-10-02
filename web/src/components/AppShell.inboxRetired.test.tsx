@@ -129,6 +129,8 @@ beforeEach(() => {
     login: vi.fn(),
     logout: vi.fn(),
     refresh: vi.fn(),
+    serverUnreachable: false,
+    retry: vi.fn(),
   });
   // A server that still reported unread inbox rows must not reach the UI at all.
   unreadSpy.mockResolvedValue({ unread: 3 });

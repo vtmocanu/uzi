@@ -99,7 +99,19 @@ interface AuthState {
   login: (email: string, password: string) => Promise<void>;
   logout: () => Promise<void>;
   refresh: () => Promise<void>;
+  // serverUnreachable is true when the session probe failed for a reason other than
+  // 401 (a 503 from a transient DB outage, or a network error), so the SPA does not
+  // know whether the visitor is signed in. Route guards show a retry panel instead
+  // of bouncing to /login while it is set and there is no user. Cleared by any
+  // successful session response, a 401, a login/register, or a logout.
+  serverUnreachable: boolean;
+  // retry re-runs the session probe now; the provider also re-runs it every 5s
+  // while serverUnreachable and signed out. Same function as refresh.
+  retry: () => Promise<void>;
 }
+
+// Re-probe cadence while the server is unreachable and nobody is signed in.
+const RETRY_INTERVAL_MS = 5000;
 
 const AuthContext = createContext<AuthState | undefined>(undefined);
 
@@ -116,6 +128,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [hasPassword, setHasPassword] = useState(true);
   const [judgeEnforcedByAdmin, setJudgeEnforcedByAdmin] = useState(false);
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
+  const [serverUnreachable, setServerUnreachable] = useState(false);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -126,6 +139,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // stamps data-theme/data-font and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
     setUser(session.user);
+    setServerUnreachable(false);
     setUziLabel(session.uzi_label || DEFAULT_UZI_LABEL);
     setAutopilotLabel(session.autopilot_label || DEFAULT_AUTOPILOT_LABEL);
     // Read as possibly-absent: an older server omits `appearance` entirely, so we
@@ -158,6 +172,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     } catch (err) {
       if (err instanceof ApiError && err.status === 401) {
         setUser(null);
+        setServerUnreachable(false);
+      } else {
+        // A 503 (transient DB outage), another non-401 status, or a network
+        // failure: the session state is unknown, so leave user untouched.
+        setServerUnreachable(true);
       }
     }
   }, [applySession]);
@@ -168,7 +187,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // — the initial me() probe's expected 401 composes without looping: it clears an
   // already-empty session and leaves a signed-out visitor on their public page.
   useEffect(() => {
-    setUnauthorizedHandler(() => setUser(null));
+    setUnauthorizedHandler(() => {
+      setUser(null);
+      setServerUnreachable(false);
+    });
     return () => setUnauthorizedHandler(null);
   }, []);
 
@@ -201,6 +223,26 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     })();
   }, [refresh]);
 
+  // While the server is unreachable and nobody is signed in, re-probe on a timer.
+  // Each failed probe leaves serverUnreachable true, so the effect does not re-run;
+  // chain the next attempt from the probe's completion instead of a state change.
+  useEffect(() => {
+    if (!serverUnreachable || user) return;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    const schedule = () => {
+      timer = setTimeout(async () => {
+        await refresh();
+        if (!cancelled) schedule();
+      }, RETRY_INTERVAL_MS);
+    };
+    schedule();
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [serverUnreachable, user, refresh]);
+
   const register = useCallback(
     async (email: string, password: string, displayName: string) => {
       applySession(await api.register(email, password, displayName));
@@ -220,6 +262,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       await api.logout();
     } finally {
       setUser(null);
+      setServerUnreachable(false);
     }
   }, []);
 
@@ -239,6 +282,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      serverUnreachable,
+      retry: refresh,
     }),
     [
       user,
@@ -255,6 +300,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       login,
       logout,
       refresh,
+      serverUnreachable,
     ],
   );
 
