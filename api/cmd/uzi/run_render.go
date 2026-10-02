@@ -1197,8 +1197,8 @@ func summaryRows(r apitypes.RunDTO) [][]string {
 }
 
 // prDescriptionRows is the CLI surface of the run's published PR description (PRD #1798 M7):
-// the summary (DELIVERED), the size line (SIZE) and, when the PR's last description write did
-// not publish, a plain note saying why (PR_UPDATE). The web twin is DeliveredCard
+// the summary (DELIVERED), published diagram edges (DIAGRAM), the size line (SIZE),
+// and a note when the PR's last description write did not publish (PR_UPDATE). The web twin is DeliveredCard
 // (web/src/pages/runView/DeliveredCard.tsx); `--json` already carries the whole artifact.
 //
 // The fields are lead- or model-authored UNTRUSTED text that the api sanitized for the forge's
@@ -1218,6 +1218,19 @@ func prDescriptionRows(r apitypes.RunDTO) [][]string {
 			// the diff. The PR body carries that note; so must this surface (web twin: DeliveredCard).
 			if d.Source == "lead_only" {
 				rows = append(rows, []string{"UNCHECKED", "Summary written by the agent, not checked against the diff."})
+			}
+		}
+		if d.DiagramPublished && d.Fields.Diagram != nil {
+			labels := make(map[string]string, len(d.Fields.Diagram.Nodes))
+			for _, node := range d.Fields.Diagram.Nodes {
+				labels[node.Key] = cellText(displayPrText(node.Label))
+			}
+			for _, edge := range d.Fields.Diagram.Edges {
+				line := labels[edge.From] + " → " + labels[edge.To]
+				if label := cellText(displayPrText(edge.Label)); label != "" {
+					line += ": " + label
+				}
+				rows = append(rows, []string{"DIAGRAM", cellText(line)})
 			}
 		}
 		if body := prSizeBody(d.Size); body != "" {
