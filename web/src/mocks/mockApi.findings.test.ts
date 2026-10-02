@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { mockAdmin, mockFindings } from "./data";
+import { mockAdmin, mockFindings, mockRuns } from "./data";
 
 // Each test re-imports a fresh mockApi so mutating verbs (file/dismiss) don't bleed across
 // tests. The session starts signed in as admin, so requireSession resolves without a login.
@@ -77,6 +77,17 @@ describe("mockApi findings backlog (PRD #333 M7)", () => {
     expect(open.run).toBe("run-done");
     expect(open.findings.map((f) => f.finding_id).sort()).toEqual(["find-1", "find-2"]);
     expect(open.findings.every((f) => f.status === "open" && f.repo_id === "repo-uzi" && f.evidence_preview && f.occurrences?.some((o) => o.run_id === "run-done"))).toBe(true);
+    for (const id of ["find-1", "find-2"]) {
+      const finding = mockFindings.find((f) => f.finding_id === id)!;
+      expect(finding.run_ids.slice().sort()).toEqual(finding.occurrences!.map((o) => o.run_id).sort());
+      for (const occurrence of finding.occurrences!) {
+        const run = mockRuns.find((r) => r.id === occurrence.run_id)!;
+        expect(Date.parse(occurrence.reported_at)).toBeGreaterThanOrEqual(Date.parse(run.started_at!));
+        if (run.finished_at) {
+          expect(Date.parse(occurrence.reported_at)).toBeLessThanOrEqual(Date.parse(run.finished_at));
+        }
+      }
+    }
 
     const all = await api.listFindings("all", undefined, "run-done");
     expect(all.findings.filter((f) => f.status === "open").map((f) => f.finding_id).sort()).toEqual(["find-1", "find-2"]);

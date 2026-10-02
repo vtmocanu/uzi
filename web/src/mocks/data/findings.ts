@@ -59,8 +59,8 @@ export const mockFindings: MockFinding[] = [
     evidence_preview:
       "The `time.Ticker` started in `sweepLoop` is never `Stop()`ed, so a cancelled sweeper leaks the ticker's goroutine.",
     occurrences: [
-      { run_id: "run-live", run_title: "Wire the findings store", reported_at: minsAgo(30), confidence: "high" },
-      { run_id: "run-done", run_title: "Run view: fold tool results under their calls", reported_at: minsAgo(600), confidence: "medium" },
+      { run_id: "run-live", run_title: "Wire the findings store", reported_at: minsAgo(0.5), confidence: "high" },
+      { run_id: "run-done", run_title: "Run view: fold tool results under their calls", reported_at: minsAgo(200), confidence: "medium" },
     ],
     filed_issue_iid: null,
     filed_issue_url: null,
@@ -83,8 +83,8 @@ export const mockFindings: MockFinding[] = [
     evidence_preview:
       "`doWithRetry` re-issues the same POST on a 5xx, but the upstream is non-idempotent, so a retry after a partial write always 409s.",
     occurrences: [
-      { run_id: "run-live", run_title: "Wire the findings store", reported_at: minsAgo(25), confidence: "high" },
-      { run_id: "run-done", run_title: "Run view: fold tool results under their calls", reported_at: minsAgo(590), confidence: "medium" },
+      { run_id: "run-live", run_title: "Wire the findings store", reported_at: minsAgo(0.25), confidence: "high" },
+      { run_id: "run-done", run_title: "Run view: fold tool results under their calls", reported_at: minsAgo(190), confidence: "medium" },
     ],
     filed_issue_iid: null,
     filed_issue_url: null,
