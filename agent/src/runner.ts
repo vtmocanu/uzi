@@ -1278,6 +1278,7 @@ export type ExecutorFactory = (runId: string, codex?: ClaimCodexSecrets) => RunE
  */
 interface ActiveRun {
   cancel: AbortController;
+  steering: SteeringChannel;
   shuttingDown: boolean;
 }
 
@@ -3669,6 +3670,7 @@ export class RunRunner {
           // `failed`). (3) Then reap this generation's provider while the run is still actively-claimed
           // and record the outcome + the reaped safety epoch, for reportGenericFailure to settle on.
           if (!flight.cancel.signal.aborted) flight.cancel.abort();
+          flight.steering.abortLifecycle();
           // Capture the epoch BEFORE the await: reapForSink reads executor.safety synchronously at
           // entry, and a checkpoint can swap it while the reap is in flight. Recording it afterwards
           // would compare the NEW epoch with itself and let the settle run under a provider this
@@ -3690,6 +3692,7 @@ export class RunRunner {
       // The install threw before beforeResolve could run, so the fallback abort still fires (guarded
       // so a concurrent abort is never doubled), unwinding execute() into reportGenericFailure.
       if (!flight.cancel.signal.aborted) flight.cancel.abort();
+      flight.steering.abortLifecycle();
     } finally {
       if (outbox) {
         const { skipped } = outbox.releaseTerminalResolve(flight.runId, flight.claimGeneration);
@@ -7588,11 +7591,12 @@ export class RunRunner {
         throw err;
       }
     }
-    const active: ActiveRun = (flight.active = { cancel, shuttingDown: false });
+    const active: ActiveRun = (flight.active = { cancel, steering, shuttingDown: false });
     this.activeRuns.set(runId, active);
     if (this.shuttingDownGlobal) {
       active.shuttingDown = true;
       cancel.abort();
+      steering.abortLifecycle();
     }
     if (retained) throw new TransientRecoveryError("recovering retained work before reseeding");
 
@@ -8528,10 +8532,10 @@ export class RunRunner {
         // and before the checkpoint returns — the same scanned path, never inside the permit — so a
         // Codex milestone still publishes like it did before #1597 instead of waiting for the next
         // iteration boundary. (With a ticker running, the kicked tick publishes it.)
-        // Skipped once the flight is cancelled (shutdown or a steering cancel aborted flight.cancel
+        // Skipped once the current lifecycle is interrupted (shutdown, steering or a pause aborted
         // while the permit was held): the shutdown sink owns durability from here, and a scan +
         // publish started now would only delay it.
-        if (!residueBlocked && flight.pendingPublish && !flight.kickMidTurnTick && !flight.cancel.signal.aborted) {
+        if (!residueBlocked && flight.pendingPublish && !flight.kickMidTurnTick && !steering.lifecycleSignal().aborted) {
           await doCheckpointPublish(undefined, false, true);
         }
       } else {
@@ -8713,33 +8717,39 @@ export class RunRunner {
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
       // the give-up's undoWipMarker — so a mid-turn tick can never publish that throwaway marker.
-      attemptCredentialSwitch: () => this.runGatedSink(flight, async () => {
-        const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
-        if (outcome === "retained_stop") {
-          // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
-          // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
-          // executeClaim's catch chain, rather than continuing in place on a claim the reclaim may
-          // already own (release) or whose switch stamp may still be pending (give-up). Do NOT clear
-          // the preserve flags or undo the wip marker — the retained work must survive for the reclaim.
-          throw new CredentialSwitchRetainedStop();
-        }
-        if (outcome === "gave_up") {
-          flight.preserveRecoveryClone = false;
-          flight.preserveSession = false;
-          // A DIRTY-tree switch committed a `wip(park):` marker in captureRecoveryRestorePoint; a
-          // give-up CONTINUES in place with NO reseed, so the marker must be undone here or it rides
-          // into the eventual MR and the restarted turn builds on a throwaway commit — the SAME orphan
-          // handlePausePark fixes on the pause-continue path (undoWipMarker's docstring). headIsWipMarker
-          // self-guards the blind `reset --mixed HEAD^` so it fires ONLY when HEAD is a marker (a
-          // clean-tree switch committed none). Kept HERE, not in enterCredentialSwitch (shared with the
-          // outer-catch requeue arm, whose reseed reset-softs the marker) and NOT on the release path
-          // (the reclaim's reseed handles it) — the two paths that MUST leave the marker.
-          if (flight.worktreePath && (await this.git.headIsWipMarker(flight.worktreePath))) {
-            await this.git.undoWipMarker(flight.worktreePath).catch(() => undefined);
+      attemptCredentialSwitch: async () => {
+        const outcome = await this.runGatedSink(flight, async () => {
+          const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
+          if (outcome === "retained_stop") {
+            // The switch could not be confirmed (BLOCKING-2/3 rework). enterCredentialSwitch RETAINED
+            // all work (the preserve flags stay set); STOP the flight NON-TERMINAL by throwing to
+            // executeClaim's catch chain, rather than continuing in place on a claim the reclaim may
+            // already own (release) or whose switch stamp may still be pending (give-up). Do NOT clear
+            // the preserve flags or undo the wip marker — the retained work must survive for the reclaim.
+            throw new CredentialSwitchRetainedStop();
           }
-        }
+          if (outcome === "gave_up") {
+            flight.preserveRecoveryClone = false;
+            flight.preserveSession = false;
+            // A DIRTY-tree switch committed a `wip(park):` marker in captureRecoveryRestorePoint; a
+            // give-up CONTINUES in place with NO reseed, so the marker must be undone here or it rides
+            // into the eventual MR and the restarted turn builds on a throwaway commit — the SAME orphan
+            // handlePausePark fixes on the pause-continue path (undoWipMarker's docstring). headIsWipMarker
+            // self-guards the blind `reset --mixed HEAD^` so it fires ONLY when HEAD is a marker (a
+            // clean-tree switch committed none). Kept HERE, not in enterCredentialSwitch (shared with the
+            // outer-catch requeue arm, whose reseed reset-softs the marker) and NOT on the release path
+            // (the reclaim's reseed handles it) — the two paths that MUST leave the marker.
+            if (flight.worktreePath && (await this.git.headIsWipMarker(flight.worktreePath))) {
+              await this.git.undoWipMarker(flight.worktreePath).catch(() => undefined);
+            }
+          }
+          return outcome;
+        });
+        // The marker cleanup and the switch settle must leave the sink before the next tick starts.
+        // A release or an uncertain settle keeps the interrupted lifecycle sticky.
+        if (outcome === "gave_up") steering.rearmLifecycle();
         return outcome;
-      }),
+      },
       resumePhase: claim.resume_phase,
       // Persist the SDK session id the moment the executor learns it, so a
       // re-queued run can resume it. Best-effort.
@@ -9081,7 +9091,11 @@ export class RunRunner {
       // returning whether the run parked. Called from the implement loop's pause boundary and
       // its `now`-pause turn catch.
       // issue #1597 M2: gated — a tick can never fetch/publish the wip marker this path commits.
-      parkForPause: (pausedAt) => this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt)),
+      parkForPause: async (pausedAt) => {
+        const parked = await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt));
+        if (!parked) steering.rearmLifecycle();
+        return parked;
+      },
       // PRD #1497 M2 (D4): park the run at its WALL-CLOCK limit — the CAPTURE-FIRST wall park,
       // NOT handlePausePark. Delegates to enterWallPark, which reaps, captures a verified restore
       // point via the SHARED captureHoldContext, reports the wall_park transition, and returns the
@@ -9089,7 +9103,11 @@ export class RunRunner {
       // implement loop's wall-pause turn catch, its pre-attempt REASON_WALL arm, and the loop-top
       // wall boundary.
       // issue #1597 M2: gated against the mid-turn tick (it reaps and captures a restore point).
-      parkForWall: () => this.runGatedSink(flight, () => this.enterWallPark(flight, claim, runLog)),
+      parkForWall: async () => {
+        const outcome = await this.runGatedSink(flight, () => this.enterWallPark(flight, claim, runLog));
+        if (outcome === "refused") steering.rearmLifecycle();
+        return outcome;
+      },
       // Issue #1600: hand the executor the budget a refused wall park carried, once.
       takeWallParkRefresh: () => {
         const refresh = flight.wallParkRefresh;
@@ -9241,6 +9259,7 @@ export class RunRunner {
     for (const a of this.activeRuns.values()) {
       a.shuttingDown = true;
       a.cancel.abort();
+      a.steering.abortLifecycle();
     }
   }
 
@@ -10466,14 +10485,15 @@ export class RunRunner {
 
     const tick = async (): Promise<MidTurnTickOutcome> => {
       // issue #1597 M2 (review items 2/4): the controller exists BEFORE any await, so stop() (and a
-      // shutdown, via flight.cancel) can abort a tick still in its pre-scope phase. That phase
+      // shutdown, via the lifecycle controller) can abort a tick still in its pre-scope phase. That phase
       // spawns nothing and holds nothing, so its awaits are RACED against the abort: teardown never
       // waits on it, even if an fs op there were somehow stuck.
       const ac = new AbortController();
       inFlightAbort = ac;
+      const lifecycleSignal = flight.steering.lifecycleSignal();
       const onFlightAbort = (): void => ac.abort();
-      if (flight.cancel.signal.aborted) ac.abort();
-      else flight.cancel.signal.addEventListener("abort", onFlightAbort, { once: true });
+      if (lifecycleSignal.aborted) ac.abort();
+      else lifecycleSignal.addEventListener("abort", onFlightAbort, { once: true });
       const cancelDeadline = this.setTimer(() => ac.abort(), MIDTURN_TICK_TIMEOUT_MS);
       const abortedP = new Promise<typeof ABORTED>((resolve) => {
         if (ac.signal.aborted) resolve(ABORTED);
@@ -10514,7 +10534,7 @@ export class RunRunner {
         return await scopedTick(ac);
       } finally {
         cancelDeadline();
-        flight.cancel.signal.removeEventListener("abort", onFlightAbort);
+        lifecycleSignal.removeEventListener("abort", onFlightAbort);
         if (inFlightAbort === ac) inFlightAbort = undefined;
       }
     };

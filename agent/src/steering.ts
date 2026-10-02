@@ -630,6 +630,7 @@ export class SteeringChannel {
     this.held = undefined;
     this.ready = undefined;
     this.stopped = true;
+    this.abortLifecycle(err);
     for (const w of this.receiptWaiters.splice(0)) w.reject(err);
     this.rejectParkedWaiters(err);
   }
@@ -647,6 +648,7 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.resolve();
     this.stopped = true;
     if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+    this.abortLifecycle(signal);
     this.rejectParkedWaiters(signal);
   }
 
@@ -1328,6 +1330,31 @@ export class SteeringChannel {
    *  prior trip re-arms the drop. The shared-controller abort is KEPT alongside it as the
    *  pre-registration safety net for the very first `now` (before the executor registers this). */
   private pauseNowInterrupt: (() => void) | undefined;
+  /** The tick's abort generation. Unlike the executor's shared cancel signal, a declined park
+   *  can replace this controller so a later tick may run. */
+  private lifecycle = new AbortController();
+  private lifecycleEnded = false;
+
+  lifecycleSignal(): AbortSignal {
+    return this.lifecycle.signal;
+  }
+
+  abortLifecycle(reason?: unknown, terminal = true): void {
+    if (terminal) this.lifecycleEnded = true;
+    if (!this.lifecycle.signal.aborted) this.lifecycle.abort(reason);
+  }
+
+  /** Called after a gated park refusal or a confirmed switch give-up. Terminal interruptions stay sticky. */
+  rearmLifecycle(): void {
+    if (
+      this.lifecycle.signal.aborted &&
+      !this.lifecycleEnded &&
+      (this.lifecycle.signal.reason instanceof PauseNowSignal ||
+        this.lifecycle.signal.reason instanceof CredentialSwitchSignal) &&
+      !this.cancelled && !this.flightEnded && this.pendingSwitchGeneration === undefined &&
+      this.pauseMode !== "disk"
+    ) this.lifecycle = new AbortController();
+  }
   /** PRD #1247 M5b: the generation of a held-state credential switch pending for THIS claim, or
    *  undefined when none is pending. Set ONCE by maybeTripCredentialSwitch on the first matching
    *  `credential_switch` poll (idempotent — every later tick with the same pending switch is a
@@ -1465,7 +1492,9 @@ export class SteeringChannel {
   requestDiskStop(): void {
     if (this.pauseMode === "disk") return;
     this.pauseMode = "disk";
-    if (!this.cancel.signal.aborted) this.cancel.abort(new PauseNowSignal());
+    const signal = new PauseNowSignal();
+    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+    this.abortLifecycle(signal);
     this.pauseNowInterrupt?.();
   }
 
@@ -2084,7 +2113,10 @@ export class SteeringChannel {
     // controller a cancel/pause already spent) and the re-armable interrupt, exactly like a `now`
     // pause. The abort reason is a CredentialSwitchSignal so the executor's cancel listener routes
     // it to REASON_CREDENTIAL_SWITCH, not REASON_CANCELLED.
-    if (!this.cancel.signal.aborted) this.cancel.abort(new CredentialSwitchSignal());
+    const signal = new CredentialSwitchSignal();
+    if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+    // A confirmed give-up can continue on this claim; the runner rearms after marker cleanup.
+    this.abortLifecycle(signal, false);
     this.credentialSwitchInterrupt?.();
     // Idle at a waiter: reject it so a gate/question/follow-up park (no live turn) is released.
     this.rejectParkedWaiters(new CredentialSwitchSignal());
@@ -2187,6 +2219,7 @@ export class SteeringChannel {
         // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
         this.cancelled = true;
         if (!this.cancel.signal.aborted) this.cancel.abort();
+        this.abortLifecycle();
         break;
       case "stop":
         // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but
@@ -2225,8 +2258,9 @@ export class SteeringChannel {
         if (this.pauseMode === "disk") break;
         this.pauseMode = mode;
         if (mode === "now" || mode === "wall") {
-          if (!this.cancel.signal.aborted)
-            this.cancel.abort(new PauseNowSignal());
+          const signal = new PauseNowSignal();
+          if (!this.cancel.signal.aborted) this.cancel.abort(signal);
+          this.abortLifecycle(signal, false);
           this.pauseNowInterrupt?.();
         }
         break;

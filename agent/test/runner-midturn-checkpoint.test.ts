@@ -2845,6 +2845,84 @@ describe("mid-turn checkpoint round 4: deferred publish vs shutdown (issue #1597
   });
 });
 
+describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", () => {
+  it("publishes a later tick after a real pause input aborted the shared controller", async () => {
+    const tmp = scratchDir("pause-rearm");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const claim = gitlabClaim(1785_201);
+    const pub = stubPublish(async (n, _tip, pack) => {
+      await drain(pack);
+      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let laterTip = "";
+    try {
+      await mkRunner(
+        mkGit(fx.dataDir, shim),
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "before.txt", "before\n");
+          api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          await waitAbort(ctx.signal!);
+          assert.equal(ctx.signal!.aborted, true);
+          assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          laterTip = commitIn(ctx.worktreePath, "after.txt", "after\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published");
+        }),
+        ctl,
+      ).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.tips.at(-1), laterTip);
+      assert.equal(pub.count(), 2);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mid-turn checkpoint lifecycle after a confirmed switch give-up (issue #1785)", () => {
+  it("publishes a later tick after the switch stamp clears and the in-place attempt returns", async () => {
+    const tmp = scratchDir("switch-rearm");
+    const shim = writeShim(tmp, "detect");
+    const ctl = control();
+    const claim = gitlabClaim(1785_202, { claim_generation: 1 });
+    const g = mkGit(fx.dataDir, shim);
+    const status = g.worktreeStatus.bind(g);
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let laterTip = "";
+    try {
+      await mkRunner(
+        g,
+        turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "before.txt", "before\n");
+          // An unreadable capture cannot verify a restore point, so the applied failed-switch
+          // report confirms give-up without releasing this claim.
+          g.worktreeStatus = async () => null;
+          api.requestCredentialSwitch(claim.run_id, 1);
+          await waitAbort(ctx.signal!);
+          assert.equal(await ctx.attemptCredentialSwitch!(), "gave_up");
+          g.worktreeStatus = status;
+          laterTip = commitIn(ctx.worktreePath, "after.txt", "after\n");
+          ctl.advance(INTERVAL_MS + 1);
+          assert.equal(await ctl.fire(), "published");
+        }),
+        ctl,
+        { recoveryRetryMs: 1 },
+      ).execute(claim);
+      assert.ok(api.states.some((s) => s.runId === claim.run_id && s.body.status === "credential_switch_failed"));
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.tips.at(-1), laterTip);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
 describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", () => {
   it("(r4 5) an owed publish whose tick finds the sink gate busy arms ONE quick retry; a second miss waits for the normal cadence", async () => {
     const tmp = scratchDir("gateretry");
