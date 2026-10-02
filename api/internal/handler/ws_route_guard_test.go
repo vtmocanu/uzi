@@ -2,7 +2,7 @@ package handler
 
 import (
 	"context"
-	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -36,7 +36,10 @@ import (
 // The cases that genuinely need a store — a VALID uzc_/uza_ must exist in cli_tokens
 // for RequireUser to resolve it — are in ws_bearer_livedb_test.go.
 
-var errWSGuardDB = errors.New("ws guard fake: no rows")
+// errWSGuardDB is a "no such row": since #1991 only pgx.ErrNoRows is a credential
+// rejection (401), and any other lookup error is a 503, so the fake must model an
+// absent row for the bogus token to read as refused.
+var errWSGuardDB = fmt.Errorf("ws guard fake: %w", pgx.ErrNoRows)
 
 // wsGuardDB is a store.DBTX that answers nothing and RECORDS every statement it is
 // asked to run. The recording is the point: RequireUser's two branches are told apart
