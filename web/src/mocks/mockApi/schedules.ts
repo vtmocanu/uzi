@@ -485,9 +485,9 @@ function materializeDefault(
     // Resolved catalog guidance for a sweep default, shown read-only (issue #675).
     baked_guidance: entry.target === "sweep" ? entry.guidance || null : null,
     model: entry.model || null,
-    // PRD #929 M1: seed the RESOLVED catalog output mode (prompt entries carry "mr"), so a
-    // freshly-enabled prompt default shows the "mr" badge exactly as production does (the
-    // server seeds the resolved value via catalogOutputMode, never NULL, for a prompt job).
+    // PRD #929 M1: seed the RESOLVED catalog output mode, so a freshly-enabled
+    // prompt default shows its catalog mode exactly as production does (the server
+    // seeds the resolved value via catalogOutputMode, never NULL, for a prompt job).
     // A non-prompt entry's "" yields null (inherit / no output channel). A seed override may
     // still replace it via `...over`.
     output_mode: entry.output_mode || null,
