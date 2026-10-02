@@ -26,8 +26,8 @@
 // classification (CodexTurnFailedError: category transport, see isCodexTransientClassification)
 // is retried a bounded number of times in the same thread, then escalates as
 // TransientRecoveryError so the runner parks the run in recovery_wait instead of failing it.
-// Codex itself already retries internally (config.ts, the production request/stream retry
-// defaults), so this outer retry runs after Codex gave up; its main effect is the park.
+// It sits on top of Codex's own request/stream retries (config.ts keeps the production retry
+// defaults); its main effect is the park rather than a failed run.
 // Issue #1764: the owner pause of PRD #1190 is honoured at the implement loop's TOP (the
 // server-decided boundary: `served.pauseRequested`, or a seeded pause mode at the first
 // boundary) through ctx.parkForPause, as SdkExecutor does. An owner `now` pause that drops a

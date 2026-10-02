@@ -1093,7 +1093,7 @@ Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources
 
 Tracked as GitHub issue vtmocanu/uzi#2099.
 
-- A Codex run turn that fails with a transient provider error (overload or internal-server failure, or a transport failure with a 408/429/5xx status or none) is retried in place a bounded number of times; if it persists, the run is parked in `recovery_wait` instead of failed. A transport failure with a permanent status, and any non-transport failure (authentication, Codex rate/usage limit, other), fails as before. Cancel, pause and the wall budget keep precedence over the retry. (AI-synced 2026-10-02)
+- A Codex run turn that fails with a transient provider error (overload, internal-server or flex-capacity failure, or a transport failure with a 408/429/5xx status or none) is retried in place a bounded number of times; if it persists, the run is parked in `recovery_wait` instead of failed. A transport failure with a permanent status, and any non-transport failure (authentication, Codex rate/usage limit, other), fails as before. Cancel, pause and the wall budget keep precedence over the retry. (AI-synced 2026-10-02)
 
 ## Startup admin seed
 

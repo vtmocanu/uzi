@@ -22,12 +22,11 @@ Uzi retries in place and, if the trouble persists, parks the run in
   included; they keep their existing handling.
 
 Uzi retries the interruption a few times in place. A Codex provider error is
-retried on the same thread up to 2 times, after a short wait (2 seconds, then
-4 seconds); Codex has already retried the request or stream itself by then.
+retried on the same thread up to 2 times per turn, after a short wait
+(2 seconds, then 4 seconds), on top of Codex's own request and stream retries.
 Cancelling, pausing, or reaching the wall-clock budget during that wait works
-as usual. If it does not clear,
-uzi saves a verified local recovery checkpoint before parking the run in
-`recovery_wait`.
+as usual. If the interruption does not clear, uzi saves a verified local
+recovery checkpoint before parking the run in `recovery_wait`.
 
 This recovery is automatic and requires no per-run setting. A missing plan
 after a turn that actually did work, missing turn-count metadata, a real
@@ -35,10 +34,10 @@ timeout, and cancellation are not classified as a transient recovery.
 
 A **permanent** provider error — for example 401, 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
-fails fast with an accurate reason and does not park here. The same holds on
-the Codex harness: a transport failure with a permanent status (400, 401,
-403, and so on), and any Codex authentication, model, or other failure, is not
-retried here.
+fails fast with an accurate reason and does not park here. On the Codex
+harness, a turn that ends with a transport failure carrying a permanent status
+(400, 401, 403, and so on), or with an authentication, model, or other
+non-transport failure, is not retried here either.
 
 One empty result is routed elsewhere on purpose: if the turn came back empty
 **because that attempt hit a hard usage limit** (its final rate-limit verdict
