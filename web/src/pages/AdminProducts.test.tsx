@@ -13,6 +13,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       adminListProducts: vi.fn(),
+      listUsers: vi.fn(),
       adminListProductTokens: vi.fn(),
       adminCreateProduct: vi.fn(),
       adminUpdateProduct: vi.fn(),
@@ -81,6 +82,7 @@ beforeEach(() => {
     user: { id: "u-admin", is_admin: true } as User,
   } as unknown as ReturnType<typeof useAuth>);
   mockApi.adminListProducts.mockResolvedValue({ products: [aProduct()] });
+  mockApi.listUsers.mockResolvedValue({ users: [] });
   mockApi.adminListProductTokens.mockResolvedValue({ truncated: false, tokens: [aToken()] });
 });
 
@@ -549,5 +551,64 @@ describe("AdminProducts truncated inventory", () => {
     ).toBeTruthy();
     // Paired with the positive in "AdminProducts list", where the same card shape says it.
     expect(within(metrics).queryByText("No tokens minted for this product.")).toBeNull();
+  });
+});
+
+describe("AdminProducts owner and product filters (issue #1935)", () => {
+  const user = (id: string, email: string) => ({ id, email, display_name: null }) as unknown as User;
+
+  async function pickFilters(filtered: AdminProductToken[] = []) {
+    mockApi.adminListProducts.mockResolvedValue({
+      products: [aProduct(), aProduct({ id: "prod-b", name: "Metrics export" })],
+    });
+    // The owner exists only in the users list, never in the initial inventory.
+    mockApi.listUsers.mockResolvedValue({ users: [user("u-dan", "dan@uzi.local"), user("u-mira", "mira@uzi.local")] });
+    mockApi.adminListProductTokens.mockImplementation(async (f) => ({
+      truncated: false,
+      tokens: f?.ownerId || f?.productId ? filtered : [aToken()],
+    }));
+    renderPage();
+    await productCard("Helpdesk assistant");
+    const owner = (await screen.findByRole("combobox", { name: "Owner" })) as HTMLSelectElement;
+    await waitFor(() => expect(within(owner).getByRole("option", { name: "dan@uzi.local" })).toBeTruthy());
+    fireEvent.change(owner, { target: { value: "u-dan" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "prod-b" } });
+  }
+
+  it("sends both filters, shows the revealed token, and keeps them when a revoke reloads", async () => {
+    const hidden = aToken({ id: "old-1", product_id: "prod-b", name: "ancient", user_id: "u-dan", owner_email: "dan@uzi.local" });
+    mockApi.adminRevokeProductToken.mockResolvedValue(null);
+    await pickFilters([hidden]);
+    await waitFor(() =>
+      expect(mockApi.adminListProductTokens).toHaveBeenLastCalledWith({ ownerId: "u-dan", productId: "prod-b" }),
+    );
+    const metrics = await productCard("Metrics export");
+    expect(await within(metrics).findByText("ancient")).toBeTruthy();
+    // Only the chosen product's card remains.
+    expect(screen.queryByRole("region", { name: "Helpdesk assistant" })).toBeNull();
+
+    mockApi.adminListProductTokens.mockClear();
+    fireEvent.click(within(metrics).getByRole("button", { name: "Revoke ancient" }));
+    await waitFor(() => expect(mockApi.adminRevokeProductToken).toHaveBeenCalledWith("old-1"));
+    await waitFor(() =>
+      expect(mockApi.adminListProductTokens).toHaveBeenCalledWith({ ownerId: "u-dan", productId: "prod-b" }),
+    );
+  });
+
+  it("says no tokens match the current filters, not that none were minted", async () => {
+    await pickFilters();
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    const metrics = await productCard("Metrics export");
+    expect(await within(metrics).findByText("No tokens match the current filters.")).toBeTruthy();
+    expect(within(metrics).queryByText("No tokens minted for this product.")).toBeNull();
+  });
+
+  it("names the filters in the truncated notice", async () => {
+    await pickFilters();
+    mockApi.adminListProductTokens.mockResolvedValue({ truncated: true, tokens: [aToken({ product_id: "prod-b" })] });
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    expect(
+      await screen.findByText("Showing the first 1 tokens matching the current filters, active first; older tokens are not listed."),
+    ).toBeTruthy();
   });
 });

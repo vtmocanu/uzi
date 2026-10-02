@@ -16,7 +16,7 @@
 // (user-written) are untrusted text: React text nodes only, never HTML.
 
 import { useEffect, useId, useRef, useState, type FormEvent } from "react";
-import { api, type AdminProductToken, type Product } from "../lib/api";
+import { api, type AdminProductToken, type Product, type User } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { useDemoMode } from "../lib/demoMode";
@@ -66,6 +66,16 @@ function stoppedWhat(tokens: number, connections: number): string {
 }
 
 export function AdminProducts() {
+  const demo = useDemoMode();
+  // Inventory filters (issue #1935): sent to the server so the 1000-row cap applies per filter.
+  const [ownerFilter, setOwnerFilter] = useState("");
+  const [productFilter, setProductFilter] = useState("");
+  const filtered = ownerFilter !== "" || productFilter !== "";
+  // Owners come from the user list, not from token rows, so an owner with no token in the
+  // current (possibly truncated) inventory is still selectable. A failed load only empties the select.
+  const { data: usersData } = useAsyncData<User[]>(async () => (await api.listUsers()).users, [], {
+    fallback: "Failed to load users",
+  });
   const { data, loading, error: loadError, reload } = useAsyncData<{
     products: Product[];
     tokens: AdminProductToken[];
@@ -74,11 +84,11 @@ export function AdminProducts() {
     async () => {
       const [{ products }, { tokens, truncated }] = await Promise.all([
         api.adminListProducts(),
-        api.adminListProductTokens(),
+        api.adminListProductTokens({ ownerId: ownerFilter, productId: productFilter }),
       ]);
       return { products, tokens, truncated: truncated === true };
     },
-    [],
+    [ownerFilter, productFilter],
     { fallback: "Failed to load products" },
   );
   const [error, setError] = useState("");
@@ -91,9 +101,11 @@ export function AdminProducts() {
   const loadFailed = data === null && loadError !== "";
 
   // Live products first, soft-deleted ones last (the audit trail), server order within.
-  const products = [...(data?.products ?? [])].sort(
+  const allProducts = [...(data?.products ?? [])].sort(
     (a, b) => Number(a.deleted_at !== null) - Number(b.deleted_at !== null),
   );
+  // A product filter shows only that product's card: the rest would all read "no tokens match".
+  const products = productFilter ? allProducts.filter((p) => p.id === productFilter) : allProducts;
   const tokensByProduct = new Map<string, AdminProductToken[]>();
   for (const t of data?.tokens ?? []) {
     const list = tokensByProduct.get(t.product_id) ?? [];
@@ -133,8 +145,44 @@ export function AdminProducts() {
 
       {truncatedAt !== null && (
         <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-sm text-info">
-          Showing the first {truncatedAt} tokens, active first; older tokens are not listed.
+          Showing the first {truncatedAt} tokens{filtered ? " matching the current filters" : ""}, active first; older
+          tokens are not listed.
         </p>
+      )}
+
+      {allProducts.length > 0 && (
+        <div className="flex flex-wrap items-center gap-3">
+          <label className="flex items-center gap-2 text-sm text-muted">
+            Owner
+            <select
+              value={ownerFilter}
+              onChange={(e) => setOwnerFilter(e.target.value)}
+              className="rounded-md border border-edge bg-surface px-2 py-1 text-sm text-fg"
+            >
+              <option value="">All owners</option>
+              {(usersData ?? []).map((u) => (
+                <option key={u.id} value={u.id}>
+                  {maskEmail(u.email, demo)}
+                </option>
+              ))}
+            </select>
+          </label>
+          <label className="flex items-center gap-2 text-sm text-muted">
+            Product
+            <select
+              value={productFilter}
+              onChange={(e) => setProductFilter(e.target.value)}
+              className="rounded-md border border-edge bg-surface px-2 py-1 text-sm text-fg"
+            >
+              <option value="">All products</option>
+              {allProducts.map((p) => (
+                <option key={p.id} value={p.id}>
+                  {stripUnsafeChars(p.name)}
+                </option>
+              ))}
+            </select>
+          </label>
+        </div>
       )}
 
       {loading ? (
@@ -153,6 +201,7 @@ export function AdminProducts() {
               product={p}
               tokens={tokensByProduct.get(p.id) ?? []}
               truncatedAt={truncatedAt}
+              filtered={filtered}
               onToggle={(enabled) =>
                 run(async () => {
                   await api.adminUpdateProduct(p.id, { enabled });
@@ -408,6 +457,7 @@ function ProductCard({
   product,
   tokens,
   truncatedAt,
+  filtered,
   onToggle,
   onJobTypes,
   onDelete,
@@ -419,6 +469,8 @@ function ProductCard({
   // Non-null when the inventory was cut server-side (the number listed), so an empty
   // `tokens` does not mean none exist.
   truncatedAt: number | null;
+  // An owner or product filter is active: an empty list then means no match, not no tokens.
+  filtered: boolean;
   onToggle: (enabled: boolean) => Promise<boolean>;
   // Sends the product's whole new allow-list (PATCH allowed_job_types; [] clears it) and
   // resolves to the error text on failure, or the list the server stored once saved (the
@@ -587,7 +639,9 @@ function ProductCard({
           <p className="text-sm text-faint">
             {truncatedAt !== null
               ? `None of this product’s tokens are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
-              : "No tokens minted for this product."}
+              : filtered
+                ? "No tokens match the current filters."
+                : "No tokens minted for this product."}
           </p>
         ) : (
           <ProductTokenTable tokens={tokens} onRevoke={onRevoke} />

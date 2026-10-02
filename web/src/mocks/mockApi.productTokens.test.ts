@@ -225,3 +225,46 @@ describe("mockApi — connection lists and revoke (PRD #1910 M5)", () => {
     expect((await api.listOAuthConnections()).connections).toEqual([]);
   });
 });
+
+describe("mockApi — admin token inventory filters (issue #1935)", () => {
+  it("lists a matching token that the unfiltered cap cuts, once owner and product filters apply", async () => {
+    vi.resetModules();
+    vi.doMock("./data", async (importOriginal) => {
+      const actual = await importOriginal<typeof import("./data")>();
+      const base = actual.mockProductTokens[0];
+      // 1001 newer active tokens from other owners push the revoked target past the 1000 cap.
+      const filler = Array.from({ length: 1001 }, (_, i) => ({
+        ...base,
+        id: `filler-${i}`,
+        user_id: "u-filler",
+        name: `filler-${i}`,
+        revoked: false,
+        expires_at: null,
+        created_at: new Date(Date.now() + 60_000 + i).toISOString(),
+      }));
+      const target = {
+        ...base,
+        id: "target-old",
+        name: "target-old",
+        revoked: true,
+        created_at: new Date(Date.now() - 400 * 86_400_000).toISOString(),
+      };
+      return { ...actual, mockProductTokens: [...actual.mockProductTokens, ...filler, target] };
+    });
+    try {
+      const api = (await import("./mockApi")).mockApi;
+      const unfiltered = await api.adminListProductTokens();
+      expect(unfiltered.truncated).toBe(true);
+      expect(unfiltered.tokens).toHaveLength(1000);
+      expect(unfiltered.tokens.some((t) => t.id === "target-old")).toBe(false);
+
+      const base = (await import("./data")).mockProductTokens[0];
+      const filtered = await api.adminListProductTokens({ ownerId: base.user_id, productId: base.product_id });
+      expect(filtered.truncated).toBe(false);
+      expect(filtered.tokens.some((t) => t.id === "target-old")).toBe(true);
+      expect(filtered.tokens.every((t) => t.user_id === base.user_id && t.product_id === base.product_id)).toBe(true);
+    } finally {
+      vi.doUnmock("./data");
+    }
+  });
+});

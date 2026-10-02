@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **The standalone worker setup command now supports hardened startup ([#1987](https://github.com/vtmocanu/uzi/issues/1987)).**
   The documented build uses the repository root as its context, and the run command grants only the five capabilities required by the entrypoint while retaining no-new-privileges. The join token is delivered through a file instead of the worker's environment.
 
+### Changed
+
+- **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
+  The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

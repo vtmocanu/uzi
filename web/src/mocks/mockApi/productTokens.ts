@@ -536,9 +536,12 @@ export const productTokensApi = {
     st.staged = null;
     return delay(skillsView(id), 300);
   },
-  adminListProductTokens: async () => {
+  adminListProductTokens: async (filter?: { ownerId?: string; productId?: string }) => {
     requireAdmin();
-    const tokens: AdminProductToken[] = productTokens.map((t) => ({
+    // Filters apply BEFORE the cap, as the server does, so a match beyond the unfiltered cap is listed.
+    const tokens: AdminProductToken[] = productTokens
+      .filter((t) => (!filter?.ownerId || t.user_id === filter.ownerId) && (!filter?.productId || t.product_id === filter.productId))
+      .map((t) => ({
       ...t,
       owner_email: users.find((u) => u.id === t.user_id)?.email ?? "",
     }));

@@ -1897,9 +1897,19 @@ const realApi = {
     request<RotateProductClientSecretResponse>("POST", `/admin/products/${id}/oauth/secret`),
   adminDeleteProduct: (id: string) =>
     request<AdminDeleteProductResponse>("DELETE", `/admin/products/${id}`),
-  // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened.
-  adminListProductTokens: () =>
-    request<{ tokens: AdminProductToken[]; truncated: boolean }>("GET", "/admin/product-tokens"),
+  // Capped at 1000 rows, active first, then newest; `truncated` says the cut happened. The
+  // optional owner/product filters narrow the set server-side (AND) BEFORE the cap, so a token
+  // beyond the unfiltered cap is reachable by filtering.
+  adminListProductTokens: (filter?: { ownerId?: string; productId?: string }) => {
+    const qs = new URLSearchParams();
+    if (filter?.ownerId) qs.set("owner_id", filter.ownerId);
+    if (filter?.productId) qs.set("product_id", filter.productId);
+    const q = qs.toString();
+    return request<{ tokens: AdminProductToken[]; truncated: boolean }>(
+      "GET",
+      `/admin/product-tokens${q ? `?${q}` : ""}`,
+    );
+  },
   adminRevokeProductToken: (id: string) =>
     request<null>("POST", `/admin/product-tokens/${id}/revoke`),
   // A product's live OAuth connections (PRD #1910 M5), whatever the state of their access tokens;
