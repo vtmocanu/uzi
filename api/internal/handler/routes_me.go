@@ -28,14 +28,17 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 			r.Get("/", h.ListMySecrets)
 			r.Post("/{kind}/{id}/test", h.TestMySecret)
 			// Credential Test (issue #1988) is a bounded, owner-scoped exception to
-			// the cookie-only rule below: it reveals and replaces no credential, and
-			// each request is rate-limited per credential and per owner. It may make
-			// up to two provider calls (Anthropic: Usage, then a small Messages check
-			// when probing is enabled). Its writes, all fenced on the credential
-			// revision: an Anthropic success records the usage gauges, increments the
-			// success generation and clears the rejection marker; a Messages 401/403
-			// sets that marker; a Codex login in staging or failed goes through the
-			// existing identity reconciliation. OpenAI results are not persisted.
+			// the cookie-only rule below: it reveals no credential and stores no new
+			// one, and each request is rate-limited per credential and per owner. It
+			// may make up to two provider calls (Anthropic: Usage, then a small
+			// Messages check when probing is enabled). Its writes, fenced on the
+			// credential revision: an Anthropic success records usage gauges when
+			// available, increments the success generation and clears the rejection
+			// marker; a Messages 401/403 sets that marker; a Codex login in staging or
+			// failed goes through the existing identity reconciliation, which can link
+			// it and, when the verified account is quarantined or needs re-login,
+			// install the user's already-stored login on that account
+			// (RefreshCodexAccountLogin). OpenAI results are not persisted.
 			//
 			// The auto-selection pool toggle (PRD #111 M2, D13) is the other write
 			// here, deliberately, on the SAME reasoning as PATCH /workers/{id}: it

@@ -165,7 +165,9 @@ carry `generic`, `vault_locked`, or `superseded` as its reason. A test after
 replacement or disablement may be superseded by the newer credential state.
 
 For a Codex login in `staging` or `failed`, Test runs identity reconciliation;
-that check can move the link state to `linked` or `failed`. For a `linked`
+that check can move the link state to `linked` or `failed`. If the verified
+account is quarantined or needs re-login, reconciliation installs this stored
+login on it, as the background check does for a new login. For a `linked`
 login, Test reads the account's usage once and does not refresh or rotate the
 login. It is a current check, not a promise that a later run can start.
 
