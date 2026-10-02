@@ -556,6 +556,7 @@ can be assumed.
   the remedy is rolling the image.
 - Operators can disable the automatic stop without losing the flag.
 - Worker authentication returns 401 for a missing, unknown, or mismatched Bearer token, and 503 for a store lookup failure so the worker can retry. (AI-synced 2026-09-30)
+- Session and CLI-token authentication return 401 for a refused credential and 503 for a store lookup failure, so a database outage does not sign users out or reject a good CLI token; on initial load the web app shows a transient can't-reach-server state that retries instead of treating the user as signed out. (AI-synced 2026-10-02, #1991)
 
 ## Feature #102 — Board v2: column rename, label chips, manual order, non-PRD issues
 

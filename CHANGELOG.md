@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **A repo's `.codex/agents/*.toml` agents are now offered at the plan gate, alongside `.claude/agents/*.md` ([#2085](https://github.com/vtmocanu/uzi/issues/2085)).**
   The worker reads the run's native folder (Claude runs prefer `.claude/agents`, Codex runs prefer `.codex/agents`) and falls back to the other only when the native folder is absent; a present native folder is final even if empty or invalid, and the two are never merged. A TOML agent needs a string `name`, `description` and `developer_instructions` (the prompt) and takes no tools or model; files declaring `features`, `skills`, `sandbox_mode` or `tools` are skipped with a note because uzi cannot honour those restrictions yet. Files are read through a no-symlink, handle-checked path, so on a platform without Linux `/proc` nothing is read. The gate card, run view and feed show the source folder; an API older than the worker does not record it and the UI shows `.claude/agents`. `.codex/config.toml` `[agents]` and other tools' folders are not read.
 
+- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
+  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, and uzi never logs the stored memo or the tool call that saves it (the lead can still quote an injected memo in its own messages). A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` when the memo is actually placed in the lead's prompt and `decisions memo saved (N bytes)` when a memo is saved. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
+
 ### Fixed
 
 - **Codex commands resolve the worker's GNU toolchain before BusyBox ([#2122](https://github.com/vtmocanu/uzi/issues/2122)).**
@@ -37,6 +40,9 @@ through `[0.52.0]`.)
 
 - **Lead text follows frame origin across Claude and Codex harnesses ([#2116](https://github.com/vtmocanu/uzi/issues/2116)).**
   Child frames displayed as lead no longer enter either harness's finalText; Claude also uses origin to request lead context only for main frames and to count subagent frames as no-progress activity, while emitted attribution and signal handling stay the same.
+
+- **A short database outage no longer signs web users out or rejects a good CLI token ([#1991](https://github.com/vtmocanu/uzi/issues/1991)).**
+  Session and CLI-token authentication now answer 503 instead of 401 when the user or token lookup fails for a reason other than a missing row, so the CLI exits 6 (retry) rather than 3 (re-authenticate). On initial load the web app shows a "Can't reach the server" panel that retries every 5 seconds and on demand, instead of redirecting to /login.
 
 - **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
   Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
@@ -54,11 +60,6 @@ through `[0.52.0]`.)
 
 - **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
   The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
-
-### Added
-
-- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
-  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, and uzi never logs the stored memo or the tool call that saves it (the lead can still quote an injected memo in its own messages). A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` when the memo is actually placed in the lead's prompt and `decisions memo saved (N bytes)` when a memo is saved. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
 
 ## [0.85.0] - 2026-09-26
 
