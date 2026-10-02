@@ -221,8 +221,9 @@ export interface DetectedRepoAgents {
 export type RepoAgentFolder = NonNullable<RepoAgentSummary["folder"]>;
 export type RepoAgentHarness = "claude" | "codex";
 
-/** The repo's agents directory inside the clone. Nothing else under `.claude/` is
- *  read by this module. */
+/** The `.claude/agents` path inside the clone. Production detection walks both
+ *  agent folders itself (see `detectRepoAgents`); this helper has no production
+ *  caller and exists for tests that build or inspect a `.claude/agents` fixture. */
 export function repoAgentsDir(clonePath: string): string {
   return path.join(clonePath, ".claude", "agents");
 }
@@ -243,7 +244,7 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
     case "over_limit":
       return `${note.count ?? 0} agent file(s) past the cap of ${REPO_AGENTS_MAX_FILES} were ignored`;
     case "invalid":
-      return `repo agent "${note.name}" was skipped: invalid frontmatter, name, description, or empty body`;
+      return `repo agent "${note.name}" was skipped: unreadable or invalid file, name, description, or empty body`;
     case "duplicate":
       return `repo agent "${note.name}" was skipped: an earlier agent file already declares that name`;
     case "tools_all_denied":
@@ -255,7 +256,7 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
     case "unsafe_path":
       return note.name === ""
         ? `the repo's ${note.folder ?? ".claude/agents or .codex/agents"}/ was not read: a path component is a symlink or escapes the clone`
-        : `repo agent file "${note.name}" was skipped: it resolves outside the agents folder`;
+        : `repo agent file "${note.name}" was skipped: its location could not be verified inside the agents folder`;
     case "restriction_unsupported":
       return `repo agent "${note.name}" was skipped: it declares a Codex restriction (${(note.restrictions ?? []).join(", ")}) uzi cannot honour yet`;
   }
@@ -331,7 +332,7 @@ async function locateAgentsDir(clonePath: string, cloneReal: string, spec: Folde
   return { kind: "ok", agentsReal };
 }
 
-type ReadResult = { kind: "ok"; raw: string } | { kind: "skip" } | { kind: "too_large" } | { kind: "unsafe" };
+type ReadResult = { kind: "ok"; raw: string } | { kind: "skip" } | { kind: "unreadable" } | { kind: "too_large" } | { kind: "unsafe" };
 
 const defaultResolveHandlePath = (fd: number): Promise<string> => fs.readlink(`/proc/self/fd/${fd}`);
 
@@ -344,7 +345,11 @@ async function readContainedFile(full: string, agentsReal: string, opts: DetectO
   try {
     handle = await fs.open(full, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
   } catch (err) {
-    return (err as NodeJS.ErrnoException).code === "ELOOP" ? { kind: "unsafe" } : { kind: "skip" };
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ELOOP") return { kind: "unsafe" };
+    // A file that vanished since discovery is not an error; anything else (EACCES, ...)
+    // is an unreadable file the author should hear about.
+    return code === "ENOENT" ? { kind: "skip" } : { kind: "unreadable" };
   }
   try {
     let handleReal: unknown;
@@ -370,7 +375,7 @@ async function readContainedFile(full: string, agentsReal: string, opts: DetectO
     if (n > REPO_AGENT_MAX_BYTES) return { kind: "too_large" };
     return { kind: "ok", raw: buf.toString("utf8", 0, n) };
   } catch {
-    return { kind: "skip" };
+    return { kind: "unreadable" };
   } finally {
     await handle.close().catch(() => undefined);
   }
@@ -398,6 +403,10 @@ async function loadFolder(spec: FolderSpec, agentsReal: string, opts: DetectOpti
     const slug = safeLabel(file.slice(0, -spec.ext.length));
     const read = await readContainedFile(path.join(agentsReal, file), agentsReal, opts);
     if (read.kind === "skip") continue;
+    if (read.kind === "unreadable") {
+      notes.push({ name: slug, reason: "invalid" });
+      continue;
+    }
     if (read.kind === "too_large") {
       notes.push({ name: slug, reason: "too_large" });
       continue;

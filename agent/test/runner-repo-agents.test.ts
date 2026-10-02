@@ -450,6 +450,18 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       assert.ok(texts.some((t) => t.includes("autopilot: using the 1 agent(s) from the repo's .codex/agents/")), texts.join("\n"));
     });
 
+    it("a Codex claim on a repo with only .claude/agents reports that folder with the feature on", async () => {
+      const { states } = await runWith(
+        { ".claude/agents/c.md": CODER_MD },
+        { codex: true, auto: true, features: ["repo_agent_folder"] },
+      );
+      const reports = states.filter((s) => s.repo_agents !== undefined);
+      assert.ok(reports.length >= 2, "preflight and autopilot reports");
+      for (const rep of reports) {
+        assert.deepStrictEqual(rep.repo_agents, [{ name: "claude-coder", description: "From claude.", folder: ".claude/agents" }]);
+      }
+    });
+
     it("detection completes before the executor's run is entered", async () => {
       const order: string[] = [];
       await runWith(

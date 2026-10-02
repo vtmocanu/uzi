@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -294,7 +295,86 @@ describe("containment shared by both loaders", () => {
       });
       assert.deepEqual(r.agents, []);
       assert.deepEqual(r.notes, [{ name: "x", reason: "unsafe_path" }]);
-      assert.equal(describeRepoAgentNote(r.notes[0]!), 'repo agent file "x" was skipped: it resolves outside the agents folder');
+      assert.equal(describeRepoAgentNote(r.notes[0]!), 'repo agent file "x" was skipped: its location could not be verified inside the agents folder');
+    });
+
+    it(`refuses a leaf swapped for a symlink to ANOTHER file in the same folder (${folder})`, async () => {
+      const ext = harness === "codex" ? "toml" : "md";
+      const put = harness === "codex" ? toml : md;
+      put(`a-target.${ext}`, harness === "codex" ? TOML_OK("a-target") : MD_OK("a-target"));
+      put(`x.${ext}`, harness === "codex" ? TOML_OK("x") : MD_OK("x"));
+      // The link target sits directly in the agents folder, so only O_NOFOLLOW
+      // (ELOOP on open) refuses it; the containment check alone would pass.
+      const r = await detectRepoAgents(clone, harness, {
+        beforeOpen: async (full) => {
+          if (!full.endsWith(`x.${ext}`)) return;
+          fs.rmSync(full);
+          fs.symlinkSync(`a-target.${ext}`, full);
+        },
+      });
+      assert.deepEqual(names(r), ["a-target"]);
+      assert.deepEqual(r.notes, [{ name: "x", reason: "unsafe_path" }]);
+    });
+
+    it(`skips a leaf swapped for a FIFO without blocking (${folder})`, async () => {
+      const ext = harness === "codex" ? "toml" : "md";
+      (harness === "codex" ? toml : md)(`x.${ext}`, harness === "codex" ? TOML_OK("x") : MD_OK("x"));
+      let fifoPath = "";
+      const run = detectRepoAgents(clone, harness, {
+        beforeOpen: async (full) => {
+          fs.rmSync(full);
+          try {
+            execFileSync("mkfifo", [full], { stdio: "pipe" });
+          } catch {
+            return; // mkfifo unavailable (non-POSIX); the file stays a regular one
+          }
+          fifoPath = full;
+        },
+      });
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      let timedOut = false;
+      const guard = new Promise<never>((_, rej) => {
+        timer = setTimeout(() => {
+          timedOut = true;
+          rej(new Error("detectRepoAgents blocked opening a FIFO"));
+        }, 3000);
+      });
+      try {
+        const r = await Promise.race([run, guard]);
+        if (fifoPath === "") return;
+        assert.deepEqual(r.agents, []);
+        assert.deepEqual(r.notes, []);
+      } finally {
+        clearTimeout(timer);
+        if (timedOut && fifoPath !== "") {
+          // Release the parked open so the process can exit.
+          const w = fs.openSync(fifoPath, fs.constants.O_WRONLY | fs.constants.O_NONBLOCK);
+          fs.closeSync(w);
+          await Promise.race([run.catch(() => undefined), new Promise((res) => setTimeout(res, 1000))]);
+        }
+      }
+    });
+
+    it(`notes an unreadable file as invalid (${folder})`, { skip: process.getuid?.() === 0 }, async () => {
+      const ext = harness === "codex" ? "toml" : "md";
+      (harness === "codex" ? toml : md)(`x.${ext}`, harness === "codex" ? TOML_OK("x") : MD_OK("x"));
+      const file = path.join(clone, folder, "agents", `x.${ext}`);
+      fs.chmodSync(file, 0o000);
+      try {
+        const r = await detectRepoAgents(clone, harness);
+        assert.deepEqual(r.agents, []);
+        assert.deepEqual(r.notes, [{ name: "x", reason: "invalid" }]);
+      } finally {
+        fs.chmodSync(file, 0o644);
+      }
+    });
+
+    it(`stays silent for a file that vanishes between discovery and open (${folder})`, async () => {
+      const ext = harness === "codex" ? "toml" : "md";
+      (harness === "codex" ? toml : md)(`x.${ext}`, harness === "codex" ? TOML_OK("x") : MD_OK("x"));
+      const r = await detectRepoAgents(clone, harness, { beforeOpen: async (full) => fs.rmSync(full) });
+      assert.deepEqual(r.agents, []);
+      assert.deepEqual(r.notes, []);
     });
 
     it(`refuses a file when ${folder} is swapped for a symlink between discovery and open`, async () => {
