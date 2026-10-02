@@ -877,11 +877,11 @@ Tracked as GitHub issue vtmocanu/uzi#1909; PRD at `prds/1909-job-files-product-s
 
 Tracked as GitHub issue vtmocanu/uzi#1910; PRD at `prds/done/1910-connect-uzi-oauth.md`.
 
-- An admin registers a product as a confidential OAuth client: exact redirect URIs, the scopes it may request and a `uzs_` client secret that is shown once. A product with none of these is not a client; pasted `uzp_` tokens keep working for every product. (AI-synced 2026-10-01)
+- An admin registers a product as a confidential OAuth client: exact redirect URIs, the scopes it may request and a `uzs_` client secret that is shown once. A product missing any of these is not a client; pasted `uzp_` tokens keep working for every product. (AI-synced 2026-10-01)
 - A product sends the user to uzi (authorization code with PKCE S256); uzi always shows an explicit consent page, and the user approves or denies. No public clients, no implicit or password grant, no OpenID Connect provider features. (AI-synced 2026-10-01)
 - The product gets a one-hour access token that goes through the same `/api/v1` enforcement as a pasted token, and a non-rotating refresh token valid 30 days idle and 90 days from the user's latest consent. (AI-synced 2026-10-01)
 - Users see and revoke their connections in Settings → Access → Connected products; admins see and revoke a product's connections on its card; the CLI lists them read-only. Revoke all includes connections. (AI-synced 2026-10-01)
-- Revoking a connection or one of its tokens cancels the jobs it created. A password change and logout do not revoke a connection. Disabling a product or deactivating a user refuses its access until re-enabled. (AI-synced 2026-10-01)
+- Revoking a connection or one of its tokens cancels the jobs it created. A password change and logout do not revoke a connection. Disabling a product refuses its connections' access until it is re-enabled; deactivating a user refuses access too, and a product may then drop the connection, so reactivation restores only the connections a product kept. (AI-synced 2026-10-01)
 - Narrowing or clearing a product's registration leaves existing access tokens with their scopes until they expire (at most one hour); disable the product to cut access at once. (AI-synced 2026-10-01)
 
 ## Feature #1390 — Api outage does not disturb a run on a still-live worker

@@ -86,12 +86,16 @@ access token and a refresh token, until the connection is revoked.
    at the 30-an-hour cap), so both lists read it through
    `idx_product_tokens_grant_last_used (grant_id, last_used_at DESC)` as a top-1
    probe per grant (`ORDER BY last_used_at DESC LIMIT 1`), never an aggregate,
-   pinned by `TestGrantListLastUsedIsATopOneIndexProbeLiveDB`. Two statements
+   pinned by `TestGrantListLastUsedIsATopOneIndexProbeLiveDB`. Indexing
+   `last_used_at` costs the throttled `TouchProductToken` write its HOT update on
+   every product token, manual ones included; accepted as a once-a-minute write. Two statements
    still read every UNREVOKED row of one grant: the scope check on approve
    (`OAuthGrantHasTokenOutsideScopes`) and the token sweep on revoke
    (`RevokeOAuthGrantProductTokens`). They run only on a user, admin or product
-   revoke or approve action, are served by `idx_product_tokens_grant_live`, and
-   read at most the grant's unrevoked rows, which are bounded by the mint rate
+   revoke or approve action and are normally served by `idx_product_tokens_grant_live`,
+   reading the grant's unrevoked rows (on a small table, where one grant is a large
+   share of `product_tokens`, the planner may scan the table instead, which is then
+   only a few times the grant's size). Those rows are which are bounded by the mint rate
    times the grant's lifetime since its last revoke (expired tokens are not
    revoked, because that would cancel their jobs). Pruning stays out of scope.
 6. **Grant tokens are not manual tokens (D5).** Rows with a `grant_id` are
@@ -212,8 +216,8 @@ access token and a refresh token, until the connection is revoked.
 - A product can stay connected (refresh) and disconnect itself (RFC 7009), and
   users and admins can list and revoke connections (M5). The M6 audit is done;
   every rule in the index below has a named test.
-- Narrowing or clearing a product's OAuth registration refuses refresh at once
-  but leaves live access tokens with their old scopes until they expire (at most
+- Clearing a product's OAuth registration refuses every refresh and narrowing it
+  refuses a refresh for any scope it lost, but either leaves live access tokens with their old scopes until they expire (at most
   one hour). Disabling the product cuts access immediately. This is documented in
   [Registering an OAuth client](../docs/oauth-clients.md).
 - A refresh does not rotate, so a leaked refresh token is good until the user or
@@ -223,7 +227,7 @@ access token and a refresh token, until the connection is revoked.
 
 ## Rule-to-test index
 
-Each row names the tests that pin a rule implemented so far. Tests whose names end
+Each row names the tests that pin a rule. Tests whose names end
 in `LiveDB` need a database (`./e2e/run-store-it.sh`); the others run in
 `task test:api` and `task gate:web`.
 
@@ -260,7 +264,7 @@ in `LiveDB` need a database (`./e2e/run-store-it.sh`); the others run in
 | D6 the owner revoking a grant token by id kills the grant; a foreign id is 404; a manual token revokes alone | `TestRevokeMyProductTokenOnGrantTokenKillsGrantLiveDB`, `TestRevokeMyProductTokenForeignGrantAndManualTokenLiveDB` |
 | D6 an admin revoking a grant token by id kills the grant | `TestAdminRevokeGrantTokenKillsGrantLiveDB` |
 | D6 Revoke all leaves no live grant, and its button counts grants; its warning tells connected products to connect again | `TestRevokeAllRevokesGrantsLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB`, `TestRevokeAllVersusFirstConsentApproveLiveDB`; web: "Revoke all counts live OAuth connections" in `ProductTokens.test.tsx`, `CliTokens.test.tsx` (including the connect-again sentence), `mockApi.productTokens.test.ts` |
-| D6 password change and logout do not revoke a connection: both bump `token_version`, and the access token and the refresh token still work afterwards | `TestPasswordChangeAndLogoutDoNotRevokeAConnectionLiveDB` |
+| D6 password change and logout do not revoke a connection: both bump `token_version`, and the access token and the refresh token still work afterwards (uzi has no password-change endpoint yet, so the password half drives the `UpdatePassword` query directly) | `TestPasswordChangeAndLogoutDoNotRevokeAConnectionLiveDB` |
 | D6 the connections lists read each grant's last use as a top-1 index probe, not the grant's whole token history | `TestGrantListLastUsedIsATopOneIndexProbeLiveDB` (store) |
 | D6 revoke cancels jobs of an expired access token | `TestCancelRevokedProductJobsExpiredGrantTokenLiveDB` |
 | D6 the product revokes its own connection with its refresh token (grant, access tokens, refresh token), idempotently | `TestOAuthRevokeWithRefreshTokenKillsGrantLiveDB` |

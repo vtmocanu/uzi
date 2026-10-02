@@ -227,7 +227,7 @@ func (e *oauthEnv) liveGrant(t *testing.T) store.OauthGrant {
 	return g
 }
 
-// seedGrantToken inserts an access-token row bound to the grant, as M3's token endpoint will.
+// seedGrantToken inserts an access-token row bound to the grant, as the token endpoint does.
 func (e *oauthEnv) seedGrantToken(t *testing.T, grant uuid.UUID, scopes []string) uuid.UUID {
 	t.Helper()
 	sum := sha256.Sum256([]byte(uuid.NewString()))
