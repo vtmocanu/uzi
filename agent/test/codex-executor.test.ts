@@ -9940,6 +9940,29 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     }
   });
 
+  it("(d4) a clock rollback cannot credit wall budget or lengthen the backoff", async (t) => {
+    const executor = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION)) as unknown as {
+      transientBackoff(ctx: RunContext, pause: { pending: boolean }, wall: { remainingMs: number }, totalMs: number): Promise<void>;
+    };
+    const wall = { remainingMs: 1000 };
+    let clock = 0;
+    let wakes = 0;
+    let afterRollback: number | undefined;
+    const realTimer = globalThis.setTimeout;
+    t.mock.method(Date, "now", () => clock);
+    t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms = 1, ...args: unknown[]) =>
+      realTimer(() => {
+        wakes++;
+        clock += wakes === 1 ? -5000 : Math.max(1, ms - 1);
+        callback(...args);
+        if (wakes === 1) queueMicrotask(() => { afterRollback = wall.remainingMs; });
+      }, 1));
+    await executor.transientBackoff(makeCtx().ctx, { pending: false }, wall, 3);
+    assert.equal(afterRollback, 1000, "a backward jump must not add wall budget");
+    assert.equal(wakes, 3, "the rollback must not add its magnitude to the wait");
+    assert.equal(wall.remainingMs, 997);
+  });
+
   // The remaining tests drive the interruption into the EXHAUSTION gate: the transient terminal
   // arrives first and the interruption becomes true only after the live turn can no longer be
   // tripped (its finally), so the in-turn trip path never sees it. Removing the gate turns each into
