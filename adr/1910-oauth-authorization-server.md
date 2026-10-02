@@ -93,9 +93,8 @@ access token and a refresh token, until the connection is revoked.
    (`OAuthGrantHasTokenOutsideScopes`) and the token sweep on revoke
    (`RevokeOAuthGrantProductTokens`). They run only on a user, admin or product
    revoke or approve action and are normally served by `idx_product_tokens_grant_live`,
-   reading the grant's unrevoked rows (on a small table, where one grant is a large
-   share of `product_tokens`, the planner may scan the table instead, which is then
-   only a few times the grant's size). Those rows are which are bounded by the mint rate
+   reading the grant's unrevoked rows (on a table small enough that a scan is cheaper
+   than the index, the planner may scan `product_tokens` instead). Those rows are bounded by the mint rate
    times the grant's lifetime since its last revoke (expired tokens are not
    revoked, because that would cancel their jobs). Pruning stays out of scope.
 6. **Grant tokens are not manual tokens (D5).** Rows with a `grant_id` are
