@@ -77,7 +77,9 @@
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
 #      --allow-changelog-removals for a deliberate reword. Deleted `### ` headings and
 #      blank lines are not a removal only when they are exactly what
-#      `changelog-union.sh --collapse` makes of the branch's file
+#      `changelog-union.sh --collapse` makes of the branch's file; bullets the collapse
+#      moves (a base [Unreleased] repeating a `### ` section with another between the
+#      copies) are not a removal when HEAD deletes nothing relative to the base's collapse
 #  10  the branch is uzi-owned (agent/*, uzi/*) and changes .github/workflows files: pushing
 #      it would make every later uzi push there fail (worker PAT lacks workflow scope).
 #      Split the workflow edit into a separate PR, or --allow-workflow-edit
@@ -449,7 +451,7 @@ changelog_placement_guard() {
   fi
 }
 changelog_guard() {
-  local cl_diff removed gd heads
+  local cl_diff removed gd heads moved
   [ "$ALLOW_CL_RM" -eq 0 ] || return 0
   if ! cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md); then
     echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3
@@ -502,6 +504,24 @@ changelog_guard() {
     if ! bash "$HERE/changelog-union.sh" --collapse "$gd/pre" > /dev/null 2>&1 || ! cmp -s "$gd/pre" "$gd/head"; then
       removed=$(printf '%s\n' "$heads" | sed 's/^/-/')
       log "the deleted CHANGELOG.md heading(s) are not exactly a --collapse of the branch's file (bullets would change section)"
+    fi
+  fi
+  # A base whose [Unreleased] repeats a `### <Section>` with another section between the
+  # copies: collapse_changelog moves the later copy's bullets up under the first, so the
+  # diff shows them deleted in place (and re-added). That is a move, not a removal, exactly
+  # when HEAD deletes no non-blank line relative to the base's own --collapse result.
+  if [ -n "$removed" ] && git show "origin/$BASE:CHANGELOG.md" > "$gd/base" 2>/dev/null; then
+    cp "$gd/base" "$gd/base.collapsed"
+    if bash "$HERE/changelog-union.sh" --collapse "$gd/base.collapsed" > /dev/null 2>&1 \
+      && ! cmp -s "$gd/base" "$gd/base.collapsed"; then
+      if ! moved=$({ diff -U0 "$gd/base.collapsed" "$gd/head.raw" || [ "$?" -eq 1 ]; } \
+        | awk '/^@@/ {inh = 1; next} !inh {next} /^-/ {l = substr($0, 2); if (l !~ /^[ \t]*$/) print "-" l}'); then
+        rm -rf "$gd"; echo "cannot diff CHANGELOG.md against the collapsed base" >&2; exit 3
+      fi
+      if [ -z "$moved" ]; then
+        removed=""
+        log "CHANGELOG.md: the only deletions move origin/$BASE's repeated [Unreleased] section bullets under their first heading (a --collapse of the base), not a removal"
+      fi
     fi
   fi
   rm -rf "$gd"

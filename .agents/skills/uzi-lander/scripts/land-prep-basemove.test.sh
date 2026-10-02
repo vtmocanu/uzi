@@ -28,7 +28,13 @@
 #   O. a branch whose later commit rewords its own earlier CHANGELOG bullet stops with exit 5
 #      instead of a union keeping both wordings (#1644);
 #   P. a blank-separated [Unreleased] union keeps main's blank lines, so the guard stays quiet;
-#   Q. ...and so does a sparse one (one existing entry, both sides appending).
+#   Q. ...and so does a sparse one (one existing entry, both sides appending);
+#   R. main's [Unreleased] repeats `### Added` with `### Fixed` between the copies: the
+#      collapse MOVES the later copy's bullet up under the first, which the guard accepts
+#      as a move (no line removed relative to main's own --collapse);
+#   R2. ...but a real deletion beside that move is still refused (exit 9);
+#   R3. ...including a deleted line that starts with `-- `, whose diff line `--- ...` must not
+#      be mistaken for a file header.
 set -eu
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
@@ -381,4 +387,41 @@ git -C "$WORK/wt-221" diff origin/main..HEAD -- CHANGELOG.md | awk '/^-/ && !/^-
 printf '## [Unreleased]\n\n### Fixed\n\n- **one**\n  one desc\n\n- **main q**\n  main desc\n\n- **branch q**\n  branch desc\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$WORK/q.want"
 diff -u "$WORK/q.want" "$WORK/wt-221/CHANGELOG.md" || fail "Q: the sparse union did not keep the blank lines"
 
-echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard, blank-separated and sparse union"
+# R. main: Added / Fixed / Added. The branch adds a Fixed bullet; collapse_changelog moves
+#    `- **added two**` up under the first `### Added`, so the diff deletes it in place.
+git -C "$SEED" switch -q main
+printf '## [Unreleased]\n\n### Added\n\n- **added one**\n\n### Fixed\n\n- **fixed one**\n\n### Added\n\n- **added two**\n\n## [0.1.0] - 2026-01-01\n\n- **old**\n' > "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'split added sections'; git -C "$SEED" push -q origin main
+cl_fixed() { awk -v add="$2" '{print} $0=="- **fixed one**"{print ""; print add}' "$1" > "$1.tmp" && mv "$1.tmp" "$1"; }
+mk_branch br; cl_fixed "$SEED/CHANGELOG.md" '- **branch r**'; commit_push br 'branch r'
+run br 222 --no-push --gate none
+[ "$rc" -eq 0 ] || fail "R: a collapse that moves a base bullet across a section was refused, rc=$rc: $(cat "$WORK/out.222")"
+[ "$(git -C "$WORK/wt-222" log -1 --format=%s)" = 'chore: collapse duplicate CHANGELOG section headings' ] || fail "R: no collapse commit (fixture did not exercise the move)"
+git -C "$WORK/wt-222" diff origin/main..HEAD -- CHANGELOG.md | grep -qxF -- '-- **added two**' || fail "R: the diff does not delete the moved bullet in place (fixture did not exercise the guard)"
+[ "$(unrel "$WORK/wt-222/CHANGELOG.md" | grep -c '^### Added$')" -eq 1 ] || fail "R: duplicate ### Added left"
+for b in '- **added one**' '- **added two**' '- **fixed one**' '- **branch r**'; do
+  grep -qxF -- "$b" "$WORK/wt-222/CHANGELOG.md" || fail "R: lost $b"
+done
+grep -q 'not a removal' "$WORK/out.222" || fail "R: the accepted move was not logged"
+
+# R2. the same base, but the branch also deletes `- **added one**`: refused, bullet named.
+mk_branch br2; cl_fixed "$SEED/CHANGELOG.md" '- **branch r2**'
+grep -vxF -- '- **added one**' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+commit_push br2 'branch r2'
+run br2 223 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "R2: a deletion beside a collapse move returned rc=$rc, want 9: $(cat "$WORK/out.223")"
+grep -qF -- '- **added one**' "$WORK/out.223" || fail "R2: the removed bullet was not printed: $(cat "$WORK/out.223")"
+
+# R3. main gains a `-- preserved note` line in the first Added section; the branch deletes it
+#     beside the same collapse move. Its diff line reads `--- preserved note`.
+git -C "$SEED" switch -q main
+awk '{print} $0=="- **added one**"{print "-- preserved note"}' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+git -C "$SEED" commit -qam 'note line'; git -C "$SEED" push -q origin main
+mk_branch br3; cl_fixed "$SEED/CHANGELOG.md" '- **branch r3**'
+grep -vxF -- '-- preserved note' "$SEED/CHANGELOG.md" > "$SEED/CHANGELOG.md.tmp"; mv "$SEED/CHANGELOG.md.tmp" "$SEED/CHANGELOG.md"
+commit_push br3 'branch r3'
+run br3 224 --no-push --gate none
+[ "$rc" -eq 9 ] || fail "R3: deleting a '-- ' line beside a collapse move returned rc=$rc, want 9: $(cat "$WORK/out.224")"
+grep -qF -- 'preserved note' "$WORK/out.224" || fail "R3: the removed line was not printed: $(cat "$WORK/out.224")"
+
+echo "PASS land-prep base move: disjoint tolerated without re-gate, overlap/conflict refused, CHANGELOG union auto-resolve, heading collapse and guard (incl. a cross-section move), blank-separated and sparse union"

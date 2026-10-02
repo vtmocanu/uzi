@@ -380,16 +380,21 @@ changes it); trust it over a handover's claim.
    `S/claims.sh reap --repo OWNER/REPO` (drops merged/closed claims and orphans of dead
    sessions), and hand any still-open item on.
 
-   **The run's follow-up issue.** A run's findings (off-task bugs, and review notes the lead
-   deferred) are uzi incidental findings, not forge issues. After the merge, list the ones
-   still to triage: `uzi findings list --run RUN --bucket to_file`. None: nothing to do.
-   - Verify each against the merged code. `uzi findings resolve ID` what the merge fixed;
-     `uzi findings dismiss ID --reason not-an-issue` a false positive, `--reason wont-do`
-     valid work deliberately declined.
-   - The rest becomes one issue. Get the buddy's `APPROVE` of its membership and its exact
-     title and body. `uzi findings file ID ID...` files the server-generated text (one id
-     files alone): preview it in the Findings page's file dialog (select the run's rows),
-     which is also where to edit it before filing.
+   **The run's follow-up issue.** A run's off-task bugs are uzi incidental findings, not forge
+   issues; review notes the lead deferred are the PR description's `deferred` scope notes,
+   not findings. After the merge, list the findings still to triage:
+   `uzi findings list --run RUN --bucket to_file`, and read the deferred scope notes. Neither
+   holds anything: nothing to do.
+   - Follow each deferred scope note's validator/report and SHA references to recover the
+     actual notes. Verify notes and findings against the merged code. `uzi findings resolve
+     ID` what the merge fixed; `uzi findings dismiss ID --reason not-an-issue` a false
+     positive, `--reason wont-do` valid work deliberately declined (finding ids only).
+   - Combine the actionable deferred notes and remaining findings into one draft. Get the
+     buddy's `APPROVE` of its membership and exact title and body. With findings, publish
+     that draft through the Findings page's grouped-file dialog (select the run's rows; it
+     edits the server text before filing; `uzi findings file ID ID...` files only the
+     unedited server text, so use it only when that text is the approved draft). Without
+     findings, `gh issue create --body-file`. A later body edit passes the same gates.
    - Filing is the human gate: file only with the user's go-ahead, given now or earlier in
      the session for this follow-up. The buddy's approval never substitutes for it.
    - A set over the grouped-filing limit (50) goes to the user for a decision; never split or
