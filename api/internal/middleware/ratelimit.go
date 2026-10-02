@@ -181,10 +181,11 @@ func (l *Limiter) PerWorkerMiddleware(next http.Handler) http.Handler {
 // IPv4 host cannot mint a budget per /64; a NAT64 well-known-prefix (64:ff9b::/96)
 // address is likewise its embedded IPv4. Residual: a holder of a larger delegation
 // (/56, /48) still gets one budget per /64 inside it; Teredo (2001::/32) and a
-// network-specific or local-use NAT64 prefix are not mapped, so all clients of one
-// Teredo server, or of one translator using a /64 or /96 prefix, share one budget
-// per /64 (a shorter NAT64 prefix embeds the IPv4 inside the /64, so each client
-// keeps its own). An unparsable input is returned unchanged.
+// network-specific or local-use NAT64 prefix are not mapped. All clients of one
+// Teredo server share one budget. Behind such a translator, clients share a budget
+// per IPv4 range that the prefix layout (RFC 6052) places in the /64: all of them
+// for a /64 or /96 prefix, one per IPv4 /8, /16 or /24 for a /56, /48 or /40, and
+// none for a /32. An unparsable input is returned unchanged.
 func rateLimitSubject(clientIP string) string {
 	addr, err := netip.ParseAddr(clientIP)
 	if err != nil {
