@@ -178,9 +178,12 @@ func (l *Limiter) PerWorkerMiddleware(next http.Handler) http.Handler {
 // IPv6 address is keyed on its /64, the same bucket as the OAuth authorize flow's
 // finest tier (oauthSourceBucketsFor in the handler package). An IPv4-mapped address
 // is its IPv4, and a 6to4 (2002::/16) address is the IPv4 address it embeds, so one
-// IPv4 host cannot mint a budget per /64. Residual: a holder of a larger delegation
-// (/56, /48) still gets one budget per /64 inside it. An unparsable input is
-// returned unchanged.
+// IPv4 host cannot mint a budget per /64; a NAT64 well-known-prefix (64:ff9b::/96)
+// address is likewise its embedded IPv4. Residual: a holder of a larger delegation
+// (/56, /48) still gets one budget per /64 inside it; Teredo (2001::/32) and a
+// network-specific or local-use NAT64 prefix are not mapped, so their clients share
+// one budget per /64 (all clients of one Teredo server, or of one translator). An
+// unparsable input is returned unchanged.
 func rateLimitSubject(clientIP string) string {
 	addr, err := netip.ParseAddr(clientIP)
 	if err != nil {
@@ -191,6 +194,10 @@ func rateLimitSubject(clientIP string) string {
 		if b := addr.As16(); b[0] == 0x20 && b[1] == 0x02 {
 			// 6to4: bits 16..47 are the embedded IPv4 address.
 			addr = netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]})
+		} else if nat64WellKnown.Contains(addr) {
+			// NAT64/SIIT well-known prefix (RFC 6052): the low 32 bits are the IPv4 client.
+			// Keyed on its /64, every IPv4 client behind such an edge would share one budget.
+			addr = netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]})
 		}
 	}
 	if addr.Is4() {
@@ -198,6 +205,9 @@ func rateLimitSubject(clientIP string) string {
 	}
 	return netip.PrefixFrom(addr, 64).Masked().String()
 }
+
+// nat64WellKnown is the RFC 6052 NAT64 well-known prefix.
+var nat64WellKnown = netip.MustParsePrefix("64:ff9b::/96")
 
 // ClientIP determines the real client IP, honoring X-Forwarded-For ONLY when the
 // direct connection (RemoteAddr) comes from a trusted-proxy CIDR; otherwise the

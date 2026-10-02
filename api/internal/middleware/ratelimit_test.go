@@ -123,6 +123,14 @@ func TestMiddlewareKeysIPv6OnItsSlash64(t *testing.T) {
 		{"[::ffff:192.0.2.1]:1", http.StatusOK},
 		{"[2002:c000:201:1::1]:1", http.StatusTooManyRequests},
 		{"[2002:c000:201:ffff::1]:1", http.StatusTooManyRequests},
+		// NAT64 well-known-prefix clients keep their own IPv4 budgets: one client
+		// exhausting its own does not lock out another IPv4 client behind the edge.
+		{"[64:ff9b::c633:6407]:1", http.StatusOK},
+		{"[64:ff9b::c633:6407]:2", http.StatusOK},
+		{"[64:ff9b::c633:6407]:3", http.StatusTooManyRequests},
+		{"[64:ff9b::cb00:7109]:1", http.StatusOK},
+		// ...and the translated client is keyed as its IPv4 (198.51.100.7).
+		{"198.51.100.7:1", http.StatusTooManyRequests},
 	}
 	for i, s := range steps {
 		if got := hit(s.remote); got != s.want {
@@ -139,6 +147,9 @@ func TestRateLimitSubject(t *testing.T) {
 		{"2001:db8:1:2::", "2001:db8:1:2::/64"},
 		{"fe80::1%eth0", "fe80::/64"},
 		{"2002:cb00:7109:1234::1", "203.0.113.9"},
+		{"64:ff9b::cb00:7109", "203.0.113.9"},
+		{"64:ff9b:1::cb00:7109", "64:ff9b:1::/64"},
+		{"2001:0:4136:e378:8000:63bf:3fff:fdd2", "2001:0:4136:e378::/64"},
 		{"not-an-ip", "not-an-ip"},
 		{"", ""},
 	} {
