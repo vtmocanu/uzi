@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Failed delegated Codex children now report their provider error category ([#2121](https://github.com/vtmocanu/uzi/issues/2121)).**
+  The lead and run feed show a closed category such as `transport` for `serverOverloaded` instead of only a generic failure; no provider text is exposed.
+
 - **A resumed Codex run no longer fails when an earlier, crashed attempt left its provider directory behind ([#2126](https://github.com/vtmocanu/uzi/issues/2126)).**
   Each run attempt now names its provider directories with its own random prefix, so a directory left by an attempt that was killed (for example by an out-of-memory kill) can no longer collide with a later attempt's `codex-data/epoch-N` and fail it with `File exists`. The directory is still created exclusively, and leftover directories are kept for inspection until the run's home is removed.
 
