@@ -8924,21 +8924,25 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
     assert.match((err as Error).message, /codex turn failed/);
   });
 
-  it("C3: a sticky owner cancel wins over the deferral", async () => {
+  it("C3: a sticky owner cancel that lands while the refresh is deferred wins over the deferral", async () => {
     const rig = makeMultiEpochRig([refreshThenFail()]);
-    rig.client.refreshCodex = async () => { throw vaultLocked409("refresh"); };
-    const { ctx } = makeCtx({ cancelRequested: () => true });
+    let cancelled = false;
+    rig.client.refreshCodex = async () => { cancelled = true; throw vaultLocked409("refresh"); };
+    const { ctx } = makeCtx({ cancelRequested: () => cancelled });
     const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "cancel wins").then(() => undefined, (e: unknown) => e);
     assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
     assert.equal((err as Error).message, "run cancelled");
+    assert.equal(cancelled, true, "the deferred refresh was reached");
   });
 
   it("C4: a shutdown abort of the run signal that lands while the refresh is deferred ends as a cancel, never a deferral", async () => {
     const controller = new AbortController();
     const rig = makeMultiEpochRig([refreshThenFail()]);
-    rig.client.refreshCodex = async () => { controller.abort(); throw vaultLocked409("refresh"); };
+    let refreshes = 0;
+    rig.client.refreshCodex = async () => { refreshes += 1; controller.abort(); throw vaultLocked409("refresh"); };
     const { ctx } = makeCtx({ signal: controller.signal });
     const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "shutdown wins").then(() => undefined, (e: unknown) => e);
+    assert.equal(refreshes, 1, "the deferred refresh was reached");
     assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
     assert.equal((err as Error).message, "run cancelled");
   });
@@ -8947,7 +8951,11 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
     const controller = new AbortController();
     const st = { cb: undefined as (() => void) | undefined };
     const rig = makeMultiEpochRig([refreshThenFail()]);
+    let refreshes = 0;
+    let pausing = false; // the owner pause is requested only once the refresh is in flight
     rig.client.refreshCodex = async () => {
+      refreshes += 1;
+      pausing = true;
       controller.abort(new PauseNowSignal());
       st.cb?.();
       throw vaultLocked409("refresh");
@@ -8955,13 +8963,38 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
     const parks: { completedCount: number }[] = [];
     const { ctx } = makeCtx({
       signal: controller.signal,
-      pauseModeRequested: () => "now",
+      pauseModeRequested: () => (pausing ? "now" : null),
       onPauseNow: (cb) => { st.cb = cb; },
       parkForPause: async (at) => { parks.push(at); return true; },
     });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "pause first");
+    assert.equal(refreshes, 1, "the latch was set (the refresh was deferred) after the pause tripped the turn");
     assert.equal(parks.length, 1, "the pause parked the run");
     assert.ok(result.pausedAt);
+  });
+
+  it("M11b: a declined owner pause re-drives the turn; the latch set meanwhile drops the re-driven turn before it starts, as a deferral", async () => {
+    const controller = new AbortController();
+    const st = { cb: undefined as (() => void) | undefined };
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    let pausing = false; // the owner pause is requested only once the refresh is in flight
+    rig.client.refreshCodex = async () => {
+      pausing = true;
+      controller.abort(new PauseNowSignal());
+      st.cb?.();
+      throw vaultLocked409("refresh");
+    };
+    let declined = 0;
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => (pausing ? "now" : null),
+      onPauseNow: (cb) => { st.cb = cb; },
+      parkForPause: async () => { declined += 1; return false; },
+    });
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "declined pause then latch").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.equal(declined, 1, "the pause path ran first (the pause trip won)");
+    assert.equal(rig.epochs[0]!.transport.turnStartCount, 1, "the re-driven turn never started");
   });
 
   it("C6: while a plan gate is open (a revise turn), the latch changes nothing: the turn fails as today", async () => {
@@ -8990,6 +9023,82 @@ describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", 
     const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "revise turn").then(() => undefined, (e: unknown) => e);
     assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
     assert.match((err as Error).message, /codex turn failed/);
+  });
+
+  // A gated run: the plan epoch's first turn submits a plan; later plan-epoch turns (revisions) run
+  // `reviseFrames` first. The next epoch is the post-approval implement epoch.
+  const gatedRig = (reviseFrames: (t: FakeTransport, th: string, tn: string) => void, implement: Responder): MultiRig => {
+    const plan: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-${c.turnStartCount}`;
+        c.transport.push(threadStarted("th-plan"));
+        if (c.turnStartCount > 1) reviseFrames(c.transport, "th-plan", turnId);
+        c.transport
+          .push(toolCall(c.turnStartCount, "submit_plan", { plan_md: "the plan" }, "th-plan", turnId, "c-plan"))
+          .push(turnCompleted("completed", "th-plan", turnId));
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    return makeMultiEpochRig([plan, implement]);
+  };
+  const approveVerdict = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+  const lockedRefresh = (rig: MultiRig): void => {
+    rig.client.refreshCodex = async (runId, req) => {
+      rig.client.refreshCalls.push({ runId, operation_id: req.operation_id, observed_generation: req.observed_generation });
+      throw vaultLocked409("refresh");
+    };
+  };
+
+  it("B1: a lock seen by a revise turn (gate open) is not carried past approval: the implement turn runs and the run completes", async () => {
+    const rig = gatedRig(
+      (t) => { t.push(refreshFrame(91)); },
+      epochResponder("th-plan", "tn-impl", (t, th, tn) => {
+        t.push(toolCall(71, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      }),
+    );
+    lockedRefresh(rig);
+    let gates = 0;
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      checkpoint: async () => undefined,
+      gatePlan: async () => (++gates === 1 ? { kind: "revise", feedback: "tighten it" } : approveVerdict),
+    } as Partial<RunContext>);
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "revise lock then approve");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(gates, 2, "the revised plan was gated again");
+    assert.equal(rig.client.refreshCalls.length, 1, "the revise turn's refresh reached the api once");
+    assert.equal(rig.epochs[1]!.transport.turnStartCount, 1, "the implement turn started");
+  });
+
+  it("M5b: the latch re-arms after approval: a lock seen by the implement turn defers the run", async () => {
+    const rig = gatedRig(
+      () => undefined,
+      epochResponder("th-plan", "tn-impl", (t, th, tn) => {
+        t.push(refreshFrame(91)).push(turnCompleted("failed", th, tn));
+      }),
+    );
+    lockedRefresh(rig);
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      checkpoint: async () => undefined,
+      gatePlan: async () => approveVerdict,
+    } as Partial<RunContext>);
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "post-approval lock").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.equal(rig.client.refreshCalls.length, 1);
+  });
+
+  it("M4: a turn that hangs after the refused refresh is ended by the vault trip and the run defers", async () => {
+    // No terminal frame follows the refresh request: only the trip can end this turn.
+    const rig = makeMultiEpochRig([epochResponder("th-1", "tn-1", (t) => { t.push(refreshFrame(91)); })]);
+    lockedRefresh(rig);
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 5000, "hung turn").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.equal(rig.client.refreshCalls.length, 1);
   });
 
   it("R5: once the run latched, the next boundary reconcile defers with ZERO credential calls", async () => {

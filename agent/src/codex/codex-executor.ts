@@ -346,20 +346,21 @@ class CodexVaultLockState {
   /** True once a refresh was deferred by a locked vault; never cleared within one run() call. */
   latched = false;
   /** True from the first plan-gate submission until approval: the server row is awaiting_approval
-   *  and can never park, so the latch must not change a turn's outcome in that window. */
+   *  and can never park, so a lock seen in that window is not latched (see onVaultLocked). */
   gateOpen = false;
   /** The live turn's trip, set by driveCodexTurn for the turn's duration. */
   activeTurnTrip: ((reason: string) => void) | undefined;
 
-  /** The latch is in force for turn outcomes (latched and no plan gate open). */
-  get active(): boolean {
-    return this.latched && !this.gateOpen;
-  }
-
-  /** The bridge callback: latch and drop the live turn, if any (suppressed while a gate is open). */
+  /**
+   * The bridge callback: latch and drop the live turn, if any. While a plan gate is open it does
+   * nothing: the bridge-local latch already refuses re-calls within that provider epoch, and the
+   * post-approval epoch builds a fresh bridge, so a lock seen in the gate window must not poison
+   * the implement turns after approval.
+   */
   onVaultLocked(): void {
+    if (this.gateOpen) return;
     this.latched = true;
-    if (!this.gateOpen) this.activeTurnTrip?.(REASON_VAULT_LOCKED);
+    this.activeTurnTrip?.(REASON_VAULT_LOCKED);
   }
 }
 
@@ -3124,7 +3125,7 @@ export class CodexExecutor implements Executor {
     // Issue #1789: a vault-lock latch set before this turn (an earlier turn's refresh, or a boundary)
     // drops it at once, unless an earlier interruption already tripped it (first-wins).
     const vaultLock = pauseNow.vaultLock;
-    if (vaultLock.active) trip(REASON_VAULT_LOCKED);
+    if (vaultLock.latched) trip(REASON_VAULT_LOCKED);
     // Issue #1764: every later interrupt trips THIS turn (first-wins), until the finally uninstalls it.
     pauseNow.activeTurnTrip = trip;
     // Issue #1789: a mid-turn vault-locked refresh deferral trips THIS turn the same way.
@@ -3380,10 +3381,8 @@ export class CodexExecutor implements Executor {
         // predicate. Check before returning the result to the plan, revision, or implement caller;
         // otherwise that caller can gate or complete the run and silently drop the cancel.
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
-        // Issue #1789: the turn ended cleanly but a refresh was deferred by a locked vault during it
-        // (cancel was checked above and wins): the run cannot continue credentialed, so defer rather
-        // than carry on into a boundary that would only be refused.
-        if (pauseNow.vaultLock.active) throw new CodexCredentialDeferredError();
+        // Issue #1789: a vault lock latched after this turn's trip was uninstalled is not checked here:
+        // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
         let err: unknown = caught;
@@ -3391,7 +3390,7 @@ export class CodexExecutor implements Executor {
         // (sticky, or a cancel/shutdown trip) always wins; a pause/wall/idle trip that fired FIRST
         // keeps its existing arm below; anything else (the vault trip, or the turn failing on the
         // refused refresh) defers with NO transient retry (a locked vault is not transient).
-        if (pauseNow.vaultLock.active) {
+        if (pauseNow.vaultLock.latched) {
           const lockedMsg = caught instanceof Error ? caught.message : "";
           if (ctx.cancelRequested?.() || lockedMsg === REASON_CANCEL) throw new Error(REASON_CANCEL);
           if (lockedMsg !== REASON_PAUSE && lockedMsg !== REASON_WALL && lockedMsg !== REASON_IDLE) {
