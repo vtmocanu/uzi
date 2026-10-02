@@ -46,6 +46,8 @@ import (
 
 // Handler bundles the dependencies shared by every HTTP handler.
 type Handler struct {
+	secretTestOnce sync.Once
+	secretTestClients *secretTestClients
 	pool *pgxpool.Pool
 	q    *store.Queries
 	cfg  config.Config

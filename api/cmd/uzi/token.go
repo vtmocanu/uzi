@@ -9,7 +9,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// newTokenCmd — `uzi token`. Only `list` and `pool` are wired, DELIBERATELY.
+// newTokenCmd — `uzi token` provides metadata listing, credential testing and pool control.
 //
 // Creating, renaming, set-defaulting and deleting a token are cookie-only web
 // actions (PRD #104 D8): those routes are RequireAuth, not RequireUser, because
@@ -26,9 +26,9 @@ import (
 func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "token",
-		Short: "List your Anthropic tokens and manage the auto-selection pool",
-		Long: "List your named Anthropic tokens (label, default flag, pool opt-in,\n" +
-			"timestamps), and opt one into or out of the auto-selection pool.\n\n" +
+		Short: "List and test your credentials, and manage the Anthropic pool",
+		Long: "List your named credentials (label, default flag, pool opt-in,\n" +
+			"timestamps), test one, or opt an Anthropic token into or out of the auto-selection pool.\n\n" +
 			"Adding, renaming, setting the default, and deleting a token are web-only,\n" +
 			"because they mint or replace a credential and must not be reachable from a\n" +
 			"CLI token. Use the web UI for those; use `uzi worker set-token` to point a\n" +
@@ -261,7 +261,83 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 	pool.Flags().BoolVar(&on, "on", false, "add the token to the auto-selection pool")
 	pool.Flags().BoolVar(&off, "off", false, "remove the token from the auto-selection pool")
 
-	cmd.AddCommand(list, pool)
+	var testKind string
+	test := &cobra.Command{
+		Use:   "test <label>",
+		Short: "Test an enabled credential by label",
+		Long:  "Test an enabled credential without revealing its value. Use --kind anthropic|codex|openai-key when a label occurs in more than one kind.",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			kind := ""
+			switch testKind {
+			case "":
+			case "anthropic":
+				kind = kindAnthropicToken
+			case "codex":
+				kind = kindCodexAuth
+			case "openai-key":
+				kind = kindOpenAIAPIKey
+			default:
+				return uzicli.Exitf(uzicli.ExitUsage, "invalid kind %q; use anthropic, codex or openai-key", testKind)
+			}
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			secrets, err := c.ListSecrets(cmd.Context())
+			if err != nil {
+				return err
+			}
+			var target apitypes.SecretDTO
+			matches := 0
+			for _, s := range secrets {
+				if kind != "" && s.Kind != kind {
+					continue
+				}
+				if strings.EqualFold(s.Label, strings.TrimSpace(args[0])) {
+					target = s
+					matches++
+				}
+			}
+			switch {
+			case matches == 0:
+				return uzicli.Exitf(uzicli.ExitUsage, "no credential labelled %q; `uzi token list` shows yours", args[0])
+			case matches > 1:
+				return uzicli.Exitf(uzicli.ExitUsage, "label %q is ambiguous; pass --kind anthropic, codex or openai-key", args[0])
+			case secretDisabled(target):
+				return uzicli.Exitf(uzicli.ExitConflict, "credential %q is disabled; enable it in Settings before testing", cellText(target.Label))
+			}
+			result, err := c.TestSecret(cmd.Context(), target.Kind, target.ID)
+			if err != nil {
+				return err
+			}
+			p := env.printer(gf)
+			if p.Format == uzicli.FormatJSON {
+				return p.JSON(struct {
+					Kind    string `json:"kind"`
+					Label   string `json:"label"`
+					ID      string `json:"id"`
+					Status  string `json:"status"`
+					Reason  string `json:"reason"`
+					Display string `json:"display"`
+				}{target.Kind, target.Label, target.ID, result.Status, result.Reason, result.Display})
+			}
+			if !gf.quiet {
+				p.Printf("%s %q: %s", tokenKindAlias(target.Kind), cellText(target.Label), cellText(result.Status))
+				if result.Reason != "" {
+					p.Printf(" (%s)", cellText(result.Reason))
+				}
+				if result.Display != "" {
+					p.Printf(" — %s", cellText(result.Display))
+				}
+				p.Printf("\n")
+			}
+			return nil
+		},
+	}
+	test.Flags().StringVar(&testKind, "kind", "", "credential kind: anthropic, codex or openai-key")
+
+	cmd.AddCommand(list, pool, test)
 	return cmd
 }
 

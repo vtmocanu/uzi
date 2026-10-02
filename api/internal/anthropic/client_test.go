@@ -11,6 +11,25 @@ import (
 	"time"
 )
 
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+func TestProbeTestStatusWithoutHeaders(t *testing.T) {
+	calls := 0
+	client := New(&http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
+		calls++
+		if r.Method != http.MethodPost || r.URL.String() != messagesURL || r.Header.Get("Authorization") != "Bearer "+"fixture" {
+			t.Fatalf("unexpected probe request: %s %s", r.Method, r.URL)
+		}
+		return &http.Response{StatusCode: http.StatusOK, Header: make(http.Header), Body: io.NopCloser(strings.NewReader("{}"))}, nil
+	})})
+	_, hasGauge, err := client.ProbeTest(context.Background(), []byte("fixture"))
+	if err != nil || hasGauge || calls != 1 {
+		t.Fatalf("ProbeTest = (gauge %v, %v), calls %d", hasGauge, err, calls)
+	}
+}
+
 func TestParseUsage(t *testing.T) {
 	tests := []struct {
 		name     string

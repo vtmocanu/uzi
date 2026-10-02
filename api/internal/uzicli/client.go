@@ -81,6 +81,7 @@ type Client interface {
 	// a list is safe from a CLI token; creating/rotating/deleting is web-only). Each
 	// entry's value appears nowhere — there is no reveal endpoint.
 	ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, error)
+	TestSecret(ctx context.Context, kind, id string) (apitypes.SecretTestResult, error)
 	// SetTokenAutoEligible opts one of the caller's Anthropic tokens into or out of
 	// the auto-selection pool (PRD #111 M2, D2): PATCH
 	// /api/me/secrets/anthropic_token/{id}/auto-eligible {auto_eligible}.

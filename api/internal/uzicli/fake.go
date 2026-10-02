@@ -313,7 +313,9 @@ type FakeClient struct {
 	Settings apitypes.UserSettingsDTO
 
 	// Secrets drives ListSecrets (PRD #104 M2).
-	Secrets []apitypes.SecretDTO
+	Secrets                  []apitypes.SecretDTO
+	SecretTestResult         apitypes.SecretTestResult
+	LastTestKind, LastTestID string
 
 	// SetWorkerToken capture (PRD #104 M3): the worker id and the label it was asked
 	// to bind. LastSetTokenLabel is "" for the clear-the-binding form, which is the

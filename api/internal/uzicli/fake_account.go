@@ -30,6 +30,14 @@ func (f *FakeClient) ListSecrets(context.Context) ([]apitypes.SecretDTO, error) 
 	return f.Secrets, nil
 }
 
+func (f *FakeClient) TestSecret(_ context.Context, kind, id string) (apitypes.SecretTestResult, error) {
+	f.LastTestKind, f.LastTestID = kind, id
+	if f.Err != nil {
+		return apitypes.SecretTestResult{}, f.Err
+	}
+	return f.SecretTestResult, nil
+}
+
 func (f *FakeClient) SetTokenAutoEligible(_ context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
 	f.LastPoolSecretID = id
 	f.LastPoolValue = eligible

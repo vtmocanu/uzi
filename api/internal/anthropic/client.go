@@ -161,6 +161,25 @@ func (c *Client) ProbeHeaders(ctx context.Context, token []byte) (Reading, error
 	return parseHeaders(resp.Header)
 }
 
+// ProbeTest sends one pinned Messages request. A 2xx proves access even when
+// rate-limit headers are absent; the optional reading is returned when parseable.
+func (c *Client) ProbeTest(ctx context.Context, token []byte) (Reading, bool, error) {
+	resp, err := c.do(ctx, http.MethodPost, messagesURL, probeBody, token)
+	if err != nil {
+		return Reading{}, false, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, maxBodyBytes))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return Reading{}, false, httpError("probe", resp.StatusCode, nil)
+	}
+	reading, err := parseHeaders(resp.Header)
+	if err != nil {
+		return Reading{}, false, nil
+	}
+	return reading, true, nil
+}
+
 // do issues the request with the shared auth headers. The token is set ONLY on the
 // Authorization header; no error path below reads the request, so no error can
 // carry the token.

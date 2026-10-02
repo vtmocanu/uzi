@@ -55,6 +55,16 @@ func (c *HTTPClient) ListSecrets(ctx context.Context) ([]apitypes.SecretDTO, err
 	return env.Secrets, nil
 }
 
+// TestSecret probes one owned credential using the server's safe result vocabulary.
+func (c *HTTPClient) TestSecret(ctx context.Context, kind, id string) (apitypes.SecretTestResult, error) {
+	var result apitypes.SecretTestResult
+	path := "/api/me/secrets/" + url.PathEscape(kind) + "/" + url.PathEscape(id) + "/test"
+	if err := c.postJSON(ctx, path, nil, &result); err != nil {
+		return apitypes.SecretTestResult{}, err
+	}
+	return result, nil
+}
+
 func (c *HTTPClient) SetTokenAutoEligible(ctx context.Context, id string, eligible bool) (apitypes.SecretDTO, error) {
 	body := struct {
 		AutoEligible bool `json:"auto_eligible"`

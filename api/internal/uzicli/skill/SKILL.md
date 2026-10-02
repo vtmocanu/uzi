@@ -218,6 +218,7 @@ uzi worker set-token <worker-id> --default
 uzi worker set-token <worker-id> --auto
 uzi token list
 uzi token pool <label> --on|--off
+uzi token test <label> [--kind anthropic|codex|openai-key]
 uzi rate-limits [--provider claude|codex]
 uzi memory list
 uzi memory rm <memory-id>
@@ -1452,6 +1453,7 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   meters read failed) — which is not the same as "not eligible", so branch on null
   before you branch on the value. An un-pooled token reports `not_pooled` there
   rather than the table's `-`.
+- `uzi token test <label> [--kind anthropic|codex|openai-key]` — test one enabled credential on demand. A label shared by kinds requires `--kind`. The response is a bounded, metadata-only outcome (`ok`, `rejected`, `permission_denied`, or `inconclusive`); Anthropic may spend about one token on its Messages check. Saving a credential does not wait for this verdict.
 - `uzi rate-limits [--provider claude|codex]` — your own rate-limit meters, the
   terminal twin of the web sidebar meters. `--provider claude` (the default) lists your
   Anthropic tokens as `TOKEN`/`STATUS`/`5H%`/`7D%`; `--provider codex` lists your linked

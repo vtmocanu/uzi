@@ -26,6 +26,7 @@ func (h *Handler) mountMeRoutes(r chi.Router, authLimiter *mw.Limiter) {
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireUser(h.q, h.cfg))
 			r.Get("/", h.ListMySecrets)
+			r.Post("/{kind}/{id}/test", h.TestMySecret)
 			// The auto-selection pool toggle (PRD #111 M2, D13). RequireUser, and
 			// it is the ONE write in this route tree that is — deliberately, and
 			// on the SAME reasoning as PATCH /workers/{id}: it mints

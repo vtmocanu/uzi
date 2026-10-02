@@ -244,6 +244,47 @@ func (s *Service) CollectCodexAccountUsage(ctx context.Context, userID, accountI
 	}, nil
 }
 
+// TestCodexLinkedAccount reads a committed login once. It never enters the
+// poller's 401 refresh path or changes account/re-auth state.
+func (s *Service) TestCodexLinkedAccount(ctx context.Context, userID, accountID uuid.UUID, reader CodexUsageReader) (string, string) {
+	q, ok := s.codexUsageQueries()
+	if !ok || reader == nil {
+		return "inconclusive", "generic"
+	}
+	acct, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
+	if err != nil || codexRotatableState(acct) != nil {
+		return "inconclusive", "generic"
+	}
+	if !s.codexVaultUnlocked(userID) {
+		return "inconclusive", "vault_locked"
+	}
+	blob, err := s.openCodexAccountLogin(userID, acct)
+	if errors.Is(err, errVaultLocked) {
+		return "inconclusive", "vault_locked"
+	}
+	if err != nil || blob.AccessToken == "" {
+		return "inconclusive", "generic"
+	}
+	reading, callErr := reader.ReadUsage(ctx, blob.AccessToken, acct.WorkspaceAccountID)
+	status := "inconclusive"
+	if callErr == nil && codexUsageIdentityMatches(acct, reading) {
+		status = "ok"
+	} else {
+		var authErr *codexauth.AuthError
+		if errors.As(callErr, &authErr) && authErr.StatusCode == http.StatusUnauthorized && blob.RefreshToken == "" {
+			status = "rejected"
+		}
+	}
+	fresh, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{UserID: userID, ID: accountID})
+	if err != nil || fresh.Generation != acct.Generation || fresh.CredentialRevision != acct.CredentialRevision || fresh.CoordState != acct.CoordState || codexRotatableState(fresh) != nil || !s.codexVaultUnlocked(userID) {
+		return "inconclusive", "superseded"
+	}
+	if status == "inconclusive" {
+		return status, "generic"
+	}
+	return status, ""
+}
+
 // readCodexUsage performs step 4-7: the first attempt with the committed token, and — on a
 // 401 only — one bounded retry, either against a newer committed generation or after a single
 // coordinated rotation. It returns the reading and the account row it was CAPTURED UNDER (so

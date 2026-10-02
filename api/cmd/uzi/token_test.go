@@ -45,7 +45,7 @@ func TestTokenListJSON(t *testing.T) {
 	}
 }
 
-// The token command tree carries `list` and `pool`, and NOTHING that mints or
+// The token command tree carries `list`, `pool` and `test`, and NOTHING that mints or
 // replaces a credential: add/rename/set-default/rm are cookie-only web actions
 // (PRD #104 D8) and must not exist as CLI commands, the same way `uzi worker` has
 // no `create`.
@@ -67,7 +67,7 @@ func TestTokenSubcommands(t *testing.T) {
 	for _, c := range tok.Commands() {
 		subs[c.Name()] = true
 	}
-	for _, want := range []string{"list", "pool"} {
+	for _, want := range []string{"list", "pool", "test"} {
 		if !subs[want] {
 			t.Errorf("`uzi token %s` is missing", want)
 		}

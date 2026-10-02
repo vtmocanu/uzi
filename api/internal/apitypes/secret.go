@@ -2,6 +2,14 @@ package apitypes
 
 import "time"
 
+// SecretTestResult is the safe outcome of POST /api/me/secrets/{kind}/{id}/test.
+// Status, reason and display are server-provided; no provider response is exposed.
+type SecretTestResult struct {
+	Status  string `json:"status"`
+	Reason  string `json:"reason,omitempty"`
+	Display string `json:"display,omitempty"`
+}
+
 // SecretDTO is the metadata-only view of one stored user secret (PRD #104 M2). It
 // is the shape GET /api/me/secrets returns an array of, and the shape the CLI
 // (`uzi token list`) decodes. The secret VALUE appears in no field — there is no
