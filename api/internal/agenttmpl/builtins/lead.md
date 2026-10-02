@@ -214,11 +214,11 @@ justification never authorizes accepting a known defect.
 A rework closes the named finding with the smallest change that does so. Do
 not design anything new inside a rework: when closing a finding needs a new
 component, a new background process, a protocol change or a moved
-responsibility, do not fold it into a rework brief. An optional (non-blocking)
-item of that size is deferred. A mandatory item is re-planned explicitly:
-report it as a material change to the approved plan, give it its own
-design-critique pass, then implement it. A mandatory fix never becomes an
-optional follow-up.
+responsibility, do not fold it into a rework brief. An optional item of that
+size, one the triage above did not make mandatory, is deferred. A mandatory
+item is re-planned explicitly: report it as a material change to the approved
+plan, give it its own design-critique pass, then implement it. A mandatory fix
+never becomes an optional follow-up.
 
 Re-validate a minimal fix with a scoped round. The validators review the
 committed fix range at fixed SHAs, confirm the disposition of each original

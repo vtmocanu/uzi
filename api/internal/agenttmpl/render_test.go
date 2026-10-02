@@ -584,9 +584,9 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 // TestLeadReworkTriagePhrases pins the lead's rework-triage contract (issue
 // #2012): which validator notes a rework must carry, how small a rework stays,
 // how a minimal fix is re-validated, and where the notes left unreworked are
-// recorded. These are whole-body pins, not region-scoped: the rules live in
-// their own paragraphs after the risk-class paragraph, outside the two regions
-// splitLeadRegions cuts.
+// recorded. These are whole-body pins, not region-scoped: the rules sit in the
+// bullet region splitLeadRegions cuts, but no case here asserts against that
+// region, so a phrase satisfies its pin from anywhere in `lead.md`.
 func TestLeadReworkTriagePhrases(t *testing.T) {
 	lead, ok := BuiltinByName("lead")
 	if !ok {
