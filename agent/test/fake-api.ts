@@ -1331,7 +1331,7 @@ export class FakeApi {
         req.socket.destroy();
         return;
       }
-      if (this.wallParkCommitted) return send(res, 409, { run: { id: runId, status: "paused" } });
+      if (this.wallParkCommitted) return send(res, 200, { run: { id: runId, status: "paused" } });
       if (this.wallParkHttpStatus !== 200 && this.wallParkHttpStatus !== 409) {
         return send(res, this.wallParkHttpStatus, { error: "run not found for this worker" });
       }

@@ -12853,20 +12853,25 @@ export class RunRunner {
     // cannot certify that this request applied; nor can a failed or absent acknowledgment.
     const confirmedPark = ack?.applied === true && ack.status === "paused";
     const refusedRunning = ack?.applied === false && ack.status === "running";
-    if (!ack || (!confirmedPark && !refusedRunning && ack.status !== "cancelled")) {
-      flight.uncertainWallPark = true;
+    if (!confirmedPark && ack?.status !== "cancelled") {
+      let provedRunning = false;
       try {
         const ownership = await this.client.getRunOwnership(flight.runId);
-        if (ownership.status === "running" && ownership.claim_generation === flight.claimGeneration) {
-          flight.uncertainWallPark = false;
-        }
+        provedRunning = ownership.status === "running" && ownership.claim_generation === flight.claimGeneration;
       } catch (err) {
         runLog.warn("wall park ownership probe failed; retaining local work", {
           run_id: flight.runId, error: errMessage(err),
         });
       }
-      return "undeliverable";
+      // A 409/running can belong to a newer claim on this same worker. Continue the executor
+      // only when the probe proves this flight's generation; every other unresolved answer
+      // remains nonterminal and bypasses finalize unless that same proof was obtained.
+      if (!refusedRunning || !provedRunning) {
+        flight.uncertainWallPark = !provedRunning;
+        return "undeliverable";
+      }
     }
+    if (!ack) return "undeliverable";
     const { status } = ack;
     const refresh: WallParkRefresh = {};
     if (ack.budgetTotalSeconds !== undefined) refresh.totalSeconds = ack.budgetTotalSeconds;

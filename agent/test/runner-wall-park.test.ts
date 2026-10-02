@@ -398,7 +398,8 @@ describe("RunRunner — capture-first wall park (PRD #1497 M2)", () => {
           },
         },
       });
-      const claim = gitlabClaim(1600);
+      const claim = gitlabClaim(1600, { claim_generation: 1 });
+      api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
       await runnerWithGit(factory, gitlab).execute(claim);
       assert.deepEqual(
         refreshes,

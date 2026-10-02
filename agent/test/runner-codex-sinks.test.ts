@@ -1285,6 +1285,7 @@ describe("RunRunner uncertain wall park", () => {
     { name: "proven same-generation running after outage", iid: 20905, lost: false, status: 503, owner: "running", finalize: true, requests: 2 },
     { name: "running at a later generation remains uncertain", iid: 20906, lost: false, status: 503, owner: "laterGeneration", finalize: false, requests: 2 },
     { name: "running without a generation remains uncertain", iid: 20907, lost: false, status: 503, owner: "unknownGeneration", finalize: false, requests: 2 },
+    { name: "409 running at a later generation remains uncertain", iid: 20908, lost: false, status: 409, owner: "laterGeneration", finalize: false, requests: 1 },
   ] as const) {
     it(scenario.name, async () => {
       const { gitlab, calls } = fakeGitlab();
@@ -1293,7 +1294,7 @@ describe("RunRunner uncertain wall park", () => {
       try {
         const claim = gitlabClaim(scenario.iid, { claim_generation: 7 });
         if (scenario.lost) api.commitWallParkThenLoseFirstReply();
-        else api.setWallParkResponse("paused", scenario.status);
+        else api.setWallParkResponse(scenario.name.startsWith("409 running") ? "running" : "paused", scenario.status);
         if (scenario.owner === "paused") api.setOwnershipStatus(claim.run_id, "paused", claim.claim_generation);
         if (scenario.owner === "notOwned") api.setOwnershipNotOwned(claim.run_id);
         if (scenario.owner === "failedProbe") api.failOwnership(claim.run_id);
@@ -1304,10 +1305,10 @@ describe("RunRunner uncertain wall park", () => {
         const runHome = path.join(homeRoot, "h");
         const probe: Probe = { refresh: -1, release: -1 };
         await runnerWith(() => ({ executor: wallExecutor(rig, runHome, probe, { on: false }), homeDir: runHome }), gitlab).execute(claim);
-        assert.equal(probe.outcome, "undeliverable");
+        assert.equal(probe.outcome, scenario.lost ? "parked" : "undeliverable");
         assert.equal(api.wallParkRequests.length, scenario.requests, "wall report has one bounded retry on throw");
         if (scenario.requests === 2) assert.deepEqual(api.wallParkRequests[0]?.body, api.wallParkRequests[1]?.body);
-        assert.deepEqual(api.ownershipRequests, [claim.run_id], "one ownership probe after unresolved report");
+        assert.deepEqual(api.ownershipRequests, scenario.lost ? [] : [claim.run_id], "only unresolved reports need one ownership probe");
         assert.equal(rig.boundaries.includes("finalize"), scenario.finalize, "finalize needs same-generation running proof");
         assert.equal(calls.length, 0, "no push/MR");
         assertKept(scenario.iid, claim.run_id, runHome, rig);
