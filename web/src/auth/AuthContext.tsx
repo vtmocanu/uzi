@@ -4,6 +4,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -129,6 +130,11 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [judgeEnforcedByAdmin, setJudgeEnforcedByAdmin] = useState(false);
   const [effectiveJudgeModel, setEffectiveJudgeModel] = useState("");
   const [serverUnreachable, setServerUnreachable] = useState(false);
+  // Session-probe generation. Each me() probe captures the value it started at and
+  // drops its result if anything newer has started or changed the session since
+  // (another probe, login, register, logout, a global 401), so probes that finish
+  // out of order cannot overwrite a newer answer.
+  const sessionGen = useRef(0);
 
   // applySession records the user and the instance labels from a session
   // response, falling back to the compiled-in defaults for a server that predates
@@ -138,6 +144,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // the deprecated single-theme trio so the app still paints. applyAppearance
   // stamps data-theme/data-font and arms the live system-mode listener.
   const applySession = useCallback((session: SessionResponse) => {
+    sessionGen.current += 1;
     setUser(session.user);
     setServerUnreachable(false);
     setUziLabel(session.uzi_label || DEFAULT_UZI_LABEL);
@@ -167,9 +174,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refresh = useCallback(async () => {
+    const gen = ++sessionGen.current;
     try {
-      applySession(await api.me());
+      const session = await api.me();
+      if (gen !== sessionGen.current) return;
+      applySession(session);
     } catch (err) {
+      if (gen !== sessionGen.current) return;
       if (err instanceof ApiError && err.status === 401) {
         setUser(null);
         setServerUnreachable(false);
@@ -188,6 +199,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   // already-empty session and leaves a signed-out visitor on their public page.
   useEffect(() => {
     setUnauthorizedHandler(() => {
+      sessionGen.current += 1;
       setUser(null);
       setServerUnreachable(false);
     });
@@ -261,6 +273,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     try {
       await api.logout();
     } finally {
+      sessionGen.current += 1;
       setUser(null);
       setServerUnreachable(false);
     }

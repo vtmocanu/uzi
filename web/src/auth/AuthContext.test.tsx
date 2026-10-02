@@ -45,7 +45,7 @@ const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
 // A tiny consumer that renders the uzi label and the resolved appearance so the
 // test can assert on what the provider exposes (PRD #764, PRD #1167).
 function Probe() {
-  const { uziLabel, appearance, user, loading, serverUnreachable, logout } = useAuth();
+  const { uziLabel, appearance, user, loading, serverUnreachable, logout, retry } = useAuth();
   return (
     <div>
       <span data-testid="loading">{String(loading)}</span>
@@ -53,6 +53,9 @@ function Probe() {
       <span data-testid="unreachable">{String(serverUnreachable)}</span>
       <button type="button" onClick={() => void logout()}>
         do logout
+      </button>
+      <button type="button" onClick={() => void retry()}>
+        do retry
       </button>
       <span data-testid="uzi">{uziLabel}</span>
       <span data-testid="mode">{appearance.mode}</span>
@@ -158,5 +161,27 @@ describe("AuthContext — server unreachable (#1991)", () => {
     });
     expect(mockApi.logout).toHaveBeenCalledTimes(1);
     expect(screen.getByTestId("unreachable").textContent).toBe("false");
+  });
+
+  it("drops an older probe's 503 that settles after a newer probe's 401", async () => {
+    let rejectOlder: (err: unknown) => void = () => {};
+    let rejectNewer: (err: unknown) => void = () => {};
+    mockApi.me
+      .mockImplementationOnce(() => new Promise((_, reject) => (rejectOlder = reject)))
+      .mockImplementationOnce(() => new Promise((_, reject) => (rejectNewer = reject)));
+    renderProbe();
+    await act(async () => {
+      screen.getByRole("button", { name: "do retry" }).click();
+    });
+    expect(mockApi.me).toHaveBeenCalledTimes(2);
+    await act(async () => {
+      rejectNewer(new ApiError(401, "unauthorized"));
+    });
+    await act(async () => {
+      rejectOlder(new ApiError(503, "service unavailable"));
+    });
+    await waitFor(() => expect(screen.getByTestId("loading").textContent).toBe("false"));
+    expect(screen.getByTestId("unreachable").textContent).toBe("false");
+    expect(screen.getByTestId("user").textContent).toBe("none");
   });
 });
