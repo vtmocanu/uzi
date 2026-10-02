@@ -50,6 +50,9 @@ through `[0.52.0]`.)
 - **A Codex run whose owner's vault locks during a long turn now parks instead of failing ([#1789](https://github.com/vtmocanu/uzi/issues/1789)).**
   When the Codex app-server asks for a credential refresh mid-turn and the api answers that the owner's vault is locked, the worker now recognises that answer, ends the turn, and parks the run as `recovery_wait` with cause `vault_locked`, with its work captured and custody kept, exactly like a lock hit at a checkpoint or finalize. After the lock the refresh bridge and the checkpoint and finalize reconciles make no further credential call, so the single-use refresh token is not spent twice, and the run resumes on the ordinary recovery timer once the vault is unlocked. A cancel or shutdown still takes precedence. Other refresh failures behave as before. While a plan is awaiting approval the run cannot park, so a lock reached by a plan revise turn does not defer the run: that turn fails only if the turn itself fails, and if it still completes the run continues (later refreshes in that same plan round are refused without an api call) and a lock after approval parks as above.
 
+- **A refused Codex wall-clock park no longer re-drives the turn on a reaped provider root ([#1782](https://github.com/vtmocanu/uzi/issues/1782)).**
+  When a Codex run's wall-clock park is refused because the owner extended, the runner's capture may already have reaped the provider root and closed its registry, so the re-driven turn (and a refused completion-hold park) now runs on a freshly recreated provider epoch that resumes the same thread instead of failing at provider admission.
+
 - **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
   The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
 

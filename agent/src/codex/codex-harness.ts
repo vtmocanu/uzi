@@ -407,6 +407,10 @@ export class CodexHarness implements RunHarness {
   // abandoning a waiter that would silently eat the next provider notification.
   private pendingNote?: Promise<IteratorResult<CodexNotification>>;
   private threadId?: string;
+  /** The root thread a recreated provider epoch must resume (issue #1782). */
+  get rootThreadId(): string | undefined {
+    return this.threadId;
+  }
   private currentModel?: string;
   private closed = false;
 

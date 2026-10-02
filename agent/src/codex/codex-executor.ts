@@ -1928,11 +1928,11 @@ export class CodexExecutor implements Executor {
     // runner-side capture runs the Codex boundary (quiesce + reap) on the LIVE root. It is set
     // BEFORE the sink is awaited, so a sink that reaps and then throws is covered too. Cleared
     // whenever a fresh epoch is installed, and whenever a turn completes on the current epoch
-    // (a refused park or a declined hold continues the run there, and a completed turn holds
-    // newer session state). The reap disposes the provider root, whose owned data root (the
-    // epoch's codexHome, sessions included) the launcher then removes, so a later persist of
-    // that epoch would find no source and publish an EMPTY store generation over the session
-    // persisted just before the reap. The finally skips it.
+    // (a completed turn holds newer session state; a refused in-turn wall park recreates the
+    // epoch, issue #1782, since the refused capture may have reaped). The reap disposes the
+    // provider root, whose owned data root (the epoch's codexHome, sessions included) the
+    // launcher then removes, so a later persist of that epoch would find no source and publish an
+    // EMPTY store generation over the session persisted just before the reap. The finally skips it.
     let reapedSinceLastPersist = false;
     // Issue #1764: the one "persist before a sink that may reap" step. Skipped when the flag is
     // already set, because the home may be gone. The store then holds the generation persisted
@@ -2163,6 +2163,22 @@ export class CodexExecutor implements Executor {
       epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, epochIndex);
       this.safety = epoch.safety;
 
+      // Issue #1782: a refused in-turn wall park may already have reaped the provider root (the
+      // runner's capture runs the Codex boundary before the owner's extension is known), which
+      // permanently closes the epoch's registry. The executor cannot tell, so a refused park always
+      // recreates the epoch. The session was persisted by beforeReapingSink before the park and the
+      // reaped home is gone, so the old epoch is NOT persisted again. If startProviderEpoch throws,
+      // `epoch` and `reapedSinceLastPersist` stay as they were, so the finally skips the persist.
+      const recreateEpochAfterReap = async (): Promise<ProviderEpoch> => {
+        const old = epoch!;
+        lastSessionId = old.harness.rootThreadId ?? lastSessionId;
+        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex);
+        this.safety = epoch.safety;
+        reapedSinceLastPersist = false;
+        await old.dispose();
+        return epoch;
+      };
+
       // Issue #1866 M2: measure the lead's command environment ONCE, through epoch 0's registered
       // command seam (the per-command private HOME/TMPDIR commandEffectSpec sets is what is
       // measured), before any turn: the plan turn, or the first implement turn of a pre-approved
@@ -2228,7 +2244,7 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap);
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
           // parks it (handlePausePark); the finally persists the live plan epoch and tears it down.
           if (turn.kind === "paused") throw new PauseNowSignal();
@@ -2564,7 +2580,7 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, recreateEpochAfterReap, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
           if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
           if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
@@ -3333,7 +3349,8 @@ export class CodexExecutor implements Executor {
    * or when that hold is refused, they route to ctx.parkForWall through the runner's
    * captureHoldContext path. Returns the turn's result, a completion hold, a `walled` sentinel so
    * phasePublish skips finalize, or `paused`. A REFUSED wall park (owner extended) re-drives the
-   * SAME turn. Idle trips hold after an attempt and otherwise rethrow; other errors propagate
+   * turn on a freshly recreated provider epoch (issue #1782: the refused capture may have reaped
+   * the root). Idle trips hold after an attempt and otherwise rethrow; other errors propagate
    * unchanged.
    *
    * Issue #1764: an owner now/milestone pause that dropped the turn (REASON_PAUSE, mode not `wall`)
@@ -3345,20 +3362,21 @@ export class CodexExecutor implements Executor {
    */
   private async driveTurnWithWallPark(
     ctx: RunContext,
-    harness: CodexHarness,
-    registry: ExecutionRegistry,
+    harnessIn: CodexHarness,
+    registryIn: ExecutionRegistry,
     reducer: RunTurnReducerImpl,
     phase: "plan" | "implement",
     prompt: string,
-    resumeId: string | undefined,
+    resumeIdIn: string | undefined,
     idleMs: number,
     wall: RunWall,
-    buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
+    buildPhaseBrokerIn: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
     selection: AgentSelection | undefined,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
     beforeReapingSink: () => Promise<void>,
     pauseNow: CodexPauseNowState,
+    recreateEpoch: () => Promise<ProviderEpoch>,
     completionAttempted = false,
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
     onFirstEvent?: () => void,
@@ -3370,6 +3388,11 @@ export class CodexExecutor implements Executor {
   > {
     // Issue #2099: transient-provider retries spent by THIS call; a wall-park re-drive does not reset it.
     let transientAttempts = 0;
+    // Issue #1782: reassigned after a refused wall park recreates the provider epoch.
+    let harness = harnessIn;
+    let registry = registryIn;
+    let resumeId = resumeIdIn;
+    let buildPhaseBroker = buildPhaseBrokerIn;
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
@@ -3470,6 +3493,14 @@ export class CodexExecutor implements Executor {
           // The owner extended: re-drive the turn. It skips reportIteration, so re-arm the run-wide
           // wall from the refusal's own budget first, or the re-drive would trip at once.
           refreshWallAfterRefusal(wall, ctx.takeWallParkRefresh?.(), this.deps.redriveAllowanceMs ?? REDRIVE_RACE_ALLOWANCE_MS);
+          // Issue #1782: the refused capture may have reaped the provider root (closing the
+          // registry for good), so the re-drive runs on a freshly recreated epoch.
+          const fresh = await recreateEpoch();
+          harness = fresh.harness;
+          registry = fresh.registry;
+          resumeId = fresh.resumeSessionId;
+          buildPhaseBroker = fresh.buildPhaseBroker;
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
           continue;
         }
         throw err; // "unwired": no seam wired (stub/test) — legacy propagation of the wall trip
