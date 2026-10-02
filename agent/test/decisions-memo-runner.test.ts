@@ -125,6 +125,23 @@ describe("decisions memo: end-to-end save", () => {
     assert.ok(!api.decisionsMemoPosts[0]!.body.body!.includes(CANARY));
   });
 
+  it("redacts a claim secret that straddles the storage cap, leaving no prefix of it", async () => {
+    simulateCommittedWork();
+    api.decisionsMemo.get = enabledMemo(null);
+    // Assembled at runtime, placed so the storage cut lands inside it (30 chars before the cap).
+    const secret = ["STRADDLE", "MARKER", "alpha", "bravo", "charlie", "delta"].join("-");
+    assert.ok(secret.length > 30);
+    const memo = "a".repeat(DECISIONS_MEMO_MAX_BYTES - 30) + secret + "b".repeat(200);
+    const claim = gitlabClaim(7, { secrets: { forge_pat: secret, anthropic_oauth_token: "dummy-oauth-do-not-scan" } });
+    await drive(claim, scriptedLead(memo));
+    assert.strictEqual(api.decisionsMemoPosts.length, 1);
+    const body = api.decisionsMemoPosts[0]!.body.body!;
+    assert.ok(Buffer.byteLength(body, "utf8") <= DECISIONS_MEMO_MAX_BYTES);
+    for (let n = 8; n <= secret.length; n++) {
+      assert.ok(!body.includes(secret.slice(0, n)), `no ${n}-char prefix of the secret survives`);
+    }
+  });
+
   it("re-clamps an executor-provided oversize memo to the cap", async () => {
     simulateCommittedWork();
     api.decisionsMemo.get = enabledMemo(null);
@@ -232,6 +249,54 @@ describe("decisions memo: claim-time read", () => {
     const statuses = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => JSON.stringify(m.payload));
     assert.ok(statuses.some((t) => t.includes("decisions memo injected (16 bytes)")));
     assert.ok(!persisted(claim, []).includes("REMEMBER-THE-FIX"), "the earlier memo is not persisted either");
+  });
+
+  const injected = (claim: ClaimResponse) =>
+    api.messages(claim.run_id).filter((m) => m.kind === "status" && JSON.stringify(m.payload).includes("decisions memo injected"));
+
+  it("a normal mr_rework reports exactly one injected status", async () => {
+    simulateCommittedWork();
+    api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX" });
+    const claim = rework();
+    await drive(claim, scriptedLead("next-memo"));
+    assert.strictEqual(injected(claim).length, 1);
+  });
+
+  it("a pre-approved mr_rework resume carries the memo into the first implement prompt, with one injected status", async () => {
+    simulateCommittedWork();
+    api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX" });
+    const claim = gitlabClaim(42, {
+      kind: "mr_rework",
+      issue_iid: null,
+      branch: "agent/issue-42",
+      resume_phase: "implementing",
+      plan_approved: true,
+      plan_source: "seeded",
+      plan_md: "# APPROVED PLAN\n- do it",
+      session_id: null,
+    });
+    const lead = scriptedLead("next-memo", true);
+    await drive(claim, lead);
+    assert.ok(lead.prompts[0]!.includes("REMEMBER-THE-FIX"), "the first (implement) prompt carries the memo");
+    assert.match(lead.prompts[0]!, /<untrusted_decisions_memo_[0-9a-f]+>/);
+    assert.strictEqual(injected(claim).length, 1);
+    assert.strictEqual(api.decisionsMemoPosts.length, 1, "its own memo is saved");
+  });
+
+  it("a Codex-bound mr_rework claim neither reads the memo nor reports an injection", async () => {
+    simulateCommittedWork();
+    api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX" });
+    const codex = { auth_mode: "api_key", access_token: "codex-dummy-do-not-scan", capability: "cap-dummy" };
+    const claim = gitlabClaim(42, {
+      kind: "mr_rework",
+      issue_iid: null,
+      branch: "agent/issue-42",
+      secrets: { forge_pat: "dummy-pat-do-not-scan", anthropic_oauth_token: "", codex } as never,
+    });
+    await drive(claim, scriptedLead("next-memo"));
+    assert.strictEqual(api.decisionsMemoGets.length, 0, "no GET for a Codex-bound claim");
+    assert.strictEqual(injected(claim).length, 0);
+    assert.strictEqual(api.decisionsMemoPosts.length, 0, "and nothing is saved");
   });
 
   it("a non-rework memo kind learns enabled but injects nothing", async () => {

@@ -8,6 +8,12 @@
  *  an over-long memo is truncated rather than lost to that rejection. */
 export const DECISIONS_MEMO_MAX_BYTES = 8192;
 
+/** Looser transport-hygiene bound for the memo as scanned off signal_done. It is NOT the
+ *  storage cap: the runner redacts the scanned text first and only then clamps to
+ *  DECISIONS_MEMO_MAX_BYTES, so a secret straddling the storage cut is redacted whole
+ *  rather than cut first and leaked as a prefix. Same size as REPORT_MD_MAX_LEN. */
+export const DECISIONS_MEMO_TRANSPORT_MAX_BYTES = 32 * 1024;
+
 /** The run kinds that take part in the memo: every kind that opens a merge request the
  *  user may later have reworked (issue, prompt, self_improve) plus the mr_rework run that
  *  reads it. Only mr_rework consumes the memo; the others only write it. */

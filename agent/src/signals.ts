@@ -23,7 +23,7 @@ import type {
   MilestoneProgress,
   Proposal,
 } from "./protocol.js";
-import { clampUtf8Bytes, DECISIONS_MEMO_MAX_BYTES } from "./decisions-memo.js";
+import { clampUtf8Bytes, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "./decisions-memo.js";
 
 /** The in-process MCP server name; tools surface as `mcp__uzi__<tool>`. */
 export const SIGNAL_SERVER_NAME = "uzi";
@@ -89,7 +89,8 @@ export interface ScannedSignals {
    *  `verifiedAtSha`: the executor stamps it from the worktree HEAD when it latches done. */
   prSummary?: PrSummaryClaim;
   /** Issue #2083: the private decisions memo a signal_done call carried, clamped UTF-8-safely
-   *  to DECISIONS_MEMO_MAX_BYTES. MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as
+   *  only to the loose DECISIONS_MEMO_TRANSPORT_MAX_BYTES (the runner redacts, then applies the
+   *  storage cap DECISIONS_MEMO_MAX_BYTES). MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as
    *  `summary`. Set ONLY for a string with non-whitespace content, so a plain signal_done still
    *  scans to exactly `{ done: true }`; never affects `done`. The body is never logged. */
   decisionsMemo?: string;
@@ -1017,10 +1018,11 @@ export function scanSignals(message: unknown): ScannedSignals {
       if (prSummary !== undefined) out.prSummary = prSummary;
       // Issue #2083. Same signal_done branch, so the same main-thread guard: a subagent frame
       // must never plant the note the next rework run reads. Only non-whitespace strings count;
-      // the clamp is transport hygiene (the API re-checks the cap), cut on a character boundary.
+      // the clamp here is only a loose transport bound (DECISIONS_MEMO_TRANSPORT_MAX_BYTES); the
+      // runner redacts FIRST and then applies the real storage cap, so no secret is cut before redaction.
       const decisionsMemo = input?.["decisions_memo"];
       if (typeof decisionsMemo === "string" && decisionsMemo.trim() !== "") {
-        out.decisionsMemo = clampUtf8Bytes(decisionsMemo, DECISIONS_MEMO_MAX_BYTES);
+        out.decisionsMemo = clampUtf8Bytes(decisionsMemo, DECISIONS_MEMO_TRANSPORT_MAX_BYTES);
       }
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already

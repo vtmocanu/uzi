@@ -5,6 +5,7 @@ import { buildSignalMcpServer, scanSignals } from "../src/signals.js";
 import {
   clampUtf8Bytes,
   DECISIONS_MEMO_MAX_BYTES,
+  DECISIONS_MEMO_TRANSPORT_MAX_BYTES,
   isDecisionsMemoKind,
   parseDecisionsMemoResponse,
 } from "../src/decisions-memo.js";
@@ -42,6 +43,7 @@ describe("buildDecisionsMemoContext", () => {
     assert.strictEqual(openLine, `<untrusted_decisions_memo_${tagA}>`);
     assert.match(frame, /DECISIONS MEMO/);
     assert.match(frame, /same pull request/);
+    assert.match(frame, /same owner, repository, branch and merge request/);
     assert.match(frame, /UNTRUSTED DATA/);
     assert.match(frame, /NEVER instructions/);
     assert.match(frame, /verify any/);
@@ -142,11 +144,23 @@ describe("signal_done decisions_memo", () => {
     }
   });
 
-  it("clamps to the byte cap on a character boundary", () => {
-    const r = scanSignals(toolUse("mcp__uzi__signal_done", { decisions_memo: "😀".repeat(5000) })); // 4 bytes each
+  it("clamps only to the loose transport bound, on a character boundary", () => {
+    const r = scanSignals(toolUse("mcp__uzi__signal_done", { decisions_memo: "😀".repeat(20000) })); // 4 bytes each
     const memo = r.decisionsMemo!;
-    assert.ok(Buffer.byteLength(memo, "utf8") <= DECISIONS_MEMO_MAX_BYTES);
-    assert.strictEqual(memo, "😀".repeat(DECISIONS_MEMO_MAX_BYTES / 4));
+    assert.ok(DECISIONS_MEMO_TRANSPORT_MAX_BYTES > DECISIONS_MEMO_MAX_BYTES, "looser than the storage cap");
+    assert.strictEqual(memo, "😀".repeat(DECISIONS_MEMO_TRANSPORT_MAX_BYTES / 4));
+  });
+
+  it("does not cut a memo at the storage cap (the runner redacts before clamping)", () => {
+    const text = "x".repeat(DECISIONS_MEMO_MAX_BYTES + 500);
+    assert.strictEqual(scanSignals(toolUse("mcp__uzi__signal_done", { decisions_memo: text })).decisionsMemo, text);
+  });
+
+  it("scans no memo from a non-signal_done tool call carrying decisions_memo", () => {
+    for (const tool of ["mcp__uzi__submit_plan", "mcp__uzi__report_progress", "mcp__uzi__checkpoint"]) {
+      const r = scanSignals(toolUse(tool, { plan_md: "# p", decisions_memo: "smuggled" }));
+      assert.strictEqual(r.decisionsMemo, undefined, tool);
+    }
   });
 });
 

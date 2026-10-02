@@ -70,6 +70,7 @@ import {
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
   isNotCodePlan,
+  buildDecisionsMemoContext,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
 import { isDecisionsMemoKind } from "./decisions-memo.js";
@@ -494,6 +495,18 @@ const defaultRunProcesses: RunProcessOps = {
  * (steering's sticky pause mode). Called at every implement boundary and on every path that clears
  * a trip and continues, because the stop's own turn drop is first-wins and can be swallowed there.
  */
+/** Issue #2083: the worker status line saying the earlier run's decisions memo was placed into
+ *  a prompt (byte count only, never the body). No-op for an absent or blank memo. */
+function announceDecisionsMemo(ctx: RunContext): void {
+  const memo = ctx.decisionsMemo;
+  if (typeof memo !== "string" || memo.trim() === "") return;
+  ctx.emit({
+    kind: "status",
+    agent: "worker",
+    payload: { text: `decisions memo injected (${Buffer.byteLength(memo, "utf8")} bytes)` },
+  });
+}
+
 function throwIfDiskStop(ctx: RunContext): void {
   if (ctx.pauseModeRequested?.() === "disk") throw new DiskParkSignal(false);
 }
@@ -1965,6 +1978,10 @@ export class SdkExecutor implements Executor {
           // runThroughSwitch: "released" → reclaim re-plans on the new token (surface switchReleased
           // and end), "gave_up" → restart the planning turn on the OLD token (re-run drivePlanningTurn,
           // like the pause_failed turn restart).
+          // Issue #2083: the memo block is in planPrompt only on the plain issue/prompt/rework
+          // path (the ci_fix and self_improve builders take none). Announced here, where the
+          // prompt is actually sent, not when the runner fetched it.
+          if (!isCIFix && !isSelfImprove) announceDecisionsMemo(ctx);
           const planStep = await this.runThroughSwitch(ctx, state, () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, planPrompt, state, idleMs, budget),
           );
@@ -2401,6 +2418,8 @@ export class SdkExecutor implements Executor {
       let declaredPrSummary: PrSummaryClaim | undefined;
       // Issue #2083: hoisted for the same reason; last-wins across signal_done turns.
       let declaredDecisionsMemo: string | undefined;
+      // Issue #2083: latched once the memo block rode an implement prompt (pre-approved resume).
+      let decisionsMemoImplementInjected = false;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -2617,6 +2636,17 @@ export class SdkExecutor implements Executor {
         // (0 turns, no activity) is retried in-process and, if still empty, escalated to
         // the recovery_wait park (TransientRecoveryError) instead of terminal-failing —
         // covering the RC2 resume-empty-turn incident on the implement path too.
+        // Issue #2083: a pre-approved resume skipped buildPlanPrompt, so the memo rides the FIRST
+        // implement prompt instead (once), and the "injected" line is emitted only then.
+        const firstImplementTurn = iteration === 1 && !hasParked;
+        const priorDecisionsMemo =
+          preApproved && firstImplementTurn && !decisionsMemoImplementInjected
+            ? ctx.decisionsMemo
+            : undefined;
+        if (buildDecisionsMemoContext(priorDecisionsMemo)) {
+          decisionsMemoImplementInjected = true;
+          announceDecisionsMemo(ctx);
+        }
         const turnPromise = this.driveTurnWithEmptyRecovery(
           ctx,
           implementConfig,
@@ -2634,7 +2664,8 @@ export class SdkExecutor implements Executor {
             // WHOLE run only, not the first turn of each follow-up. hasParked latches true
             // once the run has parked, so a resumed follow-up turn (iteration back at 1) is
             // NOT treated as first. Non-interactive runs never park → identical to before.
-            first: iteration === 1 && !hasParked,
+            first: firstImplementTurn,
+            priorDecisionsMemo,
             // issue #222: warn the lead on the first implement turn that this resume's
             // reseed destroyed any local-only prior-attempt work, so a queued follow-up
             // written against the old tree is not acted on as if that work survived. The

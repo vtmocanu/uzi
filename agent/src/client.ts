@@ -2141,12 +2141,17 @@ export class WorkerClient {
   // calls on the run's claim generation; 404/409 mean "not yours / claim moved on" and the
   // runner treats every failure as non-fatal.
 
-  /** GET /worker/runs/:id/decisions-memo?claim_generation=N. The result is UNTRUSTED. */
-  async getDecisionsMemo(runId: string, claimGeneration: number): Promise<DecisionsMemoResponse> {
+  /** GET /worker/runs/:id/decisions-memo?claim_generation=N. The result is UNTRUSTED. A short
+   *  timeout bounds how long a slow read can delay claim start. */
+  async getDecisionsMemo(
+    runId: string,
+    claimGeneration: number,
+    timeoutMs = 10_000,
+  ): Promise<DecisionsMemoResponse> {
     const path =
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/decisions-memo` +
       `?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
-    return ((await this.getJSON(path)) ?? {}) as DecisionsMemoResponse;
+    return ((await this.getJSON(path, timeoutMs)) ?? {}) as DecisionsMemoResponse;
   }
 
   /** POST /worker/runs/:id/decisions-memo (204, no body). A short timeout bounds how long a
@@ -2349,8 +2354,8 @@ export class WorkerClient {
     }
   }
 
-  private async getJSON(path: string): Promise<unknown> {
-    const res = await this.fetchRaw("GET", path, undefined);
+  private async getJSON(path: string, timeoutMs?: number): Promise<unknown> {
+    const res = await this.fetchRaw("GET", path, undefined, timeoutMs);
     if (res.status >= 400) throw await this.toError("GET", path, res);
     const text = await res.text();
     return text ? JSON.parse(text) : undefined;

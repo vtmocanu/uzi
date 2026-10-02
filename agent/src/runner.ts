@@ -125,6 +125,7 @@ import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import { makeRedactor, makeTextRedactor } from "./redact.js";
 import { sessionTranscriptResolvable } from "./sdk-session.js";
 import { CodexSessionStore } from "./codex/session-state.js";
+import { selectCodexBinding } from "./codex/select.js";
 import { errMessage, RUN_ID_RE, sleep } from "./util.js";
 import {
   AttemptReleaseError,
@@ -6834,7 +6835,9 @@ export class RunRunner {
     // Issue #2083: best-effort save of the lead's private decisions memo, MR-path completions
     // only (every other exit returned earlier). Never throws, never alters the completion
     // payload, and is bounded by saveDecisionsMemo's short timeout. The body is redacted (it
-    // is model-authored) and re-clamped, and is never logged or emitted: only byte counts.
+    // is model-authored) FIRST and only then clamped to the storage cap, so a secret straddling
+    // the cap is redacted whole instead of cut and leaked as a prefix. It is never logged or
+    // emitted: only byte counts.
     await this.saveDecisionsMemoBestEffort(flight, runKind, result.decisionsMemo);
     await finishCommittedPublish({
       status: "completed",
@@ -7979,19 +7982,25 @@ export class RunRunner {
     let decisionsMemoEnabled = false;
     let decisionsMemo: string | undefined;
     const claimKind = resolveRunKind(claim.kind);
-    if (isDecisionsMemoKind(claimKind)) {
+    // A Codex-bound claim never reads, writes or shows the memo (Codex has no seam for it), so
+    // skip the GET entirely. Same discriminator makeExecutor's seam uses; a malformed Codex
+    // block throws there (fail-closed executor), so it counts as Codex-bound here too.
+    let codexBound = false;
+    try {
+      codexBound = selectCodexBinding({ codex: claim.secrets.codex }).kind === "codex";
+    } catch {
+      codexBound = true;
+    }
+    if (isDecisionsMemoKind(claimKind) && !codexBound) {
       try {
         const parsed = parseDecisionsMemoResponse(
           await this.client.getDecisionsMemo(runId, flight.claimGeneration),
         );
         decisionsMemoEnabled = parsed.enabled;
         if (claimKind === "mr_rework" && parsed.memo !== undefined) {
+          // The "injected" status line is emitted by the executor where the block is
+          // actually placed into a prompt (a pre-approved resume skips the plan prompt).
           decisionsMemo = parsed.memo;
-          batcher.emit({
-            kind: "status",
-            agent: "worker",
-            payload: { text: `decisions memo injected (${Buffer.byteLength(parsed.memo, "utf8")} bytes)` },
-          });
         }
       } catch (err) {
         runLog.warn("could not fetch decisions memo; continuing without it", {
