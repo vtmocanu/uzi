@@ -654,6 +654,9 @@ func TestFindingPreviewAndDefaultFilingParityLiveDB(t *testing.T) {
 	if groupDraft.RepoID != e.repoID.String() || !slices.Equal(groupDraft.DispositionIDs, wantIDs) {
 		t.Fatalf("group draft identity = %+v, want repo %s ids %v", groupDraft, e.repoID, wantIDs)
 	}
+	if !strings.HasPrefix(groupDraft.Title, "Findings (2): ") {
+		t.Fatalf("two-member group title = %q", groupDraft.Title)
+	}
 	filed := e.fileGroup(e.owner, map[string]any{"ids": ids})
 	if filed.Code != http.StatusCreated {
 		t.Fatalf("group filing: %d %s", filed.Code, filed.Body.String())

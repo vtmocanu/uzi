@@ -79,7 +79,10 @@ func TestComposeFiledFindingGroupMatchesOrdinaryPreview(t *testing.T) {
 	for i, p := range parts {
 		previewParts[i] = groupDraftPart{title: p.title, location: issuedraft.SafeInlineCode(p.location), evidence: p.evidence}
 	}
-	_, preview := composeFindingGroupDraft(previewParts)
+	title, preview := composeFindingGroupDraft(previewParts)
+	if title != "Findings (2): one `tick`" {
+		t.Errorf("unexpected two-member title: %q", title)
+	}
 	marker := "\n\n<!-- uzi-finding-group-operation: " + op.String() + " -->"
 	body, ok := composeFiledFindingGroup(parts, nil, op)
 	if !ok {
@@ -131,7 +134,7 @@ func TestComposeFiledFindingGroupSanitizesRosterAndPreservesMemberEvidence(t *te
 func TestComposeFiledFindingGroupMatchesUTF8PreviewPrefixAtMarkerBoundary(t *testing.T) {
 	op := uuid.New()
 	parts := []groupDraftPart{
-		{title: "multibyte", location: "src/near.go", evidence: strings.Repeat("é", workersvc.MaxIssueDescriptionBytes)},
+		{title: "multibyte", location: "src/near.go", evidence: "x" + strings.Repeat("é", workersvc.MaxIssueDescriptionBytes)},
 		{title: "second", location: "src/two.go", evidence: "second evidence"},
 	}
 	previewParts := []groupDraftPart{
@@ -147,6 +150,9 @@ func TestComposeFiledFindingGroupMatchesUTF8PreviewPrefixAtMarkerBoundary(t *tes
 	end := limit
 	for end > 0 && !utf8.RuneStart(preview[end]) {
 		end--
+	}
+	if end == limit {
+		t.Fatal("fixture did not split a multibyte rune at the marker boundary")
 	}
 	want := preview[:end] + marker
 	body, ok := composeFiledFindingGroup(parts, nil, op)

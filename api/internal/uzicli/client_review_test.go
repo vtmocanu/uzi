@@ -6,7 +6,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
+
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"testing"
 )
 
@@ -221,8 +224,12 @@ func TestGetFindingGroupIssueDraftWire(t *testing.T) {
 	if method != http.MethodGet || path != "/api/findings/issue-draft" || query != "ids=a%2Fb%2Cc+d" {
 		t.Errorf("method=%q path=%q query=%q", method, path, query)
 	}
-	if d.RepoID != "repo" || d.Title != "web title" || d.Description != "web body" || len(d.DispositionIDs) != 2 || d.DispositionIDs[0] != "b" || len(d.Labels) != 1 {
-		t.Errorf("draft=%+v", d)
+	want := apitypes.FindingGroupDraftDTO{
+		RepoID: "repo", DispositionIDs: []string{"b", "a"}, Title: "web title",
+		Description: "web body", Labels: []string{"bug"},
+	}
+	if !reflect.DeepEqual(d, want) {
+		t.Errorf("CLI draft DTO = %+v, server draft DTO = %+v", d, want)
 	}
 }
 
