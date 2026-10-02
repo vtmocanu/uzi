@@ -1424,6 +1424,8 @@ interface RunFlight {
    *  executeClaim: a confirmed-`paused` run's credential reconcile is refused by the server. An
    *  undeliverable wall park leaves it false. */
   holdOrWallParkConfirmed: boolean;
+  /** Wall report outcome could not be proven; finalize may run only after an exact-generation probe. */
+  uncertainWallPark: boolean;
   /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
    *  sent/resolved through {@link RunRunner.journalAndSendTerminal} — a run-lane completed/failed
    *  site, the permanent-failure hook, or reportGenericFailure itself. A journaled outcome is FINAL,
@@ -1631,9 +1633,9 @@ const SNAPSHOT_PHASES = new Set<ActiveSnapshotPhase>([
  * early returns (an owner pause park, the completion hold, the wall-clock park, the in-place
  * credential-switch release) each already reported their own non-terminal state and finalize
  * nothing. Both the finalize-pending write and phasePublish use this predicate: a non-terminal
- * result never writes a finalize record or finalizes. Only an owner pause or a server-confirmed
- * hold/wall park (#1784) bypasses the Codex finalize boundary; an undeliverable wall park and a
- * credential-switch release still pass through it and take phasePublish's early return inside it.
+ * result never writes a finalize record or finalizes. An owner pause, confirmed hold/park, or
+ * unresolved wall park without same-generation running proof bypasses the Codex finalize boundary.
+ * A credential-switch release still passes through it and takes phasePublish's early return.
  */
 export function isFinalizeBoundResult(
   result: Pick<ExecutorResult, "pausedAt" | "completionHeld" | "walled" | "switchReleased">,
@@ -2501,8 +2503,9 @@ export class RunRunner {
       // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
       // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
       // (push/base-align/MR, or the not_code/report-only/undeliverable-park/switch-release early
-      // returns) runs under the held permit (an owner pause or a server-confirmed hold/wall park,
-      // #1764/#1784, bypasses it) — its per-sink reconcile + quiesce+reap close admission and tear down the
+      // returns) runs under the held permit (an owner pause, confirmed hold/wall park, or unresolved
+      // wall park without same-generation running proof bypasses it) — its per-sink reconcile and
+      // quiesce/reap close admission and tear down the
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
       // a committed publish still propagates to the failed-run report below, unless it carries a
@@ -2512,14 +2515,16 @@ export class RunRunner {
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
       if (
         flight.result?.pausedAt ||
-        ((flight.result?.walled || flight.result?.completionHeld) && flight.holdOrWallParkConfirmed)
+        ((flight.result?.walled || flight.result?.completionHeld) && flight.holdOrWallParkConfirmed) ||
+        (flight.result?.walled && flight.uncertainWallPark)
       ) {
         // Issues #1764/#1784: an owner-pause, or a completion hold / wall park the server CONFIRMED
         // (`paused`), PARKED the run, so phasePublish takes its non-terminal early return and
         // finalizes nothing. Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
         // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
         // `paused` (not an actively-claimed status), which would fail a durably parked run. An
-        // undeliverable wall park and a credential-switch release keep going through the boundary.
+        // unresolved wall park bypasses it unless the ownership probe proves this generation is
+        // still running. A credential-switch release goes through the boundary.
         // The finally's terminal safety.dispose still tears the Codex registry down. For Claude/stub the boundary wrapper
         // is a plain call, so this path is unchanged for them.
         await this.phasePublish(claim, flight, undefined, undefined);
@@ -7173,6 +7178,7 @@ export class RunRunner {
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
       holdOrWallParkConfirmed: false,
+      uncertainWallPark: false,
       // PRD #1391 Run B M3 (N2/D5): no terminal outcome resolved yet. Set by journalAndSendTerminal
       // the moment any completed/failed for this generation is sent/resolved (write-ahead or not),
       // so reportGenericFailure never falls through to a SECOND `failed` once one is final.
@@ -12822,37 +12828,50 @@ export class RunRunner {
         },
       });
     }
-    // 6. Report the WALL PARK. reportWallPark reads the status off BOTH a 200 (paused) and a 409
-    //    (refused) body; a 404 (a reclaim — ErrRunNotOwned) or a transport/5xx error THROWS, which is
-    //    an UNDELIVERABLE park (D17): keep the flags, report nothing terminal, end non-terminal.
-    let status: string;
-    let refresh: WallParkRefresh = {};
-    try {
-      let budgetTotalSeconds: number | undefined;
-      let budgetUsedSeconds: number | undefined;
-      ({ status, budgetTotalSeconds, budgetUsedSeconds } = await this.client.reportWallPark(flight.runId, {
-        // Empty on a degraded park (the server column is nullable and treats "" as null).
-        head: head ?? "",
-        published,
-        // PRD #1497 M1 (D16): stamp the claim-lane generation so the fence refuses a
-        // released/superseded stale flight's reclaimed run (the SAME value the reportState closure stamps).
-        claimGeneration: flight.claimGeneration,
-        // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before the
-        // publish packed it, so a published wall checkpoint holds the latest committed work; on a
-        // degraded park nothing verified was published and the field is omitted.
-        checkpointContainsLatest: this.checkpointDurabilityField(head !== null && published ? true : undefined)
-          .checkpoint_contains_latest,
-      }));
-      if (budgetTotalSeconds !== undefined) refresh.totalSeconds = budgetTotalSeconds;
-      if (budgetUsedSeconds !== undefined) refresh.usedSeconds = budgetUsedSeconds;
-    } catch (err) {
-      runLog.warn(
-        "wall park report undeliverable; retaining clone + HOME and ending the flight non-terminal (D17)",
-        { run_id: flight.runId, error: errMessage(err) },
-      );
+    // 6. Report the wall park. A thrown response gets one identical retry; an unresolved answer
+    //    gets one ownership read before any finalize credential reconcile.
+    const report = {
+      // Empty on a degraded park (the server column is nullable and treats "" as null).
+      head: head ?? "",
+      published,
+      // Stamp the claim-lane generation so the fence refuses a released or superseded flight.
+      claimGeneration: flight.claimGeneration,
+      // A published, verified capture fetched the clone's HEAD into the tracking ref first.
+      checkpointContainsLatest: this.checkpointDurabilityField(head !== null && published ? true : undefined)
+        .checkpoint_contains_latest,
+    };
+    let ack: Awaited<ReturnType<WorkerClient["reportWallPark"]>> | undefined;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        ack = await this.client.reportWallPark(flight.runId, report);
+        break;
+      } catch (err) {
+        runLog.warn("wall park report response uncertain", { run_id: flight.runId, error: errMessage(err) });
+      }
+    }
+    // A 409 can describe a previously committed park whose reply was lost. Its paused body
+    // cannot certify that this request applied; nor can a failed or absent acknowledgment.
+    const confirmedPark = ack?.applied === true && ack.status === "paused";
+    const refusedRunning = ack?.applied === false && ack.status === "running";
+    if (!ack || (!confirmedPark && !refusedRunning && ack.status !== "cancelled")) {
+      flight.uncertainWallPark = true;
+      try {
+        const ownership = await this.client.getRunOwnership(flight.runId);
+        if (ownership.status === "running" && ownership.claim_generation === flight.claimGeneration) {
+          flight.uncertainWallPark = false;
+        }
+      } catch (err) {
+        runLog.warn("wall park ownership probe failed; retaining local work", {
+          run_id: flight.runId, error: errMessage(err),
+        });
+      }
       return "undeliverable";
     }
-    if (status === "paused") {
+    const { status } = ack;
+    const refresh: WallParkRefresh = {};
+    if (ack.budgetTotalSeconds !== undefined) refresh.totalSeconds = ack.budgetTotalSeconds;
+    if (ack.budgetUsedSeconds !== undefined) refresh.usedSeconds = ack.budgetUsedSeconds;
+    if (confirmedPark) {
       // 7. Durably parked. Mark the flight parked so the finally's carve-out preserves the HOME +
       //    plugin dir; preserveRecoveryClone (set above) keeps the clone. phasePublish's walled branch
       //    reaps again (idempotent) and skips finalize.

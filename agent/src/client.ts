@@ -1970,16 +1970,15 @@ export class WorkerClient {
    *  authority is the three-term deadline. Like requestCompletionHold, the server returns
    *  `{run: RunDTO}` on BOTH 200 (park landed, status becomes "paused") AND 409 (park REFUSED — the
    *  owner extended in the request-then-park window, so the run's real status rides the body). A 409
-   *  is NOT an error here: the worker keys its park order off the RETURNED status. A 404
+   *  is NOT an error here: `applied` is true only for HTTP 200, and a 409's status is advisory. A 404
    *  (ErrRunNotOwned — the claim was reclaimed) DOES throw, and a genuine transport/5xx throws —
    *  either surfaces as an UNDELIVERABLE park (enterWallPark keeps the work and ends non-terminal,
-   *  D17). Returns `{ status }` = the run's status from the body ("paused" on a landed park, the
-   *  real status on a refusal); an unmodelled 2xx or an unreadable body yields "" (never "paused" ⇒
-   *  treated as refused, the safe default). */
+   *  D17). Returns the body status and budget with `applied`; an unmodelled 2xx or an unreadable
+   *  body yields an empty status and cannot confirm a park. */
   async reportWallPark(
     runId: string,
     args: { head: string; published: boolean; claimGeneration?: number; checkpointContainsLatest?: boolean },
-  ): Promise<{ status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
+  ): Promise<{ applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number }> {
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/wall-park`;
     // Stamp the claim-lane generation through the shared send-gate + skew-safe fallback, exactly as
     // requestCompletionHold does: a wall_park_v1 worker also advertises credential_switch_v1, so it
@@ -1996,7 +1995,8 @@ export class WorkerClient {
         const fields = await readRunAck(res);
         // Issue #1600: a refused park's 409 carries the run's fresh budget; pass it through so the
         // executor re-arms from the server's remaining time instead of its exhausted local wall.
-        const out: { status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number } = {
+        const out: { applied: boolean; status: string; budgetTotalSeconds?: number; budgetUsedSeconds?: number } = {
+          applied: res.status === 200,
           status: fields.status ?? "",
         };
         if (fields.budgetTotalSeconds !== undefined) out.budgetTotalSeconds = fields.budgetTotalSeconds;
@@ -2004,8 +2004,8 @@ export class WorkerClient {
         return out;
       }
       if (res.status >= 400) throw await this.toError("POST", path, res);
-      // A 2xx we do not model: no status came back, which is not "paused" ⇒ treated as refused.
-      return { status: "" };
+      // A 2xx we do not model: no status came back, so it cannot confirm a park.
+      return { applied: false, status: "" };
     });
   }
 

@@ -1149,8 +1149,8 @@ describe("RunRunner m4 — credential-free sinks mint NO permit", () => {
 // ================================================================================
 // Issue #1784: a Codex run the server CONFIRMED as wall-parked or completion-held (`paused`) must
 // bypass the finalize boundary like an owner pause (#1764): the server refuses the boundary's
-// credential reconcile for a `paused` run. An UNDELIVERABLE wall park (the claim is still owned)
-// keeps going through the boundary. captureHoldContext opens its own "shutdown" boundary, so these
+// credential reconcile for a `paused` run. An unresolved wall park needs same-generation running
+// proof before that boundary. captureHoldContext opens its own "shutdown" boundary, so these
 // assert no "finalize" entry and unchanged reconcile counts AFTER the park, not zero totals.
 describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park", () => {
   const HOLD_REASON = "test completion hold reason";
@@ -1246,10 +1246,10 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
   });
 
   for (const [name, httpStatus, iid] of [
-    ["(C1) an UNDELIVERABLE wall park (503) still passes through the finalize boundary", 503, 1786],
-    ["(C1b) a reclaimed wall park (404) still passes through the finalize boundary", 404, 1787],
+    ["(C1) an unresolved wall park (503) bypasses finalize without generation proof", 503, 1786],
+    ["(C1b) a reclaimed wall park (404) bypasses finalize without generation proof", 404, 1787],
   ] as const) {
-    it(`${name}: reconcile still runs, non-terminal, work kept`, async () => {
+    it(`${name}: non-terminal, work kept`, async () => {
       const { gitlab, calls } = fakeGitlab();
       const restore = spyPublishLands();
       const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-undeliverable-"));
@@ -1261,11 +1261,10 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
         const claim = gitlabClaim(iid);
         await runnerWith(() => ({ executor: wallExecutor(rig, runHome, probe, { on: false }), homeDir: runHome }), gitlab).execute(claim);
         assert.equal(probe.outcome, "undeliverable");
-        assert.ok(rig.boundaries.includes("finalize"), `the finalize boundary was entered; got ${JSON.stringify(rig.boundaries)}`);
-        if (httpStatus === 503) {
-          assert.ok(rig.refreshCalls() + rig.releaseCalls() > probe.refresh + probe.release, "the finalize reconcile ran");
-        }
-        assert.equal(api.wallParkRequests.length, 1, "one wall_park report was attempted");
+        assert.ok(!rig.boundaries.includes("finalize"), `no finalize without generation proof; got ${JSON.stringify(rig.boundaries)}`);
+        assert.equal(api.wallParkRequests.length, 2, "the identical wall report was retried once");
+        assert.deepEqual(api.wallParkRequests[0]?.body, api.wallParkRequests[1]?.body);
+        assert.deepEqual(api.ownershipRequests, [claim.run_id], "one ownership probe");
         assert.equal(calls.length, 0, "no push/MR");
         assertKept(iid, claim.run_id, runHome, rig);
       } finally {
@@ -1274,6 +1273,51 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
       }
     });
   }
+
+// A wall report can commit even when its acknowledgment is lost. The finalize credential reconcile
+// requires proof that this exact generation is still running after any unresolved report.
+describe("RunRunner uncertain wall park", () => {
+  for (const scenario of [
+    { name: "committed park lost acknowledgment", iid: 20901, lost: true, status: 200, owner: "paused", finalize: false, requests: 2 },
+    { name: "repeated wall report outage", iid: 20902, lost: false, status: 503, owner: "failedProbe", finalize: false, requests: 2 },
+    { name: "transient wall report 404", iid: 20903, lost: false, status: 404, owner: "notOwned", finalize: false, requests: 2 },
+    { name: "stale same-worker 409 paused", iid: 20904, lost: false, status: 409, owner: "paused", finalize: false, requests: 1 },
+    { name: "proven same-generation running after outage", iid: 20905, lost: false, status: 503, owner: "running", finalize: true, requests: 2 },
+    { name: "running at a later generation remains uncertain", iid: 20906, lost: false, status: 503, owner: "laterGeneration", finalize: false, requests: 2 },
+    { name: "running without a generation remains uncertain", iid: 20907, lost: false, status: 503, owner: "unknownGeneration", finalize: false, requests: 2 },
+  ] as const) {
+    it(scenario.name, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const restore = spyPublishLands();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-wall-uncertain-"));
+      try {
+        const claim = gitlabClaim(scenario.iid, { claim_generation: 7 });
+        if (scenario.lost) api.commitWallParkThenLoseFirstReply();
+        else api.setWallParkResponse("paused", scenario.status);
+        if (scenario.owner === "paused") api.setOwnershipStatus(claim.run_id, "paused", claim.claim_generation);
+        if (scenario.owner === "notOwned") api.setOwnershipNotOwned(claim.run_id);
+        if (scenario.owner === "failedProbe") api.failOwnership(claim.run_id);
+        if (scenario.owner === "running") api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation);
+        if (scenario.owner === "laterGeneration") api.setOwnershipStatus(claim.run_id, "running", (claim.claim_generation ?? 0) + 1);
+        if (scenario.owner === "unknownGeneration") api.setOwnershipStatus(claim.run_id, "running");
+        const rig = codexRig({ authMode: "subscription" });
+        const runHome = path.join(homeRoot, "h");
+        const probe: Probe = { refresh: -1, release: -1 };
+        await runnerWith(() => ({ executor: wallExecutor(rig, runHome, probe, { on: false }), homeDir: runHome }), gitlab).execute(claim);
+        assert.equal(probe.outcome, "undeliverable");
+        assert.equal(api.wallParkRequests.length, scenario.requests, "wall report has one bounded retry on throw");
+        if (scenario.requests === 2) assert.deepEqual(api.wallParkRequests[0]?.body, api.wallParkRequests[1]?.body);
+        assert.deepEqual(api.ownershipRequests, [claim.run_id], "one ownership probe after unresolved report");
+        assert.equal(rig.boundaries.includes("finalize"), scenario.finalize, "finalize needs same-generation running proof");
+        assert.equal(calls.length, 0, "no push/MR");
+        assertKept(scenario.iid, claim.run_id, runHome, rig);
+      } finally {
+        restore();
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+  }
+});
 });
 
 // ================================================================================

@@ -315,6 +315,9 @@ export class FakeApi {
   }> = [];
   private wallParkStatus = "paused";
   private wallParkHttpStatus = 200;
+  private wallParkLoseFirstReply = false;
+  private wallParkCommitted = false;
+  readonly ownershipRequests: string[] = [];
   // Issue #1600: the budget_total_seconds / budget_used_seconds the wall-park RunDTO carries.
   private wallParkBudget: { total?: number; used?: number } | undefined;
   // PRD #1226 M4 (D5): the completion-permit endpoint. Records each request (run + body) and answers
@@ -850,6 +853,12 @@ export class FakeApi {
     this.wallParkBudget = budget;
   }
 
+  /** Commit the first park, lose its reply, then answer the identical retry as already paused. */
+  commitWallParkThenLoseFirstReply(): void {
+    this.wallParkLoseFirstReply = true;
+    this.wallParkCommitted = false;
+  }
+
   /** PRD #1226 M4 (D5): set the completion-permit decision. `granted:true` is the issued permit;
    *  `granted:false` (with an optional `denyReason`) is the NON-TERMINAL denial (a 200 body the
    *  client does NOT throw on); `httpStatus` other than 200 models a transport/HTTP error the client
@@ -1229,6 +1238,7 @@ export class FakeApi {
     const ownMatch = /^\/api\/worker\/runs\/([^/]+)\/ownership$/.exec(p);
     if (req.method === "GET" && ownMatch) {
       const runId = ownMatch[1] as string;
+      this.ownershipRequests.push(runId);
       const o = this.ownershipByRun.get(runId);
       if (!o) return send(res, 200, { status: "running" });
       if (o.httpStatus !== 200)
@@ -1315,6 +1325,13 @@ export class FakeApi {
     if (req.method === "POST" && wallParkMatch) {
       const runId = wallParkMatch[1] as string;
       this.wallParkRequests.push({ runId, body: json });
+      if (this.wallParkLoseFirstReply && !this.wallParkCommitted) {
+        this.wallParkCommitted = true;
+        this.setOwnershipStatus(runId, "paused", json.claim_generation as number);
+        req.socket.destroy();
+        return;
+      }
+      if (this.wallParkCommitted) return send(res, 409, { run: { id: runId, status: "paused" } });
       if (this.wallParkHttpStatus !== 200 && this.wallParkHttpStatus !== 409) {
         return send(res, this.wallParkHttpStatus, { error: "run not found for this worker" });
       }
