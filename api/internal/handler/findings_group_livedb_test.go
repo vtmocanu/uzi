@@ -9,10 +9,12 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -611,6 +613,92 @@ func TestFileFindingGroupUneditedDraftDescriptionOneRosterLiveDB(t *testing.T) {
 	body2 := e.fake.create(1).Description
 	if strings.Count(body2, "## Findings") != 1 || !strings.Contains(body2, "only my own words") || !strings.Contains(body2, ms2[1].Location) {
 		t.Errorf("edited body wrong:\n%s", body2)
+	}
+}
+
+func TestFindingPreviewAndDefaultFilingParityLiveDB(t *testing.T) {
+	e := newFGEnv(t, nil)
+	single := e.seedMember(e.repoID, "single evidence for parity")
+	singlePreview := httptest.NewRecorder()
+	e.h.GetFindingIssueDraft(singlePreview, fgRequest(e.owner, http.MethodGet, "/x", nil, map[string]string{"id": single.Finding.String()}))
+	if singlePreview.Code != http.StatusOK {
+		t.Fatalf("single preview: %d %s", singlePreview.Code, singlePreview.Body.String())
+	}
+	var singleDraft apitypes.IncidentalFindingIssueDraftDTO
+	if err := json.Unmarshal(singlePreview.Body.Bytes(), &singleDraft); err != nil {
+		t.Fatal(err)
+	}
+	singleFiled := httptest.NewRecorder()
+	e.h.FileFinding(singleFiled, fileFindingReq(e.owner, single.Finding, nil))
+	if singleFiled.Code != http.StatusCreated {
+		t.Fatalf("single filing: %d %s", singleFiled.Code, singleFiled.Body.String())
+	}
+	singleIssue := e.fake.create(0)
+	if singleIssue.Title != singleDraft.Title || singleIssue.Description != singleDraft.Description {
+		t.Errorf("single default filing differs from preview: title=%q want=%q body=%q want=%q",
+			singleIssue.Title, singleDraft.Title, singleIssue.Description, singleDraft.Description)
+	}
+
+	members := e.members(2)
+	ids := fgIDs(members...)
+	groupPreview := e.groupDraft(e.owner, ids)
+	if groupPreview.Code != http.StatusOK {
+		t.Fatalf("group preview: %d %s", groupPreview.Code, groupPreview.Body.String())
+	}
+	var groupDraft apitypes.FindingGroupDraftDTO
+	if err := json.Unmarshal(groupPreview.Body.Bytes(), &groupDraft); err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := slices.Clone(ids)
+	slices.Sort(wantIDs)
+	if groupDraft.RepoID != e.repoID.String() || !slices.Equal(groupDraft.DispositionIDs, wantIDs) {
+		t.Fatalf("group draft identity = %+v, want repo %s ids %v", groupDraft, e.repoID, wantIDs)
+	}
+	filed := e.fileGroup(e.owner, map[string]any{"ids": ids})
+	if filed.Code != http.StatusCreated {
+		t.Fatalf("group filing: %d %s", filed.Code, filed.Body.String())
+	}
+	result := fgResult(t, filed)
+	issue := e.fake.create(1)
+	marker := "\n\n<!-- uzi-finding-group-operation: " + result.OperationID + " -->"
+	if issue.Title != groupDraft.Title || issue.Description != groupDraft.Description+marker {
+		t.Errorf("ordinary default group filing differs from preview: title=%q want=%q body=%q want=%q",
+			issue.Title, groupDraft.Title, issue.Description, groupDraft.Description+marker)
+	}
+}
+
+func TestFindingGroupNearLimitPreviewAndDefaultFilingParityLiveDB(t *testing.T) {
+	e := newFGEnv(t, nil)
+	first := e.seedMember(e.repoID, strings.Repeat("é", workersvc.MaxIssueDescriptionBytes))
+	second := e.seedMember(e.repoID, "second near-limit finding")
+	ids := fgIDs(first, second)
+	preview := e.groupDraft(e.owner, ids)
+	if preview.Code != http.StatusOK {
+		t.Fatalf("group preview: %d %.300s", preview.Code, preview.Body.String())
+	}
+	var draft apitypes.FindingGroupDraftDTO
+	if err := json.Unmarshal(preview.Body.Bytes(), &draft); err != nil {
+		t.Fatal(err)
+	}
+	filed := e.fileGroup(e.owner, map[string]any{"ids": ids})
+	if filed.Code != http.StatusCreated {
+		t.Fatalf("group filing: %d %s", filed.Code, filed.Body.String())
+	}
+	result := fgResult(t, filed)
+	issue := e.fake.create(0)
+	marker := "\n\n<!-- uzi-finding-group-operation: " + result.OperationID + " -->"
+	limit := workersvc.MaxIssueDescriptionBytes - len(marker)
+	if len(draft.Description) <= limit {
+		t.Fatalf("fixture did not reach marker boundary: preview=%d limit=%d", len(draft.Description), limit)
+	}
+	end := limit
+	for end > 0 && !utf8.RuneStart(draft.Description[end]) {
+		end--
+	}
+	want := draft.Description[:end] + marker
+	if issue.Title != draft.Title || issue.Description != want || !utf8.ValidString(issue.Description) {
+		t.Errorf("near-limit default filing differs from UTF-8-safe preview prefix: title=%q want=%q body bytes=%d want=%d valid=%v",
+			issue.Title, draft.Title, len(issue.Description), len(want), utf8.ValidString(issue.Description))
 	}
 }
 
