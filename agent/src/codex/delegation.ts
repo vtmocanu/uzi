@@ -52,6 +52,12 @@ import {
 import type { HarnessEffort, HarnessItem } from "../harness.js";
 import type { ExecutionRegistry } from "./registry.js";
 import type { CodexNotification } from "./transport.js";
+import {
+  normalizeCodexErrorInfo,
+  normalizeCodexStatus,
+  pickCodexClassification,
+  type CodexErrorClassification,
+} from "./terminal-normalize.js";
 
 /** One known delegation target: the child role's rendered prompt, its IMMUTABLE
  *  `isRoot:false` grants (the renderer's `perRoleGrants` entry) and its resolved
@@ -329,6 +335,8 @@ export class CodexDelegationRunner {
     let text = "";
     let textBytes = 0;
     let terminalOutcome: "success" | "failed" | undefined;
+    let terminalClassification: CodexErrorClassification | undefined;
+    let pendingCodexError: CodexErrorClassification | undefined;
 
     // Abort race so a cancel/deadline ends the child stream promptly (rule: the parent
     // must be able to cancel a child that is wedged in a never-settling callback).
@@ -370,10 +378,22 @@ export class CodexDelegationRunner {
           continue;
         }
 
+        if (note.kind === "codex_error") {
+          if (note.threadId === controller.threadId && note.turnId === controller.turnId && note.willRetry === false) {
+            pendingCodexError = normalizeCodexErrorInfo(asObject(asObject(note.params)?.error)?.codexErrorInfo);
+          }
+          continue;
+        }
+
         if (note.kind === "turn_completed") {
           // Serve ONLY the child's own turn; a stale/foreign completion is liveness.
           if (note.threadId !== controller.threadId || note.turnId !== controller.turnId) continue;
-          terminalOutcome = note.status === "completed" ? "success" : "failed";
+          const turn = asObject(asObject(note.params)?.turn);
+          terminalOutcome = normalizeCodexStatus(note.status ?? asString(turn?.status)).outcome;
+          terminalClassification = pickCodexClassification(
+            pendingCodexError,
+            normalizeCodexErrorInfo(asObject(turn?.error)?.codexErrorInfo),
+          );
           break;
         }
 
@@ -417,7 +437,8 @@ export class CodexDelegationRunner {
       return { ok: true, output: { role: request.role, text } };
     }
     if (terminalOutcome === "failed") {
-      return { ok: false, code: "child_failed", message: "the delegated child turn failed" };
+      const suffix = terminalClassification === undefined ? "" : ` (${terminalClassification.category})`;
+      return { ok: false, code: "child_failed", message: `the delegated child turn failed${suffix}` };
     }
     // No terminal was observed (clean EOF before completion): fail closed.
     return { ok: false, code: "child_failed", message: "the delegated child ended before completion" };
