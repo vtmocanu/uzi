@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -239,6 +240,10 @@ func TestSaveDecisionsMemoRacingCompletionLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer func() { _ = tx.Rollback(e.ctx) }()
+	var txPID int32
+	if err := tx.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&txPID); err != nil {
+		t.Fatalf("read tx backend pid: %v", err)
+	}
 	rows, err := e.q.WithTx(tx).SetRunCompleted(e.ctx, store.SetRunCompletedParams{
 		ID: run, WorkerID: pgconv.UUID(w),
 		Branch: pgtype.Text{String: "agent/issue-race", Valid: true},
@@ -256,10 +261,26 @@ func TestSaveDecisionsMemoRacingCompletionLiveDB(t *testing.T) {
 		n, err := svc.SaveDecisionsMemo(context.Background(), wkr, run, 3, "racing write")
 		done <- result{n, err}
 	}()
+	// Prove the save is blocked on the completion's row lock (not merely slow to start): poll until
+	// some backend is blocked by the completing transaction's pid.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var blocked int
+		if err := e.pool.QueryRow(e.ctx, `SELECT count(*) FROM pg_stat_activity WHERE $1 = ANY(pg_blocking_pids(pid))`, txPID).Scan(&blocked); err != nil {
+			t.Fatalf("read blocked backends: %v", err)
+		}
+		if blocked >= 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the save never blocked on the completion's row lock")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 	select {
 	case r := <-done:
 		t.Fatalf("the save returned %+v while the completion held the row lock; it must block on it", r)
-	case <-time.After(500 * time.Millisecond):
+	default:
 	}
 	if err := tx.Commit(e.ctx); err != nil {
 		t.Fatalf("commit completion: %v", err)
@@ -281,8 +302,11 @@ func TestSaveDecisionsMemoRacingCompletionLiveDB(t *testing.T) {
 	}
 }
 
-// TestSaveDecisionsMemoRefusedRunsLiveDB: a non-running run, a kind that carries no memo, a
-// repo-less run and another worker's run are all refused, and never create a row.
+// TestSaveDecisionsMemoRefusedRunsLiveDB: a non-running run, a kind that carries no memo (ci_fix,
+// and chat, which is also repo-less) and another worker's run are all refused, and never create a
+// row. The statement's repo_id IS NOT NULL predicate is defence in depth: the runs kind-shape CHECK
+// already requires repo_id for the four memo kinds, so no repo-less run of those kinds can exist to
+// exercise it, and the chat fixture below is refused by the kind predicate.
 func TestSaveDecisionsMemoRefusedRunsLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	svc := e.permitService(t)
@@ -311,7 +335,7 @@ func TestSaveDecisionsMemoRefusedRunsLiveDB(t *testing.T) {
 		})
 	}
 
-	// A repo-less run: the chat shape (no repo, no issue iid, no branch).
+	// A chat run: a kind that carries no memo (it also has no repo, but the kind predicate refuses it).
 	chat := uuid.New()
 	e.exec(t, `INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, worker_id, claim_generation)
 	           VALUES ($1, $2, 'chat', 't', 'd', 'running', $3, 1)`, chat, e.userID, w)
@@ -607,5 +631,56 @@ func TestMRReworkCompletionStoresBranchEqualsPipelineRefLiveDB(t *testing.T) {
 	next := e.seedRework(t, w, 1)
 	if m := e.resolve(t, svc, w, next, 1); m == nil || m.SourceRunID != rework || m.Body != "round memo" {
 		t.Fatalf("next round resolves %+v, want the completed round's memo", m)
+	}
+}
+
+// TestUpsertRunDecisionMemoFencedWorkerPredicateLiveDB: the store query alone, with a worker id that
+// is not the run's holder, writes nothing even for a running run at its current generation (the
+// service's runOwnedByWorker read would otherwise shadow the worker_id predicate).
+func TestUpsertRunDecisionMemoFencedWorkerPredicateLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	svc := e.permitService(t)
+	w := e.seedWorker(t, nil)
+	other := e.seedWorker(t, nil)
+	run := e.seedMemoRun(t, w, memoRun{gen: 2})
+	if _, err := svc.SaveDecisionsMemo(e.ctx, memoWorker(e, w), run, 2, "held"); err != nil {
+		t.Fatalf("save: %v", err)
+	}
+	before := e.memoRow(t, run)
+
+	n, err := e.q.UpsertRunDecisionMemoFenced(e.ctx, store.UpsertRunDecisionMemoFencedParams{
+		RunID: run, WorkerID: pgconv.UUID(other), ClaimGeneration: 2, Body: "intruder",
+	})
+	if err != nil || n != 0 {
+		t.Fatalf("upsert as another worker = %d, %v; want 0 rows, nil", n, err)
+	}
+	if after := e.memoRow(t, run); after != before {
+		t.Fatalf("a refused write mutated the row: before %+v after %+v", before, after)
+	}
+}
+
+// TestGetLatestDecisionMemoForLineageExcludesSelfLiveDB: the store query alone, called with the
+// caller's own run id, never returns that run even when it is completed with a valid compatible memo
+// and is the only lineage match (the service's status/kind gate would otherwise shadow the
+// r.id <> self_run_id predicate).
+func TestGetLatestDecisionMemoForLineageExcludesSelfLiveDB(t *testing.T) {
+	e := setupInterlockLiveDB(t)
+	w := e.seedWorker(t, nil)
+	now := time.Now()
+	self := e.seedLineageRun(t, w, memoRun{kind: "mr_rework", finishedAt: now})
+	e.putMemo(t, self, 1, 1, "own completed memo", now)
+
+	params := store.GetLatestDecisionMemoForLineageParams{
+		UserID: e.userID, RepoID: pgconv.UUID(e.repoID),
+		Branch: pgtype.Text{String: memoBranch, Valid: true},
+		MrIid:  pgtype.Int8{Int64: memoMR, Valid: true},
+	}
+	params.SelfRunID = uuid.New()
+	if row, err := e.q.GetLatestDecisionMemoForLineage(e.ctx, params); err != nil || row.RunID != self {
+		t.Fatalf("control: another caller resolves %+v, %v; want the run %s", row, err, self)
+	}
+	params.SelfRunID = self
+	if row, err := e.q.GetLatestDecisionMemoForLineage(e.ctx, params); !errors.Is(err, pgx.ErrNoRows) {
+		t.Fatalf("self-excluded lookup = %+v, %v; want pgx.ErrNoRows", row, err)
 	}
 }

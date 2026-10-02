@@ -70,7 +70,7 @@ WITH r AS (
        AND status = 'running'
        AND kind IN ('issue', 'prompt', 'self_improve', 'mr_rework')
        AND repo_id IS NOT NULL
-       FOR UPDATE
+       FOR NO KEY UPDATE
 )
 INSERT INTO run_decision_memos (run_id, claim_generation, format_version, body)
 SELECT r.id, $1::bigint, 1, $2::text FROM r
@@ -88,12 +88,15 @@ type UpsertRunDecisionMemoFencedParams struct {
 	WorkerID        pgtype.UUID `json:"worker_id"`
 }
 
-// Run decisions memo write (issue #2083 M1). ONE statement: the run row is locked FOR UPDATE and the
+// Run decisions memo write (issue #2083 M1). ONE statement: the run row is locked FOR NO KEY UPDATE and the
 // ownership/claim/status/kind predicates are evaluated under that lock, so a write racing the run's
 // completion (SetRunCompleted takes the same row lock) or a re-claim either lands before it or sees
 // the new state and writes nothing. 0 rows means the claim is not current (stale generation,
 // released claim, not running, a kind that carries no memo, repo-less, or not this worker's run).
 // Never a read followed by an unconditional upsert.
+// FOR NO KEY UPDATE, not FOR UPDATE: it conflicts with the plain UPDATEs of SetRunCompleted and ClaimRun
+// (which take the same lock mode), so the fence is identical, but it does not conflict with the KEY SHARE
+// lock a child-table foreign-key insert takes on the run row, so memo writes never stall those inserts.
 func (q *Queries) UpsertRunDecisionMemoFenced(ctx context.Context, arg UpsertRunDecisionMemoFencedParams) (int64, error) {
 	result, err := q.db.Exec(ctx, upsertRunDecisionMemoFenced,
 		arg.ClaimGeneration,

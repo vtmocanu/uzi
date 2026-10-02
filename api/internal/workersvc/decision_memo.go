@@ -24,8 +24,9 @@ var (
 	// ErrDecisionsMemoTooLarge is a sanitized body over MaxDecisionsMemoBytes → 400.
 	ErrDecisionsMemoTooLarge = errors.New("decisions memo body too large")
 	// ErrDecisionsMemoClaimNotCurrent is a fenced write or read the run's current state refuses:
-	// the generation is not the run's, the claim was released, the run is no longer running (a
-	// write), or its kind carries no memo → 409 claim_not_current.
+	// the generation is not the run's, the claim was released, or (a write only) the run is no
+	// longer running or its kind carries no memo → 409 claim_not_current. A read by a run whose
+	// kind carries no memo answers a nil memo, not this error.
 	ErrDecisionsMemoClaimNotCurrent = errors.New("decisions memo claim is not current")
 )
 
