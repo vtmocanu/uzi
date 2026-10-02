@@ -73,41 +73,50 @@ export function AdminProducts() {
   const filtered = ownerFilter !== "" || productFilter !== "";
   // Owners come from the user list, not from token rows, so an owner with no token in the
   // current (possibly truncated) inventory is still selectable. A failed load only empties the select.
-  const { data: usersData } = useAsyncData<User[]>(async () => (await api.listUsers()).users, [], {
+  const { data: usersData, error: usersError } = useAsyncData<User[]>(async () => (await api.listUsers()).users, [], {
     fallback: "Failed to load users",
   });
   const { data, loading, error: loadError, reload } = useAsyncData<{
     products: Product[];
     tokens: AdminProductToken[];
     truncated: boolean;
+    // The filters this result was fetched with, so rows are only shown under the same filters.
+    ownerId: string;
+    productId: string;
   }>(
     async () => {
       const [{ products }, { tokens, truncated }] = await Promise.all([
         api.adminListProducts(),
         api.adminListProductTokens({ ownerId: ownerFilter, productId: productFilter }),
       ]);
-      return { products, tokens, truncated: truncated === true };
+      return { products, tokens, truncated: truncated === true, ownerId: ownerFilter, productId: productFilter };
     },
     [ownerFilter, productFilter],
-    { fallback: "Failed to load products" },
+    // "deps": a filter change shows the skeleton instead of the previous filter's rows.
+    { fallback: "Failed to load products", skeleton: "deps" },
   );
+  // The hook keeps the last data when a refetch fails, so a failed fetch after a filter change
+  // leaves the previous filter's result in `data`. `shown` is that result only while it matches
+  // the displayed filters; otherwise nothing from it (rows, narrowing, notices) is rendered.
+  const shown = data && data.ownerId === ownerFilter && data.productId === productFilter ? data : null;
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
   // When the server cut the inventory, how many tokens it did list (the notices name
   // this number rather than a hard-coded cap that could drift from the server's).
-  const truncatedAt = data?.truncated ? data.tokens.length : null;
+  const truncatedAt = shown?.truncated ? shown.tokens.length : null;
   // The first load failed: show only the error, never a "No products registered"
   // empty state the page cannot know to be true.
-  const loadFailed = data === null && loadError !== "";
+  const loadFailed = shown === null && loadError !== "";
 
   // Live products first, soft-deleted ones last (the audit trail), server order within.
+  // (The product list itself does not depend on the filters, so it feeds the select from `data`.)
   const allProducts = [...(data?.products ?? [])].sort(
     (a, b) => Number(a.deleted_at !== null) - Number(b.deleted_at !== null),
   );
   // A product filter shows only that product's card: the rest would all read "no tokens match".
   const products = productFilter ? allProducts.filter((p) => p.id === productFilter) : allProducts;
   const tokensByProduct = new Map<string, AdminProductToken[]>();
-  for (const t of data?.tokens ?? []) {
+  for (const t of shown?.tokens ?? []) {
     const list = tokensByProduct.get(t.product_id) ?? [];
     list.push(t);
     tokensByProduct.set(t.product_id, list);
@@ -182,12 +191,13 @@ export function AdminProducts() {
               ))}
             </select>
           </label>
+          {usersError && <Alert message={usersError} />}
         </div>
       )}
 
       {loading ? (
         <ListSkeleton rows={3} />
-      ) : loadFailed ? null : products.length === 0 ? (
+      ) : loadFailed || shown === null ? null : products.length === 0 ? (
         <EmptyState
           icon={<PackageIcon />}
           title="No products registered"
@@ -638,7 +648,7 @@ function ProductCard({
         {tokens.length === 0 ? (
           <p className="text-sm text-faint">
             {truncatedAt !== null
-              ? `None of this product’s tokens are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
+              ? `None of this product’s tokens${filtered ? " matching the current filters" : ""} are among the first ${truncatedAt} listed; its tokens may be beyond the list.`
               : filtered
                 ? "No tokens match the current filters."
                 : "No tokens minted for this product."}

@@ -611,4 +611,41 @@ describe("AdminProducts owner and product filters (issue #1935)", () => {
       await screen.findByText("Showing the first 1 tokens matching the current filters, active first; older tokens are not listed."),
     ).toBeTruthy();
   });
+
+  it("does not keep the previous filter's rows while the new request is pending", async () => {
+    await pickFilters();
+    await waitFor(() => expect(mockApi.adminListProductTokens).toHaveBeenLastCalledWith({ ownerId: "u-dan", productId: "prod-b" }));
+    // Back to no filters: the unfiltered inventory shows the default token.
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "" } });
+    fireEvent.change(screen.getByRole("combobox", { name: "Product" }), { target: { value: "" } });
+    const helpdesk = await productCard("Helpdesk assistant");
+    expect(await within(helpdesk).findByText("support-prod")).toBeTruthy();
+
+    let release!: (v: { truncated: boolean; tokens: AdminProductToken[] }) => void;
+    mockApi.adminListProductTokens.mockImplementation(
+      () => new Promise((resolve) => { release = resolve; }),
+    );
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    await waitFor(() => expect(screen.queryByText("support-prod")).toBeNull());
+    expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+    release({ truncated: false, tokens: [] });
+    expect(await screen.findAllByText("No tokens match the current filters.")).toBeTruthy();
+  });
+
+  it("does not show the previous filter's rows when the refetch fails", async () => {
+    await pickFilters();
+    mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "boom"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    expect(await screen.findByText("boom")).toBeTruthy();
+    expect(screen.queryByRole("region", { name: "Metrics export" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
+  });
+
+  it("shows an error beside the filters when the users list fails to load", async () => {
+    mockApi.listUsers.mockRejectedValue(new ApiError(500, "users down"));
+    renderPage();
+    await productCard("Helpdesk assistant");
+    expect(await screen.findByText("users down")).toBeTruthy();
+    expect(screen.getByRole("combobox", { name: "Owner" })).toBeTruthy();
+  });
 });
