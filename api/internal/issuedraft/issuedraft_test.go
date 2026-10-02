@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/oauthsrv"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
@@ -245,12 +246,13 @@ func TestScrubSecretShapes(t *testing.T) {
 
 // TestScrubSecretShapesMintedUziPrefixes ranges over the EXPORTED minted uzi class
 // prefixes (uzc_/uza_ from clitoken, uzw_ from jointoken, uzp_ from producttoken,
-// PRD #1907), so this package's own copy of the uz[caprsw]_ pattern is bound to every
+// PRD #1907, and uzf_ from fetchctl, #2035), so this package's own copy of the
+// uz[capfrsw]_ pattern is bound to every
 // credential class uzi mints, not to string copies of them. secretscrub's
 // TestMintedPrefixesScrubbedOnBothPaths binds the same prefixes across all three
 // copies; this is the in-package half.
 func TestScrubSecretShapesMintedUziPrefixes(t *testing.T) {
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix, oauthsrv.RefreshPrefix)
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix, oauthsrv.RefreshPrefix, fetchctl.CredentialPrefix)
 	body := strings.Repeat("Ab1-_", 5) // 25 chars over the whole body class, assembled at runtime
 	for _, p := range prefixes {
 		tok := p + body

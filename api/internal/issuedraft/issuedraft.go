@@ -482,7 +482,7 @@ func firstNonSpaceIsSlash(s string) bool {
 }
 
 // secretShapes is a best-effort superset of the 4-family ingest scrub (slacksvc
-// .ScrubSecrets: sk-ant-, glpat-, xox*/xapp-, uz[caprsw]_) plus the foreign-credential
+// .ScrubSecrets: sk-ant-, glpat-, xox*/xapp-, uz[capfrsw]_) plus the foreign-credential
 // shapes an untrusted trace can carry into an issue on ANOTHER project (Decision 10):
 // AWS keys, GitHub tokens, Google API keys, JWTs, PEM private-key blocks, DB URLs with
 // an inline password, and an Authorization: Bearer header. Every pattern is prefix- or
@@ -492,7 +492,7 @@ var secretShapes = []*regexp.Regexp{
 	regexp.MustCompile(`x(?:ox[bpoas]|app)-[A-Za-z0-9-]+`),                                                       // Slack
 	regexp.MustCompile(`sk-ant-[A-Za-z0-9_-]+`),                                                                  // Anthropic
 	regexp.MustCompile(`glpat-[A-Za-z0-9_-]+`),                                                                   // GitLab PAT
-	regexp.MustCompile(`uz[caprsw]_[A-Za-z0-9_-]{16,}`),                                                          // uzi Bearer creds
+	regexp.MustCompile(`uz[capfrsw]_[A-Za-z0-9_-]{16,}`),                                                         // uzi Bearer creds
 	regexp.MustCompile(`AKIA[0-9A-Z]{16}`),                                                                       // AWS access key id
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9]{36,}`),                                                             // GitHub token
 	regexp.MustCompile(`AIza[0-9A-Za-z_-]{35}`),                                                                  // Google API key

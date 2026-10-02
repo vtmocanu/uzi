@@ -12,7 +12,7 @@ import (
 // minted is the exact shape Generate must produce: the class prefix and the
 // RawURLEncoding of 32 random bytes (43 chars of [A-Za-z0-9_-]). The body alphabet
 // matters beyond this package: every scrub pattern keys on
-// `uz[capw]_[A-Za-z0-9_-]{16,}`, so a body character outside that class would let
+// `uz[capfrsw]_[A-Za-z0-9_-]{16,}`, so a body character outside that class would let
 // the tail of a live token survive a scrub.
 var minted = regexp.MustCompile(`^uzp_[A-Za-z0-9_-]{43}$`)
 

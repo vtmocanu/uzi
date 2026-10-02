@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
+	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/issuedraft"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
 	"github.com/vtmocanu/uzi/api/internal/oauthsrv"
@@ -53,7 +54,7 @@ func assertScrubbedBothPaths(t *testing.T, token string) {
 }
 
 // assertScrubbedIssueDraft is the third path for the minted uzi prefixes only:
-// issuedraft.ScrubSecretShapes carries its own copy of the uz[caprsw]_ pattern. It is
+// issuedraft.ScrubSecretShapes carries its own copy of the uzi token pattern. It is
 // not folded into assertScrubbedBothPaths because issuedraft's forge families are
 // deliberately different (its GitHub pattern needs a 36+ char body), so the forge
 // test below could not share it.
@@ -75,14 +76,29 @@ func assertScrubbedIssueDraft(t *testing.T, token string) {
 // draft). The name predates the third path.
 func TestMintedPrefixesScrubbedOnBothPaths(t *testing.T) {
 	// clitoken.Prefixes = {uzc_, uza_}; jointoken.Prefix = uzw_; producttoken.Prefix =
-	// uzp_ (PRD #1907); oauthsrv.SecretPrefix = uzs_ and oauthsrv.RefreshPrefix = uzr_ (PRD #1910).
+	// uzp_ (PRD #1907); fetchctl.CredentialPrefix = uzf_ (#2035);
+	// oauthsrv.SecretPrefix = uzs_ and oauthsrv.RefreshPrefix = uzr_ (PRD #1910).
 	// The rest are consts, no slice needed.
-	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix, oauthsrv.RefreshPrefix)
+	prefixes := append(append([]string{}, clitoken.Prefixes...), jointoken.Prefix, producttoken.Prefix, oauthsrv.SecretPrefix, oauthsrv.RefreshPrefix, fetchctl.CredentialPrefix)
 	for _, p := range prefixes {
 		t.Run(p, func(t *testing.T) {
 			assertScrubbedBothPaths(t, p+body)
 			assertScrubbedIssueDraft(t, p+body)
 		})
+	}
+	// A real minted fetch credential must be replaced in full on every path.
+	fetchToken, _, err := fetchctl.GenerateCredential()
+	if err != nil {
+		t.Fatalf("fetchctl.GenerateCredential: %v", err)
+	}
+	if out := secretscrub.Scrub(fetchToken); out != "[redacted]" {
+		t.Errorf("secretscrub.Scrub left part of a minted fetch credential: %q", out)
+	}
+	if out := workersvc.ScrubKnownTokens(fetchToken); out != "[REDACTED]" {
+		t.Errorf("workersvc.ScrubKnownTokens left part of a minted fetch credential: %q", out)
+	}
+	if out := issuedraft.ScrubSecretShapes(fetchToken); out != "[redacted]" {
+		t.Errorf("issuedraft.ScrubSecretShapes left part of a minted fetch credential: %q", out)
 	}
 	// A real minted product token (not only the prefix plus a fixed body): its
 	// RawURLEncoding body may carry '-' and '_', which every copy's body class must

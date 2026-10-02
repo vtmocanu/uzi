@@ -27,9 +27,10 @@ import (
 //   - Anthropic keys (sk-ant-...), the shape of a printed per-user token.
 //   - Auth header lines a `curl -v` / `set -x` echo would emit: PRIVATE-TOKEN,
 //     Authorization (Bearer ...), and a bare "Bearer <token>".
-//   - uzi's own Bearer credentials (uzw_/uzc_/uza_, PRD #64 Risk 14; uzp_, PRD #1907). The CLI PRD
-//     tells users to put UZI_TOKEN in a GitLab CI variable, so a `uzi ...` invocation
-//     that echoes its token into a trace is exactly the path this snapshot ingests —
+//   - uzi's own Bearer credentials (uzw_/uzc_/uza_, PRD #64 Risk 14;
+//     uzp_, PRD #1907; uzf_, #2035). The CLI PRD tells users to put UZI_TOKEN
+//     in a GitLab CI variable, so a `uzi ...` invocation that echoes its token
+//     into a trace is exactly the path this snapshot ingests —
 //     a uzc_/uza_ minted by this API must never freeze into a failure_snapshot.
 //
 // Arbitrary third-party secrets with no recognizable shape remain the documented
@@ -39,7 +40,7 @@ var snapshotSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`gh[pousr]_[A-Za-z0-9_]{16,}`),
 	regexp.MustCompile(`github_pat_[A-Za-z0-9_]{16,}`),
 	regexp.MustCompile(`sk-ant-[A-Za-z0-9_\-]{16,}`),
-	regexp.MustCompile(`uz[caprsw]_[A-Za-z0-9_\-]{16,}`),
+	regexp.MustCompile(`uz[capfrsw]_[A-Za-z0-9_\-]{16,}`),
 	// Header lines a `curl -v` / `set -x` echoes — redact the WHOLE value to EOL
 	// (`.` excludes newline, so `.*` stops at the line end), never just the first word.
 	regexp.MustCompile(`(?i)(private-token|authorization)\s*[:=].*`),
