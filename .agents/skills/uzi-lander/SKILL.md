@@ -228,7 +228,8 @@ changes it); trust it over a handover's claim.
      wait, run
      `S/cr-rate-limit.sh OWNER/REPO PR --trigger-review`: it posts the exact two-word quota
      query, waits for the authoritative countdown or "Reviews are available now," then posts
-     `@coderabbitai review` itself exactly once under a per-PR lock when safe and immediately
+     `@coderabbitai review` itself under a per-PR lock when safe (a refusal as rate limited
+     re-queries and retries, 3 tries in all, then exits 1 to switch reviewer) and immediately
      execs `watch-pr.sh --reviewer coderabbit`. The atomic flag closes both background-callback
      gaps; never wait, post, or start the reviewer poller as separate agent steps. Its final exit
      is the `watch-pr.sh` result, so branch directly on step 2's exit table.

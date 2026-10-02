@@ -82,11 +82,30 @@ if [ "${1:-}" = pr ] && [ "${2:-}" = comment ]; then
     shift
   done
   printf '%s\n' "$body" >> "$POSTED"
+  [ -n "${POSTED_AT:-}" ] && printf '%s %s\n' "$(cat "$TEST_CLOCK")" "$body" >> "$POSTED_AT"
   if [ "$body" = '@coderabbitai review' ]; then
     review_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
     jq --arg t "$review_at" '. + [{user:{login:"tester"},body:"@coderabbitai review",created_at:$t,updated_at:$t}]' \
       "$COMMENTS" > "$COMMENTS.next"
     mv "$COMMENTS.next" "$COMMENTS"
+    # REFUSALS_LEFT (a file holding a count) makes CodeRabbit answer the trigger with its
+    # "Review rate limited" refusal that many times, as it did on PR #2066.
+    if [ -n "${REFUSALS_LEFT:-}" ] && [ "$(cat "$REFUSALS_LEFT")" -gt 0 ]; then
+      echo $(( $(cat "$REFUSALS_LEFT") - 1 )) > "$REFUSALS_LEFT"
+      refusal='<!-- This is an auto-generated reply by CodeRabbit -->
+<!-- CodeRabbit review command invocation: v2:abc -->
+<details>
+<summary>⚠️ Action not completed</summary>
+
+Review rate limited.
+
+> Note: CodeRabbit is an incremental review system and does not re-review already reviewed commits. This command is applicable only when automatic reviews are paused.
+
+</details>'
+      jq --arg t "$review_at" --arg b "$refusal" '. + [{user:{login:"coderabbitai[bot]"},body:$b,created_at:$t,updated_at:$t}]' \
+        "$COMMENTS" > "$COMMENTS.next"
+      mv "$COMMENTS.next" "$COMMENTS"
+    fi
     exit 0
   fi
   asked=$(date -u +%Y-%m-%dT%H:%M:%SZ)
@@ -380,4 +399,61 @@ bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$W
 grep -q '^WATCH_RESULT=ready$' "$WORK/trigger-lock-stale.out" || fail "stale-lock recovery did not enter the watcher: $(cat "$WORK/trigger-lock-stale.out")"
 unset HEAD_OID
 
-echo "PASS cr-rate-limit: exact query, unknown/long reset switch, singular minute, available-now, atomic review trigger, stale status, reset formatting"
+"$REAL_DATE" +%s > "$TEST_CLOCK"
+
+# PR #2066: CodeRabbit states whole minutes, so a trigger posted at the stated instant was
+# refused. A non-zero countdown is waited out plus the 60 s margin before the review trigger.
+MODE="query"; RESET_MIN=1; HEAD_OID=marginhead; EXACT_WAIT_CLOCK_STEP=20; POSTED_AT="$WORK/posted-at"
+unset AVAILABLE_NOW; export MODE RESET_MIN HEAD_OID EXACT_WAIT_CLOCK_STEP POSTED_AT
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED" "$POSTED_AT"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 5 > "$WORK/trigger-margin.out" 2>&1
+asked=$(awk '$2=="@coderabbitai" && $3=="rate"{print $1; exit}' "$POSTED_AT")
+reviewed=$(awk '$2=="@coderabbitai" && $3=="review"{print $1; exit}' "$POSTED_AT")
+[ -n "$reviewed" ] || fail "margin case never posted the review trigger: $(cat "$WORK/trigger-margin.out")"
+# The stub replies 1 s after the ask with "1 minutes": the stated reset is asked+61.
+[ $(( reviewed - asked )) -ge $(( 61 + 60 )) ] \
+  || fail "review trigger posted $(( reviewed - asked ))s after the ask, before the stated reset plus the 60 s margin"
+grep -q '^CR_RESET_MIN=1$' "$WORK/trigger-margin.out" || fail "margin changed the reported CodeRabbit countdown: $(cat "$WORK/trigger-margin.out")"
+unset RESET_MIN EXACT_WAIT_CLOCK_STEP POSTED_AT
+"$REAL_DATE" +%s > "$TEST_CLOCK"
+
+# A trigger CodeRabbit refuses as "Review rate limited" is not recorded as done: the script
+# re-queries the quota and posts again, then hands off to the watcher once one is accepted.
+MODE="available"; AVAILABLE_NOW=1; HEAD_OID=refusedonce; REFUSALS_LEFT="$WORK/refusals"
+export MODE AVAILABLE_NOW HEAD_OID REFUSALS_LEFT
+echo 1 > "$REFUSALS_LEFT"
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-refused.out" 2>&1
+grep -q '^CR_REVIEW_TRIGGER=refused_rate_limited$' "$WORK/trigger-refused.out" || fail "refused trigger was not detected: $(cat "$WORK/trigger-refused.out")"
+grep -q '^CR_TRIGGER_RETRY=2$' "$WORK/trigger-refused.out" || fail "refused trigger was not retried: $(cat "$WORK/trigger-refused.out")"
+[ "$(tr '\n' '|' < "$POSTED")" = '@coderabbitai rate limit|@coderabbitai review|@coderabbitai rate limit|@coderabbitai review|' ] \
+  || fail "refusal retry did not re-query then re-trigger: $(cat "$POSTED")"
+grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/trigger-refused.out" || fail "accepted retry was not reported: $(cat "$WORK/trigger-refused.out")"
+[ "$(cat "$WATCHED")" = 'test/repo 42 60 60 --reviewer coderabbit' ] || fail "accepted retry did not enter the watcher: $(cat "$WATCHED" 2>/dev/null)"
+
+# A quota that keeps refusing stops after 3 attempts and switches reviewer. The head stays
+# unrecorded, so a later run on the same head is not blocked as already_current_head.
+HEAD_OID=refusedalways; export HEAD_OID
+echo 99 > "$REFUSALS_LEFT"
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+set +e
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-refused-always.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 1 ] || fail "exhausted refusals rc=$rc, want 1: $(cat "$WORK/trigger-refused-always.out")"
+grep -q '^NEXT=switch_reviewer (CodeRabbit refused 3 review triggers' "$WORK/trigger-refused-always.out" \
+  || fail "exhausted refusals did not switch reviewer: $(cat "$WORK/trigger-refused-always.out")"
+[ "$(grep -c '^@coderabbitai review$' "$POSTED")" = 3 ] || fail "expected exactly 3 review triggers: $(cat "$POSTED")"
+[ ! -e "$WATCHED" ] || fail "exhausted refusals entered the watcher"
+echo 0 > "$REFUSALS_LEFT"
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$WORK/trigger-after-refusals.out" 2>&1
+grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/trigger-after-refusals.out" \
+  || fail "a refused head was recorded and blocked the next trigger: $(cat "$WORK/trigger-after-refusals.out")"
+unset HEAD_OID REFUSALS_LEFT
+
+echo "PASS cr-rate-limit: exact query, unknown/long reset switch, singular minute, available-now, atomic review trigger, stale status, reset formatting, trigger margin, refused-trigger retry"

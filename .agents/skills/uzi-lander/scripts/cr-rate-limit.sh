@@ -27,6 +27,11 @@
 #                    --wait. A per-PR lock plus a current-head marker and recent-trigger check
 #                    prevent parallel/replayed invocations posting twice. An unknown or
 #                    over-15-min reset exits promptly so the caller can switch reviewer.
+#                    A non-zero countdown is waited out plus UZI_LANDER_CR_TRIGGER_MARGIN
+#                    seconds (default 60): CodeRabbit states whole minutes. After posting, it
+#                    reads CodeRabbit's reply; a "Review rate limited" refusal records nothing
+#                    and restarts with a fresh exact query, up to 3 attempts in all
+#                    (CR_TRIGGER_RETRY=N), then exits 1 with NEXT=switch_reviewer.
 #   --max-wait-min   ceiling for --wait (default 180).
 #   --interval       poll seconds for --wait (default 60).
 #
@@ -36,7 +41,8 @@
 # Exit codes:
 #   0  not limited, OR the limit window has elapsed; with --trigger-review the review command
 #      was posted (or an equivalent recent command already exists)
-#   1  limited, reset known and still in the future (switch reviewer when over 15 min)
+#   1  limited, reset known and still in the future (switch reviewer when over 15 min), or
+#      --trigger-review saw 3 triggers refused as rate limited
 #   2  reset unknown (switch reviewer after an exact query; plain --wait has a ceiling)
 #   3  usage / gh error
 # With --trigger-review, a successful trigger hands control to watch-pr.sh and the final exit
@@ -48,6 +54,14 @@ WATCH_PR_SCRIPT="${UZI_LANDER_WATCH_PR_SCRIPT:-$HERE/watch-pr.sh}"
 # shellcheck source=lib/state.sh
 . "$HERE/lib/state.sh"
 
+ORIG_ARGS=("$@")
+# Seconds added to a non-zero countdown before triggering (CodeRabbit rounds to minutes).
+TRIGGER_MARGIN="${UZI_LANDER_CR_TRIGGER_MARGIN:-60}"
+# How long to wait for CodeRabbit's reply to a posted review trigger, and how many times a
+# trigger it refused as "Review rate limited" is re-queried and retried.
+TRIGGER_REPLY_POLLS="${UZI_LANDER_CR_TRIGGER_REPLY_POLLS:-8}"   # x 15 s
+TRIGGER_RETRIES_MAX=3
+TRIGGER_ATTEMPT="${UZI_LANDER_CR_TRIGGER_ATTEMPT:-1}"
 REPO=""; PR=""; ASK=0; QUERY=0; WAIT=0; TRIGGER_REVIEW=0; MAX_WAIT=180; INTERVAL=60
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -57,7 +71,7 @@ while [ $# -gt 0 ]; do
     --trigger-review) TRIGGER_REVIEW=1; QUERY=1; ASK=1; WAIT=1; shift;;
     --max-wait-min) MAX_WAIT="${2:?}"; shift 2;;
     --interval) INTERVAL="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,32p' "$0"; exit 3;;
+    -h|--help) sed -n '2,36p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$REPO" ]; then REPO="$1"; elif [ -z "$PR" ]; then PR="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
@@ -82,7 +96,7 @@ cr_status() {
 # edits in place (base = its updated_at) and (2) the newest bot reply carrying a countdown
 # or "Reviews are available now" (base = its created_at). The later base wins.
 reset_from_pr() {
-  local comments best_ts="" best_base="" best_src="" b n ts base
+  local comments best_ts="" best_base="" best_src="" best_n="" b n ts base
   comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []') || return 1
   printf '%s' "$comments" | jq -e 'type=="array"' >/dev/null 2>&1 || return 1
   # (1) walkthrough / status comment with the rate-limited block.
@@ -92,7 +106,7 @@ reset_from_pr() {
     n=$(printf '%s' "$b" | awk '/auto-generated comment: rate limited by coderabbit.ai/{f=1} f{print} /end of auto-generated comment: rate limited/{f=0}' \
         | grep -oE 'available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true)
     if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
-      best_base=$base; best_ts=$(( base + n*60 )); best_src="walkthrough"
+      best_base=$base; best_ts=$(( base + n*60 )); best_src="walkthrough"; best_n=$n
     fi
   fi
   # (2) the newest `rate limit` reply. The statement with the LATER base timestamp wins
@@ -112,11 +126,11 @@ reset_from_pr() {
     esac
     if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
       if [ -z "$best_base" ] || [ "$base" -ge "$best_base" ]; then
-        best_base=$base; best_ts=$(( base + n*60 )); best_src="reply"
+        best_base=$base; best_ts=$(( base + n*60 )); best_src="reply"; best_n=$n
       fi
     fi
   fi
-  [ -n "$best_ts" ] && printf '%s\t%s\n' "$best_ts" "$best_src"
+  [ -n "$best_ts" ] && printf '%s\t%s\t%s\n' "$best_ts" "$best_src" "$best_n"
   return 0
 }
 
@@ -139,7 +153,7 @@ reset_from_reply_after() {
     *) n=$(printf '%s' "$b" | grep -oE 'More reviews will be available in [0-9]+ minutes?' | tail -1 | grep -oE '[0-9]+' || true) ;;
   esac
   if [ -n "$n" ] && [ -n "$ts" ] && base=$(iso2epoch "$ts") && [ -n "$base" ]; then
-    printf '%s\treply\n' "$(( base + n*60 ))"
+    printf '%s\treply\t%s\n' "$(( base + n*60 ))" "$n"
   fi
   return 0
 }
@@ -162,7 +176,7 @@ report() {  # $1 = reset epoch or "", $2 = source
 # recent exact trigger makes callback replay idempotent. Run in a subshell so its trap cannot
 # replace the quota-query lock's cleanup trap.
 trigger_review_once() (
-  local sd lock marker age comments recent head marked
+  local sd lock marker age comments recent head marked posted_at reply reason
   sd=$(state_dir) || exit 3
   lock="$sd/locks/cr-review-${REPO//\//_}-$PR"
   marker="$sd/locks/cr-review-last-${REPO//\//_}-$PR"
@@ -191,15 +205,52 @@ trigger_review_once() (
     echo "CR_REVIEW_TRIGGER=already_recent"
     exit 0
   fi
+  posted_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   gh pr comment "$PR" --repo "$REPO" --body '@coderabbitai review' >/dev/null 2>&1 \
     || { echo "could not post the CodeRabbit review trigger" >&2; exit 3; }
+  # Read CodeRabbit's answer before recording the head: a refused trigger must stay
+  # retryable, or the marker would make every later attempt report already_current_head.
+  # A reply carries "review command invocation"; a refusal says "Action not completed".
+  # No reply within the window is treated as accepted (CodeRabbit may start silently).
+  reply=""
+  for _ in $(seq 1 "$TRIGGER_REPLY_POLLS"); do
+    sleep 15
+    comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" 2>/dev/null | jq -s 'add // []' 2>/dev/null || true)
+    reply=$(printf '%s' "$comments" | jq -r --arg t "$posted_at" '
+      [.[]|select(.user.login=="coderabbitai[bot]" and .created_at>=$t
+                  and ((.body // "")|contains("review command invocation")))]|last|.body // ""' 2>/dev/null || true)
+    [ -n "$reply" ] && break
+  done
+  case "$reply" in
+    *"Action not completed"*"Review rate limited"*)
+      echo "CR_REVIEW_TRIGGER=refused_rate_limited"
+      exit 4 ;;
+    *"Action not completed"*)
+      reason=$(printf '%s' "$reply" | sed -n '/Action not completed/{n;n;p;}' | head -1 | tr -cd '[:alnum:] .,:-' | cut -c1-80)
+      printf '%s\n' "$head" > "$marker" || { echo "cannot record the review-trigger head" >&2; exit 3; }
+      echo "CR_REVIEW_TRIGGER=refused (${reason:-unknown reason})"
+      exit 0 ;;
+  esac
   printf '%s\n' "$head" > "$marker" || { echo "review trigger posted but its head marker could not be recorded" >&2; exit 3; }
   echo "CR_REVIEW_TRIGGER=posted"
 )
 
 exit_safe() {
   if [ "$TRIGGER_REVIEW" -eq 1 ]; then
-    trigger_review_once || exit 3
+    local trc=0
+    trigger_review_once || trc=$?
+    if [ "$trc" -eq 4 ]; then
+      # CodeRabbit refused: the quota had not actually reset. Start over with a fresh exact
+      # query (a new countdown, a new wait), bounded so a stuck quota cannot loop forever.
+      if [ -n "${ask_lock:-}" ]; then rm -rf "$ask_lock"; ask_lock=""; trap - EXIT; fi
+      if [ "$TRIGGER_ATTEMPT" -ge "$TRIGGER_RETRIES_MAX" ]; then
+        echo "NEXT=switch_reviewer (CodeRabbit refused $TRIGGER_ATTEMPT review triggers as rate limited)"
+        exit 1
+      fi
+      echo "CR_TRIGGER_RETRY=$(( TRIGGER_ATTEMPT + 1 ))"
+      UZI_LANDER_CR_TRIGGER_ATTEMPT=$(( TRIGGER_ATTEMPT + 1 )) exec bash "$0" "${ORIG_ARGS[@]}"
+    fi
+    [ "$trc" -eq 0 ] || exit 3
     echo "NEXT=watch_pr:coderabbit"
     # exec does not run this shell's EXIT trap. Drop the quota-query lock explicitly before
     # replacing the process with watch-pr, or every successful atomic handoff leaves a live
@@ -217,9 +268,9 @@ case "$status" in *"rate limited"*) status_limited=1;; esac
 if [ "$status_limited" -eq 0 ] && [ "$QUERY" -eq 0 ]; then echo "CR_LIMITED=0"; exit 0; fi
 
 row=$(reset_from_pr) || { echo "gh error reading PR comments" >&2; exit 3; }
-reset_ts=$(printf '%s' "$row" | cut -f1); src=$(printf '%s' "$row" | cut -f2)
+reset_ts=$(printf '%s' "$row" | cut -f1); src=$(printf '%s' "$row" | cut -f2); countdown=$(printf '%s' "$row" | cut -f3)
 # --query asks for an exact live answer. Never let an inferred walkthrough timestamp satisfy it.
-if [ "$QUERY" -eq 1 ]; then reset_ts=""; src=""; fi
+if [ "$QUERY" -eq 1 ]; then reset_ts=""; src=""; countdown=""; fi
 
 if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
   # In-flight guard, FAIL CLOSED and serialised: the post happens only under a per-PR lock
@@ -256,10 +307,18 @@ if { [ "$QUERY" -eq 1 ] || [ -z "$reset_ts" ]; } && [ "$ASK" -eq 1 ]; then
     if [ -n "$row" ]; then
       reset_ts=$(printf '%s' "$row" | cut -f1)
       src=$(printf '%s' "$row" | cut -f2)
+      countdown=$(printf '%s' "$row" | cut -f3)
       break
     fi
   done
 fi
+
+# CodeRabbit states whole minutes, so "in 9 minutes" can mean up to a minute more: a review
+# posted at the stated instant was refused "Review rate limited" (PR #2066, 2026-10-02). The
+# trigger waits for gate_ts, the stated reset plus a margin; a zero countdown ("Reviews are
+# available now") needs none. CR_RESET_MIN/CR_RESET_AT keep reporting CodeRabbit's own figure.
+gate_ts="$reset_ts"
+if [ -n "$reset_ts" ] && [ "${countdown:-0}" -gt 0 ] 2>/dev/null; then gate_ts=$(( reset_ts + TRIGGER_MARGIN )); fi
 
 if [ -n "$reset_ts" ]; then
   status_limited=0
@@ -270,7 +329,7 @@ report "$reset_ts" "${src:-}"
 
 # An authoritative zero-minute reply is safe NOW. Do not sleep for one polling interval
 # before triggering, which recreates the callback-latency gap this atomic mode removes.
-if [ -n "$reset_ts" ] && [ "$reset_ts" -le "$(date +%s)" ]; then
+if [ -n "$gate_ts" ] && [ "$gate_ts" -le "$(date +%s)" ]; then
   echo "CR_RESET_ELAPSED=1"
   exit_safe
 fi
@@ -304,7 +363,7 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
   sleep "$INTERVAL"
   if [ "$QUERY" -eq 1 ]; then
     now=$(date +%s)
-    if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit_safe; fi
+    if [ -n "$gate_ts" ] && [ "$now" -ge "$gate_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit_safe; fi
     echo "$(date +%H:%M:%S) waiting on exact quota reset at $reset_label"
     continue
   fi
@@ -317,6 +376,6 @@ done
 # The wait ended: only a reset that has actually passed is "elapsed". Hitting the ceiling
 # with the reset still ahead (or unknown) is NOT permission to trigger a review.
 now=$(date +%s)
-if [ -n "$reset_ts" ] && [ "$now" -ge "$reset_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit_safe; fi
+if [ -n "$gate_ts" ] && [ "$now" -ge "$gate_ts" ]; then echo "CR_RESET_ELAPSED=1"; exit_safe; fi
 if [ -n "$reset_ts" ]; then echo "CR_WAIT_CEILING=1 (reset still $(( (reset_ts - now + 59) / 60 )) min ahead; re-run --wait)"; exit 1; fi
 echo "CR_WAIT_CEILING=1 (reset unknown; re-run with --ask)"; exit 2
