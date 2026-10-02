@@ -1066,8 +1066,9 @@ function diagramBlock(fields: SanitizedPrDescriptionFields): string[] {
   const diagram = fields.diagram;
   if (!diagram) return [];
   const ids = new Map(diagram.nodes.map((node, i) => [node.key, `n${i + 1}`]));
+  const connected = new Set(diagram.edges.flatMap((edge) => [edge.from, edge.to]));
   const source = diagram.kind === "flow"
-    ? ["flowchart LR", ...diagram.edges.map((edge) => {
+    ? ["flowchart LR", ...diagram.nodes.filter((node) => !connected.has(node.key)).map((node) => `  ${ids.get(node.key)}["${node.label}"]`), ...diagram.edges.map((edge) => {
       const from = diagram.nodes.find((node) => node.key === edge.from)!;
       const to = diagram.nodes.find((node) => node.key === edge.to)!;
       return `  ${ids.get(edge.from)}["${from.label}"] -->${edge.label ? `|"${edge.label}"|` : ""} ${ids.get(edge.to)}["${to.label}"]`;

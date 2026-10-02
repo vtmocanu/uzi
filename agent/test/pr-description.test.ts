@@ -243,6 +243,15 @@ describe("diagram regions (PRD #1840 D5/D6/D9)", () => {
       assert.notEqual(regionSha256(region), regionSha256(renderRegion({ sizeLine: table, source: "generated" }, await mint({ summary: "Diagram summary.", changes: ["One change."] })).text));
     });
   }
+  it("keeps an API-valid flow node even when no edge refers to it", async () => {
+    const fields = await mint({ diagram: { kind: "flow", nodes, edges: [
+      { from: "lead", to: "editor" }, { from: "editor", to: "lead" },
+    ] } });
+    const region = renderRegion({ sizeLine: table }, fields).text;
+    assert.match(region, /\n  n3\["API"\]\n/u);
+    assert.match(region, /\n  n1\["Lead"\] --> n2\["Editor"\]\n/u);
+  });
+
   it("emits exactly 1,500 UTF-8 bytes and omits a larger Mermaid source", async () => {
     const edges = Array.from({ length: 20 }, () => ({ from: "worker", to: "api", label: "a".repeat(59) }));
     const diagram = { kind: "sequence" as const, nodes: [{ key: "worker", label: "Worker12345678901234" }, { key: "api", label: "API" }], edges };
