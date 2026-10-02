@@ -3066,8 +3066,9 @@ export class CodexExecutor implements Executor {
     // this turn's elapsed time. An already-spent budget trips before the turn starts.
     const wallArmedAt = Date.now();
     let wallTimer: ReturnType<typeof setTimeout> | undefined;
-    if (wall.remainingMs <= 0) trip(REASON_WALL);
-    else {
+    // A spent budget already tripped REASON_WALL via pendingInterruption above, so only arm it when
+    // time remains.
+    if (wall.remainingMs > 0) {
       wallTimer = setTimeout(() => trip(REASON_WALL), wall.remainingMs);
       wallTimer.unref?.();
     }

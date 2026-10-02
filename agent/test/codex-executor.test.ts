@@ -9790,6 +9790,11 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(result.branch, "agent/issue-42", "the run completed");
     assert.equal(rig.transport.turnStartCount, 2);
     assert.deepEqual(retryNotices(emitted), ["the provider returned a transient error (serverOverloaded); retrying (1/2)…"]);
+    assert.equal(
+      rig.transport.requests.filter((r) => r.method === "thread/start").length,
+      1,
+      "exactly one thread was started across both turns",
+    );
     const threadIds = rig.transport.requests.filter((r) => r.method === "turn/start").map((r) => rec(r.params).threadId);
     assert.equal(threadIds.length, 2);
     assert.equal(threadIds[1], threadIds[0], "the retry runs in the same thread");
@@ -9928,8 +9933,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     let onPause: (() => void) | undefined;
     let armed = false;
     let fired = false;
-    // The pause-now interrupt lands as the final turn is torn down: the live turn's trip is already
-    // spent, so only the exhaustion gate can see the new generation.
+    // The pause-now interrupt lands as the final turn is torn down (its finally removes the signal
+    // listener). The live turn's trip does still fire, but it has no effect: the CodexTurnFailedError
+    // was already thrown, so only the exhaustion gate can see the new generation.
     const origRemove = controller.signal.removeEventListener.bind(controller.signal);
     controller.signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
       origRemove(...args);
@@ -10011,5 +10017,48 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
       return true;
     });
     assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
+  });
+
+  it("(g3) a cancel flipped during the backoff, with a stale shared signal, is caught by the post-backoff gate", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    let mode: "now" | null = null;
+    let onPause: (() => void) | undefined;
+    // (g2)'s setup: turn 1 is dropped by a declined `now` pause, so the shared signal is spent and
+    // turn 2 is stale-suppressed. Turn 2 fails transient with a retry available; the sticky cancel
+    // flips only after the retry notice, i.e. during the backoff. The re-driven turn's prelude does
+    // not re-check the sticky cancel, so only the post-backoff gate stops a third turn start.
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) c.transport.push(threadStarted());
+          else c.transport.push(turnCompletedWithError("serverOverloaded"));
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+    });
+    tinyBackoff(rig, { transientRetryMax: 1, transientBackoffBaseMs: 2000, wallMs: 60_000 });
+    const { ctx, emitted } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => mode,
+      cancelRequested: () => cancelled,
+      onPauseNow: (cb) => { onPause = cb; },
+      parkForPause: async () => false,
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn 1 started");
+    mode = "now";
+    controller.abort(new PauseNowSignal());
+    onPause?.();
+    await waitFor(() => retryNotices(emitted).length === 1, "the retry notice (backoff begun)");
+    cancelled = true;
+    await assert.rejects(withTimeout(running, 3000, "cancel in backoff, stale signal"), (e: Error) => {
+      assert.equal(e.message, "run cancelled");
+      assert.ok(!(e instanceof TransientRecoveryError));
+      return true;
+    });
+    assert.equal(rig.transport.turnStartCount, 2, "no provider turn started for the retry");
   });
 });
