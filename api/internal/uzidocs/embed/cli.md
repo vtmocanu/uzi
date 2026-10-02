@@ -1771,12 +1771,30 @@ worker between its members** — it cannot change the set itself:
 
 ```sh
 uzi token list                                 # labels, default flag, pool opt-in, live eligibility, enabled state
+uzi token test <label> [--kind anthropic|codex|openai-key]
 uzi token pool console-key --on                # add it to the auto-selection pool
 uzi token pool console-key --off               # take it back out
 uzi worker set-token <worker-id> console-key   # bind a worker to a named token
 uzi worker set-token <worker-id> --default     # clear the binding
 uzi worker set-token <worker-id> --auto        # pick per claim, from the pool
 ```
+
+`uzi token test` checks one enabled stored credential without exposing its
+value. Labels are matched without regard to case. If the same label occurs
+across kinds, pass `--kind`; use `uzi token list` to find the label. Anthropic
+Test tries Usage first and may use a small Messages request when probing is
+enabled; Codex Test reconciles a `staging` or `failed` login, while a `linked`
+login gets a show-only usage read without refresh; OpenAI API key Test checks
+`GET /v1/models`, which proves endpoint access alone, not inference or billing.
+See [Anthropic tokens](./anthropic-token.md#good-to-know) and [Codex credential
+testing](./codex-credentials.md#testing-a-credential).
+
+The safe result has `status` (`ok`, `rejected`, `permission_denied`, or
+`inconclusive`), optional `reason` (`generic`, `vault_locked`, or
+`superseded`), and optional `display` (for example, `models endpoint
+accessible`). `--json` also includes `kind`, `label`, and `id`; it carries no
+credential value or provider response. An inconclusive result is not a
+successful credential check. A result can go stale after the test.
 
 `uzi token pool` is the one token **write** the CLI has, and it is here for
 the same reason the others are not: it mints nothing and reveals nothing, it
@@ -1791,8 +1809,8 @@ questions:
 | `POOL` | did you opt this token in? |
 | `ELIGIBLE` | could auto-selection pick it *right now*? |
 
-`ELIGIBLE` is `eligible` when it can, or `no_reading` / `unmeasured` /
-`stale` / `below_threshold` when it cannot; `-` when the token is not pooled
+`ELIGIBLE` is `eligible` when it can, or `rejected` / `no_reading` /
+`unmeasured` / `stale` / `below_threshold` when it cannot; `-` when the token is not pooled
 (the `POOL` column beside it already says so), and `?` when the eligibility
 read failed. **Check it after opting a token in**: a token uzi has never
 managed to poll reads as not eligible for normal ranking while looking active —

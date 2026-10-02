@@ -155,6 +155,26 @@ Each stored Codex credential shows one of four statuses:
 | `failed` | Verification failed. Use **Replace value** with a *new* [login dedicated to uzi](#1-sign-in-with-a-login-dedicated-to-uzi), never a re-paste of the old one. |
 | `static` | An OpenAI API key, not a Codex login; provider-account linking doesn't apply to a key. |
 
+## Testing a credential
+
+Click **Test** on a credential card for an immediate check, or use
+[`uzi token test <label>`](./cli.md#anthropic-tokens). A result reports
+`ok`, `rejected`, `permission_denied`, or `inconclusive`; it does not reveal
+provider response bodies or the stored value. An inconclusive result can
+carry `generic`, `vault_locked`, or `superseded` as its reason. A test after
+replacement or disablement may be superseded by the newer credential state.
+
+For a Codex login in `staging` or `failed`, Test runs identity reconciliation;
+that check can move the link state to `linked` or `failed`. For a `linked`
+login, Test reads the account's usage once and does not refresh or rotate the
+login. It is a current check, not a promise that a later run can start.
+
+For an OpenAI API key, Test requests `GET /v1/models`. An `ok` result means
+exactly that the models endpoint was accessible with that key. It does not
+prove inference access or billing readiness. A 401 is `rejected`; a 403 is
+`permission_denied`. Other failures can be inconclusive. The key still has
+no subscription usage meter.
+
 ## Usage meters
 
 Once a login moves to `linked`, uzi starts polling its subscription usage in

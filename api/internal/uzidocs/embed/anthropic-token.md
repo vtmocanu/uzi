@@ -137,6 +137,7 @@ each pooled token shows whether auto-selection could pick it *right now*:
 | chip | what it means |
 |---|---|
 | **in pool** | it can be picked |
+| **rejected** | the current value was rejected; auto-selection excludes it, including from the last-resort pooled-token floor |
 | **never polled** | uzi has never read a usage figure for it, so normal ranking cannot rank it and passes it over — though, if it is pooled and nothing pooled has a usable reading, the last-resort floor can still spend it |
 | **no usage data** | it was polled, but the reading carried no percentage |
 | **stale reading** | the last reading is too old to steer a choice |
@@ -144,7 +145,7 @@ each pooled token shows whether auto-selection could pick it *right now*:
 
 These chips explain normal ranking. A pooled token without a usable usage
 reading can still be selected by the last-resort pooled-token fallback
-described below. Check them after opting a token in.
+described below; a rejected token cannot. Check them after opting a token in.
 
 Creation-time mode and claim-time fallback verified against worker creation
 and `autoChoice` on 2026-09-08.
@@ -173,33 +174,32 @@ too — see [Paused on a usage limit](run-limit-wait.md).
 
 **An `auto` worker never spends a token you have not opted into the pool** —
 not even your default, if you kept it out. If it can pick, it does. If it
-can't pick but the pool isn't empty — nothing pooled has a usable reading —
-it spends the **best pooled token anyway**, stale reading and all, rather
-than reach outside the pool. Only when the pool is genuinely **empty** does
-it stop spending anything: the run **holds**, waiting, until you opt a token
-in (or you resume it yourself).
+can't pick but the pool has a non-rejected value with no usable reading,
+it spends the **best non-rejected pooled token anyway**, stale reading and all,
+rather than reach outside the pool. A rejected value is excluded even at this
+last-resort floor. If the pool is empty or every pooled value is rejected,
+the run **holds**, waiting for a spendable pooled token (or for you to resume
+it yourself).
 
 So a token you deliberately kept **out** of the pool is safe from ordinary
 auto runs, full stop — that's the whole point of the toggle. The one thing
-auto-selection does not do is fail a run outright: a thin pool still runs (on
-whatever is pooled, however stale), and an empty pool waits rather than
-errors.
+auto-selection does not do is fail a run outright: a thin pool can still run
+on a stale, non-rejected value, while a pool with nothing spendable waits.
 
 The run view says which of these happened — see below.
 
 ### Waiting for a token
 
-When an `auto` worker's pool has nothing at all to spend, the run doesn't
-fail and doesn't reach for the default — it **holds**, showing "Waiting for
+When an `auto` worker's pool has nothing spendable (empty or only rejected
+values), the run doesn't fail and doesn't reach for the default — it **holds**, showing "Waiting for
 a pooled token" on the run view and `pool_wait` as its status everywhere
-else. It resumes on its own the moment you opt a token into the pool, or you
-can skip the wait with `uzi run resume-now <run-id>` or the run view's
+else. It resumes on its own once a spendable token is pooled (for example, after
+you opt one in or replace a rejected value), or you can skip the wait with `uzi run resume-now <run-id>` or the run view's
 **Resume now** button. This is a different wait than
 [a usage-limit pause](run-limit-wait.md): a `pool_wait` hold means there was
-nothing pooled to spend at all, not that a pooled token hit its rate limit.
+no spendable pooled value, not that a pooled token hit its rate limit.
 It is also different from [a transient-recovery
-park](run-recovery-wait.md): `pool_wait` means there was nothing pooled to
-spend, not that a resumed turn hit a transient interruption.
+park](run-recovery-wait.md): `pool_wait` means there was nothing spendable in the pool, not that a resumed turn hit a transient interruption.
 
 ### Reading it back
 
@@ -441,9 +441,16 @@ Click **Delete** on the token's row. Two rules:
   [ARCHITECTURE.md](../ARCHITECTURE.md#secrets-per-user-credentials-at-rest)
   for the mechanism and [the vault threat model](./vault-threat-model.md) for
   what that does and does not protect against.
-- **Not verified at save time.** uzi doesn't call Anthropic when you paste
-  a token, so a bad or expired one only surfaces the first time an agent
-  actually runs against it. Replace its value if that happens.
+- **Save does not wait for a verdict.** Saving or replacing a token requests
+  a best-effort background usage poll, so a meter or rejection may appear soon
+  afterwards; the save succeeds without waiting for that poll. Use **Test** on
+  its card for an immediate check. Test tries Anthropic Usage first. If Usage
+  returns an HTTP refusal and usage probing is enabled, it may send a small
+  Messages request (about one output token); a Messages 401/403 marks the
+  value rejected. With usage probing disabled, Test sends no Messages request
+  and a Usage refusal is inconclusive. A rejected value is excluded from
+  auto-selection, including its last-resort floor. Replace the value and test
+  again; see [CLI testing](./cli.md#anthropic-tokens).
 - **Meters are per token.** Each stored token gets its own 5-hour and 7-day
   reading — see [Claude rate limits](./rate-limits.md).
 - **The CLI can list tokens, and can move them in and out of the pool.**
