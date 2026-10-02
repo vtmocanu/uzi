@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A resumed Codex run no longer fails when an earlier, crashed attempt left its provider directory behind ([#2126](https://github.com/vtmocanu/uzi/issues/2126)).**
+  Each run attempt now names its provider directories with its own random prefix, so a directory left by an attempt that was killed (for example by an out-of-memory kill) can no longer collide with a later attempt's `codex-data/epoch-N` and fail it with `File exists`. The directory is still created exclusively, and leftover directories are kept for inspection until the run's home is removed.
+
 - **Codex commands resolve the worker's GNU toolchain before BusyBox ([#2122](https://github.com/vtmocanu/uzi/issues/2122)).**
   A Codex run's command PATH now puts `/opt/uzi-toolchain/bin` first, so `stat`, `timeout` and the other coreutils are the GNU ones, matching Claude commands; the Codex launch PATH is deliberately unchanged (#2129).
 
