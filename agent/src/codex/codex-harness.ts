@@ -60,6 +60,7 @@ import { renderCodexRun } from "./render.js";
 import { buildCodexDynamicTools } from "./dynamic-tools.js";
 import { CODEX_DELEGATE_TOOLS, CODEX_SIGNAL_TOOLS, canonicalizeCodexToolName } from "./broker.js";
 import {
+  CodexTurnFailedError,
   formatCodexClassification,
   normalizeCodexErrorInfo,
   normalizeCodexStatus,
@@ -1846,7 +1847,7 @@ export class CodexHarness implements RunHarness {
         // the category defaults to "unknown", byte-identical to before #1534.
         materialize: (_limit): HarnessThrownFailure => {
           const suffix = classification !== undefined ? ` (${formatCodexClassification(classification)})` : "";
-          const original = new Error(`codex turn failed: ${subtype}${suffix}`);
+          const original = new CodexTurnFailedError(`codex turn failed: ${subtype}${suffix}`, classification);
           const category = classification?.category ?? "unknown";
           return { failure: { category, message: original.message }, original };
         },

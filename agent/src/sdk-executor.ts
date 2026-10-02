@@ -202,17 +202,20 @@ const EMPTY_TURN_BACKOFF_BASE_MS = 2_000;
 const EMPTY_TURN_BACKOFF_SLICE_MS = 250;
 
 /**
- * issue #1197 (D-RC2b): a POSITIVELY-EMPTY SDK turn (0 turns, no model activity, no
- * plan/questions/done) persisted after the bounded in-process retries. Thrown by
- * {@link SdkExecutor.driveTurnWithEmptyRecovery} to escalate to the worker's
- * `recovery_wait` park (runner.ts `handleRecoveryExhausted`), which captures and
- * verifies the local restore point BEFORE reporting a promotable, resumable park —
- * never a work-destroying terminal `failed`.
+ * A transient failure persisted after bounded in-process retries: escalate to the worker's
+ * `recovery_wait` park (runner.ts `handleRecoveryExhausted`), which captures and verifies the
+ * local restore point BEFORE reporting a promotable, resumable park, never a work-destroying
+ * terminal `failed`. Two producers:
+ *  - the Claude lane, {@link SdkExecutor.driveTurnWithEmptyRecovery} (issue #1197 D-RC2b): a
+ *    POSITIVELY-EMPTY SDK turn (0 turns, no model activity, no plan/questions/done) or a
+ *    transient provider error that persisted;
+ *  - the Codex lane, `CodexExecutor.driveTurnWithWallPark` (issue #2099): a turn that kept
+ *    failing with a transient provider classification after its bounded same-thread retries.
  *
- * This is NEVER thrown for a genuine wall/idle/cancel trip (those keep their existing
- * terminal/cancelled outcome) nor for a turn that RAN but did not submit a plan (that
- * stays REASON_NO_PLAN). A distinct typed error is what lets the runner catch route it
- * to the non-terminal park instead of the generic failure path.
+ * This is NEVER thrown for a genuine wall/idle/cancel/pause interruption (those keep their
+ * existing terminal/cancelled/paused outcome) nor, on the Claude lane, for a turn that RAN but
+ * did not submit a plan (that stays REASON_NO_PLAN). A distinct typed error is what lets the
+ * runner catch route it to the non-terminal park instead of the generic failure path.
  */
 export class TransientRecoveryError extends Error {
   constructor(

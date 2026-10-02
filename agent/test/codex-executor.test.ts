@@ -1,4 +1,4 @@
-import { describe, it } from "node:test";
+import { describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
 import { randomUUID } from "node:crypto";
@@ -33,6 +33,7 @@ import {
   type CodexCommittedGenerationCell,
 } from "../src/codex/codex-executor.js";
 import { RequestError } from "../src/client.js";
+import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { WORKER_UID, RUNNER_UID } from "../src/runner-uid.js";
 import { gitEnv } from "../src/git.js";
 import { forgeToolNames } from "../src/forge-tools.js";
@@ -9731,5 +9732,284 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(texts[2]!.startsWith("The human answered your questions:"));
     assert.ok(texts[2]!.includes("Available subagents to delegate to: coder, tester."));
     assert.ok(!texts[2]!.includes(PASSAGE));
+  });
+});
+
+// ================================================================================
+// Issue #2099 — a Codex turn that ends `failed` with a TRANSIENT provider classification (category
+// transport: serverOverloaded, ...) is retried a bounded number of times in the same thread, then
+// escalates as TransientRecoveryError (the runner parks it in recovery_wait) instead of failing the
+// run as agent_failure. Cancel, pause and a spent wall budget always win over the retry and over the
+// escalation; a non-transient classification is never retried.
+describe("CodexExecutor: transient provider retry (issue #2099)", () => {
+  /** A failed `turn/completed` carrying a terminal `turn.error.codexErrorInfo`. */
+  function turnCompletedWithError(codexErrorInfo: unknown, threadId = "th-1", turnId = "tn-1"): CodexNotification {
+    return {
+      kind: "turn_completed",
+      method: "turn/completed",
+      threadId,
+      turnId,
+      status: "failed",
+      params: { threadId, turn: { id: turnId, status: "failed", error: { codexErrorInfo } } },
+    };
+  }
+
+  /** The first `failures` turns end failed with `info`; every later turn signals done and completes.
+   *  `beforeFailure(n)` runs on the n-th failing turn right before its terminal is delivered. */
+  function failingThenDone(failures: number, info: unknown, beforeFailure?: (n: number) => void): Responder {
+    return (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) c.transport.push(threadStarted());
+        if (c.turnStartCount <= failures) {
+          beforeFailure?.(c.turnStartCount);
+          c.transport.push(turnCompletedWithError(info));
+        } else c.transport.push(signalDone()).push(turnCompleted("completed"));
+        return { turn: { id: "tn-1" } };
+      }
+      return {};
+    };
+  }
+
+  const errorResults = (emitted: EmittedMessage[]): EmittedMessage[] =>
+    emitted.filter((m) => m.kind === "error" && rec(m.payload).event === "result");
+  const retryNotices = (emitted: EmittedMessage[]): string[] =>
+    emitted
+      .filter((m) => m.kind === "status" && /transient error/.test(String(rec(m.payload).text)))
+      .map((m) => String(rec(m.payload).text));
+
+  function tinyBackoff(rig: Rig, extra: Partial<CodexExecutorDeps> = {}): void {
+    rig.deps = { ...rig.deps, transientBackoffBaseMs: 1, ...extra };
+  }
+
+  it("(a) serverOverloaded once then success: the run completes in the SAME thread with one retry notice", async () => {
+    const rig = makeRig({ responder: failingThenDone(1, "serverOverloaded") });
+    tinyBackoff(rig);
+    const { ctx, emitted } = makeCtx();
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient then success");
+    assert.equal(result.branch, "agent/issue-42", "the run completed");
+    assert.equal(rig.transport.turnStartCount, 2);
+    assert.deepEqual(retryNotices(emitted), ["the provider returned a transient error (serverOverloaded); retrying (1/2)…"]);
+    const threadIds = rig.transport.requests.filter((r) => r.method === "turn/start").map((r) => rec(r.params).threadId);
+    assert.equal(threadIds.length, 2);
+    assert.equal(threadIds[1], threadIds[0], "the retry runs in the same thread");
+    assert.equal(errorResults(emitted).length, 1, "only the failed attempt published an error result");
+  });
+
+  it("(b) every attempt serverOverloaded: TransientRecoveryError after exactly 1+N turn starts", async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    tinyBackoff(rig);
+    const { ctx, emitted } = makeCtx();
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient exhausted"),
+      (e: Error) => {
+        assert.ok(e instanceof TransientRecoveryError, `expected TransientRecoveryError, got ${e.name}: ${e.message}`);
+        assert.match(e.message, /persisted after bounded in-process retries: codex turn failed: failed \(serverOverloaded\)/);
+        return true;
+      },
+    );
+    assert.equal(rig.transport.turnStartCount, 3, "1 + the default 2 retries");
+    assert.equal(errorResults(emitted).length, 3);
+    assert.equal(retryNotices(emitted).length, 2);
+  });
+
+  it("(b2) transientRetryMax bounds the retries", async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    tinyBackoff(rig, { transientRetryMax: 0 });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "no retries"),
+      TransientRecoveryError,
+    );
+    assert.equal(rig.transport.turnStartCount, 1);
+  });
+
+  for (const [name, info] of [
+    ["a tagged transport failure with a non-retryable http status", { responseStreamConnectionFailed: { httpStatusCode: 401 } }],
+    ["unauthorized", "unauthorized"],
+    ["contextWindowExceeded", "contextWindowExceeded"],
+  ] as const) {
+    it(`(c) ${name} is never retried and never parks`, async () => {
+      const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
+      tinyBackoff(rig);
+      await assert.rejects(
+        withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "non-transient"),
+        (e: Error) => {
+          assert.ok(!(e instanceof TransientRecoveryError));
+          assert.match(e.message, /^codex turn failed: failed \(/);
+          return true;
+        },
+      );
+      assert.equal(rig.transport.turnStartCount, 1);
+    });
+  }
+
+  it("(d) a cancel during the backoff ends the wait at once: run cancelled, no further turn start", async () => {
+    const controller = new AbortController();
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    tinyBackoff(rig, { transientBackoffBaseMs: 4000, wallMs: 60_000 });
+    const { ctx, emitted } = makeCtx({ signal: controller.signal });
+    const started = Date.now();
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => retryNotices(emitted).length === 1, "the retry notice (backoff begun)");
+    controller.abort();
+    await assert.rejects(withTimeout(running, 3000, "cancel in backoff"), (e: Error) => {
+      assert.equal(e.message, "run cancelled");
+      assert.ok(!(e instanceof TransientRecoveryError));
+      return true;
+    });
+    assert.ok(Date.now() - started < 3000, "the abort ended the 4s backoff early");
+    assert.equal(rig.transport.turnStartCount, 1, "no provider turn started after the cancel");
+  });
+
+  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    // The backoff (1s x attempt) is capped at the remaining wall and debited from it.
+    tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "wall in backoff"),
+      (e: Error) => {
+        assert.ok(!(e instanceof TransientRecoveryError));
+        assert.match(e.message, /codex run wall-clock timeout/);
+        return true;
+      },
+    );
+    assert.equal(rig.transport.turnStartCount, 1, "no provider turn started with the budget spent");
+
+    const parkRig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    tinyBackoff(parkRig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
+    let wallParks = 0;
+    const { ctx } = makeCtx({ parkForWall: async () => { wallParks++; return "parked"; } });
+    const result = await withTimeout(makeExecutor(parkRig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "wall park in backoff");
+    assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" });
+    assert.equal(wallParks, 1);
+    assert.equal(parkRig.transport.turnStartCount, 1);
+  });
+
+  // The remaining tests drive the interruption into the EXHAUSTION gate: the transient terminal
+  // arrives first and the interruption becomes true only after the live turn can no longer be
+  // tripped (its finally), so the in-turn trip path never sees it. Removing the gate turns each into
+  // a TransientRecoveryError.
+  it("(e) the final attempt fails with the wall budget already spent by the turn's debit: wall path, not TransientRecoveryError", async () => {
+    const realNow = Date.now.bind(Date);
+    let skewMs = 0;
+    mock.method(Date, "now", () => realNow() + skewMs);
+    try {
+      for (const wired of [false, true]) {
+        skewMs = 0;
+        const rig = makeRig({
+          // The clock jumps past the 1s budget as the final failed terminal is delivered, before the
+          // 1s wall timer can fire: only the turn's finally debit sees the spent budget.
+          responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) skewMs = 5000; }),
+        });
+        tinyBackoff(rig, { transientRetryMax: 1, wallMs: 1000, idleMs: 5000 });
+        let wallParks = 0;
+        const { ctx } = makeCtx(wired ? { parkForWall: async () => { wallParks++; return "parked"; } } : {});
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        if (wired) {
+          const result = await withTimeout(running, 3000, "spent wall at exhaustion (wired)");
+          assert.deepStrictEqual(result.walled, { reason: "codex run wall-clock timeout" });
+          assert.equal(wallParks, 1);
+        } else {
+          await assert.rejects(withTimeout(running, 3000, "spent wall at exhaustion"), (e: Error) => {
+            assert.ok(!(e instanceof TransientRecoveryError), `got ${e.name}: ${e.message}`);
+            assert.match(e.message, /codex run wall-clock timeout/);
+            return true;
+          });
+        }
+        assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
+      }
+    } finally {
+      mock.restoreAll();
+    }
+  });
+
+  it("(f) a pause-now pending at exhaustion parks for the pause, not TransientRecoveryError", async () => {
+    const controller = new AbortController();
+    let onPause: (() => void) | undefined;
+    let armed = false;
+    let fired = false;
+    // The pause-now interrupt lands as the final turn is torn down: the live turn's trip is already
+    // spent, so only the exhaustion gate can see the new generation.
+    const origRemove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.removeEventListener = ((...args: Parameters<AbortSignal["removeEventListener"]>) => {
+      origRemove(...args);
+      if (armed && !fired) {
+        fired = true;
+        onPause?.();
+      }
+    }) as AbortSignal["removeEventListener"];
+    const rig = makeRig({ responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) armed = true; }) });
+    tinyBackoff(rig, { transientRetryMax: 1 });
+    const parks: { completedCount: number }[] = [];
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      // The owner pause is requested only when the interrupt fires; a mode pending earlier would
+      // park at the implement loop top, before any turn.
+      pauseModeRequested: () => (fired ? "now" : null),
+      onPauseNow: (cb) => { onPause = cb; },
+      parkForPause: async (at) => { parks.push(at); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "pause at exhaustion");
+    assert.ok(result.pausedAt, "the run parked for the pause");
+    assert.equal(fired, true);
+    assert.equal(parks.length, 1);
+    assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
+  });
+
+  it("(g) a cancel at exhaustion ends the run cancelled, not TransientRecoveryError", async () => {
+    let cancelled = false;
+    // The sticky cancel flips as the final failed terminal is delivered; no signal abort.
+    const rig = makeRig({ responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) cancelled = true; }) });
+    tinyBackoff(rig, { transientRetryMax: 1 });
+    const { ctx } = makeCtx({ cancelRequested: () => cancelled });
+    await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "cancel at exhaustion"), (e: Error) => {
+      assert.equal(e.message, "run cancelled");
+      assert.ok(!(e instanceof TransientRecoveryError));
+      return true;
+    });
+    assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
+  });
+
+  it("(g2) a cancel after a consumed pause (stale shared signal) is seen only by the sticky cancelRequested at the gate", async () => {
+    const controller = new AbortController();
+    let cancelled = false;
+    let mode: "now" | null = null;
+    let onPause: (() => void) | undefined;
+    // Turn 1 goes quiet and is dropped by a `now` pause whose park is declined: the shared signal is
+    // spent for good and the re-driven turn 2 is stale-suppressed. Turn 2 then fails transient with
+    // retries disabled, and the cancel (which cannot abort the spent signal) is only sticky.
+    const rig = makeRig({
+      responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) c.transport.push(threadStarted());
+          else {
+            cancelled = true;
+            c.transport.push(turnCompletedWithError("serverOverloaded"));
+          }
+          return { turn: { id: "tn-1" } };
+        }
+        return {};
+      },
+    });
+    tinyBackoff(rig, { transientRetryMax: 0 });
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => mode,
+      cancelRequested: () => cancelled,
+      onPauseNow: (cb) => { onPause = cb; },
+      parkForPause: async () => false,
+    });
+    const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.transport.turnStartCount >= 1, "turn 1 started");
+    mode = "now";
+    controller.abort(new PauseNowSignal());
+    onPause?.();
+    await assert.rejects(withTimeout(running, 3000, "cancel after consumed pause"), (e: Error) => {
+      assert.equal(e.message, "run cancelled");
+      assert.ok(!(e instanceof TransientRecoveryError));
+      return true;
+    });
+    assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
   });
 });

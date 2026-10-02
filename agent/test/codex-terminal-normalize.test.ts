@@ -3,12 +3,14 @@ import assert from "node:assert/strict";
 
 import {
   formatCodexClassification,
+  isCodexTransientClassification,
   normalizeCodexErrorInfo,
   normalizeCodexStatus,
   normalizeCodexTerminalErrors,
   normalizeCodexUsage,
   pickCodexClassification,
 } from "../src/codex/terminal-normalize.js";
+import { isTransientStatus } from "../src/client.js";
 
 describe("Codex 0.159.3 error tags", () => {
   it("recognizes new scalar tags while rejecting attacker-shaped objects", () => {
@@ -316,5 +318,36 @@ describe("pickCodexClassification", () => {
 
   it("returns the terminal when the notification is undefined", () => {
     assert.deepEqual(pickCodexClassification(undefined, terminalRecognized), terminalRecognized);
+  });
+});
+
+// Issue #2099: the pure predicate deciding whether a classified terminal failure is a transient
+// provider fault worth a bounded same-thread retry. It reads only the closed classification.
+describe("isCodexTransientClassification", () => {
+  const transient = (raw: unknown): boolean => isCodexTransientClassification(normalizeCodexErrorInfo(raw), isTransientStatus);
+
+  it("is true for transport scalars and for tagged transport failures with no or a retryable status", () => {
+    for (const raw of [
+      "serverOverloaded",
+      "internalServerError",
+      "flexUnavailable",
+      { responseStreamConnectionFailed: { httpStatusCode: 503 } },
+      { httpConnectionFailed: { httpStatusCode: 429 } },
+      { responseStreamDisconnected: { httpStatusCode: 408 } },
+      { responseTooManyFailedAttempts: {} },
+    ]) assert.equal(transient(raw), true, JSON.stringify(raw));
+  });
+
+  it("is false for a tagged transport failure with a non-retryable status", () => {
+    for (const status of [400, 401, 403]) {
+      assert.equal(transient({ responseStreamConnectionFailed: { httpStatusCode: status } }), false, String(status));
+    }
+  });
+
+  it("is false for every non-transport category and for an absent classification", () => {
+    for (const raw of ["unauthorized", "usageLimitExceeded", "rateLimitExceeded", "contextWindowExceeded", "other", "totallyMadeUp"]) {
+      assert.equal(transient(raw), false, raw);
+    }
+    assert.equal(isCodexTransientClassification(undefined, isTransientStatus), false);
   });
 });

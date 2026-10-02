@@ -22,6 +22,12 @@
 //
 // SCOPE (R4): this does NOT clone SdkExecutor's Claude-lane extras (empty-turn retry,
 // plan/intent summary hooks, health/interleave sentinels, interactive OWNER park).
+// Issue #2099 is the one retry that IS in scope: a turn that fails with a transient PROVIDER
+// classification (CodexTurnFailedError: category transport, see isCodexTransientClassification)
+// is retried a bounded number of times in the same thread, then escalates as
+// TransientRecoveryError so the runner parks the run in recovery_wait instead of failing it.
+// Codex itself already retries internally (config.ts, the production request/stream retry
+// defaults), so this outer retry runs after Codex gave up; its main effect is the park.
 // Issue #1764: the owner pause of PRD #1190 is honoured at the implement loop's TOP (the
 // server-decided boundary: `served.pauseRequested`, or a seeded pause mode at the first
 // boundary) through ctx.parkForPause, as SdkExecutor does. An owner `now` pause that drops a
@@ -55,7 +61,9 @@ import { constants as FS } from "node:fs";
 import type { Readable, Writable } from "node:stream";
 
 import type { Logger } from "../log.js";
-import { codexDeferralReason, type WorkerClient } from "../client.js";
+import { codexDeferralReason, isTransientStatus, type WorkerClient } from "../client.js";
+import { TransientRecoveryError } from "../sdk-executor.js";
+import { CodexTurnFailedError, formatCodexClassification, isCodexTransientClassification } from "./terminal-normalize.js";
 import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
@@ -292,6 +300,17 @@ const REASON_CANCEL = "run cancelled";
 // and a wall park answered `cancelled` ends the run as a cancel. Secret-free static string,
 // DISTINCT from REASON_CANCEL/REASON_WALL.
 const REASON_PAUSE = "codex run paused";
+
+// Issue #2099: bounded same-thread retries of a transient provider failure, mirroring the Claude
+// lane's EMPTY_TURN_* (sdk-executor.ts). The long wait is the server-owned recovery_wait park.
+const TRANSIENT_RETRY_MAX = 2;
+const TRANSIENT_BACKOFF_BASE_MS = 2_000;
+const TRANSIENT_BACKOFF_SLICE_MS = 250;
+
+/** The trip reason an aborted run signal maps to: a PauseNowSignal is a pause, anything else a cancel. */
+function reasonForSignal(signal: AbortSignal | undefined): string {
+  return signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
+}
 
 /** Issue #1764: one handling path's snapshot of the pause-now state, taken before its first await. */
 interface PauseNowToken {
@@ -1442,6 +1461,12 @@ export interface CodexExecutorDeps {
   readonly envProbeTimeoutMs?: number;
   /** Issue #1600: the refused-park race allowance; defaults to REDRIVE_RACE_ALLOWANCE_MS. */
   readonly redriveAllowanceMs?: number;
+  /** Issue #2099: in-process same-thread retries of a transient provider failure before the
+   *  run parks via TransientRecoveryError; defaults to TRANSIENT_RETRY_MAX. 0 parks at once. */
+  readonly transientRetryMax?: number;
+  /** Issue #2099: base backoff between those retries, multiplied by the attempt number;
+   *  defaults to TRANSIENT_BACKOFF_BASE_MS. Tests inject a tiny value. */
+  readonly transientBackoffBaseMs?: number;
   readonly boundaryDeadlineMs?: number;
   readonly childTurnDeadlineMs?: number;
   /** Base TMPDIR exposed to an injected high-level command seam. The production
@@ -3013,29 +3038,15 @@ export class CodexExecutor implements Executor {
     // pause) trips REASON_PAUSE, not REASON_CANCEL, so the run-lane can route a `wall` pause to the
     // capture-first wall park instead of cancelling the run at its time limit (D2). Every other abort
     // (a steering cancel, a shutdown) has the default reason and stays REASON_CANCEL, unchanged.
-    const reasonFor = (signal: AbortSignal | undefined): string =>
-      signal?.reason instanceof PauseNowSignal ? REASON_PAUSE : REASON_CANCEL;
-    const onCancel = (): void => trip(reasonFor(ctx.signal));
-    if (ctx.signal) {
-      if (ctx.signal.aborted) {
-        // PRD #1497 M2 (Fix) / issue #1764: ctx.signal is a run-lifetime, once-only controller — the
-        // first `now`/`wall` PauseNowSignal aborts it PERMANENTLY. Each driveCodexTurn gets a fresh
-        // `turnAbort`, but this synchronous re-read of the already-fired shared signal would re-trip
-        // every restart after the pause was handled without parking (a refused wall park, a declined
-        // owner park, a withdrawn pause). Suppress the stale PauseNowSignal when its mode is gone
-        // (null), or when a PauseNowSignal abort was already handled and the mode is not `wall` (the
-        // sticky `now` a declined park leaves behind). A pending `wall` still re-trips, a genuine
-        // cancel/shutdown (reason is not a PauseNowSignal) always trips, and a NEWER owner/wall
-        // pause arrives as a fresh generation below, never through this spent signal.
-        const mode = ctx.pauseModeRequested?.();
-        const stalePause = ctx.signal.reason instanceof PauseNowSignal &&
-          (mode == null || (pauseNow.sharedAbortHandled && mode !== "wall"));
-        if (!stalePause) trip(reasonFor(ctx.signal));
-      } else ctx.signal.addEventListener("abort", onCancel, { once: true });
-    }
-    // Issue #1764: a `now`/`wall` interrupt no handling path has consumed yet (one that landed
-    // between turns, or during a park's await) drops this turn at once; the catch routes it by mode.
-    if (pauseNow.pending) trip(REASON_PAUSE);
+    const onCancel = (): void => trip(reasonForSignal(ctx.signal));
+    // Issue #2099: the prelude's three checks live in pendingInterruption (shared with the transient
+    // retry gate); evaluated first, they have no side effects.
+    const pendingAtStart = this.pendingInterruption(ctx, pauseNow, wall);
+    // Only an unfired signal needs a listener; an already-aborted one is read by pendingInterruption.
+    if (ctx.signal && !ctx.signal.aborted) ctx.signal.addEventListener("abort", onCancel, { once: true });
+    // A pending interruption (spent signal, an unconsumed `now`/`wall` generation, or a spent wall
+    // budget) drops this turn at once; the catch routes it by mode.
+    if (pendingAtStart !== undefined) trip(pendingAtStart);
     // Issue #1764: every later interrupt trips THIS turn (first-wins), until the finally uninstalls it.
     pauseNow.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
@@ -3171,6 +3182,60 @@ export class CodexExecutor implements Executor {
     }
   }
 
+  /**
+   * The reason a turn about to start (or a transient retry about to run) must trip on, or undefined.
+   * Checked in the prelude's order: the run signal, an unconsumed pause-now generation, a spent wall.
+   *
+   * PRD #1497 M2 (Fix) / issue #1764: ctx.signal is a run-lifetime, once-only controller: the
+   * first `now`/`wall` PauseNowSignal aborts it PERMANENTLY. Each driveCodexTurn gets a fresh
+   * `turnAbort`, but a read of the already-fired shared signal would re-trip every restart after
+   * the pause was handled without parking (a refused wall park, a declined owner park, a withdrawn
+   * pause). Suppress the stale PauseNowSignal when its mode is gone (null), or when a PauseNowSignal
+   * abort was already handled and the mode is not `wall` (the sticky `now` a declined park leaves
+   * behind). A pending `wall` still trips, a genuine cancel/shutdown (reason is not a
+   * PauseNowSignal) always trips, and a NEWER owner/wall pause arrives as a fresh generation, never
+   * through this spent signal.
+   */
+  private pendingInterruption(ctx: RunContext, pauseNow: CodexPauseNowState, wall: RunWall): string | undefined {
+    if (ctx.signal?.aborted) {
+      const mode = ctx.pauseModeRequested?.();
+      const stalePause = ctx.signal.reason instanceof PauseNowSignal &&
+        (mode == null || (pauseNow.sharedAbortHandled && mode !== "wall"));
+      if (!stalePause) return reasonForSignal(ctx.signal);
+    }
+    if (pauseNow.pending) return REASON_PAUSE;
+    if (wall.remainingMs <= 0) return REASON_WALL;
+    return undefined;
+  }
+
+  /**
+   * Issue #2099: the between-retries backoff. Sleeps `totalMs` (capped at the remaining wall) in
+   * short slices, DEBITING the elapsed time from the run-wide wall (the wall is disarmed between
+   * turns, so this is the only place the wait is charged), and ends early on a ctx.signal abort that
+   * fires DURING the wait, a sticky cancel, a pending pause-now generation, or a spent wall. A
+   * signal already aborted at entry (a stale pause the gate let through) does not end the wait.
+   * The caller re-runs its interruption gate afterwards.
+   */
+  private async transientBackoff(ctx: RunContext, pauseNow: CodexPauseNowState, wall: RunWall, totalMs: number): Promise<void> {
+    let aborted = false;
+    const onAbort = (): void => { aborted = true; };
+    const watch = ctx.signal !== undefined && !ctx.signal.aborted;
+    if (watch) ctx.signal!.addEventListener("abort", onAbort, { once: true });
+    try {
+      let remaining = Math.min(totalMs, Math.max(0, wall.remainingMs));
+      while (remaining > 0) {
+        if (aborted || ctx.cancelRequested?.() || pauseNow.pending || wall.remainingMs <= 0) return;
+        const slice = Math.min(TRANSIENT_BACKOFF_SLICE_MS, remaining);
+        const before = Date.now();
+        await new Promise<void>((resolve) => setTimeout(resolve, slice));
+        wall.remainingMs -= Date.now() - before;
+        remaining -= slice;
+      }
+    } finally {
+      if (watch) ctx.signal!.removeEventListener("abort", onAbort);
+    }
+  }
+
   private tripError(reason: string, pauseToken: PauseNowToken): Error {
     return new CodexTurnTripError(reason, pauseToken);
   }
@@ -3217,6 +3282,8 @@ export class CodexExecutor implements Executor {
     | { kind: "held"; reason: string }
     | { kind: "paused"; at: { completedCount: number; total?: number } }
   > {
+    // Issue #2099: transient-provider retries spent by THIS call; a wall-park re-drive does not reset it.
+    let transientAttempts = 0;
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
@@ -3229,7 +3296,36 @@ export class CodexExecutor implements Executor {
         // otherwise that caller can gate or complete the run and silently drop the cancel.
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
         return { kind: "turn", result };
-      } catch (err) {
+      } catch (caught) {
+        let err: unknown = caught;
+        // Issue #2099: a transient PROVIDER failure (closed classification, never message text) is
+        // retried in the same thread, a bounded number of times, then escalates as
+        // TransientRecoveryError (the runner's recovery_wait park). An interruption (cancel, pause,
+        // spent wall) is checked before EVERY retry decision, before exhaustion and after each
+        // backoff: it replaces the error and takes the existing arms below, never a provider turn
+        // started only to notice it and never TransientRecoveryError.
+        if (caught instanceof CodexTurnFailedError && isCodexTransientClassification(caught.classification, isTransientStatus)) {
+          const interrupted = (): Error | undefined => {
+            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+            const reason = this.pendingInterruption(ctx, pauseNow, wall);
+            return reason === undefined ? undefined : new CodexTurnTripError(reason, pauseNow.capture());
+          };
+          const max = this.deps.transientRetryMax ?? TRANSIENT_RETRY_MAX;
+          const stop = interrupted();
+          if (stop) err = stop;
+          else if (transientAttempts < max) {
+            transientAttempts++;
+            ctx.emit({ kind: "status", agent: "worker", payload: {
+              text: `the provider returned a transient error (${formatCodexClassification(caught.classification!)}); retrying (${transientAttempts}/${max})…`,
+            } });
+            await this.transientBackoff(ctx, pauseNow, wall, (this.deps.transientBackoffBaseMs ?? TRANSIENT_BACKOFF_BASE_MS) * transientAttempts);
+            const stopAfter = interrupted();
+            if (!stopAfter) continue;
+            err = stopAfter;
+          } else {
+            throw new TransientRecoveryError(`provider transient error persisted after bounded in-process retries: ${caught.message}`);
+          }
+        }
         const msg = err instanceof Error ? err.message : "";
         // Issue #1764: the interrupt generation this path handles, captured before any await; a
         // newer `now`/`wall` that lands during an await below stays pending for the re-drive.

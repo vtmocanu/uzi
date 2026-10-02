@@ -18,6 +18,7 @@ import {
   type CallbackRuntimeId,
 } from "../src/codex/broker.js";
 import { renderCodexRun } from "../src/codex/render.js";
+import { CodexTurnFailedError } from "../src/codex/terminal-normalize.js";
 import { evidencesModelProcessing, type HarnessEvent, type HarnessItem, type HarnessTerminal, type RunTurnRequest } from "../src/harness.js";
 import type { CodexNotification, CodexTransport, CodexUsageBreakdown } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
@@ -1584,6 +1585,27 @@ describe("CodexHarness: provider error classification folds into the terminal (P
     const thrown = terminal.failure!.materialize();
     assert.match(thrown.failure.message, /codex turn failed: failed \(usageLimitExceeded\)/);
     assert.equal(thrown.failure.category, "rate_limit");
+  });
+
+  it("issue #2099: the materialized failure is a CodexTurnFailedError carrying the closed classification", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompletedWithError("serverOverloaded")).end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    const thrown = terminal.failure!.materialize();
+    assert.ok(thrown.original instanceof CodexTurnFailedError);
+    assert.equal(thrown.original.message, "codex turn failed: failed (serverOverloaded)");
+    assert.deepEqual(thrown.original.classification, { classification: "serverOverloaded", category: "transport" });
+  });
+
+  it("issue #2099: a failure with no classification carries none", async () => {
+    const { harness, transport } = makeHarness();
+    transport.push(threadStarted()).push(turnCompleted("failed")).end();
+
+    const terminal = terminalOf(await collect(harness.startTurn(makeRequest()).events));
+    const thrown = terminal.failure!.materialize();
+    assert.ok(thrown.original instanceof CodexTurnFailedError);
+    assert.equal(thrown.original.classification, undefined);
   });
 
   it("PRECEDENCE: a recognized terminal turn.error WINS over an UNRECOGNIZED notification classification", async () => {

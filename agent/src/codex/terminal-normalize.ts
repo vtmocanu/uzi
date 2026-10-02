@@ -24,6 +24,31 @@ export interface CodexErrorClassification {
   httpStatus?: number;
 }
 
+/**
+ * Issue #2099: the Error a failed Codex terminal materializes, carrying the CLOSED
+ * classification (when there is one) so the executor can decide on a bounded same-thread
+ * retry from the structured category, never from message text. The message is unchanged.
+ */
+export class CodexTurnFailedError extends Error {
+  constructor(message: string, readonly classification?: CodexErrorClassification) {
+    super(message);
+    this.name = "CodexTurnFailedError";
+  }
+}
+
+/**
+ * Issue #2099: whether a classified terminal failure is a TRANSIENT provider fault worth a
+ * bounded same-thread retry: category `transport` with either no HTTP status or one the
+ * caller's predicate deems retryable. Pure; reads only the closed classification, never any
+ * message text.
+ */
+export function isCodexTransientClassification(
+  c: CodexErrorClassification | undefined,
+  isRetryableStatus: (status: number) => boolean,
+): boolean {
+  return c !== undefined && c.category === "transport" && (c.httpStatus === undefined || isRetryableStatus(c.httpStatus));
+}
+
 /** The CLOSED set of provider statuses we are willing to echo as a display `subtype`.
  *  Any status outside it collapses to the fixed token {@link UNKNOWN_STATUS}, so an
  *  arbitrary (or oversize/attacker-shaped) provider string never reaches a run message. */
