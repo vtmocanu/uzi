@@ -1936,9 +1936,11 @@ export class CodexExecutor implements Executor {
     let reapedSinceLastPersist = false;
     // Issue #1764: the one "persist before a sink that may reap" step. Skipped when the flag is
     // already set, because the home may be gone. The store then holds the generation persisted
-    // before the first such sink. After a refused sink that did NOT reap, a re-drive's newer
-    // session state is captured only once a turn completes (which clears the flag); otherwise the
-    // store keeps that pre-park generation.
+    // before the first such sink. A refused or declined sink cannot be told apart from one that
+    // reaped, so the flag stays set until a fresh epoch is installed: an in-turn refused wall park
+    // recreates it at once (recreateEpochAfterReap), a loop-top refused park or declined hold
+    // recreates it at the implement loop top (epochNeedsRecreate). The fresh epoch's newer session
+    // state is captured by its own persists; until then the store keeps the pre-sink generation.
     const beforeReapingSink = async (): Promise<void> => {
       if (reapedSinceLastPersist || !epoch) return;
       await epoch.persistSession();
