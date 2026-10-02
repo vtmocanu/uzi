@@ -294,11 +294,13 @@ type CreateOAuthAuthorizeRequestParams struct {
 // PRD #1910 M2: the consent half of the OAuth authorization server (oauth_grants and
 // oauth_authorize_requests, migration 00286). Lock order everywhere (D8): the user's grant-creation
 // advisory lock first, on the two paths that create or sweep a user's grants (approve and Revoke
-// all; LockOAuthUserGrants), then the grant row (one user's grants in ascending id order), then that
+// all; LockOAuthUserGrants), then, on approve and deny only, the product row FOR SHARE
+// (GetProductForShare, the registration re-check), then the grant row (one user's grants in ascending id order), then that
 // grant's product_tokens rows, then its oauth_authorize_requests rows. The approve transaction
 // claims the request it decides LAST (after the grant lock, the narrowing revoke and the superseding
 // of the grant's earlier codes), so it never holds a request row while waiting for a grant. Only the
-// TTL sweep and deny lock request rows without a grant lock; neither ever waits for a grant.
+// TTL sweep and deny lock request rows without a grant lock (deny after the product share lock);
+// neither ever waits for a grant.
 // Store the pending request GET /api/oauth/authorize validated. The caller has already capped and
 // validated every field (oauthsrv), so nothing here is attacker-sized. binding_hash is the sha256
 // of the browser-binding cookie nonce; the plaintext nonce is never stored.
@@ -515,8 +517,9 @@ SELECT id, name, description, enabled, deleted_at, created_by, created_at, updat
 // enabled, scopes) under this lock, so an admin registration change either commits before the
 // read and is seen, or waits until the transaction ends. Must run on a transaction-bound
 // Queries; on a bare pool the lock is released as soon as the statement ends. FOR SHARE
-// conflicts with the admin product writers (SetProductOAuthClient, UpdateProduct,
-// SoftDeleteProduct, RotateProductClientSecret, GetProductForUpdate) but not with the FOR KEY
+// conflicts with every admin product writer (e.g. SetProductOAuthClient, UpdateProduct,
+// SoftDeleteProduct, RotateProductClientSecret, GetProductForUpdate, the product_skills.sql
+// UPDATEs) but not with the FOR KEY
 // SHARE foreign-key checks of grant, token and request inserts. Position in the D8 lock order:
 // after the per-user lock, before the grants.
 func (q *Queries) GetProductForShare(ctx context.Context, id uuid.UUID) (Product, error) {

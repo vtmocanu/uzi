@@ -128,7 +128,10 @@ access token and a refresh token, until the connection is revoked.
    redirect) or waits until the approve or deny commits. The admin product
    writers take only the product row and then plain reads, and no grant, token
    or request lock waits on a conflicting product lock, so the share lock adds
-   no cycle. The full order is: per-user lock, product row (`FOR SHARE`, approve
+   no cycle. Accepted limit: Postgres lets a new share locker pass a
+   waiting writer, so a steady stream of approves and denies on one product can
+   delay an admin registration change; each is a short transaction behind a
+   capped pending request, so the delay stays short. The full order is: per-user lock, product row (`FOR SHARE`, approve
    and deny only), grants ascending, tokens, requests. What it guarantees: an
    approve that took the lock first commits before Revoke all reads the grants,
    so the revoke covers its grant and code; an approve that waits behind Revoke

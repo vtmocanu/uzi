@@ -373,8 +373,9 @@ func (h *Handler) redeemOAuthCode(ctx context.Context, clientID uuid.UUID, form 
 		return nil, errOAuthInvalidGrant, nil
 	}
 
-	// The product and user may have changed since the code was issued (approve checks them outside
-	// its own transaction): the product must still be an enabled client registering this URI and
+	// The product and user may have changed since the code was issued (an admin change waiting on
+	// approve's product share lock lands after the code exists, and approve checks the user outside
+	// its transaction): the product must still be an enabled client registering this URI and
 	// allowing the grant's scopes, and the user must still be active.
 	product, err := q.GetProduct(ctx, row.ProductID)
 	if errors.Is(err, pgx.ErrNoRows) {

@@ -7,7 +7,6 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
-	"fmt"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -452,6 +451,9 @@ func (h *Handler) OAuthGetRequest(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// errOAuthDenyProductLoad marks a product read failure OAuthDeny has already logged.
+var errOAuthDenyProductLoad = errors.New("oauth deny: load product")
+
 // OAuthDeny is POST /api/oauth/requests/{id}/deny: pending -> denied in one conditional UPDATE,
 // answering the redirect carrying error=access_denied, the client's state and iss. A request that
 // is no longer pending (a second deny, a deny after approve) is a 409, never a false success. A
@@ -478,7 +480,10 @@ func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 	err := h.inTx(ctx, func(q *store.Queries) error {
 		locked, err := q.GetProductForShare(ctx, row.ProductID)
 		if err != nil {
-			return fmt.Errorf("load product: %w", err)
+			// Logged here under its own message; the sentinel keeps a product ErrNoRows from
+			// reading as "request is no longer pending" below.
+			slog.Error("oauth deny: load product", "error", err)
+			return errOAuthDenyProductLoad
 		}
 		// The same validity re-check approve makes: a redirect URI the product no longer registers
 		// (or a product that stopped being an enabled client) must not be redirected to, even with
@@ -492,6 +497,10 @@ func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusConflict, "request is no longer pending")
+		return
+	}
+	if errors.Is(err, errOAuthDenyProductLoad) {
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
 	if err != nil {
