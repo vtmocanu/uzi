@@ -72,7 +72,8 @@ export function AdminProducts() {
   const [productFilter, setProductFilter] = useState("");
   const filtered = ownerFilter !== "" || productFilter !== "";
   // Owners come from the user list, not from token rows, so an owner with no token in the
-  // current (possibly truncated) inventory is still selectable. A failed load only empties the select.
+  // current (possibly truncated) inventory is still selectable. A failed load empties the select and
+  // shows its error beside the filters.
   const { data: usersData, error: usersError } = useAsyncData<User[]>(async () => (await api.listUsers()).users, [], {
     fallback: "Failed to load users",
   });
@@ -104,7 +105,8 @@ export function AdminProducts() {
   // When the server cut the inventory, how many tokens it did list (the notices name
   // this number rather than a hard-coded cap that could drift from the server's).
   const truncatedAt = shown?.truncated ? shown.tokens.length : null;
-  // The first load failed: show only the error, never a "No products registered"
+  // No result for the current filters (the first load, or a filter change's refetch,
+  // failed): show only the error, never a "No products registered"
   // empty state the page cannot know to be true.
   const loadFailed = shown === null && loadError !== "";
 

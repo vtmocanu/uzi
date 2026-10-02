@@ -633,7 +633,9 @@ describe("AdminProducts owner and product filters (issue #1935)", () => {
   });
 
   it("does not show the previous filter's rows when the refetch fails", async () => {
-    await pickFilters();
+    await pickFilters([aToken({ id: "old-1", product_id: "prod-b", name: "ancient", user_id: "u-dan" })]);
+    // The previous filter's result has a revocable row, so the assertions below can fail.
+    expect(await within(await productCard("Metrics export")).findByRole("button", { name: "Revoke ancient" })).toBeTruthy();
     mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "boom"));
     fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
     expect(await screen.findByText("boom")).toBeTruthy();
