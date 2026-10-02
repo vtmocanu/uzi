@@ -186,7 +186,11 @@ last resort:
    largest caches and parks it with a **counted** `data_volume_full` park. A Claude run that
    is not running (cloning, at its plan gate, in a revision turn, waiting
    on a question or follow-up, finalizing) is not stopped: its rebuildable
-   caches are dropped in place instead and it keeps its gate.
+   caches are dropped in place instead and it keeps its gate. A run in a
+   revision planning turn or in finalize is likewise not stopped, so its
+   Go caches can disappear under a running tool command (the tool rebuilds
+   them), and a question already posted to the feed stays visible if a
+   pending stop parks the run instead of entering that wait.
    See [`UZI_RUN_CACHE_CAP_ENABLED`/`UZI_DISK_HARD_STOP_ENABLED` and the
    rest of this group](configuration.md#worker-disk-safety-prd-1809) for the
    exact thresholds and how to tune or disable either layer.
