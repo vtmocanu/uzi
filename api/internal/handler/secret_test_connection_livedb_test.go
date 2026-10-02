@@ -190,3 +190,20 @@ func TestSecretConnectionReplacementSupersedesProbeLiveDB(t *testing.T) {
 		t.Fatalf("provider calls = %d, want 1", got)
 	}
 }
+
+// TestSecretConnectionSpentBudgetIsNotSupersededLiveDB pins the final re-read to
+// its own context. The provider call runs until the 12s probe budget expires; the
+// credential never changes, so the verdict must stay inconclusive/generic. With the
+// re-read on the expired probe context it failed and read as superseded.
+func TestSecretConnectionSpentBudgetIsNotSupersededLiveDB(t *testing.T) {
+	h, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	session := cliMintJWT(t, pool, owner)
+	id := seedTestConnection(t, h, pool, owner, "openai_api_key", "sk-"+"test-openai-"+uuid.NewString())
+	installTestTransport(h, func(r *http.Request) (*http.Response, error) {
+		<-r.Context().Done()
+		return nil, r.Context().Err()
+	})
+	requireTestResult(t, cookieReq(t, router, http.MethodPost, testConnectionPath("openai_api_key", id), session, ""),
+		http.StatusOK, "inconclusive", "generic")
+}
