@@ -726,6 +726,10 @@ var wantRouteMounts = []routeMount{
 	// spendable mint (M1 ships dark) → noLimiter, exactly like the anthropic create above.
 	{"POST", "/api/me/secrets/codex_auth", noLimiter},
 	{"POST", "/api/me/secrets/openai_api_key", noLimiter},
+	// Issue #1988: credential Test makes a provider call, but it rate-limits INSIDE
+	// TestMySecret (per credential and per owner, keyed explicitly; see
+	// secret_test_limits_test.go), not through a mounted per-user limiter → noLimiter.
+	{"POST", "/api/me/secrets/{kind}/{id}/test", noLimiter},
 	{"POST", "/api/me/slack/test-dm", limSlackDM},
 	{"POST", "/api/repos/{id}/ci-fix-runs", limForge},
 	// GitHub Projects v2 sync adopt + autonomous provision (issue #534, PRD #364

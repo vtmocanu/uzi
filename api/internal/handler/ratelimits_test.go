@@ -67,12 +67,13 @@ func scanSelfRateLimit(r store.ListRateLimitsForUserRow) func(dest ...any) error
 		// fake has to move in step with the query at all — a mismatch is a runtime
 		// interface-conversion panic, not a compile error.
 		*dest[3].(*bool) = r.AutoEligible
-		*dest[4].(*pgtype.Int2) = r.FiveHourPct
-		*dest[5].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[6].(*pgtype.Int2) = r.SevenDayPct
-		*dest[7].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[8].(*pgtype.Text) = r.Source
-		*dest[9].(*pgtype.Timestamptz) = r.SyncedAt
+		*dest[4].(*bool) = r.Rejected // issue #1988: rejected follows auto_eligible
+		*dest[5].(*pgtype.Int2) = r.FiveHourPct
+		*dest[6].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[7].(*pgtype.Int2) = r.SevenDayPct
+		*dest[8].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[9].(*pgtype.Text) = r.Source
+		*dest[10].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
@@ -86,12 +87,13 @@ func scanListRateLimit(r store.ListRateLimitsRow) func(dest ...any) error {
 		*dest[4].(*pgtype.Text) = r.Label
 		*dest[5].(*pgtype.Bool) = r.IsDefault
 		*dest[6].(*pgtype.Bool) = r.AutoEligible // PRD #111 M2; shifts the rest by one
-		*dest[7].(*pgtype.Int2) = r.FiveHourPct
-		*dest[8].(*pgtype.Timestamptz) = r.FiveHourResetsAt
-		*dest[9].(*pgtype.Int2) = r.SevenDayPct
-		*dest[10].(*pgtype.Timestamptz) = r.SevenDayResetsAt
-		*dest[11].(*pgtype.Text) = r.Source
-		*dest[12].(*pgtype.Timestamptz) = r.SyncedAt
+		*dest[7].(*bool) = r.Rejected            // issue #1988: rejected follows auto_eligible
+		*dest[8].(*pgtype.Int2) = r.FiveHourPct
+		*dest[9].(*pgtype.Timestamptz) = r.FiveHourResetsAt
+		*dest[10].(*pgtype.Int2) = r.SevenDayPct
+		*dest[11].(*pgtype.Timestamptz) = r.SevenDayResetsAt
+		*dest[12].(*pgtype.Text) = r.Source
+		*dest[13].(*pgtype.Timestamptz) = r.SyncedAt
 		return nil
 	}
 }
