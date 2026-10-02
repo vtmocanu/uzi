@@ -116,9 +116,10 @@ const (
 // was never checked, so the answer is 503 reason auth_unavailable, never a pass and never
 // a 401 that would tell a client to discard a good token. It is also logged at Warn with
 // the step and the error only, never any token material, so an outage is visible to
-// operators. A full store outage's 503 does not depend on the token. A partial fault
-// (the token lookup succeeds, the user lookup fails) can tell the token's holder that the
-// token passed the first lookup's checks; that is accepted because tokens carry 256 bits
+// operators. A full store outage gives every uzp_/uzc_ token the same 503 (other classes
+// never reach the store and stay 401). A partial fault (the token lookup succeeds, the
+// user lookup fails) can tell the token's holder that the token passed the first
+// lookup's checks; that is accepted because tokens carry 256 bits
 // of randomness and it is revealed only to the holder (PRD #1907 Decision Log, #1992).
 // The 503 never reaches next and never touches last_used.
 //

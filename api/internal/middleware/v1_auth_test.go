@@ -341,6 +341,10 @@ func TestRequireV1CallerLookupErrorUnavailable(t *testing.T) {
 			if !strings.Contains(rec.Body.String(), "auth_unavailable") {
 				t.Fatalf("body = %q, want reason auth_unavailable", rec.Body.String())
 			}
+			// No Retry-After: there is no honest estimate of an outage's length.
+			if got := rec.Header().Get("Retry-After"); got != "" {
+				t.Fatalf("Retry-After = %q, want none", got)
+			}
 			if strings.Contains(rec.Body.String(), v1Unauthorized) {
 				t.Fatalf("body = %q, must not read as an invalid token", rec.Body.String())
 			}

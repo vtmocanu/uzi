@@ -62,8 +62,9 @@ holding a `uzc_` holds the whole account (PRD #1907, Problem).
    *Amended 2026-10-02 (#1992):* every credential refusal is the same 401,
    and a token-store lookup failure (any error other than "no such row") is a
    fail-closed 503 `auth_unavailable` with no `Retry-After`, so an outage no
-   longer reads as a revoked token. A full outage gives the same 503 whatever
-   token is presented. A partial fault (the first lookup succeeds, the later
+   longer reads as a revoked token. A full outage gives the same 503 for every
+   `uzp_` or `uzc_` token (any other class never reaches the store and stays
+   401, which reveals nothing: the caller chose the prefix). A partial fault (the first lookup succeeds, the later
    user lookup fails) lets the holder of that exact token tell it passed the
    first lookup's checks from an unknown one; for `uzc_` the owner's active
    flag is not yet checked at that point. We do not claim a caller cannot
