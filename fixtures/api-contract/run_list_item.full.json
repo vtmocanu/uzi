@@ -236,7 +236,8 @@
   "repo_agents": [
     {
       "name": "x",
-      "description": "x"
+      "description": "x",
+      "folder": "x"
     }
   ],
   "agent_source": "x",
@@ -246,7 +247,8 @@
   "own_agents": [
     {
       "name": "x",
-      "description": "x"
+      "description": "x",
+      "folder": "x"
     }
   ],
   "anthropic_secret_id": "x",

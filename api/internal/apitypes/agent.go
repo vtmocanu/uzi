@@ -1,6 +1,7 @@
 package apitypes
 
-// RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/.
+// RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/ or
+// .codex/agents/ folder.
 // Names and descriptions only: the prompt bodies stay worker-side, so nothing this
 // struct carries is ever executed — it is what the approval gate renders and what
 // the run view shows afterwards.
@@ -11,6 +12,10 @@ package apitypes
 type RepoAgent struct {
 	Name        string `json:"name"`
 	Description string `json:"description"`
+	// Folder is the repo folder the worker read this roster from: ".claude/agents" or
+	// ".codex/agents". Empty means not reported (an older worker or run), which readers
+	// treat as ".claude/agents". Set on repo-agent rosters only, never on own_agents.
+	Folder string `json:"folder,omitempty"`
 }
 
 // AgentSelection is which roster a run's subagents come from, minus the agents the

@@ -815,6 +815,38 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
   });
 });
 
+describe("AgentRosterSummary — repo agent folder", () => {
+  it("names .codex/agents/ for a repo-source run whose roster was read from it", () => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "completed",
+          agent_source: "repo",
+          repo_agents: [{ name: "coder", description: "Codes.", folder: ".codex/agents" }],
+        })}
+      />,
+    );
+    expect(screen.getByText(/used the repository's own agents/i)).toBeTruthy();
+    expect(screen.getByText(".codex/agents/")).toBeTruthy();
+    expect(screen.queryByText(".claude/agents/")).toBeNull();
+  });
+
+  it("names .claude/agents/ when the roster carries no folder", () => {
+    render(
+      <AgentRosterSummary
+        run={run({
+          status: "completed",
+          agent_source: "repo",
+          repo_agents: [{ name: "coder", description: "Codes." }],
+        })}
+      />,
+    );
+    expect(screen.getByText(/used the repository's own agents/i)).toBeTruthy();
+    expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    expect(screen.queryByText(".codex/agents/")).toBeNull();
+  });
+});
+
 // Issue #124 / item 7. The run page's own heading renders the forge issue title, and it
 // was the one render site in this batch that no test reached — dropping its strip left the
 // whole file green, which is why RunHeading is now extracted the way the panels beside it

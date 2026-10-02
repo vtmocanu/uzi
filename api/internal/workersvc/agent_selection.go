@@ -81,6 +81,12 @@ func excludedGuardRoles(sel AgentSelection) []string {
 	return out
 }
 
+// The folders a worker may report a repo-agent roster from (RepoAgent.Folder).
+const (
+	RepoAgentFolderClaude = ".claude/agents"
+	RepoAgentFolderCodex  = ".codex/agents"
+)
+
 // validateRepoAgents enforces every bound on a worker-reported roster: length,
 // per-item name shape and length, description length, and the absence of control
 // characters (a name or description reaches a run message, the DB, and the gate
@@ -96,6 +102,14 @@ func validateRepoAgents(agents []RepoAgent) error {
 	}
 	seen := make(map[string]bool, len(agents))
 	for _, a := range agents {
+		// Folder is an allowlisted enum, empty = not reported. One roster is read from one
+		// folder, so every element must agree (issue #2085).
+		if a.Folder != "" && a.Folder != RepoAgentFolderClaude && a.Folder != RepoAgentFolderCodex {
+			return fmt.Errorf("%w: repo agent folder must be %q or %q", ErrInvalidSelection, RepoAgentFolderClaude, RepoAgentFolderCodex)
+		}
+		if a.Folder != agents[0].Folder {
+			return fmt.Errorf("%w: repo agents must all come from the same folder", ErrInvalidSelection)
+		}
 		if !agenttmpl.IsValidName(a.Name) {
 			return fmt.Errorf("%w: repo agent name must be kebab-case and at most %d characters", ErrInvalidSelection, agenttmpl.MaxNameLen)
 		}

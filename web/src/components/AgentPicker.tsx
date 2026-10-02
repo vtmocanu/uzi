@@ -12,6 +12,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import type { AgentSelectionInput, AgentSource, RepoAgent } from "../lib/api";
+import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { cx } from "./ui";
 
 /** One selectable template on the "My agent templates" card. `custom` marks a
@@ -44,6 +45,7 @@ export function AgentPicker({
   onChange: (selection: AgentSelectionInput) => void;
 }) {
   const repoDetected = repoAgents.length > 0;
+  const repoFolder = repoAgentFolder(repoAgents);
   const defaultSource: AgentSource = repoDetected ? "repo" : "own";
   const [source, setSource] = useState<AgentSource>(defaultSource);
   // Exclusions are tracked per source so switching cards preserves each card's
@@ -101,13 +103,14 @@ export function AgentPicker({
           description={
             repoDetected ? (
               <>
-                Found in the repo's <code className="font-mono text-[11px] text-fg">.claude/agents/</code>. The project
+                Found in the repo's <code className="font-mono text-[11px] text-fg">{repoFolder}/</code>. The project
                 team defined these for this codebase.
               </>
             ) : (
               <>
-                This repo has no <code className="font-mono text-[11px] text-fg">.claude/agents/</code> directory.
-                Nothing to load.
+                No agents were detected in this repo's{" "}
+                <code className="font-mono text-[11px] text-fg">.claude/agents/</code> or{" "}
+                <code className="font-mono text-[11px] text-fg">.codex/agents/</code>. Nothing to load.
               </>
             )
           }
@@ -201,7 +204,7 @@ function SourceCard({
         selected ? "border-brand/70 bg-brand/5" : "border-edge bg-surface hover:border-edge-strong",
         disabled && "cursor-not-allowed opacity-55 hover:border-edge",
       )}
-      title={disabled ? "No .claude/agents/ directory in this repo" : undefined}
+      title={disabled ? "No agents detected in .claude/agents/ or .codex/agents/ in this repo" : undefined}
     >
       <input
         type="radio"

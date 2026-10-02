@@ -34,6 +34,7 @@ import {
 } from "../lib/budget";
 import { ExtendTimePopover } from "../components/ExtendTimePopover";
 import { canReworkNow, canToggleMrRework, effectiveMrRework } from "../lib/mrRework";
+import { repoAgentFolder } from "../lib/repoAgentFolder";
 import { stripUnsafeChars } from "../lib/safeText";
 import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
@@ -3191,6 +3192,7 @@ export function AgentRosterSummary({ run }: { run: Run }) {
   const roster = run.agent_source === "repo" ? (run.repo_agents ?? []) : (run.own_agents ?? []);
   // own_agents now carries the own-source roster on the detail read, so this lists
   // the actual agent names for either source (M4-fix) instead of nothing for own.
+  const repoFolder = repoAgentFolder(run.repo_agents);
   const included = roster.filter((a) => !excluded.has(a.name)).map((a) => a.name);
   // PRD #209 M5: a seeded run whose repo roster has not been reported yet (before its
   // post-checkout report). Keyed on the seeded signal directly. Only the repo branch can
@@ -3206,13 +3208,13 @@ export function AgentRosterSummary({ run }: { run: Run }) {
       {repoRosterPending ? (
         <p className="text-sm text-muted">
           This run uses the repository's own agents from{" "}
-          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.claude/agents/</code>. The
+          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{repoFolder}/</code>. The
           roster appears here once the worker checks out the repository.
         </p>
       ) : run.agent_source === "repo" ? (
         <p className="text-sm text-muted">
           This run used the repository's own agents from{" "}
-          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.claude/agents/</code> — its
+          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{repoFolder}/</code> — its
           internal review was performed by repo-authored agents, not uzi's built-in reviewer.
         </p>
       ) : (

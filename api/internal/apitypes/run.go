@@ -565,7 +565,7 @@ type RunDTO struct {
 	// pause_requested_at, which is a PENDING pause request, not the pause-entry instant.
 	StatusSince *time.Time `json:"status_since"`
 	// Per-run agent selection (PRD #37). RepoAgents is the roster the worker
-	// detected in the clone's .claude/agents/: null when no worker ever reported
+	// detected in the clone's .claude/agents/ or .codex/agents/: null when no worker ever reported
 	// (a pre-feature run), `[]` when detection ran and found none. The plan gate
 	// distinguishes those two — an inert repo card vs. a live one — so do not
 	// collapse them. AgentSource/AgentExclusions stay null until a selection is

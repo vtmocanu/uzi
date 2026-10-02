@@ -45,7 +45,7 @@ const (
 
 // agentSources are the two rosters a plan approval may draw its subagents from
 // (apitypes.AgentSelection.Source). "own" is the run owner's template roster; "repo"
-// is the set the worker detected in the clone's .claude/agents/.
+// is the set the worker detected in the clone's .claude/agents/ or .codex/agents/.
 const (
 	agentSourceOwn  = "own"
 	agentSourceRepo = "repo"

@@ -416,6 +416,11 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a
 		// worker sends it only after seeing this token.
 		{"run_checkpoint_durability"},
+		// Issue #2085: this api accepts an optional folder (".claude/agents" or
+		// ".codex/agents") on each repo_agents element of a /state report and stores it with
+		// the roster. Advertised UNCONDITIONALLY: an older api's strict decoder 400s the
+		// unknown field, so a worker sends it only after seeing this token.
+		{"repo_agent_folder"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a

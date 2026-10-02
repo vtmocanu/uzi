@@ -2854,7 +2854,8 @@ export interface Run {
    *  render as escaped plain text, never <Markdown>. Optional for api/web rollout skew. */
   pr_description?: RunPrDescription | null;
   pr_description_outcome?: string | null;
-  /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`.
+  /** PRD #37: the roster the worker detected in the clone's `.claude/agents/`
+   *  or `.codex/agents/` (each element's optional `folder` says which).
    *  null = no worker reported (a pre-feature run); `[]` = detection ran and found
    *  none (the plan gate's repo card is inert, NOT the same as null). Names +
    *  descriptions only — REPO-SUPPLIED, untrusted text; render as plain JSX. */
@@ -4263,11 +4264,12 @@ export interface SteerInput {
 }
 
 // AgentSource is which roster a run's subagents come from (PRD #37): the repo's
-// own .claude/agents/, or the user's uzi templates. The lead orchestrator is
+// own agent folder (.claude/agents/ or .codex/agents/), or the user's uzi templates. The lead orchestrator is
 // always uzi's builtin and is never selectable.
 export type AgentSource = "repo" | "own";
 
 // RepoAgent is one agent the worker detected in the cloned repo's .claude/agents/
+// or .codex/agents/
 // (PRD #37): names + descriptions ONLY (the prompt bodies never leave the worker).
 // These are REPO-SUPPLIED, untrusted text — the plan gate renders them as plain
 // JSX, never through <Markdown>, so an attacker-authored link can't be clickable
@@ -4275,6 +4277,10 @@ export type AgentSource = "repo" | "own";
 export interface RepoAgent {
   name: string;
   description: string;
+  /** The folder the worker read the roster from; all elements of one roster share it.
+   *  Absent for a pre-feature run or when the worker/api pair did not negotiate the
+   *  feature: absent means ".claude/agents". Never set on `own_agents`. */
+  folder?: ".claude/agents" | ".codex/agents";
 }
 
 // AgentSelectionInput is the plan-gate agent choice submitted with approve_plan

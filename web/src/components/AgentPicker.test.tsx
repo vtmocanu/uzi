@@ -56,6 +56,30 @@ describe("AgentPicker", () => {
     expect(repoRadio.disabled).toBe(true);
   });
 
+  it("names the .codex/agents/ folder when the roster was read from it", () => {
+    const codex: RepoAgent[] = REPO.map((a) => ({ ...a, folder: ".codex/agents" }));
+    render(<Harness repoAgents={codex} ownTemplates={OWN} />);
+    expect(screen.getByText(".codex/agents/")).toBeTruthy();
+    expect(screen.queryByText(".claude/agents/")).toBeNull();
+  });
+
+  it("names .claude/agents/ when the roster carries no folder or an explicit claude folder", () => {
+    const { unmount } = render(<Harness repoAgents={REPO} ownTemplates={OWN} />);
+    expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    expect(screen.queryByText(".codex/agents/")).toBeNull();
+    unmount();
+    const claude: RepoAgent[] = REPO.map((a) => ({ ...a, folder: ".claude/agents" }));
+    render(<Harness repoAgents={claude} ownTemplates={OWN} />);
+    expect(screen.getByText(".claude/agents/")).toBeTruthy();
+  });
+
+  it("an empty roster names both folders in the inert card", () => {
+    render(<Harness repoAgents={[]} ownTemplates={OWN} />);
+    expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    expect(screen.getByText(".codex/agents/")).toBeTruthy();
+    expect(screen.getByText(/No agents were detected in this repo/)).toBeTruthy();
+  });
+
   it("excluding a chip adds it to the selection and drops the live count", () => {
     render(<Harness repoAgents={REPO} ownTemplates={OWN} />);
     // Exclude tester from the repo roster.
