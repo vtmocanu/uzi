@@ -1089,6 +1089,12 @@ Tracked as GitHub issue vtmocanu/uzi#1906; design in `prds/1906-official-sources
 - Every fetch attempt, allowed or refused, is in the run's source log, readable by the run owner (`uzi run fetches <run>`); a fetch that cannot be logged does not happen. (AI-synced 2026-09-29)
 - The lane is off by default; existing worker tiers are unchanged, and no new image or workflow change is needed. (AI-synced 2026-09-29)
 
+## Bug #2099 — A transient Codex provider failure is retried, not failed
+
+Tracked as GitHub issue vtmocanu/uzi#2099.
+
+- A Codex run turn that fails with a transient provider error (overload or internal-server failure, or a transport failure with a 408/429/5xx status or none) is retried in place a bounded number of times; if it persists, the run is parked in `recovery_wait` instead of failed. A transport failure with a permanent status, and any non-transport failure (authentication, Codex rate/usage limit, other), fails as before. Cancel, pause and the wall budget keep precedence over the retry. (AI-synced 2026-10-02)
+
 ## Startup admin seed
 
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.

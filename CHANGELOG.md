@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A Codex run no longer fails on one overloaded or unavailable response from the provider ([#2099](https://github.com/vtmocanu/uzi/issues/2099)).**
+  A Codex turn that ends with a transient provider failure (server overloaded, internal server error, flex capacity unavailable, or an HTTP transport failure with a 408, 429, 5xx or no status) is now retried on the same thread up to 2 times after a short wait (2s, then 4s). If it persists, the run saves a verified recovery checkpoint and parks in `recovery_wait` instead of failing as an agent failure and losing uncommitted work. Codex has already retried the request itself by then, and cancel, pause and the wall-clock budget during the wait behave as before. Permanent transport statuses (400, 401, 403 and similar), Codex's own rate-limit and usage-limit errors, and authentication or model failures keep their existing handling.
+
 - **TUI finished runs now match the web Past runs order ([#2098](https://github.com/vtmocanu/uzi/issues/2098)).**
   The DONE band shows the most recently finished runs first, falling back to the last update for runs without a finish time. Equal finish times put failed runs before cancelled runs before completed runs, retaining the server order for remaining ties.
 

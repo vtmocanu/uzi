@@ -7,14 +7,25 @@ audience: user
 # Recovering from a transient interruption
 
 Uzi retries in place and, if the trouble persists, parks the run in
-`recovery_wait` on two kinds of transient interruption:
+`recovery_wait` on these transient interruptions:
 
 - A **positively empty SDK turn** — a turn that finishes with a reported
   turn count of zero and no model activity, plan, question, or completion.
 - A **transient provider error** — the Anthropic API returning 408, 429, or
   any 5xx (500/502/503/504/529), or a status-less transport error.
+- A **transient Codex provider error** — on the Codex harness, a turn that
+  ends failed because the provider was overloaded (`serverOverloaded`), had an
+  internal server error (`internalServerError`), or had no flex capacity
+  (`flexUnavailable`), or because Codex's HTTP transport failed (a connection
+  or stream failure, or too many failed attempts) with a 408, 429, or 5xx
+  status or no status. Codex's own rate-limit and usage-limit errors are not
+  included; they keep their existing handling.
 
-Uzi retries the interruption a few times in place. If it does not clear,
+Uzi retries the interruption a few times in place. A Codex provider error is
+retried on the same thread up to 2 times, after a short wait (2 seconds, then
+4 seconds); Codex has already retried the request or stream itself by then.
+Cancelling, pausing, or reaching the wall-clock budget during that wait works
+as usual. If it does not clear,
 uzi saves a verified local recovery checkpoint before parking the run in
 `recovery_wait`.
 
@@ -24,7 +35,10 @@ timeout, and cancellation are not classified as a transient recovery.
 
 A **permanent** provider error — for example 401, 403, or 400 (bad
 credentials or a bad request) — is not a transient interruption. The run
-fails fast with an accurate reason and does not park here.
+fails fast with an accurate reason and does not park here. The same holds on
+the Codex harness: a transport failure with a permanent status (400, 401,
+403, and so on), and any Codex authentication, model, or other failure, is not
+retried here.
 
 One empty result is routed elsewhere on purpose: if the turn came back empty
 **because that attempt hit a hard usage limit** (its final rate-limit verdict
