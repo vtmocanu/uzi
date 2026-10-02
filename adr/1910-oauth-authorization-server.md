@@ -136,8 +136,9 @@ access token and a refresh token, until the connection is revoked.
    key, which a `FOR UPDATE` blocks, but that holder never waits for a grant.
    Accepted limit: Postgres lets a new share locker pass a waiting writer, so a
    steady stream of approves and denies on one product can delay an admin
-   registration change; each is a short transaction behind a capped pending
-   request, so the delay stays short. The full order is: per-user lock (approve
+   registration change. The delay has no fixed bound: an approve holds the
+   product share lock while it waits for its grant lock, so contention on a
+   grant extends it. The full order is: per-user lock (approve
    and Revoke all), product row (`FOR SHARE`, approve and deny), grants
    ascending, tokens, requests. What it guarantees: an
    approve that took the lock first commits before Revoke all reads the grants,
