@@ -17,14 +17,15 @@
 //    finalize), and at or over the hard threshold the run with the largest caches gets ONE of two
 //    actions, decided AFTER it is measured:
 //      1. STOP, when it is *parkable*: its executor is in flight (`enterRun` .. `leftLoop`), the
-//         last status the runner SENT is `running` and the server's ACK of that very send was
-//         `running` too. The stop goes through the steering channel's worker-local `disk` pause
+//         last status the runner SENT is `running`, and the server has ACKed `running` for a send
+//         newer than any non-`running` send and any declined or unreadable ACK (a same-status
+//         `running` send still in flight keeps a run parkable). The stop goes through the steering channel's worker-local `disk` pause
 //         mode (the same turn drop as an owner's `pause --now`) and the executor parks the run with
 //         a COUNTED `data_volume_full` park. This reaches a first planning turn and an implement
 //         turn alike. The disk park only lands from the server status `running`
 //         (ParkRunDataVolumeFull), so no stop is ever requested otherwise.
 //      2. IN-PLACE RECLAIM, for every other run (setup or clone, revision turns, gate and question
-//         waits, the approve-to-first-report window, finalize, an unknown or stale status): the
+//         waits, the approve-to-first-report window, finalize, a declined, unreadable or not yet ACKed `running`): the
 //         run is not stopped, it keeps its gate, its pending approval and its flight, and its
 //         rebuildable caches are dropped where it stands ({@link GovernedRun.reclaimInPlace}). No
 //         process is killed. It holds its own {@link DiskGovernor.reclaiming} slot, never
@@ -164,8 +165,13 @@ interface RunState extends GovernedRun {
   lastNonRunningSentSeq: number;
   /** The highest send number whose ACK carried the server status `running` (0 = none yet). */
   runningAckedSeq: number;
-  /** The server status of the latest ACK recorded, for the in-place drop's log line. */
+  /** The highest send number whose ACK was declined or unreadable (any status but `running`,
+   *  undefined included; 0 = none yet). It cancels every earlier `running` ACK. */
+  lastNonRunningAckedSeq: number;
+  /** The server status of the newest-send ACK recorded, for the in-place drop's log line only. */
   ackedStatus?: string;
+  /** The send number {@link ackedStatus} belongs to. */
+  ackedStatusSeq: number;
   /** The hard layer asked this run to stop. */
   stopRequested: boolean;
   /** Issue #1830: an in-place drop left this run holding bytes (or threw); it is skipped for the
@@ -218,7 +224,7 @@ export class DiskGovernor {
 
   /** Watch a running Claude run. Idempotent per run id (a later call replaces the entry). */
   register(runId: string, run: GovernedRun): void {
-    this.runs.set(runId, { ...run, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, stopRequested: false, inPlaceSkipped: false });
+    this.runs.set(runId, { ...run, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, lastNonRunningAckedSeq: 0, ackedStatusSeq: 0, stopRequested: false, inPlaceSkipped: false });
   }
 
   /** Issue #1830: `executor.run` is about to start; the run may now take a stop (see {@link parkable}). */
@@ -249,19 +255,33 @@ export class DiskGovernor {
   statusAcked(runId: string, seq: number, status: string | undefined): void {
     const run = this.runs.get(runId);
     if (!run) return;
-    run.ackedStatus = status;
-    if (status !== "running" || seq <= run.runningAckedSeq) return;
+    // Log-only: a late ACK of an older send must not overwrite a newer send's.
+    if (seq >= run.ackedStatusSeq) {
+      run.ackedStatus = status;
+      run.ackedStatusSeq = seq;
+    }
+    if (status !== "running") {
+      // Declined or unreadable (a 409 carries the run's real status; an already-terminal
+      // run has none): it cancels every earlier `running` ACK.
+      run.lastNonRunningAckedSeq = Math.max(run.lastNonRunningAckedSeq, seq);
+      return;
+    }
+    if (seq <= run.runningAckedSeq) return;
     run.runningAckedSeq = seq;
     // Newly parkable: an in-place skip from the un-ACKed window must not outlive it.
     if (this.parkable(run)) run.inPlaceSkipped = false;
   }
 
   /** A stop can become a counted park only from the server status `running`: the executor is in
-   *  flight, the latest send says `running`, and a `running` ACK arrived for a send newer than the
-   *  last non-`running` send (so the server has moved back to `running` since). A same-status
-   *  `running` report still in flight does not unmake that. */
+   *  flight, the latest send says `running`, and the server ACKed `running` for a send newer than
+   *  any non-`running` send and any declined or unreadable ACK. A same-status `running` send still
+   *  in flight does not unmake that. */
   private parkable(run: RunState): boolean {
-    return run.inExecutor && run.sentStatus === "running" && run.runningAckedSeq > run.lastNonRunningSentSeq;
+    return (
+      run.inExecutor &&
+      run.sentStatus === "running" &&
+      run.runningAckedSeq > Math.max(run.lastNonRunningSentSeq, run.lastNonRunningAckedSeq)
+    );
   }
 
   /**

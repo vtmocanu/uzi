@@ -7011,7 +7011,8 @@ export class RunRunner {
           await steering.awaitReceiptSettlement(signal);
         }
         // Issue #1830: the choke point that closes the stop-then-wait race. A hard disk stop is only
-        // ever requested while the run's sent and ACKed status are both `running`; if the run then
+        // ever requested while the server has ACKed `running` for a send newer than any non-running
+        // send and any declined or unreadable ACK (a same-status running send in flight keeps it); if the run then
         // reaches a wait (gate, question, follow-up) with the sticky `disk` stop still pending, the
         // `awaiting_*` report is NOT sent: the park lands from `running` (an awaiting_* park would
         // be refused by ParkRunDataVolumeFull). Placed ABOVE the snapshot setPhase so the

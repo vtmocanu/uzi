@@ -6,6 +6,7 @@ import path from "node:path";
 import { type ExecutorResult, type RunContext, StubExecutor } from "../src/executor.js";
 import { RunRunner, type ExecutorFactory } from "../src/runner.js";
 import { WorkerClient } from "../src/client.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { StateAck, StateRequest } from "../src/protocol.js";
 import { type CacheCapConfig, DiskGovernor, DiskParkSignal } from "../src/cache-cap.js";
 import { PauseNowSignal } from "../src/steering.js";
@@ -677,7 +678,14 @@ describe("RunRunner — issue #1830: the choke point on a question wait, and the
         };
       };
       const { gitlab } = fakeGitlab();
-      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov });
+      const phases: string[] = [];
+      const activeRuns = new ActiveRunRegistry();
+      const setPhase = activeRuns.setPhase.bind(activeRuns);
+      activeRuns.setPhase = (id, phase) => {
+        phases.push(phase);
+        setPhase(id, phase);
+      };
+      const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { diskGovernor: probe.gov, activeRuns });
       // A state probe at the park seam (openQuestionIds is private and the execute() finally clears it
       // anyway, so the clear on the park path is only visible between the catch and the finally).
       const internals = runner as unknown as {
@@ -696,6 +704,7 @@ describe("RunRunner — issue #1830: the choke point on a question wait, and the
         !api.states.some((s) => s.runId === claim.run_id && String(s.body.status).startsWith("awaiting_")),
         "no awaiting_input report was sent",
       );
+      assert.ok(!phases.includes("awaiting_input"), `the snapshot registry never showed awaiting_input: ${phases.join(",")}`);
       assert.ok(api.messages(claim.run_id).some((m) => m.kind === "question"), "the question feed line was already emitted");
       assert.deepStrictEqual(idsAtPark, [undefined], "the park path forgot the question id it had minted");
       const [park, ...more] = parks(claim.run_id);

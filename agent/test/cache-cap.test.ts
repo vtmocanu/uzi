@@ -509,6 +509,32 @@ describe("issue #1830: the hard layer covers every phase of a run", () => {
     assert.deepStrictEqual(h.inPlace, []);
   });
 
+  for (const declined of ["awaiting_approval", undefined] as const) {
+    it(`a declined or unreadable ACK (${String(declined)}) of a LATER running send cancels the earlier running ACK`, async () => {
+      const h = harness();
+      watch(h, "later", 5 * GIB); // running sent (1) and ACKed running
+      const second = h.gov.statusRequested("later", "running");
+      h.gov.statusAcked("later", second, declined); // the server declined it (409) or the ACK was unreadable
+      h.gov.observe(0.99);
+      await settle();
+      assert.deepStrictEqual(h.stops, [], "no stop: the server may not be at running");
+      assert.deepStrictEqual(h.inPlace, ["later"], "dropped in place instead");
+    });
+  }
+
+  it("a LATER running ACK (a higher seq) after a declined one restores parkable", async () => {
+    const h = harness();
+    watch(h, "restored", 5 * GIB);
+    const second = h.gov.statusRequested("restored", "running");
+    h.gov.statusAcked("restored", second, undefined);
+    const third = h.gov.statusRequested("restored", "running");
+    h.gov.statusAcked("restored", third, "running");
+    h.gov.observe(0.99);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["restored"]);
+    assert.deepStrictEqual(h.inPlace, []);
+  });
+
   it("a same-status running report in flight (un-ACKed) does not unmake a parkable run", async () => {
     const h = harness();
     watch(h, "impl", 5 * GIB); // running sent and ACKed
