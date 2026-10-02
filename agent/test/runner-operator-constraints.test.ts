@@ -29,8 +29,12 @@ describe("operator constraints survive a re-claim (issue #1660)", () => {
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
   });
   afterEach(async () => {
-    await api.close();
-    fx.cleanup();
+    // try/finally (issue #2020): a throwing close must not skip the fixture cleanup.
+    try {
+      await api.close();
+    } finally {
+      fx.cleanup();
+    }
   });
 
   // What the SDK executor's Agent guard would hand a reviewer dispatched right now.

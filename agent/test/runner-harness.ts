@@ -66,9 +66,16 @@ export function installHarness(): void {
   });
 
   afterEach(async () => {
-    await api.close();
-    fx.cleanup();
-    fs.rmSync(homeDir, { recursive: true, force: true });
+    // try/finally (issue #2020): a throwing close must not skip the temp-dir cleanup.
+    try {
+      await api.close();
+    } finally {
+      try {
+        fx.cleanup();
+      } finally {
+        fs.rmSync(homeDir, { recursive: true, force: true });
+      }
+    }
   });
 }
 

@@ -34,7 +34,18 @@ const WF = ".github/workflows/ci.yml";
 
 const cleanups: Array<() => void> = [];
 afterEach(() => {
-  while (cleanups.length) cleanups.pop()!();
+  // Run every cleanup even when one throws (issue #2020), then rethrow the first error.
+  let first: unknown;
+  let failed = false;
+  while (cleanups.length) {
+    try {
+      cleanups.pop()!();
+    } catch (err) {
+      if (!failed) first = err;
+      failed = true;
+    }
+  }
+  if (failed) throw first;
 });
 
 /** A fixture whose origin `main` carries the given files (a `.github/workflows/ci.yml` by

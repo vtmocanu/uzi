@@ -49,8 +49,12 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  for (const p of unlock.splice(0)) fs.chmodSync(p, 0o755);
-  fx.cleanup();
+  // try/finally (issue #2020): a failed chmod must not skip the fixture cleanup.
+  try {
+    for (const p of unlock.splice(0)) fs.chmodSync(p, 0o755);
+  } finally {
+    fx.cleanup();
+  }
 });
 
 function cfg(bare: string, ...args: string[]): string {

@@ -68,8 +68,12 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  await api.close();
-  fx.cleanup();
+  // try/finally (issue #2020): a throwing close must not skip the fixture cleanup.
+  try {
+    await api.close();
+  } finally {
+    fx.cleanup();
+  }
 });
 
 /** A GitLab client whose transport is captured; opens MR !42 with no network. */

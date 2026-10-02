@@ -77,8 +77,12 @@ describe("a run failing REASON_PLAN_MISSING", () => {
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { sleep: async () => {}, terminalRetrySchedule: [1, 1] });
   });
   afterEach(async () => {
-    await api.close();
-    fx.cleanup();
+    // try/finally (issue #2020): a throwing close must not skip the fixture cleanup.
+    try {
+      await api.close();
+    } finally {
+      fx.cleanup();
+    }
   });
 
   it("reports fail_origin plan_missing and exactly the static failure_reason", async () => {
