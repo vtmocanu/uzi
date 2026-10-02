@@ -42,6 +42,7 @@ import (
 // Error contract (api/openapi/v1.yaml documents each):
 //
 //	401 (no reason)                RequireV1Caller
+//	503 auth_unavailable           RequireV1Caller, when a token-store lookup fails (not an invalid token)
 //	403 insufficient_scope         RequireScope
 //	413 file_too_large             the declared size is over the per-file cap, or the request body
 //	                               is over the per-file cap plus multipart overhead (payload_too_large)

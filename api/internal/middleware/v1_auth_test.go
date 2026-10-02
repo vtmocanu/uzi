@@ -147,7 +147,13 @@ func (p *v1Probe) handler() http.Handler {
 // header; withCookie adds a session cookie and a CSRF header, which must never matter.
 func v1Do(t *testing.T, st V1CallerStore, authz string, withCookie bool, probe *v1Probe) *httptest.ResponseRecorder {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/whoami", nil)
+	return v1DoCtx(t, context.Background(), st, authz, withCookie, probe)
+}
+
+// v1DoCtx is v1Do with the request carrying ctx.
+func v1DoCtx(t *testing.T, ctx context.Context, st V1CallerStore, authz string, withCookie bool, probe *v1Probe) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/whoami", nil).WithContext(ctx)
 	if authz != "" {
 		req.Header.Set("Authorization", authz)
 	}
@@ -265,20 +271,12 @@ func TestRequireV1CallerRefusals(t *testing.T) {
 			authz: func(fx v1Fixture) string { return "Bearer " + fx.uzc }, wantCLI: 1,
 		},
 		{
-			name: "uzp_ lookup error", authz: func(fx v1Fixture) string { return "Bearer " + fx.uzp },
-			mutate: func(fx v1Fixture) { fx.st.productErr = errors.New("db down") }, wantProduct: 1,
-		},
-		{
 			name: "uzp_ owner inactive", authz: func(fx v1Fixture) string { return "Bearer " + fx.uzp },
 			mutate: func(fx v1Fixture) {
 				u := fx.st.users[fx.user.ID]
 				u.IsActive = false
 				fx.st.users[fx.user.ID] = u
 			}, wantProduct: 1,
-		},
-		{
-			name: "uzp_ user lookup error", authz: func(fx v1Fixture) string { return "Bearer " + fx.uzp },
-			mutate: func(fx v1Fixture) { fx.st.userErr = errors.New("db down") }, wantProduct: 1,
 		},
 		{
 			name: "uzc_ owner inactive", authz: func(fx v1Fixture) string { return "Bearer " + fx.uzc },
@@ -313,6 +311,52 @@ func TestRequireV1CallerRefusals(t *testing.T) {
 			if fx.st.productTouches != 0 || fx.st.cliTouches != 0 {
 				t.Fatalf("a refused request touched last_used (product=%d cli=%d)", fx.st.productTouches, fx.st.cliTouches)
 			}
+		})
+	}
+}
+
+// A store error other than "no such row" means the token was never checked: 503
+// auth_unavailable, never the downstream handler, never a last_used touch. The same
+// site failing with a wrapped pgx.ErrNoRows is an ordinary refusal (401).
+func TestRequireV1CallerLookupErrorUnavailable(t *testing.T) {
+	sites := []struct {
+		name   string
+		tok    func(fx v1Fixture) string
+		inject func(fx v1Fixture, err error)
+	}{
+		{"uzp_ token lookup", func(fx v1Fixture) string { return fx.uzp }, func(fx v1Fixture, err error) { fx.st.productErr = err }},
+		{"uzc_ token lookup", func(fx v1Fixture) string { return fx.uzc }, func(fx v1Fixture, err error) { fx.st.cliErr = err }},
+		{"uzp_ user lookup", func(fx v1Fixture) string { return fx.uzp }, func(fx v1Fixture, err error) { fx.st.userErr = err }},
+		{"uzc_ user lookup", func(fx v1Fixture) string { return fx.uzc }, func(fx v1Fixture, err error) { fx.st.userErr = err }},
+	}
+	for _, site := range sites {
+		t.Run(site.name+" fails", func(t *testing.T) {
+			fx := newV1Fixture(t, clitoken.ScopeUser)
+			site.inject(fx, errors.New("db down"))
+			var probe v1Probe
+			rec := v1Do(t, fx.st, "Bearer "+site.tok(fx), false, &probe)
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Fatalf("status = %d, want 503 (body %q)", rec.Code, rec.Body.String())
+			}
+			if !strings.Contains(rec.Body.String(), "auth_unavailable") {
+				t.Fatalf("body = %q, want reason auth_unavailable", rec.Body.String())
+			}
+			if strings.Contains(rec.Body.String(), v1Unauthorized) {
+				t.Fatalf("body = %q, must not read as an invalid token", rec.Body.String())
+			}
+			if probe.called {
+				t.Fatal("the downstream handler ran on an unavailable lookup")
+			}
+			if fx.st.productTouches != 0 || fx.st.cliTouches != 0 {
+				t.Fatalf("an unavailable lookup touched last_used (product=%d cli=%d)", fx.st.productTouches, fx.st.cliTouches)
+			}
+		})
+		t.Run(site.name+" wrapped ErrNoRows", func(t *testing.T) {
+			fx := newV1Fixture(t, clitoken.ScopeUser)
+			site.inject(fx, fmt.Errorf("q: %w", pgx.ErrNoRows))
+			var probe v1Probe
+			rec := v1Do(t, fx.st, "Bearer "+site.tok(fx), false, &probe)
+			assertV1Unauthorized(t, rec, &probe)
 		})
 	}
 }
@@ -406,9 +450,11 @@ func TestRequireScopePanicsOnUnknownScope(t *testing.T) {
 	}
 }
 
-// A lookup error that is not "no such row" is still a 401 but is logged at Warn, with
-// no token material; a plain unknown token (ErrNoRows) or a cancelled/timed-out request
-// context logs nothing.
+// A lookup error that is not "no such row" answers 503 and is logged at Warn, with no
+// token material; a plain unknown token (ErrNoRows) logs nothing and stays 401. The Warn
+// is decided by the REQUEST context, not the error chain: a store error wrapping
+// context.Canceled or DeadlineExceeded on a live request (a DB dial or pool timeout) is
+// logged, while any store error on an already-cancelled request is still 503 but silent.
 func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
 	var buf bytes.Buffer
 	prev := slog.Default()
@@ -416,35 +462,52 @@ func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
 	t.Cleanup(func() { slog.SetDefault(prev) })
 
 	dbDown := errors.New("db down: connection refused")
+	canceled := fmt.Errorf("query: %w", context.Canceled)
+	deadline := fmt.Errorf("query: %w", context.DeadlineExceeded)
 	cases := []struct {
-		name    string
-		tok     func(fx v1Fixture) string
-		mutate  func(fx v1Fixture)
-		wantLog string // "" = nothing logged
+		name       string
+		tok        func(fx v1Fixture) string
+		mutate     func(fx v1Fixture)
+		cancelReq  bool   // send the request with an already-cancelled context
+		want503    bool   // else 401
+		wantLog    string // "" = nothing logged
+		wantErrLog string // the error text the log must carry
 	}{
-		{"unknown uzp_", func(v1Fixture) string { return "uz" + "p_" + strings.Repeat("a", 43) }, nil, ""},
-		{"unknown uzc_", func(v1Fixture) string { return "uz" + "c_" + strings.Repeat("a", 43) }, nil, ""},
-		{"product lookup error", func(fx v1Fixture) string { return fx.uzp },
-			func(fx v1Fixture) { fx.st.productErr = dbDown }, "product token lookup failed"},
-		{"product user lookup error", func(fx v1Fixture) string { return fx.uzp },
-			func(fx v1Fixture) { fx.st.userErr = dbDown }, "product token user lookup failed"},
-		{"cli lookup error", func(fx v1Fixture) string { return fx.uzc },
-			func(fx v1Fixture) { fx.st.cliErr = dbDown }, "cli token lookup failed"},
-		{"cli user lookup error", func(fx v1Fixture) string { return fx.uzc },
-			func(fx v1Fixture) { fx.st.userErr = dbDown }, "cli token user lookup failed"},
-		{"product user missing (ErrNoRows)", func(fx v1Fixture) string { return fx.uzp },
-			func(fx v1Fixture) { delete(fx.st.users, fx.user.ID) }, ""},
-		// A request whose context was cancelled or timed out mid-lookup is still a 401,
-		// but a client going away is not an infrastructure fault: no Warn. Wrapped, as
-		// pgx returns them, so the check must be errors.Is rather than ==.
-		{"product lookup cancelled", func(fx v1Fixture) string { return fx.uzp },
-			func(fx v1Fixture) { fx.st.productErr = fmt.Errorf("query: %w", context.Canceled) }, ""},
-		{"cli lookup deadline", func(fx v1Fixture) string { return fx.uzc },
-			func(fx v1Fixture) { fx.st.cliErr = fmt.Errorf("query: %w", context.DeadlineExceeded) }, ""},
-		{"product user lookup cancelled", func(fx v1Fixture) string { return fx.uzp },
-			func(fx v1Fixture) { fx.st.userErr = fmt.Errorf("query: %w", context.Canceled) }, ""},
-		{"cli user lookup deadline", func(fx v1Fixture) string { return fx.uzc },
-			func(fx v1Fixture) { fx.st.userErr = fmt.Errorf("query: %w", context.DeadlineExceeded) }, ""},
+		{name: "unknown uzp_", tok: func(v1Fixture) string { return "uz" + "p_" + strings.Repeat("a", 43) }},
+		{name: "unknown uzc_", tok: func(v1Fixture) string { return "uz" + "c_" + strings.Repeat("a", 43) }},
+		{name: "product lookup error", tok: func(fx v1Fixture) string { return fx.uzp },
+			mutate: func(fx v1Fixture) { fx.st.productErr = dbDown }, want503: true,
+			wantLog: "product token lookup failed", wantErrLog: "db down"},
+		{name: "product user lookup error", tok: func(fx v1Fixture) string { return fx.uzp },
+			mutate: func(fx v1Fixture) { fx.st.userErr = dbDown }, want503: true,
+			wantLog: "product token user lookup failed", wantErrLog: "db down"},
+		{name: "cli lookup error", tok: func(fx v1Fixture) string { return fx.uzc },
+			mutate: func(fx v1Fixture) { fx.st.cliErr = dbDown }, want503: true,
+			wantLog: "cli token lookup failed", wantErrLog: "db down"},
+		{name: "cli user lookup error", tok: func(fx v1Fixture) string { return fx.uzc },
+			mutate: func(fx v1Fixture) { fx.st.userErr = dbDown }, want503: true,
+			wantLog: "cli token user lookup failed", wantErrLog: "db down"},
+		{name: "product user missing (ErrNoRows)", tok: func(fx v1Fixture) string { return fx.uzp },
+			mutate: func(fx v1Fixture) { delete(fx.st.users, fx.user.ID) }},
+		// Store errors that wrap a context error on a LIVE request are real faults (a DB
+		// dial or pool timeout): logged, 503.
+		{name: "product lookup wraps Canceled", tok: func(fx v1Fixture) string { return fx.uzp },
+			mutate: func(fx v1Fixture) { fx.st.productErr = canceled }, want503: true,
+			wantLog: "product token lookup failed", wantErrLog: "context canceled"},
+		{name: "cli lookup wraps DeadlineExceeded", tok: func(fx v1Fixture) string { return fx.uzc },
+			mutate: func(fx v1Fixture) { fx.st.cliErr = deadline }, want503: true,
+			wantLog: "cli token lookup failed", wantErrLog: "deadline exceeded"},
+		{name: "product user lookup wraps Canceled", tok: func(fx v1Fixture) string { return fx.uzp },
+			mutate: func(fx v1Fixture) { fx.st.userErr = canceled }, want503: true,
+			wantLog: "product token user lookup failed", wantErrLog: "context canceled"},
+		{name: "cli user lookup wraps DeadlineExceeded", tok: func(fx v1Fixture) string { return fx.uzc },
+			mutate: func(fx v1Fixture) { fx.st.userErr = deadline }, want503: true,
+			wantLog: "cli token user lookup failed", wantErrLog: "deadline exceeded"},
+		// The client already went away: still unavailable, but not an operator signal.
+		{name: "cancelled request, product lookup error", tok: func(fx v1Fixture) string { return fx.uzp },
+			mutate: func(fx v1Fixture) { fx.st.productErr = dbDown }, cancelReq: true, want503: true},
+		{name: "cancelled request, cli user lookup error", tok: func(fx v1Fixture) string { return fx.uzc },
+			mutate: func(fx v1Fixture) { fx.st.userErr = canceled }, cancelReq: true, want503: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -454,9 +517,24 @@ func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
 				tc.mutate(fx)
 			}
 			tok := tc.tok(fx)
+			ctx := context.Background()
+			if tc.cancelReq {
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithCancel(ctx)
+				cancel()
+			}
 			var probe v1Probe
-			rec := v1Do(t, fx.st, "Bearer "+tok, false, &probe)
-			assertV1Unauthorized(t, rec, &probe)
+			rec := v1DoCtx(t, ctx, fx.st, "Bearer "+tok, false, &probe)
+			if tc.want503 {
+				if rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), "auth_unavailable") {
+					t.Fatalf("status = %d body %q, want 503 auth_unavailable", rec.Code, rec.Body.String())
+				}
+				if probe.called {
+					t.Fatal("the downstream handler ran on an unavailable lookup")
+				}
+			} else {
+				assertV1Unauthorized(t, rec, &probe)
+			}
 			logged := buf.String()
 			if tc.wantLog == "" {
 				if logged != "" {
@@ -464,8 +542,9 @@ func TestRequireV1CallerLogsLookupErrors(t *testing.T) {
 				}
 				return
 			}
-			if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, tc.wantLog) || !strings.Contains(logged, "db down") {
-				t.Fatalf("log %q lacks a WARN %q with the error", logged, tc.wantLog)
+			if !strings.Contains(logged, "level=WARN") || !strings.Contains(logged, tc.wantLog) ||
+				!strings.Contains(logged, "answering 503") || !strings.Contains(logged, tc.wantErrLog) {
+				t.Fatalf("log %q lacks a WARN %q with the error %q", logged, tc.wantLog, tc.wantErrLog)
 			}
 			// No token material: neither the token, its body, nor its sha256 (hex).
 			body := tok[4:]

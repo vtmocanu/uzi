@@ -68,10 +68,32 @@ type V1CallerStore interface {
 	TouchCLIToken(ctx context.Context, arg store.TouchCLITokenParams) error
 }
 
-// v1Unauthorized is the ONE 401 message RequireV1Caller writes, whatever failed (no
-// header, wrong class, unknown/revoked/expired token, disabled product, inactive user,
-// admin_ro row, lookup error), so a prober learns nothing about which tokens exist.
+// v1Unauthorized is the ONE 401 message RequireV1Caller writes for a credential it
+// refuses (no header, wrong class, unknown/revoked/expired token, disabled product,
+// inactive user, admin_ro row), so a prober learns nothing about which tokens exist.
 const v1Unauthorized = "invalid token"
+
+// v1AuthUnavailable and v1AuthUnavailableReason are the 503 RequireV1Caller writes when a
+// token-store lookup fails with an error other than "no such row": the token could not be
+// checked, which says nothing about whether it is valid.
+const (
+	v1AuthUnavailable       = "authentication temporarily unavailable"
+	v1AuthUnavailableReason = "auth_unavailable"
+)
+
+// v1Outcome is how one token resolution ended.
+type v1Outcome int
+
+// v1Refused is the zero value, so an outcome nobody set fails closed.
+const (
+	// v1Refused: the credential was checked and refused (the identical 401).
+	v1Refused v1Outcome = iota
+	// v1Authed: the principal is valid.
+	v1Authed
+	// v1Unavailable: a store lookup failed with an error other than pgx.ErrNoRows, so the
+	// credential was not checked (503 auth_unavailable).
+	v1Unavailable
+)
 
 // RequireV1Caller is the only authenticating middleware of the /api/v1 subtree
 // (PRD #1907 D2) and the only code that resolves a uzp_ product token. It is written
@@ -89,10 +111,16 @@ const v1Unauthorized = "invalid token"
 //	        refused whatever its value looks like. The user must be active.
 //	other → 401 (uza_, no or non-Bearer header, a cookie alone).
 //
-// Every failure is the same 401, including a lookup error: fail closed, never a pass.
-// A lookup error other than "no such row" (the database is unreachable, a query
-// fails) is also logged at Warn with the token class and the error only, never any
-// token material, so an outage that turns every caller away is visible to operators.
+// Every credential refusal is the same 401 (v1Unauthorized). A lookup error other than
+// "no such row" (the database is unreachable, a query fails) is not a refusal: the token
+// was never checked, so the answer is 503 reason auth_unavailable, never a pass and never
+// a 401 that would tell a client to discard a good token. It is also logged at Warn with
+// the step and the error only, never any token material, so an outage is visible to
+// operators. A full store outage's 503 does not depend on the token. A partial fault
+// (the token lookup succeeds, the user lookup fails) can tell the token's holder that the
+// token passed the first lookup's checks; that is accepted because tokens carry 256 bits
+// of randomness and it is revealed only to the holder (PRD #1907 Decision Log, #1992).
+// The 503 never reaches next and never touches last_used.
 //
 // D3: the context user is a COPY with IsAdmin cleared, for both kinds, before anything
 // downstream sees it, so a handler reused from the internal API (which takes admin-ness
@@ -110,16 +138,21 @@ func RequireV1Caller(q V1CallerStore, cfg config.Config) func(http.Handler) http
 			}
 
 			var (
-				p      V1Principal
-				authed bool
+				p       V1Principal
+				outcome v1Outcome
 			)
 			switch {
 			case producttoken.HasPrefix(tok):
-				p, authed = resolveV1ProductToken(r, q, cfg, tok)
+				p, outcome = resolveV1ProductToken(r, q, cfg, tok)
 			case strings.HasPrefix(tok, clitoken.PrefixUser):
-				p, authed = resolveV1CLIToken(r, q, cfg, tok)
+				p, outcome = resolveV1CLIToken(r, q, cfg, tok)
 			}
-			if !authed {
+			switch outcome {
+			case v1Authed:
+			case v1Unavailable:
+				httpx.ErrorReason(w, http.StatusServiceUnavailable, v1AuthUnavailable, v1AuthUnavailableReason)
+				return
+			default:
 				httpx.Error(w, http.StatusUnauthorized, v1Unauthorized)
 				return
 			}
@@ -142,21 +175,19 @@ func RequireV1Caller(q V1CallerStore, cfg config.Config) func(http.Handler) http
 // found by an indexed equality on the sha256 of a 256-bit random token, which leaks no
 // exploitable timing signal on its own; RequireUser's compare is an explicit
 // belt-and-suspenders on the same property, not a second control.
-func resolveV1ProductToken(r *http.Request, q V1CallerStore, cfg config.Config, tok string) (V1Principal, bool) {
+func resolveV1ProductToken(r *http.Request, q V1CallerStore, cfg config.Config, tok string) (V1Principal, v1Outcome) {
 	row, err := q.GetProductTokenForAuth(r.Context(), producttoken.Hash(tok))
 	if err != nil {
-		warnV1LookupError("product token lookup", err)
-		return V1Principal{}, false
+		return V1Principal{}, v1LookupFailed(r, "product token lookup", err)
 	}
 	// Defense in depth: the auth query already filters on users.is_active, but the user
 	// row we hand downstream is loaded here and re-checked on its own.
 	user, err := q.GetUserByID(r.Context(), row.UserID)
 	if err != nil {
-		warnV1LookupError("product token user lookup", err)
-		return V1Principal{}, false
+		return V1Principal{}, v1LookupFailed(r, "product token user lookup", err)
 	}
 	if !user.IsActive {
-		return V1Principal{}, false
+		return V1Principal{}, v1Refused
 	}
 	if err := q.TouchProductToken(r.Context(), store.TouchProductTokenParams{
 		ID:       row.ID,
@@ -172,32 +203,30 @@ func resolveV1ProductToken(r *http.Request, q V1CallerStore, cfg config.Config, 
 		ProductID:   uuid.NullUUID{UUID: row.ProductID, Valid: true},
 		ProductName: row.ProductName,
 		Scopes:      slices.Clone(row.Scopes),
-	}, true
+	}, v1Authed
 }
 
 // resolveV1CLIToken resolves a uzc_ Bearer against cli_tokens only, then requires the
 // row's scope to be "user" (the row, not the prefix, is the authority).
-func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok string) (V1Principal, bool) {
+func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok string) (V1Principal, v1Outcome) {
 	hash := clitoken.Hash(tok)
 	row, err := q.GetCLITokenByHash(r.Context(), hash)
 	if err != nil {
-		warnV1LookupError("cli token lookup", err)
-		return V1Principal{}, false
+		return V1Principal{}, v1LookupFailed(r, "cli token lookup", err)
 	}
 	// The same explicit constant-time compare RequireUser makes.
 	if !clitoken.Equal(hash, row.TokenHash) {
-		return V1Principal{}, false
+		return V1Principal{}, v1Refused
 	}
 	if row.Scope != clitoken.ScopeUser {
-		return V1Principal{}, false
+		return V1Principal{}, v1Refused
 	}
 	user, err := q.GetUserByID(r.Context(), row.UserID)
 	if err != nil {
-		warnV1LookupError("cli token user lookup", err)
-		return V1Principal{}, false
+		return V1Principal{}, v1LookupFailed(r, "cli token user lookup", err)
 	}
 	if !user.IsActive {
-		return V1Principal{}, false
+		return V1Principal{}, v1Refused
 	}
 	if err := q.TouchCLIToken(r.Context(), store.TouchCLITokenParams{
 		ID:       row.ID,
@@ -211,24 +240,26 @@ func resolveV1CLIToken(r *http.Request, q V1CallerStore, cfg config.Config, tok 
 		TokenID: row.ID,
 		// The user acting directly holds every scope (D5).
 		Scopes: slices.Clone(producttoken.Scopes),
-	}, true
+	}, v1Authed
 }
 
-// warnV1LookupError logs an auth lookup failure that is not "no such row". The caller
-// still answers 401 (fail closed); this only makes an infrastructure fault visible. The
-// log carries the step and the error, never the token or its hash.
+// v1LookupFailed classifies a failed auth lookup. "No such row" is an ordinary refusal
+// (v1Refused). Any other error means the credential could not be checked, so it is
+// v1Unavailable and, unless the request is already cancelled, logged at Warn. The log
+// carries the step and the error, never the token or its hash.
 //
-// A cancelled or timed-out request context is not an infrastructure fault either: the
-// client went away (or the server's own deadline fired) mid-lookup, which is routine
-// and would otherwise make every dropped connection read as a database problem. It is
-// still a 401; only the Warn is skipped.
-func warnV1LookupError(step string, err error) {
-	if errors.Is(err, pgx.ErrNoRows) ||
-		errors.Is(err, context.Canceled) ||
-		errors.Is(err, context.DeadlineExceeded) {
-		return
+// A cancelled request (the client went away mid-lookup) is still unavailable, only the
+// Warn is skipped, so dropped connections do not read as a database problem. The request
+// context is tested, never the error chain: a DB dial or pool timeout also unwraps to
+// context.DeadlineExceeded and is a real fault.
+func v1LookupFailed(r *http.Request, step string, err error) v1Outcome {
+	if errors.Is(err, pgx.ErrNoRows) {
+		return v1Refused
 	}
-	slog.Warn("v1 auth: "+step+" failed; answering 401", "error", err)
+	if r.Context().Err() == nil {
+		slog.Warn("v1 auth: "+step+" failed; answering 503", "error", err)
+	}
+	return v1Unavailable
 }
 
 // RequireScope gates an /api/v1 route on one scope (PRD #1907 D5). It must run after

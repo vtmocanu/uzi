@@ -262,6 +262,9 @@ func TestV1OpenAPIRouteParity(t *testing.T) {
 		if _, ok := op.Responses["401"]; !ok {
 			t.Errorf("%s does not document the 401 RequireV1Caller answers", key)
 		}
+		if _, ok := op.Responses["503"]; !ok {
+			t.Errorf("%s does not document the 503 auth_unavailable RequireV1Caller answers on a store failure", key)
+		}
 	}
 }
 

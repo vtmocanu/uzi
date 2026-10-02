@@ -55,6 +55,8 @@ paths:
           $ref: "#/components/responses/Unauthorized"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /jobs:
     post:
       operationId: createJob
@@ -131,6 +133,8 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /jobs/{id}:
     get:
       operationId: getJob
@@ -155,6 +159,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /jobs/{id}/result:
     get:
       operationId: getJobResult
@@ -180,6 +186,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /jobs/{id}/messages:
     get:
       operationId: listJobMessages
@@ -214,6 +222,8 @@ paths:
           $ref: "#/components/responses/Unprocessable"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /jobs/{id}/cancel:
     post:
       operationId: cancelJob
@@ -241,6 +251,8 @@ paths:
           $ref: "#/components/responses/Conflict"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /jobs/{id}/files:
     get:
       operationId: listJobFiles
@@ -270,6 +282,8 @@ paths:
           $ref: "#/components/responses/NotFound"
         "429":
           $ref: "#/components/responses/TooManyRequests"
+        "503":
+          $ref: "#/components/responses/ServiceUnavailable"
   /files:
     post:
       operationId: uploadFile
@@ -520,7 +534,10 @@ components:
         deployment has no isolated research lane enabled and the request names an
         egress_profile (reason isolated_lane_unavailable; no job is created), or, on POST /files, too many
         uploads are streaming at once, process-wide or for this user (reason
-        uploads_busy; retry after the number of seconds in the Retry-After header).
+        uploads_busy; retry after the number of seconds in the Retry-After header). On
+        every operation, reason auth_unavailable means the token could not be checked
+        because the token store failed (a transient fault, not an invalid token): retry
+        with backoff.
       headers:
         Retry-After:
           description: "Present with reason uploads_busy: the seconds to wait before retrying."

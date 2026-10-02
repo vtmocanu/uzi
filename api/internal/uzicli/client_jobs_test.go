@@ -137,3 +137,26 @@ func TestHTTPJobTypedReasonSurvives(t *testing.T) {
 		t.Fatalf("err = %v", err)
 	}
 }
+
+// A 503 auth_unavailable from /api/v1 is a transient server fault (ExitUnreachable, retry
+// with backoff), not a bad credential (ExitAuth); a plain 401 stays ExitAuth.
+func TestHTTPJobAuthUnavailableIsUnreachableNotAuth(t *testing.T) {
+	c, _, _ := jobServer(t, 503, "application/json", `{"error":"authentication temporarily unavailable","reason":"auth_unavailable"}`)
+	_, err := c.JobGet(context.Background(), "j")
+	var ee *ExitError
+	if !errors.As(err, &ee) {
+		t.Fatalf("err = %v, want *ExitError", err)
+	}
+	if ee.Code != ExitUnreachable {
+		t.Fatalf("503 auth_unavailable: Code = %d, want ExitUnreachable (%d)", ee.Code, ExitUnreachable)
+	}
+	if ee.Reason != "auth_unavailable" {
+		t.Fatalf("Reason = %q, want auth_unavailable", ee.Reason)
+	}
+
+	c, _, _ = jobServer(t, 401, "application/json", `{"error":"invalid token"}`)
+	_, err = c.JobGet(context.Background(), "j")
+	if !errors.As(err, &ee) || ee.Code != ExitAuth {
+		t.Fatalf("401 control: err = %v, want ExitAuth", err)
+	}
+}
