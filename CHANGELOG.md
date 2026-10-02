@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A repo's `.codex/agents/*.toml` agents are now offered at the plan gate, alongside `.claude/agents/*.md` ([#2085](https://github.com/vtmocanu/uzi/issues/2085)).**
+  The worker reads the run's native folder (Claude runs prefer `.claude/agents`, Codex runs prefer `.codex/agents`) and falls back to the other only when the native folder is absent; a present native folder is final even if empty or invalid, and the two are never merged. A TOML agent needs a string `name`, `description` and `developer_instructions` (the prompt) and takes no tools or model; files declaring `features`, `skills`, `sandbox_mode` or `tools` are skipped with a note because uzi cannot honour those restrictions yet. Files are read through a no-symlink, handle-checked path, so on a platform without Linux `/proc` nothing is read. The gate card, run view and feed show the source folder; an API older than the worker does not record it and the UI shows `.claude/agents`. `.codex/config.toml` `[agents]` and other tools' folders are not read.
+
 ### Fixed
 
 - **A CI auto-fix or MR rework halt DM that Slack failed to take is now retried until it reaches you, instead of being lost ([#1675](https://github.com/vtmocanu/uzi/issues/1675)).**

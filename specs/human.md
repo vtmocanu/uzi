@@ -286,6 +286,7 @@ Tracked as GitLab issue vtmocanu/uzi#32; PRD at `prds/done/32-user-vault-passwor
 Tracked as GitLab issue vtmocanu/uzi#37; PRD at `prds/done/37-run-agent-selection.md`.
 
 - At the plan-approval gate, the user chooses which agents the run uses: the repo's own agents (detected from `.claude/agents/`) or the user's uzi templates. [user 2026-07-10]
+- The repo roster may also come from `.codex/agents/*.toml`; the run's native folder is preferred, never merged (issue #2085). (AI-synced 2026-10-02)
 - Show whether repo agents were detected and which ones. [user 2026-07-10]
 - Default to the detected repo agents; if the user does not want them, they can choose their own templates instead. [user 2026-07-10]
 - Repo agents run with the tools and model their files declare (honored as they would be under Claude Code), still subject to uzi's guardrails. [user 2026-07-10; a review-round proposal to deny WebFetch/WebSearch and clamp the model to aliases was rejected by the user the same day — `Agent`/nested-spawn and the async-deferral tools stay denied]

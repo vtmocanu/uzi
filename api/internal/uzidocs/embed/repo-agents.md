@@ -6,7 +6,8 @@ audience: user
 
 # Repo agents
 
-Some repos ship their own agent roster in a `.claude/agents/` directory: a
+Some repos ship their own agent roster in a `.claude/agents/` directory (Markdown
+files) or a `.codex/agents/` directory (TOML files): a
 team that knows a codebase can define the exact `coder`, `reviewer`, and
 specialist roles it wants. When a run clones such a repo, uzi detects that
 roster and lets you run the repo's agents instead of your own
@@ -20,10 +21,11 @@ repo agents and your templates only ever supply the **subagents** it delegates t
 When a run reaches the approval gate, the plan panel shows an **Agents for this
 run** section with two cards:
 
-1. **Repo agents** — the roster detected in the repo's `.claude/agents/`. This
-   is the default when a repo ships one; the card lists the detected names.
+1. **Repo agents** — the roster detected in the repo's `.claude/agents/` or
+   `.codex/agents/` (the card shows which folder). This is the default when a repo
+   ships one; the card lists the detected names.
 2. **My agent templates** — your uzi templates. This is the default (and the
-   repo card is inert) when the repo has no `.claude/agents/`.
+   repo card is inert) when the repo has no agent folder uzi reads.
 
 Pick one source, then click any agent chip to exclude it from the run. At least
 one subagent must remain. The choice locks in when you approve; the run view then
@@ -54,10 +56,70 @@ The [trust trade-off](#the-trust-trade-off--read-before-you-pick-repo-agents)
 below applies unchanged: the lead is told repo-defined subagents' output is
 unverified.
 
+## Which folder is read
+
+A worker reads one folder per run, never both: a roster is never merged across
+folders. Each harness prefers its own folder, and falls back to the other only
+when its own folder is absent.
+
+| Run harness | Preferred folder | Falls back to |
+|---|---|---|
+| Claude | `.claude/agents/*.md` | `.codex/agents/*.toml` |
+| Codex | `.codex/agents/*.toml` | `.claude/agents/*.md` |
+
+If the preferred folder is present, it is final, even when it is empty, holds
+only invalid files, or is rejected as unsafe (see below): uzi does not then look
+at the other folder. The detected roster is shown with its source folder at the
+plan gate, in the run view, and in the feed lines. When the API is older than
+the worker and cannot record the folder, the UI shows `.claude/agents`.
+
+### `.codex/agents/*.toml` files
+
+Each TOML file becomes one subagent:
+
+- **Required:** a string `name` (there is no filename fallback), a string
+  `description`, and a non-empty string `developer_instructions`, which becomes
+  the agent's prompt. The `name` and `description` rules match the Markdown
+  agents.
+- **No tools, no model:** a TOML agent declares neither, so it runs with the
+  run's default tools and model. `model`, `model_reasoning_effort`,
+  `nickname_candidates`, `config_file`, `includes`, and any other key are ignored.
+- **Skipped, not run:** a file that declares `features`, `skills`,
+  `sandbox_mode`, or `tools` (with any value) is skipped with a "declares a Codex
+  restriction uzi cannot honour yet" note, rather than running without the
+  restriction its author asked for.
+- **Invalid:** a file that does not parse, including duplicate keys or tables,
+  is invalid and skipped. The same caps apply as for Markdown agents (16 files,
+  64 KiB per file).
+- A Codex agent's instructions run verbatim even on a Claude run (the fallback
+  case).
+
+TOML-sourced agents get the same guards as Markdown ones on both harnesses:
+their output is treated as untrusted, they cannot spawn nested agents, and the
+deferral tools stay denied.
+
+Out of scope: the `[agents]` table in `.codex/config.toml`, and other tools'
+agent folders, are not read.
+
+### How uzi keeps the read inside the clone
+
+Detection is hardened against a repo that tries to point it elsewhere. uzi
+walks the folder's path components without following symlinks: a symlink
+anywhere in them means the folder is not read, and it still counts as present,
+so there is no fallback to the other folder. Each file is opened without
+following symlinks, and before any byte is read the opened file's real path must
+sit directly inside the agents folder; a file that fails this check is skipped.
+The size check and read use that same open handle. The check relies on Linux
+`/proc`, so on a platform without it nothing is read. As supporting context,
+detection runs during preflight, after the clone or resume and before the
+executor starts, in a clone owned by the runner.
+
 ## What is loaded, and what is never
 
 uzi parses the agent files itself; it never points Claude Code at the repo's
-`.claude/` directory. Each file's `name`, `description`, `tools`, and `model`
+`.claude/` directory. (This section describes `.claude/agents/*.md` files;
+`.codex/agents/*.toml` files are covered under
+[Which folder is read](#which-folder-is-read).) Each file's `name`, `description`, `tools`, and `model`
 frontmatter is honored — including a `tools:` entry naming one of the
 [forge read tools](./forge-read-tools.md) (`mcp__forge__*`), which a repo
 agent can grant itself the same way a template does. That surface is
@@ -115,7 +177,7 @@ Two consequences are worth stating plainly:
   request on that repo.
 
 Repo agents need no opt-in; they are offered at the plan gate whenever the
-repo has a `.claude/agents/` folder. Two related per-repo opt-ins are separate:
+repo has a `.claude/agents/` or `.codex/agents/` folder. Two related per-repo opt-ins are separate:
 the repo's own skills and its root `CLAUDE.md`, both off by default (see
 [Agent skills](./skills.md#repo-skills-opt-in-default-off) and
 [Repo instructions](./skills.md#repo-instructions-opt-in-default-off)).

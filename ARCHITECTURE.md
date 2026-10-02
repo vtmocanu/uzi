@@ -1227,7 +1227,9 @@ Four independent layers, any one of which failing still leaves the others:
    `.claude/settings.json`, hooks, commands, or `.claude/agents` is loaded *by
    the SDK* — a prompt-injection-via-repo defense none of the inspiration
    projects has. The one deliberate, user-gated exception is per-run agent
-   selection (PRD #37): the *worker* parses `.claude/agents/*.md` itself and
+   selection (PRD #37): the *worker* parses `.claude/agents/*.md` (or, issue #2085,
+   `.codex/agents/*.toml`, projected onto the same shape; the harness's native
+   folder wins, never merged) itself and
    feeds them through the same programmatic `agents` map, only when the user
    picks the repo source at the plan gate. `settingSources` stays `[]`; repo
    hooks/settings/commands never load; and repo subagents are still bound by

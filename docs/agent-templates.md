@@ -220,7 +220,7 @@ own edits:
 Or skip reset entirely and hand-merge the new paragraphs into your
 customized body yourself.
 
-A repo can ship its own agent roster in `.claude/agents/`; you can run those
+A repo can ship its own agent roster in `.claude/agents/` or `.codex/agents/`; you can run those
 instead of your templates, chosen per run at the plan gate — see
 [Repo agents](./repo-agents.md).
 
