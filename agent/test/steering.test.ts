@@ -269,6 +269,31 @@ describe("SteeringChannel — disk stop (PRD #1809 D4)", () => {
     assert.strictEqual(fired, 1, "idempotent");
   });
 
+  it("a disk stop interrupts work entered after a now pause spent the shared controller", async () => {
+    const { ch, cancel } = makeChannel([[inp("pause", "now")]]);
+    let interrupts = 0;
+    let restartedWork: AbortController | undefined;
+    ch.onPauseNow(() => {
+      interrupts++;
+      restartedWork?.abort();
+    });
+    ch.start();
+    for (let n = 0; n < 300 && interrupts === 0; n++) await tick();
+    assert.strictEqual(interrupts, 1, "the first now pause spent the shared controller");
+    assert.strictEqual(cancel.signal.aborted, true);
+    assert.strictEqual(ch.lifecycleSignal().aborted, true);
+    ch.rearmLifecycle();
+    assert.strictEqual(ch.lifecycleSignal().aborted, false, "the continued flight can checkpoint again");
+    restartedWork = new AbortController();
+    assert.strictEqual(restartedWork.signal.aborted, false, "restarted work entered before disk pressure");
+    ch.requestDiskStop();
+    assert.strictEqual(ch.lifecycleSignal().aborted, true, "disk pressure stops the rearmed checkpoint lifecycle");
+    assert.strictEqual(interrupts, 2, "the disk interrupt fired after the first abort");
+    assert.strictEqual(restartedWork.signal.aborted, true, "the entered restarted work was stopped");
+    assert.strictEqual(ch.getPauseMode(), "disk");
+    await ch.stop();
+  });
+
   it("an owner pause or pause_cancel arriving after it neither clears nor replaces the disk stop", async () => {
     const { ch } = makeChannel([[inp("pause", "now"), inp("pause", "milestone"), inp("pause_cancel")]]);
     ch.requestDiskStop();

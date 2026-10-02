@@ -2879,6 +2879,265 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       fs.rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("captures a new Codex commit on a tick after a real pause is declined", async () => {
+    const tmp = scratchDir("codex-pause-rearm");
+    const codex = fakeCodex();
+    const ctl = control();
+    const claim = gitlabClaim(1785_203);
+    const pub = stubPublish(async (n, _tip, pack) => {
+      await drain(pack);
+      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let sha = "";
+    try {
+      await mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              commitIn(ctx.worktreePath, "before-codex-pause.txt", "before\\n");
+              api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+              await waitAbort(ctx.signal!);
+              assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              sha = commitIn(ctx.worktreePath, "codex-after.txt", "after\\n");
+              assert.equal(pub.count(), 1, "the post-pause commit has not been published");
+              ctl.advance(INTERVAL_MS + 1);
+              assert.equal(await ctl.fire(), "published");
+            });
+            return { branch: ctx.branch };
+          },
+          safety: codex.safety,
+        },
+      }), ctl).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed", JSON.stringify(turnErrors.map(String)));
+      assert.deepEqual(codex.boundaryErrors, []);
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("publishes a deferred Codex milestone immediately after a declined pause with no ticker", async () => {
+    const tmp = scratchDir("codex-pause-notick");
+    const codex = fakeCodex();
+    const claim = gitlabClaim(1785_204);
+    const outsidePermit: boolean[] = [];
+    const pub = stubPublish(async (n, _tip, pack) => {
+      outsidePermit.push(!codex.inPermit());
+      await drain(pack);
+      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let sha = "";
+    let atReturn = -1;
+    try {
+      await mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), () => ({
+        executor: {
+          run: async (ctx: RunContext) => {
+            await recordingTurnErrors(async () => {
+              commitIn(ctx.worktreePath, "before-codex-notick.txt", "before\\n");
+              api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+              await waitAbort(ctx.signal!);
+              assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              sha = commitIn(ctx.worktreePath, "codex-notick.txt", "after\\n");
+              await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+              atReturn = pub.count();
+            });
+            return { branch: ctx.branch };
+          },
+          safety: codex.safety,
+        },
+      }), undefined, { checkpointTickIntervalMs: 0 }).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(atReturn, 2);
+      assert.equal(pub.tips.at(-1), sha);
+      assert.deepEqual(outsidePermit, [true, true]);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  for (const stop of ["cancel", "shutdown"] as const) {
+    it(`keeps ${stop} sticky after a spent pause and aborts an entered restarted tick`, async () => {
+      const tmp = scratchDir(`pause-${stop}-sticky`);
+      const ctl = control();
+      const codex = fakeCodex();
+      const claim = gitlabClaim(stop === "cancel" ? 1785_207 : 1785_208);
+      const entered = deferred();
+      const landedTips: string[] = [];
+      let owedSha = "";
+      const pub = stubPublish(async (n, tip, pack, signal) => {
+        if (n === 1) {
+          entered.resolve();
+          return hangUntilAborted(pack, signal);
+        }
+        await drain(pack);
+        if (n > 0) landedTips.push(tip);
+        return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      });
+      let runner: RunRunner | undefined;
+      try {
+        runner = mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), () => ({
+          executor: {
+            run: async (ctx: RunContext) => {
+              await recordingTurnErrors(async () => {
+                commitIn(ctx.worktreePath, "before-sticky.txt", "before\\n");
+                api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+                await waitAbort(ctx.signal!);
+                assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+                owedSha = commitIn(ctx.worktreePath, "after-sticky.txt", "after\\n");
+                await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
+                assert.equal(pub.count(), 1, "the Codex milestone still owes its publish");
+                ctl.fireNoWait();
+                await bounded(entered.promise, TEARDOWN_MS, "restarted tick publish entry");
+                const outcome = ctl.nextOutcome();
+                if (stop === "cancel") {
+                  api.setInputs(claim.run_id, [{ id: 2, kind: "cancel" }]);
+                } else {
+                  runner!.shutdown();
+                }
+                assert.equal(await bounded(outcome, TEARDOWN_MS, "restarted tick abort"), "aborted");
+                assert.equal(pub.count(), 2, "the owed publish was aborted, with no later delivery");
+              });
+              return { branch: ctx.branch };
+            },
+            safety: codex.safety,
+          },
+        }), ctl);
+        await runner.execute(claim).catch(() => undefined);
+        assert.equal(pub.count(), 2);
+        assert.ok(!landedTips.includes(owedSha), "the aborted deferred milestone never landed");
+      } finally {
+        await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: pub.restore, paths: [tmp] });
+      }
+    });
+  }
+
+  for (const interrupt of ["now", "switch"] as const) {
+    it(`aborts an entered restarted tick on a second ${interrupt} interrupt`, async () => {
+      const tmp = scratchDir(`pause-repeat-${interrupt}`);
+      const ctl = control();
+      const claim = gitlabClaim(interrupt === "now" ? 1785_209 : 1785_210, { claim_generation: 1 });
+      const entered = deferred();
+      const pub = stubPublish(async (n, _tip, pack, signal) => {
+        if (n === 1) {
+          entered.resolve();
+          return hangUntilAborted(pack, signal);
+        }
+        await drain(pack);
+        return { ok: false, httpStatus: 500 };
+      });
+      let runner: RunRunner | undefined;
+      try {
+        runner = mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "before-repeat.txt", "before\n");
+          api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+          await waitAbort(ctx.signal!);
+          assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          commitIn(ctx.worktreePath, "after-repeat.txt", "after\n");
+          ctl.advance(INTERVAL_MS + 1);
+          ctl.fireNoWait();
+          await bounded(entered.promise, TEARDOWN_MS, "restarted tick publish entry");
+          const outcome = ctl.nextOutcome();
+          if (interrupt === "now") {
+            api.setInputs(claim.run_id, [{ id: 2, kind: "pause", body: "now" }]);
+          } else {
+            api.requestCredentialSwitch(claim.run_id, 1);
+          }
+          assert.equal(await bounded(outcome, TEARDOWN_MS, "restarted tick interruption"), "aborted");
+          assert.equal(pub.count(), 2);
+        }), ctl);
+        await runner.execute(claim).catch(() => undefined);
+        assert.equal(ctl.outcomes[0], "aborted");
+      } finally {
+        await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: pub.restore, paths: [tmp] });
+      }
+    });
+  }
+
+  it("settles an active tick before pause capture, then publishes a later tick", async () => {
+    const tmp = scratchDir("pause-active-tick");
+    const ctl = control();
+    const claim = gitlabClaim(1785_205);
+    const entered = deferred();
+    const order: string[] = [];
+    const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
+    let pauseRequested = false;
+    const pub = stubPublish(async (n, _tip, pack, signal) => {
+      if (n === 0) {
+        entered.resolve();
+        try { return await hangUntilAborted(pack, signal); }
+        finally { order.push("tick publish aborted"); }
+      }
+      order.push(n === 1 ? "pause publish" : "later tick publish");
+      await drain(pack);
+      return n === 1 ? { ok: false, httpStatus: 500 } : LANDED;
+    });
+    let sha = "";
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "before-active.txt", "before\\n");
+        ctl.advance(INTERVAL_MS + 1);
+        ctl.fireNoWait();
+        await bounded(entered.promise, TEARDOWN_MS, "tick publish entry");
+        api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
+        await waitAbort(ctx.signal!);
+        pauseRequested = true;
+        assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+        assert.equal(ctl.outcomes[0], "aborted", "the tick settled before the park acquired the sink");
+        sha = commitIn(ctx.worktreePath, "after-active.txt", "after\\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published");
+      }), ctl, {
+        quiesceRun: async (req) => {
+          if (req.site === "pause_park" && pauseRequested) {
+            assert.equal(ctl.outcomes[0], "aborted", "the tick settled before park quiescence");
+            order.push("pause quiesce");
+          }
+          return { process: undefined, docker: { state: "not_wired", removed: [], detail: "test quiescence" } };
+        },
+      }).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.deepEqual(order, ["tick publish aborted", "pause quiesce", "pause publish", "later tick publish"]);
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("mid-turn checkpoint lifecycle after a refused wall park (issue #1785)", () => {
+  it("publishes a later tick after real wall input and a refused park", async () => {
+    const tmp = scratchDir("wall-rearm");
+    const ctl = control();
+    const claim = gitlabClaim(1785_206);
+    api.setWallParkResponse("running", 409, { total: 7200, used: 3600 });
+    const pub = stubPublish(async (_n, _tip, pack) => {
+      await drain(pack);
+      return LANDED;
+    });
+    let sha = "";
+    try {
+      await mkRunner(mkGit(fx.dataDir, writeShim(tmp, "detect")), turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "before-wall.txt", "before\\n");
+        api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "wall" }]);
+        await waitAbort(ctx.signal!);
+        assert.equal(await ctx.parkForWall!({ completedCount: 0 }), "refused");
+        ctx.clearWallMode!();
+        sha = commitIn(ctx.worktreePath, "after-wall.txt", "after\\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published");
+      }), ctl).execute(claim);
+      assert.equal(finalStatus(claim.run_id), "completed");
+      assert.equal(pub.tips.at(-1), sha);
+    } finally {
+      api.setWallParkResponse("paused", 200);
+      pub.restore();
+      fs.rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("mid-turn checkpoint lifecycle after a confirmed switch give-up (issue #1785)", () => {
