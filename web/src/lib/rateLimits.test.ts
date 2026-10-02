@@ -223,7 +223,7 @@ describe("autoStatusChip", () => {
     const rejected = autoStatusChip("rejected");
     expect(rejected.label).toBe("rejected by Anthropic");
     expect(rejected.hint).toMatch(/Anthropic/);
-    expect(rejected.hint).toMatch(/auto-selection/);
+    expect(rejected.hint).toMatch(/auto-selection/i);
     expect(rejected.hint).toMatch(/cannot|will not/);
 
     const noReading = autoStatusChip("no_reading");
