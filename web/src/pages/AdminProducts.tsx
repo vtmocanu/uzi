@@ -107,7 +107,10 @@ export function AdminProducts() {
       return { tokens, truncated: truncated === true, ownerId: ownerFilter, productId: productFilter };
     },
     [ownerFilter, productFilter],
-    { fallback: "Failed to load tokens" },
+    // "deps": a filter change clears the previous filter's error, so a failed fetch under one
+    // filter neither keeps its banner nor hides "Loading tokens…" while the next one loads.
+    // (Its `loading` is unused: the cards stay mounted and read `shown` instead.)
+    { fallback: "Failed to load tokens", skeleton: "deps" },
   );
   const reload = () => Promise.all([reloadProducts(), reloadTokens()]);
   // The hook keeps the last data when a refetch fails, and while a new filter's fetch is pending

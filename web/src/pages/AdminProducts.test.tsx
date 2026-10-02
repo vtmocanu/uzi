@@ -647,6 +647,17 @@ describe("AdminProducts owner and product filters (issue #1935)", () => {
     expect(screen.queryByRole("button", { name: /^Revoke/ })).toBeNull();
   });
 
+  it("drops a failed filter's error and shows Loading tokens while the next filter loads", async () => {
+    await pickFilters();
+    mockApi.adminListProductTokens.mockRejectedValue(new ApiError(500, "boom"));
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-mira" } });
+    expect(await screen.findByText("boom")).toBeTruthy();
+    mockApi.adminListProductTokens.mockImplementation(() => new Promise(() => {}));
+    fireEvent.change(screen.getByRole("combobox", { name: "Owner" }), { target: { value: "u-dan" } });
+    await waitFor(() => expect(screen.queryByText("boom")).toBeNull());
+    expect(within(await productCard("Metrics export")).getByText("Loading tokens…")).toBeTruthy();
+  });
+
   // Opens a card's OAuth disclosure the way ProductOAuthClient's own tests do.
   function openOAuth(card: HTMLElement) {
     const details = Array.from(card.querySelectorAll("details")).find((d) =>

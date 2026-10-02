@@ -228,7 +228,7 @@ SELECT t.id,
 -- deliberately absent, the security boundary documented on that query), joins, ordering and
 -- bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
 -- stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
--- (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+-- (user_id, revoked) (migrations/00270_product_tokens.sql).
 SELECT t.id,
        t.user_id,
        u.email AS owner_email,
@@ -256,8 +256,8 @@ SELECT t.id,
 -- Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
 -- deliberately absent, the security boundary documented on that query), joins, ordering and
 -- bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
--- stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
--- (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+-- stays reachable, and "truncated" is judged per filtered result. Served by
+-- idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
 SELECT t.id,
        t.user_id,
        u.email AS owner_email,
@@ -286,7 +286,7 @@ SELECT t.id,
 -- deliberately absent, the security boundary documented on that query), joins, ordering and
 -- bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
 -- stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
--- (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+-- (user_id, revoked) or idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
 SELECT t.id,
        t.user_id,
        u.email AS owner_email,

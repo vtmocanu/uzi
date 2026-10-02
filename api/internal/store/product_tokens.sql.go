@@ -555,7 +555,7 @@ type ListProductTokensForAdminByOwnerRow struct {
 // deliberately absent, the security boundary documented on that query), joins, ordering and
 // bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
 // stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
-// (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+// (user_id, revoked) (migrations/00270_product_tokens.sql).
 func (q *Queries) ListProductTokensForAdminByOwner(ctx context.Context, arg ListProductTokensForAdminByOwnerParams) ([]ListProductTokensForAdminByOwnerRow, error) {
 	rows, err := q.db.Query(ctx, listProductTokensForAdminByOwner, arg.OwnerID, arg.MaxRows)
 	if err != nil {
@@ -642,7 +642,7 @@ type ListProductTokensForAdminByOwnerAndProductRow struct {
 // deliberately absent, the security boundary documented on that query), joins, ordering and
 // bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
 // stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
-// (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+// (user_id, revoked) or idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
 func (q *Queries) ListProductTokensForAdminByOwnerAndProduct(ctx context.Context, arg ListProductTokensForAdminByOwnerAndProductParams) ([]ListProductTokensForAdminByOwnerAndProductRow, error) {
 	rows, err := q.db.Query(ctx, listProductTokensForAdminByOwnerAndProduct, arg.OwnerID, arg.ProductID, arg.MaxRows)
 	if err != nil {
@@ -726,8 +726,8 @@ type ListProductTokensForAdminByProductRow struct {
 // Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
 // deliberately absent, the security boundary documented on that query), joins, ordering and
 // bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
-// stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
-// (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+// stays reachable, and "truncated" is judged per filtered result. Served by
+// idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
 func (q *Queries) ListProductTokensForAdminByProduct(ctx context.Context, arg ListProductTokensForAdminByProductParams) ([]ListProductTokensForAdminByProductRow, error) {
 	rows, err := q.db.Query(ctx, listProductTokensForAdminByProduct, arg.ProductID, arg.MaxRows)
 	if err != nil {
