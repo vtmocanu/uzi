@@ -40,6 +40,11 @@ through `[0.52.0]`.)
 - **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
   The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
 
+### Added
+
+- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
+  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, the run logs or the run transcript. A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` and `decisions memo saved (N bytes)`. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

@@ -1102,6 +1102,14 @@ Tracked as GitHub issue vtmocanu/uzi#2099.
 - Seed an admin user from env at startup (`UZI_SEED_EMAIL` / `UZI_SEED_PASSWORD` / `UZI_SEED_NAME`) so the user survives DB wipes.
 - Seeded user gets the admin role; never overwrite an existing user.
 
+## Feature #2083 — Decisions memo for MR rework (experiment)
+
+Tracked as GitHub issue vtmocanu/uzi#2083; an experiment to decide the next step of PRD #1214.
+
+- An admin setting `decisions_memo_enabled` (default off) lets a Claude run that publishes its merge request save a private decisions memo (up to 8 KiB), stored with the run, owner-scoped, and never in the PR description, run logs or run transcript. (AI-synced 2026-10-02)
+- Only a later MR rework on the same lineage (same owner, repo, branch and MR) receives the latest memo, as untrusted, advisory context; an absent memo or any fetch problem means a normal fresh rework. (AI-synced 2026-10-02)
+- A failed, held or unpublished round never replaces the prior memo; turning the setting off stops writes and injection but keeps stored memos; Codex runs neither write nor receive one. (AI-synced 2026-10-02)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is

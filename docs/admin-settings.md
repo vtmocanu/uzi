@@ -186,6 +186,12 @@ kill switch, off by default. See
 [GitHub Projects v2 sync](./github-project-sync.md) for what it does, the
 required PAT scope, and how a repo gets linked.
 
+## Decisions memo
+
+| Setting | Default | Controls |
+|---|---|---|
+| `decisions_memo_enabled` | `false` | Experiment (#2083): lets a Claude run that publishes a PR save a private, owner-scoped decisions memo (up to 8 KiB), and lets a later [MR rework](./mr-review-watcher.md#decisions-memo-experiment) on the same PR receive it as untrusted, advisory context. Text `true` or `false`; set through `PUT /api/admin/settings`, with no Admin Settings control. Turning it off stops new writes and injection but keeps stored memos. Codex runs are unaffected. |
+
 ## Hosted worker quota
 
 On a k8s deployment with [hosted workers](./hosted-workers.md) turned on, a
