@@ -15,6 +15,10 @@ around it. `S` is `.agents/skills/uzi-lander/scripts/`.
   false`). By day a conflicting Renovate PR stays conflicting: tick its rebase checkbox
   (honoured outside the schedule, on Renovate's next run, up to 4 h away), or re-apply
   the same bump on your own branch off `main` and let Renovate close its PR.
+- **Patch updates automerge** (`renovate.json`, first `packageRules` entry): Renovate
+  rebases, waits for every check green, then merges them itself on a night run. A patch PR
+  you see open is red, pending, or excluded (Codex runtime, `@anthropic-ai/claude-agent-sdk`):
+  land it like any other. A red `main` after a night with no lander merge may be one of these.
 - **A pending `renovate/stability-days` is not a required check** and can stay pending for
   good (a digest update with no release timestamp). Judge the target's provenance and age
   yourself (e.g. an action digest is an upstream release-tag commit), not the status.

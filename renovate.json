@@ -90,6 +90,13 @@
   ],
   "packageRules": [
     {
+      "description": "Patch updates automerge on green CI. Repo auto-merge is off, so Renovate merges them itself: it rebases a behind branch first (strict required checks), then merges once every check is green. Later rules override this one (Codex runtime, the agent SDK).",
+      "matchUpdateTypes": ["patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": false
+    },
+    {
       "description": "One reviewed Codex runtime upgrade PR. Stable release timestamps share the repository's seven-day age and nightly schedule. Runtime probe/launcher parity deliberately blocks a lock-only bump until upgrade work is done.",
       "matchPackageNames": ["openai/codex"],
       "groupName": "Codex runtime",
@@ -141,6 +148,11 @@
       "matchPackageNames": ["helm/kind-action", "kindest/node"],
       "groupName": "KinD toolchain",
       "separateMajorMinor": false
+    },
+    {
+      "description": "Agent runtime core: every bump gets an adoption read of its release notes (uzi-lander references/renovate.md), so it is never automerged.",
+      "matchPackageNames": ["@anthropic-ai/claude-agent-sdk"],
+      "automerge": false
     }
   ]
 }

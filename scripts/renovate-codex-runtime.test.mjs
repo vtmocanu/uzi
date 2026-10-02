@@ -38,6 +38,12 @@ assert(rule, 'all pins need one group');
 assert.equal(rule.groupName, 'Codex runtime');
 assert.equal(rule.separateMajorMinor, false);
 assert.equal(rule.automerge, false);
+// Later packageRules win, so each automerge opt-out must follow every automerge opt-in.
+const lastOptIn = config.packageRules.findLastIndex(r => r.automerge === true);
+for (const name of ['openai/codex', '@anthropic-ai/claude-agent-sdk']) {
+  const optOut = config.packageRules.findIndex(r => r.matchPackageNames?.includes(name) && r.automerge === false);
+  assert(optOut > lastOptIn, `${name} automerge opt-out must follow the last automerge opt-in`);
+}
 assert.equal(rule.dependencyDashboardApproval ?? false, false);
 assert.equal(config.minimumReleaseAge, '7 days');
 assert.equal(config.internalChecksFilter, 'strict');
