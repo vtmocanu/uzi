@@ -3670,7 +3670,7 @@ export class RunRunner {
           // `failed`). (3) Then reap this generation's provider while the run is still actively-claimed
           // and record the outcome + the reaped safety epoch, for reportGenericFailure to settle on.
           if (!flight.cancel.signal.aborted) flight.cancel.abort();
-          flight.steering.abortLifecycle();
+          flight.steering?.abortLifecycle();
           // Capture the epoch BEFORE the await: reapForSink reads executor.safety synchronously at
           // entry, and a checkpoint can swap it while the reap is in flight. Recording it afterwards
           // would compare the NEW epoch with itself and let the settle run under a provider this
@@ -3692,7 +3692,7 @@ export class RunRunner {
       // The install threw before beforeResolve could run, so the fallback abort still fires (guarded
       // so a concurrent abort is never doubled), unwinding execute() into reportGenericFailure.
       if (!flight.cancel.signal.aborted) flight.cancel.abort();
-      flight.steering.abortLifecycle();
+      flight.steering?.abortLifecycle();
     } finally {
       if (outbox) {
         const { skipped } = outbox.releaseTerminalResolve(flight.runId, flight.claimGeneration);
