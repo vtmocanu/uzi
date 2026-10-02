@@ -935,7 +935,7 @@ function buildAdviceAuthConfig(
  * a "provider" root under app-server auth, so the credential flows over the login RPC and
  * NEVER the launcher env — but for the isolated, tool-less advice lane: NO registry, NO
  * broker, NO command-effect surface, and its OWN disposable per-call owned-data-root/cwd
- * (never the run lane's `codex-data/epoch-N` tree or worktree). `authMode` is bound once at
+ * (never the run lane's `codex-data/<namespace>-epoch-N` tree or worktree). `authMode` is bound once at
  * FACTORY construction ({@link makeProductionCodexAdviceHarnessFactory}) because
  * {@link CodexAdviceLaunchSpec} itself carries no auth-mode field (the pinned app-server auth
  * owner authenticates over the login RPC, not a launcher config choice).
@@ -1895,6 +1895,7 @@ export class CodexExecutor implements Executor {
     if (ctx.signal?.aborted) forwardLifecycleAbort();
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
     let epochIndex = 0;
+    const epochNamespace = randomUUID();
     let provisionDir: string | undefined;
     // Issue #1598: the run's ONE command cache (a `--hold-cache` process as the command uid),
     // or undefined when none is held. Settled exactly once at the run's TERMINAL registry
@@ -2052,7 +2053,7 @@ export class CodexExecutor implements Executor {
         // codex-data/ is DENIED before the command launcher, not left to OS containment. The
         // absence of CODEX_HOME from the command env does NOT protect a known absolute path, so
         // the prefix is what closes the literal-resolved-path form. `homeRoot/codex-data/` is a
-        // STATIC parent of every `epoch-*/codex` owned HOME (startProviderEpoch, below), so the
+        // STATIC parent of every `<namespace>-epoch-*/codex` owned HOME (startProviderEpoch, below), so the
         // trailing-separator prefix survives epoch recreation and reaches child turns via this
         // same object threaded through delegation.ts — no per-epoch rebuild is needed.
         //
@@ -2090,7 +2091,7 @@ export class CodexExecutor implements Executor {
       // cross-worker resume) or starts a fresh session. `lastSessionId` tracks the most recent
       // turn's session id so a recreated epoch resumes the RIGHT thread.
       let lastSessionId = ctx.sessionId ?? undefined;
-      epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochIndex);
+      epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, epochIndex);
       this.safety = epoch.safety;
 
       // Issue #1866 M2: measure the lead's command environment ONCE, through epoch 0's registered
@@ -2266,7 +2267,7 @@ export class CodexExecutor implements Executor {
         // propagates out of run() unchanged (startProviderEpoch rethrows it unwrapped and
         // `this.safety` is still the OLD live epoch, since it is swapped only after a
         // successful start), and the runner does the fenced positive running report itself.
-        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
+        epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex);
         this.safety = epoch.safety;
         reapedSinceLastPersist = false;
         await old.dispose();
@@ -2446,7 +2447,7 @@ export class CodexExecutor implements Executor {
         if (reapedSinceLastPersist) epochNeedsRecreate = true;
         if (epochNeedsRecreate) {
           const old = epoch;
-          epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, ++epochIndex);
+          epoch = await this.startProviderEpoch(ctx, shared, lastSessionId, epochNamespace, ++epochIndex);
           this.safety = epoch.safety;
           await old.dispose();
           epochNeedsRecreate = false;
@@ -2711,6 +2712,7 @@ export class CodexExecutor implements Executor {
     ctx: RunContext,
     shared: EpochSharedContext,
     resumeSessionId: string | undefined,
+    epochNamespace: string,
     epochIndex: number,
   ): Promise<ProviderEpoch> {
     const {
@@ -2734,7 +2736,7 @@ export class CodexExecutor implements Executor {
     // Each epoch gets its OWN owned data root / codexHome (M3a fresh-home semantics), so a
     // recreated provider root never inherits the prior root's auth/cache material; it adopts the
     // credential-free session subset from the SHARED store instead.
-    const ownedDataRoot = path.join(homeRoot, "codex-data", `epoch-${epochIndex}`);
+    const ownedDataRoot = path.join(homeRoot, "codex-data", `${epochNamespace}-epoch-${epochIndex}`);
     const codexHome = path.join(ownedDataRoot, "codex");
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(epochIndex));
     this.unverifiedEpochRegistries.add(registry);
