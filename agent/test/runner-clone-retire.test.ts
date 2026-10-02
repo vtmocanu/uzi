@@ -744,6 +744,26 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
 
   const scratchDirs = (): string[] => fs.readdirSync(runnerRoot()).filter((d) => d.startsWith(".retire-"));
 
+  async function bindAndMoveSocket(
+    server: net.Server,
+    clonePath: string,
+    move: (from: string, to: string) => void,
+    retire: () => Promise<void>,
+  ): Promise<void> {
+    const short = shortUnixSocket();
+    try {
+      await listenUnix(server, short.socket);
+      move(short.socket, path.join(clonePath, ".sock"));
+    } finally {
+      short.dispose();
+    }
+    try {
+      await retire();
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+
   it("T1354-a (discard EXDEV): the atomic rename frees the canonical past a FIFO + socket; no quarantine retained", async () => {
     const iid = 1470;
     const ownerRunId = "d1354001-0000-4000-8000-000000000001";
@@ -757,27 +777,58 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
     // from shortUnixSocket.
     execFileSync("mkfifo", [path.join(clonePath, "worktree.fifo")]);
     const server = net.createServer();
-    const short = shortUnixSocket();
-    try {
-      await listenUnix(server, short.socket);
-      fs.renameSync(short.socket, path.join(clonePath, ".sock"));
-    } finally {
-      short.dispose();
-    }
-
-    const restore = stubDockerLaneRename();
-    try {
-      await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: true });
-    } finally {
-      restore();
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    }
+    await bindAndMoveSocket(server, clonePath, fs.renameSync, async () => {
+      const restore = stubDockerLaneRename();
+      try {
+        await git.retireRunnerClone(bare, clonePath, branch, ownerRunId, { discard: true });
+      } finally {
+        restore();
+      }
+    });
 
     assert.equal(fs.existsSync(clonePath), false, "the canonical is freed by the intra-device atomic rename");
     assert.equal(readJournal(bare, branch), undefined, "the journal is cleared once the rename frees the canonical");
     const q = fs.existsSync(holdingRoot()) ? fs.readdirSync(holdingRoot()) : [];
     assert.equal(q.length, 0, "the discard path retains NO quarantine subtree");
     assert.equal(scratchDirs().length, 0, "the intra-device scratch parent is disposed out of the lock");
+  });
+
+  it("T1354-a socket move failure preserves the error and closes the bound server", { timeout: 5000 }, async () => {
+    const { clonePath } = await seedResidue(1477, "d1354007-0000-4000-8000-000000000007", "MOVE.txt");
+    const server = net.createServer();
+    const moveError = new Error("T1354-a socket move failed");
+    let movedAfterBind = false;
+    try {
+      await assert.rejects(
+        bindAndMoveSocket(server, clonePath, (from) => {
+          movedAfterBind = server.listening && fs.existsSync(from);
+          throw moveError;
+        }, async () => {}),
+        (error: unknown) => error === moveError,
+      );
+      assert.equal(movedAfterBind, true, "the move fails after the socket is bound");
+      assert.equal(server.listening, false, "a failed socket move closes the bound server");
+    } finally {
+      if (server.listening) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    }
+  });
+
+  it("T1354-a bind failure preserves the original listen error", { timeout: 5000 }, async () => {
+    const server = net.createServer();
+    const listenError = new Error("T1354-a socket bind failed");
+    server.listen = (() => {
+      queueMicrotask(() => server.emit("error", listenError));
+      return server;
+    }) as typeof server.listen;
+    let moveCalled = false;
+    await assert.rejects(
+      bindAndMoveSocket(server, runnerRoot(), () => { moveCalled = true; }, async () => {}),
+      (error: unknown) => error === listenError,
+    );
+    assert.equal(moveCalled, false, "a failed bind never attempts the move");
+    assert.equal(server.listening, false, "a failed bind leaves the server unbound");
   });
 
   it("T1354-b (!discard EXDEV): copy-before-free keeps a symlink-faithful quarantine and skips the FIFO", async () => {
