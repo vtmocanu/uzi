@@ -398,6 +398,10 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
+      # CI and the baked worker share one SAST engine (#2093). A lone Renovate
+      # CI bump must fail here until the worker lock moves with it.
+      - task: test:semgrep-parity
+      - task: check:semgrep-parity
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -945,6 +949,16 @@ tasks:
     desc: hermetic exit-code contract for check:changelog-entry (throwaway git repos, no network), tally-guarded
     cmds:
       - ./scripts/check-changelog-entry.test.sh
+
+  test:semgrep-parity:
+    desc: hermetic CI and worker semgrep parity fixtures, including fail-closed inputs
+    cmds:
+      - ./scripts/check-semgrep-parity.test.sh
+
+  check:semgrep-parity:
+    desc: CI semgrep pin matches the worker lock's default x86_64-linux output
+    cmds:
+      - ./scripts/check-semgrep-parity.sh
 
   test:scan-secrets:
     desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)

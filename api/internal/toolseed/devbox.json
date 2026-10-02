@@ -367,16 +367,11 @@
   // semgrep is Python/OCaml with no static binary, so BYO-on-PATH via this baked toolchain is the
   // delivery (devs install locally, CI installs it) rather than a pinned-download wrapper.
   //
-  // Multi-output at this rev — MEASURED not assumed (outputs [out dist], meta.outputsToInstall
-  // [out]) — but the CLI is in the DEFAULT `out` output (store ls of out/bin → `semgrep` present),
-  // so a BARE `semgrep` carries the CLI and NO `.bin`/`.out` selector is needed or correct
-  // (contrast openssl.bin/file.out/shellcheck.bin, whose CLI-bearing output is not `out`). No
-  // meta.mainProgram is set, but bin/semgrep lands regardless. This rev carries semgrep 1.164.0;
-  // its out-output narinfo (4dhfl2628wgqj25rm9m0mn28cp5x3lhq) is HTTP 200 on cache.nixos.org for
-  // x86_64-linux, so CI's amd64-only image build SUBSTITUTES it rather than compiling
-  // semgrep-core from source — the non-negotiable condition for baking a tool in. Guard row is
-  // `semgrep  semgrep  semgrep --version`. Added by hand-editing this file + the sibling
-  // devbox.lock entry (never `devbox add`); locks as `source: "nixpkg"` at 20535e48….
+  // The sibling lock is the version source of truth: nixpkgs 419fe0f4 resolves the
+  // default x86_64-linux output to python3.14-semgrep-1.172.0. Keep the bare `semgrep`
+  // selector; the lock selects the default output. Guard row:
+  // `semgrep  semgrep  semgrep --version`. CI must move with the lock, enforced by
+  // `task check:semgrep-parity`; a lone CI version bump cannot land silently.
   //
   // `lsof` + `procps` (2026-09-24, issue #1575) replace busybox applets that are a HAZARD,
   // not merely missing. Busybox `lsof` ignores every option: `lsof -ti tcp:<port>` prints
