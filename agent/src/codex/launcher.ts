@@ -61,10 +61,12 @@ const MAX_EVIDENCE_LINES = 256;
 const MAX_EVIDENCE_LINE_BYTES = 65536; // 64 KiB per evidence line
 const MAX_CONTROL_BYTES = 8192; // 8 KiB per control frame
 
-/** The fully-REPLACED PATH: system dirs + the pinned worker toolchain, and NOT the
+/** The fully-REPLACED PATH deliberately excludes the worker toolchain (#2129):
+ *  its /nix targets are runner-owned on hosted workers, so keep them off the
+ *  credentialed lane, as entrypoint.sh does for the worker PATH. Also excludes the
  *  Codex bundle (`/opt/uzi-codex/.../bin` and `codex-path/rg` are resolved by
  *  absolute path INSIDE the launch, never via PATH — PRD #1156 build facts). */
-const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
+const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 /** The pinned, image-baked Codex app-server binary. Exported so the production adapter
  *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
  *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */

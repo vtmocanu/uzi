@@ -214,8 +214,9 @@ describe("launchCodexRoot: env allowlist, trees, argv", () => {
     assert.equal(env.SHELL, "/bin/sh");
     assert.equal(env.LANG, "C");
     assert.equal(env.TERM, "dumb");
-    // Fixed PATH: system dirs + toolchain, NOT the codex bundle.
-    assert.match(String(env.PATH), /\/opt\/uzi-toolchain\/bin/);
+    // The credentialed launch lane resolves only system tools, never the writable store.
+    assert.equal(env.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
+    assert.ok(String(env.PATH).split(":").every((entry) => !entry.startsWith("/opt/uzi-toolchain") && !entry.startsWith("/nix")));
     assert.doesNotMatch(String(env.PATH), /uzi-codex/);
     // No leak of the worker/host env.
     assert.equal(env.CODEX_CANARY_LEAK, undefined);

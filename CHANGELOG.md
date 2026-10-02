@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
+  The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
+
 - **Failed delegated Codex children now report their provider error category ([#2121](https://github.com/vtmocanu/uzi/issues/2121)).**
   The lead and run feed show a closed category such as `transport` for `serverOverloaded` instead of only a generic failure; no provider text is exposed.
 
