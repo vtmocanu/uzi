@@ -86,6 +86,15 @@ warnings, and a fixed footer: "Opened by uzi from `<branch>`. A human
 reviews and merges; uzi never merges." The summary and the size line are
 omitted, not left blank, when there's nothing to show.
 
+**An optional diagram.** When the editor can ground a change involving several
+interacting components or an order-dependent flow in the diff, the PR may show
+one small Mermaid flow or sequence diagram after "What changed" and before
+"Verification". Most PRs have none: docs, config, dependency bumps and other
+diffs with no code do not get one, and the editor omits it when the evidence
+is uncertain. The editor supplies components and connections; uzi renders the
+Mermaid syntax inside its existing description block. A review bot's diagram
+outside that block remains separate.
+
 **The size block.** A file count and a small table, like:
 
 ```
@@ -115,7 +124,10 @@ doesn't match a common pattern, for example), add or adjust a
 `.gitattributes` entry for it; the size block has no repo-specific rules
 baked in. `uzi run get`'s own `SIZE` row and the run page's "Delivered"
 section both print the same numbers on one line: each omits a bucket that has a file but no added and no
-deleted lines, which the PR's own size table still shows.
+deleted lines, which the PR's own size table still shows. If the description
+exceeds its size limit, uzi drops the diagram first; the computed size table
+keeps its rows and line breaks even if the rest of the description must fall
+back to the size block alone.
 
 **Verification is only what the agent reported.** The Verification section
 never claims the CI passed (that's on the PR itself, from the forge) and
@@ -130,7 +142,10 @@ plain-English text from the lead's structured claims and the final diff. If
 that pass fails or times out, the description falls back to rendering the
 lead's own claims directly (marked "Summary written by the agent, not
 checked against the diff"); if neither is available, the region shows only
-the size line. The completion block is always written, on every rung.
+the size line. Neither fallback draws a diagram. Diagram labels are normalized
+and limited to safe characters by the api; a label that contains a closing
+directive or mention causes the whole diagram to be dropped. The completion
+block is always written, on every rung.
 
 **Editing the description.** You can edit the text uzi writes, or add your
 own notes outside it (a review bot's summary, a filled-in PR template
@@ -161,4 +176,8 @@ uzi markers untouched entirely.
 card as the intent and plan summaries. `uzi run get <id>` prints the same
 summary as a `DELIVERED` row (followed by an `UNCHECKED` row when the summary is
 the agent's own, not checked against the diff), the size line as `SIZE`, and, when the PR's
-description couldn't be refreshed, a `PR_UPDATE` row explaining why.
+description couldn't be refreshed, a `PR_UPDATE` row explaining why. If the
+published PR region has a diagram, the Delivered card and CLI also show its
+connections as a plain-text outline, in order. A stored diagram alone does
+not show an outline: the publication flag recorded when the region is bound
+must confirm that the diagram made it into the PR.
