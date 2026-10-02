@@ -297,13 +297,16 @@ func (h *Handler) OAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 	default:
 		client = oauthClientFromProduct(product)
 	}
-	if err := oauthsrv.CheckClient(client, q); err != nil {
+	// From here on, every redirect goes to the registered URI CheckClient returned, never to the
+	// request's own redirect_uri string.
+	registered, err := oauthsrv.CheckClient(client, q)
+	if err != nil {
 		oauthStaticError(w, http.StatusBadRequest)
 		return
 	}
-	req, verr := oauthsrv.ValidateAuthorize(client, q)
+	req, verr := oauthsrv.ValidateAuthorize(client, q, registered)
 	if verr != nil {
-		oauthRedirect(w, oauthsrv.ErrorRedirectURL(q.RedirectURI, verr, h.oauthIssuer()))
+		oauthRedirect(w, oauthsrv.ErrorRedirectURL(registered, verr, h.oauthIssuer()))
 		return
 	}
 

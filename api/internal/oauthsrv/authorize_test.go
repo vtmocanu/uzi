@@ -57,8 +57,8 @@ func TestCheckClientRejectsBeforeAnyRedirect(t *testing.T) {
 			if tt.mut != nil {
 				tt.mut(v)
 			}
-			if err := CheckClient(tt.client, ParseAuthorizeQuery(v)); err != ErrClientRejected {
-				t.Fatalf("CheckClient = %v, want ErrClientRejected", err)
+			if got, err := CheckClient(tt.client, ParseAuthorizeQuery(v)); err != ErrClientRejected || got != "" {
+				t.Fatalf("CheckClient = %q, %v; want \"\", ErrClientRejected", got, err)
 			}
 		})
 	}
@@ -68,8 +68,8 @@ func TestCheckClientAcceptsExactMatch(t *testing.T) {
 	for _, uri := range []string{"https://p.example/cb", "http://127.0.0.1:8080/cb?x=1"} {
 		v := goodQuery()
 		v.Set("redirect_uri", uri)
-		if err := CheckClient(testClient(), ParseAuthorizeQuery(v)); err != nil {
-			t.Errorf("CheckClient(%q) = %v", uri, err)
+		if got, err := CheckClient(testClient(), ParseAuthorizeQuery(v)); err != nil || got != uri {
+			t.Errorf("CheckClient(%q) = %q, %v", uri, got, err)
 		}
 	}
 }
@@ -112,7 +112,7 @@ func TestValidateAuthorizeRejects(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			v := goodQuery()
 			tt.mut(v)
-			req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v))
+			req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v), "https://p.example/cb")
 			if req != nil || e == nil {
 				t.Fatalf("ValidateAuthorize = %+v, %v; want an error", req, e)
 			}
@@ -134,14 +134,14 @@ func TestValidateAuthorizeScopeNarrowerThanClient(t *testing.T) {
 	c.Scopes = []string{"jobs:read"}
 	v := goodQuery()
 	v.Set("scope", "jobs:run")
-	if _, e := ValidateAuthorize(c, ParseAuthorizeQuery(v)); e == nil || e.Code != ErrInvalidScope {
+	if _, e := ValidateAuthorize(c, ParseAuthorizeQuery(v), "https://p.example/cb"); e == nil || e.Code != ErrInvalidScope {
 		t.Fatalf("scope outside the client's allowed list: %v", e)
 	}
 }
 
 func TestValidateAuthorizeAccepts(t *testing.T) {
 	t.Run("missing scope means all allowed", func(t *testing.T) {
-		req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(goodQuery()))
+		req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(goodQuery()), "https://p.example/cb")
 		if e != nil {
 			t.Fatal(e)
 		}
@@ -152,7 +152,7 @@ func TestValidateAuthorizeAccepts(t *testing.T) {
 	t.Run("explicit subset", func(t *testing.T) {
 		v := goodQuery()
 		v.Set("scope", "jobs:read")
-		req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v))
+		req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v), "https://p.example/cb")
 		if e != nil || strings.Join(req.Scopes, " ") != "jobs:read" {
 			t.Fatalf("got %+v, %v", req, e)
 		}
@@ -160,20 +160,30 @@ func TestValidateAuthorizeAccepts(t *testing.T) {
 	t.Run("state at the cap", func(t *testing.T) {
 		v := goodQuery()
 		v.Set("state", strings.Repeat("s", MaxStateBytes))
-		if _, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v)); e != nil {
+		if _, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v), "https://p.example/cb"); e != nil {
 			t.Fatal(e)
 		}
 	})
 	t.Run("scope at the cap is still a normal scope list", func(t *testing.T) {
 		v := goodQuery()
 		v.Set("scope", "jobs:run jobs:read")
-		if _, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v)); e != nil {
+		if _, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v), "https://p.example/cb"); e != nil {
 			t.Fatal(e)
+		}
+	})
+	t.Run("redirect URI is the verified one passed in, not the query's", func(t *testing.T) {
+		// The request's redirect_uri must never flow to a redirect or the stored row: only the
+		// registered value CheckClient returned does.
+		v := goodQuery()
+		v.Set("redirect_uri", "https://evil.example/cb")
+		req, e := ValidateAuthorize(testClient(), ParseAuthorizeQuery(v), "https://p.example/cb")
+		if e != nil || req.RedirectURI != "https://p.example/cb" {
+			t.Fatalf("got %+v, %v", req, e)
 		}
 	})
 	t.Run("does not alias the client's scope slice", func(t *testing.T) {
 		c := testClient()
-		req, _ := ValidateAuthorize(c, ParseAuthorizeQuery(goodQuery()))
+		req, _ := ValidateAuthorize(c, ParseAuthorizeQuery(goodQuery()), "https://p.example/cb")
 		req.Scopes[0] = "x"
 		if c.Scopes[0] != "jobs:run" {
 			t.Fatal("request scopes alias the client's")
