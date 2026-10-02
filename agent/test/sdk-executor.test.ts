@@ -13,6 +13,7 @@ import type { PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
+import { detectRepoAgents } from "../src/repoagents.js";
 import { FINDINGS_SERVER_NAME, reportIncidentalIssueToolName } from "../src/findings-tools.js";
 import {
   FINDINGS_NUDGE_APPEND,
@@ -645,6 +646,30 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     const append = appendOf(impl.systemPrompt);
     assert.ok(append.includes("LEAD SYSTEM PROMPT"), "the own builtin lead prompt runs the main thread");
     assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
+  });
+
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or model)", async () => {
+    const clone = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-toml-"));
+    try {
+      fs.mkdirSync(path.join(clone, ".codex", "agents"), { recursive: true });
+      fs.writeFileSync(
+        path.join(clone, ".codex", "agents", "t.toml"),
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+      );
+      const detected = await detectRepoAgents(clone, "claude");
+      assert.deepStrictEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
+      const { turns, result } = await runWith({ repoAgents: detected.agents }, approveWith("repo"));
+      const impl = turns[1]!.options;
+      const sub = impl.agents!["toml-agent"]!;
+      assert.strictEqual(sub.prompt, withNudge("TOML BODY"));
+      assert.strictEqual(sub.model, undefined, "the TOML model key never reaches the SDK");
+      assert.strictEqual(sub.tools, undefined);
+      assert.ok(sub.disallowedTools?.includes("Agent"), "Agent denied structurally");
+      assert.ok(appendOf(impl.systemPrompt).includes("UNVERIFIED"), "repo source warns the lead");
+      assert.deepStrictEqual(result.agentSelection, { source: "repo", agents: ["toml-agent"] });
+    } finally {
+      fs.rmSync(clone, { recursive: true, force: true });
+    }
   });
 
   it("the Claude lead's plan and implement system prompts carry the Claude long-command recipe", async () => {

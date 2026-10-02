@@ -5,6 +5,7 @@ import { makeClaim, nullLogger, testGitCacheOptions } from "./helpers.js";
 import { GitCache } from "../src/git.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
+import { detectRepoAgents } from "../src/repoagents.js";
 import { RunRunner } from "../src/runner.js";
 import {
   api,
@@ -339,6 +340,147 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
       ),
       texts.join("\n"),
     );
+  });
+
+  describe("second source: .codex/agents (issue #2085)", () => {
+    const CODER_MD = "---\nname: claude-coder\ndescription: From claude.\n---\n\nbody\n";
+    const CODER_TOML =
+      'name = "codex-coder"\ndescription = "From codex."\ndeveloper_instructions = "Do it."\n';
+    const CODEX_SECRETS = {
+      forge_pat: "fixture-forge-pat-000000",
+      anthropic_oauth_token: "dummy-oauth-do-not-scan",
+      codex: {
+        auth_mode: "subscription" as const,
+        access_token: "fixture-codex-access-token-abc123",
+        capability: "fixture-codex-capability-abc123",
+        generation: 1,
+        chatgpt_account_id: "verified-account",
+        chatgpt_plan_type: null,
+      },
+    };
+
+    async function runWith(
+      files: Record<string, string>,
+      o: { codex?: boolean; features?: string[]; auto?: boolean; executor?: () => Executor; detect?: RunnerDetect } = {},
+    ) {
+      const repoFx = makeFixture(files);
+      try {
+        client.protocolFeatures = o.features ?? [];
+        const { gitlab } = fakeGitlab();
+        const claim = makeClaim({
+          issue_iid: 41,
+          issue_title: "roster source",
+          repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: repoFx.originPath },
+          last_seq: 0,
+          secrets: o.codex
+            ? CODEX_SECRETS
+            : { forge_pat: "fixture-forge-pat-000000", anthropic_oauth_token: "dummy-oauth-do-not-scan" },
+          ...(o.auto ? { auto_approve: true } : {}),
+        });
+        const r = new RunRunner(
+          client,
+          new GitCache(repoFx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() })),
+          () => ({ executor: o.executor?.() ?? new StubExecutor(nullLogger(), o.auto ? { planGate: true } : undefined) }),
+          nullLogger(),
+          20,
+          undefined,
+          { pollMs: 5, planApprovalTimeoutMs: 0, gitlab, ...(o.detect ? { detectRepoAgents: o.detect } : {}) },
+        );
+        await r.execute(claim);
+        return {
+          states: api.states.filter((s) => s.runId === claim.run_id).map((s) => s.body),
+          texts: api
+            .messages(claim.run_id)
+            .filter((m) => m.kind === "status")
+            .map((m) => String(m.payload.text)),
+        };
+      } finally {
+        client.protocolFeatures = [];
+        repoFx.cleanup();
+      }
+    }
+    type RunnerDetect = NonNullable<ConstructorParameters<typeof RunRunner>[6]>["detectRepoAgents"];
+
+    it("reports a .codex/agents roster on a Claude claim when .claude/agents is absent, naming the folder", async () => {
+      const { states, texts } = await runWith({ ".codex/agents/c.toml": CODER_TOML });
+      const report = states.find((s) => s.repo_agents !== undefined);
+      assert.deepStrictEqual(report?.repo_agents, [{ name: "codex-coder", description: "From codex." }]);
+      assert.ok(texts.some((t) => t.includes("detected 1 agent(s) in the repo's .codex/agents/: codex-coder")), texts.join("\n"));
+    });
+
+    it("a Codex claim uses .codex/agents when both folders exist; a Claude claim uses .claude/agents", async () => {
+      const files = { ".claude/agents/c.md": CODER_MD, ".codex/agents/c.toml": CODER_TOML };
+      const codex = await runWith(files, { codex: true });
+      assert.deepStrictEqual(
+        codex.states.find((s) => s.repo_agents !== undefined)?.repo_agents?.map((a) => a.name),
+        ["codex-coder"],
+      );
+      assert.ok(codex.texts.some((t) => t.includes("agent(s) in the repo's .codex/agents/: codex-coder")));
+      const claude = await runWith(files);
+      assert.deepStrictEqual(
+        claude.states.find((s) => s.repo_agents !== undefined)?.repo_agents?.map((a) => a.name),
+        ["claude-coder"],
+      );
+      assert.ok(claude.texts.some((t) => t.includes("agent(s) in the repo's .claude/agents/: claude-coder")));
+    });
+
+    it("without the repo_agent_folder feature no report carries a folder key (preflight and autopilot)", async () => {
+      const { states } = await runWith({ ".codex/agents/c.toml": CODER_TOML }, { auto: true, features: [] });
+      const reports = states.filter((s) => s.repo_agents !== undefined);
+      assert.ok(reports.length >= 2, "both the preflight and the autopilot report carry the roster");
+      for (const rep of reports) {
+        for (const a of rep.repo_agents!) assert.ok(!("folder" in a), JSON.stringify(a));
+      }
+      assert.ok(!JSON.stringify(reports).includes("folder"));
+    });
+
+    it("with the repo_agent_folder feature both reports carry the folder", async () => {
+      const { states, texts } = await runWith(
+        { ".codex/agents/c.toml": CODER_TOML },
+        { auto: true, features: ["repo_agent_folder"] },
+      );
+      const reports = states.filter((s) => s.repo_agents !== undefined);
+      assert.ok(reports.some((r) => r.status === "running" && r.agent_selection === undefined), "preflight report");
+      assert.ok(reports.some((r) => r.agent_selection !== undefined), "autopilot report");
+      for (const rep of reports) {
+        assert.deepStrictEqual(rep.repo_agents, [
+          { name: "codex-coder", description: "From codex.", folder: ".codex/agents" },
+        ]);
+      }
+      assert.ok(texts.some((t) => t.includes("autopilot: using the 1 agent(s) from the repo's .codex/agents/")), texts.join("\n"));
+    });
+
+    it("detection completes before the executor's run is entered", async () => {
+      const order: string[] = [];
+      await runWith(
+        { ".codex/agents/c.toml": CODER_TOML },
+        {
+          detect: async (p, h) => {
+            order.push("detect");
+            return detectRepoAgents(p, h);
+          },
+          executor: () => ({
+            run: async (ctx) => {
+              order.push("run");
+              return { branch: ctx.branch };
+            },
+          }),
+        },
+      );
+      assert.deepStrictEqual(order, ["detect", "run"]);
+    });
+
+    it("the failure line names both folders", async () => {
+      const { texts } = await runWith({}, {
+        detect: async () => {
+          throw new Error("boom");
+        },
+      });
+      assert.ok(
+        texts.some((t) => t.includes("could not read the repo's .claude/agents/ or .codex/agents/; continuing with your own agent templates")),
+        texts.join("\n"),
+      );
+    });
   });
 
   it("the MR description carries the repo-agents note only when the run used repo agents", async () => {

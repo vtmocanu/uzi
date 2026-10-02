@@ -74,12 +74,35 @@
 // from the claim payload). `assembleAgents()` routes a `lead`-named template to
 // the MAIN THREAD system prompt, so the repo roster must never be fed through
 // that lead-detection path. Keep repo agents on the subagent side of the map.
+//
+// TWO SOURCES (issue #2085). The roster comes from `.claude/agents/*.md` (this
+// file's parser) or `.codex/agents/*.toml` (repoagents-codex.ts, projected onto the
+// same AgentTemplate). Each harness prefers its native folder: if the native folder
+// is PRESENT (even empty, even all-invalid, even rejected as unsafe) its result is
+// final; only an absent native folder falls back to the other one. They are never
+// merged.
+//
+// Containment. Both loaders share one path discipline, because a hostile repo
+// controls every path component under the clone. (1) The folder is walked
+// component by component with lstat; a symlink anywhere on `<a>/<b>` rejects the
+// folder (`unsafe_path`) and counts as present. (2) Each file is opened with
+// O_NOFOLLOW (leaf) and the HANDLE'S real path (/proc/self/fd/<fd>) is required to
+// sit directly in the realpath'd agents folder BEFORE any content is read; this
+// closes an ancestor swapped for a symlink between discovery and open. A resolver
+// that fails or disagrees fails closed (the file is skipped), with no pathname
+// fallback, so a platform without that path reads nothing. (3) The size check and
+// the bounded read use that same handle. The handle-path check is the proof.
+// SUPPORTING evidence only: detection runs in the runner's phasePreflightHandoff,
+// after the clone phases and before any executor run(), in a clone owned by the
+// runner uid, so the repo's own code has not yet been run against the tree.
 
+import { constants as fsc } from "node:fs";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { AGENT_NAME_MAX_LEN, AGENT_NAME_RE, type AgentTemplate, type RepoAgentSummary } from "./protocol.js";
 import { ASYNC_DEFERRAL_TOOLS, NESTED_AGENT_TOOL } from "./guardrails.js";
 import { isValidModel } from "./models.js";
+import { parseCodexAgentFile } from "./repoagents-codex.js";
 
 /** Tools a repo-authored subagent can never receive, whatever its frontmatter
  *  declares (PRD #37 Decision 2). NARROW by design: only `Agent` and the async-
@@ -160,7 +183,13 @@ export type RepoAgentNoteReason =
   /** Kept, with denied tools removed from its allowlist. */
   | "tools_filtered"
   /** Kept, with an unusable `model` string ignored (inherits the run default). */
-  | "model_ignored";
+  | "model_ignored"
+  /** A path component is a symlink or the folder/file resolves outside the clone's
+   *  agents folder. With an empty `name` the whole folder was not read. */
+  | "unsafe_path"
+  /** A Codex agent declares a restriction (`features`, `skills`, `sandbox_mode`,
+   *  `tools`) uzi cannot honour yet, so it is skipped rather than run unrestricted. */
+  | "restriction_unsupported";
 
 export interface RepoAgentNote {
   /** The agent (or file) the note is about. Sanitized: it reaches a run message.
@@ -172,6 +201,11 @@ export interface RepoAgentNote {
   tools?: string[];
   /** For "over_limit": how many files past the cap were ignored. */
   count?: number;
+  /** For "restriction_unsupported": which restriction keys were present. Always a
+   *  subset of our own constant key names, never repo-supplied text. */
+  restrictions?: string[];
+  /** For a folder-level "unsafe_path" (empty `name`): the folder that was refused. */
+  folder?: RepoAgentFolder;
 }
 
 export interface DetectedRepoAgents {
@@ -180,7 +214,12 @@ export interface DetectedRepoAgents {
   /** Every skip/clamp, for the caller to emit as run messages (the worker owns
    *  the gapless seq). */
   notes: RepoAgentNote[];
+  /** Which folder the roster came from; null when neither folder is present. */
+  folder: RepoAgentFolder | null;
 }
+
+export type RepoAgentFolder = NonNullable<RepoAgentSummary["folder"]>;
+export type RepoAgentHarness = "claude" | "codex";
 
 /** The repo's agents directory inside the clone. Nothing else under `.claude/` is
  *  read by this module. */
@@ -190,8 +229,9 @@ export function repoAgentsDir(clonePath: string): string {
 
 /** Names + descriptions only — the wire form the worker reports (bodies stay
  *  worker-side; the API stores a roster, not untrusted prompts). */
-export function repoAgentSummaries(agents: readonly AgentTemplate[]): RepoAgentSummary[] {
-  return agents.map((a) => ({ name: a.name, description: a.description }));
+export function repoAgentSummaries(agents: readonly AgentTemplate[], folder?: RepoAgentFolder): RepoAgentSummary[] {
+  // The folder key is added ONLY when passed: an older API rejects unknown fields.
+  return agents.map((a) => (folder ? { name: a.name, description: a.description, folder } : { name: a.name, description: a.description }));
 }
 
 /** Run-message text for one note. Repo-supplied strings never appear beyond the
@@ -212,41 +252,141 @@ export function describeRepoAgentNote(note: RepoAgentNote): string {
       return `repo agent "${note.name}": removed ${(note.tools ?? []).join(", ")} — repo agents never receive these tools`;
     case "model_ignored":
       return `repo agent "${note.name}" declared an unusable model string; it will inherit the run's default model`;
+    case "unsafe_path":
+      return note.name === ""
+        ? `the repo's ${note.folder ?? ".claude/agents or .codex/agents"}/ was not read: a path component is a symlink or escapes the clone`
+        : `repo agent file "${note.name}" was skipped: it resolves outside the agents folder`;
+    case "restriction_unsupported":
+      return `repo agent "${note.name}" was skipped: it declares a Codex restriction (${(note.restrictions ?? []).join(", ")}) uzi cannot honour yet`;
   }
 }
 
-/**
- * Enumerate + parse `<clone>/.claude/agents/*.md`.
- *
- * Symlinks are never followed (the agents dir must be a real directory, each
- * `*.md` a real file), so a hostile repo cannot redirect the read outside its own
- * tree. Files are visited in filename order, so the caps and the first-wins
- * dedupe are deterministic; the result is sorted by agent name.
- *
- * A missing directory yields an empty roster and no notes.
- */
-export async function detectRepoAgents(clonePath: string): Promise<DetectedRepoAgents> {
-  const dir = repoAgentsDir(clonePath);
-  const notes: RepoAgentNote[] = [];
+/** Test seams. Production passes none. */
+export interface DetectOptions {
+  /** Resolve the real path of an open descriptor. Default reads the descriptor's
+   *  /proc/self/fd/<fd> link. */
+  resolveHandlePath?: (fd: number) => Promise<string>;
+  /** Called after discovery and before each file is opened. */
+  beforeOpen?: (fullPath: string) => Promise<void>;
+}
 
-  let dirStat;
-  try {
-    dirStat = await fs.lstat(dir);
-  } catch {
-    return { agents: [], notes: [] };
+interface FolderSpec {
+  folder: RepoAgentFolder;
+  parts: [string, string];
+  ext: string;
+  parse: (raw: string, slug: string) => ParsedAgentFile;
+  /** Basenames that are documentation when they fail to parse (silently dropped). */
+  reservedDocs: ReadonlySet<string>;
+}
+
+const CLAUDE_SPEC: FolderSpec = {
+  folder: ".claude/agents",
+  parts: [".claude", "agents"],
+  ext: ".md",
+  parse: parseAgentFile,
+  reservedDocs: RESERVED_DOC_NAMES,
+};
+const CODEX_SPEC: FolderSpec = {
+  folder: ".codex/agents",
+  parts: [".codex", "agents"],
+  ext: ".toml",
+  parse: parseCodexAgentFile,
+  reservedDocs: new Set(),
+};
+
+type Located = { kind: "absent" } | { kind: "rejected" } | { kind: "ok"; agentsReal: string };
+
+function isMissing(err: unknown): boolean {
+  const code = (err as NodeJS.ErrnoException | undefined)?.code;
+  return code === "ENOENT" || code === "ENOTDIR";
+}
+
+/** Walk `<clone>/<a>/<b>` one component at a time. A symlink on the way rejects
+ *  the folder (present but unsafe); a missing or non-directory component means the
+ *  folder is absent. The final real path must lie inside the real clone, compared
+ *  by path components, never by string prefix. */
+async function locateAgentsDir(clonePath: string, cloneReal: string, spec: FolderSpec): Promise<Located> {
+  let cur = clonePath;
+  for (const part of spec.parts) {
+    cur = path.join(cur, part);
+    let st;
+    try {
+      st = await fs.lstat(cur);
+    } catch (err) {
+      if (isMissing(err)) return { kind: "absent" };
+      throw err;
+    }
+    if (st.isSymbolicLink()) return { kind: "rejected" };
+    if (!st.isDirectory()) return { kind: "absent" };
   }
-  if (!dirStat.isDirectory()) return { agents: [], notes: [] };
+  let agentsReal: string;
+  try {
+    agentsReal = await fs.realpath(cur);
+  } catch (err) {
+    if (isMissing(err)) return { kind: "absent" };
+    throw err;
+  }
+  const rel = path.relative(cloneReal, agentsReal);
+  if (rel === "" || path.isAbsolute(rel) || rel.split(path.sep).includes("..")) return { kind: "rejected" };
+  return { kind: "ok", agentsReal };
+}
 
-  const entries = await fs.readdir(dir, { withFileTypes: true });
+type ReadResult = { kind: "ok"; raw: string } | { kind: "skip" } | { kind: "too_large" } | { kind: "unsafe" };
+
+const defaultResolveHandlePath = (fd: number): Promise<string> => fs.readlink(`/proc/self/fd/${fd}`);
+
+/** Open one file and read it through that single handle: O_NOFOLLOW on the leaf,
+ *  the handle's real path proven to sit directly in `agentsReal` before any byte
+ *  is read, then fstat + a bounded read on the same descriptor. */
+async function readContainedFile(full: string, agentsReal: string, opts: DetectOptions): Promise<ReadResult> {
+  await opts.beforeOpen?.(full);
+  let handle;
+  try {
+    handle = await fs.open(full, fsc.O_RDONLY | fsc.O_NOFOLLOW | fsc.O_NONBLOCK);
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ELOOP" ? { kind: "unsafe" } : { kind: "skip" };
+  }
+  try {
+    let handleReal: unknown;
+    try {
+      handleReal = await (opts.resolveHandlePath ?? defaultResolveHandlePath)(handle.fd);
+    } catch {
+      return { kind: "unsafe" };
+    }
+    if (typeof handleReal !== "string" || handleReal === "" || path.dirname(handleReal) !== agentsReal) {
+      return { kind: "unsafe" };
+    }
+    const st = await handle.stat();
+    if (!st.isFile()) return { kind: "skip" };
+    // Checked BEFORE the read, so an oversized file is never loaded into memory.
+    if (st.size > REPO_AGENT_MAX_BYTES) return { kind: "too_large" };
+    const buf = Buffer.alloc(REPO_AGENT_MAX_BYTES + 1);
+    let n = 0;
+    while (n < buf.length) {
+      const { bytesRead } = await handle.read(buf, n, buf.length - n, null);
+      if (bytesRead === 0) break;
+      n += bytesRead;
+    }
+    if (n > REPO_AGENT_MAX_BYTES) return { kind: "too_large" };
+    return { kind: "ok", raw: buf.toString("utf8", 0, n) };
+  } catch {
+    return { kind: "skip" };
+  } finally {
+    await handle.close().catch(() => undefined);
+  }
+}
+
+async function loadFolder(spec: FolderSpec, agentsReal: string, opts: DetectOptions): Promise<DetectedRepoAgents> {
+  const notes: RepoAgentNote[] = [];
+  const entries = await fs.readdir(agentsReal, { withFileTypes: true });
   const allFiles = entries
-    .filter((e) => e.isFile() && e.name.endsWith(".md"))
+    .filter((e) => e.isFile() && e.name.endsWith(spec.ext))
     .map((e) => e.name)
     .sort();
 
   // Only the first REPO_AGENTS_MAX_FILES (by name) are considered; the rest are
-  // ignored with a SINGLE aggregated note. Slicing here also means the parse loop
-  // never runs past the cap, so a hostile repo with 10k agent files costs one
-  // readdir + one note, not 10k run_messages (auditor F3).
+  // ignored with a SINGLE aggregated note, before any file is opened. A hostile
+  // repo with 10k agent files costs one readdir + one note (auditor F3).
   const overCap = allFiles.length - REPO_AGENTS_MAX_FILES;
   const files = allFiles.slice(0, REPO_AGENTS_MAX_FILES);
   if (overCap > 0) notes.push({ name: "", reason: "over_limit", count: overCap });
@@ -255,43 +395,29 @@ export async function detectRepoAgents(clonePath: string): Promise<DetectedRepoA
   const seen = new Set<string>();
 
   for (const file of files) {
-    const slug = safeLabel(file.replace(/\.md$/, ""));
-    const full = path.join(dir, file);
-    let fileStat;
-    try {
-      // lstat, not stat: a symlinked *.md is skipped outright rather than read
-      // through (`readdir` already reports a symlink as neither file nor dir, so
-      // this is belt-and-braces against a future switch to `stat`).
-      fileStat = await fs.lstat(full);
-    } catch {
-      continue;
-    }
-    if (!fileStat.isFile()) continue;
-    // Checked BEFORE the read, so an oversized file is never loaded into memory.
-    if (fileStat.size > REPO_AGENT_MAX_BYTES) {
+    const slug = safeLabel(file.slice(0, -spec.ext.length));
+    const read = await readContainedFile(path.join(agentsReal, file), agentsReal, opts);
+    if (read.kind === "skip") continue;
+    if (read.kind === "too_large") {
       notes.push({ name: slug, reason: "too_large" });
       continue;
     }
-
-    let raw: string;
-    try {
-      raw = await fs.readFile(full, "utf8");
-    } catch {
-      notes.push({ name: slug, reason: "invalid" });
+    if (read.kind === "unsafe") {
+      notes.push({ name: slug, reason: "unsafe_path" });
       continue;
     }
 
-    const parsed = parseAgentFile(raw, slug);
+    const parsed = spec.parse(read.raw, slug);
     if (!parsed.ok) {
       // A reserved documentation basename (README.md, LICENSE.md, …) that fails to
       // parse as an agent is documentation, not a failed agent: drop it silently so it
       // never becomes an `invalid` note (issue #715). Scoped to the `invalid` reason —
       // a reserved name that parses as a valid agent reaches the keep path below, and a
       // parsed-but-rejected agent (tools_all_denied) still surfaces its note.
-      if (parsed.reason === "invalid" && RESERVED_DOC_NAMES.has(file.toLowerCase())) {
+      if (parsed.reason === "invalid" && spec.reservedDocs.has(file.toLowerCase())) {
         continue;
       }
-      notes.push({ name: parsed.name, reason: parsed.reason });
+      notes.push({ name: parsed.name, reason: parsed.reason, ...(parsed.restrictions ? { restrictions: parsed.restrictions } : {}) });
       continue;
     }
     if (seen.has(parsed.template.name)) {
@@ -304,14 +430,50 @@ export async function detectRepoAgents(clonePath: string): Promise<DetectedRepoA
   }
 
   agents.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-  return { agents, notes };
+  return { agents, notes, folder: spec.folder };
+}
+
+/**
+ * Enumerate + parse the repo's agent roster for `harness`: its native folder
+ * (`.claude/agents/*.md` for claude, `.codex/agents/*.toml` for codex) when that is
+ * present, else the other one. A present native folder is final, however empty or
+ * invalid; the two are never merged.
+ *
+ * Symlinks are never followed (see the header's Containment note). Files are
+ * visited in filename order, so the caps and the first-wins dedupe are
+ * deterministic; the result is sorted by agent name. Neither folder present yields
+ * an empty roster, no notes and `folder: null`.
+ */
+export async function detectRepoAgents(
+  clonePath: string,
+  harness: RepoAgentHarness = "claude",
+  opts: DetectOptions = {},
+): Promise<DetectedRepoAgents> {
+  const none: DetectedRepoAgents = { agents: [], notes: [], folder: null };
+  let cloneReal: string;
+  try {
+    cloneReal = await fs.realpath(clonePath);
+  } catch (err) {
+    if (isMissing(err)) return none;
+    throw err;
+  }
+  const order = harness === "codex" ? [CODEX_SPEC, CLAUDE_SPEC] : [CLAUDE_SPEC, CODEX_SPEC];
+  for (const spec of order) {
+    const located = await locateAgentsDir(clonePath, cloneReal, spec);
+    if (located.kind === "absent") continue;
+    if (located.kind === "rejected") {
+      return { agents: [], notes: [{ name: "", reason: "unsafe_path", folder: spec.folder }], folder: spec.folder };
+    }
+    return loadFolder(spec, located.agentsReal, opts);
+  }
+  return none;
 }
 
 /** A parsed file: either a template (plus the non-fatal clamps applied to it), or
  *  the reason it is not usable as an agent, under the name to blame in the note. */
-type ParsedAgentFile =
+export type ParsedAgentFile =
   | { ok: true; template: AgentTemplate; notes: RepoAgentNote[] }
-  | { ok: false; name: string; reason: "invalid" | "tools_all_denied" };
+  | { ok: false; name: string; reason: "invalid" | "tools_all_denied" | "restriction_unsupported"; restrictions?: string[] };
 
 function parseAgentFile(raw: string, slug: string): ParsedAgentFile {
   const invalid = (name: string): ParsedAgentFile => ({ ok: false, name, reason: "invalid" });
@@ -324,7 +486,7 @@ function parseAgentFile(raw: string, slug: string): ParsedAgentFile {
   // holds its own templates to — the name keys the SDK `agents` map, is echoed in
   // run messages, and (M2) round-trips through the API's roster validation.
   const name = fm.fields.name?.trim() || slug;
-  if (name.length > AGENT_NAME_MAX_LEN || !AGENT_NAME_RE.test(name)) return invalid(slug);
+  if (!isValidAgentName(name)) return invalid(slug);
 
   // The description reaches a run message, the DB, and the plan-gate panel (as
   // plain text). It is UNTRUSTED repo-supplied text, so it is held to a STRICTER
@@ -334,9 +496,7 @@ function parseAgentFile(raw: string, slug: string): ParsedAgentFile {
   // visually reorder the rendered text in an approval dialog. Rejected, not
   // scrubbed — a description that needs a format character is not a real one.
   const description = fm.fields.description?.trim() ?? "";
-  if (description === "" || Buffer.byteLength(description, "utf8") > REPO_AGENT_MAX_DESCRIPTION_LEN || hasUnsafeChar(description)) {
-    return invalid(name);
-  }
+  if (!isValidDescription(description)) return invalid(name);
 
   const body = fm.body;
   if (body.trim() === "") return invalid(name);
@@ -471,6 +631,18 @@ const BLOCK_SCALAR_OPENER_RE = /^[|>][0-9]*[+-]?$/;
  *  approval panel. */
 function hasUnsafeChar(s: string): boolean {
   return /[\p{Cc}\p{Cf}]/u.test(s);
+}
+
+/** The kebab-case rule the API holds its own templates to (shared with the Codex
+ *  loader). */
+export function isValidAgentName(name: string): boolean {
+  return name.length <= AGENT_NAME_MAX_LEN && AGENT_NAME_RE.test(name);
+}
+
+/** A trimmed description: non-empty, within the byte cap, no control/format chars
+ *  (shared with the Codex loader). */
+export function isValidDescription(description: string): boolean {
+  return description !== "" && Buffer.byteLength(description, "utf8") <= REPO_AGENT_MAX_DESCRIPTION_LEN && !hasUnsafeChar(description);
 }
 
 /** `Bash, Read` or `[Bash, Read]` → ["Bash","Read"]. */

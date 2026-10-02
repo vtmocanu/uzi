@@ -56,6 +56,7 @@ import { CodexTransportError, type CodexNotification, type CodexTransport } from
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
+import { detectRepoAgents } from "../src/repoagents.js";
 import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
@@ -9579,6 +9580,33 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(!toolNames(0).includes("uzi_bash"), "the unknown tool granted nothing");
     assert.ok(toolNames(1).includes("uzi_bash"), "a known allowlisted tool is granted");
     assert.ok(!toolNames(1).includes("spawn_agent"), "the denylisted Task/Agent alias adds no delegation");
+  });
+
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (passage, denied tools, no nested delegation, only the selected roster)", async () => {
+    const clone = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-codex-toml-"));
+    try {
+      await fs.mkdir(path.join(clone, ".codex", "agents"), { recursive: true });
+      await fs.writeFile(
+        path.join(clone, ".codex", "agents", "t.toml"),
+        'name = "toml-agent"\ndescription = "From toml."\ndeveloper_instructions = "TOML BODY"\nmodel = "gpt-5"\n',
+      );
+      const detected = await detectRepoAgents(clone, "codex");
+      assert.deepEqual(detected.agents.map((a) => a.name), ["toml-agent"]);
+      const { rig, admitted, result } = await gated(okSel("repo"), { repoAgents: detected.agents }, ["toml-agent", "coder"]);
+      assert.deepEqual(admitted, { "toml-agent": true, coder: false });
+      assert.deepEqual(result.agentSelection, { source: "repo", agents: ["toml-agent"] });
+      const [implText] = turnInputs(rig.epochs[1]!.transport);
+      assert.ok(implText!.includes(PASSAGE), "the implement turn carries the untrusted-review passage");
+      assert.ok(implText!.includes("Available subagents to delegate to: toml-agent."));
+      const childStarts = rig.epochs[1]!.transport.requests.filter((r) => r.method === "thread/start");
+      assert.ok(childStarts.length >= 1, "the TOML agent was spawned");
+      for (const c of childStarts) {
+        const tools = ((rec(c.params).dynamicTools ?? []) as Array<{ name: string }>).map((x) => x.name);
+        assert.ok(!tools.includes("spawn_agent"), "no nested delegation for a repo-sourced child");
+      }
+    } finally {
+      await fs.rm(clone, { recursive: true, force: true });
+    }
   });
 
   it("repo-source agents are granted every run skill (ctx.skills); an own-source template with skills [] is denied", async () => {

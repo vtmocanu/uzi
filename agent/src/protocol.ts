@@ -1983,6 +1983,9 @@ export interface MessagesRequest {
 export interface RepoAgentSummary {
   name: string;
   description: string;
+  /** Which repo folder the roster came from. Sent only when the API advertises
+   *  the `repo_agent_folder` feature; absent otherwise. */
+  folder?: ".claude/agents" | ".codex/agents";
 }
 
 /** Which roster a run's SUBAGENTS come from (PRD #37 Decision 4: either/or, no

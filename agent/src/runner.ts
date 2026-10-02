@@ -93,6 +93,8 @@ import {
   detectRepoAgents,
   repoAgentSummaries,
   type DetectedRepoAgents,
+  type RepoAgentFolder,
+  type RepoAgentHarness,
 } from "./repoagents.js";
 import { MessageBatcher } from "./batcher.js";
 import type { Outbox } from "./outbox.js";
@@ -688,6 +690,11 @@ const DATA_VOLUME_FULL_FEATURE = "recovery_cause_data_volume_full";
  *  /state decode is strict, so an api without it would 400 the field: it is sent only when
  *  advertised. */
 const CHECKPOINT_DURABILITY_FEATURE = "run_checkpoint_durability";
+
+/** Issue #2085: the api feature that accepts `folder` on a reported repo-agent summary. The
+ *  /state decode is strict, so an api without it would 400 the field: it is sent only when
+ *  advertised. */
+const REPO_AGENT_FOLDER_FEATURE = "repo_agent_folder";
 
 /**
  * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
@@ -1680,9 +1687,9 @@ export interface RunnerOptions {
   forgejo?: ForgeClient;
   /** Injected for tests; default opens real GitHub PRs (PRD #238 D9). */
   github?: ForgeClient;
-  /** Injected for tests; default is the real `.claude/agents/` parser (PRD #37).
+  /** Injected for tests; default is the real `.claude/agents/` / `.codex/agents/` parser (PRD #37).
    *  A seam so a test can drive the detection-failure path deterministically. */
-  detectRepoAgents?: (worktreePath: string) => Promise<DetectedRepoAgents>;
+  detectRepoAgents?: (worktreePath: string, harness: RepoAgentHarness) => Promise<DetectedRepoAgents>;
   /** Injected for tests; default runs the uzi test suites as real subprocesses. A
    *  self_improve run's MR carries these results as its own evidence (PRD #46). */
   checkRunner?: CheckRunner;
@@ -1868,6 +1875,7 @@ export class RunRunner {
   private readonly diskGovernor: DiskGovernor | undefined;
   private readonly detect: (
     worktreePath: string,
+    harness: RepoAgentHarness,
   ) => Promise<DetectedRepoAgents>;
   // Optional test override; production builds it per-run with the scrubbed check env
   // (buildCheckEnv) once the executor's provisioned toolEnv is known (M9).
@@ -7869,10 +7877,12 @@ export class RunRunner {
     // inert data: nothing is assembled until a selection picks the repo source.
     const detection = await this.parseRepoAgents(
       runnerClone.path,
+      claim.secrets.codex ? "codex" : "claude",
       batcher,
       runLog,
     );
     const repoAgents = detection.agents;
+    const repoAgentFolder = detection.folder;
     if (detection.ok) {
       // Non-fatal, and fire-and-forget (matching the session-id report below): an
       // INFORMATIONAL roster report must never fail a run. An older API without the
@@ -7883,7 +7893,7 @@ export class RunRunner {
       // ("scanned, found none") — the two must stay distinguishable.
       void reportState({
         status: "running",
-        repo_agents: repoAgentSummaries(repoAgents),
+        repo_agents: repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder)),
       }).catch((e) =>
         runLog.warn("could not report repo agent roster", {
           error: errMessage(e),
@@ -8685,6 +8695,7 @@ export class RunRunner {
           runLog,
           effectiveAutoApprove,
           repoAgents,
+          repoAgentFolder,
           toolchainDetection,
           // PRD #212: the runner clone path for the gate's runner-uid `git status`.
           // Use runnerClone.path (const, string), NOT the `worktreePath` local
@@ -13058,8 +13069,15 @@ export class RunRunner {
     return { verified: true, published, mode: "same_worker_only", head };
   }
 
+  /** Issue #2085: the source folder rides a roster report only on an api that advertises
+   *  REPO_AGENT_FOLDER_FEATURE (strict /state decode); otherwise undefined, so the summary
+   *  carries no `folder` key at all. */
+  private reportedRepoAgentFolder(folder: RepoAgentFolder | null): RepoAgentFolder | undefined {
+    return this.client.protocolFeatures.includes(REPO_AGENT_FOLDER_FEATURE) ? (folder ?? undefined) : undefined;
+  }
+
   /**
-   * Parse the clone's `.claude/agents/*.md` (PRD #37), logging every skipped or
+   * Parse the clone's `.claude/agents/*.md` or `.codex/agents/*.toml` (PRD #37, issue #2085), logging every skipped or
    * clamped file to the run stream. Detection is best-effort by construction: a
    * repo without the directory has no agents (ok: true, agents: []), and an
    * enumeration FAILURE (e.g. an unreadable dir) is reported as a warning and a run
@@ -13072,22 +13090,23 @@ export class RunRunner {
    */
   private async parseRepoAgents(
     worktreePath: string,
+    harness: RepoAgentHarness,
     batcher: MessageBatcher,
     runLog: Logger,
-  ): Promise<{ agents: AgentTemplate[]; ok: boolean }> {
+  ): Promise<{ agents: AgentTemplate[]; ok: boolean; folder: RepoAgentFolder | null }> {
     let detected;
     try {
-      detected = await this.detect(worktreePath);
+      detected = await this.detect(worktreePath, harness);
     } catch (err) {
       runLog.warn("repo agent detection failed", { error: errMessage(err) });
       batcher.emit({
         kind: "status",
         agent: "worker",
         payload: {
-          text: "could not read the repo's .claude/agents/; continuing with your own agent templates",
+          text: "could not read the repo's .claude/agents/ or .codex/agents/; continuing with your own agent templates",
         },
       });
-      return { agents: [], ok: false };
+      return { agents: [], ok: false, folder: null };
     }
     for (const note of detected.notes) {
       batcher.emit({
@@ -13102,7 +13121,7 @@ export class RunRunner {
         kind: "status",
         agent: "worker",
         payload: {
-          text: `detected ${detected.agents.length} agent(s) in the repo's .claude/agents/: ${names}`,
+          text: `detected ${detected.agents.length} agent(s) in the repo's ${detected.folder ?? ".claude/agents"}/: ${names}`,
         },
       });
     }
@@ -13110,7 +13129,7 @@ export class RunRunner {
       count: detected.agents.length,
       dropped: detected.notes.length,
     });
-    return { agents: detected.agents, ok: true };
+    return { agents: detected.agents, ok: true, folder: detected.folder };
   }
 
   /**
@@ -13270,6 +13289,8 @@ export class RunRunner {
     runLog: Logger,
     autoApprove: boolean,
     repoAgents: AgentTemplate[],
+    // Issue #2085: the folder the roster came from (null when neither exists).
+    repoAgentFolder: RepoAgentFolder | null,
     // PRD #84 M4: the plan-time inferred requirement set (deterministic detectToolchain()),
     // or undefined when the scan failed. Rides the same two reports as `milestones` — the
     // CANDIDATE set on the awaiting_approval report and the FROZEN set on the autopilot
@@ -13345,7 +13366,7 @@ export class RunRunner {
         agent_selection: selection,
       };
       if (repoAgents.length > 0)
-        autopilotState.repo_agents = repoAgentSummaries(repoAgents);
+        autopilotState.repo_agents = repoAgentSummaries(repoAgents, this.reportedRepoAgentFolder(repoAgentFolder));
       // PRD #122 M1 (Decision 2): an autopilot run never reports awaiting_approval, so
       // the FROZEN milestone list rides this self-contained running report instead —
       // mirroring the repo_agents conditional above. Only when non-empty (additive-
@@ -13380,7 +13401,7 @@ export class RunRunner {
       batcher.emit({
         kind: "status",
         agent: "worker",
-        payload: { text: autopilotSelectionText(selection, repoAgents.length) },
+        payload: { text: autopilotSelectionText(selection, repoAgents.length, repoAgentFolder) },
       });
       runLog.info("plan gate: auto-approved (autopilot)", {
         run_id: runId,
@@ -14141,8 +14162,9 @@ export function mrCompletionBlock(
 function autopilotSelectionText(
   selection: AgentSelection,
   repoCount: number,
+  folder: RepoAgentFolder | null,
 ): string {
   return selection.source === "repo"
-    ? `autopilot: using the ${repoCount} agent(s) from the repo's .claude/agents/`
+    ? `autopilot: using the ${repoCount} agent(s) from the repo's ${folder ?? ".claude/agents"}/`
     : "autopilot: using your own agent templates";
 }
