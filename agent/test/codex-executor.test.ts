@@ -1603,7 +1603,7 @@ describe("CodexExecutor: credential bridge + isolation", () => {
     assert.equal(env.GIT_CONFIG_VALUE_0, "", "pair 0 resets every inherited safe.directory entry");
     assert.equal(env.GIT_CONFIG_KEY_1, "safe.directory");
     assert.equal(env.GIT_CONFIG_VALUE_1, path.resolve(WORKSPACE), "pair 1 trusts only the run's checkout");
-    assert.equal(env.PATH, "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin");
+    assert.equal(env.PATH, "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin");
     assert.equal(env.LANG, "C");
     assert.match(String(env.HOME), /^\/tmp\/uzi-codex-command-/);
     assert.equal(env.TMPDIR, env.HOME, "one random Landlock-allowed tmp per command root");
@@ -4730,7 +4730,7 @@ describe("CodexExecutor: Docker wiring", () => {
 });
 
 describe("CodexExecutor: credential-free command env (item 6)", () => {
-  const FIXED_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
+  const FIXED_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
   it("accepts only a trusted Docker host after folding hostile toolEnv keys", () => {
     const hostile = {
@@ -4752,19 +4752,16 @@ describe("CodexExecutor: credential-free command env (item 6)", () => {
     assert.equal(wired.NIX_SSL_CERT_FILE, "/nix/cert");
   });
 
-  it("puts the fixed toolchain+system dirs FIRST and APPENDS the provisioned PATH (fail-old/pass-fixed on /opt/uzi-toolchain/bin)", () => {
+  it("puts the toolchain before system dirs and appends the provisioned PATH after every fixed dir", () => {
     const env = buildCommandEnv("/private/tmp", {
       PATH: "/provisioned/tool/bin",
       NIX_SSL_CERT_FILE: "/nix/cacert",
       LOCALE_ARCHIVE: "/nix/locale-archive",
     });
-    // fail-old: the retired "/usr/bin:/bin" literal lacked the toolchain dir.
-    assert.ok(env.PATH!.includes("/opt/uzi-toolchain/bin"), "the fixed toolchain dir is on the command PATH");
-    assert.ok(env.PATH!.startsWith(FIXED_PATH), "the fixed boundary dirs lead the PATH");
-    assert.ok(
-      env.PATH!.indexOf("/opt/uzi-toolchain/bin") < env.PATH!.indexOf("/provisioned/tool/bin"),
-      "fixed dirs precede the appended provisioned PATH",
-    );
+    assert.equal(env.PATH, `${FIXED_PATH}:/provisioned/tool/bin`, "every fixed dir precedes the appended provisioned PATH");
+    const pathDirs = env.PATH!.split(":");
+    assert.ok(pathDirs.indexOf("/opt/uzi-toolchain/bin") < pathDirs.indexOf("/usr/bin"), "toolchain precedes /usr/bin");
+    assert.ok(pathDirs.indexOf("/opt/uzi-toolchain/bin") < pathDirs.indexOf("/bin"), "toolchain precedes /bin");
     // The other allowlisted vars are folded; boundary literals are fixed.
     assert.equal(env.NIX_SSL_CERT_FILE, "/nix/cacert");
     assert.equal(env.LOCALE_ARCHIVE, "/nix/locale-archive");

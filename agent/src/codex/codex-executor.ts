@@ -209,16 +209,16 @@ export { CODEX_TASK_REVIEW_MODEL } from "./task-review-model.js";
  *  Codex-bound claim selects the CodexExecutor. */
 const FILEOP_BIN = "/usr/local/bin/uzi-codex-fileop";
 
-/** The fixed command-identity PATH: the system dirs plus the pinned worker toolchain,
- *  mirroring the provider lane's `CODEX_LAUNCH_PATH` (launcher.ts). These FIXED dirs are
- *  always present and come FIRST; a run's provisioned `toolEnv.PATH` is APPENDED after
- *  them (see {@link buildCommandEnv}), so provisioned tools resolve but can never displace
- *  or drop the boundary dirs. Every entry sits under a directory the command root's
- *  Landlock allows read+exec on (`/usr`, `/sbin`, `/bin`, `/opt/uzi-toolchain`, `/nix`),
- *  so a resolved binary is executable inside the sandbox. This env is never merged with
+/** The fixed command-identity PATH puts the pinned worker toolchain before system dirs.
+ *  These FIXED dirs are always present and come FIRST; a run's provisioned
+ *  `toolEnv.PATH` is APPENDED after them (see {@link buildCommandEnv}), so provisioned
+ *  tools resolve but can never displace or drop the boundary dirs. Every entry sits
+ *  under a directory the command root's Landlock allows read+exec on (`/usr`,
+ *  `/sbin`, `/bin`, `/opt/uzi-toolchain`, `/nix`), so a resolved binary is
+ *  executable inside the sandbox. This env is never merged with
  *  `process.env`: NOTHING is inherited (no PAT/token/provider credential) — the
  *  credential-free command surface must not see the worker's environment. */
-const COMMAND_ENV_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/opt/uzi-toolchain/bin";
+const COMMAND_ENV_PATH = "/opt/uzi-toolchain/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 
 /** Keys a provisioned `toolEnv` entry may NEVER set in the credential-free command env.
  *  UNIONS the command boundary literals (PATH/TMPDIR/LANG/HOME — the scrubbed command
