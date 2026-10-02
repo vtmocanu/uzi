@@ -149,7 +149,24 @@
           "result": "x",
           "verified_at_sha": "x"
         }
-      ]
+      ],
+      "diagram": {
+        "kind": "x",
+        "title": "x",
+        "nodes": [
+          {
+            "key": "x",
+            "label": "x"
+          }
+        ],
+        "edges": [
+          {
+            "from": "x",
+            "to": "x",
+            "label": "x"
+          }
+        ]
+      }
     },
     "size": {
       "unavailable": true,
@@ -182,7 +199,8 @@
     "base_sha": "x",
     "head_sha": "x",
     "target_branch": "x",
-    "published_at": "2020-01-02T03:04:05Z"
+    "published_at": "2020-01-02T03:04:05Z",
+    "diagram_published": true
   },
   "pr_description_outcome": "x",
   "job": {

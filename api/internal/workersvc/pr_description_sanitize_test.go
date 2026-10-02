@@ -20,6 +20,44 @@ const zw = "\u200B"
 // emphasis tolerance) so a regression in the production pattern is not masked by sharing it.
 var closingProbe = regexp.MustCompile(`(?i)\b(clos(e[sd]?|ing)|fix(e[sd]|ing)?|resolv(e[sd]?|ing)|implement(s|ed|ing)?)\b:?\s+(issues?\s+)?(#\d+|[\w.-]+(/[\w.-]+)*#\d+|https?://\S*/(issues|work_items)/\d+)`)
 
+func TestPrDescriptionDiagramSanitization(t *testing.T) {
+	makeDiagram := func(label string) *apitypes.PrDescriptionDiagram {
+		return &apitypes.PrDescriptionDiagram{Kind: "flow", Title: "Overview", Nodes: []apitypes.PrDescriptionDiagramNode{{Key: "a", Label: label}, {Key: "b", Label: "Second"}, {Key: "c", Label: "Third"}}, Edges: []apitypes.PrDescriptionDiagramEdge{{From: "a", To: "b"}, {From: "b", To: "c"}}}
+	}
+	for _, label := range []string{"Fixes #12", "Fixes <b></b>#12", "@alice", "&commat;alice", "glpat-" + strings.Repeat("A", 20)} {
+		got, err := SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{Summary: "keep", Diagram: makeDiagram(label)})
+		if err != nil || got.Diagram != nil || got.Summary != "keep" {
+			t.Errorf("unsafe label %q: %+v, %v", label, got, err)
+		}
+	}
+	got, err := SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{Diagram: makeDiagram("A <b>node</b>.")})
+	if err != nil || got.Diagram == nil || got.Diagram.Nodes[0].Label != "A node." {
+		t.Fatalf("valid diagram: %+v, %v", got.Diagram, err)
+	}
+	got.Diagram.Title = ""
+	got, err = SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{Diagram: got.Diagram})
+	if err != nil || got.Diagram == nil || got.Diagram.Title != "" {
+		t.Fatalf("empty optional title: %+v, %v", got.Diagram, err)
+	}
+	for name, change := range map[string]func(*apitypes.PrDescriptionDiagram){
+		"duplicate key":    func(d *apitypes.PrDescriptionDiagram) { d.Nodes[1].Key = "a" },
+		"missing endpoint": func(d *apitypes.PrDescriptionDiagram) { d.Edges[0].To = "missing" },
+		"self edge":        func(d *apitypes.PrDescriptionDiagram) { d.Edges[0].To = "a" },
+		"few nodes":        func(d *apitypes.PrDescriptionDiagram) { d.Nodes = d.Nodes[:2] },
+		"unsafe title":     func(d *apitypes.PrDescriptionDiagram) { d.Title = "Closes #12" },
+		"unsafe edge":      func(d *apitypes.PrDescriptionDiagram) { d.Edges[0].Label = "@alice" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			d := makeDiagram("First")
+			change(d)
+			fields, err := SanitizePrDescriptionFields(context.Background(), apitypes.PrDescriptionFields{Summary: "keep", Diagram: d})
+			if err != nil || fields.Diagram != nil || fields.Summary != "keep" {
+				t.Fatalf("invalid graph must drop as a unit: %+v, %v", fields, err)
+			}
+		})
+	}
+}
+
 func TestSanitizePrDescriptionTextMarkup(t *testing.T) {
 	cases := []struct {
 		name, in, want string

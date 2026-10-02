@@ -60,6 +60,21 @@ func prDescRawCapOK(f apitypes.PrDescriptionFields) bool {
 		len(f.ReviewPointers) > workersvc.MaxPrDescListRawEntries || len(f.Verification) > workersvc.MaxPrDescListRawEntries {
 		return false
 	}
+	if d := f.Diagram; d != nil {
+		if len(d.Nodes) > workersvc.MaxPrDescDiagramRawEntries || len(d.Edges) > workersvc.MaxPrDescDiagramRawEntries || len(d.Title) > workersvc.MaxPrDescDiagramRawLabelBytes {
+			return false
+		}
+		for _, n := range d.Nodes {
+			if len(n.Key) > workersvc.MaxPrDescDiagramRawLabelBytes || len(n.Label) > workersvc.MaxPrDescDiagramRawLabelBytes {
+				return false
+			}
+		}
+		for _, e := range d.Edges {
+			if len(e.From) > workersvc.MaxPrDescDiagramRawLabelBytes || len(e.To) > workersvc.MaxPrDescDiagramRawLabelBytes || len(e.Label) > workersvc.MaxPrDescDiagramRawLabelBytes {
+				return false
+			}
+		}
+	}
 	over := func(s string) bool { return len(s) > workersvc.MaxPrDescItemRawBytes }
 	if slices.ContainsFunc(f.Changes, over) || slices.ContainsFunc(f.ReviewPointers, over) {
 		return false

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"html"
+	"log/slog"
 	"regexp"
 	"strings"
 	"unicode"
@@ -24,9 +25,11 @@ import (
 //     and ends with "…" inside the cap; a list longer than its layout cap keeps its first
 //     entries. The worker mirrors these numbers (see /tmp/plan1798/m4a-shapes.md).
 const (
-	MaxPrDescSummaryRawBytes = 4000
-	MaxPrDescItemRawBytes    = 1000
-	MaxPrDescListRawEntries  = 50
+	MaxPrDescSummaryRawBytes      = 4000
+	MaxPrDescItemRawBytes         = 1000
+	MaxPrDescListRawEntries       = 50
+	MaxPrDescDiagramRawEntries    = 50
+	MaxPrDescDiagramRawLabelBytes = 1000
 
 	PrDescSummaryMaxBytes       = 600
 	PrDescItemMaxBytes          = 200
@@ -575,7 +578,112 @@ func SanitizePrDescriptionFields(ctx context.Context, in apitypes.PrDescriptionF
 			Command: cmd, Result: v.Result, VerifiedAtSha: strings.ToLower(v.VerifiedAtSha),
 		})
 	}
+	if in.Diagram != nil {
+		if len(in.Diagram.Nodes) > MaxPrDescDiagramRawEntries || len(in.Diagram.Edges) > MaxPrDescDiagramRawEntries || len(in.Diagram.Title) > MaxPrDescDiagramRawLabelBytes {
+			return out, ErrPrDescriptionInvalid
+		}
+		for _, n := range in.Diagram.Nodes {
+			if len(n.Key) > MaxPrDescDiagramRawLabelBytes || len(n.Label) > MaxPrDescDiagramRawLabelBytes {
+				return out, ErrPrDescriptionInvalid
+			}
+		}
+		for _, e := range in.Diagram.Edges {
+			if len(e.From) > MaxPrDescDiagramRawLabelBytes || len(e.To) > MaxPrDescDiagramRawLabelBytes || len(e.Label) > MaxPrDescDiagramRawLabelBytes {
+				return out, ErrPrDescriptionInvalid
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return out, err
+		}
+		var reason string
+		out.Diagram, reason = sanitizePrDescDiagram(in.Diagram)
+		if reason != "" {
+			slog.Warn("workersvc: dropped pr description diagram", "reason", reason)
+		}
+	}
 	return out, nil
+}
+
+var prDescDiagramKey = regexp.MustCompile(`^[a-z0-9_]{1,16}$`)
+
+// sanitizePrDescDiagram drops an invalid graph as a unit. Every label is checked before and
+// after the final allowlist, since punctuation replacement can expose a directive.
+func sanitizePrDescDiagram(in *apitypes.PrDescriptionDiagram) (*apitypes.PrDescriptionDiagram, string) {
+	if in.Kind != "flow" && in.Kind != "sequence" {
+		return nil, "kind"
+	}
+	minNodes := 3
+	if in.Kind == "sequence" {
+		minNodes = 2
+	}
+	if len(in.Nodes) < minNodes || len(in.Nodes) > 12 || len(in.Edges) < 2 || len(in.Edges) > 20 {
+		return nil, "entries"
+	}
+	label := func(raw string, cap int) (string, bool) {
+		if len(raw) > MaxPrDescDiagramRawLabelBytes {
+			return "", false
+		}
+		s, ok := prDescNormalize(raw)
+		if !ok || prDescRenderedSecret(s) || secretscrub.Scrub(s) != s || prDescClosing.MatchString(s) || neutralizeClosingDirectives(s) != s || breakMentions(s) != s {
+			return "", false
+		}
+		var b strings.Builder
+		for _, r := range s {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) || r == ' ' || strings.ContainsRune(".,-_/+'()", r) {
+				b.WriteRune(r)
+			} else {
+				b.WriteByte(' ')
+			}
+		}
+		s = strings.Join(strings.Fields(b.String()), " ")
+		if len(s) > cap {
+			for len(s) > cap {
+				_, size := utf8.DecodeLastRuneInString(s)
+				s = s[:len(s)-size]
+			}
+			s = strings.TrimSpace(s)
+		}
+		if len(s) > cap || s == "" || prDescRenderedSecret(s) || secretscrub.Scrub(s) != s || neutralizeClosingDirectives(s) != s || breakMentions(s) != s {
+			return "", false
+		}
+		return s, true
+	}
+	title := ""
+	if in.Title != "" {
+		var ok bool
+		title, ok = label(in.Title, 80)
+		if !ok {
+			return nil, "title"
+		}
+	}
+	out := &apitypes.PrDescriptionDiagram{Kind: in.Kind, Title: title, Nodes: make([]apitypes.PrDescriptionDiagramNode, 0, len(in.Nodes)), Edges: make([]apitypes.PrDescriptionDiagramEdge, 0, len(in.Edges))}
+	keys := make(map[string]bool, len(in.Nodes))
+	for _, n := range in.Nodes {
+		if !prDescDiagramKey.MatchString(n.Key) || keys[n.Key] {
+			return nil, "node key"
+		}
+		v, ok := label(n.Label, 60)
+		if !ok {
+			return nil, "node label"
+		}
+		keys[n.Key] = true
+		out.Nodes = append(out.Nodes, apitypes.PrDescriptionDiagramNode{Key: n.Key, Label: v})
+	}
+	for _, e := range in.Edges {
+		if !keys[e.From] || !keys[e.To] || (in.Kind == "flow" && e.From == e.To) {
+			return nil, "edge endpoint"
+		}
+		v := ""
+		if e.Label != "" {
+			var ok bool
+			v, ok = label(e.Label, 60)
+			if !ok {
+				return nil, "edge label"
+			}
+		}
+		out.Edges = append(out.Edges, apitypes.PrDescriptionDiagramEdge{From: e.From, To: e.To, Label: v})
+	}
+	return out, ""
 }
 
 func sanitizePrDescList(ctx context.Context, items []string, maxEntries int) ([]string, error) {

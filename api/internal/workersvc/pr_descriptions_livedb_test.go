@@ -248,6 +248,45 @@ func TestPrDescriptionSkippedWriteKeepsPublishedLiveDB(t *testing.T) {
 	}
 }
 
+func TestPrDescriptionDiagramBindAndLostAckLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	lost := p.stage(t, 1, "Diagram written, ack lost.", nil)
+	bind := func(id, hash string, flag *bool) (apitypes.PrDescriptionBindResponse, error) {
+		return p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+			ClaimGeneration: gen(1), VersionID: id, MrIid: 5, RenderedRegionSha256: hash, RegionHasDiagram: flag,
+		})
+	}
+	first, err := bind(lost.ID, prDescLiveHashA, genBool(true))
+	if err != nil || first.Version.RegionHasDiagram == nil || !*first.Version.RegionHasDiagram {
+		t.Fatalf("bind diagram flag = %+v, %v", first.Version, err)
+	}
+	if retry, err := bind(lost.ID, prDescLiveHashA, genBool(true)); err != nil || retry.Version.RegionHasDiagram == nil || !*retry.Version.RegionHasDiagram {
+		t.Fatalf("idempotent bind = %+v, %v", retry.Version, err)
+	}
+	for _, flag := range []*bool{nil, genBool(false)} {
+		if _, err := bind(lost.ID, prDescLiveHashA, flag); !errors.Is(err, ErrPrDescriptionVersionConflict) {
+			t.Fatalf("changed flag %v: %v", flag, err)
+		}
+	}
+	next := p.stage(t, 1, "Next write.", gen(5))
+	if _, err := bind(next.ID, prDescLiveHashB, nil); err != nil {
+		t.Fatalf("legacy bind: %v", err)
+	}
+	observed := prDescLiveHashA
+	ack, err := p.ack(1, next.ID, "skipped_human_edit", 0, &observed)
+	if err != nil || ack.RecoveredVersionID == nil || *ack.RecoveredVersionID != lost.ID ||
+		ack.PR.PublishedVersion == nil || ack.PR.PublishedVersion.RegionHasDiagram == nil || !*ack.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("lost ack recovery = %+v, %v", ack, err)
+	}
+	run := mustRun(t, p.env, p.runID)
+	desc, _, err := p.svc.RunPrDescription(p.env.ctx, run)
+	if err != nil || desc == nil || !desc.DiagramPublished {
+		t.Fatalf("run diagram published = %+v, %v", desc, err)
+	}
+}
+
+func genBool(v bool) *bool { return &v }
+
 // TestPrDescriptionLostAckRecoveryLiveDB: a version whose forge write landed but whose ack was
 // lost is recovered by the next ack that observes its region hash, before that ack applies.
 func TestPrDescriptionLostAckRecoveryLiveDB(t *testing.T) {

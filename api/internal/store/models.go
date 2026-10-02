@@ -594,6 +594,7 @@ type PrDescriptionVersion struct {
 	State                string             `json:"state"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	PublishedAt          pgtype.Timestamptz `json:"published_at"`
+	RegionHasDiagram     pgtype.Bool        `json:"region_has_diagram"`
 }
 
 type Product struct {
