@@ -1114,7 +1114,8 @@ func (q *Queries) RewrapUserSecret(ctx context.Context, arg RewrapUserSecretPara
 
 const rotateUserSecret = `-- name: RotateUserSecret :one
 UPDATE user_secrets
-SET ciphertext = $3, sealed_with = $4, updated_at = now()
+SET ciphertext = $3, sealed_with = $4, updated_at = now(),
+    enablement_rev = enablement_rev + 1, anthropic_rejected_at = NULL
 WHERE id = $1 AND user_id = $2
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at
 `
@@ -1163,7 +1164,8 @@ func (q *Queries) RotateUserSecret(ctx context.Context, arg RotateUserSecretPara
 const setSecretEnablement = `-- name: SetSecretEnablement :one
 UPDATE user_secrets
 SET disabled_at = CASE WHEN $1::boolean THEN NULL ELSE now() END,
-    enablement_rev = enablement_rev + 1, updated_at = now()
+    enablement_rev = enablement_rev + 1, anthropic_rejected_at = NULL,
+    updated_at = now()
 WHERE id = $2 AND user_id = $3
   AND (disabled_at IS NULL) <> $1::boolean
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at,
@@ -1337,7 +1339,9 @@ VALUES ($1, $2, CASE WHEN EXISTS (
 ON CONFLICT (user_id, kind) WHERE is_default DO UPDATE
     SET ciphertext = EXCLUDED.ciphertext,
         sealed_with = EXCLUDED.sealed_with,
-        updated_at = now()
+        updated_at = now(),
+        enablement_rev = user_secrets.enablement_rev + 1,
+        anthropic_rejected_at = NULL
         -- Preserve the existing opt-in/opt-out state on rotation.
     WHERE user_secrets.disabled_at IS NULL
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at

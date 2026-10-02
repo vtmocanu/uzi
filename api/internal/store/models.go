@@ -1259,18 +1259,19 @@ type User struct {
 }
 
 type UserSecret struct {
-	ID            uuid.UUID          `json:"id"`
-	UserID        uuid.UUID          `json:"user_id"`
-	Kind          string             `json:"kind"`
-	Ciphertext    []byte             `json:"ciphertext"`
-	CreatedAt     pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt     pgtype.Timestamptz `json:"updated_at"`
-	SealedWith    string             `json:"sealed_with"`
-	Label         string             `json:"label"`
-	IsDefault     bool               `json:"is_default"`
-	AutoEligible  bool               `json:"auto_eligible"`
-	DisabledAt    pgtype.Timestamptz `json:"disabled_at"`
-	EnablementRev int64              `json:"enablement_rev"`
+	ID                  uuid.UUID          `json:"id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	Kind                string             `json:"kind"`
+	Ciphertext          []byte             `json:"ciphertext"`
+	CreatedAt           pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt           pgtype.Timestamptz `json:"updated_at"`
+	SealedWith          string             `json:"sealed_with"`
+	Label               string             `json:"label"`
+	IsDefault           bool               `json:"is_default"`
+	AutoEligible        bool               `json:"auto_eligible"`
+	DisabledAt          pgtype.Timestamptz `json:"disabled_at"`
+	EnablementRev       int64              `json:"enablement_rev"`
+	AnthropicRejectedAt pgtype.Timestamptz `json:"anthropic_rejected_at"`
 }
 
 type UserVault struct {

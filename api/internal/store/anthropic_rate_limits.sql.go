@@ -184,6 +184,7 @@ const listAutoSelectCandidates = `-- name: ListAutoSelectCandidates :many
 SELECT s.id                     AS user_secret_id,
        s.label                  AS label,
        s.auto_eligible          AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -241,6 +242,7 @@ type ListAutoSelectCandidatesRow struct {
 	UserSecretID     uuid.UUID          `json:"user_secret_id"`
 	Label            string             `json:"label"`
 	AutoEligible     bool               `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -310,6 +312,7 @@ func (q *Queries) ListAutoSelectCandidates(ctx context.Context, userID uuid.UUID
 			&i.UserSecretID,
 			&i.Label,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -336,6 +339,7 @@ SELECT
     s.label         AS label,
     s.is_default    AS is_default,
     s.auto_eligible AS auto_eligible,
+    (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,
@@ -358,6 +362,7 @@ type ListRateLimitsRow struct {
 	Label            pgtype.Text        `json:"label"`
 	IsDefault        pgtype.Bool        `json:"is_default"`
 	AutoEligible     pgtype.Bool        `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -409,6 +414,7 @@ func (q *Queries) ListRateLimits(ctx context.Context) ([]ListRateLimitsRow, erro
 			&i.Label,
 			&i.IsDefault,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -431,6 +437,7 @@ SELECT s.id            AS user_secret_id,
        s.label         AS label,
        s.is_default    AS is_default,
        s.auto_eligible AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -449,6 +456,7 @@ type ListRateLimitsForUserRow struct {
 	Label            string             `json:"label"`
 	IsDefault        bool               `json:"is_default"`
 	AutoEligible     bool               `json:"auto_eligible"`
+	Rejected         bool               `json:"rejected"`
 	FiveHourPct      pgtype.Int2        `json:"five_hour_pct"`
 	FiveHourResetsAt pgtype.Timestamptz `json:"five_hour_resets_at"`
 	SevenDayPct      pgtype.Int2        `json:"seven_day_pct"`
@@ -497,6 +505,7 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 			&i.Label,
 			&i.IsDefault,
 			&i.AutoEligible,
+			&i.Rejected,
 			&i.FiveHourPct,
 			&i.FiveHourResetsAt,
 			&i.SevenDayPct,
@@ -512,6 +521,29 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 		return nil, err
 	}
 	return items, nil
+}
+
+const markAnthropicTokenRejected = `-- name: MarkAnthropicTokenRejected :execrows
+UPDATE user_secrets SET anthropic_rejected_at = now()
+WHERE id = $1 AND user_id = $2
+  AND kind = 'anthropic_token' AND disabled_at IS NULL
+  AND enablement_rev = $3
+`
+
+type MarkAnthropicTokenRejectedParams struct {
+	UserSecretID  uuid.UUID `json:"user_secret_id"`
+	UserID        uuid.UUID `json:"user_id"`
+	EnablementRev int64     `json:"enablement_rev"`
+}
+
+// Only a definitive probe refusal marks the exact enabled credential revision.
+// A replacement, disable, or re-enable makes an older poll's write affect zero rows.
+func (q *Queries) MarkAnthropicTokenRejected(ctx context.Context, arg MarkAnthropicTokenRejectedParams) (int64, error) {
+	result, err := q.db.Exec(ctx, markAnthropicTokenRejected, arg.UserSecretID, arg.UserID, arg.EnablementRev)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markFiveHourExhausted = `-- name: MarkFiveHourExhausted :execrows
@@ -576,6 +608,13 @@ func (q *Queries) MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.U
 }
 
 const upsertRateLimits = `-- name: UpsertRateLimits :execrows
+WITH current_secret AS (
+    UPDATE user_secrets s SET anthropic_rejected_at = NULL
+    WHERE s.id = $7 AND s.user_id = $8
+      AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+      AND s.enablement_rev = $9
+    RETURNING s.id, s.user_id, s.enablement_rev
+)
 INSERT INTO anthropic_rate_limits (
     user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
     seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev
@@ -588,11 +627,7 @@ SELECT s.id, s.user_id,
        $5::text,
        $6::timestamptz,
        s.enablement_rev
-FROM user_secrets s
-WHERE s.id = $7 AND s.user_id = $8
-  AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
-  AND s.enablement_rev = $9
-FOR SHARE OF s
+FROM current_secret s
 ON CONFLICT (user_secret_id) DO UPDATE SET
     five_hour_pct       = EXCLUDED.five_hour_pct,
     five_hour_resets_at = EXCLUDED.five_hour_resets_at,
@@ -633,14 +668,11 @@ type UpsertRateLimitsParams struct {
 // the poll captured when it started, so a poll that started before a disable (or
 // before a disable and the following re-enable) writes nothing: the SELECT yields
 // no row and the statement affects 0 rows, which the caller reads as "not written"
-// and then must not notify. FOR SHARE serialises the check against the transition
-// (SetSecretEnablement's UPDATE, and the handler's FOR UPDATE, conflict with it):
-// a transition that commits first makes this re-check see the new revision and
-// write nothing, and one that comes second waits for this write. Without it the
-// write still waits behind the enablement handler's FOR UPDATE (the FK's KEY SHARE
-// check conflicts with it) but then lands the old revision's reading, because the
-// fence was evaluated before the wait; TestRateLimitFenceSerializesWithTransitionLiveDB
-// measures exactly that.
+// and then must not notify. The current_secret UPDATE takes the secret row lock
+// before the gauge insert or conflict update, and clears the rejection marker in
+// the same statement as the successful reading. A credential transition that
+// commits first makes the revision check write zero rows; one that comes second
+// waits for the successful reading. This also orders locks secret then gauge.
 // The row is stamped with the revision it was polled at, which is what hides it
 // from every reader once the revision moves on.
 func (q *Queries) UpsertRateLimits(ctx context.Context, arg UpsertRateLimitsParams) (int64, error) {

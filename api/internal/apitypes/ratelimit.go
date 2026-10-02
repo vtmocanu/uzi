@@ -35,7 +35,7 @@ type TokenRateLimitDTO struct {
 	// Auto-selection (PRD #111 M2). AutoEligible is the owner's opt-in — the setting
 	// they toggled. AutoStatus is the LIVE answer: whether the selector could pick
 	// this token right now, and if not, why (`eligible` | `not_pooled` |
-	// `no_reading` | `unmeasured` | `stale` | `below_threshold`).
+	// `rejected` | `no_reading` | `unmeasured` | `stale` | `below_threshold`).
 	//
 	// 🔴 AutoStatus IS COMPUTED SERVER-SIDE AND MUST BE RENDERED, NEVER RE-DERIVED
 	// (D21). It comes from autoselect.Classify, the same single function the ranker

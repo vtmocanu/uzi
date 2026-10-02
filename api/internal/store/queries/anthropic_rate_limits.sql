@@ -76,16 +76,20 @@ WHERE user_secret_id = @user_secret_id AND enablement_rev = @enablement_rev;
 -- the poll captured when it started, so a poll that started before a disable (or
 -- before a disable and the following re-enable) writes nothing: the SELECT yields
 -- no row and the statement affects 0 rows, which the caller reads as "not written"
--- and then must not notify. FOR SHARE serialises the check against the transition
--- (SetSecretEnablement's UPDATE, and the handler's FOR UPDATE, conflict with it):
--- a transition that commits first makes this re-check see the new revision and
--- write nothing, and one that comes second waits for this write. Without it the
--- write still waits behind the enablement handler's FOR UPDATE (the FK's KEY SHARE
--- check conflicts with it) but then lands the old revision's reading, because the
--- fence was evaluated before the wait; TestRateLimitFenceSerializesWithTransitionLiveDB
--- measures exactly that.
+-- and then must not notify. The current_secret UPDATE takes the secret row lock
+-- before the gauge insert or conflict update, and clears the rejection marker in
+-- the same statement as the successful reading. A credential transition that
+-- commits first makes the revision check write zero rows; one that comes second
+-- waits for the successful reading. This also orders locks secret then gauge.
 -- The row is stamped with the revision it was polled at, which is what hides it
 -- from every reader once the revision moves on.
+WITH current_secret AS (
+    UPDATE user_secrets s SET anthropic_rejected_at = NULL
+    WHERE s.id = @user_secret_id AND s.user_id = @user_id
+      AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
+      AND s.enablement_rev = @enablement_rev
+    RETURNING s.id, s.user_id, s.enablement_rev
+)
 INSERT INTO anthropic_rate_limits (
     user_secret_id, user_id, five_hour_pct, five_hour_resets_at,
     seven_day_pct, seven_day_resets_at, source, synced_at, enablement_rev
@@ -98,11 +102,7 @@ SELECT s.id, s.user_id,
        sqlc.narg(source)::text,
        sqlc.narg(synced_at)::timestamptz,
        s.enablement_rev
-FROM user_secrets s
-WHERE s.id = @user_secret_id AND s.user_id = @user_id
-  AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
-  AND s.enablement_rev = @enablement_rev
-FOR SHARE OF s
+FROM current_secret s
 ON CONFLICT (user_secret_id) DO UPDATE SET
     five_hour_pct       = EXCLUDED.five_hour_pct,
     five_hour_resets_at = EXCLUDED.five_hour_resets_at,
@@ -111,6 +111,14 @@ ON CONFLICT (user_secret_id) DO UPDATE SET
     source              = EXCLUDED.source,
     synced_at           = EXCLUDED.synced_at,
     enablement_rev      = EXCLUDED.enablement_rev;
+
+-- name: MarkAnthropicTokenRejected :execrows
+-- Only a definitive probe refusal marks the exact enabled credential revision.
+-- A replacement, disable, or re-enable makes an older poll's write affect zero rows.
+UPDATE user_secrets SET anthropic_rejected_at = now()
+WHERE id = @user_secret_id AND user_id = @user_id
+  AND kind = 'anthropic_token' AND disabled_at IS NULL
+  AND enablement_rev = @enablement_rev;
 
 -- name: ListRateLimitsForUser :many
 -- One user's meters, one row per TOKEN, for GET /api/me/rate-limits (PRD #104 D4 —
@@ -143,6 +151,7 @@ SELECT s.id            AS user_secret_id,
        s.label         AS label,
        s.is_default    AS is_default,
        s.auto_eligible AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,
@@ -189,6 +198,7 @@ SELECT
     s.label         AS label,
     s.is_default    AS is_default,
     s.auto_eligible AS auto_eligible,
+    (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
     rl.five_hour_pct,
     rl.five_hour_resets_at,
     rl.seven_day_pct,
@@ -252,6 +262,7 @@ ORDER BY u.email ASC, s.is_default DESC NULLS LAST, lower(s.label) ASC;
 SELECT s.id                     AS user_secret_id,
        s.label                  AS label,
        s.auto_eligible          AS auto_eligible,
+       (s.anthropic_rejected_at IS NOT NULL)::boolean AS rejected,
        rl.five_hour_pct,
        rl.five_hour_resets_at,
        rl.seven_day_pct,

@@ -47,6 +47,7 @@ type Candidate struct {
 	SecretID      uuid.UUID
 	Label         string
 	AutoEligible  bool // user_secrets.auto_eligible — the D2 opt-in
+	Rejected      bool // current credential value was rejected by the probe
 	HasReading    bool // false ⇒ no anthropic_rate_limits row for this token
 	FiveHourPct   *int16
 	SevenDayPct   *int16
@@ -96,6 +97,7 @@ const (
 	StatusEligible Status = "eligible"
 	// StatusNotPooled: auto_eligible = false. Not a problem, just not opted in.
 	StatusNotPooled Status = "not_pooled"
+	StatusRejected  Status = "rejected"
 	// StatusNoReading: pooled, but the gauge has never produced a row for it.
 	// Rendered "never polled". This is R7's silent no-op made visible: a credential
 	// the usage endpoint permanently refuses never produces a row at all, so opting
@@ -153,6 +155,9 @@ func Classify(c Candidate, p Policy, now time.Time) Eligibility {
 	// SyncedAt is checked alongside HasReading rather than trusted from it: the
 	// column is NOT NULL in the table but nullable through the LEFT JOIN, so a
 	// query that projects the join differently could hand us one without the other.
+	if c.Rejected {
+		return Eligibility{Status: StatusRejected}
+	}
 	if !c.HasReading || c.SyncedAt == nil {
 		return Eligibility{Status: StatusNoReading}
 	}

@@ -65,6 +65,7 @@ type Store interface {
 	// rows written, 0 when the token was disabled or its enablement revision moved
 	// on since the poll started.
 	UpsertRateLimits(ctx context.Context, arg store.UpsertRateLimitsParams) (int64, error)
+	MarkAnthropicTokenRejected(ctx context.Context, arg store.MarkAnthropicTokenRejectedParams) (int64, error)
 	// GetRateLimitsForToken reads the prior gauge row for a token before the tick
 	// overwrites it, so early-reset detection can compare the previously reported
 	// 7-day reset against the fresh reading (PRD #1020 M2). Returns pgx.ErrNoRows
@@ -341,6 +342,15 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev 
 		e.observe(ctx, userID, secretID, rev, notifyEarly, preading)
 		e.clearBackoff(secretID)
 		return
+	}
+	var probeErr *anthropic.Error
+	if errors.As(perr, &probeErr) && probeErr.Kind == anthropic.KindHTTP &&
+		(probeErr.Status == 401 || probeErr.Status == 403) {
+		if _, markErr := e.store.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{
+			UserSecretID: secretID, UserID: userID, EnablementRev: rev,
+		}); markErr != nil {
+			e.logger.Error("usage poller: mark rejected token", "secret", secretID.String(), "error", markErr)
+		}
 	}
 	// The probe also failed (refused, transport, or malformed) — no usable fallback,
 	// so back off to avoid hammering a persistently refusing credential (D5).

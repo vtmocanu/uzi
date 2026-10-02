@@ -40,6 +40,7 @@ func FromRateLimitRow(row store.ListRateLimitsForUserRow) autoselect.Candidate {
 		SecretID:     row.UserSecretID,
 		Label:        row.Label,
 		AutoEligible: row.AutoEligible,
+		Rejected:     row.Rejected,
 		// HasReading comes from synced_at's validity, which is the LEFT JOIN's own miss
 		// signal: the column is NOT NULL in the table, so an invalid one can only mean
 		// the join matched nothing. That distinction is the whole of D16 — never polled
@@ -78,6 +79,7 @@ func FromAdminRateLimitRow(row store.ListRateLimitsRow) autoselect.Candidate {
 		UserSecretID:     uuid.UUID(row.UserSecretID.Bytes),
 		Label:            row.Label.String,
 		AutoEligible:     row.AutoEligible.Bool,
+		Rejected:         row.Rejected,
 		FiveHourPct:      row.FiveHourPct,
 		FiveHourResetsAt: row.FiveHourResetsAt,
 		SevenDayPct:      row.SevenDayPct,
@@ -105,6 +107,7 @@ func FromCandidateRow(row store.ListAutoSelectCandidatesRow) autoselect.Candidat
 		UserSecretID:     row.UserSecretID,
 		Label:            row.Label,
 		AutoEligible:     row.AutoEligible,
+		Rejected:         row.Rejected,
 		FiveHourPct:      row.FiveHourPct,
 		FiveHourResetsAt: row.FiveHourResetsAt,
 		SevenDayPct:      row.SevenDayPct,

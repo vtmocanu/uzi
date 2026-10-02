@@ -344,7 +344,7 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 func Floor(cands []Candidate, exclude uuid.UUID, now time.Time) (secretID uuid.UUID, ok bool) {
 	var best Candidate
 	for _, c := range cands {
-		if !c.AutoEligible {
+		if !c.AutoEligible || c.Rejected {
 			continue
 		}
 		if exclude != uuid.Nil && c.SecretID == exclude {
