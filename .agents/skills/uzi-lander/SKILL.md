@@ -385,15 +385,16 @@ changes it); trust it over a handover's claim.
    not findings. After the merge, list the findings still to triage:
    `uzi findings list --run RUN --bucket to_file`, and read the deferred scope notes. Neither
    holds anything: nothing to do.
-   - A deferred note worth doing joins the follow-up: add it to the filed issue's body, or
-     file it with `gh issue create` when no finding remains, under the same gates below.
-   - Verify each against the merged code. `uzi findings resolve ID` what the merge fixed;
-     `uzi findings dismiss ID --reason not-an-issue` a false positive, `--reason wont-do`
-     valid work deliberately declined.
-   - The rest becomes one issue. Get the buddy's `APPROVE` of its membership and its exact
-     title and body. `uzi findings file ID ID...` files the server-generated text (one id
-     files alone): preview it in the Findings page's file dialog (select the run's rows),
-     which is also where to edit it before filing.
+   - Follow each deferred scope note's validator/report and SHA references to recover the
+     actual notes. Verify notes and findings against the merged code. `uzi findings resolve
+     ID` what the merge fixed; `uzi findings dismiss ID --reason not-an-issue` a false
+     positive, `--reason wont-do` valid work deliberately declined (finding ids only).
+   - Combine the actionable deferred notes and remaining findings into one draft. Get the
+     buddy's `APPROVE` of its membership and exact title and body. With findings, publish
+     that draft through the Findings page's grouped-file dialog (select the run's rows; it
+     edits the server text before filing; `uzi findings file ID ID...` files only the
+     unedited server text, so use it only when that text is the approved draft). Without
+     findings, `gh issue create --body-file`. A later body edit passes the same gates.
    - Filing is the human gate: file only with the user's go-ahead, given now or earlier in
      the session for this follow-up. The buddy's approval never substitutes for it.
    - A set over the grouped-filing limit (50) goes to the user for a decision; never split or
