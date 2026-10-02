@@ -144,11 +144,13 @@ describe("signal_done decisions_memo", () => {
     }
   });
 
-  it("clamps only to the loose transport bound, on a character boundary", () => {
-    const r = scanSignals(toolUse("mcp__uzi__signal_done", { decisions_memo: "😀".repeat(20000) })); // 4 bytes each
-    const memo = r.decisionsMemo!;
+  it("drops a memo over the loose transport bound instead of cutting it before redaction", () => {
     assert.ok(DECISIONS_MEMO_TRANSPORT_MAX_BYTES > DECISIONS_MEMO_MAX_BYTES, "looser than the storage cap");
-    assert.strictEqual(memo, "😀".repeat(DECISIONS_MEMO_TRANSPORT_MAX_BYTES / 4));
+    const atBound = "😀".repeat(DECISIONS_MEMO_TRANSPORT_MAX_BYTES / 4); // 4 bytes each
+    assert.strictEqual(scanSignals(toolUse("mcp__uzi__signal_done", { decisions_memo: atBound })).decisionsMemo, atBound);
+    const r = scanSignals(toolUse("mcp__uzi__signal_done", { decisions_memo: atBound + "x" }));
+    assert.strictEqual(r.decisionsMemo, undefined);
+    assert.strictEqual(r.done, true, "the signal itself still counts");
   });
 
   it("does not cut a memo at the storage cap (the runner redacts before clamping)", () => {

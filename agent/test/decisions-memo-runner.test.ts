@@ -4,7 +4,7 @@ import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { recordingLogger, nullLogger } from "./helpers.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { Executor } from "../src/executor.js";
-import { DECISIONS_MEMO_MAX_BYTES } from "../src/decisions-memo.js";
+import { DECISIONS_MEMO_MAX_BYTES, DECISIONS_MEMO_TRANSPORT_MAX_BYTES } from "../src/decisions-memo.js";
 import type { ClaimResponse } from "../src/protocol.js";
 import {
   api,
@@ -140,6 +140,30 @@ describe("decisions memo: end-to-end save", () => {
     for (let n = 8; n <= secret.length; n++) {
       assert.ok(!body.includes(secret.slice(0, n)), `no ${n}-char prefix of the secret survives`);
     }
+  });
+
+  it("a raw memo over the transport bound is dropped, never cut before redaction", async () => {
+    simulateCommittedWork();
+    api.decisionsMemo.get = enabledMemo(null);
+    // Repeated claim secrets shrink to short markers once redacted, so a secret cut at the
+    // transport bound would fit under the storage cap as a bare prefix the redactor cannot match.
+    const secret = ["TRANSPORT", "MARKER", "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliett"]
+      .join("-")
+      .padEnd(80, "k");
+    const copies = Math.floor(DECISIONS_MEMO_TRANSPORT_MAX_BYTES / secret.length);
+    const memo = secret.repeat(copies + 1);
+    // Preconditions: the transport cut lands inside a secret, and the redacted remainder fits the storage cap.
+    assert.ok(DECISIONS_MEMO_TRANSPORT_MAX_BYTES % secret.length >= 8);
+    assert.ok(copies * "***REDACTED***".length + secret.length < DECISIONS_MEMO_MAX_BYTES);
+    const claim = gitlabClaim(7, { secrets: { forge_pat: secret, anthropic_oauth_token: "dummy-oauth-do-not-scan" } });
+    const { completed } = await drive(claim, scriptedLead(memo));
+    assert.ok(completed, "the run still completes");
+    for (const post of api.decisionsMemoPosts) {
+      for (let n = 8; n <= secret.length; n++) {
+        assert.ok(!post.body.body!.includes(secret.slice(0, n)), `no ${n}-char prefix of the secret survives`);
+      }
+    }
+    assert.strictEqual(api.decisionsMemoPosts.length, 0, "an over-bound memo is not saved at all");
   });
 
   it("re-clamps an executor-provided oversize memo to the cap", async () => {

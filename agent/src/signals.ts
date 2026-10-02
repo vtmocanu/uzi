@@ -1017,13 +1017,17 @@ export function scanSignals(message: unknown): ScannedSignals {
       const prSummary = parsePrSummary(input?.["pr_summary"]);
       if (prSummary !== undefined) out.prSummary = prSummary;
       // Issue #2083. Same signal_done branch, so the same main-thread guard: a subagent frame
-      // must never plant the note the next rework run reads. Only non-whitespace strings count;
-      // the clamp here is only a loose transport bound (DECISIONS_MEMO_TRANSPORT_MAX_BYTES), hygiene
-      // only; the runner redacts FIRST and then applies the real storage cap, so no secret straddling
-      // the STORAGE cap is cut before redaction.
+      // must never plant the note the next rework run reads. Only non-whitespace strings count.
+      // A memo over the transport bound (DECISIONS_MEMO_TRANSPORT_MAX_BYTES) is DROPPED, never
+      // cut: the runner redacts before applying the storage cap, and a cut here would come before
+      // that redaction, so a secret straddling it could survive as an unmatchable prefix.
       const decisionsMemo = input?.["decisions_memo"];
-      if (typeof decisionsMemo === "string" && decisionsMemo.trim() !== "") {
-        out.decisionsMemo = clampUtf8Bytes(decisionsMemo, DECISIONS_MEMO_TRANSPORT_MAX_BYTES);
+      if (
+        typeof decisionsMemo === "string" &&
+        decisionsMemo.trim() !== "" &&
+        Buffer.byteLength(decisionsMemo, "utf8") <= DECISIONS_MEMO_TRANSPORT_MAX_BYTES
+      ) {
+        out.decisionsMemo = decisionsMemo;
       }
     } else if (name === ASK_USER_QUALIFIED) {
       // PRD #88. Extracted HERE, inside the content loop that isSubagentFrame already
