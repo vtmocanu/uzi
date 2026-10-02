@@ -758,9 +758,11 @@ export interface ExecutorResult {
    *  the runner reads it only where it renders a PR description. Absent when the lead declared
    *  none, which an older prompt or a terse lead does. StubExecutor never sets it. */
   prSummary?: PrSummaryClaim;
-  /** Issue #2083: the private decisions memo from signal_done's `decisions_memo` (last-wins,
-   *  already clamped by signals.ts). The runner redacts and saves it on an MR-path completion
-   *  only; it is never part of any persisted message. StubExecutor never sets it. */
+  /** Issue #2083: the private decisions memo from signal_done's `decisions_memo` (last-wins).
+   *  signals.ts passes it through verbatim or drops it whole when over the transport bound;
+   *  it is never cut before the runner redacts it, then clamps to the storage cap, and saves
+   *  it on an MR-path completion only. It is never part of any persisted message.
+   *  StubExecutor never sets it. */
   decisionsMemo?: string;
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
    *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),

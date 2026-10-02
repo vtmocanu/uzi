@@ -88,9 +88,10 @@ export interface ScannedSignals {
    *  parsed, so a plain signal_done still scans to exactly `{ done: true }`. The scan never sets
    *  `verifiedAtSha`: the executor stamps it from the worktree HEAD when it latches done. */
   prSummary?: PrSummaryClaim;
-  /** Issue #2083: the private decisions memo a signal_done call carried, clamped UTF-8-safely
-   *  only to the loose DECISIONS_MEMO_TRANSPORT_MAX_BYTES (the runner redacts, then applies the
-   *  storage cap DECISIONS_MEMO_MAX_BYTES). MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as
+  /** Issue #2083: the private decisions memo a signal_done call carried, verbatim. A memo over
+   *  the loose DECISIONS_MEMO_TRANSPORT_MAX_BYTES is dropped whole, never cut, so accepted text
+   *  stays intact until the runner redacts it and only then applies the storage cap
+   *  DECISIONS_MEMO_MAX_BYTES. MAIN-THREAD-ONLY, behind the same isSubagentFrame guard as
    *  `summary`. Set ONLY for a string with non-whitespace content, so a plain signal_done still
    *  scans to exactly `{ done: true }`; never affects `done`. The body is never logged. */
   decisionsMemo?: string;
