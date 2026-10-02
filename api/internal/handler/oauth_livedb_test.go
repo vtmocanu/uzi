@@ -947,6 +947,250 @@ func TestOAuthDenyStaleRequestIsRefusedLiveDB(t *testing.T) {
 	}
 }
 
+// oauthLockRaceWait runs consent in a goroutine and blocks until a backend waits on a lock inside
+// a statement containing fragment. Ordering is observed (pg_stat_activity), never slept. The wait
+// is bounded: if the request finishes without ever blocking (the unlocked behaviour) or the lock
+// wait never shows, it fails cleanly instead of hanging. It returns a func yielding the response.
+func oauthLockRaceWait(t *testing.T, e *tokenEnv, fragment string, consent func() *httptest.ResponseRecorder) (wait func() *httptest.ResponseRecorder) {
+	t.Helper()
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- consent() }()
+	deadline := time.Now().Add(10 * time.Second)
+	for pgWaitingCount(t, e, fragment) < 1 {
+		select {
+		case rec := <-done:
+			done <- rec
+			t.Fatalf("request finished (%d %q) without waiting on a lock in %q", rec.Code, rec.Body.String(), fragment)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("request never waited on a lock in %q", fragment)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return func() *httptest.ResponseRecorder {
+		select {
+		case rec := <-done:
+			return rec
+		case <-time.After(10 * time.Second):
+			t.Fatal("request did not finish after the lock was released")
+			return nil
+		}
+	}
+}
+
+// oauthRegistrationRemovals are admin writes that each make a request for oauthTestRedirect with
+// scope jobs:run invalid.
+var oauthRegistrationRemovals = []struct{ name, sql string }{
+	{"redirect URI removed", `UPDATE products SET redirect_uris = ARRAY['https://other.example.test/cb'] WHERE id = $1`},
+	{"client disabled", `UPDATE products SET enabled = false WHERE id = $1`},
+	{"scopes narrowed past the request", `UPDATE products SET oauth_scopes = ARRAY['jobs:read'] WHERE id = $1`},
+}
+
+// beginUncommittedAdminWrite opens a pool tx, runs sql (an uncommitted admin product write) and
+// registers a rollback cleanup; commit it with the returned func.
+func beginUncommittedAdminWrite(t *testing.T, e *oauthEnv, sql string) (commit func()) {
+	t.Helper()
+	ctx := context.Background()
+	tx, err := e.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	finished := false
+	t.Cleanup(func() {
+		if !finished {
+			_ = tx.Rollback(ctx)
+		}
+	})
+	if _, err := tx.Exec(ctx, sql, e.product); err != nil {
+		t.Fatalf("admin write: %v", err)
+	}
+	return func() {
+		finished = true
+		if err := tx.Commit(ctx); err != nil {
+			t.Fatalf("commit admin write: %v", err)
+		}
+	}
+}
+
+func scopeJobsRun(v url.Values) { v.Set("scope", "jobs:run") }
+
+// An admin registration change that is uncommitted when approve starts is serialized by the
+// product row FOR SHARE: approve waits, and after the commit it re-reads the new registration and
+// refuses, instead of redirecting a code to the removed URI.
+func TestOAuthApproveRegistrationRemovedBeforeLockedRecheckLiveDB(t *testing.T) {
+	for _, tc := range oauthRegistrationRemovals {
+		for _, reconsent := range []bool{false, true} {
+			name := tc.name
+			if reconsent {
+				name += " (re-consent)"
+			}
+			t.Run(name, func(t *testing.T) {
+				e := tokenSetup(t)
+				var before store.OauthGrant
+				if reconsent {
+					id0, c0 := e.start(t, nil, scopeJobsRun)
+					decodeRedirect(t, e.consent(t, http.MethodPost, id0, "/approve", e.jwt, c0))
+					before = e.liveGrant(t)
+				}
+				id, c := e.start(t, nil, scopeJobsRun)
+				commit := beginUncommittedAdminWrite(t, e.oauthEnv, tc.sql)
+				wait := oauthLockRaceWait(t, e, "name: GetProductForShare", func() *httptest.ResponseRecorder {
+					return e.consent(t, http.MethodPost, id, "/approve", e.jwt, c)
+				})
+				commit()
+				rec := wait()
+				if rec.Code != http.StatusConflict {
+					t.Fatalf("approve = %d, want 409\n%s", rec.Code, rec.Body.String())
+				}
+				if strings.Contains(rec.Body.String(), "redirect_url") || strings.Contains(rec.Body.String(), "code=") {
+					t.Errorf("a refused approve must not yield a redirect: %q", rec.Body.String())
+				}
+				row := e.requestRow(t, id)
+				if row.Status != "pending" || row.CodeHash != nil {
+					t.Errorf("request = %q code_hash=%v, want pending with no code", row.Status, row.CodeHash)
+				}
+				if reconsent {
+					after := e.liveGrant(t)
+					if after.ID != before.ID || strings.Join(after.Scopes, " ") != strings.Join(before.Scopes, " ") || !after.ConsentedAt.Time.Equal(before.ConsentedAt.Time) {
+						t.Errorf("existing grant changed by a refused approve: before %+v after %+v", before, after)
+					}
+				} else {
+					var grants int
+					if err := e.pool.QueryRow(context.Background(), `SELECT count(*) FROM oauth_grants WHERE product_id = $1`, e.product).Scan(&grants); err != nil || grants != 0 {
+						t.Errorf("grants = %d (%v), want 0", grants, err)
+					}
+				}
+			})
+		}
+	}
+}
+
+// The deny twin: the same uncommitted admin write is awaited, then the stale request is marked
+// denied and answers 409 with no redirect to the removed URI.
+func TestOAuthDenyRegistrationRemovedBeforeLockedRecheckLiveDB(t *testing.T) {
+	for _, tc := range oauthRegistrationRemovals {
+		t.Run(tc.name, func(t *testing.T) {
+			e := tokenSetup(t)
+			id, c := e.start(t, nil, scopeJobsRun)
+			commit := beginUncommittedAdminWrite(t, e.oauthEnv, tc.sql)
+			wait := oauthLockRaceWait(t, e, "name: GetProductForShare", func() *httptest.ResponseRecorder {
+				return e.consent(t, http.MethodPost, id, "/deny", e.jwt, c)
+			})
+			commit()
+			rec := wait()
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("deny = %d, want 409\n%s", rec.Code, rec.Body.String())
+			}
+			if rec.Header().Get("Location") != "" || strings.Contains(rec.Body.String(), oauthTestRedirect) || strings.Contains(rec.Body.String(), "redirect_url") {
+				t.Errorf("a stale deny must not yield a redirect: %q %q", rec.Header().Get("Location"), rec.Body.String())
+			}
+			if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+				t.Errorf("Cache-Control = %q, want no-store", cc)
+			}
+			if st := e.requestRow(t, id).Status; st != "denied" {
+				t.Errorf("status = %q, want denied", st)
+			}
+		})
+	}
+}
+
+// The product share lock is held through commit: an admin registration change that starts while
+// an approve is mid-transaction (blocked on the grant) waits for it, the approve still succeeds,
+// and the code it issued is unredeemable once the change lands (redeem re-checks the registration).
+func TestOAuthAdminRegistrationChangeWaitsForApproveLiveDB(t *testing.T) {
+	e := tokenSetup(t)
+	ctx := context.Background()
+	id0, c0 := e.start(t, nil, nil)
+	decodeRedirect(t, e.consent(t, http.MethodPost, id0, "/approve", e.jwt, c0))
+	grant := e.liveGrant(t)
+	id, c := e.start(t, nil, nil)
+
+	// A test tx holds the existing grant, so approve (per-user lock, product FOR SHARE) blocks on it.
+	gtx, err := e.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	released := false
+	t.Cleanup(func() {
+		if !released {
+			_ = gtx.Rollback(ctx)
+		}
+	})
+	var one int
+	if err := gtx.QueryRow(ctx, `SELECT 1 FROM oauth_grants WHERE id = $1 FOR UPDATE`, grant.ID).Scan(&one); err != nil {
+		t.Fatal(err)
+	}
+	waitApprove := oauthLockRaceWait(t, e, "name: LockLiveOAuthGrant", func() *httptest.ResponseRecorder {
+		return e.consent(t, http.MethodPost, id, "/approve", e.jwt, c)
+	})
+
+	adminDone := make(chan error, 1)
+	go func() {
+		_, err := e.h.q.SetProductOAuthClient(ctx, store.SetProductOAuthClientParams{
+			ID: e.product, RedirectUris: []string{"https://other.example.test/cb"}, OauthScopes: []string{"jobs:run", "jobs:read"},
+		})
+		adminDone <- err
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for pgWaitingCount(t, e, "name: SetProductOAuthClient") < 1 {
+		select {
+		case err := <-adminDone:
+			t.Fatalf("admin change finished (%v) without waiting for the in-flight approve", err)
+		default:
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("admin change never waited on a lock")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	var blockedByApprove bool
+	if err := e.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM pg_stat_activity adm, pg_stat_activity app
+		   WHERE adm.wait_event_type = 'Lock' AND adm.query LIKE '%name: SetProductOAuthClient%'
+		     AND app.wait_event_type = 'Lock' AND app.query LIKE '%name: LockLiveOAuthGrant%'
+		     AND app.pid = ANY(pg_blocking_pids(adm.pid)))`).Scan(&blockedByApprove); err != nil {
+		t.Fatal(err)
+	}
+	if !blockedByApprove {
+		t.Fatal("the admin change is not blocked by the approve backend")
+	}
+
+	released = true
+	if err := gtx.Rollback(ctx); err != nil {
+		t.Fatal(err)
+	}
+	rec := waitApprove()
+	redirect := decodeRedirect(t, rec)
+	if got := redirect.Scheme + "://" + redirect.Host + redirect.Path; got != oauthTestRedirect {
+		t.Errorf("redirect = %q, want %q", got, oauthTestRedirect)
+	}
+	code := redirect.Query().Get("code")
+	if code == "" {
+		t.Fatalf("approve redirect carries no code: %s", rec.Body.String())
+	}
+	select {
+	case err := <-adminDone:
+		if err != nil {
+			t.Fatalf("admin change: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("admin change did not complete after the approve committed")
+	}
+	var uris []string
+	if err := e.pool.QueryRow(ctx, `SELECT redirect_uris FROM products WHERE id = $1`, e.product).Scan(&uris); err != nil {
+		t.Fatal(err)
+	}
+	if len(uris) != 1 || uris[0] != "https://other.example.test/cb" {
+		t.Fatalf("product redirect_uris = %v, want the admin's replacement", uris)
+	}
+	exch := e.exchange(t, code)
+	if exch.Code != http.StatusBadRequest || !strings.Contains(exch.Body.String(), "invalid_grant") {
+		t.Errorf("exchange after the registration change = %d %q, want 400 invalid_grant", exch.Code, exch.Body.String())
+	}
+}
+
 // withOAuthPendingCaps lowers the authorize pending-request caps for one test.
 func withOAuthPendingCaps(t *testing.T, perSource, perProduct, global int) {
 	t.Helper()

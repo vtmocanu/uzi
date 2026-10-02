@@ -7,6 +7,7 @@ import (
 	"crypto/subtle"
 	"encoding/base64"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/netip"
@@ -456,9 +457,15 @@ func (h *Handler) OAuthGetRequest(w http.ResponseWriter, r *http.Request) {
 // is no longer pending (a second deny, a deny after approve) is a 409, never a false success. A
 // request whose product stopped being a client, was disabled or no longer registers the redirect
 // URI is marked denied and answers the same 409 as approve, with no redirect to the stale URI.
+//
+// One transaction, lock order: the product row FOR SHARE (GetProductForShare), then the request
+// row (the deny UPDATE). Deny takes no grant lock. The product is read under that share lock and
+// held through commit, so an admin registration change either commits before the read and is
+// seen, or waits until the response is decided; there is no unlocked pre-read.
 func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
-	user, ok := mw.UserFromContext(r.Context())
+	ctx := r.Context()
+	user, ok := mw.UserFromContext(ctx)
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
 		return
@@ -467,19 +474,21 @@ func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	product, err := h.q.GetProduct(r.Context(), row.ProductID)
-	if err != nil {
-		slog.Error("oauth deny: load product", "error", err)
-		httpx.Error(w, http.StatusInternalServerError, "internal error")
-		return
-	}
-	// The same validity re-check approve makes: a redirect URI the product no longer registers (or a
-	// product that stopped being an enabled client) must not be redirected to, even with
-	// error=access_denied. The request is still marked denied so it cannot be approved later.
-	stillValid := oauthRequestStillValid(product, row)
-	_, err = h.q.DenyOAuthAuthorizeRequest(r.Context(), store.DenyOAuthAuthorizeRequestParams{
-		ID:     row.ID,
-		UserID: pgtype.UUID{Bytes: user.ID, Valid: true},
+	var stillValid bool
+	err := h.inTx(ctx, func(q *store.Queries) error {
+		locked, err := q.GetProductForShare(ctx, row.ProductID)
+		if err != nil {
+			return fmt.Errorf("load product: %w", err)
+		}
+		// The same validity re-check approve makes: a redirect URI the product no longer registers
+		// (or a product that stopped being an enabled client) must not be redirected to, even with
+		// error=access_denied. The request is still marked denied so it cannot be approved later.
+		stillValid = oauthRequestStillValid(locked, row)
+		_, err = q.DenyOAuthAuthorizeRequest(ctx, store.DenyOAuthAuthorizeRequestParams{
+			ID:     row.ID,
+			UserID: pgtype.UUID{Bytes: user.ID, Valid: true},
+		})
+		return err
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
 		httpx.Error(w, http.StatusConflict, "request is no longer pending")
@@ -504,22 +513,27 @@ func (h *Handler) OAuthDeny(w http.ResponseWriter, r *http.Request) {
 //  0. the per-user advisory lock (LockOAuthUserGrants, OAuthUserLockClass), the FIRST statement:
 //     a first-consent grant inserted but not yet committed is invisible to row locks, so Revoke
 //     all would miss it without this (D8);
-//  1. the grant, lock first among the row locks (D8): INSERT ... ON CONFLICT DO NOTHING; on a conflict, in a SEPARATE
+//  1. the product row FOR SHARE (GetProductForShare) and the registration re-check against it
+//     (oauthRequestStillValid): a refusal is a 409 and the rollback undoes everything;
+//  2. the grant, lock first among the grant-side row locks (D8): INSERT ... ON CONFLICT DO NOTHING; on a conflict, in a SEPARATE
 //     statement, SELECT the live grant FOR UPDATE (an ON CONFLICT DO NOTHING can meet a row its
 //     own statement snapshot cannot see), retrying if it was revoked meanwhile;
-//  2. for an existing live grant (re-consent): the scopes are replaced with the approved set,
+//  3. for an existing live grant (re-consent): the scopes are replaced with the approved set,
 //     consented_at advances and the refresh token is cleared; the grant's access tokens are
 //     revoked ONLY if the new set drops a scope that ANY unrevoked token of the grant holds,
 //     expired or not (an expired jobs:run token may have created a still-running job), so
 //     reconnecting with the same or wider scopes never cancels a running job;
-//  3. the grant's earlier unredeemed codes are superseded;
-//  4. the single-use claim: a conditional UPDATE pending -> approved ... RETURNING, so a second
+//  4. the grant's earlier unredeemed codes are superseded;
+//  5. the single-use claim: a conditional UPDATE pending -> approved ... RETURNING, so a second
 //     approve, or an approve after deny, finds no row (409); then this request gets its own code
 //     (256-bit random, sha256 at rest, 60 seconds, bound to the grant).
 //
-// Lock order (D8) is the per-user lock, then the grant, then its product_tokens, then request
-// rows: the request this approve decides is claimed LAST, after the grant lock, so no step holds a request row while waiting for
-// a grant. A claim that loses (409) rolls the grant work back with the transaction.
+// Lock order (D8) is the per-user lock, then the product row FOR SHARE, then the grant, then its
+// product_tokens, then request rows: the request this approve decides is claimed LAST, after the
+// grant lock, so no step holds a request row while waiting for a grant. The product share lock is
+// held through commit, so an admin registration change either commits before the re-read and is
+// seen, or waits until after commit; the issued code is then unredeemable because
+// redeemOAuthCode re-checks oauthClientAllows at the token endpoint. A claim that loses (409) rolls the grant work back with the transaction.
 //
 // Any failure rolls the whole transaction back, so the request stays pending. The response is the
 // server-built redirect: the registered URI plus code, the client's state and iss.
@@ -545,8 +559,8 @@ func (h *Handler) OAuthApprove(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	// The product may have changed since authorize: re-check it is still a client with this
-	// redirect URI and these scopes before granting anything.
+	// Early fast-path only, on an UNLOCKED read: it spares a doomed approve the transaction. The
+	// deciding check is the one under the product row's share lock inside the transaction.
 	if !oauthRequestStillValid(product, row) {
 		httpx.Error(w, http.StatusConflict, "this application can no longer be connected; start again from the application")
 		return
@@ -579,7 +593,20 @@ func (h *Handler) OAuthApprove(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	grant, existed, err := lockOrCreateOAuthGrant(ctx, qtx, user.ID, product.ID, row.Scopes)
+	// The deciding registration check: the product row FOR SHARE, held through commit (D8: after the
+	// per-user lock, before the grants). An admin change that committed before this read is seen
+	// here; one that has not waits for this transaction.
+	locked, err := qtx.GetProductForShare(ctx, row.ProductID)
+	if err != nil {
+		slog.Error("oauth approve: lock product", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if !oauthRequestStillValid(locked, row) {
+		httpx.Error(w, http.StatusConflict, "this application can no longer be connected; start again from the application")
+		return
+	}
+	grant, existed, err := lockOrCreateOAuthGrant(ctx, qtx, user.ID, locked.ID, row.Scopes)
 	if err != nil {
 		slog.Error("oauth approve: grant", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

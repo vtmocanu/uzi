@@ -420,3 +420,15 @@ SELECT g.id,
    AND g.revoked_at IS NULL
  ORDER BY g.consented_at DESC, g.id ASC
  LIMIT sqlc.arg(max_rows);
+
+-- name: GetProductForShare :one
+-- One product by id, soft-deleted included, ROW-LOCKED FOR SHARE for the rest of the transaction
+-- (PRD #1910 D8). The approve and deny handlers re-read the product registration (redirect URIs,
+-- enabled, scopes) under this lock, so an admin registration change either commits before the
+-- read and is seen, or waits until the transaction ends. Must run on a transaction-bound
+-- Queries; on a bare pool the lock is released as soon as the statement ends. FOR SHARE
+-- conflicts with the admin product writers (SetProductOAuthClient, UpdateProduct,
+-- SoftDeleteProduct, RotateProductClientSecret, GetProductForUpdate) but not with the FOR KEY
+-- SHARE foreign-key checks of grant, token and request inserts. Position in the D8 lock order:
+-- after the per-user lock, before the grants.
+SELECT * FROM products WHERE id = $1 FOR SHARE;

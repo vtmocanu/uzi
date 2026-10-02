@@ -506,6 +506,47 @@ func (q *Queries) GetOwnProductTokenGrantID(ctx context.Context, arg GetOwnProdu
 	return grant_id, err
 }
 
+const getProductForShare = `-- name: GetProductForShare :one
+SELECT id, name, description, enabled, deleted_at, created_by, created_at, updated_at, allowed_job_types, skills_repo_url, skills_ref, skills_token_sealed, skills_applied_sha, skills_applied_by, skills_applied_at, redirect_uris, oauth_scopes, client_secret_hash, client_secret_prefix, client_secret_rotated_at FROM products WHERE id = $1 FOR SHARE
+`
+
+// One product by id, soft-deleted included, ROW-LOCKED FOR SHARE for the rest of the transaction
+// (PRD #1910 D8). The approve and deny handlers re-read the product registration (redirect URIs,
+// enabled, scopes) under this lock, so an admin registration change either commits before the
+// read and is seen, or waits until the transaction ends. Must run on a transaction-bound
+// Queries; on a bare pool the lock is released as soon as the statement ends. FOR SHARE
+// conflicts with the admin product writers (SetProductOAuthClient, UpdateProduct,
+// SoftDeleteProduct, RotateProductClientSecret, GetProductForUpdate) but not with the FOR KEY
+// SHARE foreign-key checks of grant, token and request inserts. Position in the D8 lock order:
+// after the per-user lock, before the grants.
+func (q *Queries) GetProductForShare(ctx context.Context, id uuid.UUID) (Product, error) {
+	row := q.db.QueryRow(ctx, getProductForShare, id)
+	var i Product
+	err := row.Scan(
+		&i.ID,
+		&i.Name,
+		&i.Description,
+		&i.Enabled,
+		&i.DeletedAt,
+		&i.CreatedBy,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.AllowedJobTypes,
+		&i.SkillsRepoUrl,
+		&i.SkillsRef,
+		&i.SkillsTokenSealed,
+		&i.SkillsAppliedSha,
+		&i.SkillsAppliedBy,
+		&i.SkillsAppliedAt,
+		&i.RedirectUris,
+		&i.OauthScopes,
+		&i.ClientSecretHash,
+		&i.ClientSecretPrefix,
+		&i.ClientSecretRotatedAt,
+	)
+	return i, err
+}
+
 const getProductTokenForOAuthRevoke = `-- name: GetProductTokenForOAuthRevoke :one
 SELECT id, product_id, grant_id, revoked, (expires_at IS NOT NULL AND expires_at <= now())::boolean AS expired
   FROM product_tokens WHERE token_hash = $1
