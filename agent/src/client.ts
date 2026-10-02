@@ -1670,9 +1670,9 @@ export class WorkerClient {
    *  writer verifies the bytes itself against the claim manifest); a body cut short by a server
    *  abort rejects the stream, so a truncated 200 never reads as complete. Body errors are
    *  observed from creation: a body torn before the sink reads it still rejects the stream rather
-   *  than crashing the process, and a sink that returns without draining a torn body rejects too.
-   *  If `sink` throws, the response body is destroyed so the socket is released at once. `signal` aborts the request or
-   *  the body in flight; `timeoutMs` bounds the whole download (default JOB_FILE_DOWNLOAD_TIMEOUT_MS).
+   *  than crashing the process, and a sink that returns while the body is already torn rejects
+   *  too. If `sink` throws, the response body is destroyed so the socket is released at once.
+   *  `signal` aborts the request or the body in flight; `timeoutMs` bounds the whole download (default JOB_FILE_DOWNLOAD_TIMEOUT_MS).
    *  Throws RequestError on non-2xx. */
   async downloadJobFile(
     runId: string,
