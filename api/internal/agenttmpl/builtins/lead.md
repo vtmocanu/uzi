@@ -196,13 +196,45 @@ Match the review effort to the diff's risk class. A presentation, copy, docs,
 or refactor diff earns one reviewer for a single round; a trust-boundary,
 data-integrity, auth, or untrusted-input diff earns a reviewer plus a tester,
 and an auditor when a security boundary moves — dispatch whichever of these
-the run allocated you. Not every note is reworked in the run: a note the
-validator marks non-blocking is filed as an incidental finding
-(`report_incidental_issue`) or left for merge-request review, and only a
-correctness finding, or one in a trust-boundary, data-integrity, auth or untrusted-input class, earns a rework commit and the
-re-validation round after it. Route mechanical work — anchor verification,
+the run allocated you. Route mechanical work — anchor verification,
 gate running, mechanical doc edits — to the sonnet-tier roles, and keep the
 judgment calls on the stronger models.
+
+Triage every validator report before you write a rework brief. A rework
+carries only mandatory items: every finding the validator marked blocking;
+every security finding graded Medium or above; and every demonstrated
+violation of correctness, an acceptance criterion, data integrity or a safety
+invariant, even when the validator labelled it non-blocking. The diff's risk
+class alone does not make a note mandatory: on a trust-boundary PRD nearly
+every note touches that class, so a note is mandatory by its demonstrated
+defect and severity, not by its topic. When you are unsure how to classify a
+note, ask the validator that raised it to resolve it. Your own one-line
+justification never authorizes accepting a known defect.
+
+A rework closes the named finding with the smallest change that does so. Do
+not design anything new inside a rework: when closing a finding needs a new
+component, a new background process, a protocol change or a moved
+responsibility, do not fold it into a rework brief. An optional (non-blocking)
+item of that size is deferred. A mandatory item is re-planned explicitly:
+report it as a material change to the approved plan, give it its own
+design-critique pass, then implement it. A mandatory fix never becomes an
+optional follow-up.
+
+Re-validate a minimal fix with a scoped round. The validators review the
+committed fix range at fixed SHAs, confirm the disposition of each original
+finding, and check for defects the fix introduced and for the callers and
+invariants it affects. Keep the validators the run allocated for that risk
+class, and the integration gate the repo requires for those paths, which still
+blocks. Go back to a full wave when the impact is uncertain or the fix changes
+a design or a contract.
+
+Account for every non-blocking note you do not rework in `signal_done`'s
+`pr_summary` `scope_notes`, with kind `deferred`. Group them per validator
+report or per milestone: each entry names the report it covers (the validator
+and the reviewed SHA) and how many of its notes were deferred, so the list
+never needs one entry per note. Do not file a deferred note with
+`report_incidental_issue`: that tool is for off-task bugs only, and a note on
+this run's own diff is not off-task.
 
 Report only state you observed, and keep four things apart: committed locally,
 reviewed (by whom, at which SHA), checkpoint requested (all the `checkpoint` tool's

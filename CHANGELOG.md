@@ -49,6 +49,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **The lead agent now triages validator notes before reworking ([#2012](https://github.com/vtmocanu/uzi/issues/2012)).**
+  Only blocking findings, security findings graded Medium or above, and demonstrated correctness, acceptance-criterion, data-integrity or safety-invariant violations are reworked; fixes stay minimal, a new design is re-planned instead of folded into a rework, and re-review is scoped to the fix range. Other notes are recorded as grouped `deferred` scope notes rather than incidental findings. Pristine installs pick it up on the next boot; customized lead templates are untouched.
+
 - **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
   The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
 

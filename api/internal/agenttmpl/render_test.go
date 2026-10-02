@@ -581,6 +581,57 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 	}
 }
 
+// TestLeadReworkTriagePhrases pins the lead's rework-triage contract (issue
+// #2012): which validator notes a rework must carry, how small a rework stays,
+// how a minimal fix is re-validated, and where the notes left unreworked are
+// recorded. These are whole-body pins, not region-scoped: the rules live in
+// their own paragraphs after the risk-class paragraph, outside the two regions
+// splitLeadRegions cuts.
+func TestLeadReworkTriagePhrases(t *testing.T) {
+	lead, ok := BuiltinByName("lead")
+	if !ok {
+		t.Fatal("lead builtin missing")
+	}
+	body := flatten(string(Render(lead)))
+
+	cases := []struct{ behavior, phrase string }{
+		{"a rework carries every finding the validator marked blocking", "every finding the validator marked blocking"},
+		{"a security finding graded Medium or above is mandatory", "graded Medium or above"},
+		{"a demonstrated violation is mandatory even when labelled non-blocking", "even when the validator labelled it non-blocking"},
+		{"an uncertain classification goes back to the validator that raised it", "ask the validator that raised it to resolve it"},
+		{"the risk class alone does not make a note mandatory", "risk class alone does not make a note mandatory"},
+		{"the lead's own justification never accepts a known defect", "never authorizes accepting a known defect"},
+		{"a rework closes the finding with the smallest change", "with the smallest change that does so"},
+		{"no new design is folded into a rework", "do not fold it into a rework brief"},
+		{"a mandatory item needing new design is re-planned as a material change", "report it as a material change to the approved plan, give it its own design-critique pass"},
+		{"a mandatory fix never becomes an optional follow-up", "A mandatory fix never becomes an optional follow-up"},
+		{"re-validation reviews the committed fix range at fixed SHAs", "review the committed fix range at fixed SHAs"},
+		{"re-validation confirms the disposition of each original finding", "confirm the disposition of each original finding"},
+		{"re-validation checks defects the fix introduced", "check for defects the fix introduced"},
+		{"the integration gate still blocks on a scoped re-validation", "which still blocks"},
+		{"an uncertain impact goes back to a full wave", "Go back to a full wave when the impact is uncertain"},
+		{"unreworked notes are recorded as deferred scope notes", "`scope_notes`, with kind `deferred`"},
+		{"deferred notes are grouped and name the report and the count", "names the report it covers (the validator and the reviewed SHA) and how many of its notes were deferred"},
+		{"a deferred note is not an incidental finding", "that tool is for off-task bugs only"},
+	}
+	for _, c := range cases {
+		if !strings.Contains(body, c.phrase) {
+			t.Errorf("lead template lost: %s (missing phrase %q)", c.behavior, c.phrase)
+		}
+	}
+
+	// Retired directives from issue #2012: a non-blocking note is no longer
+	// filed as an incidental finding or left for merge-request review.
+	for _, retired := range []string{
+		"filed as an incidental finding",
+		"left for merge-request review",
+	} {
+		if strings.Contains(body, retired) {
+			t.Errorf("lead template still carries the retired directive %q", retired)
+		}
+	}
+}
+
 // TestCoderParallelModeContract pins the coder's parallel-mode contract (PRD #43
 // M1): the hard file-scope boundary, stop-and-report on out-of-scope or shared
 // files, no commit in parallel mode, and gate only what it exclusively owns.

@@ -1110,6 +1110,14 @@ Tracked as GitHub issue vtmocanu/uzi#2083; an experiment to decide the next step
 - Only a later MR rework on the same lineage (same owner, repo, branch and MR) receives the latest memo, as untrusted, advisory context; an absent memo or any fetch problem means a normal fresh rework. (AI-synced 2026-10-02)
 - A failed, held or unpublished round never replaces the prior memo; turning the setting off stops writes and injection but keeps stored memos; Codex runs neither write nor receive one. (AI-synced 2026-10-02)
 
+## Feature #2012 — Lead rework triage
+
+Tracked as GitHub issue vtmocanu/uzi#2012.
+
+- The lead reworks only mandatory items: blocking findings, security findings graded Medium or above, and demonstrated correctness, acceptance-criterion, data-integrity or safety-invariant violations even when labelled non-blocking; a trust-boundary class alone does not make a note mandatory, and a demonstrated defect is never deferred. (AI-synced 2026-10-02)
+- Reworks use the smallest fixing change with no new design (a mandatory item needing one is re-planned as a material change); re-validation is scoped to the committed fix range, with a full wave when impact is uncertain. (AI-synced 2026-10-02)
+- Non-blocking notes not reworked are recorded as grouped `deferred` scope notes in `signal_done`, never as incidental findings. (AI-synced 2026-10-02)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is
