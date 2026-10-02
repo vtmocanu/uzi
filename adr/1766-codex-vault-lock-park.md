@@ -164,11 +164,19 @@ gap: the fix needs its own investigation into safely retrying (or reconciling) a
 failure without risking a double-mint, and is deliberately left to #1770 rather than folded in
 here.
 
-Two related paths are not covered by this decision:
+A lock during a long turn — a mid-turn app-server refresh hitting the same 409 — was first left
+out of this park and is now covered by issue #1789. The run-lane refresh bridge
+(`buildAppServerRefreshBridge`, `agent/src/codex/codex-executor.ts`) recognises the typed reply
+from its `reason` field before the app-server auth owner collapses it into a generic refresh
+failure. It latches a run-scoped deferral, drops the live turn, and leaves `run()` with
+`CodexCredentialDeferredError`, so the runner takes this same park. Once latched, neither the
+bridge nor the boundary reconcile makes another credential call. A cancel or shutdown still wins,
+and a pause or wall trip that fired first keeps its own path. One window stays out: while a plan
+gate is open (from the first plan submission until approval) the run sits at `awaiting_approval`,
+which can never park, so a lock reached by a plan revise turn still fails the run as before.
 
-- A lock during a long turn — a mid-turn app-server refresh hitting the same 409 — is not covered
-  by this park. The refresh bridge collapses the typed reply into a generic refresh failure, so
-  the run can still fail terminally; issue #1789 owns it.
+One related path is not covered by this decision:
+
 - Advice-lane credential calls (the isolated advice harness's own credential bridge) are not
   deferred either, but a vault lock there does not fail the run: the judge falls back to its
   deterministic review, and a review-advice run posts a failed review and completes. The cost is
@@ -187,7 +195,7 @@ Two related paths are not covered by this decision:
   vault-locked recheck's tolerance from scratch.
 - A post-exchange seal failure combined with a lost reply remains a real, if rare, way for a run
   to still fail outright on a vault lock; issue #1770 owns closing it.
-- A mid-turn app-server refresh remains un-deferred and can still fail the run (issue #1789).
-  Advice-lane credential calls remain un-deferred too, but degrade to fallback or failed advice
-  rather than failing the run. Both are narrower windows than the boundary-reconcile path this
-  ADR covers.
+- A mid-turn app-server refresh now parks through the same path (issue #1789), except during a
+  plan revise round, where the run is `awaiting_approval` and a lock still fails it.
+  Advice-lane credential calls remain un-deferred, but degrade to fallback or failed advice
+  rather than failing the run.
