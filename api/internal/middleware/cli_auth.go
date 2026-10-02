@@ -1,6 +1,7 @@
 package middleware
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 
@@ -10,10 +11,19 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// CLIUserStore is the narrow store dependency of RequireUser: the session user
+// lookup plus the CLI-token lookup and last-used stamp. *store.Queries satisfies it.
+type CLIUserStore interface {
+	SessionStore
+	GetCLITokenByHash(ctx context.Context, tokenHash []byte) (store.CliToken, error)
+	TouchCLIToken(ctx context.Context, arg store.TouchCLITokenParams) error
+}
+
 // RequireUser authenticates a request from EITHER a browser session cookie OR a
 // Bearer CLI token (PRD #64), populating the SAME userKey every existing handler
 // already reads — so no handler needs rewriting. It composes ABOVE RequireAuth,
-// which is left byte-identical so its existing tests still pin the browser path.
+// whose chain the cookie path reuses unmodified, so its existing tests still pin the
+// browser path.
 //
 // The dispatch is presence-on-PARSE, never fallback-on-failure:
 //
@@ -36,7 +46,7 @@ import (
 // under /api/admin/*. Admin-ness is always resolved live from the row (loaded fresh
 // per request), never from the credential, so demoting the owner instantly neuters
 // a uza_ token with no revocation step.
-func RequireUser(q *store.Queries, cfg config.Config) func(http.Handler) http.Handler {
+func RequireUser(q CLIUserStore, cfg config.Config) func(http.Handler) http.Handler {
 	cookieAuth := RequireAuth(q, cfg)
 	return func(next http.Handler) http.Handler {
 		// The cookie path is the UNMODIFIED RequireAuth chain, pre-wrapped once.
@@ -55,8 +65,9 @@ func RequireUser(q *store.Queries, cfg config.Config) func(http.Handler) http.Ha
 				// Do not distinguish "no such token" from "revoked/expired" — a probing
 				// caller learns nothing about which tokens exist. The lookup carries the
 				// NULL trap, so a never-expiring uzc_ is accepted while a revoked/expired
-				// one is not.
-				httpx.Error(w, http.StatusUnauthorized, "invalid CLI token")
+				// one is not. A store failure (issue #1991) answers 503, not 401, and does
+				// not depend on which tokens exist, so it adds no oracle.
+				authLookupFailed(w, r, err, "invalid CLI token", "cli auth: token lookup failed; answering 503")
 				return
 			}
 			// Belt-and-suspenders constant-time compare. The row was found by an indexed
@@ -70,7 +81,7 @@ func RequireUser(q *store.Queries, cfg config.Config) func(http.Handler) http.Ha
 
 			user, err := q.GetUserByID(r.Context(), row.UserID)
 			if err != nil {
-				httpx.Error(w, http.StatusUnauthorized, "invalid CLI token")
+				authLookupFailed(w, r, err, "invalid CLI token", "cli auth: user lookup failed; answering 503")
 				return
 			}
 			if !user.IsActive {
