@@ -6,7 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { type ExecutorResult, type RunContext } from "../src/executor.js";
 import { type ExecutorFactory } from "../src/runner.js";
-import { WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import { ScratchPublicationError, WIP_PARK_COMMIT_PREFIX } from "../src/git.js";
+import type { Logger } from "../src/log.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
 import { skillsPluginDir } from "../src/skills-plugin.js";
 import {
@@ -346,6 +347,47 @@ describe("RunRunner — recovery-capture ancestry bridge (PRD #1416 M3, FIX 2)",
       assert.ok(bareAncestor(bare, P, B!), "P is an ancestor of the captured tip B");
       assert.ok(H && bareAncestor(bare, H, B!), "H is an ancestor of the captured tip B");
     } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("a scratch publication refusal at the capture bridge is logged with its kind and step, and the run still parks", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-2054-rec-"));
+    const original = git.scratchPublicationPreflight.bind(git);
+    try {
+      const iid = 2054;
+      publishAgentBranch(iid);
+      const { factory } = recoveryFactory(homeRoot, iid, (wt) => {
+        fs.writeFileSync(path.join(wt, "REWRITE.md"), "rewrite below P\n");
+        execFileSync("git", ["-C", wt, "add", "."], { env: GIT_ENV, stdio: "pipe" });
+        execFileSync("git", ["-C", wt, ...IDENT, "commit", "--amend", "--no-edit"], { env: GIT_ENV, stdio: "pipe" });
+      });
+      git.scratchPublicationPreflight = (async () => {
+        throw new ScratchPublicationError("candidate history contains scratch", undefined, {
+          kind: "scratch_present", step: "scratch_walk", detail: ".uzi/scratch appears in candidate history",
+        });
+      }) as typeof git.scratchPublicationPreflight;
+      const lines: Array<{ msg: string; fields?: Record<string, unknown> }> = [];
+      const logger: Logger = {
+        debug() {}, info() {}, warn() {}, addSecret() {}, removeSecret() {},
+        error: (msg, fields) => void lines.push({ msg, fields }),
+        child: () => logger,
+      };
+      await runnerWith(factory, gitlab, undefined, logger).execute(
+        gitlabClaim(iid, { run_id: "20000000-0000-4000-8000-000000002054" }),
+      );
+      // The capture bridge's own catch and the checkpoint publish that follows each log the refusal;
+      // the site field pins the bridge, which the publish site alone would otherwise mask.
+      const refused = lines.filter((l) => l.msg === "scratch publication refused");
+      const bridge = refused.filter((l) => l.fields?.site === "park_bridge");
+      assert.equal(bridge.length, 1, JSON.stringify(refused.map((l) => l.fields?.site)));
+      assert.equal(bridge[0]?.fields?.kind, "scratch_present");
+      assert.equal(bridge[0]?.fields?.step, "scratch_walk");
+      assert.ok(refused.some((l) => l.fields?.site === "checkpoint_publish"), "the publish that follows logs too");
+      assert.ok(api.states.some((s) => s.body.status === "recovery_wait"), "a refused bridge never undoes the park");
+    } finally {
+      git.scratchPublicationPreflight = original;
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   });

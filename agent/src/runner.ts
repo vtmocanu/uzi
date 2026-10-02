@@ -1267,6 +1267,96 @@ interface ActiveRun {
   shuttingDown: boolean;
 }
 
+/** Where a scratch publication refusal was caught, logged as `site`. */
+type ScratchPublicationSite = "finalize" | "park_bridge" | "checkpoint_publish";
+
+const SCRATCH_CAUSE_MAX_DEPTH = 4;
+const SCRATCH_CAUSE_PART_MAX = 200;
+const SCRATCH_CAUSE_TOTAL_MAX = 600;
+/** Cap on the text handed to the redactor: a runGit cause message can carry up to 64 MiB of stderr. */
+const SCRATCH_REDACT_INPUT_MAX = 4096;
+
+/** Bound `text` for the redactor and turn U+2028/U+2029 into LF: the redactor matches a token across
+ *  control characters such as LF but not across those two separators, which the first-line pick and
+ *  sanitizeForLog would otherwise turn into a cut or a `?` inside an unredacted token. Leading
+ *  whitespace is trimmed first; text still longer than SCRATCH_REDACT_INPUT_MAX is replaced by a
+ *  marker naming its length, never cut, because a cut can separate a padding-split token from its
+ *  suffix and leave the redactor a bare prefix. */
+function redactorInput(text: string): string {
+  const trimmed = text.trimStart();
+  if (trimmed.length > SCRATCH_REDACT_INPUT_MAX) {
+    return `[${trimmed.length} characters omitted: over the redaction bound]`;
+  }
+  return trimmed.replace(/[\u2028\u2029]/g, "\n");
+}
+
+/** Redact FIRST, then sanitize and cap: sanitizing first would turn a control character inside a
+ *  token into `?` (the redactor no longer matches it) and a cap could leave a token prefix. An
+ *  oversized message is omitted before redaction (redactorInput), so the redactor pass stays bounded. */
+function redactThenSanitize(redactText: (text: string) => string, text: string): string {
+  return sanitizeForLog(redactText(redactorInput(text)), SCRATCH_CAUSE_PART_MAX);
+}
+
+/** The DETAIL path: bound the unsplit raw text (omitting it when oversized), redact it whole (the redactor matches across CR and
+ *  LF, so a token split by a newline is caught only before any line split), THEN pick the first
+ *  non-empty line and sanitize and cap it. U+2028/U+2029 become LF before redaction (redactorInput). */
+function redactThenFirstLine(redactText: (text: string) => string, text: string): string {
+  const redacted = redactText(redactorInput(text));
+  for (const raw of redacted.split(/[\r\n]/)) {
+    const line = raw.trim();
+    if (line) return sanitizeForLog(line, SCRATCH_CAUSE_PART_MAX);
+  }
+  return "";
+}
+
+/** The failure_reason for a refused scratch publication. Only kind floor_unverified omits the
+ *  detail (it can carry forge or remote stderr, untrusted): its reason names only kind and step.
+ *  Every other kind, including a refusal from the forward-advance preflight of the fetched remote
+ *  tip (refreshScratchPublicationFloor rethrows its ScratchPublicationError unchanged), keeps its own
+ *  kind and its local-git detail, redacted with the claim's redactor before it is sanitized and
+ *  capped. The structured log line from {@link logScratchPublicationRefused} carries the detail for
+ *  every kind. */
+function scratchPublicationFailureReason(
+  err: ScratchPublicationError,
+  redactText: ((text: string) => string) | undefined,
+): string {
+  const at = err.step === undefined ? "" : ` at ${err.step}`;
+  if (err.kind === "floor_unverified") {
+    return `scratch_publication_refused: cannot verify fresh remote floor (${err.kind}${at})`;
+  }
+  const source = err.rawDetail ?? err.detail;
+  // Without a redactor (a partial test flight) free text is omitted rather than reported unredacted.
+  const detail = source && redactText ? `: ${redactThenFirstLine(redactText, source)}` : "";
+  return `scratch_publication_refused: candidate history cannot be published (${err.kind}${at}${detail})`;
+}
+
+/** Log why a scratch publication was refused: kind, step, detail and the cause chain, each
+ *  redacted then sanitized. Without a redactor (a partial test flight) the free text (detail and
+ *  cause) is omitted rather than logged unredacted. */
+function logScratchPublicationRefused(
+  runLog: Logger,
+  redactText: ((text: string) => string) | undefined,
+  err: ScratchPublicationError,
+  site: ScratchPublicationSite,
+): void {
+  let detail: string | undefined;
+  let cause: string | undefined;
+  if (redactText) {
+    const source = err.rawDetail ?? err.detail;
+    if (source !== undefined) detail = redactThenFirstLine(redactText, source);
+    const parts: string[] = [];
+    let cur: unknown = err.cause;
+    for (let depth = 0; cur !== undefined && cur !== null && depth < SCRATCH_CAUSE_MAX_DEPTH; depth++) {
+      parts.push(redactThenSanitize(redactText, cur instanceof Error ? cur.message : String(cur)));
+      cur = cur instanceof Error ? cur.cause : undefined;
+    }
+    // Parts are already sanitized, so this only code-point-truncates; the cap leaves room for the
+    // `...` marker so the whole value is at most SCRATCH_CAUSE_TOTAL_MAX characters.
+    if (parts.length > 0) cause = sanitizeForLog(parts.join(" <- "), SCRATCH_CAUSE_TOTAL_MAX - 3);
+  }
+  runLog.error("scratch publication refused", { site, kind: err.kind, step: err.step, detail, cause });
+}
+
 /**
  * PRD #949 M2 — the per-run state carrier for RunRunner.execute(). Holds the
  * cross-phase state the extracted phase methods, the (still-inline) back half, and
@@ -3600,9 +3690,7 @@ export class RunRunner {
         : err instanceof TerminalReportError
           ? err.reason
           : err instanceof ScratchPublicationError
-            ? err.message === "scratch_publication_refused: cannot verify fresh remote floor"
-              ? "scratch_publication_refused: cannot verify fresh remote floor"
-              : "scratch_publication_refused: candidate history cannot be published"
+            ? scratchPublicationFailureReason(err, redactText)
             : (codexBoundaryDiagnosticOf(err) ?? errMessage(err));
     const reason = redactText(rawReason);
     // PRD #69 M7a: derive the TRUSTED failure class from the RAW reason (before
@@ -3620,6 +3708,7 @@ export class RunRunner {
         ? err.failOrigin
         : failOriginForReason(rawReason);
     runLog.error("run failed", { error: reason });
+    if (err instanceof ScratchPublicationError) logScratchPublicationRefused(runLog, redactText, err, "finalize");
     // Issue #1864: a Codex boundary failure also logs which stage, boundary and sink failed.
     const boundaryDiagnostic = codexBoundaryDiagnosticOf(err);
     if (boundaryDiagnostic !== undefined) {
@@ -9555,6 +9644,7 @@ export class RunRunner {
       }
     } catch (e) {
       if (e instanceof ScratchPublicationError) {
+        logScratchPublicationRefused(runLog, flight.redactText, e, "park_bridge");
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
         return;
       }
@@ -10498,6 +10588,7 @@ export class RunRunner {
       return { published: false, reason: "rejected", httpStatus: res.httpStatus };
     } catch (e) {
       if (e instanceof ScratchPublicationError) {
+        logScratchPublicationRefused(flight.runLog, flight.redactText, e, "checkpoint_publish");
         this.reportPublishOutcome(flight, "scratch_publication_refused", "checkpoint publish failed: scratch_publication_refused");
         return { published: false, reason: "scratch_publication_refused" };
       }
