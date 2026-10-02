@@ -2,12 +2,13 @@
 -- oauth_authorize_requests, migration 00286). Lock order everywhere (D8): the user's grant-creation
 -- advisory lock first, on the two paths that create or sweep a user's grants (approve and Revoke
 -- all; LockOAuthUserGrants), then, on approve and deny only, the product row FOR SHARE
--- (GetProductForShare, the registration re-check), then the grant row (one user's grants in ascending id order), then that
--- grant's product_tokens rows, then its oauth_authorize_requests rows. The approve transaction
--- claims the request it decides LAST (after the grant lock, the narrowing revoke and the superseding
--- of the grant's earlier codes), so it never holds a request row while waiting for a grant. Only the
--- TTL sweep and deny lock request rows without a grant lock (deny after the product share lock);
--- neither ever waits for a grant.
+-- (GetProductForShare, the registration re-check; deny takes no per-user lock), then the grant
+-- row (one user's grants in ascending id order), then that grant's product_tokens rows, then its
+-- oauth_authorize_requests rows. The approve transaction claims the request it decides LAST
+-- (after the grant lock, the narrowing revoke and the superseding of the grant's earlier codes),
+-- so it never holds a request row while waiting for a grant. Only the TTL sweep and deny lock
+-- request rows without a grant lock (deny after the product share lock); neither ever waits for a
+-- grant.
 
 -- name: CreateOAuthAuthorizeRequest :one
 -- Store the pending request GET /api/oauth/authorize validated. The caller has already capped and
@@ -433,5 +434,6 @@ SELECT g.id,
 -- SoftDeleteProduct, RotateProductClientSecret, GetProductForUpdate, the product_skills.sql
 -- UPDATEs) but not with the FOR KEY
 -- SHARE foreign-key checks of grant, token and request inserts. Position in the D8 lock order:
--- after the per-user lock, before the grants.
+-- before any grant, token or request lock (approve takes it after its per-user lock; deny, which
+-- has no per-user lock, takes it first).
 SELECT * FROM products WHERE id = $1 FOR SHARE;

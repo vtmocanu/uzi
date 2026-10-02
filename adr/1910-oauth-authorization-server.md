@@ -124,15 +124,22 @@ access token and a refresh token, until the connection is revoked.
    still registered, scopes still allowed) on that locked row, holding the share
    lock through commit, so an admin who removes a redirect URI, disables the
    client or narrows its scopes while a user is on the consent page either
-   commits first (the request is refused with 409 and marked denied, no
-   redirect) or waits until the approve or deny commits. The admin product
-   writers take only the product row and then plain reads, and no grant, token
-   or request lock waits on a conflicting product lock, so the share lock adds
-   no cycle. Accepted limit: Postgres lets a new share locker pass a
-   waiting writer, so a steady stream of approves and denies on one product can
-   delay an admin registration change; each is a short transaction behind a
-   capped pending request, so the delay stays short. The full order is: per-user lock, product row (`FOR SHARE`, approve
-   and deny only), grants ascending, tokens, requests. What it guarantees: an
+   commits first, and the request is refused with 409 and no redirect (deny
+   still marks it denied; approve rolls back and it stays pending), or waits
+   until the approve or deny commits. The share lock adds no cycle: approve and
+   deny take it before any grant, token or request lock, and no transaction
+   holding an admin product lock (`SetProductOAuthClient`, `UpdateProduct`,
+   `GetProductForUpdate` on delete and the skills stage and apply, the secret
+   rotation) goes on to take a grant-side lock or an OAuth advisory lock. A
+   grant-lock holder can still wait on the product row: the `product_tokens`
+   insert of an exchange or refresh takes `FOR KEY SHARE` through its foreign
+   key, which a `FOR UPDATE` blocks, but that holder never waits for a grant.
+   Accepted limit: Postgres lets a new share locker pass a waiting writer, so a
+   steady stream of approves and denies on one product can delay an admin
+   registration change; each is a short transaction behind a capped pending
+   request, so the delay stays short. The full order is: per-user lock (approve
+   and Revoke all), product row (`FOR SHARE`, approve and deny), grants
+   ascending, tokens, requests. What it guarantees: an
    approve that took the lock first commits before Revoke all reads the grants,
    so the revoke covers its grant and code; an approve that waits behind Revoke
    all runs after it and creates a live grant of its own (a consent given after
@@ -297,7 +304,7 @@ in `LiveDB` need a database (`./e2e/run-store-it.sh`); the others run in
 | D7 revoking an access token revokes that token only; a manual token is not revoked there | `TestOAuthRevokeAccessTokenRevokesOnlyThatTokenLiveDB`, `TestOAuthRevokeHintIsAdvisoryLiveDB` (access token cases) |
 | D8 lock order grant, tokens, requests on every path; replay takes no request-row lock | `TestOAuthTokenReplayTakesNoRequestRowLockLiveDB`, `TestOAuthTokenCapIsCountedUnderTheGrantLockLiveDB`, `TestOAuthTokenConcurrentSameCodeLiveDB`, `TestRevokeAllRacingCodeExchangeLiveDB` |
 | D8 per-user lock first on approve and Revoke all: both orderings of a first-consent approve against Revoke all leave no live grant or redeemable code the button missed | `TestRevokeAllVersusFirstConsentApproveLiveDB` (both orderings), `TestOAuthUserLockClassMatchesSQL`, `TestProductTokenMintLockClassMatchesSQL` (class collision enumeration) |
-| D8 approve and deny re-check the registration under a product `FOR SHARE` lock: a redirect URI removed before the locked re-read gets no code or deny redirect (409, request denied), and an admin registration change issued during an approve waits for it to commit | `TestOAuthApproveRegistrationRemovedBeforeLockedRecheckLiveDB`, `TestOAuthDenyRegistrationRemovedBeforeLockedRecheckLiveDB`, `TestOAuthAdminRegistrationChangeWaitsForApproveLiveDB` |
+| D8 approve and deny re-check the registration under a product `FOR SHARE` lock: a redirect URI removed before the locked re-read gets no code or deny redirect (409; deny marks the request denied, approve leaves it pending), and an admin registration change issued during an approve waits for it to commit | `TestOAuthApproveRegistrationRemovedBeforeLockedRecheckLiveDB`, `TestOAuthDenyRegistrationRemovedBeforeLockedRecheckLiveDB`, `TestOAuthAdminRegistrationChangeWaitsForApproveLiveDB` |
 | D8 approve and first consent under the grant lock | `TestOAuthConcurrentApproveLiveDB`, `TestOAuthConcurrentFirstConsentsShareOneGrantLiveDB`, `TestOAuthLosingApproveRollsBackSupersedeLiveDB` |
 | D8 refresh vs revoke and refresh vs re-consent races: a refresh blocked on the grant lock while a revoke or re-consent commits mints nothing, and no live token survives Revoke all | `TestOAuthRefreshVersusGrantMutationLiveDB` (owner revoke, `revokeGrantLocked`, re-consent), `TestOAuthRefreshVersusRevokeAllLiveDB` |
 | D8 refresh vs `POST /api/oauth/revoke` with the refresh token, both queued on the grant lock in either order: the losing refresh mints nothing that survives (revoke first: no token is minted; refresh first: the minted token is revoked with the grant), no live grant or unrevoked token remains | `TestOAuthRefreshVersusOAuthRevokeLiveDB` (both orders) |
