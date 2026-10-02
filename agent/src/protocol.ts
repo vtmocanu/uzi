@@ -1837,6 +1837,14 @@ export interface MemoryListResponse {
   memories?: MemoryEntry[];
 }
 
+/** Response for GET /api/worker/runs/:id/decisions-memo (issue #2083). `enabled` says whether
+ *  the memo feature is on for this run; `memo` is the earlier run's private note, if any.
+ *  UNTRUSTED — the runner validates every field before it reaches a prompt. */
+export interface DecisionsMemoResponse {
+  enabled?: boolean;
+  memo?: { format?: number; body?: string; source_run_id?: string } | null;
+}
+
 // ── Forge read tools (PRD #158) ────────────────────────────────────────────────
 // Response shapes for the six worker-mediated forge READ endpoints the run-lane
 // forge MCP server (forge-tools.ts) calls via WorkerClient. Field names are EXACT

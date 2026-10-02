@@ -72,6 +72,7 @@ import {
   isNotCodePlan,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
+import { isDecisionsMemoKind } from "./decisions-memo.js";
 import { dropRunCaches, type RunCacheDropResult } from "./run-caches.js";
 import { defaultEnvProbeSpawner, environmentFactsSummary, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "./env-probe.js";
 import { readRepoInstructions } from "./repo-instructions.js";
@@ -548,6 +549,8 @@ interface TurnResult {
    *  any. Last-wins within the turn (like summary); stamped with the worktree HEAD by the loop
    *  when it latches the claims and forwarded as ExecutorResult.prSummary. */
   prSummary?: PrSummaryClaim;
+  /** Issue #2083: forwarded as ExecutorResult.decisionsMemo (last-wins). */
+  decisionsMemo?: string;
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -1333,6 +1336,9 @@ export class SdkExecutor implements Executor {
     // a stricter fail-closed default here would silently break every test that omits
     // kind, and the AUTHORITATIVE gate is the api's, where runs.kind is NOT NULL.
     const isIssueRun = resolveRunKind(ctx.kind) === "issue";
+    // Issue #2083: the decisions memo is a memo-kind run with the server-side feature on.
+    const decisionsMemoOn =
+      ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind));
     const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
       [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
         prdDonePath: isIssueRun,
@@ -1348,6 +1354,8 @@ export class SdkExecutor implements Executor {
         // issue #279: report_only on signal_done, gated on the same isIssueRun discriminator —
         // a non-issue run (ci_fix/self_improve/prompt) has its own terminal paths.
         reportOnly: isIssueRun,
+        // Issue #2083: decisions_memo on signal_done, only when the memo is enabled.
+        decisionsMemo: decisionsMemoOn,
       }),
     };
     if (this.client) {
@@ -1856,6 +1864,9 @@ export class SdkExecutor implements Executor {
             // PRD #90: inert, nonce-fenced, untrusted-advisory cross-run memory (the
             // runner fetched it at claim time; empty/absent injects nothing).
             memory: ctx.memory,
+            // Issue #2083: the earlier run's private decisions memo (mr_rework only; the
+            // runner sets it only then), fenced as UNTRUSTED. Absent injects nothing.
+            decisionsMemo: ctx.decisionsMemo,
             // Issue #105: see above — prior pushed work on this issue's branch.
             priorWork: ctx.priorWork,
             // See above.
@@ -2388,6 +2399,8 @@ export class SdkExecutor implements Executor {
       // PRD #1798 M2 (D4): hoisted for the same reason as declaredProposal. Stamped with the
       // worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
+      // Issue #2083: hoisted for the same reason; last-wins across signal_done turns.
+      let declaredDecisionsMemo: string | undefined;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
       // the `break` into the ExecutorResult assembly. Issue runs only.
@@ -2682,6 +2695,9 @@ export class SdkExecutor implements Executor {
             // issue #279: teach the lead the report-only evidence path, ISSUE RUNS ONLY —
             // gated on the same isIssueRun discriminator the signal_done schema uses.
             reportOnly: isIssueRun,
+            // Issue #2083: ask the lead for decisions_memo (same gate as the signal param).
+            decisionsMemo:
+              ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind)),
           }),
           state,
           idleMs,
@@ -2859,6 +2875,7 @@ export class SdkExecutor implements Executor {
         if (turn.prSummary !== undefined) {
           declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
         }
+        if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -3463,6 +3480,7 @@ export class SdkExecutor implements Executor {
       // pushes a branch opens a PR; the runner reads it only where it renders a description).
       // OMITTED-not-undefined like the siblings above.
       if (declaredPrSummary !== undefined) result.prSummary = declaredPrSummary;
+      if (declaredDecisionsMemo !== undefined) result.decisionsMemo = declaredDecisionsMemo;
       // PRD #1798 M2: the last plan summary + deltas the api accepted this run, if any. Absent
       // on a resume past the gate or when the advisory pass never succeeded.
       if (this.latestPlanSummary !== undefined) {

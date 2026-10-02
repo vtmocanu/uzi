@@ -212,6 +212,12 @@ export interface RunContext {
    *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
    *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
   memory?: MemoryEntry[];
+  /** Issue #2083: whether the server enabled the private decisions memo for this run (claim-
+   *  time read; false on any read failure). Gates the `decisions_memo` signal_done param. */
+  decisionsMemoEnabled?: boolean;
+  /** Issue #2083: the earlier run's validated decisions memo body, set ONLY on an mr_rework run
+   *  whose memo read parsed cleanly. Composed into the plan prompt nonce-fenced, UNTRUSTED. */
+  decisionsMemo?: string;
   /** Issue #297: work already in flight on the same repo at claim time, carried only
    *  on a self_improve run so the picker avoids overlapping a recommendation with an
    *  active run's work. Absent/empty ⇒ no block injected. UNTRUSTED-content advisory
@@ -751,6 +757,10 @@ export interface ExecutorResult {
    *  the runner reads it only where it renders a PR description. Absent when the lead declared
    *  none, which an older prompt or a terse lead does. StubExecutor never sets it. */
   prSummary?: PrSummaryClaim;
+  /** Issue #2083: the private decisions memo from signal_done's `decisions_memo` (last-wins,
+   *  already clamped by signals.ts). The runner redacts and saves it on an MR-path completion
+   *  only; it is never part of any persisted message. StubExecutor never sets it. */
+  decisionsMemo?: string;
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
    *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
    *  latched from the LAST successful generation of this run. Absent whenever that pass did not

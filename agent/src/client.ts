@@ -52,6 +52,7 @@ import {
   type TaskReviewRequest,
   type WorkerStats,
   type SaveMemoryRequest,
+  type DecisionsMemoResponse,
   type MemoryEntry,
   type MemoryListResponse,
   type IssueDTO,
@@ -2133,6 +2134,34 @@ export class WorkerClient {
   async getMemory(runId: string): Promise<MemoryEntry[]> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/memory`)) as MemoryListResponse;
     return res.memories ?? [];
+  }
+
+  // ── Decisions memo (issue #2083) ───────────────────────────────────────────
+  // A private, claim-fenced note from an earlier run on the same PR. The server fences both
+  // calls on the run's claim generation; 404/409 mean "not yours / claim moved on" and the
+  // runner treats every failure as non-fatal.
+
+  /** GET /worker/runs/:id/decisions-memo?claim_generation=N. The result is UNTRUSTED. */
+  async getDecisionsMemo(runId: string, claimGeneration: number): Promise<DecisionsMemoResponse> {
+    const path =
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/decisions-memo` +
+      `?claim_generation=${encodeURIComponent(String(claimGeneration))}`;
+    return ((await this.getJSON(path)) ?? {}) as DecisionsMemoResponse;
+  }
+
+  /** POST /worker/runs/:id/decisions-memo (204, no body). A short timeout bounds how long a
+   *  best-effort save can delay completion. */
+  async saveDecisionsMemo(
+    runId: string,
+    claimGeneration: number,
+    body: string,
+    timeoutMs = 10_000,
+  ): Promise<void> {
+    await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/decisions-memo`,
+      { claim_generation: claimGeneration, body },
+      timeoutMs,
+    );
   }
 
   // ── Forge read surface (PRD #158) ──────────────────────────────────────────

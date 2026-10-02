@@ -501,6 +501,8 @@ export interface TurnSignals {
   proposal?: Proposal;
   /** PRD #1798 M2: see ScannedSignals.prSummary (last-wins; never carries verifiedAtSha). */
   prSummary?: PrSummaryClaim;
+  /** Issue #2083: see ScannedSignals.decisionsMemo (last-wins; never logged). */
+  decisionsMemo?: string;
 }
 
 export interface ReducedTurnResult extends TurnSignals {

@@ -195,6 +195,8 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     if (s.proposal !== undefined) this.result.proposal = s.proposal;
     // PRD #1798 M2: last-wins like summary/proposal, so the terminating signal_done's claims win.
     if (s.prSummary !== undefined) this.result.prSummary = s.prSummary;
+    // Issue #2083: last-wins, so the terminating signal_done's memo is the one saved.
+    if (s.decisionsMemo !== undefined) this.result.decisionsMemo = s.decisionsMemo;
     if (s.questions?.length) {
       const accepted = this.result.questions?.length ?? 0;
       const remaining = MAX_TURN_QUESTIONS - accepted;

@@ -340,6 +340,13 @@ export class FakeApi {
   /** PRD #1798 M6: the in-memory pr-description api (fake-pr-desc-api.ts); unset ⇒ the routes 404. */
   prDescription: FakePrDescApi | undefined;
 
+  /** Issue #2083: the decisions-memo routes. `get` is the GET answer (unset ⇒ 404, like an api
+   *  that predates the feature); `postStatus` is the POST status (204 = saved). Every call is
+   *  recorded so a test can assert exactly what the worker read and saved. */
+  decisionsMemo: { get?: { status: number; body: unknown }; postStatus: number } = { postStatus: 204 };
+  readonly decisionsMemoGets: Array<{ runId: string; claimGeneration: string | null }> = [];
+  readonly decisionsMemoPosts: Array<{ runId: string; body: { claim_generation?: number; body?: string } }> = [];
+
   constructor(private readonly token: string) {
     this.server = http.createServer((req, res) => {
       this.handle(req, res).catch((err) => {
@@ -1243,6 +1250,23 @@ export class FakeApi {
       if (!o || o.httpStatus === 404) return send(res, 404, { error: "run not found for this worker" });
       if (o.httpStatus !== 200 || !o.identity) return send(res, o.httpStatus, { error: "injected orphan failure" });
       return send(res, 200, o.identity);
+    }
+
+    // Issue #2083: the decisions-memo routes.
+    const decisionsMatch = /^\/api\/worker\/runs\/([^/]+)\/decisions-memo$/.exec(p);
+    if (decisionsMatch) {
+      const runId = decisionsMatch[1] as string;
+      if (req.method === "GET") {
+        this.decisionsMemoGets.push({ runId, claimGeneration: url.searchParams.get("claim_generation") });
+        const g = this.decisionsMemo.get;
+        if (!g) return send(res, 404, { error: "not found" });
+        return send(res, g.status, g.body);
+      }
+      if (req.method === "POST") {
+        this.decisionsMemoPosts.push({ runId, body: json as { claim_generation?: number; body?: string } });
+        if (this.decisionsMemo.postStatus === 204) return sendEmpty(res, 204);
+        return send(res, this.decisionsMemo.postStatus, { error: "decisions_memo_rejected" });
+      }
     }
 
     // PRD #1798 M6: the pr-description routes, answered by an in-memory model when a test installs
