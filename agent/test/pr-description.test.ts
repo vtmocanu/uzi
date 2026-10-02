@@ -61,6 +61,7 @@ async function mint(fields: Partial<RawPrDescriptionFields>): Promise<SanitizedP
       target_branch: "main",
       source: "generated",
       rendered_region_sha256: null,
+      region_has_diagram: null,
       state: "pending",
       created_at: "2026-09-27T10:00:00Z",
       published_at: null,
