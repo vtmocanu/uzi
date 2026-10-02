@@ -408,9 +408,11 @@ func TestMissingProtectedByOverflowLiveDB(t *testing.T) {
 	fireRequeue := func(t *testing.T, workerID uuid.UUID) {
 		t.Helper()
 		if _, err := env.q.RequeueRunsMissingFromSnapshot(env.ctx, store.RequeueRunsMissingFromSnapshotParams{
-			WorkerID:      pgconv.UUID(workerID),
-			MissingCutoff: missingCutoff,
-			MaxRequeues:   1,
+			WorkerID:             pgconv.UUID(workerID),
+			MissingCutoff:        missingCutoff,
+			MaxRequeues:          1,
+			Now:                  pgconv.Time(time.Now()),
+			GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
 		}); err != nil {
 			t.Fatalf("RequeueRunsMissingFromSnapshot: %v", err)
 		}

@@ -3476,6 +3476,7 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = @id AND worker_id = @worker_id
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND NOT (status = 'paused' AND hold_reason IN ('budget_exhausted', 'completion_blocked'))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -3526,6 +3527,7 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = @id AND worker_id = @worker_id
       AND status NOT IN ('completed', 'failed', 'cancelled')
+      AND NOT (status = 'paused' AND hold_reason IN ('budget_exhausted', 'completion_blocked'))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -4887,6 +4889,12 @@ WHERE runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
   AND runs.requeue_count >= @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = @worker_id AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
@@ -4919,6 +4927,12 @@ WHERE runs.worker_id = @worker_id
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < @missing_cutoff                   -- fence: stale window + one heartbeat interval, D4
   AND runs.requeue_count < @max_requeues
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < (sqlc.arg('now')::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, sqlc.arg('global_timeout_seconds')::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = @worker_id AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)

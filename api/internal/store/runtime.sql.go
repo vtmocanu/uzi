@@ -4049,6 +4049,12 @@ WHERE runs.worker_id = $2
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < $3                   -- fence: stale window + one heartbeat interval, D4
   AND runs.requeue_count >= $4
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($5::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $6::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = $2 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
@@ -4062,10 +4068,12 @@ RETURNING id, user_id, status
 `
 
 type FailRunsMissingFromSnapshotParams struct {
-	FailureReason pgtype.Text        `json:"failure_reason"`
-	WorkerID      pgtype.UUID        `json:"worker_id"`
-	MissingCutoff pgtype.Timestamptz `json:"missing_cutoff"`
-	MaxRequeues   int32              `json:"max_requeues"`
+	FailureReason        pgtype.Text        `json:"failure_reason"`
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues          int32              `json:"max_requeues"`
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
 }
 
 type FailRunsMissingFromSnapshotRow struct {
@@ -4087,6 +4095,8 @@ func (q *Queries) FailRunsMissingFromSnapshot(ctx context.Context, arg FailRunsM
 		arg.WorkerID,
 		arg.MissingCutoff,
 		arg.MaxRequeues,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
 	)
 	if err != nil {
 		return nil, err
@@ -12606,6 +12616,12 @@ WHERE runs.worker_id = $1
   AND runs.claim_released_at IS NULL                        -- #1247 fence
   AND runs.status_since < $2                   -- fence: stale window + one heartbeat interval, D4
   AND runs.requeue_count < $3
+  AND NOT (runs.kind NOT IN ('chat', 'judge', 'job') AND runs.interactive = false
+    AND runs.completion_attempts = 0
+    AND runs.started_at < ($4::timestamptz
+      - make_interval(secs => COALESCE(runs.budget_wall_seconds, $5::int)
+                            + runs.budget_paused_seconds + runs.budget_extension_seconds
+                            + runs.budget_finalize_seconds)))
   AND NOT EXISTS (SELECT 1 FROM worker_active_runs a        -- ABSENT (or a different generation) from the snapshot
                   WHERE a.worker_id = $1 AND a.run_id = runs.id
                     AND a.claim_generation = runs.claim_generation)
@@ -12619,9 +12635,11 @@ RETURNING id, user_id, status
 `
 
 type RequeueRunsMissingFromSnapshotParams struct {
-	WorkerID      pgtype.UUID        `json:"worker_id"`
-	MissingCutoff pgtype.Timestamptz `json:"missing_cutoff"`
-	MaxRequeues   int32              `json:"max_requeues"`
+	WorkerID             pgtype.UUID        `json:"worker_id"`
+	MissingCutoff        pgtype.Timestamptz `json:"missing_cutoff"`
+	MaxRequeues          int32              `json:"max_requeues"`
+	Now                  pgtype.Timestamptz `json:"now"`
+	GlobalTimeoutSeconds int32              `json:"global_timeout_seconds"`
 }
 
 type RequeueRunsMissingFromSnapshotRow struct {
@@ -12637,7 +12655,13 @@ type RequeueRunsMissingFromSnapshotRow struct {
 // cap revocation, requeue_count++). It does NOT set stale_requeue_generation: a genuine loss is
 // never refunded (D2). Chat is a target restriction (kind <> 'chat', D10).
 func (q *Queries) RequeueRunsMissingFromSnapshot(ctx context.Context, arg RequeueRunsMissingFromSnapshotParams) ([]RequeueRunsMissingFromSnapshotRow, error) {
-	rows, err := q.db.Query(ctx, requeueRunsMissingFromSnapshot, arg.WorkerID, arg.MissingCutoff, arg.MaxRequeues)
+	rows, err := q.db.Query(ctx, requeueRunsMissingFromSnapshot,
+		arg.WorkerID,
+		arg.MissingCutoff,
+		arg.MaxRequeues,
+		arg.Now,
+		arg.GlobalTimeoutSeconds,
+	)
 	if err != nil {
 		return nil, err
 	}
@@ -14461,6 +14485,7 @@ UPDATE runs SET
     updated_at         = now()
 WHERE id = $5 AND worker_id = $6
   AND status NOT IN ('completed', 'failed', 'cancelled')
+  AND NOT (status = 'paused' AND hold_reason IN ('budget_exhausted', 'completion_blocked'))
   -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
   -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
   -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the
@@ -14531,6 +14556,7 @@ WITH failed AS (
         updated_at         = now()
     WHERE runs.id = $5 AND worker_id = $6
       AND status NOT IN ('completed', 'failed', 'cancelled')
+      AND NOT (status = 'paused' AND hold_reason IN ('budget_exhausted', 'completion_blocked'))
       -- PRD #1247 M5a-1 rework (m6): the per-query generation fence, the SAME nil-guarded shape as
       -- UpdateRunLastSeq/InsertRunMessage. limit_wait (non-park + forge-park DEGRADED) callers skip
       -- the outer FOR UPDATE fence, so when a generation is supplied the fail applies ONLY to the

@@ -19,8 +19,8 @@ var outageIIDSeq int64 = time.Now().UnixNano() % 1_000_000_000
 func nextOutageIID() int64 { return atomic.AddInt64(&outageIIDSeq, 1) }
 
 // seedOutageRun inserts a run owned by workerID at the given status/kind/generation and
-// requeue_count, with every time-based sweep window pushed 3h into the past so ONLY the
-// window under test (or the D11 lease/overflow predicate) decides its fate.
+// requeue_count, with missing-run windows pushed 3h into the past but a 24h wall
+// budget so worker-loss tests do not enter the separate wall-park path.
 func seedOutageRun(t *testing.T, env codexTestEnv, userID, repoID, workerID uuid.UUID, status, kind string, gen int64, requeueCount int32) uuid.UUID {
 	t.Helper()
 	runID := uuid.New()
@@ -28,6 +28,7 @@ func seedOutageRun(t *testing.T, env codexTestEnv, userID, repoID, workerID uuid
 	          VALUES ($1, $2, $3, $4, $5, 't', 'd', $6, $7, $8, $9)`,
 		runID, userID, repoID, kind, nextOutageIID(), status, workerID, gen, requeueCount)
 	env.exec(`UPDATE runs SET started_at = now() - interval '3 hours',
+	                          budget_wall_seconds = 86400,
 	                          status_since = now() - interval '3 hours',
 	                          claimed_at = now() - interval '3 hours'
 	          WHERE id = $1`, runID)
@@ -99,6 +100,8 @@ func outageTerminalWriters() []terminalWriter {
 	// the SAME D11 terminal-pending / pending_overflow guards SweepRunningTimeout had, so this writer
 	// still exercises those guards — only the swept status changed from 'failed' to 'paused'.
 	fireParkRunsAtWall := func(t *testing.T, env codexTestEnv, workerID, runID uuid.UUID) {
+		// This writer specifically exercises an expired wall, unlike the other outage writers.
+		env.exec(`UPDATE runs SET budget_wall_seconds = 60 WHERE id = $1`, runID)
 		if _, err := env.q.ParkRunsAtWall(env.ctx, store.ParkRunsAtWallParams{
 			Now:                  pgconv.Time(time.Now()),
 			GlobalTimeoutSeconds: 7200,

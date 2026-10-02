@@ -2595,25 +2595,30 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	if applied {
 		// (d) Reconcile, fail before requeue (over-cap fail-first ordering). The missing fence is the
 		// stale window plus one heartbeat interval (D4). max_requeues is RUN_MAX_REQUEUES.
-		missingCutoff := pgconv.Time(s.now().Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
+		now := s.now()
+		missingCutoff := pgconv.Time(now.Add(-(s.p.WorkerHeartbeatStale + s.p.WorkerHeartbeatInterval)))
 		maxRequeues := int32(s.p.RunMaxRequeues) //nolint:gosec // G115: RunMaxRequeues is a small bounded config int (env RUN_MAX_REQUEUES), never near int32 range
 		readopted, err = qtx.ReadoptRunsFromSnapshot(ctx, updated.ID)
 		if err != nil {
 			return store.Worker{}, err
 		}
 		missingFailed, err = qtx.FailRunsMissingFromSnapshot(ctx, store.FailRunsMissingFromSnapshotParams{
-			FailureReason: pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
-			WorkerID:      pgconv.UUID(updated.ID),
-			MissingCutoff: missingCutoff,
-			MaxRequeues:   maxRequeues,
+			FailureReason:        pgconv.TextOrNull("worker lost the execution; exceeded re-queue budget"),
+			WorkerID:             pgconv.UUID(updated.ID),
+			MissingCutoff:        missingCutoff,
+			MaxRequeues:          maxRequeues,
+			Now:                  pgconv.Time(now),
+			GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
 		})
 		if err != nil {
 			return store.Worker{}, err
 		}
 		missingRequeued, err = qtx.RequeueRunsMissingFromSnapshot(ctx, store.RequeueRunsMissingFromSnapshotParams{
-			WorkerID:      pgconv.UUID(updated.ID),
-			MissingCutoff: missingCutoff,
-			MaxRequeues:   maxRequeues,
+			WorkerID:             pgconv.UUID(updated.ID),
+			MissingCutoff:        missingCutoff,
+			MaxRequeues:          maxRequeues,
+			Now:                  pgconv.Time(now),
+			GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
 		})
 		if err != nil {
 			return store.Worker{}, err

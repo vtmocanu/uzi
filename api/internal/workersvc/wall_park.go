@@ -78,6 +78,10 @@ func (s *Service) ReportWallPark(ctx context.Context, wkr store.Worker, runID uu
 			if rerr != nil {
 				return store.Run{}, false, rerr
 			}
+			// A same-worker reclaim can reuse worker_id; its newer generation is not this flight.
+			if claimGen != nil && current.ClaimGeneration != *claimGen {
+				return current, false, nil
+			}
 			// D16 idempotency: the server already parked this row. Treat the report as parked, and
 			// keep a captured head the server park did not have (only ADDS information, never changes
 			// status).
