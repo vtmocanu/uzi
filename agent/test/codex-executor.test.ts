@@ -610,6 +610,7 @@ interface MultiRig {
   client: FakeClient;
   sessionOps: { adopt: number; removeCalls: number; inspect: number; persist: number };
   providerLaunches: () => number;
+  launchRoots: string[];
   effectDisposes: () => number;
   /** Issue #1866 M2: the environment probes makeExecutor answered for this rig. */
   probeCalls: ProbeCall[];
@@ -624,9 +625,11 @@ function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {
   const fh = fakeFileopHandle();
   const sessionOps = { adopt: 0, removeCalls: 0, inspect: 0, persist: 0 };
   let providerLaunches = 0;
+  const launchRoots: string[] = [];
   let effectDisposes = 0;
   const deps: CodexExecutorDeps = {
-    launchProviderRoot: async (_spec, authMode): Promise<CodexLaunchRootResult> => {
+    launchProviderRoot: async (spec, authMode): Promise<CodexLaunchRootResult> => {
+      launchRoots.push(spec.ownedDataRoot);
       const epoch = epochs[providerLaunches];
       providerLaunches += 1;
       if (!epoch) throw new Error(`no scripted epoch for provider launch #${providerLaunches}`);
@@ -676,6 +679,7 @@ function makeMultiEpochRig(responders: Responder[], opts: { token?: string } = {
     client,
     sessionOps,
     providerLaunches: () => providerLaunches,
+    launchRoots,
     effectDisposes: () => effectDisposes,
     probeCalls: [],
     deps,
@@ -7420,6 +7424,47 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
     t.push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
   });
 
+  it("a retained HOME permits a second invocation to recreate epoch 1 without touching stale roots", async () => {
+    const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-codex-epochs-"));
+    const dataDir = path.join(homeRoot, "codex-data");
+    await fs.mkdir(dataDir);
+    const runFlight = async (): Promise<MultiRig> => {
+      const rig = makeMultiEpochRig([checkpointEpoch(), resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(3, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
+      })]);
+      const launch = rig.deps.launchProviderRoot!;
+      rig.deps = { ...rig.deps, launchProviderRoot: async (spec, authMode) => {
+        await fs.mkdir(spec.ownedDataRoot);
+        return launch(spec, authMode);
+      } };
+      const { ctx } = makeCtx({ checkpoint: async () => undefined });
+      const executor = new CodexExecutor(noopLog, homeRoot,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider }, rig.deps);
+      await withTimeout(executor.run(ctx), 5000, "retained-HOME flight");
+      assert.equal(rig.providerLaunches(), 2, "each flight reached the recreated epoch");
+      return rig;
+    };
+    try {
+      const first = await runFlight();
+      const priorRoot = first.launchRoots[0]!;
+      const priorMarker = path.join(priorRoot, "prior-attempt.txt");
+      await fs.writeFile(priorMarker, "prior attempt intact");
+      const legacyRoot = path.join(dataDir, "epoch-1");
+      await fs.mkdir(legacyRoot, { recursive: true });
+      const legacyMarker = path.join(legacyRoot, "legacy.txt");
+      await fs.writeFile(legacyMarker, "legacy epoch intact");
+
+      const second = await runFlight();
+      assert.match(path.basename(second.launchRoots[0]!), /^[0-9a-f-]{36}-epoch-0$/);
+      assert.equal(second.launchRoots[1], second.launchRoots[0]!.replace(/epoch-0$/, "epoch-1"));
+      assert.notDeepEqual(second.launchRoots, first.launchRoots, "invocations use distinct namespaces");
+      assert.equal(await fs.readFile(priorMarker, "utf8"), "prior attempt intact");
+      assert.equal(await fs.readFile(legacyMarker, "utf8"), "legacy epoch intact");
+    } finally {
+      await fs.rm(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("(T1/T2) a late pauseRequested ACK after a checkpoint turn parks once at the ACK's count, with no further turn and no epoch recreated", async () => {
     // ONE scripted epoch: a recreated epoch would throw "no scripted epoch" at its provider launch.
     const rig = makeMultiEpochRig([checkpointEpoch()]);
@@ -7680,15 +7725,21 @@ describe("CodexExecutor: loop-top owner pause (issue #1764)", () => {
   // The spy records every persist's codexHome and every reap of the then-current epoch's home.
   const persistSpy = (rig: MultiRig): { events: string[]; homeOf: (i: number) => string } => {
     const events: string[] = [];
+    const homes: string[] = [];
     (rig.deps as { sessionStore?: CodexExecutorDeps["sessionStore"] }).sessionStore = {
       ...rig.deps.sessionStore!,
       persist: async (codexHome: string) => {
         rig.sessionOps.persist += 1;
+        if (!homes.includes(codexHome)) homes.push(codexHome);
         events.push(`persist:${codexHome}`);
         return { files: 0, bytes: 0 };
       },
     };
-    return { events, homeOf: (i) => `/data/agent-home/run-1/codex-data/epoch-${i}/codex` };
+    return { events, homeOf: (i) => {
+      const home = homes[i];
+      assert.ok(home, `provider epoch ${i} selected and persisted`);
+      return home;
+    } };
   };
   const assertNoPersistAfterReap = (events: string[]): void => {
     events.forEach((event, i) => {

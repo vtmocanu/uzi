@@ -2,6 +2,9 @@ import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
 import { readFileSync } from "node:fs";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
 import { createInterface } from "node:readline";
 import { PassThrough, Writable } from "node:stream";
 
@@ -538,6 +541,28 @@ describe("launchCodexRoot: trusted construction contract", () => {
       /ownedDataRoot and cwd must be disjoint/,
     );
   });
+
+  it("the production tree creator refuses the chosen existing provider root before launch and preserves its contents",
+    { skip: process.getuid?.() === WORKER_UID ? false : "requires the worker uid to launch the runner-owned creator" },
+    async () => {
+      const parent = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-codex-existing-"));
+      const root = path.join(parent, "chosen-provider-root");
+      const marker = path.join(root, "keep.txt");
+      try {
+        await fs.chmod(parent, 0o777);
+        await fs.mkdir(root);
+        await fs.writeFile(marker, "existing root must survive");
+        const fake = newFake();
+        await assert.rejects(
+          launchCodexRoot(baseSpec({ ownedDataRoot: root }), baseDeps(fake, { makeRunnerTrees: undefined })),
+          /runner-owned tree creation failed/,
+        );
+        assert.equal(await fs.readFile(marker, "utf8"), "existing root must survive");
+        assert.equal(spawnCalls.length, 0, "the provider supervisor was never launched");
+      } finally {
+        await fs.rm(parent, { recursive: true, force: true });
+      }
+    });
 
   it("rejects a non-canonical owned data root before provisioning", async () => {
     const fake = newFake();

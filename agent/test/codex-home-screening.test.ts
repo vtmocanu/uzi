@@ -16,11 +16,10 @@
 // `screenPolicy` at the wiring site under test, so the assertion exercises the repaired
 // construction, not a test-authored policy.
 //
-// The executor is constructed with a KNOWN `homeRoot` so the test can name the literal absolute
-// path to the epoch-0 provider HOME's `auth.json` (`homeRoot/codex-data/epoch-0/codex/auth.json`,
-// per startProviderEpoch's ownedDataRoot/codexHome derivation). The screener guards the STATIC
-// parent `homeRoot/codex-data/`, so the concrete epoch-0 credential path is caught even though the
-// epoch index is chosen inside the executor.
+// The executor is constructed with a KNOWN `homeRoot` so the test can name a literal absolute
+// credential path under its guarded `codex-data/` parent. The path represents a retained old
+// epoch; current provider roots use a per-invocation namespace that the test cannot predict.
+// Screening the static parent must cover both retained and current provider credentials.
 //
 // Calibration (failing-old / passing-fixed) is the SHELL leg: with the repair the `cat <authPath>`
 // command is DENIED before the spawn seam (spawn counter stays 0); revert the repair and the
@@ -57,11 +56,9 @@ import { recordConformanceEvidence } from "./conformance-evidence.js";
 import { workerSecretDenyPaths } from "../src/guardrails.js";
 import { ENV_PROBE_SCRIPT } from "../src/env-probe.js";
 
-// The executor's homeRoot is KNOWN so the test can name the literal epoch-0 provider-HOME path.
+// The executor's homeRoot is KNOWN so the test can name a literal retained provider-HOME path.
 const HOME_ROOT = "/data/agent-home/run-1";
-// The STATIC parent the repaired screenPolicy guards (homeRoot/codex-data/), and the concrete
-// epoch-0 credential file UNDER it (startProviderEpoch: ownedDataRoot = homeRoot/codex-data/epoch-N,
-// codexHome = ownedDataRoot/codex).
+// The static parent guarded by screenPolicy, and a retained credential file beneath it.
 const CODEX_DATA_DIR = path.join(HOME_ROOT, "codex-data");
 const EPOCH0_AUTH_PATH = path.join(CODEX_DATA_DIR, "epoch-0", "codex", "auth.json");
 

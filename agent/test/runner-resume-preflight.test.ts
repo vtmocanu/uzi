@@ -375,7 +375,7 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", async () =
   const runHome = path.join(homeRoot, claim.run_id);
   const sessionFile = `rollout-2026-09-25-${sid}.jsonl`;
   const sessionBytes = '{"thread":"held-run-session"}\n';
-  const artifact = path.join(runHome, "codex-data", "epoch-0", "codex", "sessions", sessionFile);
+  let artifact: string | undefined;
   let artifactAtLaunch = false;
   let completedTurn = false;
   let enteredHold: boolean | undefined;
@@ -395,7 +395,7 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", async () =
       if (method === "initialize") return { userAgent: "codex/0.153.2", codexHome: source, platformFamily: "unix", platformOs: "linux" } as T;
       if (method === "account/login/start") return { type: (params as { type: string }).type } as T;
       if (method === "thread/resume") {
-        if (!artifactAtLaunch || !fs.existsSync(artifact) || fs.readFileSync(artifact, "utf8") !== sessionBytes) {
+        if (!artifactAtLaunch || !artifact || !fs.existsSync(artifact) || fs.readFileSync(artifact, "utf8") !== sessionBytes) {
           throw new Error("claimed thread artifact was not adopted before resume");
         }
         return { thread: { id: sid } } as T;
@@ -430,8 +430,7 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", async () =
     fs.mkdirSync(path.join(source, "sessions"), { recursive: true });
     fs.writeFileSync(path.join(source, "sessions", sessionFile), sessionBytes);
     const store = path.join(runHome, "codex-session-store");
-    // The injected launcher owns the synthetic provider HOME's parent.
-    fs.mkdirSync(path.join(runHome, "codex-data", "epoch-0"), { recursive: true });
+    fs.mkdirSync(runHome, { recursive: true });
     await CodexSessionStore.persist(source, store);
 
     // Seed the real clone, then park this run with its per-run HOME and session intact.
@@ -482,7 +481,17 @@ it("a resumed Codex runner turn adopts the claimed persisted thread", async () =
       executor: (() => {
         const codexExecutor = new CodexExecutor({ debug() {}, info() {}, warn() {}, error() {}, addSecret() {}, removeSecret() {}, child() { return this; } },
         path.join(homeRoot, runId), { binding: selected.binding, client, provider }, {
-          launchProviderRoot: async () => {
+          sessionStore: {
+            ...CodexSessionStore,
+            adopt: async (storeDir, codexHome, opts) => {
+              // The injected launcher owns this synthetic root's parent; derive it from
+              // the requested destination before the executor performs its direct adoption.
+              fs.mkdirSync(path.dirname(codexHome), { recursive: true });
+              return CodexSessionStore.adopt(storeDir, codexHome, opts);
+            },
+          },
+          launchProviderRoot: async (spec) => {
+            artifact = path.join(spec.ownedDataRoot, "codex", "sessions", sessionFile);
             artifactAtLaunch = fs.existsSync(artifact) && fs.readFileSync(artifact, "utf8") === sessionBytes;
             return { root: { kind: "provider", reap: async () => ({ ok: true }), dispose: async () => {} }, transport, supervisorPid: 1234 };
           },
