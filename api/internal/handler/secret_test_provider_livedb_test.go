@@ -102,6 +102,9 @@ func TestSecretAnthropicProviderLiveDB(t *testing.T) {
 	t.Run("Messages success without meter", func(t *testing.T) {
 		id := seedTestConnection(t, h, pool, owner, "anthropic_token", "fixture-anthropic-"+uuid.NewString())
 		cliMustExec(t, pool, `UPDATE user_secrets SET anthropic_rejected_at = now() WHERE id = $1`, id)
+		cliMustExec(t, pool, `INSERT INTO anthropic_rate_limits
+			(user_secret_id, user_id, five_hour_pct, seven_day_pct, source, synced_at)
+			VALUES ($1, $2, 41, 53, 'usage_endpoint', now())`, id, owner)
 		installAnthropicTestClient(h, providerAnthropicFake{
 			usage: func(context.Context, []byte) (anthropic.Reading, error) {
 				return anthropic.Reading{}, anthropicHTTPFailure(http.StatusUnauthorized)
@@ -111,9 +114,10 @@ func TestSecretAnthropicProviderLiveDB(t *testing.T) {
 			},
 		})
 		requireTestResult(t, cookieReq(t, router, http.MethodPost, testConnectionPath("anthropic_token", id), session, ""), http.StatusOK, "ok", "")
-		marker, generation, _, _, _, gauge := anthropicTestState(t, pool, id)
-		if marker || generation != 1 || gauge {
-			t.Fatalf("status-only success: marker=%v generation=%d gauge=%v", marker, generation, gauge)
+		marker, generation, five, seven, source, gauge := anthropicTestState(t, pool, id)
+		if marker || generation != 1 || !gauge || five != 41 || seven != 53 || source != anthropic.SourceUsageEndpoint {
+			t.Fatalf("status-only success: marker=%v generation=%d gauge=%v five=%d seven=%d source=%q",
+				marker, generation, gauge, five, seven, source)
 		}
 	})
 
@@ -228,6 +232,10 @@ func TestSecretCodexReconcileLiveDB(t *testing.T) {
 			owner := cliSeedUser(t, pool, false)
 			session := cliMintJWT(t, pool, owner)
 			id, token := seedCodexTestAlias(t, h, pool, owner, initial)
+			identity := codexauth.Identity{
+				ProviderUserID:     "provider-" + uuid.NewString(),
+				WorkspaceAccountID: "workspace-" + uuid.NewString(),
+			}
 			var calls atomic.Int32
 			h.secretTestOnce.Do(func() {})
 			h.secretTestClients = &secretTestClients{codex: providerCodexFake{
@@ -236,10 +244,7 @@ func TestSecretCodexReconcileLiveDB(t *testing.T) {
 					if got != token {
 						t.Errorf("identity received wrong token")
 					}
-					return codexauth.Identity{
-						ProviderUserID:     "provider-" + uuid.NewString(),
-						WorkspaceAccountID: "workspace-" + uuid.NewString(),
-					}, nil
+					return identity, nil
 				},
 			}, openai: &http.Client{Timeout: 10 * time.Second}}
 			requireTestResult(t, cookieReq(t, router, http.MethodPost, testConnectionPath("codex_auth", id), session, ""),
@@ -247,6 +252,15 @@ func TestSecretCodexReconcileLiveDB(t *testing.T) {
 			status, account, revision := codexTestState(t, pool, id)
 			if status != "linked" || !account || revision != 0 || calls.Load() != 1 {
 				t.Fatalf("reconcile: status=%q account=%v revision=%d calls=%d", status, account, revision, calls.Load())
+			}
+			var providerID, workspaceID string
+			err := pool.QueryRow(context.Background(), `SELECT a.provider_user_id, a.workspace_account_id
+				FROM codex_provider_account a JOIN codex_credential_state c
+				ON c.provider_account_id = a.id WHERE c.user_secret_id = $1`, id).
+				Scan(&providerID, &workspaceID)
+			if err != nil || providerID != identity.ProviderUserID || workspaceID != identity.WorkspaceAccountID {
+				t.Fatalf("linked identity = %q/%q, want %q/%q, err=%v",
+					providerID, workspaceID, identity.ProviderUserID, identity.WorkspaceAccountID, err)
 			}
 		})
 	}
@@ -280,7 +294,21 @@ func TestSecretCodexReplacementDuringIdentityLiveDB(t *testing.T) {
 		t.Fatal("identity call did not start")
 	}
 	cliMustExec(t, pool, `UPDATE codex_credential_state SET material_revision=material_revision+1 WHERE user_secret_id=$1`, id)
-	cliMustExec(t, pool, `UPDATE user_secrets SET updated_at=updated_at+interval '1 second' WHERE id=$1`, id)
+	replacementBlob, err := json.Marshal(map[string]string{
+		"access_token":  "replacement-access-" + uuid.NewString(),
+		"refresh_token": "replacement-refresh-" + uuid.NewString(),
+	})
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	sealed, err := h.box.Seal(replacementBlob)
+	if err != nil {
+		close(release)
+		t.Fatal(err)
+	}
+	cliMustExec(t, pool, `UPDATE user_secrets SET ciphertext=$1, updated_at=updated_at+interval '1 second',
+		enablement_rev=enablement_rev+1 WHERE id=$2`, sealed, id)
 	close(release)
 	select {
 	case rec := <-done:
@@ -291,5 +319,13 @@ func TestSecretCodexReplacementDuringIdentityLiveDB(t *testing.T) {
 	status, account, revision := codexTestState(t, pool, id)
 	if status != "staging" || account || revision != 1 {
 		t.Fatalf("replacement: status=%q account=%v revision=%d", status, account, revision)
+	}
+	var accounts int
+	if err := pool.QueryRow(context.Background(), `SELECT count(*) FROM codex_provider_account WHERE user_id=$1`, owner).Scan(&accounts); err != nil || accounts != 0 {
+		t.Fatalf("stale reconciliation left %d account rows, err=%v", accounts, err)
+	}
+	var persisted []byte
+	if err := pool.QueryRow(context.Background(), `SELECT ciphertext FROM user_secrets WHERE id=$1`, id).Scan(&persisted); err != nil || string(persisted) != string(sealed) {
+		t.Fatalf("replacement ciphertext did not persist, err=%v", err)
 	}
 }
