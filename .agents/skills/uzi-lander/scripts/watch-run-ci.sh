@@ -39,8 +39,9 @@
 #      appeared for the SHA" (a push to main sometimes spawns none: re-point at a descendant
 #      commit rather than waiting)
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
-#      superseded it) and nothing failed. A run still listed in_progress whose jobs are
-#      all terminal with at least one cancelled counts as superseded too, never green. `git fetch origin main` and re-watch the CURRENT
+#      superseded it) and nothing failed. A run not yet concluded whose jobs are all
+#      terminal with at least one cancelled counts as superseded too, never green; a run
+#      GitHub already concluded success keeps that verdict. `git fetch origin main` and re-watch the CURRENT
 #      head, whose run exercises this change plus the newer one. Not a failure.
 #
 # Design notes:
@@ -260,7 +261,12 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           ;;
         PENDING) pending=1 ;;
         CANCELLED)
-          superseded=$((superseded+1)); echo "[tick $tick] $wname run $rid jobs cancelled before the run concluded (superseded)" ;;
+          # Inferred only for a run not yet concluded: a run GitHub already concluded
+          # success (a cancelled job inside a green run) keeps its own verdict.
+          if [ "$rstatus" = "completed" ] && [ "$rconcl" = "success" ]; then :
+          else
+            superseded=$((superseded+1)); echo "[tick $tick] $wname run $rid jobs cancelled before the run concluded (superseded)"
+          fi ;;
         GREEN) : ;;
       esac
     done <<< "$runs"
@@ -334,6 +340,12 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       exit 0
       ;;
     CANCELLED)
+      # Inferred only for a run not yet concluded (concl is read above in branch mode):
+      # a run GitHub already concluded success keeps its own verdict.
+      if [ "${concl:-}" = "success" ]; then
+        echo "=== run $cur: concluded success (a cancelled job inside it), none failed after $((tick*INTERVAL))s ==="
+        exit 0
+      fi
       echo "[tick $tick] run $cur jobs cancelled before the run concluded (superseded); re-resolving next tick"
       ;;
     PENDING)
