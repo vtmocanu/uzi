@@ -117,7 +117,7 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	// NUL-strip it like the partial/accept reason (#1227): a NUL raises SQLSTATE 22021 and fails
 	// the decision (#1728). An all-NUL guidance strips to "", the existing bare-continue case.
 	guidance, _ = stripNUL(guidance)
-	// The continue writes are NON-transactional and byte-identical to #1226: the shared
+	// The continue writes are NON-transactional and otherwise byte-identical to #1226: the shared
 	// resumeCompletionBlocked helper (also used by the #1227 partial/accept transaction) executes
 	// them against s.q, with followupGuidance == auditBody == guidance.
 	if err := resumeCompletionBlocked(ctx, s.q, run, userID, guidance, guidance, int32(s.p.RunTimeout.Seconds())); err != nil {
@@ -249,7 +249,7 @@ func completionQuestionOpen(run store.Run) bool {
 func (s *Service) DecideCompletion(ctx context.Context, userID uuid.UUID, runID uuid.UUID, req CompletionDecisionInput) (store.Run, error) {
 	switch req.Decision {
 	case "continue":
-		// Owner-only, byte-identical to #1226 (ContinueCompletionDecision's GetRun is owner-scoped).
+		// Owner-only, as #1226 apart from the #1728 NUL strip (ContinueCompletionDecision's GetRun is owner-scoped).
 		return s.ContinueCompletionDecision(ctx, userID, runID, req.Guidance)
 	case "partial", "accept":
 		// handled below
