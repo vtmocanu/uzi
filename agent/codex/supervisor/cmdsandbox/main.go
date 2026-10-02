@@ -180,7 +180,12 @@ func realMain(args []string) int {
 		return setupFailure("enter command cwd", err)
 	}
 	cmd := exec.Command(child[0], child[1:]...)
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = os.Stdin, os.Stdout, os.Stderr
+	// Stdin stays nil so os/exec gives the command /dev/null, opened here after
+	// applyPolicy (the /dev Landlock rule keeps read access for this open). The
+	// inherited stdin is a pipe nobody writes to or closes, so a command that
+	// reads it (rg PATTERN with no path, cat) would block until the command
+	// deadline. Shell-internal pipes and heredocs are unaffected.
+	cmd.Stdout, cmd.Stderr = os.Stdout, os.Stderr
 	cmd.Env = os.Environ()
 	if err := cmd.Run(); err != nil {
 		var exit *exec.ExitError
