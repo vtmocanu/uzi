@@ -2040,8 +2040,6 @@ const realApi = {
     request<{ ensured: string[] }>("POST", `/repos/${repoId}/labels/ensure`, { labels }),
 };
 
-// The one client the app talks to. The mock build keeps Test local and inconclusive
-// because it has no provider connection. Other mock routes come from mockApi.
-export const api: typeof realApi = MOCK_MODE
-  ? { ...mockApi, testSecret: async () => ({ status: "inconclusive" as const, reason: "generic" as const }) }
-  : realApi;
+// The one client the app talks to. The mock Test method is defined alongside
+// the other secret methods so the real and demo clients keep the same surface.
+export const api: typeof realApi = MOCK_MODE ? mockApi : realApi;

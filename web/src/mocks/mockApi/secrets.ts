@@ -306,6 +306,9 @@ function deleteCodexCredential(kind: CodexKind, id: string) {
 
 export const secretsApi = {
   // ── Secrets ─────────────────────────────────────────────────────────────────
+  // The demo has no provider connection, so an explicit Test stays inconclusive.
+  testSecret: async (_kind: "anthropic_token" | "codex_auth" | "openai_api_key", _id: string) =>
+    delay({ status: "inconclusive" as const, reason: "generic" as const }),
   listSecrets: async () =>
     delay({
       // Default first, then by label — the order the server's query returns.
