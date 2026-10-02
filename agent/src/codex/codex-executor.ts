@@ -3229,8 +3229,12 @@ export class CodexExecutor implements Executor {
         const slice = Math.min(TRANSIENT_BACKOFF_SLICE_MS, remaining);
         const before = Date.now();
         await new Promise<void>((resolve) => setTimeout(resolve, slice));
-        wall.remainingMs -= Date.now() - before;
-        remaining -= slice;
+        const elapsed = Date.now() - before;
+        wall.remainingMs -= elapsed;
+        // Timers can wake before the requested slice in this clock's millisecond
+        // resolution. Charge both counters the same elapsed time, or a wall-capped
+        // wait can finish with wall budget left and start another provider turn.
+        remaining -= elapsed;
       }
     } finally {
       if (watch) ctx.signal!.removeEventListener("abort", onAbort);

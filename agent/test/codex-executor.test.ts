@@ -9918,6 +9918,28 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(parkRig.transport.turnStartCount, 1);
   });
 
+  it("(d3) an early timer wake cannot finish a wall-capped backoff with budget left", async (t) => {
+    const executor = makeExecutor(makeRig(), bindingOf(SUBSCRIPTION)) as unknown as {
+      transientBackoff(ctx: RunContext, pause: { pending: boolean }, wall: { remainingMs: number }, totalMs: number): Promise<void>;
+    };
+    // Timer callbacks advance a controlled clock by one millisecond less than
+    // requested (with a 1 ms floor). This pins the nominal-wait/elapsed-wall
+    // mismatch (#2111) without relying on real timers waking early under CI load.
+    let clock = 0;
+    const realTimer = globalThis.setTimeout;
+    t.mock.method(Date, "now", () => clock);
+    t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms = 1, ...args: unknown[]) =>
+      realTimer(() => {
+        clock += Math.max(1, ms - 1);
+        callback(...args);
+      }, 1));
+    for (const [budget, wait, left] of [[3, 1000, 0], [1000, 3, 997]]) {
+      const wall = { remainingMs: budget! };
+      await executor.transientBackoff(makeCtx().ctx, { pending: false }, wall, wait!);
+      assert.equal(wall.remainingMs, left, "finish only after the requested wait or remaining wall is spent");
+    }
+  });
+
   // The remaining tests drive the interruption into the EXHAUSTION gate: the transient terminal
   // arrives first and the interruption becomes true only after the live turn can no longer be
   // tripped (its finally), so the in-turn trip path never sees it. Removing the gate turns each into

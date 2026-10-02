@@ -2,6 +2,7 @@
 """Prove both Node test shards ran every tracked agent test file exactly once."""
 
 import argparse
+import re
 import subprocess
 import tempfile
 import xml.etree.ElementTree as ET
@@ -10,6 +11,35 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 REPORTS = ("shard-1.xml", "shard-2.xml")
+
+
+def latest_reports(report_dir):
+    """Select each shard independently; a partial rerun need not rerun both legs."""
+    artifacts = sorted(report_dir.glob("agent-tests-*"))
+    if not artifacts:
+        # Keep the standalone flat-report input used by local checks.
+        return {name: report_dir / name for name in REPORTS}, []
+    errors = []
+    if list(report_dir.glob("*.xml")):
+        errors.append("flat reports cannot be mixed with per-attempt artifacts")
+    latest = {}
+    for artifact in artifacts:
+        match = re.fullmatch(r"agent-tests-([12])-attempt-([1-9][0-9]*)", artifact.name)
+        if not match or not artifact.is_dir():
+            errors.append(f"unrecognized shard artifact: {artifact.name}")
+            continue
+        shard, attempt = map(int, match.groups())
+        if shard not in latest or attempt > latest[shard][0]:
+            latest[shard] = (attempt, artifact)
+    paths = {}
+    for shard, name in enumerate(REPORTS, 1):
+        directory = latest.get(shard, (0, report_dir))[1]
+        paths[name] = directory / name
+        if directory != report_dir:
+            unexpected = sorted(p.name for p in directory.glob("*.xml") if p.name != name)
+            if unexpected:
+                errors.append(f"{directory.name}: unexpected reports: {', '.join(unexpected)}")
+    return paths, errors
 
 
 def tracked_tests():
@@ -44,18 +74,21 @@ def describe_files(files):
 
 
 def check_reports(report_dir, expected):
-    errors = []
+    paths, errors = latest_reports(report_dir)
     observed = {}
-    present = {p.name for p in report_dir.glob("*.xml")}
+    if all(path.parent == report_dir for path in paths.values()):
+        present = {p.name for p in report_dir.glob("*.xml")}
+    else:
+        present = {name for name, path in paths.items() if path.is_file()}
     if present != set(REPORTS):
         errors.append(f"expected exactly {', '.join(REPORTS)}; found {', '.join(sorted(present)) or '(none)'}")
-    marker = report_dir / "shard-1.codex-m4"
+    marker = paths[REPORTS[0]].with_suffix(".codex-m4")
     if not marker.is_file() or marker.read_text().strip() != "passed":
         errors.append("Codex M4 did not complete in shard 1")
-    if (report_dir / "shard-2.codex-m4").exists():
+    if paths[REPORTS[1]].with_suffix(".codex-m4").exists():
         errors.append("Codex M4 also ran in shard 2")
     for name in REPORTS:
-        path = report_dir / name
+        path = paths[name]
         if not path.is_file():
             continue
         try:
@@ -131,7 +164,47 @@ def self_test():
         (directory / REPORTS[1]).unlink()
         errors, _ = check_reports(directory, expected)
         require(errors, "expected exactly", "missing shard report went unnoticed")
-    print("agent shard checker self-test passed: duplicate, dropped, unexpected, empty, missing, and M4-count cases fail")
+        attempts = directory / "attempts"
+        attempts.mkdir()
+        old = attempts / "agent-tests-1-attempt-1"
+        retried = attempts / "agent-tests-1-attempt-2"
+        second = attempts / "agent-tests-2-attempt-1"
+        for artifact in (old, retried, second):
+            artifact.mkdir()
+        write(old / REPORTS[0], ["agent/test/a.test.ts", "agent/test/b.test.ts"])
+        write(retried / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
+        write(second / REPORTS[1], ["agent/test/b.test.ts"])
+        (retried / "shard-1.codex-m4").write_text("passed\n")
+        errors, _ = check_reports(attempts, expected)
+        if errors:
+            raise RuntimeError(f"self-test failed: latest reports from different attempts were refused; errors={errors}")
+        # A whole-workflow rerun selects both new legs and ignores old payloads.
+        second_retry = attempts / "agent-tests-2-attempt-2"
+        second_retry.mkdir()
+        write(second_retry / REPORTS[1], ["agent/test/b.test.ts"])
+        write(second / REPORTS[1], ["agent/test/c.test.ts"])
+        (second / "shard-2.codex-m4").write_text("passed\n")
+        errors, _ = check_reports(attempts, expected)
+        if errors:
+            raise RuntimeError(f"self-test failed: whole-workflow retry selected stale payloads; errors={errors}")
+        # An old success cannot fill in a missing marker from the latest attempt.
+        (old / "shard-1.codex-m4").write_text("passed\n")
+        (retried / "shard-1.codex-m4").unlink()
+        errors, _ = check_reports(attempts, expected)
+        require(errors, "did not complete", "a stale M4 marker satisfied the latest attempt")
+        # Attempts sort numerically, not lexically; an aggregator-only rerun needs
+        # the most recent AVAILABLE report for each shard, not its own attempt.
+        tenth = attempts / "agent-tests-1-attempt-10"
+        tenth.mkdir()
+        write(tenth / REPORTS[0], ["agent/test/a.test.ts", "agent/test/c.test.ts"])
+        (tenth / "shard-1.codex-m4").write_text("passed\n")
+        errors, _ = check_reports(attempts, expected)
+        if errors:
+            raise RuntimeError(f"self-test failed: numeric latest attempt was refused; errors={errors}")
+        (tenth / REPORTS[0]).unlink()
+        errors, _ = check_reports(attempts, expected)
+        require(errors, "expected exactly", "a missing latest report fell back to an older report")
+    print("agent shard checker self-test passed: file union, M4 count, mixed-attempt reruns, numeric ordering and stale-report cases")
 
 
 def main():

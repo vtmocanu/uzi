@@ -536,7 +536,8 @@ jobs:
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
         with:
-          name: agent-tests-${{ matrix.shard }}
+          # Preserve each attempt: a failed-only rerun may rerun just one shard.
+          name: agent-tests-${{ matrix.shard }}-attempt-${{ github.run_attempt }}
           path: agent/shard-${{ matrix.shard }}.*
           if-no-files-found: error
           retention-days: 1
@@ -563,7 +564,8 @@ jobs:
         with:
           pattern: agent-tests-*
           path: ${{ runner.temp }}/agent-shards
-          merge-multiple: true
+          # Keep attempts separate; check:agent-shards picks the latest per shard.
+          merge-multiple: false
       - name: Check executed-file union and M4 count
         env:
           UZI_AGENT_SHARD_REPORT_DIR: ${{ runner.temp }}/agent-shards
