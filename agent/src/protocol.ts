@@ -2118,6 +2118,20 @@ export function resolveAgentSelection(
   }
 }
 
+/**
+ * The selection an executor starts a run with, before any gate verdict: the claim's
+ * PERSISTED selection when it carried one (so a pre-approved resume honours the same
+ * human verdict that let it skip the gate), else `absent`. Absent is the right answer for
+ * a run that never reached a gate and for an older server that predates the field, because
+ * resolveAgentSelection's absent-default (repo when a roster was detected, else own) is
+ * exactly what such a run should get. It is NOT folded into `invalid`: absence is not a
+ * signal to distrust, and forcing `own` would pin every gate-less run to a source this
+ * code guessed. Shared by both executors so the seed cannot drift between harnesses.
+ */
+export function seedAgentSelection(persisted?: AgentSelection | null): AgentSelectionParse {
+  return persisted ? { status: "ok", selection: persisted } : { status: "absent" };
+}
+
 /** Body of POST /runs/:id/state. Fields are set per target status.
  *
  *  NOTE FOR ANYONE GREPPING THIS FILE: `plan_md` is declared on FOUR separate

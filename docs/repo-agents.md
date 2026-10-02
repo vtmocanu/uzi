@@ -36,6 +36,24 @@ roster is detected the message shows two approve buttons — **Approve · repo a
 and **Approve · my templates** — so you pick the source without leaving Slack.
 Per-agent exclusions are a web-only refinement; use "Open in uzi" for those.
 
+## Repo agents on Codex runs
+
+On a Codex run the agent selection applies the same way: implementation
+delegates to the roster you chose at the plan gate (by default the detected
+repo roster), honours your exclusions, and falls back to your own templates when
+the selection is invalid. Planning keeps your own templates. Two Codex-specific
+rules apply to each repo agent's frontmatter:
+
+- **`model:`** is honored only when it names a supported Codex model; otherwise
+  the run's model is used and an `unknown_model` diagnostic is recorded.
+- **`tools:`** entries Codex does not recognise are dropped (with an
+  `unknown_tool` diagnostic), never widened into something broader, so a repo
+  agent can only end up with less authority than it declared.
+
+The [trust trade-off](#the-trust-trade-off--read-before-you-pick-repo-agents)
+below applies unchanged: the lead is told repo-defined subagents' output is
+unverified.
+
 ## What is loaded, and what is never
 
 uzi parses the agent files itself; it never points Claude Code at the repo's

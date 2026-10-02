@@ -56,7 +56,10 @@ import { CodexTransportError, type CodexNotification, type CodexTransport } from
 import type { RunContext, EmittedMessage, Executor, WallParkOutcome, SecretRemediationDecision } from "../src/executor.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
-import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE } from "../src/prompt.js";
+import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
+
+/** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
+const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
 import type { SpawnCommandOptions } from "../src/codex/broker.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
@@ -2312,7 +2315,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
       approvedPlan: undefined,
       gatePlan: async () => {
         gated = true;
-        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
       },
     });
     const planP = makeExecutor(planRig, bindingOf(SUBSCRIPTION)).run(plan.ctx);
@@ -3705,7 +3708,7 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       gated = true;
       gatedPlan = planMd;
       lifecycle.push("approve");
-      return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+      return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
     };
     const { ctx } = makeCtx({
       planApproved: false,
@@ -3790,7 +3793,7 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       gateCalls += 1;
       return gateCalls === 1
         ? { kind: "revise", feedback }
-        : { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
     };
     const { ctx } = makeCtx({
       planApproved: false,
@@ -3858,7 +3861,7 @@ describe("CodexExecutor: plan folding + implement/review loop (m2)", () => {
       gated.push(milestones);
       return gated.length === 1
         ? { kind: "revise", feedback: "again" }
-        : { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
     };
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan, config: { plan_max_revisions: 1 } });
 
@@ -4043,7 +4046,7 @@ describe("CodexExecutor — in-process approved plan drives implement (#1586)", 
     }
     return {};
   };
-  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const approve = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
   const assertApprovedPlanPrompt = (text: string, plan: string, label: string, notPlans: string[] = []): void => {
     assert.ok(text.includes(APPROVAL_FRAMING), `${label}: carries the approval framing`);
     assert.ok(text.includes(`<approved_plan>\n${plan}\n</approved_plan>`), `${label}: carries the gated plan in its fence`);
@@ -4184,7 +4187,7 @@ describe("CodexExecutor — in-process approved plan drives implement (#1586)", 
     const texts = turnTexts(rig.epochs[0]!.transport);
     assert.equal(texts.length, 1);
     // PRD #1798 M2: the raw persisted plan, followed only by the shared pr_summary ask.
-    assert.equal(texts[0], `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "the implement prompt is the raw persisted plan, unframed, then the pr_summary ask");
+    assert.equal(texts[0], `the approved plan\n\n${PR_SUMMARY_GUIDANCE}${NO_SUBAGENTS_BLOCK}`, "the implement prompt is the raw persisted plan, unframed, then the pr_summary ask");
     assert.ok(!texts[0]!.includes(APPROVAL_FRAMING), "no approval framing on the pre-approved path");
     assert.ok(!texts[0]!.includes("<approved_plan>"), "no plan fence on the pre-approved path");
   });
@@ -4432,7 +4435,7 @@ describe("CodexExecutor: new-root resume + session lifecycle (m4)", () => {
         t.push(toolCall(2, "signal_done", {}, th, tn, "c-done")).push(turnCompleted("completed", th, tn));
       }),
     ]);
-    const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => ({ kind: "approve", selection: { source: "own", agents: [] } } as never);
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async () => ({ kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never);
     const { ctx } = makeCtx({ planApproved: false, approvedPlan: undefined, gatePlan });
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "m4-2 run");
 
@@ -5449,7 +5452,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
         gated.push(plan);
         gateStarted();
         await pendingGate;
-        return { kind: "approve", selection: { source: "own", agents: [] } } as never;
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
       },
     });
     const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan clarification");
@@ -5483,7 +5486,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
           }
           return { kind: "cancel" };
         },
-        gatePlan: async () => { gates++; return { kind: "approve", selection: { source: "own", agents: [] } } as never; },
+        gatePlan: async () => { gates++; return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never; },
       });
       const run = withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, mode);
       if (mode === "cancel") {
@@ -5534,7 +5537,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     const followUp = promptTexts(rig.transport)[1]!;
     const entries = Array.from({ length: 10 }, (_, i) => `Q: Question ${i + 1}?\nA: yes`);
     assert.equal(followUp,
-      `The human answered your questions:\n\n${entries.join("\n\n")}\n\nContinue the work with these answers.\n\nContinue the implementation.`);
+      `The human answered your questions:\n\n${entries.join("\n\n")}\n\nContinue the work with these answers.\n\nContinue the implementation.${NO_SUBAGENTS_BLOCK}`);
   });
 
   it("shares the human cap across planning, revision, and implementation", async () => {
@@ -5550,7 +5553,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
       gatePlan: async () => {
         gates++;
         return gates === 1 ? { kind: "revise", feedback: "revise" }
-          : { kind: "approve", selection: { source: "own", agents: [] } } as never;
+          : { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
       },
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "shared cap");
@@ -5609,8 +5612,8 @@ describe("CodexExecutor clarification turns (#1584)", () => {
         assert.deepEqual(checkpoints, []);
         const prompt = promptTexts(rig.transport)[1]!;
         assert.equal(prompt, mode === "answer"
-          ? "The human answered your questions:\n\nQ: Which target?\nA: use server\n\nContinue the work with these answers.\n\nContinue the implementation."
-          : "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nContinue the implementation.");
+          ? "The human answered your questions:\n\nQ: Which target?\nA: use server\n\nContinue the work with these answers.\n\nContinue the implementation." + NO_SUBAGENTS_BLOCK
+          : "Your questions could not be put to a human on this run:\n\n- Which target?\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.\n\nContinue the implementation." + NO_SUBAGENTS_BLOCK);
         if (mode === "auto") assert.doesNotMatch(prompt, /AUTOPILOT_SENTINEL/);
       }
       assert.equal(calls, mode === "answer" || mode === "cancel" || mode === "auto" ? 1 : 0);
@@ -5677,7 +5680,7 @@ describe("CodexExecutor clarification turns (#1584)", () => {
     const { ctx, emitted } = makeCtx({
       planApproved: false, approvedPlan: undefined,
       askUser: async () => { asks++; return { kind: "answer", answers: ["bad"] }; },
-      gatePlan: async () => { gates++; return { kind: "approve", selection: { source: "own", agents: [] } } as never; },
+      gatePlan: async () => { gates++; return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never; },
     });
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "plan and question");
     assert.equal(asks, 0);
@@ -5710,7 +5713,7 @@ describe("CodexExecutor prose-only planning turns (#1593)", () => {
   const promptTexts = (t: FakeTransport): string[] => t.requests.filter((r) => r.method === "turn/start")
     .map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
   const cards = (emitted: EmittedMessage[]) => emitted.filter((m) => m.kind === "status" && m.payload.event === "plan_missing");
-  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const approve = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
   // The nudge and guidance turns RESUME the prose turn's session: one thread/start, no fresh
   // thread, and every root turn/start targets the same thread id.
   const assertSameSession = (t: FakeTransport, turns: number, th = "th-plan"): void => {
@@ -6857,7 +6860,7 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
     .map((m) => String((m.payload as { text?: string }).text ?? ""));
   const transitions = (emitted: EmittedMessage[]): string[] =>
     statusTexts(emitted).filter((t) => /^milestone \S+ (started|reported complete)/.test(t));
-  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const approve = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
   const planWith = (milestones: unknown[][]): Responder => script("th-plan", milestones.map((ms, i) => (th, tn) => [
     toolCall(i + 1, "submit_plan", { plan_md: `PLAN-${i + 1}`, milestones: ms }, th, tn, `c-plan-${i + 1}`),
   ]));
@@ -8693,7 +8696,7 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
       { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, dockerWiring },
       { ...rig.deps, ...deps },
     );
-  const approve = { kind: "approve", selection: { source: "own", agents: [] } } as never;
+  const approve = { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
   const planEpoch = (plan: string): Responder => (c) => {
     if (c.method === "thread/start") return { thread: { id: "th-plan" } };
     if (c.method === "turn/start") {
@@ -8839,7 +8842,7 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
     );
     assert.equal(rig.probeCalls.length, 1, "the probe still ran");
     const [impl] = turnTexts(rig.transport);
-    assert.equal(impl, `the approved plan\n\n${PR_SUMMARY_GUIDANCE}`, "byte-identical to a run without facts");
+    assert.equal(impl, `the approved plan\n\n${PR_SUMMARY_GUIDANCE}${NO_SUBAGENTS_BLOCK}`, "byte-identical to a run without facts");
     assert.deepEqual(statusTexts(emitted), []);
   });
 
@@ -9172,7 +9175,7 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     assert.ok(texts[1]!.includes(A), "turn 2 carries it");
     assert.ok(/<follow_up_[0-9a-f]{16}>/.test(texts[1]!) && texts[1]!.includes("UNTRUSTED INPUT"), "inside the untrusted-input fence");
     assert.ok(texts[1]!.indexOf("the approved plan") < texts[1]!.indexOf("<follow_up_"), "after the base implement prompt");
-    assert.ok(texts[1]!.trimEnd().endsWith(FOLLOW_UP_TRAILER), "a worker trailer, not the user's text, closes the prompt");
+    assert.ok(texts[1]!.trimEnd().endsWith(`${FOLLOW_UP_TRAILER}${NO_SUBAGENTS_BLOCK}`), "a worker trailer, then the worker roster line, never the user's text, closes the prompt");
     assert.deepEqual(seams.included, [1], "reported included once, when turn 2 reached the model");
   });
 
@@ -9352,5 +9355,262 @@ describe("CodexExecutor owner follow-up (issue #1800)", () => {
     await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1800 task run");
     assert.ok(turnTexts(rig.epochs[0]!.transport)[0]!.includes(A));
     assert.deepEqual(seams.included, [1]);
+  });
+});
+
+// ================================================================================
+// Issue #1718: the Codex implement phase honours the approved agent selection (and the repo
+// roster) the way the Claude executor does. The plan phase is deliberately unchanged.
+describe("CodexExecutor agent selection (issue #1718)", () => {
+  const tmpl = (name: string, body: string, extra: Partial<AgentTemplate> = {}): AgentTemplate =>
+    ({ name, description: `${name} agent`, prompt_body: body, tools: null, skills: [], ...extra });
+  const ownAgents = [tmpl("lead", "OWN LEAD BODY"), tmpl("coder", "coder body"), tmpl("tester", "tester body")];
+  const repoReviewer = tmpl("repo-reviewer", "repo reviewer body");
+  const repoTester = tmpl("repo-tester", "repo tester body");
+  const PASSAGE = REPO_SUBAGENT_UNTRUSTED_APPEND;
+  const okSel = (source: "own" | "repo", exclusions: string[] = []) =>
+    ({ status: "ok", selection: { source, exclusions } }) as const;
+
+  /** A responder for ONE epoch whose root turn stays open (so the test can drive spawn_agent
+   *  callbacks) and whose child turns complete at once. `resumed`: the root thread comes from
+   *  thread/resume (a recreated epoch), so every thread/start is a child. */
+  const spawnResponder = (rootTh: string, resumed: boolean): Responder => {
+    let children = 0;
+    return (c) => {
+      if (c.method === "thread/resume") return { thread: { id: rootTh } };
+      if (c.method === "thread/start") {
+        if (!resumed && c.threadStartCount === 1) return { thread: { id: rootTh } };
+        children += 1;
+        return { thread: { id: `th-child-${children}` } };
+      }
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) {
+          if (!resumed) c.transport.push(threadStarted(rootTh));
+          return { turn: { id: "tn-root" } };
+        }
+        const th = String(rec(c.params).threadId);
+        c.transport.push(turnCompleted("completed", th, `tn-${th}`));
+        return { turn: { id: `tn-${th}` } };
+      }
+      return {};
+    };
+  };
+  /** spawn_agent each role in turn on the root; true = admitted (the reply succeeded). Then end the run. */
+  const probeSpawns = async (t: FakeTransport, th: string, roles: string[]): Promise<Record<string, boolean>> => {
+    const out: Record<string, boolean> = {};
+    await waitFor(() => t.turnStartCount >= 1, "root turn started");
+    for (const [i, role] of roles.entries()) {
+      const id = 100 + i;
+      t.push(toolCall(id, "spawn_agent", { role, prompt: "p" }, th, "tn-root", `c-${id}`));
+      await waitFor(() => t.responses.some((r) => r.requestId === id), `spawn_agent ${role} reply`);
+      const entry = t.responses.find((r) => r.requestId === id);
+      out[role] = rec(rec(entry?.response).result).success === true;
+    }
+    t.push(signalDone(th, "tn-root", 900)).push(turnCompleted("completed", th, "tn-root")).end();
+    return out;
+  };
+  const planResponder: Responder = (c) => {
+    if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+    if (c.method === "turn/start") {
+      c.transport.push(threadStarted("th-plan"));
+      c.transport.push(toolCall(1, "submit_plan", { plan_md: "PLAN-1", milestones: [{ id: "m1", title: "Alpha" }] }, "th-plan", "tn-plan", "c-plan"));
+      c.transport.push(turnCompleted("completed", "th-plan", "tn-plan"));
+      return { turn: { id: "tn-plan" } };
+    }
+    return {};
+  };
+  const turnInputs = (t: FakeTransport): string[] =>
+    t.requests.filter((r) => r.method === "turn/start").map((r) => (r.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "");
+  const rootInstructions = (t: FakeTransport): string => {
+    const r = t.requests.find((q) => q.method === "thread/start" || q.method === "thread/resume");
+    return String(rec(r?.params).developerInstructions);
+  };
+  const statuses = (emitted: EmittedMessage[]): string[] =>
+    emitted.filter((m) => m.kind === "status" && m.agent === "worker").map((m) => String((m.payload as { text?: string }).text ?? ""));
+
+  /** Pre-approved run: the root probes spawn_agent for `roles`. */
+  const preApproved = async (extra: Partial<RunContext>, roles: string[]) => {
+    const rig = makeRig({ responder: spawnResponder("th-1", false) });
+    const { ctx, emitted } = makeCtx({ agents: ownAgents, ...extra });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    const admitted = await probeSpawns(rig.transport, "th-1", roles);
+    const result = await withTimeout(run, 5000, "pre-approved selection run");
+    return { rig, emitted, admitted, result };
+  };
+  /** Gated run: plan epoch, approval with `selection`, then the implement epoch probes `roles`. */
+  const gated = async (selection: unknown, extra: Partial<RunContext>, roles: string[]) => {
+    const rig = makeMultiEpochRig([planResponder, spawnResponder("th-plan", true)]);
+    const { ctx, emitted } = makeCtx({
+      agents: ownAgents, planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection }) as never,
+      ...extra,
+    });
+    const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+    await waitFor(() => rig.epochs[1]?.transport !== undefined && rig.providerLaunches() >= 2, "implement epoch");
+    const admitted = await probeSpawns(rig.epochs[1]!.transport, "th-plan", roles);
+    const result = await withTimeout(run, 5000, "gated selection run");
+    return { rig, emitted, admitted, result };
+  };
+
+  it("REGRESSION: a pre-approved run with a repo roster and no selection delegates to the repo agents, not the owner templates", async () => {
+    const { admitted, result, emitted } = await preApproved({ repoAgents: [repoReviewer] }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
+    assert.deepEqual(result.agentSelection, { source: "repo", agents: ["repo-reviewer"] });
+    assert.ok(statuses(emitted).includes("implementing with the repo's agents (repo-reviewer)"));
+  });
+
+  it("absent selection with no repo roster implements with the owner templates (lead excluded)", async () => {
+    const { admitted, result, emitted } = await preApproved({}, ["coder", "tester", "lead"]);
+    assert.deepEqual(admitted, { coder: true, tester: true, lead: false });
+    assert.deepEqual(result.agentSelection, { source: "own", agents: ["coder", "tester"] });
+    assert.ok(statuses(emitted).includes("implementing with your agent templates (coder, tester)"));
+  });
+
+  it("a persisted repo selection with one exclusion refuses the excluded role on a resume", async () => {
+    const { admitted, result } = await preApproved(
+      { repoAgents: [repoReviewer, repoTester], approvedSelection: { source: "repo", exclusions: ["repo-tester"] } },
+      ["repo-reviewer", "repo-tester"],
+    );
+    assert.deepEqual(admitted, { "repo-reviewer": true, "repo-tester": false });
+    assert.deepEqual(result.agentSelection, { source: "repo", agents: ["repo-reviewer"] });
+  });
+
+  it("an approved own selection with exclusions [coder] admits the other owner roles and refuses repo roles", async () => {
+    const { admitted, result } = await gated(okSel("own", ["coder"]), { repoAgents: [repoReviewer] }, ["tester", "coder", "repo-reviewer"]);
+    assert.deepEqual(admitted, { tester: true, coder: false, "repo-reviewer": false });
+    assert.deepEqual(result.agentSelection, { source: "own", agents: ["tester"] });
+  });
+
+  it("approval of a repo selection: the implement turn and resume carry the passage and the selected names; the plan phase is unchanged", async () => {
+    const { rig, admitted } = await gated(okSel("repo", ["repo-tester"]), { repoAgents: [repoReviewer, repoTester] }, ["repo-reviewer", "repo-tester", "coder"]);
+    assert.deepEqual(admitted, { "repo-reviewer": true, "repo-tester": false, coder: false });
+    const [planText] = turnInputs(rig.epochs[0]!.transport);
+    assert.ok(!planText!.includes(PASSAGE) && !planText!.includes("Available subagents") && !planText!.includes("No subagents"), "no roster block on the plan turn");
+    assert.ok(!rootInstructions(rig.epochs[0]!.transport).includes(PASSAGE), "no passage in the plan thread's instructions");
+    assert.ok(rootInstructions(rig.epochs[0]!.transport).includes("OWN LEAD BODY"));
+    const [implText] = turnInputs(rig.epochs[1]!.transport);
+    assert.ok(implText!.includes(PASSAGE), "the implement turn carries the untrusted-review passage");
+    assert.ok(implText!.includes("Available subagents to delegate to: repo-reviewer."), "and the selected names only");
+    assert.ok(!implText!.includes("repo-tester"));
+    assert.ok(rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE), "the resumed thread's developer instructions carry the passage");
+    assert.ok(rootInstructions(rig.epochs[1]!.transport).includes("OWN LEAD BODY"), "the lead stays uzi's builtin");
+  });
+
+  it("own source: names on the base turn, no passage", async () => {
+    const { rig } = await gated(okSel("own"), { repoAgents: [repoReviewer] }, []);
+    const [implText] = turnInputs(rig.epochs[1]!.transport);
+    assert.ok(implText!.includes("Available subagents to delegate to: coder, tester."));
+    assert.ok(!implText!.includes(PASSAGE));
+    assert.ok(!rootInstructions(rig.epochs[1]!.transport).includes(PASSAGE));
+  });
+
+  it("absent selection at the gate resolves to the repo roster when one was detected", async () => {
+    const { admitted, result } = await gated({ status: "absent" }, { repoAgents: [repoReviewer] }, ["repo-reviewer", "coder"]);
+    assert.deepEqual(admitted, { "repo-reviewer": true, coder: false });
+    assert.equal(result.agentSelection?.source, "repo");
+  });
+
+  it("an invalid selection forces own and emits the malformed-selection note", async () => {
+    const { admitted, emitted } = await gated({ status: "invalid" }, { repoAgents: [repoReviewer] }, ["coder", "repo-reviewer"]);
+    assert.deepEqual(admitted, { coder: true, "repo-reviewer": false });
+    assert.ok(statuses(emitted).includes("the submitted agent selection was malformed; using your own agent templates"));
+  });
+
+  it("an ok-repo selection with no roster degrades to own and emits the note", async () => {
+    const { admitted, emitted } = await gated(okSel("repo"), {}, ["coder"]);
+    assert.deepEqual(admitted, { coder: true });
+    assert.ok(statuses(emitted).includes("this clone has no repo agent roster; using your own agent templates"));
+  });
+
+  it("a repo file named lead is a subagent role, never the lead prompt", async () => {
+    const repoLead = tmpl("lead", "REPO LEAD BODY");
+    const { rig, admitted } = await preApproved({ repoAgents: [repoLead, repoReviewer] }, ["lead", "repo-reviewer"]);
+    assert.deepEqual(admitted, { lead: true, "repo-reviewer": true });
+    const instructions = rootInstructions(rig.transport);
+    assert.ok(instructions.includes("OWN LEAD BODY"), "the root keeps uzi's builtin lead");
+    assert.ok(!instructions.includes("REPO LEAD BODY"));
+  });
+
+  it("a repo agent declaring an unsupported tool gets no added tools, and the repo denylist applies", async () => {
+    const odd = tmpl("repo-odd", "odd body", { tools: ["NotARealTool"] });
+    const shell = tmpl("repo-shell", "shell body", { tools: ["Bash", "Task"] });
+    const { rig, admitted } = await preApproved({ repoAgents: [odd, shell] }, ["repo-odd", "repo-shell"]);
+    assert.deepEqual(admitted, { "repo-odd": true, "repo-shell": true });
+    const childStarts = rig.transport.requests.filter((r) => r.method === "thread/start").slice(1);
+    const toolNames = (i: number): string[] => (rec(childStarts[i]?.params).dynamicTools as Array<{ name: string }>).map((x) => x.name);
+    assert.ok(!toolNames(0).includes("uzi_bash"), "the unknown tool granted nothing");
+    assert.ok(toolNames(1).includes("uzi_bash"), "a known allowlisted tool is granted");
+    assert.ok(!toolNames(1).includes("spawn_agent"), "the denylisted Task/Agent alias adds no delegation");
+  });
+
+  it("repo source: completion-rework and clarification continuation prompts carry the passage and names", async () => {
+    const script1 = (th: string, calls: (tn: string) => CodexNotification[][]): Responder => (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: th } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted(th));
+        for (const n of calls(tn)[c.turnStartCount - 1] ?? []) c.transport.push(n);
+        c.transport.push(turnCompleted("completed", th, tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    };
+    // Rework: epoch 0 signals done (attempt 1 unmet) -> the rework turn runs on epoch 1.
+    const reworkRig = makeMultiEpochRig([
+      script1("th-1", (tn) => [[toolCall(21, "signal_done", { milestones_completed: ["m1"] }, "th-1", tn, "c-d1")]]),
+      script1("th-1", (tn) => [[toolCall(31, "signal_done", { milestones_completed: ["m1", "m2"] }, "th-1", tn, "c-d2")]]),
+    ]);
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, config: { max_iterations: 5 },
+      frozenMilestones: [{ id: "m1", title: "Alpha" }, { id: "m2", title: "Beta" }],
+      agents: ownAgents, repoAgents: [repoReviewer],
+      checkpoint: async () => {},
+      recordCompletionAttempt: async () => ({ unmet: attempts++ === 0 ? ["m2"] : [], attemptCount: attempts }),
+    });
+    await withTimeout(makeExecutor(reworkRig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "rework run");
+    const [rework] = turnInputs(reworkRig.epochs[1]!.transport);
+    assert.ok(rework!.startsWith("Completion check (structural interlock)"));
+    assert.ok(rework!.includes(PASSAGE) && rework!.includes("Available subagents to delegate to: repo-reviewer."));
+
+    // Clarification continuation on the same epoch.
+    const clarRig = makeMultiEpochRig([script1("th-1", (tn) => [
+      [],
+      [toolCall(41, "ask_user", { questions: [{ question: "Which target?", header: "Target" }] }, "th-1", tn, "c-ask")],
+      [toolCall(42, "signal_done", {}, "th-1", tn, "c-d3")],
+    ])]);
+    const { ctx: clarCtx } = makeCtx({
+      config: { max_iterations: 3 }, agents: ownAgents, repoAgents: [repoReviewer],
+      askUser: async () => ({ kind: "answer", answers: ["server"] }),
+    });
+    await withTimeout(makeExecutor(clarRig, bindingOf(SUBSCRIPTION)).run(clarCtx), 5000, "clarification run");
+    const texts = turnInputs(clarRig.epochs[0]!.transport);
+    assert.ok(texts[2]!.startsWith("The human answered your questions:"));
+    assert.ok(texts[2]!.includes(PASSAGE) && texts[2]!.includes("Available subagents to delegate to: repo-reviewer."));
+  });
+
+  it("own source: a replacement prompt carries the names and no passage", async () => {
+    const rig = makeMultiEpochRig([(c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method === "turn/start") {
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) c.transport.push(threadStarted("th-1"));
+        if (c.turnStartCount === 2) c.transport.push(toolCall(51, "ask_user", { questions: [{ question: "Q?", header: "H" }] }, "th-1", tn, "c-ask"));
+        if (c.turnStartCount === 3) c.transport.push(toolCall(52, "signal_done", {}, "th-1", tn, "c-d"));
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      }
+      return {};
+    }]);
+    const { ctx } = makeCtx({
+      config: { max_iterations: 3 }, agents: ownAgents, repoAgents: [repoReviewer],
+      approvedSelection: { source: "own", exclusions: [] },
+      askUser: async () => ({ kind: "answer", answers: ["x"] }),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "own clarification run");
+    const texts = turnInputs(rig.epochs[0]!.transport);
+    assert.ok(texts[2]!.startsWith("The human answered your questions:"));
+    assert.ok(texts[2]!.includes("Available subagents to delegate to: coder, tester."));
+    assert.ok(!texts[2]!.includes(PASSAGE));
   });
 });

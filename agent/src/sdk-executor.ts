@@ -52,6 +52,7 @@ import {
 } from "./agents.js";
 import {
   resolveAgentSelection,
+  seedAgentSelection,
   type AgentSelectionParse,
   type AskUserQuestion,
   type ClaimConfig,
@@ -1662,9 +1663,7 @@ export class SdkExecutor implements Executor {
       // roster was detected, else own) is exactly what such a run should get. It is
       // NOT folded into "invalid": absence is not a signal to distrust, and forcing
       // `own` would pin every gate-less run to a source this code guessed.
-      let approvedSelection: AgentSelectionParse = ctx.approvedSelection
-        ? { status: "ok", selection: ctx.approvedSelection }
-        : { status: "absent" };
+      let approvedSelection: AgentSelectionParse = seedAgentSelection(ctx.approvedSelection);
 
       /** PRD #88: parks used so far, against QUESTION_MAX. Worker-side because a
        *  question is an in-process ask_user signal — there is no run_user_inputs row

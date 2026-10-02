@@ -88,14 +88,16 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
-import type { AgentTemplate, AskUserQuestion, ClaimSkill, IterationBudget, Milestone, MilestoneProgress } from "../protocol.js";
+import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
+import { selectSubagentTemplates } from "../agents.js";
+import { REPO_AGENT_DENIED_TOOLS } from "../repoagents.js";
 import type { CommandSandboxMode } from "../config.js";
 
 import { ExecutionRegistry, newLocalExecutionEpoch, type RegisteredRoot } from "./registry.js";
@@ -457,17 +459,27 @@ function planMaxRevisionsOf(config: RunContext["config"]): number {
     : DEFAULT_MAX_REVISIONS;
 }
 
+/** The implement-phase delegation targets for a RESOLVED selection (agents.ts
+ *  selectSubagentTemplates, which owns the source/exclusion semantics). Used by both the request
+ *  builder and run()'s status line / result so the names cannot diverge. */
+function implementTemplates(ctx: RunContext, selection: AgentSelection): AgentTemplate[] {
+  return selectSubagentTemplates(selection.source, ctx.agents ?? [], ctx.repoAgents ?? [], selection.exclusions);
+}
+
 /** Map one uzi {@link AgentTemplate} onto the neutral {@link HarnessAgent} the Codex
  *  renderer consumes. `null`/absent tools = inherit; a list = an explicit allowlist. */
-function toHarnessAgent(t: AgentTemplate): HarnessAgent {
+function toHarnessAgent(t: AgentTemplate, repoSkills?: readonly string[]): HarnessAgent {
+  // Repo-sourced agents (repoSkills given) are untrusted and have no template rows to allocate
+  // skills against: every one gets the run's whole skill set (agents.ts subagentsFromTemplates
+  // parity) and the repo denylist, which the renderer applies to an explicit allowlist too.
   return {
     description: t.description,
     prompt: t.prompt_body,
     model: t.model ?? undefined,
     tools: t.tools == null ? { kind: "inherit" } : { kind: "allow", names: t.tools },
-    deniedTools: [],
+    deniedTools: repoSkills ? [...REPO_AGENT_DENIED_TOOLS] : [],
     toolServers: [],
-    skills: t.skills ?? [],
+    skills: repoSkills ? [...repoSkills] : (t.skills ?? []),
   };
 }
 
@@ -1551,6 +1563,10 @@ interface EpochSharedContext {
    *  It follows ctx.signal for a genuine cancel/shutdown only: a PauseNowSignal abort spends the
    *  shared signal permanently, and a declined or refused pause must still mint fresh epochs. */
   readonly lifecycleSignal: AbortSignal;
+  /** The run's RESOLVED agent selection (issue #1718), set once by run() before the implement
+   *  loop and read per request by buildRunRequest. A run-local cell (not an executor field) so it
+   *  cannot outlive run(); undefined during the plan phase, which never reads it. */
+  readonly selection: { current: AgentSelection | undefined };
 }
 
 /**
@@ -2037,6 +2053,7 @@ export class CodexExecutor implements Executor {
         // a later worker claim gets a new accountant and a new explicit init lineage.
         accountant: new CodexUsageAccountant(),
         lifecycleSignal: lifecycleAbort.signal,
+        selection: { current: undefined },
       };
 
       // Build the FIRST provider epoch (epoch 0): eager fresh credential release (fail-closed),
@@ -2115,7 +2132,7 @@ export class CodexExecutor implements Executor {
         let fallbackUsed = false;
         // `round` counts clarification rounds only; the prose-only recovery below has its own budget.
         for (let round = 0; ; ) {
-          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow);
+          const turn = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer, "plan", prompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker, shared.selection.current, { completedCount: 0 }, shared.scrubProjected, beforeReapingSink, pauseNow);
           // Issue #1764: an owner `now` pause dropped the plan turn. The runner's plan-phase catch
           // parks it (handlePausePark); the finally persists the live plan epoch and tears it down.
           if (turn.kind === "paused") throw new PauseNowSignal();
@@ -2156,6 +2173,10 @@ export class CodexExecutor implements Executor {
           prompt = `${followUp}\n\nNow produce the implementation plan and submit it with submit_plan. Do not begin implementing.`;
         }
       };
+      // Issue #1718 (sdk-executor parity): the selection this run implements with. Seeded from the
+      // claim's persisted selection (a pre-approved resume honours the verdict that skipped the
+      // gate); the gate's approve verdict overwrites it below.
+      let approvedSelection = seedAgentSelection(ctx.approvedSelection);
       if (!preApproved && ctx.gatePlan) {
         // The PLAN turn(s) run under PLAN-phase grants: the broker denies every file write
         // (write_denied_in_plan) and child subagents inherit plan-phase grants, so nothing
@@ -2202,6 +2223,7 @@ export class CodexExecutor implements Executor {
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         gatedPlan = planMd;
         approvedMilestones = planResult.milestones;
+        approvedSelection = verdict.selection;
 
         // NEW-ROOT RESUME at plan approval. The plan turn's provider root holds a live credential
         // it does not need during the approval wait, so: persist the credential-free session,
@@ -2241,6 +2263,28 @@ export class CodexExecutor implements Executor {
       //   - reaching the bounded iteration budget holds a post-attempt run and otherwise fails;
       //   - otherwise an iteration-boundary fallback checkpoint (reap:false — credential-free, does
       //     NOT reap the provider → NO recreation; the SAME epoch drives the next turn), then continue.
+      // Issue #1718: resolve the selection ONCE, on every path (gated, pre-approved, resumed, no
+      // gate), before any implement turn. An invalid selection forces `own` and a repo selection
+      // with no detected roster degrades to `own` (resolveAgentSelection owns both rules), so a
+      // malformed verdict can never activate attacker-authored repo agents.
+      const resolvedSelection = resolveAgentSelection(approvedSelection, (ctx.repoAgents?.length ?? 0) > 0);
+      if (resolvedSelection.note) {
+        ctx.emit({ kind: "status", agent: "worker", payload: { text: resolvedSelection.note } });
+      }
+      const selection = resolvedSelection.selection;
+      shared.selection.current = selection;
+      const selectedNames = implementTemplates(ctx, selection).map((t) => t.name);
+      const agentSelection = { source: selection.source, agents: selectedNames };
+      ctx.emit({
+        kind: "status",
+        agent: "worker",
+        payload: {
+          text:
+            selection.source === "repo"
+              ? `implementing with the repo's agents (${selectedNames.join(", ") || "none"})`
+              : `implementing with your agent templates (${selectedNames.join(", ") || "none"})`,
+        },
+      });
       let maxIterations = positiveOr(ctx.config?.max_iterations, DEFAULT_MAX_ITERATIONS);
       let latestProgress: ReducedTurnResult["progress"];
       let iteration = 0;
@@ -2286,6 +2330,7 @@ export class CodexExecutor implements Executor {
       let epochNeedsRecreate = false;
       const loopResult = (): ExecutorResult => ({
         branch: ctx.branch,
+        agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
         ...(pausedAt ? { pausedAt } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
@@ -2342,7 +2387,7 @@ export class CodexExecutor implements Executor {
               break;
             }
             const outcome = await this.parkAtWall(ctx, at, beforeReapingSink, pauseNow, pauseToken);
-            if (outcome === "parked") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
+            if (outcome === "parked") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
             // "refused" (the owner extended; wall mode cleared): re-arm the run-wide wall from the
             // refusal's budget and fall through to the turn. "unwired" (no seam): fall through.
             if (outcome === "refused") {
@@ -2410,9 +2455,9 @@ export class CodexExecutor implements Executor {
           const onProgress = makeProgressObserver(ctx, latestProgress, milestones);
           // Issue #1764: an in-turn owner park reports the server's cumulative count when it served one.
           const turnAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
-          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
-          if (implTurn.kind === "walled") return { branch: ctx.branch, walled: { reason: REASON_WALL } };
-          if (implTurn.kind === "held") return { branch: ctx.branch, completionHeld: { reason: implTurn.reason } };
+          const implTurn = await this.driveTurnWithWallPark(ctx, epoch.harness, epoch.registry, reducer, "implement", nextPrompt, epoch.resumeSessionId, idleMs, wall, epoch.buildPhaseBroker, shared.selection.current, turnAt, shared.scrubProjected, beforeReapingSink, pauseNow, completionAttempted, onProgress, round === 0 ? onOwnerFirstEvent : undefined);
+          if (implTurn.kind === "walled") return { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+          if (implTurn.kind === "held") return { branch: ctx.branch, agentSelection, completionHeld: { reason: implTurn.reason } };
           // Issue #1764: an owner `now` pause dropped the turn and ctx.parkForPause parked the run.
           if (implTurn.kind === "paused") {
             pausedAt = implTurn.at;
@@ -2613,7 +2658,7 @@ export class CodexExecutor implements Executor {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
-      commandCache, lifecycleSignal,
+      commandCache, lifecycleSignal, selection,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -2720,7 +2765,7 @@ export class CodexExecutor implements Executor {
         ));
       const buildPhaseBroker = (phase: "plan" | "implement", signal?: AbortSignal): CodexCallbackBroker => {
         const runPlan = buildCodexRunPlan(
-          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal),
+          this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current),
         );
         const delegationRunner = new CodexDelegationRunner({
           registry,
@@ -2904,6 +2949,7 @@ export class CodexExecutor implements Executor {
     idleMs: number,
     wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
+    selection: AgentSelection | undefined,
     scrubLeadText: (s: string) => string,
     onProgress: (progress: MilestoneProgress) => void,
     pauseNow: CodexPauseNowState,
@@ -2999,7 +3045,7 @@ export class CodexExecutor implements Executor {
     // signal, and the harness reads an abort of it as an owner stop (watchdog/cancel), not as a
     // clean end of the turn. A separate controller cancels only the delegations.
     const effectsAbort = new AbortController();
-    const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal);
+    const request = this.buildRunRequest(ctx, phase, prompt, resumeId, turnAbort.signal, selection);
     try {
       harness.useBroker(buildPhaseBroker(phase, AbortSignal.any([turnAbort.signal, effectsAbort.signal])));
       if (tripReason) throw this.tripError(tripReason, tripToken!);
@@ -3018,7 +3064,7 @@ export class CodexExecutor implements Executor {
             text: "the earlier Codex session was rejected by the provider — continuing WITHOUT its earlier context, so some work may be repeated",
             event: "resume_lineage_break",
           } });
-          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal));
+          turn = harness.startTurn(this.buildRunRequest(ctx, phase, prompt, undefined, turnAbort.signal, selection));
           events = turn.events[Symbol.asyncIterator]();
           return events.next();
         }
@@ -3123,6 +3169,7 @@ export class CodexExecutor implements Executor {
     idleMs: number,
     wall: RunWall,
     buildPhaseBroker: (phase: "plan" | "implement", signal?: AbortSignal) => CodexCallbackBroker,
+    selection: AgentSelection | undefined,
     at: { completedCount: number; total?: number },
     scrubLeadText: (s: string) => string,
     beforeReapingSink: () => Promise<void>,
@@ -3139,7 +3186,7 @@ export class CodexExecutor implements Executor {
     for (;;) {
       try {
         const result = await this.driveCodexTurn(
-          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, scrubLeadText, onProgress, pauseNow, onFirstEvent,
+          ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
         // wall-park re-drive in EVERY phase. The wall PauseNowSignal permanently spent the shared
@@ -3425,19 +3472,38 @@ export class CodexExecutor implements Executor {
     prompt: string,
     resumeId: string | undefined,
     signal: AbortSignal,
+    selection: AgentSelection | undefined,
   ): RunTurnRequest {
     let leadBody: string | undefined;
     const agents: Record<string, HarnessAgent> = {};
-    for (const t of ctx.agents ?? []) {
-      // The lead is the ROOT thread, not a subagent — its body seeds the lead system
-      // prompt; every other template is a delegation target.
-      if (t.name === "lead") {
-        leadBody = t.prompt_body;
-        continue;
+    let repoSourced = false;
+    if (phase === "plan") {
+      // The plan phase is deliberately independent of the selection: it runs before the human
+      // approves one, with the owner's roster, exactly as before issue #1718.
+      for (const t of ctx.agents ?? []) {
+        // The lead is the ROOT thread, not a subagent — its body seeds the lead system
+        // prompt; every other template is a delegation target.
+        if (t.name === "lead") {
+          leadBody = t.prompt_body;
+          continue;
+        }
+        agents[t.name] = toHarnessAgent(t);
       }
-      agents[t.name] = toHarnessAgent(t);
+    } else {
+      if (!selection) throw new Error("codex implement request built without a resolved agent selection");
+      repoSourced = selection.source === "repo";
+      // The lead body is ALWAYS the owner's `lead` template (uzi's builtin) under either source;
+      // a repo file named `lead` is only ever a subagent (selectSubagentTemplates).
+      leadBody = (ctx.agents ?? []).find((t) => t.name === "lead")?.prompt_body;
+      const repoSkills = repoSourced ? (ctx.skills ?? []).map((s) => s.name) : undefined;
+      for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
+      // The roster (and, for a repo roster, the untrusted-content passage) rides EVERY implement
+      // prompt built here, so the base prompt and every replacement prompt (completion rework,
+      // safety steer, clarification continuation) carry it: the resumed thread's developer
+      // instructions alone are not enough on a turn that bypasses implementPrompt.
+      prompt = [prompt, "", delegatesLine(Object.keys(agents)), ...(repoSourced ? [REPO_SUBAGENT_UNTRUSTED_APPEND] : [])].join("\n");
     }
-    const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex" }).append;
+    const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
     const request: RunTurnRequest = {

@@ -21,6 +21,7 @@ import {
   encodeAgentSelection,
   parseAgentSelection,
   resolveAgentSelection,
+  seedAgentSelection,
 } from "../src/protocol.js";
 
 let clone: string;
@@ -524,5 +525,16 @@ describe("resolveAgentSelection — the fallback never resolves toward the untru
     assert.deepEqual(resolveAgentSelection({ status: "absent" }, false), {
       selection: { source: "own", exclusions: [] },
     });
+  });
+});
+
+describe("seedAgentSelection (issue #1718)", () => {
+  it("seeds ok from a persisted selection, absent otherwise (never invalid)", () => {
+    const sel = { source: "repo" as const, exclusions: ["x"] };
+    assert.deepEqual(seedAgentSelection(sel), { status: "ok", selection: sel });
+    assert.deepEqual(seedAgentSelection(undefined), { status: "absent" });
+    assert.deepEqual(seedAgentSelection(null), { status: "absent" });
+    // The absent seed resolves exactly as a gate-less run should.
+    assert.deepEqual(resolveAgentSelection(seedAgentSelection(undefined), true).selection.source, "repo");
   });
 });

@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex runs now delegate to the repo's `.claude/agents/` roster and honour the plan-gate agent selection ([#1718](https://github.com/vtmocanu/uzi/issues/1718)).**
+  On Codex, implementation delegates to the selected roster (default: the detected repo roster), honours exclusions, falls back to your own templates on an invalid selection, and tells the lead that repo-defined subagents' output is unverified; planning keeps your templates, a repo agent's `model:` is used only when it names a supported Codex model (else the run's model, with an `unknown_model` diagnostic), and unrecognised tool names are dropped.
+
 - **Codex runs, delegated agents and the judge apply the configured reasoning effort.**
   The executor consumes the claimed effort and sends the app-server turn parameter as `effort`; the previously used internal field name was ignored by Codex.
 

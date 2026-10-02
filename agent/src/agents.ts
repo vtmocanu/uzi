@@ -481,3 +481,27 @@ export function selectSubagents(
   }
   return out;
 }
+
+/**
+ * The IMPLEMENT-phase subagent TEMPLATES for a harness that renders from templates (Codex)
+ * rather than from SDK AgentDefinitions; the template-level counterpart of
+ * {@link selectSubagents}, with the same source/exclusion semantics (PRD #37 Decision 5).
+ *
+ *   - "own":  the owner's templates minus the one named exactly `lead` (the lead is the root
+ *             thread, never a delegation target) minus the exclusions.
+ *   - "repo": every repo template minus the exclusions. A repo file named `lead` stays an
+ *             ordinary subagent: the lead prompt is always uzi's builtin under either source.
+ *
+ * Exclusions are re-applied here worker-side, as in selectSubagents; naming an agent that is
+ * not in the chosen source is a harmless no-op.
+ */
+export function selectSubagentTemplates(
+  source: AgentSource,
+  ownTemplates: AgentTemplate[],
+  repoTemplates: AgentTemplate[],
+  exclusions: readonly string[],
+): AgentTemplate[] {
+  const exclude = new Set(exclusions);
+  const pool = source === "repo" ? repoTemplates : ownTemplates.filter((t) => t.name !== "lead");
+  return pool.filter((t) => !exclude.has(t.name));
+}

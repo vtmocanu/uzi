@@ -8,6 +8,7 @@ import {
   LEAD_NAME_RE,
   planTurnSubagents,
   selectSubagents,
+  selectSubagentTemplates,
   subagentsFromTemplates,
   subagentCanWrite,
   subagentWriteCapabilities,
@@ -893,6 +894,41 @@ describe("uzi runtime facts reach every subagent through the append (PRD #1849)"
         for (const phrase of UZI_RUNTIME_PHRASES) {
           assert.ok(def.prompt.includes(phrase), `${source}/${name}: missing ${JSON.stringify(phrase)}`);
         }
+      }
+    }
+  });
+});
+
+describe("selectSubagentTemplates (issue #1718)", () => {
+  const repoLead: AgentTemplate = { name: "lead", description: "repo lead", prompt_body: "REPO LEAD" };
+  const repoCoder: AgentTemplate = { name: "coder", description: "repo coder", prompt_body: "REPO CODER" };
+  const repoAuditor: AgentTemplate = { name: "auditor", description: "repo auditor", prompt_body: "audit" };
+  const names = (ts: AgentTemplate[]): string[] => ts.map((t) => t.name);
+
+  it("own: owner templates minus the lead and the exclusions, in input order", () => {
+    assert.deepStrictEqual(names(selectSubagentTemplates("own", [lead, coder, reviewer], [repoAuditor], [])), ["coder", "reviewer"]);
+    assert.deepStrictEqual(names(selectSubagentTemplates("own", [lead, coder, reviewer], [], ["coder"])), ["reviewer"]);
+  });
+
+  it("repo: every repo template (a repo lead stays a subagent) minus the exclusions", () => {
+    assert.deepStrictEqual(names(selectSubagentTemplates("repo", [lead, coder], [repoLead, repoCoder, repoAuditor], [])), ["lead", "coder", "auditor"]);
+    assert.deepStrictEqual(names(selectSubagentTemplates("repo", [lead, coder], [repoLead, repoCoder, repoAuditor], ["lead", "auditor"])), ["coder"]);
+  });
+
+  it("an exclusion naming nothing in the chosen source is a no-op", () => {
+    assert.deepStrictEqual(names(selectSubagentTemplates("own", [lead, coder], [repoAuditor], ["auditor"])), ["coder"]);
+  });
+
+  it("names match selectSubagents for the same inputs (both sources)", () => {
+    const own = [lead, coder, reviewer];
+    const repo = [repoCoder, repoAuditor];
+    for (const source of ["own", "repo"] as const) {
+      for (const exclusions of [[], ["coder"], ["auditor", "reviewer"]]) {
+        assert.deepStrictEqual(
+          names(selectSubagentTemplates(source, own, repo, exclusions)).sort(),
+          Object.keys(selectSubagents(source, assembleAgents(own).subagents, repo, exclusions)).sort(),
+          `${source} / ${exclusions.join(",") || "none"}`,
+        );
       }
     }
   });

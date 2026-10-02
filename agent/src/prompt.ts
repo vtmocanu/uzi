@@ -1805,7 +1805,7 @@ export function milestoneStatusNote(
 // (inherit-all) as read-only. `canWrite` is looked up per name; a name missing from
 // the map (should not happen for a real roster) defaults to read-only. When the map
 // is absent entirely (back-compat), the line renders names only, as before.
-function delegatesLine(
+export function delegatesLine(
   subagentNames: string[],
   canWrite?: Record<string, boolean>,
 ): string {
