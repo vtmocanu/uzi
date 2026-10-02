@@ -69,6 +69,11 @@ const CTX: DeliveryContext = {
   truncated: { issue: false, prd: false, plan: false, previous: false, claims: false, commits: false, paths: false, diff: false },
   bytes: 0,
 };
+const DIAGRAM = {
+  kind: "sequence" as const,
+  nodes: [{ key: "worker", label: "Worker" }, { key: "api", label: "API" }],
+  edges: [{ from: "worker", to: "api", label: "stage" }, { from: "api", to: "worker", label: "ack" }],
+};
 const SUMMARY: DeliverySummary = {
   summary: "Reviewers can now mark a finding done from the Findings page.",
   changes: ["Web: a Mark done button on each row."],
@@ -299,6 +304,44 @@ const OLD_REGION = [REGION_START, "An older summary of this PR.", "", SIZE_LINE,
 // ── Step 1 and the fallback ladder (D8) ──────────────────────────────────────────────────────
 
 describe("publisher: staging and the fallback ladder (D8)", () => {
+  it("the fake bind records an optional diagram flag and rejects a changed flag or hash", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const version = [...api.versions.values()][0]!;
+    assert.equal(version.region_has_diagram, null);
+    assert.deepEqual(version.fields.diagram, { ...DIAGRAM, title: "" });
+    const body = { version_id: version.id, mr_iid: MR, rendered_region_sha256: "a".repeat(64), region_has_diagram: true };
+    assert.equal(api.handle("bind", RUN, body).status, 200);
+    assert.equal(version.region_has_diagram, true);
+    assert.equal(api.state(MR)?.diagram_published, false);
+    assert.equal(api.handle("bind", RUN, { ...body, region_has_diagram: false }).status, 409);
+    assert.equal(api.handle("bind", RUN, { version_id: version.id, mr_iid: MR, rendered_region_sha256: body.rendered_region_sha256 }).status, 409);
+    assert.equal(api.handle("bind", RUN, { ...body, rendered_region_sha256: "b".repeat(64) }).status, 409);
+  });
+
+  it("drops malformed diagrams from a custom delivery pass while retaining prose", async () => {
+    const malformed = { ...DIAGRAM, edges: [{ from: "worker", to: "missing" }, DIAGRAM.edges[1]] };
+    const r = rig(new FakePass({ ...SUMMARY, diagram: malformed }));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const stage = stages().at(-1)!;
+    assert.equal(stage.source, "generated");
+    assert.equal((stage.fields as { diagram?: unknown }).diagram, undefined);
+    assert.equal(stage.fields.summary, SUMMARY.summary);
+  });
+
+  it("drops diagrams for docs-only and binary-only zero-code sizes, but keeps them when size is unavailable", async () => {
+    for (const [name, size, kept] of [
+      ["docs", { ...SIZE, code: ZERO, docs: { added: 3, deleted: 0 } }, false],
+      ["binary", { ...SIZE, code: ZERO }, false],
+      ["unavailable", { ...SIZE, unavailable: true, code: ZERO }, true],
+    ] as const) {
+      const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+      await r.publisher.prepare(makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: SIZE_LINE, size } }) }), { headSha: H1, targetBranch: "main" });
+      const stage = stages().at(-1)!;
+      assert.equal((stage.fields as { diagram?: unknown }).diagram !== undefined, kept, name);
+    }
+  });
+
   it("rung 1: the editor pass stages `generated` with the lead's stamped checks, and a new PR is published as created", async () => {
     const r = rig();
     const { pub, out } = await newPr(r, makeSpec({ lead: LEAD }));

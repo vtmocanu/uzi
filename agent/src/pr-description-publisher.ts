@@ -84,7 +84,7 @@ import type {
   RawPrDescriptionFields,
 } from "./protocol.js";
 import type { PrSummaryClaim } from "./signals.js";
-import type { DeliverySummary, DeliverySummaryClaimView, DeliverySummaryInput } from "./summary-runner.js";
+import { parseDeliveryDiagram, type DeliverySummary, type DeliverySummaryClaimView, type DeliverySummaryInput } from "./summary-runner.js";
 
 // ── Seams ──────────────────────────────────────────────────────────────────────────────────
 
@@ -594,7 +594,16 @@ export class PrDescriptionPublication {
       const lead = leadFields(spec.lead);
       if (generated) {
         source = "generated";
-        fields = { ...generated, scope_notes: generated.scope_notes.map((n) => ({ ...n })), verification: leadVerification(spec.lead) };
+        const zeroCode = facts && !facts.size.size.unavailable &&
+          facts.size.size.code.added + facts.size.size.code.deleted === 0;
+        fields = {
+          ...generated,
+          scope_notes: generated.scope_notes.map((n) => ({ ...n })),
+          verification: leadVerification(spec.lead),
+        };
+        const diagram = !zeroCode && parseDeliveryDiagram(generated.diagram);
+        if (diagram) fields.diagram = diagram;
+        else delete fields.diagram;
       } else if (lead) {
         source = "lead_only";
         fields = lead;
