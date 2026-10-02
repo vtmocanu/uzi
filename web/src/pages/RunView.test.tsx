@@ -62,6 +62,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       listAgentTemplates: vi.fn(),
+      listFindings: vi.fn().mockResolvedValue({ findings: [], open_count: 0 }),
       getRunReview: vi.fn(),
       rerunJudge: vi.fn(),
       // PRD #68 M4: the file-issue draft/write + the picker's repo list. Defaulted to an
@@ -2103,6 +2104,61 @@ describe("RunView report-only surfaces (issue #279)", () => {
     expect(link.textContent).toContain("Open merge request");
     expect(screen.queryByText("report only")).toBeNull();
     expect(screen.queryByText("Findings")).toBeNull();
+  });
+});
+
+describe("RunView incidental findings summary", () => {
+  function show(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over), messages: [], connected: true, error: "", submit: vi.fn(),
+      refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+  }
+
+  it("counts returned open rows, ignores global open_count and links to the filtered page", async () => {
+    mockApi.listFindings.mockResolvedValue({
+      findings: [{ status: "open" }, { status: "open" }, { status: "done" }, { status: "filed" }],
+      open_count: 99,
+    } as Awaited<ReturnType<typeof api.listFindings>>);
+    show({ id: "r/1 &", status: "completed", report_only: true, report_md: "Report result" });
+    render(<MemoryRouter initialEntries={["/runs/r%2F1%20%26"]}><RunView /></MemoryRouter>);
+    expect(await screen.findByText("Incidental findings: 2 open")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &");
+    expect(screen.getByRole("link", { name: "View findings" }).getAttribute("href")).toBe("/findings?run=r%2F1%20%26");
+    expect(screen.getByText("Report result")).toBeTruthy();
+    expect(screen.getByRole("heading", { name: "Findings" })).toBeTruthy();
+  });
+
+  it("hides zero rows, nonterminal runs and fetch errors", async () => {
+    mockApi.listFindings.mockResolvedValue({ findings: [], open_count: 9 } as Awaited<ReturnType<typeof api.listFindings>>);
+    show({ status: "completed" });
+    const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
+    show({ status: "running" });
+    view.rerender(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
+    mockApi.listFindings.mockRejectedValue(new Error("offline"));
+    show({ id: "r2", status: "failed" });
+    view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
+  });
+
+  it("ignores a response from the previous run", async () => {
+    let resolveOld!: (value: Awaited<ReturnType<typeof api.listFindings>>) => void;
+    mockApi.listFindings.mockImplementation((_, __, id) => id === "r1"
+      ? new Promise((resolve) => { resolveOld = resolve; })
+      : Promise.resolve({ findings: [], open_count: 0 } as Awaited<ReturnType<typeof api.listFindings>>));
+    show({ id: "r1", status: "completed" });
+    const view = render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r1"));
+    show({ id: "r2", status: "completed" });
+    view.rerender(<MemoryRouter initialEntries={["/runs/r2"]}><RunView /></MemoryRouter>);
+    await waitFor(() => expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r2"));
+    await act(async () => resolveOld({ findings: [{ status: "open" }], open_count: 1 } as Awaited<ReturnType<typeof api.listFindings>>));
+    expect(screen.queryByText(/Incidental findings:/)).toBeNull();
   });
 });
 

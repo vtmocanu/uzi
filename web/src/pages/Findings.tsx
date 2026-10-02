@@ -577,7 +577,7 @@ export function Findings() {
 
       {runAnchor && (
         <div className="flex flex-wrap items-center gap-2 rounded-lg border border-info/30 bg-info/[0.06] px-3 py-2 text-sm">
-          <span className="text-muted">Filtered to one run's findings (from a notification).</span>
+          <span className="text-muted">Filtered to one run's findings.</span>
           <button
             type="button"
             onClick={clearRunAnchor}

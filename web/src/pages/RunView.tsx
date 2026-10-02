@@ -1841,6 +1841,22 @@ export function RunView() {
   const currentRunIdRef = useRef(id);
   currentRunIdRef.current = id;
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer } = useRunStream(id);
+  const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
+  const findingsRunId = run?.id;
+  const findingsTerminal = !!run && isTerminalRun(run.status);
+  useEffect(() => {
+    setIncidentalSummary(null);
+    if (!findingsTerminal || !findingsRunId) return;
+    let current = true;
+    api.listFindings("to_file", undefined, findingsRunId)
+      .then(({ findings }) => {
+        if (current) setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
+      })
+      .catch(() => {
+        if (current) setIncidentalSummary(null);
+      });
+    return () => { current = false; };
+  }, [findingsRunId, findingsTerminal]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
@@ -2757,6 +2773,15 @@ export function RunView() {
             )}
           </div>
         </div>
+      )}
+
+      {terminal && incidentalSummary?.runId === run.id && incidentalSummary.count > 0 && (
+        <Card className="flex flex-wrap items-center justify-between gap-2 p-3 text-sm">
+          <span>Incidental findings: {incidentalSummary.count} open</span>
+          <Link className="text-brand hover:underline" to={`/findings?run=${encodeURIComponent(run.id)}`}>
+            View findings
+          </Link>
+        </Card>
       )}
 
       {/* issue #279: a report-only run's deliverable is report_md. Render it right

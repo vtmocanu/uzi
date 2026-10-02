@@ -863,6 +863,30 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     });
   }
 
+  it("uses the run filter with the existing grouped filing flow", async () => {
+    mockApi.listFindings.mockResolvedValue(backlog({
+      run: "r/1 &", open_count: 40, findings: rows.slice(0, 2),
+    }));
+    openDraft();
+    mockApi.fileFindingGroup.mockResolvedValue({
+      operation_id: "op-filtered", disposition_ids: ["d1", "d2"], phase: "settled",
+      issue: { iid: 81, web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/81", title: "Grouped" },
+    });
+    renderFindings(["/findings?run=r%2F1%20%26"]);
+    expect(await screen.findByText("Alpha bug")).toBeTruthy();
+    expect(screen.getByText("Filtered to one run's findings.")).toBeTruthy();
+    expect(mockApi.listFindings).toHaveBeenCalledWith("to_file", undefined, "r/1 &");
+    tick("Alpha bug");
+    tick("Beta bug");
+    fireEvent.click(groupButton());
+    fireEvent.click(await screen.findByRole("button", { name: "Create issue" }));
+    await waitFor(() => expect(mockApi.fileFindingGroup).toHaveBeenCalledWith({
+      ids: ["d1", "d2"], title: "Findings (2): Alpha bug",
+      description: "1. Alpha\n2. Beta", labels: ["uzi"],
+    }));
+    expect(await screen.findByText(/Filed 2 findings as issue #81/)).toBeTruthy();
+  });
+
   it("happy path: loads the draft, posts ids and edits, reloads, and shows the warning", async () => {
     openDraft();
     mockApi.fileFindingGroup.mockResolvedValue({
