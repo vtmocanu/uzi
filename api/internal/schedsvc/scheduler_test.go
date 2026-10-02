@@ -3059,48 +3059,72 @@ func TestFirePromptMrModeNoDigestNoForgeCall(t *testing.T) {
 	}
 }
 
-// TestFirePromptMrModeFeatureBingoNoDeliveryInjection proves the SHIPPED feature-bingo
-// default (output: mr) fires byte-identical to its catalog body: no delivery override, no
-// digest, no forge call. This is success criterion 1 (mr mode stays byte-identical) for the
-// exact catalog prompt whose body carries the idea-file/MR mechanics.
+// TestFirePromptMrModeFeatureBingoNoDeliveryInjection covers stored mr and NULL
+// modes at fire time for both proposal catalog jobs. Existing rows retain mr delivery.
 func TestFirePromptMrModeFeatureBingoNoDeliveryInjection(t *testing.T) {
-	h := newHarness()
-	h.fb.f.listResult = []forge.Issue{{IID: 10, Title: "SHOULD-NOT-APPEAR", State: "opened"}}
-	want, ok := schedtmpl.BySlug("feature-bingo")
-	if !ok {
-		t.Fatal("feature-bingo catalog entry missing")
-	}
-	sched := store.RunSchedule{
-		ID:          uuid.New(),
-		UserID:      h.owner,
-		RepoID:      h.repoID,
-		Target:      "prompt",
-		Origin:      "default",
-		CatalogSlug: pgtype.Text{String: "feature-bingo", Valid: true},
-		OutputMode:  pgtype.Text{}, // NULL → resolves to the catalog default (mr)
-		Timing:      "recurring",
-		CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
-		Timezone:    "UTC",
-		AutoApprove: true,
-		Status:      "active",
-		Enabled:     true,
-	}
+	for _, slug := range []string{"feature-bingo", "refactor-scout"} {
+		for _, tc := range []struct {
+			name string
+			mode pgtype.Text
+		}{
+			{name: "null_inherits_issues"},
+			{name: "stored_mr", mode: pgtype.Text{String: "mr", Valid: true}},
+		} {
+			t.Run(slug+"/"+tc.name, func(t *testing.T) {
+				h := newHarness()
+				const title = "EXISTING-PROPOSAL"
+				h.fb.f.listResult = []forge.Issue{{IID: 10, Title: title, State: "opened"}}
+				want, ok := schedtmpl.BySlug(slug)
+				if !ok {
+					t.Fatalf("%s catalog entry missing", slug)
+				}
+				sched := store.RunSchedule{
+					ID:          uuid.New(),
+					UserID:      h.owner,
+					RepoID:      h.repoID,
+					Target:      "prompt",
+					Origin:      "default",
+					CatalogSlug: pgtype.Text{String: slug, Valid: true},
+					OutputMode:  tc.mode,
+					Timing:      "recurring",
+					CronExpr:    pgtype.Text{String: "0 * * * *", Valid: true},
+					Timezone:    "UTC",
+					AutoApprove: true,
+					Status:      "active",
+					Enabled:     true,
+				}
 
-	if _, err := h.sched.firePrompt(context.Background(), sched); err != nil {
-		t.Fatalf("firePrompt: %v", err)
-	}
-	if len(h.runs.prompts) != 1 {
-		t.Fatalf("CreatePromptRun calls = %d, want 1", len(h.runs.prompts))
-	}
-	if h.fb.f.listCount != 0 {
-		t.Fatalf("mr-mode feature-bingo made %d ListIssues call(s); it must make NONE", h.fb.f.listCount)
-	}
-	got := h.runs.prompts[0].prompt
-	if got != want.Prompt {
-		t.Fatalf("mr-mode feature-bingo prompt = %q, want the catalog body byte-for-byte", got)
-	}
-	if strings.Contains(got, issuesDeliveryInstruction) {
-		t.Fatalf("mr-mode feature-bingo must carry no delivery instruction; prompt=%q", got)
+				if _, err := h.sched.firePrompt(context.Background(), sched); err != nil {
+					t.Fatalf("firePrompt: %v", err)
+				}
+				if len(h.runs.prompts) != 1 {
+					t.Fatalf("CreatePromptRun calls = %d, want 1", len(h.runs.prompts))
+				}
+				got := h.runs.prompts[0].prompt
+				if tc.mode.Valid {
+					if h.fb.f.listCount != 0 {
+						t.Fatalf("stored mr made %d ListIssues calls, want none", h.fb.f.listCount)
+					}
+					if got != want.Prompt {
+						t.Fatalf("stored mr prompt = %q, want catalog body byte-for-byte", got)
+					}
+					return
+				}
+				if h.fb.f.listCount != 1 {
+					t.Fatalf("NULL mode made %d ListIssues calls, want 1", h.fb.f.listCount)
+				}
+				if !strings.HasPrefix(got, want.Prompt+issuesDeliverySection) {
+					t.Fatalf("NULL mode prompt lacks catalog body followed by delivery instruction: %q", got)
+				}
+				if !strings.Contains(got, "Proposals already filed for this job") ||
+					!strings.Contains(got, fmt.Sprintf("(open) %q", title)) {
+					t.Fatalf("NULL mode prompt lacks existing proposal digest: %q", got)
+				}
+				if strings.Index(got, issuesDeliveryInstruction) > strings.Index(got, "Proposals already filed for this job") {
+					t.Fatalf("delivery instruction must precede digest: %q", got)
+				}
+			})
+		}
 	}
 }
 

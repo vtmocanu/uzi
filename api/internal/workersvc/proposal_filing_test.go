@@ -119,8 +119,13 @@ func TestMaybeFileProposalGates(t *testing.T) {
 		{"output mode mr", func(fs *fakeStore, _ *store.Run, _ **ProposalPayload) {
 			fs.runSchedule.OutputMode = pgtype.Text{String: "mr", Valid: true}
 		}},
-		{"output mode null (defaults mr)", func(fs *fakeStore, _ *store.Run, _ **ProposalPayload) {
+		{"output mode null with unknown slug defaults mr", func(fs *fakeStore, _ *store.Run, _ **ProposalPayload) {
 			fs.runSchedule.OutputMode = pgtype.Text{}
+			fs.runSchedule.CatalogSlug = pgtype.Text{String: "unknown-slug", Valid: true}
+		}},
+		{"output mode null without slug defaults mr", func(fs *fakeStore, _ *store.Run, _ **ProposalPayload) {
+			fs.runSchedule.OutputMode = pgtype.Text{}
+			fs.runSchedule.CatalogSlug = pgtype.Text{}
 		}},
 		{"target not prompt", func(fs *fakeStore, _ *store.Run, _ **ProposalPayload) {
 			fs.runSchedule.Target = "sweep"
@@ -138,6 +143,44 @@ func TestMaybeFileProposalGates(t *testing.T) {
 			if ff.createCalls != 0 {
 				t.Fatalf("CreateIssue was called %d time(s); this gate must file nothing", ff.createCalls)
 			}
+		})
+	}
+}
+
+// TestMaybeFileProposalCatalogOutputMode checks that NULL inherits each catalog
+// default while a stored mr mode still prevents issue filing.
+func TestMaybeFileProposalCatalogOutputMode(t *testing.T) {
+	for _, slug := range []string{"feature-bingo", "refactor-scout"} {
+		t.Run(slug, func(t *testing.T) {
+			t.Run("null inherits issues", func(t *testing.T) {
+				svc, fs, ff, run := proposalFixture(t, slug)
+				fs.runSchedule.OutputMode = pgtype.Text{}
+
+				svc.maybeFileProposal(context.Background(), run, aProposal())
+
+				if ff.createCalls != 1 {
+					t.Fatalf("CreateIssue calls = %d, want 1", ff.createCalls)
+				}
+				if got, want := ff.createLabels, "proposal::"+slug; len(got) != 1 || got[0] != want {
+					t.Fatalf("filed labels = %v, want exactly [%s]", got, want)
+				}
+				if fs.stampedProposal == nil {
+					t.Fatal("expected filed proposal to be stamped confirmed")
+				}
+			})
+			t.Run("stored mr wins", func(t *testing.T) {
+				svc, fs, ff, run := proposalFixture(t, slug)
+				fs.runSchedule.OutputMode = pgtype.Text{String: "mr", Valid: true}
+
+				svc.maybeFileProposal(context.Background(), run, aProposal())
+
+				if ff.createCalls != 0 {
+					t.Fatalf("CreateIssue calls = %d, want 0", ff.createCalls)
+				}
+				if fs.createdProposal != nil {
+					t.Fatal("stored mr mode must not create a proposal audit row")
+				}
+			})
 		})
 	}
 }

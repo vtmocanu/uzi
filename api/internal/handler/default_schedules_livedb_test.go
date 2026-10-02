@@ -364,6 +364,74 @@ func TestPatchDefaultScheduleOutputModeLiveDB(t *testing.T) {
 	}
 }
 
+// TestCatalogProposalOutputModeLiveDB pins catalog seeding, stored overrides, and reset
+// for the proposal jobs whose catalog default is issues. docs-hygiene retains mr.
+func TestCatalogProposalOutputModeLiveDB(t *testing.T) {
+	ctx := context.Background()
+	f := newScheduleFixture(ctx, t)
+
+	for _, tc := range []struct {
+		slug string
+		want string
+	}{
+		{"feature-bingo", schedtmpl.OutputModeIssues},
+		{"refactor-scout", schedtmpl.OutputModeIssues},
+		{"docs-hygiene", schedtmpl.OutputModeMR},
+	} {
+		t.Run(tc.slug, func(t *testing.T) {
+			dto, code := f.enableCatalog(t, f.owner.ID, f.repoID, tc.slug)
+			if code != http.StatusCreated {
+				t.Fatalf("enable status = %d, want 201", code)
+			}
+			if dto.OutputMode == nil || *dto.OutputMode != tc.want {
+				t.Fatalf("enabled output_mode = %v, want %q", dto.OutputMode, tc.want)
+			}
+			if dto.Customized {
+				t.Fatal("fresh catalog schedule is customized")
+			}
+			if tc.slug == "docs-hygiene" {
+				return
+			}
+
+			patched := f.patchDefault(t, f.owner.ID, dto.ID, `{"output_mode":"mr"}`)
+			if patched.OutputMode == nil || *patched.OutputMode != schedtmpl.OutputModeMR {
+				t.Fatalf("patched output_mode = %v, want mr", patched.OutputMode)
+			}
+			if !patched.Customized {
+				t.Fatal("stored mr override should customize an issues-default schedule")
+			}
+
+			got, code := f.getSchedule(t, f.owner.ID, dto.ID)
+			if code != http.StatusOK {
+				t.Fatalf("get status = %d, want 200", code)
+			}
+			if got.OutputMode == nil || *got.OutputMode != schedtmpl.OutputModeMR {
+				t.Fatalf("persisted output_mode = %v, want mr", got.OutputMode)
+			}
+			if resolved := schedtmpl.ResolveOutputMode(*got.OutputMode, true, tc.slug); resolved != schedtmpl.OutputModeMR {
+				t.Fatalf("stored override resolves to %q, want mr", resolved)
+			}
+
+			resetReq := userReq(http.MethodPost, "/api/schedules/"+dto.ID+"/reset", "", f.owner.ID, map[string]string{"id": dto.ID})
+			resetRec := httptest.NewRecorder()
+			f.h.ResetSchedule(resetRec, resetReq)
+			if resetRec.Code != http.StatusOK {
+				t.Fatalf("reset status = %d, want 200 (body %s)", resetRec.Code, resetRec.Body.String())
+			}
+			var reset apitypes.ScheduleDTO
+			if err := json.Unmarshal(resetRec.Body.Bytes(), &reset); err != nil {
+				t.Fatalf("decode reset: %v", err)
+			}
+			if reset.OutputMode == nil || *reset.OutputMode != schedtmpl.OutputModeIssues {
+				t.Fatalf("reset output_mode = %v, want issues", reset.OutputMode)
+			}
+			if reset.Customized {
+				t.Fatal("reset catalog schedule is customized")
+			}
+		})
+	}
+}
+
 // TestPatchDefaultOverrideSubagentModelLiveDB (issue #691): override_subagent_model is a run
 // option owner-editable on a default. A config PATCH toggling it persists AND flips
 // customized (its catalog baseline is always false, so any toggled-on value diverges); an
