@@ -531,3 +531,75 @@ func TestSetRunCompletionHoldClearsCompletionMarkerLiveDB(t *testing.T) {
 		t.Fatal("completion_question_at must be NULL in the row after the hold")
 	}
 }
+
+// TestCompletionDecisionContinueStripsNULLiveDB (#1728): owner continue guidance is free text, and
+// a raw NUL in it raised SQLSTATE 22021 on the follow_up / completion_decision TEXT writes, failing
+// the decision and leaving the run blocked. ContinueCompletionDecision now NUL-strips it (the same
+// stripNUL the partial/accept reason uses), so on both branches the decision applies and every
+// stored body carries the stripped guidance.
+func TestCompletionDecisionContinueStripsNULLiveDB(t *testing.T) {
+	const guidance = "cover the\x00 error path"
+	const want = "cover the error path"
+
+	t.Run("paused", func(t *testing.T) {
+		e := setupInterlockLiveDB(t)
+		svc := e.permitService(t)
+		wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+		runID := e.seedFrozenRun(t, wid, []string{"m1", "m2"}, []string{"m1"}, false)
+		e.exec(t, `UPDATE runs SET status = 'paused', hold_reason = 'completion_blocked',
+		               hold_captured_head = 'capturedhead1', completion_attempts = 1 WHERE id = $1`, runID)
+
+		run, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, guidance)
+		if err != nil {
+			t.Fatalf("an embedded-NUL guidance must strip cleanly and store, not error; got %v", err)
+		}
+		if run.Status != "queued" {
+			t.Fatalf("the decision must apply and resume through queued; status = %q", run.Status)
+		}
+		if body := e.pendingFollowUpBody(t, runID); body != want {
+			t.Fatalf("follow_up body = %q, want the stripped guidance %q", body, want)
+		}
+		if body := e.decisionAuditBody(t, runID); body != want {
+			t.Fatalf("completion_decision audit body = %q, want the stripped guidance %q", body, want)
+		}
+	})
+
+	t.Run("awaiting_input", func(t *testing.T) {
+		e := setupInterlockLiveDB(t)
+		svc := e.permitService(t)
+		wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+		runID := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+		const qid = "completion-q-nul1728"
+		e.exec(t, `UPDATE runs SET status = 'awaiting_input', completion_attempts = 2,
+		               open_question_id = $2, completion_question_at = now() WHERE id = $1`, runID, qid)
+
+		if _, err := svc.ContinueCompletionDecision(e.ctx, e.userID, runID, guidance); err != nil {
+			t.Fatalf("an embedded-NUL guidance must strip cleanly and store, not error; got %v", err)
+		}
+		body, _ := e.pendingAnswer(t, runID)
+		var ab struct {
+			Answers []string `json:"answers"`
+		}
+		if err := json.Unmarshal([]byte(body), &ab); err != nil {
+			t.Fatalf("answer body %q: %v", body, err)
+		}
+		if len(ab.Answers) != 1 || ab.Answers[0] != want {
+			t.Fatalf("answer answers = %q, want [%q]", ab.Answers, want)
+		}
+		if body := e.decisionAuditBody(t, runID); body != want {
+			t.Fatalf("completion_decision audit body = %q, want the stripped guidance %q", body, want)
+		}
+	})
+}
+
+// decisionAuditBody returns the body of the run's single completion_decision audit row.
+func (e interlockLiveDB) decisionAuditBody(t *testing.T, runID uuid.UUID) string {
+	t.Helper()
+	var body pgtype.Text
+	if err := e.pool.QueryRow(e.ctx,
+		`SELECT body FROM run_user_inputs WHERE run_id = $1 AND kind = 'completion_decision'`, runID).
+		Scan(&body); err != nil {
+		t.Fatalf("read completion_decision audit row: %v", err)
+	}
+	return body.String
+}

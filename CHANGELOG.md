@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A completion `continue` decision whose guidance contains a NUL byte no longer fails ([#1728](https://github.com/vtmocanu/uzi/issues/1728)).**
+  The guidance is NUL-stripped before it is stored, as the partial/accept reason already was, so the decision applies instead of erroring with SQLSTATE 22021 and leaving the run blocked; web and CLI both benefit.
+
 - **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
   The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
 

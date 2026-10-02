@@ -113,6 +113,10 @@ func (s *Service) ContinueCompletionDecision(ctx context.Context, userID, runID 
 	if err != nil {
 		return store.Run{}, err
 	}
+	// guidance is owner-supplied free text written raw to TEXT columns (follow_up + audit body), so
+	// NUL-strip it like the partial/accept reason (#1227): a NUL raises SQLSTATE 22021 and fails
+	// the decision (#1728). An all-NUL guidance strips to "", the existing bare-continue case.
+	guidance, _ = stripNUL(guidance)
 	// The continue writes are NON-transactional and byte-identical to #1226: the shared
 	// resumeCompletionBlocked helper (also used by the #1227 partial/accept transaction) executes
 	// them against s.q, with followupGuidance == auditBody == guidance.
