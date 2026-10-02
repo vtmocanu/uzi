@@ -751,16 +751,20 @@ describe("retireRunnerClone EXDEV fallback (#1354)", () => {
     retire: () => Promise<void>,
   ): Promise<void> {
     const short = shortUnixSocket();
+    let bound = false;
     try {
-      await listenUnix(server, short.socket);
-      move(short.socket, path.join(clonePath, ".sock"));
-    } finally {
-      short.dispose();
-    }
-    try {
+      try {
+        await listenUnix(server, short.socket);
+        bound = true;
+        move(short.socket, path.join(clonePath, ".sock"));
+      } finally {
+        short.dispose();
+      }
       await retire();
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      if (bound) {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
     }
   }
 
