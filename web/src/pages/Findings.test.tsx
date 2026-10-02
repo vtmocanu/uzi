@@ -4,6 +4,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import { MemoryRouter } from "react-router-dom";
 import { Findings } from "./Findings";
 import { findingsApi } from "../mocks/mockApi/findings";
+import sharedGroupDraft from "../../../fixtures/finding-group-draft/response.json";
 import { AppShell } from "../components/AppShell";
 import { useAuth } from "../auth/AuthContext";
 import {
@@ -855,13 +856,7 @@ describe("Findings page - File as one issue (issue #1724)", () => {
   });
 
   function openDraft() {
-    mockApi.findingGroupIssueDraft.mockResolvedValue({
-      repo_id: "repo-uzi",
-      disposition_ids: ["d1", "d2"],
-      title: "Findings (2): Alpha bug",
-      description: "1. Alpha\n2. Beta",
-      labels: ["uzi"],
-    });
+    mockApi.findingGroupIssueDraft.mockResolvedValue(sharedGroupDraft);
   }
 
   it("shows the completed mock run's two open findings as a selectable group", async () => {
@@ -915,7 +910,9 @@ describe("Findings page - File as one issue (issue #1724)", () => {
     tick("Beta bug");
     fireEvent.click(groupButton());
     await screen.findByRole("button", { name: "Create issue" });
-    expect(mockApi.findingGroupIssueDraft).toHaveBeenCalledWith(["d1", "d2"]);
+    expect(mockApi.findingGroupIssueDraft).toHaveBeenCalledWith(sharedGroupDraft.disposition_ids);
+    expect(screen.getByDisplayValue(sharedGroupDraft.title)).toBeTruthy();
+    expect(screen.getByText("Description").parentElement?.querySelector("textarea")?.value).toBe(sharedGroupDraft.description);
     expect(screen.getByText("vtmocanu/uzi", { selector: "span, p, div, code" })).toBeTruthy();
 
     fireEvent.change(screen.getByDisplayValue("Findings (2): Alpha bug"), { target: { value: "edited" } });

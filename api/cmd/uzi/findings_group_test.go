@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"os"
 	"reflect"
 	"strconv"
 	"strings"
@@ -59,6 +60,30 @@ func TestFindingsDraftGroupDedupesAndPrintsServerText(t *testing.T) {
 	out, _, code = runCLI(t, fakeEnv(fc), "--quiet", "findings", "draft", "e-1", "e-2")
 	if code != uzicli.ExitOK || out != "" {
 		t.Errorf("quiet: exit=%d out=%q", code, out)
+	}
+}
+
+func TestFindingsDraftMatchesWebDialogFixture(t *testing.T) {
+	raw, err := os.ReadFile("../../../fixtures/finding-group-draft/response.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var webDraft apitypes.FindingGroupDraftDTO
+	if err := json.Unmarshal(raw, &webDraft); err != nil {
+		t.Fatal(err)
+	}
+	fc := groupFake()
+	fc.FindingDrafts["e-1"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d1"}
+	fc.FindingDrafts["e-2"] = apitypes.IncidentalFindingIssueDraftDTO{DispositionID: "d2"}
+	fc.FindingGroupDraftResult = webDraft
+	out, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2")
+	if code != uzicli.ExitOK || out != webDraft.Title+"\n\n"+webDraft.Description+"\n" || !reflect.DeepEqual(fc.LastFindingGroupDraftIDs, webDraft.DispositionIDs) {
+		t.Errorf("CLI preview = %q (exit %d, ids %v), web dialog draft = %+v", out, code, fc.LastFindingGroupDraftIDs, webDraft)
+	}
+	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2", "--json")
+	var cliDraft apitypes.FindingGroupDraftDTO
+	if code != uzicli.ExitOK || json.Unmarshal([]byte(out), &cliDraft) != nil || !reflect.DeepEqual(cliDraft, webDraft) {
+		t.Errorf("CLI JSON draft = %q (exit %d), web dialog draft = %+v", out, code, webDraft)
 	}
 }
 

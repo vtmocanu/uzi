@@ -1,0 +1,7 @@
+{
+  "repo_id": "repo-uzi",
+  "disposition_ids": ["d1", "d2"],
+  "title": "Findings (2): Alpha bug",
+  "description": "1. Alpha\n2. Beta",
+  "labels": ["uzi"]
+}
