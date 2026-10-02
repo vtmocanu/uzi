@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"net"
+	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
@@ -87,5 +88,62 @@ func TestLimiterAllows(t *testing.T) {
 	}
 	if !l.allow("other") {
 		t.Fatal("different key should have its own budget")
+	}
+}
+
+// TestMiddlewareKeysIPv6OnItsSlash64 is the #2075 regression: the IP-keyed middleware
+// used the full client address, so an IPv6 client rotating addresses inside its /64
+// got a fresh budget per address on every authLimiter route (login included).
+func TestMiddlewareKeysIPv6OnItsSlash64(t *testing.T) {
+	h := NewLimiter(2, time.Hour, nil).Middleware(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	hit := func(remote string) int {
+		r := httptest.NewRequest(http.MethodPost, "/api/auth/login", nil)
+		r.RemoteAddr = remote
+		w := httptest.NewRecorder()
+		h.ServeHTTP(w, r)
+		return w.Code
+	}
+	steps := []struct {
+		remote string
+		want   int
+	}{
+		// Three addresses in one /64 share one budget of 2.
+		{"[2001:db8:1:2::1]:1", http.StatusOK},
+		{"[2001:db8:1:2::abcd]:2", http.StatusOK},
+		{"[2001:db8:1:2:ffff::9]:3", http.StatusTooManyRequests},
+		// The neighbouring /64 has its own budget.
+		{"[2001:db8:1:3::1]:1", http.StatusOK},
+		// IPv4 stays per address.
+		{"192.0.2.1:1", http.StatusOK},
+		{"192.0.2.2:1", http.StatusOK},
+		// An IPv4-mapped address and 6to4 addresses embedding 192.0.2.1 (c000:0201)
+		// share 192.0.2.1's bucket, whichever /64 the 6to4 address picks.
+		{"[::ffff:192.0.2.1]:1", http.StatusOK},
+		{"[2002:c000:201:1::1]:1", http.StatusTooManyRequests},
+		{"[2002:c000:201:ffff::1]:1", http.StatusTooManyRequests},
+	}
+	for i, s := range steps {
+		if got := hit(s.remote); got != s.want {
+			t.Fatalf("step %d: request from %s = %d, want %d", i, s.remote, got, s.want)
+		}
+	}
+}
+
+func TestRateLimitSubject(t *testing.T) {
+	for _, tt := range []struct{ in, want string }{
+		{"203.0.113.9", "203.0.113.9"},
+		{"::ffff:203.0.113.9", "203.0.113.9"},
+		{"2001:db8:1:2:3:4:5:6", "2001:db8:1:2::/64"},
+		{"2001:db8:1:2::", "2001:db8:1:2::/64"},
+		{"fe80::1%eth0", "fe80::/64"},
+		{"2002:cb00:7109:1234::1", "203.0.113.9"},
+		{"not-an-ip", "not-an-ip"},
+		{"", ""},
+	} {
+		if got := rateLimitSubject(tt.in); got != tt.want {
+			t.Errorf("rateLimitSubject(%q) = %q, want %q", tt.in, got, tt.want)
+		}
 	}
 }

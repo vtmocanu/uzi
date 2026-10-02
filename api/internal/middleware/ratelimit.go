@@ -5,6 +5,7 @@ package middleware
 import (
 	"net"
 	"net/http"
+	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,7 +16,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 )
 
-// Limiter is an in-process, per-IP fixed-window rate limiter. It intentionally
+// Limiter is an in-process, per-IP fixed-window rate limiter (an IPv6 client is
+// keyed on its /64, see rateLimitSubject). It intentionally
 // avoids an external dependency, since the MVP is a single-process demo.
 // Expired buckets are reclaimed both lazily (on access)
 // and by a background sweeper so the map cannot grow without bound.
@@ -89,8 +91,8 @@ func (l *Limiter) Allow(key string) bool { return l.allow(key) }
 // have to wait, which is what a Retry-After header advertises.
 func (l *Limiter) Window() time.Duration { return l.window }
 
-// Middleware limits by (route pattern, client IP). Apply it per-route so each
-// endpoint gets its own budget.
+// Middleware limits by (route pattern, client IP, an IPv6 client by its /64). Apply
+// it per-route so each endpoint gets its own budget.
 func (l *Limiter) Middleware(next http.Handler) http.Handler {
 	return l.MiddlewareRejecting(func(w http.ResponseWriter, _ int) {
 		httpx.Error(w, http.StatusTooManyRequests, "too many requests")
@@ -104,7 +106,7 @@ func (l *Limiter) Middleware(next http.Handler) http.Handler {
 func (l *Limiter) MiddlewareRejecting(reject func(w http.ResponseWriter, retryAfterSeconds int)) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			key := r.URL.Path + "|" + ClientIP(r, l.trustedProxies)
+			key := r.URL.Path + "|" + rateLimitSubject(ClientIP(r, l.trustedProxies))
 			if !l.allow(key) {
 				secs := int(l.window.Seconds())
 				w.Header().Set("Retry-After", strconv.Itoa(secs))
@@ -133,7 +135,7 @@ func (l *Limiter) PerUserMiddleware(next http.Handler) http.Handler {
 		if user, ok := UserFromContext(r.Context()); ok {
 			who = user.ID.String()
 		} else {
-			who = ClientIP(r, l.trustedProxies)
+			who = rateLimitSubject(ClientIP(r, l.trustedProxies))
 		}
 		if !l.allow(pattern + "|" + who) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
@@ -160,7 +162,7 @@ func (l *Limiter) PerWorkerMiddleware(next http.Handler) http.Handler {
 		if wkr, ok := WorkerFromContext(r.Context()); ok {
 			who = wkr.ID.String()
 		} else {
-			who = ClientIP(r, l.trustedProxies)
+			who = rateLimitSubject(ClientIP(r, l.trustedProxies))
 		}
 		if !l.allow(pattern + "|" + who) {
 			w.Header().Set("Retry-After", strconv.Itoa(int(l.window.Seconds())))
@@ -169,6 +171,32 @@ func (l *Limiter) PerWorkerMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// rateLimitSubject is the source a client IP is rate-limited as. An IPv6 client
+// usually controls at least a /64 and can rotate source addresses inside it, so an
+// IPv6 address is keyed on its /64, the same bucket as the OAuth authorize flow's
+// finest tier (oauthSourceBucketsFor in the handler package). An IPv4-mapped address
+// is its IPv4, and a 6to4 (2002::/16) address is the IPv4 address it embeds, so one
+// IPv4 host cannot mint a budget per /64. Residual: a holder of a larger delegation
+// (/56, /48) still gets one budget per /64 inside it. An unparsable input is
+// returned unchanged.
+func rateLimitSubject(clientIP string) string {
+	addr, err := netip.ParseAddr(clientIP)
+	if err != nil {
+		return clientIP
+	}
+	addr = addr.WithZone("").Unmap()
+	if addr.Is6() {
+		if b := addr.As16(); b[0] == 0x20 && b[1] == 0x02 {
+			// 6to4: bits 16..47 are the embedded IPv4 address.
+			addr = netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]})
+		}
+	}
+	if addr.Is4() {
+		return addr.String()
+	}
+	return netip.PrefixFrom(addr, 64).Masked().String()
 }
 
 // ClientIP determines the real client IP, honoring X-Forwarded-For ONLY when the

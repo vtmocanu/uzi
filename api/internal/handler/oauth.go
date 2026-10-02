@@ -77,8 +77,9 @@ const (
 //
 // A 6to4 (2002::/16) address is bucketed as the IPv4 address it embeds, so one IPv4 host cannot
 // mint 65536 /64 buckets; an IPv4-mapped IPv6 address is its IPv4. THESE are the fairness
-// bound: authLimiter keys on the full address, so without them one source could fill a
-// product's table and lock every real user of that product out. A request lives 5 minutes and a
+// bound: authLimiter keys an IPv6 client on its /64, so a holder of a larger delegation (/56,
+// /48) still gets one rate-limit budget per /64 inside it, and without the tiers one source
+// could fill a product's table and lock every real user of that product out. A request lives 5 minutes and a
 // human decides each, so a source needs a handful at once, never 20.
 //
 //   - oauthPendingPerProductCap (5000) per product and oauthPendingGlobalCap (50000) overall are
