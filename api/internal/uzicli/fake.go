@@ -496,6 +496,9 @@ type FakeClient struct {
 	FindingDrafts             map[string]apitypes.IncidentalFindingIssueDraftDTO
 	LastFindingDraftIDs       []string
 	FindingIssueDraftErr      error
+	FindingGroupDraftResult   apitypes.FindingGroupDraftDTO
+	LastFindingGroupDraftIDs  []string
+	FindingGroupDraftErr      error
 	FileFindingGroupResult    apitypes.FindingGroupFileResultDTO
 	FileFindingGroupAccepted  bool
 	LastFileFindingGroupIDs   []string

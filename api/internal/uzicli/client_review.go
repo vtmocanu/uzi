@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"net/url"
+	"strings"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 )
@@ -132,6 +133,15 @@ func (c *HTTPClient) FindingIssueDraft(ctx context.Context, evidenceID string) (
 	var out apitypes.IncidentalFindingIssueDraftDTO
 	if err := c.get(ctx, "/api/findings/"+url.PathEscape(evidenceID)+"/issue-draft", &out); err != nil {
 		return apitypes.IncidentalFindingIssueDraftDTO{}, err
+	}
+	return out, nil
+}
+
+func (c *HTTPClient) GetFindingGroupIssueDraft(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupDraftDTO, error) {
+	var out apitypes.FindingGroupDraftDTO
+	path := "/api/findings/issue-draft?" + url.Values{"ids": {strings.Join(dispositionIDs, ",")}}.Encode()
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.FindingGroupDraftDTO{}, err
 	}
 	return out, nil
 }

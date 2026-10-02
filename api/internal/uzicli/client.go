@@ -569,6 +569,8 @@ type Client interface {
 	// (possibly older) evidence id to its coordinate's disposition so a group file can dedupe.
 	// An unknown/foreign id is a 404 (exit 4).
 	FindingIssueDraft(ctx context.Context, evidenceID string) (apitypes.IncidentalFindingIssueDraftDTO, error)
+	// GetFindingGroupIssueDraft previews one issue for multiple disposition IDs.
+	GetFindingGroupIssueDraft(ctx context.Context, dispositionIDs []string) (apitypes.FindingGroupDraftDTO, error)
 	// FileFindingGroup files ONE forge issue from several coordinates (issue #1724): POST
 	// /api/findings/issue {ids} keyed on DISPOSITION ids, with the server's default text. The bool
 	// is true on a 202 (the filing has not settled: pre_call/in_flight/returned_uncertain, no

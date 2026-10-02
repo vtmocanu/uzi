@@ -74,6 +74,20 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
+	draft := &cobra.Command{
+		Use:   "draft <finding-id> [<finding-id>...]",
+		Short: "Preview the issue draft for one or more findings (read-only)",
+		Long:  "Preview the server's issue title and description without filing. A grouped preview omits the filing-time operation marker; filing may trim evidence to make room for it. Draft labels are suggestions: `uzi findings file` with defaults sends only explicit finding IDs and the server applies its mandatory marker label.",
+		Args:  cobra.MinimumNArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			c, err := env.client(gf)
+			if err != nil {
+				return err
+			}
+			return runFindingsDraft(env, gf, c, cmd, args)
+		},
+	}
+
 	release := &cobra.Command{
 		Use:   "release <operation-id> --confirm-no-issue",
 		Short: "Release a stuck group filing after confirming no forge issue was created",
@@ -172,7 +186,7 @@ func newFindingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(list, file, release, dismiss, resolve, stats, undo)
+	cmd.AddCommand(list, file, draft, release, dismiss, resolve, stats, undo)
 	return cmd
 }
 
@@ -424,6 +438,72 @@ func runFindingsDismiss(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Co
 // maxGroupFindings is the server's cap on one group filing. The CLI refuses more than this many
 // DISTINCT input ids (repeats do not count) before any request so the draft lookups stay bounded.
 const maxGroupFindings = 50
+
+// runFindingsDraft previews the same server drafts shown by the web editor.
+func runFindingsDraft(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, ids []string) error {
+	seenEvidence := map[string]bool{}
+	var distinct []string
+	for _, id := range ids {
+		if !seenEvidence[id] {
+			seenEvidence[id] = true
+			distinct = append(distinct, id)
+		}
+	}
+	if len(distinct) > maxGroupFindings {
+		return uzicli.Exitf(uzicli.ExitUsage, "at most %d distinct findings can be previewed as one issue (got %d)", maxGroupFindings, len(distinct))
+	}
+	first, err := c.FindingIssueDraft(cmd.Context(), distinct[0])
+	if err != nil {
+		return err
+	}
+	if len(distinct) == 1 {
+		return printFindingDraft(env, gf, first)
+	}
+	if first.DispositionID == "" {
+		return uzicli.Exitf(uzicli.ExitUsage, "finding %s has no triage record yet", sanitizeTTY(distinct[0]))
+	}
+	seenDisposition := map[string]bool{first.DispositionID: true}
+	dispositionIDs := []string{first.DispositionID}
+	for _, id := range distinct[1:] {
+		d, err := c.FindingIssueDraft(cmd.Context(), id)
+		if err != nil {
+			return err
+		}
+		if d.DispositionID == "" {
+			return uzicli.Exitf(uzicli.ExitUsage, "finding %s has no triage record yet", sanitizeTTY(id))
+		}
+		if !seenDisposition[d.DispositionID] {
+			seenDisposition[d.DispositionID] = true
+			dispositionIDs = append(dispositionIDs, d.DispositionID)
+		}
+	}
+	if len(dispositionIDs) == 1 {
+		return printFindingDraft(env, gf, first)
+	}
+	group, err := c.GetFindingGroupIssueDraft(cmd.Context(), dispositionIDs)
+	if err != nil {
+		return err
+	}
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(group)
+	}
+	if !gf.quiet {
+		p.Printf("%s\n\n%s\n", sanitizeTTY(group.Title), sanitizeTTY(group.Description))
+	}
+	return nil
+}
+
+func printFindingDraft(env Env, gf *globalFlags, d apitypes.IncidentalFindingIssueDraftDTO) error {
+	p := env.printer(gf)
+	if p.Format == uzicli.FormatJSON {
+		return p.JSON(d)
+	}
+	if !gf.quiet {
+		p.Printf("%s\n\n%s\n", sanitizeTTY(d.Title), sanitizeTTY(d.Description))
+	}
+	return nil
+}
 
 // releaseHint is the operator guidance shared by every unsettled group filing report.
 const releaseHint = "release is accepted only after the operation's deadline and only once you checked the forge and no such issue exists"

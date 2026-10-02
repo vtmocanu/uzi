@@ -137,6 +137,17 @@ func (f *FakeClient) MarkFindingDone(_ context.Context, id string) (apitypes.Mar
 	return f.MarkFindingDoneResult, nil
 }
 
+func (f *FakeClient) GetFindingGroupIssueDraft(_ context.Context, dispositionIDs []string) (apitypes.FindingGroupDraftDTO, error) {
+	f.LastFindingGroupDraftIDs = append([]string(nil), dispositionIDs...)
+	if f.FindingGroupDraftErr != nil {
+		return apitypes.FindingGroupDraftDTO{}, f.FindingGroupDraftErr
+	}
+	if f.Err != nil {
+		return apitypes.FindingGroupDraftDTO{}, f.Err
+	}
+	return f.FindingGroupDraftResult, nil
+}
+
 // GetReviewIssueDraft records the (run, rec) it was asked about and returns the canned draft.
 // GetReviewIssueDraftErr wins over the blanket Err so a test can model a 404 on the read while
 // the capture still proves the read was reached.
