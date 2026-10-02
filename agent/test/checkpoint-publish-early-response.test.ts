@@ -31,7 +31,7 @@ async function child(mode: Mode): Promise<void> {
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), "ckpt-git-shim-"));
   const release = path.join(shimDir, "release");
   const shim = path.join(shimDir, "git");
-  fs.writeFileSync(shim, `#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = pack-objects ] && [ '${mode}' != success ]; then\n    printf PACK\n    while [ ! -f '${release}' ]; do sleep 0.01; done\n    echo 'intentional pack failure' >&2\n    exit 47\n  fi\ndone\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
+  fs.writeFileSync(shim, `#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = pack-objects ] && [ '${mode}' != success ]; then\n    printf PACK\n    while [ ! -f '${release}' ] && [ -d '${shimDir}' ]; do sleep 0.01; done\n    echo 'intentional pack failure' >&2\n    exit 47\n  fi\ndone\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
   const oldPath = process.env.PATH;
   process.env.PATH = `${shimDir}:${oldPath}`;
 
@@ -113,7 +113,9 @@ if (process.env.UZI_1725_CHILD === "1") {
         timeout: 15_000,
       });
     } finally {
-      fs.rmSync(childTmp, { recursive: true, force: true });
+      // Retries as fixture cleanup does: a killed child's git may still be writing. Removing the
+      // shim dir also ends an orphaned shim's wait loop, which exits once its dir is gone.
+      fs.rmSync(childTmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
     }
     assert.equal(result.status, 0, result.stderr || result.error?.message);
     const observed = JSON.parse(result.stdout.trim());

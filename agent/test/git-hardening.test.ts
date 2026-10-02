@@ -178,8 +178,12 @@ describe("gitEnv M0 hardening: code-exec keys neutralized in real git (functiona
   });
 
   afterEach(() => {
-    fx?.cleanup();
-    if (markerDir) fs.rmSync(markerDir, { recursive: true, force: true });
+    // try/finally (issue #2020): a throwing fixture cleanup must not skip the marker dir.
+    try {
+      fx?.cleanup();
+    } finally {
+      if (markerDir) fs.rmSync(markerDir, { recursive: true, force: true });
+    }
   });
 
   it("diff.external planted in <bare>/config does NOT code-exec in a worker-BARE content diff (baseline proves it would)", async (t) => {

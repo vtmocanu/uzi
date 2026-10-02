@@ -24,7 +24,8 @@ OUTER="$TMP/outer"
 mkdir -p "$OUTER"
 
 # The fake commands. `leave NAME MODE` creates NAME/data/x in its TMPDIR; MODE is
-# none | created | removed (created and removed lines) | longer (created and removed
+# none | created | removed (created and removed lines) | backslash (a created line whose
+# test name carries JSON-escaped backslashes) | longer (created and removed
 # lines for NAME plus one more character, which must NOT be attributed to NAME). `clean` leaves nothing. `fail RC`
 # exits RC. `probe FILE` records the ledger path and the TMPDIR the command saw.
 FAKE="$TMP/fake-tests"
@@ -42,6 +43,9 @@ case "$1" in
     case "$3" in
       removed)
         printf '{"entry":"%s","path":"%s/%s","event":"removed","pid":1,"at":"t"}\n' "$2" "$TMPDIR" "$2" >> "$UZI_TMPDIR_GUARD_LEDGER"
+        ;;
+      backslash)
+        printf '{"entry":"%s","path":"%s/%s","event":"created","pid":1,"at":"t","file":"/w/bs.test.ts","test":"strips \\\\c and \\\\n","site":[]}\n' "$2" "$TMPDIR" "$2" >> "$UZI_TMPDIR_GUARD_LEDGER"
         ;;
       longer)
         printf '{"entry":"%sX","path":"%s/%sX","event":"created","pid":1,"at":"t","file":"/w/other.test.ts","test":"other","site":[]}\n' "$2" "$TMPDIR" "$2" >> "$UZI_TMPDIR_GUARD_LEDGER"
@@ -123,6 +127,13 @@ check "g: rc=1" rc_is 1
 check "g: verdict" err_has "no creator recorded in the ledger"
 check "g: other entry not attributed" err_lacks "/w/other.test.ts"
 check "g: scratch and ledger removed" outer_empty
+
+# h. backslashes in a ledger line print verbatim (an echo under dash would eat `\c`).
+run_guard leave uzi-agent-test-HHHHHH backslash
+check "h: rc=1" rc_is 1
+check "h: backslashes verbatim" err_has '"test":"strips \\c and \\n"'
+check "h: line not truncated" err_has 'and \\n","site":[]}'
+check "h: scratch and ledger removed" outer_empty
 
 # d. clean command.
 run_guard clean

@@ -49,13 +49,30 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  // try/finally (issue #2020): a failed chmod must not skip the fixture cleanup.
-  try {
-    for (const p of unlock.splice(0)) fs.chmodSync(p, 0o755);
-  } finally {
-    fx.cleanup();
+  // Issue #2020: an unlock that fails (product code moved the read-only dir) must neither skip
+  // the fixture cleanup nor leave a read-only subtree that makes it fail, so each listed path is
+  // unlocked best-effort and then every directory under the fixture is made writable.
+  for (const p of unlock.splice(0)) {
+    try {
+      fs.chmodSync(p, 0o755);
+    } catch {
+      // the sweep below covers a path that moved
+    }
   }
+  makeTreeWritable(path.dirname(fx.dataDir));
+  fx.cleanup();
 });
+
+function makeTreeWritable(dir: string): void {
+  try {
+    fs.chmodSync(dir, 0o755);
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (e.isDirectory()) makeTreeWritable(path.join(dir, e.name));
+    }
+  } catch {
+    // best-effort: cleanup() reports anything still undeletable
+  }
+}
 
 function cfg(bare: string, ...args: string[]): string {
   return execFileSync("git", ["-C", bare, "config", "--local", ...args], { env: GIT_ENV, encoding: "utf8", stdio: "pipe" });

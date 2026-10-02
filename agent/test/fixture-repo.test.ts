@@ -61,10 +61,13 @@ if (process.env.UZI_FIXTURE_REPO_CHILD === "1") {
       } finally {
         // A failed assertion above must not leak the fixture into the real guard's TMPDIR,
         // where its created line (in this private ledger) would be gone.
-        if (fx) fs.rmSync(path.dirname(fx.dataDir), { recursive: true, force: true });
         if (saved === undefined) delete process.env.UZI_TMPDIR_GUARD_LEDGER;
         else process.env.UZI_TMPDIR_GUARD_LEDGER = saved;
-        fs.rmSync(dir, { recursive: true, force: true });
+        try {
+          if (fx) fs.rmSync(path.dirname(fx.dataDir), { recursive: true, force: true });
+        } finally {
+          fs.rmSync(dir, { recursive: true, force: true });
+        }
       }
     });
 
