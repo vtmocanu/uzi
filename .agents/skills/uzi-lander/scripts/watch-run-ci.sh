@@ -39,7 +39,8 @@
 #      appeared for the SHA" (a push to main sometimes spawns none: re-point at a descendant
 #      commit rather than waiting)
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
-#      superseded it) and nothing failed. `git fetch origin main` and re-watch the CURRENT
+#      superseded it) and nothing failed. A run still listed in_progress whose jobs are
+#      all terminal with at least one cancelled counts as superseded too, never green. `git fetch origin main` and re-watch the CURRENT
 #      head, whose run exercises this change plus the newer one. Not a failure.
 #
 # Design notes:
@@ -54,7 +55,8 @@
 #    with one immediate re-query before exiting.
 #  - FAILURE conclusions: failure timed_out action_required startup_failure, plus
 #    cancelled in run-id mode (you asked to watch that specific run). In --branch and
-#    --sha mode a cancelled RUN is supersession, handled at run level before jobs.
+#    --sha mode a cancelled RUN is supersession, handled at run level before jobs; a
+#    cancelled JOB under a run not yet concluded is classified CANCELLED, never GREEN.
 #    OK-TERMINAL: success skipped neutral (path-filtered build-* jobs report skipped).
 #    NON-TERMINAL: any job whose status != completed.
 #  - Early-exit on the first failure is the whole point: one red job means the run
@@ -156,7 +158,9 @@ runs_for_sha() {
 # $1 == "1" excludes `cancelled` from the failure set: in --branch/--sha mode a cancelled
 # run means it was superseded by a newer push (ci.yml concurrency), NOT a failure, and the
 # run-level guard handles it before jobs are read. In explicit run-id mode a cancelled job
-# IS a failure (you asked to watch that specific run).
+# IS a failure (you asked to watch that specific run). In --branch/--sha mode a
+# cancelled job yields CANCELLED (no failure, nothing pending): the run is being
+# superseded but its own conclusion has not landed yet, so it is never GREEN.
 classify() {
   awk -F'\t' -v bmode="${1:-0}" '
     function isfail(c){
@@ -168,10 +172,12 @@ classify() {
       status=$1; concl=$2; name=$3; url=$4; id=$5
       if (status!="completed") { pend++; next }        # non-terminal job
       if (isfail(concl)) { fails[nf++]=name "\t" url "\t" id }  # completed AND failed
+      else if (concl=="cancelled") canc++                        # bmode only: superseded
     }
     END {
       if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i] }
       else if (pend>0) print "PENDING"
+      else if (canc>0) print "CANCELLED"
       else print "GREEN"
     }'
 }
@@ -253,6 +259,8 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           fi
           ;;
         PENDING) pending=1 ;;
+        CANCELLED)
+          superseded=$((superseded+1)); echo "[tick $tick] $wname run $rid jobs cancelled before the run concluded (superseded)" ;;
         GREEN) : ;;
       esac
     done <<< "$runs"
@@ -324,6 +332,9 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
     GREEN)
       echo "=== run $cur: all jobs terminal, none failed after $((tick*INTERVAL))s ==="
       exit 0
+      ;;
+    CANCELLED)
+      echo "[tick $tick] run $cur jobs cancelled before the run concluded (superseded); re-resolving next tick"
       ;;
     PENDING)
       open_jobs="$(printf '%s\n' "$out" | awk -F'\t' '$1!="completed"{n++} END{print n+0}')"
