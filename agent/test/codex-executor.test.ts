@@ -2449,6 +2449,7 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(completion.payload.is_error, true);
     assert.ok(String(completion.payload.content).includes("the delegated child turn failed (transport)"));
     assert.ok(!String(completion.payload.content).includes(providerText));
+    assert.ok(!JSON.stringify(emitted).includes(providerText), "no run-feed message exposes provider text");
     assert.equal(result.branch, "agent/issue-42", "the root completes after the child failure");
     assert.equal(emitted.filter((m) => m.kind === "status" && m.payload.event === "result").length, 1);
     assert.equal(responsesFor(rig, 1), 1);

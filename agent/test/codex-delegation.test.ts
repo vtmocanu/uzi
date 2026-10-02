@@ -388,6 +388,8 @@ describe("CodexDelegationRunner: terminal + cancellation", () => {
     const controller = new FakeController({ threadId: "ct", turnId: "cu", notes: [] });
     withNotes(controller, [
       { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: false,
+        params: { error: { codexErrorInfo: "unauthorized" } } },
+      { kind: "codex_error", method: "error", threadId: controller.threadId, turnId: controller.turnId, willRetry: false,
         params: { error: { codexErrorInfo: "serverOverloaded", message: "private provider detail" } } },
       { kind: "turn_completed", method: "turn/completed", threadId: controller.threadId, turnId: controller.turnId,
         params: { turn: { status: "failed", error: { codexErrorInfo: "unauthorized" } } } },
