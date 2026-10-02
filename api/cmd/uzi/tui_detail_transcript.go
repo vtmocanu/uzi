@@ -393,7 +393,7 @@ func resultIsError(payload json.RawMessage) bool {
 // two-pane body fills the screen down to the footer (issue #379) rather than stopping at the
 // last line of content and leaving a tall terminal with dead space below the footer. It
 // counts the SAME chrome renderDetail emits — header (always 1 row, detailHeaderLines), optional
-// park line, an optional degraded
+// park line, an optional pause line (its own row, independent of the park line), an optional degraded
 // transport line (a healthy "live"/"connecting…" folds into the header), the blank separator,
 // the pane title row, an optional attention banner, an optional steer bar, and the footer — so
 // this and the render cannot disagree; both the window render and the scroll clamp read it.
@@ -416,6 +416,13 @@ func (m tuiModel) transcriptViewport() int {
 		// park are distinct recovery_wait causes),
 		// so together they add at most one physical row that renderDetail must be charged for.
 		// The width-shed fitNearTimeoutLine draws the same single row; presence is width-free.
+	}
+	if credentialDisabledLine(m.detail.run) != "" || m.detail.run.Status == statusPaused ||
+		m.detail.run.PauseRequestedAt != nil {
+		chrome++ // the pause row-2 slot (PRD #1190 M4 paused / pause-requested, PRD #1732 credential
+		// hold): its own row in renderDetail, independent of the park slot above, so a parked run
+		// with a pending pause (limit_wait + pause_requested_at) is charged two rows. The three
+		// renderDetail arms are mutually exclusive, so this is at most one row.
 	}
 	if m.transportLine() != "" {
 		chrome++ // the degraded transport line (a healthy "live"/"connecting…" folds into the header)

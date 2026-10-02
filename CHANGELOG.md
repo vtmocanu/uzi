@@ -36,10 +36,16 @@ through `[0.52.0]`.)
 - **PR descriptions uzi writes can include a small Mermaid diagram where the change warrants one ([#1840](https://github.com/vtmocanu/uzi/issues/1840)).**
   The worker renders a flowchart or sequence diagram from structured fields (at most 1,500 bytes, after "What changed"); the api validates the structure and sanitizes every label, and drops the diagram when a label carries an issue-closing directive or a mention. A description that would exceed the region or body cap is retried without the diagram first. The run page and `uzi run get` show the diagram as a plain-text outline only when one was published.
 
+- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
+  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, and uzi never logs the stored memo or the tool call that saves it (the lead can still quote an injected memo in its own messages). A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` when the memo is actually placed in the lead's prompt and `decisions memo saved (N bytes)` when a memo is saved. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
+
 ### Fixed
 
 - **A completion `continue` decision whose guidance contains a NUL byte no longer fails ([#1728](https://github.com/vtmocanu/uzi/issues/1728)).**
   The guidance is NUL-stripped before it is stored, as the partial/accept reason already was, so the decision applies instead of erroring with SQLSTATE 22021 (which, on a paused run, left it blocked); web and CLI both benefit.
+
+- **The TUI run detail no longer overflows the terminal by a row when a pause line is shown ([#1791](https://github.com/vtmocanu/uzi/issues/1791)).**
+  A paused run, a run with a pending pause request, or a credential-disabled hold draws its pause line in its own row, but the transcript height budget did not count it, so the frame came out one row taller than the terminal (a usage-limit park that also carried a pending pause drew both lines); the budget now charges the pause row.
 
 - **Codex launches exclude the writable worker toolchain from PATH ([#2129](https://github.com/vtmocanu/uzi/issues/2129)).**
   The provider launch uses only system directories, keeping runner-owned toolchain entries out of credentialed executable lookup; Codex commands retain their GNU toolchain precedence.
@@ -90,11 +96,6 @@ through `[0.52.0]`.)
 
 - **Admin product-token inventory filters by owner and product ([#1935](https://github.com/vtmocanu/uzi/issues/1935)).**
   The admin Products page and `GET /api/admin/product-tokens` accept an owner and a product filter, applied before the 1000-row bound, so an older active token cut from the unfiltered inventory can still be found and revoked.
-
-### Added
-
-- **A Claude run that opens a PR can now leave a private decisions memo that the next MR rework on that PR starts from, behind a new admin setting that is off by default ([#2083](https://github.com/vtmocanu/uzi/issues/2083)).**
-  With `decisions_memo_enabled` set to `true` (through `PUT /api/admin/settings`; there is no Admin Settings control), a run that publishes its merge request may save a memo of at most 8 KiB (decisions and rejected alternatives, relevant files, validation commands and results, open risks), stored with the run and scoped to its owner; it never goes into the PR description, and uzi never logs the stored memo or the tool call that saves it (the lead can still quote an injected memo in its own messages). A later MR rework on the same PR (same owner, repo, branch and MR) gets the latest memo in its planning prompt as untrusted, advisory, possibly stale context, so current review comments and the code win, and the activity shows `decisions memo injected (N bytes)` when the memo is actually placed in the lead's prompt and `decisions memo saved (N bytes)` when a memo is saved. A failed, held or unpublished round never replaces the prior memo, no memo or any fetch problem means a normal fresh rework, turning the setting off stops new writes and injection but keeps stored memos, and Codex runs neither write nor receive one. This is an experiment to decide the next step of PRD #1214, not a shipped benefit: the measurement runbook is in [MR review rework](docs/mr-review-watcher.md#decisions-memo-experiment).
 
 ## [0.85.0] - 2026-09-26
 
