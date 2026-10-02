@@ -253,9 +253,10 @@ func probeOpenAIModels(ctx context.Context, client *http.Client, plain []byte) s
 				Object string `json:"object"`
 			} `json:"data"`
 		}
-		body, err := io.ReadAll(io.LimitReader(resp.Body, 8193))
-		if err != nil || len(body) > 8192 || json.Unmarshal(body, &models) != nil ||
-			models.Object != "list" || len(models.Data) == 0 {
+		const maxModelsResponseBytes = 2 << 20
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxModelsResponseBytes+1))
+		if err != nil || len(body) > maxModelsResponseBytes || json.Unmarshal(body, &models) != nil ||
+			models.Object != "list" || models.Data == nil {
 			return secretTestResult{Status: "inconclusive", Reason: "generic"}
 		}
 		for _, model := range models.Data {

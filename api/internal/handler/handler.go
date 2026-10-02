@@ -46,11 +46,11 @@ import (
 
 // Handler bundles the dependencies shared by every HTTP handler.
 type Handler struct {
-	secretTestOnce sync.Once
+	secretTestOnce    sync.Once
 	secretTestClients *secretTestClients
-	pool *pgxpool.Pool
-	q    *store.Queries
-	cfg  config.Config
+	pool              *pgxpool.Pool
+	q                 *store.Queries
+	cfg               config.Config
 	// oauthBeginTx, when non-nil, replaces h.pool.Begin as the transaction source of the OAuth
 	// token endpoint's code redemption, so a LiveDB test can hand it a transaction whose chosen
 	// statement fails and prove a storage error answers 503 temporarily_unavailable at every step
