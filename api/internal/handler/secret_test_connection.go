@@ -118,7 +118,11 @@ func (h *Handler) TestMySecret(w http.ResponseWriter, r *http.Request) {
 	case store.KindCodexAuth:
 		result = h.testCodexSecret(ctx, user.ID, id)
 	}
-	after, err := h.q.GetSecretEnablement(ctx, store.GetSecretEnablementParams{ID: id, UserID: user.ID})
+	// Re-read on a fresh context: the provider calls may have spent the probe
+	// budget, and an expired ctx here would mislabel a committed verdict superseded.
+	readCtx, readCancel := context.WithTimeout(r.Context(), 2*time.Second)
+	defer readCancel()
+	after, err := h.q.GetSecretEnablement(readCtx, store.GetSecretEnablementParams{ID: id, UserID: user.ID})
 	if err != nil || after.Kind != kind || after.DisabledAt.Valid || after.EnablementRev != before.EnablementRev || !after.UpdatedAt.Time.Equal(before.UpdatedAt.Time) {
 		result = secretTestResult{Status: "inconclusive", Reason: "superseded"}
 	}
