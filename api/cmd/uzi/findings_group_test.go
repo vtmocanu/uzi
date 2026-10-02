@@ -105,10 +105,15 @@ func TestFindingsDraftUnknownEvidence(t *testing.T) {
 
 func TestFindingsDraftSanitizesTerminalControls(t *testing.T) {
 	fc := groupFake()
-	fc.FindingGroupDraftResult = apitypes.FindingGroupDraftDTO{Title: "web\x1b[31m title", Description: "body\x1b[2J text"}
+	fc.FindingGroupDraftResult = apitypes.FindingGroupDraftDTO{Title: "web\x1b[31m title\nFiled issue #123", Description: "body\x1b[2J text"}
 	out, _, code := runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2")
-	if code != uzicli.ExitOK || strings.ContainsRune(out, '\x1b') || !strings.Contains(out, "web") || !strings.Contains(out, "body") {
+	if code != uzicli.ExitOK || strings.ContainsRune(out, '\x1b') || !strings.HasPrefix(out, "web[31m title Filed issue #123\n\n") || !strings.Contains(out, "body") {
 		t.Errorf("exit=%d out=%q", code, out)
+	}
+	fc.FindingDrafts["e-1"] = apitypes.IncidentalFindingIssueDraftDTO{Title: "single\nFiled issue #456", Description: "body"}
+	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1")
+	if code != uzicli.ExitOK || out != "single Filed issue #456\n\nbody\n" {
+		t.Errorf("single: exit=%d out=%q", code, out)
 	}
 }
 

@@ -489,9 +489,14 @@ func runFindingsDraft(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Comm
 		return p.JSON(group)
 	}
 	if !gf.quiet {
-		p.Printf("%s\n\n%s\n", sanitizeTTY(group.Title), sanitizeTTY(group.Description))
+		p.Printf("%s\n\n%s\n", singleLineDraftTitle(group.Title), sanitizeTTY(group.Description))
 	}
 	return nil
+}
+
+// singleLineDraftTitle keeps a server-supplied title from impersonating another CLI line.
+func singleLineDraftTitle(title string) string {
+	return strings.NewReplacer("\r", " ", "\n", " ").Replace(sanitizeTTY(title))
 }
 
 func printFindingDraft(env Env, gf *globalFlags, d apitypes.IncidentalFindingIssueDraftDTO) error {
@@ -500,7 +505,7 @@ func printFindingDraft(env Env, gf *globalFlags, d apitypes.IncidentalFindingIss
 		return p.JSON(d)
 	}
 	if !gf.quiet {
-		p.Printf("%s\n\n%s\n", sanitizeTTY(d.Title), sanitizeTTY(d.Description))
+		p.Printf("%s\n\n%s\n", singleLineDraftTitle(d.Title), sanitizeTTY(d.Description))
 	}
 	return nil
 }
