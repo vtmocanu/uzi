@@ -53,10 +53,10 @@ export let homeDir: string;
  * splitting runner.test.ts needed no edits inside any test body.
  */
 export function installHarness(): void {
-  beforeEach(async () => {
+  beforeEach(async (t) => {
     api = new FakeApi(TOKEN);
     baseUrl = await api.listen();
-    fx = makeFixture();
+    fx = makeFixture({}, { testName: t.fullName ?? t.name });
     git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-runnerhome-"));
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {

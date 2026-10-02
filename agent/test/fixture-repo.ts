@@ -56,14 +56,53 @@ export function disableAutoMaintenance(repoPath: string, env: NodeJS.ProcessEnv)
 }
 
 /**
+ * Best-effort ledger line for scripts/tmpdir-leak-guard.sh (issue #2020): when the
+ * guard exported UZI_TMPDIR_GUARD_LEDGER, append one JSON line so a leftover
+ * `uzi-agent-test-*` dir can be attributed to its creator. A failed write is
+ * swallowed: the ledger is evidence only and must never fail a test.
+ */
+function ledger(event: "created" | "removed", base: string, extra: Record<string, unknown> = {}): void {
+  const file = process.env.UZI_TMPDIR_GUARD_LEDGER;
+  if (!file) return;
+  try {
+    const line = JSON.stringify({
+      entry: path.basename(base),
+      path: base,
+      event,
+      pid: process.pid,
+      at: new Date().toISOString(),
+      ...extra,
+    });
+    fs.appendFileSync(file, line + "\n");
+  } catch {
+    // best-effort
+  }
+}
+
+/** Up to 4 `file:line` stack frames under agent/test/, excluding this file. */
+function callerSites(): string[] {
+  const sites: string[] = [];
+  for (const frame of (new Error().stack ?? "").split("\n").slice(1)) {
+    const m = /\(?((?:file:\/\/)?[^()\s]*\/test\/[^()\s]+?:\d+):\d+\)?\s*$/.exec(frame);
+    const site = m?.[1];
+    if (site === undefined || site.includes("/fixture-repo.ts:")) continue;
+    sites.push(site.replace(/^file:\/\//, ""));
+    if (sites.length === 4) break;
+  }
+  return sites;
+}
+
+/**
  * Build a throwaway git "origin" on disk. A bare clone of a local path needs no
  * network and no auth, so the whole worktree lifecycle is exercisable offline.
  *
  * `files` (repo-relative path → contents) are committed alongside the README, so
  * a test can ship a repo that carries e.g. its own `.claude/agents/`.
  */
-export function makeFixture(files: Record<string, string> = {}): Fixture {
+export function makeFixture(files: Record<string, string> = {}, opts: { testName?: string } = {}): Fixture {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
+  // Recorded before the git work so a later throw in makeFixture still leaves a created line.
+  ledger("created", base, { file: process.argv[1] ?? null, test: opts.testName ?? null, site: callerSites() });
   const originPath = path.join(base, "origin");
   const dataDir = path.join(base, "data");
   fs.mkdirSync(originPath);
@@ -128,6 +167,7 @@ export function makeFixture(files: Record<string, string> = {}): Fixture {
       // 2750 ms per stuck directory — NOT maxRetries*retryDelay, and a linear back-off
       // cannot have a product ceiling. A tree stuck at several levels multiplies it.
       fs.rmSync(base, { recursive: true, force: true, maxRetries: 10, retryDelay: 50 });
+      ledger("removed", base);
     },
   };
 }
