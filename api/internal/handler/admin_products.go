@@ -177,9 +177,34 @@ const maxAdminProductTokenRows = 1000
 // says whether anything was cut: {"tokens": [...], "truncated": bool}. The per-user mint
 // limiter (authLimiter on POST /api/me/product-tokens) bounds how fast any one user can
 // add rows.
+//
+// FILTERS (#1935): optional ?owner_id=<uuid> and ?product_id=<uuid>; absent or empty
+// means no predicate, both together mean AND, and a non-empty value that is not a UUID
+// is a 400. They are applied in SQL before the ORDER BY ... LIMIT cut, so an active
+// token that the unfiltered list cuts past the bound stays reachable (and revocable) by
+// narrowing to its owner and/or product. The bound and "truncated" apply to the
+// filtered result.
 func (h *Handler) AdminListProductTokens(w http.ResponseWriter, r *http.Request) {
+	var filter store.ListAllProductTokensForAdminParams
+	for _, f := range []struct {
+		param, msg string
+		dst        *pgtype.UUID
+	}{
+		{"owner_id", "invalid owner_id", &filter.OwnerID},
+		{"product_id", "invalid product_id", &filter.ProductID},
+	} {
+		if raw := r.URL.Query().Get(f.param); raw != "" {
+			parsed, err := uuid.Parse(raw)
+			if err != nil {
+				httpx.Error(w, http.StatusBadRequest, f.msg)
+				return
+			}
+			*f.dst = pgtype.UUID{Bytes: parsed, Valid: true}
+		}
+	}
 	bound := productTokenListBound(h.adminProductTokenRowsOverride, maxAdminProductTokenRows)
-	rows, err := h.q.ListAllProductTokensForAdmin(r.Context(), bound+1)
+	filter.MaxRows = bound + 1
+	rows, err := h.q.ListAllProductTokensForAdmin(r.Context(), filter)
 	if err != nil {
 		slog.Error("admin list product tokens", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")

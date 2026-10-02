@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
@@ -179,7 +180,7 @@ func TestProductTokenListsAskForBoundPlusOne(t *testing.T) {
 		{"GET /api/me/product-tokens", func(h *Handler) http.HandlerFunc { return h.ListMyProductTokens },
 			[]any{userID, int32(maxMyProductTokenRows + 1)}},
 		{"GET /api/admin/product-tokens", func(h *Handler) http.HandlerFunc { return h.AdminListProductTokens },
-			[]any{int32(maxAdminProductTokenRows + 1)}},
+			[]any{pgtype.UUID{}, pgtype.UUID{}, int32(maxAdminProductTokenRows + 1)}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			db := &fakeViewerListDB{}

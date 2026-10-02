@@ -86,9 +86,25 @@ func apListProducts(t *testing.T, routes http.Handler, jwt string) map[string]ap
 // the response's truncated flag).
 func apListProductTokens(t *testing.T, routes http.Handler, jwt string) (string, map[string]apitypes.AdminProductTokenDTO, bool) {
 	t.Helper()
-	rec := cookieReq(t, routes, http.MethodGet, "/api/admin/product-tokens", jwt, "")
+	raw, tokens, truncated := apListProductTokensQuery(t, routes, jwt, "")
+	byID := make(map[string]apitypes.AdminProductTokenDTO, len(tokens))
+	for _, tk := range tokens {
+		byID[tk.ID] = tk
+	}
+	return raw, byID, truncated
+}
+
+// apListProductTokensQuery is GET /api/admin/product-tokens?<query>, returning the raw
+// body, the rows in response order, and the truncated flag.
+func apListProductTokensQuery(t *testing.T, routes http.Handler, jwt, query string) (string, []apitypes.AdminProductTokenDTO, bool) {
+	t.Helper()
+	path := "/api/admin/product-tokens"
+	if query != "" {
+		path += "?" + query
+	}
+	rec := cookieReq(t, routes, http.MethodGet, path, jwt, "")
 	if rec.Code != http.StatusOK {
-		t.Fatalf("GET /api/admin/product-tokens = %d %q, want 200", rec.Code, rec.Body.String())
+		t.Fatalf("GET %s = %d %q, want 200", path, rec.Code, rec.Body.String())
 	}
 	raw := rec.Body.String()
 	var body struct {
@@ -103,11 +119,7 @@ func apListProductTokens(t *testing.T, routes http.Handler, jwt string) (string,
 	if body.Truncated == nil {
 		t.Fatalf("GET /api/admin/product-tokens has no truncated key: %q", raw)
 	}
-	out := make(map[string]apitypes.AdminProductTokenDTO, len(body.Tokens))
-	for _, tk := range body.Tokens {
-		out[tk.ID] = tk
-	}
-	return raw, out, *body.Truncated
+	return raw, body.Tokens, *body.Truncated
 }
 
 // apInventoryRows returns the admin inventory rows by id for assertions that a specific
@@ -123,7 +135,7 @@ func apInventoryRows(t *testing.T, q *store.Queries, httpRows map[string]apitype
 		return httpRows
 	}
 	t.Logf("GET /api/admin/product-tokens is truncated on this shared database; asserting the rows via ListAllProductTokensForAdmin")
-	rows, err := q.ListAllProductTokensForAdmin(context.Background(), 1_000_000_000)
+	rows, err := q.ListAllProductTokensForAdmin(context.Background(), store.ListAllProductTokensForAdminParams{MaxRows: 1_000_000_000})
 	if err != nil {
 		t.Fatalf("ListAllProductTokensForAdmin: %v", err)
 	}
@@ -535,6 +547,168 @@ func TestAdminListProductTokensTruncatedLiveDB(t *testing.T) {
 		for _, r := range rows {
 			if r.Revoked || (r.ExpiresAt != nil && !r.ExpiresAt.After(time.Now())) {
 				t.Errorf("row %+v survived the cut, want only active rows (active first)", r)
+			}
+		}
+	})
+}
+
+// TestAdminProductTokenFiltersLiveDB (#1935): an OLDER active token that the unfiltered,
+// bounded inventory cuts is recovered by the owner_id/product_id filters, which narrow in
+// SQL before the LIMIT, and can then be admin-revoked. Bound lowered to 3; the unique
+// owners and products keep every filtered assertion independent of the shared table.
+func TestAdminProductTokenFiltersLiveDB(t *testing.T) {
+	h, pool := v1LiveDB(t)
+	routes, _ := v1Routers(h)
+	jwt := cliMintJWT(t, pool, cliSeedUser(t, pool, true))
+	ownerA := cliSeedUser(t, pool, false)
+	ownerB := cliSeedUser(t, pool, false)
+	productA := v1SeedProduct(t, h.q, ownerA)
+	productB := v1SeedProduct(t, h.q, ownerA)
+	const bound = 3
+	h.adminProductTokenRowsOverride = bound
+	t.Cleanup(func() { h.adminProductTokenRowsOverride = 0 })
+
+	mint := func(owner, product uuid.UUID) string {
+		return v1MintProductToken(t, h.q, owner, product, producttoken.Scopes, nil).tokenID.String()
+	}
+	target := mint(ownerA, productA)
+	// A newer REVOKED token of the same pair: it must sort after the active target.
+	revokedNewer := mint(ownerA, productA)
+	if _, err := pool.Exec(t.Context(), `UPDATE product_tokens SET revoked = true WHERE id = $1`, revokedNewer); err != nil {
+		t.Fatalf("revoke fixture: %v", err)
+	}
+	// More than bound newer active tokens on every other pair: owner-only (A, B-product),
+	// product-only (B-owner, A-product) and unrelated (B, B).
+	for range bound + 1 {
+		mint(ownerA, productB)
+		mint(ownerB, productA)
+		mint(ownerB, productB)
+	}
+
+	query := func(owner, product uuid.UUID) string {
+		var parts []string
+		if owner != uuid.Nil {
+			parts = append(parts, "owner_id="+owner.String())
+		}
+		if product != uuid.Nil {
+			parts = append(parts, "product_id="+product.String())
+		}
+		return strings.Join(parts, "&")
+	}
+	inactive := func(r apitypes.AdminProductTokenDTO) bool {
+		return r.Revoked || (r.ExpiresAt != nil && !r.ExpiresAt.After(time.Now()))
+	}
+	// checkOrder: active rows first, newest first within each group.
+	checkOrder := func(label string, rows []apitypes.AdminProductTokenDTO) {
+		t.Helper()
+		for i := 1; i < len(rows); i++ {
+			prev, cur := rows[i-1], rows[i]
+			if inactive(prev) && !inactive(cur) {
+				t.Errorf("%s: inactive row %s precedes active row %s", label, prev.ID, cur.ID)
+			}
+			if inactive(prev) == inactive(cur) && prev.CreatedAt.Before(cur.CreatedAt) {
+				t.Errorf("%s: row %s precedes the newer row %s in the same group", label, prev.ID, cur.ID)
+			}
+		}
+	}
+	checkRaw := func(label, raw string) {
+		t.Helper()
+		if strings.Contains(raw, "token_hash") {
+			t.Errorf("%s: response carries a token_hash key: %s", label, raw)
+		}
+	}
+
+	t.Run("unfiltered list cuts the older token", func(t *testing.T) {
+		raw, rows, truncated := apListProductTokensQuery(t, routes, jwt, "")
+		checkRaw("unfiltered", raw)
+		if !truncated || len(rows) != bound {
+			t.Errorf("unfiltered: %d rows, truncated=%t; want %d rows, truncated", len(rows), truncated, bound)
+		}
+		for _, r := range rows {
+			if r.ID == target {
+				t.Fatalf("the older target %s is listed unfiltered; the fixture no longer exceeds the bound", target)
+			}
+		}
+	})
+
+	t.Run("owner and product recover the target", func(t *testing.T) {
+		raw, rows, truncated := apListProductTokensQuery(t, routes, jwt, query(ownerA, productA))
+		checkRaw("combined", raw)
+		var found bool
+		for _, r := range rows {
+			if r.UserID != ownerA.String() || r.ProductID != productA.String() {
+				t.Errorf("combined filter returned a non-matching row %+v", r)
+			}
+			found = found || r.ID == target
+		}
+		if !found {
+			t.Fatalf("omitted token was not recovered: %s missing from owner_id+product_id result %s", target, raw)
+		}
+		if truncated || len(rows) != 2 {
+			t.Errorf("combined: %d rows, truncated=%t; want 2 rows (target + revoked sibling), not truncated", len(rows), truncated)
+		}
+		checkOrder("combined", rows)
+		if len(rows) == 2 && (rows[0].ID != target || rows[1].ID != revokedNewer) {
+			t.Errorf("combined order = [%s %s], want active target first, then the newer revoked row", rows[0].ID, rows[1].ID)
+		}
+
+		path := "/api/admin/product-tokens/" + target + "/revoke"
+		if rec := cookieReq(t, routes, http.MethodPost, path, jwt, ""); rec.Code != http.StatusNoContent {
+			t.Fatalf("POST %s = %d %q, want 204", path, rec.Code, rec.Body.String())
+		}
+		_, after, truncated := apListProductTokensQuery(t, routes, jwt, query(ownerA, productA))
+		if truncated {
+			t.Errorf("after revoke: combined result truncated, want not")
+		}
+		var seen bool
+		for _, r := range after {
+			if r.ID == target {
+				seen = true
+				if !r.Revoked {
+					t.Errorf("target %s is not revoked after the admin revoke: %+v", target, r)
+				}
+			}
+		}
+		if !seen {
+			t.Errorf("target %s missing from the filtered list after revoke", target)
+		}
+		checkOrder("combined after revoke", after)
+	})
+
+	t.Run("single filters narrow and stay bounded", func(t *testing.T) {
+		for _, c := range []struct {
+			name, q string
+			match   func(apitypes.AdminProductTokenDTO) bool
+		}{
+			{"owner_id only", query(ownerA, uuid.Nil), func(r apitypes.AdminProductTokenDTO) bool { return r.UserID == ownerA.String() }},
+			{"product_id only", query(uuid.Nil, productA), func(r apitypes.AdminProductTokenDTO) bool { return r.ProductID == productA.String() }},
+		} {
+			raw, rows, truncated := apListProductTokensQuery(t, routes, jwt, c.q)
+			checkRaw(c.name, raw)
+			if len(rows) != bound || !truncated {
+				t.Errorf("%s: %d rows, truncated=%t; want %d rows, truncated", c.name, len(rows), truncated, bound)
+			}
+			for _, r := range rows {
+				if !c.match(r) {
+					t.Errorf("%s returned a non-matching row %+v", c.name, r)
+				}
+			}
+			checkOrder(c.name, rows)
+		}
+	})
+
+	t.Run("empty values mean no filter", func(t *testing.T) {
+		_, rows, truncated := apListProductTokensQuery(t, routes, jwt, "owner_id=&product_id=")
+		if len(rows) != bound || !truncated {
+			t.Errorf("empty filters: %d rows, truncated=%t; want the unfiltered %d rows, truncated", len(rows), truncated, bound)
+		}
+	})
+
+	t.Run("malformed ids are 400", func(t *testing.T) {
+		for _, q := range []string{"owner_id=not-a-uuid", "product_id=not-a-uuid", "owner_id=" + ownerA.String() + "&product_id=zz"} {
+			rec := cookieReq(t, routes, http.MethodGet, "/api/admin/product-tokens?"+q, jwt, "")
+			if rec.Code != http.StatusBadRequest {
+				t.Errorf("GET ?%s = %d %q, want 400", q, rec.Code, rec.Body.String())
 			}
 		}
 	})

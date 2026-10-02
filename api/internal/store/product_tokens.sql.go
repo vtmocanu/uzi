@@ -372,11 +372,19 @@ SELECT t.id,
   JOIN users u ON u.id = t.user_id
   JOIN products p ON p.id = t.product_id
  WHERE t.grant_id IS NULL
+   AND ($1::uuid IS NULL OR t.user_id = $1::uuid)
+   AND ($2::uuid IS NULL OR t.product_id = $2::uuid)
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
- LIMIT $1::int
+ LIMIT $3::int
 `
+
+type ListAllProductTokensForAdminParams struct {
+	OwnerID   pgtype.UUID `json:"owner_id"`
+	ProductID pgtype.UUID `json:"product_id"`
+	MaxRows   int32       `json:"max_rows"`
+}
 
 type ListAllProductTokensForAdminRow struct {
 	ID          uuid.UUID          `json:"id"`
@@ -417,8 +425,14 @@ type ListAllProductTokensForAdminRow struct {
 // first) before any active token; once the ACTIVE tokens alone exceed the bound, the
 // oldest active tokens are cut too, and "truncated" is what tells the admin. The
 // per-user mint limiter bounds how fast rows can be added.
-func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int32) ([]ListAllProductTokensForAdminRow, error) {
-	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin, maxRows)
+//
+// OPTIONAL FILTERS (#1935): sqlc.narg(owner_id) (t.user_id) and sqlc.narg(product_id)
+// (t.product_id); NULL means no predicate, both set means AND. They are applied in the
+// WHERE, so they narrow the rows BEFORE the ORDER BY ... LIMIT cut: an active token
+// that the unfiltered inventory cuts is still reachable (and revocable) by filtering
+// to its owner and/or product, and "truncated" is judged per filtered result.
+func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, arg ListAllProductTokensForAdminParams) ([]ListAllProductTokensForAdminRow, error) {
+	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin, arg.OwnerID, arg.ProductID, arg.MaxRows)
 	if err != nil {
 		return nil, err
 	}

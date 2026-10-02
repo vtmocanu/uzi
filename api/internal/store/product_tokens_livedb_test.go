@@ -503,7 +503,7 @@ func TestProductTokenLifecycleQueriesLiveDB(t *testing.T) {
 	})
 
 	t.Run("admin list and admin revoke", func(t *testing.T) {
-		rows, err := q.ListAllProductTokensForAdmin(ctx, 1_000_000)
+		rows, err := q.ListAllProductTokensForAdmin(ctx, store.ListAllProductTokensForAdminParams{MaxRows: 1_000_000})
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -785,7 +785,7 @@ func TestProductTokenListsActiveFirstLiveDB(t *testing.T) {
 		setAges("now() + interval '100 years'")
 		list := func(maxRows int32) []store.ListAllProductTokensForAdminRow {
 			t.Helper()
-			rows, err := q.ListAllProductTokensForAdmin(ctx, maxRows)
+			rows, err := q.ListAllProductTokensForAdmin(ctx, store.ListAllProductTokensForAdminParams{MaxRows: maxRows})
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -818,6 +818,43 @@ func TestProductTokenListsActiveFirstLiveDB(t *testing.T) {
 				t.Fatalf("uncut admin list puts %s (position %d) at or after %s (position %d); want order %v",
 					wantAll[i-1], pos[wantAll[i-1]], wantAll[i], pos[wantAll[i]], wantAll)
 			}
+		}
+	})
+
+	// #1935: owner/product filters narrow in SQL, so they hold on a table shared with
+	// other tests: this test's owner and product are unique to it.
+	t.Run("admin list filters", func(t *testing.T) {
+		setAges("now() + interval '100 years'")
+		otherProduct := newProduct(ctx, t, q, owner)
+		list := func(f store.ListAllProductTokensForAdminParams) []uuid.UUID {
+			t.Helper()
+			f.MaxRows = 1_000_000
+			rows, err := q.ListAllProductTokensForAdmin(ctx, f)
+			if err != nil {
+				t.Fatal(err)
+			}
+			ids := make([]uuid.UUID, 0, len(rows))
+			for _, r := range rows {
+				ids = append(ids, r.ID)
+			}
+			return ids
+		}
+		ownerF := pgtype.UUID{Bytes: owner, Valid: true}
+		productF := pgtype.UUID{Bytes: p.ID, Valid: true}
+		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: ownerF}); !slices.Equal(got, wantAll) {
+			t.Fatalf("owner filter = %v, want %v", got, wantAll)
+		}
+		if got := list(store.ListAllProductTokensForAdminParams{ProductID: productF}); !slices.Equal(got, wantAll) {
+			t.Fatalf("product filter = %v, want %v", got, wantAll)
+		}
+		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: ownerF, ProductID: productF}); !slices.Equal(got, wantAll) {
+			t.Fatalf("owner+product filter = %v, want %v", got, wantAll)
+		}
+		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: ownerF, ProductID: pgtype.UUID{Bytes: otherProduct.ID, Valid: true}}); len(got) != 0 {
+			t.Fatalf("owner + a product they hold no tokens on = %v, want none", got)
+		}
+		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}); len(got) != 0 {
+			t.Fatalf("unknown owner = %v, want none", got)
 		}
 	})
 }
