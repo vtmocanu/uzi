@@ -489,8 +489,8 @@ describe("AnthropicTokens", () => {
   });
 
   // The consequence has to be visible at the moment of the choice. Opting in a
-  // token whose gauge has never polled is a silent no-op — it looks active and can
-  // never be picked — so the chip lives beside the toggle rather than a card away.
+  // token whose gauge has never polled cannot be ranked by usage, so the chip
+  // lives beside the toggle rather than a card away.
   it("shows the SERVER's eligibility beside the toggle for a pooled token", async () => {
     mockApi.getMyRateLimits.mockResolvedValue({
       tokens: [
@@ -518,10 +518,30 @@ describe("AnthropicTokens", () => {
     // Asserted on the class rather than the computed colour because jsdom does not
     // run tailwind — so this pins the one thing that WAS wrong (the stem) and is
     // honest about not proving the pixel.
-    const note = screen.getByText(/auto-selection skips it/);
+    const note = screen.getByText(/may be picked as a fallback/);
     expect(note.className, "text-warning is not a class here; the token is warn").toMatch(/\btext-warn\b/);
     expect(note.className).not.toMatch(/text-warning/);
     expect(container).toBeTruthy();
+  });
+
+  it("shows provider rejection with its warning hint beside the pool toggle", async () => {
+    mockApi.getMyRateLimits.mockResolvedValue({
+      tokens: [
+        {
+          secret_id: "sec-1",
+          label: "default",
+          is_default: true,
+          auto_eligible: true,
+          auto_status: "rejected",
+          limits: { status: "unavailable" },
+        },
+      ],
+    });
+    renderList([secret({ auto_eligible: true })]);
+    const chip = await screen.findByText("rejected by Anthropic");
+    expect(chip.getAttribute("title")).toMatch(/Anthropic/);
+    expect(chip.getAttribute("title")).toMatch(/cannot|will not/);
+    expect(screen.getByText(/auto-selection cannot pick it/)).toBeTruthy();
   });
 
   // An UN-pooled token gets no chip: the unchecked box beside it already says so,

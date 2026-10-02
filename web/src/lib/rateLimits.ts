@@ -240,7 +240,12 @@ const AUTO_STATUS_CHIPS: Record<AutoStatus, AutoStatusChip> = {
   no_reading: {
     tone: "warning",
     label: "never polled",
-    hint: "Opted in, but uzi has never read a usage figure for this token, so auto-selection cannot rank it — it will never be picked. A credential the usage endpoint refuses stays in this state.",
+    hint: "Opted in, but uzi has never read a usage figure for this token, so auto-selection cannot rank it by usage. It may still be picked as a fallback from the pool.",
+  },
+  rejected: {
+    tone: "warning",
+    label: "rejected by Anthropic",
+    hint: "Anthropic rejected this credential. Auto-selection cannot pick it until the token is replaced or updated.",
   },
   unmeasured: {
     tone: "warning",
@@ -253,8 +258,8 @@ const AUTO_STATUS_CHIPS: Record<AutoStatus, AutoStatusChip> = {
     hint: "Opted in, but the last usage reading is too old to steer a choice — auto-selection skips it until a fresh one lands. A token uzi is currently backing off from also reads this way.",
   },
   below_threshold: {
-    // NOT `warning`, deliberately, and the difference is not cosmetic. The three
-    // states above mean the selector SKIPS this token. This one means the opposite in
+    // NOT `warning`, deliberately, and the difference is not cosmetic. The
+    // states above cannot be ranked by usage or are rejected. This one differs in
     // the case that matters: per D10, when every pooled token is below the threshold
     // the emptiest of them is still picked — "least consumed" has a best answer even
     // when every answer is poor. Wearing the same amber as `stale` would say "not in

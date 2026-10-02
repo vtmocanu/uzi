@@ -204,6 +204,7 @@ describe("autoStatusChip", () => {
       "eligible",
       "not_pooled",
       "no_reading",
+      "rejected",
       "unmeasured",
       "stale",
       "below_threshold",
@@ -218,6 +219,18 @@ describe("autoStatusChip", () => {
     }
   });
 
+  it("identifies provider rejection and explains the no-reading floor", () => {
+    const rejected = autoStatusChip("rejected");
+    expect(rejected.label).toBe("rejected by Anthropic");
+    expect(rejected.hint).toMatch(/Anthropic/);
+    expect(rejected.hint).toMatch(/auto-selection/);
+    expect(rejected.hint).toMatch(/cannot|will not/);
+
+    const noReading = autoStatusChip("no_reading");
+    expect(noReading.hint).toMatch(/fallback|floor/);
+    expect(noReading.hint).not.toMatch(/never be picked/);
+  });
+
   it("greens only 'eligible' and stays calm for 'not_pooled'", () => {
     expect(autoStatusChip("eligible").tone).toBe("ok");
     // not_pooled is a setting, not a problem: a user who has not opted a token in
@@ -225,18 +238,18 @@ describe("autoStatusChip", () => {
     expect(autoStatusChip("not_pooled").tone).toBe("neutral");
   });
 
-  // The three states that mean "opted in, and the selector SKIPS it" warn. That is
-  // R7's silent no-op made visible — the reason the status is surfaced at all.
-  it("warns on every state where the selector skips the token", () => {
-    for (const s of ["no_reading", "unmeasured", "stale"] as AutoStatus[]) {
+  // Missing or stale readings cannot be ranked by usage, while rejection excludes
+  // the token entirely. Each needs a warning beside the opt-in.
+  it("warns on unreadable, stale, and rejected tokens", () => {
+    for (const s of ["no_reading", "rejected", "unmeasured", "stale"] as AutoStatus[]) {
       expect(autoStatusChip(s).tone).toBe("warning");
     }
   });
 
   // …and `below_threshold` deliberately does NOT (web-ux F4). It is the one state
-  // that means the opposite in the case that matters: per D10, when every pooled
-  // token is below the threshold the emptiest of them is STILL picked. Four states
-  // sharing one amber said "not in play" about a token that is very much in play.
+  // that can still be ranked by usage: per D10, when every pooled token is below
+  // the threshold the emptiest of them is STILL picked. Sharing the warning tone
+  // would say "not in play" about a token that is very much in play.
   it("does not warn on low headroom, which is still picked when the whole pool is low", () => {
     expect(autoStatusChip("below_threshold").tone).not.toBe("warning");
     // And it stays visually distinct from the calm "not opted in" state, so the row

@@ -3566,6 +3566,7 @@ export type AutoStatus =
   | "eligible"
   | "not_pooled"
   | "no_reading"
+  | "rejected"
   | "unmeasured"
   | "stale"
   | "below_threshold";
@@ -3575,9 +3576,9 @@ export interface TokenRateLimits {
   label: string;
   is_default: boolean;
   /** The owner's pool opt-in, and the live eligibility it produces (PRD #111 M2).
-   *  Not redundant: a token can be opted IN and still unpickable — its gauge never
-   *  polled, or its reading aged out — which is the silent no-op the status exists
-   *  to surface. */
+   *  Not redundant: a token can be opted in while its gauge is unreadable or
+   *  stale, or while Anthropic has rejected its credential. The status explains
+   *  why it cannot be ranked or picked normally. */
   auto_eligible: boolean;
   auto_status: AutoStatus;
   limits: MyRateLimits;

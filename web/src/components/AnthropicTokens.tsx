@@ -356,10 +356,9 @@ function TokenRow({
         )}
       </div>
       {/* Auto-selection pool (PRD #111 M2, D2). The toggle and the live status sit
-          together on purpose: opting a token in whose gauge has never polled is a
-          silent no-op — it looks active and can never be picked (R7) — so the
-          consequence has to be visible at the moment of the choice, not one card
-          down. The chip renders the SERVER's answer verbatim. */}
+          together on purpose: a token without a gauge cannot be ranked, while a
+          rejected token cannot be selected. The chip shows that distinction at
+          the moment of the pool choice. */}
       <div className="mt-2 flex flex-wrap items-center gap-2">
         {/* h-4 w-4 / text-sm to match autopilot, judge and Slack on this same page
             (web-ux F7). The control deciding which account gets billed was the most
@@ -442,7 +441,9 @@ function TokenRow({
                   elsewhere in this codebase. Those predate this PRD and are being
                   raised separately rather than ridden in on a token-selection change. */}
               {skipped && (
-                <span className="text-xs text-warn">— auto-selection skips it</span>
+                <span className="text-xs text-warn">
+                  {autoStatus === "rejected" ? "— auto-selection cannot pick it" : "— may be picked as a fallback"}
+                </span>
               )}
               <span id={autoHintId} className="sr-only">
                 {decision.chip.hint}
