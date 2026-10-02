@@ -81,10 +81,11 @@ afterEach(() => {
 });
 
 describe("Codex/OpenAI Test action", () => {
-  it("routes both kinds, announces sanitized outcomes, and never tests on save", async () => {
+  it("routes both kinds, announces sanitized outcomes, and refreshes Codex status", async () => {
     mockApi.testSecret.mockResolvedValueOnce({ status: "ok", display: "models endpoint accessible" })
       .mockResolvedValueOnce({ status: "permission_denied" });
-    renderCard([secret(), secret({ id: "sec-2", kind: "openai_api_key", label: "console-key", is_default: false })]);
+    const reload = vi.fn(async () => {});
+    renderCard([secret(), secret({ id: "sec-2", kind: "openai_api_key", label: "console-key", is_default: false })], reload);
     expect(mockApi.testSecret).not.toHaveBeenCalled();
     const login = screen.getByTestId("codex-sec-1");
     const key = screen.getByTestId("codex-sec-2");
@@ -94,6 +95,7 @@ describe("Codex/OpenAI Test action", () => {
     await waitFor(() => expect(within(login).getByRole("status").textContent).toMatch(/lacks permission/i));
     expect(mockApi.testSecret).toHaveBeenNthCalledWith(1, "openai_api_key", "sec-2");
     expect(mockApi.testSecret).toHaveBeenNthCalledWith(2, "codex_auth", "sec-1");
+    await waitFor(() => expect(reload).toHaveBeenCalledTimes(1));
   });
 
   it("clears the verdict when a credential is replaced", async () => {

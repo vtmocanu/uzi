@@ -272,7 +272,18 @@ function CredentialRow({
     setVerdict("");
     try {
       const result = await api.testSecret(secret.kind as CodexKind, secret.id);
-      if (runId === testRun.current) setVerdict(testOutcome(result));
+      if (runId === testRun.current) {
+        setVerdict(testOutcome(result));
+        // Staging/failed Codex tests can reconcile the server-side link state.
+        // Refresh the row so its badge agrees with the outcome just displayed.
+        if (secret.kind === "codex_auth") {
+          try {
+            await onChanged();
+          } catch {
+            onError("Could not refresh credential status. Reload Settings to see its current state.");
+          }
+        }
+      }
     } catch {
       if (runId === testRun.current) setVerdict("Test could not complete. Try again.");
     } finally {

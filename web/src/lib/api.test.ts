@@ -35,8 +35,8 @@ describe("testSecret request", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toBe("/api/me/secrets/openai_api_key/sec-2/test");
-    expect(init.method).toBe("POST");
-    expect(init.body).toBeUndefined();
+    expect(init?.method).toBe("POST");
+    expect(init?.body).toBeUndefined();
   });
 });
 
