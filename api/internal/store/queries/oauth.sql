@@ -1,5 +1,5 @@
 -- PRD #1910 M2: the consent half of the OAuth authorization server (oauth_grants and
--- oauth_authorize_requests, migration 00286). Lock order everywhere (D8): the user's grant-creation
+-- oauth_authorize_requests, migration 00287). Lock order everywhere (D8): the user's grant-creation
 -- advisory lock first, on the two paths that create or sweep a user's grants (approve and Revoke
 -- all; LockOAuthUserGrants), then, on approve and deny only, the product row FOR SHARE
 -- (GetProductForShare, the registration re-check; deny takes no per-user lock), then the grant
