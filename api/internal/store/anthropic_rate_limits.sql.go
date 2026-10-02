@@ -61,7 +61,7 @@ type GetAnthropicTokenToPollRow struct {
 // (PRD #1732 M3a): the named token when @secret_id is set, else the owner's
 // default. Same projection as the listing, so the poke opens exactly the row it
 // resolved (never "whatever the default is by open time") and captures the same
-// enablement_rev fence. A disabled token resolves to no row, so a poke never polls
+// enablement_rev fence and success generation. A disabled token resolves to no row, so a poke never polls
 // it (D1).
 func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicTokenToPollParams) (GetAnthropicTokenToPollRow, error) {
 	row := q.db.QueryRow(ctx, getAnthropicTokenToPoll, arg.UserID, arg.SecretID)
@@ -155,7 +155,8 @@ type ListAnthropicTokensToPollRow struct {
 //
 // A DISABLED token is not listed (PRD #1732 D1: background polling stops on
 // disable). enablement_rev is captured with the row so the poll's write can be
-// fenced on the revision it started at (D13, see UpsertRateLimits).
+// fenced on the revision it started at (D13, see UpsertRateLimits). The success
+// generation is captured before the provider call to fence a later refusal.
 func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropicTokensToPollRow, error) {
 	rows, err := q.db.Query(ctx, listAnthropicTokensToPoll)
 	if err != nil {
@@ -683,7 +684,8 @@ type UpsertRateLimitsParams struct {
 // before a disable and the following re-enable) writes nothing: the SELECT yields
 // no row and the statement affects 0 rows, which the caller reads as "not written"
 // and then must not notify. The current_secret UPDATE takes the secret row lock
-// before the gauge insert or conflict update, and clears the rejection marker in
+// before the gauge insert or conflict update, increments the success generation,
+// and clears the rejection marker in
 // the same statement as the successful reading. A credential transition that
 // commits first makes the revision check write zero rows; one that comes second
 // waits for the successful reading. This also orders locks secret then gauge.
