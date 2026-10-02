@@ -468,8 +468,12 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
         { ".codex/agents/c.toml": CODER_TOML },
         {
           detect: async (p, h) => {
+            const r = await detectRepoAgents(p, h);
+            // Record completion, after a delay, so a runner that did not await
+            // detection would enter the executor's run first.
+            await new Promise((resolve) => setTimeout(resolve, 25));
             order.push("detect");
-            return detectRepoAgents(p, h);
+            return r;
           },
           executor: () => ({
             run: async (ctx) => {

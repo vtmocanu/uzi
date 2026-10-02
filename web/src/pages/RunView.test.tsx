@@ -801,7 +801,9 @@ describe("AgentRosterSummary (read-only, post-approval)", () => {
     );
     // Positive: the pending copy names the source (repo agents) and explains the gap.
     expect(screen.getByText(/roster appears here once the worker checks out/i)).toBeTruthy();
+    // Not yet reported, so neither folder is claimed: both are named.
     expect(screen.getByText(".claude/agents/")).toBeTruthy();
+    expect(screen.getByText(".codex/agents/")).toBeTruthy();
     // Non-vacuous negative: the past-tense "internal review was performed by" claim —
     // the misleading assertion this fix removes — must NOT render here. It CAN render
     // (the adjacent "repo-source run" test above asserts it does for a populated roster),

@@ -3208,7 +3208,8 @@ export function AgentRosterSummary({ run }: { run: Run }) {
       {repoRosterPending ? (
         <p className="text-sm text-muted">
           This run uses the repository's own agents from{" "}
-          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">{repoFolder}/</code>. The
+          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.claude/agents/</code> or{" "}
+          <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs text-fg">.codex/agents/</code>. The
           roster appears here once the worker checks out the repository.
         </p>
       ) : run.agent_source === "repo" ? (

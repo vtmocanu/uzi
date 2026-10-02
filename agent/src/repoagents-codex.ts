@@ -6,9 +6,10 @@
 // The template is built FRESH from three validated string fields (`name`,
 // `description`, `developer_instructions`) and never spread from the parsed object:
 // no tools, no model. `model`, `model_reasoning_effort`, `nickname_candidates`,
-// `config_file`, `includes` and every other key are ignored. A file declaring a
-// Codex restriction uzi cannot honour yet (see CODEX_RESTRICTION_KEYS) is skipped
-// rather than run without the restriction its author asked for.
+// `config_file`, `includes` and every other key are ignored. Only the four keys in
+// CODEX_RESTRICTION_KEYS (`features`, `skills`, `sandbox_mode`, `tools`) skip a file,
+// rather than run it without the restriction its author asked for; any other Codex
+// config key (e.g. `approval_policy`, `sandbox_workspace_write`) is ignored like the rest.
 
 import { parse } from "smol-toml";
 import type { AgentTemplate } from "./protocol.js";
