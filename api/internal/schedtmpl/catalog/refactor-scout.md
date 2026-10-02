@@ -1,10 +1,11 @@
 ---
 slug: refactor-scout
 name: Refactor scout
-description: Biweekly propose-only scout that surveys the repo for one high-value structural refactor and opens an MR adding it as a proposal file.
+description: Biweekly scout that surveys the repo for one high-value structural refactor and files a proposal issue.
 target: prompt
 cron: 0 5 1,15 * *
 timezone: UTC
+output: issues
 ---
 
 Survey this repository for ONE high-value structural refactor worth proposing — and PROPOSE it, never implement it. This job never changes the code under refactor; its only output is a single proposal file. Propose-only is the point: structural refactors are exactly the category where unattended implementation is riskiest, and the human gate ("real refactor or nitpick?") is the value.

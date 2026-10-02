@@ -73,10 +73,10 @@ const (
 )
 
 // OutputModeMR and OutputModeIssues are the two per-schedule output modes (PRD #929
-// M1), honored for a "prompt" target only. OutputModeMR (the default) writes an idea
-// file and opens a merge request — today's behavior; OutputModeIssues files the
-// proposal as a forge issue server-side. A prompt catalog entry whose frontmatter omits
-// `output` resolves to DefaultOutputMode via DefaultJob.OutputMode.
+// M1), honored for a "prompt" target only. OutputModeMR writes an idea file
+// and opens a merge request; OutputModeIssues files the proposal as a forge issue
+// server-side. A prompt catalog entry whose frontmatter omits `output` resolves
+// to DefaultOutputMode ("mr") via DefaultJob.OutputMode.
 const (
 	OutputModeMR      = "mr"
 	OutputModeIssues  = "issues"
@@ -98,9 +98,9 @@ type DefaultJob struct {
 	Prompt string
 
 	// Output is a "prompt" target's output mode (PRD #929 M1): OutputModeMR (the
-	// default) or OutputModeIssues. An empty/absent value means the default —
-	// resolve it via OutputMode, never read this field directly. Empty for a
-	// non-prompt target (parse rejects a set `output` there).
+	// default) or OutputModeIssues. An empty/absent value resolves to
+	// DefaultOutputMode; use OutputMode instead of reading this field directly.
+	// Empty for a non-prompt target (parse rejects a set `output` there).
 	Output string
 
 	// SelectorKind is a "sweep" target's selector kind (PRD #767 M4):
@@ -174,7 +174,8 @@ func BySlug(slug string) (DefaultJob, bool) {
 // OutputMode resolves a prompt job's output mode (PRD #929 M1): the frontmatter
 // `output:` value, or DefaultOutputMode ("mr") when it is empty/absent. Callers use
 // this to resolve a NULL run_schedules.output_mode to the catalog default and to seed a
-// default row's stored mode, so an unset job always reads as "mr" rather than "".
+// default row's stored mode. A catalog job with `output: issues` therefore resolves
+// to "issues", while a job without `output:` resolves to "mr".
 func (j DefaultJob) OutputMode() string {
 	if j.Output == "" {
 		return DefaultOutputMode
@@ -192,7 +193,7 @@ func (j DefaultJob) OutputMode() string {
 //     (DefaultJob.OutputMode) is used — so a catalog that ships `output: issues` as its
 //     default is honored identically on both sides;
 //   - otherwise (a user/slugless schedule, or an unknown slug) it falls back to
-//     DefaultOutputMode ("mr").
+//     DefaultOutputMode ("mr"). Known jobs without `output:` also resolve to "mr".
 func ResolveOutputMode(storedMode string, storedValid bool, catalogSlug string) string {
 	if storedValid && storedMode != "" {
 		return storedMode
