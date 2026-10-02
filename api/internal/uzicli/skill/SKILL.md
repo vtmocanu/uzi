@@ -763,12 +763,16 @@ nothing a manual start cannot.
     run instruction ("keep the diff small", "add a failing test first") without editing
     each issue; capped at 8 KiB.
   - `--output mr|issues` (with `--prompt` **only** — an `--issue`/`--sweep` target rejects
-    it, exit 2) picks a proposal run's output shape: `mr` (the default) writes an idea file
+    it, exit 2) picks a proposal run's output shape: `mr` writes an idea file
     and opens an MR, `issues` files the proposal as a `proposal::<slug>`-labelled forge
     issue server-side (that issue is never sweep-eligible until a human promotes it). It is
     three-way like `--model`: omit to inherit the job/catalog default, set it explicitly to
-    override, and on `edit` pass `--output ""` to clear back to inherit. Shipped catalog
-    defaults stay `mr`.
+    override, and on `edit` pass `--output ""` to clear back to inherit. Without catalog
+    output, the fallback is `mr`; feature bingo and refactor scout ship with `issues`.
+    Stored `mr`/`issues` modes remain in effect; an existing NULL mode inherits the new
+    catalog value on its next fire, without migrating the row. Reset adopts the current
+    catalog baseline (`issues` for those jobs). Use `--output mr` for their idea-file and
+    MR delivery.
   - `--model <alias|id>` (valid on every target) pins the model a fired run uses;
     `--apply-model-to-agents` (default off) additionally applies that model to every
     subagent, overriding each agent's own model pin. Both are restated on `edit`, so a

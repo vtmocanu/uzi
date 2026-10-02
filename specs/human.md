@@ -1119,6 +1119,10 @@ Tracked as GitHub issue vtmocanu/uzi#2012.
 - Reworks use the smallest fixing change with no new design (a mandatory item needing one is re-planned as a material change); re-validation is scoped to the committed fix range, with a full wave when impact is uncertain. (AI-synced 2026-10-02)
 - Non-blocking notes not reworked are recorded as grouped `deferred` scope notes in `signal_done`, never as incidental findings. (AI-synced 2026-10-02)
 
+## Proposal agent output modes
+
+- Feature-bingo and refactor-scout default to issues (supersedes PRD #929 D5); global fallback stays mr; stored mr/issues modes remain authoritative, NULL inherits the catalog default, and reset adopts that default; no migration. (AI-synced 2026-10-02)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is

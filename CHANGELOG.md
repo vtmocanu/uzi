@@ -73,6 +73,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Feature-bingo and refactor-scout schedules now default to issues ([#2145](https://github.com/vtmocanu/uzi/issues/2145)).**
+  New enablements, catalog resets, and `uzi schedule reset` use issues; existing schedules with a NULL mode inherit that default on their next fire, while schedules with a stored `mr` or `issues` mode keep their choice. No migration is needed, and both proposal prompt bodies are unchanged.
+
 - **The lead agent now triages validator notes before reworking ([#2012](https://github.com/vtmocanu/uzi/issues/2012)).**
   Only blocking findings, security findings graded Medium or above, and demonstrated correctness, acceptance-criterion, data-integrity or safety-invariant violations are reworked; fixes stay minimal, a new design is re-planned instead of folded into a rework, and re-review is scoped to the fix range. Other notes are recorded as grouped `deferred` scope notes rather than incidental findings. Pristine installs pick it up on the next boot; customized lead templates are untouched.
 

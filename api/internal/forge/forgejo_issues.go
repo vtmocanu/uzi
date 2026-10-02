@@ -162,9 +162,9 @@ func (f *forgejo) CreateIssue(ctx context.Context, projectID int64, title, descr
 	}
 	opt := gitea.CreateIssueOption{Title: title, Body: description}
 	if len(labels) > 0 {
-		// Forgejo's create takes label IDs, not names; resolve against the repo
-		// catalog. uzi ensures its labels exist before use, so an unresolved name is
-		// a real error, not something to silently drop.
+		// Forgejo's create takes label IDs, not names. Resolve against the repo
+		// catalog, creating missing labels before the issue is filed. A lookup or
+		// creation failure is an error, not a reason to silently drop a label.
 		ids, err := f.resolveLabelIDs(c, slug, labels, nil)
 		if err != nil {
 			return Issue{}, err

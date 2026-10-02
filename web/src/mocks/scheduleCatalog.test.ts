@@ -9,6 +9,17 @@ import { describe, expect, it } from "vitest";
 import { mockApi } from "./mockApi";
 
 describe("mock default-jobs catalog (PRD #589)", () => {
+  it("lists the five prompt jobs with their catalog output modes", async () => {
+    const { entries } = await mockApi.listScheduleCatalog();
+    expect(entries.filter((entry) => entry.target === "prompt").map(({ slug, output_mode }) => [slug, output_mode]).sort()).toEqual([
+      ["bug-hunt", "mr"],
+      ["docs-hygiene", "mr"],
+      ["feature-bingo", "issues"],
+      ["refactor-scout", "issues"],
+      ["test-improvement", "mr"],
+    ]);
+  });
+
   it("lists the 9 catalog entries and seeds a visible Layout-A demo state", async () => {
     const { entries, enablements } = await mockApi.listScheduleCatalog();
     expect(entries.map((e) => e.slug).sort()).toEqual(

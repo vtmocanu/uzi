@@ -426,12 +426,17 @@ A few worth knowing:
   large issue body plus guidance would otherwise push the composed instruction
   over its size limit. `--output mr|issues` sets a **prompt-target** schedule's
   proposal output mode and is valid only with `--prompt` (an `--issue`/`--sweep`
-  target rejects it, exit 2): `mr` (the default) writes an idea file and opens an
+  target rejects it, exit 2): `mr` writes an idea file and opens an
   MR, `issues` files the proposal as a `proposal::<slug>`-labelled forge issue
   server-side (never sweep-eligible until a human promotes it). It is three-way,
   like `--model`: omit it to inherit the job/catalog default, `--output issues`
-  (or `mr`) to set it, and `--output ""` on `edit` to clear it back to inherit;
-  shipped catalog defaults stay `mr`. `--model <alias|id>` (valid on every target) pins the
+  (or `mr`) to set it, and `--output ""` on `edit` to clear it back to inherit.
+  Without catalog output, the fallback is `mr`; feature bingo and refactor
+  scout ship with `issues`. Stored `mr`/`issues` modes remain in effect; an
+  existing NULL mode inherits the new catalog value on its next fire, without
+  migrating the row. Reset adopts the current catalog baseline (`issues` for
+  those two jobs). Use `--output mr` for their idea-file and MR delivery.
+  `--model <alias|id>` (valid on every target) pins the
   model a fired run uses; add `--apply-model-to-agents` (default off) to also
   apply that model to every subagent, overriding each agent's own model pin.
   Both `--max-issues` and `--wait-on-limit`'s new default

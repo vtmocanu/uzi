@@ -124,14 +124,18 @@ and your overlay is composed onto it at fire time, under a single guidance heade
 
 A prompt-target schedule that *proposes* work — a brainstorm or a survey that
 suggests something a maintainer might pick up, like feature bingo or the
-refactor scout — has an **output mode**: `mr` (the default) or `issues`. It is
-**prompt-target only**: a pinned issue or a label sweep runs against an issue
-that already exists, so there is no proposal to file, and the setting is
+refactor scout — has an **output mode**: `mr` or `issues`. Without a
+catalog output setting, the default is `mr`; feature bingo and refactor scout
+ship with `issues`. It is **prompt-target only**: a pinned issue or a label
+sweep runs against an issue that already exists, so there is no proposal to
+file, and the setting is
 rejected there (HTTP 422 / a CLI usage error) rather than silently ignored.
 
-In **`mr` mode** — today's behavior, unchanged — a proposal run writes an idea
-file and opens a merge request for it (feature bingo's `bingo: <feature>` MR,
-the refactor scout's proposal file), exactly as before this setting existed.
+In **`mr` mode** — the existing delivery behavior — a proposal run writes an
+idea file and opens a merge request for it (feature bingo's `bingo: <feature>` MR,
+the refactor scout's proposal file). Set `--output mr` to keep this path for
+either catalog job; their prompt bodies still contain the idea-file and MR
+instructions used by this mode.
 
 In **`issues` mode**, the run produces the proposal as structured content and,
 when it completes, uzi files it as a **forge issue** on the owner's connection.
@@ -154,11 +158,15 @@ appends a compact digest of them to the rendered prompt, so the run sees what
 has already been proposed (and declined) and is told not to repeat it unless
 the evidence materially changed.
 
-The shipped catalog defaults all stay `mr`, so enabling a default job — or
-upgrading one you already enabled — changes nothing about how it delivers;
-switching a schedule to `issues` is a per-schedule choice its owner makes, on
-the CLI (`uzi schedule create`/`edit --output`, see [the CLI
-reference](./cli.md#commands)) or in the web schedule modal.
+Feature bingo and refactor scout now ship with `issues` as their catalog
+output; prompt jobs without a catalog output setting fall back to `mr`. A
+schedule with a stored `mr` or `issues` mode keeps that choice. An existing
+catalog schedule whose stored mode is NULL inherits the new catalog value on
+its next fire, with no migration of stored rows. Reset restores a catalog
+job's current baseline, so resetting either proposal job adopts `issues`.
+Choose `--output mr` on the CLI (`uzi schedule create`/`edit`, see [the CLI
+reference](./cli.md#commands)) or in the web schedule modal to retain
+idea-file and MR delivery.
 
 ## Managing schedules
 
@@ -407,9 +415,9 @@ uzi ships a small **catalog of built-in default jobs** — nine generic,
 repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, a biweekly propose-only
-refactoring scout that surveys for one structural refactor and opens an MR
-with a proposal file (never implementing it, `refactor-scout`), daily sweeps
-over the `bug` and `Planned` labels and over issues **assigned to the uzi-bot
+refactoring scout that surveys for one structural refactor and files a
+proposal issue by default (never implementing it, `refactor-scout`), daily
+sweeps over the `bug` and `Planned` labels and over issues **assigned to the uzi-bot
 account** (`assigned-sweep`), and self-improvement — an autonomous audit of
 the enabled repo's own codebase that picks one top improvement. Each has a
 baked cron cadence and, for the five prompt
@@ -454,17 +462,17 @@ the catalog — its entry is cadence and model only (see
   the source is how you replicate a schedule across repos.
 - **Auto-approve, on by default.** Like any new schedule, a default is
   created with auto-approve and wait-on-limit both on — the point of a
-  default is that it runs unattended off-hours. Every default job only opens
-  merge requests; nothing it does ever merges on its own, so an unattended
-  run is safe to leave running. Each prompt job opens a merge request when it
-  produces a change: docs hygiene lands its mechanical fixes (broken links,
-  stale refs, frontmatter only — never prose rewrites, `CLAUDE.md`, or
-  anything under `.claude/`), weekly test improvement lands new tests (test
-  files only, no production code), bug hunt lands one focused fix for its
-  single highest-confidence bug, and feature bingo lands an idea file (an
-  MR titled `bingo: <feature>`). A run that commits nothing opens no branch or
-  empty MR either (issue #341), so a quiet week produces no off-hours MR noise,
-  and every job falls back to a plain report when it has nothing worth landing.
+  default is that it runs unattended off-hours. Nothing a default job does
+  merges on its own. In their default `issues` mode, feature bingo and
+  refactor scout file proposal issues; `--output mr` retains their idea-file
+  and MR path. The other prompt jobs open merge requests when they produce a
+  change: docs hygiene lands its mechanical fixes (broken links, stale refs,
+  frontmatter only — never prose rewrites, `CLAUDE.md`, or anything under
+  `.claude/`), weekly test improvement lands new tests (test files only, no
+  production code), and bug hunt lands one focused fix for its single
+  highest-confidence bug. An MR-mode run that commits nothing opens no branch
+  or empty MR either (issue #341), so a quiet week produces no off-hours MR
+  noise, and each job can report when it has nothing worth landing.
 - **Sweep-label guardrail.** Enabling one of the two label-selector sweep
   defaults (or creating or editing a label-selector sweep schedule) checks
   whether its selector label actually exists on the target repo, and offers
@@ -555,9 +563,10 @@ anything until the label exists.
 
 ## Automatic fixes on scheduled-run MRs
 
-The merge requests a schedule opens — both the **ad-hoc prompt** jobs (docs
-hygiene, test improvement, bug hunt, feature bingo, refactor scout, and any
-custom prompt schedule) and the [self-improvement](#self-improvement) job —
+The merge requests a schedule opens — **MR-mode prompt** jobs (docs
+hygiene, test improvement, bug hunt, feature bingo or refactor scout with
+`--output mr`, and custom prompt schedules in `mr` mode) and the
+[self-improvement](#self-improvement) job —
 participate in uzi's two unattended autofix lanes, exactly like the MRs your
 issue runs open:
 
