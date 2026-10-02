@@ -22,7 +22,7 @@ const userKey ctxKey = iota
 // passiveHeader marks a request as a passive poll — the hidden-tab favicon poll
 // (#331) — which authenticates normally but must not slide the session forward
 // via rolling refresh.
-const passiveHeader = "X-Uzi-Passive"
+const passiveHeader = "X-Uzi-Passive" //nolint:gosec // G101: a request header NAME marking a passive poll, not a credential.
 
 // UserFromContext returns the authenticated user set by RequireAuth.
 func UserFromContext(ctx context.Context) (store.User, bool) {

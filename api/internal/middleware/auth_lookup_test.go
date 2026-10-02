@@ -56,7 +56,7 @@ func sessionRequest(t *testing.T, ctx context.Context, userID uuid.UUID) (*http.
 		t.Fatalf("IssueToken: %v", err)
 	}
 	req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/api/x", nil)
-	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: tok})
+	req.AddCookie(&http.Cookie{Name: auth.AuthCookieName, Value: tok}) //nolint:gosec // G124: test-only client cookie on an httptest request.
 	return req, tok
 }
 
