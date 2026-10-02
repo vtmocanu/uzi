@@ -55,7 +55,7 @@ const pokeBuffer = 64
 
 // Store is the query surface the engine needs. *store.Queries satisfies it.
 // ListAnthropicTokensToPoll returns each ENABLED TOKEN's id, owner, ciphertext +
-// sealed_with, owner opt-in and enablement revision so the tick opens them in one
+// sealed_with, owner opt-in, enablement revision and success generation so the tick opens them in one
 // pass (no per-row re-fetch); GetAnthropicTokenToPoll is its single-token sibling
 // for the poke path, which polls the token a save or re-enable just touched.
 type Store interface {
@@ -237,7 +237,7 @@ func (e *Engine) tickAll(ctx context.Context) {
 			// ListAnthropicTokensToPoll), so detection needs no second lookup here.
 			// The listing holds enabled tokens only (PRD #1732 D1) and carries the
 			// enablement revision this poll is fenced on (D13).
-			e.pollToken(tickCtx, row.UserID, row.ID, row.EnablementRev, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
+			e.pollToken(tickCtx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, false, row.NotifyEarlyLimitReset, func() ([]byte, error) {
 				return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
 			})
 		}(row)
@@ -274,7 +274,7 @@ func (e *Engine) pokeUser(ctx context.Context, userID, secretID uuid.UUID) {
 		}
 		return
 	}
-	e.pollToken(ctx, row.UserID, row.ID, row.EnablementRev, true, row.NotifyEarlyLimitReset, func() ([]byte, error) {
+	e.pollToken(ctx, row.UserID, row.ID, row.EnablementRev, row.AnthropicSuccessGeneration, true, row.NotifyEarlyLimitReset, func() ([]byte, error) {
 		return e.opener.OpenSealed(row.UserID, store.KindAnthropicToken, row.SealedWith, row.Ciphertext)
 	})
 }
@@ -284,13 +284,14 @@ func (e *Engine) pokeUser(ctx context.Context, userID, secretID uuid.UUID) {
 // the vault path (OpenSealed on both the tick's listing row and the poke's resolved
 // row); ignoreBackoff is set on the poke path so a just-saved credential is polled even if the one it replaced was
 // backed off. rev is the token's enablement revision captured when the poll
-// started; the write is fenced on it (PRD #1732 D13).
+// started; the write is fenced on it (PRD #1732 D13). successGeneration is
+// captured before the provider call and fences a later rejection write.
 //
 // Backoff is keyed on the TOKEN since M5, not the user: one refusing credential
 // must not silence its owner's other meters, which is precisely the case this
 // feature exists to support (a throttled subscription alongside a working console
 // key).
-func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev int64, ignoreBackoff, notifyEarly bool, open func() ([]byte, error)) {
+func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev, successGeneration int64, ignoreBackoff, notifyEarly bool, open func() ([]byte, error)) {
 	if ignoreBackoff {
 		e.clearBackoff(secretID)
 	} else if e.inBackoff(secretID) {
@@ -348,6 +349,7 @@ func (e *Engine) pollToken(ctx context.Context, userID, secretID uuid.UUID, rev 
 		(probeErr.Status == 401 || probeErr.Status == 403) {
 		if _, markErr := e.store.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{
 			UserSecretID: secretID, UserID: userID, EnablementRev: rev,
+			AnthropicSuccessGeneration: successGeneration,
 		}); markErr != nil {
 			e.logger.Error("usage poller: mark rejected token", "secret", secretID.String(), "error", markErr)
 		}

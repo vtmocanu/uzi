@@ -34,7 +34,7 @@ func (q *Queries) DeleteRateLimits(ctx context.Context, userID uuid.UUID) (int64
 
 const getAnthropicTokenToPoll = `-- name: GetAnthropicTokenToPoll :one
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev
+       s.enablement_rev, s.anthropic_success_generation
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.user_id = $1 AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -48,12 +48,13 @@ type GetAnthropicTokenToPollParams struct {
 }
 
 type GetAnthropicTokenToPollRow struct {
-	ID                    uuid.UUID `json:"id"`
-	UserID                uuid.UUID `json:"user_id"`
-	Ciphertext            []byte    `json:"ciphertext"`
-	SealedWith            string    `json:"sealed_with"`
-	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
-	EnablementRev         int64     `json:"enablement_rev"`
+	ID                         uuid.UUID `json:"id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	Ciphertext                 []byte    `json:"ciphertext"`
+	SealedWith                 string    `json:"sealed_with"`
+	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
 }
 
 // The single-token sibling of ListAnthropicTokensToPoll for the out-of-band poke
@@ -72,6 +73,7 @@ func (q *Queries) GetAnthropicTokenToPoll(ctx context.Context, arg GetAnthropicT
 		&i.SealedWith,
 		&i.NotifyEarlyLimitReset,
 		&i.EnablementRev,
+		&i.AnthropicSuccessGeneration,
 	)
 	return i, err
 }
@@ -112,7 +114,7 @@ func (q *Queries) GetRateLimitsForToken(ctx context.Context, arg GetRateLimitsFo
 
 const listAnthropicTokensToPoll = `-- name: ListAnthropicTokensToPoll :many
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev
+       s.enablement_rev, s.anthropic_success_generation
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -120,12 +122,13 @@ ORDER BY s.user_id, s.id
 `
 
 type ListAnthropicTokensToPollRow struct {
-	ID                    uuid.UUID `json:"id"`
-	UserID                uuid.UUID `json:"user_id"`
-	Ciphertext            []byte    `json:"ciphertext"`
-	SealedWith            string    `json:"sealed_with"`
-	NotifyEarlyLimitReset bool      `json:"notify_early_limit_reset"`
-	EnablementRev         int64     `json:"enablement_rev"`
+	ID                         uuid.UUID `json:"id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	Ciphertext                 []byte    `json:"ciphertext"`
+	SealedWith                 string    `json:"sealed_with"`
+	NotifyEarlyLimitReset      bool      `json:"notify_early_limit_reset"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
 }
 
 // Every anthropic_token secret to poll each tick (PRD #104 M5): the token's id and
@@ -169,6 +172,7 @@ func (q *Queries) ListAnthropicTokensToPoll(ctx context.Context) ([]ListAnthropi
 			&i.SealedWith,
 			&i.NotifyEarlyLimitReset,
 			&i.EnablementRev,
+			&i.AnthropicSuccessGeneration,
 		); err != nil {
 			return nil, err
 		}
@@ -524,22 +528,31 @@ func (q *Queries) ListRateLimitsForUser(ctx context.Context, userID uuid.UUID) (
 }
 
 const markAnthropicTokenRejected = `-- name: MarkAnthropicTokenRejected :execrows
-UPDATE user_secrets SET anthropic_rejected_at = now()
+UPDATE user_secrets SET anthropic_rejected_at = clock_timestamp()
 WHERE id = $1 AND user_id = $2
   AND kind = 'anthropic_token' AND disabled_at IS NULL
   AND enablement_rev = $3
+  AND anthropic_success_generation = $4
 `
 
 type MarkAnthropicTokenRejectedParams struct {
-	UserSecretID  uuid.UUID `json:"user_secret_id"`
-	UserID        uuid.UUID `json:"user_id"`
-	EnablementRev int64     `json:"enablement_rev"`
+	UserSecretID               uuid.UUID `json:"user_secret_id"`
+	UserID                     uuid.UUID `json:"user_id"`
+	EnablementRev              int64     `json:"enablement_rev"`
+	AnthropicSuccessGeneration int64     `json:"anthropic_success_generation"`
 }
 
 // Only a definitive probe refusal marks the exact enabled credential revision.
 // A replacement, disable, or re-enable makes an older poll's write affect zero rows.
+// The generation predicate is rechecked after a row-lock wait by UPDATE under
+// read committed, so an in-flight refusal cannot undo a newer success.
 func (q *Queries) MarkAnthropicTokenRejected(ctx context.Context, arg MarkAnthropicTokenRejectedParams) (int64, error) {
-	result, err := q.db.Exec(ctx, markAnthropicTokenRejected, arg.UserSecretID, arg.UserID, arg.EnablementRev)
+	result, err := q.db.Exec(ctx, markAnthropicTokenRejected,
+		arg.UserSecretID,
+		arg.UserID,
+		arg.EnablementRev,
+		arg.AnthropicSuccessGeneration,
+	)
 	if err != nil {
 		return 0, err
 	}
@@ -609,7 +622,8 @@ func (q *Queries) MarkSevenDayExhausted(ctx context.Context, userSecretID uuid.U
 
 const upsertRateLimits = `-- name: UpsertRateLimits :execrows
 WITH current_secret AS (
-    UPDATE user_secrets s SET anthropic_rejected_at = NULL
+    UPDATE user_secrets s SET anthropic_rejected_at = NULL,
+                              anthropic_success_generation = s.anthropic_success_generation + 1
     WHERE s.id = $7 AND s.user_id = $8
       AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
       AND s.enablement_rev = $9

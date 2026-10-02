@@ -318,7 +318,8 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 
 // Floor is the LAST-RESORT pool pick (#754): the best pooled candidate even when
 // none is measurable, so a caller can spend a token the user opted in rather than
-// a non-pooled one. It never returns a token that is not AutoEligible.
+// a non-pooled one. It never returns a token that is not AutoEligible or is
+// rejected.
 //
 // It differs from Select in two ways. Select ranks by headroom and returns nothing
 // when no token is measurable (ReasonPoolStale) or below MinHeadroom-with-no-best;
@@ -333,9 +334,9 @@ func Select(cands []Candidate, exclude uuid.UUID, p Policy, now time.Time) Outco
 //
 // exclude is honoured exactly as in Select: a candidate whose SecretID == exclude is
 // skipped, and uuid.Nil (which never equals a real id) excludes nothing. ok is false
-// ONLY when no pooled AutoEligible candidate remains AFTER exclusion. This is NOT
-// the same condition as Select's PoolNonEmpty, which is counted BEFORE the exclude
-// skip: excluding the user's sole pooled token gives PoolNonEmpty == true yet Floor
+// ONLY when no pooled, non-rejected AutoEligible candidate remains AFTER
+// exclusion. This is NOT the same condition as Select's PoolNonEmpty, which is
+// counted BEFORE the exclude skip: excluding the user's sole pooled token gives PoolNonEmpty == true yet Floor
 // ok == false. So a caller must consult Floor's own ok return to decide empty-vs-
 // floorable — do not infer it from PoolNonEmpty. (PoolNonEmpty answers "did the user
 // pool anything at all"; Floor.ok answers "is there a pooled token I may spend now".)

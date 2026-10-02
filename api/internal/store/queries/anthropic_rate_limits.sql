@@ -23,9 +23,10 @@
 --
 -- A DISABLED token is not listed (PRD #1732 D1: background polling stops on
 -- disable). enablement_rev is captured with the row so the poll's write can be
--- fenced on the revision it started at (D13, see UpsertRateLimits).
+-- fenced on the revision it started at (D13, see UpsertRateLimits). The success
+-- generation is captured before the provider call to fence a later refusal.
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev
+       s.enablement_rev, s.anthropic_success_generation
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -36,10 +37,10 @@ ORDER BY s.user_id, s.id;
 -- (PRD #1732 M3a): the named token when @secret_id is set, else the owner's
 -- default. Same projection as the listing, so the poke opens exactly the row it
 -- resolved (never "whatever the default is by open time") and captures the same
--- enablement_rev fence. A disabled token resolves to no row, so a poke never polls
+-- enablement_rev fence and success generation. A disabled token resolves to no row, so a poke never polls
 -- it (D1).
 SELECT s.id, s.user_id, s.ciphertext, s.sealed_with, u.notify_early_limit_reset,
-       s.enablement_rev
+       s.enablement_rev, s.anthropic_success_generation
 FROM user_secrets s
 JOIN users u ON s.user_id = u.id
 WHERE s.user_id = @user_id AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
@@ -77,14 +78,16 @@ WHERE user_secret_id = @user_secret_id AND enablement_rev = @enablement_rev;
 -- before a disable and the following re-enable) writes nothing: the SELECT yields
 -- no row and the statement affects 0 rows, which the caller reads as "not written"
 -- and then must not notify. The current_secret UPDATE takes the secret row lock
--- before the gauge insert or conflict update, and clears the rejection marker in
+-- before the gauge insert or conflict update, increments the success generation,
+-- and clears the rejection marker in
 -- the same statement as the successful reading. A credential transition that
 -- commits first makes the revision check write zero rows; one that comes second
 -- waits for the successful reading. This also orders locks secret then gauge.
 -- The row is stamped with the revision it was polled at, which is what hides it
 -- from every reader once the revision moves on.
 WITH current_secret AS (
-    UPDATE user_secrets s SET anthropic_rejected_at = NULL
+    UPDATE user_secrets s SET anthropic_rejected_at = NULL,
+                              anthropic_success_generation = s.anthropic_success_generation + 1
     WHERE s.id = @user_secret_id AND s.user_id = @user_id
       AND s.kind = 'anthropic_token' AND s.disabled_at IS NULL
       AND s.enablement_rev = @enablement_rev
@@ -115,10 +118,13 @@ ON CONFLICT (user_secret_id) DO UPDATE SET
 -- name: MarkAnthropicTokenRejected :execrows
 -- Only a definitive probe refusal marks the exact enabled credential revision.
 -- A replacement, disable, or re-enable makes an older poll's write affect zero rows.
-UPDATE user_secrets SET anthropic_rejected_at = now()
+-- The generation predicate is rechecked after a row-lock wait by UPDATE under
+-- read committed, so an in-flight refusal cannot undo a newer success.
+UPDATE user_secrets SET anthropic_rejected_at = clock_timestamp()
 WHERE id = @user_secret_id AND user_id = @user_id
   AND kind = 'anthropic_token' AND disabled_at IS NULL
-  AND enablement_rev = @enablement_rev;
+  AND enablement_rev = @enablement_rev
+  AND anthropic_success_generation = @anthropic_success_generation;
 
 -- name: ListRateLimitsForUser :many
 -- One user's meters, one row per TOKEN, for GET /api/me/rate-limits (PRD #104 D4 —

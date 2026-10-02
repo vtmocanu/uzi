@@ -19,7 +19,7 @@ func TestAnthropicRejectionReplacementFenceLiveDB(t *testing.T) {
 			id := enablementToken(ctx, t, q, user, "default", true)
 			mark := func(rev int64) int64 {
 				t.Helper()
-				n, err := q.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{UserSecretID: id, UserID: user, EnablementRev: rev})
+				n, err := q.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{UserSecretID: id, UserID: user, EnablementRev: rev, AnthropicSuccessGeneration: 0})
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -92,6 +92,87 @@ func TestAnthropicRejectionReplacementFenceLiveDB(t *testing.T) {
 	}
 }
 
+func TestAnthropicSameRevisionRejectionSuccessRaceLiveDB(t *testing.T) {
+	for _, successFirst := range []bool{true, false} {
+		name := "rejection waits for success"
+		if !successFirst {
+			name = "success waits for rejection"
+		}
+		t.Run(name, func(t *testing.T) {
+			ctx, pool, q, user := rateLimitEnablementDB(t)
+			id := enablementToken(ctx, t, q, user, "default", true)
+
+			mark := func(queries *store.Queries) (int64, error) {
+				return queries.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{
+					UserSecretID: id, UserID: user, EnablementRev: 0,
+					AnthropicSuccessGeneration: 0,
+				})
+			}
+			success := func(queries *store.Queries) (int64, error) {
+				return queries.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
+					UserSecretID: id, UserID: user, EnablementRev: 0,
+					FiveHourPct: pgtype.Int2{Int16: 40, Valid: true},
+					Source:      pgtype.Text{String: "usage_endpoint", Valid: true},
+					SyncedAt:    pgtype.Timestamptz{Time: time.Now().UTC(), Valid: true},
+				})
+			}
+			first, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer first.Release()
+			second, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer second.Release()
+			tx, err := first.Begin(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer func() { _ = tx.Rollback(ctx) }()
+			firstWrite, secondWrite := mark, success
+			if successFirst {
+				firstWrite, secondWrite = success, mark
+			}
+			if n, err := firstWrite(q.WithTx(tx)); err != nil || n != 1 {
+				t.Fatalf("first write rows=%d err=%v", n, err)
+			}
+			finished := make(chan rejectionRaceResult, 1)
+			go func() {
+				n, err := secondWrite(store.New(second))
+				finished <- rejectionRaceResult{n, err}
+			}()
+			waitForRejectionRaceLock(t, ctx, pool, second.Conn().PgConn().PID(), finished)
+			if err := tx.Commit(ctx); err != nil {
+				t.Fatal(err)
+			}
+			select {
+			case got := <-finished:
+				want := int64(1)
+				if successFirst {
+					want = 0
+				}
+				if got.err != nil || got.rows != want {
+					t.Fatalf("second write rows=%d err=%v, want %d", got.rows, got.err, want)
+				}
+			case <-time.After(5 * time.Second):
+				t.Fatal("second write did not finish")
+			}
+			var rejected bool
+			var generation int64
+			if err := pool.QueryRow(ctx, `SELECT anthropic_rejected_at IS NOT NULL,
+				anthropic_success_generation FROM user_secrets WHERE id=$1`, id).
+				Scan(&rejected, &generation); err != nil {
+				t.Fatal(err)
+			}
+			if rejected || generation != 1 {
+				t.Fatalf("same-revision final state rejected=%v generation=%d", rejected, generation)
+			}
+		})
+	}
+}
+
 type rejectionRaceResult struct {
 	rows int64
 	err  error
@@ -109,7 +190,7 @@ func TestAnthropicRejectionRotationRaceLiveDB(t *testing.T) {
 			if n := fencedUpsert(ctx, t, q, user, id, 0, 30); n != 1 {
 				t.Fatalf("initial gauge rows = %d", n)
 			}
-			if n, err := q.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{UserSecretID: id, UserID: user, EnablementRev: 0}); err != nil || n != 1 {
+			if n, err := q.MarkAnthropicTokenRejected(ctx, store.MarkAnthropicTokenRejectedParams{UserSecretID: id, UserID: user, EnablementRev: 0, AnthropicSuccessGeneration: 1}); err != nil || n != 1 {
 				t.Fatalf("initial rejection rows = %d, %v", n, err)
 			}
 			first, err := pool.Acquire(ctx)
@@ -126,7 +207,7 @@ func TestAnthropicRejectionRotationRaceLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			defer tx.Rollback(ctx)
+			defer func() { _ = tx.Rollback(ctx) }()
 			rotate := func(queries *store.Queries) error {
 				_, err := queries.RotateUserSecret(ctx, store.RotateUserSecretParams{ID: id, UserID: user, Ciphertext: []byte("replacement"), SealedWith: store.SealedWithMaster})
 				return err

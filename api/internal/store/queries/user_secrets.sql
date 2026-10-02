@@ -256,7 +256,8 @@ ORDER BY is_default DESC, lower(label) ASC;
 -- per-(user,kind) advisory lock the mutation takes first, it is what lets
 -- set-default's clear-then-set and delete-default's guard read a stable picture.
 -- Owner-scoped, so a foreign id is pgx.ErrNoRows (a 404), never another user's row.
-SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev FROM user_secrets
+SELECT id, kind, label, is_default, auto_eligible, disabled_at, enablement_rev,
+       anthropic_success_generation FROM user_secrets
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
@@ -408,8 +409,7 @@ FROM user_secrets WHERE id = @id AND user_id = @user_id;
 -- UpsertCodexAccountRateLimits in codex_rate_limits.sql for why the Codex poll writes rely on it.
 UPDATE user_secrets
 SET disabled_at = CASE WHEN @enabled::boolean THEN NULL ELSE now() END,
-    enablement_rev = enablement_rev + 1, anthropic_rejected_at = NULL,
-    updated_at = now()
+    enablement_rev = enablement_rev + 1, anthropic_rejected_at = NULL, updated_at = now()
 WHERE id = @id AND user_id = @user_id
   AND (disabled_at IS NULL) <> @enabled::boolean
 RETURNING id, kind, label, is_default, auto_eligible, created_at, updated_at,
