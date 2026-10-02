@@ -45,9 +45,9 @@ the selection is invalid. Planning keeps your own templates. Two Codex-specific
 rules apply to each repo agent's frontmatter:
 
 - **`model:`** is honored only when it names a supported Codex model; otherwise
-  the run's model is used and an `unknown_model` diagnostic is recorded.
-- **`tools:`** entries Codex does not recognise are dropped (with an
-  `unknown_tool` diagnostic), never widened into something broader, so a repo
+  the run's model is used.
+- **`tools:`** entries Codex does not recognise are dropped, never widened
+  into something broader, so a repo
   agent can only end up with less authority than it declared.
 
 The [trust trade-off](#the-trust-trade-off--read-before-you-pick-repo-agents)

@@ -58,8 +58,6 @@ import { PauseNowSignal } from "../src/steering.js";
 import { scanSignals } from "../src/signals.js";
 import { CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
 
-/** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
-const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
 import type { SpawnCommandOptions } from "../src/codex/broker.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
@@ -79,6 +77,9 @@ import { SupervisedChildExitTimeoutError } from "../src/codex/launcher.js";
 import { CommandDeadlineError } from "../src/codex/broker.js";
 import { CODEX_M3B_LOOPBACK_PROVIDER_NAME } from "../src/codex/config.js";
 import { MAX_LEAD_FINAL_MESSAGE_LEN, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING } from "../src/plan-missing.js";
+
+/** Issue #1718: every implement prompt now ends with the roster line; makeCtx has no agents. */
+const NO_SUBAGENTS_BLOCK = "\n\nNo subagents are available; do the work yourself.";
 
 // PRD #1171 (M3, milestone 3, Phase 2A) — the production CodexExecutor + the claim-aware
 // DARK selection seam, driven with an in-memory transport and scripted app-server frames
@@ -9531,7 +9532,11 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(!instructions.includes("REPO LEAD BODY"));
   });
 
-  it("a repo agent declaring an unsupported tool gets no added tools, and the repo denylist applies", async () => {
+  // The repo denylist (REPO_AGENT_DENIED_TOOLS in toHarnessAgent) is defence in depth on Codex: render.ts
+  // already strips spawn from every subagent and the async-deferral names are unknown to Codex, so the
+  // denylist is not observable through the renderer. This test guards the unsupported-tool and no-delegation
+  // behaviour only.
+  it("a repo agent declaring an unsupported tool gets no added tools and cannot delegate", async () => {
     const odd = tmpl("repo-odd", "odd body", { tools: ["NotARealTool"] });
     const shell = tmpl("repo-shell", "shell body", { tools: ["Bash", "Task"] });
     const { rig, admitted } = await preApproved({ repoAgents: [odd, shell] }, ["repo-odd", "repo-shell"]);
@@ -9541,6 +9546,55 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(!toolNames(0).includes("uzi_bash"), "the unknown tool granted nothing");
     assert.ok(toolNames(1).includes("uzi_bash"), "a known allowlisted tool is granted");
     assert.ok(!toolNames(1).includes("spawn_agent"), "the denylisted Task/Agent alias adds no delegation");
+  });
+
+  it("repo-source agents are granted every run skill (ctx.skills); an own-source template with skills [] is denied", async () => {
+    const skillCall = (id: number, th: string): CodexNotification =>
+      toolCall(id, "Skill", { skill: "prd-lifecycle" }, th, `tn-${th}`, `c-skill-${id}`);
+    const childResponder = (): Responder => {
+      let children = 0;
+      return (c) => {
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "thread/start") {
+          if (c.threadStartCount === 1) return { thread: { id: "th-1" } };
+          children += 1;
+          return { thread: { id: `th-child-${children}` } };
+        }
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) {
+            c.transport.push(threadStarted("th-1"));
+            return { turn: { id: "tn-root" } };
+          }
+          const th = String(rec(c.params).threadId);
+          c.transport.push(skillCall(200 + children, th)).push(turnCompleted("completed", th, `tn-${th}`));
+          return { turn: { id: `tn-${th}` } };
+        }
+        return {};
+      };
+    };
+    const run1 = async (extra: Partial<RunContext>, role: string): Promise<{ success: boolean; text: string }> => {
+      const rig = makeRig({ responder: childResponder() });
+      const { ctx } = makeCtx({
+        agents: ownAgents,
+        skills: [{ name: "prd-lifecycle", description: "the prd lifecycle", body: "PRD BODY TEXT" }],
+        ...extra,
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      await waitFor(() => rig.transport.turnStartCount >= 1, "root turn started");
+      rig.transport.push(toolCall(100, "spawn_agent", { role, prompt: "p" }, "th-1", "tn-root", "c-100"));
+      await waitFor(() => rig.transport.responses.some((r) => r.requestId === 201), "child Skill reply");
+      const reply = rec(rec(rig.transport.responses.find((r) => r.requestId === 201)?.response).result);
+      rig.transport.push(signalDone("th-1", "tn-root", 900)).push(turnCompleted("completed", "th-1", "tn-root")).end();
+      await withTimeout(run, 5000, "skill grant run");
+      return { success: reply.success === true, text: JSON.stringify(reply) };
+    };
+    // The child's own template declares no skills, so only the repo-source grant can allow it.
+    const repoChild = await run1({ repoAgents: [tmpl("repo-reviewer", "repo reviewer body", { skills: [] })] }, "repo-reviewer");
+    assert.equal(repoChild.success, true, repoChild.text);
+    assert.match(repoChild.text, /PRD BODY TEXT/);
+    const ownChild = await run1({ approvedSelection: { source: "own", exclusions: [] }, repoAgents: [tmpl("repo-reviewer", "x")] }, "coder");
+    assert.equal(ownChild.success, false, ownChild.text);
+    assert.doesNotMatch(ownChild.text, /PRD BODY TEXT/);
   });
 
   it("repo source: completion-rework and clarification continuation prompts carry the passage and names", async () => {

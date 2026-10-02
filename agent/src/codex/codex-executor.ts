@@ -3499,7 +3499,7 @@ export class CodexExecutor implements Executor {
       for (const t of implementTemplates(ctx, selection)) agents[t.name] = toHarnessAgent(t, repoSkills);
       // The roster (and, for a repo roster, the untrusted-content passage) rides EVERY implement
       // prompt built here, so the base prompt and every replacement prompt (completion rework,
-      // safety steer, clarification continuation) carry it: the resumed thread's developer
+      // safety steer, clarification continuation, resume-reject restart) carry it: the resumed thread's developer
       // instructions alone are not enough on a turn that bypasses implementPrompt.
       prompt = [prompt, "", delegatesLine(Object.keys(agents)), ...(repoSourced ? [REPO_SUBAGENT_UNTRUSTED_APPEND] : [])].join("\n");
     }
