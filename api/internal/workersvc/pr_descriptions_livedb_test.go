@@ -285,6 +285,87 @@ func TestPrDescriptionDiagramBindAndLostAckLiveDB(t *testing.T) {
 	}
 }
 
+func TestPrDescriptionDiagramPublishedTransitionsLiveDB(t *testing.T) {
+	p := setupPrDescLive(t)
+	v, err := p.svc.StagePrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionStageRequest{
+		ClaimGeneration: gen(1), Source: "generated",
+		Fields: apitypes.PrDescriptionFields{Summary: "With diagram.", Diagram: &apitypes.PrDescriptionDiagram{
+			Kind: "flow", Title: "Flow",
+			Nodes: []apitypes.PrDescriptionDiagramNode{{Key: "a", Label: "Start"}, {Key: "b", Label: "Work"}, {Key: "c", Label: "Done"}},
+			Edges: []apitypes.PrDescriptionDiagramEdge{{From: "a", To: "b"}, {From: "b", To: "c"}},
+		}},
+		BaseSha: strings.Repeat("1", 40), HeadSha: strings.Repeat("2", 40), TargetBranch: "main",
+	})
+	if err != nil || v.Fields.Diagram == nil {
+		t.Fatalf("stage diagram = %+v, %v", v, err)
+	}
+	bind := func(id, hash string, flag bool) apitypes.PrDescriptionBindResponse {
+		t.Helper()
+		r, err := p.svc.BindPrDescription(p.env.ctx, p.wkr, p.runID, apitypes.PrDescriptionBindRequest{
+			ClaimGeneration: gen(1), VersionID: id, MrIid: 5, RenderedRegionSha256: hash, RegionHasDiagram: genBool(flag),
+		})
+		if err != nil {
+			t.Fatalf("bind %s: %v", id, err)
+		}
+		return r
+	}
+	checkRun := func(want *bool) {
+		t.Helper()
+		desc, _, err := p.svc.RunPrDescription(p.env.ctx, mustRun(t, p.env, p.runID))
+		if err != nil || (want == nil && desc != nil) || (want != nil && (desc == nil || desc.DiagramPublished != *want)) {
+			t.Fatalf("RunPrDescription = %+v, %v; want diagram_published %v", desc, err, want)
+		}
+	}
+	checkFlag := func(id string, want bool) {
+		t.Helper()
+		var flag *bool
+		if err := p.env.pool.QueryRow(p.env.ctx, `SELECT region_has_diagram FROM pr_description_versions WHERE id = $1`, id).Scan(&flag); err != nil || flag == nil || *flag != want {
+			t.Fatalf("stored region_has_diagram for %s = %v, %v; want %t", id, flag, err, want)
+		}
+	}
+	checkRun(nil) // A staged version is not a published run description.
+	b := bind(v.ID, prDescLiveHashA, true)
+	if b.Version.RegionHasDiagram == nil || !*b.Version.RegionHasDiagram || b.PR.PublishedVersion != nil {
+		t.Fatalf("bound pending version = %+v", b)
+	}
+	checkFlag(v.ID, true)
+	checkRun(nil) // Binding alone cannot expose pending content in the run DTO.
+	a, err := p.ack(1, v.ID, "published", 0, nil)
+	if err != nil || a.PR.PublishedVersion == nil || a.PR.PublishedVersion.ID != v.ID ||
+		a.PR.PublishedVersion.RegionHasDiagram == nil || !*a.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("publish diagram = %+v, %v", a, err)
+	}
+	checkRun(genBool(true))
+	if retry, err := p.ack(1, v.ID, "published", 0, nil); err != nil || retry.PR.PublishedVersion == nil ||
+		retry.PR.PublishedVersion.ID != v.ID || retry.PR.PublishedVersion.RegionHasDiagram == nil || !*retry.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("lost ack retry = %+v, %v", retry, err)
+	}
+	checkFlag(v.ID, true)
+	checkRun(genBool(true))
+
+	attempt := p.stage(t, 1, "Attempt without diagram.", gen(5))
+	bind(attempt.ID, prDescLiveHashB, false)
+	if skipped, err := p.ack(1, attempt.ID, "skipped_human_edit", 1, nil); err != nil ||
+		skipped.PR.PublishedVersion == nil || skipped.PR.PublishedVersion.ID != v.ID ||
+		skipped.PR.PublishedVersion.RegionHasDiagram == nil || !*skipped.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("skipped attempt changed publication = %+v, %v", skipped, err)
+	}
+	checkRun(genBool(true))
+	checkFlag(v.ID, true)
+
+	plain := p.stage(t, 1, "Published without diagram.", gen(5))
+	if plain.Fields.Diagram != nil {
+		t.Fatalf("diagram-less stage = %+v", plain.Fields)
+	}
+	bind(plain.ID, prDescLiveHashC, false)
+	if final, err := p.ack(1, plain.ID, "published", 2, nil); err != nil || final.PR.PublishedVersion == nil ||
+		final.PR.PublishedVersion.ID != plain.ID || final.PR.PublishedVersion.RegionHasDiagram == nil || *final.PR.PublishedVersion.RegionHasDiagram {
+		t.Fatalf("publish diagram-less version = %+v, %v", final, err)
+	}
+	checkFlag(plain.ID, false)
+	checkRun(genBool(false))
+}
+
 func genBool(v bool) *bool { return &v }
 
 // TestPrDescriptionLostAckRecoveryLiveDB: a version whose forge write landed but whose ack was
