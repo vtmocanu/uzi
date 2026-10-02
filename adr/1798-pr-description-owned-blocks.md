@@ -69,7 +69,7 @@ precedence. The grounded editor returns structured nodes and edges, never
 Mermaid syntax. The renderer alone emits the fenced Mermaid source from the
 api-sanitized fields (I3). The api normalizes labels, limits their characters,
 and rejects a whole diagram containing a closing directive or mention;
-I4's whole-body closing scan still applies. Lead-only and deterministic
+I5's whole-body closing scan still applies. Lead-only and deterministic
 fallbacks contain no diagram. The published region's bind-time flag governs
 whether web and CLI show a plain-text outline, including after lost-ack
 recovery. The diagram is dropped before the computed size table when either
