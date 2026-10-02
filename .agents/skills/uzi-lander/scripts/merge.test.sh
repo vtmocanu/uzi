@@ -16,7 +16,9 @@ fail() { echo "FAIL: $*" >&2; exit 1; }
 HEAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
 MSHA=abcabcabcabcabcabcabcabcabcabcabcabcabca
 
-mkdir -p "$WORK/bin" "$WORK/state"
+REAL_STAT=$(command -v stat) || { echo "BROKEN: no stat on PATH" >&2; exit 2; }
+export REAL_STAT
+mkdir -p "$WORK/bin" "$WORK/outer-bin" "$WORK/state"
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
 exit 0
@@ -28,7 +30,7 @@ set -eu
 # succeeds with filesystem-formatted text and therefore is not a portable feature probe.
 if [ "${1:-}" = -c ]; then
   last="${!#}"
-  if [ "$(uname -s)" = Darwin ]; then /usr/bin/stat -f %m "$last"; else /usr/bin/stat -c %Y "$last"; fi
+  if [ "$(uname -s)" = Darwin ]; then "$REAL_STAT" -f %m "$last"; else "$REAL_STAT" -c %Y "$last"; fi
   exit 0
 fi
 if [ "${1:-}" = -f ]; then
@@ -36,8 +38,16 @@ if [ "${1:-}" = -f ]; then
   echo '    ID: deadbeef Namelen: 255 Type: ext2/ext3'
   exit 0
 fi
-exec /usr/bin/stat "$@"
+exec "$REAL_STAT" "$@"
 STUB
+export OUTER_GH_LOG="$WORK/outer-gh.log"
+cat > "$WORK/outer-bin/gh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$OUTER_GH_LOG"
+exit 1
+STUB
+chmod +x "$WORK/outer-bin/gh"
+export PATH="$WORK/outer-bin:$PATH"
 cat > "$WORK/bin/gh" <<STUB
 #!/usr/bin/env bash
 set -eu
@@ -64,7 +74,7 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
   esac
   exit 0
 fi
-# The base branch's required contexts as `gh api --paginate --slurp` returns them (pages).
+# The base branch's required contexts as gh api --paginate --slurp returns them (pages).
 # RULES_JSON = one page; RULES_FAIL=1 = unreadable. Default: none required.
 # The every-author blockers: review threads (THREADS_JSON nodes), code-scanning alerts
 # (CS_MODE alert|broken), issue comments (COMMENTS_FILE) and reviews (none). Default: clear.
@@ -91,6 +101,7 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = merge ]; then echo "\$*" >> "$WORK/merge.
 echo "unexpected gh call: \$*" >&2
 exit 1
 STUB
+[ ! -s "$OUTER_GH_LOG" ] || fail "outer gh ran while creating the gh stub: $(cat "$OUTER_GH_LOG")"
 chmod +x "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat"
 export PATH="$WORK/bin:$PATH"
 export UZI_LANDER_STATE_DIR="$WORK/state"
