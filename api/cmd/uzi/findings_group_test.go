@@ -81,9 +81,15 @@ func TestFindingsDraftMatchesWebDialogFixture(t *testing.T) {
 		t.Errorf("CLI preview = %q (exit %d, ids %v), web dialog draft = %+v", out, code, fc.LastFindingGroupDraftIDs, webDraft)
 	}
 	out, _, code = runCLI(t, fakeEnv(fc), "findings", "draft", "e-1", "e-2", "--json")
-	var cliDraft apitypes.FindingGroupDraftDTO
-	if code != uzicli.ExitOK || json.Unmarshal([]byte(out), &cliDraft) != nil || !reflect.DeepEqual(cliDraft, webDraft) {
-		t.Errorf("CLI JSON draft = %q (exit %d), web dialog draft = %+v", out, code, webDraft)
+	var cliJSON, webJSON map[string]any
+	if err := json.Unmarshal([]byte(out), &cliJSON); err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &webJSON); err != nil {
+		t.Fatal(err)
+	}
+	if code != uzicli.ExitOK || !reflect.DeepEqual(cliJSON, webJSON) {
+		t.Errorf("CLI JSON draft = %q (exit %d), web dialog draft = %s", out, code, raw)
 	}
 }
 
