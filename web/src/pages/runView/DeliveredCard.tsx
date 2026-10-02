@@ -2,13 +2,12 @@
 // PUBLISHED plain-English PR description (Run.pr_description) and the PR's last
 // description-write outcome (Run.pr_description_outcome).
 //
-// TRUST: every field is lead- or model-authored and UNTRUSTED. The api sanitized it FOR THE
-// FORGE's markdown (api/internal/workersvc/pr_description_sanitize.go, step 3): every `<` is
-// encoded as `&lt;`, block tokens, code-fence runs and every `[` / `]` are backslash-escaped, and
-// a U+200B is inserted after `@` and inside closing keywords. This surface is NOT markdown:
-// displayPrText undoes the two encodings (so `\[x\]` reads `[x]` and `&lt;b&gt;` reads `<b>`)
-// and the result is rendered ONLY as React text nodes. Never <Markdown>, never
-// dangerouslySetInnerHTML: once unescaped the text is exactly as hostile as the lead wrote it.
+// TRUST: the prose fields are lead- or model-authored and UNTRUSTED. The api sanitizes prose
+// FOR THE FORGE's markdown (api/internal/workersvc/pr_description_sanitize.go): it encodes `<`
+// as `&lt;`, escapes block tokens, fences and brackets, and inserts U+200B breakers. Diagram
+// labels use a separate strict allowlist that maps unsafe characters to spaces. This surface
+// is NOT markdown: displayPrText undoes prose encodings for display and every value is rendered
+// ONLY as a React text node. Never <Markdown>, never dangerouslySetInnerHTML.
 
 import { useId } from "react";
 import { Badge, type BadgeTone } from "../../components/ui";
