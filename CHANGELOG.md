@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **The standalone worker setup command now supports hardened startup ([#1987](https://github.com/vtmocanu/uzi/issues/1987)).**
+  The documented build uses the repository root as its context, and the run command grants only the five capabilities required by the entrypoint while retaining no-new-privileges. The join token is delivered through a file instead of the worker's environment.
+
 ## [0.85.0] - 2026-09-26
 
 ### Added

@@ -35,13 +35,19 @@ docker compose --profile agent up
 
 This starts the `agent` service pointed at the compose network's `api`, with its data on the named volume `agentdata`. Once it registers, **Settings → Workers** shows it as **online**.
 
-**Standalone**, for a different host or a remote server (note the `-f` selecting the template Dockerfile, see [Worker templates](#worker-templates) below):
+**Standalone**, for a different host or a remote server: run these commands from the repository root (note the `-f` selecting the template Dockerfile, see [Worker templates](#worker-templates) below). First save the join token in a dedicated file outside the repository/build context, and replace `/absolute/path/worker-token` with that existing file's absolute path:
 
 ```sh
-docker build -t uzi-agent -f agent/templates/base/Dockerfile agent
-docker run -d -e UZI_API_URL=https://uzi.example.com -e UZI_WORKER_TOKEN=<the join token> \
-  -v uzi-agent-data:/data --cap-drop ALL --security-opt no-new-privileges:true uzi-agent
+docker build -t uzi-agent -f agent/templates/base/Dockerfile .
+docker run -d -e UZI_API_URL=https://uzi.example.com \
+  -e UZI_WORKER_TOKEN_FILE=/run/secrets/worker_token \
+  --mount type=bind,src=/absolute/path/worker-token,dst=/run/secrets/worker_token \
+  -v uzi-agent-data:/data --cap-drop ALL \
+  --cap-add SETUID --cap-add SETGID --cap-add SETPCAP --cap-add CHOWN --cap-add DAC_OVERRIDE \
+  --security-opt no-new-privileges:true uzi-agent
 ```
+
+The five capabilities support the root startup window; the entrypoint then drops to the unprivileged worker with only SETUID/SETGID, so it can launch agents under a separate runner UID. Keep the token bind mount writable: startup re-owns the mounted file to UID/GID 10001 and sets its mode to 0400. This changes the backing host file's permissions and, on Linux, its ownership; desktop container runtimes may map ownership differently. A generic read-only bind mount refuses to start because the entrypoint cannot enforce that token posture. File delivery keeps the join token out of the worker's environment.
 
 Put a TLS-terminating proxy in front of a worker reached over an untrusted network: `api` itself listens plain HTTP.
 
@@ -63,7 +69,7 @@ WORKER_TEMPLATE=jvm docker compose --profile agent build agent
 WORKER_TEMPLATE=jvm docker compose --profile agent up
 ```
 
-With `WORKER_TEMPLATE` unset, compose builds `base`. Set it to a **bare template name** only (one of the names above): it is interpolated into the Dockerfile path, so a value with `/`, `..`, or an absolute path is unsupported and would resolve outside `agent/templates/`. Standalone, point `docker build -f` at the template's Dockerfile (e.g. `-f agent/templates/jvm/Dockerfile agent`).
+With `WORKER_TEMPLATE` unset, compose builds `base`. Set it to a **bare template name** only (one of the names above): it is interpolated into the Dockerfile path, so a value with `/`, `..`, or an absolute path is unsupported and would resolve outside `agent/templates/`. Standalone, point `docker build -f` at the template's Dockerfile and use the repository root as the context (e.g. `-f agent/templates/jvm/Dockerfile .`).
 
 Each template's Dockerfile bakes its own name into the image as `UZI_WORKER_TEMPLATE` (a fixed literal, independent of the `WORKER_TEMPLATE` build variable), and the worker **reports** that at register, so **Settings → Workers** shows each worker's template. Because the reported value is the image's own baked-in identity, it flags a genuine mismatch when you build with one `WORKER_TEMPLATE` but declared another at issuance. This is observability only: the join token is still the sole trust anchor, so a worker's reported template is never used to accept or reject it.
 
