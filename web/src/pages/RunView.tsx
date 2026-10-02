@@ -1864,7 +1864,8 @@ export function RunView() {
   useEffect(() => {
     setIncidentalSummary(null);
     refreshIncidentalSummary();
-    return () => { summaryRequest.current++; };
+    const requestRef = summaryRequest;
+    return () => { requestRef.current++; };
   }, [refreshIncidentalSummary]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
