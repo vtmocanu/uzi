@@ -32,6 +32,8 @@ COPY fixtures/api-contract/ /app/fixtures/api-contract/
 COPY fixtures/milestone-attribution/ /app/fixtures/milestone-attribution/
 # Same reason for the PR size-line cases (PRD #1798): DeliveredCard.test.tsx imports them.
 COPY fixtures/pr-size-line/ /app/fixtures/pr-size-line/
+# Same reason for the grouped findings draft: Findings.test.tsx imports it. Mirrors web/Dockerfile.
+COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
 ENV VITE_UZI_MOCK=1
 RUN npm run build
 

@@ -51,6 +51,9 @@ COPY fixtures/milestone-attribution/ /app/fixtures/milestone-attribution/
 # Same reason for the PR size-line cases (PRD #1798): DeliveredCard.test.tsx statically imports
 # `../../../../fixtures/pr-size-line/cases.json`, shared with the agent's size-line renderer.
 COPY fixtures/pr-size-line/ /app/fixtures/pr-size-line/
+# Same reason for the grouped findings draft: Findings.test.tsx statically imports
+# `../../../fixtures/finding-group-draft/response.json`, shared with the CLI's draft test.
+COPY fixtures/finding-group-draft/ /app/fixtures/finding-group-draft/
 RUN npm run build
 
 # --- runtime stage ---
