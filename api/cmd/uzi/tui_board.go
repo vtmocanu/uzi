@@ -1,6 +1,7 @@
 package main
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -218,19 +219,49 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	return word
 }
 
-// bandOrder partitions runs into the three bands, preserving each band's internal order
-// (the server's), and concatenates them NEEDS YOU → ON THE FLOOR → DONE.
+// bandOrder concatenates NEEDS YOU → ON THE FLOOR → DONE. Active bands keep the
+// server's order; DONE uses the web archive's newest-finish-first order (#2098),
+// preserving server order when both the finish instant and status rank tie.
 func bandOrder(runs []apitypes.RunListItemDTO) []apitypes.RunListItemDTO {
 	var buckets [numBands][]apitypes.RunListItemDTO
 	for _, r := range runs {
 		b := runBandOf(r)
 		buckets[b] = append(buckets[b], r)
 	}
+	slices.SortStableFunc(buckets[bandDone], compareDoneRuns)
 	out := make([]apitypes.RunListItemDTO, 0, len(runs))
 	for b := 0; b < numBands; b++ {
 		out = append(out, buckets[b]...)
 	}
 	return out
+}
+
+func compareDoneRuns(a, b apitypes.RunListItemDTO) int {
+	aTime, bTime := a.UpdatedAt, b.UpdatedAt
+	if a.FinishedAt != nil {
+		aTime = *a.FinishedAt
+	}
+	if b.FinishedAt != nil {
+		bTime = *b.FinishedAt
+	}
+	if cmp := bTime.Compare(aTime); cmp != 0 {
+		return cmp
+	}
+	return doneStatusRank(a.Status) - doneStatusRank(b.Status)
+}
+
+// Keep aligned with PAST_STATUS_RANK in web/src/pages/RunsList.tsx.
+func doneStatusRank(status string) int {
+	switch status {
+	case "failed":
+		return 0
+	case "cancelled":
+		return 1
+	case "completed":
+		return 2
+	default:
+		return 3
+	}
 }
 
 func (b *boardState) selected() (apitypes.RunListItemDTO, bool) {

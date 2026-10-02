@@ -28,6 +28,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **TUI finished runs now match the web Past runs order ([#2098](https://github.com/vtmocanu/uzi/issues/2098)).**
+  The DONE band shows the most recently finished runs first, falling back to the last update for runs without a finish time. Equal finish times put failed runs before cancelled runs before completed runs, retaining the server order for remaining ties.
+
 - **Codex agent commands that read stdin no longer hang until the 60-minute command deadline ([#2087](https://github.com/vtmocanu/uzi/issues/2087)).**
   The command sandbox passed its own stdin, an open pipe that nothing writes to or closes, through to every command, so `rg PATTERN` with no path or a bare `cat` could block until the command deadline unless interrupted. Model-authorized commands now get an empty stdin (`/dev/null`) and see end-of-file at once; pipes and heredocs written inside the command itself work as before. The worker's own internal processes that stream data (file operations, git pack import) keep their stdin.
 - **CI and worker semgrep versions stay in sync ([#2093](https://github.com/vtmocanu/uzi/issues/2093)).**
