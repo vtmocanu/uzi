@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex runs now honour “Apply model also to agents” ([#2115](https://github.com/vtmocanu/uzi/issues/2115)).**
+  When enabled, plan agents and selected owner or repo subagents follow the resolved run model instead of their pinned model; with it off, their model pins still apply.
+
 - **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
   Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
 
