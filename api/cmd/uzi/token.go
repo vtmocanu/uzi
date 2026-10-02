@@ -328,7 +328,7 @@ func newTokenCmd(env Env, gf *globalFlags) *cobra.Command {
 					p.Printf(" (%s)", cellText(result.Reason))
 				}
 				if result.Display != "" {
-					p.Printf(" — %s", cellText(result.Display))
+					p.Printf(", %s", cellText(result.Display))
 				}
 				p.Printf("\n")
 			}

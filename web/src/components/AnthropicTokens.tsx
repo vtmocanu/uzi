@@ -480,7 +480,7 @@ function TokenRow({
                   raised separately rather than ridden in on a token-selection change. */}
               {skipped && (
                 <span className="text-xs text-warn">
-                  {autoStatus === "rejected" ? "— auto-selection cannot pick it" : "— may be picked as a fallback"}
+                  {autoStatus === "rejected" ? "(auto-selection cannot pick it)" : "(may be picked as a fallback)"}
                 </span>
               )}
               <span id={autoHintId} className="sr-only">
