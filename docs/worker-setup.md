@@ -182,12 +182,13 @@ last resort:
    the cap parks preventively (uncounted, so this cannot by itself fail a
    run). A *hard* layer watches the data volume itself on every stats tick,
    independent of turn boundaries, and — only once the volume nears the
-   api's disk-pressure threshold — stops the Claude run with the
-   largest caches and parks it with a **counted** `data_volume_full` park. A run is stopped
-   only while its executor is running and the server has acknowledged
-   `running` since the run last reported, or was told, any other status (a
-   `running` report still awaiting its reply does not unmake that, but a
-   reply that declines it or is unreadable does). A Claude run that
+   api's disk-pressure threshold — acts on the Claude run with the largest
+   caches. It stops that run and parks it with a **counted**
+   `data_volume_full` park only while its executor is running and the server
+   has acknowledged `running` for a status report newer than its last
+   non-`running` report and newer than any declined or unreadable reply
+   (reports are ordered by when they were sent; a `running` report still
+   awaiting its reply changes nothing). A Claude run that
    is not running (cloning, at its plan gate, in a revision turn, waiting
    on a question or follow-up, finalizing) is not stopped: its rebuildable
    caches are dropped in place instead and it keeps its gate. Because of
