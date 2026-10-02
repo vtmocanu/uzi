@@ -15,6 +15,7 @@ export FULL_SHA SHORT_SHA BAD_SHA
 mkdir -p "$WORK/bin"
 cat > "$WORK/bin/sleep" <<'STUB'
 #!/usr/bin/env bash
+[ -z "${SLEEPS:-}" ] || printf '%s\n' "$1" >> "$SLEEPS"
 exit 0
 STUB
 cat > "$WORK/bin/gh" <<'STUB'
@@ -50,11 +51,15 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
         *" --branch main "*) printf '102\tcompleted\tsuccess\tCI\n' ;;
       esac
       ;;
-    transient)
+    transient|escape-pending)
       n=0; [ -f "$LIST_COUNT" ] && n=$(cat "$LIST_COUNT")
       n=$((n+1)); printf '%s' "$n" > "$LIST_COUNT"
       case "$n" in
-        1) printf '103\tin_progress\t\tCI\n' ;;
+        1)
+          if [ "$MODE" = escape-pending ]; then
+            printf '103\tin_progress\t\tCI%s]52;c;Zm9v\a\n' $'\x1b'
+          else printf '103\tin_progress\t\tCI\n'; fi
+          ;;
         2) : ;;
         *) printf '103\tcompleted\tsuccess\tCI\n' ;;
       esac
@@ -71,7 +76,7 @@ if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
   if [ "$MODE" = failure ]; then
     escape=$'\x1b'
     printf 'completed\tfailure\tlint%s[31m-repo\thttps://github.com/test/repo/actions/runs/104/job/999\t999\n' "$escape"
-  elif [ "$MODE" = transient ]; then
+  elif [ "$MODE" = transient ] || [ "$MODE" = escape-pending ]; then
     n=0; [ -f "$VIEW_COUNT" ] && n=$(cat "$VIEW_COUNT")
     n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
     if [ "$n" -eq 1 ]; then printf 'in_progress\t\tCI\thttps://example.invalid/job/103\t103\n'
@@ -153,6 +158,45 @@ set -e
 [ "$rc" -eq 0 ] || fail "pending/empty/green sequence did not recover, rc=$rc: $(cat "$WORK/transient.out")"
 grep -q 'workflow listing temporarily empty after runs were seen' "$WORK/transient.out" \
   || fail "transient empty listing used misleading never-seen wording: $(cat "$WORK/transient.out")"
+grep -Fxq '[tick 0] pending after 0s: CI' "$WORK/transient.out" \
+  || fail "--sha pending tick printed no heartbeat naming the open workflow: $(cat "$WORK/transient.out")"
+
+# --sha defaults to a 60s tick; an explicit --interval still wins.
+: > "$CALLS"; rm -f "$LIST_COUNT" "$VIEW_COUNT"; : > "$WORK/sleeps"
+MODE=transient; SLEEPS="$WORK/sleeps"; export MODE SLEEPS
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --max-ticks 4 > "$WORK/sha-default.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "--sha default-interval run failed, rc=$rc: $(cat "$WORK/sha-default.out")"
+[ -s "$WORK/sleeps" ] && [ -z "$(grep -vx 60 "$WORK/sleeps")" ] \
+  || fail "--sha default interval is not 60s: $(cat "$WORK/sleeps")"
+
+# Run-id mode keeps its 120s default and also heartbeats.
+: > "$CALLS"; rm -f "$VIEW_COUNT"; : > "$WORK/sleeps"
+set +e
+bash "$SCRIPT" 103 --repo test/repo --max-ticks 3 > "$WORK/run-id.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "run-id pending/green sequence failed, rc=$rc: $(cat "$WORK/run-id.out")"
+[ "$(cat "$WORK/sleeps")" = 120 ] || fail "run-id default interval is not 120s: $(cat "$WORK/sleeps")"
+grep -Fxq '[tick 0] pending after 0s: run 103, 1 job(s) not completed' "$WORK/run-id.out" \
+  || fail "run-id pending tick printed no heartbeat: $(cat "$WORK/run-id.out")"
+unset SLEEPS
+
+# An untrusted workflow name reaches the heartbeat without its escape sequence.
+: > "$CALLS"; rm -f "$LIST_COUNT" "$VIEW_COUNT"
+MODE=escape-pending; export MODE
+set +e
+bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 4 > "$WORK/escape-pending.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 0 ] || fail "escape-pending sequence failed, rc=$rc: $(cat "$WORK/escape-pending.out")"
+grep -Fq '[tick 0] pending after 0s: CI' "$WORK/escape-pending.out" \
+  || fail "escaped workflow name produced no heartbeat: $(cat "$WORK/escape-pending.out")"
+if LC_ALL=C grep -Fq $'\033' "$WORK/escape-pending.out"; then
+  fail "untrusted workflow name in the heartbeat emitted a raw escape byte: $(cat -v "$WORK/escape-pending.out")"
+fi
 
 : > "$CALLS"
 MODE=failure; export MODE
@@ -180,4 +224,4 @@ grep -Fq 'live log: gh api --allow-escape-sequences repos/test/repo/actions/jobs
 grep -Fq 'after run terminal: gh run view 104 --repo test/repo --job 999 --log-failed' "$WORK/failure-derived.out" \
   || fail "URL-derived repo missing from terminal command: $(cat "$WORK/failure-derived.out")"
 
-echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, live failed-job logs"
+echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat, default intervals, live failed-job logs"

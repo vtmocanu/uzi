@@ -16,15 +16,16 @@
 #   watch-run-ci.sh --branch main [--workflow ci.yml] [--interval SECS] [--max-ticks N]
 #   watch-run-ci.sh --sha <sha> [--branch main] [--interval SECS] [--max-ticks N]
 #
-#   --interval     seconds between polls (default 120; CI jobs are minutes-long, so a
-#                  tighter cadence just burns API calls; 60 is plenty for --sha).
-#   --max-ticks    give up after N polls (default 40 -> ~80 min at 120s).
+#   --interval     seconds between polls (default 120, or 60 with --sha: a release or
+#                  post-merge gate waits on its result, so a 120s tick reports green late).
+#   --max-ticks    give up after N polls (default 40, or 80 with --sha -> ~80 min either way).
 #   --repo         OWNER/REPO (default: inferred by gh from the checkout).
 #
 # Run it in the BACKGROUND (the harness re-invokes you when it exits); do not block a
 # foreground turn on it. Polling the whole-run `status` and reacting only at `completed`
 # is the bug this replaces: a long job (test-api-store-it) keeps the run in_progress for
-# minutes after a fast job (validate-api) has already gone red.
+# minutes after a fast job (validate-api) has already gone red. Each pending tick prints
+# one `[tick N] pending after Ns: ...` line, so an empty output means no tick finished yet.
 #
 # Exit codes (callers branch on these; keep them stable):
 #   0  every job terminal and none failed (green). In --sha mode: every run that EXISTS
@@ -60,7 +61,7 @@
 #    cannot go green, so there is nothing to gain by waiting for the rest.
 set -uo pipefail
 
-RUN=""; BRANCH=""; SHA=""; WORKFLOW="ci.yml"; INTERVAL=120; MAX_TICKS=40; REPO=""
+RUN=""; BRANCH=""; SHA=""; WORKFLOW="ci.yml"; INTERVAL=""; MAX_TICKS=""; REPO=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --branch) BRANCH="${2:?}"; shift 2;;
@@ -85,6 +86,11 @@ if [ -n "$SHA" ] && [ -n "$RUN" ]; then echo "--sha and <run-id> are exclusive" 
 # --sha defaults the branch to main; --branch alone keeps its latest-run semantics.
 SHA_MODE=0
 if [ -n "$SHA" ]; then SHA_MODE=1; BRANCH="${BRANCH:-main}"; fi
+if [ "$SHA_MODE" -eq 1 ]; then INTERVAL="${INTERVAL:-60}"; MAX_TICKS="${MAX_TICKS:-80}"
+else INTERVAL="${INTERVAL:-120}"; MAX_TICKS="${MAX_TICKS:-40}"; fi
+
+# shellcheck source=lib/sanitize.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib/sanitize.sh"
 
 # gh repo flag, spliced as an array so an empty value adds no argument (zsh does not
 # word-split, and bash would pass an empty string).
@@ -260,6 +266,10 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       printf '%s\n' "$runs" | awk -F'\t' '{printf "  %-10s %-9s %s\n",$3,$1,$4}'
       exit 0
     fi
+    # Heartbeat: workflow names are untrusted (anyone who can push a workflow names one).
+    open_runs="$(printf '%s\n' "$runs" | awk -F'\t' '$2!="completed"{printf "%s%s", sep, $4; sep=", "}' \
+      | sanitize_untrusted 200)"
+    echo "[tick $tick] pending after $((tick*INTERVAL))s: ${open_runs:-runs completed, rechecking jobs}"
     sleep "$INTERVAL"; tick=$((tick+1)); continue
   fi
 
@@ -315,7 +325,10 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       echo "=== run $cur: all jobs terminal, none failed after $((tick*INTERVAL))s ==="
       exit 0
       ;;
-    PENDING) : ;;  # keep waiting
+    PENDING)
+      open_jobs="$(printf '%s\n' "$out" | awk -F'\t' '$1!="completed"{n++} END{print n+0}')"
+      echo "[tick $tick] pending after $((tick*INTERVAL))s: run $cur, $open_jobs job(s) not completed"
+      ;;
   esac
 
   sleep "$INTERVAL"; tick=$((tick+1))
