@@ -52,7 +52,7 @@ func TestCodexLinkedProbeUnit(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			raw, err := json.Marshal(codexLoginBlob{AccessToken: "access", RefreshToken: tc.refresh})
+			raw, err := json.Marshal(codexLoginBlob{AccessToken: "access", RefreshToken: tc.refresh}) //nolint:gosec // G117: fixture login blob with placeholder tokens
 			if err != nil {
 				t.Fatal(err)
 			}

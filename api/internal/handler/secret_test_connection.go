@@ -207,9 +207,9 @@ func (h *Handler) anthropicTestRejected(ctx context.Context, row store.GetAnthro
 func (h *Handler) anthropicTestSuccess(ctx context.Context, row store.GetAnthropicTokenToPollRow, reading anthropic.Reading) secretTestResult {
 	n, err := h.q.UpsertRateLimits(ctx, store.UpsertRateLimitsParams{
 		UserSecretID: row.ID, UserID: row.UserID, EnablementRev: row.EnablementRev,
-		FiveHourPct:      pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true},
+		FiveHourPct:      pgtype.Int2{Int16: int16(reading.FiveHour.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
 		FiveHourResetsAt: pgconv.TimePtr(reading.FiveHour.ResetsAt),
-		SevenDayPct:      pgtype.Int2{Int16: int16(reading.SevenDay.Pct), Valid: true},
+		SevenDayPct:      pgtype.Int2{Int16: int16(reading.SevenDay.Pct), Valid: true}, //nolint:gosec // G115: a rate-limit percentage (0-100), far within int16 range
 		SevenDayResetsAt: pgconv.TimePtr(reading.SevenDay.ResetsAt),
 		Source:           pgconv.Text(reading.Source), SyncedAt: pgconv.Time(time.Now().UTC()),
 	})
@@ -243,7 +243,7 @@ func probeOpenAIModels(ctx context.Context, client *http.Client, plain []byte) s
 	if err != nil {
 		return secretTestResult{Status: "inconclusive", Reason: "generic"}
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	switch {
 	case resp.StatusCode >= 200 && resp.StatusCode < 300:
 		var models struct {

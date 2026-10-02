@@ -200,7 +200,7 @@ func TestParseHeaders(t *testing.T) {
 	}
 }
 
-const secretToken = "sk-ant-oat-SECRETsentinelVALUE-do-not-leak"
+const secretToken = "sk-ant-oat-SECRETsentinelVALUE-do-not-leak" //nolint:gosec // G101: a sentinel the no-leak test searches for, not a credential
 
 // TestNoTokenInError is the load-bearing security test: no error path can carry
 // the token. It exercises HTTP-refusal and transport failures and asserts the
@@ -240,7 +240,7 @@ func (c *Client) doAndClassify(ctx context.Context, method, url string, body, to
 	if err != nil {
 		return Reading{}, err
 	}
-	defer resp.Body.Close()
+	defer func() { _ = resp.Body.Close() }()
 	b, _ := io.ReadAll(io.LimitReader(resp.Body, maxBodyBytes))
 	if resp.StatusCode != http.StatusOK {
 		return Reading{}, httpError("test", resp.StatusCode, b)
