@@ -22,6 +22,10 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Built-in agents synced to skills v0.44.0** ([#2086](https://github.com/vtmocanu/uzi/pull/2086)). The architect (v12) consults a `dba` database specialist on schema, index, transaction and migration decisions when the team has one, and the reviewer (v19) asks for it when correctness depends on database behaviour instead of certifying that behaviour without evidence.
+
 ### Fixed
 
 - **A CI auto-fix or MR rework halt DM that Slack failed to take is now retried until it reaches you, instead of being lost ([#1675](https://github.com/vtmocanu/uzi/issues/1675)).**
