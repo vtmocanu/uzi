@@ -401,6 +401,21 @@ function snapshot(dir: string, into: string): () => void {
   };
 }
 
+/** Await the worker's fire-and-forget recovery passes (bounded: the aborted signal stops each at its
+ *  next record, so this only waits out the record step in flight). Newly started passes are awaited too. */
+async function drainBackground(background: Promise<void>[]): Promise<void> {
+  const deadline = Date.now() + 10_000;
+  let seen = 0;
+  while (seen < background.length) {
+    const batch = background.slice(seen);
+    seen = background.length;
+    const timeout = new Promise<never>((_, rej) => {
+      setTimeout(() => rej(new Error("a boot recovery pass did not settle within 10s of the abort")), Math.max(0, deadline - Date.now())).unref();
+    });
+    await Promise.race([Promise.allSettled(batch), timeout]);
+  }
+}
+
 /** Restart a worker over the durable state in fx.dataDir (the forge is unreachable) and wait until
  *  the settlement journal of `runId` is empty. Returns the boot events (`state:*` replays, `settle:*`)
  *  and the settle requests. `onPromote` sees every settlement put of a `pending_settle` record. */
@@ -408,9 +423,20 @@ async function bootAndSettle(
   runId: string,
   outboxRoot: string,
   onPromote?: (outbox: Outbox) => void,
+  /** `slowBundleMs` delays every recovery bundle the restarted worker's boot sweep produces, so a
+   *  sweep still mid-record when the settlement journal empties is deterministic (issue #2020). */
+  opts: { slowBundleMs?: number; bundleStarts?: { n: number } } = {},
 ): Promise<{ events: string[]; calls: FakeSettleClient["calls"]; s2: Stores }> {
   const events: string[] = [];
   const git2 = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+  if (opts.slowBundleMs) {
+    const produce = git2.produceRecoveryBundle.bind(git2);
+    git2.produceRecoveryBundle = async (...args) => {
+      if (opts.bundleStarts) opts.bundleStarts.n++;
+      await sleep(opts.slowBundleMs!);
+      return produce(...args);
+    };
+  }
   const s2 = stores(git2);
   const settleClient2 = new FakeSettleClient((rid, holdId) => {
     events.push(`settle:${holdId}`);
@@ -431,6 +457,20 @@ async function bootAndSettle(
     settleClient: settleClient2,
     outbox: outbox2,
   });
+  // issue #2020: Worker.run starts the boot recovery sweep (resumePendingRecoveries) and the
+  // heartbeat-driven live re-drive (resumeLiveRecoveries) fire-and-forget, and aborting the signal
+  // does not wait for them. Each one journals under fx.dataDir/recovery, so one still running when
+  // this helper returns recreates that tree after the harness afterEach removed the fixture (a
+  // leaked uzi-agent-test-* dir). Collect their promises here and await them before returning.
+  const background: Promise<void>[] = [];
+  for (const name of ["resumePendingRecoveries", "resumeLiveRecoveries"] as const) {
+    const orig = runner2[name].bind(runner2) as (...a: unknown[]) => Promise<void>;
+    (runner2 as unknown as Record<string, unknown>)[name] = (...a: unknown[]) => {
+      const p = orig(...a);
+      background.push(p);
+      return p;
+    };
+  }
   const worker = new Worker(fakeConfig(fx.dataDir), client2, runner2, idleChat, noJudge, noReview, nullLogger(), okPreflight, outbox2, new Map(), undefined, 60_000);
   const controller = new AbortController();
   const done = worker.run(controller.signal);
@@ -439,8 +479,39 @@ async function bootAndSettle(
   } finally {
     controller.abort();
     await done;
+    await drainBackground(background);
   }
   return { events, calls: settleClient2.calls, s2 };
+}
+
+/** Scenario (c)'s crash state: gen2 completed and its ACK was observed, and the durable state
+ *  (outbox, settlement journal, recovery journal) is frozen just BEFORE the pushed -> pending_settle
+ *  promotion. Restores that state before returning. The caller removes `snapRoot`. */
+async function crashBeforePromotion(iid: number): Promise<{ s: Stores; gen2Claim: ClaimResponse; gen1Head: string; outboxRoot: string; snapRoot: string }> {
+  const { s, gen2Claim, gen1Head } = await trackingScenario(iid);
+  const outboxRoot = path.join(fx.dataDir, "outbox");
+  const outbox1 = await mkOutbox(outboxRoot);
+  const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-crash-"));
+  let restore: Array<() => void> = [];
+  // The "crash": the completion ACK came back, and the process dies at the instant it would
+  // promote the write-ahead `pushed` record (freeze the durable state BEFORE that write).
+  const put = s.settlement.put.bind(s.settlement);
+  s.settlement.put = async (rec) => {
+    if (rec.state === "pending_settle" && restore.length === 0) {
+      restore = [
+        snapshot(outboxRoot, path.join(snapRoot, "outbox")),
+        snapshot(git.recoverySettlementRoot, path.join(snapRoot, "settlement")),
+        snapshot(git.recoveryRoot, path.join(snapRoot, "recovery")),
+      ];
+    }
+    return put(rec);
+  };
+  await runGen2(s, gen2Claim, new FakeSettleClient(released), outbox1);
+  assert.ok(restore.length > 0, "precondition: the promotion was reached");
+  for (const r of restore) r();
+  const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
+  assert.equal(atCrash!.state, "pushed", "at the crash the record is write-ahead only (never sendable)");
+  return { s, gen2Claim, gen1Head, outboxRoot, snapRoot };
 }
 
 describe("settlement crash boundaries (issue #1582 M2)", () => {
@@ -500,29 +571,7 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
 
   it("(c) completion ACK received, crash BEFORE the promotion → boot replays the terminal, promotes before retiring it, then the sweep settles", async () => {
     const iid = 6202;
-    const { s, gen2Claim, gen1Head } = await trackingScenario(iid);
-    const outboxRoot = path.join(fx.dataDir, "outbox");
-    const outbox1 = await mkOutbox(outboxRoot);
-    const snapRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-crash-"));
-    let restore: Array<() => void> = [];
-    // The "crash": the completion ACK came back, and the process dies at the instant it would
-    // promote the write-ahead `pushed` record (freeze the durable state BEFORE that write).
-    const put = s.settlement.put.bind(s.settlement);
-    s.settlement.put = async (rec) => {
-      if (rec.state === "pending_settle" && restore.length === 0) {
-        restore = [
-          snapshot(outboxRoot, path.join(snapRoot, "outbox")),
-          snapshot(git.recoverySettlementRoot, path.join(snapRoot, "settlement")),
-          snapshot(git.recoveryRoot, path.join(snapRoot, "recovery")),
-        ];
-      }
-      return put(rec);
-    };
-    await runGen2(s, gen2Claim, new FakeSettleClient(released), outbox1);
-    assert.ok(restore.length > 0, "precondition: the promotion was reached");
-    for (const r of restore) r();
-    const [atCrash] = await s.settlement.listRun(gen2Claim.run_id);
-    assert.equal(atCrash!.state, "pushed", "at the crash the record is write-ahead only (never sendable)");
+    const { gen2Claim, gen1Head, outboxRoot, snapRoot } = await crashBeforePromotion(iid);
     fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
     try {
       const outboxProbe = await mkOutbox(outboxRoot);
@@ -546,6 +595,37 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
         [],
         "gen1's journal removed after the release",
       );
+    } finally {
+      fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
+      fs.rmSync(snapRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("the restarted worker's boot recovery sweep is drained: the journal is quiescent once bootAndSettle returns (issue #2020)", async () => {
+    // Scenario (c)'s restart. Its boot sweep (fire-and-forget in Worker.run) re-bundles gen2's pinned
+    // journal record; the slowed bundle keeps that sweep mid-record past the point where the
+    // settlement journal is already empty and the worker is aborted.
+    const { gen2Claim, outboxRoot, snapRoot } = await crashBeforePromotion(6203);
+    fs.renameSync(fx.originPath, `${fx.originPath}.gone`);
+    try {
+      const bundleStarts = { n: 0 };
+      await bootAndSettle(gen2Claim.run_id, outboxRoot, undefined, { slowBundleMs: 800, bundleStarts });
+      assert.ok(bundleStarts.n >= 1, "precondition: the boot sweep reached its (slowed) bundle production");
+      const tree = (): string[] => {
+        const out: string[] = [];
+        const walk = (d: string): void => {
+          for (const e of fs.readdirSync(d, { withFileTypes: true })) {
+            const f = path.join(d, e.name);
+            out.push(`${f} ${e.isDirectory() ? "d" : fs.statSync(f).mtimeMs}`);
+            if (e.isDirectory()) walk(f);
+          }
+        };
+        if (fs.existsSync(git.recoveryRoot)) walk(git.recoveryRoot);
+        return out.sort();
+      };
+      const atReturn = tree();
+      await sleep(1500); // longer than the slowed bundle: any late journal write lands here
+      assert.deepEqual(tree(), atReturn, "no recovery journal write after bootAndSettle returned");
     } finally {
       fs.renameSync(`${fx.originPath}.gone`, fx.originPath);
       fs.rmSync(snapRoot, { recursive: true, force: true });
