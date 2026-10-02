@@ -205,6 +205,7 @@ uzi review undo <run-id> <rec-id>
 uzi review file <run-id> <rec-id> [--repo <repo-id>]
 uzi review stats
 uzi findings list [--repo <repo-id>] [--bucket to_file|filed|done|dismissed|all] [--run <run-id>]
+uzi findings draft <finding-id> [<finding-id>...] [--json]
 uzi findings file <finding-id> [<finding-id>...]
 uzi findings release <operation-id> --confirm-no-issue
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
@@ -1345,6 +1346,19 @@ which you triage from the terminal exactly like the judge backlog.
   is an **empty list** (no existence oracle), never a 404. `--json` passes the whole
   envelope through, including the `open_count` meta and each coordinate's
   `dismiss_reason`, `set_via`, `evidence_preview` and per-run `occurrences`.
+- `uzi findings draft <finding-id> [<finding-id>...]` — read-only preview of
+  the server issue draft. One id, or several ids collapsing to one coordinate,
+  uses the single finding draft. Multiple distinct coordinates from one repo use
+  the group draft, with members ordered by disposition UUID; at most 50
+  distinct ids can be previewed; older evidence ids
+  resolve to their coordinate and duplicates count once. In a multi-id call,
+  each id needs a triage record. Human output is title, blank line, then body;
+  `--json` emits the exact server draft DTO. The group preview omits the
+  filing-time operation marker; filing may trim evidence at a UTF-8-safe
+  boundary to fit it. Draft labels are suggestions: the group draft includes
+  assembled labels including the mandatory marker label, but unedited CLI
+  filing sends only explicit ids and the server applies that label. Use
+  explicit ids for `file` too; there is no `--run` shortcut.
 - `uzi findings file <finding-id>` — file a real forge issue from one coordinate, on
   **your own** forge connection. The title, description and labels are assembled
   server-side from the stored, sanitised finding plus a mandatory marker label — the

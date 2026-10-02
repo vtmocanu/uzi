@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Added
 
+- **Review a terminal run's incidental findings and preview filing text in the CLI.**
+  Terminal run pages link to their filtered to-triage findings for grouped filing; `uzi findings draft <finding-id> [<finding-id>...]` previews the server's single or grouped issue draft without filing. Group previews omit the filing-time operation marker, so filing may trim evidence at a UTF-8-safe boundary to fit it; draft labels are suggestions, while unedited CLI filing sends explicit ids and the server applies its mandatory marker label.
+
 - **Stored credentials have an explicit Test action, and a rejected Anthropic token is remembered ([#1988](https://github.com/vtmocanu/uzi/issues/1988)).**
   Settings and `uzi token test <label> [--kind anthropic|codex|openai-key]` check one enabled credential without exposing it and answer `ok`, `rejected`, `permission_denied` or `inconclusive`: Anthropic tries Usage first and may send a small Messages request when probing is enabled, a linked Codex login gets a show-only usage read, and an OpenAI API key is checked against `GET /v1/models` (endpoint access only, not inference or billing). An Anthropic probe 401/403 now records the token as `rejected` until a successful usage reading, a successful Test (including a Messages check that returns no usage meters), a replaced value, or a disable/re-enable clears it; a rejected token is excluded from auto-selection, including the last-resort pooled-token floor, and `uzi token list` and the web show it.
 

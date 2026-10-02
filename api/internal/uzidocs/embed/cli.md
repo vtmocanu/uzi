@@ -138,6 +138,7 @@ uzi review dismiss <id> <rec> | --category <c> --target <t> --reason wont-do|not
 uzi review undo <id> <rec> | stats [--json]
 uzi review file <id> <rec> [--repo <repo-id>]
 uzi findings list [--repo <id>] [--bucket to_file|filed|done|dismissed|all] [--run <id>]
+uzi findings draft <finding-id> [<finding-id>...] [--json]
 uzi findings file <finding-id>
 uzi findings dismiss <finding-id> --reason wont-do|not-an-issue
 uzi findings resolve <finding-id>
@@ -1672,6 +1673,8 @@ uzi findings list                                            # what still needs 
 uzi findings list --bucket all --json                        # filed, done and dismissed too, for an agent
 uzi findings list --repo <repo-id>                           # one repo
 uzi findings list --run <run-id>                             # coordinates that also occur in that run
+uzi findings draft <finding-id>                               # preview one issue without filing
+uzi findings draft <finding-id> <finding-id> ...              # preview one grouped issue
 uzi findings file <finding-id>                               # file a forge issue from a coordinate
 uzi findings file <finding-id> <finding-id> ...              # file ONE issue for several coordinates
 uzi findings release <operation-id> --confirm-no-issue       # free a group filing that never confirmed
@@ -1694,6 +1697,20 @@ envelope. `--bucket` filters by disposition and defaults to `to_file`; `filed`,
 unknown `--bucket` is a usage error (exit 2), never a silently empty list, while a
 well-formed but foreign or unknown `--repo`/`--run` returns an **empty list** — no
 existence oracle — rather than a 404.
+
+`draft` previews the server's issue draft without filing. Give it one finding id,
+or several ids that collapse to one `(repo, location)` coordinate, for the single
+finding draft. For multiple coordinates it fetches the group draft using their
+distinct disposition UUIDs from one repo; the server orders group members by
+disposition UUID. Older evidence ids resolve to the same coordinate and duplicates
+count once; each id in a multi-id call needs a triage record. At most 50 distinct
+ids can be previewed. The human output is the title, a blank line, then the body;
+`--json` returns the exact server draft DTO, including its labels. A group
+preview omits the filing-time operation marker, and filing may trim evidence at
+a UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
+group draft includes assembled labels, including the mandatory marker label,
+but unedited CLI filing sends only the explicit ids and the server applies its
+mandatory marker label. Use explicit ids with `file`; there is no `--run` shortcut.
 
 `file` turns one coordinate into a real forge issue on **your own** connection. The
 title, description and labels are assembled server-side from the stored, sanitised

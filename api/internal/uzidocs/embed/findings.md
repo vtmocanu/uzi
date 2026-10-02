@@ -167,6 +167,8 @@ Everything here is also available from the [uzi CLI](./cli.md#incidental-finding
 
 ```sh
 uzi findings list                                       # what still needs triage
+uzi findings draft <finding-id>                          # preview without filing
+uzi findings draft <finding-id> <finding-id> ...         # preview a grouped issue
 uzi findings file <finding-id>                           # file it
 uzi findings file <finding-id> <finding-id> ...          # file several as one issue
 uzi findings release <operation-id> --confirm-no-issue   # free a group filing that never confirmed
@@ -180,6 +182,17 @@ uzi findings stats                                       # your triage totals, a
 issue-close sync's alike. `resolve` takes the `finding-id`, same as `file`
 and `dismiss`; `undo` takes the coordinate's `disposition_id` instead, not
 the `finding_id` the human `list` view prints — read it off `--json`.
+
+Give `draft` one id, or several ids that resolve to the same coordinate, to
+preview the single finding's issue. Several distinct coordinates from one repo
+request the server's group draft, ordered by disposition UUID. At most 50
+distinct ids can be previewed. The human output prints title,
+a blank line and body; `--json` returns the exact server draft DTO. A group
+preview omits the filing-time operation marker; filing may trim evidence at a
+UTF-8-safe boundary to make room for it. Draft labels are suggestions: the
+group includes assembled labels with the mandatory marker label, while unedited
+CLI filing sends only explicit ids and the server applies that label. Preview
+is read-only; pass explicit ids to `file` too, with no `--run` shortcut.
 
 Give `file` several ids of one repo to file one issue for all of them (see
 [Filing several findings as one issue](#filing-several-findings-as-one-issue)).
