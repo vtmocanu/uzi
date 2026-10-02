@@ -372,19 +372,11 @@ SELECT t.id,
   JOIN users u ON u.id = t.user_id
   JOIN products p ON p.id = t.product_id
  WHERE t.grant_id IS NULL
-   AND ($1::uuid IS NULL OR t.user_id = $1::uuid)
-   AND ($2::uuid IS NULL OR t.product_id = $2::uuid)
  ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
           t.created_at DESC,
           t.id ASC
- LIMIT $3::int
+ LIMIT $1::int
 `
-
-type ListAllProductTokensForAdminParams struct {
-	OwnerID   pgtype.UUID `json:"owner_id"`
-	ProductID pgtype.UUID `json:"product_id"`
-	MaxRows   int32       `json:"max_rows"`
-}
 
 type ListAllProductTokensForAdminRow struct {
 	ID          uuid.UUID          `json:"id"`
@@ -426,13 +418,11 @@ type ListAllProductTokensForAdminRow struct {
 // oldest active tokens are cut too, and "truncated" is what tells the admin. The
 // per-user mint limiter bounds how fast rows can be added.
 //
-// OPTIONAL FILTERS (#1935): sqlc.narg(owner_id) (t.user_id) and sqlc.narg(product_id)
-// (t.product_id); NULL means no predicate, both set means AND. They are applied in the
-// WHERE, so they narrow the rows BEFORE the ORDER BY ... LIMIT cut: an active token
-// that the unfiltered inventory cuts is still reachable (and revocable) by filtering
-// to its owner and/or product, and "truncated" is judged per filtered result.
-func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, arg ListAllProductTokensForAdminParams) ([]ListAllProductTokensForAdminRow, error) {
-	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin, arg.OwnerID, arg.ProductID, arg.MaxRows)
+// The owner/product-filtered inventory (#1935) uses the three static sibling queries
+// below, not optional predicates here: a generic plan cannot use an index under
+// "$1 IS NULL OR col = $1".
+func (q *Queries) ListAllProductTokensForAdmin(ctx context.Context, maxRows int32) ([]ListAllProductTokensForAdminRow, error) {
+	rows, err := q.db.Query(ctx, listAllProductTokensForAdmin, maxRows)
 	if err != nil {
 		return nil, err
 	}
@@ -504,6 +494,263 @@ func (q *Queries) ListEnabledProducts(ctx context.Context) ([]Product, error) {
 			&i.ClientSecretHash,
 			&i.ClientSecretPrefix,
 			&i.ClientSecretRotatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProductTokensForAdminByOwner = `-- name: ListProductTokensForAdminByOwner :many
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.product_id,
+       p.name AS product_name,
+       t.name,
+       t.token_prefix,
+       t.scopes,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM product_tokens t
+  JOIN users u ON u.id = t.user_id
+  JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
+   AND t.user_id = $1
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT $2::int
+`
+
+type ListProductTokensForAdminByOwnerParams struct {
+	OwnerID uuid.UUID `json:"owner_id"`
+	MaxRows int32     `json:"max_rows"`
+}
+
+type ListProductTokensForAdminByOwnerRow struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	OwnerEmail  string             `json:"owner_email"`
+	ProductID   uuid.UUID          `json:"product_id"`
+	ProductName string             `json:"product_name"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scopes      []string           `json:"scopes"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+}
+
+// Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
+// deliberately absent, the security boundary documented on that query), joins, ordering and
+// bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
+// stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
+// (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+func (q *Queries) ListProductTokensForAdminByOwner(ctx context.Context, arg ListProductTokensForAdminByOwnerParams) ([]ListProductTokensForAdminByOwnerRow, error) {
+	rows, err := q.db.Query(ctx, listProductTokensForAdminByOwner, arg.OwnerID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListProductTokensForAdminByOwnerRow{}
+	for rows.Next() {
+		var i ListProductTokensForAdminByOwnerRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OwnerEmail,
+			&i.ProductID,
+			&i.ProductName,
+			&i.Name,
+			&i.TokenPrefix,
+			&i.Scopes,
+			&i.Revoked,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.LastUsedIp,
+			&i.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProductTokensForAdminByOwnerAndProduct = `-- name: ListProductTokensForAdminByOwnerAndProduct :many
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.product_id,
+       p.name AS product_name,
+       t.name,
+       t.token_prefix,
+       t.scopes,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM product_tokens t
+  JOIN users u ON u.id = t.user_id
+  JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
+   AND t.user_id = $1
+   AND t.product_id = $2
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT $3::int
+`
+
+type ListProductTokensForAdminByOwnerAndProductParams struct {
+	OwnerID   uuid.UUID `json:"owner_id"`
+	ProductID uuid.UUID `json:"product_id"`
+	MaxRows   int32     `json:"max_rows"`
+}
+
+type ListProductTokensForAdminByOwnerAndProductRow struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	OwnerEmail  string             `json:"owner_email"`
+	ProductID   uuid.UUID          `json:"product_id"`
+	ProductName string             `json:"product_name"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scopes      []string           `json:"scopes"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+}
+
+// Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
+// deliberately absent, the security boundary documented on that query), joins, ordering and
+// bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
+// stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
+// (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+func (q *Queries) ListProductTokensForAdminByOwnerAndProduct(ctx context.Context, arg ListProductTokensForAdminByOwnerAndProductParams) ([]ListProductTokensForAdminByOwnerAndProductRow, error) {
+	rows, err := q.db.Query(ctx, listProductTokensForAdminByOwnerAndProduct, arg.OwnerID, arg.ProductID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListProductTokensForAdminByOwnerAndProductRow{}
+	for rows.Next() {
+		var i ListProductTokensForAdminByOwnerAndProductRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OwnerEmail,
+			&i.ProductID,
+			&i.ProductName,
+			&i.Name,
+			&i.TokenPrefix,
+			&i.Scopes,
+			&i.Revoked,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.LastUsedIp,
+			&i.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listProductTokensForAdminByProduct = `-- name: ListProductTokensForAdminByProduct :many
+SELECT t.id,
+       t.user_id,
+       u.email AS owner_email,
+       t.product_id,
+       p.name AS product_name,
+       t.name,
+       t.token_prefix,
+       t.scopes,
+       t.revoked,
+       t.created_at,
+       t.last_used_at,
+       t.last_used_ip,
+       t.expires_at
+  FROM product_tokens t
+  JOIN users u ON u.id = t.user_id
+  JOIN products p ON p.id = t.product_id
+ WHERE t.grant_id IS NULL
+   AND t.product_id = $1
+ ORDER BY (t.revoked OR (t.expires_at IS NOT NULL AND t.expires_at <= now())) ASC,
+          t.created_at DESC,
+          t.id ASC
+ LIMIT $2::int
+`
+
+type ListProductTokensForAdminByProductParams struct {
+	ProductID uuid.UUID `json:"product_id"`
+	MaxRows   int32     `json:"max_rows"`
+}
+
+type ListProductTokensForAdminByProductRow struct {
+	ID          uuid.UUID          `json:"id"`
+	UserID      uuid.UUID          `json:"user_id"`
+	OwnerEmail  string             `json:"owner_email"`
+	ProductID   uuid.UUID          `json:"product_id"`
+	ProductName string             `json:"product_name"`
+	Name        string             `json:"name"`
+	TokenPrefix string             `json:"token_prefix"`
+	Scopes      []string           `json:"scopes"`
+	Revoked     bool               `json:"revoked"`
+	CreatedAt   pgtype.Timestamptz `json:"created_at"`
+	LastUsedAt  pgtype.Timestamptz `json:"last_used_at"`
+	LastUsedIp  *netip.Addr        `json:"last_used_ip"`
+	ExpiresAt   pgtype.Timestamptz `json:"expires_at"`
+}
+
+// Filtered variant of ListAllProductTokensForAdmin (#1935): same projection (token_hash is
+// deliberately absent, the security boundary documented on that query), joins, ordering and
+// bound. The filter narrows in the WHERE BEFORE the LIMIT, so a token the unfiltered list cuts
+// stays reachable, and "truncated" is judged per filtered result. Served by idx_product_tokens_user
+// (user_id, revoked) and idx_product_tokens_product (product_id) (migrations/00270_product_tokens.sql).
+func (q *Queries) ListProductTokensForAdminByProduct(ctx context.Context, arg ListProductTokensForAdminByProductParams) ([]ListProductTokensForAdminByProductRow, error) {
+	rows, err := q.db.Query(ctx, listProductTokensForAdminByProduct, arg.ProductID, arg.MaxRows)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListProductTokensForAdminByProductRow{}
+	for rows.Next() {
+		var i ListProductTokensForAdminByProductRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.OwnerEmail,
+			&i.ProductID,
+			&i.ProductName,
+			&i.Name,
+			&i.TokenPrefix,
+			&i.Scopes,
+			&i.Revoked,
+			&i.CreatedAt,
+			&i.LastUsedAt,
+			&i.LastUsedIp,
+			&i.ExpiresAt,
 		); err != nil {
 			return nil, err
 		}

@@ -135,7 +135,7 @@ func apInventoryRows(t *testing.T, q *store.Queries, httpRows map[string]apitype
 		return httpRows
 	}
 	t.Logf("GET /api/admin/product-tokens is truncated on this shared database; asserting the rows via ListAllProductTokensForAdmin")
-	rows, err := q.ListAllProductTokensForAdmin(context.Background(), store.ListAllProductTokensForAdminParams{MaxRows: 1_000_000_000})
+	rows, err := q.ListAllProductTokensForAdmin(context.Background(), 1_000_000_000)
 	if err != nil {
 		t.Fatalf("ListAllProductTokensForAdmin: %v", err)
 	}

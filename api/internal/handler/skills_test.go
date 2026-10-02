@@ -519,14 +519,16 @@ func (*emptyViewerRows) TypeMap() *pgtype.Map   { return pgtype.NewMap() }
 // It returns an empty-but-valid result so the handler reaches 200.
 type fakeViewerListDB struct {
 	gotArgs []any
+	gotSQL  string
 	called  bool
 }
 
 func (*fakeViewerListDB) Exec(context.Context, string, ...any) (pgconn.CommandTag, error) {
 	return pgconn.CommandTag{}, nil
 }
-func (f *fakeViewerListDB) Query(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
+func (f *fakeViewerListDB) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
 	f.called = true
+	f.gotSQL = sql
 	f.gotArgs = args
 	return &emptyViewerRows{}, nil
 }

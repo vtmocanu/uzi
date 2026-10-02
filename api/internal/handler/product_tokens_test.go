@@ -9,7 +9,6 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/jackc/pgx/v5/pgtype"
 
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/producttoken"
@@ -180,7 +179,7 @@ func TestProductTokenListsAskForBoundPlusOne(t *testing.T) {
 		{"GET /api/me/product-tokens", func(h *Handler) http.HandlerFunc { return h.ListMyProductTokens },
 			[]any{userID, int32(maxMyProductTokenRows + 1)}},
 		{"GET /api/admin/product-tokens", func(h *Handler) http.HandlerFunc { return h.AdminListProductTokens },
-			[]any{pgtype.UUID{}, pgtype.UUID{}, int32(maxAdminProductTokenRows + 1)}},
+			[]any{int32(maxAdminProductTokenRows + 1)}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			db := &fakeViewerListDB{}
@@ -202,28 +201,29 @@ func TestProductTokenListsAskForBoundPlusOne(t *testing.T) {
 	}
 }
 
-// TestAdminListProductTokensFilterBinding pins, without a database, how the optional
-// owner_id / product_id query params bind into the store query args (owner, product,
-// bound plus one): distinct UUIDs catch a swapped binding, a missing param stays NULL,
-// and a malformed one is a 400 that never reaches the store.
+// TestAdminListProductTokensFilterBinding pins, without a database, which of the four
+// admin inventory queries each owner_id / product_id combination runs (the sqlc "-- name:"
+// header is embedded in the query text) and how the params bind into its args: distinct
+// UUIDs catch a swapped binding, and a malformed one is a 400 that never reaches the store.
 func TestAdminListProductTokensFilterBinding(t *testing.T) {
 	ownerID, productID := uuid.New(), uuid.New()
-	owner := pgtype.UUID{Bytes: ownerID, Valid: true}
-	product := pgtype.UUID{Bytes: productID, Valid: true}
 	bound := int32(maxAdminProductTokenRows + 1)
 	for _, c := range []struct {
 		name, query string
 		wantCode    int
+		wantQuery   string
 		wantArgs    []any
 	}{
+		{"unfiltered", "", http.StatusOK, "ListAllProductTokensForAdmin",
+			[]any{bound}},
 		{"both", "owner_id=" + ownerID.String() + "&product_id=" + productID.String(), http.StatusOK,
-			[]any{owner, product, bound}},
+			"ListProductTokensForAdminByOwnerAndProduct", []any{ownerID, productID, bound}},
 		{"owner only", "owner_id=" + ownerID.String(), http.StatusOK,
-			[]any{owner, pgtype.UUID{}, bound}},
+			"ListProductTokensForAdminByOwner", []any{ownerID, bound}},
 		{"product only", "product_id=" + productID.String(), http.StatusOK,
-			[]any{pgtype.UUID{}, product, bound}},
-		{"malformed owner_id", "owner_id=not-a-uuid&product_id=" + productID.String(), http.StatusBadRequest, nil},
-		{"malformed product_id", "owner_id=" + ownerID.String() + "&product_id=not-a-uuid", http.StatusBadRequest, nil},
+			"ListProductTokensForAdminByProduct", []any{productID, bound}},
+		{"malformed owner_id", "owner_id=not-a-uuid&product_id=" + productID.String(), http.StatusBadRequest, "", nil},
+		{"malformed product_id", "owner_id=" + ownerID.String() + "&product_id=not-a-uuid", http.StatusBadRequest, "", nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			db := &fakeViewerListDB{}
@@ -242,6 +242,9 @@ func TestAdminListProductTokensFilterBinding(t *testing.T) {
 			}
 			if !db.called || !slices.Equal(db.gotArgs, c.wantArgs) {
 				t.Errorf("store query args = %#v, want %#v", db.gotArgs, c.wantArgs)
+			}
+			if want := "-- name: " + c.wantQuery + " "; !strings.Contains(db.gotSQL, want) {
+				t.Errorf("ran the wrong query, want header %q in:\n%s", want, db.gotSQL)
 			}
 		})
 	}

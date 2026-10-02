@@ -503,7 +503,7 @@ func TestProductTokenLifecycleQueriesLiveDB(t *testing.T) {
 	})
 
 	t.Run("admin list and admin revoke", func(t *testing.T) {
-		rows, err := q.ListAllProductTokensForAdmin(ctx, store.ListAllProductTokensForAdminParams{MaxRows: 1_000_000})
+		rows, err := q.ListAllProductTokensForAdmin(ctx, 1_000_000)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -785,7 +785,7 @@ func TestProductTokenListsActiveFirstLiveDB(t *testing.T) {
 		setAges("now() + interval '100 years'")
 		list := func(maxRows int32) []store.ListAllProductTokensForAdminRow {
 			t.Helper()
-			rows, err := q.ListAllProductTokensForAdmin(ctx, store.ListAllProductTokensForAdminParams{MaxRows: maxRows})
+			rows, err := q.ListAllProductTokensForAdmin(ctx, maxRows)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -826,34 +826,53 @@ func TestProductTokenListsActiveFirstLiveDB(t *testing.T) {
 	t.Run("admin list filters", func(t *testing.T) {
 		setAges("now() + interval '100 years'")
 		otherProduct := newProduct(ctx, t, q, owner)
-		list := func(f store.ListAllProductTokensForAdminParams) []uuid.UUID {
+		const max = 1_000_000
+		ids := func(rows []store.ListProductTokensForAdminByOwnerRow, err error) []uuid.UUID {
 			t.Helper()
-			f.MaxRows = 1_000_000
-			rows, err := q.ListAllProductTokensForAdmin(ctx, f)
 			if err != nil {
 				t.Fatal(err)
 			}
-			ids := make([]uuid.UUID, 0, len(rows))
+			out := make([]uuid.UUID, 0, len(rows))
 			for _, r := range rows {
-				ids = append(ids, r.ID)
+				out = append(out, r.ID)
 			}
-			return ids
+			return out
 		}
-		ownerF := pgtype.UUID{Bytes: owner, Valid: true}
-		productF := pgtype.UUID{Bytes: p.ID, Valid: true}
-		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: ownerF}); !slices.Equal(got, wantAll) {
+		byOwner := func(o uuid.UUID) []uuid.UUID {
+			t.Helper()
+			return ids(q.ListProductTokensForAdminByOwner(ctx, store.ListProductTokensForAdminByOwnerParams{OwnerID: o, MaxRows: max}))
+		}
+		byProduct := func(pr uuid.UUID) []uuid.UUID {
+			t.Helper()
+			rows, err := q.ListProductTokensForAdminByProduct(ctx, store.ListProductTokensForAdminByProductParams{ProductID: pr, MaxRows: max})
+			conv := make([]store.ListProductTokensForAdminByOwnerRow, 0, len(rows))
+			for _, r := range rows {
+				conv = append(conv, store.ListProductTokensForAdminByOwnerRow(r))
+			}
+			return ids(conv, err)
+		}
+		byBoth := func(o, pr uuid.UUID) []uuid.UUID {
+			t.Helper()
+			rows, err := q.ListProductTokensForAdminByOwnerAndProduct(ctx, store.ListProductTokensForAdminByOwnerAndProductParams{OwnerID: o, ProductID: pr, MaxRows: max})
+			conv := make([]store.ListProductTokensForAdminByOwnerRow, 0, len(rows))
+			for _, r := range rows {
+				conv = append(conv, store.ListProductTokensForAdminByOwnerRow(r))
+			}
+			return ids(conv, err)
+		}
+		if got := byOwner(owner); !slices.Equal(got, wantAll) {
 			t.Fatalf("owner filter = %v, want %v", got, wantAll)
 		}
-		if got := list(store.ListAllProductTokensForAdminParams{ProductID: productF}); !slices.Equal(got, wantAll) {
+		if got := byProduct(p.ID); !slices.Equal(got, wantAll) {
 			t.Fatalf("product filter = %v, want %v", got, wantAll)
 		}
-		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: ownerF, ProductID: productF}); !slices.Equal(got, wantAll) {
+		if got := byBoth(owner, p.ID); !slices.Equal(got, wantAll) {
 			t.Fatalf("owner+product filter = %v, want %v", got, wantAll)
 		}
-		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: ownerF, ProductID: pgtype.UUID{Bytes: otherProduct.ID, Valid: true}}); len(got) != 0 {
+		if got := byBoth(owner, otherProduct.ID); len(got) != 0 {
 			t.Fatalf("owner + a product they hold no tokens on = %v, want none", got)
 		}
-		if got := list(store.ListAllProductTokensForAdminParams{OwnerID: pgtype.UUID{Bytes: uuid.New(), Valid: true}}); len(got) != 0 {
+		if got := byOwner(uuid.New()); len(got) != 0 {
 			t.Fatalf("unknown owner = %v, want none", got)
 		}
 	})
