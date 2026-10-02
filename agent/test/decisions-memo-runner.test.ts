@@ -299,6 +299,20 @@ describe("decisions memo: claim-time read", () => {
     assert.strictEqual(api.decisionsMemoPosts.length, 0, "and nothing is saved");
   });
 
+  it("a Codex-bound claim with a MALFORMED codex block fails closed: no GET", async () => {
+    simulateCommittedWork();
+    api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX" });
+    const claim = gitlabClaim(42, {
+      kind: "mr_rework",
+      issue_iid: null,
+      branch: "agent/issue-42",
+      secrets: { forge_pat: "dummy-pat-do-not-scan", anthropic_oauth_token: "", codex: { auth_mode: "bogus" } } as never,
+    });
+    await drive(claim, scriptedLead("next-memo"));
+    assert.strictEqual(api.decisionsMemoGets.length, 0, "a malformed Codex block counts as Codex-bound");
+    assert.strictEqual(injected(claim).length, 0);
+  });
+
   it("a non-rework memo kind learns enabled but injects nothing", async () => {
     simulateCommittedWork();
     api.decisionsMemo.get = enabledMemo({ format: 1, body: "REMEMBER-THE-FIX" });

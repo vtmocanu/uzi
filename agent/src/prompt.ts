@@ -605,7 +605,7 @@ export function buildMemoryContext(
 /**
  * Issue #2083: render the decisions memo an earlier uzi run on THIS pull request wrote about
  * its own work, as an inert, nonce-fenced, untrusted-advisory block for an mr_rework run's
- * planning prompt. Returns "" for an absent/empty memo so the prompt is byte-identical.
+ * plan prompt or first implement prompt. Returns "" for an absent/empty memo so the prompt is byte-identical.
  * The memo is model-authored (so attacker-influenceable via the issue/diff it read): the
  * per-prompt CSPRNG nonce makes a literal closing tag inside the body unable to end the
  * fence, and the frame says the review comments, the code and the task outrank it.

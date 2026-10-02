@@ -70,7 +70,6 @@ import {
   buildRevisePlanPrompt,
   buildSelfImprovePlanPrompt,
   isNotCodePlan,
-  buildDecisionsMemoContext,
 } from "./prompt.js";
 import { resolveRunKind } from "./run-kind.js";
 import { isDecisionsMemoKind } from "./decisions-memo.js";
@@ -497,14 +496,21 @@ const defaultRunProcesses: RunProcessOps = {
  */
 /** Issue #2083: the worker status line saying the earlier run's decisions memo was placed into
  *  a prompt (byte count only, never the body). No-op for an absent or blank memo. */
-function announceDecisionsMemo(ctx: RunContext): void {
+function announceDecisionsMemo(ctx: RunContext): boolean {
   const memo = ctx.decisionsMemo;
-  if (typeof memo !== "string" || memo.trim() === "") return;
+  if (!hasDecisionsMemo(memo)) return false;
   ctx.emit({
     kind: "status",
     agent: "worker",
     payload: { text: `decisions memo injected (${Buffer.byteLength(memo, "utf8")} bytes)` },
   });
+  return true;
+}
+
+/** Issue #2083: whether a memo is non-blank (the same predicate buildDecisionsMemoContext uses
+ *  to render a block), without building the fenced block just to test non-emptiness. */
+function hasDecisionsMemo(memo: string | undefined | null): memo is string {
+  return typeof memo === "string" && memo.trim() !== "";
 }
 
 function throwIfDiskStop(ctx: RunContext): void {
@@ -717,6 +723,9 @@ interface DriveState {
   approvedPlan?: string;
   approvedSelection?: AgentSelectionParse;
   preApproved?: boolean;
+  /** Issue #2083: the decisions memo block was already placed in this execution's plan or
+   *  session-less revise prompt (so the first implement prompt must not carry it again). */
+  decisionsMemoPlaced?: boolean;
   budget?: { asked: number };
 }
 
@@ -1664,6 +1673,10 @@ export class SdkExecutor implements Executor {
       // planning label) reads the same values on both paths.
       const isCIFix = ctx.kind === "ci_fix" && ctx.pipeline != null;
       const isSelfImprove = ctx.kind === "self_improve";
+      // Issue #2083: latched when the decisions memo block rides a plan or session-less revise
+      // prompt of THIS execution; read by the implement phase so the memo reaches the lead's
+      // conversation once.
+      let decisionsMemoPlaced = false;
       // Assigned by the gate below, or seeded directly on the pre-approved path.
       let approvedPlan: string;
       // The agent selection the approve verdict carried (PRD #37).
@@ -1981,7 +1994,7 @@ export class SdkExecutor implements Executor {
           // Issue #2083: the memo block is in planPrompt only on the plain issue/prompt/rework
           // path (the ci_fix and self_improve builders take none). Announced here, where the
           // prompt is actually sent, not when the runner fetched it.
-          if (!isCIFix && !isSelfImprove) announceDecisionsMemo(ctx);
+          if (!isCIFix && !isSelfImprove && announceDecisionsMemo(ctx)) decisionsMemoPlaced = true;
           const planStep = await this.runThroughSwitch(ctx, state, () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, planPrompt, state, idleMs, budget),
           );
@@ -2109,6 +2122,10 @@ export class SdkExecutor implements Executor {
             resumeId === undefined
               ? `${planPrompt}\n\n${buildRevisePlanPrompt(feedback, approvedPlan)}`
               : buildRevisePlanPrompt(feedback);
+          // Issue #2083: a session-less revise re-sends the full planPrompt, which carries the
+          // memo block on the plain issue/rework path: announce where it is actually placed.
+          if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
+            decisionsMemoPlaced = true;
           const runRevisionTurn = () =>
             this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget);
           const turn = ctx.deferCredentialSwitch
@@ -2170,6 +2187,7 @@ export class SdkExecutor implements Executor {
       drive.approvedPlan = approvedPlan;
       drive.approvedSelection = approvedSelection;
       drive.preApproved = preApproved;
+      drive.decisionsMemoPlaced = decisionsMemoPlaced;
       drive.budget = budget;
       return undefined;
   }
@@ -2203,6 +2221,7 @@ export class SdkExecutor implements Executor {
       environmentFacts,
     } = drive;
     const preApproved = drive.preApproved!;
+    const decisionsMemoPlaced = drive.decisionsMemoPlaced === true;
     const approvedPlan = drive.approvedPlan!;
     const approvedSelection = drive.approvedSelection!;
     const budget = drive.budget!;
@@ -2418,7 +2437,8 @@ export class SdkExecutor implements Executor {
       let declaredPrSummary: PrSummaryClaim | undefined;
       // Issue #2083: hoisted for the same reason; last-wins across signal_done turns.
       let declaredDecisionsMemo: string | undefined;
-      // Issue #2083: latched once the memo block rode an implement prompt (pre-approved resume).
+      // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
+      // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
       // PRD #634 M3: latched when the operator's scope ceiling truncates the run at the loop
       // top (the honor gate below). Hoisted like the other loop-latched locals so it survives
@@ -2636,14 +2656,20 @@ export class SdkExecutor implements Executor {
         // (0 turns, no activity) is retried in-process and, if still empty, escalated to
         // the recovery_wait park (TransientRecoveryError) instead of terminal-failing —
         // covering the RC2 resume-empty-turn incident on the implement path too.
-        // Issue #2083: a pre-approved resume skipped buildPlanPrompt, so the memo rides the FIRST
-        // implement prompt instead (once), and the "injected" line is emitted only then.
+        // Issue #2083: the memo rides the FIRST implement prompt only when this conversation has
+        // not seen it: no session resumed (a resumed session already saw it in its plan prompt,
+        // like embedSeededPlan's hasSession guard) and no plan/revise prompt of this execution
+        // carried it. The "injected" line is emitted only when the block is placed.
         const firstImplementTurn = iteration === 1 && !hasParked;
         const priorDecisionsMemo =
-          preApproved && firstImplementTurn && !decisionsMemoImplementInjected
+          firstImplementTurn &&
+          !ctx.sessionId &&
+          !decisionsMemoPlaced &&
+          !decisionsMemoImplementInjected &&
+          hasDecisionsMemo(ctx.decisionsMemo)
             ? ctx.decisionsMemo
             : undefined;
-        if (buildDecisionsMemoContext(priorDecisionsMemo)) {
+        if (priorDecisionsMemo !== undefined) {
           decisionsMemoImplementInjected = true;
           announceDecisionsMemo(ctx);
         }

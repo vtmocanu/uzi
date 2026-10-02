@@ -1018,8 +1018,9 @@ export function scanSignals(message: unknown): ScannedSignals {
       if (prSummary !== undefined) out.prSummary = prSummary;
       // Issue #2083. Same signal_done branch, so the same main-thread guard: a subagent frame
       // must never plant the note the next rework run reads. Only non-whitespace strings count;
-      // the clamp here is only a loose transport bound (DECISIONS_MEMO_TRANSPORT_MAX_BYTES); the
-      // runner redacts FIRST and then applies the real storage cap, so no secret is cut before redaction.
+      // the clamp here is only a loose transport bound (DECISIONS_MEMO_TRANSPORT_MAX_BYTES), hygiene
+      // only; the runner redacts FIRST and then applies the real storage cap, so no secret straddling
+      // the STORAGE cap is cut before redaction.
       const decisionsMemo = input?.["decisions_memo"];
       if (typeof decisionsMemo === "string" && decisionsMemo.trim() !== "") {
         out.decisionsMemo = clampUtf8Bytes(decisionsMemo, DECISIONS_MEMO_TRANSPORT_MAX_BYTES);

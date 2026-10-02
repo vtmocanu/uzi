@@ -211,6 +211,24 @@ describe("Codex credential bridge", () => {
     );
   });
 
+  it("bounds the decisions memo read and save at 10s, not the general worker timeout", async () => {
+    api.decisionsMemo.get = { status: 200, body: { enabled: true } };
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { httpTimeoutMs: 7_777 });
+    const timeouts: number[] = [];
+    const orig = AbortSignal.timeout.bind(AbortSignal);
+    AbortSignal.timeout = (ms: number) => {
+      timeouts.push(ms);
+      return orig(ms);
+    };
+    try {
+      await client.getDecisionsMemo("run-1", 3);
+      await client.saveDecisionsMemo("run-1", 3, "memo");
+    } finally {
+      AbortSignal.timeout = orig;
+    }
+    assert.deepStrictEqual(timeouts, [10_000, 10_000]);
+  });
+
   it("combines caller cancellation with the fixed Codex deadline", async () => {
     api.delayCodexResponses(100);
     const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {

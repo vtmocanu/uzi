@@ -216,7 +216,8 @@ export interface RunContext {
    *  time read; false on any read failure). Gates the `decisions_memo` signal_done param. */
   decisionsMemoEnabled?: boolean;
   /** Issue #2083: the earlier run's validated decisions memo body, set ONLY on an mr_rework run
-   *  whose memo read parsed cleanly. Composed into the plan prompt nonce-fenced, UNTRUSTED. */
+   *  whose memo read parsed cleanly. Composed nonce-fenced, UNTRUSTED, into the plan prompt or (when the
+   *  conversation has not seen it) the first implement prompt. */
   decisionsMemo?: string;
   /** Issue #297: work already in flight on the same repo at claim time, carried only
    *  on a self_improve run so the picker avoids overlapping a recommendation with an

@@ -5883,24 +5883,79 @@ describe("SdkExecutor decisions memo (issue #2083)", () => {
     assert.ok(String(injectedLines(probe.emits)[0]!.payload["text"]).includes(`(${MEMO.length} bytes)`));
   });
 
-  it("a pre-approved mr_rework resume puts the fenced memo in the FIRST implement prompt, once", async () => {
+  const memoBlock = new RegExp(`<untrusted_decisions_memo_[0-9a-f]+>\\n${MEMO}\\n</untrusted_decisions_memo_`);
+  const reworkBase = {
+    kind: "mr_rework" as const,
+    planApproved: true,
+    approvedPlan: "# Approved plan\nship it",
+    decisionsMemoEnabled: true,
+    decisionsMemo: MEMO,
+  };
+
+  it("a session-less pre-approved mr_rework resume puts the fenced memo in the FIRST implement prompt, once", async () => {
     const { queryFn, turns } = fakeTurns([
       [assistantText("working"), resultSuccess()],
       [signalDone(), resultSuccess()],
     ]);
-    const probe = makeCtx({
-      kind: "mr_rework",
-      planApproved: true,
-      sessionId: "sess-parked",
-      approvedPlan: "# Approved plan\nship it",
-      decisionsMemoEnabled: true,
-      decisionsMemo: MEMO,
-    });
+    const probe = makeCtx({ ...reworkBase, seeded: true });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.deepStrictEqual(probe.gated, [], "no plan turn and no gate ran");
-    assert.match(turns[0]!.promptText!, new RegExp(`<untrusted_decisions_memo_[0-9a-f]+>\\n${MEMO}\\n</untrusted_decisions_memo_`));
+    assert.match(turns[0]!.promptText!, memoBlock);
     assert.match(turns[0]!.promptText!, /pass `decisions_memo`/);
     for (const t of turns.slice(1)) assert.ok(!t.promptText!.includes(MEMO), "later implement turns do not repeat it");
+    assert.strictEqual(injectedLines(probe.emits).length, 1);
+  });
+
+  it("a pre-approved resume WITH a live session does not re-send the memo its session already saw", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [assistantText("working"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({ ...reworkBase, sessionId: "sess-parked" });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    for (const t of turns) assert.ok(!t.promptText!.includes(MEMO));
+    assert.strictEqual(injectedLines(probe.emits).length, 0, "nothing placed, nothing announced");
+  });
+
+  it("a first-turn clarification (ask_user) does not re-send the memo on the next turn", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [askUserTurn("which config?"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      ...reworkBase,
+      seeded: true,
+      askUser: async () => ({ kind: "answer", answers: ["the default"] }),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.ok(turns.length >= 2, "the clarification turn was followed by another turn");
+    assert.strictEqual(turns.filter((t) => t.promptText!.includes(MEMO)).length, 1, "the block rides one prompt");
+    assert.strictEqual(injectedLines(probe.emits).length, 1);
+  });
+
+  it("a session-less revise at the plan gate carries the memo in the revise prompt, announced once", async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("revised plan"), resultSuccess()],
+      [signalDone(), resultSuccess()],
+    ]);
+    const probe = makeCtx({
+      ...reworkBase,
+      planApproved: false,
+      resumePhase: "awaiting_approval",
+      takeResumedGateEvent: async () => ({ kind: "revise", feedback: "split it" }),
+    });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.match(turns[0]!.promptText!, memoBlock, "the revise prompt re-sends the planning prompt");
+    assert.ok(!turns[1]!.promptText!.includes(MEMO), "the implement prompt does not repeat it");
+    assert.strictEqual(injectedLines(probe.emits).length, 1);
+  });
+
+  it("a session-less resume at the gate then approve places the memo in the first implement prompt", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+    const probe = makeCtx({ ...reworkBase, planApproved: false, resumePhase: "awaiting_approval" });
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.strictEqual(probe.gated.length, 1, "the submitted plan was re-presented");
+    assert.match(turns[0]!.promptText!, memoBlock);
     assert.strictEqual(injectedLines(probe.emits).length, 1);
   });
 
