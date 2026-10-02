@@ -3076,11 +3076,9 @@ export class CodexExecutor implements Executor {
     reducer.beginTurn();
     let sawTerminal = false;
     let terminal: import("../harness.js").HarnessTerminal | undefined;
-    // #1593: the root thread's own text this turn. The harness projects root agent messages
-    // with NO agent attribution (children carry their role), so the shared reducer, which keys
-    // lead text on agent "lead", never sets finalText for a Codex turn. Collected here so the
-    // planning loop can tell a prose-only turn from a genuinely empty one. Only the most recent
-    // LEAD_TEXT_TAIL_KEEP characters are held, so a long turn never grows this without bound.
+    // #1593: capture root-thread text by frame origin, independently of displayed
+    // attribution. The planning loop uses this bounded, scrubbed tail as finalText
+    // to distinguish a prose-only turn from an empty one.
     let rootText = "";
 
     // Issue #1864: the per-turn broker's effects signal also fires when this turn returns, so a
@@ -3136,7 +3134,7 @@ export class CodexExecutor implements Executor {
           }
         }
         for (const em of reduction.messages) {
-          if (em.kind === "text" && (em.agent === undefined || em.agent === "lead")) {
+          if (event.kind === "frame" && event.origin.kind === "main" && em.kind === "text") {
             const t = em.payload["text"];
             if (typeof t === "string" && t) rootText = appendLeadTextTail(rootText, t);
           }

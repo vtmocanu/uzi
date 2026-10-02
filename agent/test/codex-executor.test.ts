@@ -2143,6 +2143,45 @@ describe("CodexExecutor: delegation projection (issue #1583 m2)", () => {
     assert.equal(rec(rec(rig.transport.responses.find((r) => r.requestId === 1)?.response).result).success, true);
   });
 
+  it("issue #2116: an implement-phase repo lead child keeps its attribution but not the root finalText", async () => {
+    const CHILD = "repo lead child report";
+    const ROOT = "root implement report";
+    const rig = makeRig({
+      responder: delegationResponder((t, th, tn) => {
+        t.push(agentMessage(CHILD, th)).push(turnCompleted("completed", th, tn));
+      }),
+    });
+    rig.transport.push(threadStarted()).push(spawn(1, "c-repo-lead", { role: "lead", prompt: "review" }));
+    const { ctx, emitted } = makeCtx({ agents, repoAgents: [
+      { name: "lead", description: "repo lead reviewer", prompt_body: "review", tools: null, skills: [] },
+    ] });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    // Observe the real implement-turn result at the narrow executor boundary; preserve
+    // the original method and all of its transport, reducer, and workflow behavior.
+    type TurnBoundary = { driveTurnWithWallPark: (...args: never[]) => Promise<{ kind: string; result?: { finalText?: string } }> };
+    const boundary = executor as unknown as TurnBoundary;
+    const drive = boundary.driveTurnWithWallPark;
+    const finalTexts: Array<string | undefined> = [];
+    boundary.driveTurnWithWallPark = async function (...args) {
+      const turn = await drive.apply(this, args);
+      if (turn.kind === "turn") finalTexts.push(turn.result?.finalText);
+      return turn;
+    };
+    const runP = executor.run(ctx);
+    await waitFor(() => rig.transport.responses.some((r) => r.requestId === 1), "repo lead delegation reply");
+    rig.transport.push(agentMessage(ROOT)).push(signalDone()).push(turnCompleted()).end();
+    await withTimeout(runP, 3000, "repo lead implement turn");
+
+    const dispatch = agentUses(emitted).find((m) => rec(m.payload.input).subagent_type === "lead");
+    assert.ok(dispatch, "repo-sourced lead was delegated in implement phase");
+    const child = emitted.find((m) => m.kind === "text" && m.payload.text === CHILD);
+    assert.ok(child, "child text reached the emitted stream");
+    assert.equal(child.agent, "lead");
+    assert.equal(child.agentInstance, dispatch.payload.id, "the child retains its dispatch instance");
+    assert.ok(emitted.some((m) => m.kind === "text" && m.payload.text === ROOT), "root text reached the stream");
+    assert.deepEqual(finalTexts, [ROOT], "turn finalText retains root prose and excludes repo lead child prose");
+  });
+
   it("(m2-2) two dispatches of the same role get distinct instance ids, each with its own completion", async () => {
     const rig = makeRig({
       responder: delegationResponder((t, th, tn, input) => {

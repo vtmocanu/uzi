@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 - **Codex runs now honour “Apply model also to agents” ([#2115](https://github.com/vtmocanu/uzi/issues/2115)).**
   When enabled, plan agents and selected owner or repo subagents follow the resolved run model instead of their pinned model; with it off, their model pins still apply.
 
+- **Lead text follows frame origin across Claude and Codex harnesses ([#2116](https://github.com/vtmocanu/uzi/issues/2116)).**
+  Child frames displayed as lead no longer enter either harness's finalText; Claude also uses origin to request lead context only for main frames and to count subagent frames as no-progress activity, while emitted attribution and signal handling stay the same.
+
 - **Codex transient retry backoff respects the remaining wall budget, and agent CI reruns select fresh shard reports ([#2111](https://github.com/vtmocanu/uzi/issues/2111)).**
   Early timer wakes no longer finish a wall-capped backoff with budget left for an extra provider turn. CI stores reports separately for each attempt and checks the latest available report independently for each shard, so partial reruns cannot use a stale M4 completion marker.
 

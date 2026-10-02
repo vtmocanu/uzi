@@ -30,7 +30,6 @@ import type {
 } from "./harness.js";
 import { projectInit, projectItem, projectResult } from "./harness-messages.js";
 
-const LEAD = "lead";
 const MAX_TURN_QUESTIONS = 10;
 
 export class RunTurnReducerImpl implements RunTurnReducer {
@@ -126,13 +125,13 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         continue;
       }
       const em: EmittedMessage = projectItem(item, at);
-      // Display-based no-progress derivation: the lead's own text (verbatim-repeat
-      // input) and whether any subagent produced a frame this turn (work in flight).
-      if (em.kind === "text" && em.agent === LEAD) {
+      // Use frame origin for no-progress evidence; display attribution can name
+      // a subagent "lead" and must remain untouched on the emitted message.
+      if (em.kind === "text" && event.origin.kind === "main") {
         const t = em.payload["text"];
         if (typeof t === "string" && t) this.leadText.push(t);
       }
-      if (em.agent !== undefined && em.agent !== LEAD) {
+      if (event.origin.kind === "subagent") {
         this.result.subagentActivity = true;
       }
       if (event.usage && !usageAttached) {
@@ -144,9 +143,9 @@ export class RunTurnReducerImpl implements RunTurnReducer {
         // cannot silently drop the usage signal).
         this.result.sawModelActivity = true;
         // Fire the lead context read once per turn, on the first surviving
-        // usage-bearing item whose displayed agent is the lead — NOT awaited here
-        // (the adapter's read runs concurrently while the turn streams).
-        if (!this.contextRequested && em.agent === LEAD) {
+        // usage-bearing main-origin item — NOT awaited here (the adapter's read
+        // runs concurrently while the turn streams).
+        if (!this.contextRequested && event.origin.kind === "main") {
           this.context.request();
           this.contextRequested = true;
         }
