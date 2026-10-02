@@ -1668,8 +1668,10 @@ export class WorkerClient {
    *  D8), streaming the body to `sink` without buffering the file. `claimGeneration` is the job
    *  flight's generation (the api fences on it). `sink` must consume the stream to its end (the
    *  writer verifies the bytes itself against the claim manifest); a body cut short by a server
-   *  abort rejects the stream, so a truncated 200 never reads as complete. If `sink` throws, the
-   *  response body is destroyed so the socket is released at once. `signal` aborts the request or
+   *  abort rejects the stream, so a truncated 200 never reads as complete. Body errors are
+   *  observed from creation: a body torn before the sink reads it still rejects the stream rather
+   *  than crashing the process, and a sink that returns without draining a torn body rejects too.
+   *  If `sink` throws, the response body is destroyed so the socket is released at once. `signal` aborts the request or
    *  the body in flight; `timeoutMs` bounds the whole download (default JOB_FILE_DOWNLOAD_TIMEOUT_MS).
    *  Throws RequestError on non-2xx. */
   async downloadJobFile(
@@ -1696,8 +1698,16 @@ export class WorkerClient {
     if (res.status !== 200) throw await this.toError("GET", path, res);
     if (!res.body) throw new Error("job file download returned no body");
     const body = Readable.fromWeb(res.body as import("node:stream/web").ReadableStream<Uint8Array>);
+    // Observe body errors from creation: a stream torn before the sink starts reading would
+    // otherwise emit 'error' with no listener (an uncaught exception that kills the worker).
+    let bodyError: Error | undefined;
+    body.on("error", (err: Error) => {
+      bodyError ??= err;
+    });
     try {
       await sink(body);
+      // A sink that returned without draining a torn body must not read as a clean download.
+      if (bodyError) throw bodyError;
     } catch (err) {
       // The per-file timeout errors the body mid-stream, which a sink reports as a torn stream;
       // name the timeout instead. (Not when the caller's own signal fired: that is its own reason.)

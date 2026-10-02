@@ -805,15 +805,28 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
   });
 
   it("reports a stream torn after the headers as an integrity failure, not 'could not download'", async () => {
+    let consumedBeforeTear = false;
     const { client, calls } = fakeClient({
       downloadJobFile: async (_i, _f, _g, sink) => {
-        const r = new Readable({ read() {} });
-        r.push(body.subarray(0, 4));
-        setTimeout(() => r.destroy(new Error("terminated")), 5);
+        // Consumer-driven tear, no timer: with highWaterMark 0 the second read() only happens
+        // once the consumer has taken the first chunk, so the tear lands mid-consumption.
+        let reads = 0;
+        const r = new Readable({
+          highWaterMark: 0,
+          read() {
+            if (++reads === 1) {
+              this.push(body.subarray(0, 4));
+              return;
+            }
+            consumedBeforeTear = this.readableLength === 0 && this.readableDidRead;
+            this.destroy(new Error("terminated"));
+          },
+        });
         await sink(r);
       },
     });
     await newRunner(client, await tmpJobsRoot(), noSession({ ran: false })).execute(jobClaim({}, { files: [fileEntry()] }));
+    assert.strictEqual(consumedBeforeTear, true);
     assert.strictEqual(calls.states.at(-1)!.body.failure_reason, 'job input file "Q3 report.pdf" failed its integrity check');
   });
 

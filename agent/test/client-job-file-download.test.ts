@@ -71,6 +71,51 @@ describe("WorkerClient.downloadJobFile", () => {
     await assert.rejects(() => client.downloadJobFile("r", "f", 1, async (body) => { await collect(body); }));
   });
 
+  // The torn body must be observed from creation: a sink that is slow to start reading must not
+  // let the stream's 'error' fire with no listener (an uncaught exception, issue #2019).
+  async function tornBeforeRead(sink: (body: import("node:stream").Readable) => Promise<void>): Promise<{ err: unknown; uncaught: unknown[]; restored: boolean }> {
+    const client = await serve((req, res) => {
+      res.writeHead(200, { "Content-Length": "100" });
+      res.write("only");
+      setTimeout(() => req.socket.destroy(), 5);
+    });
+    const before = process.listenerCount("uncaughtException");
+    const uncaught: unknown[] = [];
+    const probe = (e: unknown): void => { uncaught.push(e); };
+    process.on("uncaughtException", probe);
+    let err: unknown;
+    try {
+      await client.downloadJobFile("r", "f", 1, async (body) => {
+        const deadline = Date.now() + 5000;
+        while (!body.destroyed && Date.now() < deadline) await new Promise((r) => setTimeout(r, 2));
+        assert.ok(body.destroyed, "body never torn");
+        await new Promise((r) => setTimeout(r, 20)); // let a would-be uncaught error surface
+        await sink(body);
+      });
+    } catch (e) {
+      err = e;
+    } finally {
+      process.off("uncaughtException", probe);
+    }
+    return { err, uncaught, restored: process.listenerCount("uncaughtException") === before };
+  }
+
+  it("a body torn before the sink reads it rejects with the original error and never raises an uncaught exception", async () => {
+    const r = await tornBeforeRead(async (body) => { await collect(body); });
+    assert.ok(r.restored);
+    assert.deepStrictEqual(r.uncaught, []);
+    assert.ok(!(r.err instanceof JobFileTimeoutError));
+    assert.match((r.err as Error).message, /terminated/);
+  });
+
+  it("a sink that returns without reading a torn body still rejects with the original error", async () => {
+    const r = await tornBeforeRead(async () => {});
+    assert.ok(r.restored);
+    assert.deepStrictEqual(r.uncaught, []);
+    assert.ok(!(r.err instanceof JobFileTimeoutError));
+    assert.match((r.err as Error).message, /terminated/);
+  });
+
   it("destroys the response body when the sink throws, so the socket is released rather than held", async () => {
     let closed: Promise<void> = Promise.resolve();
     const client = await serve((req, res) => {
