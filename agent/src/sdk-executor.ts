@@ -935,7 +935,6 @@ export class SdkExecutor implements Executor {
     return dropRunCaches(this.homeDir, this.log, {
       message: "run caches dropped in place at the hard disk threshold",
       ...(this.depsJoined ? {} : { keep: [".npm/_cacache"] }),
-      
     });
   }
 

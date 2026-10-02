@@ -507,8 +507,12 @@ function askUserTurn(sessionId = "sess-1"): SDKMessage {
   } as unknown as SDKMessage;
 }
 
-describe("SdkExecutor — issue #1830 a `disk` stop reaches a PLANNING run and its waits", () => {
-  it("a disk stop during the first planning turn rejects run() with the PauseNowSignal while the disk mode is pending", async () => {
+// CHARACTERIZATION (issue #1830): the three tests below pass on the code from before the fix. They
+// pin the existing executor behaviour the runner's reportState choke point relies on (a disk stop
+// and a DiskParkSignal thrown by a wait callback both escape run() untouched); they do not guard
+// the fix itself, which is covered through the runner in runner-disk-cap-park.test.ts.
+describe("SdkExecutor — issue #1830 characterization: the propagation the choke point relies on", () => {
+  it("pins the propagation the #1830 choke point relies on: a disk stop during the first planning turn rejects run() with the PauseNowSignal while the disk mode is pending", async () => {
     const runSignal = new AbortController();
     const holder: { mode?: { value: PauseMode } } = {};
     const exec = new SdkExecutor(nullLogger(), homeDir, {
@@ -535,7 +539,7 @@ describe("SdkExecutor — issue #1830 a `disk` stop reaches a PLANNING run and i
     assert.strictEqual(mode.value, "disk", "the runner routes the escaped signal to the counted disk park from this mode");
   });
 
-  it("a DiskParkSignal thrown by ctx.askUser in the planning phase propagates out of run()", async () => {
+  it("pins the propagation the #1830 choke point relies on: a DiskParkSignal thrown by ctx.askUser in the planning phase propagates out of run()", async () => {
     const exec = new SdkExecutor(nullLogger(), homeDir, {
       queryFn: spawningTurns([[askUserTurn(), resultSuccess()]]),
       spawn: () => ({ pid: 8000 }),
@@ -550,7 +554,7 @@ describe("SdkExecutor — issue #1830 a `disk` stop reaches a PLANNING run and i
     await assert.rejects(exec.run(ctx), (err: unknown) => err instanceof DiskParkSignal && err.preventive === false);
   });
 
-  it("a DiskParkSignal thrown by ctx.askCompletionQuestion propagates out of run()", async () => {
+  it("pins the propagation the #1830 choke point relies on: a DiskParkSignal thrown by ctx.askCompletionQuestion propagates out of run()", async () => {
     const exec = new SdkExecutor(nullLogger(), homeDir, {
       queryFn: spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]),
       spawn: () => ({ pid: 8100 }),

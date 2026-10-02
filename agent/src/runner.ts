@@ -7010,6 +7010,19 @@ export class RunRunner {
             throw new CredentialSwitchSignal();
           await steering.awaitReceiptSettlement(signal);
         }
+        // Issue #1830: the choke point that closes the stop-then-wait race. A hard disk stop is only
+        // ever requested while the run's sent and ACKed status are both `running`; if the run then
+        // reaches a wait (gate, question, follow-up) with the sticky `disk` stop still pending, the
+        // `awaiting_*` report is NOT sent: the park lands from `running` (an awaiting_* park would
+        // be refused by ParkRunDataVolumeFull). Placed ABOVE the snapshot setPhase so the
+        // registry never shows an awaiting_* phase for a report that is not sent; after the
+        // awaitReceiptSettlement above, with no await between this check, statusRequested and the send.
+        if (
+          (body.status === "awaiting_approval" || body.status === "awaiting_input" || body.status === "awaiting_followup") &&
+          steering.getPauseMode() === "disk"
+        ) {
+          throw new DiskParkSignal(false);
+        }
         // PRD #1390 M2a: this same choke point is where the run announces every phase
         // transition, so reflect the four snapshot phases (running / awaiting_approval /
         // awaiting_input / awaiting_followup) into the active-run registry BEFORE the report
@@ -7026,18 +7039,6 @@ export class RunRunner {
           claim_generation: flight.claimGeneration,
           ...(flight.observedSessionId ? { session_id: flight.observedSessionId } : {}),
         };
-        // Issue #1830: the choke point that closes the stop-then-wait race. A hard disk stop is only
-        // ever requested while the run's sent and ACKed status are both `running`; if the run then
-        // reaches a wait (gate, question, follow-up) with the sticky `disk` stop still pending, the
-        // `awaiting_*` report is NOT sent: the park lands from `running` (an awaiting_* park would
-        // be refused by ParkRunDataVolumeFull). Hooks sit after the awaitReceiptSettlement above
-        // with no await between the throw check, statusRequested and the send.
-        if (
-          (body.status === "awaiting_approval" || body.status === "awaiting_input" || body.status === "awaiting_followup") &&
-          steering.getPauseMode() === "disk"
-        ) {
-          throw new DiskParkSignal(false);
-        }
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
         const ack = await this.client.reportState(runId, stamped, signal);
         if (diskSeq !== undefined) this.diskGovernor?.statusAcked(runId, diskSeq, ack.status);

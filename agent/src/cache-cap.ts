@@ -160,10 +160,12 @@ interface RunState extends GovernedRun {
   /** The status of the latest report the runner sent, and its send number. */
   sentStatus?: string;
   sentSeq: number;
-  /** The server's status in the ACK of send {@link ackedSeq} (undefined = unreadable). Only the ACK
-   *  of the LATEST send is recorded: a late ACK of an older send is ignored. */
+  /** The number of the latest send whose status was not `running` (0 = none yet). */
+  lastNonRunningSentSeq: number;
+  /** The highest send number whose ACK carried the server status `running` (0 = none yet). */
+  runningAckedSeq: number;
+  /** The server status of the latest ACK recorded, for the in-place drop's log line. */
   ackedStatus?: string;
-  ackedSeq?: number;
   /** The hard layer asked this run to stop. */
   stopRequested: boolean;
   /** Issue #1830: an in-place drop left this run holding bytes (or threw); it is skipped for the
@@ -184,7 +186,7 @@ export class DiskGovernor {
   private readonly now: () => number;
   private readonly measure: NonNullable<DiskGovernorOptions["measure"]>;
   private readonly trim: NonNullable<DiskGovernorOptions["trim"]>;
-  /** The run the hard layer stopped, until its flight ends (or it leaves its implement loop
+  /** The run the hard layer stopped, until its flight ends (or it leaves its executor
    *  without parking, or {@link STOP_TIMEOUT_MS} passes). At most one at a time. */
   private stopping: string | undefined;
   /** When {@link stopping} was asked to stop. */
@@ -216,7 +218,7 @@ export class DiskGovernor {
 
   /** Watch a running Claude run. Idempotent per run id (a later call replaces the entry). */
   register(runId: string, run: GovernedRun): void {
-    this.runs.set(runId, { ...run, overStreak: 0, inExecutor: false, sentSeq: 0, stopRequested: false, inPlaceSkipped: false });
+    this.runs.set(runId, { ...run, overStreak: 0, inExecutor: false, sentSeq: 0, lastNonRunningSentSeq: 0, runningAckedSeq: 0, stopRequested: false, inPlaceSkipped: false });
   }
 
   /** Issue #1830: `executor.run` is about to start; the run may now take a stop (see {@link parkable}). */
@@ -237,22 +239,29 @@ export class DiskGovernor {
     if (run.sentStatus !== status) run.inPlaceSkipped = false;
     run.sentStatus = status;
     run.sentSeq += 1;
+    if (status !== "running") run.lastNonRunningSentSeq = run.sentSeq;
     return run.sentSeq;
   }
 
-  /** Issue #1830: the server's ACK of send `seq` carried `status` (undefined when unreadable). Only
-   *  the ACK of the latest send is recorded. */
+  /** Issue #1830: the server's ACK of send `seq` carried `status` (undefined when unreadable). A
+   *  `running` ACK is remembered by its send number; whether it still counts is decided by
+   *  {@link parkable}, so a late ACK of a send older than the last non-`running` one never does. */
   statusAcked(runId: string, seq: number, status: string | undefined): void {
     const run = this.runs.get(runId);
-    if (!run || run.sentSeq !== seq) return;
-    run.ackedSeq = seq;
+    if (!run) return;
     run.ackedStatus = status;
+    if (status !== "running" || seq <= run.runningAckedSeq) return;
+    run.runningAckedSeq = seq;
+    // Newly parkable: an in-place skip from the un-ACKed window must not outlive it.
+    if (this.parkable(run)) run.inPlaceSkipped = false;
   }
 
   /** A stop can become a counted park only from the server status `running`: the executor is in
-   *  flight, and the latest send AND its ACK both say `running`. */
+   *  flight, the latest send says `running`, and a `running` ACK arrived for a send newer than the
+   *  last non-`running` send (so the server has moved back to `running` since). A same-status
+   *  `running` report still in flight does not unmake that. */
   private parkable(run: RunState): boolean {
-    return run.inExecutor && run.sentStatus === "running" && run.ackedSeq === run.sentSeq && run.ackedStatus === "running";
+    return run.inExecutor && run.sentStatus === "running" && run.runningAckedSeq > run.lastNonRunningSentSeq;
   }
 
   /**
