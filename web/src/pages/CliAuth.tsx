@@ -9,6 +9,7 @@
 import { useState, type FormEvent } from "react";
 import { Navigate, useLocation, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
+import { ServerUnreachable } from "../components/RouteGuards";
 import {
   api,
   ApiError,
@@ -39,7 +40,7 @@ const MISSING_REQUEST = Symbol("missing-request");
 
 export function CliAuth() {
   const demo = useDemoMode();
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, serverUnreachable } = useAuth();
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const requestId = searchParams.get("request");
@@ -84,6 +85,9 @@ export function CliAuth() {
   // Not signed in → send to login, preserving the full URL so the consent page is
   // returned to after authenticating (password OR OIDC). The request id rides the
   // query, so nothing is lost.
+  // A failed session probe (e.g. a 503) is not "signed out": show the retry panel and
+  // keep the pending ?request= so the page proceeds once the probe recovers.
+  if (!authLoading && !user && serverUnreachable) return <ServerUnreachable />;
   if (!authLoading && !user) {
     const next = encodeURIComponent(location.pathname + location.search);
     return <Navigate to={`/login?next=${next}`} replace />;

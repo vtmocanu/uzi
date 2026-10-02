@@ -190,4 +190,19 @@ describe("CliAuth auth gate", () => {
     expect(await screen.findByText("LOGIN PAGE")).toBeTruthy();
     expect(mockApi.getCliAuthRequest).not.toHaveBeenCalled();
   });
+
+  it("shows the retry panel instead of redirecting to /login when the server is unreachable", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      serverUnreachable: true,
+      retry: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    renderPage();
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.getByText("Can't reach the server")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry now" })).toBeTruthy();
+    expect(screen.queryByText("LOGIN PAGE")).toBeNull();
+    expect(mockApi.getCliAuthRequest).not.toHaveBeenCalled();
+  });
 });

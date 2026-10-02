@@ -17,6 +17,7 @@
 import { useEffect, useState } from "react";
 import { Navigate, useLocation, useSearchParams } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
+import { ServerUnreachable } from "../components/RouteGuards";
 import { api, ApiError, type OAuthAuthorizeRequest } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
@@ -46,7 +47,7 @@ const MISSING_REQUEST = Symbol("missing-request");
 
 export function Connect() {
   const demo = useDemoMode();
-  const { user, loading: authLoading } = useAuth();
+  const { user, loading: authLoading, serverUnreachable } = useAuth();
   const location = useLocation();
   const [searchParams] = useSearchParams();
   const requestId = searchParams.get("request");
@@ -62,7 +63,10 @@ export function Connect() {
   }, []);
 
   // Signed out: remember this page for a login that cannot carry ?next= (OIDC lands on "/").
-  const signedOut = !authLoading && !user;
+  // An unreachable server is not "signed out": the visitor may be signed in, so neither
+  // redirect nor remember the return path until the session probe answers.
+  const unreachable = !authLoading && !user && serverUnreachable;
+  const signedOut = !authLoading && !user && !serverUnreachable;
   useEffect(() => {
     if (signedOut && requestId) {
       setPendingReturn(`/connect?request=${encodeURIComponent(requestId)}`);
@@ -90,6 +94,7 @@ export function Connect() {
     },
   );
 
+  if (unreachable) return <ServerUnreachable />;
   if (signedOut) {
     const next = encodeURIComponent(location.pathname + location.search);
     return <Navigate to={`/login?next=${next}`} replace />;

@@ -11,15 +11,14 @@ function Loading() {
 // ServerUnreachable replaces a redirect while the session probe could not reach
 // the API (e.g. a 503 during a DB outage): the visitor may well be signed in, so
 // bouncing them to /login would be wrong. AuthProvider keeps retrying on a timer.
-function ServerUnreachable() {
+export function ServerUnreachable() {
   const { retry } = useAuth();
   return (
-    <div
-      role="alert"
-      className="flex min-h-screen flex-col items-center justify-center gap-3 text-center"
-    >
-      <h1 className="text-lg font-medium text-fg">Can't reach the server</h1>
-      <p className="text-sm text-faint">Retrying automatically…</p>
+    <div className="flex min-h-screen flex-col items-center justify-center gap-3 text-center">
+      <div role="alert" className="flex flex-col gap-3">
+        <h1 className="text-lg font-medium text-fg">Can't reach the server</h1>
+        <p className="text-sm text-faint">Retrying automatically…</p>
+      </div>
       <button
         type="button"
         onClick={() => void retry()}

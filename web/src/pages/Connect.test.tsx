@@ -205,4 +205,20 @@ describe("Connect and the login return", () => {
     await screen.findByText("Acme Planner");
     expect(consumePendingReturn()).toBeNull();
   });
+
+  it("signed out because the server is unreachable: shows the retry panel, no redirect, no pending return", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: null,
+      loading: false,
+      serverUnreachable: true,
+      retry: vi.fn(),
+    } as unknown as ReturnType<typeof useAuth>);
+    renderPage();
+    expect(await screen.findByRole("alert")).toBeTruthy();
+    expect(screen.getByText("Can't reach the server")).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Retry now" })).toBeTruthy();
+    expect(screen.queryByText(/LOGIN PAGE/)).toBeNull();
+    expect(consumePendingReturn()).toBeNull();
+    expect(mockApi.getOAuthRequest).not.toHaveBeenCalled();
+  });
 });

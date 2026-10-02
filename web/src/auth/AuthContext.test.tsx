@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import { AuthProvider, useAuth } from "./AuthContext";
 import { api, ApiError } from "../lib/api";
 import type { SessionResponse } from "../lib/api";
@@ -9,7 +9,7 @@ import type { SessionResponse } from "../lib/api";
 // stay real so the provider's effects compose as they do in the app.
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
-  return { ...actual, api: { ...actual.api, me: vi.fn() } };
+  return { ...actual, api: { ...actual.api, me: vi.fn(), logout: vi.fn() } };
 });
 
 const mockApi = vi.mocked(api);
@@ -45,12 +45,15 @@ const baseSession = (over: Partial<SessionResponse> = {}): SessionResponse => ({
 // A tiny consumer that renders the uzi label and the resolved appearance so the
 // test can assert on what the provider exposes (PRD #764, PRD #1167).
 function Probe() {
-  const { uziLabel, appearance, user, loading, serverUnreachable } = useAuth();
+  const { uziLabel, appearance, user, loading, serverUnreachable, logout } = useAuth();
   return (
     <div>
       <span data-testid="loading">{String(loading)}</span>
       <span data-testid="user">{user ? user.email : "none"}</span>
       <span data-testid="unreachable">{String(serverUnreachable)}</span>
+      <button type="button" onClick={() => void logout()}>
+        do logout
+      </button>
       <span data-testid="uzi">{uziLabel}</span>
       <span data-testid="mode">{appearance.mode}</span>
       <span data-testid="dark">{appearance.dark_theme}</span>
@@ -143,5 +146,17 @@ describe("AuthContext — server unreachable (#1991)", () => {
     await waitFor(() => expect(screen.getByTestId("loading").textContent).toBe("false"));
     expect(screen.getByTestId("unreachable").textContent).toBe("false");
     expect(screen.getByTestId("user").textContent).toBe("none");
+  });
+
+  it("logout clears the flag", async () => {
+    mockApi.me.mockRejectedValue(new ApiError(503, "service unavailable"));
+    mockApi.logout.mockResolvedValue({ status: "ok" });
+    renderProbe();
+    await waitFor(() => expect(screen.getByTestId("unreachable").textContent).toBe("true"));
+    await act(async () => {
+      screen.getByRole("button", { name: "do logout" }).click();
+    });
+    expect(mockApi.logout).toHaveBeenCalledTimes(1);
+    expect(screen.getByTestId("unreachable").textContent).toBe("false");
   });
 });
