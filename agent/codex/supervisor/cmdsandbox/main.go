@@ -207,7 +207,6 @@ func realMain(args []string) int {
 				}
 			}
 		}
-		_, _ = fmt.Fprintf(os.Stderr, "uzi-codex-command-sandbox: start command: %v\n", err)
 		return 1
 	}
 	return 0
