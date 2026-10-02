@@ -98,7 +98,7 @@ func (c *Client) IsClient() bool {
 // CheckClient is the first stage of authorize validation (PRD #1910 D3). It returns
 // ErrClientRejected for an unknown (nil) or inactive product, a product that is not a client, a
 // repeated client_id or redirect_uri, or a redirect_uri that is not an exact string match for a
-// registered one. No parameter is trusted until it returns nil. On success it returns the
+// registered one. No parameter is trusted until it returns a nil error. On success it returns the
 // matching entry of c.RedirectURIs: that registered value, never the request's own string, is
 // the one every later redirect goes to.
 func CheckClient(c *Client, q AuthorizeQuery) (string, error) {
@@ -136,7 +136,8 @@ type Error struct {
 func (e *Error) Error() string { return e.Code + ": " + e.Description }
 
 // ValidateAuthorize is the second stage (PRD #1910 D3); call it only after CheckClient returned
-// nil, passing the registered redirectURI it returned (the Request carries that value). It checks, in order: no repeated parameter, response_type=code, PKCE (S256 only, a
+// a nil error, passing the registered redirectURI it returned (the Request carries that value).
+// It checks, in order: no repeated parameter, response_type=code, PKCE (S256 only, a
 // 43-character base64url challenge), state (1..512 printable ASCII bytes), and scope (at most 64
 // bytes, a non-empty subset of the client's allowed scopes; a missing scope means all of them).
 // The descriptions are fixed strings: no parameter value is echoed.

@@ -355,7 +355,7 @@ func (h *Handler) OAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 			}
 			row, err = q.CreateOAuthAuthorizeRequest(ctx, store.CreateOAuthAuthorizeRequestParams{
 				ProductID:     product.ID,
-				RedirectUri:   req.RedirectURI,
+				RedirectUri:   registered,
 				Scopes:        req.Scopes,
 				State:         req.State,
 				CodeChallenge: req.CodeChallenge,
@@ -378,7 +378,7 @@ func (h *Handler) OAuthAuthorize(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if refused {
-		oauthRedirect(w, oauthsrv.ErrorRedirectURL(req.RedirectURI, &oauthsrv.Error{
+		oauthRedirect(w, oauthsrv.ErrorRedirectURL(registered, &oauthsrv.Error{
 			Code:        oauthsrv.ErrTemporarilyUnavailable,
 			Description: "too many authorization requests are pending; try again shortly",
 			State:       req.State,
