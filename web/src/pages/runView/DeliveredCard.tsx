@@ -123,6 +123,7 @@ interface Delivered {
   pointers: string[];
   scopeNotes: { kind: string; text: string }[];
   verification: { command: string; result: string; sha: string }[];
+  outline: string[];
   sizeLine: string | null;
   /** PRD #1798 D8 rung 2: the summary is the lead's own claims (`source: "lead_only"`), not checked
    *  against the diff; the PR body says so and this surface must too. */
@@ -154,12 +155,24 @@ function delivered(run: Run): Delivered | null {
       sha: displayPrText(v?.verified_at_sha).slice(0, 7),
     }))
     .filter((v) => v.command !== "");
+  const diagram = desc?.diagram_published === true ? fields.diagram : undefined;
+  const nodeLabels = new Map(
+    (Array.isArray(diagram?.nodes) ? diagram.nodes : []).map((node) => [node.key, displayPrText(node.label)]),
+  );
+  const outline = (Array.isArray(diagram?.edges) ? diagram.edges : []).flatMap((edge) => {
+    const from = nodeLabels.get(edge.from);
+    const to = nodeLabels.get(edge.to);
+    if (!from || !to) return [];
+    const label = displayPrText(edge.label);
+    return [`${from} → ${to}${label ? `: ${label}` : ""}`];
+  });
   const sizeLine = prSizeLine(desc?.size);
   const note = prDescriptionOutcomeNote(run.pr_description_outcome);
   const hasBody =
     summary !== "" ||
     sizeLine !== null ||
     changes.length > 0 ||
+    outline.length > 0 ||
     pointers.length > 0 ||
     scopeNotes.length > 0 ||
     verification.length > 0;
@@ -168,8 +181,8 @@ function delivered(run: Run): Delivered | null {
   // lead_only description may carry changes with an empty summary.
   const unchecked =
     desc?.source === "lead_only" &&
-    (summary !== "" || changes.length > 0 || pointers.length > 0 || scopeNotes.length > 0 || verification.length > 0);
-  return { summary, changes, pointers, scopeNotes, verification, sizeLine, note, hasBody, unchecked };
+    (summary !== "" || changes.length > 0 || outline.length > 0 || pointers.length > 0 || scopeNotes.length > 0 || verification.length > 0);
+  return { summary, changes, pointers, scopeNotes, verification, outline, sizeLine, note, hasBody, unchecked };
 }
 
 /** Whether the run has a Delivered section to show (RunSummary's gate for rendering at all). */
@@ -189,7 +202,7 @@ export function DeliveredCard({ run }: { run: Run }) {
   const d = delivered(run);
   if (!d) return null;
   if (!d.hasBody) return <p className={NOTE}>{d.note}</p>;
-  const { summary, changes, pointers, scopeNotes, verification, sizeLine, note, unchecked } = d;
+  const { summary, changes, pointers, scopeNotes, verification, outline, sizeLine, note, unchecked } = d;
 
   return (
     <section className="space-y-3" aria-labelledby={headingId}>
@@ -206,6 +219,17 @@ export function DeliveredCard({ run }: { run: Run }) {
           <ul className="list-disc space-y-1 pl-5 text-sm text-fg">
             {changes.map((c, i) => (
               <li key={i}>{c}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {outline.length > 0 && (
+        <div className="space-y-1">
+          <h4 className="text-xs font-medium text-muted">Diagram outline</h4>
+          <ul className="space-y-1 text-sm text-fg">
+            {outline.map((line, i) => (
+              <li key={i} className="whitespace-pre-wrap">{line}</li>
             ))}
           </ul>
         </div>
