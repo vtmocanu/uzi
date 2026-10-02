@@ -843,6 +843,7 @@ Tracked as GitHub issue vtmocanu/uzi#1907; PRD at `prds/1907-product-tokens-api-
 
 - An admin registers an external product; a user then mints a `uzp_` product token for it in Settings → Access, which acts as that user (once job endpoints exist, on the user's own worker and model credential) but only on the stable, versioned `/api/v1` and never with admin authority, and is refused on every other route exactly like an unknown token. A user holds at most 10 active manually created tokens per product (connections made through OAuth, #1910, are counted apart), chooses an expiry (30 days, 90 days by default, 1 year or never), and can revoke one token or use the existing Revoke all, which now covers product tokens too; an admin can revoke one product token or disable or delete a product, which cuts off all its tokens on their next request. A password change and logout do not revoke them. `/api/v1` changes are additive only, with a deprecation window of at least two minor releases and 90 days. Only `GET /api/v1/whoami` exists so far; job endpoints come later. (AI-synced 2026-09-29)
 - `/api/v1` now serves `whoami` and the jobs endpoints of Feature #1908. (AI-synced 2026-09-30)
+- `/api/v1` returns 401 for a refused token and 503 `auth_unavailable` when the token store cannot be read, so a caller can retry instead of dropping a good token. (AI-synced 2026-10-02)
 
 ## Feature #1908 — Repo-less jobs over `/api/v1`
 

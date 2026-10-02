@@ -160,6 +160,8 @@ Files of a running job stay attached. When the job ends, each file becomes `avai
 - **Request rate:** `/api/v1` has its own per-user budget, 120 per minute by default. `POST /api/v1/jobs` also has its own separate per-user counter, sized by the same `RATE_LIMIT_MAX` and window as the sign-in limiter (10 per minute by default); it does not share a count with sign-in attempts. A 429 without a `reason` carries `Retry-After`. See [Configuration](./configuration.md).
 - **Body size:** a create body over 4 MiB is a 413; the prompt is capped at 256 KiB.
 
+A store failure while checking the token answers 503 `auth_unavailable` with no `Retry-After` header; before [#1992](https://github.com/vtmocanu/uzi/issues/1992) it answered 401, so a 401 now always means the credential itself was refused. Every `/api/v1` operation can return it.
+
 | Status | `reason` | Meaning |
 |---|---|---|
 | 401 | none | Missing, revoked, expired or unknown token |
@@ -172,6 +174,7 @@ Files of a running job stay attached. When the job ends, each file becomes `avai
 | 404 | `unknown_egress_profile` | `egress_profile` names no existing site list |
 | 422 | `invalid_request`, `unknown_job_type`, `no_model_credential` | Bad request (an explicit empty `egress_profile` included), or you have no usable Anthropic credential |
 | 429 | `over_cap` | Active-job cap reached |
+| 503 | `auth_unavailable` | Authentication temporarily unavailable (the token could not be checked); retry with backoff |
 | 503 | `isolated_lane_unavailable` | A non-empty `egress_profile` was supplied while this instance has no isolated research lane enabled; checked after body decoding and empty-profile validation (422), before the site list's allowance (403) and existence (404) and the remaining job validation |
 
 ## Site lists

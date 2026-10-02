@@ -59,6 +59,17 @@ holding a `uzc_` holds the whole account (PRD #1907, Problem).
    `cli_tokens` and the row's scope must be `user` (the prefix is a label,
    authority comes from the row); anything else, including `uza_`, is 401.
    Every failure is the same 401.
+   *Amended 2026-10-02 (#1992):* every credential refusal is the same 401,
+   and a token-store lookup failure (any error other than "no such row") is a
+   fail-closed 503 `auth_unavailable` with no `Retry-After`, so an outage no
+   longer reads as a revoked token. A full outage gives the same 503 whatever
+   token is presented. A partial fault (the first lookup succeeds, the later
+   user lookup fails) lets the holder of that exact token tell it passed the
+   first lookup's checks from an unknown one; for `uzc_` the owner's active
+   flag is not yet checked at that point. We do not claim a caller cannot
+   induce the fault. Accepted: it reaches only the token's holder, 256-bit
+   tokens make it useless for enumeration, and a healthy 200 tells that
+   holder more. See the PRD #1907 Decision Log (2026-10-02).
 
 ## Consequences
 
@@ -69,10 +80,15 @@ holding a `uzc_` holds the whole account (PRD #1907, Problem).
   wrapper script; PRD #1907 deliberately wrote no diff checker for one
   endpoint. Until then additive-only is enforced by review and by the parity
   test, not by an automated diff.
+  *Amended 2026-10-02 (#1992):* it is built: `task check:api-v1-compat`
+  (PRD #1908, Decision 11), part of `gate:repo`.
 - PRD #1908 and later mount their endpoints under the existing
   `RequireV1Caller` and add no auth of their own.
 - Scopes (`jobs:run`, `jobs:read`) exist, but no endpoint enforces them yet;
   `whoami` requires none.
+  *Amended 2026-10-02 (#1992):* the job endpoints enforce them through
+  `RequireScope` in `api/internal/handler/routes_v1.go` (PRD #1908, Decision
+  10); `whoami` still requires none.
 - A `uzp_` token is a bearer credential: "bound to one product" labels the row
   and does not prove which application presents it. PRD #1910's client
   credentials address that.
