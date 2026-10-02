@@ -94,9 +94,11 @@ this lander's second pair of eyes.
 - **One request per pushed head.** The buddy reviews the exact head SHA; reuse its
   verdict until the head moves. Re-request on the same head only when the findings
   or evidence change (a new bot finding, a disposition it should concur on).
-- **Longer loops.** With a Claude lander and a Codex buddy, a user-authorized
-  multi-round loop runs `peers.py budget allow buddy --replies N` once, not a reset
-  per round. A correlated `ask`/`dispatch` reply needs no allowance.
+- **Longer loops.** A Codex buddy bound by a Claude lander normally carries a reply
+  total (`peers.py buddy` shows "replies left") that covers the session. Only when it
+  reports "no buddy reply total recorded", or the buddy is not Codex, does a
+  user-authorized multi-round loop run `peers.py budget allow buddy --replies N` once,
+  not a reset per round. A correlated `ask`/`dispatch` reply needs no allowance.
 - **Issues you file** (follow-ups, inherited or incidental findings): label `reviewed`
   per the root `CLAUDE.md` rule.
 - **Skill or script PRs you open**: the buddy reviews the final draft, then add the
