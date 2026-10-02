@@ -1414,8 +1414,8 @@ export interface ImplementPromptInput {
    *  (memo-kind runs with the memo enabled). Absent/false ⇒ prompt unchanged. */
   decisionsMemo?: boolean;
   /** Issue #2083: the earlier run's private decisions memo, rendered (fenced, untrusted) on the
-   *  FIRST implement turn only. Set by the executor only when the plan turn was skipped (a
-   *  pre-approved resume), where buildPlanPrompt never ran to carry it. */
+   *  FIRST implement turn only. Set by the executor only when this conversation has not seen
+   *  the memo yet: no resumed session, and no plan or revise prompt of this execution carried it. */
   priorDecisionsMemo?: string | null;
   branch: string;
   subagentNames: string[];
