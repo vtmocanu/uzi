@@ -1640,6 +1640,40 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     assert.equal(rig.refreshCalls(), 1, "no credential call while retrying");
   });
 
+  it("issue #1789: a mid-turn CodexCredentialDeferredError after committed work, with a failed first park report, retries visibly then parks typed; custody is never released", async () => {
+    const { gitlab } = fakeGitlab();
+    client.protocolFeatures = [VAULT_FEATURE];
+    const rig = codexRig();
+    const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+      commitInTree(ctx.worktreePath, "MIDTURN.txt", "work done before the vault locked\n");
+      throw new CodexCredentialDeferredError();
+    }, rig.settle);
+    const claim = gitlabClaim(1789);
+    api.failStateWhen(claim.run_id, (b) => b.status === "recovery_wait", { httpStatus: 400 });
+    let parkAttempts = 0;
+    const original = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait") parkAttempts += 1;
+      return original(runId, body, signal);
+    };
+    const runner = runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+    const custody = spyCustodySettle(runner);
+    await runner.execute(claim);
+    assert.equal(parkAttempts, 2, "the failed park report was retried");
+    const parks = parkReports(claim.run_id);
+    assert.equal(parks.length, 1, "then the run parked");
+    assert.equal(parks[0]!.recovery_cause, "vault_locked", "the park is typed");
+    assert.ok(!statuses(claim.run_id).includes("failed"), "never failed");
+    assert.equal(trackedFile(1789, "MIDTURN.txt"), "work done before the vault locked\n", "the committed work is in the tracking ref");
+    const feed = feedTexts(claim.run_id);
+    assert.ok(
+      feed.some((t) => t.startsWith("The run owner's vault is locked. Could not record the pause yet")),
+      `the failed park report is visible; feed=${JSON.stringify(feed)}`,
+    );
+    assert.equal(custody(), 0, "custody is never released");
+    assert.equal(rig.refreshCalls() + rig.releaseCalls(), 0, "no credential call from the park");
+  });
+
   it("(f) an incomplete settle (a surviving writer) never parks: work is retained and the settle retried", async () => {
     const { gitlab } = fakeGitlab();
     client.protocolFeatures = [VAULT_FEATURE];

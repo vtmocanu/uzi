@@ -301,6 +301,11 @@ const REASON_CANCEL = "run cancelled";
 // DISTINCT from REASON_CANCEL/REASON_WALL.
 const REASON_PAUSE = "codex run paused";
 
+// Issue #1789: the trip reason a mid-turn vault-locked refresh deferral drops the live turn with.
+// Routed by driveTurnWithWallPark to CodexCredentialDeferredError (the runner's vault_locked park),
+// never failed. Secret-free static string, DISTINCT from REASON_CANCEL/REASON_PAUSE/REASON_WALL.
+const REASON_VAULT_LOCKED = "codex run deferred: vault locked";
+
 // Issue #2099: bounded same-thread retries of a transient provider failure, mirroring the Claude
 // lane's EMPTY_TURN_* (sdk-executor.ts). The long wait is the server-owned recovery_wait park.
 const TRANSIENT_RETRY_MAX = 2;
@@ -331,6 +336,34 @@ class CodexTurnTripError extends Error {
 }
 
 /**
+ * Issue #1789: run-scoped latch for a vault-locked credential refresh DURING a turn. The app-server
+ * refresh bridge ({@link buildAppServerRefreshBridge}) sets it when the api answers a refresh with
+ * the typed 409 `vault_locked`; the live turn is then dropped (REASON_VAULT_LOCKED) and the run
+ * defers through CodexCredentialDeferredError instead of failing. One instance per run() invocation,
+ * shared across provider epochs. Carries no credential, body or error text: only a boolean.
+ */
+class CodexVaultLockState {
+  /** True once a refresh was deferred by a locked vault; never cleared within one run() call. */
+  latched = false;
+  /** True from the first plan-gate submission until approval: the server row is awaiting_approval
+   *  and can never park, so the latch must not change a turn's outcome in that window. */
+  gateOpen = false;
+  /** The live turn's trip, set by driveCodexTurn for the turn's duration. */
+  activeTurnTrip: ((reason: string) => void) | undefined;
+
+  /** The latch is in force for turn outcomes (latched and no plan gate open). */
+  get active(): boolean {
+    return this.latched && !this.gateOpen;
+  }
+
+  /** The bridge callback: latch and drop the live turn, if any (suppressed while a gate is open). */
+  onVaultLocked(): void {
+    this.latched = true;
+    if (!this.gateOpen) this.activeTurnTrip?.(REASON_VAULT_LOCKED);
+  }
+}
+
+/**
  * Issue #1764: run-scoped state of the owner/wall pause-now interrupt (PRD #1190 rework N2 parity
  * with sdk-executor's re-armable trip). The shared ctx.signal aborts only once, so every `now`/`wall`
  * pause after the first reaches this executor only through ctx.onPauseNow, which bumps `seq` and
@@ -346,6 +379,8 @@ class CodexPauseNowState {
   sharedAbortHandled = false;
   /** The live turn's trip, set by driveCodexTurn for the turn's duration. */
   activeTurnTrip: ((reason: string) => void) | undefined;
+  /** Issue #1789: the run-scoped vault-lock latch, shared by every epoch's refresh bridge. */
+  readonly vaultLock = new CodexVaultLockState();
 
   constructor(private readonly signal: AbortSignal | undefined) {}
 
@@ -720,6 +755,7 @@ export function buildAppServerRefreshBridge(
   binding: CodexBinding,
   committed: CodexCommittedGenerationCell,
   registerToken: (token: string) => void,
+  onVaultLocked?: () => void,
 ): CodexSubscriptionRefreshBridge {
   if (binding.authMode !== "subscription") {
     // Fail-closed guard: an api_key credential can never refresh (mirrors the reconcile).
@@ -728,8 +764,14 @@ export function buildAppServerRefreshBridge(
   const { capability, chatgptAccountId } = binding;
   let lastSeenOperationId: string | undefined;
   let pendingGeneration: number | undefined;
+  // Issue #1789: set once a refresh was deferred by a locked vault. Only ever set when the caller
+  // supplied `onVaultLocked` (the run lane); the advice lane leaves it unset and keeps today's behaviour.
+  let vaultLocked = false;
   return {
     refresh: async ({ operationId, signal }): Promise<{ accessToken: string; accountId: string }> => {
+      // Issue #1789: a locked vault will not unlock inside this run. Refuse further refreshes with
+      // the same typed error and NO api call, so Codex's retry cannot hammer the endpoint.
+      if (vaultLocked) throw new CodexCredentialDeferredError();
       // A genuinely NEW operation id is the auth owner's DELIVERY signal for the prior refresh:
       // fold pending → committed (never regressing the shared cell). A same-id retry keeps the
       // OLD committed generation as the observed value it sends.
@@ -744,12 +786,24 @@ export function buildAppServerRefreshBridge(
         // A subscription binding always carries a generation; its absence is a protocol fault.
         throw new Error("codex app-server refresh has no observed generation");
       }
-      const res = await client.refreshCodex(
-        runId,
-        { capability, operation_id: operationId, observed_generation: observedGeneration },
-        { authMode: "subscription", chatgptAccountId },
-        signal,
-      );
+      let res: Awaited<ReturnType<typeof client.refreshCodex>>;
+      try {
+        res = await client.refreshCodex(
+          runId,
+          { capability, operation_id: operationId, observed_generation: observedGeneration },
+          { authMode: "subscription", chatgptAccountId },
+          signal,
+        );
+      } catch (err) {
+        // Issue #1789: only the parsed reason crosses (never the RequestError or its body). Every
+        // other failure (contended/quarantined 409, 5xx, transport) is rethrown unchanged.
+        if (onVaultLocked !== undefined && codexDeferralReason(err) === "vault_locked") {
+          vaultLocked = true;
+          onVaultLocked();
+          throw new CodexCredentialDeferredError();
+        }
+        throw err;
+      }
       registerToken(res.access_token);
       // Held, NOT committed: the shared cell only advances once a NEW operation id proves this
       // token reached Codex (see fold above).
@@ -764,6 +818,8 @@ export function buildAppServerRefreshBridge(
  * the owner vault is locked (the api's typed 409 `vault_locked`). It is thrown from
  * `startProviderEpoch` (which tears the half-built epoch down and rethrows it unwrapped) and
  * propagates out of `run()`, so the runner can park the run for recovery rather than fail it.
+ * Issue #1789: it is also what `run()` rejects with when an app-server credential refresh DURING a
+ * turn was deferred by a locked vault (the run-lane refresh bridge latches, the turn is dropped).
  * The message is fixed and secret-free: it never carries the request path, body or a token.
  */
 export class CodexCredentialDeferredError extends Error {
@@ -807,9 +863,18 @@ export function buildRunLaneReconcile(
   binding: CodexBinding,
   registerToken: (token: string) => void,
   committed: CodexCommittedGenerationCell = { value: binding.authMode === "subscription" ? binding.generation : undefined },
+  isVaultLocked?: () => boolean,
 ): ReconcileBeforeBoundary {
   let reconcileOperationId: string | undefined;
   return async (_request: BoundaryRequest, signal: AbortSignal): Promise<ReconcileOutcome> => {
+    // Issue #1789: the run already learned (mid-turn) that the owner vault is locked: defer at once
+    // with NO credential call, instead of re-asking the api for a refresh/release it will refuse.
+    if (isVaultLocked?.()) {
+      const errors: readonly HarnessError[] = [
+        { category: "authorization", message: `codex ${binding.authMode} boundary reconcile deferred: vault locked` },
+      ];
+      return { kind: "blocked", errors, deferral: "vault_locked" };
+    }
     try {
       if (binding.authMode === "subscription") {
         if (committed.value === undefined) {
@@ -1570,6 +1635,8 @@ interface EpochSharedContext {
    *  an unredacted prefix straddling the bound's cut. */
   readonly scrubProjected: (s: string) => string;
   readonly committedGeneration: CodexCommittedGenerationCell;
+  /** Issue #1789: the run-scoped vault-lock latch the run-lane refresh bridge reports into. */
+  readonly vaultLock: CodexVaultLockState;
   readonly launchEffectRoot: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>;
   readonly spawnBoundaryRoot: SpawnRootSeam;
   readonly boundaryProcessSpawner: SpawnBoundaryProcessSeam;
@@ -2014,7 +2081,7 @@ export class CodexExecutor implements Executor {
         ((): Promise<RegisteredRoot> =>
           Promise.reject(new Error("codex boundary-action spawn seam is not wired (the runner drives spawnBoundaryProcess)")));
       const boundaryProcessSpawner = makeBoundaryProcessSpawner(launchEffectRoot, commandSandbox, this.log, runCache);
-      const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration);
+      const reconcile = this.makeBoundaryReconcile(ctx.runId, registerToken, committedGeneration, () => pauseNow.vaultLock.latched);
       // (C, F1) Terminal eviction of tokens released by the POST-RUN sink reconciles. The runner
       // calls safety.dispose after the last durability sink — by which point run()'s finally has
       // already evicted+cleared the DURING-run tokens — so the FINAL epoch's onDispose evicts only
@@ -2041,6 +2108,7 @@ export class CodexExecutor implements Executor {
       const shared: EpochSharedContext = {
         provider,
         binding,
+        vaultLock: pauseNow.vaultLock,
         worktreePath,
         storeDir,
         homeRoot: this.homeRoot,
@@ -2223,6 +2291,9 @@ export class CodexExecutor implements Executor {
         // Issue #1626: a malformed milestone list (any entry dropped, or a non-array) rides the
         // report as rejectedMilestones, so the server rejects the candidate as a unit instead of
         // reading "no milestones" (or a narrowed list) as the completion contract.
+        // Issue #1789: from the first gate submission until approval the server row is
+        // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
+        pauseNow.vaultLock.gateOpen = true;
         let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones);
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         let revisions = 0;
@@ -2248,6 +2319,7 @@ export class CodexExecutor implements Executor {
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        pauseNow.vaultLock.gateOpen = false;
         gatedPlan = planMd;
         approvedMilestones = planResult.milestones;
         approvedSelection = verdict.selection;
@@ -2719,7 +2791,7 @@ export class CodexExecutor implements Executor {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
       spawnBoundaryRoot, boundaryProcessSpawner, reconcile, onTerminalDispose, accountant, scrubProjected,
-      commandCache, lifecycleSignal, selection,
+      commandCache, lifecycleSignal, selection, vaultLock,
     } = shared;
 
     // Per-epoch trust-boundary REVALIDATION: re-verify the run HOME + codex-data parent's
@@ -2771,7 +2843,7 @@ export class CodexExecutor implements Executor {
         ? {
             mode: "subscription",
             initial: { accessToken: initialToken, accountId: binding.chatgptAccountId },
-            bridge: buildAppServerRefreshBridge(ctx.runId, this.opts.client, binding, committedGeneration, registerToken),
+            bridge: buildAppServerRefreshBridge(ctx.runId, this.opts.client, binding, committedGeneration, registerToken, () => vaultLock.onVaultLocked()),
           }
         : { mode: "api_key", apiKey: initialToken };
       const appServerAuth = createCodexAppServerAuth(authConfig);
@@ -3049,8 +3121,14 @@ export class CodexExecutor implements Executor {
     // A pending interruption (spent signal, an unconsumed `now`/`wall` generation, or a spent wall
     // budget) drops this turn at once; the catch routes it by mode.
     if (pendingAtStart !== undefined) trip(pendingAtStart);
+    // Issue #1789: a vault-lock latch set before this turn (an earlier turn's refresh, or a boundary)
+    // drops it at once, unless an earlier interruption already tripped it (first-wins).
+    const vaultLock = pauseNow.vaultLock;
+    if (vaultLock.active) trip(REASON_VAULT_LOCKED);
     // Issue #1764: every later interrupt trips THIS turn (first-wins), until the finally uninstalls it.
     pauseNow.activeTurnTrip = trip;
+    // Issue #1789: a mid-turn vault-locked refresh deferral trips THIS turn the same way.
+    vaultLock.activeTurnTrip = trip;
     let idleTimer: ReturnType<typeof setTimeout> | undefined;
     let currentTurnCallbacks = registry.inFlightCallbackCountSince(callbackCursor);
     const armIdle = (): void => {
@@ -3180,6 +3258,7 @@ export class CodexExecutor implements Executor {
       wall.remainingMs -= Date.now() - wallArmedAt;
       if (ctx.signal) ctx.signal.removeEventListener("abort", onCancel);
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
+      if (vaultLock.activeTurnTrip === trip) vaultLock.activeTurnTrip = undefined;
     }
   }
 
@@ -3301,9 +3380,24 @@ export class CodexExecutor implements Executor {
         // predicate. Check before returning the result to the plan, revision, or implement caller;
         // otherwise that caller can gate or complete the run and silently drop the cancel.
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCEL);
+        // Issue #1789: the turn ended cleanly but a refresh was deferred by a locked vault during it
+        // (cancel was checked above and wins): the run cannot continue credentialed, so defer rather
+        // than carry on into a boundary that would only be refused.
+        if (pauseNow.vaultLock.active) throw new CodexCredentialDeferredError();
         return { kind: "turn", result };
       } catch (caught) {
         let err: unknown = caught;
+        // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
+        // (sticky, or a cancel/shutdown trip) always wins; a pause/wall/idle trip that fired FIRST
+        // keeps its existing arm below; anything else (the vault trip, or the turn failing on the
+        // refused refresh) defers with NO transient retry (a locked vault is not transient).
+        if (pauseNow.vaultLock.active) {
+          const lockedMsg = caught instanceof Error ? caught.message : "";
+          if (ctx.cancelRequested?.() || lockedMsg === REASON_CANCEL) throw new Error(REASON_CANCEL);
+          if (lockedMsg !== REASON_PAUSE && lockedMsg !== REASON_WALL && lockedMsg !== REASON_IDLE) {
+            throw new CodexCredentialDeferredError();
+          }
+        }
         // Issue #2099: a transient PROVIDER failure (closed classification, never message text) is
         // retried in the same thread, a bounded number of times, then escalates as
         // TransientRecoveryError (the runner's recovery_wait park). An interruption (cancel, pause,
@@ -3512,8 +3606,9 @@ export class CodexExecutor implements Executor {
     runId: string,
     registerToken: (token: string) => void,
     committed: CodexCommittedGenerationCell,
+    isVaultLocked: () => boolean,
   ): ReconcileBeforeBoundary {
-    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, registerToken, committed);
+    return buildRunLaneReconcile(runId, this.opts.client, this.opts.binding, registerToken, committed, isVaultLocked);
   }
 
   // ─── the child-turn demux seam (part C) ───────────────────────────────────────

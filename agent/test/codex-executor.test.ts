@@ -8842,6 +8842,175 @@ describe("CodexExecutor: vault_locked deferral (issue #1766)", () => {
 });
 
 // ================================================================================
+// Issue #1789: a locked owner vault DURING a long turn. The app-server refresh bridge (run lane
+// only) latches the typed 409 vault_locked; the live turn is dropped and run() rejects with
+// CodexCredentialDeferredError (the runner's vault_locked park) instead of a failed turn.
+describe("CodexExecutor: mid-turn vault_locked refresh deferral (issue #1789)", () => {
+  const OP = { operationId: "op-1", signal: new AbortController().signal };
+
+  it("R1: the run-lane bridge turns a 409 vault_locked into CodexCredentialDeferredError, signals once, and refuses further refreshes without an api call", async () => {
+    let calls = 0;
+    const client = { refreshCodex: async (): Promise<never> => { calls += 1; throw vaultLocked409("refresh"); } };
+    let signalled = 0;
+    const bridge = buildAppServerRefreshBridge("run-1", client as never, bindingOf(SUBSCRIPTION), { value: 3 }, () => {}, () => { signalled += 1; });
+    const err = await bridge.refresh(OP).then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.doesNotMatch(String((err as Error).message), new RegExp(FRESH_TOKEN));
+    assert.equal(signalled, 1);
+    assert.equal(calls, 1);
+    // The same logical operation AND a new one: neither reaches the api again.
+    assert.ok(await bridge.refresh(OP).then(() => undefined, (e: unknown) => e) instanceof CodexCredentialDeferredError);
+    assert.ok(await bridge.refresh({ ...OP, operationId: "op-2" }).then(() => undefined, (e: unknown) => e) instanceof CodexCredentialDeferredError);
+    assert.equal(calls, 1, "no refreshCodex call once latched");
+    assert.equal(signalled, 1, "the latch signals once");
+  });
+
+  it("C1: every other refresh failure is rethrown unchanged and never signals; the advice lane (no callback) keeps its behaviour", async () => {
+    const failures: unknown[] = [
+      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_contended" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "refresh_quarantined" })),
+      new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })),
+      new Error("fetch failed"),
+    ];
+    for (const failure of failures) {
+      let signalled = 0;
+      const client = { refreshCodex: async (): Promise<never> => { throw failure; } };
+      const bridge = buildAppServerRefreshBridge("run-1", client as never, bindingOf(SUBSCRIPTION), { value: 3 }, () => {}, () => { signalled += 1; });
+      await assert.rejects(bridge.refresh(OP), (e: unknown) => e === failure);
+      assert.equal(signalled, 0);
+    }
+    // Advice lane: no callback, so a 409 vault_locked is rethrown as-is and a retry calls the api again.
+    let calls = 0;
+    const locked = vaultLocked409("refresh");
+    const client = { refreshCodex: async (): Promise<never> => { calls += 1; throw locked; } };
+    const bridge = buildAppServerRefreshBridge("run-1", client as never, bindingOf(SUBSCRIPTION), { value: 3 }, () => {});
+    await assert.rejects(bridge.refresh(OP), (e: unknown) => e === locked);
+    await assert.rejects(bridge.refresh(OP), (e: unknown) => e === locked);
+    assert.equal(calls, 2, "the advice-lane bridge keeps asking the api");
+  });
+
+  // A refresh request from the app-server, mid-turn, as the harness pumps it.
+  const refreshFrame = (requestId: number): CodexNotification => ({
+    kind: "activity",
+    method: "account/chatgptAuthTokens/refresh",
+    requestId,
+    params: { reason: "unauthorized", previousAccountId: null },
+  });
+  // One epoch whose turn asks for a refresh then fails (what Codex does once the refresh is refused).
+  // The failed terminal is queued after the request so an unfixed run ends fast instead of idling.
+  const refreshThenFail = (): Responder => epochResponder("th-1", "tn-1", (t) => {
+    t.push(refreshFrame(91)).push(turnCompleted("failed"));
+  });
+
+  it("R2: a vault_locked refresh DURING an implement turn makes run() reject with CodexCredentialDeferredError (not a failed turn); one refresh call, no later credential call", async () => {
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    rig.client.refreshCodex = async (runId, req) => {
+      rig.client.refreshCalls.push({ runId, operation_id: req.operation_id, observed_generation: req.observed_generation });
+      throw vaultLocked409("refresh");
+    };
+    const { ctx, emitted } = makeCtx();
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "mid-turn deferral").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof CodexCredentialDeferredError, `got ${String(err)}`);
+    assert.equal(rig.client.refreshCalls.length, 1, "exactly one refresh reached the api");
+    assert.equal(rig.client.releaseCalls.length, 1, "only the epoch's initial release; nothing after the deferral");
+    assert.doesNotMatch(JSON.stringify(emitted), new RegExp(FRESH_TOKEN));
+  });
+
+  it("C2: the same refresh answered 500 (even with a vault_locked body) fails the turn as today", async () => {
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    rig.client.refreshCodex = async () => { throw new RequestError("POST", "/x", 500, JSON.stringify({ reason: "vault_locked" })); };
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 5000, "500 refresh").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
+    assert.match((err as Error).message, /codex turn failed/);
+  });
+
+  it("C3: a sticky owner cancel wins over the deferral", async () => {
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    rig.client.refreshCodex = async () => { throw vaultLocked409("refresh"); };
+    const { ctx } = makeCtx({ cancelRequested: () => true });
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "cancel wins").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
+    assert.equal((err as Error).message, "run cancelled");
+  });
+
+  it("C4: a shutdown abort of the run signal that lands while the refresh is deferred ends as a cancel, never a deferral", async () => {
+    const controller = new AbortController();
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    rig.client.refreshCodex = async () => { controller.abort(); throw vaultLocked409("refresh"); };
+    const { ctx } = makeCtx({ signal: controller.signal });
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "shutdown wins").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
+    assert.equal((err as Error).message, "run cancelled");
+  });
+
+  it("C5: an owner pause that tripped the turn first keeps the pause path (the deferral does not override it)", async () => {
+    const controller = new AbortController();
+    const st = { cb: undefined as (() => void) | undefined };
+    const rig = makeMultiEpochRig([refreshThenFail()]);
+    rig.client.refreshCodex = async () => {
+      controller.abort(new PauseNowSignal());
+      st.cb?.();
+      throw vaultLocked409("refresh");
+    };
+    const parks: { completedCount: number }[] = [];
+    const { ctx } = makeCtx({
+      signal: controller.signal,
+      pauseModeRequested: () => "now",
+      onPauseNow: (cb) => { st.cb = cb; },
+      parkForPause: async (at) => { parks.push(at); return true; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "pause first");
+    assert.equal(parks.length, 1, "the pause parked the run");
+    assert.ok(result.pausedAt);
+  });
+
+  it("C6: while a plan gate is open (a revise turn), the latch changes nothing: the turn fails as today", async () => {
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+      if (c.method === "turn/start") {
+        const turnId = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) {
+          c.transport.push(threadStarted("th-plan"))
+            .push(toolCall(1, "submit_plan", { plan_md: "the plan" }, "th-plan", turnId, "c-plan"))
+            .push(turnCompleted("completed", "th-plan", turnId));
+        } else {
+          c.transport.push(refreshFrame(91)).push(turnCompleted("failed", "th-plan", turnId));
+        }
+        return { turn: { id: turnId } };
+      }
+      return {};
+    };
+    const rig = makeMultiEpochRig([responder]);
+    rig.client.refreshCodex = async () => { throw vaultLocked409("refresh"); };
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "revise", feedback: "tighten it" }),
+    } as Partial<RunContext>);
+    const err = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "revise turn").then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof Error && !(err instanceof CodexCredentialDeferredError), `got ${String(err)}`);
+    assert.match((err as Error).message, /codex turn failed/);
+  });
+
+  it("R5: once the run latched, the next boundary reconcile defers with ZERO credential calls", async () => {
+    let calls = 0;
+    const client = {
+      refreshCodex: async (): Promise<never> => { calls += 1; throw new Error("unused"); },
+      releaseCodex: async (): Promise<never> => { calls += 1; throw new Error("unused"); },
+    };
+    let locked = false;
+    const reconcile = buildRunLaneReconcile("run-1", client as never, bindingOf(SUBSCRIPTION), () => {}, { value: 3 }, () => locked);
+    locked = true;
+    assert.deepEqual(await reconcile(RECONCILE_REQ, RECONCILE_SIGNAL), {
+      kind: "blocked",
+      errors: [{ category: "authorization", message: "codex subscription boundary reconcile deferred: vault locked" }],
+      deferral: "vault_locked",
+    });
+    assert.equal(calls, 0);
+  });
+});
+
+// ================================================================================
 // Issue #1866 M2 — the run-start environment probe on the Codex harness. The probe runs ONCE,
 // through epoch 0's registered command seam, before any turn; its facts are cached for the whole
 // run (a recreated epoch never probes again); an unconfirmed cleanup fails the run before any turn.

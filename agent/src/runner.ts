@@ -391,7 +391,8 @@ class BoundaryStepTracker {
 /** Issue #1766: the harness-agnostic probe for a Codex credential DEFERRAL. A locked owner vault
  *  answers a Codex refresh/release with a typed 409 `vault_locked`; the Codex side surfaces it as a
  *  boundary-reconcile block (`CodexBoundaryError`, finalize/checkpoint sinks) or as a failed epoch
- *  credential release (`CodexCredentialDeferredError`, epoch recreation). Like
+ *  credential release or a mid-turn app-server refresh (`CodexCredentialDeferredError`, epoch
+ *  recreation / issue #1789). Like
  *  {@link isCodexBoundaryError} it reads only the error's `name` and its `deferral` field (never
  *  `instanceof`, never the message text), so the runner never imports agent/src/codex/**. Returns
  *  "vault_locked" only for those two names carrying that exact deferral; undefined otherwise. */
@@ -3177,7 +3178,8 @@ export class RunRunner {
         await batcher.close().catch(() => undefined);
       } else if (codexDeferralOf(err) === "vault_locked") {
         // Issue #1766: a Codex credential refresh/release was deferred because the owner vault is
-        // locked (finalize or checkpoint boundary reconcile, or an epoch recreation's release). That
+        // locked (finalize or checkpoint boundary reconcile, an epoch recreation's release, or a
+        // mid-turn app-server refresh, issue #1789). That
         // is recoverable, never a failed run: park it for recovery, credential-free. Placed AFTER the
         // claim-fence, stale-claim, running-ack-terminal and credential-switch arms, so a released or
         // superseded claim is never parked.

@@ -9,6 +9,7 @@ import {
   type ServerVerifiedCodexAuthTokens,
 } from "../src/codex/appserver-auth.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
+import { CodexCredentialDeferredError } from "../src/codex/codex-executor.js";
 
 const INITIAL = { accessToken: "initial-access-token", accountId: "server-account-1" };
 const REFRESHED = { accessToken: "refreshed-access-token", accountId: "server-account-1" };
@@ -251,6 +252,33 @@ describe("Codex app-server auth: subscription refresh", () => {
 
     assert.equal(await auth.handleServerRequest(transport, refreshRequest(3)), true);
     assert.notEqual(operationIds[2], operationIds[1], "a later logical refresh gets a new operation id");
+  });
+
+  it("issue #1789: a bridge that throws CodexCredentialDeferredError answers coalesced callbacks with one -32001 each from ONE bridge call, and the retained operation id is reused", async () => {
+    const operationIds: string[] = [];
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    const auth = subscription({
+      refresh: async ({ operationId }) => {
+        operationIds.push(operationId);
+        await held;
+        throw new CodexCredentialDeferredError();
+      },
+    });
+    const transport = new FakeTransport();
+    await auth.authenticate(transport);
+
+    const first = auth.handleServerRequest(transport, refreshRequest(1));
+    const second = auth.handleServerRequest(transport, refreshRequest(2));
+    release();
+    assert.deepEqual(await Promise.all([first, second]), [true, true]);
+    assert.equal(operationIds.length, 1, "the coalesced callbacks share one bridge call");
+    assert.deepEqual(responses(transport).map((r) => [r.requestId, (r.response as { error: unknown }).error]), [1, 2].map((id) => [id, {
+      code: -32001,
+      message: "codex authentication refresh unavailable",
+    }]));
+    assert.equal(await auth.handleServerRequest(transport, refreshRequest(3)), true);
+    assert.equal(operationIds[1], operationIds[0], "the failed operation id is retained for the next callback");
   });
 
   it("handles an already-aborted outer signal without an unhandled rejected promise", async () => {
