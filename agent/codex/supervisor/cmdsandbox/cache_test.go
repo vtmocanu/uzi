@@ -26,28 +26,28 @@ func TestParseArgsCache(t *testing.T) {
 	with := func(extra ...string) []string { return append(append([]string{}, base...), extra...) }
 
 	// (present) --cache before -- is parsed.
-	_, _, _, cache, mode, child, err := parseArgs(with("--cache", cacheA, "--", "/bin/true"))
+	_, _, _, cache, mode, _, child, err := parseArgs(with("--cache", cacheA, "--", "/bin/true"))
 	if err != nil || cache != cacheA || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/true"}) {
 		t.Fatalf("--cache: cache=%q mode=%q child=%v err=%v", cache, mode, child, err)
 	}
 
 	// (absent) cache is "".
-	if _, _, _, cache, _, _, err := parseArgs(with("--", "/bin/true")); err != nil || cache != "" {
+	if _, _, _, cache, _, _, _, err := parseArgs(with("--", "/bin/true")); err != nil || cache != "" {
 		t.Fatalf("absent --cache: cache=%q err=%v", cache, err)
 	}
 
 	// (combined) --cache then --mode, both honoured.
-	_, _, _, cache, mode, child, err = parseArgs(with("--cache", "/c/"+runTokenB, "--mode", "best-effort", "--", "/bin/true", "x"))
+	_, _, _, cache, mode, _, child, err = parseArgs(with("--cache", "/c/"+runTokenB, "--mode", "best-effort", "--", "/bin/true", "x"))
 	if err != nil || cache != "/c/"+runTokenB || mode != modeBestEffort || !reflect.DeepEqual(child, []string{"/bin/true", "x"}) {
 		t.Fatalf("--cache --mode: cache=%q mode=%q child=%v err=%v", cache, mode, child, err)
 	}
 
 	// (after --) a --cache token belongs to the child and is never the cache.
-	_, _, _, cache, _, child, err = parseArgs(with("--", "/bin/sh", "--cache", "/etc"))
+	_, _, _, cache, _, _, child, err = parseArgs(with("--", "/bin/sh", "--cache", "/etc"))
 	if err != nil || cache != "" || !reflect.DeepEqual(child, []string{"/bin/sh", "--cache", "/etc"}) {
 		t.Fatalf("--cache after --: cache=%q child=%v err=%v", cache, child, err)
 	}
-	_, _, _, cache, mode, child, err = parseArgs(with("--mode", "required", "--", "/bin/sh", "--cache", "/etc", "--mode", "best-effort"))
+	_, _, _, cache, mode, _, child, err = parseArgs(with("--mode", "required", "--", "/bin/sh", "--cache", "/etc", "--mode", "best-effort"))
 	if err != nil || cache != "" || mode != modeRequired || len(child) != 5 {
 		t.Fatalf("flags after --: cache=%q mode=%q child=%v err=%v", cache, mode, child, err)
 	}
@@ -71,7 +71,7 @@ func TestParseArgsCache(t *testing.T) {
 		"double slash":        with("--cache", "/var/cache//"+runTokenA, "--", "/bin/true"),
 		"bare uuid":           with("--cache", runTokenA, "--", "/bin/true"),
 	} {
-		if _, _, _, _, _, _, err := parseArgs(args); err == nil {
+		if _, _, _, _, _, _, _, err := parseArgs(args); err == nil {
 			t.Errorf("%s: %v accepted", name, args)
 		}
 	}

@@ -45,6 +45,9 @@ func runSandbox(t *testing.T, testName string, args []string, stdin *os.File) (i
 			}
 			code = exit.ExitCode()
 		}
+		if code != 0 && stderr.Len() > 0 {
+			t.Logf("sandbox stderr:\n%s", stderr.String())
+		}
 		return code, stdout.String()
 	case <-time.After(10 * time.Second):
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
@@ -54,10 +57,15 @@ func runSandbox(t *testing.T, testName string, args []string, stdin *os.File) (i
 	}
 }
 
-func sandboxArgs(t *testing.T, mode string, child ...string) []string {
+// sandboxArgs builds the sandbox argv; nullStdin adds the opt-in `--stdin null`.
+func sandboxArgs(t *testing.T, mode string, nullStdin bool, child ...string) []string {
 	t.Helper()
 	root := t.TempDir()
-	return append([]string{"--root", root, "--tmp", privateTmp(t), "--cwd", root, "--mode", mode, "--"}, child...)
+	args := []string{"--root", root, "--tmp", privateTmp(t), "--cwd", root, "--mode", mode}
+	if nullStdin {
+		args = append(args, "--stdin", "null")
+	}
+	return append(append(args, "--"), child...)
 }
 
 func helperMain() {
@@ -71,7 +79,8 @@ func helperMain() {
 }
 
 // TestCommandStdinIsEmpty keeps the write end of the inherited stdin pipe open,
-// as the supervisor does: a command reading stdin must still see EOF.
+// as the supervisor does: with `--stdin null` a command reading stdin must
+// still see EOF.
 func TestCommandStdinIsEmpty(t *testing.T) {
 	helperMain()
 	cat, err := exec.LookPath("cat")
@@ -95,7 +104,7 @@ func TestCommandStdinIsEmpty(t *testing.T) {
 				t.Fatal(err)
 			}
 			t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
-			code, out := runSandbox(t, "TestCommandStdinIsEmpty", sandboxArgs(t, mode, cat), r)
+			code, out := runSandbox(t, "TestCommandStdinIsEmpty", sandboxArgs(t, mode, true, cat), r)
 			if code != 0 || out != "" {
 				t.Fatalf("exit=%d stdout=%q, want 0 and empty", code, out)
 			}
@@ -104,7 +113,7 @@ func TestCommandStdinIsEmpty(t *testing.T) {
 }
 
 // TestShellProvidedStdinStillWorks proves pipes and heredocs inside the
-// command are unaffected by the empty stdin, and that exit status passes through.
+// command are unaffected by `--stdin null`, and that exit status passes through.
 func TestShellProvidedStdinStillWorks(t *testing.T) {
 	helperMain()
 	cases := []struct {
@@ -117,10 +126,34 @@ func TestShellProvidedStdinStillWorks(t *testing.T) {
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			code, out := runSandbox(t, "TestShellProvidedStdinStillWorks", sandboxArgs(t, "off", "/bin/sh", "-c", c.script), nil)
+			code, out := runSandbox(t, "TestShellProvidedStdinStillWorks", sandboxArgs(t, "off", true, "/bin/sh", "-c", c.script), nil)
 			if code != c.code || out != c.out {
 				t.Fatalf("exit=%d stdout=%q, want %d %q", code, out, c.code, c.out)
 			}
 		})
+	}
+}
+
+// TestDefaultStdinIsInherited pins the contract the worker's own streaming
+// processes (fileop, git index-pack --stdin) rely on: without `--stdin null`
+// the command reads the sandbox's stdin.
+func TestDefaultStdinIsInherited(t *testing.T) {
+	helperMain()
+	cat, err := exec.LookPath("cat")
+	if err != nil {
+		t.Skipf("cat not found: %v", err)
+	}
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = r.Close(); _ = w.Close() })
+	if _, err := w.WriteString("payload\n"); err != nil {
+		t.Fatal(err)
+	}
+	_ = w.Close()
+	code, out := runSandbox(t, "TestDefaultStdinIsInherited", sandboxArgs(t, "off", false, cat), r)
+	if code != 0 || out != "payload\n" {
+		t.Fatalf("exit=%d stdout=%q, want 0 and %q", code, out, "payload\n")
 	}
 }

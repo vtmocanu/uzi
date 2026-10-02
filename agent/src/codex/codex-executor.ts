@@ -3932,7 +3932,12 @@ async function launchRegisteredEffectRoot(
  * token BEFORE the `--` separator. It is the trusted worker's Config value (never
  * run/repo/model input); a `--mode` token that the model puts in `command`/`args`
  * lands AFTER `--` and the Go sandbox reads it as part of the child, never as the
- * mode. */
+ * mode.
+ *
+ * `nullStdin` emits `--stdin null` after `--mode` (also before `--`), giving the command an
+ * empty stdin. Only model-authorized commands set it: their inherited stdin is a pipe nobody
+ * writes or closes, so `rg PATTERN` or `cat` would block until the wall deadline. The fileop
+ * root and boundary processes (git `index-pack --stdin`) leave it unset and keep their stdin. */
 export function commandSandboxArgv(
   worktreePath: string,
   cwd: string,
@@ -3941,6 +3946,7 @@ export function commandSandboxArgv(
   privateTmp: string,
   mode: CommandSandboxMode,
   cacheDir?: string,
+  nullStdin?: boolean,
 ): string[] {
   const worktree = path.resolve(worktreePath);
   const workCwd = path.resolve(cwd);
@@ -3960,6 +3966,7 @@ export function commandSandboxArgv(
     "--cwd", workCwd,
     ...(cacheDir === undefined ? [] : ["--cache", cacheDir]),
     "--mode", mode,
+    ...(nullStdin === true ? ["--stdin", "null"] : []),
     "--", command, ...args,
   ];
 }
@@ -4082,6 +4089,7 @@ function commandEffectSpec(
   env: NodeJS.ProcessEnv,
   mode: CommandSandboxMode,
   cacheDir?: string,
+  nullStdin?: boolean,
 ): CodexEffectLaunchSpec {
   const cleanupToken = randomUUID();
   const privateTmp = `/tmp/uzi-codex-command-${cleanupToken}`;
@@ -4098,7 +4106,7 @@ function commandEffectSpec(
   return {
     identity: "command",
     command: COMMAND_SANDBOX_BIN,
-    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode, cacheDir),
+    args: commandSandboxArgv(worktreePath, cwd, command, args, privateTmp, mode, cacheDir, nullStdin),
     cwd: worktreePath,
     env: { ...commandEnv, HOME: privateTmp, TMPDIR: privateTmp },
     supervisorBin: SUPERVISOR_BIN,
@@ -4113,7 +4121,8 @@ function commandEffectSpec(
  * {@link CommandDeadlineError} is thrown. Any other waitChild rejection also reaps first;
  * with the real launcher that reap is unclean after the supervisor's fail(), so it surfaces
  * as COMMAND_ROOT_UNREAPED with the registry poisoned (fail-closed). `wallMs` is a test
- * seam; production uses the default. */
+ * seam; production uses the default. The command gets an empty stdin (`--stdin null`), so a
+ * command that reads stdin sees EOF instead of blocking on the supervisor's open pipe. */
 export function makeDefaultSpawnCommand(
   registry: ExecutionRegistry,
   launch: (spec: CodexEffectLaunchSpec, deadlineMs?: number) => Promise<CodexRootHandle>,
@@ -4131,7 +4140,7 @@ export function makeDefaultSpawnCommand(
       const launched = await launchRegisteredEffectRoot(
         registry,
         withCache.launch,
-        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, withCache.dir),
+        commandEffectSpec(worktreePath, opts.cwd ?? worktreePath, cmd ?? "/bin/sh", rest, opts.env ?? commandEnv, mode, withCache.dir, true),
         reapDeadlineMs,
         "command",
         log,

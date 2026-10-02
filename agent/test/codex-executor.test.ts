@@ -24,6 +24,7 @@ import {
   MAX_COMMAND_CAPTURE_BYTES,
   COMMAND_CAPTURE_KILLED_CODE,
   commandSandboxArgv,
+  boundaryProcessSpawnerForTest,
   HeldRunCommandCache,
   canonicalCheckoutPath,
   withCommandGitTrust,
@@ -3025,6 +3026,37 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
     // The model's --mode best-effort is entirely inside the child argv (after --).
     assert.deepEqual(args.slice(sep + 1), ["/bin/sh", "-c", "echo hi", "--mode", "best-effort"]);
     assert.equal(args.slice(0, sep).filter((a) => a === "--mode").length, 1, "exactly one trusted --mode before --");
+  });
+
+  it("emits --stdin null after --mode and before --, and a model-supplied --stdin lands after --", () => {
+    const wt = "/data/runner/repo/run-a";
+    const tmp = "/tmp/uzi-codex-command-test-a";
+    const args = commandSandboxArgv(wt, wt, "/bin/sh", ["-c", "cat", "--stdin", "inherit"], tmp, "required", undefined, true);
+    const sep = args.indexOf("--");
+    assert.deepEqual(args.slice(0, sep), ["--root", wt, "--tmp", tmp, "--cwd", wt, "--mode", "required", "--stdin", "null"]);
+    assert.deepEqual(args.slice(sep + 1), ["/bin/sh", "-c", "cat", "--stdin", "inherit"]);
+    assert.ok(!commandSandboxArgv(wt, wt, "/bin/sh", [], tmp, "required").includes("--stdin"), "absent unless requested");
+  });
+
+  // Launch that records the spec and then refuses, so only the argv the caller built is observed.
+  const recordingLaunch = (specs: CodexEffectLaunchSpec[]) => async (spec: CodexEffectLaunchSpec): Promise<never> => {
+    specs.push(spec);
+    throw new Error("recorded");
+  };
+
+  it("a model-authorized command launches with --stdin null; a boundary command process (index-pack --stdin) does not", async () => {
+    const specs: CodexEffectLaunchSpec[] = [];
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const spawnCommand = makeDefaultSpawnCommand(registry, recordingLaunch(specs), 1000, "/data/runner/repo/run-1", {}, "required");
+    await assert.rejects(spawnCommand(["/bin/cat"], { cwd: "/data/runner/repo/run-1" }));
+    const boundary = boundaryProcessSpawnerForTest("required", recordingLaunch(specs));
+    const clone = "/data/runner/repo/issue-1";
+    await assert.rejects(boundary({ argv: ["/usr/bin/git", "-C", clone, "index-pack", "--stdin"], cwd: clone, env: {}, identity: "command" }, 1000));
+    assert.equal(specs.length, 2);
+    const [model, pack] = specs as [CodexEffectLaunchSpec, CodexEffectLaunchSpec];
+    const modelFlags = model.args.slice(0, model.args.indexOf("--"));
+    assert.deepEqual(modelFlags.slice(-4), ["--mode", "required", "--stdin", "null"]);
+    assert.ok(!pack.args.slice(0, pack.args.indexOf("--")).includes("--stdin"), "the pack import keeps its stdin");
   });
 });
 
@@ -6260,7 +6292,7 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
     const flags = flagsOf(command);
     const tmp = flags[flags.indexOf("--tmp") + 1];
     assert.match(String(tmp), /^\/tmp\/uzi-codex-command-/);
-    assert.deepEqual(flags, ["--root", WORKSPACE, "--tmp", tmp, "--cwd", WORKSPACE, "--cache", CACHE_DIR, "--mode", "required"]);
+    assert.deepEqual(flags, ["--root", WORKSPACE, "--tmp", tmp, "--cwd", WORKSPACE, "--cache", CACHE_DIR, "--mode", "required", "--stdin", "null"]);
     assert.equal(command.env.GOMODCACHE, `${CACHE_DIR}/gomod`);
     assert.equal(command.env.GOCACHE, `${CACHE_DIR}/gocache`);
     assert.equal(command.env.npm_config_cache, `${CACHE_DIR}/npm`);

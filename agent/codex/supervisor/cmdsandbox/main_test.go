@@ -14,7 +14,7 @@ import (
 )
 
 func TestParseArgs(t *testing.T) {
-	root, tmp, cwd, cache, mode, child, err := parseArgs([]string{
+	root, tmp, cwd, cache, mode, _, child, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run/sub", "--", "/bin/sh", "-c", "true",
 	})
 	if err != nil || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run/sub" || cache != "" || mode != modeRequired || !reflect.DeepEqual(child, []string{"/bin/sh", "-c", "true"}) {
@@ -25,7 +25,7 @@ func TestParseArgs(t *testing.T) {
 func TestParseArgsMode(t *testing.T) {
 	// (present) an explicit --mode before -- is honored.
 	for _, want := range []sandboxMode{modeRequired, modeBestEffort, modeOff} {
-		root, tmp, cwd, _, mode, child, err := parseArgs([]string{
+		root, tmp, cwd, _, mode, _, child, err := parseArgs([]string{
 			"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", string(want), "--", "/bin/true",
 		})
 		if err != nil || mode != want || root != "/data/run" || tmp != "/tmp/run" || cwd != "/data/run" || !reflect.DeepEqual(child, []string{"/bin/true"}) {
@@ -34,7 +34,7 @@ func TestParseArgsMode(t *testing.T) {
 	}
 
 	// (absent) defaults to required.
-	if _, _, _, _, mode, _, err := parseArgs([]string{
+	if _, _, _, _, mode, _, _, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "/bin/true",
 	}); err != nil || mode != modeRequired {
 		t.Fatalf("absent --mode should default to required: mode=%q err=%v", mode, err)
@@ -42,7 +42,7 @@ func TestParseArgsMode(t *testing.T) {
 
 	// (after --) a --mode token in the CHILD command is NOT parsed as the sandbox
 	// mode — the trust property: the mode comes only from the trusted worker argv.
-	root, _, _, _, mode, child, err := parseArgs([]string{
+	root, _, _, _, mode, _, child, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--", "/bin/sh", "--mode", "best-effort",
 	})
 	if err != nil || root != "/data/run" || mode != modeRequired {
@@ -53,7 +53,7 @@ func TestParseArgsMode(t *testing.T) {
 	}
 
 	// (invalid) an unknown mode value is rejected (fail closed).
-	if _, _, _, _, _, _, err := parseArgs([]string{
+	if _, _, _, _, _, _, _, err := parseArgs([]string{
 		"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run", "--mode", "loose", "--", "/bin/true",
 	}); err == nil {
 		t.Fatal("an unknown --mode value must be rejected")
@@ -97,7 +97,7 @@ func TestParseArgsRejectsEscape(t *testing.T) {
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
-			if _, _, _, _, _, _, err := parseArgs(test.args); err == nil {
+			if _, _, _, _, _, _, _, err := parseArgs(test.args); err == nil {
 				t.Fatal("expected argument rejection")
 			}
 		})
@@ -565,5 +565,34 @@ func TestAddRulesGrantsTmpThroughTheAdoptedFd(t *testing.T) {
 	}
 	if len(paths) == 0 || paths[len(paths)-1] != root {
 		t.Fatalf("path rules %v do not end with the root %q", paths, root)
+	}
+}
+
+func TestParseArgsStdin(t *testing.T) {
+	base := []string{"--root", "/data/run", "--tmp", "/tmp/run", "--cwd", "/data/run"}
+	with := func(extra ...string) []string { return append(append([]string{}, base...), extra...) }
+
+	if _, _, _, _, _, null, child, err := parseArgs(with("--stdin", "null", "--", "/bin/true")); err != nil || !null || len(child) != 1 {
+		t.Fatalf("--stdin null: null=%v child=%v err=%v", null, child, err)
+	}
+	if _, _, _, _, mode, null, _, err := parseArgs(with("--mode", "off", "--stdin", "null", "--", "/bin/true")); err != nil || !null || mode != modeOff {
+		t.Fatalf("--mode --stdin: mode=%q null=%v err=%v", mode, null, err)
+	}
+	if _, _, _, _, _, null, _, err := parseArgs(with("--", "/bin/true")); err != nil || null {
+		t.Fatalf("absent --stdin: null=%v err=%v", null, err)
+	}
+	// After -- the token belongs to the child.
+	_, _, _, _, _, null, child, err := parseArgs(with("--", "/bin/sh", "--stdin", "null"))
+	if err != nil || null || len(child) != 3 {
+		t.Fatalf("--stdin after --: null=%v child=%v err=%v", null, child, err)
+	}
+	for name, args := range map[string][]string{
+		"bad value":     with("--stdin", "inherit", "--", "/bin/true"),
+		"missing value": with("--stdin", "--", "/bin/true"),
+		"before mode":   with("--stdin", "null", "--mode", "off", "--", "/bin/true"),
+	} {
+		if _, _, _, _, _, _, _, err := parseArgs(args); err == nil {
+			t.Fatalf("%s: want an error", name)
+		}
 	}
 }
