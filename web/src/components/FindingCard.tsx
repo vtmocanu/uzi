@@ -61,12 +61,14 @@ export function FindingCard({
   location,
   confidence,
   labels,
+  onMutation,
 }: {
   id: string;
   title: string;
   location: string;
   confidence?: string;
   labels: string[];
+  onMutation?: () => void;
 }) {
   const [state, setState] = useState<FindingCardState>({ kind: "open" });
   const [busy, setBusy] = useState(false);
@@ -123,9 +125,11 @@ export function FindingCard({
         labels: values.labels,
       });
       setState({ kind: "filed", issue: res.issue, warning: res.warning ?? "" });
+      onMutation?.();
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         setState({ kind: "resolved" });
+        onMutation?.();
         return;
       }
       throw e;
@@ -138,11 +142,13 @@ export function FindingCard({
     try {
       await api.dismissFinding(id, reason);
       setState({ kind: "dismissed", reason });
+      onMutation?.();
     } catch (e) {
       // A dismiss 409 means the coordinate is already filed/being filed/dismissed from the
       // backlog — same advisory story as File: show the resolved state, not an error.
       if (e instanceof ApiError && e.status === 409) {
         setState({ kind: "resolved" });
+        onMutation?.();
       } else {
         setErr(errorMessage(e, "Could not dismiss the finding"));
       }
@@ -162,12 +168,14 @@ export function FindingCard({
       focusAfterMutation.current = true;
       setAnnounce("Marked done");
       setState({ kind: "done", dispositionId: res.disposition_id, resolvedAt: new Date().toISOString() });
+      onMutation?.();
     } catch (e) {
       if (e instanceof ApiError && e.status === 409) {
         // The action row (and the Mark done button that held focus) unmounts for the advisory, so
         // arm the focus move too: it lands via the same fallback chain, on the card itself here.
         focusAfterMutation.current = true;
         setState({ kind: "resolved" });
+        onMutation?.();
       } else {
         setErr(errorMessage(e, "Could not mark the finding done"));
       }
@@ -197,6 +205,7 @@ export function FindingCard({
       } else {
         setState({ kind: "resolved" });
       }
+      onMutation?.();
     } catch (e) {
       setErr(errorMessage(e, "Could not undo"));
     } finally {

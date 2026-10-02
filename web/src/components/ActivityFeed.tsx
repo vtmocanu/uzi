@@ -540,6 +540,7 @@ export function ActivityFeed({
   terminal,
   phaseUsageBySeq,
   leadContext: leadContextProp,
+  onFindingMutation,
 }: {
   messages: RunMessage[];
   // The full run (PRD #95 M1 seam). M2 consumes it: the crew roster reads run.health /
@@ -550,6 +551,7 @@ export function ActivityFeed({
   terminal: boolean;
   // PRD #40: per-result-frame token/cost deltas keyed by seq. Optional.
   phaseUsageBySeq?: Map<number, PhaseUsage>;
+  onFindingMutation?: () => void;
   // PRD #516 / issue #553: the lead's live context-window fill. Three-state contract:
   //   `undefined` ⇒ the parent did NOT derive (standalone/tests) — fall back to deriving
   //                 it here from `messages` below.
@@ -1083,6 +1085,7 @@ export function ActivityFeed({
                   toolIndex={toolIndex}
                   visibleToolUseIds={visibleToolUseIds}
                   phaseUsageBySeq={phaseUsageBySeq}
+                  onFindingMutation={onFindingMutation}
                   // PRD #516: the context-window meter rides the LEAD lane only. The lead
                   // lane is the one whose key is LEAD (null instance + null/"lead" agent);
                   // a repo-shipped `lead.md` subagent has a real instance id → its key is
@@ -1119,6 +1122,7 @@ export function ActivityFeed({
                     toolIndex={toolIndex}
                     visibleToolUseIds={visibleToolUseIds}
                     phaseUsageBySeq={phaseUsageBySeq}
+                    onFindingMutation={onFindingMutation}
                   />
                 );
               })}
@@ -1147,6 +1151,7 @@ function AgentBlock({
   visibleToolUseIds,
   phaseUsageBySeq,
   leadContext,
+  onFindingMutation,
 }: {
   agent: string;
   // The lane's task label, ALREADY clamped by laneLabelText: model-authored text
@@ -1173,6 +1178,7 @@ function AgentBlock({
   toolIndex: ReturnType<typeof buildToolIndex>;
   visibleToolUseIds: Set<string>;
   phaseUsageBySeq?: Map<number, PhaseUsage>;
+  onFindingMutation?: () => void;
   // PRD #516: the lead's context-window fill. Set ONLY on the lead lane (undefined on
   // every subagent lane), so the header meter renders lead-only by construction.
   leadContext?: LeadContext;
@@ -1233,6 +1239,7 @@ function AgentBlock({
         msg={m}
         live={live}
         phaseUsage={phaseUsageBySeq?.get(m.seq)}
+        onFindingMutation={onFindingMutation}
       />,
     );
   }

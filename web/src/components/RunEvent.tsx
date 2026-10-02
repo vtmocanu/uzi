@@ -1036,6 +1036,7 @@ export const RunEventRow = memo(function RunEventRow({
   result,
   live,
   phaseUsage,
+  onFindingMutation,
 }: {
   msg: RunMessage;
   result?: RunMessage;
@@ -1043,6 +1044,7 @@ export const RunEventRow = memo(function RunEventRow({
   // PRD #40: the per-phase token/cost delta for a result frame (status/error),
   // looked up by seq upstream. undefined for every non-result row.
   phaseUsage?: PhaseUsage;
+  onFindingMutation?: () => void;
 }) {
   const rec = asRecord(msg.payload);
   switch (msg.kind) {
@@ -1250,6 +1252,7 @@ export const RunEventRow = memo(function RunEventRow({
           location={asString(rec?.["location"]) ?? ""}
           confidence={asString(rec?.["confidence"])}
           labels={asStringArray(rec?.["labels"])}
+          onMutation={onFindingMutation}
         />
       );
     }

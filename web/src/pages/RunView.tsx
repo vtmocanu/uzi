@@ -6,7 +6,7 @@
 // states get a hero banner: the MR link is the run's entire output and must
 // not hide in chrome. The breadcrumb keeps PRD #12's in-app board / issue links.
 
-import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import { Link, useParams } from "react-router-dom";
 import {
   api,
@@ -1844,19 +1844,28 @@ export function RunView() {
   const [incidentalSummary, setIncidentalSummary] = useState<{ runId: string; count: number } | null>(null);
   const findingsRunId = run?.id;
   const findingsTerminal = !!run && isTerminalRun(run.status);
-  useEffect(() => {
-    setIncidentalSummary(null);
-    if (!findingsTerminal || !findingsRunId) return;
-    let current = true;
+  const summaryContext = useRef({ runId: findingsRunId, terminal: findingsTerminal });
+  summaryContext.current = { runId: findingsRunId, terminal: findingsTerminal };
+  const summaryRequest = useRef(0);
+  const refreshIncidentalSummary = useCallback(() => {
+    if (!findingsTerminal || !findingsRunId ||
+        summaryContext.current.runId !== findingsRunId || !summaryContext.current.terminal) return;
+    const request = ++summaryRequest.current;
     api.listFindings("to_file", undefined, findingsRunId)
       .then(({ findings }) => {
-        if (current) setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
+        if (summaryRequest.current === request) {
+          setIncidentalSummary({ runId: findingsRunId, count: findings.filter((f) => f.status === "open").length });
+        }
       })
       .catch(() => {
-        if (current) setIncidentalSummary(null);
+        if (summaryRequest.current === request) setIncidentalSummary(null);
       });
-    return () => { current = false; };
   }, [findingsRunId, findingsTerminal]);
+  useEffect(() => {
+    setIncidentalSummary(null);
+    refreshIncidentalSummary();
+    return () => { summaryRequest.current++; };
+  }, [refreshIncidentalSummary]);
   const [repoWebUrl, setRepoWebUrl] = useState<string | null>(null);
   const [workers, setWorkers] = useState<Worker[]>([]);
   const [actionErr, setActionErr] = useState("");
@@ -3003,6 +3012,7 @@ export function RunView() {
           connected={connected}
           terminal={terminal}
           phaseUsageBySeq={usage.phaseUsageBySeq}
+          onFindingMutation={refreshIncidentalSummary}
           // `?? null` tells ActivityFeed "the parent already derived; do not re-derive"
           // (PRD #516 / issue #553): null distinguishes "no reading" from "not computed".
           leadContext={usage.leadContext ?? null}
