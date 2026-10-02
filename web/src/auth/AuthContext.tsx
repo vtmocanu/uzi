@@ -132,8 +132,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [serverUnreachable, setServerUnreachable] = useState(false);
   // At most one session probe is in flight: a refresh while one is pending joins it,
   // so probe results can never settle out of order. sessionGen is bumped only by an
-  // explicit login, register or logout; a probe that started before one of those
-  // drops its result, so it cannot undo the newer session state.
+  // explicit login, register or logout, or by another request's 401; a probe that
+  // started before one of those drops its result, so it cannot undo the newer state.
   const probeInFlight = useRef<Promise<void> | null>(null);
   const sessionGen = useRef(0);
 
@@ -203,13 +203,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
   // Any authenticated request that comes back 401 (a session expired or deleted
   // mid-session) clears the user here; a rendered ProtectedRoute then redirects
-  // to /login (replace). Because we only clear state — never navigate imperatively
-  // — the initial me() probe's expected 401 composes without looping: it clears an
-  // already-empty session and leaves a signed-out visitor on their public page.
+  // to /login (replace). We only clear state, never navigate imperatively. The
+  // session probe's own 401 does not come through here (api.me opts out); refresh
+  // handles it behind the generation check.
   useEffect(() => {
     setUnauthorizedHandler(() => {
+      // Another request's 401: the session is gone. Invalidate any pending probe
+      // so its later result cannot restore the user.
+      sessionGen.current += 1;
       setUser(null);
       setServerUnreachable(false);
+      setLoading(false);
     });
     return () => setUnauthorizedHandler(null);
   }, []);

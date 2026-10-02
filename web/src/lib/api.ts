@@ -224,8 +224,8 @@ function readCookie(name: string): string | null {
 // page inventing its own 401 string. It fires inside request() before the error
 // propagates, so even a 401 the caller swallows (the board's background poll)
 // still trips it. Clearing the session (not an imperative redirect) is what
-// composes safely: the initial me() probe's expected 401 just clears an already
-// -empty session and never bounces a signed-out visitor off a public page.
+// composes safely. The session probe (api.me) opts out and reports its own 401 to
+// AuthContext, which applies it only if no login, register or logout happened since.
 type UnauthorizedHandler = () => void;
 let unauthorizedHandler: UnauthorizedHandler | null = null;
 export function setUnauthorizedHandler(
@@ -333,6 +333,10 @@ async function request<T>(
   path: string,
   body?: unknown,
   extraHeaders?: Record<string, string>,
+  // false keeps a 401 out of the global unauthorized handler. Only the session probe
+  // passes it: AuthContext handles the probe's own 401 behind its generation check,
+  // so a probe that started before a login cannot sign that login out (#1991).
+  notifyUnauthorized = true,
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (body !== undefined) {
@@ -364,7 +368,7 @@ async function request<T>(
   }
 
   if (!res.ok) {
-    if (res.status === 401) unauthorizedHandler?.();
+    if (res.status === 401 && notifyUnauthorized) unauthorizedHandler?.();
     if (
       res.status === 409 &&
       (payload as { code?: string } | null)?.code === "vault_locked"
@@ -448,7 +452,7 @@ const realApi = {
       "/me/workers/upgrade-summary",
     ),
   logout: () => request<{ status: string }>("POST", "/auth/logout"),
-  me: () => request<SessionResponse>("GET", "/auth/me"),
+  me: () => request<SessionResponse>("GET", "/auth/me", undefined, undefined, false),
   listUsers: () => request<{ users: User[] }>("GET", "/admin/users"),
   setUserActive: (id: string, isActive: boolean) =>
     request<{ user: User }>("PATCH", `/admin/users/${id}`, {
