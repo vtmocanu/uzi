@@ -273,14 +273,16 @@ describe("SummaryRunner.generateDeliverySummary (PRD #1798 M5)", () => {
     assert.equal(Buffer.byteLength(out.changes[0]!), 199 * 4 + 3);
   });
 
-  it("keeps a two-participant sequence and clips raw UTF-8 labels before the api boundary", async () => {
-    const raw = { ...diagram, nodes: [{ key: "worker", label: "😀".repeat(300) }, diagram.nodes[1]] };
+  it("keeps a two-participant sequence and clips node and edge labels to 60 UTF-8 bytes", async () => {
+    const raw = { ...diagram, nodes: [{ key: "worker", label: "😀".repeat(16) }, diagram.nodes[1]], edges: [{ ...diagram.edges[0], label: "é".repeat(31) }, diagram.edges[1]] };
     const r = await runner(claudeQueryFn(JSON.stringify({ ...good, diagram: raw })));
     const out = (await r.generateDeliverySummary(await deliveryInput()))!;
     assert.equal(out.diagram?.kind, "sequence");
     assert.equal(out.diagram?.edges.length, 2);
-    assert.ok(Buffer.byteLength(out.diagram!.nodes[0]!.label) <= 1000);
-    assert.ok(out.diagram!.nodes[0]!.label.endsWith("…"));
+    assert.equal(out.diagram!.nodes[0]!.label, "😀".repeat(14) + "…");
+    assert.equal(Buffer.byteLength(out.diagram!.nodes[0]!.label), 59);
+    assert.equal(out.diagram!.edges[0]!.label, "é".repeat(28) + "…");
+    assert.equal(Buffer.byteLength(out.diagram!.edges[0]!.label!), 59);
   });
 
   it("keeps hostile diff instructions inside the untrusted frame, not in a mocked editor's diagram", async () => {

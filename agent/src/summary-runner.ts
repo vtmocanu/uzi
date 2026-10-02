@@ -583,7 +583,7 @@ export function parseDeliveryDiagram(raw: unknown): PrDescriptionDiagram | null 
   if (d.kind !== "flow" && d.kind !== "sequence") return null;
   if (!Array.isArray(d.nodes) || !Array.isArray(d.edges)) return null;
   if (d.nodes.length < (d.kind === "flow" ? 3 : 2) || d.nodes.length > 12 || d.edges.length < 2 || d.edges.length > 20) return null;
-  const label = (v: unknown): string | null => typeof v === "string" && v.trim() ? clipBytes(v.trim(), 1000) : null;
+  const label = (v: unknown): string | null => typeof v === "string" && v.trim() ? clipBytes(v.trim(), 60) : null;
   if (d.title !== undefined && typeof d.title !== "string") return null;
   const title = d.title === undefined ? undefined : clipBytes(d.title.trim(), 80);
   const nodes: PrDescriptionDiagram["nodes"] = [];
@@ -603,7 +603,7 @@ export function parseDeliveryDiagram(raw: unknown): PrDescriptionDiagram | null 
     const e = rawEdge as Record<string, unknown>;
     if (typeof e.from !== "string" || typeof e.to !== "string" || !keys.has(e.from) || !keys.has(e.to) || (d.kind === "flow" && e.from === e.to)) return null;
     if (e.label !== undefined && typeof e.label !== "string") return null;
-    edges.push({ from: e.from, to: e.to, ...(e.label !== undefined ? { label: clipBytes(e.label, 1000) } : {}) });
+    edges.push({ from: e.from, to: e.to, ...(e.label !== undefined ? { label: clipBytes(e.label, 60) } : {}) });
   }
   return { kind: d.kind, ...(title !== undefined ? { title } : {}), nodes, edges };
 }

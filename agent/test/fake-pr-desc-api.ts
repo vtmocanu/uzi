@@ -59,6 +59,9 @@ function sanitizeDiagram(raw: unknown): Json | undefined {
   const d = raw as Json;
   if ((d.kind !== "flow" && d.kind !== "sequence") || !Array.isArray(d.nodes) || !Array.isArray(d.edges)) return undefined;
   if (d.nodes.length < (d.kind === "flow" ? 3 : 2) || d.nodes.length > 12 || d.edges.length < 2 || d.edges.length > 20) return undefined;
+  // Narrow D4 stand-in for the hostile editor fixture. The API owns the full directive scan.
+  const labels = [d.title, ...(d.nodes as Json[]).map((n) => n.label), ...(d.edges as Json[]).map((e) => e.label)];
+  if (labels.some((v) => typeof v === "string" && /\bFixes\s+#1\b/iu.test(v))) return undefined;
   const label = (v: unknown, max: number): string => {
     const clean = String(v ?? "").replace(/[^\p{L}\p{N} .,\-_/+'()]/gu, " ").replace(/\s+/gu, " ").trim();
     let out = "";

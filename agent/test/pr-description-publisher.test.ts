@@ -320,13 +320,25 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
   });
 
   it("drops malformed diagrams from a custom delivery pass while retaining prose", async () => {
-    const malformed = { ...DIAGRAM, edges: [{ from: "worker", to: "missing" }, DIAGRAM.edges[1]] };
+    const malformed = { ...DIAGRAM, edges: [{ from: "worker", to: "missing" }, { from: "api", to: "worker", label: "ack" }] };
     const r = rig(new FakePass({ ...SUMMARY, diagram: malformed }));
     await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
     const stage = stages().at(-1)!;
     assert.equal(stage.source, "generated");
     assert.equal((stage.fields as { diagram?: unknown }).diagram, undefined);
-    assert.equal(stage.fields.summary, SUMMARY.summary);
+    assert.equal((stage.fields as { summary: string }).summary, SUMMARY.summary);
+  });
+
+  it("keeps prose when the API rejects a hostile diagram label from the editor", async () => {
+    const hostile = { ...DIAGRAM, edges: [{ ...DIAGRAM.edges[0]!, label: "Fixes #1" }, DIAGRAM.edges[1]!] };
+    const r = rig(new FakePass({ ...SUMMARY, diagram: hostile }));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const stage = stages().at(-1)!;
+    assert.equal((stage.fields as { diagram?: unknown }).diagram !== undefined, true);
+    const stored = [...api.versions.values()][0]!;
+    assert.equal(stored.fields.diagram, undefined);
+    assert.equal(stored.fields.summary, SUMMARY.summary);
+    assert.deepEqual(stored.fields.changes, SUMMARY.changes);
   });
 
   it("drops diagrams for docs-only and binary-only zero-code sizes, but keeps them when size is unavailable", async () => {
