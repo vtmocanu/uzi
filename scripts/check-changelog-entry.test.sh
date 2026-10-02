@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=25
+FLOOR=29
 cases=0
 passed=0
 
@@ -21,7 +21,9 @@ fresh() {
   mkdir -p "$d/seed/scripts/lib" "$d/seed/api" "$d/seed/deploy/chart"
   cp "$ROOT/scripts/check-changelog-entry.sh" "$d/seed/scripts/"
   cp "$ROOT/scripts/lib/shipping-paths.sh" "$d/seed/scripts/lib/"
-  printf '# Changelog\n\n## [Unreleased]\n\n## [0.1.0] - 2026-01-01\n\n- old\n' > "$d/seed/CHANGELOG.md"
+  printf '# Changelog\n\n## [Unreleased]\n\n' > "$d/seed/CHANGELOG.md"
+  if [ "$#" -gt 1 ]; then printf '%s\n\n' "$2" >> "$d/seed/CHANGELOG.md"; fi
+  printf '## [0.1.0] - 2026-01-01\n\n- old\n' >> "$d/seed/CHANGELOG.md"
   echo 'FROM scratch' > "$d/seed/api/Dockerfile"
   echo 'package api' > "$d/seed/api/x.go"
   echo 'module x' > "$d/seed/api/go.mod"
@@ -65,6 +67,29 @@ expect 1 "shipping change, no entry"
 
 fresh with-entry; echo '// y' >> "$W/api/x.go"; unrel '- y (#1)'; commit "fix(api): y"
 expect 0 "shipping change with an [Unreleased] line"
+
+# A PATH-first shim models BusyBox unified headers. Its added record corresponds to
+# the real new line in the fixture; the headers alone must never count as an entry.
+mkdir -p "$TMP/diff-shim"
+cat > "$TMP/diff-shim/diff" <<'SH'
+#!/usr/bin/env bash
+printf '%s\n' '--- unreleased.base' '+++ unreleased.head' '@@ -0,0 +1 @@' '+- y (#1)'
+exit 1
+SH
+chmod +x "$TMP/diff-shim/diff"
+fresh busybox-unified; echo '// y' >> "$W/api/x.go"; unrel '- y (#1)'; commit "fix(api): y"
+PATH="$TMP/diff-shim:$PATH" expect 0 "BusyBox-style unified diff accepts a real entry"
+
+fresh duplicate-entry '- existing'; echo '// y' >> "$W/api/x.go"; unrel '- existing'; commit "fix(api): y"
+expect 0 "duplicating an existing [Unreleased] line counts"
+
+fresh reordered-entries $'- first\n- second'; echo '// y' >> "$W/api/x.go"
+printf '# Changelog\n\n## [Unreleased]\n\n- second\n- first\n\n## [0.1.0] - 2026-01-01\n\n- old\n' > "$W/CHANGELOG.md"
+commit "fix(api): y"
+expect 0 "reordering [Unreleased] lines counts as an added diff record"
+
+fresh plus-prefixed; echo '// y' >> "$W/api/x.go"; unrel '+ prefixed entry'; commit "fix(api): y"
+expect 0 "added content beginning with + counts"
 
 fresh blank-line; echo '// y' >> "$W/api/x.go"; unrel ''; commit "fix(api): y"
 expect 1 "a blank [Unreleased] line is not an entry"

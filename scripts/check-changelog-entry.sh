@@ -96,10 +96,17 @@ pass() { echo "check-changelog-entry.sh: OK: $1"; exit 0; }
 unreleased() { awk '/^## \[Unreleased\]/ {f=1; next} /^## \[/ {f=0} f'; }
 { git show "$BASE:CHANGELOG.md" 2>/dev/null || true; } | unreleased > "$TMP/unreleased.base"
 { cat CHANGELOG.md 2>/dev/null || true; } | unreleased > "$TMP/unreleased.head"
-# A nonblank line the base section lacks; a blank line or an edit under a released
-# version does not count.
-diff "$TMP/unreleased.base" "$TMP/unreleased.head" > "$TMP/unreleased.diff" || true
-grep -qE '^> .*[^[:space:]]' "$TMP/unreleased.diff" && pass "CHANGELOG.md [Unreleased] gains an entry"
+# A nonblank added diff record counts, including a duplicate or a reordered line.
+# Blank lines and edits under a released version do not count.
+diff -U0 "$TMP/unreleased.base" "$TMP/unreleased.head" > "$TMP/unreleased.diff" || true
+awk '
+  /^@@ / { in_hunk = 1; next }
+  in_hunk && /^\+/ {
+    added = substr($0, 2)
+    if (added ~ /[^[:space:]]/) { found = 1; exit }
+  }
+  END { exit !found }
+' "$TMP/unreleased.diff" && pass "CHANGELOG.md [Unreleased] gains an entry"
 
 git log --no-merges --format=%B "$BASE..HEAD" > "$TMP/bodies"
 grep -qiE '^Changelog:[[:space:]]*none' "$TMP/bodies" && pass "a branch commit carries 'Changelog: none'"
