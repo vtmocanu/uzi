@@ -35,6 +35,8 @@ interface Harness {
   clock: { now: number };
   /** The governor's warn messages, in order. */
   warns: string[];
+  /** The governor's warn messages with their structured fields, in order. */
+  warnFields: { msg: string; fields?: Record<string, unknown> }[];
   /** While set, every in-place drop waits for it before it does anything (a PENDING drop). */
   inPlaceHold: { until?: Promise<void> };
 }
@@ -48,8 +50,13 @@ function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: Tri
   let reclaims = 0;
   const clock = { now: 1_000_000 };
   const warns: string[] = [];
+  const warnFields: Harness["warnFields"] = [];
   const inPlaceHold: Harness["inPlaceHold"] = {};
-  const log: Logger = { ...nullLogger(), warn: (m: string) => void warns.push(m) };
+  const log: Logger = { ...nullLogger(), warn: (m: string, fields?: Record<string, unknown>) => {
+      warns.push(m);
+      warnFields.push({ msg: m, fields });
+    },
+  };
   const options: DiskGovernorOptions = {
     config: { ...CONFIG, ...opts.config },
     log,
@@ -82,7 +89,7 @@ function harness(opts: { config?: Partial<CacheCapConfig>; trimTo?: (target: Tri
     now: () => clock.now,
   };
   const gov = new DiskGovernor(options);
-  return { gov, sizes, trims, stops, inPlace, inPlaceLeaves, reclaims: () => reclaims, clock, warns, inPlaceHold };
+  return { gov, sizes, trims, stops, inPlace, inPlaceLeaves, reclaims: () => reclaims, clock, warns, warnFields, inPlaceHold };
 }
 
 /** Register a run with no executor yet (cloning / setup): no status sent, not in the executor. */
@@ -507,6 +514,53 @@ describe("issue #1830: the hard layer covers every phase of a run", () => {
     await settle();
     assert.deepStrictEqual(h.stops, ["back"]);
     assert.deepStrictEqual(h.inPlace, []);
+  });
+
+  it("a late declined ACK of an older send does not cancel a newer running ACK (lastNonRunningAckedSeq is monotone)", async () => {
+    const h = harness();
+    watchSetup(h, "ooo", 3 * GIB);
+    h.gov.enterRun("ooo");
+    h.gov.statusRequested("ooo", "running"); // 1
+    const second = h.gov.statusRequested("ooo", "running");
+    const third = h.gov.statusRequested("ooo", "running");
+    h.gov.statusAcked("ooo", third, "running");
+    h.gov.statusAcked("ooo", second, "awaiting_approval"); // late, older than the running ACK
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, ["ooo"]);
+    assert.deepStrictEqual(h.inPlace, []);
+  });
+
+  it("a late declined ACK of an older send does not undo an earlier declined ACK's cancel", async () => {
+    const h = harness();
+    watchSetup(h, "ooo2", 3 * GIB);
+    h.gov.enterRun("ooo2");
+    const first = h.gov.statusRequested("ooo2", "running");
+    const second = h.gov.statusRequested("ooo2", "running");
+    const third = h.gov.statusRequested("ooo2", "running");
+    h.gov.statusAcked("ooo2", second, "running");
+    h.gov.statusAcked("ooo2", third, "awaiting_approval"); // cancels the running ACK of 2
+    h.gov.statusAcked("ooo2", first, "awaiting_approval"); // late: must not lower the cancel mark
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.stops, []);
+    assert.deepStrictEqual(h.inPlace, ["ooo2"]);
+  });
+
+  it("the logged acked_status is the newest send's, not a late ACK of an older one", async () => {
+    const h = harness();
+    watch(h, "log", 3 * GIB);
+    h.gov.statusRequested("log", "awaiting_approval"); // 2
+    const second = 2;
+    const third = h.gov.statusRequested("log", "awaiting_input"); // 3
+    h.gov.statusAcked("log", third, "awaiting_input");
+    h.gov.statusAcked("log", second, "awaiting_approval"); // late ACK of the older send
+    h.gov.observe(0.9);
+    await settle();
+    assert.deepStrictEqual(h.inPlace, ["log"]);
+    const drop = h.warnFields.find((w) => w.fields?.in_place === true);
+    assert.ok(drop, "the in-place drop was logged");
+    assert.strictEqual(drop.fields?.acked_status, "awaiting_input");
   });
 
   for (const declined of ["awaiting_approval", undefined] as const) {
