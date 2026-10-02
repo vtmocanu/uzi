@@ -19,6 +19,20 @@ var catalogSlugs = []string{
 	"assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "planned-sweep", "refactor-scout", "self-improve", "test-improvement",
 }
 
+func TestProposalJobsInheritOwnerModel(t *testing.T) {
+	for _, slug := range []string{"feature-bingo", "refactor-scout"} {
+		t.Run(slug, func(t *testing.T) {
+			job, ok := schedtmpl.BySlug(slug)
+			if !ok {
+				t.Fatalf("catalog job %q missing", slug)
+			}
+			if job.Model != "" {
+				t.Fatalf("catalog model = %q, want empty to inherit the owner's default", job.Model)
+			}
+		})
+	}
+}
+
 func TestCatalogSetIsExactlyNine(t *testing.T) {
 	got := schedtmpl.Catalog()
 	if len(got) != len(catalogSlugs) {

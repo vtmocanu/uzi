@@ -5,7 +5,6 @@ description: Weekly brainstorm that proposes one concrete new feature or improve
 target: prompt
 cron: 0 3 * * 2
 timezone: UTC
-model: fable
 ---
 
 Brainstorm ONE concrete, genuinely useful new feature or improvement for this
