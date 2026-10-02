@@ -6,6 +6,9 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { detectRepoAgents, repoAgentsDir, type RepoAgentNote } from "../src/repoagents.js";
+import { realProcfsSkip } from "./real-procfs.js";
+
+const HAS_PROCFS = process.platform === "linux";
 
 // The TS half of the PRD #602 M3 differential test (architect N4). It runs the
 // WORKER's repoagents.ts parser over the SAME committed corpus + hand-authored
@@ -41,7 +44,7 @@ function noteShape(note: RepoAgentNote): Record<string, unknown> {
   return note.tools ? { reason: note.reason, name: note.name, tools: note.tools } : { reason: note.reason, name: note.name };
 }
 
-describe("agentsource parser parity (repoagents.ts ↔ api/internal/agentsource)", () => {
+describe("agentsource parser parity (repoagents.ts ↔ api/internal/agentsource)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("agentsource parity: fixtures") }, () => {
   const mdFiles = fs.readdirSync(fixtureDir).filter((f) => f.endsWith(".md"));
   assert.ok(mdFiles.length > 0, `parity corpus is empty: ${fixtureDir}`);
 
@@ -92,7 +95,7 @@ describe("agentsource parser parity (repoagents.ts ↔ api/internal/agentsource)
 // assertions in api/internal/agentsource/parser_test.go (TestParseSetCapsAndDedupe),
 // so the set-level contract is pinned on both sides too. (too_large stays Go-only —
 // sharing it would mean committing a >64KB fixture — see that test's comment.)
-describe("agentsource parser parity — set level (detectRepoAgents ↔ ParseSet)", () => {
+describe("agentsource parser parity — set level (detectRepoAgents ↔ ParseSet)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("agentsource parity: set level") }, () => {
   const validFile = (name: string, body: string): string =>
     `---\nname: ${name}\ndescription: ok.\n---\n\n${body}\n`;
 

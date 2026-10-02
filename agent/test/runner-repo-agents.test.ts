@@ -7,6 +7,11 @@ import { defaultGitleaksShim } from "./gitleaks-shim.js";
 import { StubExecutor, type Executor } from "../src/executor.js";
 import { detectRepoAgents } from "../src/repoagents.js";
 import { RunRunner } from "../src/runner.js";
+import { realProcfsSkip } from "./real-procfs.js";
+
+const HAS_PROCFS = process.platform === "linux";
+const repoAgentReadSkip = (label: string): string | false =>
+  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`runner repoagents: ${label}`);
 import {
   api,
   client,
@@ -68,7 +73,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     }
   }
 
-  it("reports the parsed roster on a running report, noting every drop", async () => {
+  it("reports the parsed roster on a running report, noting every drop", { skip: repoAgentReadSkip("parsed roster") }, async () => {
     const { states, texts } = await runAgainst({
       ".claude/agents/coder.md":
         "---\nname: coder\ndescription: Implements changes.\nmodel: opus\n---\n\nImplement it.\n",
@@ -189,7 +194,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     }
   });
 
-  it("autopilot resolves + reports the repo-agent default selection with a feed note (PRD #37)", async () => {
+  it("autopilot resolves + reports the repo-agent default selection with a feed note (PRD #37)", { skip: repoAgentReadSkip("autopilot repo selection") }, async () => {
     // A repo shipping agents + an autopilot claim: the self-approve path resolves
     // the default to the repo source, reports it on a running report (the only
     // channel a no-input run has), and states it on the feed — never parking at the
@@ -342,7 +347,7 @@ describe("RunRunner — repo agent detection (PRD #37)", () => {
     );
   });
 
-  describe("second source: .codex/agents (issue #2085)", () => {
+  describe("second source: .codex/agents (issue #2085)", { skip: repoAgentReadSkip("second source") }, () => {
     const CODER_MD = "---\nname: claude-coder\ndescription: From claude.\n---\n\nbody\n";
     const CODER_TOML =
       'name = "codex-coder"\ndescription = "From codex."\ndeveloper_instructions = "Do it."\n';

@@ -7,6 +7,9 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { spawnSync } from "node:child_process";
+import { realProcfsSkip } from "./real-procfs.js";
+
+const HAS_PROCFS = process.platform === "linux";
 
 import {
   CodexExecutor,
@@ -9797,7 +9800,7 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
     assert.ok(!toolNames(1).includes("spawn_agent"), "the denylisted Task/Agent alias adds no delegation");
   });
 
-  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (passage, denied tools, no nested delegation, only the selected roster)", async () => {
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (passage, denied tools, no nested delegation, only the selected roster)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("CodexExecutor: TOML repo guards") }, async () => {
     const clone = await fs.mkdtemp(path.join(os.tmpdir(), "uzi-codex-toml-"));
     try {
       await fs.mkdir(path.join(clone, ".codex", "agents"), { recursive: true });

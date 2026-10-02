@@ -4,6 +4,9 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { realProcfsSkip } from "./real-procfs.js";
+
+const HAS_PROCFS = process.platform === "linux";
 
 import {
   REPO_AGENTS_MAX_FILES,
@@ -55,7 +58,7 @@ const CODER = [
   "",
 ].join("\n");
 
-describe("detectRepoAgents", () => {
+describe("detectRepoAgents", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("detectRepoAgents") }, () => {
   it("returns nothing when the repo has no .claude/agents", async () => {
     const { agents, notes } = await detectRepoAgents(clone);
     assert.deepEqual(agents, []);
@@ -378,7 +381,7 @@ describe("repo agents are structurally denied Agent by the assembly path", () =>
   });
 });
 
-describe("repo agents: committed fixture roster", () => {
+describe("repo agents: committed fixture roster", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("repoagents: committed fixture roster") }, () => {
   // A committed corpus of REAL, hand-authored role frontmatter that this test OWNS.
   //
   // detectRepoAgents is a PRODUCT function: it parses agents out of a USER'S cloned

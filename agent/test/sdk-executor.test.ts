@@ -4,6 +4,9 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { realProcfsSkip } from "./real-procfs.js";
+
+const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError, ProviderTransientError, type SdkQueryFn, type SdkExecutorOptions, type ContextUsageReading } from "../src/sdk-executor.js";
 import { LimitReachedError } from "../src/limit.js";
@@ -648,7 +651,7 @@ describe("SdkExecutor agent selection at the gate boundary (PRD #37)", () => {
     assert.ok(!append.includes("REPO LEAD BODY"), "the repo lead body never reaches the main-thread prompt");
   });
 
-  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or model)", async () => {
+  it("issue #2085: a .codex/agents TOML-sourced template gets the repo guards (untrusted passage, structural Agent denial, no tools or model)", { skip: !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip("SdkExecutor: TOML repo guards") }, async () => {
     const clone = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sdk-toml-"));
     try {
       fs.mkdirSync(path.join(clone, ".codex", "agents"), { recursive: true });

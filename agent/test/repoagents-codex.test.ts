@@ -4,6 +4,11 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { realProcfsSkip } from "./real-procfs.js";
+
+const HAS_PROCFS = process.platform === "linux";
+const repoAgentReadSkip = (label: string): string | false =>
+  !HAS_PROCFS ? "reads procfs (Linux only)" : realProcfsSkip(`repoagents-codex: ${label}`);
 
 import {
   REPO_AGENTS_MAX_FILES,
@@ -42,7 +47,7 @@ const MD_OK = (name: string) => `---\nname: ${name}\ndescription: Does ${name} t
 const names = (r: DetectedRepoAgents) => r.agents.map((a) => a.name);
 const reasons = (r: DetectedRepoAgents) => r.notes.map((n) => n.reason);
 
-describe("Codex TOML projection", () => {
+describe("Codex TOML projection", { skip: repoAgentReadSkip("TOML projection") }, () => {
   it("projects exactly name, description and developer_instructions onto a template", async () => {
     toml("coder.toml", TOML_OK("coder"));
     const r = await detectRepoAgents(clone, "codex");
@@ -170,7 +175,7 @@ describe("Codex TOML projection", () => {
   });
 });
 
-describe("native-folder precedence", () => {
+describe("native-folder precedence", { skip: repoAgentReadSkip("native-folder precedence") }, () => {
   it("claude harness: only .claude, only .codex, both", async () => {
     md("m.md", MD_OK("m"));
     let r = await detectRepoAgents(clone, "claude");
@@ -274,7 +279,7 @@ describe("containment shared by both loaders", () => {
       assert.deepEqual(reasons(r), ["unsafe_path"]);
     });
 
-    it(`never reads a symlinked leaf file in ${folder}/agents`, async () => {
+    it(`never reads a symlinked leaf file in ${folder}/agents`, { skip: repoAgentReadSkip(`symlinked leaf (${folder})`) }, async () => {
       leakDir();
       const ext = harness === "codex" ? "toml" : "md";
       (harness === "codex" ? toml : md)(`legit.${ext}`, harness === "codex" ? TOML_OK("legit") : MD_OK("legit"));
@@ -298,7 +303,7 @@ describe("containment shared by both loaders", () => {
       assert.equal(describeRepoAgentNote(r.notes[0]!), 'repo agent file "x" was skipped: its location could not be verified inside the agents folder');
     });
 
-    it(`refuses a leaf swapped for a symlink to ANOTHER file in the same folder (${folder})`, async () => {
+    it(`refuses a leaf swapped for a symlink to ANOTHER file in the same folder (${folder})`, { skip: repoAgentReadSkip(`same-folder leaf swap (${folder})`) }, async () => {
       const ext = harness === "codex" ? "toml" : "md";
       const put = harness === "codex" ? toml : md;
       put(`a-target.${ext}`, harness === "codex" ? TOML_OK("a-target") : MD_OK("a-target"));
@@ -316,7 +321,7 @@ describe("containment shared by both loaders", () => {
       assert.deepEqual(r.notes, [{ name: "x", reason: "unsafe_path" }]);
     });
 
-    it(`skips a leaf swapped for a FIFO without blocking (${folder})`, async () => {
+    it(`skips a leaf swapped for a FIFO without blocking (${folder})`, { skip: repoAgentReadSkip(`FIFO leaf swap (${folder})`) }, async () => {
       const ext = harness === "codex" ? "toml" : "md";
       (harness === "codex" ? toml : md)(`x.${ext}`, harness === "codex" ? TOML_OK("x") : MD_OK("x"));
       let fifoPath = "";
@@ -451,8 +456,7 @@ describe("containment shared by both loaders", () => {
   });
 
   // One real check of the default resolver; the rest of the suite injects.
-  const hasProcFd = fs.existsSync("/proc/self/fd");
-  it("default resolver: accepts a real file and refuses a real ancestor swap", { skip: !hasProcFd }, async () => {
+  it("default resolver: accepts a real file and refuses a real ancestor swap", { skip: repoAgentReadSkip("default resolver") }, async () => {
     toml("x.toml", TOML_OK("x"));
     const ok = await detectRepoAgents(clone, "codex");
     assert.deepEqual(names(ok), ["x"]);
