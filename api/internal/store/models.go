@@ -967,6 +967,15 @@ type RunCredentialEpoch struct {
 	AppliedAt       pgtype.Timestamptz `json:"applied_at"`
 }
 
+type RunDecisionMemo struct {
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	FormatVersion   int16              `json:"format_version"`
+	Body            string             `json:"body"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type RunFetch struct {
 	ID            uuid.UUID          `json:"id"`
 	RunID         uuid.UUID          `json:"run_id"`

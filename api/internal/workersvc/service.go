@@ -1194,6 +1194,9 @@ type Store interface {
 	InsertAgentMemory(ctx context.Context, arg store.InsertAgentMemoryParams) (store.AgentMemory, error)
 	ListAgentMemoryForUserRepo(ctx context.Context, arg store.ListAgentMemoryForUserRepoParams) ([]store.AgentMemory, error)
 	CountAgentMemoryForRun(ctx context.Context, runID pgtype.UUID) (int64, error)
+	// Run decisions memo (issue #2083): the fenced single-statement write and the lineage read.
+	UpsertRunDecisionMemoFenced(ctx context.Context, arg store.UpsertRunDecisionMemoFencedParams) (int64, error)
+	GetLatestDecisionMemoForLineage(ctx context.Context, arg store.GetLatestDecisionMemoForLineageParams) (store.GetLatestDecisionMemoForLineageRow, error)
 	EvictAgentMemoryOverCap(ctx context.Context, arg store.EvictAgentMemoryOverCapParams) error
 
 	// Chat runs (PRD #39): a third run kind riding the run machinery. The chat

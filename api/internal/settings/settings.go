@@ -443,7 +443,7 @@ func Validate(key, value string) error {
 		return validateTypeface(value)
 	case KeySlackEnabled, KeyJudgeEnabled, KeyJudgeEnforceAll, KeyHealthEnabled,
 		KeyCapabilityAwareScheduling, KeyCompletionInterlockRollout, KeyGithubProjectSyncEnabled,
-		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled,
+		KeyEphemeralWorkersEnabled, KeyAgentSourceEnabled, KeyMrReworkEnabled, KeyDecisionsMemoEnabled,
 		KeyCiAutofixEnabled,
 		KeyReleaseCheckEnabled, KeyReleaseCheckBannerEnabled,
 		KeyAppLogoKeepName, KeyBrandPlaque:

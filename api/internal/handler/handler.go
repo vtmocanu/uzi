@@ -1213,6 +1213,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		r.With(h.refuseJobRuns).Post("/runs/{id}/memory", h.WorkerSaveMemory)
 		r.With(h.refuseJobRuns).Get("/runs/{id}/memory", h.WorkerListMemory)
 
+		// Run decisions memo (issue #2083): the lead saves one bounded memo per run, fenced on the
+		// claim generation; a resumed mr_rework run reads the prior completed run's memo on its MR
+		// lineage. Both are gated by the decisions_memo_enabled admin setting, failing closed.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/decisions-memo", h.WorkerSaveDecisionsMemo)
+		r.With(h.refuseJobRuns).Get("/runs/{id}/decisions-memo", h.WorkerGetDecisionsMemo)
+
 		// Forge read surface (PRD #158 M1): worker-authenticated, run-scoped, READ
 		// ONLY. Every route derives the (repo, connection, project id) from the OWNED
 		// run — never from the request — builds a driver, and returns a coordinate-free
