@@ -1172,6 +1172,15 @@ of which seeding is one mode (the "Seed & ship" option).
    touch, the change in each, and how to tell it's done, as if handing the
    plan to someone who has read nothing else. Any plain text works — there
    is no required schema.
+
+   **Strip every gate or approval line before seeding.** A seeded run has no
+   plan gate, so a sentence such as "no implementation occurs before plan
+   approval", or a note that the plan was approved at another run's gate,
+   reads as an approval still pending: the lead re-submits the plan and waits
+   for a verdict that never comes, until the iteration budget fails the run
+   with no file changed. When reusing a gated run's approved plan, delete its
+   gate wording and say plainly that the plan is approved for this run and
+   implementation starts at once.
 3. **Read the roster off the clone, not from memory, if you're naming one.**
    `--agent-source repo` means the roster in the clone's `.claude/agents/`
    (`ls .claude/agents/` there to see it — one role per file, named by its
