@@ -24,7 +24,8 @@ OUTER="$TMP/outer"
 mkdir -p "$OUTER"
 
 # The fake commands. `leave NAME MODE` creates NAME/data/x in its TMPDIR; MODE is
-# none | created | removed (created and removed lines). `clean` leaves nothing. `fail RC`
+# none | created | removed (created and removed lines) | longer (created and removed
+# lines for NAME plus one more character, which must NOT be attributed to NAME). `clean` leaves nothing. `fail RC`
 # exits RC. `probe FILE` records the ledger path and the TMPDIR the command saw.
 FAKE="$TMP/fake-tests"
 cat > "$FAKE" <<'EOS'
@@ -41,6 +42,10 @@ case "$1" in
     case "$3" in
       removed)
         printf '{"entry":"%s","path":"%s/%s","event":"removed","pid":1,"at":"t"}\n' "$2" "$TMPDIR" "$2" >> "$UZI_TMPDIR_GUARD_LEDGER"
+        ;;
+      longer)
+        printf '{"entry":"%sX","path":"%s/%sX","event":"created","pid":1,"at":"t","file":"/w/other.test.ts","test":"other","site":[]}\n' "$2" "$TMPDIR" "$2" >> "$UZI_TMPDIR_GUARD_LEDGER"
+        printf '{"entry":"%sX","path":"%s/%sX","event":"removed","pid":1,"at":"t"}\n' "$2" "$TMPDIR" "$2" >> "$UZI_TMPDIR_GUARD_LEDGER"
         ;;
     esac
     exit 0
@@ -82,6 +87,8 @@ check() {
 }
 rc_is() { [ "$rc" -eq "$1" ]; }
 err_has() { grep -qF -- "$1" "$ERR"; }
+err_lacks() { ! grep -qF -- "$1" "$ERR"; }
+err_line() { grep -qxF -- "$1" "$ERR"; }
 outer_empty() { [ -z "$(ls -A "$OUTER")" ]; }
 
 # a. created line only: attribution, honest verdict, listing.
@@ -91,19 +98,31 @@ check "a: file shown" err_has "/w/fake.test.ts"
 check "a: test shown" err_has "fake test name"
 check "a: verdict" err_has "no successful cleanup recorded"
 check "a: listing" err_has "uzi-agent-test-AAAAAA/data/x"
+check "a: listing is relative to scratch" err_line "      uzi-agent-test-AAAAAA/data/x"
+check "a: no recreated verdict" err_lacks "cleanup ran; the directory was recreated afterwards"
+check "a: no missing-creator verdict" err_lacks "no creator recorded in the ledger"
 check "a: scratch and ledger removed" outer_empty
 
 # b. created + removed, dir still present.
 run_guard leave uzi-agent-test-BBBBBB removed
 check "b: rc=1" rc_is 1
 check "b: verdict" err_has "cleanup ran; the directory was recreated afterwards"
+check "b: no created-only verdict" err_lacks "no successful cleanup recorded"
 check "b: scratch and ledger removed" outer_empty
 
 # c. no ledger lines at all.
 run_guard leave uzi-agent-test-CCCCCC none
 check "c: rc=1" rc_is 1
 check "c: verdict" err_has "no creator recorded in the ledger"
+check "c: no other verdict" err_lacks "cleanup ran; the directory was recreated afterwards"
 check "c: scratch and ledger removed" outer_empty
+
+# g. a ledger entry whose name merely starts with the leftover's name is not its creator.
+run_guard leave uzi-agent-test-GGGGGG longer
+check "g: rc=1" rc_is 1
+check "g: verdict" err_has "no creator recorded in the ledger"
+check "g: other entry not attributed" err_lacks "/w/other.test.ts"
+check "g: scratch and ledger removed" outer_empty
 
 # d. clean command.
 run_guard clean

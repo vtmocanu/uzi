@@ -32,7 +32,7 @@
 #   the command's own non-zero status, when it failed (the leak report still
 #     prints, and the scratch dir is still removed)
 #   1 = the command passed but left something in the scratch dir
-#   2 = usage / could not create the scratch dir
+#   2 = usage / could not create the scratch dir or the ledger file
 #   0 = the command passed and the scratch dir holds nothing but the two tool caches
 # POSIX sh on purpose: runs under busybox sh, dash and macOS /bin/sh alike.
 set -u
@@ -84,11 +84,12 @@ for entry in "$scratch"/* "$scratch"/.[!.]* "$scratch"/..?*; do
     echo "tmpdir-leak-guard: the command left these entries in its TMPDIR ($scratch):" >&2
   fi
   leftover=$((leftover + 1))
-  echo "  $name" >&2
+  # printf, not echo: dash and macOS sh echo interpret backslashes in untrusted text.
+  printf '  %s\n' "$name" >&2
   matched="$(grep -F "\"entry\":\"$name\"" "$ledger" 2>/dev/null)"
   if [ -n "$matched" ]; then
     printf '%s\n' "$matched" | while IFS= read -r line; do
-      echo "    ledger: $line" >&2
+      printf '    ledger: %s\n' "$line" >&2
     done
     case "$matched" in
       *'"event":"removed"'*) echo "    verdict: cleanup ran; the directory was recreated afterwards" >&2 ;;
@@ -99,7 +100,7 @@ for entry in "$scratch"/* "$scratch"/.[!.]* "$scratch"/..?*; do
   fi
   echo "    contents (bounded):" >&2
   find "$entry" -maxdepth 4 2>/dev/null | head -n 40 | while IFS= read -r p; do
-    echo "      ${p#"$scratch"/}" >&2
+    printf '      %s\n' "${p#"$scratch"/}" >&2
   done
 done
 

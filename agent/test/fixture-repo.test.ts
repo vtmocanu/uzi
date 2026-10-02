@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { makeFixture } from "./fixture-repo.js";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
 
 const SELF = fileURLToPath(import.meta.url);
 const GUARD = path.resolve(path.dirname(SELF), "../../scripts/tmpdir-leak-guard.sh");
@@ -36,8 +36,9 @@ if (process.env.UZI_FIXTURE_REPO_CHILD === "1") {
       const ledger = path.join(dir, "ledger");
       const saved = process.env.UZI_TMPDIR_GUARD_LEDGER;
       process.env.UZI_TMPDIR_GUARD_LEDGER = ledger;
+      let fx: Fixture | undefined;
       try {
-        const fx = makeFixture({}, { testName: "x" });
+        fx = makeFixture({}, { testName: "x" });
         const base = path.dirname(fx.dataDir);
         let lines = readLedger(ledger);
         assert.equal(lines.length, 1);
@@ -58,6 +59,9 @@ if (process.env.UZI_FIXTURE_REPO_CHILD === "1") {
         assert.equal((lines[1] as Record<string, unknown>).event, "removed");
         assert.equal((lines[1] as Record<string, unknown>).entry, path.basename(base));
       } finally {
+        // A failed assertion above must not leak the fixture into the real guard's TMPDIR,
+        // where its created line (in this private ledger) would be gone.
+        if (fx) fs.rmSync(path.dirname(fx.dataDir), { recursive: true, force: true });
         if (saved === undefined) delete process.env.UZI_TMPDIR_GUARD_LEDGER;
         else process.env.UZI_TMPDIR_GUARD_LEDGER = saved;
         fs.rmSync(dir, { recursive: true, force: true });
