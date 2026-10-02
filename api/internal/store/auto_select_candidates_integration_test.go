@@ -536,7 +536,7 @@ func TestAutoSelectCandidatesLiveDB(t *testing.T) {
 func sameCandidate(a, b autoselect.Candidate) (string, bool) {
 	// 🔴 THE FIELD COUNT IS THE OTHER HALF OF THIS HELPER, and without it the whole
 	// differential is one struct change away from being decorative. The comparison
-	// below enumerates ten fields BY HAND; add an eleventh to autoselect.Candidate and
+	// below enumerates eleven fields BY HAND; add a twelfth to autoselect.Candidate and
 	// it is silently uncompared, so D21's test — the entire reason this seam exists —
 	// would go on agreeing about a field it never looked at. That failure is invisible
 	// in every existing fixture, which is precisely the class this repo keeps getting
@@ -546,8 +546,8 @@ func sameCandidate(a, b autoselect.Candidate) (string, bool) {
 	// EXTEND it with five more fixture cases, and M5/M6 are the milestones most likely
 	// to widen Candidate. Reflection is the Go-side equivalent of the exhaustive
 	// Record<AutoStatus, …> the web already gets from its typechecker.
-	if n := reflect.TypeOf(autoselect.Candidate{}).NumField(); n != 10 {
-		return fmt.Sprintf("autoselect.Candidate has %d fields and this comparison covers 10 by "+
+	if n := reflect.TypeOf(autoselect.Candidate{}).NumField(); n != 11 {
+		return fmt.Sprintf("autoselect.Candidate has %d fields and this comparison covers 11 by "+
 			"hand; add the new one below or the differential silently stops checking it", n), false
 	}
 	i16 := func(p *int16) string {
@@ -566,6 +566,7 @@ func sameCandidate(a, b autoselect.Candidate) (string, bool) {
 		{"SecretID", a.SecretID.String(), b.SecretID.String()},
 		{"Label", a.Label, b.Label},
 		{"AutoEligible", fmt.Sprint(a.AutoEligible), fmt.Sprint(b.AutoEligible)},
+		{"Rejected", fmt.Sprint(a.Rejected), fmt.Sprint(b.Rejected)},
 		{"HasReading", fmt.Sprint(a.HasReading), fmt.Sprint(b.HasReading)},
 		{"FiveHourPct", i16(a.FiveHourPct), i16(b.FiveHourPct)},
 		{"SevenDayPct", i16(a.SevenDayPct), i16(b.SevenDayPct)},
